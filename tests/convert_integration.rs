@@ -211,3 +211,166 @@ fn test_convert_coreml_requires_feature() {
         .failure()
         .stderr(predicate::str::contains("coreml-backend"));
 }
+
+#[test]
+fn test_convert_mixed_46_produces_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_mixed");
+
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input",
+            input_dir.to_str().unwrap(),
+            "--format",
+            "mlx",
+            "--quant",
+            "mixed-4-6",
+            "--sensitive-layers",
+            "0-1",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    assert!(output_dir.join("config.json").exists());
+    assert!(output_dir.join("quantization_config.json").exists());
+}
+
+#[test]
+fn test_convert_mixed_26_produces_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_mixed26");
+
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input",
+            input_dir.to_str().unwrap(),
+            "--format",
+            "mlx",
+            "--quant",
+            "mixed-2-6",
+            "--sensitive-layers",
+            "1",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    assert!(output_dir.join("config.json").exists());
+}
+
+#[test]
+fn test_convert_with_json_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_report");
+
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input",
+            input_dir.to_str().unwrap(),
+            "--format",
+            "mlx",
+            "--quant",
+            "q4",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--json-report",
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    // Verify report.json was written
+    let report_path = output_dir.join("report.json");
+    assert!(report_path.exists(), "report.json should exist in output");
+
+    // Verify it's valid JSON with expected fields
+    let content = fs::read_to_string(&report_path).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(report["schema_version"], "1");
+    assert_eq!(report["quantization"]["method"], "q4");
+    assert_eq!(report["quantization"]["bits"], 4);
+    assert!(report["model"]["architecture"].is_string());
+}
+
+#[test]
+fn test_convert_json_report_to_stdout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_stdout_report");
+
+    setup_tiny_model(&input_dir);
+
+    let output = Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input",
+            input_dir.to_str().unwrap(),
+            "--format",
+            "mlx",
+            "--quant",
+            "q4",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--json-report",
+            "--yes",
+            "--skip-quality",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    // stdout should contain JSON
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(report["schema_version"], "1");
+}
+
+#[test]
+fn test_convert_skip_quality_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_skipq");
+
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input",
+            input_dir.to_str().unwrap(),
+            "--format",
+            "mlx",
+            "--quant",
+            "q4",
+            "--output",
+            output_dir.to_str().unwrap(),
+            "--skip-quality",
+        ])
+        .assert()
+        .success();
+
+    assert!(output_dir.join("config.json").exists());
+}

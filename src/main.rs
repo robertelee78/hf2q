@@ -535,23 +535,25 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // Phase 7: Print summary
-    let model_name = config
-        .input_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "model".to_string());
+    // Phase 7: Print summary (skip when writing JSON to stdout to keep stdout clean)
+    if !(config.json_report && config.yes) {
+        let model_name = config
+            .input_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "model".to_string());
 
-    progress::print_summary(
-        &model_name,
-        &metadata.architecture,
-        metadata.param_count,
-        &quant_method_str,
-        input_size,
-        manifest.total_size_bytes,
-        &manifest.output_dir,
-        &progress.elapsed_display(),
-    );
+        progress::print_summary(
+            &model_name,
+            &metadata.architecture,
+            metadata.param_count,
+            &quant_method_str,
+            input_size,
+            manifest.total_size_bytes,
+            &manifest.output_dir,
+            &progress.elapsed_display(),
+        );
+    }
 
     Ok(())
 }
