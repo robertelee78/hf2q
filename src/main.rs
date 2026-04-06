@@ -2,6 +2,12 @@
 //!
 //! Entry point: dispatches clap subcommands to appropriate handlers.
 //! anyhow is used at this level for top-level error handling.
+//!
+//! Exit codes (FR39):
+//!   0 = success
+//!   1 = conversion error
+//!   2 = quality threshold exceeded
+//!   3 = input/validation error
 
 mod backends;
 mod cli;
@@ -9,10 +15,8 @@ mod doctor;
 #[allow(dead_code)]
 mod inference;
 mod input;
-#[allow(dead_code)]
 mod intelligence;
 mod ir;
-#[allow(dead_code)]
 mod preflight;
 mod progress;
 #[allow(dead_code)]
@@ -21,16 +25,65 @@ mod quantize;
 #[allow(dead_code)]
 mod report;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::error;
+use tracing::{error, warn};
 
 use cli::{Cli, Command};
 
+/// Global flag set when SIGINT (Ctrl+C) is received.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Exit codes per FR39.
+const EXIT_SUCCESS: u8 = 0;
+const EXIT_CONVERSION_ERROR: u8 = 1;
+const EXIT_QUALITY_EXCEEDED: u8 = 2;
+const EXIT_INPUT_ERROR: u8 = 3;
+
+/// Error types for exit code classification.
+#[derive(Debug)]
+enum AppError {
+    /// Input or validation error (exit code 3)
+    Input(anyhow::Error),
+    /// Conversion error (exit code 1)
+    Conversion(anyhow::Error),
+    /// Quality threshold exceeded (exit code 2)
+    #[allow(dead_code)]
+    QualityExceeded(anyhow::Error),
+    /// Interrupted by signal (exit code 1)
+    Interrupted,
+}
+
+impl AppError {
+    fn exit_code(&self) -> u8 {
+        match self {
+            AppError::Input(_) => EXIT_INPUT_ERROR,
+            AppError::Conversion(_) => EXIT_CONVERSION_ERROR,
+            AppError::QualityExceeded(_) => EXIT_QUALITY_EXCEEDED,
+            AppError::Interrupted => EXIT_CONVERSION_ERROR,
+        }
+    }
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::Input(e) => write!(f, "{:#}", e),
+            AppError::Conversion(e) => write!(f, "{:#}", e),
+            AppError::QualityExceeded(e) => write!(f, "{:#}", e),
+            AppError::Interrupted => write!(f, "Conversion interrupted by user"),
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    // Initialize tracing subscriber for structured logging
+    // Initialize tracing subscriber for structured logging.
+    // All progress/warnings go to stderr so stdout stays clean for --json-report.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,42 +101,51 @@ fn main() -> ExitCode {
             2 => "debug",
             _ => "trace",
         };
-        // Re-initialize would fail since tracing is already init'd, so we use env filter
-        // The user can also set RUST_LOG=debug for fine-grained control
         tracing::debug!("Verbosity level: {}", level);
     }
 
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            error!("{:#}", e);
-            eprintln!("Error: {:#}", e);
-            // Map error types to exit codes (FR39)
-            // 1 = conversion error, 3 = input error
-            // (exit code 2 = quality threshold exceeded — Epic 4)
-            ExitCode::from(1)
+        Ok(()) => ExitCode::from(EXIT_SUCCESS),
+        Err(app_err) => {
+            let exit_code = app_err.exit_code();
+            match &app_err {
+                AppError::Interrupted => {
+                    // Message already printed by the signal handler
+                }
+                _ => {
+                    error!("{}", app_err);
+                    eprintln!("Error: {}", app_err);
+                }
+            }
+            ExitCode::from(exit_code)
         }
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Convert(args) => cmd_convert(args),
-        Command::Info(args) => cmd_info(args),
-        Command::Doctor => doctor::run_doctor(),
-        Command::Completions(args) => cmd_completions(args),
+        Command::Info(args) => cmd_info(args).map_err(AppError::Input),
+        Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
+        Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
     }
 }
 
 /// Handle the `convert` subcommand.
-fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
+fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
+    use backends::coreml::CoremlBackend;
     use backends::mlx::MlxBackend;
     use backends::OutputBackend;
+    use intelligence::fingerprint::ModelFingerprint;
+    use intelligence::hardware::HardwareProfiler;
+    use intelligence::ruvector::{QualityMetrics, RuVectorDb};
+    use intelligence::AutoResolver;
     use progress::ProgressReporter;
     use quantize::static_quant::StaticQuantizer;
 
-    let config = cli::resolve_convert_config(&args)
-        .context("Failed to resolve conversion configuration")?;
+    let mut config = cli::resolve_convert_config(&args)
+        .context("Failed to resolve conversion configuration")
+        .map_err(AppError::Input)?;
 
     let progress = ProgressReporter::new();
 
@@ -94,10 +156,173 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
         "Starting conversion"
     );
 
-    // Phase 1: Read model metadata and tensors
-    let (metadata, mut tensor_map) =
-        input::read_model(&config.input_dir, &progress)
-            .context("Failed to read model")?;
+    // Phase 0: Read model metadata for preflight
+    let config_path = config.input_dir.join("config.json");
+    let metadata = if config_path.exists() {
+        input::config_parser::parse_config(&config_path)
+            .context("Failed to parse model config")
+            .map_err(AppError::Input)?
+    } else {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "No config.json found in {}. Is this a HuggingFace model directory?",
+            config.input_dir.display()
+        )));
+    };
+
+    // Phase 0.25: Initialize RuVector (required for all conversions)
+    let mut ruvector_db = match RuVectorDb::open_default() {
+        Ok(db) => db,
+        Err(e) => {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "RuVector not accessible: {}. Required to store learnings. Run `hf2q doctor` to diagnose.",
+                e
+            )));
+        }
+    };
+
+    // Flag any records from previous hf2q versions for re-calibration (FR29)
+    if let Err(e) = ruvector_db.flag_version_changes() {
+        warn!("Failed to check RuVector version flags: {}", e);
+    }
+
+    // Phase 0.3: Hardware profiling and model fingerprinting
+    let hardware = HardwareProfiler::detect()
+        .context("Hardware profiling failed")
+        .map_err(AppError::Conversion)?;
+
+    let fingerprint = ModelFingerprint::from_metadata(&metadata)
+        .context("Model fingerprinting failed")
+        .map_err(AppError::Conversion)?;
+
+    // Phase 0.4: Auto mode resolution (if --quant auto or default)
+    let resolved_auto = if config.quant == cli::QuantMethod::Auto {
+        let resolved = AutoResolver::resolve(&hardware, &fingerprint, Some(&ruvector_db))
+            .context("Auto mode resolution failed")
+            .map_err(AppError::Conversion)?;
+
+        // Display the resolved config
+        intelligence::display_resolved_config(&resolved);
+
+        // Apply the resolved config to the ConvertConfig
+        let resolved_quant = match resolved.quant_method.as_str() {
+            "f16" => cli::QuantMethod::F16,
+            "q8" => cli::QuantMethod::Q8,
+            "q4" => cli::QuantMethod::Q4,
+            "q2" => cli::QuantMethod::Q2,
+            "mixed-4-6" => {
+                // mixed-4-6 is not implemented yet (Epic 5), fall back to q4
+                warn!(
+                    "Auto mode recommended mixed-4-6 but it is not yet implemented. Falling back to q4."
+                );
+                cli::QuantMethod::Q4
+            }
+            other => {
+                warn!(
+                    "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
+                    other
+                );
+                cli::QuantMethod::Q4
+            }
+        };
+
+        config.quant = resolved_quant;
+        if config.bits.is_none() {
+            config.bits = Some(resolved.bits);
+        }
+        if resolved.group_size > 0 {
+            config.group_size = resolved.group_size;
+        }
+
+        // Update output dir if it was auto-generated with "auto" in the name
+        if args.output.is_none() {
+            let model_name = config
+                .input_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "model".to_string());
+            config.output_dir =
+                std::path::PathBuf::from(format!("{}-{}-{}", model_name, config.format, config.quant));
+        }
+
+        Some(resolved)
+    } else {
+        None
+    };
+
+    // Phase 0.5: Pre-flight validation (Story 2.1)
+    let preflight_report = preflight::validate(&config, &metadata)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    // Log preflight warnings
+    for warning in &preflight_report.warnings {
+        warn!("{}", warning);
+    }
+
+    // Log passthrough layers
+    for pt in &preflight_report.passthrough_layers {
+        warn!(
+            "Layer {} (type '{}') will be passed through at f16",
+            pt.layer_index, pt.layer_type
+        );
+    }
+
+    // If dry run, print plan and exit
+    if config.dry_run {
+        // Also show auto mode resolution in dry run
+        if let Some(ref resolved) = resolved_auto {
+            tracing::info!(
+                "Auto mode resolved to {} (source: {}, confidence: {:.0}%)",
+                resolved.quant_method,
+                resolved.source,
+                resolved.confidence * 100.0,
+            );
+        }
+        print_dry_run_plan(&config, &metadata, &preflight_report);
+        return Ok(());
+    }
+
+    // Set up Ctrl+C handler (Story 2.4)
+    // Track whether the output directory was created by us (not pre-existing)
+    let output_dir_created_by_us = !config.output_dir.exists();
+    let output_dir_for_cleanup = Arc::new(config.output_dir.clone());
+    let cleanup_dir = output_dir_for_cleanup.clone();
+
+    ctrlc::set_handler(move || {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+
+        // Only clean up directories we created
+        if output_dir_created_by_us {
+            let dir = cleanup_dir.as_ref();
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    eprintln!(
+                        "Warning: Failed to clean up partial output directory '{}': {}",
+                        dir.display(),
+                        e
+                    );
+                } else {
+                    eprintln!(
+                        "Conversion interrupted. Partial output cleaned up: {}",
+                        dir.display()
+                    );
+                }
+            } else {
+                eprintln!("Conversion interrupted.");
+            }
+        } else {
+            eprintln!("Conversion interrupted. Pre-existing output directory was not modified.");
+        }
+
+        // The ctrlc crate with "termination" feature will terminate the process after this handler
+    })
+    .ok(); // Ignore error if handler was already set (e.g., in tests)
+
+    // Phase 1: Read model tensors
+    let (_, mut tensor_map) = input::read_model(&config.input_dir, &progress)
+        .context("Failed to read model")
+        .map_err(AppError::Conversion)?;
+
+    check_interrupted()?;
 
     let input_size = tensor_map.total_size_bytes() as u64;
 
@@ -108,18 +333,22 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
         "Model loaded"
     );
 
-    // Phase 2: Convert bf16 → f16
+    // Phase 2: Convert bf16 -> f16
     let bf16_count = tensor_map
         .convert_bf16_to_f16()
-        .context("bf16 to f16 conversion failed")?;
+        .context("bf16 to f16 conversion failed")
+        .map_err(AppError::Conversion)?;
     if bf16_count > 0 {
         tracing::info!(converted = bf16_count, "Converted bf16 tensors to f16");
     }
 
+    check_interrupted()?;
+
     // Phase 3: Quantize
     let quant_method_str = config.quant.to_string();
     let quantizer = StaticQuantizer::new(&quant_method_str)
-        .context("Failed to create quantizer")?;
+        .context("Failed to create quantizer")
+        .map_err(AppError::Conversion)?;
 
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
@@ -131,14 +360,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
         config.group_size,
         &progress,
     )
-    .context("Quantization failed")?;
+    .context("Quantization failed")
+    .map_err(AppError::Conversion)?;
 
-    // Phase 4: Validate and write output
-    let backend = MlxBackend::new();
+    check_interrupted()?;
+
+    // Phase 4: Select backend, validate, and write output
+    let backend: Box<dyn OutputBackend> = match config.format {
+        cli::OutputFormat::Mlx => Box::new(MlxBackend::new()),
+        cli::OutputFormat::Coreml => Box::new(CoremlBackend::new()),
+        other => {
+            return Err(AppError::Conversion(anyhow::anyhow!(
+                "Output format '{}' is not yet implemented",
+                other
+            )));
+        }
+    };
 
     let warnings = backend
         .validate(&quantized_model)
-        .context("Output validation failed")?;
+        .context("Output validation failed")
+        .map_err(AppError::Conversion)?;
 
     for w in &warnings {
         tracing::warn!("{}", w.message);
@@ -151,9 +393,30 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
             &config.output_dir,
             &progress,
         )
-        .context("Failed to write output")?;
+        .context("Failed to write output")
+        .map_err(AppError::Conversion)?;
 
-    // Phase 5: Print summary
+    check_interrupted()?;
+
+    // Phase 5: Store conversion result in RuVector (Story 7.2)
+    if let Err(e) = ruvector_db.store_conversion(
+        &hardware,
+        &fingerprint,
+        &quant_method_str,
+        bits,
+        config.group_size,
+        QualityMetrics {
+            // Quality metrics will be populated when Epic 4 (quality measurement) is complete
+            kl_divergence: None,
+            perplexity_delta: None,
+            cosine_similarity: None,
+        },
+    ) {
+        // Storage failure is not fatal — warn but continue
+        warn!("Failed to store conversion result in RuVector: {}", e);
+    }
+
+    // Phase 6: Print summary
     let model_name = config
         .input_dir
         .file_name()
@@ -174,6 +437,97 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<()> {
     Ok(())
 }
 
+/// Check if the process has been interrupted by SIGINT.
+fn check_interrupted() -> Result<(), AppError> {
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        Err(AppError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+/// Print the dry-run conversion plan.
+fn print_dry_run_plan(
+    config: &cli::ConvertConfig,
+    metadata: &ir::ModelMetadata,
+    preflight: &preflight::PreflightReport,
+) {
+    use console::style;
+
+    let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
+    let estimated_memory = preflight.estimated_output_bytes + (metadata.param_count * 2);
+
+    eprintln!();
+    eprintln!("{}", style("Dry Run -- Conversion Plan").bold().cyan());
+    eprintln!("{}", style("============================").bold().cyan());
+    eprintln!();
+    eprintln!("  Input:        {}", config.input_dir.display());
+    eprintln!("  Output:       {}", config.output_dir.display());
+    eprintln!("  Format:       {}", config.format);
+    eprintln!("  Quantization: {}", config.quant);
+    eprintln!("  Bit width:    {}", bits);
+    eprintln!("  Group size:   {}", config.group_size);
+    eprintln!();
+    eprintln!("  Model:        {}", metadata.architecture);
+    eprintln!("  Parameters:   {}", progress::format_param_count(metadata.param_count));
+    eprintln!("  Layers:       {}", metadata.num_layers);
+    if metadata.is_moe() {
+        eprintln!(
+            "  MoE:          {} experts, top-k={}",
+            metadata.num_experts.unwrap_or(0),
+            metadata.top_k_experts.unwrap_or(0)
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  Est. output:  {}",
+        progress::format_bytes(preflight.estimated_output_bytes)
+    );
+    eprintln!(
+        "  Est. memory:  {}",
+        progress::format_bytes(estimated_memory)
+    );
+    if preflight.available_disk_bytes > 0 {
+        eprintln!(
+            "  Avail. disk:  {}",
+            progress::format_bytes(preflight.available_disk_bytes)
+        );
+    }
+
+    // CoreML-specific validation in dry-run
+    if config.format == cli::OutputFormat::Coreml {
+        match backends::coreml::validate_metadata_for_coreml(metadata) {
+            Ok(coreml_warnings) => {
+                for w in &coreml_warnings {
+                    eprintln!("  Warning: {}", style(&w.message).yellow());
+                }
+            }
+            Err(e) => {
+                eprintln!("  {}: {}", style("ERROR").bold().red(), e);
+            }
+        }
+    }
+
+    if !preflight.passthrough_layers.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  {} layers will be passed through at f16:",
+            preflight.passthrough_layers.len()
+        );
+        for pt in &preflight.passthrough_layers {
+            eprintln!("    - Layer {} (type '{}')", pt.layer_index, pt.layer_type);
+        }
+    }
+
+    for warning in &preflight.warnings {
+        eprintln!("  Warning: {}", style(warning).yellow());
+    }
+
+    eprintln!();
+    eprintln!("{}", style("No files were written (dry run).").dim());
+    eprintln!();
+}
+
 /// Get the default bit width for a quantization method.
 fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
     match method {
@@ -181,8 +535,6 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
         cli::QuantMethod::Q8 => 8,
         cli::QuantMethod::Q4 => 4,
         cli::QuantMethod::Q2 => 2,
-        // These are not reachable for Epic 1 (resolved in cli.rs),
-        // but provide sensible defaults for future use.
         cli::QuantMethod::Auto => 4,
         cli::QuantMethod::Q4Mxfp => 4,
         cli::QuantMethod::Mixed26 => 4,
@@ -194,26 +546,7 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
 
 /// Handle the `info` subcommand.
 fn cmd_info(args: cli::InfoArgs) -> Result<()> {
-    let input_dir = match (&args.input, &args.repo) {
-        (Some(path), None) => {
-            if !path.exists() {
-                anyhow::bail!("Input directory does not exist: {}", path.display());
-            }
-            path.clone()
-        }
-        (None, Some(_repo)) => {
-            anyhow::bail!(
-                "HuggingFace Hub download (--repo) is not yet implemented. \
-                 Use --input with a local model directory."
-            );
-        }
-        (None, None) => {
-            anyhow::bail!("Either --input or --repo must be specified");
-        }
-        (Some(_), Some(_)) => {
-            anyhow::bail!("--input and --repo are mutually exclusive");
-        }
-    };
+    let input_dir = resolve_info_input(&args)?;
 
     let config_path = input_dir.join("config.json");
     if !config_path.exists() {
@@ -226,6 +559,8 @@ fn cmd_info(args: cli::InfoArgs) -> Result<()> {
     let metadata = input::config_parser::parse_config(&config_path)
         .context("Failed to parse model config")?;
 
+    // Use eprintln for the header (keeps stdout clean for piping)
+    // But for info command, stdout is the expected output
     println!();
     println!(
         "{}",
@@ -235,6 +570,31 @@ fn cmd_info(args: cli::InfoArgs) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Resolve the input directory for the info subcommand, supporting --repo via HF download.
+fn resolve_info_input(args: &cli::InfoArgs) -> Result<PathBuf> {
+    match (&args.input, &args.repo) {
+        (Some(path), None) => {
+            if !path.exists() {
+                anyhow::bail!("Input directory does not exist: {}", path.display());
+            }
+            Ok(path.clone())
+        }
+        (None, Some(repo_id)) => {
+            // Story 3.2: hf2q info --repo org/model for remote inspection
+            let progress = progress::ProgressReporter::new();
+            let download_dir = input::hf_download::download_model(repo_id, &progress)
+                .context("Failed to download model from HuggingFace Hub")?;
+            Ok(download_dir)
+        }
+        (None, None) => {
+            anyhow::bail!("Either --input or --repo must be specified");
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--input and --repo are mutually exclusive");
+        }
+    }
 }
 
 /// Handle the `completions` subcommand.

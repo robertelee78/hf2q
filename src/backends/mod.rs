@@ -3,7 +3,6 @@
 //! Trait-based architecture: adding a new format = adding a new file + registry entry.
 //! Every backend validates its output before writing.
 
-#[allow(dead_code)]
 pub mod coreml;
 #[allow(dead_code)]
 pub mod gguf;

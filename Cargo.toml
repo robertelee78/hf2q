@@ -54,6 +54,9 @@ thiserror = "2"
 # System info
 sysinfo = "0.32"
 
+# Signal handling
+ctrlc = { version = "3.4", features = ["termination"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

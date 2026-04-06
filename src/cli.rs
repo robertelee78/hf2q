@@ -285,12 +285,11 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
             }
             path.clone()
         }
-        (None, Some(_repo)) => {
-            // HF Hub download — not yet implemented (Epic 3)
-            anyhow::bail!(
-                "HuggingFace Hub download (--repo) is not yet implemented. \
-                 Use --input with a local model directory."
-            );
+        (None, Some(repo_id)) => {
+            // HF Hub download (Epic 3, Story 3.1)
+            let progress = crate::progress::ProgressReporter::new();
+            crate::input::hf_download::download_model(repo_id, &progress)
+                .map_err(|e| anyhow::anyhow!("{}", e))?
         }
         (None, None) => {
             anyhow::bail!("Either --input or --repo must be specified");
@@ -325,16 +324,13 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
     // Validate quant method is implemented
     match args.quant {
         QuantMethod::Auto => {
-            anyhow::bail!(
-                "Auto quantization mode is not yet implemented (Epic 6). \
-                 Please specify an explicit --quant method: f16, q8, q4, q2"
-            );
+            // Auto mode is now implemented (Epic 6) — resolve at conversion time
         }
         QuantMethod::Q4Mxfp | QuantMethod::Mixed26 | QuantMethod::Mixed36
         | QuantMethod::Mixed46 | QuantMethod::DwqMixed46 => {
             anyhow::bail!(
                 "Quantization method '{}' is not yet implemented (Epic 5). \
-                 Available methods: f16, q8, q4, q2",
+                 Available methods: auto, f16, q8, q4, q2",
                 args.quant
             );
         }
@@ -343,17 +339,11 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
 
     // Validate output format is implemented
     match args.format {
-        OutputFormat::Mlx => {}
-        OutputFormat::Coreml => {
-            anyhow::bail!(
-                "CoreML output format is not yet implemented (Epic 8). \
-                 Available formats: mlx"
-            );
-        }
+        OutputFormat::Mlx | OutputFormat::Coreml => {}
         OutputFormat::Gguf | OutputFormat::Nvfp4 | OutputFormat::Gptq | OutputFormat::Awq => {
             anyhow::bail!(
                 "Output format '{}' is not yet implemented. \
-                 Available formats: mlx",
+                 Available formats: mlx, coreml",
                 args.format
             );
         }

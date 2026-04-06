@@ -163,11 +163,13 @@ fn test_convert_no_input_fails() {
 }
 
 #[test]
-fn test_convert_auto_quant_not_implemented() {
+fn test_convert_auto_quant_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output_auto");
     setup_tiny_model(&input_dir);
 
+    // Auto mode should now resolve via heuristics and produce output
     Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -178,18 +180,22 @@ fn test_convert_auto_quant_not_implemented() {
             "mlx",
             "--quant",
             "auto",
+            "--output",
+            output_dir.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success();
+
+    assert!(output_dir.join("config.json").exists());
 }
 
 #[test]
-fn test_convert_coreml_not_implemented() {
+fn test_convert_coreml_requires_feature() {
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
     setup_tiny_model(&input_dir);
 
+    // CoreML backend requires the coreml-backend feature flag
     Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -203,5 +209,5 @@ fn test_convert_coreml_not_implemented() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("coreml-backend"));
 }

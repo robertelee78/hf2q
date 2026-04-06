@@ -1,9 +1,13 @@
 //! HuggingFace Hub download integration (Epic 3).
 //!
 //! Downloads model files from HuggingFace Hub via the `hf-hub` crate,
-//! with fallback to the `hf` CLI. Not yet implemented.
+//! with fallback to the `hf` CLI.
+
+use std::path::PathBuf;
 
 use thiserror::Error;
+
+use crate::progress::ProgressReporter;
 
 /// Errors from HF download operations.
 #[derive(Error, Debug)]
@@ -25,4 +29,16 @@ pub enum DownloadError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Download a model from HuggingFace Hub to a local cache directory.
+///
+/// Returns the path to the local directory containing the downloaded model files.
+///
+/// Not yet fully implemented (Epic 3) — currently returns an error.
+pub fn download_model(
+    _repo_id: &str,
+    _progress: &ProgressReporter,
+) -> Result<PathBuf, DownloadError> {
+    Err(DownloadError::NotImplemented)
 }
