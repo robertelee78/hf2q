@@ -2,7 +2,7 @@
 models/
 
 # Build artifacts
-target/
+/target
 
 # BMad project files
 _bmad/

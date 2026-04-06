@@ -1,0 +1,73 @@
+[package]
+name = "hf2q"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81.0"
+description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robertelee78/hf2q"
+
+[features]
+default = []
+# Enable MLX inference backend (requires Apple Silicon + Metal Toolchain)
+mlx-backend = ["dep:mlx-rs"]
+# Enable CoreML output backend (requires Apple Silicon)
+coreml-backend = ["dep:coreml-native"]
+# Enable RuVector self-learning
+ruvector = ["dep:ruvector-core"]
+
+[dependencies]
+# Core ML pipeline — optional, requires Metal Toolchain
+mlx-rs = { version = "0.25", features = ["safetensors", "metal", "accelerate"], optional = true }
+safetensors = "0.7"
+half = "2.4"
+
+# HuggingFace integration
+hf-hub = "0.5"
+
+# Self-learning intelligence — optional
+ruvector-core = { version = "2.1", optional = true }
+
+# CoreML output target — optional
+coreml-native = { version = "0.2", optional = true }
+
+# CLI framework
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+
+# Performance
+rayon = "1.10"
+memmap2 = "0.9"
+
+# UX
+indicatif = "0.17"
+console = "0.15"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# System info
+sysinfo = "0.32"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "quantize_bench"
+harness = false
+
+[[bench]]
+name = "shard_read_bench"
+harness = false
