@@ -98,6 +98,20 @@ impl MixedBitQuantizer {
             }
         })?;
 
+        // Validate sensitive layer ranges
+        for range in sensitive_layers {
+            if range.start() > range.end() {
+                return Err(QuantizeError::UnsupportedMethod {
+                    method: MixedQuantError::InvalidLayerRange(format!(
+                        "start ({}) > end ({})",
+                        range.start(),
+                        range.end()
+                    ))
+                    .to_string(),
+                });
+            }
+        }
+
         // Build the set of sensitive layer indices
         let mut sensitive_indices = HashSet::new();
         for range in sensitive_layers {

@@ -64,6 +64,25 @@ pub trait Quantizer: Send + Sync {
     ) -> Result<QuantizedTensor, QuantizeError>;
 }
 
+/// Validate that group size evenly divides the tensor dimension.
+///
+/// Returns an error if the group size does not divide the last dimension of the tensor.
+/// This is used for strict validation when exact group alignment is required.
+pub fn validate_group_size(tensor: &TensorRef, group_size: usize) -> Result<(), QuantizeError> {
+    if group_size == 0 || !tensor.is_weight() {
+        return Ok(());
+    }
+    let dim = tensor.numel();
+    if dim > group_size && dim % group_size != 0 {
+        return Err(QuantizeError::GroupSizeMismatch {
+            tensor: tensor.name.clone(),
+            group_size,
+            dim,
+        });
+    }
+    Ok(())
+}
+
 /// Quantize an entire TensorMap using the given quantizer.
 pub fn quantize_model(
     tensor_map: &crate::ir::TensorMap,
@@ -86,6 +105,11 @@ pub fn quantize_model(
 
     for name in tensor_names {
         let tensor = &tensor_map.tensors[name];
+
+        // Log group size misalignment (non-fatal: quantizer will pad)
+        if let Err(e) = validate_group_size(tensor, group_size) {
+            tracing::debug!("{}", e);
+        }
 
         let config = LayerQuantConfig {
             bits,

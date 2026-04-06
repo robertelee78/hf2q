@@ -142,6 +142,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use intelligence::AutoResolver;
     use progress::ProgressReporter;
     use quantize::static_quant::StaticQuantizer;
+    use quantize::Quantizer;
 
     let mut config = cli::resolve_convert_config(&args)
         .context("Failed to resolve conversion configuration")
@@ -355,6 +356,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .context("Failed to create mixed-bit quantizer")
             .map_err(AppError::Conversion)?;
 
+            if mixed_quantizer.requires_calibration() {
+                tracing::info!("Mixed-bit quantizer requires calibration data");
+            }
+
+            // Build per-layer bit allocation map for logging
+            let tensor_names: Vec<String> = tensor_map.tensors.keys().cloned().collect();
+            let bits_map = quantize::mixed::build_per_layer_bits_map(&mixed_quantizer, &tensor_names);
+            tracing::debug!(
+                layer_count = bits_map.len(),
+                "Built per-layer bit allocation map for mixed-bit quantization"
+            );
+
             quantize::quantize_model(
                 &tensor_map,
                 &metadata,
@@ -384,6 +397,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 sensitive_bits: 6,
                 ..quantize::dwq::DwqConfig::default()
             };
+
+            // Validate DWQ config by constructing the quantizer
+            let dwq_quantizer = quantize::dwq::DwqQuantizer::new(dwq_config.clone())
+                .context("Failed to create DWQ quantizer")
+                .map_err(AppError::Conversion)?;
+            tracing::info!(
+                calibration = dwq_quantizer.requires_calibration(),
+                max_iterations = dwq_quantizer.config().max_iterations,
+                "DWQ quantizer initialized: {}",
+                dwq_quantizer.name()
+            );
 
             quantize::dwq::run_dwq_calibration(
                 runner.as_mut(),

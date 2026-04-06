@@ -84,6 +84,11 @@ pub struct DwqQuantizer {
 }
 
 impl DwqQuantizer {
+    /// Access the DWQ configuration.
+    pub fn config(&self) -> &DwqConfig {
+        &self.config
+    }
+
     /// Create a new DWQ quantizer.
     pub fn new(config: DwqConfig) -> Result<Self, QuantizeError> {
         let preset_name = format!(
@@ -155,6 +160,14 @@ pub fn run_dwq_calibration(
         config.calibration_samples,
         metadata.vocab_size as u32,
     );
+    if calibration_tokens.is_empty() {
+        return Err(DwqError::NoCalibrationData {
+            reason: format!(
+                "Failed to generate calibration tokens (samples={}, vocab_size={})",
+                config.calibration_samples, metadata.vocab_size
+            ),
+        });
+    }
     debug!(
         samples = calibration_tokens.len(),
         "Generated calibration tokens"
