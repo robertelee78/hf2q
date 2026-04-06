@@ -209,13 +209,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             "q8" => cli::QuantMethod::Q8,
             "q4" => cli::QuantMethod::Q4,
             "q2" => cli::QuantMethod::Q2,
-            "mixed-4-6" => {
-                // mixed-4-6 is not implemented yet (Epic 5), fall back to q4
-                warn!(
-                    "Auto mode recommended mixed-4-6 but it is not yet implemented. Falling back to q4."
-                );
-                cli::QuantMethod::Q4
-            }
+            "mixed-4-6" => cli::QuantMethod::Mixed46,
+            "mixed-3-6" => cli::QuantMethod::Mixed36,
+            "mixed-2-6" => cli::QuantMethod::Mixed26,
             other => {
                 warn!(
                     "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
@@ -346,22 +342,77 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     // Phase 3: Quantize
     let quant_method_str = config.quant.to_string();
-    let quantizer = StaticQuantizer::new(&quant_method_str)
-        .context("Failed to create quantizer")
-        .map_err(AppError::Conversion)?;
-
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
-    let quantized_model = quantize::quantize_model(
-        &tensor_map,
-        &metadata,
-        &quantizer,
-        bits,
-        config.group_size,
-        &progress,
-    )
-    .context("Quantization failed")
-    .map_err(AppError::Conversion)?;
+    let quantized_model = match config.quant {
+        cli::QuantMethod::Mixed26 | cli::QuantMethod::Mixed36 | cli::QuantMethod::Mixed46 => {
+            // Mixed-bit quantization (Story 5.1)
+            let mixed_quantizer = quantize::mixed::MixedBitQuantizer::new(
+                &quant_method_str,
+                &config.sensitive_layers,
+                config.group_size,
+            )
+            .context("Failed to create mixed-bit quantizer")
+            .map_err(AppError::Conversion)?;
+
+            quantize::quantize_model(
+                &tensor_map,
+                &metadata,
+                &mixed_quantizer,
+                bits,
+                config.group_size,
+                &progress,
+            )
+            .context("Mixed-bit quantization failed")
+            .map_err(AppError::Conversion)?
+        }
+        cli::QuantMethod::DwqMixed46 => {
+            // DWQ calibration (Story 5.2) — requires InferenceRunner
+            let mut runner = inference::create_runner();
+            if !runner.is_available() {
+                return Err(AppError::Conversion(anyhow::anyhow!(
+                    "DWQ quantization requires the mlx-backend feature. \
+                     Rebuild with: cargo build --features mlx-backend"
+                )));
+            }
+
+            let dwq_config = quantize::dwq::DwqConfig {
+                calibration_samples: config.calibration_samples,
+                sensitive_layers: config.sensitive_layers.clone(),
+                group_size: config.group_size,
+                base_bits: 4,
+                sensitive_bits: 6,
+                ..quantize::dwq::DwqConfig::default()
+            };
+
+            quantize::dwq::run_dwq_calibration(
+                runner.as_mut(),
+                &tensor_map,
+                &metadata,
+                &dwq_config,
+                &progress,
+            )
+            .context("DWQ calibration failed")
+            .map_err(AppError::Conversion)?
+        }
+        _ => {
+            // Static quantization (f16, q8, q4, q2)
+            let quantizer = StaticQuantizer::new(&quant_method_str)
+                .context("Failed to create quantizer")
+                .map_err(AppError::Conversion)?;
+
+            quantize::quantize_model(
+                &tensor_map,
+                &metadata,
+                &quantizer,
+                bits,
+                config.group_size,
+                &progress,
+            )
+            .context("Quantization failed")
+            .map_err(AppError::Conversion)?
+        }
+    };
 
     check_interrupted()?;
 
@@ -398,7 +449,39 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 5: Store conversion result in RuVector (Story 7.2)
+    // Phase 5: Quality measurement (Story 4.2, 4.3)
+    let quality_report = if config.skip_quality {
+        tracing::info!("Quality measurement skipped (--skip-quality)");
+        quality::QualityReport::empty()
+    } else {
+        let mut runner = inference::create_runner();
+        if runner.is_available() {
+            match quality::measure_quality(
+                runner.as_mut(),
+                &tensor_map,
+                &tensor_map, // Use original tensors for comparison
+                &metadata,
+                &progress,
+            ) {
+                Ok(qr) => {
+                    quality::print_quality_summary(&qr);
+                    qr
+                }
+                Err(e) => {
+                    warn!("Quality measurement failed: {}. Continuing without quality metrics.", e);
+                    quality::QualityReport::empty()
+                }
+            }
+        } else {
+            tracing::info!(
+                "Quality measurement skipped: mlx-backend feature not enabled. \
+                 Rebuild with --features mlx-backend to enable quality measurement."
+            );
+            quality::QualityReport::empty()
+        }
+    };
+
+    // Phase 5.5: Store conversion result in RuVector (Story 7.2)
     if let Err(e) = ruvector_db.store_conversion(
         &hardware,
         &fingerprint,
@@ -406,17 +489,53 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         bits,
         config.group_size,
         QualityMetrics {
-            // Quality metrics will be populated when Epic 4 (quality measurement) is complete
-            kl_divergence: None,
-            perplexity_delta: None,
-            cosine_similarity: None,
+            kl_divergence: quality_report.kl_divergence,
+            perplexity_delta: quality_report.perplexity_delta,
+            cosine_similarity: quality_report.cosine_sim_average,
         },
     ) {
         // Storage failure is not fatal — warn but continue
         warn!("Failed to store conversion result in RuVector: {}", e);
     }
 
-    // Phase 6: Print summary
+    // Phase 6: JSON report generation (Story 4.4)
+    if config.json_report {
+        let json_report = report::ReportBuilder::new(
+            config.input_dir.display().to_string(),
+            config.output_dir.display().to_string(),
+            metadata.clone(),
+            quant_method_str.clone(),
+            bits,
+            config.group_size,
+        )
+        .with_input_size(input_size)
+        .with_manifest(manifest.clone())
+        .with_quality(quality_report.clone())
+        .with_hardware(report::HardwareSummary {
+            chip_model: hardware.chip_model.clone(),
+            total_memory_bytes: hardware.total_memory_bytes,
+            available_memory_bytes: hardware.available_memory_bytes,
+            total_cores: hardware.total_cores,
+        })
+        .with_timing(progress.elapsed().as_secs_f64(), None)
+        .build();
+
+        if config.yes {
+            // Write to stdout when --json-report + --yes
+            report::write_to_stdout(&json_report)
+                .context("Failed to write JSON report to stdout")
+                .map_err(AppError::Conversion)?;
+        } else {
+            // Write to file in output directory
+            let report_path = config.output_dir.join("report.json");
+            report::write_to_file(&json_report, &report_path)
+                .context("Failed to write JSON report")
+                .map_err(AppError::Conversion)?;
+            tracing::info!(path = %report_path.display(), "JSON report written");
+        }
+    }
+
+    // Phase 7: Print summary
     let model_name = config
         .input_dir
         .file_name()

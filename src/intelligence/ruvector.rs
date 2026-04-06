@@ -441,6 +441,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 /// Check if the ruvector crate feature is enabled at compile time.
+#[allow(dead_code)]
 pub fn is_feature_enabled() -> bool {
     cfg!(feature = "ruvector")
 }
