@@ -326,13 +326,18 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         QuantMethod::Auto => {
             // Auto mode is now implemented (Epic 6) — resolve at conversion time
         }
-        QuantMethod::Q4Mxfp | QuantMethod::Mixed26 | QuantMethod::Mixed36
-        | QuantMethod::Mixed46 | QuantMethod::DwqMixed46 => {
+        QuantMethod::Q4Mxfp => {
             anyhow::bail!(
-                "Quantization method '{}' is not yet implemented (Epic 5). \
-                 Available methods: auto, f16, q8, q4, q2",
+                "Quantization method '{}' is not yet implemented. \
+                 Available methods: auto, f16, q8, q4, q2, mixed-2-6, mixed-3-6, mixed-4-6, dwq-mixed-4-6",
                 args.quant
             );
+        }
+        QuantMethod::Mixed26 | QuantMethod::Mixed36 | QuantMethod::Mixed46 => {
+            // Mixed-bit quantization (Epic 5, Story 5.1)
+        }
+        QuantMethod::DwqMixed46 => {
+            // DWQ calibration (Epic 5, Story 5.2) — requires mlx-backend for inference
         }
         QuantMethod::F16 | QuantMethod::Q8 | QuantMethod::Q4 | QuantMethod::Q2 => {}
     }

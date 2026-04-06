@@ -2,12 +2,11 @@
 //!
 //! Nothing outside this module touches raw model files directly.
 //! Sub-modules:
-//! - `config_parser`: HF config.json → ModelMetadata
-//! - `safetensors`: Streaming mmap shard reader → TensorMap
+//! - `config_parser`: HF config.json -> ModelMetadata
+//! - `safetensors`: Streaming mmap shard reader -> TensorMap
 //! - `hf_download`: HF Hub download (Epic 3)
 
 pub mod config_parser;
-#[allow(dead_code)]
 pub mod hf_download;
 pub mod safetensors;
 
@@ -36,6 +35,9 @@ pub enum InputError {
 
     #[error("Safetensors read error: {0}")]
     SafetensorsRead(#[from] safetensors::SafetensorsError),
+
+    #[error("HF download error: {0}")]
+    HfDownload(#[from] hf_download::DownloadError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

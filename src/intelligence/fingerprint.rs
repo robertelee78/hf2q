@@ -13,6 +13,7 @@ use crate::ir::ModelMetadata;
 
 /// Errors from model fingerprinting.
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum FingerprintError {
     #[error("Model fingerprinting failed: {reason}")]
     FingerprintFailed { reason: String },

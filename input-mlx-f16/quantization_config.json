@@ -1,0 +1,38 @@
+{
+  "bits": 16,
+  "group_size": 64,
+  "per_tensor": {
+    "model.embed_tokens.weight": {
+      "bits": 16,
+      "group_size": 0,
+      "method": "passthrough",
+      "preserved": true
+    },
+    "model.layers.0.input_layernorm.weight": {
+      "bits": 16,
+      "group_size": 0,
+      "method": "passthrough",
+      "preserved": true
+    },
+    "model.layers.0.self_attn.q_proj.weight": {
+      "bits": 16,
+      "group_size": 0,
+      "method": "f16",
+      "preserved": false
+    },
+    "model.layers.1.input_layernorm.weight": {
+      "bits": 16,
+      "group_size": 0,
+      "method": "passthrough",
+      "preserved": true
+    },
+    "model.layers.1.self_attn.q_proj.weight": {
+      "bits": 16,
+      "group_size": 0,
+      "method": "f16",
+      "preserved": false
+    }
+  },
+  "quant_method": "f16",
+  "tensor_count": 5
+}

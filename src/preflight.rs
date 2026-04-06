@@ -470,24 +470,6 @@ mod tests {
         }
     }
 
-    fn make_test_config(quant: QuantMethod) -> ConvertConfig {
-        ConvertConfig {
-            input_dir: std::path::PathBuf::from("/tmp/test_nonexistent"),
-            format: OutputFormat::Mlx,
-            quant,
-            sensitive_layers: Vec::new(),
-            calibration_samples: 1024,
-            bits: None,
-            group_size: 64,
-            output_dir: std::path::PathBuf::from("/tmp/test_output_nonexistent"),
-            json_report: false,
-            skip_quality: false,
-            dry_run: false,
-            yes: false,
-            unsupported_layers: None,
-        }
-    }
-
     #[test]
     fn test_supported_layer_types_pass() {
         let metadata = make_test_metadata(

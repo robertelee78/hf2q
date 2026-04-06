@@ -3,12 +3,10 @@
 //! Implements the `Quantizer` trait with dispatch by QuantMethod.
 //! Sub-modules:
 //! - `static_quant`: f16, q8, q4, q2 round-to-nearest
-//! - `mixed`: Mixed-bit with --sensitive-layers (Epic 5)
-//! - `dwq`: DWQ calibration via InferenceRunner (Epic 5)
+//! - `mixed`: Mixed-bit with --sensitive-layers
+//! - `dwq`: DWQ calibration via InferenceRunner
 
-#[allow(dead_code)]
 pub mod dwq;
-#[allow(dead_code)]
 pub mod mixed;
 pub mod static_quant;
 
@@ -26,7 +24,6 @@ pub enum QuantizeError {
     #[error("Unsupported quantization method: {method}")]
     UnsupportedMethod { method: String },
 
-    #[allow(dead_code)]
     #[error("Group size {group_size} does not evenly divide tensor dimension {dim} for tensor '{tensor}'")]
     GroupSizeMismatch {
         tensor: String,
@@ -52,7 +49,6 @@ pub struct LayerQuantConfig {
 /// Trait for quantization implementations.
 ///
 /// All implementations must be Send + Sync for rayon parallelism.
-#[allow(dead_code)]
 pub trait Quantizer: Send + Sync {
     /// Human-readable name of this quantization method.
     fn name(&self) -> &str;

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 /// Errors from hardware profiling.
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum HardwareError {
     #[error("Hardware profiling failed: {reason}")]
     DetectionFailed { reason: String },

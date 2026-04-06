@@ -22,6 +22,7 @@ use self::heuristics::HeuristicResult;
 
 /// Errors from intelligence operations.
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum IntelligenceError {
     #[error("Hardware profiling failed: {0}")]
     Hardware(#[from] hardware::HardwareError),
