@@ -1,14 +1,9 @@
-# Model weights — do not commit to git
-*.safetensors
-model.safetensors.index.json
-
-# Model config files (these are model-specific, not project files)
-ara_config.json
-chat_template.jinja
-config.json
-generation_config.json
-tokenizer.json
-tokenizer_config.json
+# Model files — do not commit to git
+models/
 
 # Build artifacts
 target/
+
+# BMad project files
+_bmad/
+_bmad-output/
