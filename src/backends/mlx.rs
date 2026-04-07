@@ -341,10 +341,11 @@ fn write_native_safetensors_file(
             || name.contains("std_bias")
             || name.contains("std_scale")
             || name.contains("position_embedding");
-        // Vision tower tensors are preserved at original precision (bf16) so
-        // multimodal servers can still use them for image understanding.
+        // Modality encoder tensors are preserved at original precision (bf16) so
+        // multimodal servers can still use them for image/audio understanding.
         let is_vision = name.contains("vision_tower") || name.contains("embed_vision");
-        let should_quantize = is_2d_plus && !is_norm_or_scalar && !is_vision;
+        let is_audio = name.contains("audio_tower") || name.contains("embed_audio") || name.contains("audio_encoder");
+        let should_quantize = is_2d_plus && !is_norm_or_scalar && !is_vision && !is_audio;
 
         if should_quantize {
             // Look up per-tensor bit override (e.g., 8-bit for MLP/router in MoE)
@@ -495,11 +496,13 @@ fn write_mlx_config_native(
 
     if let Some(quant_obj) = quant_config.as_object_mut() {
         for (tensor_name, &override_bits) in bit_overrides {
-            // Skip vision tower / embed_vision tensors — they're preserved at
-            // original precision (bf16) in the native path, so listing them
-            // in the quantization config would cause mlx-vlm to expect
-            // quantized weight+scales+biases that don't exist.
-            if tensor_name.contains("vision_tower") || tensor_name.contains("embed_vision") {
+            // Skip modality encoder tensors — they're preserved at original
+            // precision (bf16) in the native path, so listing them in the
+            // quantization config would cause mlx-vlm to expect quantized
+            // weight+scales+biases that don't exist.
+            if tensor_name.contains("vision_tower") || tensor_name.contains("embed_vision")
+                || tensor_name.contains("audio_tower") || tensor_name.contains("embed_audio")
+                || tensor_name.contains("audio_encoder") {
                 continue;
             }
             // Convert tensor name to mlx-lm module path
