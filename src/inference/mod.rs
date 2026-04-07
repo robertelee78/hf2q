@@ -18,6 +18,8 @@ pub mod stub_runner;
 pub mod weight_loader;
 #[cfg(feature = "mlx-native")]
 pub mod memory_estimate;
+#[cfg(feature = "mlx-native")]
+pub mod kv_cache;
 
 use thiserror::Error;
 
