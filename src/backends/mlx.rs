@@ -1244,6 +1244,7 @@ fn copy_tokenizer_files(
         "tokenizer_config.json",
         "special_tokens_map.json",
         "tokenizer.model",
+        "chat_template.jinja",
     ];
 
     for filename in &tokenizer_files {
