@@ -1815,11 +1815,20 @@ impl Gemma4Model {
 // ---- Helper functions ----
 
 /// Require a weight to exist in the weight map.
+/// Tries the given name first, then with `language_model.` prefix (MLX-format models).
 fn require_weight<'a>(
     weights: &'a WeightMap,
     name: &str,
 ) -> Result<&'a LoadedWeight, Gemma4Error> {
-    weights.get(name).ok_or_else(|| Gemma4Error::MissingWeight {
+    if let Some(w) = weights.get(name) {
+        return Ok(w);
+    }
+    // Try with language_model. prefix (MLX-format Gemma 4 models use this)
+    let prefixed = format!("language_model.{}", name);
+    if let Some(w) = weights.get(&prefixed) {
+        return Ok(w);
+    }
+    Err(Gemma4Error::MissingWeight {
         name: name.to_string(),
     })
 }
