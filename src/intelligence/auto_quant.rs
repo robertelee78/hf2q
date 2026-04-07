@@ -625,7 +625,7 @@ fn build_component_overrides(
 /// Currently limited to power-of-2 widths (2, 4, 8) which are verified working.
 /// TODO: Enable 3-bit and 6-bit once non-power-of-2 uint32 packing is validated.
 fn next_valid_mlx_bits(base: u8, steps: u8) -> u8 {
-    const VALID: [u8; 3] = [2, 4, 8]; // power-of-2 only until 3/6-bit packing is fixed
+    const VALID: [u8; 5] = [2, 3, 4, 6, 8];
     let target = base + steps;
     for &v in &VALID {
         if v >= target {
@@ -945,7 +945,7 @@ mod tests {
 
         let v_proj = overrides.iter().find(|o| o.pattern == "v_proj");
         assert!(v_proj.is_some(), "4-bit plan should elevate v_proj");
-        assert_eq!(v_proj.unwrap().bits, 8); // base 4, next valid power-of-2 >= 6 is 8
+        assert_eq!(v_proj.unwrap().bits, 6); // base 4 + 2 steps = 6
     }
 
     #[test]
