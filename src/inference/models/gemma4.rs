@@ -934,10 +934,10 @@ impl Gemma4Model {
             kv_out_dim,
         )?;
 
-        // K-eq-V only applies to global (non-sliding) layers.
-        // Sliding layers always have their own v_proj weight.
-        let use_k_eq_v = self.config.attention_k_eq_v
-            && layer_type == LayerAttentionType::Global;
+        // K-eq-V applies to ALL layers when the config flag is set.
+        // When attention_k_eq_v is true, V is derived from the K projection
+        // (not a separate v_proj) for every layer type.
+        let use_k_eq_v = self.config.attention_k_eq_v;
 
         let v_proj = if use_k_eq_v {
             // K == V: reuse the K projection output as V
@@ -984,10 +984,25 @@ impl Gemma4Model {
         let v_normed_buf = f32_vec_to_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
 
         if diag {
+            // Compare K and V raw projections (should be IDENTICAL for k_eq_v)
+            eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_data_raw[..5.min(k_data_raw.len())]);
+            eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
+            let k_v_match = k_data_raw.len() == v_data_raw.len() &&
+                k_data_raw.iter().zip(v_data_raw.iter()).take(10).all(|(a, b)| (a - b).abs() < 1e-6);
+            eprintln!("[DIAG]   K==V? {} (k_eq_v={}, k_len={}, v_len={})", k_v_match, use_k_eq_v, k_data_raw.len(), v_data_raw.len());
+
             let n = q_normed_data.len().min(5);
             eprintln!("[DIAG] Layer 0 after QK norms, Q first {}: {:?}", n, &q_normed_data[..n]);
             let n = k_normed_data.len().min(5);
             eprintln!("[DIAG] Layer 0 after QK norms, K first {}: {:?}", n, &k_normed_data[..n]);
+
+            // V diagnostic: raw projection and after norm
+            eprintln!("[DIAG] Layer 0 V raw (k_proj, before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
+            eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_normed_data[..5.min(v_normed_data.len())]);
+            // Compute RMS of V raw for head 0, pos 0 to verify norm
+            let v_head0 = &v_data_raw[..head_dim];
+            let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
+            eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
         }
 
         // --- Step 3: RoPE on Q and K ---
@@ -1037,6 +1052,30 @@ impl Gemma4Model {
         )?;
 
         if diag {
+            // Print V values before attention (what we stored in the cache)
+            eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data[..5.min(v_data.len())]);
+            eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
+
+            // Read back from cache to verify
+            let layer_cache_read = self.kv_cache.layer(layer_idx)?;
+            let (k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
+            let v_cache_data: &[f32] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read v cache: {e}"),
+            })?;
+            let v_first5 = &v_cache_data[..5.min(v_cache_data.len())];
+            eprintln!("[DIAG] Layer 0 V cache readback pos 0 first 5: {:?}, kv_seq_len={}", v_first5, kv_slen);
+
+            // Print reshaped V that goes into SDPA
+            let v_valid = &v_cache_data[..kv_slen * n_kv_heads * head_dim];
+            let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_slen, n_kv_heads, head_dim);
+            eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
+
+            // Print Q pre-scaled values
+            let q_ps: &[f32] = q_prescaled.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read q_prescaled: {e}"),
+            })?;
+            eprintln!("[DIAG] Layer 0 Q pre-scaled (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
+
             let s: &[f32] = attn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read attn L0: {e}"),
             })?;
