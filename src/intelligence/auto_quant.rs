@@ -40,8 +40,6 @@
 //! | 9 (low)  | down_proj       | FFN output; least sensitive of projections      |
 //! | 10(low)  | expert FFN      | Redundancy across experts provides resilience   |
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -138,7 +136,7 @@ struct BandwidthProfile {
 /// falls back to conservative estimates for unknown hardware.
 fn estimate_bandwidth(hardware: &HardwareProfile) -> f64 {
     let chip = hardware.chip_model.to_lowercase();
-    let mem_gb = hardware.total_memory_gb();
+    let _mem_gb = hardware.total_memory_gb();
 
     let profile = if chip.contains("m5 ultra") {
         BandwidthProfile { effective_bandwidth_gbps: 780.0 }
@@ -559,7 +557,7 @@ pub fn resolve_auto_plan(
 /// - k_proj gets +1 bit over base
 /// - Other components stay at base bits
 fn build_component_overrides(
-    arch_family: ArchFamily,
+    _arch_family: ArchFamily,
     fingerprint: &ModelFingerprint,
     base_bits: u8,
 ) -> Vec<ComponentOverride> {
@@ -638,7 +636,7 @@ fn next_valid_mlx_bits(base: u8, steps: u8) -> u8 {
 }
 
 /// Map a (base_bits, arch_family) pair to the appropriate CLI quant method name.
-fn plan_to_quant_method(base_bits: u8, arch_family: ArchFamily, fingerprint: &ModelFingerprint) -> String {
+fn plan_to_quant_method(base_bits: u8, _arch_family: ArchFamily, fingerprint: &ModelFingerprint) -> String {
     // If there are component overrides that differ from base, use mixed-bit
     let has_elevated = fingerprint.is_moe() || base_bits <= 4;
 
@@ -695,6 +693,7 @@ pub enum AutoQuantError {
     ModelTooLarge { reason: String },
 
     #[error("Hardware detection failed: {reason}")]
+    #[allow(dead_code)]
     HardwareDetection { reason: String },
 }
 
@@ -723,6 +722,7 @@ pub enum AutoQuantError {
 ///   "confidence": 0.85
 /// }
 /// ```
+#[allow(dead_code)] // Planned for use when auto_quant writes config files directly
 pub fn plan_to_config_json(plan: &AutoQuantPlan, hardware: &HardwareProfile) -> serde_json::Value {
     let mut overrides_map = serde_json::Map::new();
     for ov in &plan.component_overrides {

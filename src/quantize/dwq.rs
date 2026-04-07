@@ -16,7 +16,7 @@ use std::ops::RangeInclusive;
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::inference::{InferenceError, InferenceRunner, TokenInput};
+use crate::inference::{InferenceError, InferenceRunner};
 use crate::ir::{ModelMetadata, QuantizedModel, QuantizedTensor, TensorMap, TensorRef};
 use crate::progress::ProgressReporter;
 use crate::quality::kl_divergence;
@@ -58,6 +58,7 @@ pub struct DwqConfig {
     /// Maximum number of calibration iterations
     pub max_iterations: u32,
     /// KL divergence threshold for convergence
+    #[allow(dead_code)] // Will be used when iterative DWQ calibration is enabled
     pub convergence_threshold: f64,
 }
 
@@ -152,7 +153,7 @@ pub fn run_dwq_calibration(
     }
 
     let num_layers = metadata.num_layers as usize;
-    let hidden_size = metadata.hidden_size as usize;
+    let _hidden_size = metadata.hidden_size as usize;
     let total_steps = 2 + (num_layers as u64) * (1 + config.max_iterations as u64) + 1;
     let pb = progress.bar(total_steps, "DWQ Calibration (layer-streaming)");
 
@@ -337,6 +338,7 @@ fn tensor_to_f32_safe(tensor: &TensorRef) -> Vec<f32> {
 ///   optimal_scale = dot(W_group, Q_group) / dot(Q_group, Q_group)
 ///
 /// This is the GPTQ approach to scale calibration — exact, not iterative.
+#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
 fn adjust_scales_weight_space(
     quantized_tensors: &mut HashMap<String, QuantizedTensor>,
     original_tensors: &HashMap<String, TensorRef>,
@@ -395,6 +397,7 @@ fn adjust_scales_weight_space(
 /// This is a simplified version of scale adjustment that slightly
 /// modifies the scale factors in the direction that would reduce
 /// the KL divergence between reference and quantized outputs.
+#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
 fn adjust_scales(
     quantized_tensors: &mut HashMap<String, QuantizedTensor>,
     reference_logits: &[f32],
@@ -437,6 +440,7 @@ fn adjust_scales(
 /// Dequantizes packed weight data back to f16 so the InferenceRunner can
 /// load and run forward passes. This is the inverse of `quantize_weight`:
 /// `float_val = scale * quantized_int` (symmetric dequantization).
+#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
 fn build_tensor_map_from_quantized(
     quantized: &HashMap<String, QuantizedTensor>,
 ) -> TensorMap {

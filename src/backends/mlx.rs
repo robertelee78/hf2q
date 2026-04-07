@@ -879,12 +879,27 @@ fn mlx_affine_quantize(
     let total_elements = weights.len();
     let num_groups = total_elements.div_ceil(group_size);
 
-    // All bit widths pack into uint32 words.
-    // For N-bit: floor(32/N) values per uint32, and (group_size * N / 32) uint32s per group.
-    let el_per_u32 = 32 / bits as usize; // 2-bit:16, 3-bit:10, 4-bit:8, 6-bit:5, 8-bit:4
-    let u32s_per_group = (group_size * bits as usize) / 32;
+    // MLX uses two different packing strategies depending on whether bits is a
+    // power of 2.  See mlx/backend/cpu/quantized.cpp `quantize()`.
+    //
+    // Power-of-2 bits (2, 4, 8): pack floor(32/bits) values per uint32.
+    //   el_per_int = 32 / bits, bytes_per_pack = 1 (one uint32 per pack).
+    //
+    // Non-power-of-2 bits (3, 6): pack values into 24-bit (3-byte) groups,
+    //   then store as 3 consecutive uint8 bytes.
+    //   3-bit: el_per_int = 8  (8 * 3 = 24 bits)
+    //   6-bit: el_per_int = 4  (4 * 6 = 24 bits)
+    //   bytes_per_pack = 3
+    //
+    // In both cases the final byte stream is reinterpreted as uint32 in safetensors.
+    let power_of_2 = (bits & (bits - 1)) == 0;
+    let el_per_int: usize = if bits == 3 { 8 } else if bits == 6 { 4 } else { 32 / bits as usize };
+    let bytes_per_pack: usize = if power_of_2 { 1 } else { 3 };
+    // int_per_group counts uint8 slots for non-pow2, uint32 slots for pow2
+    let int_per_group: usize = group_size * bytes_per_pack / el_per_int;
+    let bytes_per_group: usize = if power_of_2 { int_per_group * 4 } else { int_per_group };
 
-    let mut packed = Vec::with_capacity(num_groups * u32s_per_group * 4);
+    let mut packed = Vec::with_capacity(num_groups * bytes_per_group);
     let mut scales_bf16 = Vec::with_capacity(num_groups * 2);
     let mut biases_bf16 = Vec::with_capacity(num_groups * 2);
 
@@ -922,18 +937,27 @@ fn mlx_affine_quantize(
         scales_bf16.extend_from_slice(&scale_bf16.to_le_bytes());
         biases_bf16.extend_from_slice(&bias_bf16.to_le_bytes());
 
-        // Quantize values and pack into uint32 words
+        // Quantize values and pack into bytes.
         let actual_len = end - start;
+        let packs = int_per_group / bytes_per_pack;
         let mut val_idx = 0usize;
-        for _j in 0..u32s_per_group {
+        for _j in 0..packs {
             let mut out_el: u32 = 0;
-            for k in 0..el_per_u32 {
+            for k in 0..el_per_int {
                 let w_el = if val_idx < actual_len { group[val_idx] } else { 0.0 };
                 let q = ((w_el - bias) / scale).round().clamp(0.0, n_bins);
                 out_el |= (q as u32) << (k as u32 * bits);
                 val_idx += 1;
             }
-            packed.extend_from_slice(&out_el.to_le_bytes());
+            if power_of_2 {
+                // Store as one uint32
+                packed.extend_from_slice(&out_el.to_le_bytes());
+            } else {
+                // Store as 3 consecutive uint8 bytes (24 bits)
+                packed.push((out_el & 0xff) as u8);
+                packed.push(((out_el >> 8) & 0xff) as u8);
+                packed.push(((out_el >> 16) & 0xff) as u8);
+            }
         }
     }
 
@@ -941,6 +965,7 @@ fn mlx_affine_quantize(
 }
 
 /// Whether the given bit width uses uint8 triplet packing (3, 6) vs uint32 packing (2, 4, 8).
+#[allow(dead_code)] // May be needed for future MLX format variants
 fn mlx_uses_u8_packing(bits: u8) -> bool {
     !((bits as u32).is_power_of_two())
 }
@@ -1535,46 +1560,67 @@ mod tests {
 
     #[test]
     fn test_mlx_affine_quantize_3bit_packing() {
-        // 3-bit: 10 values per uint32 (30 bits used), stored as U32
-        // group_size must be divisible by el_per_u32 — use 10 (=10*1 u32)
-        // Actually group_size * 3 / 32 must be integer. Use 32 values: 32*3/32 = 3 u32s
+        // 3-bit: non-power-of-2 → 8 values per 3 bytes (24 bits)
+        // group_size=32: 32 values / 8 per pack = 4 packs * 3 bytes = 12 bytes
         let weights: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 5.0).collect();
         let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 3, 32);
 
-        // 32 values * 3 bits / 32 = 3 uint32s = 12 bytes
-        assert_eq!(packed.len(), 12, "3-bit packing of 32 values: 3 uint32s = 12 bytes");
-        assert_eq!(scales_bf16.len(), 2); // 1 group
-        assert_eq!(biases_bf16.len(), 2);
-    }
-
-    #[test]
-    fn test_mlx_affine_quantize_6bit_packing() {
-        // 6-bit: 5 values per uint32 (30 bits used), stored as U32
-        // group_size=64: 64*6/32 = 12 uint32s
-        let weights: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
-        let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 6, 64);
-
-        // 64 values * 6 bits / 32 = 12 uint32s = 48 bytes
-        assert_eq!(packed.len(), 48, "6-bit packing of 64 values: 12 uint32s = 48 bytes");
+        // 32 values → 4 packs of 3 bytes = 12 bytes
+        assert_eq!(packed.len(), 12, "3-bit packing of 32 values: 4 packs * 3 bytes = 12 bytes");
         assert_eq!(scales_bf16.len(), 2); // 1 group
         assert_eq!(biases_bf16.len(), 2);
 
-        // Verify dequantization roundtrip
+        // Verify dequantization roundtrip using 3-byte pack layout
         let scale = half::bf16::from_le_bytes([scales_bf16[0], scales_bf16[1]]).to_f32();
         let bias = half::bf16::from_le_bytes([biases_bf16[0], biases_bf16[1]]).to_f32();
 
         let mut max_error = 0.0f32;
-        for (j, chunk) in packed.chunks_exact(4).enumerate() {
-            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            for k in 0..5 { // 5 values per uint32 for 6-bit
-                let idx = j * 5 + k;
-                if idx >= 64 { break; }
-                let uint_val = ((word >> (k * 6)) & 0x3F) as f32;
+        let mut val_idx = 0usize;
+        for chunk in packed.chunks_exact(3) {
+            let pack = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+            for k in 0..8 { // 8 values per 3-byte pack for 3-bit
+                if val_idx >= 32 { break; }
+                let uint_val = ((pack >> (k * 3)) & 0x7) as f32;
                 let dequant = uint_val * scale + bias;
-                let error = (weights[idx] - dequant).abs();
+                let error = (weights[val_idx] - dequant).abs();
                 max_error = max_error.max(error);
+                val_idx += 1;
             }
         }
+        assert_eq!(val_idx, 32, "all 32 values must be unpacked");
+        assert!(max_error < 1.0, "3-bit max reconstruction error too high: {}", max_error);
+    }
+
+    #[test]
+    fn test_mlx_affine_quantize_6bit_packing() {
+        // 6-bit: non-power-of-2 → 4 values per 3 bytes (24 bits)
+        // group_size=64: 64 values / 4 per pack = 16 packs * 3 bytes = 48 bytes
+        let weights: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
+        let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 6, 64);
+
+        // 64 values → 16 packs of 3 bytes = 48 bytes
+        assert_eq!(packed.len(), 48, "6-bit packing of 64 values: 16 packs * 3 bytes = 48 bytes");
+        assert_eq!(scales_bf16.len(), 2); // 1 group
+        assert_eq!(biases_bf16.len(), 2);
+
+        // Verify dequantization roundtrip using 3-byte pack layout
+        let scale = half::bf16::from_le_bytes([scales_bf16[0], scales_bf16[1]]).to_f32();
+        let bias = half::bf16::from_le_bytes([biases_bf16[0], biases_bf16[1]]).to_f32();
+
+        let mut max_error = 0.0f32;
+        let mut val_idx = 0usize;
+        for chunk in packed.chunks_exact(3) {
+            let pack = (chunk[0] as u32) | ((chunk[1] as u32) << 8) | ((chunk[2] as u32) << 16);
+            for k in 0..4 { // 4 values per 3-byte pack for 6-bit
+                if val_idx >= 64 { break; }
+                let uint_val = ((pack >> (k * 6)) & 0x3F) as f32;
+                let dequant = uint_val * scale + bias;
+                let error = (weights[val_idx] - dequant).abs();
+                max_error = max_error.max(error);
+                val_idx += 1;
+            }
+        }
+        assert_eq!(val_idx, 64, "all 64 values must be unpacked");
         assert!(max_error < 0.5, "6-bit max reconstruction error too high: {}", max_error);
     }
 

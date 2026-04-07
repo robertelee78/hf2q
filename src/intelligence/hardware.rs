@@ -93,6 +93,7 @@ impl HardwareProfile {
     ///
     /// Uses a simplified model: tok/s ~ bandwidth_bytes / model_size_bytes.
     /// Returns 0.0 if `model_size_bytes` is 0.
+    #[allow(dead_code)] // Used by auto_quant heuristics and will be called directly
     pub fn estimated_tok_s(&self, model_size_bytes: u64) -> f64 {
         if model_size_bytes == 0 {
             return 0.0;
@@ -104,6 +105,7 @@ impl HardwareProfile {
     /// Maximum model size (in bytes) that can sustain the target tok/s.
     ///
     /// Returns 0 if `target_tok_s` is <= 0.
+    #[allow(dead_code)] // Used by auto_quant heuristics and will be called directly
     pub fn max_model_bytes_for_tok_s(&self, target_tok_s: f64) -> u64 {
         if target_tok_s <= 0.0 {
             return 0;
