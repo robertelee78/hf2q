@@ -385,12 +385,12 @@ impl Gemma4Model {
             eprintln!("[DIAG] Input tokens: {:?}", &tokens[..tokens.len().min(20)]);
         }
 
-        // Step 1: Embedding gather (returns f32), then convert to bf16 pipeline
+        // Step 1: Embedding gather
         debug!(seq_len = seq_len, "Embedding gather");
-        let hidden_f32 = self.embedding_gather(tokens)?;
+        let mut hidden = self.embedding_gather(tokens)?;
 
         if diag {
-            let s: &[f32] = hidden_f32.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            let s: &[f32] = hidden.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read embed: {e}"),
             })?;
             let n = s.len().min(5);
@@ -399,32 +399,23 @@ impl Gemma4Model {
             eprintln!("[DIAG]   total_elements={}, nonzero={}", s.len(), nonzero);
         }
 
-        // Convert embedding output to bf16 for the bf16 pipeline
-        let embed_f32_data = read_buffer_f32(&hidden_f32)?;
-        let mut hidden = f32_vec_to_bf16_buffer(
-            &self.device, &embed_f32_data, vec![seq_len, hidden_size],
-        )?;
-
         // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         // Gemma models scale embeddings by sqrt(hidden_size)
-        // Operate on bf16 data: read as u16, convert to f32, scale, convert back
         let scale = (hidden_size as f32).sqrt();
         {
-            let slice: &mut [u16] = hidden
+            let slice: &mut [f32] = hidden
                 .as_mut_slice()
                 .map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("Embedding scale bf16: {e}"),
+                    reason: format!("Embedding scale: {e}"),
                 })?;
             for v in slice.iter_mut() {
-                let f = half::bf16::from_bits(*v).to_f32() * scale;
-                *v = half::bf16::from_f32(f).to_bits();
+                *v *= scale;
             }
 
             if diag {
                 let n = slice.len().min(5);
-                let diag_vals: Vec<f32> = slice[..n].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
-                eprintln!("[DIAG] After embedding scale bf16 (factor={:.4}), first {}: {:?}",
-                    scale, n, diag_vals);
+                eprintln!("[DIAG] After embedding scale (factor={:.4}), first {}: {:?}",
+                    scale, n, &slice[..n]);
             }
         }
 
@@ -434,7 +425,9 @@ impl Gemma4Model {
             hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
 
             if diag {
-                let s = read_buffer_f32(&hidden)?;
+                let s: &[f32] = hidden.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("diag read layer{}: {e}", layer_idx),
+                })?;
                 // Print L2 norm of last token's hidden state
                 let last_start = (seq_len - 1) * hidden_size;
                 let last_token = &s[last_start..last_start + hidden_size];
@@ -448,12 +441,14 @@ impl Gemma4Model {
             }
         }
 
-        // Step 4: Final RMS norm (bf16 in, bf16 out)
+        // Step 4: Final RMS norm
         debug!("Final RMS norm");
         let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
 
         if diag {
-            let s = read_buffer_f32(&normed)?;
+            let s: &[f32] = normed.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read final norm: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] After final rms_norm, first {}: {:?}", n, &s[..n]);
             // Also last token's first 5 values (this is what gets projected to logits)
@@ -465,7 +460,6 @@ impl Gemma4Model {
         }
 
         // Step 5: lm_head (tied embeddings -- transpose embed_tokens and matmul)
-        // lm_head takes bf16 input and returns f32 logits
         debug!("lm_head projection (tied embeddings)");
         let logits = self.lm_head_projection(&normed, seq_len)?;
 
@@ -543,43 +537,41 @@ impl Gemma4Model {
 
         let hidden_size = self.config.hidden_size;
 
-        // Step 1: Embedding gather (f32) -> bf16
+        // Step 1: Embedding gather
         debug!(seq_len = seq_len, "Embedding gather (hidden states)");
-        let hidden_f32 = self.embedding_gather(tokens)?;
-        let mut hidden = f32_vec_to_bf16_buffer(
-            &self.device,
-            &read_buffer_f32(&hidden_f32)?,
-            vec![seq_len, hidden_size],
-        )?;
+        let mut hidden = self.embedding_gather(tokens)?;
 
-        // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention (in bf16)
+        // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         let scale = (hidden_size as f32).sqrt();
         {
-            let slice: &mut [u16] = hidden
+            let slice: &mut [f32] = hidden
                 .as_mut_slice()
                 .map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("Embedding scale bf16: {e}"),
+                    reason: format!("Embedding scale: {e}"),
                 })?;
             for v in slice.iter_mut() {
-                let f = half::bf16::from_bits(*v).to_f32() * scale;
-                *v = half::bf16::from_f32(f).to_bits();
+                *v *= scale;
             }
         }
 
-        // Step 3: Process each transformer layer (bf16 pipeline)
+        // Step 3: Process each transformer layer
         for layer_idx in 0..self.config.num_layers {
             debug!(layer = layer_idx, "Processing transformer layer (hidden states)");
             hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
         }
 
-        // Step 4: Final RMS norm (bf16 in, bf16 out)
+        // Step 4: Final RMS norm (stop here -- do NOT project to vocab)
         debug!("Final RMS norm (hidden states)");
         let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
 
-        // Read bf16 hidden states to CPU as f32
-        let output = read_buffer_f32(&normed)?;
+        // Read hidden states to CPU
+        let output: &[f32] = normed
+            .as_slice()
+            .map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("Read hidden states: {e}"),
+            })?;
 
-        Ok(output)
+        Ok(output.to_vec())
     }
 
     /// Run a forward pass with vision token injection.
@@ -615,26 +607,37 @@ impl Gemma4Model {
             .map(|&t| if t == image_token_id { pad_token_id } else { t })
             .collect();
         debug!(seq_len = seq_len, "Embedding gather (with vision)");
-        let hidden_f32 = self.embedding_gather(&safe_tokens)?;
+        let mut hidden = self.embedding_gather(&safe_tokens)?;
 
-        // Convert to bf16 and scale
-        let mut hidden_data = read_buffer_f32(&hidden_f32)?;
+        // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         let scale = (hidden_size as f32).sqrt();
-        for v in hidden_data.iter_mut() {
-            *v *= scale;
+        {
+            let slice: &mut [f32] = hidden
+                .as_mut_slice()
+                .map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Embedding scale: {e}"),
+                })?;
+            for v in slice.iter_mut() {
+                *v *= scale;
+            }
         }
 
-        // Step 3: Scatter vision features into image token positions (in f32 space)
+        // Step 3: Scatter vision features into image token positions
         // The vision features are already in the text model's hidden dimension
         // and have been processed by the vision encoder + projection.
         {
+            let slice: &mut [f32] = hidden
+                .as_mut_slice()
+                .map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Vision scatter: {e}"),
+                })?;
             let mut vision_idx = 0usize;
             for (pos, &token_id) in tokens.iter().enumerate() {
                 if token_id == image_token_id {
                     let src_offset = vision_idx * hidden_size;
                     let dst_offset = pos * hidden_size;
                     if src_offset + hidden_size <= vision_features.len() {
-                        hidden_data[dst_offset..dst_offset + hidden_size]
+                        slice[dst_offset..dst_offset + hidden_size]
                             .copy_from_slice(&vision_features[src_offset..src_offset + hidden_size]);
                     }
                     vision_idx += 1;
@@ -646,24 +649,17 @@ impl Gemma4Model {
             );
         }
 
-        // Convert to bf16 for the pipeline
-        let mut hidden = f32_vec_to_bf16_buffer(
-            &self.device,
-            &hidden_data,
-            vec![seq_len, hidden_size],
-        )?;
-
-        // Step 4: Process each transformer layer (bf16 pipeline)
+        // Step 4: Process each transformer layer
         for layer_idx in 0..self.config.num_layers {
             debug!(layer = layer_idx, "Processing transformer layer");
             hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
         }
 
-        // Step 5: Final RMS norm (bf16 in, bf16 out)
+        // Step 5: Final RMS norm
         debug!("Final RMS norm");
         let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
 
-        // Step 6: lm_head (bf16 in, f32 logits out)
+        // Step 6: lm_head (tied embeddings)
         debug!("lm_head projection (tied embeddings)");
         let logits = self.lm_head_projection(&normed, seq_len)?;
 
@@ -898,7 +894,9 @@ impl Gemma4Model {
         let normed = self.apply_rms_norm(input, &norm_name, seq_len)?;
 
         if diag {
-            let s = read_buffer_f32(&normed)?;
+            let s: &[f32] = normed.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read norm L0: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after rms_norm, first {}: {:?}", n, &s[..n]);
         }
@@ -920,7 +918,9 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            let s = read_buffer_f32(&q_proj)?;
+            let s: &[f32] = q_proj.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read q_proj L0: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after Q proj (dim={}), first {}: {:?}", q_out_dim, n, &s[..n]);
         }
@@ -968,20 +968,19 @@ impl Gemma4Model {
         let q_norm_weight = read_weight_as_f32(require_weight(&self.weights, &q_norm_name)?)?;
         let k_norm_weight = read_weight_as_f32(require_weight(&self.weights, &k_norm_name)?)?;
 
-        // read_buffer_f32 handles bf16 -> f32 conversion automatically
         let q_data = read_buffer_f32(&q_proj)?;
         let q_normed_data = cpu_per_head_rms_norm(&q_data, &q_norm_weight, seq_len, n_heads, head_dim, eps);
-        let q_normed = f32_vec_to_bf16_buffer(&self.device, &q_normed_data, vec![seq_len, q_out_dim])?;
+        let q_normed = f32_vec_to_buffer(&self.device, &q_normed_data, vec![seq_len, q_out_dim])?;
 
         let k_data_raw = read_buffer_f32(&k_proj)?;
         let k_normed_data = cpu_per_head_rms_norm(&k_data_raw, &k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
-        let k_normed = f32_vec_to_bf16_buffer(&self.device, &k_normed_data, vec![seq_len, kv_out_dim])?;
+        let k_normed = f32_vec_to_buffer(&self.device, &k_normed_data, vec![seq_len, kv_out_dim])?;
 
         // --- Step 2c: V norm (scaleless per-head RMS norm on V) ---
         // Gemma 4 applies RMSNormNoScale to V (normalize without learned weight).
         let v_data_raw = read_buffer_f32(&v_proj)?;
         let v_normed_data = cpu_per_head_rms_norm_no_scale(&v_data_raw, seq_len, n_kv_heads, head_dim, eps);
-        let v_normed_buf = f32_vec_to_bf16_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
+        let v_normed_buf = f32_vec_to_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
 
         if diag {
             // Compare K and V raw projections (should be IDENTICAL for k_eq_v)
@@ -1020,7 +1019,7 @@ impl Gemma4Model {
         )?;
 
         // --- Step 4: KV cache append ---
-        // Read K and V (bf16) to CPU as f32, append to cache (f32 storage)
+        // Read K and V to CPU, append to cache, then read back cache contents
         let k_data = read_buffer_f32(&k_roped)?;
         let v_data = read_buffer_f32(&v_normed_buf)?; // V does NOT get RoPE, but does get v_norm
 
@@ -1034,12 +1033,11 @@ impl Gemma4Model {
         // However, the SDPA kernel hardcodes scale = 1/sqrt(head_dim).
         // To compensate, we pre-scale Q by sqrt(head_dim) so the kernel's
         // division cancels out, yielding an effective scale of 1.0.
-        // Q is bf16; read as f32, scale, write back as bf16 for SDPA.
         let q_prescaled = {
             let q_data = read_buffer_f32(&q_roped)?;
             let sqrt_hd = (head_dim as f32).sqrt();
             let scaled: Vec<f32> = q_data.iter().map(|v| v * sqrt_hd).collect();
-            f32_vec_to_bf16_buffer(&self.device, &scaled, vec![seq_len, n_heads * head_dim])?
+            f32_vec_to_buffer(&self.device, &scaled, vec![seq_len, n_heads * head_dim])?
         };
 
         let attn_out = self.compute_attention(
@@ -1059,7 +1057,7 @@ impl Gemma4Model {
 
             // Read back from cache to verify
             let layer_cache_read = self.kv_cache.layer(layer_idx)?;
-            let (_k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
+            let (k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
             let v_cache_data: &[f32] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read v cache: {e}"),
             })?;
@@ -1072,10 +1070,14 @@ impl Gemma4Model {
             eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
 
             // Print Q pre-scaled values
-            let q_ps = read_buffer_f32(&q_prescaled)?;
+            let q_ps: &[f32] = q_prescaled.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read q_prescaled: {e}"),
+            })?;
             eprintln!("[DIAG] Layer 0 Q pre-scaled (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
 
-            let s = read_buffer_f32(&attn_out)?;
+            let s: &[f32] = attn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read attn L0: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
@@ -1165,7 +1167,9 @@ impl Gemma4Model {
         };
 
         if diag {
-            let s = read_buffer_f32(&ffn_out)?;
+            let s: &[f32] = ffn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read ffn L0: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after FFN+norms output, first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
@@ -1186,10 +1190,6 @@ impl Gemma4Model {
     }
 
     /// Apply RMS normalization using a named weight tensor.
-    ///
-    /// The output dtype matches the input dtype. When input is bf16, the bf16
-    /// RMS norm kernel is dispatched and the weight is kept as bf16 (or cast
-    /// to bf16 if stored as f32). When input is f32, the f32 kernel is used.
     fn apply_rms_norm(
         &mut self,
         input: &MlxBuffer,
@@ -1197,18 +1197,16 @@ impl Gemma4Model {
         seq_len: usize,
     ) -> Result<MlxBuffer, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
-        let input_dtype = input.dtype();
 
         // Clone the weight buffer so we can release the immutable borrow on self
         let weight = require_weight(&self.weights, weight_name)?;
         let norm_weight_buf = clone_buffer(&self.device, &weight.buffer)?;
 
-        // Output matches input dtype
-        let elem_size = input_dtype.size_of();
-        let output_bytes = seq_len * hidden_size * elem_size;
+        // RMS norm needs: input [rows, dim], weight [dim], output [rows, dim], params_buf [eps, dim]
+        let output_bytes = seq_len * hidden_size * std::mem::size_of::<f32>();
         let output = self.device.alloc_buffer(
             output_bytes,
-            input_dtype,
+            DType::F32,
             vec![seq_len, hidden_size],
         )?;
 
@@ -1230,33 +1228,8 @@ impl Gemma4Model {
             slice[1] = dim;
         }
 
-        // Prepare the norm weight to match input dtype.
-        // For bf16 pipeline: if weight is already bf16, use as-is; if f32, cast to bf16.
-        // For f32 pipeline: ensure weight is f32.
-        let norm_weight = match input_dtype {
-            DType::BF16 => {
-                match norm_weight_buf.dtype() {
-                    DType::BF16 => clone_buffer(&self.device, &norm_weight_buf)?,
-                    DType::F32 => {
-                        self.cast_f32_to_bf16(&norm_weight_buf, hidden_size)?
-                    }
-                    DType::F16 => {
-                        // f16 -> f32 -> bf16
-                        let f32_buf = self.cast_to_f32(&norm_weight_buf, hidden_size)?;
-                        self.cast_f32_to_bf16(&f32_buf, hidden_size)?
-                    }
-                    _ => {
-                        return Err(Gemma4Error::ForwardError {
-                            reason: format!("Unsupported norm weight dtype for bf16 pipeline: {}", norm_weight_buf.dtype()),
-                        });
-                    }
-                }
-            }
-            _ => {
-                // f32 pipeline: ensure weight is f32
-                self.ensure_f32_weight(&norm_weight_buf, hidden_size, weight_name)?
-            }
-        };
+        // Norm weights may be f32 or need conversion
+        let norm_weight = self.ensure_f32_weight(&norm_weight_buf, hidden_size, weight_name)?;
 
         let mut encoder = self.device.command_encoder()?;
         rms_norm::dispatch_rms_norm(
@@ -1392,9 +1365,7 @@ impl Gemma4Model {
     /// Perform a quantized matmul projection (e.g., Q/K/V/O projections).
     ///
     /// Looks up weight, scales, biases tensors by the base name pattern.
-    /// Input may be f32 or bf16. Output is bf16 to keep the pipeline in bf16.
-    /// The GPU qmatmul kernel produces f32 output which is then cast to bf16.
-    /// The CPU path accumulates in f32 and writes bf16.
+    /// Input is f32 [seq_len, in_dim]; output is f16 [seq_len, out_dim] (converted to f32).
     fn quantized_projection(
         &mut self,
         input: &MlxBuffer,
@@ -1419,7 +1390,6 @@ impl Gemma4Model {
             let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
             if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
                 // GPU path (default — matches MLX's bf16 precision)
-                // qmatmul kernel expects f32 input; convert bf16 if needed
                 let input_f32 = self.ensure_f32_input(input, seq_len * in_dim)?;
 
                 let loaded = require_weight(&self.weights, &weight_name)?;
@@ -1435,7 +1405,7 @@ impl Gemma4Model {
                 };
 
                 let mut encoder = self.device.command_encoder()?;
-                let output_f32 = qmatmul::quantized_matmul(
+                let output_f32 = qmatmul::quantized_matmul_simd(
                     &mut encoder,
                     &mut self.registry,
                     &self.device,
@@ -1447,9 +1417,7 @@ impl Gemma4Model {
                 )?;
                 encoder.commit_and_wait()?;
 
-                // Cast f32 output to bf16 for the bf16 pipeline
-                let output_bf16 = self.cast_f32_to_bf16(&output_f32, seq_len * out_dim)?;
-                return Ok(output_bf16);
+                return Ok(output_f32);
             }
 
             // CPU dequantize + bf16-precision matmul.
@@ -1475,18 +1443,16 @@ impl Gemma4Model {
                 }
             }
 
-            // Write as bf16 for the bf16 pipeline
-            return f32_vec_to_bf16_buffer(&self.device, &output_data, vec![seq_len, out_dim]);
+            return f32_vec_to_buffer(&self.device, &output_data, vec![seq_len, out_dim]);
         }
 
-        // Non-quantized path: CPU matmul fallback, output as bf16
+        // Non-quantized path: CPU matmul fallback
+        // Need to clone the weight buffer to avoid borrow conflict with self.cpu_matmul
         let weight_buf = clone_buffer(
             &self.device,
             &require_weight(&self.weights, &weight_name)?.buffer,
         )?;
-        let f32_result = self.cpu_matmul(input, &weight_buf, seq_len, in_dim, out_dim)?;
-        // Cast to bf16
-        self.cast_f32_to_bf16(&f32_result, seq_len * out_dim)
+        self.cpu_matmul(input, &weight_buf, seq_len, in_dim, out_dim)
     }
 
     /// Cast an f32 buffer to f16 on the GPU.
@@ -1534,56 +1500,6 @@ impl Gemma4Model {
             &output,
             n_elements,
             elementwise::CastDirection::F16ToF32,
-        )?;
-        encoder.commit_and_wait()?;
-        Ok(output)
-    }
-
-    /// Cast an f32 buffer to bf16 on the GPU.
-    fn cast_f32_to_bf16(
-        &mut self,
-        input: &MlxBuffer,
-        n_elements: usize,
-    ) -> Result<MlxBuffer, Gemma4Error> {
-        let out_bytes = n_elements * 2; // bf16 = 2 bytes
-        let output =
-            self.device
-                .alloc_buffer(out_bytes, DType::BF16, vec![n_elements])?;
-
-        let mut encoder = self.device.command_encoder()?;
-        elementwise::cast(
-            &mut encoder,
-            &mut self.registry,
-            self.device.metal_device(),
-            input,
-            &output,
-            n_elements,
-            elementwise::CastDirection::F32ToBF16,
-        )?;
-        encoder.commit_and_wait()?;
-        Ok(output)
-    }
-
-    /// Cast a bf16 buffer to f32 on the GPU.
-    fn cast_bf16_to_f32(
-        &mut self,
-        input: &MlxBuffer,
-        n_elements: usize,
-    ) -> Result<MlxBuffer, Gemma4Error> {
-        let out_bytes = n_elements * std::mem::size_of::<f32>();
-        let output =
-            self.device
-                .alloc_buffer(out_bytes, DType::F32, vec![n_elements])?;
-
-        let mut encoder = self.device.command_encoder()?;
-        elementwise::cast(
-            &mut encoder,
-            &mut self.registry,
-            self.device.metal_device(),
-            input,
-            &output,
-            n_elements,
-            elementwise::CastDirection::BF16ToF32,
         )?;
         encoder.commit_and_wait()?;
         Ok(output)
@@ -1781,15 +1697,27 @@ impl Gemma4Model {
             }
         }
 
-        // Write to bf16 Metal buffer for the bf16 pipeline
-        f32_vec_to_bf16_buffer(&self.device, &output_data, input.shape().to_vec())
+        // Write to Metal buffer
+        let mut buf = self.device.alloc_buffer(
+            output_data.len() * std::mem::size_of::<f32>(),
+            DType::F32,
+            input.shape().to_vec(),
+        )?;
+        {
+            let slice: &mut [f32] = buf.as_mut_slice().map_err(|e| {
+                Gemma4Error::ForwardError {
+                    reason: format!("RoPE output write: {e}"),
+                }
+            })?;
+            slice.copy_from_slice(&output_data);
+        }
+        Ok(buf)
     }
 
     /// Compute attention for a single layer.
     ///
-    /// Q is bf16 [seq_len, n_heads * head_dim]. K/V are read from the f32 KV cache
-    /// and converted to bf16 at the SDPA boundary. The SDPA bf16 kernel is dispatched
-    /// based on the Q buffer dtype. Output is bf16 [seq_len, n_heads * head_dim].
+    /// Reshapes Q from [seq_len, n_heads * head_dim] to [1, n_heads, seq_len, head_dim],
+    /// reads K and V from the KV cache, dispatches sdpa or sdpa_sliding.
     fn compute_attention(
         &mut self,
         layer_idx: usize,
@@ -1809,14 +1737,18 @@ impl Gemma4Model {
             });
         }
 
-        // Q is bf16 [seq_len, n_heads * head_dim].
+        // Q is [seq_len, n_heads * head_dim] in memory.
         // SDPA expects [batch, n_heads, seq_len, head_dim].
-        // Read Q as f32 for reshape, then write as bf16.
+        // We need to transpose: reshape to [seq_len, n_heads, head_dim] then
+        // permute to [n_heads, seq_len, head_dim] and add batch dim.
+        // Since batch=1, the layout is [1, n_heads, seq_len, head_dim].
+
+        // Do the reshape/transpose on CPU for correctness:
         let q_data = read_buffer_f32(q)?;
         let q_reshaped = reshape_qkv_for_sdpa(&q_data, seq_len, n_heads, head_dim);
 
-        // K/V cache is f32 [kv_seq_len, n_kv_heads * head_dim].
-        // Read, reshape, then write as bf16 for the bf16 SDPA kernel.
+        // K cache is [kv_seq_len, n_kv_heads * head_dim]
+        // Read and reshape to [1, n_kv_heads, kv_seq_len, head_dim]
         let k_data: &[f32] = k_cache_buf.as_slice().map_err(|e| {
             Gemma4Error::ForwardError {
                 reason: format!("K cache read: {e}"),
@@ -1833,28 +1765,27 @@ impl Gemma4Model {
         let v_valid = &v_data[..kv_seq_len * n_kv_heads * head_dim];
         let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_seq_len, n_kv_heads, head_dim);
 
-        // Allocate bf16 GPU buffers for SDPA
-        let q_buf = f32_vec_to_bf16_buffer(
+        // Allocate GPU buffers
+        let q_buf = f32_vec_to_buffer(
             &self.device,
             &q_reshaped,
             vec![1, n_heads, seq_len, head_dim],
         )?;
-        let k_buf = f32_vec_to_bf16_buffer(
+        let k_buf = f32_vec_to_buffer(
             &self.device,
             &k_reshaped,
             vec![1, n_kv_heads, kv_seq_len, head_dim],
         )?;
-        let v_buf = f32_vec_to_bf16_buffer(
+        let v_buf = f32_vec_to_buffer(
             &self.device,
             &v_reshaped,
             vec![1, n_kv_heads, kv_seq_len, head_dim],
         )?;
 
-        // Output is bf16 to match the pipeline
         let output_elements = 1 * n_heads * seq_len * head_dim;
         let output = self.device.alloc_buffer(
-            output_elements * 2, // bf16 = 2 bytes
-            DType::BF16,
+            output_elements * std::mem::size_of::<f32>(),
+            DType::F32,
             vec![1, n_heads, seq_len, head_dim],
         )?;
 
@@ -1907,11 +1838,10 @@ impl Gemma4Model {
         encoder.commit_and_wait()?;
 
         // Reshape output from [1, n_heads, seq_len, head_dim] back to [seq_len, n_heads * head_dim]
-        // Read bf16 output as f32, reshape, write back as bf16
         let out_data = read_buffer_f32(&output)?;
         let out_flat = reshape_sdpa_output(&out_data, seq_len, n_heads, head_dim);
 
-        f32_vec_to_bf16_buffer(
+        f32_vec_to_buffer(
             &self.device,
             &out_flat,
             vec![seq_len, n_heads * head_dim],
@@ -1920,7 +1850,6 @@ impl Gemma4Model {
 
     /// Apply per-layer scalar: output = layer_scalar * input.
     /// Gemma 4 has a learned scalar per layer that scales residual contributions.
-    /// Input/output are bf16 in the bf16 pipeline.
     fn apply_layer_scalar(
         &mut self,
         layer_idx: usize,
@@ -1931,7 +1860,8 @@ impl Gemma4Model {
         match require_weight(&self.weights, &scalar_name) {
             Ok(w) => {
                 // Read the scalar value (bf16 -> f32)
-                let scalar_val = if w.buffer.byte_len() >= 4 && w.buffer.dtype() == DType::F32 {
+                let scalar_val = if w.buffer.byte_len() >= 4 {
+                    // f32
                     let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
                         reason: format!("read layer_scalar: {e}"),
                     })?;
@@ -1944,10 +1874,12 @@ impl Gemma4Model {
                     half::bf16::from_bits(raw[0]).to_f32()
                 };
 
-                // Read bf16 input as f32, multiply, write back as bf16
-                let input_data = read_buffer_f32(input)?;
+                // Multiply input by scalar
+                let input_data: &[f32] = input.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("read input for layer_scalar: {e}"),
+                })?;
                 let scaled: Vec<f32> = input_data.iter().map(|v| v * scalar_val).collect();
-                f32_vec_to_bf16_buffer(&self.device, &scaled, vec![n_elements])
+                f32_vec_to_buffer(&self.device, &scaled, vec![n_elements])
                     .map_err(|e| Gemma4Error::ForwardError {
                         reason: format!("alloc scaled buffer: {e}"),
                     })
@@ -1962,21 +1894,17 @@ impl Gemma4Model {
         }
     }
 
-    /// Elementwise add of two buffers (f32 or bf16).
-    ///
-    /// Both inputs must have the same dtype. Output matches the input dtype.
+    /// Elementwise add of two f32 buffers.
     fn elementwise_add(
         &mut self,
         a: &MlxBuffer,
         b: &MlxBuffer,
         n_elements: usize,
     ) -> Result<MlxBuffer, Gemma4Error> {
-        let dtype = a.dtype();
-        let elem_size = dtype.size_of();
-        let output_bytes = n_elements * elem_size;
+        let output_bytes = n_elements * std::mem::size_of::<f32>();
         let output = self.device.alloc_buffer(
             output_bytes,
-            dtype,
+            DType::F32,
             vec![n_elements],
         )?;
 
@@ -1989,7 +1917,7 @@ impl Gemma4Model {
             b,
             &output,
             n_elements,
-            dtype,
+            DType::F32,
         )?;
         encoder.commit_and_wait()?;
 
@@ -2153,7 +2081,7 @@ impl Gemma4Model {
                 .copy_from_slice(&token_output);
         }
 
-        f32_vec_to_bf16_buffer(
+        f32_vec_to_buffer(
             &self.device,
             &output_data,
             vec![seq_len, hidden_size],
@@ -2493,7 +2421,9 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            let s = read_buffer_f32(&gate)?;
+            let s: &[f32] = gate.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense gate: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] dense_ffn L0: gate output first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
@@ -2512,7 +2442,9 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            let s = read_buffer_f32(&up)?;
+            let s: &[f32] = up.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense up: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] dense_ffn L0: up output first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
@@ -2534,13 +2466,13 @@ impl Gemma4Model {
             eprintln!("[DIAG] dense_ffn L0: GELU*up first {}: {:?}", n, &hidden_data[..n]);
         }
 
-        let hidden_buf = f32_vec_to_bf16_buffer(
+        let hidden_buf = f32_vec_to_buffer(
             &self.device,
             &hidden_data,
             vec![seq_len, intermediate_size],
         )?;
 
-        // down_proj (bf16 in, bf16 out)
+        // down_proj
         let result = self.quantized_projection(
             &hidden_buf,
             &format!("model.layers.{layer_idx}.mlp.down_proj"),
@@ -2550,7 +2482,9 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            let s = read_buffer_f32(&result)?;
+            let s: &[f32] = result.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense down: {e}"),
+            })?;
             let n = s.len().min(5);
             eprintln!("[DIAG] dense_ffn L0: down output first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
@@ -2566,9 +2500,6 @@ impl Gemma4Model {
     ///
     /// The embedding weight is [vocab_size, hidden_size].
     /// lm_head = hidden_state @ embed_weight^T => [seq_len, vocab_size].
-    ///
-    /// Input is bf16 (final normed hidden state). Output is f32 logits
-    /// (for softcap and sampling). This is where we transition back to f32.
     fn lm_head_projection(
         &mut self,
         input: &MlxBuffer,
@@ -2582,24 +2513,25 @@ impl Gemma4Model {
         // Check if embedding is quantized
         if let Some(ref qmeta) = embed_weight.quant_meta {
             if qmeta.bits == 4 || qmeta.bits == 6 {
-                // quantized_projection now returns bf16. For lm_head we need f32 logits.
-                // Use the GPU qmatmul directly which returns f32, or convert after.
-                let bf16_result = self.quantized_projection(
+                // For quantized lm_head, use quantized_matmul
+                // embed_weight is [vocab_size, hidden_size] quantized
+                // We want: input [seq_len, hidden_size] @ embed_weight^T => [seq_len, vocab_size]
+                // quantized_matmul computes: output = input @ dequant(weight)^T
+                // where weight is [N, K] = [vocab_size, hidden_size]
+                // So N=vocab_size, K=hidden_size, M=seq_len. This matches.
+                return self.quantized_projection(
                     input,
                     "model.embed_tokens",
                     seq_len,
                     hidden_size,
                     vocab_size,
-                )?;
-                // Cast bf16 logits back to f32 for softcap
-                return self.cast_bf16_to_f32(&bf16_result, seq_len * vocab_size);
+                );
             }
         }
 
-        // Unquantized: CPU matmul (input is bf16, read as f32 by cpu_matmul)
+        // Unquantized: CPU matmul
         // embed_weight is [vocab_size, hidden_size]
         // We want: input @ embed_weight^T => [seq_len, vocab_size]
-        // cpu_matmul reads buffers as f32 (handles bf16), produces f32 output
         self.cpu_matmul(input, &embed_weight.buffer, seq_len, hidden_size, vocab_size)
     }
 
@@ -2778,29 +2710,6 @@ fn f32_vec_to_buffer(
             }
         })?;
         slice.copy_from_slice(data);
-    }
-    Ok(buf)
-}
-
-/// Create a bf16 Metal buffer from f32 data.
-///
-/// Each f32 value is rounded to bf16 precision and stored as u16.
-fn f32_vec_to_bf16_buffer(
-    device: &MlxDevice,
-    data: &[f32],
-    shape: Vec<usize>,
-) -> Result<MlxBuffer, Gemma4Error> {
-    let byte_len = data.len() * 2; // bf16 = 2 bytes
-    let mut buf = device.alloc_buffer(byte_len, DType::BF16, shape)?;
-    {
-        let slice: &mut [u16] = buf.as_mut_slice().map_err(|e| {
-            Gemma4Error::ForwardError {
-                reason: format!("bf16 buffer write: {e}"),
-            }
-        })?;
-        for (i, &v) in data.iter().enumerate() {
-            slice[i] = half::bf16::from_f32(v).to_bits();
-        }
     }
     Ok(buf)
 }
