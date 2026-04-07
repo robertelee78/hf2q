@@ -908,6 +908,7 @@ impl Gemma4Model {
         // If attention_k_eq_v, K and V share the same projection weight.
         let q_out_dim = n_heads * head_dim;
         let kv_out_dim = n_kv_heads * head_dim;
+        let eps = self.config.rms_norm_eps;
 
         let q_proj = self.quantized_projection(
             &normed,
@@ -933,10 +934,15 @@ impl Gemma4Model {
             kv_out_dim,
         )?;
 
-        let v_proj = if self.config.attention_k_eq_v {
+        // K-eq-V only applies to global (non-sliding) layers.
+        // Sliding layers always have their own v_proj weight.
+        let use_k_eq_v = self.config.attention_k_eq_v
+            && layer_type == LayerAttentionType::Global;
+
+        let v_proj = if use_k_eq_v {
             // K == V: reuse the K projection output as V
             // Note: we need to create a separate buffer copy because they might
-            // diverge after RoPE (RoPE only applies to K, not V)
+            // diverge after norms (k_norm vs v_norm, RoPE only on K)
             self.quantized_projection(
                 &normed,
                 &format!("model.layers.{layer_idx}.self_attn.k_proj"),
@@ -954,6 +960,36 @@ impl Gemma4Model {
             )?
         };
 
+        // --- Step 2b: QK norms (per-head RMS norm on Q and K) ---
+        // Gemma 4 applies RMS norm per-head to Q and K after projection, before RoPE.
+        // Weight shape is [head_dim], shared across all heads.
+        let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
+        let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
+
+        let q_norm_weight = read_weight_as_f32(require_weight(&self.weights, &q_norm_name)?)?;
+        let k_norm_weight = read_weight_as_f32(require_weight(&self.weights, &k_norm_name)?)?;
+
+        let q_data = read_buffer_f32(&q_proj)?;
+        let q_normed_data = cpu_per_head_rms_norm(&q_data, &q_norm_weight, seq_len, n_heads, head_dim, eps);
+        let q_normed = f32_vec_to_buffer(&self.device, &q_normed_data, vec![seq_len, q_out_dim])?;
+
+        let k_data_raw = read_buffer_f32(&k_proj)?;
+        let k_normed_data = cpu_per_head_rms_norm(&k_data_raw, &k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
+        let k_normed = f32_vec_to_buffer(&self.device, &k_normed_data, vec![seq_len, kv_out_dim])?;
+
+        // --- Step 2c: V norm (scaleless per-head RMS norm on V) ---
+        // Gemma 4 applies RMSNormNoScale to V (normalize without learned weight).
+        let v_data_raw = read_buffer_f32(&v_proj)?;
+        let v_normed_data = cpu_per_head_rms_norm_no_scale(&v_data_raw, seq_len, n_kv_heads, head_dim, eps);
+        let v_normed_buf = f32_vec_to_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
+
+        if diag {
+            let n = q_normed_data.len().min(5);
+            eprintln!("[DIAG] Layer 0 after QK norms, Q first {}: {:?}", n, &q_normed_data[..n]);
+            let n = k_normed_data.len().min(5);
+            eprintln!("[DIAG] Layer 0 after QK norms, K first {}: {:?}", n, &k_normed_data[..n]);
+        }
+
         // --- Step 3: RoPE on Q and K ---
         // For global attention with partial_rotary_factor, only apply RoPE to
         // the first rope_dim dimensions of each head, leaving the rest unchanged.
@@ -961,17 +997,17 @@ impl Gemma4Model {
         let theta = self.config.rope_theta(layer_idx);
 
         let q_roped = self.apply_rope_to_heads(
-            &q_proj, seq_len, n_heads, head_dim, rope_dim, theta,
+            &q_normed, seq_len, n_heads, head_dim, rope_dim, theta,
         )?;
 
         let k_roped = self.apply_rope_to_heads(
-            &k_proj, seq_len, n_kv_heads, head_dim, rope_dim, theta,
+            &k_normed, seq_len, n_kv_heads, head_dim, rope_dim, theta,
         )?;
 
         // --- Step 4: KV cache append ---
         // Read K and V to CPU, append to cache, then read back cache contents
         let k_data = read_buffer_f32(&k_roped)?;
-        let v_data = read_buffer_f32(&v_proj)?; // V does NOT get RoPE
+        let v_data = read_buffer_f32(&v_normed_buf)?; // V does NOT get RoPE, but does get v_norm
 
         {
             let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
@@ -979,9 +1015,20 @@ impl Gemma4Model {
         }
 
         // --- Step 5: Attention ---
+        // Gemma 4 uses scale=1.0 for attention (QK norms handle the scaling).
+        // However, the SDPA kernel hardcodes scale = 1/sqrt(head_dim).
+        // To compensate, we pre-scale Q by sqrt(head_dim) so the kernel's
+        // division cancels out, yielding an effective scale of 1.0.
+        let q_prescaled = {
+            let q_data = read_buffer_f32(&q_roped)?;
+            let sqrt_hd = (head_dim as f32).sqrt();
+            let scaled: Vec<f32> = q_data.iter().map(|v| v * sqrt_hd).collect();
+            f32_vec_to_buffer(&self.device, &scaled, vec![seq_len, n_heads * head_dim])?
+        };
+
         let attn_out = self.compute_attention(
             layer_idx,
-            &q_roped,
+            &q_prescaled,
             seq_len,
             n_heads,
             n_kv_heads,
@@ -1011,26 +1058,82 @@ impl Gemma4Model {
             hidden_size,
         )?;
 
-        // --- Step 7: Apply layer_scalar and residual add ---
-        // Gemma 4 has a per-layer scalar: hidden = input + layer_scalar * attn_output
-        let scaled_attn = self.apply_layer_scalar(layer_idx, &o_proj, seq_len * hidden_size)?;
-        let residual1 = self.elementwise_add(input, &scaled_attn, seq_len * hidden_size)?;
-
-        // --- Step 8: Post-attention RMS norm ---
-        let post_norm_name = format!(
+        // --- Step 7: Post-attention layernorm and residual add ---
+        // Python: h = self.post_attention_layernorm(attn_output)
+        //         h = residual + h
+        // The norm is applied to the attention output BEFORE adding the residual.
+        let post_attn_norm_name = format!(
             "model.layers.{layer_idx}.post_attention_layernorm.weight"
         );
-        let post_normed = self.apply_rms_norm(&residual1, &post_norm_name, seq_len)?;
+        let post_attn_normed = self.apply_rms_norm(&o_proj, &post_attn_norm_name, seq_len)?;
+        let residual1 = self.elementwise_add(input, &post_attn_normed, seq_len * hidden_size)?;
 
-        // --- Step 9: MoE FFN ---
-        let ffn_out = self.moe_ffn(layer_idx, &post_normed, seq_len)?;
+        // --- Step 8: Feedforward with pre/post norms ---
+        // Gemma 4 MoE layers have TWO parallel paths:
+        //   Path 1 (dense MLP): pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm_1
+        //   Path 2 (MoE experts): router(h), pre_feedforward_layernorm_2 -> experts -> post_feedforward_layernorm_2
+        //   Combined: h = path1 + path2
+        //   Final: post_feedforward_layernorm(combined)
+        // Non-MoE layers: pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm
+
+        // Check if this layer has MoE (router exists)
+        let router_weight_name = format!("model.layers.{layer_idx}.router.proj.weight");
+        let has_moe_router = self.weights.get(&router_weight_name).is_some()
+            || self.weights.get(&format!("language_model.{}", router_weight_name)).is_some();
+
+        let ffn_out = if has_moe_router {
+            // --- MoE path: two parallel branches ---
+
+            // Path 1: dense MLP
+            let pre_ff_norm_name = format!(
+                "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+            );
+            let pre_ff_normed = self.apply_rms_norm(&residual1, &pre_ff_norm_name, seq_len)?;
+            let mlp_out = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
+            let post_ff_norm1_name = format!(
+                "model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+            );
+            let mlp_normed = self.apply_rms_norm(&mlp_out, &post_ff_norm1_name, seq_len)?;
+
+            // Path 2: MoE experts
+            let pre_ff_norm2_name = format!(
+                "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+            );
+            let pre_ff_normed2 = self.apply_rms_norm(&residual1, &pre_ff_norm2_name, seq_len)?;
+            // Router gets the un-normed residual1 (it does its own internal norm)
+            let moe_out = self.moe_ffn(layer_idx, &residual1, &pre_ff_normed2, seq_len)?;
+            let post_ff_norm2_name = format!(
+                "model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+            );
+            let moe_normed = self.apply_rms_norm(&moe_out, &post_ff_norm2_name, seq_len)?;
+
+            // Sum the two paths
+            let combined = self.elementwise_add(&mlp_normed, &moe_normed, seq_len * hidden_size)?;
+
+            // Final post-feedforward norm
+            let post_ff_norm_name = format!(
+                "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+            );
+            self.apply_rms_norm(&combined, &post_ff_norm_name, seq_len)?
+        } else {
+            // --- Non-MoE path: simple MLP with pre/post norms ---
+            let pre_ff_norm_name = format!(
+                "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+            );
+            let pre_ff_normed = self.apply_rms_norm(&residual1, &pre_ff_norm_name, seq_len)?;
+            let mlp_out = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
+            let post_ff_norm_name = format!(
+                "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+            );
+            self.apply_rms_norm(&mlp_out, &post_ff_norm_name, seq_len)?
+        };
 
         if diag {
             let s: &[f32] = ffn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read ffn L0: {e}"),
             })?;
             let n = s.len().min(5);
-            eprintln!("[DIAG] Layer 0 after MoE FFN output, first {}: {:?}", n, &s[..n]);
+            eprintln!("[DIAG] Layer 0 after FFN+norms output, first {}: {:?}", n, &s[..n]);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
             let inf_count = s.iter().filter(|v| v.is_infinite()).count();
             if nan_count > 0 || inf_count > 0 {
@@ -1038,9 +1141,12 @@ impl Gemma4Model {
             }
         }
 
-        // --- Step 10: Apply layer_scalar to FFN output and residual add ---
-        let scaled_ffn = self.apply_layer_scalar(layer_idx, &ffn_out, seq_len * hidden_size)?;
-        let output = self.elementwise_add(&residual1, &scaled_ffn, seq_len * hidden_size)?;
+        // --- Step 9: Residual add ---
+        let pre_scalar = self.elementwise_add(&residual1, &ffn_out, seq_len * hidden_size)?;
+
+        // --- Step 10: Apply layer_scalar to the ENTIRE layer output ---
+        // Python: h = h * self.layer_scalar (applied to the full output, not sub-parts)
+        let output = self.apply_layer_scalar(layer_idx, &pre_scalar, seq_len * hidden_size)?;
 
         Ok(output)
     }
@@ -1239,14 +1345,16 @@ impl Gemma4Model {
         let quant_info = loaded.quant_meta.as_ref().map(|qm| (qm.bits, qm.group_size));
 
         // Check if weight is quantized
-        if let Some((bits, group_size)) = quant_info {
-            if bits == 4 || bits == 6 {
-                // Ensure input is f32 (it should already be, but be safe).
-                // The GPU shader now accepts f32 input and produces f32 output
-                // to avoid f16 overflow (max ~65504) on large activations.
+        if let Some((bits, _group_size)) = quant_info {
+            // CPU dequantize + matmul for all quantized weights.
+            // The GPU qmatmul kernel has accuracy issues for some configurations,
+            // so we use CPU dequantization for correctness. This is slower but
+            // produces numerically correct results matching the reference.
+            let _use_gpu_qmatmul = std::env::var("HF2Q_GPU_QMATMUL").is_ok();
+            if _use_gpu_qmatmul && (bits == 4 || bits == 6) {
+                // GPU path (opt-in for performance testing)
                 let input_f32 = self.ensure_f32_input(input, seq_len * in_dim)?;
 
-                // Now re-borrow the weights we need
                 let loaded = require_weight(&self.weights, &weight_name)?;
                 let scales = require_weight(&self.weights, &scales_name)?;
                 let biases = require_weight(&self.weights, &biases_name)?;
@@ -1255,7 +1363,7 @@ impl Gemma4Model {
                     m: seq_len as u32,
                     k: in_dim as u32,
                     n: out_dim as u32,
-                    group_size: group_size as u32,
+                    group_size: _group_size as u32,
                     bits: bits as u32,
                 };
 
@@ -1274,6 +1382,23 @@ impl Gemma4Model {
 
                 return Ok(output_f32);
             }
+
+            // CPU dequantize + matmul (default path for correctness)
+            let weight_f32 = self.dequantize_2d_weight(weight_base, out_dim, in_dim)?;
+            let input_data = read_buffer_f32(input)?;
+
+            let mut output_data = vec![0.0f32; seq_len * out_dim];
+            for row in 0..seq_len {
+                for col in 0..out_dim {
+                    let mut sum = 0.0f32;
+                    for k in 0..in_dim {
+                        sum += input_data[row * in_dim + k] * weight_f32[col * in_dim + k];
+                    }
+                    output_data[row * out_dim + col] = sum;
+                }
+            }
+
+            return f32_vec_to_buffer(&self.device, &output_data, vec![seq_len, out_dim]);
         }
 
         // Non-quantized path: CPU matmul fallback
@@ -1756,55 +1881,34 @@ impl Gemma4Model {
 
     /// MoE FFN for a single layer.
     ///
+    /// `router_input` is the un-normed hidden state used for routing (the router
+    /// applies its own internal RMS norm).
+    /// `expert_input` is the pre-normed hidden state (after pre_feedforward_layernorm_2)
+    /// that gets fed through the selected experts.
+    ///
     /// For each token in the sequence:
-    /// 1. Router: dequantize router weight and compute logits, apply sigmoid routing
-    /// 2. Top-K selection with sigmoid weights scaled by per_expert_scale
-    /// 3. Dispatch to selected experts (slice 3D packed tensors per expert)
-    /// 4. Weighted sum of expert outputs
+    /// 1. Router: RMS-norm input, project to expert scores, top-K with softmax
+    /// 2. Dispatch to selected experts using expert_input
+    /// 3. Weighted sum of expert outputs
     fn moe_ffn(
         &mut self,
         layer_idx: usize,
-        input: &MlxBuffer,
+        router_input: &MlxBuffer,
+        expert_input: &MlxBuffer,
         seq_len: usize,
     ) -> Result<MlxBuffer, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
         let n_experts = self.config.num_experts;
         let top_k = self.config.top_k_experts;
+        let eps = self.config.rms_norm_eps;
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        // Router weight: [n_experts, hidden_size] (may be quantized)
-        let router_weight_name =
-            format!("model.layers.{layer_idx}.router.proj.weight");
-
-        let input_data = read_buffer_f32(input)?;
+        let router_data = read_buffer_f32(router_input)?;
+        let expert_data = read_buffer_f32(expert_input)?;
         let mut output_data = vec![0.0f32; seq_len * hidden_size];
 
-        // Check if router weight exists -- if not, check for a dense FFN
-        let has_moe_router = self.weights.get(&router_weight_name).is_some()
-            || self.weights.get(&format!("language_model.{}", router_weight_name)).is_some();
-
         if diag {
-            eprintln!("[DIAG] MoE layer 0: has_moe_router={} (checked '{}')",
-                has_moe_router, router_weight_name);
-            if !has_moe_router {
-                let prefix = format!("model.layers.{layer_idx}.");
-                let alt_prefix = format!("language_model.model.layers.{layer_idx}.");
-                let matching: Vec<_> = self.weights.weights.keys()
-                    .filter(|k| k.starts_with(&prefix) || k.starts_with(&alt_prefix))
-                    .take(20)
-                    .collect();
-                eprintln!("[DIAG]   Available weight keys for layer {}: {:?}", layer_idx, matching);
-            }
-        }
-
-        if !has_moe_router {
-            if diag {
-                eprintln!("[DIAG] Falling back to dense FFN for layer {}", layer_idx);
-            }
-            return self.dense_ffn(layer_idx, input, seq_len);
-        }
-
-        if diag {
+            let router_weight_name = format!("model.layers.{layer_idx}.router.proj.weight");
             let rw = require_weight(&self.weights, &router_weight_name)?;
             eprintln!("[DIAG] router weight: dtype={}, shape={:?}, byte_len={}",
                 rw.buffer.dtype(), rw.buffer.shape(), rw.buffer.byte_len());
@@ -1821,47 +1925,55 @@ impl Gemma4Model {
             hidden_size,
         )?;
 
-        // Read router.scale (scalar) and per_expert_scale [n_experts] if present
-        let router_scale = self.read_scalar_weight(
+        // Read router.scale [hidden_size] and per_expert_scale [n_experts]
+        // The router's scale weight is used as the RMS norm weight, scaled by hidden_size^(-0.5).
+        // Python: x = rms_norm(x, self.scale * self._root_size, eps)
+        let router_scale_vec = self.read_1d_weight(
             &format!("model.layers.{layer_idx}.router.scale"),
-        ).unwrap_or(1.0);
+            hidden_size,
+        ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
 
         let per_expert_scale = self.read_1d_weight(
             &format!("model.layers.{layer_idx}.router.per_expert_scale"),
             n_experts,
         ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
 
+        // Pre-scale the router norm weight: scale * hidden_size^(-0.5)
+        let root_size = (hidden_size as f32).powf(-0.5);
+        let router_norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
+
         if diag {
-            eprintln!("[DIAG] router_scale={}, per_expert_scale first 5: {:?}",
-                router_scale, &per_expert_scale[..5.min(per_expert_scale.len())]);
+            eprintln!("[DIAG] router_norm_weight first 5: {:?}, per_expert_scale first 5: {:?}",
+                &router_norm_weight[..5.min(router_norm_weight.len())],
+                &per_expert_scale[..5.min(per_expert_scale.len())]);
             let n = router_f32.len().min(10);
             eprintln!("[DIAG] router_f32 first {}: {:?}", n, &router_f32[..n]);
         }
 
-        // Pre-dequantize expert weights once for this layer (avoids redundant work
-        // across tokens). Each returns a flat Vec<f32> of size [rows * cols] for
-        // one expert, keyed by expert_id. We use lazy per-expert dequant below.
         let intermediate_size = self.config.moe_intermediate_size;
 
         // Process token by token for MoE (each token routes to different experts)
         for t in 0..seq_len {
-            let token_hidden = &input_data[t * hidden_size..(t + 1) * hidden_size];
+            let token_router = &router_data[t * hidden_size..(t + 1) * hidden_size];
+            let token_expert = &expert_data[t * hidden_size..(t + 1) * hidden_size];
 
-            // Step 1: Router logits via CPU matmul with dequantized router weight
+            // Step 1: RMS-normalize the router input, then project to expert scores
+            // Python: x = rms_norm(x, self.scale * root_size, eps); scores = self.proj(x)
+            let normed_router = cpu_rms_norm(token_router, &router_norm_weight, eps);
+
             let mut logits = vec![0.0f32; n_experts];
             for e in 0..n_experts {
                 let mut sum = 0.0f32;
                 for k in 0..hidden_size {
-                    sum += router_f32[e * hidden_size + k] * token_hidden[k];
+                    sum += router_f32[e * hidden_size + k] * normed_router[k];
                 }
-                // Apply router scale
-                logits[e] = sum * router_scale;
+                logits[e] = sum;
             }
 
             if diag && t == 0 {
                 let mut sorted: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
                 sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                eprintln!("[DIAG] MoE L0 T0 router logits (pre-sigmoid) top-5: {:?}",
+                eprintln!("[DIAG] MoE L0 T0 router logits (pre-softmax) top-5: {:?}",
                     &sorted[..5.min(sorted.len())]);
                 let nan_count = logits.iter().filter(|v| v.is_nan()).count();
                 if nan_count > 0 {
@@ -1869,9 +1981,10 @@ impl Gemma4Model {
                 }
             }
 
-            // Step 2: Sigmoid routing + per_expert_scale, then top-K
+            // Step 2: Top-K with softmax, then apply per_expert_scale
+            // Python: argpartition -> take top-K scores -> softmax -> * per_expert_scale
             let (expert_ids, routing_weights) =
-                top_k_sigmoid(&logits, &per_expert_scale, top_k);
+                top_k_softmax_with_scale(&logits, &per_expert_scale, top_k);
 
             if diag && t == 0 {
                 eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
@@ -1879,6 +1992,7 @@ impl Gemma4Model {
             }
 
             // Step 3: Dispatch to selected experts and accumulate
+            // Expert input is the pre-normed tensor (after pre_feedforward_layernorm_2)
             let mut token_output = vec![0.0f32; hidden_size];
 
             for (rank, &expert_id) in expert_ids.iter().enumerate() {
@@ -1888,7 +2002,7 @@ impl Gemma4Model {
                 }
 
                 let expert_output = self.expert_ffn_3d(
-                    layer_idx, expert_id, token_hidden,
+                    layer_idx, expert_id, token_expert,
                     hidden_size, intermediate_size,
                 )?;
 
@@ -2595,6 +2709,110 @@ fn reshape_sdpa_output(
     out
 }
 
+/// CPU RMS normalization of a single vector with a learned weight.
+///
+/// `output[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps)`
+fn cpu_rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let dim = x.len();
+    debug_assert_eq!(dim, weight.len());
+    let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+    let scale = 1.0 / (mean_sq + eps).sqrt();
+    x.iter()
+        .zip(weight.iter())
+        .map(|(&xi, &wi)| wi * xi * scale)
+        .collect()
+}
+
+/// CPU RMS normalization without a learnable scale (unit weight).
+///
+/// `output[i] = x[i] / sqrt(mean(x^2) + eps)`
+fn cpu_rms_norm_no_scale(x: &[f32], eps: f32) -> Vec<f32> {
+    let dim = x.len();
+    let mean_sq: f32 = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+    let scale = 1.0 / (mean_sq + eps).sqrt();
+    x.iter().map(|&xi| xi * scale).collect()
+}
+
+/// Apply per-head RMS normalization to Q or K.
+///
+/// Input layout: `[seq_len, n_heads * head_dim]` (flat f32).
+/// Weight: `[head_dim]` (one weight vector shared across all heads).
+///
+/// For each sequence position and each head, independently normalizes the
+/// `head_dim`-sized vector using the given weight.
+fn cpu_per_head_rms_norm(
+    data: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let total_dim = n_heads * head_dim;
+    let mut output = vec![0.0f32; seq_len * total_dim];
+
+    for s in 0..seq_len {
+        for h in 0..n_heads {
+            let offset = s * total_dim + h * head_dim;
+            let head_slice = &data[offset..offset + head_dim];
+            let normed = cpu_rms_norm(head_slice, weight, eps);
+            output[offset..offset + head_dim].copy_from_slice(&normed);
+        }
+    }
+
+    output
+}
+
+/// Apply scaleless per-head RMS normalization to V (no learnable weight).
+///
+/// Input layout: `[seq_len, n_heads * head_dim]` (flat f32).
+///
+/// For each sequence position and each head, independently normalizes the
+/// `head_dim`-sized vector without a learned scale.
+fn cpu_per_head_rms_norm_no_scale(
+    data: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let total_dim = n_heads * head_dim;
+    let mut output = vec![0.0f32; seq_len * total_dim];
+
+    for s in 0..seq_len {
+        for h in 0..n_heads {
+            let offset = s * total_dim + h * head_dim;
+            let head_slice = &data[offset..offset + head_dim];
+            let normed = cpu_rms_norm_no_scale(head_slice, eps);
+            output[offset..offset + head_dim].copy_from_slice(&normed);
+        }
+    }
+
+    output
+}
+
+/// CPU RMS normalization of a full `[seq_len, dim]` tensor with a learned weight.
+///
+/// This is like `apply_rms_norm` but works on arbitrary `dim` (not just `hidden_size`),
+/// using CPU for simplicity and correctness.
+#[allow(dead_code)]
+fn cpu_rms_norm_2d(
+    data: &[f32],
+    weight: &[f32],
+    seq_len: usize,
+    dim: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; seq_len * dim];
+    for s in 0..seq_len {
+        let offset = s * dim;
+        let row = &data[offset..offset + dim];
+        let normed = cpu_rms_norm(row, weight, eps);
+        output[offset..offset + dim].copy_from_slice(&normed);
+    }
+    output
+}
+
 /// GELU activation with PyTorch tanh approximation.
 ///
 /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
@@ -2635,11 +2853,12 @@ fn top_k_softmax(
     (expert_ids, weights)
 }
 
-/// Top-K selection with sigmoid routing (Gemma 4 style).
+/// Top-K selection with sigmoid routing (legacy, kept for tests).
 ///
 /// For each expert: routing_weight = sigmoid(logit) * per_expert_scale[expert].
 /// Then select the top-K experts by routing_weight. The returned weights are the
-/// raw sigmoid * scale values (NOT renormalized) — this matches the Gemma 4 spec.
+/// raw sigmoid * scale values (NOT renormalized).
+#[allow(dead_code)]
 fn top_k_sigmoid(
     logits: &[f32],
     per_expert_scale: &[f32],
@@ -2664,13 +2883,52 @@ fn top_k_sigmoid(
     (expert_ids, weights)
 }
 
+/// Top-K selection with softmax normalization and per-expert scaling (Gemma 4 router).
+///
+/// Matches the Python reference:
+///   1. Find top-K expert indices by raw logit score
+///   2. Softmax over only those K logits
+///   3. Multiply by per_expert_scale for selected experts
+fn top_k_softmax_with_scale(
+    logits: &[f32],
+    per_expert_scale: &[f32],
+    top_k: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    // Find top-K indices by raw logit value (descending)
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let selected: Vec<(usize, f32)> = indexed.into_iter().take(top_k).collect();
+
+    // Softmax over selected logits
+    let max_logit = selected
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_sum: f32 = selected.iter().map(|(_, v)| (v - max_logit).exp()).sum();
+
+    let expert_ids: Vec<usize> = selected.iter().map(|(id, _)| *id).collect();
+    // Apply softmax then multiply by per_expert_scale
+    let weights: Vec<f32> = selected
+        .iter()
+        .map(|(id, v)| {
+            let softmax_w = (v - max_logit).exp() / exp_sum;
+            softmax_w * per_expert_scale[*id]
+        })
+        .collect();
+
+    (expert_ids, weights)
+}
+
 /// CPU dequantization of a flat packed uint32 weight array.
 ///
-/// Supports 4-bit and 6-bit quantization with affine dequant:
-///   float_val = scale * quant_val + bias
+/// Supports power-of-2 bit widths (2, 4, 8) and non-power-of-2 (3, 6).
 ///
-/// For N-bit packing, each u32 contains `32/N` quantized values.
-/// MLX packs values in little-endian order within each u32 word.
+/// For power-of-2 bits: each u32 contains `32/bits` quantized values.
+/// For 3-bit/6-bit: MLX uses 3-byte (24-bit) triplet packing:
+///   - 6-bit: 4 values per 3 bytes (4 * 6 = 24 bits)
+///   - 3-bit: 8 values per 3 bytes (8 * 3 = 24 bits)
+///   The byte stream is stored as u32 in safetensors.
 ///
 /// Layout: weight `[rows, packed_cols]`, scales/biases `[rows, n_groups]`
 /// where `n_groups = cols / group_size`, `packed_cols = cols * bits / 32`.
@@ -2683,30 +2941,75 @@ fn cpu_dequantize_flat(
     bits: usize,
     group_size: usize,
 ) -> Result<Vec<f32>, Gemma4Error> {
-    let vals_per_u32 = 32 / bits;
-    let mask = (1u32 << bits) - 1;
     let packed_cols = (cols * bits + 31) / 32; // ceil division
     let n_groups = (cols + group_size - 1) / group_size;
 
     let mut output = vec![0.0f32; rows * cols];
 
-    for row in 0..rows {
-        let packed_row = &packed[row * packed_cols..];
-        let scale_row = &scales[row * n_groups..];
-        let bias_row = &biases[row * n_groups..];
+    if bits == 3 || bits == 6 {
+        // Non-power-of-2: 3-byte triplet packing.
+        // The packed u32 array is actually a byte stream reinterpreted as u32.
+        // We need to process it as bytes.
+        // Reinterpret the u32 array as a byte array (safe for little-endian)
+        let packed_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                packed.as_ptr() as *const u8,
+                packed.len() * 4,
+            )
+        };
+        let vals_per_triplet = if bits == 3 { 8 } else { 4 }; // 24/3=8 or 24/6=4
+        let mask = (1u32 << bits) - 1;
+        let bytes_per_row = packed_cols * 4; // u32 count * 4 bytes
 
-        for col in 0..cols {
-            // Which u32 word and which position within it?
-            let word_idx = col / vals_per_u32;
-            let bit_offset = (col % vals_per_u32) * bits;
-            let quant_val = (packed_row[word_idx] >> bit_offset) & mask;
+        for row in 0..rows {
+            let row_bytes = &packed_bytes[row * bytes_per_row..];
+            let scale_row = &scales[row * n_groups..];
+            let bias_row = &biases[row * n_groups..];
 
-            // Which group does this column belong to?
-            let group_idx = col / group_size;
-            let scale = scale_row[group_idx];
-            let bias = bias_row[group_idx];
+            let mut col = 0usize;
+            let mut byte_idx = 0usize;
+            while col < cols {
+                // Read a 3-byte triplet as a 24-bit value
+                let b0 = row_bytes.get(byte_idx).copied().unwrap_or(0) as u32;
+                let b1 = row_bytes.get(byte_idx + 1).copied().unwrap_or(0) as u32;
+                let b2 = row_bytes.get(byte_idx + 2).copied().unwrap_or(0) as u32;
+                let pack = b0 | (b1 << 8) | (b2 << 16);
+                byte_idx += 3;
 
-            output[row * cols + col] = scale * (quant_val as f32) + bias;
+                for k in 0..vals_per_triplet {
+                    if col >= cols {
+                        break;
+                    }
+                    let quant_val = (pack >> (k * bits)) & mask;
+                    let group_idx = col / group_size;
+                    let scale = scale_row[group_idx];
+                    let bias = bias_row[group_idx];
+                    output[row * cols + col] = scale * (quant_val as f32) + bias;
+                    col += 1;
+                }
+            }
+        }
+    } else {
+        // Power-of-2 bits (2, 4, 8): standard u32 packing
+        let vals_per_u32 = 32 / bits;
+        let mask = (1u32 << bits) - 1;
+
+        for row in 0..rows {
+            let packed_row = &packed[row * packed_cols..];
+            let scale_row = &scales[row * n_groups..];
+            let bias_row = &biases[row * n_groups..];
+
+            for col in 0..cols {
+                let word_idx = col / vals_per_u32;
+                let bit_offset = (col % vals_per_u32) * bits;
+                let quant_val = (packed_row[word_idx] >> bit_offset) & mask;
+
+                let group_idx = col / group_size;
+                let scale = scale_row[group_idx];
+                let bias = bias_row[group_idx];
+
+                output[row * cols + col] = scale * (quant_val as f32) + bias;
+            }
         }
     }
 
