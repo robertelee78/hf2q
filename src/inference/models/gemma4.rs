@@ -486,9 +486,11 @@ impl Gemma4Model {
             eprintln!("[DIAG]   logit stats: min={:.4}, max={:.4}, mean={:.4}, std={:.4}", min, max, mean, std_dev);
         }
 
-        // Step 6: Softcap
+        // Step 6: Softcap (CPU path — the GPU softcap kernel produces
+        // incorrect results for very large dispatch grids on some Metal
+        // implementations; CPU is fast enough for this element-wise op).
         debug!(cap = self.config.final_logit_softcapping, "Softcap");
-        let capped_logits = self.apply_softcap(&logits, seq_len)?;
+        let capped_logits = self.apply_softcap_cpu(&logits, seq_len)?;
 
         if diag {
             let s: &[f32] = capped_logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
@@ -662,9 +664,9 @@ impl Gemma4Model {
         debug!("lm_head projection (tied embeddings)");
         let logits = self.lm_head_projection(&normed, seq_len)?;
 
-        // Step 7: Softcap
+        // Step 7: Softcap (CPU path to avoid GPU kernel issues with large buffers)
         debug!(cap = self.config.final_logit_softcapping, "Softcap");
-        let capped_logits = self.apply_softcap(&logits, seq_len)?;
+        let capped_logits = self.apply_softcap_cpu(&logits, seq_len)?;
 
         // Read logits to CPU
         let output: &[f32] = capped_logits
@@ -1102,6 +1104,49 @@ impl Gemma4Model {
         Ok(output)
     }
 
+    /// Ensure an input buffer is f32. Returns a reference to the same buffer if
+    /// already f32, or casts from f16/bf16 to a new f32 buffer.
+    fn ensure_f32_input(
+        &mut self,
+        buffer: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        match buffer.dtype() {
+            DType::F32 => {
+                // Already f32 -- clone to satisfy ownership
+                clone_buffer(&self.device, buffer)
+                    .map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("clone f32 input: {e}"),
+                    })
+            }
+            DType::F16 => {
+                self.cast_to_f32(buffer, n_elements)
+            }
+            DType::BF16 => {
+                // Cast bf16 -> f32
+                let out_bytes = n_elements * std::mem::size_of::<f32>();
+                let output = self.device.alloc_buffer(
+                    out_bytes, DType::F32, vec![n_elements],
+                )?;
+                let mut encoder = self.device.command_encoder()?;
+                elementwise::cast(
+                    &mut encoder,
+                    &mut self.registry,
+                    self.device.metal_device(),
+                    buffer,
+                    &output,
+                    n_elements,
+                    elementwise::CastDirection::BF16ToF32,
+                )?;
+                encoder.commit_and_wait()?;
+                Ok(output)
+            }
+            other => Err(Gemma4Error::ForwardError {
+                reason: format!("Unsupported input dtype for f32 cast: {other}"),
+            }),
+        }
+    }
+
     /// Ensure a weight buffer is in f32 format (convert from f16/bf16 if needed).
     fn ensure_f32_weight(
         &mut self,
@@ -1196,8 +1241,10 @@ impl Gemma4Model {
         // Check if weight is quantized
         if let Some((bits, group_size)) = quant_info {
             if bits == 4 || bits == 6 {
-                // Cast input to f16 first (releases immutable borrow on self.weights)
-                let input_f16 = self.cast_to_f16(input, seq_len * in_dim)?;
+                // Ensure input is f32 (it should already be, but be safe).
+                // The GPU shader now accepts f32 input and produces f32 output
+                // to avoid f16 overflow (max ~65504) on large activations.
+                let input_f32 = self.ensure_f32_input(input, seq_len * in_dim)?;
 
                 // Now re-borrow the weights we need
                 let loaded = require_weight(&self.weights, &weight_name)?;
@@ -1213,11 +1260,11 @@ impl Gemma4Model {
                 };
 
                 let mut encoder = self.device.command_encoder()?;
-                let output_f16 = qmatmul::quantized_matmul(
+                let output_f32 = qmatmul::quantized_matmul(
                     &mut encoder,
                     &mut self.registry,
                     &self.device,
-                    &input_f16,
+                    &input_f32,
                     &loaded.buffer,
                     &scales.buffer,
                     &biases.buffer,
@@ -1225,8 +1272,6 @@ impl Gemma4Model {
                 )?;
                 encoder.commit_and_wait()?;
 
-                // Cast output back to f32
-                let output_f32 = self.cast_to_f32(&output_f16, seq_len * out_dim)?;
                 return Ok(output_f32);
             }
         }
@@ -2362,6 +2407,34 @@ impl Gemma4Model {
         encoder.commit_and_wait()?;
 
         Ok(output)
+    }
+
+    /// Apply softcap on CPU: cap * tanh(logits / cap).
+    ///
+    /// This is a fallback for the GPU kernel which can produce incorrect results
+    /// on some Metal implementations with very large dispatch grids.
+    fn apply_softcap_cpu(
+        &self,
+        logits: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let vocab_size = self.config.vocab_size;
+        let cap = self.config.final_logit_softcapping;
+        let n_elements = seq_len * vocab_size;
+
+        let input_data: &[f32] = logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("softcap_cpu read input: {e}"),
+        })?;
+
+        let capped: Vec<f32> = input_data[..n_elements]
+            .iter()
+            .map(|&x| (x / cap).tanh() * cap)
+            .collect();
+
+        f32_vec_to_buffer(&self.device, &capped, vec![seq_len, vocab_size])
+            .map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("softcap_cpu alloc output: {e}"),
+            })
     }
 }
 
