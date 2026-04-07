@@ -355,15 +355,25 @@ fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
     eprintln!("{}", style("Loading model...").dim());
     let chat_template_override = args.chat_template.as_deref();
 
-    let engine = InferenceEngine::new(&model_dir, engine_config, chat_template_override)
-        .map_err(|e| match &e {
-            inference::engine::EngineError::ChatTemplate(
-                crate::tokenizer::chat_template::ChatTemplateError::NotFound,
-            ) => AppError::Input(anyhow::anyhow!(
-                "No chat template found. Provide one with --chat-template"
-            )),
-            _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
-        })?;
+    let prompt_cache_config = inference::prompt_cache::PromptCacheConfig {
+        enabled: !args.no_prompt_cache,
+        ..Default::default()
+    };
+
+    let engine = InferenceEngine::new_with_prompt_cache(
+        &model_dir,
+        engine_config,
+        chat_template_override,
+        prompt_cache_config,
+    )
+    .map_err(|e| match &e {
+        inference::engine::EngineError::ChatTemplate(
+            crate::tokenizer::chat_template::ChatTemplateError::NotFound,
+        ) => AppError::Input(anyhow::anyhow!(
+            "No chat template found. Provide one with --chat-template"
+        )),
+        _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
+    })?;
 
     let engine_max_seq_len = engine.max_seq_len();
 
@@ -388,6 +398,12 @@ fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
 
     eprintln!(
         "{} {}",
+        style("Prompt cache:").bold(),
+        if args.no_prompt_cache { "disabled" } else { "enabled" }
+    );
+
+    eprintln!(
+        "{} {}",
         style("Model:").bold(),
         model_name
     );
@@ -403,6 +419,11 @@ fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| AppError::Conversion(anyhow::anyhow!("Failed to create tokio runtime: {}", e)))?;
 
+    // Pass the raw model config for vision encoder initialization
+    let raw_config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
     rt.block_on(async {
         serve::run(
             engine,
@@ -411,6 +432,7 @@ fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
             model_name,
             engine_max_seq_len,
             serve_config,
+            raw_config.as_ref(),
         )
         .await
         .map_err(|e| AppError::Conversion(e))

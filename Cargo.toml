@@ -18,7 +18,7 @@ ruvector = ["dep:ruvector-core"]
 # Enable mlx-native inference engine (requires Apple Silicon + Metal)
 mlx-native = ["dep:mlx-native", "dep:tokenizers", "dep:minijinja", "dep:rand"]
 # Enable OpenAI-compatible API server
-serve = ["mlx-native", "dep:axum", "dep:tokio", "dep:tower-http", "dep:uuid", "dep:async-stream", "dep:futures"]
+serve = ["mlx-native", "dep:axum", "dep:tokio", "dep:tower-http", "dep:uuid", "dep:async-stream", "dep:futures", "dep:image", "dep:base64"]
 
 [dependencies]
 # Core ML pipeline — optional, requires Metal Toolchain
@@ -54,6 +54,10 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 async-stream = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
+
+# Image processing — optional, gated behind serve feature
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 # CLI framework
 clap = { version = "4.5", features = ["derive"] }
@@ -100,4 +104,8 @@ harness = false
 
 [[bench]]
 name = "shard_read_bench"
+harness = false
+
+[[bench]]
+name = "inference_bench"
 harness = false

@@ -19,6 +19,7 @@ use tracing::{debug, info};
 
 use crate::inference::models::gemma4::{Gemma4Config, Gemma4Error, Gemma4Model};
 use crate::inference::models::registry;
+use crate::inference::prompt_cache::{CacheLookup, PromptCache, PromptCacheConfig};
 use crate::inference::sampler::{Sampler, SamplerConfig};
 use crate::inference::weight_loader;
 use crate::tokenizer::chat_template::{ChatTemplate, ChatTemplateError, Message};
@@ -82,6 +83,10 @@ pub struct GenerationStats {
     pub decode_time_secs: f64,
     /// Total wall-clock time (seconds).
     pub total_time_secs: f64,
+    /// Number of prompt tokens that were served from the prompt cache
+    /// (skipped during prefill). Zero when prompt caching is disabled
+    /// or on a cache miss.
+    pub cached_tokens: usize,
 }
 
 impl GenerationStats {
@@ -114,6 +119,8 @@ pub struct InferenceEngine {
     chat_template: ChatTemplate,
     /// Engine configuration (max_tokens, stop sequences, etc.).
     pub config: EngineConfig,
+    /// Prompt cache for prefix matching across multi-turn conversations.
+    prompt_cache: PromptCache,
 }
 
 impl InferenceEngine {
@@ -121,6 +128,9 @@ impl InferenceEngine {
     ///
     /// Loads the model weights, tokenizer, and chat template. The `chat_template_override`
     /// parameter allows overriding the model's built-in template with a CLI-specified file.
+    ///
+    /// Prompt caching is enabled by default. Pass a `PromptCacheConfig` with
+    /// `enabled: false` to disable it, or use [`new_with_prompt_cache`].
     pub fn new(
         model_dir: &Path,
         config: EngineConfig,
@@ -167,7 +177,22 @@ impl InferenceEngine {
             tokenizer,
             chat_template,
             config,
+            prompt_cache: PromptCache::new(PromptCacheConfig::default()),
         })
+    }
+
+    /// Build a new inference engine with explicit prompt cache configuration.
+    ///
+    /// Same as [`new`] but allows disabling or customizing prompt caching.
+    pub fn new_with_prompt_cache(
+        model_dir: &Path,
+        config: EngineConfig,
+        chat_template_override: Option<&Path>,
+        prompt_cache_config: PromptCacheConfig,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::new(model_dir, config, chat_template_override)?;
+        engine.prompt_cache = PromptCache::new(prompt_cache_config);
+        Ok(engine)
     }
 
     /// Generate text from a user prompt.
@@ -185,9 +210,6 @@ impl InferenceEngine {
         F: Fn(&str) -> bool,
     {
         let total_start = Instant::now();
-
-        // Reset KV cache for the new sequence
-        self.model.reset_cache();
 
         // Step 1: Render the chat template
         let messages = vec![Message {
@@ -224,15 +246,19 @@ impl InferenceEngine {
             });
         }
 
-        // Step 3: Prefill — forward pass on all prompt tokens
+        // Step 3: Prefill with prompt cache awareness
         let prefill_start = Instant::now();
-        let prefill_logits = self.model.forward(&prompt_tokens)?;
+        let (prefill_logits, cached_tokens) =
+            self.prefill_with_cache(&prompt_tokens, false)?;
         let prefill_time = prefill_start.elapsed().as_secs_f64();
 
         let vocab_size = self.model.config().vocab_size;
 
-        // Extract logits for the last prompt position
-        let last_pos_logits = extract_last_position_logits(&prefill_logits, prompt_len, vocab_size)?;
+        // The prefill_logits contain logits only for the tokens that were
+        // actually encoded (the non-cached portion). We need the last position.
+        let encoded_len = prompt_len - cached_tokens;
+        let last_pos_logits =
+            extract_last_position_logits(&prefill_logits, encoded_len, vocab_size)?;
 
         // Step 4: Create sampler and sample first token
         let mut sampler = Sampler::new(self.config.sampler.clone());
@@ -247,6 +273,8 @@ impl InferenceEngine {
 
         // Check stop conditions for first token
         if Some(first_token) == eos_id {
+            // Store prompt tokens in cache before returning
+            self.store_prompt_in_cache(prompt_tokens, false);
             let total_time = total_start.elapsed().as_secs_f64();
             return Ok((
                 generated_text,
@@ -256,6 +284,7 @@ impl InferenceEngine {
                     prefill_time_secs: prefill_time,
                     decode_time_secs: 0.0,
                     total_time_secs: total_time,
+                    cached_tokens,
                 },
             ));
         }
@@ -266,6 +295,7 @@ impl InferenceEngine {
 
         // Stream the first token
         if !on_token(&token_text) {
+            self.store_prompt_in_cache(prompt_tokens, false);
             let total_time = total_start.elapsed().as_secs_f64();
             return Ok((
                 generated_text,
@@ -275,6 +305,7 @@ impl InferenceEngine {
                     prefill_time_secs: prefill_time,
                     decode_time_secs: decode_start.elapsed().as_secs_f64(),
                     total_time_secs: total_time,
+                    cached_tokens,
                 },
             ));
         }
@@ -317,6 +348,11 @@ impl InferenceEngine {
             }
         }
 
+        // Store the prompt tokens in cache (not the generated tokens; those
+        // are part of the assistant turn and will appear in the next request's
+        // prompt via the chat template).
+        self.store_prompt_in_cache(prompt_tokens, false);
+
         let decode_time = decode_start.elapsed().as_secs_f64();
         let total_time = total_start.elapsed().as_secs_f64();
 
@@ -326,9 +362,93 @@ impl InferenceEngine {
             prefill_time_secs: prefill_time,
             decode_time_secs: decode_time,
             total_time_secs: total_time,
+            cached_tokens,
         };
 
         Ok((generated_text, stats))
+    }
+
+    /// Perform prefill with prompt cache awareness.
+    ///
+    /// Checks the prompt cache for a prefix match. On cache hit, restores
+    /// the KV cache positions and encodes only the new tokens. On miss,
+    /// resets the KV cache and encodes all tokens from scratch.
+    ///
+    /// Returns `(logits, cached_tokens)` where:
+    /// - `logits` contains the forward-pass output for the encoded tokens
+    ///   (shape `[encoded_len, vocab_size]` where `encoded_len = prompt_len - cached_tokens`)
+    /// - `cached_tokens` is the number of tokens served from cache (0 on miss)
+    fn prefill_with_cache(
+        &mut self,
+        prompt_tokens: &[u32],
+        has_vision: bool,
+    ) -> Result<(Vec<f32>, usize), EngineError> {
+        let lookup = self.prompt_cache.lookup(prompt_tokens, has_vision);
+
+        match lookup {
+            CacheLookup::Hit {
+                prefix_len,
+                kv_position,
+            } => {
+                // Restore KV cache to the prefix boundary. The buffers already
+                // contain valid KV data for positions 0..kv_position from the
+                // previous forward pass; we just need to rewind the write heads.
+                self.model.restore_cache_position(kv_position).map_err(|e| {
+                    EngineError::Forward(e.into())
+                })?;
+
+                // Encode only the new tokens (from prefix_len onward)
+                let new_tokens = &prompt_tokens[prefix_len..];
+                if new_tokens.is_empty() {
+                    // The entire prompt was cached. We still need logits for
+                    // the last position to sample the first generated token.
+                    // Re-encode just the last token to get its logits. The KV
+                    // cache already has all the context, so this single-token
+                    // forward is equivalent to a decode step.
+                    let last_token = &prompt_tokens[prompt_tokens.len() - 1..];
+                    // But we need to rewind one position since the last token's
+                    // KV is already in the cache from the previous request.
+                    // Actually: just rewind by 1 and re-encode the last token.
+                    if kv_position > 0 {
+                        self.model
+                            .restore_cache_position(kv_position - 1)
+                            .map_err(|e| EngineError::Forward(e.into()))?;
+                    }
+                    let logits = self.model.forward(last_token)?;
+                    // The cached_tokens count is prefix_len - 1 since we
+                    // re-encoded the last one.
+                    return Ok((logits, prefix_len.saturating_sub(1)));
+                }
+
+                debug!(
+                    cached = prefix_len,
+                    new = new_tokens.len(),
+                    "Prefill: encoding only new tokens after cache hit"
+                );
+
+                let logits = self.model.forward(new_tokens)?;
+                Ok((logits, prefix_len))
+            }
+            CacheLookup::Miss => {
+                // Full reset and encode from scratch
+                self.model.reset_cache();
+                let logits = self.model.forward(prompt_tokens)?;
+                Ok((logits, 0))
+            }
+        }
+    }
+
+    /// Store the prompt token sequence in the cache after a successful
+    /// generation (or early EOS).
+    ///
+    /// Only stores the prompt tokens (not the generated tokens). The
+    /// generated tokens form the assistant's response, which will appear
+    /// in the next request's prompt via the chat template.
+    fn store_prompt_in_cache(&mut self, prompt_tokens: Vec<u32>, has_vision: bool) {
+        let kv_position = prompt_tokens.len();
+        let kv_byte_size = self.model.kv_cache_allocated_bytes();
+        self.prompt_cache
+            .store(prompt_tokens, kv_position, has_vision, kv_byte_size);
     }
 
     /// Check if the generated text ends with any configured stop sequence.
@@ -356,6 +476,10 @@ impl InferenceEngine {
     /// special tokens if needed). This is used by the API server which
     /// handles multi-message template rendering externally.
     ///
+    /// This is the primary beneficiary of prompt caching: in multi-turn
+    /// chat, each request contains the entire conversation history, so the
+    /// common prefix grows with each turn.
+    ///
     /// The `on_token` callback is invoked for each generated token with the
     /// decoded text fragment. Return `true` to continue, `false` to stop.
     pub fn generate_from_formatted_prompt<F>(
@@ -368,9 +492,6 @@ impl InferenceEngine {
     {
         let total_start = Instant::now();
 
-        // Reset KV cache for the new sequence
-        self.model.reset_cache();
-
         // Tokenize the already-rendered prompt
         let prompt_tokens = self.tokenizer.encode_with_special_tokens(rendered_prompt)?;
         let prompt_len = prompt_tokens.len();
@@ -382,14 +503,16 @@ impl InferenceEngine {
             });
         }
 
-        // Prefill
+        // Prefill with prompt cache awareness
         let prefill_start = Instant::now();
-        let prefill_logits = self.model.forward(&prompt_tokens)?;
+        let (prefill_logits, cached_tokens) =
+            self.prefill_with_cache(&prompt_tokens, false)?;
         let prefill_time = prefill_start.elapsed().as_secs_f64();
 
         let vocab_size = self.model.config().vocab_size;
+        let encoded_len = prompt_len - cached_tokens;
         let last_pos_logits =
-            extract_last_position_logits(&prefill_logits, prompt_len, vocab_size)?;
+            extract_last_position_logits(&prefill_logits, encoded_len, vocab_size)?;
 
         // Sample first token
         let mut sampler = Sampler::new(self.config.sampler.clone());
@@ -401,6 +524,7 @@ impl InferenceEngine {
         let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
 
         if Some(first_token) == eos_id {
+            self.store_prompt_in_cache(prompt_tokens, false);
             let total_time = total_start.elapsed().as_secs_f64();
             return Ok((
                 generated_text,
@@ -410,6 +534,7 @@ impl InferenceEngine {
                     prefill_time_secs: prefill_time,
                     decode_time_secs: 0.0,
                     total_time_secs: total_time,
+                    cached_tokens,
                 },
             ));
         }
@@ -419,6 +544,7 @@ impl InferenceEngine {
         generated_text.push_str(&token_text);
 
         if !on_token(&token_text) {
+            self.store_prompt_in_cache(prompt_tokens, false);
             let total_time = total_start.elapsed().as_secs_f64();
             return Ok((
                 generated_text,
@@ -428,6 +554,7 @@ impl InferenceEngine {
                     prefill_time_secs: prefill_time,
                     decode_time_secs: decode_start.elapsed().as_secs_f64(),
                     total_time_secs: total_time,
+                    cached_tokens,
                 },
             ));
         }
@@ -459,6 +586,9 @@ impl InferenceEngine {
             }
         }
 
+        // Store prompt tokens in the cache for the next turn
+        self.store_prompt_in_cache(prompt_tokens, false);
+
         let decode_time = decode_start.elapsed().as_secs_f64();
         let total_time = total_start.elapsed().as_secs_f64();
 
@@ -470,8 +600,152 @@ impl InferenceEngine {
                 prefill_time_secs: prefill_time,
                 decode_time_secs: decode_time,
                 total_time_secs: total_time,
+                cached_tokens,
             },
         ))
+    }
+
+    /// Generate text from a formatted prompt with vision features injected.
+    ///
+    /// This is the multimodal generation path. The `vision_features` buffer
+    /// contains pre-encoded vision tokens (from the vision encoder), and
+    /// `image_token_id` indicates which token positions should be replaced.
+    ///
+    /// The rendered prompt should contain `image_token_id` tokens as placeholders
+    /// for the vision features.
+    pub fn generate_from_formatted_prompt_with_vision<F>(
+        &mut self,
+        rendered_prompt: &str,
+        image_token_id: u32,
+        vision_features: &[f32],
+        on_token: F,
+    ) -> Result<(String, GenerationStats), EngineError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let total_start = Instant::now();
+
+        // Tokenize the prompt
+        let prompt_tokens = self.tokenizer.encode_with_special_tokens(rendered_prompt)?;
+        let prompt_len = prompt_tokens.len();
+        debug!(prompt_tokens = prompt_len, "Prompt tokenized (with vision)");
+
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation {
+                reason: "Prompt tokenized to zero tokens".into(),
+            });
+        }
+
+        // Vision invalidates prompt cache -- always reset
+        self.model.reset_cache();
+
+        // Prefill with vision token injection
+        let prefill_start = Instant::now();
+        let prefill_logits = self.model.forward_with_vision(
+            &prompt_tokens,
+            image_token_id,
+            vision_features,
+        )?;
+        let prefill_time = prefill_start.elapsed().as_secs_f64();
+
+        let vocab_size = self.model.config().vocab_size;
+        let last_pos_logits =
+            extract_last_position_logits(&prefill_logits, prompt_len, vocab_size)?;
+
+        // Sample first token
+        let mut sampler = Sampler::new(self.config.sampler.clone());
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(self.config.max_tokens);
+        let mut generated_text = String::new();
+        let eos_id = self.tokenizer.eos_id();
+        let decode_start = Instant::now();
+
+        let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
+
+        if Some(first_token) == eos_id {
+            // Store in prompt cache with vision flag
+            self.store_prompt_in_cache(prompt_tokens, true);
+            let total_time = total_start.elapsed().as_secs_f64();
+            return Ok((
+                generated_text,
+                GenerationStats {
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    prefill_time_secs: prefill_time,
+                    decode_time_secs: 0.0,
+                    total_time_secs: total_time,
+                    cached_tokens: 0,
+                },
+            ));
+        }
+
+        generated_ids.push(first_token);
+        let token_text = self.tokenizer.decode(&[first_token]).unwrap_or_default();
+        generated_text.push_str(&token_text);
+
+        if !on_token(&token_text) {
+            self.store_prompt_in_cache(prompt_tokens, true);
+            let total_time = total_start.elapsed().as_secs_f64();
+            return Ok((
+                generated_text,
+                GenerationStats {
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 1,
+                    prefill_time_secs: prefill_time,
+                    decode_time_secs: decode_start.elapsed().as_secs_f64(),
+                    total_time_secs: total_time,
+                    cached_tokens: 0,
+                },
+            ));
+        }
+
+        // Decode loop (same as text-only -- vision tokens are cached in KV)
+        for step in 1..self.config.max_tokens {
+            let step_logits = self.model.forward(&[*generated_ids.last().unwrap()])?;
+            let token_logits = extract_last_position_logits(&step_logits, 1, vocab_size)?;
+            let next_token = sampler.sample_next(&token_logits, &generated_ids);
+
+            if Some(next_token) == eos_id {
+                debug!(step = step, "EOS token generated");
+                break;
+            }
+
+            generated_ids.push(next_token);
+            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            generated_text.push_str(&token_text);
+
+            if self.check_stop_sequences(&generated_text) {
+                self.trim_stop_sequence(&mut generated_text);
+                debug!(step = step, "Stop sequence matched");
+                break;
+            }
+
+            if !on_token(&token_text) {
+                debug!(step = step, "Generation stopped by callback");
+                break;
+            }
+        }
+
+        let decode_time = decode_start.elapsed().as_secs_f64();
+        let total_time = total_start.elapsed().as_secs_f64();
+
+        self.store_prompt_in_cache(prompt_tokens, true);
+
+        Ok((
+            generated_text,
+            GenerationStats {
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+                prefill_time_secs: prefill_time,
+                decode_time_secs: decode_time,
+                total_time_secs: total_time,
+                cached_tokens: 0,
+            },
+        ))
+    }
+
+    /// Access the model's weight map (for vision encoder weight loading).
+    pub fn weights(&self) -> &crate::inference::weight_loader::WeightMap {
+        self.model.weights()
     }
 
     /// Get a reference to the model's maximum sequence length.
@@ -610,6 +884,7 @@ mod tests {
             prefill_time_secs: 0.5,
             decode_time_secs: 2.5,
             total_time_secs: 3.0,
+            cached_tokens: 0,
         };
         assert!((stats.decode_tokens_per_sec() - 20.0).abs() < 1e-6);
         assert!((stats.prefill_tokens_per_sec() - 200.0).abs() < 1e-6);
@@ -623,8 +898,27 @@ mod tests {
             prefill_time_secs: 0.0,
             decode_time_secs: 0.0,
             total_time_secs: 0.0,
+            cached_tokens: 0,
         };
         assert_eq!(stats.decode_tokens_per_sec(), 0.0);
         assert_eq!(stats.prefill_tokens_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn test_generation_stats_with_cache() {
+        let stats = GenerationStats {
+            prompt_tokens: 500,
+            generated_tokens: 50,
+            prefill_time_secs: 0.1,
+            decode_time_secs: 2.5,
+            total_time_secs: 2.6,
+            cached_tokens: 450,
+        };
+        // Only 50 tokens were actually prefilled, but prompt_tokens reports
+        // the full count for the API response.
+        assert_eq!(stats.prompt_tokens, 500);
+        assert_eq!(stats.cached_tokens, 450);
+        // Prefill tok/s should reflect the reported prompt_tokens / prefill_time
+        assert!((stats.prefill_tokens_per_sec() - 5000.0).abs() < 1e-6);
     }
 }

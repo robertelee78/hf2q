@@ -122,6 +122,9 @@ pub async fn chat_completions(
         ApiError::queue_full()
     })?;
 
+    // Extract and preprocess images from multimodal content (if any)
+    let vision_features = extract_and_encode_images(&req.messages, &state)?;
+
     // Format the prompt using the chat template (with tools if present)
     let prompt = format_prompt(&req.messages, effective_tools, &state)?;
 
@@ -179,6 +182,7 @@ pub async fn chat_completions(
         // Move the permit into the spawned task so it is held for the
         // duration of generation and released on completion/error.
         let _permit = permit;
+        let vision_features_clone = vision_features.clone();
 
         tokio::task::spawn_blocking(move || {
             run_generation_blocking(
@@ -190,6 +194,7 @@ pub async fn chat_completions(
                 stop_sequences,
                 cancel_token,
                 tx,
+                vision_features_clone,
             );
             // _permit drops here, releasing the queue slot
             drop(_permit);
@@ -224,6 +229,7 @@ pub async fn chat_completions(
                 stop_sequences,
                 cancel_token,
                 tx,
+                vision_features,
             );
             drop(_permit_guard);
         });
@@ -281,7 +287,7 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content,
+                    content: content.map(MessageContent::Text),
                     tool_calls: tool_calls_vec,
                     tool_call_id: None,
                 },
@@ -291,6 +297,7 @@ pub async fn chat_completions(
                 prompt_tokens: prompt_token_count,
                 completion_tokens,
                 total_tokens: prompt_token_count + completion_tokens,
+                prompt_tokens_details: None,
             },
         };
 
@@ -398,7 +405,7 @@ fn format_prompt(
 
             Message {
                 role: m.role.clone(),
-                content: m.content.clone().unwrap_or_default(),
+                content: m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
                 tool_call_id: m.tool_call_id.clone(),
                 tool_calls: tool_calls_value,
             }
@@ -557,6 +564,7 @@ fn run_generation_blocking(
     stop_sequences: Vec<String>,
     cancellation: Arc<AtomicBool>,
     tx: mpsc::Sender<GenerationEvent>,
+    vision_features: Option<VisionFeatures>,
 ) {
     use crate::inference::engine::EngineConfig;
     use crate::inference::sampler::SamplerConfig;
@@ -566,8 +574,6 @@ fn run_generation_blocking(
         let mut engine_guard = engine.lock().unwrap();
 
         // Reconfigure the engine for this request's parameters.
-        // The engine is behind a Mutex so we can mutate its config.
-        // We create a new sampler config for each request.
         let sampler_config = SamplerConfig {
             temperature,
             top_p,
@@ -575,8 +581,6 @@ fn run_generation_blocking(
             repetition_penalty: 1.0,
         };
 
-        // We need to reconfigure the engine for this specific request.
-        // Temporarily update the engine's config.
         engine_guard.config = EngineConfig {
             max_tokens,
             sampler: sampler_config,
@@ -586,17 +590,25 @@ fn run_generation_blocking(
         let tx_clone = tx.clone();
         let cancel_ref = cancellation.clone();
 
-        let result = engine_guard.generate_from_formatted_prompt(&prompt, |token_text| {
-            // Check cancellation
+        let on_token = |token_text: &str| -> bool {
             if cancel_ref.load(Ordering::Relaxed) {
                 return false;
             }
-            // Send the token through the channel; if the receiver is dropped
-            // (client disconnected), stop generating.
             tx_clone
                 .blocking_send(GenerationEvent::Token(token_text.to_string()))
                 .is_ok()
-        });
+        };
+
+        let result = if let Some(ref vf) = vision_features {
+            engine_guard.generate_from_formatted_prompt_with_vision(
+                &prompt,
+                vf.image_token_id,
+                &vf.features,
+                on_token,
+            )
+        } else {
+            engine_guard.generate_from_formatted_prompt(&prompt, on_token)
+        };
 
         result
     }));
@@ -626,4 +638,122 @@ fn run_generation_blocking(
     }
 
     // tx is dropped here, closing the channel
+}
+
+// ---------------------------------------------------------------------------
+// Vision image extraction and encoding
+// ---------------------------------------------------------------------------
+
+/// Pre-computed vision features ready for injection into the text model.
+#[derive(Clone)]
+struct VisionFeatures {
+    /// Flat f32 buffer of shape [num_vision_tokens, text_hidden_size].
+    features: Vec<f32>,
+    /// The token ID that marks image placeholder positions.
+    image_token_id: u32,
+}
+
+/// Extract images from multimodal messages, preprocess, and encode them.
+///
+/// Returns `None` if no images are present in any message.
+/// Returns an error if images are present but cannot be processed.
+fn extract_and_encode_images(
+    messages: &[ChatMessage],
+    state: &AppState,
+) -> Result<Option<VisionFeatures>, ApiError> {
+    use crate::inference::vision::preprocessing::{
+        decode_base64_image, load_image_from_path, preprocess_image,
+    };
+    use crate::inference::vision::config::VisionConfig;
+    use crate::inference::vision::encoder::VisionEncoder;
+
+    // Collect all image URLs from all messages
+    let mut image_urls: Vec<&str> = Vec::new();
+    for msg in messages {
+        if let Some(ref content) = msg.content {
+            let urls = content.image_urls();
+            image_urls.extend(urls);
+        }
+    }
+
+    if image_urls.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse vision config from the model config
+    // We need to access the model's raw config JSON. For now, read it from
+    // the engine's config path stored in AppState. Since we don't have direct
+    // access to the raw config JSON from the handler, we use the vision config
+    // that should be parsed during model loading.
+    //
+    // If the model doesn't have vision weights, return an error.
+    let vision_config = state.vision_config.as_ref().ok_or_else(|| {
+        ApiError::invalid_request(
+            "This model does not support vision/image inputs",
+            Some("messages".into()),
+        )
+    })?;
+
+    // Load and preprocess each image
+    let mut all_vision_features: Vec<f32> = Vec::new();
+
+    for url in &image_urls {
+        // Extract image bytes
+        let image_bytes = if url.starts_with("data:") || !url.contains("://") && !url.starts_with("/") {
+            // Base64 data URL or raw base64
+            decode_base64_image(url).map_err(|e| {
+                ApiError::invalid_request(
+                    format!("Invalid image: {e}"),
+                    Some("messages".into()),
+                )
+            })?
+        } else if url.starts_with("file://") || url.starts_with("/") {
+            // Local file path
+            load_image_from_path(url).map_err(|e| {
+                ApiError::invalid_request(
+                    format!("Invalid image: {e}"),
+                    Some("messages".into()),
+                )
+            })?
+        } else {
+            return Err(ApiError::invalid_request(
+                format!("Unsupported image URL scheme: {url}. Supported: data: (base64), file://, or local path"),
+                Some("messages".into()),
+            ));
+        };
+
+        // Preprocess: decode, resize, patchify
+        let preprocessed = preprocess_image(&image_bytes, vision_config).map_err(|e| {
+            ApiError::invalid_request(
+                format!("Invalid image: {e}"),
+                Some("messages".into()),
+            )
+        })?;
+
+        // Encode: run through vision encoder + projection
+        let encoder = VisionEncoder::new(VisionConfig::clone(&vision_config));
+        let engine_guard = state.engine.lock().unwrap();
+        let weights = engine_guard.weights();
+
+        // Check if vision weights are present
+        if !VisionEncoder::has_vision_weights(weights) {
+            return Err(ApiError::invalid_request(
+                "Model weights do not include vision encoder weights. \
+                 Use a multimodal model checkpoint.",
+                Some("messages".into()),
+            ));
+        }
+
+        let features = encoder.encode_image(&preprocessed, weights).map_err(|e| {
+            error!(error = %e, "Vision encoder error");
+            ApiError::generation_error(format!("Vision encoding failed: {e}"))
+        })?;
+
+        all_vision_features.extend_from_slice(&features);
+    }
+
+    Ok(Some(VisionFeatures {
+        features: all_vision_features,
+        image_token_id: vision_config.image_token_id,
+    }))
 }

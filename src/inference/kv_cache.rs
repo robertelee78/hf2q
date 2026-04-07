@@ -214,6 +214,43 @@ impl LayerCache {
         self.total_written = 0;
     }
 
+    /// Restore the cache write position to a specific point.
+    ///
+    /// Used by prompt caching: after finding a common prefix of length `P`,
+    /// the cache is restored to position `P` so that only the new tokens
+    /// (from `P` onward) need to be encoded. The KV data in positions
+    /// `0..P` is already valid from the previous forward pass.
+    ///
+    /// For sliding caches: if `total_written > window`, the `position`
+    /// (ring buffer write head) wraps as `total_written % window`.
+    /// For global caches: `position == total_written`.
+    ///
+    /// Returns an error if `new_total_written` exceeds the cache capacity
+    /// (should never happen in practice since we are restoring to a
+    /// previously valid state).
+    pub fn restore_position(&mut self, new_total_written: usize) -> Result<(), KvCacheError> {
+        match self.cache_type {
+            CacheType::Sliding { window } => {
+                // For sliding, the ring buffer write head wraps
+                self.total_written = new_total_written;
+                self.position = new_total_written % window;
+            }
+            CacheType::Global { max_seq_len } => {
+                if new_total_written > max_seq_len {
+                    return Err(KvCacheError::BufferWriteError {
+                        reason: format!(
+                            "Cannot restore global cache to position {new_total_written}: \
+                             exceeds max_seq_len {max_seq_len}"
+                        ),
+                    });
+                }
+                self.total_written = new_total_written;
+                self.position = new_total_written;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the cache type.
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
@@ -328,6 +365,33 @@ impl KvCache {
     /// Number of layers in the cache.
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Restore all layers' write positions to a given total-written count.
+    ///
+    /// Used by prompt caching to rewind the KV cache to the end of a
+    /// previously-computed prefix. Each layer's `position` and
+    /// `total_written` are set so that the next `append()` will write
+    /// at position `new_total_written`.
+    pub fn restore_all_positions(&mut self, new_total_written: usize) -> Result<(), KvCacheError> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.restore_position(new_total_written).map_err(|e| {
+                KvCacheError::BufferWriteError {
+                    reason: format!("Layer {i} restore failed: {e}"),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Total allocated byte size of all KV cache buffers across all layers.
+    ///
+    /// This reflects the pre-allocated capacity (not just the filled portion).
+    pub fn total_allocated_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.k_cache.byte_len() + l.v_cache.byte_len())
+            .sum()
     }
 }
 

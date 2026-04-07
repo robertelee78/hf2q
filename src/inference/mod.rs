@@ -13,6 +13,8 @@ pub mod mlx_runner {
 
 pub mod models;
 pub mod stub_runner;
+#[cfg(feature = "serve")]
+pub mod vision;
 
 #[cfg(feature = "mlx-native")]
 pub mod weight_loader;
@@ -22,6 +24,8 @@ pub mod memory_estimate;
 pub mod kv_cache;
 #[cfg(feature = "mlx-native")]
 pub mod sampler;
+#[cfg(feature = "mlx-native")]
+pub mod prompt_cache;
 #[cfg(feature = "mlx-native")]
 pub mod engine;
 

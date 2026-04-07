@@ -115,6 +115,7 @@ pub fn generation_events_to_sse(
                             prompt_tokens,
                             completion_tokens,
                             total_tokens: prompt_tokens + completion_tokens,
+                            prompt_tokens_details: None,
                         }),
                     };
                     let json = serde_json::to_string(&final_chunk).unwrap_or_default();
@@ -414,6 +415,7 @@ pub fn generation_events_to_sse_with_tools(
                             prompt_tokens,
                             completion_tokens,
                             total_tokens: prompt_tokens + completion_tokens,
+                            prompt_tokens_details: None,
                         }),
                     };
                     let json = serde_json::to_string(&final_chunk).unwrap_or_default();

@@ -477,9 +477,130 @@ impl Gemma4Model {
         Ok(output.to_vec())
     }
 
+    /// Run a forward pass with vision token injection.
+    ///
+    /// This is the multimodal path: after computing text embeddings and scaling,
+    /// the vision features are scattered into positions where `token_ids[i] == image_token_id`.
+    /// The vision features are already projected to the text model's hidden dimension
+    /// by the vision encoder.
+    ///
+    /// `vision_features` is a flat f32 buffer of shape `[num_vision_tokens, hidden_size]`
+    /// where num_vision_tokens equals the count of image_token_id occurrences in `tokens`.
+    ///
+    /// Returns logits of shape `[seq_len, vocab_size]`.
+    pub fn forward_with_vision(
+        &mut self,
+        tokens: &[u32],
+        image_token_id: u32,
+        vision_features: &[f32],
+    ) -> Result<Vec<f32>, Gemma4Error> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(Gemma4Error::ForwardError {
+                reason: "Empty token sequence".into(),
+            });
+        }
+
+        let hidden_size = self.config.hidden_size;
+
+        // Step 1: Embedding gather (replace image tokens with PAD to avoid OOV)
+        let pad_token_id = 0u32; // PAD token
+        let safe_tokens: Vec<u32> = tokens
+            .iter()
+            .map(|&t| if t == image_token_id { pad_token_id } else { t })
+            .collect();
+        debug!(seq_len = seq_len, "Embedding gather (with vision)");
+        let mut hidden = self.embedding_gather(&safe_tokens)?;
+
+        // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
+        let scale = (hidden_size as f32).sqrt();
+        {
+            let slice: &mut [f32] = hidden
+                .as_mut_slice()
+                .map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Embedding scale: {e}"),
+                })?;
+            for v in slice.iter_mut() {
+                *v *= scale;
+            }
+        }
+
+        // Step 3: Scatter vision features into image token positions
+        // The vision features are already in the text model's hidden dimension
+        // and have been processed by the vision encoder + projection.
+        {
+            let slice: &mut [f32] = hidden
+                .as_mut_slice()
+                .map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Vision scatter: {e}"),
+                })?;
+            let mut vision_idx = 0usize;
+            for (pos, &token_id) in tokens.iter().enumerate() {
+                if token_id == image_token_id {
+                    let src_offset = vision_idx * hidden_size;
+                    let dst_offset = pos * hidden_size;
+                    if src_offset + hidden_size <= vision_features.len() {
+                        slice[dst_offset..dst_offset + hidden_size]
+                            .copy_from_slice(&vision_features[src_offset..src_offset + hidden_size]);
+                    }
+                    vision_idx += 1;
+                }
+            }
+            debug!(
+                vision_tokens = vision_idx,
+                "Vision features scattered into sequence"
+            );
+        }
+
+        // Step 4: Process each transformer layer
+        for layer_idx in 0..self.config.num_layers {
+            debug!(layer = layer_idx, "Processing transformer layer");
+            hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
+        }
+
+        // Step 5: Final RMS norm
+        debug!("Final RMS norm");
+        let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
+
+        // Step 6: lm_head (tied embeddings)
+        debug!("lm_head projection (tied embeddings)");
+        let logits = self.lm_head_projection(&normed, seq_len)?;
+
+        // Step 7: Softcap
+        debug!(cap = self.config.final_logit_softcapping, "Softcap");
+        let capped_logits = self.apply_softcap(&logits, seq_len)?;
+
+        // Read logits to CPU
+        let output: &[f32] = capped_logits
+            .as_slice()
+            .map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("Read logits: {e}"),
+            })?;
+
+        Ok(output.to_vec())
+    }
+
     /// Reset the KV cache (call between different sequences).
     pub fn reset_cache(&mut self) {
         self.kv_cache.reset();
+    }
+
+    /// Restore the KV cache write positions to a previously valid point.
+    ///
+    /// Used by prompt caching: after finding that the first `position`
+    /// tokens match a cached prefix, the KV cache is rewound so the next
+    /// forward pass appends starting at `position`. The KV buffer data
+    /// for positions `0..position` is already valid from the previous
+    /// generation and is reused in-place (no copies needed).
+    pub fn restore_cache_position(&mut self, position: usize) -> Result<(), Gemma4Error> {
+        self.kv_cache
+            .restore_all_positions(position)
+            .map_err(|e| Gemma4Error::KvCacheError(e))
+    }
+
+    /// Total allocated byte size of all KV cache buffers.
+    pub fn kv_cache_allocated_bytes(&self) -> usize {
+        self.kv_cache.total_allocated_bytes()
     }
 
     /// Get a reference to the model config.

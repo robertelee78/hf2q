@@ -190,17 +190,129 @@ pub struct ModelListResponse {
 // ---------------------------------------------------------------------------
 
 /// A single message in the chat conversation.
+///
+/// The `content` field supports both the simple string format and the OpenAI
+/// Vision API array format (with `text` and `image_url` content parts).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    /// Message content, either as a plain string or as an array of content parts
+    /// (for multimodal messages with images).
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     /// Tool calls made by the assistant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Tool call ID for tool-role messages (references a previous tool call).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// Message content: either a plain string or an array of content parts.
+///
+/// Supports the OpenAI Vision API format:
+/// ```json
+/// [
+///   {"type": "text", "text": "What's in this image?"},
+///   {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+/// ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Plain string content (most common).
+    Text(String),
+    /// Array of content parts (for multimodal messages).
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Extract the text content from this message, concatenating all text parts
+    /// if this is a multimodal message.
+    pub fn text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => {
+                parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            }
+        }
+    }
+
+    /// Extract image URLs from multimodal content parts.
+    /// Returns an empty vec for plain text content.
+    pub fn image_urls(&self) -> Vec<&str> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => {
+                parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::ImageUrl { image_url } => Some(image_url.url.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Check if this content contains any images.
+    #[allow(dead_code)]
+    pub fn has_images(&self) -> bool {
+        match self {
+            MessageContent::Text(_) => false,
+            MessageContent::Parts(parts) => {
+                parts.iter().any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+            }
+        }
+    }
+
+    /// Get as Option<String> for backward compatibility with code expecting
+    /// the old `Option<String>` content field.
+    #[allow(dead_code)]
+    pub fn as_text_opt(&self) -> Option<String> {
+        let text = self.text();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+}
+
+/// A single content part within a multimodal message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    /// Text content.
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+    },
+    /// Image URL content (base64 data URL, file path, or HTTP URL).
+    #[serde(rename = "image_url")]
+    ImageUrl {
+        image_url: ImageUrl,
+    },
+}
+
+/// Image URL within a content part.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// The image URL. Supported formats:
+    /// - `data:image/{format};base64,{data}` -- inline base64
+    /// - `file:///path/to/image.jpg` -- local file
+    /// - `/path/to/image.jpg` -- local file (shorthand)
+    pub url: String,
+    /// Optional detail level (not used by hf2q but accepted for compatibility).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A tool call object (forward compatibility for Epic 4).
@@ -314,6 +426,16 @@ pub struct UsageStats {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Details about prompt token processing (OpenAI-compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of prompt token processing.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    /// Number of prompt tokens served from the prompt cache.
+    pub cached_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +724,7 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: Some("Hello!".into()),
+                    content: Some(MessageContent::Text("Hello!".into())),
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -612,6 +734,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: None,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -666,7 +789,7 @@ mod tests {
         assert_eq!(req.model, "test-model");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
-        assert_eq!(req.messages[0].content.as_deref(), Some("Hello"));
+        assert_eq!(req.messages[0].content.as_ref().map(|c| c.text()).as_deref(), Some("Hello"));
         assert_eq!(req.stream, Some(true));
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.max_tokens, Some(256));
@@ -722,6 +845,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                prompt_tokens_details: None,
             }),
         };
         let json = serde_json::to_value(&chunk).unwrap();
@@ -801,7 +925,7 @@ mod tests {
         let json = r#"{"role":"tool","content":"sunny","tool_call_id":"call_123"}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, "tool");
-        assert_eq!(msg.content.as_deref(), Some("sunny"));
+        assert_eq!(msg.content.as_ref().map(|c| c.text()).as_deref(), Some("sunny"));
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
     }
 
@@ -927,5 +1051,137 @@ mod tests {
         assert_eq!(tc["index"], 0);
         assert_eq!(tc["id"], "call_xyz");
         assert_eq!(tc["function"]["name"], "search");
+    }
+
+    // --- Epic 5 Vision API tests ---
+
+    #[test]
+    fn test_message_content_text_string() {
+        let json = r#"{"role":"user","content":"Hello"}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.content.as_ref().unwrap().text(), "Hello");
+        assert!(!msg.content.as_ref().unwrap().has_images());
+        assert!(msg.content.as_ref().unwrap().image_urls().is_empty());
+    }
+
+    #[test]
+    fn test_message_content_null() {
+        let json = r#"{"role":"assistant","content":null}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_none());
+    }
+
+    #[test]
+    fn test_message_content_vision_array() {
+        let json = r#"{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What's in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc123"}}
+            ]
+        }"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        let content = msg.content.as_ref().unwrap();
+        assert_eq!(content.text(), "What's in this image?");
+        assert!(content.has_images());
+        let urls = content.image_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "data:image/png;base64,abc123");
+    }
+
+    #[test]
+    fn test_message_content_multiple_images() {
+        let json = r#"{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare these:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,img1"}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,img2"}}
+            ]
+        }"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        let content = msg.content.as_ref().unwrap();
+        assert_eq!(content.text(), "Compare these:");
+        let urls = content.image_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "data:image/png;base64,img1");
+        assert_eq!(urls[1], "data:image/jpeg;base64,img2");
+    }
+
+    #[test]
+    fn test_message_content_image_url_with_detail() {
+        let json = r#"{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "file:///tmp/test.png", "detail": "high"}}
+            ]
+        }"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        let content = msg.content.as_ref().unwrap();
+        assert!(content.has_images());
+        assert_eq!(content.image_urls()[0], "file:///tmp/test.png");
+    }
+
+    #[test]
+    fn test_message_content_text_only_array() {
+        let json = r#"{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "First part"},
+                {"type": "text", "text": " second part"}
+            ]
+        }"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        let content = msg.content.as_ref().unwrap();
+        assert_eq!(content.text(), "First part second part");
+        assert!(!content.has_images());
+    }
+
+    #[test]
+    fn test_message_content_as_text_opt() {
+        // Non-empty text
+        let content = MessageContent::Text("hello".to_string());
+        assert_eq!(content.as_text_opt(), Some("hello".to_string()));
+
+        // Empty text
+        let content = MessageContent::Text("".to_string());
+        assert_eq!(content.as_text_opt(), None);
+    }
+
+    #[test]
+    fn test_message_content_serialization_round_trip() {
+        // Plain text should serialize as a string
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("Hello".into())),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["content"], "Hello");
+
+        // Array content should serialize as array
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Look at this:".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,abc".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json["content"].is_array());
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "Look at this:");
+        assert_eq!(json["content"][1]["type"], "image_url");
+        assert_eq!(json["content"][1]["image_url"]["url"], "data:image/png;base64,abc");
     }
 }

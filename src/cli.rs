@@ -184,6 +184,12 @@ pub struct ServeArgs {
     /// Path to a custom chat template (Jinja2 format)
     #[arg(long)]
     pub chat_template: Option<std::path::PathBuf>,
+
+    /// Disable prompt caching (skip prefix matching between requests).
+    /// By default, multi-turn conversations reuse cached KV state from
+    /// previous turns, reducing time-to-first-token.
+    #[arg(long)]
+    pub no_prompt_cache: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
