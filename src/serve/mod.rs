@@ -102,6 +102,8 @@ pub struct AppState {
     pub max_seq_len: usize,
     /// Embedding lane for concurrent embedding requests (independent of generation).
     pub embedding_lane: Arc<EmbeddingLane>,
+    /// Vision encoder configuration (None if model has no vision support).
+    pub vision_config: Option<Arc<crate::inference::vision::config::VisionConfig>>,
 }
 
 /// Configuration for the serve command.
@@ -128,7 +130,22 @@ pub async fn run(
     model_name: String,
     max_seq_len: usize,
     config: ServeConfig,
+    raw_model_config: Option<&serde_json::Value>,
 ) -> Result<()> {
+    // Parse vision configuration from model config (if available)
+    let vision_config = raw_model_config
+        .and_then(|cfg| crate::inference::vision::config::VisionConfig::from_model_config(cfg))
+        .map(Arc::new);
+
+    if let Some(ref vc) = vision_config {
+        info!(
+            vision_hidden = vc.hidden_size,
+            vision_layers = vc.num_hidden_layers,
+            soft_tokens = vc.vision_soft_tokens_per_image,
+            "Vision encoder configured"
+        );
+    }
+
     let state = AppState {
         model_name,
         created_at: unix_timestamp(),
@@ -138,6 +155,7 @@ pub async fn run(
         queue: Arc::new(GenerationQueue::new(config.queue_depth)),
         max_seq_len,
         embedding_lane: Arc::new(EmbeddingLane::new(config.embedding_concurrency)),
+        vision_config,
     };
 
     let app = router::build_router(state);
