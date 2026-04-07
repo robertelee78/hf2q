@@ -322,6 +322,12 @@ fn write_native_safetensors_file(
     let mut entries: Vec<SafetensorEntry> = Vec::new();
 
     for (name, tensor) in tensors {
+        // Remap HF key names to MLX-compatible names (strip "model." prefix,
+        // insert "language_model.model." nesting). Since we stamp safetensors
+        // with {"format": "mlx"}, mlx-vlm skips its sanitizer at load time,
+        // so the keys must already be in the final form.
+        let mlx_name = remap_tensor_name_for_mlx(name);
+
         // Determine if this tensor should be quantized.
         // Quantize all 2D+ weight tensors: Linear projections, Embeddings, expert weights.
         // Preserve: layer norms (1D), scalars (0D/1D), position embeddings, std_bias/scale.
@@ -368,8 +374,8 @@ fn write_native_safetensors_file(
                 ]
             };
 
-            if name.ends_with(".experts.gate_up_proj") {
-                let base = name.strip_suffix(".gate_up_proj").unwrap();
+            if mlx_name.ends_with(".experts.gate_up_proj") {
+                let base = mlx_name.strip_suffix(".gate_up_proj").unwrap();
                 let (gate_w, up_w, half_w_shape, _) = split_tensor_axis_neg2(&mlx_packed, &weight_shape);
                 let (gate_s, up_s, half_s_shape, _) = split_tensor_axis_neg2(&mlx_scales, &scales_shape);
                 let (gate_b, up_b, _, _) = split_tensor_axis_neg2(&mlx_biases, &scales_shape);
@@ -382,14 +388,14 @@ fn write_native_safetensors_file(
                     &format!("{}.switch_glu.up_proj", base),
                     up_w, half_w_shape, up_s, half_s_shape, up_b,
                 ));
-            } else if name.ends_with(".experts.down_proj") {
-                let base = name.strip_suffix(".down_proj").unwrap();
+            } else if mlx_name.ends_with(".experts.down_proj") {
+                let base = mlx_name.strip_suffix(".down_proj").unwrap();
                 entries.extend(make_entries(
                     &format!("{}.switch_glu.down_proj", base),
                     mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
                 ));
             } else {
-                let module = name.strip_suffix(".weight").unwrap_or(name);
+                let module = mlx_name.strip_suffix(".weight").unwrap_or(&mlx_name);
                 entries.extend(make_entries(
                     module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
                 ));
@@ -408,7 +414,7 @@ fn write_native_safetensors_file(
                 IrDType::Bool => "BOOL",
             };
             entries.push(SafetensorEntry {
-                name: (*name).clone(),
+                name: mlx_name.clone(),
                 dtype: dtype_str,
                 shape: tensor.shape.clone(),
                 data: tensor.data.clone(),
@@ -489,6 +495,13 @@ fn write_mlx_config_native(
 
     if let Some(quant_obj) = quant_config.as_object_mut() {
         for (tensor_name, &override_bits) in bit_overrides {
+            // Skip vision tower / embed_vision tensors — they're preserved at
+            // original precision (bf16) in the native path, so listing them
+            // in the quantization config would cause mlx-vlm to expect
+            // quantized weight+scales+biases that don't exist.
+            if tensor_name.contains("vision_tower") || tensor_name.contains("embed_vision") {
+                continue;
+            }
             // Convert tensor name to mlx-lm module path
             let paths = tensor_name_to_mlx_module_paths(tensor_name);
             for path in paths {
@@ -650,10 +663,16 @@ fn write_single_safetensors_file(
     let mut entries: Vec<SafetensorEntry> = Vec::new();
 
     for (name, tensor) in tensors {
+        // Remap HF key names to MLX-compatible names (strip "model." prefix,
+        // insert "language_model.model." nesting). Since we stamp safetensors
+        // with {"format": "mlx"}, mlx-vlm skips its sanitizer at load time,
+        // so the keys must already be in the final form.
+        let mlx_name = remap_tensor_name_for_mlx(name);
+
         if tensor.quant_info.preserved || tensor.quant_info.scales.is_none() {
             // Preserved / unquantized tensor — write as-is
             entries.push(SafetensorEntry {
-                name: (*name).clone(),
+                name: mlx_name,
                 dtype: output_dtype_string(tensor),
                 shape: tensor.shape.clone(),
                 data: tensor.data.clone(),
@@ -724,9 +743,9 @@ fn write_single_safetensors_file(
             ]
         };
 
-        if name.ends_with(".experts.gate_up_proj") {
+        if mlx_name.ends_with(".experts.gate_up_proj") {
             // Split fused gate+up into separate tensors along axis=-2
-            let base = name.strip_suffix(".gate_up_proj").unwrap();
+            let base = mlx_name.strip_suffix(".gate_up_proj").unwrap();
 
             let (gate_w, up_w, half_w_shape, _) =
                 split_tensor_axis_neg2(&mlx_packed, &weight_shape);
@@ -744,17 +763,17 @@ fn write_single_safetensors_file(
             entries.extend(make_entries(
                 &up_mod, up_w, half_w_shape, up_s, half_s_shape, up_b,
             ));
-        } else if name.ends_with(".experts.down_proj") {
-            let base = name.strip_suffix(".down_proj").unwrap();
+        } else if mlx_name.ends_with(".experts.down_proj") {
+            let base = mlx_name.strip_suffix(".down_proj").unwrap();
             let module = format!("{}.switch_glu.down_proj", base);
             entries.extend(make_entries(
                 &module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
             ));
         } else {
-            let module = if let Some(m) = name.strip_suffix(".weight") {
+            let module = if let Some(m) = mlx_name.strip_suffix(".weight") {
                 m.to_string()
             } else {
-                (*name).clone()
+                mlx_name.clone()
             };
             entries.extend(make_entries(
                 &module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
@@ -1219,10 +1238,16 @@ fn write_mlx_config(model: &QuantizedModel, output_dir: &Path) -> Result<u64, Ba
     Ok(config_json.len() as u64)
 }
 
-/// Convert an hf2q tensor name to the module path(s) mlx-lm expects after sanitization.
+/// Remap an HF tensor name to the key MLX expects in safetensors.
 ///
-/// Returns multiple paths for fused tensors (gate_up_proj → gate_proj + up_proj).
-fn tensor_name_to_mlx_module_paths(name: &str) -> Vec<String> {
+/// This matches the transformations that mlx-vlm's `Model.sanitize()` performs,
+/// so that weights stored with `{"format": "mlx"}` metadata (which skips
+/// sanitization at load time) have the correct key names.
+///
+/// Transformations:
+/// 1. Strip `model.` prefix (HF wraps everything in `model.`)
+/// 2. Insert `.model.` after `language_model.` (MLX nests the text model)
+fn remap_tensor_name_for_mlx(name: &str) -> String {
     let mut path = name.to_string();
 
     // Strip "model." prefix
@@ -1235,7 +1260,16 @@ fn tensor_name_to_mlx_module_paths(name: &str) -> Vec<String> {
         path = path.replacen("language_model.", "language_model.model.", 1);
     }
 
-    // Strip ".weight" suffix
+    path
+}
+
+/// Convert an hf2q tensor name to the module path(s) mlx-lm expects after sanitization.
+///
+/// Returns multiple paths for fused tensors (gate_up_proj → gate_proj + up_proj).
+fn tensor_name_to_mlx_module_paths(name: &str) -> Vec<String> {
+    let mut path = remap_tensor_name_for_mlx(name);
+
+    // Strip ".weight" suffix (module paths don't include it)
     if let Some(stripped) = path.strip_suffix(".weight") {
         path = stripped.to_string();
     }
@@ -1678,12 +1712,37 @@ mod tests {
         let mut names = Vec::new();
         write_single_safetensors_file(&tensors, &path, &mut names).unwrap();
 
-        // Should produce weight + scales + biases with proper sibling naming
-        assert!(names.contains(&"model.layer.biases".to_string()));
-        assert!(names.contains(&"model.layer.scales".to_string()));
-        assert!(names.contains(&"model.layer.weight".to_string()));
-        // Should NOT have "model.layer.weight.scales"
+        // After remapping, "model.layer.weight" → "layer" module → layer.{weight,scales,biases}
+        // (the "model." HF prefix is stripped by remap_tensor_name_for_mlx)
+        assert!(names.contains(&"layer.biases".to_string()));
+        assert!(names.contains(&"layer.scales".to_string()));
+        assert!(names.contains(&"layer.weight".to_string()));
+        // Should NOT have "layer.weight.scales"
         assert!(!names.iter().any(|n| n.contains("weight.scales")));
+    }
+
+    #[test]
+    fn test_remap_tensor_name_for_mlx() {
+        // Strip "model." HF prefix
+        assert_eq!(
+            remap_tensor_name_for_mlx("model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight"),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight"
+        );
+        // Strip "model." AND insert "language_model.model."
+        assert_eq!(
+            remap_tensor_name_for_mlx("model.language_model.layers.0.mlp.down_proj.weight"),
+            "language_model.model.layers.0.mlp.down_proj.weight"
+        );
+        // Already correct — no double-insert
+        assert_eq!(
+            remap_tensor_name_for_mlx("language_model.model.layers.0.mlp.up_proj.weight"),
+            "language_model.model.layers.0.mlp.up_proj.weight"
+        );
+        // embed_vision — just strip model. prefix
+        assert_eq!(
+            remap_tensor_name_for_mlx("model.embed_vision.embedding_projection.weight"),
+            "embed_vision.embedding_projection.weight"
+        );
     }
 
     #[test]
