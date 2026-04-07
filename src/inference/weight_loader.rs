@@ -210,30 +210,87 @@ fn discover_safetensors(dir: &Path) -> Result<Vec<std::path::PathBuf>, WeightLoa
     Ok(files)
 }
 
-/// Load quantization_config.json if present. Returns None if the file
-/// doesn't exist or can't be parsed (non-fatal).
+/// Load quantization config from the model directory.
+///
+/// Tries sources in order:
+/// 1. `quantization_config.json` — standard hf2q per-tensor config.
+/// 2. `config.json["quantization"]` — MLX-format with flat tensor-name keys.
+///
+/// If `quantization_config.json` exists but has no per-tensor overrides, we
+/// check `config.json` as a fallback since MLX models store per-tensor
+/// overrides there.
+///
+/// Returns None if neither source provides quantization info (non-fatal).
 fn load_quant_config(model_dir: &Path) -> Option<QuantizationConfig> {
-    let config_path = model_dir.join("quantization_config.json");
-    if !config_path.exists() {
-        debug!("No quantization_config.json found — treating all tensors as unquantized");
-        return None;
+    let qc_path = model_dir.join("quantization_config.json");
+
+    // Try quantization_config.json first.
+    if qc_path.exists() {
+        match QuantizationConfig::from_file(&qc_path) {
+            Ok(config) if !config.per_tensor.is_empty() => {
+                info!(
+                    bits = config.bits,
+                    group_size = config.group_size,
+                    per_tensor_overrides = config.per_tensor.len(),
+                    "Loaded quantization config from quantization_config.json"
+                );
+                return Some(config);
+            }
+            Ok(config) => {
+                // quantization_config.json exists but has no per-tensor overrides.
+                // Fall through to check config.json for MLX-style overrides.
+                debug!(
+                    bits = config.bits,
+                    group_size = config.group_size,
+                    "quantization_config.json has no per-tensor overrides, checking config.json"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to parse quantization_config.json: {}. Checking config.json fallback.",
+                    e
+                );
+            }
+        }
     }
 
-    match QuantizationConfig::from_file(&config_path) {
-        Ok(config) => {
-            info!(
-                bits = config.bits,
-                group_size = config.group_size,
-                per_tensor_overrides = config.per_tensor.len(),
-                "Loaded quantization config"
-            );
-            Some(config)
-        }
-        Err(e) => {
-            warn!("Failed to parse quantization_config.json: {}. Treating all tensors as unquantized.", e);
-            None
+    // Try config.json["quantization"] (MLX format with flat tensor-name keys).
+    let config_path = model_dir.join("config.json");
+    if config_path.exists() {
+        match QuantizationConfig::from_model_config_file(&config_path) {
+            Ok(config) => {
+                info!(
+                    bits = config.bits,
+                    group_size = config.group_size,
+                    per_tensor_overrides = config.per_tensor.len(),
+                    "Loaded quantization config from config.json[\"quantization\"]"
+                );
+                return Some(config);
+            }
+            Err(e) => {
+                debug!("No usable quantization section in config.json: {}", e);
+            }
         }
     }
+
+    // Last resort: re-read quantization_config.json for defaults only (no overrides).
+    if qc_path.exists() {
+        match QuantizationConfig::from_file(&qc_path) {
+            Ok(config) => {
+                info!(
+                    bits = config.bits,
+                    group_size = config.group_size,
+                    per_tensor_overrides = 0,
+                    "Loaded quantization config (defaults only) from quantization_config.json"
+                );
+                return Some(config);
+            }
+            Err(_) => {}
+        }
+    }
+
+    debug!("No quantization config found — treating all tensors as unquantized");
+    None
 }
 
 #[cfg(test)]
@@ -310,6 +367,67 @@ mod tests {
         // We'd need an MlxDevice for this, so just test the discovery part
         let result = discover_safetensors(tmp.path()).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_load_quant_config_fallback_to_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        // quantization_config.json with no per-tensor overrides.
+        std::fs::write(
+            tmp.path().join("quantization_config.json"),
+            r#"{"bits": 4, "group_size": 64}"#,
+        )
+        .unwrap();
+        // config.json with MLX-style per-tensor overrides.
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{
+                "model_type": "test",
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "language_model.model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64},
+                    "language_model.model.layers.0.self_attn.v_proj": {"bits": 6, "group_size": 64}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_quant_config(tmp.path());
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert_eq!(config.per_tensor.len(), 2);
+
+        // Verify per-tensor overrides are accessible (with suffix stripping).
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.0.mlp.down_proj.weight");
+        assert_eq!(bits, 8);
+        let (bits, _) = config.config_for_tensor("language_model.model.layers.0.self_attn.v_proj.weight");
+        assert_eq!(bits, 6);
+    }
+
+    #[test]
+    fn test_load_quant_config_config_json_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No quantization_config.json, only config.json.
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{
+                "model_type": "test",
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "model.layers.0.mlp.down_proj": {"bits": 8, "group_size": 64}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_quant_config(tmp.path());
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert_eq!(config.per_tensor.len(), 1);
+        let (bits, _) = config.config_for_tensor("model.layers.0.mlp.down_proj.weight");
+        assert_eq!(bits, 8);
     }
 
     #[test]
