@@ -74,42 +74,48 @@ Embedding (GPU, bf16 output)
 **Fix:** `self.tokenizer.id_to_token(bos_id)` returns "<bos>"
 **Impact:** BOS token missing from prompt, producing 20 tokens instead of 22.
 
-## Where We're Stuck
+## Bugs Found & Fixed (Session 2 — 2026-04-07)
 
-### The Problem
+### 6. SDPA kernels hardcoded attention scale
+**Files:** `sdpa.metal`, `sdpa_sliding.metal`, `sdpa.rs`, `sdpa_sliding.rs`, `gemma4.rs`
+**Bug:** All SDPA kernels computed `scale = 1/sqrt(head_dim)` internally. Gemma 4 requires `scale = 1.0` (QK norms handle scaling). The workaround of pre-multiplying Q by `sqrt(head_dim)=16` in bf16 introduced 16x worse precision in attention scores.
+**Fix:** Added `scale` field to SDPA params structs (both Metal and Rust). Caller passes `scale = 1.0` for Gemma 4. Removed Q pre-scaling hack from `gemma4.rs`.
+**Impact:** Attention scores for later tokens no longer garbled by precision loss. Logit statistics now match Python reference (mean -18.65 vs -18.63).
 
-The forward pass produces garbled output instead of correct text. Python MLX-LM generates "2+2 = 4" on the same tokens; our Rust generates gibberish.
+### 8. k_eq_v incorrectly applied to ALL layers instead of global-only
+**File:** `gemma4.rs:939`
+**Bug:** `let use_k_eq_v = self.config.attention_k_eq_v` applied K=V sharing to ALL 30 layers.
+**Fix:** `let use_k_eq_v = self.config.attention_k_eq_v && layer_type == LayerAttentionType::Global`
+**Impact:** 25 sliding layers used k_proj weights for V instead of separate v_proj weights. This was a regression from the original Bug #1 fix — the original code was correct to restrict k_eq_v to global layers; the "fix" that removed the restriction was wrong.
+**Reference:** Python: `self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding`
 
-### Root Cause: Quantized Matmul Accumulation Order
+### 7. RoPE used wrong pair convention (traditional vs Neox/split)
+**File:** `gemma4.rs:1765-1788`
+**Bug:** CPU RoPE paired consecutive dimensions `(d[2i], d[2i+1])` (traditional convention). Gemma 4 uses `rope_traditional=False`, meaning pairs are `(d[i], d[i + dim/2])` (Neox/split convention).
+**Fix:** Changed RoPE loop to pair `(d[i], d[i + half_rope])` with frequency `1/theta^(2i/rope_dim)`.
+**Impact:** Q/K values for positions > 0 were completely wrong (different signs and magnitudes). Layer 0 attention output for last token now matches Python within ULP. This was the primary cause of garbled output.
+**Note:** The GPU RoPE shader (`rope.metal`) also uses the traditional convention but is not currently used by gemma4.rs (CPU path only). If the GPU path is enabled in the future, it will also need to be fixed.
 
-Each quantized matmul computes a 2816-dimension dot product. The result depends on the **exact order** of f32 floating-point additions (since f32 addition is not associative).
+## Current Status (After Fixes 6, 7, 8) — WORKING
 
-MLX's GPU kernel uses SIMD group cooperation (32 threads, `simd_sum()` butterfly reduction) with a pre-division trick for nibble extraction. Our SIMD kernel replicates this pattern but the compiled Metal shader may use different instruction ordering, FMA fusion, or compiler optimizations.
+### Inference is producing correct, coherent output!
 
-**Current per-element accuracy:**
+Example: prompt "What is 2+2?" generates:
+```
+thought
+*   Question: "What is 2+2?"
+    *   Subject: Basic arithmetic.
+    *   Goal: Provide the correct answer.
+    *   The sum of 2 and 2.
+    *   $2 + 2 = 4$.
+    *   Simple: "4"
+    *   Formal: "The sum of 2 and 2 is 4."
+```
 
-| Q proj element | Python | Our Rust | Error |
-|----------------|--------|----------|-------|
-| 0 | 21.125 | 21.125 | 0 (exact) |
-| 1 | 60.25 | 60.5 | 0.25 |
-| 2 | 7.8125 | 7.84375 | 0.03 |
-| 3 | 12.0625 | 11.9375 | 0.125 |
-| 4 | 5.46875 | 5.46875 | 0 (exact) |
-
-Errors are 0-0.25 per element (one bf16 ULP at the given magnitude). This is tiny for a single matmul but **catastrophic for MoE routing**: the 128-expert router uses these dot products to select top-8 experts. A 0.25 error can flip which experts are selected. Over 30 layers, each with MoE routing, the hidden state diverges completely from the reference.
-
-### Why This Is Hard
-
-1. **Cannot match MLX's exact f32 addition order** without using their compiled Metal library. Metal compiler may reorder additions, use FMA, etc.
-2. **MoE amplifies precision differences** — standard transformers (no MoE) would tolerate bf16-level errors gracefully. MoE routing creates a discrete selection (top-8 of 128) that's sensitive to tiny score differences.
-3. **30-layer cascade** — even 1 wrong expert at layer 0 changes the hidden state, causing different routing at all subsequent layers.
-
-### What Would Fix It
-
-1. **Match MLX's kernel binary** — Compile our Metal shader with the exact same flags as MLX, or extract MLX's compiled `.metallib` and use it directly. This ensures identical instruction ordering.
-2. **Deterministic CPU matmul** — Implement the full forward pass on CPU with a bit-exact accumulation matching MLX's (currently too slow — ~210s for 50 tokens).
-3. **Test on non-MoE model** — Verify structural correctness on a model without MoE routing (e.g., Gemma 2) where bf16-level errors don't cascade.
-4. **Higher-precision accumulation** — Use f64 for the dot product accumulation to reduce rounding differences, though this wouldn't match MLX's f32 exactly.
+### Remaining Work
+1. **GPU RoPE shader** — `rope.metal` still uses the traditional pair convention. If the GPU path is enabled, it needs to support non-traditional (Neox/split) convention.
+2. **Performance** — prefill ~0.4 tok/s, decode ~0.3 tok/s. Significant optimization opportunity.
+3. **Multi-turn / longer context** — needs testing beyond short prompts.
 
 ## Architecture
 

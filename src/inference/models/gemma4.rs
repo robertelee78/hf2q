@@ -933,10 +933,11 @@ impl Gemma4Model {
             kv_out_dim,
         )?;
 
-        // K-eq-V applies to ALL layers when the config flag is set.
-        // When attention_k_eq_v is true, V is derived from the K projection
-        // (not a separate v_proj) for every layer type.
-        let use_k_eq_v = self.config.attention_k_eq_v;
+        // K-eq-V applies to GLOBAL (full_attention) layers only.
+        // Sliding layers always use a separate v_proj weight.
+        // Python: self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
+        let use_k_eq_v = self.config.attention_k_eq_v
+            && layer_type == LayerAttentionType::Global;
 
         let v_proj = if use_k_eq_v {
             // K == V: reuse the K projection output as V
@@ -1031,20 +1032,10 @@ impl Gemma4Model {
 
         // --- Step 5: Attention ---
         // Gemma 4 uses scale=1.0 for attention (QK norms handle the scaling).
-        // However, the SDPA kernel hardcodes scale = 1/sqrt(head_dim).
-        // To compensate, we pre-scale Q by sqrt(head_dim) so the kernel's
-        // division cancels out, yielding an effective scale of 1.0.
-        // Q is bf16; read as f32, scale, write back as bf16 for SDPA.
-        let q_prescaled = {
-            let q_data = read_buffer_f32(&q_roped)?;
-            let sqrt_hd = (head_dim as f32).sqrt();
-            let scaled: Vec<f32> = q_data.iter().map(|v| v * sqrt_hd).collect();
-            f32_vec_to_bf16_buffer(&self.device, &scaled, vec![seq_len, n_heads * head_dim])?
-        };
-
+        // The SDPA kernel accepts a caller-provided scale parameter.
         let attn_out = self.compute_attention(
             layer_idx,
-            &q_prescaled,
+            &q_roped,
             seq_len,
             n_heads,
             n_kv_heads,
@@ -1071,13 +1062,22 @@ impl Gemma4Model {
             let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_slen, n_kv_heads, head_dim);
             eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
 
-            // Print Q pre-scaled values
-            let q_ps = read_buffer_f32(&q_prescaled)?;
-            eprintln!("[DIAG] Layer 0 Q pre-scaled (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
+            // Print Q values going into SDPA (no pre-scaling, scale=1.0 passed to kernel)
+            let q_ps = read_buffer_f32(&q_roped)?;
+            eprintln!("[DIAG] Layer 0 Q for SDPA (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
 
             let s = read_buffer_f32(&attn_out)?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
+            // Also print LAST token's attention output (head 0, first 5 dims)
+            let last_attn_start = (seq_len - 1) * n_heads * head_dim;
+            let last_attn_5 = &s[last_attn_start..last_attn_start + 5.min(s.len() - last_attn_start)];
+            eprintln!("[DIAG] Layer 0 attn output LAST token (head 0, first 5): {:?}", last_attn_5);
+            // Print Q last token for comparison
+            let q_data_all = read_buffer_f32(&q_roped)?;
+            let last_q_start = (seq_len - 1) * n_heads * head_dim;
+            let last_q_5 = &q_data_all[last_q_start..last_q_start + 5.min(q_data_all.len() - last_q_start)];
+            eprintln!("[DIAG] Layer 0 Q LAST token (head 0, first 5): {:?}", last_q_5);
             let nan_count = s.iter().filter(|v| v.is_nan()).count();
             let inf_count = s.iter().filter(|v| v.is_infinite()).count();
             if nan_count > 0 || inf_count > 0 {
@@ -1103,6 +1103,14 @@ impl Gemma4Model {
         );
         let post_attn_normed = self.apply_rms_norm(&o_proj, &post_attn_norm_name, seq_len)?;
         let residual1 = self.elementwise_add(input, &post_attn_normed, seq_len * hidden_size)?;
+
+        if diag {
+            let o_data = read_buffer_f32(&o_proj)?;
+            let last_o = (seq_len - 1) * hidden_size;
+            eprintln!("[DIAG] Layer 0 O proj LAST token first 5: {:?}", &o_data[last_o..last_o + 5]);
+            let r1_data = read_buffer_f32(&residual1)?;
+            eprintln!("[DIAG] Layer 0 residual1 LAST token first 5: {:?}", &r1_data[last_o..last_o + 5]);
+        }
 
         // --- Step 8: Feedforward with pre/post norms ---
         // Gemma 4 MoE layers have TWO parallel paths:
@@ -1131,6 +1139,12 @@ impl Gemma4Model {
             );
             let mlp_normed = self.apply_rms_norm(&mlp_out, &post_ff_norm1_name, seq_len)?;
 
+            if diag {
+                let d = read_buffer_f32(&mlp_normed)?;
+                let last = (seq_len - 1) * hidden_size;
+                eprintln!("[DIAG] Layer 0 dense_mlp_normed LAST token first 5: {:?}", &d[last..last + 5]);
+            }
+
             // Path 2: MoE experts
             let pre_ff_norm2_name = format!(
                 "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
@@ -1143,8 +1157,20 @@ impl Gemma4Model {
             );
             let moe_normed = self.apply_rms_norm(&moe_out, &post_ff_norm2_name, seq_len)?;
 
+            if diag {
+                let d = read_buffer_f32(&moe_normed)?;
+                let last = (seq_len - 1) * hidden_size;
+                eprintln!("[DIAG] Layer 0 moe_normed LAST token first 5: {:?}", &d[last..last + 5]);
+            }
+
             // Sum the two paths
             let combined = self.elementwise_add(&mlp_normed, &moe_normed, seq_len * hidden_size)?;
+
+            if diag {
+                let d = read_buffer_f32(&combined)?;
+                let last = (seq_len - 1) * hidden_size;
+                eprintln!("[DIAG] Layer 0 combined (dense+moe) LAST token first 5: {:?}", &d[last..last + 5]);
+            }
 
             // Final post-feedforward norm
             let post_ff_norm_name = format!(
@@ -1178,9 +1204,23 @@ impl Gemma4Model {
         // --- Step 9: Residual add ---
         let pre_scalar = self.elementwise_add(&residual1, &ffn_out, seq_len * hidden_size)?;
 
+        if diag {
+            let f = read_buffer_f32(&ffn_out)?;
+            let p = read_buffer_f32(&pre_scalar)?;
+            let last = (seq_len - 1) * hidden_size;
+            eprintln!("[DIAG] Layer 0 ffn_out LAST token first 5: {:?}", &f[last..last + 5]);
+            eprintln!("[DIAG] Layer 0 residual2 (r1+ffn) LAST token first 5: {:?}", &p[last..last + 5]);
+        }
+
         // --- Step 10: Apply layer_scalar to the ENTIRE layer output ---
         // Python: h = h * self.layer_scalar (applied to the full output, not sub-parts)
         let output = self.apply_layer_scalar(layer_idx, &pre_scalar, seq_len * hidden_size)?;
+
+        if diag {
+            let o = read_buffer_f32(&output)?;
+            let last = (seq_len - 1) * hidden_size;
+            eprintln!("[DIAG] Layer 0 FINAL output LAST token first 5: {:?}", &o[last..last + 5]);
+        }
 
         Ok(output)
     }
@@ -1755,20 +1795,23 @@ impl Gemma4Model {
             0
         };
 
-        // Apply RoPE per head
+        // Apply RoPE per head using non-traditional (Neox/split) convention.
+        // Gemma 4 uses rope_traditional=False, so pairs are (d[i], d[i + half])
+        // instead of consecutive (d[2i], d[2i+1]).
+        let half_rope = rope_dim / 2;
         for pos in 0..seq_len {
             let abs_pos = pos_offset + pos;
             for head in 0..n_heads {
                 let base = pos * total_dim + head * head_dim;
-                // Apply rotation to the first rope_dim dimensions (in pairs)
-                for i in (0..rope_dim).step_by(2) {
-                    let freq = 1.0 / theta.powf(i as f32 / rope_dim as f32);
+                // Non-traditional: pair dim i with dim i + half_rope
+                for i in 0..half_rope {
+                    let freq = 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32);
                     let angle = abs_pos as f32 * freq;
                     let cos_val = angle.cos();
                     let sin_val = angle.sin();
 
                     let idx0 = base + i;
-                    let idx1 = base + i + 1;
+                    let idx1 = base + i + half_rope;
                     if idx1 < output_data.len() {
                         let x0 = input_data[idx0];
                         let x1 = input_data[idx1];
@@ -1869,6 +1912,7 @@ impl Gemma4Model {
                     seq_len: seq_len as u32,
                     kv_seq_len: kv_seq_len as u32,
                     window_size: self.config.sliding_window as u32,
+                    scale: 1.0, // Gemma 4: QK norms handle scaling
                 };
                 sdpa_sliding::sdpa_sliding(
                     &mut encoder,
@@ -1889,6 +1933,7 @@ impl Gemma4Model {
                     head_dim: head_dim as u32,
                     seq_len: seq_len as u32,
                     kv_seq_len: kv_seq_len as u32,
+                    scale: 1.0, // Gemma 4: QK norms handle scaling
                 };
                 sdpa::sdpa(
                     &mut encoder,
@@ -2111,6 +2156,13 @@ impl Gemma4Model {
             if diag && t == 0 {
                 eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
                     expert_ids, routing_weights);
+            }
+            if diag && t == seq_len - 1 {
+                let mut sorted: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                eprintln!("[DIAG] MoE L0 T{} (LAST) router top-5: {:?}", t, &sorted[..5.min(sorted.len())]);
+                eprintln!("[DIAG] MoE L0 T{} (LAST) selected experts: {:?}, weights: {:?}",
+                    t, expert_ids, routing_weights);
             }
 
             // Step 3: Dispatch to selected experts and accumulate
