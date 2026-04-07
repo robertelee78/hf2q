@@ -1712,9 +1712,9 @@ impl Gemma4Model {
     /// MoE FFN for a single layer.
     ///
     /// For each token in the sequence:
-    /// 1. Router: matmul hidden_state with gate weight to get [n_experts] logits
-    /// 2. Top-K selection with softmax routing weights
-    /// 3. Dispatch to selected experts (gate_proj, up_proj, down_proj with GELU)
+    /// 1. Router: dequantize router weight and compute logits, apply sigmoid routing
+    /// 2. Top-K selection with sigmoid weights scaled by per_expert_scale
+    /// 3. Dispatch to selected experts (slice 3D packed tensors per expert)
     /// 4. Weighted sum of expert outputs
     fn moe_ffn(
         &mut self,
@@ -1727,7 +1727,7 @@ impl Gemma4Model {
         let top_k = self.config.top_k_experts;
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        // Router weight: [n_experts, hidden_size]
+        // Router weight: [n_experts, hidden_size] (may be quantized)
         let router_weight_name =
             format!("model.layers.{layer_idx}.router.proj.weight");
 
@@ -1735,16 +1735,13 @@ impl Gemma4Model {
         let mut output_data = vec![0.0f32; seq_len * hidden_size];
 
         // Check if router weight exists -- if not, check for a dense FFN
-        let has_moe_router = self.weights.get(&router_weight_name).is_some();
+        let has_moe_router = self.weights.get(&router_weight_name).is_some()
+            || self.weights.get(&format!("language_model.{}", router_weight_name)).is_some();
 
         if diag {
-            // Also check with the language_model prefix
-            let alt_name = format!("language_model.{}", router_weight_name);
-            let has_alt = self.weights.get(&alt_name).is_some();
-            eprintln!("[DIAG] MoE layer 0: has_moe_router={} (checked '{}'), alt_prefix={}",
-                has_moe_router, router_weight_name, has_alt);
-            if !has_moe_router && !has_alt {
-                // List some available weight keys for this layer
+            eprintln!("[DIAG] MoE layer 0: has_moe_router={} (checked '{}')",
+                has_moe_router, router_weight_name);
+            if !has_moe_router {
                 let prefix = format!("model.layers.{layer_idx}.");
                 let alt_prefix = format!("language_model.model.layers.{layer_idx}.");
                 let matching: Vec<_> = self.weights.weights.keys()
@@ -1759,37 +1756,77 @@ impl Gemma4Model {
             if diag {
                 eprintln!("[DIAG] Falling back to dense FFN for layer {}", layer_idx);
             }
-            // Dense FFN fallback (some layers might not have MoE)
             return self.dense_ffn(layer_idx, input, seq_len);
         }
 
         if diag {
-            // Check router weight info
             let rw = require_weight(&self.weights, &router_weight_name)?;
             eprintln!("[DIAG] router weight: dtype={}, shape={:?}, byte_len={}",
                 rw.buffer.dtype(), rw.buffer.shape(), rw.buffer.byte_len());
+            if let Some(ref qm) = rw.quant_meta {
+                eprintln!("[DIAG]   router quant: bits={}, group_size={}", qm.bits, qm.group_size);
+            }
         }
+
+        // Dequantize the router weight once for all tokens in this layer call.
+        // Router weight is [n_experts, hidden_size], possibly quantized.
+        let router_f32 = self.dequantize_2d_weight(
+            &format!("model.layers.{layer_idx}.router.proj"),
+            n_experts,
+            hidden_size,
+        )?;
+
+        // Read router.scale (scalar) and per_expert_scale [n_experts] if present
+        let router_scale = self.read_scalar_weight(
+            &format!("model.layers.{layer_idx}.router.scale"),
+        ).unwrap_or(1.0);
+
+        let per_expert_scale = self.read_1d_weight(
+            &format!("model.layers.{layer_idx}.router.per_expert_scale"),
+            n_experts,
+        ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
+
+        if diag {
+            eprintln!("[DIAG] router_scale={}, per_expert_scale first 5: {:?}",
+                router_scale, &per_expert_scale[..5.min(per_expert_scale.len())]);
+            let n = router_f32.len().min(10);
+            eprintln!("[DIAG] router_f32 first {}: {:?}", n, &router_f32[..n]);
+        }
+
+        // Pre-dequantize expert weights once for this layer (avoids redundant work
+        // across tokens). Each returns a flat Vec<f32> of size [rows * cols] for
+        // one expert, keyed by expert_id. We use lazy per-expert dequant below.
+        let intermediate_size = self.config.moe_intermediate_size;
 
         // Process token by token for MoE (each token routes to different experts)
         for t in 0..seq_len {
             let token_hidden = &input_data[t * hidden_size..(t + 1) * hidden_size];
 
-            // Step 1: Router -- CPU matmul for the gate
-            let router_data = self.cpu_router_forward(layer_idx, token_hidden)?;
+            // Step 1: Router logits via CPU matmul with dequantized router weight
+            let mut logits = vec![0.0f32; n_experts];
+            for e in 0..n_experts {
+                let mut sum = 0.0f32;
+                for k in 0..hidden_size {
+                    sum += router_f32[e * hidden_size + k] * token_hidden[k];
+                }
+                // Apply router scale
+                logits[e] = sum * router_scale;
+            }
 
             if diag && t == 0 {
-                let mut router_sorted: Vec<(usize, f32)> = router_data.iter().copied().enumerate().collect();
-                router_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                eprintln!("[DIAG] MoE L0 T0 router top-5: {:?}", &router_sorted[..5.min(router_sorted.len())]);
-                let nan_count = router_data.iter().filter(|v| v.is_nan()).count();
+                let mut sorted: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                eprintln!("[DIAG] MoE L0 T0 router logits (pre-sigmoid) top-5: {:?}",
+                    &sorted[..5.min(sorted.len())]);
+                let nan_count = logits.iter().filter(|v| v.is_nan()).count();
                 if nan_count > 0 {
-                    eprintln!("[DIAG]   WARNING: router has {} NaN values", nan_count);
+                    eprintln!("[DIAG]   WARNING: router logits have {} NaN values", nan_count);
                 }
             }
 
-            // Step 2: Top-K selection and softmax
+            // Step 2: Sigmoid routing + per_expert_scale, then top-K
             let (expert_ids, routing_weights) =
-                top_k_softmax(&router_data, n_experts, top_k);
+                top_k_sigmoid(&logits, &per_expert_scale, top_k);
 
             if diag && t == 0 {
                 eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
@@ -1805,8 +1842,10 @@ impl Gemma4Model {
                     continue;
                 }
 
-                let expert_output =
-                    self.expert_ffn(layer_idx, expert_id, token_hidden)?;
+                let expert_output = self.expert_ffn_3d(
+                    layer_idx, expert_id, token_hidden,
+                    hidden_size, intermediate_size,
+                )?;
 
                 if diag && t == 0 && rank == 0 {
                     let n = expert_output.len().min(5);
@@ -1840,84 +1879,147 @@ impl Gemma4Model {
         )
     }
 
-    /// CPU router forward: matmul hidden_state with gate weight.
-    fn cpu_router_forward(
+    /// Dequantize a 2D weight tensor (possibly quantized) and return as flat f32 [rows * cols].
+    ///
+    /// `weight_base` is the base name without `.weight` suffix; we look up
+    /// `.weight`, `.scales`, `.biases` as needed.
+    fn dequantize_2d_weight(
         &self,
-        layer_idx: usize,
-        token_hidden: &[f32],
+        weight_base: &str,
+        rows: usize,
+        cols: usize,
     ) -> Result<Vec<f32>, Gemma4Error> {
-        let router_name =
-            format!("model.layers.{layer_idx}.router.proj.weight");
-        let router_weight = require_weight(&self.weights, &router_name)?;
-        let router_data = read_weight_as_f32(router_weight)?;
+        let weight_name = format!("{weight_base}.weight");
+        let loaded = require_weight(&self.weights, &weight_name)?;
 
-        let hidden_size = self.config.hidden_size;
-        let n_experts = self.config.num_experts;
-
-        // router_weight is [n_experts, hidden_size]
-        let mut logits = vec![0.0f32; n_experts];
-        for e in 0..n_experts {
-            let mut sum = 0.0f32;
-            for k in 0..hidden_size {
-                sum += router_data[e * hidden_size + k] * token_hidden[k];
-            }
-            logits[e] = sum;
+        // If not quantized, just read as float
+        if loaded.quant_meta.is_none() || loaded.buffer.dtype() == DType::F32
+            || loaded.buffer.dtype() == DType::F16 || loaded.buffer.dtype() == DType::BF16
+        {
+            return read_weight_as_f32(loaded);
         }
 
-        Ok(logits)
+        // Quantized path: dequantize on CPU
+        let qmeta = loaded.quant_meta.as_ref().unwrap();
+        let bits = qmeta.bits as usize;
+        let group_size = qmeta.group_size;
+
+        let scales_name = format!("{weight_base}.scales");
+        let biases_name = format!("{weight_base}.biases");
+        let scales_w = require_weight(&self.weights, &scales_name)?;
+        let biases_w = require_weight(&self.weights, &biases_name)?;
+
+        let packed_u32: &[u32] = loaded.buffer.as_slice().map_err(|e| {
+            Gemma4Error::ForwardError { reason: format!("read packed weight u32: {e}") }
+        })?;
+        let scales_f32 = read_weight_as_f32(scales_w)?;
+        let biases_f32 = read_weight_as_f32(biases_w)?;
+
+        cpu_dequantize_flat(packed_u32, &scales_f32, &biases_f32, rows, cols, bits, group_size)
     }
 
-    /// Run a single expert's FFN: gate_proj(x) * GELU(up_proj(x)), then down_proj.
-    fn expert_ffn(
+    /// Read a scalar weight (bf16 or f32) as f32.
+    fn read_scalar_weight(&self, name: &str) -> Result<f32, Gemma4Error> {
+        let loaded = require_weight(&self.weights, name)?;
+        if loaded.buffer.byte_len() >= 4 && loaded.buffer.dtype() == DType::F32 {
+            let s: &[f32] = loaded.buffer.as_slice().map_err(|e| {
+                Gemma4Error::ForwardError { reason: format!("read scalar f32: {e}") }
+            })?;
+            Ok(s[0])
+        } else {
+            // bf16 (2 bytes)
+            let raw: &[u16] = loaded.buffer.as_slice().map_err(|e| {
+                Gemma4Error::ForwardError { reason: format!("read scalar bf16: {e}") }
+            })?;
+            Ok(half::bf16::from_bits(raw[0]).to_f32())
+        }
+    }
+
+    /// Read a 1D weight vector as f32, handling bf16/f16/f32.
+    fn read_1d_weight(
+        &self,
+        name: &str,
+        expected_len: usize,
+    ) -> Result<Vec<f32>, Gemma4Error> {
+        let loaded = require_weight(&self.weights, name)?;
+        match loaded.buffer.dtype() {
+            DType::F32 => {
+                let s: &[f32] = loaded.buffer.as_slice().map_err(|e| {
+                    Gemma4Error::ForwardError { reason: format!("read 1d f32: {e}") }
+                })?;
+                Ok(s[..expected_len].to_vec())
+            }
+            DType::F16 => {
+                let s: &[u16] = loaded.buffer.as_slice().map_err(|e| {
+                    Gemma4Error::ForwardError { reason: format!("read 1d f16: {e}") }
+                })?;
+                Ok(s[..expected_len].iter().map(|&b| f16_to_f32(b)).collect())
+            }
+            DType::BF16 => {
+                let s: &[u16] = loaded.buffer.as_slice().map_err(|e| {
+                    Gemma4Error::ForwardError { reason: format!("read 1d bf16: {e}") }
+                })?;
+                Ok(s[..expected_len].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect())
+            }
+            other => Err(Gemma4Error::ForwardError {
+                reason: format!("Unsupported dtype for 1d weight '{}': {}", name, other),
+            }),
+        }
+    }
+
+    /// Run a single expert's FFN by slicing 3D packed weight tensors.
+    ///
+    /// Expert weights are stored as 3D tensors `[n_experts, rows, packed_cols]`
+    /// where `packed_cols = cols * bits / 32`. This method slices the expert's
+    /// 2D plane `[rows, packed_cols]` along dim 0, dequantizes, and computes
+    /// the gated FFN: `down_proj(GELU(gate_proj(x)) * up_proj(x))`.
+    fn expert_ffn_3d(
         &self,
         layer_idx: usize,
         expert_id: usize,
         token_hidden: &[f32],
+        hidden_size: usize,
+        intermediate_size: usize,
     ) -> Result<Vec<f32>, Gemma4Error> {
-        let hidden_size = self.config.hidden_size;
-        let intermediate_size = self.config.moe_intermediate_size;
         // Only diagnose for first call on layer 0
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
-        // Use a simple static to only print once
         static DIAG_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let diag = diag && !DIAG_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed);
 
-        // Weight names for expert
-        let base = format!(
-            "model.layers.{layer_idx}.experts.switch_glu"
-        );
+        let base = format!("model.layers.{layer_idx}.experts.switch_glu");
 
-        let gate_name = format!("{base}.gate_proj.weight");
-        let up_name = format!("{base}.up_proj.weight");
-        let down_name = format!("{base}.down_proj.weight");
+        let gate_name = format!("{base}.gate_proj");
+        let up_name = format!("{base}.up_proj");
+        let down_name = format!("{base}.down_proj");
 
         if diag {
-            // Check what the weight looks like
-            let gw = require_weight(&self.weights, &gate_name)?;
-            eprintln!("[DIAG] expert_ffn L0 E{}: gate_proj dtype={}, shape={:?}, byte_len={}",
+            let gw = require_weight(&self.weights, &format!("{gate_name}.weight"))?;
+            eprintln!("[DIAG] expert_ffn_3d L0 E{}: gate_proj dtype={}, shape={:?}, byte_len={}",
                 expert_id, gw.buffer.dtype(), gw.buffer.shape(), gw.buffer.byte_len());
             if let Some(ref qm) = gw.quant_meta {
                 eprintln!("[DIAG]   gate_proj quant: bits={}, group_size={}", qm.bits, qm.group_size);
             }
-            let uw = require_weight(&self.weights, &up_name)?;
-            eprintln!("[DIAG]   up_proj dtype={}, shape={:?}", uw.buffer.dtype(), uw.buffer.shape());
-            let dw = require_weight(&self.weights, &down_name)?;
+            let dw = require_weight(&self.weights, &format!("{down_name}.weight"))?;
             eprintln!("[DIAG]   down_proj dtype={}, shape={:?}", dw.buffer.dtype(), dw.buffer.shape());
         }
 
-        let gate_data = self.read_expert_weight(&gate_name,
-            intermediate_size, hidden_size)?;
-        let up_data = self.read_expert_weight(&up_name,
-            intermediate_size, hidden_size)?;
-        let down_data = self.read_expert_weight(&down_name,
-            hidden_size, intermediate_size)?;
+        // gate_proj: [n_experts, intermediate_size, packed_k] where packed_k = hidden_size * bits / 32
+        let gate_data = self.dequantize_expert_slice(
+            &gate_name, expert_id, intermediate_size, hidden_size,
+        )?;
+        // up_proj: same shape as gate_proj
+        let up_data = self.dequantize_expert_slice(
+            &up_name, expert_id, intermediate_size, hidden_size,
+        )?;
+        // down_proj: [n_experts, hidden_size, packed_k] where packed_k = intermediate_size * bits / 32
+        let down_data = self.dequantize_expert_slice(
+            &down_name, expert_id, hidden_size, intermediate_size,
+        )?;
 
         if diag {
-            eprintln!("[DIAG] expert_ffn L0 E{}: gate_data len={} (expect {}x{}={}), first 5: {:?}",
+            eprintln!("[DIAG] expert_ffn_3d L0 E{}: gate_data len={} (expect {}x{}={}), first 5: {:?}",
                 expert_id, gate_data.len(), intermediate_size, hidden_size,
                 intermediate_size * hidden_size, &gate_data[..5.min(gate_data.len())]);
-            eprintln!("[DIAG]   up_data len={}, first 5: {:?}",
-                up_data.len(), &up_data[..5.min(up_data.len())]);
             eprintln!("[DIAG]   down_data len={} (expect {}x{}={}), first 5: {:?}",
                 down_data.len(), hidden_size, intermediate_size,
                 hidden_size * intermediate_size, &down_data[..5.min(down_data.len())]);
@@ -1925,7 +2027,7 @@ impl Gemma4Model {
             let up_nan = up_data.iter().filter(|v| v.is_nan()).count();
             let down_nan = down_data.iter().filter(|v| v.is_nan()).count();
             if gate_nan > 0 || up_nan > 0 || down_nan > 0 {
-                eprintln!("[DIAG]   NaN in weights! gate={}, up={}, down={}",
+                eprintln!("[DIAG]   NaN in dequantized weights! gate={}, up={}, down={}",
                     gate_nan, up_nan, down_nan);
             }
             eprintln!("[DIAG]   input token_hidden first 5: {:?}, len={}",
@@ -1944,12 +2046,8 @@ impl Gemma4Model {
 
         if diag {
             let n = gate_out.len().min(5);
-            eprintln!("[DIAG] expert_ffn L0 E{}: gate_out first {}: {:?}",
+            eprintln!("[DIAG] expert_ffn_3d L0 E{}: gate_out first {}: {:?}",
                 expert_id, n, &gate_out[..n]);
-            let nan_count = gate_out.iter().filter(|v| v.is_nan()).count();
-            if nan_count > 0 {
-                eprintln!("[DIAG]   WARNING: gate_out has {} NaN", nan_count);
-            }
         }
 
         // up_out = up_proj @ x   [intermediate_size]
@@ -1962,16 +2060,6 @@ impl Gemma4Model {
             up_out[i] = sum;
         }
 
-        if diag {
-            let n = up_out.len().min(5);
-            eprintln!("[DIAG] expert_ffn L0 E{}: up_out first {}: {:?}",
-                expert_id, n, &up_out[..n]);
-            let nan_count = up_out.iter().filter(|v| v.is_nan()).count();
-            if nan_count > 0 {
-                eprintln!("[DIAG]   WARNING: up_out has {} NaN", nan_count);
-            }
-        }
-
         // hidden = GELU(gate_out) * up_out
         let mut hidden = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
@@ -1980,7 +2068,7 @@ impl Gemma4Model {
 
         if diag {
             let n = hidden.len().min(5);
-            eprintln!("[DIAG] expert_ffn L0 E{}: after GELU*up first {}: {:?}",
+            eprintln!("[DIAG] expert_ffn_3d L0 E{}: after GELU*up first {}: {:?}",
                 expert_id, n, &hidden[..n]);
         }
 
@@ -1996,7 +2084,7 @@ impl Gemma4Model {
 
         if diag {
             let n = expert_out.len().min(5);
-            eprintln!("[DIAG] expert_ffn L0 E{}: final expert_out first {}: {:?}",
+            eprintln!("[DIAG] expert_ffn_3d L0 E{}: final expert_out first {}: {:?}",
                 expert_id, n, &expert_out[..n]);
             let nan_count = expert_out.iter().filter(|v| v.is_nan()).count();
             if nan_count > 0 {
@@ -2007,15 +2095,77 @@ impl Gemma4Model {
         Ok(expert_out)
     }
 
-    /// Read an expert weight tensor as f32 (handling quantized or float formats).
-    fn read_expert_weight(
+    /// Dequantize a single expert's 2D weight slice from a 3D packed tensor.
+    ///
+    /// The weight tensor has shape `[n_experts, rows, packed_cols]` where
+    /// `packed_cols = cols * bits / 32`. Scales and biases have shape
+    /// `[n_experts, rows, n_groups]` where `n_groups = cols / group_size`.
+    ///
+    /// This method extracts `expert_id`'s plane and dequantizes to `[rows, cols]` f32.
+    fn dequantize_expert_slice(
         &self,
-        name: &str,
-        _rows: usize,
-        _cols: usize,
+        weight_base: &str,
+        expert_id: usize,
+        rows: usize,
+        cols: usize,
     ) -> Result<Vec<f32>, Gemma4Error> {
-        let loaded = require_weight(&self.weights, name)?;
-        read_weight_as_f32(loaded)
+        let weight_name = format!("{weight_base}.weight");
+        let loaded = require_weight(&self.weights, &weight_name)?;
+
+        // If not quantized (float dtype), handle the 3D float case
+        if loaded.quant_meta.is_none() || loaded.buffer.dtype() == DType::F32
+            || loaded.buffer.dtype() == DType::F16 || loaded.buffer.dtype() == DType::BF16
+        {
+            let all_data = read_weight_as_f32(loaded)?;
+            let shape = loaded.buffer.shape();
+            if shape.len() == 3 {
+                // 3D float tensor: [n_experts, rows, cols]
+                let expert_stride = shape[1] * shape[2];
+                let start = expert_id * expert_stride;
+                let end = start + rows * cols;
+                return Ok(all_data[start..end].to_vec());
+            }
+            // 2D: already per-expert or shared (return as-is)
+            return Ok(all_data);
+        }
+
+        // Quantized 3D tensor path
+        let qmeta = loaded.quant_meta.as_ref().unwrap();
+        let bits = qmeta.bits as usize;
+        let group_size = qmeta.group_size;
+
+        let scales_name = format!("{weight_base}.scales");
+        let biases_name = format!("{weight_base}.biases");
+        let scales_w = require_weight(&self.weights, &scales_name)?;
+        let biases_w = require_weight(&self.weights, &biases_name)?;
+
+        let packed_u32: &[u32] = loaded.buffer.as_slice().map_err(|e| {
+            Gemma4Error::ForwardError { reason: format!("read 3D packed weight u32: {e}") }
+        })?;
+        let scales_f32 = read_weight_as_f32(scales_w)?;
+        let biases_f32 = read_weight_as_f32(biases_w)?;
+
+        let shape = loaded.buffer.shape();
+        let scales_shape = scales_w.buffer.shape();
+
+        // Determine packed_cols and n_groups from the actual tensor shape
+        let packed_cols = if shape.len() == 3 { shape[2] } else { shape[1] };
+        let n_groups = if scales_shape.len() == 3 { scales_shape[2] } else { scales_shape[1] };
+
+        // Stride for one expert in the packed weight tensor
+        let weight_expert_stride = rows * packed_cols;
+        let scales_expert_stride = rows * n_groups;
+
+        let w_start = expert_id * weight_expert_stride;
+        let w_end = w_start + weight_expert_stride;
+        let s_start = expert_id * scales_expert_stride;
+        let s_end = s_start + scales_expert_stride;
+
+        let expert_packed = &packed_u32[w_start..w_end];
+        let expert_scales = &scales_f32[s_start..s_end];
+        let expert_biases = &biases_f32[s_start..s_end];
+
+        cpu_dequantize_flat(expert_packed, expert_scales, expert_biases, rows, cols, bits, group_size)
     }
 
     /// Dense (non-MoE) FFN fallback.
@@ -2255,6 +2405,14 @@ fn read_buffer_f32(buffer: &MlxBuffer) -> Result<Vec<f32>, Gemma4Error> {
             })?;
             Ok(slice.iter().map(|&bits| f16_to_f32(bits)).collect())
         }
+        DType::BF16 => {
+            let slice: &[u16] = buffer.as_slice().map_err(|e| {
+                Gemma4Error::ForwardError {
+                    reason: format!("Buffer read bf16: {e}"),
+                }
+            })?;
+            Ok(slice.iter().map(|&bits| half::bf16::from_bits(bits).to_f32()).collect())
+        }
         other => Err(Gemma4Error::ForwardError {
             reason: format!("Unsupported buffer dtype for read: {other}"),
         }),
@@ -2374,6 +2532,9 @@ fn gelu_pytorch_tanh(x: f32) -> f32 {
 }
 
 /// Top-K selection with softmax normalization over the selected experts.
+///
+/// Used by models that employ softmax-based routing.
+#[allow(dead_code)]
 fn top_k_softmax(
     logits: &[f32],
     _n_experts: usize,
@@ -2399,6 +2560,84 @@ fn top_k_softmax(
         .collect();
 
     (expert_ids, weights)
+}
+
+/// Top-K selection with sigmoid routing (Gemma 4 style).
+///
+/// For each expert: routing_weight = sigmoid(logit) * per_expert_scale[expert].
+/// Then select the top-K experts by routing_weight. The returned weights are the
+/// raw sigmoid * scale values (NOT renormalized) — this matches the Gemma 4 spec.
+fn top_k_sigmoid(
+    logits: &[f32],
+    per_expert_scale: &[f32],
+    top_k: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    let n = logits.len();
+    // Compute sigmoid(logit) * per_expert_scale for each expert
+    let mut scored: Vec<(usize, f32)> = (0..n)
+        .map(|i| {
+            let sig = 1.0 / (1.0 + (-logits[i]).exp());
+            (i, sig * per_expert_scale[i])
+        })
+        .collect();
+
+    // Sort by score descending
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let selected: Vec<(usize, f32)> = scored.into_iter().take(top_k).collect();
+    let expert_ids: Vec<usize> = selected.iter().map(|(id, _)| *id).collect();
+    let weights: Vec<f32> = selected.iter().map(|(_, w)| *w).collect();
+
+    (expert_ids, weights)
+}
+
+/// CPU dequantization of a flat packed uint32 weight array.
+///
+/// Supports 4-bit and 6-bit quantization with affine dequant:
+///   float_val = scale * quant_val + bias
+///
+/// For N-bit packing, each u32 contains `32/N` quantized values.
+/// MLX packs values in little-endian order within each u32 word.
+///
+/// Layout: weight `[rows, packed_cols]`, scales/biases `[rows, n_groups]`
+/// where `n_groups = cols / group_size`, `packed_cols = cols * bits / 32`.
+fn cpu_dequantize_flat(
+    packed: &[u32],
+    scales: &[f32],
+    biases: &[f32],
+    rows: usize,
+    cols: usize,
+    bits: usize,
+    group_size: usize,
+) -> Result<Vec<f32>, Gemma4Error> {
+    let vals_per_u32 = 32 / bits;
+    let mask = (1u32 << bits) - 1;
+    let packed_cols = (cols * bits + 31) / 32; // ceil division
+    let n_groups = (cols + group_size - 1) / group_size;
+
+    let mut output = vec![0.0f32; rows * cols];
+
+    for row in 0..rows {
+        let packed_row = &packed[row * packed_cols..];
+        let scale_row = &scales[row * n_groups..];
+        let bias_row = &biases[row * n_groups..];
+
+        for col in 0..cols {
+            // Which u32 word and which position within it?
+            let word_idx = col / vals_per_u32;
+            let bit_offset = (col % vals_per_u32) * bits;
+            let quant_val = (packed_row[word_idx] >> bit_offset) & mask;
+
+            // Which group does this column belong to?
+            let group_idx = col / group_size;
+            let scale = scale_row[group_idx];
+            let bias = bias_row[group_idx];
+
+            output[row * cols + col] = scale * (quant_val as f32) + bias;
+        }
+    }
+
+    Ok(output)
 }
 
 /// Convert f16 bits to f32.
@@ -2631,5 +2870,92 @@ mod tests {
         let sticky = if (mantissa & 0xFFF) != 0 { 1u32 } else { 0 };
         let round_up = round_bit & (sticky | m);
         (sign | ((new_exp as u32) << 10) | m + round_up) as u16
+    }
+
+    #[test]
+    fn test_top_k_sigmoid_basic() {
+        // 5 experts, select top 2
+        let logits = vec![0.0, 2.0, -1.0, 1.0, 3.0];
+        let per_expert_scale = vec![1.0; 5];
+        let (ids, weights) = top_k_sigmoid(&logits, &per_expert_scale, 2);
+
+        assert_eq!(ids.len(), 2);
+        assert_eq!(weights.len(), 2);
+        // Expert 4 (logit=3.0) and expert 1 (logit=2.0) should be top 2
+        assert_eq!(ids[0], 4);
+        assert_eq!(ids[1], 1);
+        // sigmoid(3.0) ~ 0.9526, sigmoid(2.0) ~ 0.8808
+        assert!((weights[0] - 0.9526).abs() < 0.01);
+        assert!((weights[1] - 0.8808).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_top_k_sigmoid_with_scale() {
+        // per_expert_scale can reorder experts
+        let logits = vec![2.0, 1.0];
+        let per_expert_scale = vec![0.1, 10.0]; // scale suppresses expert 0, boosts expert 1
+        let (ids, weights) = top_k_sigmoid(&logits, &per_expert_scale, 1);
+
+        assert_eq!(ids[0], 1); // expert 1 wins despite lower logit
+        // sigmoid(1.0) * 10.0 ~ 7.31
+        assert!(weights[0] > 5.0);
+    }
+
+    #[test]
+    fn test_cpu_dequantize_flat_4bit() {
+        // 2 rows, 8 cols, 4-bit, group_size=4
+        // Each u32 holds 8 x 4-bit values = 8 values
+        // packed_cols = 8 * 4 / 32 = 1 u32 per row
+        // n_groups = 8 / 4 = 2
+        let rows = 2;
+        let cols = 8;
+        let bits = 4;
+        let group_size = 4;
+
+        // Pack values 0..7 into row 0, and 8..15 into row 1
+        // 4-bit packing: val[0] in bits 0-3, val[1] in bits 4-7, etc.
+        let row0_packed: u32 = 0 | (1 << 4) | (2 << 8) | (3 << 12)
+            | (4 << 16) | (5 << 20) | (6 << 24) | (7 << 28);
+        let row1_packed: u32 = 8 | (9 << 4) | (10 << 8) | (11 << 12)
+            | (12 << 16) | (13 << 20) | (14 << 24) | (15 << 28);
+        let packed = vec![row0_packed, row1_packed];
+
+        // scale=1.0, bias=0.0 for identity transform
+        let scales = vec![1.0f32; rows * 2]; // 2 groups per row
+        let biases = vec![0.0f32; rows * 2];
+
+        let result = cpu_dequantize_flat(&packed, &scales, &biases, rows, cols, bits, group_size).unwrap();
+        assert_eq!(result.len(), 16);
+        for i in 0..16 {
+            assert!(
+                (result[i] - i as f32).abs() < 1e-6,
+                "result[{}] = {}, expected {}",
+                i, result[i], i,
+            );
+        }
+    }
+
+    #[test]
+    fn test_cpu_dequantize_flat_affine() {
+        // Test scale=2.0, bias=-3.0
+        let rows = 1;
+        let cols = 4;
+        let bits = 4;
+        let group_size = 4;
+
+        // Pack values [1, 2, 3, 4]
+        let packed = vec![1u32 | (2 << 4) | (3 << 8) | (4 << 12)];
+        let scales = vec![2.0f32]; // 1 group
+        let biases = vec![-3.0f32];
+
+        let result = cpu_dequantize_flat(&packed, &scales, &biases, rows, cols, bits, group_size).unwrap();
+        // 2.0 * 1 + (-3.0) = -1.0
+        // 2.0 * 2 + (-3.0) = 1.0
+        // 2.0 * 3 + (-3.0) = 3.0
+        // 2.0 * 4 + (-3.0) = 5.0
+        assert!((result[0] - (-1.0)).abs() < 1e-6);
+        assert!((result[1] - 1.0).abs() < 1e-6);
+        assert!((result[2] - 3.0).abs() < 1e-6);
+        assert!((result[3] - 5.0).abs() < 1e-6);
     }
 }
