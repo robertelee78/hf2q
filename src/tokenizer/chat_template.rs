@@ -147,6 +147,7 @@ impl ChatTemplate {
             .render(context! {
                 messages => messages,
                 add_generation_prompt => true,
+                enable_thinking => true,
                 bos_token => bos_token,
                 eos_token => eos_token,
             })
@@ -193,6 +194,7 @@ impl ChatTemplate {
             .render(context! {
                 messages => messages,
                 add_generation_prompt => true,
+                enable_thinking => true,
                 bos_token => bos_token,
                 eos_token => eos_token,
                 tools => tools,

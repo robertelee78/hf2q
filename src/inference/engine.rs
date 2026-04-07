@@ -219,15 +219,17 @@ impl InferenceEngine {
             tool_calls: None,
         }];
 
+        // Use id_to_token (not decode) for BOS/EOS strings.
+        // decode() skips special tokens, returning empty string for <bos>.
         let bos_token = self
             .tokenizer
             .bos_id()
-            .and_then(|id| self.tokenizer.decode(&[id]).ok())
+            .and_then(|id| self.tokenizer.id_to_token(id))
             .unwrap_or_default();
         let eos_token = self
             .tokenizer
             .eos_id()
-            .and_then(|id| self.tokenizer.decode(&[id]).ok())
+            .and_then(|id| self.tokenizer.id_to_token(id))
             .unwrap_or_default();
 
         let rendered = self

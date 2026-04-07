@@ -135,6 +135,11 @@ impl HfTokenizer {
         self.inner.get_vocab_size(true)
     }
 
+    /// Get the string representation of a token ID, including special tokens.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+
     /// Get the BOS token ID if configured.
     pub fn bos_id(&self) -> Option<u32> {
         self.special_tokens.bos_id
