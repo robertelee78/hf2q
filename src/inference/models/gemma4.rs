@@ -19,7 +19,7 @@ use mlx_native::ops::{
     elementwise, embedding, quantized_matmul as qmatmul,
     rms_norm, sdpa, sdpa_sliding, softcap,
 };
-use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
+use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
 use tracing::{debug, info};
 
 use crate::inference::kv_cache::{CacheType, KvCache, KvCacheError};
@@ -891,85 +891,94 @@ impl Gemma4Model {
         let head_dim = self.config.head_dim(layer_idx);
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        // --- Step 1: Pre-attention RMS norm ---
-        let norm_name = format!(
-            "model.layers.{layer_idx}.input_layernorm.weight"
-        );
-        let normed = self.apply_rms_norm(input, &norm_name, seq_len)?;
-
-        if diag {
-            let s = read_buffer_f32(&normed)?;
-            let n = s.len().min(5);
-            eprintln!("[DIAG] Layer 0 after rms_norm, first {}: {:?}", n, &s[..n]);
-        }
-
-        // --- Step 2: Q/K/V projections ---
-        // For Gemma 4: Q has n_heads * head_dim output dims,
-        // K and V each have n_kv_heads * head_dim output dims.
-        // If attention_k_eq_v, K and V share the same projection weight.
+        // =================================================================
+        // BATCH 1: Pre-attention norm + Q/K/V projections
+        //
+        // All GPU dispatches (rms_norm, casts, qmatmuls) are encoded into a
+        // single command buffer. One commit_and_wait replaces ~10 individual
+        // commits that the unbatched path would have used.
+        // =================================================================
         let q_out_dim = n_heads * head_dim;
         let kv_out_dim = n_kv_heads * head_dim;
         let eps = self.config.rms_norm_eps;
 
-        let q_proj = self.quantized_projection(
-            &normed,
-            &format!("model.layers.{layer_idx}.self_attn.q_proj"),
-            seq_len,
-            hidden_size,
-            q_out_dim,
-        )?;
+        let (normed, q_proj, k_proj, v_proj);
+        {
+            let mut encoder = self.device.command_encoder()?;
 
-        if diag {
-            let s = read_buffer_f32(&q_proj)?;
-            let n = s.len().min(5);
-            eprintln!("[DIAG] Layer 0 after Q proj (dim={}), first {}: {:?}", q_out_dim, n, &s[..n]);
-        }
+            // Step 1: Pre-attention RMS norm
+            let norm_name = format!(
+                "model.layers.{layer_idx}.input_layernorm.weight"
+            );
+            normed = self.apply_rms_norm_with_encoder(&mut encoder, input, &norm_name, seq_len)?;
 
-        let k_proj = self.quantized_projection(
-            &normed,
-            &format!("model.layers.{layer_idx}.self_attn.k_proj"),
-            seq_len,
-            hidden_size,
-            kv_out_dim,
-        )?;
+            // Step 2: Q/K/V projections (each batches cast+qmatmul+cast internally)
+            q_proj = self.quantized_projection_with_encoder(
+                &mut encoder,
+                &normed,
+                &format!("model.layers.{layer_idx}.self_attn.q_proj"),
+                seq_len,
+                hidden_size,
+                q_out_dim,
+            )?;
 
-        // K-eq-V applies to GLOBAL (full_attention) layers only.
-        // Sliding layers always use a separate v_proj weight.
-        // Python: self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
-        let use_k_eq_v = self.config.attention_k_eq_v
-            && layer_type == LayerAttentionType::Global;
-
-        let v_proj = if use_k_eq_v {
-            // K == V: reuse the K projection output as V
-            // Note: we need to create a separate buffer copy because they might
-            // diverge after norms (k_norm vs v_norm, RoPE only on K)
-            self.quantized_projection(
+            k_proj = self.quantized_projection_with_encoder(
+                &mut encoder,
                 &normed,
                 &format!("model.layers.{layer_idx}.self_attn.k_proj"),
                 seq_len,
                 hidden_size,
                 kv_out_dim,
-            )?
-        } else {
-            self.quantized_projection(
-                &normed,
-                &format!("model.layers.{layer_idx}.self_attn.v_proj"),
-                seq_len,
-                hidden_size,
-                kv_out_dim,
-            )?
-        };
+            )?;
 
-        // --- Step 2b: QK norms (per-head RMS norm on Q and K) ---
-        // Gemma 4 applies RMS norm per-head to Q and K after projection, before RoPE.
-        // Weight shape is [head_dim], shared across all heads.
+            // K-eq-V applies to GLOBAL (full_attention) layers only.
+            let use_k_eq_v_check = self.config.attention_k_eq_v
+                && layer_type == LayerAttentionType::Global;
+
+            v_proj = if use_k_eq_v_check {
+                self.quantized_projection_with_encoder(
+                    &mut encoder,
+                    &normed,
+                    &format!("model.layers.{layer_idx}.self_attn.k_proj"),
+                    seq_len,
+                    hidden_size,
+                    kv_out_dim,
+                )?
+            } else {
+                self.quantized_projection_with_encoder(
+                    &mut encoder,
+                    &normed,
+                    &format!("model.layers.{layer_idx}.self_attn.v_proj"),
+                    seq_len,
+                    hidden_size,
+                    kv_out_dim,
+                )?
+            };
+
+            encoder.commit_and_wait()?;
+        }
+        // GPU results now available for CPU reads
+
+        if diag {
+            let s = read_buffer_f32(&normed)?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after rms_norm, first {}: {:?}", n, &s[..n]);
+
+            let s = read_buffer_f32(&q_proj)?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after Q proj (dim={}), first {}: {:?}", q_out_dim, n, &s[..n]);
+        }
+
+        let use_k_eq_v = self.config.attention_k_eq_v
+            && layer_type == LayerAttentionType::Global;
+
+        // --- Step 2b: QK norms (per-head RMS norm on Q and K) --- (CPU)
         let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
         let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
 
         let q_norm_weight = read_weight_as_f32(require_weight(&self.weights, &q_norm_name)?)?;
         let k_norm_weight = read_weight_as_f32(require_weight(&self.weights, &k_norm_name)?)?;
 
-        // read_buffer_f32 handles bf16 -> f32 conversion automatically
         let q_data = read_buffer_f32(&q_proj)?;
         let q_normed_data = cpu_per_head_rms_norm(&q_data, &q_norm_weight, seq_len, n_heads, head_dim, eps);
         let q_normed = f32_vec_to_bf16_buffer(&self.device, &q_normed_data, vec![seq_len, q_out_dim])?;
@@ -978,14 +987,12 @@ impl Gemma4Model {
         let k_normed_data = cpu_per_head_rms_norm(&k_data_raw, &k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
         let k_normed = f32_vec_to_bf16_buffer(&self.device, &k_normed_data, vec![seq_len, kv_out_dim])?;
 
-        // --- Step 2c: V norm (scaleless per-head RMS norm on V) ---
-        // Gemma 4 applies RMSNormNoScale to V (normalize without learned weight).
+        // --- Step 2c: V norm (scaleless per-head RMS norm on V) --- (CPU)
         let v_data_raw = read_buffer_f32(&v_proj)?;
         let v_normed_data = cpu_per_head_rms_norm_no_scale(&v_data_raw, seq_len, n_kv_heads, head_dim, eps);
         let v_normed_buf = f32_vec_to_bf16_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
 
         if diag {
-            // Compare K and V raw projections (should be IDENTICAL for k_eq_v)
             eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_data_raw[..5.min(k_data_raw.len())]);
             eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
             let k_v_match = k_data_raw.len() == v_data_raw.len() &&
@@ -997,18 +1004,14 @@ impl Gemma4Model {
             let n = k_normed_data.len().min(5);
             eprintln!("[DIAG] Layer 0 after QK norms, K first {}: {:?}", n, &k_normed_data[..n]);
 
-            // V diagnostic: raw projection and after norm
             eprintln!("[DIAG] Layer 0 V raw (k_proj, before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
             eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_normed_data[..5.min(v_normed_data.len())]);
-            // Compute RMS of V raw for head 0, pos 0 to verify norm
             let v_head0 = &v_data_raw[..head_dim];
             let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
             eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
         }
 
-        // --- Step 3: RoPE on Q and K ---
-        // For global attention with partial_rotary_factor, only apply RoPE to
-        // the first rope_dim dimensions of each head, leaving the rest unchanged.
+        // --- Step 3: RoPE on Q and K --- (CPU)
         let rope_dim = self.config.rope_dim(layer_idx);
         let theta = self.config.rope_theta(layer_idx);
 
@@ -1020,19 +1023,16 @@ impl Gemma4Model {
             &k_normed, seq_len, n_kv_heads, head_dim, rope_dim, theta,
         )?;
 
-        // --- Step 4: KV cache append ---
-        // Read K and V (bf16) to CPU as f32, append to cache (f32 storage)
+        // --- Step 4: KV cache append --- (CPU)
         let k_data = read_buffer_f32(&k_roped)?;
-        let v_data = read_buffer_f32(&v_normed_buf)?; // V does NOT get RoPE, but does get v_norm
+        let v_data = read_buffer_f32(&v_normed_buf)?;
 
         {
             let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
             layer_cache.append(&k_data, &v_data)?;
         }
 
-        // --- Step 5: Attention ---
-        // Gemma 4 uses scale=1.0 for attention (QK norms handle the scaling).
-        // The SDPA kernel accepts a caller-provided scale parameter.
+        // --- Step 5: Attention --- (GPU, own encoder -- heavy kernel with CPU reshape)
         let attn_out = self.compute_attention(
             layer_idx,
             &q_roped,
@@ -1044,11 +1044,9 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            // Print V values before attention (what we stored in the cache)
             eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data[..5.min(v_data.len())]);
             eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
 
-            // Read back from cache to verify
             let layer_cache_read = self.kv_cache.layer(layer_idx)?;
             let (_k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
             let v_cache_data: &[f32] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
@@ -1057,23 +1055,19 @@ impl Gemma4Model {
             let v_first5 = &v_cache_data[..5.min(v_cache_data.len())];
             eprintln!("[DIAG] Layer 0 V cache readback pos 0 first 5: {:?}, kv_seq_len={}", v_first5, kv_slen);
 
-            // Print reshaped V that goes into SDPA
             let v_valid = &v_cache_data[..kv_slen * n_kv_heads * head_dim];
             let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_slen, n_kv_heads, head_dim);
             eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
 
-            // Print Q values going into SDPA (no pre-scaling, scale=1.0 passed to kernel)
             let q_ps = read_buffer_f32(&q_roped)?;
             eprintln!("[DIAG] Layer 0 Q for SDPA (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
 
             let s = read_buffer_f32(&attn_out)?;
             let n = s.len().min(5);
             eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
-            // Also print LAST token's attention output (head 0, first 5 dims)
             let last_attn_start = (seq_len - 1) * n_heads * head_dim;
             let last_attn_5 = &s[last_attn_start..last_attn_start + 5.min(s.len() - last_attn_start)];
             eprintln!("[DIAG] Layer 0 attn output LAST token (head 0, first 5): {:?}", last_attn_5);
-            // Print Q last token for comparison
             let q_data_all = read_buffer_f32(&q_roped)?;
             let last_q_start = (seq_len - 1) * n_heads * head_dim;
             let last_q_5 = &q_data_all[last_q_start..last_q_start + 5.min(q_data_all.len() - last_q_start)];
@@ -1085,24 +1079,42 @@ impl Gemma4Model {
             }
         }
 
-        // --- Step 6: Output projection ---
-        let o_proj = self.quantized_projection(
-            &attn_out,
-            &format!("model.layers.{layer_idx}.self_attn.o_proj"),
-            seq_len,
-            n_heads * head_dim,
-            hidden_size,
-        )?;
+        // =================================================================
+        // BATCH 2: O projection + post-attention norm + residual add
+        //
+        // The output projection (cast+qmatmul+cast), post-attention RMS norm,
+        // and elementwise add are all GPU-only and chain together. One commit
+        // replaces ~5 individual commits.
+        // =================================================================
+        let (o_proj, residual1);
+        {
+            let mut encoder = self.device.command_encoder()?;
 
-        // --- Step 7: Post-attention layernorm and residual add ---
-        // Python: h = self.post_attention_layernorm(attn_output)
-        //         h = residual + h
-        // The norm is applied to the attention output BEFORE adding the residual.
-        let post_attn_norm_name = format!(
-            "model.layers.{layer_idx}.post_attention_layernorm.weight"
-        );
-        let post_attn_normed = self.apply_rms_norm(&o_proj, &post_attn_norm_name, seq_len)?;
-        let residual1 = self.elementwise_add(input, &post_attn_normed, seq_len * hidden_size)?;
+            // Step 6: Output projection
+            let o_proj_tmp = self.quantized_projection_with_encoder(
+                &mut encoder,
+                &attn_out,
+                &format!("model.layers.{layer_idx}.self_attn.o_proj"),
+                seq_len,
+                n_heads * head_dim,
+                hidden_size,
+            )?;
+
+            // Step 7: Post-attention layernorm and residual add
+            let post_attn_norm_name = format!(
+                "model.layers.{layer_idx}.post_attention_layernorm.weight"
+            );
+            let post_attn_normed = self.apply_rms_norm_with_encoder(
+                &mut encoder, &o_proj_tmp, &post_attn_norm_name, seq_len,
+            )?;
+            let residual1_tmp = self.elementwise_add_with_encoder(
+                &mut encoder, input, &post_attn_normed, seq_len * hidden_size,
+            )?;
+
+            encoder.commit_and_wait()?;
+            o_proj = o_proj_tmp;
+            residual1 = residual1_tmp;
+        }
 
         if diag {
             let o_data = read_buffer_f32(&o_proj)?;
@@ -1113,13 +1125,6 @@ impl Gemma4Model {
         }
 
         // --- Step 8: Feedforward with pre/post norms ---
-        // Gemma 4 MoE layers have TWO parallel paths:
-        //   Path 1 (dense MLP): pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm_1
-        //   Path 2 (MoE experts): router(h), pre_feedforward_layernorm_2 -> experts -> post_feedforward_layernorm_2
-        //   Combined: h = path1 + path2
-        //   Final: post_feedforward_layernorm(combined)
-        // Non-MoE layers: pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm
-
         // Check if this layer has MoE (router exists)
         let router_weight_name = format!("model.layers.{layer_idx}.router.proj.weight");
         let has_moe_router = self.weights.get(&router_weight_name).is_some()
@@ -1127,67 +1132,125 @@ impl Gemma4Model {
 
         let ffn_out = if has_moe_router {
             // --- MoE path: two parallel branches ---
+            // dense_ffn and moe_ffn both do CPU reads internally, so we batch
+            // what we can around them.
 
-            // Path 1: dense MLP
-            let pre_ff_norm_name = format!(
-                "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
-            );
-            let pre_ff_normed = self.apply_rms_norm(&residual1, &pre_ff_norm_name, seq_len)?;
+            // BATCH 3a: Pre-FFN norms for both paths
+            let (pre_ff_normed, pre_ff_normed2);
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let pre_ff_norm_name = format!(
+                    "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+                );
+                pre_ff_normed = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &residual1, &pre_ff_norm_name, seq_len,
+                )?;
+                let pre_ff_norm2_name = format!(
+                    "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+                );
+                pre_ff_normed2 = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &residual1, &pre_ff_norm2_name, seq_len,
+                )?;
+                encoder.commit_and_wait()?;
+            }
+
+            // Path 1: dense MLP (uses quantized_projection internally, has own commits)
             let mlp_out = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
-            let post_ff_norm1_name = format!(
-                "model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
-            );
-            let mlp_normed = self.apply_rms_norm(&mlp_out, &post_ff_norm1_name, seq_len)?;
+
+            // Path 2: MoE experts (CPU-heavy, does its own reads)
+            let moe_out = self.moe_ffn(layer_idx, &residual1, &pre_ff_normed2, seq_len)?;
+
+            // BATCH 3b: Post-FFN norms + combine + final norm
+            let (mlp_normed, moe_normed);
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let post_ff_norm1_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+                );
+                mlp_normed = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &mlp_out, &post_ff_norm1_name, seq_len,
+                )?;
+                let post_ff_norm2_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+                );
+                moe_normed = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &moe_out, &post_ff_norm2_name, seq_len,
+                )?;
+                encoder.commit_and_wait()?;
+            }
 
             if diag {
                 let d = read_buffer_f32(&mlp_normed)?;
                 let last = (seq_len - 1) * hidden_size;
                 eprintln!("[DIAG] Layer 0 dense_mlp_normed LAST token first 5: {:?}", &d[last..last + 5]);
-            }
-
-            // Path 2: MoE experts
-            let pre_ff_norm2_name = format!(
-                "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
-            );
-            let pre_ff_normed2 = self.apply_rms_norm(&residual1, &pre_ff_norm2_name, seq_len)?;
-            // Router gets the un-normed residual1 (it does its own internal norm)
-            let moe_out = self.moe_ffn(layer_idx, &residual1, &pre_ff_normed2, seq_len)?;
-            let post_ff_norm2_name = format!(
-                "model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
-            );
-            let moe_normed = self.apply_rms_norm(&moe_out, &post_ff_norm2_name, seq_len)?;
-
-            if diag {
                 let d = read_buffer_f32(&moe_normed)?;
-                let last = (seq_len - 1) * hidden_size;
                 eprintln!("[DIAG] Layer 0 moe_normed LAST token first 5: {:?}", &d[last..last + 5]);
             }
 
-            // Sum the two paths
-            let combined = self.elementwise_add(&mlp_normed, &moe_normed, seq_len * hidden_size)?;
+            // BATCH 3c: Sum paths + final post-feedforward norm
+            let ffn_result;
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let combined = self.elementwise_add_with_encoder(
+                    &mut encoder, &mlp_normed, &moe_normed, seq_len * hidden_size,
+                )?;
 
-            if diag {
-                let d = read_buffer_f32(&combined)?;
-                let last = (seq_len - 1) * hidden_size;
-                eprintln!("[DIAG] Layer 0 combined (dense+moe) LAST token first 5: {:?}", &d[last..last + 5]);
+                if diag {
+                    // Need to commit before CPU read for diag
+                    encoder.commit_and_wait()?;
+                    let d = read_buffer_f32(&combined)?;
+                    let last = (seq_len - 1) * hidden_size;
+                    eprintln!("[DIAG] Layer 0 combined (dense+moe) LAST token first 5: {:?}", &d[last..last + 5]);
+                    // Start a new encoder for the final norm
+                    let mut encoder2 = self.device.command_encoder()?;
+                    let post_ff_norm_name = format!(
+                        "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                    );
+                    ffn_result = self.apply_rms_norm_with_encoder(
+                        &mut encoder2, &combined, &post_ff_norm_name, seq_len,
+                    )?;
+                    encoder2.commit_and_wait()?;
+                } else {
+                    let post_ff_norm_name = format!(
+                        "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                    );
+                    ffn_result = self.apply_rms_norm_with_encoder(
+                        &mut encoder, &combined, &post_ff_norm_name, seq_len,
+                    )?;
+                    encoder.commit_and_wait()?;
+                }
             }
-
-            // Final post-feedforward norm
-            let post_ff_norm_name = format!(
-                "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
-            );
-            self.apply_rms_norm(&combined, &post_ff_norm_name, seq_len)?
+            ffn_result
         } else {
             // --- Non-MoE path: simple MLP with pre/post norms ---
-            let pre_ff_norm_name = format!(
-                "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
-            );
-            let pre_ff_normed = self.apply_rms_norm(&residual1, &pre_ff_norm_name, seq_len)?;
+            // Pre-FFN norm (batched alone since dense_ffn follows with its own commits)
+            let pre_ff_normed;
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let pre_ff_norm_name = format!(
+                    "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+                );
+                pre_ff_normed = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &residual1, &pre_ff_norm_name, seq_len,
+                )?;
+                encoder.commit_and_wait()?;
+            }
+
             let mlp_out = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
-            let post_ff_norm_name = format!(
-                "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
-            );
-            self.apply_rms_norm(&mlp_out, &post_ff_norm_name, seq_len)?
+
+            // Post-FFN norm (batched alone)
+            let ffn_result;
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let post_ff_norm_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                );
+                ffn_result = self.apply_rms_norm_with_encoder(
+                    &mut encoder, &mlp_out, &post_ff_norm_name, seq_len,
+                )?;
+                encoder.commit_and_wait()?;
+            }
+            ffn_result
         };
 
         if diag {
@@ -1201,8 +1264,19 @@ impl Gemma4Model {
             }
         }
 
-        // --- Step 9: Residual add ---
-        let pre_scalar = self.elementwise_add(&residual1, &ffn_out, seq_len * hidden_size)?;
+        // =================================================================
+        // BATCH 4: Final residual add
+        //
+        // Single GPU op but still uses shared encoder pattern for consistency.
+        // =================================================================
+        let pre_scalar;
+        {
+            let mut encoder = self.device.command_encoder()?;
+            pre_scalar = self.elementwise_add_with_encoder(
+                &mut encoder, &residual1, &ffn_out, seq_len * hidden_size,
+            )?;
+            encoder.commit_and_wait()?;
+        }
 
         if diag {
             let f = read_buffer_f32(&ffn_out)?;
@@ -1212,8 +1286,7 @@ impl Gemma4Model {
             eprintln!("[DIAG] Layer 0 residual2 (r1+ffn) LAST token first 5: {:?}", &p[last..last + 5]);
         }
 
-        // --- Step 10: Apply layer_scalar to the ENTIRE layer output ---
-        // Python: h = h * self.layer_scalar (applied to the full output, not sub-parts)
+        // --- Step 10: Apply layer_scalar --- (CPU: read + multiply + write)
         let output = self.apply_layer_scalar(layer_idx, &pre_scalar, seq_len * hidden_size)?;
 
         if diag {
@@ -1311,6 +1384,91 @@ impl Gemma4Model {
             hidden_size as u32,
         )?;
         encoder.commit_and_wait()?;
+
+        Ok(output)
+    }
+
+    /// Apply RMS normalization using a shared command encoder (batched variant).
+    ///
+    /// Same as [`apply_rms_norm`] but dispatches into the caller's encoder
+    /// instead of creating and committing its own. The caller is responsible
+    /// for calling `commit_and_wait()` on the encoder after all batched
+    /// dispatches are encoded.
+    fn apply_rms_norm_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        input: &MlxBuffer,
+        weight_name: &str,
+        seq_len: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let input_dtype = input.dtype();
+
+        let weight = require_weight(&self.weights, weight_name)?;
+        let norm_weight_buf = clone_buffer(&self.device, &weight.buffer)?;
+
+        let elem_size = input_dtype.size_of();
+        let output_bytes = seq_len * hidden_size * elem_size;
+        let output = self.device.alloc_buffer(
+            output_bytes,
+            input_dtype,
+            vec![seq_len, hidden_size],
+        )?;
+
+        let eps = self.config.rms_norm_eps;
+        let dim = hidden_size as f32;
+        let mut params_buf = self.device.alloc_buffer(
+            std::mem::size_of::<[f32; 2]>(),
+            DType::F32,
+            vec![2],
+        )?;
+        {
+            let slice: &mut [f32] = params_buf.as_mut_slice().map_err(|e| {
+                Gemma4Error::ForwardError {
+                    reason: format!("RMS norm params write: {e}"),
+                }
+            })?;
+            slice[0] = eps;
+            slice[1] = dim;
+        }
+
+        let norm_weight = match input_dtype {
+            DType::BF16 => {
+                match norm_weight_buf.dtype() {
+                    DType::BF16 => clone_buffer(&self.device, &norm_weight_buf)?,
+                    DType::F32 => {
+                        self.cast_f32_to_bf16_with_encoder(encoder, &norm_weight_buf, hidden_size)?
+                    }
+                    DType::F16 => {
+                        let f32_buf = self.cast_with_encoder(
+                            encoder, &norm_weight_buf, hidden_size,
+                            DType::F32, elementwise::CastDirection::F16ToF32,
+                        )?;
+                        self.cast_f32_to_bf16_with_encoder(encoder, &f32_buf, hidden_size)?
+                    }
+                    _ => {
+                        return Err(Gemma4Error::ForwardError {
+                            reason: format!("Unsupported norm weight dtype for bf16 pipeline: {}", norm_weight_buf.dtype()),
+                        });
+                    }
+                }
+            }
+            _ => {
+                self.ensure_f32_weight_with_encoder(encoder, &norm_weight_buf, hidden_size, weight_name)?
+            }
+        };
+
+        rms_norm::dispatch_rms_norm(
+            encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            input,
+            &norm_weight,
+            &output,
+            &params_buf,
+            seq_len as u32,
+            hidden_size as u32,
+        )?;
 
         Ok(output)
     }
@@ -1668,6 +1826,253 @@ impl Gemma4Model {
             slice.copy_from_slice(&output_data);
         }
         Ok(buf)
+    }
+
+    /// Generic cast dispatch into a shared command encoder.
+    ///
+    /// Encodes a cast operation without committing. The caller must commit the
+    /// encoder after all dispatches are encoded.
+    fn cast_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        input: &MlxBuffer,
+        n_elements: usize,
+        out_dtype: DType,
+        direction: elementwise::CastDirection,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let out_bytes = n_elements * out_dtype.size_of();
+        let output = self.device.alloc_buffer(out_bytes, out_dtype, vec![n_elements])?;
+        elementwise::cast(
+            encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            input,
+            &output,
+            n_elements,
+            direction,
+        )?;
+        Ok(output)
+    }
+
+    /// Cast f32 to bf16 using a shared command encoder (batched variant).
+    fn cast_f32_to_bf16_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        input: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        self.cast_with_encoder(
+            encoder, input, n_elements,
+            DType::BF16, elementwise::CastDirection::F32ToBF16,
+        )
+    }
+
+    /// Cast bf16 to f32 using a shared command encoder (batched variant).
+    fn cast_bf16_to_f32_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        input: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        self.cast_with_encoder(
+            encoder, input, n_elements,
+            DType::F32, elementwise::CastDirection::BF16ToF32,
+        )
+    }
+
+    /// Ensure f32 input using a shared command encoder (batched variant).
+    fn ensure_f32_input_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        buffer: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        match buffer.dtype() {
+            DType::F32 => {
+                clone_buffer(&self.device, buffer)
+                    .map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("clone f32 input: {e}"),
+                    })
+            }
+            DType::F16 => {
+                self.cast_with_encoder(
+                    encoder, buffer, n_elements,
+                    DType::F32, elementwise::CastDirection::F16ToF32,
+                )
+            }
+            DType::BF16 => {
+                self.cast_with_encoder(
+                    encoder, buffer, n_elements,
+                    DType::F32, elementwise::CastDirection::BF16ToF32,
+                )
+            }
+            other => Err(Gemma4Error::ForwardError {
+                reason: format!("Unsupported input dtype for f32 cast: {other}"),
+            }),
+        }
+    }
+
+    /// Ensure weight is f32 using a shared command encoder (batched variant).
+    fn ensure_f32_weight_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        buffer: &MlxBuffer,
+        n_elements: usize,
+        _name: &str,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        match buffer.dtype() {
+            DType::F32 => {
+                let data = read_buffer_f32(buffer)?;
+                let mut out = self.device.alloc_buffer(
+                    data.len() * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![n_elements],
+                )?;
+                {
+                    let slice: &mut [f32] =
+                        out.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                            reason: format!("Weight copy: {e}"),
+                        })?;
+                    slice.copy_from_slice(&data);
+                }
+                Ok(out)
+            }
+            DType::F16 => {
+                self.cast_with_encoder(
+                    encoder, buffer, n_elements,
+                    DType::F32, elementwise::CastDirection::F16ToF32,
+                )
+            }
+            DType::BF16 => {
+                self.cast_with_encoder(
+                    encoder, buffer, n_elements,
+                    DType::F32, elementwise::CastDirection::BF16ToF32,
+                )
+            }
+            other => Err(Gemma4Error::ForwardError {
+                reason: format!("Unsupported weight dtype: {other}"),
+            }),
+        }
+    }
+
+    /// Elementwise add using a shared command encoder (batched variant).
+    fn elementwise_add_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        a: &MlxBuffer,
+        b: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let dtype = a.dtype();
+        let elem_size = dtype.size_of();
+        let output_bytes = n_elements * elem_size;
+        let output = self.device.alloc_buffer(
+            output_bytes,
+            dtype,
+            vec![n_elements],
+        )?;
+
+        elementwise::elementwise_add(
+            encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            a,
+            b,
+            &output,
+            n_elements,
+            dtype,
+        )?;
+
+        Ok(output)
+    }
+
+    /// Quantized projection using a shared command encoder (batched variant).
+    ///
+    /// Batches the ensure_f32_input cast, qmatmul, and cast_f32_to_bf16 into
+    /// the caller's encoder instead of creating 3 separate encoders.
+    fn quantized_projection_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        input: &MlxBuffer,
+        weight_base: &str,
+        seq_len: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let weight_name = format!("{weight_base}.weight");
+        let scales_name = format!("{weight_base}.scales");
+        let biases_name = format!("{weight_base}.biases");
+
+        let loaded = require_weight(&self.weights, &weight_name)?;
+        let quant_info = loaded.quant_meta.as_ref().map(|qm| (qm.bits, qm.group_size));
+
+        if let Some((bits, _group_size)) = quant_info {
+            let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
+            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+                // GPU path: batch cast + qmatmul + cast into shared encoder
+                let input_f32 = self.ensure_f32_input_with_encoder(encoder, input, seq_len * in_dim)?;
+
+                let loaded = require_weight(&self.weights, &weight_name)?;
+                let scales = require_weight(&self.weights, &scales_name)?;
+                let biases = require_weight(&self.weights, &biases_name)?;
+
+                let params = QuantizedMatmulParams {
+                    m: seq_len as u32,
+                    k: in_dim as u32,
+                    n: out_dim as u32,
+                    group_size: _group_size as u32,
+                    bits: bits as u32,
+                };
+
+                let output_f32 = qmatmul::quantized_matmul_simd(
+                    encoder,
+                    &mut self.registry,
+                    &self.device,
+                    &input_f32,
+                    &loaded.buffer,
+                    &scales.buffer,
+                    &biases.buffer,
+                    &params,
+                )?;
+
+                let output_bf16 = self.cast_f32_to_bf16_with_encoder(encoder, &output_f32, seq_len * out_dim)?;
+                return Ok(output_bf16);
+            }
+
+            // CPU dequantize + bf16-precision matmul (same as non-batched path).
+            // Must commit the encoder first to ensure any prior GPU work is done,
+            // then do CPU work, then the encoder is "used up" -- caller will need
+            // a new one after this returns.
+            // NOTE: We flush the encoder to ensure GPU data is available for CPU reads.
+            encoder.commit_and_wait()?;
+            let weight_f32 = self.dequantize_2d_weight(weight_base, out_dim, in_dim)?;
+            let input_data = read_buffer_f32(input)?;
+
+            let weight_bf16 = round_to_bf16(&weight_f32);
+            let input_bf16 = round_to_bf16(&input_data);
+
+            let mut output_data = vec![0.0f32; seq_len * out_dim];
+            for row in 0..seq_len {
+                for col in 0..out_dim {
+                    let mut sum = 0.0f32;
+                    for k in 0..in_dim {
+                        sum += input_bf16[row * in_dim + k] * weight_bf16[col * in_dim + k];
+                    }
+                    output_data[row * out_dim + col] = sum;
+                }
+            }
+
+            return f32_vec_to_bf16_buffer(&self.device, &output_data, vec![seq_len, out_dim]);
+        }
+
+        // Non-quantized path: CPU matmul fallback -- same commit-first strategy
+        encoder.commit_and_wait()?;
+        let weight_buf = clone_buffer(
+            &self.device,
+            &require_weight(&self.weights, &weight_name)?.buffer,
+        )?;
+        let f32_result = self.cpu_matmul(input, &weight_buf, seq_len, in_dim, out_dim)?;
+        self.cast_f32_to_bf16(&f32_result, seq_len * out_dim)
     }
 
     /// Apply RoPE to Q or K tensor organized as [seq_len, n_heads * head_dim].
@@ -2535,14 +2940,28 @@ impl Gemma4Model {
             }
         }
 
-        // gate_proj
-        let gate = self.quantized_projection(
-            input,
-            &format!("model.layers.{layer_idx}.mlp.gate_proj"),
-            seq_len,
-            hidden_size,
-            intermediate_size,
-        )?;
+        // Batch gate_proj + up_proj into one command buffer (saves ~5 commits)
+        let (gate, up);
+        {
+            let mut encoder = self.device.command_encoder()?;
+            gate = self.quantized_projection_with_encoder(
+                &mut encoder,
+                input,
+                &format!("model.layers.{layer_idx}.mlp.gate_proj"),
+                seq_len,
+                hidden_size,
+                intermediate_size,
+            )?;
+            up = self.quantized_projection_with_encoder(
+                &mut encoder,
+                input,
+                &format!("model.layers.{layer_idx}.mlp.up_proj"),
+                seq_len,
+                hidden_size,
+                intermediate_size,
+            )?;
+            encoder.commit_and_wait()?;
+        }
 
         if diag {
             let s = read_buffer_f32(&gate)?;
@@ -2552,18 +2971,6 @@ impl Gemma4Model {
             if nan_count > 0 {
                 eprintln!("[DIAG]   WARNING dense gate: NaN={}/{}", nan_count, s.len());
             }
-        }
-
-        // up_proj
-        let up = self.quantized_projection(
-            input,
-            &format!("model.layers.{layer_idx}.mlp.up_proj"),
-            seq_len,
-            hidden_size,
-            intermediate_size,
-        )?;
-
-        if diag {
             let s = read_buffer_f32(&up)?;
             let n = s.len().min(5);
             eprintln!("[DIAG] dense_ffn L0: up output first {}: {:?}", n, &s[..n]);
@@ -2573,7 +2980,7 @@ impl Gemma4Model {
             }
         }
 
-        // GELU(gate) * up
+        // GELU(gate) * up (CPU)
         let gate_data = read_buffer_f32(&gate)?;
         let up_data = read_buffer_f32(&up)?;
         let mut hidden_data = vec![0.0f32; seq_len * intermediate_size];
@@ -2592,14 +2999,20 @@ impl Gemma4Model {
             vec![seq_len, intermediate_size],
         )?;
 
-        // down_proj (bf16 in, bf16 out)
-        let result = self.quantized_projection(
-            &hidden_buf,
-            &format!("model.layers.{layer_idx}.mlp.down_proj"),
-            seq_len,
-            intermediate_size,
-            hidden_size,
-        )?;
+        // down_proj (bf16 in, bf16 out) -- batched into single encoder
+        let result;
+        {
+            let mut encoder = self.device.command_encoder()?;
+            result = self.quantized_projection_with_encoder(
+                &mut encoder,
+                &hidden_buf,
+                &format!("model.layers.{layer_idx}.mlp.down_proj"),
+                seq_len,
+                intermediate_size,
+                hidden_size,
+            )?;
+            encoder.commit_and_wait()?;
+        }
 
         if diag {
             let s = read_buffer_f32(&result)?;
