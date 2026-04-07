@@ -32,13 +32,12 @@
 //! | 1 (must) | Router proj     | Misrouting is catastrophic in MoE models      |
 //! | 2 (must) | embed_tokens    | Shared across all tokens; errors compound      |
 //! | 3 (must) | lm_head         | Directly impacts output distribution           |
-//! | 4 (high) | v_proj          | Biggest quality jump per bit across all archs  |
-//! | 5 (high) | k_proj          | Attention pattern corruption is hard to recover|
-//! | 6 (med)  | q_proj          | Less sensitive than k/v but still important    |
-//! | 7 (med)  | o_proj          | Output projection of attention                 |
-//! | 8 (low)  | gate_proj/up    | FFN gating; moderate sensitivity               |
-//! | 9 (low)  | down_proj       | FFN output; least sensitive of projections      |
-//! | 10(low)  | expert FFN      | Redundancy across experts provides resilience   |
+//! | 4 (high) | MLP (gate/up/dn)| FFN pathway is #1 source of quant artifacts   |
+//! | 5 (high) | v_proj          | Biggest quality jump per bit across all archs  |
+//! | 6 (med)  | k_proj          | Attention pattern corruption is hard to recover|
+//! | 7 (med)  | q_proj          | Less sensitive than k/v but still important    |
+//! | 8 (med)  | o_proj          | Output projection of attention                 |
+//! | 9 (low)  | expert FFN      | Redundancy across experts provides resilience   |
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -549,13 +548,18 @@ pub fn resolve_auto_plan(
 
 /// Build component overrides based on architecture family and base bit width.
 ///
-/// The rules encode the sensitivity hierarchy from the CFA research:
+/// The strategy: keep attention projections at base bits but elevate the MLP
+/// pathway and critical routing to 8-bit. This matches the approach used by
+/// high-quality community quantizations (e.g., mlx-community 4-bit models)
+/// and dramatically reduces generation artifacts compared to uniform quantization.
 ///
-/// - Router projections are ALWAYS 8-bit (MoE only; misrouting is catastrophic)
-/// - embed_tokens and lm_head are preserved at f16 when base >= 4-bit
-/// - v_proj gets +2 bits over base (biggest single-component quality impact)
-/// - k_proj gets +1 bit over base
-/// - Other components stay at base bits
+/// Override hierarchy (highest priority first):
+///
+/// 1. Router projections: ALWAYS 8-bit (MoE only; misrouting is catastrophic)
+/// 2. MLP layers (gate_proj, up_proj, down_proj): 8-bit (FFN precision is the
+///    biggest quality lever — community quants prove this eliminates artifacts)
+/// 3. v_proj: +2 bits over base (biggest attention component impact)
+/// 4. First/last layers: elevated at aggressive (2-3 bit) quantization
 fn build_component_overrides(
     _arch_family: ArchFamily,
     fingerprint: &ModelFingerprint,
@@ -574,7 +578,24 @@ fn build_component_overrides(
         // as non-weight tensors by the MLX backend's should_quantize logic — no override needed.
     }
 
-    // Rule 2: v_proj gets elevated bits (biggest quality impact per bit)
+    // Rule 2: MLP layers at 8-bit when base is 4-bit or lower.
+    // This is the single biggest quality lever — community 4-bit quants all do this.
+    // The FFN pathway (gate/up/down projections) is where most generation artifacts
+    // originate under aggressive quantization.
+    if base_bits <= 4 {
+        for component in &["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+            overrides.push(ComponentOverride {
+                pattern: component.to_string(),
+                bits: 8,
+                reason: format!(
+                    "MLP {} at 8-bit eliminates FFN-induced generation artifacts ({}-bit base)",
+                    component, base_bits
+                ),
+            });
+        }
+    }
+
+    // Rule 3: v_proj gets elevated bits (biggest attention component quality impact)
     // MLX only supports 2, 3, 4, 6, 8 — use next_valid_mlx_bits to clamp
     let v_proj_bits = next_valid_mlx_bits(base_bits, 2);
     if v_proj_bits > base_bits {
@@ -584,19 +605,6 @@ fn build_component_overrides(
             reason: format!(
                 "v_proj has the highest per-bit quality impact ({}-bit vs {}-bit base)",
                 v_proj_bits, base_bits
-            ),
-        });
-    }
-
-    // Rule 3: k_proj gets next valid MLX bit width above base
-    let k_proj_bits = next_valid_mlx_bits(base_bits, 1);
-    if k_proj_bits > base_bits && k_proj_bits != v_proj_bits {
-        overrides.push(ComponentOverride {
-            pattern: "k_proj".to_string(),
-            bits: k_proj_bits,
-            reason: format!(
-                "k_proj attention patterns are sensitive to quantization ({}-bit)",
-                k_proj_bits
             ),
         });
     }
@@ -946,6 +954,27 @@ mod tests {
         let v_proj = overrides.iter().find(|o| o.pattern == "v_proj");
         assert!(v_proj.is_some(), "4-bit plan should elevate v_proj");
         assert_eq!(v_proj.unwrap().bits, 6); // base 4 + 2 steps = 6
+    }
+
+    #[test]
+    fn test_mlp_8bit_overrides_at_4bit_base() {
+        let fp = make_dense_fingerprint(8.0);
+        let overrides = build_component_overrides(ArchFamily::DenseDecoder, &fp, 4);
+
+        for component in &["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+            let found = overrides.iter().find(|o| o.pattern == *component);
+            assert!(found.is_some(), "4-bit plan should elevate {} to 8-bit", component);
+            assert_eq!(found.unwrap().bits, 8, "{} should be 8-bit", component);
+        }
+    }
+
+    #[test]
+    fn test_no_mlp_override_at_8bit_base() {
+        let fp = make_dense_fingerprint(8.0);
+        let overrides = build_component_overrides(ArchFamily::DenseDecoder, &fp, 8);
+
+        let mlp = overrides.iter().find(|o| o.pattern.contains("mlp."));
+        assert!(mlp.is_none(), "8-bit base should not need MLP overrides");
     }
 
     #[test]
