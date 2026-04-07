@@ -424,21 +424,20 @@ impl Gemma4Model {
             debug!(layer = layer_idx, "Processing transformer layer");
             hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
 
-            if diag && layer_idx == 0 {
+            if diag {
                 let s: &[f32] = hidden.as_slice().map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("diag read layer0: {e}"),
+                    reason: format!("diag read layer{}: {e}", layer_idx),
                 })?;
-                let n = s.len().min(5);
-                eprintln!("[DIAG] After layer 0 output, first {}: {:?}", n, &s[..n]);
-                // Check for NaN/Inf
+                // Print L2 norm of last token's hidden state
+                let last_start = (seq_len - 1) * hidden_size;
+                let last_token = &s[last_start..last_start + hidden_size];
+                let l2 = last_token.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let first5 = &last_token[..5.min(last_token.len())];
                 let nan_count = s.iter().filter(|v| v.is_nan()).count();
-                let inf_count = s.iter().filter(|v| v.is_infinite()).count();
-                if nan_count > 0 || inf_count > 0 {
-                    eprintln!("[DIAG]   WARNING: NaN={}, Inf={}", nan_count, inf_count);
-                }
-                // Print last 5 too for diversity check
-                let last_n = s.len().min(5);
-                eprintln!("[DIAG]   last {}: {:?}", last_n, &s[s.len()-last_n..]);
+                let layer_type = self.config.layer_type(layer_idx);
+                eprintln!("[DIAG] After layer {:2} ({:?}): L2={:.4}, first5={:?}{}",
+                    layer_idx, layer_type, l2, first5,
+                    if nan_count > 0 { format!(", NaN={}", nan_count) } else { String::new() });
             }
         }
 
@@ -2971,6 +2970,11 @@ fn top_k_softmax_with_scale(
 ///
 /// Layout: weight `[rows, packed_cols]`, scales/biases `[rows, n_groups]`
 /// where `n_groups = cols / group_size`, `packed_cols = cols * bits / 32`.
+///
+/// NOTE: MLX's GPU dequantization returns bf16, causing slight differences
+/// from this f32 implementation. These differences cascade through MoE
+/// routing across 30 layers. For exact MLX match, the GPU quantized
+/// matmul kernel should be used instead.
 fn cpu_dequantize_flat(
     packed: &[u32],
     scales: &[f32],
