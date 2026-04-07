@@ -335,13 +335,10 @@ fn write_native_safetensors_file(
             || name.contains("std_bias")
             || name.contains("std_scale")
             || name.contains("position_embedding");
-        // Skip vision tower entirely — text-only inference doesn't use it,
-        // and quantizing it creates extra keys that may confuse the loader.
+        // Vision tower tensors are preserved at original precision (bf16) so
+        // multimodal servers can still use them for image understanding.
         let is_vision = name.contains("vision_tower") || name.contains("embed_vision");
-        if is_vision {
-            continue;
-        }
-        let should_quantize = is_2d_plus && !is_norm_or_scalar;
+        let should_quantize = is_2d_plus && !is_norm_or_scalar && !is_vision;
 
         if should_quantize {
             // Look up per-tensor bit override (e.g., 8-bit for MLP/router in MoE)
