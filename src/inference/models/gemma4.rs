@@ -377,10 +377,27 @@ impl Gemma4Model {
         }
 
         let hidden_size = self.config.hidden_size;
+        let diag = std::env::var("HF2Q_DIAG").is_ok();
+
+        if diag {
+            eprintln!("[DIAG] === Forward pass: seq_len={}, hidden_size={}, vocab_size={} ===",
+                seq_len, hidden_size, self.config.vocab_size);
+            eprintln!("[DIAG] Input tokens: {:?}", &tokens[..tokens.len().min(20)]);
+        }
 
         // Step 1: Embedding gather
         debug!(seq_len = seq_len, "Embedding gather");
         let mut hidden = self.embedding_gather(tokens)?;
+
+        if diag {
+            let s: &[f32] = hidden.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read embed: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] After embedding_gather (first {}): {:?}", n, &s[..n]);
+            let nonzero = s.iter().filter(|v| **v != 0.0).count();
+            eprintln!("[DIAG]   total_elements={}, nonzero={}", s.len(), nonzero);
+        }
 
         // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         // Gemma models scale embeddings by sqrt(hidden_size)
@@ -394,25 +411,104 @@ impl Gemma4Model {
             for v in slice.iter_mut() {
                 *v *= scale;
             }
+
+            if diag {
+                let n = slice.len().min(5);
+                eprintln!("[DIAG] After embedding scale (factor={:.4}), first {}: {:?}",
+                    scale, n, &slice[..n]);
+            }
         }
 
         // Step 3: Process each transformer layer
         for layer_idx in 0..self.config.num_layers {
             debug!(layer = layer_idx, "Processing transformer layer");
             hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
+
+            if diag && layer_idx == 0 {
+                let s: &[f32] = hidden.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("diag read layer0: {e}"),
+                })?;
+                let n = s.len().min(5);
+                eprintln!("[DIAG] After layer 0 output, first {}: {:?}", n, &s[..n]);
+                // Check for NaN/Inf
+                let nan_count = s.iter().filter(|v| v.is_nan()).count();
+                let inf_count = s.iter().filter(|v| v.is_infinite()).count();
+                if nan_count > 0 || inf_count > 0 {
+                    eprintln!("[DIAG]   WARNING: NaN={}, Inf={}", nan_count, inf_count);
+                }
+                // Print last 5 too for diversity check
+                let last_n = s.len().min(5);
+                eprintln!("[DIAG]   last {}: {:?}", last_n, &s[s.len()-last_n..]);
+            }
         }
 
         // Step 4: Final RMS norm
         debug!("Final RMS norm");
         let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
 
+        if diag {
+            let s: &[f32] = normed.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read final norm: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] After final rms_norm, first {}: {:?}", n, &s[..n]);
+            // Also last token's first 5 values (this is what gets projected to logits)
+            if seq_len > 1 {
+                let last_start = (seq_len - 1) * hidden_size;
+                let last_end = (last_start + 5).min(s.len());
+                eprintln!("[DIAG]   last token first 5: {:?}", &s[last_start..last_end]);
+            }
+        }
+
         // Step 5: lm_head (tied embeddings -- transpose embed_tokens and matmul)
         debug!("lm_head projection (tied embeddings)");
         let logits = self.lm_head_projection(&normed, seq_len)?;
 
+        if diag {
+            let s: &[f32] = logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read logits: {e}"),
+            })?;
+            // Print top-10 logits for the LAST token position
+            let vocab_size = self.config.vocab_size;
+            let last_logits_start = (seq_len - 1) * vocab_size;
+            let last_logits = &s[last_logits_start..last_logits_start + vocab_size];
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[DIAG] After lm_head, top-10 logit (idx, val) for last token:");
+            for (i, (idx, val)) in indexed.iter().take(10).enumerate() {
+                eprintln!("[DIAG]   #{}: token_id={}, logit={:.6}", i, idx, val);
+            }
+            // Also print min/max/mean
+            let min = last_logits.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = last_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mean = last_logits.iter().sum::<f32>() / vocab_size as f32;
+            let std_dev = (last_logits.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / vocab_size as f32).sqrt();
+            eprintln!("[DIAG]   logit stats: min={:.4}, max={:.4}, mean={:.4}, std={:.4}", min, max, mean, std_dev);
+        }
+
         // Step 6: Softcap
         debug!(cap = self.config.final_logit_softcapping, "Softcap");
         let capped_logits = self.apply_softcap(&logits, seq_len)?;
+
+        if diag {
+            let s: &[f32] = capped_logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read capped logits: {e}"),
+            })?;
+            let vocab_size = self.config.vocab_size;
+            let last_logits_start = (seq_len - 1) * vocab_size;
+            let last_logits = &s[last_logits_start..last_logits_start + vocab_size];
+            let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[DIAG] After softcap (cap={}), top-10 logit (idx, val) for last token:",
+                self.config.final_logit_softcapping);
+            for (i, (idx, val)) in indexed.iter().take(10).enumerate() {
+                eprintln!("[DIAG]   #{}: token_id={}, logit={:.6}", i, idx, val);
+            }
+            let min = last_logits.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = last_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mean = last_logits.iter().sum::<f32>() / vocab_size as f32;
+            eprintln!("[DIAG]   capped stats: min={:.4}, max={:.4}, mean={:.4}", min, max, mean);
+        }
 
         // Read logits to CPU
         let output: &[f32] = capped_logits
@@ -622,16 +718,33 @@ impl Gemma4Model {
     fn embedding_gather(&mut self, tokens: &[u32]) -> Result<MlxBuffer, Gemma4Error> {
         let embed_weight = require_weight(&self.weights, "model.embed_tokens.weight")?;
         let hidden_size = self.config.hidden_size;
+        let diag = std::env::var("HF2Q_DIAG").is_ok();
+
+        if diag {
+            eprintln!("[DIAG] embed_tokens.weight: dtype={}, shape={:?}, byte_len={}",
+                embed_weight.buffer.dtype(), embed_weight.buffer.shape(), embed_weight.buffer.byte_len());
+            if let Some(ref qmeta) = embed_weight.quant_meta {
+                eprintln!("[DIAG]   quant_meta: bits={}, group_size={}", qmeta.bits, qmeta.group_size);
+            } else {
+                eprintln!("[DIAG]   quant_meta: None (unquantized)");
+            }
+        }
 
         // Check if embedding is quantized
         if let Some(ref qmeta) = embed_weight.quant_meta {
             if qmeta.bits == 4 || qmeta.bits == 6 {
+                if diag {
+                    eprintln!("[DIAG] Using QUANTIZED embedding gather (bits={})", qmeta.bits);
+                }
                 return self.quantized_embedding_gather(tokens, qmeta.bits, qmeta.group_size);
             }
         }
 
         // Unquantized path: CPU gather from the f32/f16 embedding table
         // Read embedding weight to CPU, gather rows, write to a new f32 buffer
+        if diag {
+            eprintln!("[DIAG] Using CPU embedding gather (unquantized)");
+        }
         self.cpu_embedding_gather(tokens, hidden_size)
     }
 
@@ -771,12 +884,21 @@ impl Gemma4Model {
         let n_heads = self.config.num_attention_heads;
         let n_kv_heads = self.config.n_kv_heads(layer_idx);
         let head_dim = self.config.head_dim(layer_idx);
+        let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
         // --- Step 1: Pre-attention RMS norm ---
         let norm_name = format!(
             "model.layers.{layer_idx}.input_layernorm.weight"
         );
         let normed = self.apply_rms_norm(input, &norm_name, seq_len)?;
+
+        if diag {
+            let s: &[f32] = normed.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read norm L0: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after rms_norm, first {}: {:?}", n, &s[..n]);
+        }
 
         // --- Step 2: Q/K/V projections ---
         // For Gemma 4: Q has n_heads * head_dim output dims,
@@ -792,6 +914,14 @@ impl Gemma4Model {
             hidden_size,
             q_out_dim,
         )?;
+
+        if diag {
+            let s: &[f32] = q_proj.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read q_proj L0: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after Q proj (dim={}), first {}: {:?}", q_out_dim, n, &s[..n]);
+        }
 
         let k_proj = self.quantized_projection(
             &normed,
@@ -857,6 +987,19 @@ impl Gemma4Model {
             layer_type,
         )?;
 
+        if diag {
+            let s: &[f32] = attn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read attn L0: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
+            let nan_count = s.iter().filter(|v| v.is_nan()).count();
+            let inf_count = s.iter().filter(|v| v.is_infinite()).count();
+            if nan_count > 0 || inf_count > 0 {
+                eprintln!("[DIAG]   WARNING attn: NaN={}, Inf={}", nan_count, inf_count);
+            }
+        }
+
         // --- Step 6: Output projection ---
         let o_proj = self.quantized_projection(
             &attn_out,
@@ -866,8 +1009,10 @@ impl Gemma4Model {
             hidden_size,
         )?;
 
-        // --- Step 7: Residual add (input + attn_output) ---
-        let residual1 = self.elementwise_add(input, &o_proj, seq_len * hidden_size)?;
+        // --- Step 7: Apply layer_scalar and residual add ---
+        // Gemma 4 has a per-layer scalar: hidden = input + layer_scalar * attn_output
+        let scaled_attn = self.apply_layer_scalar(layer_idx, &o_proj, seq_len * hidden_size)?;
+        let residual1 = self.elementwise_add(input, &scaled_attn, seq_len * hidden_size)?;
 
         // --- Step 8: Post-attention RMS norm ---
         let post_norm_name = format!(
@@ -878,8 +1023,22 @@ impl Gemma4Model {
         // --- Step 9: MoE FFN ---
         let ffn_out = self.moe_ffn(layer_idx, &post_normed, seq_len)?;
 
-        // --- Step 10: Residual add (residual1 + ffn_output) ---
-        let output = self.elementwise_add(&residual1, &ffn_out, seq_len * hidden_size)?;
+        if diag {
+            let s: &[f32] = ffn_out.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read ffn L0: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] Layer 0 after MoE FFN output, first {}: {:?}", n, &s[..n]);
+            let nan_count = s.iter().filter(|v| v.is_nan()).count();
+            let inf_count = s.iter().filter(|v| v.is_infinite()).count();
+            if nan_count > 0 || inf_count > 0 {
+                eprintln!("[DIAG]   WARNING ffn: NaN={}, Inf={}", nan_count, inf_count);
+            }
+        }
+
+        // --- Step 10: Apply layer_scalar to FFN output and residual add ---
+        let scaled_ffn = self.apply_layer_scalar(layer_idx, &ffn_out, seq_len * hidden_size)?;
+        let output = self.elementwise_add(&residual1, &scaled_ffn, seq_len * hidden_size)?;
 
         Ok(output)
     }
@@ -1474,6 +1633,52 @@ impl Gemma4Model {
         )
     }
 
+    /// Apply per-layer scalar: output = layer_scalar * input.
+    /// Gemma 4 has a learned scalar per layer that scales residual contributions.
+    fn apply_layer_scalar(
+        &mut self,
+        layer_idx: usize,
+        input: &MlxBuffer,
+        n_elements: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let scalar_name = format!("model.layers.{layer_idx}.layer_scalar");
+        match require_weight(&self.weights, &scalar_name) {
+            Ok(w) => {
+                // Read the scalar value (bf16 -> f32)
+                let scalar_val = if w.buffer.byte_len() >= 4 {
+                    // f32
+                    let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("read layer_scalar: {e}"),
+                    })?;
+                    s[0]
+                } else {
+                    // bf16 (2 bytes) — read as u16 and convert
+                    let raw: &[u16] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("read layer_scalar bf16: {e}"),
+                    })?;
+                    half::bf16::from_bits(raw[0]).to_f32()
+                };
+
+                // Multiply input by scalar
+                let input_data: &[f32] = input.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("read input for layer_scalar: {e}"),
+                })?;
+                let scaled: Vec<f32> = input_data.iter().map(|v| v * scalar_val).collect();
+                f32_vec_to_buffer(&self.device, &scaled, vec![n_elements])
+                    .map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("alloc scaled buffer: {e}"),
+                    })
+            }
+            Err(_) => {
+                // No layer_scalar for this layer — return input unchanged (clone it)
+                clone_buffer(&self.device, input)
+                    .map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("clone for missing layer_scalar: {e}"),
+                    })
+            }
+        }
+    }
+
     /// Elementwise add of two f32 buffers.
     fn elementwise_add(
         &mut self,
@@ -1520,10 +1725,11 @@ impl Gemma4Model {
         let hidden_size = self.config.hidden_size;
         let n_experts = self.config.num_experts;
         let top_k = self.config.top_k_experts;
+        let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
         // Router weight: [n_experts, hidden_size]
         let router_weight_name =
-            format!("model.layers.{layer_idx}.block_sparse_moe.router.weight");
+            format!("model.layers.{layer_idx}.router.proj.weight");
 
         let input_data = read_buffer_f32(input)?;
         let mut output_data = vec![0.0f32; seq_len * hidden_size];
@@ -1531,9 +1737,37 @@ impl Gemma4Model {
         // Check if router weight exists -- if not, check for a dense FFN
         let has_moe_router = self.weights.get(&router_weight_name).is_some();
 
+        if diag {
+            // Also check with the language_model prefix
+            let alt_name = format!("language_model.{}", router_weight_name);
+            let has_alt = self.weights.get(&alt_name).is_some();
+            eprintln!("[DIAG] MoE layer 0: has_moe_router={} (checked '{}'), alt_prefix={}",
+                has_moe_router, router_weight_name, has_alt);
+            if !has_moe_router && !has_alt {
+                // List some available weight keys for this layer
+                let prefix = format!("model.layers.{layer_idx}.");
+                let alt_prefix = format!("language_model.model.layers.{layer_idx}.");
+                let matching: Vec<_> = self.weights.weights.keys()
+                    .filter(|k| k.starts_with(&prefix) || k.starts_with(&alt_prefix))
+                    .take(20)
+                    .collect();
+                eprintln!("[DIAG]   Available weight keys for layer {}: {:?}", layer_idx, matching);
+            }
+        }
+
         if !has_moe_router {
+            if diag {
+                eprintln!("[DIAG] Falling back to dense FFN for layer {}", layer_idx);
+            }
             // Dense FFN fallback (some layers might not have MoE)
             return self.dense_ffn(layer_idx, input, seq_len);
+        }
+
+        if diag {
+            // Check router weight info
+            let rw = require_weight(&self.weights, &router_weight_name)?;
+            eprintln!("[DIAG] router weight: dtype={}, shape={:?}, byte_len={}",
+                rw.buffer.dtype(), rw.buffer.shape(), rw.buffer.byte_len());
         }
 
         // Process token by token for MoE (each token routes to different experts)
@@ -1543,9 +1777,24 @@ impl Gemma4Model {
             // Step 1: Router -- CPU matmul for the gate
             let router_data = self.cpu_router_forward(layer_idx, token_hidden)?;
 
+            if diag && t == 0 {
+                let mut router_sorted: Vec<(usize, f32)> = router_data.iter().copied().enumerate().collect();
+                router_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                eprintln!("[DIAG] MoE L0 T0 router top-5: {:?}", &router_sorted[..5.min(router_sorted.len())]);
+                let nan_count = router_data.iter().filter(|v| v.is_nan()).count();
+                if nan_count > 0 {
+                    eprintln!("[DIAG]   WARNING: router has {} NaN values", nan_count);
+                }
+            }
+
             // Step 2: Top-K selection and softmax
             let (expert_ids, routing_weights) =
                 top_k_softmax(&router_data, n_experts, top_k);
+
+            if diag && t == 0 {
+                eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
+                    expert_ids, routing_weights);
+            }
 
             // Step 3: Dispatch to selected experts and accumulate
             let mut token_output = vec![0.0f32; hidden_size];
@@ -1559,9 +1808,25 @@ impl Gemma4Model {
                 let expert_output =
                     self.expert_ffn(layer_idx, expert_id, token_hidden)?;
 
+                if diag && t == 0 && rank == 0 {
+                    let n = expert_output.len().min(5);
+                    eprintln!("[DIAG] MoE L0 T0 expert {} output first {}: {:?}",
+                        expert_id, n, &expert_output[..n]);
+                    let nan_count = expert_output.iter().filter(|v| v.is_nan()).count();
+                    if nan_count > 0 {
+                        eprintln!("[DIAG]   WARNING: expert output has {} NaN values out of {}",
+                            nan_count, expert_output.len());
+                    }
+                }
+
                 for (j, &val) in expert_output.iter().enumerate() {
                     token_output[j] += weight * val;
                 }
+            }
+
+            if diag && t == 0 {
+                let n = token_output.len().min(5);
+                eprintln!("[DIAG] MoE L0 T0 final accumulated output first {}: {:?}", n, &token_output[..n]);
             }
 
             output_data[t * hidden_size..(t + 1) * hidden_size]
@@ -1582,7 +1847,7 @@ impl Gemma4Model {
         token_hidden: &[f32],
     ) -> Result<Vec<f32>, Gemma4Error> {
         let router_name =
-            format!("model.layers.{layer_idx}.block_sparse_moe.router.weight");
+            format!("model.layers.{layer_idx}.router.proj.weight");
         let router_weight = require_weight(&self.weights, &router_name)?;
         let router_data = read_weight_as_f32(router_weight)?;
 
@@ -1611,18 +1876,61 @@ impl Gemma4Model {
     ) -> Result<Vec<f32>, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.moe_intermediate_size;
+        // Only diagnose for first call on layer 0
+        let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
+        // Use a simple static to only print once
+        static DIAG_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let diag = diag && !DIAG_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed);
 
         // Weight names for expert
         let base = format!(
-            "model.layers.{layer_idx}.block_sparse_moe.experts.{expert_id}"
+            "model.layers.{layer_idx}.experts.switch_glu"
         );
 
-        let gate_data = self.read_expert_weight(&format!("{base}.gate_proj.weight"),
+        let gate_name = format!("{base}.gate_proj.weight");
+        let up_name = format!("{base}.up_proj.weight");
+        let down_name = format!("{base}.down_proj.weight");
+
+        if diag {
+            // Check what the weight looks like
+            let gw = require_weight(&self.weights, &gate_name)?;
+            eprintln!("[DIAG] expert_ffn L0 E{}: gate_proj dtype={}, shape={:?}, byte_len={}",
+                expert_id, gw.buffer.dtype(), gw.buffer.shape(), gw.buffer.byte_len());
+            if let Some(ref qm) = gw.quant_meta {
+                eprintln!("[DIAG]   gate_proj quant: bits={}, group_size={}", qm.bits, qm.group_size);
+            }
+            let uw = require_weight(&self.weights, &up_name)?;
+            eprintln!("[DIAG]   up_proj dtype={}, shape={:?}", uw.buffer.dtype(), uw.buffer.shape());
+            let dw = require_weight(&self.weights, &down_name)?;
+            eprintln!("[DIAG]   down_proj dtype={}, shape={:?}", dw.buffer.dtype(), dw.buffer.shape());
+        }
+
+        let gate_data = self.read_expert_weight(&gate_name,
             intermediate_size, hidden_size)?;
-        let up_data = self.read_expert_weight(&format!("{base}.up_proj.weight"),
+        let up_data = self.read_expert_weight(&up_name,
             intermediate_size, hidden_size)?;
-        let down_data = self.read_expert_weight(&format!("{base}.down_proj.weight"),
+        let down_data = self.read_expert_weight(&down_name,
             hidden_size, intermediate_size)?;
+
+        if diag {
+            eprintln!("[DIAG] expert_ffn L0 E{}: gate_data len={} (expect {}x{}={}), first 5: {:?}",
+                expert_id, gate_data.len(), intermediate_size, hidden_size,
+                intermediate_size * hidden_size, &gate_data[..5.min(gate_data.len())]);
+            eprintln!("[DIAG]   up_data len={}, first 5: {:?}",
+                up_data.len(), &up_data[..5.min(up_data.len())]);
+            eprintln!("[DIAG]   down_data len={} (expect {}x{}={}), first 5: {:?}",
+                down_data.len(), hidden_size, intermediate_size,
+                hidden_size * intermediate_size, &down_data[..5.min(down_data.len())]);
+            let gate_nan = gate_data.iter().filter(|v| v.is_nan()).count();
+            let up_nan = up_data.iter().filter(|v| v.is_nan()).count();
+            let down_nan = down_data.iter().filter(|v| v.is_nan()).count();
+            if gate_nan > 0 || up_nan > 0 || down_nan > 0 {
+                eprintln!("[DIAG]   NaN in weights! gate={}, up={}, down={}",
+                    gate_nan, up_nan, down_nan);
+            }
+            eprintln!("[DIAG]   input token_hidden first 5: {:?}, len={}",
+                &token_hidden[..5.min(token_hidden.len())], token_hidden.len());
+        }
 
         // gate_out = gate_proj @ x   [intermediate_size]
         let mut gate_out = vec![0.0f32; intermediate_size];
@@ -1632,6 +1940,16 @@ impl Gemma4Model {
                 sum += gate_data[i * hidden_size + k] * token_hidden[k];
             }
             gate_out[i] = sum;
+        }
+
+        if diag {
+            let n = gate_out.len().min(5);
+            eprintln!("[DIAG] expert_ffn L0 E{}: gate_out first {}: {:?}",
+                expert_id, n, &gate_out[..n]);
+            let nan_count = gate_out.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING: gate_out has {} NaN", nan_count);
+            }
         }
 
         // up_out = up_proj @ x   [intermediate_size]
@@ -1644,10 +1962,26 @@ impl Gemma4Model {
             up_out[i] = sum;
         }
 
+        if diag {
+            let n = up_out.len().min(5);
+            eprintln!("[DIAG] expert_ffn L0 E{}: up_out first {}: {:?}",
+                expert_id, n, &up_out[..n]);
+            let nan_count = up_out.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING: up_out has {} NaN", nan_count);
+            }
+        }
+
         // hidden = GELU(gate_out) * up_out
         let mut hidden = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
             hidden[i] = gelu_pytorch_tanh(gate_out[i]) * up_out[i];
+        }
+
+        if diag {
+            let n = hidden.len().min(5);
+            eprintln!("[DIAG] expert_ffn L0 E{}: after GELU*up first {}: {:?}",
+                expert_id, n, &hidden[..n]);
         }
 
         // expert_out = down_proj @ hidden   [hidden_size]
@@ -1658,6 +1992,16 @@ impl Gemma4Model {
                 sum += down_data[i * intermediate_size + k] * hidden[k];
             }
             expert_out[i] = sum;
+        }
+
+        if diag {
+            let n = expert_out.len().min(5);
+            eprintln!("[DIAG] expert_ffn L0 E{}: final expert_out first {}: {:?}",
+                expert_id, n, &expert_out[..n]);
+            let nan_count = expert_out.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING: expert_out has {} NaN out of {}", nan_count, expert_out.len());
+            }
         }
 
         Ok(expert_out)
@@ -1683,6 +2027,21 @@ impl Gemma4Model {
     ) -> Result<MlxBuffer, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
+        let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
+
+        if diag {
+            eprintln!("[DIAG] dense_ffn L0: hidden_size={}, intermediate_size={}", hidden_size, intermediate_size);
+            let gw_name = format!("model.layers.{layer_idx}.mlp.gate_proj.weight");
+            let gw = require_weight(&self.weights, &gw_name)?;
+            eprintln!("[DIAG]   gate_proj.weight: dtype={}, shape={:?}, byte_len={}",
+                gw.buffer.dtype(), gw.buffer.shape(), gw.buffer.byte_len());
+            if let Some(ref qm) = gw.quant_meta {
+                eprintln!("[DIAG]   gate_proj quant: bits={}, group_size={}", qm.bits, qm.group_size);
+                let packed_cols = hidden_size * qm.bits as usize / 32;
+                eprintln!("[DIAG]   expected packed shape for [{},{}] at {} bits: [{},{}]",
+                    intermediate_size, hidden_size, qm.bits, intermediate_size, packed_cols);
+            }
+        }
 
         // gate_proj
         let gate = self.quantized_projection(
@@ -1693,6 +2052,18 @@ impl Gemma4Model {
             intermediate_size,
         )?;
 
+        if diag {
+            let s: &[f32] = gate.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense gate: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] dense_ffn L0: gate output first {}: {:?}", n, &s[..n]);
+            let nan_count = s.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING dense gate: NaN={}/{}", nan_count, s.len());
+            }
+        }
+
         // up_proj
         let up = self.quantized_projection(
             input,
@@ -1702,6 +2073,18 @@ impl Gemma4Model {
             intermediate_size,
         )?;
 
+        if diag {
+            let s: &[f32] = up.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense up: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] dense_ffn L0: up output first {}: {:?}", n, &s[..n]);
+            let nan_count = s.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING dense up: NaN={}/{}", nan_count, s.len());
+            }
+        }
+
         // GELU(gate) * up
         let gate_data = read_buffer_f32(&gate)?;
         let up_data = read_buffer_f32(&up)?;
@@ -1709,6 +2092,12 @@ impl Gemma4Model {
         for i in 0..hidden_data.len() {
             hidden_data[i] = gelu_pytorch_tanh(gate_data[i]) * up_data[i];
         }
+
+        if diag {
+            let n = hidden_data.len().min(5);
+            eprintln!("[DIAG] dense_ffn L0: GELU*up first {}: {:?}", n, &hidden_data[..n]);
+        }
+
         let hidden_buf = f32_vec_to_buffer(
             &self.device,
             &hidden_data,
@@ -1716,13 +2105,27 @@ impl Gemma4Model {
         )?;
 
         // down_proj
-        self.quantized_projection(
+        let result = self.quantized_projection(
             &hidden_buf,
             &format!("model.layers.{layer_idx}.mlp.down_proj"),
             seq_len,
             intermediate_size,
             hidden_size,
-        )
+        )?;
+
+        if diag {
+            let s: &[f32] = result.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag dense down: {e}"),
+            })?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] dense_ffn L0: down output first {}: {:?}", n, &s[..n]);
+            let nan_count = s.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("[DIAG]   WARNING dense down: NaN={}/{}", nan_count, s.len());
+            }
+        }
+
+        Ok(result)
     }
 
     /// Compute the lm_head projection using tied embeddings.
