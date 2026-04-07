@@ -2,7 +2,7 @@
 
 **Pure Rust CLI for converting HuggingFace models to hardware-optimized formats.**
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.81.0+](https://img.shields.io/badge/rust-1.81.0%2B-orange.svg)](https://www.rust-lang.org)
 
 ---
@@ -295,9 +295,4 @@ No features are enabled by default. The tool compiles and runs basic conversions
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or <http://www.apache.org/licenses/LICENSE-2.0>).
