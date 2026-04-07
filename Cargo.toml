@@ -16,7 +16,7 @@ coreml-backend = ["dep:coreml-native"]
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
 # Enable mlx-native inference engine (requires Apple Silicon + Metal)
-mlx-native = ["dep:mlx-native", "dep:tokenizers", "dep:minijinja"]
+mlx-native = ["dep:mlx-native", "dep:tokenizers", "dep:minijinja", "dep:rand"]
 
 [dependencies]
 # Core ML pipeline — optional, requires Metal Toolchain
@@ -41,6 +41,9 @@ tokenizers = { version = "0.20", optional = true }
 
 # Chat template rendering — optional, gated behind mlx-native feature
 minijinja = { version = "2", optional = true }
+
+# Random number generation for sampling — optional, gated behind mlx-native feature
+rand = { version = "0.8", optional = true }
 
 # CLI framework
 clap = { version = "4.5", features = ["derive"] }

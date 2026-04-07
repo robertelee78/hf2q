@@ -142,13 +142,44 @@ fn run(cli: Cli) -> Result<(), AppError> {
 /// Handle the `infer` subcommand (requires mlx-native feature).
 #[cfg(feature = "mlx-native")]
 fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
+    use std::io::Write;
+
     use console::style;
+    use inference::engine::{EngineConfig, InferenceEngine};
+    use inference::sampler::SamplerConfig;
+
+    // Validate sampling parameters
+    if args.temperature < 0.0 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "Temperature must be >= 0.0, got {}",
+            args.temperature
+        )));
+    }
+    if args.top_p <= 0.0 || args.top_p > 1.0 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "Top-p must be in (0.0, 1.0], got {}",
+            args.top_p
+        )));
+    }
+    if args.repetition_penalty < 1.0 {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "Repetition penalty must be >= 1.0, got {}",
+            args.repetition_penalty
+        )));
+    }
+
+    // Require a prompt for CLI mode
+    let prompt = args.prompt.as_deref().ok_or_else(|| {
+        AppError::Input(anyhow::anyhow!(
+            "No prompt provided. Use --prompt \"your text here\""
+        ))
+    })?;
 
     // Step 1: Resolve model path (local or Hub download)
     let model_dir = hub::download::resolve_model_path(&args.model)
         .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
 
-    // Step 2: Detect architecture
+    // Step 2: Detect architecture (for memory estimation display)
     let config_path = model_dir.join("config.json");
     if !config_path.exists() {
         return Err(AppError::Input(anyhow::anyhow!(
@@ -167,7 +198,8 @@ fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
     );
 
     // Step 3: Memory estimation and fail-fast check
-    let max_seq_len = args.max_tokens.unwrap_or(4096) as u64;
+    let max_tokens = args.max_tokens.unwrap_or(512) as usize;
+    let max_seq_len = (max_tokens as u64).max(4096);
     let mem_estimate = inference::memory_estimate::estimate_memory(
         &model_config,
         &model_dir,
@@ -192,43 +224,71 @@ fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
     inference::memory_estimate::check_memory(&mem_estimate)
         .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
 
-    // Step 4: Load tokenizer
-    let _tokenizer = tokenizer::HfTokenizer::from_dir(&model_dir)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+    // Step 4: Build engine config
+    let sampler_config = SamplerConfig {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k as usize,
+        repetition_penalty: args.repetition_penalty,
+    };
 
-    eprintln!(
-        "{} {} tokens",
-        style("Tokenizer:").bold(),
-        _tokenizer.vocab_size()
-    );
+    let engine_config = EngineConfig {
+        max_tokens,
+        sampler: sampler_config,
+        stop_sequences: Vec::new(),
+    };
 
-    // Step 5: Initialize Metal device and load weights
-    let device = mlx_native::MlxDevice::new()
-        .map_err(|e| AppError::Conversion(anyhow::anyhow!("Metal device init failed: {}", e)))?;
+    // Step 5: Create inference engine (loads model, tokenizer, chat template)
+    eprintln!("{}", style("Loading model...").dim());
+    let chat_template_override = args.chat_template.as_deref();
 
-    eprintln!(
-        "{} {}",
-        style("Metal device:").bold(),
-        device.name()
-    );
+    let mut engine = InferenceEngine::new(&model_dir, engine_config, chat_template_override)
+        .map_err(|e| {
+            // Map chat template not found to a user-friendly message
+            match &e {
+                inference::engine::EngineError::ChatTemplate(
+                    crate::tokenizer::chat_template::ChatTemplateError::NotFound,
+                ) => AppError::Input(anyhow::anyhow!(
+                    "No chat template found. Provide one with --chat-template"
+                )),
+                _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
+            }
+        })?;
 
-    let weights = inference::weight_loader::load_weights(&model_dir, &device)
+    eprintln!("{}", style("Generating...").dim());
+    eprintln!();
+
+    // Step 6: Generate with streaming output
+    let stdout = std::io::stdout();
+    let (text, stats) = engine
+        .generate(prompt, |token_text| {
+            // Stream each token to stdout as it is generated
+            let mut out = stdout.lock();
+            let _ = out.write_all(token_text.as_bytes());
+            let _ = out.flush();
+            true // continue generating
+        })
         .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
 
-    eprintln!(
-        "{} {} tensors ({:.1} GB)",
-        style("Weights loaded:").bold(),
-        weights.len(),
-        weights.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
+    // Ensure we end on a newline
+    if !text.ends_with('\n') {
+        println!();
+    }
 
-    // For Story 2.1, we validate loading completes successfully.
-    // Actual text generation is Story 2.2+.
+    // Step 7: Print generation statistics
     eprintln!();
     eprintln!(
-        "{}",
-        style("Model loaded successfully. Text generation will be available in a future release.")
-            .green()
+        "{} {} prompt tokens, {} generated tokens",
+        style("Stats:").bold(),
+        stats.prompt_tokens,
+        stats.generated_tokens,
+    );
+    eprintln!(
+        "{} prefill {:.1} tok/s, decode {:.1} tok/s, total {:.2}s",
+        style("Speed:").bold(),
+        stats.prefill_tokens_per_sec(),
+        stats.decode_tokens_per_sec(),
+        stats.total_time_secs,
     );
 
     Ok(())

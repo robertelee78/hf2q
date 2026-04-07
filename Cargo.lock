@@ -1349,6 +1349,7 @@ dependencies = [
  "mlx-native",
  "mlx-rs",
  "predicates",
+ "rand 0.8.5",
  "rayon",
  "ruvector-core",
  "safetensors 0.7.0",

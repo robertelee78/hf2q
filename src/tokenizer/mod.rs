@@ -3,6 +3,8 @@
 //! Loads tokenizer.json from a model directory and provides encode/decode
 //! operations with proper handling of special tokens (BOS, EOS).
 
+pub mod chat_template;
+
 use std::path::Path;
 
 use thiserror::Error;
