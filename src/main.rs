@@ -12,6 +12,8 @@
 mod backends;
 mod cli;
 mod doctor;
+#[cfg(feature = "mlx-native")]
+mod hub;
 #[allow(dead_code)]
 mod inference;
 mod input;
@@ -24,6 +26,9 @@ mod quality;
 mod quantize;
 #[allow(dead_code)]
 mod report;
+#[cfg(feature = "mlx-native")]
+#[allow(dead_code)]
+mod tokenizer;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -129,7 +134,104 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
+        #[cfg(feature = "mlx-native")]
+        Command::Infer(args) => cmd_infer(args),
     }
+}
+
+/// Handle the `infer` subcommand (requires mlx-native feature).
+#[cfg(feature = "mlx-native")]
+fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
+    use console::style;
+
+    // Step 1: Resolve model path (local or Hub download)
+    let model_dir = hub::download::resolve_model_path(&args.model)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    // Step 2: Detect architecture
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "No config.json found in {}. Is this a valid model directory?",
+            model_dir.display()
+        )));
+    }
+
+    let model_config = inference::models::registry::detect_architecture(&config_path)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {}",
+        style("Architecture:").bold(),
+        model_config.architecture_str
+    );
+
+    // Step 3: Memory estimation and fail-fast check
+    let max_seq_len = args.max_tokens.unwrap_or(4096) as u64;
+    let mem_estimate = inference::memory_estimate::estimate_memory(
+        &model_config,
+        &model_dir,
+        max_seq_len,
+    )
+    .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {:.1} GB (weights: {:.1} GB, KV cache: {:.1} GB)",
+        style("Memory estimate:").bold(),
+        mem_estimate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mem_estimate.weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mem_estimate.kv_cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    eprintln!(
+        "{} {:.1} GB ({:.1}% usage)",
+        style("Available memory:").bold(),
+        mem_estimate.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mem_estimate.usage_percent(),
+    );
+
+    inference::memory_estimate::check_memory(&mem_estimate)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    // Step 4: Load tokenizer
+    let _tokenizer = tokenizer::HfTokenizer::from_dir(&model_dir)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {} tokens",
+        style("Tokenizer:").bold(),
+        _tokenizer.vocab_size()
+    );
+
+    // Step 5: Initialize Metal device and load weights
+    let device = mlx_native::MlxDevice::new()
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!("Metal device init failed: {}", e)))?;
+
+    eprintln!(
+        "{} {}",
+        style("Metal device:").bold(),
+        device.name()
+    );
+
+    let weights = inference::weight_loader::load_weights(&model_dir, &device)
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {} tensors ({:.1} GB)",
+        style("Weights loaded:").bold(),
+        weights.len(),
+        weights.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+
+    // For Story 2.1, we validate loading completes successfully.
+    // Actual text generation is Story 2.2+.
+    eprintln!();
+    eprintln!(
+        "{}",
+        style("Model loaded successfully. Text generation will be available in a future release.")
+            .green()
+    );
+
+    Ok(())
 }
 
 /// Handle the `convert` subcommand.

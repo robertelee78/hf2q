@@ -33,6 +33,10 @@ pub enum Command {
 
     /// Generate shell completions
     Completions(CompletionsArgs),
+
+    /// Run inference on a model (requires --features mlx-native)
+    #[cfg(feature = "mlx-native")]
+    Infer(InferArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -110,6 +114,43 @@ pub struct CompletionsArgs {
     /// Shell to generate completions for
     #[arg(long, value_enum)]
     pub shell: Shell,
+}
+
+/// Arguments for the `infer` subcommand.
+#[cfg(feature = "mlx-native")]
+#[derive(clap::Args, Debug)]
+pub struct InferArgs {
+    /// Model path (local directory) or HuggingFace Hub ID (e.g., mlx-community/gemma-4-26b-a4b-it-4bit)
+    #[arg(long)]
+    pub model: String,
+
+    /// Prompt text for generation
+    #[arg(long)]
+    pub prompt: Option<String>,
+
+    /// Maximum number of tokens to generate
+    #[arg(long, default_value = "512")]
+    pub max_tokens: Option<u32>,
+
+    /// Sampling temperature (0.0 = greedy, higher = more random)
+    #[arg(long, default_value = "0.7")]
+    pub temperature: f32,
+
+    /// Top-p (nucleus) sampling threshold
+    #[arg(long, default_value = "0.9")]
+    pub top_p: f32,
+
+    /// Top-k sampling (0 = disabled)
+    #[arg(long, default_value = "0")]
+    pub top_k: u32,
+
+    /// Repetition penalty (1.0 = disabled)
+    #[arg(long, default_value = "1.0")]
+    pub repetition_penalty: f32,
+
+    /// Path to a custom chat template (Jinja2 format)
+    #[arg(long)]
+    pub chat_template: Option<std::path::PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

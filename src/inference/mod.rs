@@ -11,7 +11,13 @@ pub mod mlx_runner {
     //! Placeholder when mlx-backend feature is not enabled.
 }
 
+pub mod models;
 pub mod stub_runner;
+
+#[cfg(feature = "mlx-native")]
+pub mod weight_loader;
+#[cfg(feature = "mlx-native")]
+pub mod memory_estimate;
 
 use thiserror::Error;
 
