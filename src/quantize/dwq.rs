@@ -201,111 +201,75 @@ pub fn run_dwq_calibration(
     }
     info!(tensors = quantized_tensors.len(), "Initial quantization complete");
 
-    // Step 4: Layer-by-layer weight-space calibration.
+    // Step 4: Layer-by-layer weight-space calibration (single-pass, closed-form).
     //
-    // For each layer, compare the original f16 weights against their quantized
-    // (then dequantized) versions. Adjust quantization scales to minimize
-    // per-tensor MSE: ||W_original - dequant(quant(W))||².
+    // For each quantized weight tensor, compute the optimal scale per group:
+    //   optimal_scale = dot(W_original, Q_int) / dot(Q_int, Q_int)
     //
-    // This is the GPTQ/AWQ approach: calibration happens in weight space,
-    // not activation space. No forward passes needed per layer — just direct
-    // weight comparison. This is both correct and memory-efficient.
-    for layer_idx in 0..num_layers {
-        pb.set_message(format!("Calibrating layer {}/{}", layer_idx + 1, num_layers));
+    // This is exact — no iterations needed. Process one tensor at a time
+    // to minimize memory: extract original f32 values, compute optimal scales,
+    // then immediately drop the f32 copy.
+    pb.set_message("Calibrating scales (weight-space)");
+    let mut calibrated_count = 0usize;
 
-        let layer_prefix = format!(".layers.{}.", layer_idx);
-
-        // Get original tensors for this layer
-        let original_layer_tensors: Vec<(&String, &TensorRef)> = tensor_map
-            .tensors
-            .iter()
-            .filter(|(k, _)| k.contains(&layer_prefix))
-            .collect();
-
-        // For each weight tensor in this layer, compare original vs dequantized
-        let mut best_layer_mse = f64::MAX;
-
-        for iter in 0..config.max_iterations {
-            let mut total_mse = 0.0f64;
-            let mut total_elements = 0usize;
-
-            for (name, original) in &original_layer_tensors {
-                if let Some(quantized) = quantized_tensors.get(*name) {
-                    if quantized.quant_info.preserved || quantized.quant_info.scales.is_none() {
-                        continue; // skip non-quantized tensors
-                    }
-
-                    // Dequantize to get the reconstructed weights
-                    let bits = quantized.quant_info.bits;
-                    let group_size = quantized.quant_info.group_size;
-                    let scales_raw = quantized.quant_info.scales.as_ref().unwrap();
-                    let num_elements: usize = quantized.shape.iter().product();
-
-                    let int_values = unpack_quantized(&quantized.data, bits, num_elements);
-                    let scales: Vec<f32> = scales_raw
-                        .chunks_exact(2)
-                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                        .collect();
-
-                    let effective_gs = if num_elements < group_size { num_elements } else { group_size };
-
-                    // Get original f32 values
-                    let original_f32 = tensor_to_f32_safe(original);
-
-                    // Compute MSE between original and dequantized
-                    let min_len = original_f32.len().min(num_elements);
-                    for i in 0..min_len {
-                        let group_idx = i / effective_gs;
-                        let scale = scales.get(group_idx).copied().unwrap_or(0.0);
-                        let dequant_val = scale * (int_values[i] as f32);
-                        let diff = original_f32[i] - dequant_val;
-                        total_mse += (diff as f64) * (diff as f64);
-                    }
-                    total_elements += min_len;
-                }
-            }
-
-            let mse = if total_elements > 0 {
-                total_mse / total_elements as f64
-            } else {
-                0.0
-            };
-
-            debug!(layer = layer_idx, iteration = iter, mse = mse, "Layer weight calibration");
-
-            if mse < config.convergence_threshold {
-                best_layer_mse = mse;
-                break;
-            }
-
-            if mse < best_layer_mse {
-                best_layer_mse = mse;
-
-                // Adjust scales for this layer's quantized tensors
-                let mut layer_tensors: HashMap<String, QuantizedTensor> = quantized_tensors
-                    .iter()
-                    .filter(|(k, _)| k.contains(&layer_prefix))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-
-                // Weight-space scale adjustment: for each tensor, compute the
-                // optimal scale per group as argmin ||W_group - scale * Q_group||²
-                // which has closed-form solution: scale = dot(W, Q) / dot(Q, Q)
-                adjust_scales_weight_space(&mut layer_tensors, &tensor_map.tensors);
-
-                for (k, v) in layer_tensors {
-                    quantized_tensors.insert(k, v);
-                }
-            } else {
-                break; // MSE increased — stop for this layer
-            }
-
-            pb.inc(1);
+    for (name, qt) in quantized_tensors.iter_mut() {
+        if qt.quant_info.preserved || qt.quant_info.scales.is_none() {
+            continue;
         }
 
-        debug!(layer = layer_idx, best_mse = best_layer_mse, "Layer calibration complete");
-        pb.inc(1);
+        let original = match tensor_map.tensors.get(name) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let bits = qt.quant_info.bits;
+        let group_size = qt.quant_info.group_size;
+        let num_elements: usize = qt.shape.iter().product();
+        let effective_gs = if num_elements < group_size { num_elements } else { group_size };
+        let num_groups = num_elements.div_ceil(effective_gs);
+
+        // Unpack quantized integers (temporary — dropped after this tensor)
+        let int_values = unpack_quantized(&qt.data, bits, num_elements);
+
+        // Convert original to f32 (temporary — dropped after this tensor)
+        let original_f32 = tensor_to_f32_safe(original);
+
+        // Compute optimal scale per group using closed-form solution
+        let mut new_scales = Vec::with_capacity(num_groups * 2);
+        let min_len = original_f32.len().min(num_elements);
+
+        for g in 0..num_groups {
+            let start = g * effective_gs;
+            let end = (start + effective_gs).min(min_len);
+
+            let mut dot_wq = 0.0f64;
+            let mut dot_qq = 0.0f64;
+
+            for i in start..end {
+                let w = original_f32[i] as f64;
+                let q = int_values[i] as f64;
+                dot_wq += w * q;
+                dot_qq += q * q;
+            }
+
+            let optimal_scale = if dot_qq > 1e-12 {
+                (dot_wq / dot_qq) as f32
+            } else {
+                0.0f32
+            };
+
+            let scale_f16 = half::f16::from_f32(optimal_scale);
+            new_scales.extend_from_slice(&scale_f16.to_le_bytes());
+        }
+
+        qt.quant_info.scales = Some(new_scales);
+        calibrated_count += 1;
+
+        // original_f32 and int_values are dropped here — memory freed per-tensor
     }
+
+    info!(calibrated = calibrated_count, "Weight-space scale calibration complete");
+    pb.inc(num_layers as u64 + 1);
 
     pb.set_message("Finalizing");
     pb.inc(1);

@@ -330,13 +330,28 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         "Model loaded"
     );
 
-    // Phase 2: Convert bf16 -> f16
-    let bf16_count = tensor_map
-        .convert_bf16_to_f16()
-        .context("bf16 to f16 conversion failed")
-        .map_err(AppError::Conversion)?;
-    if bf16_count > 0 {
-        tracing::info!(converted = bf16_count, "Converted bf16 tensors to f16");
+    // Phase 2: Convert bf16 -> f16 (skip for MLX native path which preserves bf16)
+    let backend: Box<dyn OutputBackend> = match config.format {
+        cli::OutputFormat::Mlx => Box::new(MlxBackend::new()),
+        cli::OutputFormat::Coreml => Box::new(CoremlBackend::new()),
+        other => {
+            return Err(AppError::Conversion(anyhow::anyhow!(
+                "Output format '{}' is not yet implemented",
+                other
+            )));
+        }
+    };
+
+    if !backend.requires_native_quantization() {
+        let bf16_count = tensor_map
+            .convert_bf16_to_f16()
+            .context("bf16 to f16 conversion failed")
+            .map_err(AppError::Conversion)?;
+        if bf16_count > 0 {
+            tracing::info!(converted = bf16_count, "Converted bf16 tensors to f16");
+        }
+    } else {
+        tracing::info!("Preserving bf16 tensors for native quantization backend");
     }
 
     check_interrupted()?;
@@ -440,36 +455,44 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 4: Select backend, validate, and write output
-    let backend: Box<dyn OutputBackend> = match config.format {
-        cli::OutputFormat::Mlx => Box::new(MlxBackend::new()),
-        cli::OutputFormat::Coreml => Box::new(CoremlBackend::new()),
-        other => {
-            return Err(AppError::Conversion(anyhow::anyhow!(
-                "Output format '{}' is not yet implemented",
-                other
-            )));
+    // Phase 4: Write output (backend was created in Phase 2)
+
+    let manifest = if backend.requires_native_quantization() {
+        // MLX path: backend quantizes directly from f16 weights
+        let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
+        backend
+            .quantize_and_write(
+                &tensor_map,
+                &metadata,
+                bits as u8,
+                config.group_size,
+                &config.input_dir,
+                &config.output_dir,
+                &progress,
+            )
+            .context("Native quantization and write failed")
+            .map_err(AppError::Conversion)?
+    } else {
+        // Standard path: validate pre-quantized model and write
+        let warnings = backend
+            .validate(&quantized_model)
+            .context("Output validation failed")
+            .map_err(AppError::Conversion)?;
+
+        for w in &warnings {
+            tracing::warn!("{}", w.message);
         }
+
+        backend
+            .write(
+                &quantized_model,
+                &config.input_dir,
+                &config.output_dir,
+                &progress,
+            )
+            .context("Failed to write output")
+            .map_err(AppError::Conversion)?
     };
-
-    let warnings = backend
-        .validate(&quantized_model)
-        .context("Output validation failed")
-        .map_err(AppError::Conversion)?;
-
-    for w in &warnings {
-        tracing::warn!("{}", w.message);
-    }
-
-    let manifest = backend
-        .write(
-            &quantized_model,
-            &config.input_dir,
-            &config.output_dir,
-            &progress,
-        )
-        .context("Failed to write output")
-        .map_err(AppError::Conversion)?;
 
     check_interrupted()?;
 

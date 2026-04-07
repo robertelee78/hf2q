@@ -14,7 +14,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::ir::{FormatWarning, OutputManifest, QuantizedModel};
+use crate::ir::{FormatWarning, OutputManifest, QuantizedModel, ModelMetadata, TensorMap};
 use crate::progress::ProgressReporter;
 
 /// Errors from output backend operations.
@@ -57,4 +57,33 @@ pub trait OutputBackend: Send + Sync {
         output_dir: &Path,
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError>;
+
+    /// Quantize original f16 weights using the backend's native algorithm and write output.
+    ///
+    /// Some formats (e.g., MLX) have specific quantization algorithms baked into their
+    /// inference kernels. For these, the backend must perform quantization itself rather
+    /// than receiving pre-quantized IR output.
+    ///
+    /// Default: not supported (returns error). Backends that support this override it.
+    fn quantize_and_write(
+        &self,
+        tensor_map: &TensorMap,
+        metadata: &ModelMetadata,
+        bits: u8,
+        group_size: usize,
+        input_dir: &Path,
+        output_dir: &Path,
+        progress: &ProgressReporter,
+    ) -> Result<OutputManifest, BackendError> {
+        let _ = (tensor_map, metadata, bits, group_size, input_dir, output_dir, progress);
+        Err(BackendError::UnsupportedFormat {
+            format: format!("{} does not support native quantization", self.name()),
+        })
+    }
+
+    /// Whether this backend requires native quantization (quantize_and_write)
+    /// rather than receiving pre-quantized IR.
+    fn requires_native_quantization(&self) -> bool {
+        false
+    }
 }

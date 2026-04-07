@@ -16,7 +16,8 @@ use tracing::{debug, info, warn};
 use crate::backends::{BackendError, OutputBackend};
 use crate::cli::DEFAULT_OUTPUT_SHARDS;
 use crate::ir::{
-    FormatWarning, OutputFile, OutputManifest, QuantizedModel, QuantizedTensor, WarningSeverity,
+    DType as IrDType, FormatWarning, ModelMetadata, OutputFile, OutputManifest, QuantizedModel,
+    QuantizedTensor, TensorMap, TensorRef, WarningSeverity,
 };
 use crate::progress::ProgressReporter;
 
@@ -121,6 +122,416 @@ impl OutputBackend for MlxBackend {
             shard_count,
         })
     }
+
+    fn requires_native_quantization(&self) -> bool {
+        true
+    }
+
+    fn quantize_and_write(
+        &self,
+        tensor_map: &TensorMap,
+        metadata: &ModelMetadata,
+        bits: u8,
+        group_size: usize,
+        input_dir: &Path,
+        output_dir: &Path,
+        progress: &ProgressReporter,
+    ) -> Result<OutputManifest, BackendError> {
+        fs::create_dir_all(output_dir).map_err(|e| BackendError::WriteFailed {
+            reason: format!("Failed to create output directory: {}", e),
+        })?;
+
+        let mut files = Vec::new();
+
+        // 1. Quantize f16 tensors using MLX affine algorithm and write shards
+        // Build per-tensor bit width map.
+        // MoE models (Gemma 4, etc.) keep MLP dense layers and router at higher
+        // precision (8-bit) for routing quality, matching mlx-lm's quant_predicate.
+        let is_moe = metadata.num_experts.map_or(false, |n| n > 1);
+        let bit_overrides: HashMap<String, u8> = if is_moe {
+            tensor_map.tensors.keys()
+                .filter(|name| {
+                    name.contains(".mlp.gate_proj") ||
+                    name.contains(".mlp.up_proj") ||
+                    name.contains(".mlp.down_proj") ||
+                    name.contains(".router.proj")
+                })
+                .map(|name| (name.clone(), 8u8))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let shard_files = write_natively_quantized_shards(
+            tensor_map, metadata, bits, group_size, &bit_overrides, output_dir, progress,
+        )?;
+        files.extend(shard_files);
+
+        // 2. Write config.json with quantization metadata + per-layer overrides
+        let config_size = write_mlx_config_native(
+            metadata, bits, group_size, &bit_overrides, output_dir,
+        )?;
+        files.push(OutputFile {
+            filename: "config.json".to_string(),
+            size_bytes: config_size,
+        });
+
+        // 3. Copy tokenizer files
+        let tokenizer_files = copy_tokenizer_files(input_dir, output_dir)?;
+        files.extend(tokenizer_files);
+
+        // 4. Write quantization_config.json (metadata for downstream tools)
+        let qc = serde_json::json!({
+            "quant_method": "mlx_affine",
+            "bits": bits,
+            "group_size": group_size,
+        });
+        let qc_json = serde_json::to_string_pretty(&qc).map_err(BackendError::Serialization)?;
+        let qc_path = output_dir.join("quantization_config.json");
+        fs::write(&qc_path, &qc_json).map_err(|e| BackendError::WriteFailed {
+            reason: format!("Failed to write quantization_config.json: {}", e),
+        })?;
+        files.push(OutputFile {
+            filename: "quantization_config.json".to_string(),
+            size_bytes: qc_json.len() as u64,
+        });
+
+        let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
+        let shard_count = files
+            .iter()
+            .filter(|f| f.filename.ends_with(".safetensors"))
+            .count();
+
+        info!(
+            output_dir = %output_dir.display(),
+            total_size_mb = total_size / (1024 * 1024),
+            shard_count,
+            "MLX native quantization output written"
+        );
+
+        Ok(OutputManifest {
+            output_dir: output_dir.display().to_string(),
+            files,
+            total_size_bytes: total_size,
+            shard_count,
+        })
+    }
+}
+
+/// Quantize f16 tensors using MLX affine algorithm and write as safetensors shards.
+///
+/// This is the native quantization path: original f16 weights go directly through
+/// MLX's affine quantize algorithm (pure Rust port), producing bit-exact compatible
+/// output for MLX's `quantized_matmul` Metal kernel.
+///
+/// Weight tensors (2D+ with "weight" in name, not norms/scalars) are quantized.
+/// Everything else is preserved at original precision.
+fn write_natively_quantized_shards(
+    tensor_map: &TensorMap,
+    _metadata: &ModelMetadata,
+    bits: u8,
+    group_size: usize,
+    bit_overrides: &HashMap<String, u8>,
+    output_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<Vec<OutputFile>, BackendError> {
+    let num_shards = DEFAULT_OUTPUT_SHARDS;
+
+    // Sort tensors by name for deterministic output
+    let mut sorted_tensors: Vec<(&String, &TensorRef)> = tensor_map.tensors.iter().collect();
+    sorted_tensors.sort_by_key(|(name, _)| name.as_str());
+
+    // Distribute tensors across shards roughly evenly by data size
+    let total_size: usize = sorted_tensors.iter().map(|(_, t)| t.data.len()).sum();
+    let target_shard_size = (total_size / num_shards).max(1);
+
+    let mut shards: Vec<Vec<(&String, &TensorRef)>> = vec![Vec::new(); num_shards];
+    let mut shard_sizes = vec![0usize; num_shards];
+    let mut current_shard = 0;
+
+    for tensor_pair in &sorted_tensors {
+        shards[current_shard].push(*tensor_pair);
+        shard_sizes[current_shard] += tensor_pair.1.data.len();
+
+        if shard_sizes[current_shard] >= target_shard_size && current_shard < num_shards - 1 {
+            current_shard += 1;
+        }
+    }
+
+    let pb = progress.bar(num_shards as u64, "Writing MLX shards (native quant)");
+    let mut files = Vec::new();
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+
+    for (shard_idx, shard_tensors) in shards.iter().enumerate() {
+        if shard_tensors.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        let shard_filename = if num_shards == 1 {
+            "model.safetensors".to_string()
+        } else {
+            format!("model-{:05}-of-{:05}.safetensors", shard_idx + 1, num_shards)
+        };
+
+        let shard_path = output_dir.join(&shard_filename);
+
+        let mut shard_tensor_names: Vec<String> = Vec::new();
+        let shard_size = write_native_safetensors_file(
+            shard_tensors,
+            bits,
+            group_size,
+            bit_overrides,
+            &shard_path,
+            &mut shard_tensor_names,
+        )?;
+
+        for tensor_name in &shard_tensor_names {
+            weight_map.insert(tensor_name.clone(), shard_filename.clone());
+        }
+
+        files.push(OutputFile {
+            filename: shard_filename,
+            size_bytes: shard_size,
+        });
+
+        pb.inc(1);
+    }
+
+    // Write index.json
+    if num_shards > 1 {
+        let index = serde_json::json!({
+            "metadata": { "total_size": total_size },
+            "weight_map": weight_map
+        });
+        let index_path = output_dir.join("model.safetensors.index.json");
+        let index_json = serde_json::to_string_pretty(&index)
+            .map_err(BackendError::Serialization)?;
+        fs::write(&index_path, &index_json).map_err(|e| BackendError::WriteFailed {
+            reason: format!("Failed to write index.json: {}", e),
+        })?;
+        files.push(OutputFile {
+            filename: "model.safetensors.index.json".to_string(),
+            size_bytes: index_json.len() as u64,
+        });
+    }
+
+    pb.finish_with_message("MLX shards written (native quant)");
+    Ok(files)
+}
+
+/// Write a single safetensors file, quantizing weight tensors with MLX affine algorithm.
+///
+/// For each tensor:
+/// - If it's a weight tensor (2D+, not a norm/scalar): convert to f32, quantize, write
+///   as (uint32 weight + bf16 scales + bf16 biases) with proper naming
+/// - If it's a non-weight tensor: write as-is at original precision
+fn write_native_safetensors_file(
+    tensors: &[(&String, &TensorRef)],
+    bits: u8,
+    group_size: usize,
+    bit_overrides: &HashMap<String, u8>,
+    path: &Path,
+    output_tensor_names: &mut Vec<String>,
+) -> Result<u64, BackendError> {
+    let mut entries: Vec<SafetensorEntry> = Vec::new();
+
+    for (name, tensor) in tensors {
+        // Determine if this tensor should be quantized.
+        // Quantize all 2D+ weight tensors: Linear projections, Embeddings, expert weights.
+        // Preserve: layer norms (1D), scalars (0D/1D), position embeddings, std_bias/scale.
+        // This matches mlx-lm's nn.quantize which transforms both nn.Linear and nn.Embedding.
+        let is_2d_plus = tensor.shape.len() >= 2;
+        let is_norm_or_scalar = name.contains("layernorm")
+            || name.contains("_norm.")
+            || name.contains("layer_scalar")
+            || name.contains("router.scale")
+            || name.contains("per_expert_scale")
+            || name.contains("std_bias")
+            || name.contains("std_scale")
+            || name.contains("position_embedding");
+        // Skip vision tower entirely — text-only inference doesn't use it,
+        // and quantizing it creates extra keys that may confuse the loader.
+        let is_vision = name.contains("vision_tower") || name.contains("embed_vision");
+        if is_vision {
+            continue;
+        }
+        let should_quantize = is_2d_plus && !is_norm_or_scalar;
+
+        if should_quantize {
+            // Look up per-tensor bit override (e.g., 8-bit for MLP/router in MoE)
+            let tensor_bits = bit_overrides.get(*name).copied().unwrap_or(bits);
+
+            // Convert to f32 for quantization
+            let f32_values = tensor_ref_to_f32(tensor);
+
+            // Run MLX affine quantization at the right bit width
+            let (mlx_packed, mlx_scales, mlx_biases) =
+                mlx_affine_quantize(&f32_values, tensor_bits as u32, group_size);
+
+            let weight_shape = mlx_weight_shape(&tensor.shape, tensor_bits);
+            let scales_shape = mlx_scales_shape(&tensor.shape, group_size);
+
+            // Handle expert naming
+            let make_entries = |module: &str,
+                                w_data: Vec<u8>, w_shape: Vec<usize>,
+                                s_data: Vec<u8>, s_shape: Vec<usize>,
+                                b_data: Vec<u8>| -> Vec<SafetensorEntry> {
+                vec![
+                    SafetensorEntry { name: format!("{}.weight", module), dtype: "U32", shape: w_shape, data: w_data },
+                    SafetensorEntry { name: format!("{}.scales", module), dtype: "BF16", shape: s_shape.clone(), data: s_data },
+                    SafetensorEntry { name: format!("{}.biases", module), dtype: "BF16", shape: s_shape, data: b_data },
+                ]
+            };
+
+            if name.ends_with(".experts.gate_up_proj") {
+                let base = name.strip_suffix(".gate_up_proj").unwrap();
+                let (gate_w, up_w, half_w_shape, _) = split_tensor_axis_neg2(&mlx_packed, &weight_shape);
+                let (gate_s, up_s, half_s_shape, _) = split_tensor_axis_neg2(&mlx_scales, &scales_shape);
+                let (gate_b, up_b, _, _) = split_tensor_axis_neg2(&mlx_biases, &scales_shape);
+
+                entries.extend(make_entries(
+                    &format!("{}.switch_glu.gate_proj", base),
+                    gate_w, half_w_shape.clone(), gate_s, half_s_shape.clone(), gate_b,
+                ));
+                entries.extend(make_entries(
+                    &format!("{}.switch_glu.up_proj", base),
+                    up_w, half_w_shape, up_s, half_s_shape, up_b,
+                ));
+            } else if name.ends_with(".experts.down_proj") {
+                let base = name.strip_suffix(".down_proj").unwrap();
+                entries.extend(make_entries(
+                    &format!("{}.switch_glu.down_proj", base),
+                    mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
+                ));
+            } else {
+                let module = name.strip_suffix(".weight").unwrap_or(name);
+                entries.extend(make_entries(
+                    module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
+                ));
+            }
+        } else {
+            // Non-weight tensor: preserve as-is
+            let dtype_str = match tensor.dtype {
+                IrDType::F32 => "F32",
+                IrDType::F16 => "F16",
+                IrDType::BF16 => "BF16", // preserved as bf16 for MLX native path
+                IrDType::I32 => "I32",
+                IrDType::I64 => "I64",
+                IrDType::U8 => "U8",
+                IrDType::U16 => "U16",
+                IrDType::U32 => "U32",
+                IrDType::Bool => "BOOL",
+            };
+            entries.push(SafetensorEntry {
+                name: (*name).clone(),
+                dtype: dtype_str,
+                shape: tensor.shape.clone(),
+                data: tensor.data.clone(),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    output_tensor_names.extend(entries.iter().map(|e| e.name.clone()));
+
+    // Build safetensors file
+    let mut header_map: BTreeMap<String, Value> = BTreeMap::new();
+    let mut current_offset = 0usize;
+
+    for entry in &entries {
+        let data_end = current_offset + entry.data.len();
+        header_map.insert(
+            entry.name.clone(),
+            serde_json::json!({
+                "dtype": entry.dtype,
+                "shape": entry.shape,
+                "data_offsets": [current_offset, data_end]
+            }),
+        );
+        current_offset = data_end;
+    }
+
+    header_map.insert("__metadata__".to_string(), serde_json::json!({"format": "mlx"}));
+
+    let header_json = serde_json::to_string(&header_map).map_err(BackendError::Serialization)?;
+    let header_bytes = header_json.as_bytes();
+    let header_size = header_bytes.len() as u64;
+
+    let mut file_data = Vec::with_capacity(8 + header_bytes.len() + current_offset);
+    file_data.extend_from_slice(&header_size.to_le_bytes());
+    file_data.extend_from_slice(header_bytes);
+    for entry in &entries {
+        file_data.extend_from_slice(&entry.data);
+    }
+
+    fs::write(path, &file_data).map_err(|e| BackendError::WriteFailed {
+        reason: format!("Failed to write {}: {}", path.display(), e),
+    })?;
+
+    debug!(path = %path.display(), size = file_data.len(), "Wrote safetensors shard (native quant)");
+    Ok(file_data.len() as u64)
+}
+
+/// Convert a TensorRef to f32 values for quantization.
+fn tensor_ref_to_f32(tensor: &TensorRef) -> Vec<f32> {
+    match tensor.dtype {
+        IrDType::F32 => tensor.data.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        IrDType::F16 => tensor.data.chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        IrDType::BF16 => tensor.data.chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        _ => vec![0.0; tensor.shape.iter().product()],
+    }
+}
+
+/// Write MLX config.json for native quantization path with per-layer overrides.
+fn write_mlx_config_native(
+    metadata: &ModelMetadata,
+    bits: u8,
+    group_size: usize,
+    bit_overrides: &HashMap<String, u8>,
+    output_dir: &Path,
+) -> Result<u64, BackendError> {
+    let mut config = metadata.raw_config.clone();
+
+    // Build quantization config with per-layer overrides
+    let mut quant_config = serde_json::json!({
+        "group_size": group_size,
+        "bits": bits,
+        "mode": "affine"
+    });
+
+    if let Some(quant_obj) = quant_config.as_object_mut() {
+        for (tensor_name, &override_bits) in bit_overrides {
+            // Convert tensor name to mlx-lm module path
+            let paths = tensor_name_to_mlx_module_paths(tensor_name);
+            for path in paths {
+                quant_obj.insert(
+                    path,
+                    serde_json::json!({
+                        "group_size": group_size,
+                        "bits": override_bits
+                    }),
+                );
+            }
+        }
+    }
+
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert("quantization".to_string(), quant_config);
+    }
+
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(BackendError::Serialization)?;
+
+    let path = output_dir.join("config.json");
+    fs::write(&path, &config_json).map_err(|e| BackendError::WriteFailed {
+        reason: format!("Failed to write config.json: {}", e),
+    })?;
+
+    Ok(config_json.len() as u64)
 }
 
 /// Write quantized tensors as consolidated safetensors shards.
@@ -266,90 +677,104 @@ fn write_single_safetensors_file(
             continue;
         }
 
-        // --- Quantized tensor: convert to MLX format ---
+        // --- Quantized tensor: re-quantize using MLX's affine algorithm ---
+        //
+        // hf2q uses symmetric quantization internally. MLX uses affine quantization
+        // with a different packing and scale/bias convention. Rather than trying to
+        // convert between formats, we dequantize back to f32 and then re-quantize
+        // using MLX's exact algorithm (ported to pure Rust from mlx/backend/cpu/quantized.cpp).
         let bits = tensor.quant_info.bits;
         let group_size = tensor.quant_info.group_size;
         let scales_raw = tensor.quant_info.scales.as_ref().unwrap();
 
-        // 1. Convert signed packed nibbles to unsigned (for MLX affine mode).
-        //    For N-bit: XOR each nibble's MSB. For 4-bit packed 2-per-byte: XOR 0x88.
-        let unsigned_data = convert_signed_to_unsigned(&tensor.data, bits);
+        // Step 1: Dequantize our packed data back to f32 using our symmetric scales
+        let total_elements: usize = tensor.shape.iter().product();
+        let int_values = unpack_symmetric(&tensor.data, bits, total_elements);
+        let our_scales: Vec<f32> = scales_raw
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        let effective_gs = if total_elements < group_size { total_elements } else { group_size };
+        let mut f32_weights = Vec::with_capacity(total_elements);
+        for (i, &ival) in int_values.iter().enumerate() {
+            let g = i / effective_gs;
+            let scale = our_scales.get(g).copied().unwrap_or(0.0);
+            f32_weights.push(scale * (ival as f32));
+        }
 
-        // 2. Compute MLX shapes:
-        //    weight: last dim becomes last_dim * bits / 32 (packed into u32)
-        //    scales/biases: last dim becomes last_dim / group_size
+        // Step 2: Re-quantize using MLX's affine algorithm
+        let (mlx_packed, mlx_scales, mlx_biases) =
+            mlx_affine_quantize(&f32_weights, bits as u32, group_size);
+
+        // Step 3: Compute shapes for the MLX format
         let weight_shape = mlx_weight_shape(&tensor.shape, bits);
         let scales_shape = mlx_scales_shape(&tensor.shape, group_size);
 
-        // 3. Convert scales from f16 to f32 (MLX QuantizedLinear uses f32)
-        let scales_f32 = f16_bytes_to_f32_bytes(scales_raw);
+        // Step 4: Emit entries with correct naming
+        let make_entries = |module: &str,
+                            w_data: Vec<u8>,
+                            w_shape: Vec<usize>,
+                            s_data: Vec<u8>,
+                            s_shape: Vec<usize>,
+                            b_data: Vec<u8>|
+         -> Vec<SafetensorEntry> {
+            vec![
+                SafetensorEntry {
+                    name: format!("{}.weight", module),
+                    dtype: "U32",
+                    shape: w_shape,
+                    data: w_data,
+                },
+                SafetensorEntry {
+                    name: format!("{}.scales", module),
+                    dtype: "BF16",
+                    shape: s_shape.clone(),
+                    data: s_data,
+                },
+                SafetensorEntry {
+                    name: format!("{}.biases", module),
+                    dtype: "BF16",
+                    shape: s_shape,
+                    data: b_data,
+                },
+            ]
+        };
 
-        // 4. Create biases (zero-point) tensor: constant 2^(bits-1) for all groups
-        let zero_point = (1u32 << (bits - 1)) as f32;
-        let num_scale_elements = scales_raw.len() / 2; // f16 = 2 bytes each
-        let biases_f32 = vec_f32_to_bytes(zero_point, num_scale_elements);
-
-        // 5. Handle expert tensor naming and gate_up_proj splitting
         if name.ends_with(".experts.gate_up_proj") {
             // Split fused gate+up into separate tensors along axis=-2
             let base = name.strip_suffix(".gate_up_proj").unwrap();
-            let split_entries = split_expert_gate_up(
-                base,
-                &unsigned_data,
-                &weight_shape,
-                &scales_f32,
-                &scales_shape,
-                &biases_f32,
-            );
-            entries.extend(split_entries);
+
+            let (gate_w, up_w, half_w_shape, _) =
+                split_tensor_axis_neg2(&mlx_packed, &weight_shape);
+            let (gate_s, up_s, half_s_shape, _) =
+                split_tensor_axis_neg2(&mlx_scales, &scales_shape);
+            let (gate_b, up_b, _, _) =
+                split_tensor_axis_neg2(&mlx_biases, &scales_shape);
+
+            let gate_mod = format!("{}.switch_glu.gate_proj", base);
+            let up_mod = format!("{}.switch_glu.up_proj", base);
+
+            entries.extend(make_entries(
+                &gate_mod, gate_w, half_w_shape.clone(), gate_s, half_s_shape.clone(), gate_b,
+            ));
+            entries.extend(make_entries(
+                &up_mod, up_w, half_w_shape, up_s, half_s_shape, up_b,
+            ));
         } else if name.ends_with(".experts.down_proj") {
-            // Rename to switch_glu.down_proj
             let base = name.strip_suffix(".down_proj").unwrap();
             let module = format!("{}.switch_glu.down_proj", base);
-            entries.push(SafetensorEntry {
-                name: format!("{}.weight", module),
-                dtype: "U32",
-                shape: weight_shape,
-                data: unsigned_data,
-            });
-            entries.push(SafetensorEntry {
-                name: format!("{}.scales", module),
-                dtype: "F32",
-                shape: scales_shape.clone(),
-                data: scales_f32,
-            });
-            entries.push(SafetensorEntry {
-                name: format!("{}.biases", module),
-                dtype: "F32",
-                shape: scales_shape,
-                data: biases_f32,
-            });
+            entries.extend(make_entries(
+                &module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
+            ));
         } else {
-            // Standard quantized tensor (e.g., self_attn.k_proj.weight)
-            // Strip ".weight" suffix to get the module path for sibling naming
             let module = if let Some(m) = name.strip_suffix(".weight") {
                 m.to_string()
             } else {
                 (*name).clone()
             };
-            entries.push(SafetensorEntry {
-                name: format!("{}.weight", module),
-                dtype: "U32",
-                shape: weight_shape,
-                data: unsigned_data,
-            });
-            entries.push(SafetensorEntry {
-                name: format!("{}.scales", module),
-                dtype: "F32",
-                shape: scales_shape.clone(),
-                data: scales_f32,
-            });
-            entries.push(SafetensorEntry {
-                name: format!("{}.biases", module),
-                dtype: "F32",
-                shape: scales_shape,
-                data: biases_f32,
-            });
+            entries.extend(make_entries(
+                &module, mlx_packed, weight_shape, mlx_scales, scales_shape, mlx_biases,
+            ));
         }
     }
 
@@ -402,20 +827,120 @@ fn write_single_safetensors_file(
     Ok(file_data.len() as u64)
 }
 
-/// Convert signed quantized packed bytes to unsigned for MLX affine mode.
+/// Unpack hf2q's symmetric-quantized packed bytes into signed integers.
+/// Inverse of `pack_quantized` in static_quant.rs.
+fn unpack_symmetric(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
+    let mut values = Vec::with_capacity(total_elements);
+    match bits {
+        4 => {
+            for &byte in data {
+                let lo = (byte & 0x0F) as i8;
+                let lo = if lo & 0x08 != 0 { lo | !0x0F } else { lo };
+                values.push(lo);
+                let hi = ((byte >> 4) & 0x0F) as i8;
+                let hi = if hi & 0x08 != 0 { hi | !0x0F } else { hi };
+                values.push(hi);
+            }
+        }
+        2 => {
+            for &byte in data {
+                for shift in (0..8).step_by(2) {
+                    let val = ((byte >> shift) & 0x03) as i8;
+                    let val = if val & 0x02 != 0 { val | !0x03 } else { val };
+                    values.push(val);
+                }
+            }
+        }
+        8 => {
+            values.extend(data.iter().map(|&b| b as i8));
+        }
+        _ => {
+            values.extend(data.iter().map(|&b| b as i8));
+        }
+    }
+    values.truncate(total_elements);
+    values
+}
+
+/// Pure Rust implementation of MLX's affine quantization algorithm.
 ///
-/// For 4-bit: each byte has two nibbles. XOR with 0x88 flips the MSB of
-/// each nibble, converting signed [-8..7] to unsigned [0..15].
-/// For 2-bit: XOR with 0xAA (flip MSB of each 2-bit field).
-/// For 8-bit: XOR with 0x80 (flip sign bit).
-fn convert_signed_to_unsigned(data: &[u8], bits: u8) -> Vec<u8> {
-    let xor_mask: u8 = match bits {
-        4 => 0x88,   // flip bit 3 of each nibble
-        2 => 0xAA,   // flip bit 1 of each 2-bit field
-        8 => 0x80,   // flip sign bit
-        _ => 0x00,   // no conversion for unknown bit widths
-    };
-    data.iter().map(|&b| b ^ xor_mask).collect()
+/// Ported from `mlx/backend/cpu/quantized.cpp::quantize()`.
+/// For each group of `group_size` f32 values:
+///   1. Find min/max
+///   2. Compute scale = (max - min) / n_bins, with sign flip for numerical stability
+///   3. Compute bias from the edge value
+///   4. Quantize: uint_val = clamp(round((w - bias) / scale), 0, n_bins)
+///   5. Pack into uint32 (8 values per u32 for 4-bit)
+///
+/// Dequantization formula: `w ≈ uint_val * scale + bias`
+///
+/// Returns (packed_uint32_bytes, scales_bf16_bytes, biases_bf16_bytes).
+fn mlx_affine_quantize(
+    weights: &[f32],
+    bits: u32,
+    group_size: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let n_bins = ((1u32 << bits) - 1) as f32;
+    let eps = 1e-7f32;
+    let el_per_int = 32 / bits as usize; // 8 for 4-bit
+    let total_elements = weights.len();
+    let num_groups = total_elements.div_ceil(group_size);
+    let ints_per_group = group_size / el_per_int;
+
+    let mut packed = Vec::with_capacity(num_groups * ints_per_group * 4);
+    let mut scales_bf16 = Vec::with_capacity(num_groups * 2);
+    let mut biases_bf16 = Vec::with_capacity(num_groups * 2);
+
+    for g in 0..num_groups {
+        let start = g * group_size;
+        let end = (start + group_size).min(total_elements);
+        let group = &weights[start..end];
+
+        // Find min/max
+        let mut w_min = f32::INFINITY;
+        let mut w_max = f32::NEG_INFINITY;
+        for &v in group {
+            w_min = w_min.min(v);
+            w_max = w_max.max(v);
+        }
+
+        // Compute scale with sign flip for stability (matches MLX exactly)
+        let mask = w_min.abs() > w_max.abs();
+        let mut scale = ((w_max - w_min) / n_bins).max(eps);
+        if !mask {
+            scale = -scale;
+        }
+
+        let edge = if mask { w_min } else { w_max };
+        let q0 = (edge / scale).round();
+        let mut bias = 0.0f32;
+        if q0 != 0.0 {
+            scale = edge / q0;
+            bias = edge;
+        }
+
+        // Store scale and bias as bf16
+        let scale_bf16 = half::bf16::from_f32(scale);
+        let bias_bf16 = half::bf16::from_f32(bias);
+        scales_bf16.extend_from_slice(&scale_bf16.to_le_bytes());
+        biases_bf16.extend_from_slice(&bias_bf16.to_le_bytes());
+
+        // Quantize and pack into uint32 words
+        // Process el_per_int values at a time into one uint32
+        let actual_len = end - start;
+        for j in 0..ints_per_group {
+            let mut out_el: u32 = 0;
+            for k in 0..el_per_int {
+                let idx = j * el_per_int + k;
+                let w_el = if idx < actual_len { group[idx] } else { 0.0 };
+                let q = ((w_el - bias) / scale).round().clamp(0.0, n_bins);
+                out_el |= (q as u32) << (k as u32 * bits);
+            }
+            packed.extend_from_slice(&out_el.to_le_bytes());
+        }
+    }
+
+    (packed, scales_bf16, biases_bf16)
 }
 
 /// Compute MLX weight shape: last dimension packed into uint32.
@@ -657,17 +1182,16 @@ fn write_mlx_config(model: &QuantizedModel, output_dir: &Path) -> Result<u64, Ba
             {
                 continue; // matches global default, no override needed
             }
-            // Convert to mlx-lm module path: strip "model." prefix, add extra
-            // "model." after "language_model", strip ".weight" suffix, handle
-            // expert renaming.
-            let module_path = tensor_name_to_mlx_module_path(name);
-            quant_obj.insert(
-                module_path,
-                serde_json::json!({
-                    "group_size": tensor.quant_info.group_size,
-                    "bits": tensor.quant_info.bits
-                }),
-            );
+            // Convert to mlx-lm module path(s). Expert gate_up_proj splits
+            // into both gate_proj and up_proj — emit overrides for both.
+            let module_paths = tensor_name_to_mlx_module_paths(name);
+            let override_val = serde_json::json!({
+                "group_size": tensor.quant_info.group_size,
+                "bits": tensor.quant_info.bits
+            });
+            for path in module_paths {
+                quant_obj.insert(path, override_val.clone());
+            }
         }
     }
 
@@ -686,17 +1210,10 @@ fn write_mlx_config(model: &QuantizedModel, output_dir: &Path) -> Result<u64, Ba
     Ok(config_json.len() as u64)
 }
 
-/// Convert an hf2q tensor name to the module path mlx-lm expects after sanitization.
+/// Convert an hf2q tensor name to the module path(s) mlx-lm expects after sanitization.
 ///
-/// Examples:
-///   "model.language_model.layers.0.self_attn.k_proj.weight"
-///     → "language_model.model.layers.0.self_attn.k_proj"
-///   "model.language_model.layers.0.mlp.gate_proj.weight"
-///     → "language_model.model.layers.0.mlp.gate_proj"
-///   "model.language_model.layers.0.experts.gate_up_proj"
-///     → "language_model.model.layers.0.experts.switch_glu.gate_proj"
-///     (Note: split tensors get two entries; we return the gate_proj path)
-fn tensor_name_to_mlx_module_path(name: &str) -> String {
+/// Returns multiple paths for fused tensors (gate_up_proj → gate_proj + up_proj).
+fn tensor_name_to_mlx_module_paths(name: &str) -> Vec<String> {
     let mut path = name.to_string();
 
     // Strip "model." prefix
@@ -705,24 +1222,27 @@ fn tensor_name_to_mlx_module_path(name: &str) -> String {
     }
 
     // Insert extra "model." after "language_model."
-    // "language_model.layers.0..." → "language_model.model.layers.0..."
     if path.starts_with("language_model.") && !path.starts_with("language_model.model.") {
         path = path.replacen("language_model.", "language_model.model.", 1);
     }
 
-    // Strip ".weight" suffix to get module path
+    // Strip ".weight" suffix
     if let Some(stripped) = path.strip_suffix(".weight") {
         path = stripped.to_string();
     }
 
-    // Handle expert renaming
+    // Handle expert renaming — gate_up_proj produces TWO module paths
     if path.ends_with(".experts.gate_up_proj") {
-        path = path.replace(".experts.gate_up_proj", ".experts.switch_glu.gate_proj");
+        let base = path.replace(".experts.gate_up_proj", ".experts.switch_glu");
+        vec![
+            format!("{}.gate_proj", base),
+            format!("{}.up_proj", base),
+        ]
     } else if path.ends_with(".experts.down_proj") {
-        path = path.replace(".experts.down_proj", ".experts.switch_glu.down_proj");
+        vec![path.replace(".experts.down_proj", ".experts.switch_glu.down_proj")]
+    } else {
+        vec![path]
     }
-
-    path
 }
 
 /// Copy tokenizer files from source to output directory.
@@ -953,20 +1473,51 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_signed_to_unsigned_4bit() {
-        // 4-bit: XOR with 0x88
-        // Byte 0x37 = lo=7(signed +7), hi=3(signed +3)
-        // After: lo=15(unsigned), hi=11(unsigned)
+    fn test_unpack_symmetric_4bit() {
+        // Byte 0x37 = lo nibble 0x7 (signed +7), hi nibble 0x3 (signed +3)
         let data = vec![0x37u8];
-        let result = convert_signed_to_unsigned(&data, 4);
-        assert_eq!(result, vec![0x37 ^ 0x88]);
-        assert_eq!(result[0] & 0x0F, 15); // +7 → 15
-        assert_eq!((result[0] >> 4) & 0x0F, 11); // +3 → 11
+        let result = unpack_symmetric(&data, 4, 2);
+        assert_eq!(result, vec![7i8, 3i8]);
 
-        // Zero nibbles: 0x00 → 0x88 (unsigned 8 = zero point)
-        let zero = convert_signed_to_unsigned(&[0x00], 4);
-        assert_eq!(zero[0] & 0x0F, 8);
-        assert_eq!((zero[0] >> 4) & 0x0F, 8);
+        // Byte 0xF9 = lo=0x9 (signed -7), hi=0xF (signed -1)
+        let data2 = vec![0xF9u8];
+        let result2 = unpack_symmetric(&data2, 4, 2);
+        assert_eq!(result2, vec![-7i8, -1i8]);
+
+        // Zero byte: both nibbles = 0
+        let zero = unpack_symmetric(&[0x00], 4, 2);
+        assert_eq!(zero, vec![0i8, 0i8]);
+    }
+
+    #[test]
+    fn test_mlx_affine_quantize_roundtrip() {
+        // Quantize known values and verify dequantization matches
+        let weights: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
+        let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 4, 64);
+
+        // Verify output sizes
+        assert_eq!(packed.len(), 64 * 4 / 32 * 4); // 64 values, 8 per uint32, 4 bytes each = 32 bytes
+        assert_eq!(scales_bf16.len(), 2); // 1 group * 2 bytes bf16
+        assert_eq!(biases_bf16.len(), 2);
+
+        // Dequantize and check reconstruction error
+        let scale = half::bf16::from_le_bytes([scales_bf16[0], scales_bf16[1]]).to_f32();
+        let bias = half::bf16::from_le_bytes([biases_bf16[0], biases_bf16[1]]).to_f32();
+
+        let mut max_error = 0.0f32;
+        for (j, chunk) in packed.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for k in 0..8 {
+                let idx = j * 8 + k;
+                if idx >= 64 { break; }
+                let uint_val = ((word >> (k * 4)) & 0xF) as f32;
+                let dequant = uint_val * scale + bias;
+                let error = (weights[idx] - dequant).abs();
+                max_error = max_error.max(error);
+            }
+        }
+        // 4-bit quantization of range [-3.2, 3.1] should have max error < 0.5
+        assert!(max_error < 0.5, "Max reconstruction error too high: {}", max_error);
     }
 
     #[test]
