@@ -193,6 +193,8 @@ impl InferenceEngine {
         let messages = vec![Message {
             role: "user".to_string(),
             content: prompt.to_string(),
+            tool_call_id: None,
+            tool_calls: None,
         }];
 
         let bos_token = self
@@ -482,6 +484,65 @@ impl InferenceEngine {
         // The model doesn't store its name; this is handled at a higher level.
         // Return a placeholder; the serve module extracts the name from the path.
         "unknown"
+    }
+
+    /// Get the model's hidden size (embedding dimension).
+    pub fn hidden_size(&self) -> usize {
+        self.model.config().hidden_size
+    }
+
+    /// Compute embeddings for the given text by running a prefill-only
+    /// forward pass and mean-pooling the final hidden states.
+    ///
+    /// This resets the KV cache, tokenizes the input, runs the full
+    /// transformer stack, then returns the mean-pooled, L2-normalized
+    /// hidden state vector along with the token count.
+    ///
+    /// Returns `(embedding_vector, token_count)`.
+    pub fn embed_text(&mut self, text: &str) -> Result<(Vec<f32>, usize), EngineError> {
+        // Reset KV cache for this independent forward pass
+        self.model.reset_cache();
+
+        // Tokenize
+        let tokens = self.tokenizer.encode_with_special_tokens(text)?;
+        let token_count = tokens.len();
+
+        if tokens.is_empty() {
+            return Err(EngineError::Generation {
+                reason: "Input tokenized to zero tokens".into(),
+            });
+        }
+
+        let hidden_size = self.model.config().hidden_size;
+
+        // Forward pass: get hidden states (before lm_head)
+        let hidden_states = self.model.forward_hidden_states(&tokens)?;
+
+        // Mean pool across all token positions
+        // hidden_states shape: [seq_len, hidden_size]
+        let seq_len = token_count;
+        let mut pooled = vec![0.0f32; hidden_size];
+        for pos in 0..seq_len {
+            let offset = pos * hidden_size;
+            for dim in 0..hidden_size {
+                pooled[dim] += hidden_states[offset + dim];
+            }
+        }
+        let inv_len = 1.0 / seq_len as f32;
+        for v in pooled.iter_mut() {
+            *v *= inv_len;
+        }
+
+        // L2 normalize
+        let norm = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            let inv_norm = 1.0 / norm;
+            for v in pooled.iter_mut() {
+                *v *= inv_norm;
+            }
+        }
+
+        Ok((pooled, token_count))
     }
 }
 

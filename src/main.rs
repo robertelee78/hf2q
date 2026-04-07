@@ -397,6 +397,7 @@ fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
         host: args.host,
         port: args.port,
         queue_depth: args.queue_depth,
+        embedding_concurrency: args.embedding_concurrency,
     };
 
     let rt = tokio::runtime::Runtime::new()

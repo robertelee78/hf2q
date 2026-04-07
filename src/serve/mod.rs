@@ -1,21 +1,28 @@
 //! OpenAI-compatible API server for hf2q inference.
 //!
-//! Exposes `/v1/models`, `/v1/chat/completions`, and `/health` endpoints
-//! matching the OpenAI API specification. The entire module is gated behind
-//! the `serve` feature flag.
+//! Exposes the following endpoints matching the OpenAI API specification:
+//! - `/v1/models` -- list loaded models
+//! - `/v1/chat/completions` -- text generation with tool calling support
+//! - `/v1/embeddings` -- text embeddings via prefill-only forward pass
+//! - `/health` -- health check
+//!
+//! The entire module is gated behind the `serve` feature flag.
 //!
 //! Architecture:
 //! - axum 0.8 for HTTP routing and handler extraction
 //! - tower-http for CORS middleware
 //! - tokio::task::spawn_blocking for Metal GPU compute isolation
 //! - tokio::sync::mpsc for sync-to-async token streaming
-//! - tokio::sync::Semaphore for generation queue backpressure
+//! - Dual-lane concurrency: Semaphore for generation queue, separate Semaphore
+//!   for embedding requests (embeddings never block behind generation)
 
+pub mod embeddings;
 mod handlers;
 mod middleware;
 mod router;
 pub mod schema;
 mod sse;
+pub mod tool_parser;
 
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +34,7 @@ use crate::inference::engine::InferenceEngine;
 use crate::tokenizer::chat_template::ChatTemplate;
 use crate::tokenizer::HfTokenizer;
 
+use embeddings::EmbeddingLane;
 use sse::unix_timestamp;
 
 // ---------------------------------------------------------------------------
@@ -92,6 +100,8 @@ pub struct AppState {
     pub queue: Arc<GenerationQueue>,
     /// Maximum sequence length supported by the model.
     pub max_seq_len: usize,
+    /// Embedding lane for concurrent embedding requests (independent of generation).
+    pub embedding_lane: Arc<EmbeddingLane>,
 }
 
 /// Configuration for the serve command.
@@ -99,6 +109,8 @@ pub struct ServeConfig {
     pub host: String,
     pub port: u16,
     pub queue_depth: usize,
+    /// Maximum concurrent embedding requests (default 4).
+    pub embedding_concurrency: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +137,7 @@ pub async fn run(
         chat_template: Arc::new(chat_template),
         queue: Arc::new(GenerationQueue::new(config.queue_depth)),
         max_seq_len,
+        embedding_lane: Arc::new(EmbeddingLane::new(config.embedding_concurrency)),
     };
 
     let app = router::build_router(state);

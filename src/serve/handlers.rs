@@ -14,7 +14,8 @@ use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use super::schema::*;
-use super::sse::{generation_events_to_sse, unix_timestamp, GenerationEvent};
+use super::sse::{generation_events_to_sse_with_tools, unix_timestamp, GenerationEvent};
+use super::tool_parser::{generate_tool_call_id, ToolCallParser, ToolParserEvent};
 use super::AppState;
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,21 @@ pub async fn chat_completions(
     // Validate the request before acquiring a queue permit (fail fast)
     validate_chat_request(&req, &state)?;
 
+    // Parse tool_choice
+    let tool_choice = ToolChoiceValue::parse(req.tool_choice.as_ref());
+
+    // Determine which tools to pass to the template (respecting tool_choice)
+    let effective_tools: Option<&Vec<Tool>> = match &tool_choice {
+        ToolChoiceValue::None => None, // "none" -- omit tools from template
+        ToolChoiceValue::Function(_) => {
+            // Pass all tools to template; the parser will only accept the named one
+            req.tools.as_ref()
+        }
+        _ => req.tools.as_ref(),
+    };
+    // Suppress warning: effective_tools is used intentionally in both branches
+    let _ = &tool_choice;
+
     // Acquire a generation queue permit (non-blocking)
     let permit = state.queue.try_acquire().map_err(|_| {
         warn!(
@@ -106,8 +122,8 @@ pub async fn chat_completions(
         ApiError::queue_full()
     })?;
 
-    // Format the prompt using the chat template
-    let prompt = format_prompt(&req.messages, &state)?;
+    // Format the prompt using the chat template (with tools if present)
+    let prompt = format_prompt(&req.messages, effective_tools, &state)?;
 
     // Tokenize to get prompt token count and check context length
     let prompt_tokens = {
@@ -144,6 +160,14 @@ pub async fn chat_completions(
     let model_name = state.model_name.clone();
     let is_streaming = req.stream.unwrap_or(false);
 
+    // Determine whether tool parsing is active
+    let tools_active = matches!(tool_choice, ToolChoiceValue::Auto | ToolChoiceValue::Required | ToolChoiceValue::Function(_))
+        && req.tools.is_some();
+    let forced_function = match &tool_choice {
+        ToolChoiceValue::Function(name) => Some(name.clone()),
+        _ => None,
+    };
+
     if is_streaming {
         // Streaming mode: spawn_blocking + mpsc -> SSE
         let (tx, rx) = mpsc::channel::<GenerationEvent>(32);
@@ -171,7 +195,14 @@ pub async fn chat_completions(
             drop(_permit);
         });
 
-        let sse = generation_events_to_sse(rx, request_id, model_name, created);
+        let sse = generation_events_to_sse_with_tools(
+            rx,
+            request_id,
+            model_name,
+            created,
+            tools_active,
+            forced_function,
+        );
         Ok(sse.into_response())
     } else {
         // Non-streaming mode: collect all tokens, return complete response
@@ -234,6 +265,13 @@ pub async fn chat_completions(
             return Err(ApiError::generation_error(err_msg));
         }
 
+        // Parse tool calls from the full text if tools are active
+        let (content, tool_calls_vec, finish_reason) = if tools_active {
+            parse_tool_calls_from_text(&full_text, forced_function.as_deref())
+        } else {
+            (Some(full_text), None, "stop".to_string())
+        };
+
         let response = ChatCompletionResponse {
             id: request_id,
             object: "chat.completion".into(),
@@ -243,10 +281,11 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: Some(full_text),
-                    tool_calls: None,
+                    content,
+                    tool_calls: tool_calls_vec,
+                    tool_call_id: None,
                 },
-                finish_reason: "stop".into(),
+                finish_reason,
             }],
             usage: UsageStats {
                 prompt_tokens: prompt_token_count,
@@ -277,14 +316,23 @@ fn validate_chat_request(req: &ChatCompletionRequest, state: &AppState) -> Resul
         ));
     }
 
-    // Validate roles
+    // Validate roles and tool message requirements
     for msg in &req.messages {
         match msg.role.as_str() {
-            "system" | "user" | "assistant" | "tool" => {}
+            "system" | "user" | "assistant" => {}
+            "tool" => {
+                // Tool role messages require a tool_call_id
+                if msg.tool_call_id.is_none() || msg.tool_call_id.as_deref() == Some("") {
+                    return Err(ApiError::invalid_request(
+                        "Messages with role 'tool' must include a non-empty 'tool_call_id'",
+                        Some("messages".into()),
+                    ));
+                }
+            }
             other => {
                 return Err(ApiError::invalid_request(
                     format!(
-                        "Invalid role '{}'. Must be one of: system, user, assistant",
+                        "Invalid role '{}'. Must be one of: system, user, assistant, tool",
                         other
                     ),
                     Some("messages".into()),
@@ -329,14 +377,31 @@ fn validate_chat_request(req: &ChatCompletionRequest, state: &AppState) -> Resul
 // ---------------------------------------------------------------------------
 
 /// Apply the chat template to format messages into a single prompt string.
-fn format_prompt(messages: &[ChatMessage], state: &AppState) -> Result<String, ApiError> {
+///
+/// When `tools` is provided (and not empty), they are passed to the template
+/// via the `tools` variable so that tool-aware templates (like Gemma 4's)
+/// can include tool definitions in the prompt.
+fn format_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&Vec<Tool>>,
+    state: &AppState,
+) -> Result<String, ApiError> {
     use crate::tokenizer::chat_template::Message;
 
     let template_messages: Vec<Message> = messages
         .iter()
-        .map(|m| Message {
-            role: m.role.clone(),
-            content: m.content.clone().unwrap_or_default(),
+        .map(|m| {
+            // Convert tool_calls from ChatMessage to a JSON value for the template
+            let tool_calls_value = m.tool_calls.as_ref().map(|calls| {
+                serde_json::to_value(calls).unwrap_or(serde_json::Value::Null)
+            });
+
+            Message {
+                role: m.role.clone(),
+                content: m.content.clone().unwrap_or_default(),
+                tool_call_id: m.tool_call_id.clone(),
+                tool_calls: tool_calls_value,
+            }
         })
         .collect();
 
@@ -350,15 +415,127 @@ fn format_prompt(messages: &[ChatMessage], state: &AppState) -> Result<String, A
         .and_then(|id| tokenizer.decode(&[id]).ok())
         .unwrap_or_default();
 
+    // Convert tools to a JSON value for the template
+    let tools_value = tools
+        .filter(|t| !t.is_empty())
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+
     state
         .chat_template
-        .render(&template_messages, &bos_token, &eos_token)
+        .render_with_tools(
+            &template_messages,
+            &bos_token,
+            &eos_token,
+            tools_value.as_ref(),
+        )
         .map_err(|e| {
             ApiError::invalid_request(
                 format!("Chat template rendering failed: {}", e),
                 Some("messages".into()),
             )
         })
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming tool call parsing
+// ---------------------------------------------------------------------------
+
+/// Parse tool calls from the complete generated text.
+///
+/// Runs the text through the `ToolCallParser` after generation completes.
+/// Returns `(content, tool_calls, finish_reason)`.
+/// - `content` is `Some(text)` for any text before tool calls (or `None` if only tool calls).
+/// - `tool_calls` is `Some(vec)` if tool calls were detected.
+/// - `finish_reason` is `"tool_calls"` if tool calls were found, otherwise `"stop"`.
+fn parse_tool_calls_from_text(
+    text: &str,
+    forced_function: Option<&str>,
+) -> (Option<String>, Option<Vec<ToolCall>>, String) {
+    let mut parser = ToolCallParser::new(true, forced_function.map(|s| s.to_string()));
+
+    let mut content_parts = String::new();
+    let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
+
+    // Feed the entire text character by character
+    for ch in text.chars() {
+        for event in parser.feed(&ch.to_string()) {
+            match event {
+                ToolParserEvent::ContentDelta(text) => {
+                    content_parts.push_str(&text);
+                }
+                ToolParserEvent::ToolCallStart { index } => {
+                    // Ensure we have a builder for this index
+                    while tool_calls.len() <= index {
+                        tool_calls.push(ToolCallBuilder::new());
+                    }
+                }
+                ToolParserEvent::NameDelta { index, text } => {
+                    if let Some(tc) = tool_calls.get_mut(index) {
+                        tc.name.push_str(&text);
+                    }
+                }
+                ToolParserEvent::ArgumentsDelta { index, text } => {
+                    if let Some(tc) = tool_calls.get_mut(index) {
+                        tc.arguments.push_str(&text);
+                    }
+                }
+                ToolParserEvent::ToolCallEnd { .. } => {}
+            }
+        }
+    }
+
+    // Finalize
+    for event in parser.finalize() {
+        match event {
+            ToolParserEvent::ContentDelta(text) => content_parts.push_str(&text),
+            ToolParserEvent::ArgumentsDelta { index, text } => {
+                if let Some(tc) = tool_calls.get_mut(index) {
+                    tc.arguments.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parser.has_tool_calls() && !tool_calls.is_empty() {
+        let calls: Vec<ToolCall> = tool_calls
+            .into_iter()
+            .filter(|tc| !tc.name.is_empty())
+            .map(|tc| ToolCall {
+                id: generate_tool_call_id(),
+                call_type: "function".to_string(),
+                function: ToolCallFunction {
+                    name: tc.name,
+                    arguments: tc.arguments,
+                },
+            })
+            .collect();
+
+        let content = if content_parts.trim().is_empty() {
+            None
+        } else {
+            Some(content_parts)
+        };
+
+        (content, Some(calls), "tool_calls".to_string())
+    } else {
+        (Some(text.to_string()), None, "stop".to_string())
+    }
+}
+
+/// Builder for accumulating tool call parts during non-streaming parsing.
+struct ToolCallBuilder {
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallBuilder {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            arguments: String::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

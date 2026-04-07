@@ -424,6 +424,59 @@ impl Gemma4Model {
         Ok(output.to_vec())
     }
 
+    /// Run a forward pass returning the final hidden states (after the last
+    /// RMS norm but before the lm_head projection).
+    ///
+    /// Returns a flat f32 buffer of shape `[seq_len, hidden_size]`. This is
+    /// used by the embeddings endpoint which needs the hidden representation
+    /// rather than logits.
+    pub fn forward_hidden_states(&mut self, tokens: &[u32]) -> Result<Vec<f32>, Gemma4Error> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(Gemma4Error::ForwardError {
+                reason: "Empty token sequence".into(),
+            });
+        }
+
+        let hidden_size = self.config.hidden_size;
+
+        // Step 1: Embedding gather
+        debug!(seq_len = seq_len, "Embedding gather (hidden states)");
+        let mut hidden = self.embedding_gather(tokens)?;
+
+        // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
+        let scale = (hidden_size as f32).sqrt();
+        {
+            let slice: &mut [f32] = hidden
+                .as_mut_slice()
+                .map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Embedding scale: {e}"),
+                })?;
+            for v in slice.iter_mut() {
+                *v *= scale;
+            }
+        }
+
+        // Step 3: Process each transformer layer
+        for layer_idx in 0..self.config.num_layers {
+            debug!(layer = layer_idx, "Processing transformer layer (hidden states)");
+            hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
+        }
+
+        // Step 4: Final RMS norm (stop here -- do NOT project to vocab)
+        debug!("Final RMS norm (hidden states)");
+        let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
+
+        // Read hidden states to CPU
+        let output: &[f32] = normed
+            .as_slice()
+            .map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("Read hidden states: {e}"),
+            })?;
+
+        Ok(output.to_vec())
+    }
+
     /// Reset the KV cache (call between different sequences).
     pub fn reset_cache(&mut self) {
         self.kv_cache.reset();

@@ -6,6 +6,7 @@
 use axum::routing::{get, post};
 use axum::Router;
 
+use super::embeddings;
 use super::handlers;
 use super::middleware;
 use super::AppState;
@@ -20,6 +21,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/chat/completions",
             post(handlers::chat_completions),
         )
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .fallback(handlers::fallback)
         .layer(middleware::cors_layer())
         .with_state(state)

@@ -177,6 +177,10 @@ pub struct ServeArgs {
     #[arg(long, default_value = "16")]
     pub queue_depth: usize,
 
+    /// Maximum concurrent embedding requests (independent of generation queue)
+    #[arg(long, default_value = "4")]
+    pub embedding_concurrency: usize,
+
     /// Path to a custom chat template (Jinja2 format)
     #[arg(long)]
     pub chat_template: Option<std::path::PathBuf>,

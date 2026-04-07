@@ -39,6 +39,12 @@ pub struct Message {
     pub role: String,
     /// The text content of the message.
     pub content: String,
+    /// Tool call ID for tool-role messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool calls in assistant messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 /// A loaded chat template ready for rendering.
@@ -150,6 +156,53 @@ impl ChatTemplate {
 
         Ok(rendered)
     }
+
+    /// Render the template with the given conversation messages and optional
+    /// tool definitions.
+    ///
+    /// When `tools` is `Some`, the template receives a `tools` variable
+    /// containing the serialized tool definitions. This enables models with
+    /// tool-aware templates (like Gemma 4) to format tool descriptions
+    /// into the prompt.
+    pub fn render_with_tools(
+        &self,
+        messages: &[Message],
+        bos_token: &str,
+        eos_token: &str,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String, ChatTemplateError> {
+        let mut env = Environment::new();
+
+        env.add_function("raise_exception", |msg: String| -> Result<String, _> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        });
+
+        env.add_template("chat", &self.template_source)
+            .map_err(|e| ChatTemplateError::RenderError {
+                reason: format!("Template parse error: {e}"),
+            })?;
+
+        let tmpl = env.get_template("chat").map_err(|e| ChatTemplateError::RenderError {
+            reason: format!("Template lookup error: {e}"),
+        })?;
+
+        let rendered = tmpl
+            .render(context! {
+                messages => messages,
+                add_generation_prompt => true,
+                bos_token => bos_token,
+                eos_token => eos_token,
+                tools => tools,
+            })
+            .map_err(|e| ChatTemplateError::RenderError {
+                reason: format!("Template render error: {e}"),
+            })?;
+
+        Ok(rendered)
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +228,8 @@ mod tests {
             Message {
                 role: "user".to_string(),
                 content: "Hello, world!".to_string(),
+                tool_call_id: None,
+                tool_calls: None,
             },
         ];
 
@@ -193,6 +248,8 @@ mod tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: "Hi".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
         }];
 
         let rendered = template.render(&messages, "<bos>", "<eos>").unwrap();
@@ -215,10 +272,14 @@ mod tests {
             Message {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
+                tool_call_id: None,
+                tool_calls: None,
             },
             Message {
                 role: "user".to_string(),
                 content: "What is 2+2?".to_string(),
+                tool_call_id: None,
+                tool_calls: None,
             },
         ];
 
@@ -251,6 +312,8 @@ mod tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: "world".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
         }];
         let rendered = tmpl.render(&messages, "", "").unwrap();
         assert_eq!(rendered, "Hello world");
@@ -276,6 +339,8 @@ mod tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: "test".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
         }];
         let rendered = tmpl.render(&messages, "", "").unwrap();
         assert_eq!(rendered, "standalone: test");
@@ -291,6 +356,8 @@ mod tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: "ignored".to_string(),
+            tool_call_id: None,
+            tool_calls: None,
         }];
         let rendered = tmpl.render(&messages, "", "").unwrap();
         assert_eq!(rendered, "custom: user");
