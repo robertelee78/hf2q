@@ -7,3 +7,6 @@ models/
 # BMad project files
 _bmad/
 _bmad-output/
+
+# Claude Code local config
+.claude/
