@@ -21,7 +21,7 @@ pub enum HardwareError {
 }
 
 /// Hardware profile for a machine.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareProfile {
     /// Chip model (e.g., "Apple M5 Max")
     pub chip_model: String,
@@ -35,6 +35,35 @@ pub struct HardwareProfile {
     pub efficiency_cores: u32,
     /// Total core count (performance + efficiency)
     pub total_cores: u32,
+    /// Estimated memory bandwidth in GB/s (derived from chip model)
+    pub memory_bandwidth_gbs: f64,
+}
+
+// Manual impls so that memory_bandwidth_gbs (derived, f64) does not
+// participate in Eq/Hash, which would break stable_id determinism and
+// the Eq requirement (f64 is not Eq).
+impl PartialEq for HardwareProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.chip_model == other.chip_model
+            && self.total_memory_bytes == other.total_memory_bytes
+            && self.available_memory_bytes == other.available_memory_bytes
+            && self.performance_cores == other.performance_cores
+            && self.efficiency_cores == other.efficiency_cores
+            && self.total_cores == other.total_cores
+    }
+}
+
+impl Eq for HardwareProfile {}
+
+impl std::hash::Hash for HardwareProfile {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.chip_model.hash(state);
+        self.total_memory_bytes.hash(state);
+        self.available_memory_bytes.hash(state);
+        self.performance_cores.hash(state);
+        self.efficiency_cores.hash(state);
+        self.total_cores.hash(state);
+    }
 }
 
 impl HardwareProfile {
@@ -58,6 +87,88 @@ impl HardwareProfile {
     /// Available memory in gigabytes.
     pub fn available_memory_gb(&self) -> f64 {
         self.available_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Estimate tokens per second for a model of the given size.
+    ///
+    /// Uses a simplified model: tok/s ~ bandwidth_bytes / model_size_bytes.
+    /// Returns 0.0 if `model_size_bytes` is 0.
+    pub fn estimated_tok_s(&self, model_size_bytes: u64) -> f64 {
+        if model_size_bytes == 0 {
+            return 0.0;
+        }
+        let bandwidth_bytes = self.memory_bandwidth_gbs * 1e9;
+        bandwidth_bytes / model_size_bytes as f64
+    }
+
+    /// Maximum model size (in bytes) that can sustain the target tok/s.
+    ///
+    /// Returns 0 if `target_tok_s` is <= 0.
+    pub fn max_model_bytes_for_tok_s(&self, target_tok_s: f64) -> u64 {
+        if target_tok_s <= 0.0 {
+            return 0;
+        }
+        let bandwidth_bytes = self.memory_bandwidth_gbs * 1e9;
+        (bandwidth_bytes / target_tok_s) as u64
+    }
+}
+
+/// Look up memory bandwidth (GB/s) for a chip model string.
+///
+/// Parses strings like "Apple M5 Max", "Apple M1", etc. to extract the
+/// generation and variant, then returns the published bandwidth.
+/// Falls back to 100 GB/s for unrecognised chips.
+pub fn lookup_memory_bandwidth_gbs(chip_model: &str) -> f64 {
+    // Normalise to lowercase for matching
+    let lower = chip_model.to_lowercase();
+
+    // Try to find an "mN" pattern (m1, m2, m3, m4, m5 ...)
+    let mut gen: Option<&str> = None;
+    let mut variant: Option<&str> = None;
+
+    // Tokenise on whitespace
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok.starts_with('m') && tok.len() <= 3 {
+            // Could be "m1", "m2", "m3", "m4", "m5" etc.
+            if tok[1..].chars().all(|c| c.is_ascii_digit()) {
+                gen = Some(*tok);
+                // Check for a variant token following the generation
+                if i + 1 < tokens.len() {
+                    let next = tokens[i + 1];
+                    if next == "pro" || next == "max" || next == "ultra" {
+                        variant = Some(next);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    match (gen, variant) {
+        // M1 family
+        (Some("m1"), None) => 68.0,
+        (Some("m1"), Some("pro")) => 200.0,
+        (Some("m1"), Some("max")) => 400.0,
+        (Some("m1"), Some("ultra")) => 800.0,
+        // M2 family
+        (Some("m2"), None) => 100.0,
+        (Some("m2"), Some("pro")) => 200.0,
+        (Some("m2"), Some("max")) => 400.0,
+        (Some("m2"), Some("ultra")) => 800.0,
+        // M3 family
+        (Some("m3"), None) => 100.0,
+        (Some("m3"), Some("pro")) => 150.0,
+        (Some("m3"), Some("max")) => 400.0,
+        (Some("m3"), Some("ultra")) => 800.0,
+        // M4 family
+        (Some("m4"), None) => 120.0,
+        (Some("m4"), Some("pro")) => 273.0,
+        (Some("m4"), Some("max")) => 546.0,
+        // M5 family
+        (Some("m5"), Some("max")) => 540.0,
+        // Unknown
+        _ => 100.0,
     }
 }
 
@@ -93,6 +204,8 @@ impl HardwareProfiler {
         // We use sysctl to get the actual counts on macOS.
         let (performance_cores, efficiency_cores) = detect_core_counts(total_cores);
 
+        let memory_bandwidth_gbs = lookup_memory_bandwidth_gbs(&chip_model);
+
         Ok(HardwareProfile {
             chip_model,
             total_memory_bytes,
@@ -100,6 +213,7 @@ impl HardwareProfiler {
             performance_cores,
             efficiency_cores,
             total_cores,
+            memory_bandwidth_gbs,
         })
     }
 }
@@ -180,17 +294,21 @@ fn read_sysctl_u32(key: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_hardware_profile_stable_id_deterministic() {
-        let profile = HardwareProfile {
-            chip_model: "Apple M5 Max".to_string(),
+    fn make_profile(chip: &str) -> HardwareProfile {
+        HardwareProfile {
+            chip_model: chip.to_string(),
             total_memory_bytes: 128 * 1024 * 1024 * 1024,
             available_memory_bytes: 64 * 1024 * 1024 * 1024,
             performance_cores: 14,
             efficiency_cores: 4,
             total_cores: 18,
-        };
+            memory_bandwidth_gbs: lookup_memory_bandwidth_gbs(chip),
+        }
+    }
 
+    #[test]
+    fn test_hardware_profile_stable_id_deterministic() {
+        let profile = make_profile("Apple M5 Max");
         let id1 = profile.stable_id();
         let id2 = profile.stable_id();
         assert_eq!(id1, id2);
@@ -199,44 +317,29 @@ mod tests {
 
     #[test]
     fn test_hardware_profile_stable_id_ignores_available_memory() {
-        let profile1 = HardwareProfile {
-            chip_model: "Apple M5 Max".to_string(),
-            total_memory_bytes: 128 * 1024 * 1024 * 1024,
-            available_memory_bytes: 64 * 1024 * 1024 * 1024,
-            performance_cores: 14,
-            efficiency_cores: 4,
-            total_cores: 18,
-        };
-        let profile2 = HardwareProfile {
-            chip_model: "Apple M5 Max".to_string(),
-            total_memory_bytes: 128 * 1024 * 1024 * 1024,
-            available_memory_bytes: 32 * 1024 * 1024 * 1024, // different
-            performance_cores: 14,
-            efficiency_cores: 4,
-            total_cores: 18,
-        };
+        let profile1 = make_profile("Apple M5 Max");
+        let mut profile2 = make_profile("Apple M5 Max");
+        profile2.available_memory_bytes = 32 * 1024 * 1024 * 1024;
 
         assert_eq!(profile1.stable_id(), profile2.stable_id());
     }
 
     #[test]
+    fn test_stable_id_ignores_bandwidth() {
+        let mut p1 = make_profile("Apple M4 Max");
+        let mut p2 = make_profile("Apple M4 Max");
+        p1.memory_bandwidth_gbs = 546.0;
+        p2.memory_bandwidth_gbs = 999.0; // artificially different
+        assert_eq!(p1.stable_id(), p2.stable_id());
+    }
+
+    #[test]
     fn test_hardware_profile_different_chips_different_ids() {
-        let profile1 = HardwareProfile {
-            chip_model: "Apple M5 Max".to_string(),
-            total_memory_bytes: 128 * 1024 * 1024 * 1024,
-            available_memory_bytes: 64 * 1024 * 1024 * 1024,
-            performance_cores: 14,
-            efficiency_cores: 4,
-            total_cores: 18,
-        };
-        let profile2 = HardwareProfile {
-            chip_model: "Apple M4 Pro".to_string(),
-            total_memory_bytes: 48 * 1024 * 1024 * 1024,
-            available_memory_bytes: 32 * 1024 * 1024 * 1024,
-            performance_cores: 12,
-            efficiency_cores: 4,
-            total_cores: 16,
-        };
+        let profile1 = make_profile("Apple M5 Max");
+        let mut profile2 = make_profile("Apple M4 Pro");
+        profile2.total_memory_bytes = 48 * 1024 * 1024 * 1024;
+        profile2.performance_cores = 12;
+        profile2.total_cores = 16;
 
         assert_ne!(profile1.stable_id(), profile2.stable_id());
     }
@@ -250,6 +353,7 @@ mod tests {
             performance_cores: 8,
             efficiency_cores: 4,
             total_cores: 12,
+            memory_bandwidth_gbs: 100.0,
         };
 
         assert!((profile.total_memory_gb() - 128.0).abs() < 0.01);
@@ -258,13 +362,77 @@ mod tests {
 
     #[test]
     fn test_detect_runs_without_panic() {
-        // This test just ensures detect() doesn't panic on the current machine.
-        // We can't assert specific values since they depend on the hardware.
         let result = HardwareProfiler::detect();
         assert!(result.is_ok());
         let profile = result.unwrap();
         assert!(profile.total_memory_bytes > 0);
         assert!(profile.total_cores > 0);
         assert!(!profile.chip_model.is_empty());
+        assert!(profile.memory_bandwidth_gbs > 0.0);
+    }
+
+    // ---- Bandwidth lookup tests ----
+
+    #[test]
+    fn test_bandwidth_known_chips() {
+        assert!((lookup_memory_bandwidth_gbs("Apple M1") - 68.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M1 Pro") - 200.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M1 Max") - 400.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M1 Ultra") - 800.0).abs() < f64::EPSILON);
+
+        assert!((lookup_memory_bandwidth_gbs("Apple M2") - 100.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M2 Pro") - 200.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M2 Max") - 400.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M2 Ultra") - 800.0).abs() < f64::EPSILON);
+
+        assert!((lookup_memory_bandwidth_gbs("Apple M3") - 100.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M3 Pro") - 150.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M3 Max") - 400.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M3 Ultra") - 800.0).abs() < f64::EPSILON);
+
+        assert!((lookup_memory_bandwidth_gbs("Apple M4") - 120.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M4 Pro") - 273.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Apple M4 Max") - 546.0).abs() < f64::EPSILON);
+
+        assert!((lookup_memory_bandwidth_gbs("Apple M5 Max") - 540.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_bandwidth_unknown_chip_fallback() {
+        assert!((lookup_memory_bandwidth_gbs("Intel Core i9-13900K") - 100.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("Unknown (arm64)") - 100.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("") - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_bandwidth_case_insensitive() {
+        assert!((lookup_memory_bandwidth_gbs("apple m4 max") - 546.0).abs() < f64::EPSILON);
+        assert!((lookup_memory_bandwidth_gbs("APPLE M4 MAX") - 546.0).abs() < f64::EPSILON);
+    }
+
+    // ---- Convenience method tests ----
+
+    #[test]
+    fn test_estimated_tok_s() {
+        let profile = make_profile("Apple M4 Max"); // 546 GB/s
+        // 546 GB/s = 546e9 B/s, model = 10 GB = 10e9 B
+        // tok/s = 546e9 / 10e9 = 54.6
+        let tok_s = profile.estimated_tok_s(10_000_000_000);
+        assert!((tok_s - 54.6).abs() < 0.01);
+
+        // Zero model size returns 0
+        assert!((profile.estimated_tok_s(0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_max_model_bytes_for_tok_s() {
+        let profile = make_profile("Apple M4 Max"); // 546 GB/s
+        // target 10 tok/s -> 546e9 / 10 = 54.6e9
+        let max_bytes = profile.max_model_bytes_for_tok_s(10.0);
+        assert_eq!(max_bytes, 54_600_000_000);
+
+        // Zero / negative target returns 0
+        assert_eq!(profile.max_model_bytes_for_tok_s(0.0), 0);
+        assert_eq!(profile.max_model_bytes_for_tok_s(-1.0), 0);
     }
 }

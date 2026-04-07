@@ -6,6 +6,7 @@
 //! - AutoResolver: RuVector query -> heuristic fallback
 //! - RuVector: self-learning conversion result storage
 
+pub mod auto_quant;
 pub mod fingerprint;
 pub mod hardware;
 pub mod heuristics;
@@ -214,6 +215,7 @@ mod tests {
             performance_cores: 14,
             efficiency_cores: 4,
             total_cores: 18,
+            memory_bandwidth_gbs: 540.0,
         }
     }
 

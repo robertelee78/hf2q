@@ -217,6 +217,7 @@ mod tests {
             performance_cores: 14,
             efficiency_cores: 4,
             total_cores: 18,
+            memory_bandwidth_gbs: 540.0,
         }
     }
 

@@ -476,6 +476,7 @@ mod tests {
             performance_cores: 14,
             efficiency_cores: 4,
             total_cores: 18,
+            memory_bandwidth_gbs: 540.0,
         }
     }
 
@@ -626,6 +627,7 @@ mod tests {
             performance_cores: 12,
             efficiency_cores: 4,
             total_cores: 16,
+            memory_bandwidth_gbs: 273.0,
         };
 
         let result = db.query_best_config(&hw2, &fp).unwrap();

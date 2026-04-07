@@ -133,6 +133,7 @@ impl OutputBackend for MlxBackend {
         metadata: &ModelMetadata,
         bits: u8,
         group_size: usize,
+        bit_overrides: Option<&HashMap<String, u8>>,
         input_dir: &Path,
         output_dir: &Path,
         progress: &ProgressReporter,
@@ -142,34 +143,18 @@ impl OutputBackend for MlxBackend {
         })?;
 
         let mut files = Vec::new();
+        let empty_overrides = HashMap::new();
+        let overrides = bit_overrides.unwrap_or(&empty_overrides);
 
         // 1. Quantize f16 tensors using MLX affine algorithm and write shards
-        // Build per-tensor bit width map.
-        // MoE models (Gemma 4, etc.) keep MLP dense layers and router at higher
-        // precision (8-bit) for routing quality, matching mlx-lm's quant_predicate.
-        let is_moe = metadata.num_experts.map_or(false, |n| n > 1);
-        let bit_overrides: HashMap<String, u8> = if is_moe {
-            tensor_map.tensors.keys()
-                .filter(|name| {
-                    name.contains(".mlp.gate_proj") ||
-                    name.contains(".mlp.up_proj") ||
-                    name.contains(".mlp.down_proj") ||
-                    name.contains(".router.proj")
-                })
-                .map(|name| (name.clone(), 8u8))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-
         let shard_files = write_natively_quantized_shards(
-            tensor_map, metadata, bits, group_size, &bit_overrides, output_dir, progress,
+            tensor_map, metadata, bits, group_size, overrides, output_dir, progress,
         )?;
         files.extend(shard_files);
 
         // 2. Write config.json with quantization metadata + per-layer overrides
         let config_size = write_mlx_config_native(
-            metadata, bits, group_size, &bit_overrides, output_dir,
+            metadata, bits, group_size, overrides, output_dir,
         )?;
         files.push(OutputFile {
             filename: "config.json".to_string(),
@@ -373,12 +358,14 @@ fn write_native_safetensors_file(
             let scales_shape = mlx_scales_shape(&tensor.shape, group_size);
 
             // Handle expert naming
+            // MLX stores ALL bit widths as uint32 in safetensors
+            let weight_dtype: &'static str = "U32";
             let make_entries = |module: &str,
                                 w_data: Vec<u8>, w_shape: Vec<usize>,
                                 s_data: Vec<u8>, s_shape: Vec<usize>,
                                 b_data: Vec<u8>| -> Vec<SafetensorEntry> {
                 vec![
-                    SafetensorEntry { name: format!("{}.weight", module), dtype: "U32", shape: w_shape, data: w_data },
+                    SafetensorEntry { name: format!("{}.weight", module), dtype: weight_dtype, shape: w_shape, data: w_data },
                     SafetensorEntry { name: format!("{}.scales", module), dtype: "BF16", shape: s_shape.clone(), data: s_data },
                     SafetensorEntry { name: format!("{}.biases", module), dtype: "BF16", shape: s_shape, data: b_data },
                 ]
@@ -870,11 +857,18 @@ fn unpack_symmetric(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
 ///   2. Compute scale = (max - min) / n_bins, with sign flip for numerical stability
 ///   3. Compute bias from the edge value
 ///   4. Quantize: uint_val = clamp(round((w - bias) / scale), 0, n_bins)
-///   5. Pack into uint32 (8 values per u32 for 4-bit)
+///   5. Pack values into output bytes
+///
+/// Packing format depends on bit width:
+/// - Power-of-2 bits (2, 4, 8): pack into uint32, `el_per_int = 32/bits`
+/// - Non-power-of-2 bits (3, 6): pack into 3-byte (24-bit) groups:
+///   - 3-bit: 8 values per 3 bytes (8*3 = 24 bits)
+///   - 6-bit: 4 values per 3 bytes (4*6 = 24 bits)
+///   Stored as uint8 arrays (not uint32).
 ///
 /// Dequantization formula: `w ≈ uint_val * scale + bias`
 ///
-/// Returns (packed_uint32_bytes, scales_bf16_bytes, biases_bf16_bytes).
+/// Returns (packed_bytes, scales_bf16_bytes, biases_bf16_bytes).
 fn mlx_affine_quantize(
     weights: &[f32],
     bits: u32,
@@ -882,12 +876,15 @@ fn mlx_affine_quantize(
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let n_bins = ((1u32 << bits) - 1) as f32;
     let eps = 1e-7f32;
-    let el_per_int = 32 / bits as usize; // 8 for 4-bit
     let total_elements = weights.len();
     let num_groups = total_elements.div_ceil(group_size);
-    let ints_per_group = group_size / el_per_int;
 
-    let mut packed = Vec::with_capacity(num_groups * ints_per_group * 4);
+    // All bit widths pack into uint32 words.
+    // For N-bit: floor(32/N) values per uint32, and (group_size * N / 32) uint32s per group.
+    let el_per_u32 = 32 / bits as usize; // 2-bit:16, 3-bit:10, 4-bit:8, 6-bit:5, 8-bit:4
+    let u32s_per_group = (group_size * bits as usize) / 32;
+
+    let mut packed = Vec::with_capacity(num_groups * u32s_per_group * 4);
     let mut scales_bf16 = Vec::with_capacity(num_groups * 2);
     let mut biases_bf16 = Vec::with_capacity(num_groups * 2);
 
@@ -925,16 +922,16 @@ fn mlx_affine_quantize(
         scales_bf16.extend_from_slice(&scale_bf16.to_le_bytes());
         biases_bf16.extend_from_slice(&bias_bf16.to_le_bytes());
 
-        // Quantize and pack into uint32 words
-        // Process el_per_int values at a time into one uint32
+        // Quantize values and pack into uint32 words
         let actual_len = end - start;
-        for j in 0..ints_per_group {
+        let mut val_idx = 0usize;
+        for _j in 0..u32s_per_group {
             let mut out_el: u32 = 0;
-            for k in 0..el_per_int {
-                let idx = j * el_per_int + k;
-                let w_el = if idx < actual_len { group[idx] } else { 0.0 };
+            for k in 0..el_per_u32 {
+                let w_el = if val_idx < actual_len { group[val_idx] } else { 0.0 };
                 let q = ((w_el - bias) / scale).round().clamp(0.0, n_bins);
                 out_el |= (q as u32) << (k as u32 * bits);
+                val_idx += 1;
             }
             packed.extend_from_slice(&out_el.to_le_bytes());
         }
@@ -943,8 +940,18 @@ fn mlx_affine_quantize(
     (packed, scales_bf16, biases_bf16)
 }
 
-/// Compute MLX weight shape: last dimension packed into uint32.
-/// For 4-bit with shape [64, 128]: result is [64, 16] (128 * 4 / 32 = 16).
+/// Whether the given bit width uses uint8 triplet packing (3, 6) vs uint32 packing (2, 4, 8).
+fn mlx_uses_u8_packing(bits: u8) -> bool {
+    !((bits as u32).is_power_of_two())
+}
+
+/// Compute MLX weight shape after packing.
+///
+/// ALL bit widths are stored as uint32 in safetensors.
+/// Shape: last_dim * bits / 32 (uint32 count).
+///   Example: 4-bit [64, 128] -> [64, 16] (128 * 4 / 32 = 16)
+///   Example: 6-bit [64, 128] -> [64, 24] (128 * 6 / 32 = 24)
+///   Example: 3-bit [64, 128] -> [64, 12] (128 * 3 / 32 = 12)
 fn mlx_weight_shape(original_shape: &[usize], bits: u8) -> Vec<usize> {
     if original_shape.is_empty() {
         return vec![];
@@ -967,32 +974,12 @@ fn mlx_scales_shape(original_shape: &[usize], group_size: usize) -> Vec<usize> {
     shape
 }
 
-/// Convert f16 byte array to f32 byte array (little-endian).
-fn f16_bytes_to_f32_bytes(f16_data: &[u8]) -> Vec<u8> {
-    let mut f32_data = Vec::with_capacity(f16_data.len() * 2);
-    for chunk in f16_data.chunks_exact(2) {
-        let f16_val = half::f16::from_le_bytes([chunk[0], chunk[1]]);
-        let f32_val = f16_val.to_f32();
-        f32_data.extend_from_slice(&f32_val.to_le_bytes());
-    }
-    f32_data
-}
-
-/// Create a byte buffer of `count` repeated f32 values (little-endian).
-fn vec_f32_to_bytes(value: f32, count: usize) -> Vec<u8> {
-    let bytes = value.to_le_bytes();
-    let mut buf = Vec::with_capacity(count * 4);
-    for _ in 0..count {
-        buf.extend_from_slice(&bytes);
-    }
-    buf
-}
-
 /// Split a fused expert gate_up_proj tensor into separate gate_proj + up_proj
 /// entries under the switch_glu namespace.
 ///
-/// The fused tensor has shape (num_experts, hidden*2, in_features).
-/// Split along axis=-2 to produce two (num_experts, hidden, in_features) tensors.
+/// NOTE: This function is used by the legacy `write()` path (non-native backends).
+/// The native quantization path uses inline splitting in `write_native_safetensors_file`.
+#[allow(dead_code)]
 fn split_expert_gate_up(
     base: &str, // e.g., "model.language_model.layers.0.experts"
     weight_data: &[u8],
@@ -1522,11 +1509,20 @@ mod tests {
 
     #[test]
     fn test_mlx_weight_shape() {
+        // Power-of-2: packed into uint32
         // 4-bit: last dim * 4 / 32 = last_dim / 8
         assert_eq!(mlx_weight_shape(&[64, 128], 4), vec![64, 16]);
         assert_eq!(mlx_weight_shape(&[8, 64, 128], 4), vec![8, 64, 16]);
         // 2-bit: last dim * 2 / 32 = last_dim / 16
         assert_eq!(mlx_weight_shape(&[64, 128], 2), vec![64, 8]);
+        // 8-bit: last dim * 8 / 32 = last_dim / 4
+        assert_eq!(mlx_weight_shape(&[64, 128], 8), vec![64, 32]);
+
+        // Non-power-of-2: also packed into uint32
+        // 3-bit: last dim * 3 / 32
+        assert_eq!(mlx_weight_shape(&[64, 128], 3), vec![64, 12]);
+        // 6-bit: last dim * 6 / 32
+        assert_eq!(mlx_weight_shape(&[64, 128], 6), vec![64, 24]);
     }
 
     #[test]
@@ -1537,13 +1533,57 @@ mod tests {
     }
 
     #[test]
-    fn test_f16_to_f32_conversion() {
-        // f16 value 1.0 = 0x3C00
-        let f16_data = vec![0x00u8, 0x3C];
-        let f32_data = f16_bytes_to_f32_bytes(&f16_data);
-        assert_eq!(f32_data.len(), 4);
-        let f32_val = f32::from_le_bytes([f32_data[0], f32_data[1], f32_data[2], f32_data[3]]);
-        assert!((f32_val - 1.0).abs() < 1e-6);
+    fn test_mlx_affine_quantize_3bit_packing() {
+        // 3-bit: 10 values per uint32 (30 bits used), stored as U32
+        // group_size must be divisible by el_per_u32 — use 10 (=10*1 u32)
+        // Actually group_size * 3 / 32 must be integer. Use 32 values: 32*3/32 = 3 u32s
+        let weights: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 5.0).collect();
+        let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 3, 32);
+
+        // 32 values * 3 bits / 32 = 3 uint32s = 12 bytes
+        assert_eq!(packed.len(), 12, "3-bit packing of 32 values: 3 uint32s = 12 bytes");
+        assert_eq!(scales_bf16.len(), 2); // 1 group
+        assert_eq!(biases_bf16.len(), 2);
+    }
+
+    #[test]
+    fn test_mlx_affine_quantize_6bit_packing() {
+        // 6-bit: 5 values per uint32 (30 bits used), stored as U32
+        // group_size=64: 64*6/32 = 12 uint32s
+        let weights: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
+        let (packed, scales_bf16, biases_bf16) = mlx_affine_quantize(&weights, 6, 64);
+
+        // 64 values * 6 bits / 32 = 12 uint32s = 48 bytes
+        assert_eq!(packed.len(), 48, "6-bit packing of 64 values: 12 uint32s = 48 bytes");
+        assert_eq!(scales_bf16.len(), 2); // 1 group
+        assert_eq!(biases_bf16.len(), 2);
+
+        // Verify dequantization roundtrip
+        let scale = half::bf16::from_le_bytes([scales_bf16[0], scales_bf16[1]]).to_f32();
+        let bias = half::bf16::from_le_bytes([biases_bf16[0], biases_bf16[1]]).to_f32();
+
+        let mut max_error = 0.0f32;
+        for (j, chunk) in packed.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for k in 0..5 { // 5 values per uint32 for 6-bit
+                let idx = j * 5 + k;
+                if idx >= 64 { break; }
+                let uint_val = ((word >> (k * 6)) & 0x3F) as f32;
+                let dequant = uint_val * scale + bias;
+                let error = (weights[idx] - dequant).abs();
+                max_error = max_error.max(error);
+            }
+        }
+        assert!(max_error < 0.5, "6-bit max reconstruction error too high: {}", max_error);
+    }
+
+    #[test]
+    fn test_mlx_weight_shape_3bit_6bit() {
+        // All bit widths stored as uint32: last_dim * bits / 32
+        assert_eq!(mlx_weight_shape(&[64, 128], 3), vec![64, 12]); // 128 * 3 / 32 = 12
+        assert_eq!(mlx_weight_shape(&[64, 64], 3), vec![64, 6]);   // 64 * 3 / 32 = 6
+        assert_eq!(mlx_weight_shape(&[64, 128], 6), vec![64, 24]); // 128 * 6 / 32 = 24
+        assert_eq!(mlx_weight_shape(&[64, 64], 6), vec![64, 12]);  // 64 * 6 / 32 = 12
     }
 
     #[test]

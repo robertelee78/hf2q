@@ -10,6 +10,7 @@ pub mod mlx;
 #[allow(dead_code)]
 pub mod nvfp4;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use thiserror::Error;
@@ -71,11 +72,12 @@ pub trait OutputBackend: Send + Sync {
         metadata: &ModelMetadata,
         bits: u8,
         group_size: usize,
+        bit_overrides: Option<&HashMap<String, u8>>,
         input_dir: &Path,
         output_dir: &Path,
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError> {
-        let _ = (tensor_map, metadata, bits, group_size, input_dir, output_dir, progress);
+        let _ = (tensor_map, metadata, bits, group_size, bit_overrides, input_dir, output_dir, progress);
         Err(BackendError::UnsupportedFormat {
             format: format!("{} does not support native quantization", self.name()),
         })

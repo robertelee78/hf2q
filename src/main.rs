@@ -25,6 +25,7 @@ mod quantize;
 #[allow(dead_code)]
 mod report;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -196,52 +197,137 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .map_err(AppError::Conversion)?;
 
     // Phase 0.4: Auto mode resolution (if --quant auto or default)
+    //
+    // For MLX output, we use the intelligent auto_quant algorithm which produces
+    // per-tensor bit overrides. For other formats, we use the existing AutoResolver
+    // which returns a simple ResolvedConfig.
+    use intelligence::auto_quant::{resolve_auto_plan, AutoQuantConstraints, QualityPreference};
+
+    let mut auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
     let resolved_auto = if config.quant == cli::QuantMethod::Auto {
-        let resolved = AutoResolver::resolve(&hardware, &fingerprint, Some(&ruvector_db))
-            .context("Auto mode resolution failed")
-            .map_err(AppError::Conversion)?;
+        if config.format == cli::OutputFormat::Mlx {
+            // MLX path: use intelligent auto_quant for per-tensor bit allocation
+            let constraints = AutoQuantConstraints {
+                min_tok_per_sec: 80.0,
+                quality_preference: QualityPreference::Balanced,
+                ..AutoQuantConstraints::default()
+            };
 
-        // Display the resolved config
-        intelligence::display_resolved_config(&resolved);
+            let plan = resolve_auto_plan(&hardware, &fingerprint, &constraints)
+                .context("Auto-quant resolution failed")
+                .map_err(AppError::Conversion)?;
 
-        // Apply the resolved config to the ConvertConfig
-        let resolved_quant = match resolved.quant_method.as_str() {
-            "f16" => cli::QuantMethod::F16,
-            "q8" => cli::QuantMethod::Q8,
-            "q4" => cli::QuantMethod::Q4,
-            "q2" => cli::QuantMethod::Q2,
-            "mixed-4-6" => cli::QuantMethod::Mixed46,
-            "mixed-3-6" => cli::QuantMethod::Mixed36,
-            "mixed-2-6" => cli::QuantMethod::Mixed26,
-            other => {
-                warn!(
-                    "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
-                    other
-                );
-                cli::QuantMethod::Q4
+            // Log the auto plan
+            tracing::info!(
+                base_bits = plan.base_bits,
+                estimated_tok_s = plan.estimated_tok_per_sec,
+                overrides = plan.component_overrides.len(),
+                "Auto-quant resolved: {}",
+                plan.reasoning
+            );
+
+            // Map the plan's quant_method to our CLI enum
+            let resolved_quant = match plan.quant_method.as_str() {
+                "f16" => cli::QuantMethod::F16,
+                "q8" => cli::QuantMethod::Q8,
+                "q4" => cli::QuantMethod::Q4,
+                "q2" => cli::QuantMethod::Q2,
+                "mixed-4-6" => cli::QuantMethod::Mixed46,
+                "mixed-3-6" => cli::QuantMethod::Mixed36,
+                "mixed-2-6" => cli::QuantMethod::Mixed26,
+                other => {
+                    warn!(
+                        "Auto-quant recommended '{}' which is not a known method. Using q4 as base.",
+                        other
+                    );
+                    cli::QuantMethod::Q4
+                }
+            };
+
+            config.quant = resolved_quant;
+            config.bits = Some(plan.base_bits);
+            if plan.group_size > 0 {
+                config.group_size = plan.group_size;
             }
-        };
 
-        config.quant = resolved_quant;
-        if config.bits.is_none() {
-            config.bits = Some(resolved.bits);
-        }
-        if resolved.group_size > 0 {
-            config.group_size = resolved.group_size;
-        }
+            // Build a ResolvedConfig for display and dry-run compatibility
+            let resolved = intelligence::ResolvedConfig {
+                quant_method: plan.quant_method.clone(),
+                bits: plan.base_bits,
+                group_size: plan.group_size,
+                confidence: plan.confidence,
+                source: intelligence::ResolvedSource::Heuristic,
+                reasoning: plan.reasoning.clone(),
+                hardware: hardware.clone(),
+                fingerprint: fingerprint.clone(),
+            };
+            intelligence::display_resolved_config(&resolved);
 
-        // Update output dir if it was auto-generated with "auto" in the name
-        if args.output.is_none() {
-            let model_name = config
-                .input_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "model".to_string());
-            config.output_dir =
-                std::path::PathBuf::from(format!("{}-{}-{}", model_name, config.format, config.quant));
-        }
+            // Update output dir if it was auto-generated with "auto" in the name
+            if args.output.is_none() {
+                let model_name = config
+                    .input_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "model".to_string());
+                config.output_dir = std::path::PathBuf::from(format!(
+                    "{}-{}-{}",
+                    model_name, config.format, config.quant
+                ));
+            }
 
-        Some(resolved)
+            auto_plan = Some(plan);
+            Some(resolved)
+        } else {
+            // Non-MLX path: use existing AutoResolver (works for CoreML/GGUF)
+            let resolved = AutoResolver::resolve(&hardware, &fingerprint, Some(&ruvector_db))
+                .context("Auto mode resolution failed")
+                .map_err(AppError::Conversion)?;
+
+            // Display the resolved config
+            intelligence::display_resolved_config(&resolved);
+
+            // Apply the resolved config to the ConvertConfig
+            let resolved_quant = match resolved.quant_method.as_str() {
+                "f16" => cli::QuantMethod::F16,
+                "q8" => cli::QuantMethod::Q8,
+                "q4" => cli::QuantMethod::Q4,
+                "q2" => cli::QuantMethod::Q2,
+                "mixed-4-6" => cli::QuantMethod::Mixed46,
+                "mixed-3-6" => cli::QuantMethod::Mixed36,
+                "mixed-2-6" => cli::QuantMethod::Mixed26,
+                other => {
+                    warn!(
+                        "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
+                        other
+                    );
+                    cli::QuantMethod::Q4
+                }
+            };
+
+            config.quant = resolved_quant;
+            if config.bits.is_none() {
+                config.bits = Some(resolved.bits);
+            }
+            if resolved.group_size > 0 {
+                config.group_size = resolved.group_size;
+            }
+
+            // Update output dir if it was auto-generated with "auto" in the name
+            if args.output.is_none() {
+                let model_name = config
+                    .input_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "model".to_string());
+                config.output_dir = std::path::PathBuf::from(format!(
+                    "{}-{}-{}",
+                    model_name, config.format, config.quant
+                ));
+            }
+
+            Some(resolved)
+        }
     } else {
         None
     };
@@ -356,116 +442,181 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 3: Quantize
+    // Phase 3: Quantize (skipped for native backends like MLX)
     let quant_method_str = config.quant.to_string();
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
-    let quantized_model = match config.quant {
-        cli::QuantMethod::Mixed26 | cli::QuantMethod::Mixed36 | cli::QuantMethod::Mixed46 => {
-            // Mixed-bit quantization (Story 5.1)
-            let mixed_quantizer = quantize::mixed::MixedBitQuantizer::new(
-                &quant_method_str,
-                &config.sensitive_layers,
-                config.group_size,
-            )
-            .context("Failed to create mixed-bit quantizer")
-            .map_err(AppError::Conversion)?;
-
-            if mixed_quantizer.requires_calibration() {
-                tracing::info!("Mixed-bit quantizer requires calibration data");
-            }
-
-            // Build per-layer bit allocation map for logging
-            let tensor_names: Vec<String> = tensor_map.tensors.keys().cloned().collect();
-            let bits_map = quantize::mixed::build_per_layer_bits_map(&mixed_quantizer, &tensor_names);
-            tracing::debug!(
-                layer_count = bits_map.len(),
-                "Built per-layer bit allocation map for mixed-bit quantization"
-            );
-
-            quantize::quantize_model(
-                &tensor_map,
-                &metadata,
-                &mixed_quantizer,
-                bits,
-                config.group_size,
-                &progress,
-            )
-            .context("Mixed-bit quantization failed")
-            .map_err(AppError::Conversion)?
-        }
-        cli::QuantMethod::DwqMixed46 => {
-            // DWQ calibration (Story 5.2) — requires InferenceRunner
-            let mut runner = inference::create_runner();
-            if !runner.is_available() {
-                return Err(AppError::Conversion(anyhow::anyhow!(
-                    "DWQ quantization requires the mlx-backend feature. \
-                     Rebuild with: cargo build --features mlx-backend"
-                )));
-            }
-
-            let dwq_config = quantize::dwq::DwqConfig {
-                calibration_samples: config.calibration_samples,
-                sensitive_layers: config.sensitive_layers.clone(),
-                group_size: config.group_size,
-                base_bits: 4,
-                sensitive_bits: 6,
-                ..quantize::dwq::DwqConfig::default()
-            };
-
-            // Validate DWQ config by constructing the quantizer
-            let dwq_quantizer = quantize::dwq::DwqQuantizer::new(dwq_config.clone())
-                .context("Failed to create DWQ quantizer")
-                .map_err(AppError::Conversion)?;
-            tracing::info!(
-                calibration = dwq_quantizer.requires_calibration(),
-                max_iterations = dwq_quantizer.config().max_iterations,
-                "DWQ quantizer initialized: {}",
-                dwq_quantizer.name()
-            );
-
-            quantize::dwq::run_dwq_calibration(
-                runner.as_mut(),
-                &tensor_map,
-                &metadata,
-                &dwq_config,
-                &progress,
-            )
-            .context("DWQ calibration failed")
-            .map_err(AppError::Conversion)?
-        }
-        _ => {
-            // Static quantization (f16, q8, q4, q2)
-            let quantizer = StaticQuantizer::new(&quant_method_str)
-                .context("Failed to create quantizer")
+    let quantized_model = if backend.requires_native_quantization() {
+        // Skip IR quantization for native backends — they quantize from original tensors
+        // directly in Phase 4. Running IR quantization here would be wasted work since
+        // the native path re-quantizes from the original tensor_map.
+        tracing::info!("Skipping IR quantization (native backend handles quantization)");
+        None
+    } else {
+        Some(match config.quant {
+            cli::QuantMethod::Mixed26 | cli::QuantMethod::Mixed36 | cli::QuantMethod::Mixed46 => {
+                // Mixed-bit quantization (Story 5.1)
+                let mixed_quantizer = quantize::mixed::MixedBitQuantizer::new(
+                    &quant_method_str,
+                    &config.sensitive_layers,
+                    config.group_size,
+                )
+                .context("Failed to create mixed-bit quantizer")
                 .map_err(AppError::Conversion)?;
 
-            quantize::quantize_model(
-                &tensor_map,
-                &metadata,
-                &quantizer,
-                bits,
-                config.group_size,
-                &progress,
-            )
-            .context("Quantization failed")
-            .map_err(AppError::Conversion)?
-        }
+                if mixed_quantizer.requires_calibration() {
+                    tracing::info!("Mixed-bit quantizer requires calibration data");
+                }
+
+                // Build per-layer bit allocation map for logging
+                let tensor_names: Vec<String> = tensor_map.tensors.keys().cloned().collect();
+                let bits_map =
+                    quantize::mixed::build_per_layer_bits_map(&mixed_quantizer, &tensor_names);
+                tracing::debug!(
+                    layer_count = bits_map.len(),
+                    "Built per-layer bit allocation map for mixed-bit quantization"
+                );
+
+                quantize::quantize_model(
+                    &tensor_map,
+                    &metadata,
+                    &mixed_quantizer,
+                    bits,
+                    config.group_size,
+                    &progress,
+                )
+                .context("Mixed-bit quantization failed")
+                .map_err(AppError::Conversion)?
+            }
+            cli::QuantMethod::DwqMixed46 => {
+                // DWQ calibration (Story 5.2) — requires InferenceRunner
+                let mut runner = inference::create_runner();
+                if !runner.is_available() {
+                    return Err(AppError::Conversion(anyhow::anyhow!(
+                        "DWQ quantization requires the mlx-backend feature. \
+                         Rebuild with: cargo build --features mlx-backend"
+                    )));
+                }
+
+                let dwq_config = quantize::dwq::DwqConfig {
+                    calibration_samples: config.calibration_samples,
+                    sensitive_layers: config.sensitive_layers.clone(),
+                    group_size: config.group_size,
+                    base_bits: 4,
+                    sensitive_bits: 6,
+                    ..quantize::dwq::DwqConfig::default()
+                };
+
+                // Validate DWQ config by constructing the quantizer
+                let dwq_quantizer = quantize::dwq::DwqQuantizer::new(dwq_config.clone())
+                    .context("Failed to create DWQ quantizer")
+                    .map_err(AppError::Conversion)?;
+                tracing::info!(
+                    calibration = dwq_quantizer.requires_calibration(),
+                    max_iterations = dwq_quantizer.config().max_iterations,
+                    "DWQ quantizer initialized: {}",
+                    dwq_quantizer.name()
+                );
+
+                quantize::dwq::run_dwq_calibration(
+                    runner.as_mut(),
+                    &tensor_map,
+                    &metadata,
+                    &dwq_config,
+                    &progress,
+                )
+                .context("DWQ calibration failed")
+                .map_err(AppError::Conversion)?
+            }
+            _ => {
+                // Static quantization (f16, q8, q4, q2)
+                let quantizer = StaticQuantizer::new(&quant_method_str)
+                    .context("Failed to create quantizer")
+                    .map_err(AppError::Conversion)?;
+
+                quantize::quantize_model(
+                    &tensor_map,
+                    &metadata,
+                    &quantizer,
+                    bits,
+                    config.group_size,
+                    &progress,
+                )
+                .context("Quantization failed")
+                .map_err(AppError::Conversion)?
+            }
+        })
     };
 
     check_interrupted()?;
 
     // Phase 4: Write output (backend was created in Phase 2)
 
+    // Build per-tensor bit overrides from auto_quant plan or sensitive_layers
+    let mut bit_overrides: Option<HashMap<String, u8>> = if let Some(ref plan) = auto_plan {
+        // Auto-quant plan: convert component_overrides to tensor-name -> bits map
+        let mut map = HashMap::new();
+        for co in &plan.component_overrides {
+            // Match each pattern against actual tensor names
+            for tensor_name in tensor_map.tensors.keys() {
+                if tensor_name.contains(&co.pattern) {
+                    map.insert(tensor_name.clone(), co.bits);
+                }
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            tracing::info!(
+                overrides = map.len(),
+                "Built per-tensor bit override map from auto-quant plan"
+            );
+            Some(map)
+        }
+    } else {
+        None
+    };
+
+    // Wire --sensitive-layers for non-auto modes: elevate sensitive layers by +2 bits
+    if !config.sensitive_layers.is_empty() && bit_overrides.is_none() {
+        let mut map = HashMap::new();
+        for range in &config.sensitive_layers {
+            for layer_idx in range.clone() {
+                let prefix = format!(".layers.{}.", layer_idx);
+                for tensor_name in tensor_map.tensors.keys() {
+                    if tensor_name.contains(&prefix) {
+                        // Sensitive layers get +2 bits, capped at 8
+                        let elevated = (bits + 2).min(8);
+                        map.insert(tensor_name.clone(), elevated);
+                    }
+                }
+            }
+        }
+        if !map.is_empty() {
+            tracing::info!(
+                overrides = map.len(),
+                "Built per-tensor bit override map from --sensitive-layers"
+            );
+            bit_overrides = Some(map);
+        }
+    }
+
     let manifest = if backend.requires_native_quantization() {
-        // MLX path: backend quantizes directly from f16 weights
-        let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
+        // Native path (MLX): backend quantizes directly from original tensors.
+        // Pass auto_quant base_bits (or the configured bits) plus per-tensor overrides.
+        let native_bits = if let Some(ref plan) = auto_plan {
+            plan.base_bits
+        } else {
+            config.bits.unwrap_or(quantizer_default_bits(&config.quant))
+        };
+
         backend
             .quantize_and_write(
                 &tensor_map,
                 &metadata,
-                bits as u8,
+                native_bits,
                 config.group_size,
+                bit_overrides.as_ref(),
                 &config.input_dir,
                 &config.output_dir,
                 &progress,
@@ -474,8 +625,12 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .map_err(AppError::Conversion)?
     } else {
         // Standard path: validate pre-quantized model and write
+        let quantized = quantized_model.expect(
+            "BUG: quantized_model should be Some for non-native backends",
+        );
+
         let warnings = backend
-            .validate(&quantized_model)
+            .validate(&quantized)
             .context("Output validation failed")
             .map_err(AppError::Conversion)?;
 
@@ -485,7 +640,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
         backend
             .write(
-                &quantized_model,
+                &quantized,
                 &config.input_dir,
                 &config.output_dir,
                 &progress,
