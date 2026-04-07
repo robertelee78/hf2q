@@ -25,6 +25,8 @@ impl InferenceRunner for StubRunner {
         Err(InferenceError::MlxBackendRequired)
     }
 
+    fn unload(&mut self) {}
+
     fn forward(&self, _input: &TokenInput) -> Result<ForwardOutput, InferenceError> {
         Err(InferenceError::MlxBackendRequired)
     }

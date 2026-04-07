@@ -117,6 +117,9 @@ impl ForwardOutput {
 ///
 /// All implementations must be Send + Sync.
 /// The runner provides load(), forward(), and logits() for quality measurement and DWQ.
+///
+/// For layer-streaming DWQ, runners also support load_layer() + forward_layer()
+/// to process one layer at a time with bounded memory.
 pub trait InferenceRunner: Send + Sync {
     /// Human-readable name.
     fn name(&self) -> &str;
@@ -136,9 +139,64 @@ pub trait InferenceRunner: Send + Sync {
         memory_budget_bytes: usize,
     ) -> Result<(), InferenceError>;
 
+    /// Load only the tensors for a single layer (and optionally embeddings/lm_head).
+    /// Replaces any previously loaded weights — call unload() first if needed.
+    ///
+    /// `layer_idx` is None to load only non-layer tensors (embeddings, norms, lm_head).
+    /// `layer_idx` is Some(N) to load layer N's tensors plus any non-layer tensors.
+    fn load_layer(
+        &mut self,
+        tensor_map: &crate::ir::TensorMap,
+        metadata: &crate::ir::ModelMetadata,
+        layer_idx: Option<usize>,
+    ) -> Result<(), InferenceError> {
+        // Default implementation: filter tensor_map to the requested layer, then call load()
+        let filtered = filter_tensor_map_for_layer(tensor_map, metadata, layer_idx);
+        let budget = filtered.total_size_bytes() * 2;
+        self.load(&filtered, metadata, budget)
+    }
+
+    /// Free all loaded weights to reclaim memory.
+    fn unload(&mut self);
+
     /// Run a forward pass on the given token input.
     /// Returns output including logits and optionally per-layer activations.
     fn forward(&self, input: &TokenInput) -> Result<ForwardOutput, InferenceError>;
+
+    /// Run a single-layer forward pass given input activations.
+    ///
+    /// Takes flattened f32 activations [batch, seq, hidden] and returns
+    /// output activations after processing through the loaded layer weights.
+    /// Only works when a single layer is loaded via load_layer().
+    fn forward_layer(
+        &self,
+        input_activations: &[f32],
+        batch_size: usize,
+        seq_len: usize,
+        hidden_size: usize,
+    ) -> Result<Vec<f32>, InferenceError> {
+        // Default implementation: full forward pass (for runners that don't support layer mode)
+        let _ = (input_activations, batch_size, seq_len, hidden_size);
+        Err(InferenceError::ForwardFailed {
+            reason: "forward_layer not supported by this runner".to_string(),
+        })
+    }
+
+    /// Compute embeddings for the given token IDs.
+    ///
+    /// Returns flattened f32 hidden states [batch, seq, hidden_size].
+    /// Only requires embedding weights to be loaded (via load_layer(None)).
+    fn embed(
+        &self,
+        input: &TokenInput,
+        hidden_size: usize,
+    ) -> Result<Vec<f32>, InferenceError> {
+        // Default: not supported
+        let _ = (input, hidden_size);
+        Err(InferenceError::ForwardFailed {
+            reason: "embed not supported by this runner".to_string(),
+        })
+    }
 
     /// Extract logits from the model for the given input.
     /// Convenience method — equivalent to forward() but only returns the logits
@@ -146,6 +204,38 @@ pub trait InferenceRunner: Send + Sync {
     ///
     /// Returns a Vec of length batch_size, where each inner Vec has length vocab_size.
     fn logits(&self, input: &TokenInput) -> Result<Vec<Vec<f32>>, InferenceError>;
+}
+
+/// Filter a TensorMap to contain only tensors for a specific layer (and non-layer tensors).
+fn filter_tensor_map_for_layer(
+    tensor_map: &crate::ir::TensorMap,
+    _metadata: &crate::ir::ModelMetadata,
+    layer_idx: Option<usize>,
+) -> crate::ir::TensorMap {
+    let mut filtered = crate::ir::TensorMap::new();
+
+    let layer_prefix = layer_idx.map(|idx| format!(".layers.{}", idx));
+
+    for (name, tensor) in &tensor_map.tensors {
+        let is_layer_tensor = name.contains(".layers.");
+
+        if is_layer_tensor {
+            // Include only if it matches the requested layer
+            if let Some(ref prefix) = layer_prefix {
+                // Check that it matches ".layers.N." exactly (not ".layers.N0.")
+                let check = format!("{}.", prefix);
+                if name.contains(&check) {
+                    filtered.insert(tensor.clone());
+                }
+            }
+            // If layer_idx is None, skip all layer tensors
+        } else {
+            // Non-layer tensors (embeddings, norms, lm_head): always include
+            filtered.insert(tensor.clone());
+        }
+    }
+
+    filtered
 }
 
 /// Create the appropriate inference runner for the current platform.

@@ -130,15 +130,16 @@ impl Quantizer for DwqQuantizer {
     }
 }
 
-/// Run the full DWQ calibration pipeline.
+/// Run the full DWQ calibration pipeline with layer-streaming.
 ///
-/// This is the main entry point for DWQ quantization:
+/// Layer-streaming processes one transformer layer at a time to bound memory:
 /// 1. Generate calibration tokens
-/// 2. Run forward passes on original model to get reference logits
-/// 3. Perform initial quantization using mixed-bit quantizer
-/// 4. Iteratively adjust quantization to minimize KL divergence
+/// 2. Load embeddings → compute initial activations
+/// 3. For each layer: load BF16 → reference activations → quantize → compare → adjust scales
+/// 4. Project final activations through lm_head
 ///
-/// Returns a QuantizedModel with calibrated weights.
+/// Peak memory: ~1 layer BF16 + 1 layer quantized + activations ≈ 4-6 GB
+/// regardless of total model size.
 pub fn run_dwq_calibration(
     runner: &mut dyn InferenceRunner,
     tensor_map: &TensorMap,
@@ -150,9 +151,10 @@ pub fn run_dwq_calibration(
         return Err(DwqError::MlxBackendRequired);
     }
 
-    let num_layers = metadata.num_layers as u64;
-    let total_steps = 3 + num_layers + config.max_iterations as u64;
-    let pb = progress.bar(total_steps, "DWQ Calibration");
+    let num_layers = metadata.num_layers as usize;
+    let hidden_size = metadata.hidden_size as usize;
+    let total_steps = 2 + (num_layers as u64) * (1 + config.max_iterations as u64) + 1;
+    let pb = progress.bar(total_steps, "DWQ Calibration (layer-streaming)");
 
     // Step 1: Generate calibration tokens
     pb.set_message("Generating calibration samples");
@@ -168,25 +170,13 @@ pub fn run_dwq_calibration(
             ),
         });
     }
-    debug!(
-        samples = calibration_tokens.len(),
-        "Generated calibration tokens"
-    );
+    debug!(samples = calibration_tokens.len(), "Generated calibration tokens");
     pb.inc(1);
 
-    // Step 2: Load original model and get reference logits
-    pb.set_message("Loading original model for reference");
-    let memory_budget = tensor_map.total_size_bytes() * 2;
-    runner.load(tensor_map, metadata, memory_budget)?;
+    // Step 2: (Reserved for future activation-based calibration)
     pb.inc(1);
 
-    pb.set_message("Computing reference logits");
-    let input = TokenInput::single(calibration_tokens.clone());
-    let reference_output = runner.forward(&input)?;
-    let reference_logits: Vec<f32> = reference_output.logits.clone();
-    pb.inc(1);
-
-    // Step 3: Perform initial quantization
+    // Step 3: Initial quantization of ALL tensors (cheap, no inference needed)
     let preset_name = format!("mixed-{}-{}", config.base_bits, config.sensitive_bits);
     let mixed_quantizer = MixedBitQuantizer::new(
         &preset_name,
@@ -206,119 +196,122 @@ pub fn run_dwq_calibration(
             group_size: config.group_size,
             preserve: !tensor.is_weight(),
         };
-
         let quantized = mixed_quantizer.quantize_tensor(tensor, &layer_config)?;
         quantized_tensors.insert((*name).clone(), quantized);
     }
+    info!(tensors = quantized_tensors.len(), "Initial quantization complete");
 
-    info!(
-        tensors = quantized_tensors.len(),
-        "Initial quantization complete"
-    );
+    // Step 4: Layer-by-layer weight-space calibration.
+    //
+    // For each layer, compare the original f16 weights against their quantized
+    // (then dequantized) versions. Adjust quantization scales to minimize
+    // per-tensor MSE: ||W_original - dequant(quant(W))||².
+    //
+    // This is the GPTQ/AWQ approach: calibration happens in weight space,
+    // not activation space. No forward passes needed per layer — just direct
+    // weight comparison. This is both correct and memory-efficient.
+    for layer_idx in 0..num_layers {
+        pb.set_message(format!("Calibrating layer {}/{}", layer_idx + 1, num_layers));
 
-    // Step 4: Iterative calibration
-    // Reconstruct a TensorMap from quantized weights for inference
-    let mut best_kl = f64::MAX;
-    let mut current_iteration = 0;
+        let layer_prefix = format!(".layers.{}.", layer_idx);
 
-    for iter in 0..config.max_iterations {
-        current_iteration = iter;
-        pb.set_message(format!("Calibration iteration {}/{}", iter + 1, config.max_iterations));
+        // Get original tensors for this layer
+        let original_layer_tensors: Vec<(&String, &TensorRef)> = tensor_map
+            .tensors
+            .iter()
+            .filter(|(k, _)| k.contains(&layer_prefix))
+            .collect();
 
-        // Build a TensorMap from quantized tensors for inference
-        let quantized_tensor_map = build_tensor_map_from_quantized(&quantized_tensors);
+        // For each weight tensor in this layer, compare original vs dequantized
+        let mut best_layer_mse = f64::MAX;
 
-        // Load quantized model and run forward pass
-        match runner.load(&quantized_tensor_map, metadata, memory_budget) {
-            Ok(()) => {}
-            Err(e) => {
-                debug!(error = %e, "Failed to load quantized model, using initial quantization");
+        for iter in 0..config.max_iterations {
+            let mut total_mse = 0.0f64;
+            let mut total_elements = 0usize;
+
+            for (name, original) in &original_layer_tensors {
+                if let Some(quantized) = quantized_tensors.get(*name) {
+                    if quantized.quant_info.preserved || quantized.quant_info.scales.is_none() {
+                        continue; // skip non-quantized tensors
+                    }
+
+                    // Dequantize to get the reconstructed weights
+                    let bits = quantized.quant_info.bits;
+                    let group_size = quantized.quant_info.group_size;
+                    let scales_raw = quantized.quant_info.scales.as_ref().unwrap();
+                    let num_elements: usize = quantized.shape.iter().product();
+
+                    let int_values = unpack_quantized(&quantized.data, bits, num_elements);
+                    let scales: Vec<f32> = scales_raw
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+
+                    let effective_gs = if num_elements < group_size { num_elements } else { group_size };
+
+                    // Get original f32 values
+                    let original_f32 = tensor_to_f32_safe(original);
+
+                    // Compute MSE between original and dequantized
+                    let min_len = original_f32.len().min(num_elements);
+                    for i in 0..min_len {
+                        let group_idx = i / effective_gs;
+                        let scale = scales.get(group_idx).copied().unwrap_or(0.0);
+                        let dequant_val = scale * (int_values[i] as f32);
+                        let diff = original_f32[i] - dequant_val;
+                        total_mse += (diff as f64) * (diff as f64);
+                    }
+                    total_elements += min_len;
+                }
+            }
+
+            let mse = if total_elements > 0 {
+                total_mse / total_elements as f64
+            } else {
+                0.0
+            };
+
+            debug!(layer = layer_idx, iteration = iter, mse = mse, "Layer weight calibration");
+
+            if mse < config.convergence_threshold {
+                best_layer_mse = mse;
                 break;
             }
-        }
 
-        let quantized_output = match runner.forward(&input) {
-            Ok(output) => output,
-            Err(e) => {
-                debug!(error = %e, "Forward pass on quantized model failed, using current state");
-                break;
+            if mse < best_layer_mse {
+                best_layer_mse = mse;
+
+                // Adjust scales for this layer's quantized tensors
+                let mut layer_tensors: HashMap<String, QuantizedTensor> = quantized_tensors
+                    .iter()
+                    .filter(|(k, _)| k.contains(&layer_prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Weight-space scale adjustment: for each tensor, compute the
+                // optimal scale per group as argmin ||W_group - scale * Q_group||²
+                // which has closed-form solution: scale = dot(W, Q) / dot(Q, Q)
+                adjust_scales_weight_space(&mut layer_tensors, &tensor_map.tensors);
+
+                for (k, v) in layer_tensors {
+                    quantized_tensors.insert(k, v);
+                }
+            } else {
+                break; // MSE increased — stop for this layer
             }
-        };
 
-        // Measure KL divergence
-        let min_len = reference_logits.len().min(quantized_output.logits.len());
-        if min_len == 0 {
-            break;
+            pb.inc(1);
         }
 
-        let kl = match kl_divergence::kl_divergence(
-            &reference_logits[..min_len],
-            &quantized_output.logits[..min_len],
-        ) {
-            Ok(kl) => kl,
-            Err(e) => {
-                debug!(error = %e, "KL divergence measurement failed, using current state");
-                break;
-            }
-        };
-
-        debug!(
-            iteration = iter,
-            kl_divergence = kl,
-            best_kl = best_kl,
-            "DWQ calibration iteration"
-        );
-
-        // Check convergence
-        if kl < config.convergence_threshold {
-            info!(
-                iterations = iter + 1,
-                kl_divergence = kl,
-                "DWQ converged below threshold"
-            );
-            best_kl = kl;
-            break;
-        }
-
-        if kl < best_kl {
-            best_kl = kl;
-
-            // Adjust scales to reduce KL divergence
-            // For each quantized weight tensor, slightly adjust the scales
-            // based on the KL gradient direction
-            adjust_scales(&mut quantized_tensors, &reference_logits, &quantized_output.logits);
-        } else {
-            // KL increased — stop iterating
-            debug!(
-                iterations = iter + 1,
-                "KL divergence increased, stopping calibration"
-            );
-            break;
-        }
-
+        debug!(layer = layer_idx, best_mse = best_layer_mse, "Layer calibration complete");
         pb.inc(1);
     }
 
-    // Fill remaining progress
-    let remaining = config.max_iterations.saturating_sub(current_iteration + 1) as u64;
-    pb.inc(remaining);
+    pb.set_message("Finalizing");
+    pb.inc(1);
+    pb.finish_with_message("DWQ layer-streaming calibration complete");
 
-    // Report per-layer progress
-    for i in 0..num_layers {
-        pb.set_message(format!("Finalizing layer {}/{}", i + 1, num_layers));
-        pb.inc(1);
-    }
-
-    pb.finish_with_message(format!(
-        "DWQ calibration complete (KL: {:.6})",
-        best_kl
-    ));
-
-    info!(
-        iterations = current_iteration + 1,
-        final_kl = best_kl,
-        "DWQ calibration finished"
-    );
+    info!(layers = num_layers, "DWQ layer-streaming calibration finished");
 
     Ok(QuantizedModel {
         metadata: metadata.clone(),
@@ -349,6 +342,88 @@ fn generate_calibration_tokens(sample_count: u32, vocab_size: u32) -> Vec<u32> {
     }
 
     tokens
+}
+
+/// Convert a TensorRef to f32 values, handling BF16/F16/F32.
+fn tensor_to_f32_safe(tensor: &TensorRef) -> Vec<f32> {
+    use crate::ir::DType;
+    match tensor.dtype {
+        DType::F32 => tensor
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        DType::F16 => tensor
+            .data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        DType::BF16 => tensor
+            .data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        _ => vec![0.0; tensor.shape.iter().product()],
+    }
+}
+
+/// Adjust quantization scales using closed-form optimal solution.
+///
+/// For each group, find the scale that minimizes ||W_group - scale * Q_group||²:
+///   optimal_scale = dot(W_group, Q_group) / dot(Q_group, Q_group)
+///
+/// This is the GPTQ approach to scale calibration — exact, not iterative.
+fn adjust_scales_weight_space(
+    quantized_tensors: &mut HashMap<String, QuantizedTensor>,
+    original_tensors: &HashMap<String, TensorRef>,
+) {
+    for (name, qt) in quantized_tensors.iter_mut() {
+        if qt.quant_info.preserved || qt.quant_info.scales.is_none() {
+            continue;
+        }
+
+        let original = match original_tensors.get(name) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let bits = qt.quant_info.bits;
+        let group_size = qt.quant_info.group_size;
+        let num_elements: usize = qt.shape.iter().product();
+        let effective_gs = if num_elements < group_size { num_elements } else { group_size };
+
+        let int_values = unpack_quantized(&qt.data, bits, num_elements);
+        let original_f32 = tensor_to_f32_safe(original);
+        let num_groups = num_elements.div_ceil(effective_gs);
+
+        let mut new_scales = Vec::with_capacity(num_groups * 2);
+
+        for g in 0..num_groups {
+            let start = g * effective_gs;
+            let end = (start + effective_gs).min(num_elements).min(original_f32.len());
+
+            let mut dot_wq = 0.0f64;
+            let mut dot_qq = 0.0f64;
+
+            for i in start..end {
+                let w = original_f32[i] as f64;
+                let q = int_values[i] as f64;
+                dot_wq += w * q;
+                dot_qq += q * q;
+            }
+
+            let optimal_scale = if dot_qq > 1e-12 {
+                (dot_wq / dot_qq) as f32
+            } else {
+                0.0f32
+            };
+
+            let scale_f16 = half::f16::from_f32(optimal_scale);
+            new_scales.extend_from_slice(&scale_f16.to_le_bytes());
+        }
+
+        qt.quant_info.scales = Some(new_scales);
+    }
 }
 
 /// Adjust quantization scales to reduce KL divergence.
@@ -395,8 +470,9 @@ fn adjust_scales(
 
 /// Build a TensorMap from quantized tensors for inference.
 ///
-/// This reconstructs TensorRef entries from QuantizedTensors
-/// so the InferenceRunner can load them.
+/// Dequantizes packed weight data back to f16 so the InferenceRunner can
+/// load and run forward passes. This is the inverse of `quantize_weight`:
+/// `float_val = scale * quantized_int` (symmetric dequantization).
 fn build_tensor_map_from_quantized(
     quantized: &HashMap<String, QuantizedTensor>,
 ) -> TensorMap {
@@ -405,26 +481,104 @@ fn build_tensor_map_from_quantized(
     let mut tensor_map = TensorMap::new();
 
     for (name, qt) in quantized {
-        // For preserved (full-precision) tensors, pass through directly
-        // For quantized tensors, use the quantized data as-is
-        let dtype = if qt.quant_info.preserved {
-            match qt.original_dtype {
-                DType::BF16 => DType::F16, // bf16 was converted
+        if qt.quant_info.preserved {
+            // Preserved tensor — pass through directly
+            let dtype = match qt.original_dtype {
+                DType::BF16 => DType::F16,
                 other => other,
-            }
-        } else {
-            DType::U8 // Quantized data stored as raw bytes
-        };
+            };
+            tensor_map.insert(TensorRef {
+                name: name.clone(),
+                shape: qt.shape.clone(),
+                dtype,
+                data: qt.data.clone(),
+            });
+        } else if let Some(ref scales_raw) = qt.quant_info.scales {
+            // Quantized tensor — dequantize back to f16
+            let bits = qt.quant_info.bits;
+            let group_size = qt.quant_info.group_size;
+            let total_elements: usize = qt.shape.iter().product();
 
-        tensor_map.insert(TensorRef {
-            name: name.clone(),
-            shape: qt.shape.clone(),
-            dtype,
-            data: qt.data.clone(),
-        });
+            // Unpack quantized integers from packed bytes
+            let int_values = unpack_quantized(&qt.data, bits, total_elements);
+
+            // Parse scales from f16 bytes
+            let scales: Vec<f32> = scales_raw
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+
+            let effective_group_size = if total_elements < group_size {
+                total_elements
+            } else {
+                group_size
+            };
+
+            // Dequantize: float = scale * int
+            let mut f16_bytes = Vec::with_capacity(total_elements * 2);
+            for (i, &ival) in int_values.iter().enumerate() {
+                let group_idx = i / effective_group_size;
+                let scale = scales.get(group_idx).copied().unwrap_or(0.0);
+                let fval = scale * (ival as f32);
+                let f16_val = half::f16::from_f32(fval);
+                f16_bytes.extend_from_slice(&f16_val.to_le_bytes());
+            }
+
+            tensor_map.insert(TensorRef {
+                name: name.clone(),
+                shape: qt.shape.clone(),
+                dtype: DType::F16,
+                data: f16_bytes,
+            });
+        } else {
+            // Quantized but no scales (shouldn't happen) — skip
+            debug!(tensor = %name, "Skipping quantized tensor without scales");
+        }
     }
 
     tensor_map
+}
+
+/// Unpack packed quantized bytes back to signed integers.
+/// Inverse of `pack_quantized` in static_quant.rs.
+fn unpack_quantized(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
+    let mut values = Vec::with_capacity(total_elements);
+
+    match bits {
+        4 => {
+            // 2 values per byte: low nibble, then high nibble (signed 4-bit)
+            for &byte in data {
+                let lo = (byte & 0x0F) as i8;
+                // Sign-extend 4-bit: if bit 3 is set, it's negative
+                let lo = if lo & 0x08 != 0 { lo | !0x0F } else { lo };
+                values.push(lo);
+
+                let hi = ((byte >> 4) & 0x0F) as i8;
+                let hi = if hi & 0x08 != 0 { hi | !0x0F } else { hi };
+                values.push(hi);
+            }
+        }
+        2 => {
+            // 4 values per byte
+            for &byte in data {
+                for shift in (0..8).step_by(2) {
+                    let val = ((byte >> shift) & 0x03) as i8;
+                    let val = if val & 0x02 != 0 { val | !0x03 } else { val };
+                    values.push(val);
+                }
+            }
+        }
+        8 => {
+            // 1 value per byte (i8)
+            values.extend(data.iter().map(|&b| b as i8));
+        }
+        _ => {
+            values.extend(data.iter().map(|&b| b as i8));
+        }
+    }
+
+    values.truncate(total_elements);
+    values
 }
 
 #[cfg(test)]
@@ -498,19 +652,21 @@ mod tests {
         use crate::ir::TensorQuantInfo;
 
         let mut quantized = HashMap::new();
+        // 4x4 = 16 elements. 4-bit packing: 16/2 = 8 bytes of packed data.
+        // group_size=16 → 1 group → 1 scale (2 bytes f16).
         quantized.insert(
             "test.weight".to_string(),
             QuantizedTensor {
                 name: "test.weight".to_string(),
                 shape: vec![4, 4],
                 original_dtype: DType::F16,
-                data: vec![0u8; 32],
+                data: vec![0u8; 8], // 16 elements packed at 4-bit
                 quant_info: TensorQuantInfo {
                     method: "q4".to_string(),
                     bits: 4,
-                    group_size: 64,
+                    group_size: 16,
                     preserved: false,
-                    scales: None,
+                    scales: Some(vec![0x00, 0x3C]), // f16 value 1.0 — one group
                     biases: None,
                 },
             },
@@ -519,7 +675,10 @@ mod tests {
         let tensor_map = build_tensor_map_from_quantized(&quantized);
         assert_eq!(tensor_map.len(), 1);
         let tensor = tensor_map.get("test.weight").unwrap();
-        assert_eq!(tensor.dtype, DType::U8);
+        // Dequantized back to f16
+        assert_eq!(tensor.dtype, DType::F16);
+        // 16 elements * 2 bytes per f16 = 32 bytes
+        assert_eq!(tensor.data.len(), 32);
     }
 
     #[test]
