@@ -1384,13 +1384,12 @@ impl Gemma4Model {
 
         // Check if weight is quantized
         if let Some((bits, _group_size)) = quant_info {
-            // CPU dequantize + matmul for all quantized weights.
-            // The GPU qmatmul kernel has accuracy issues for some configurations,
-            // so we use CPU dequantization for correctness. This is slower but
-            // produces numerically correct results matching the reference.
-            let _use_gpu_qmatmul = std::env::var("HF2Q_GPU_QMATMUL").is_ok();
-            if _use_gpu_qmatmul && (bits == 4 || bits == 6) {
-                // GPU path (opt-in for performance testing)
+            // GPU quantized matmul: uses native bf16 dequantization on Metal,
+            // matching MLX's precision exactly. The kernel dequantizes weights
+            // to bf16, truncates input to bf16, and accumulates in f32.
+            let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
+            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+                // GPU path (default — matches MLX's bf16 precision)
                 let input_f32 = self.ensure_f32_input(input, seq_len * in_dim)?;
 
                 let loaded = require_weight(&self.weights, &weight_name)?;
@@ -1421,16 +1420,24 @@ impl Gemma4Model {
                 return Ok(output_f32);
             }
 
-            // CPU dequantize + matmul (default path for correctness)
+            // CPU dequantize + bf16-precision matmul.
+            // MLX operates entirely in bf16: dequantized weights are bf16,
+            // inputs are bf16, products are f32 (accumulated in f32).
+            // We match this by rounding both operands to bf16 precision
+            // before multiplying. This is critical for MoE models where
+            // small precision differences cascade through expert routing.
             let weight_f32 = self.dequantize_2d_weight(weight_base, out_dim, in_dim)?;
             let input_data = read_buffer_f32(input)?;
+
+            let weight_bf16 = round_to_bf16(&weight_f32);
+            let input_bf16 = round_to_bf16(&input_data);
 
             let mut output_data = vec![0.0f32; seq_len * out_dim];
             for row in 0..seq_len {
                 for col in 0..out_dim {
                     let mut sum = 0.0f32;
                     for k in 0..in_dim {
-                        sum += input_data[row * in_dim + k] * weight_f32[col * in_dim + k];
+                        sum += input_bf16[row * in_dim + k] * weight_bf16[col * in_dim + k];
                     }
                     output_data[row * out_dim + col] = sum;
                 }
@@ -1957,11 +1964,13 @@ impl Gemma4Model {
 
         // Dequantize the router weight once for all tokens in this layer call.
         // Router weight is [n_experts, hidden_size], possibly quantized.
-        let router_f32 = self.dequantize_2d_weight(
+        // Round to bf16 to match MLX's precision.
+        let router_f32_raw = self.dequantize_2d_weight(
             &format!("model.layers.{layer_idx}.router.proj"),
             n_experts,
             hidden_size,
         )?;
+        let router_bf16 = round_to_bf16(&router_f32_raw);
 
         // Read router.scale [hidden_size] and per_expert_scale [n_experts]
         // The router's scale weight is used as the RMS norm weight, scaled by hidden_size^(-0.5).
@@ -1984,8 +1993,8 @@ impl Gemma4Model {
             eprintln!("[DIAG] router_norm_weight first 5: {:?}, per_expert_scale first 5: {:?}",
                 &router_norm_weight[..5.min(router_norm_weight.len())],
                 &per_expert_scale[..5.min(per_expert_scale.len())]);
-            let n = router_f32.len().min(10);
-            eprintln!("[DIAG] router_f32 first {}: {:?}", n, &router_f32[..n]);
+            let n = router_bf16.len().min(10);
+            eprintln!("[DIAG] router_f32 first {}: {:?}", n, &router_bf16[..n]);
         }
 
         let intermediate_size = self.config.moe_intermediate_size;
@@ -1999,11 +2008,14 @@ impl Gemma4Model {
             // Python: x = rms_norm(x, self.scale * root_size, eps); scores = self.proj(x)
             let normed_router = cpu_rms_norm(token_router, &router_norm_weight, eps);
 
+            // Round to bf16 to match MLX's precision for router scoring
+            let normed_bf16 = round_to_bf16(&normed_router);
+
             let mut logits = vec![0.0f32; n_experts];
             for e in 0..n_experts {
                 let mut sum = 0.0f32;
                 for k in 0..hidden_size {
-                    sum += router_f32[e * hidden_size + k] * normed_router[k];
+                    sum += router_bf16[e * hidden_size + k] * normed_bf16[k];
                 }
                 logits[e] = sum;
             }
@@ -2231,12 +2243,18 @@ impl Gemma4Model {
                 &token_hidden[..5.min(token_hidden.len())], token_hidden.len());
         }
 
+        // Round weights and input to bf16 to match MLX's precision
+        let gate_bf16 = round_to_bf16(&gate_data);
+        let up_bf16 = round_to_bf16(&up_data);
+        let down_bf16 = round_to_bf16(&down_data);
+        let input_bf16 = round_to_bf16(token_hidden);
+
         // gate_out = gate_proj @ x   [intermediate_size]
         let mut gate_out = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
             let mut sum = 0.0f32;
             for k in 0..hidden_size {
-                sum += gate_data[i * hidden_size + k] * token_hidden[k];
+                sum += gate_bf16[i * hidden_size + k] * input_bf16[k];
             }
             gate_out[i] = sum;
         }
@@ -2252,7 +2270,7 @@ impl Gemma4Model {
         for i in 0..intermediate_size {
             let mut sum = 0.0f32;
             for k in 0..hidden_size {
-                sum += up_data[i * hidden_size + k] * token_hidden[k];
+                sum += up_bf16[i * hidden_size + k] * input_bf16[k];
             }
             up_out[i] = sum;
         }
@@ -2269,12 +2287,15 @@ impl Gemma4Model {
                 expert_id, n, &hidden[..n]);
         }
 
+        // Round hidden to bf16 for down_proj matmul
+        let hidden_bf16 = round_to_bf16(&hidden);
+
         // expert_out = down_proj @ hidden   [hidden_size]
         let mut expert_out = vec![0.0f32; hidden_size];
         for i in 0..hidden_size {
             let mut sum = 0.0f32;
             for k in 0..intermediate_size {
-                sum += down_data[i * intermediate_size + k] * hidden[k];
+                sum += down_bf16[i * intermediate_size + k] * hidden_bf16[k];
             }
             expert_out[i] = sum;
         }
@@ -3057,6 +3078,18 @@ fn cpu_dequantize_flat(
     }
 
     Ok(output)
+}
+
+/// Round an f32 slice to bf16 precision.
+///
+/// MLX operates entirely in bf16 for quantized models. To match its behavior,
+/// both matmul operands (input and dequantized weight) must be rounded to bf16
+/// before multiplication. This ensures `bf16 * bf16 → f32` accumulation matches
+/// MLX's fused quantized matmul kernel exactly.
+fn round_to_bf16(data: &[f32]) -> Vec<f32> {
+    data.iter()
+        .map(|&v| half::bf16::from_f32(v).to_f32())
+        .collect()
 }
 
 /// Convert f16 bits to f32.
