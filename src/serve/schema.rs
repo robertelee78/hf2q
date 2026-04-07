@@ -170,12 +170,18 @@ pub struct HealthResponse {
 // ---------------------------------------------------------------------------
 
 /// A single model object in the OpenAI format.
+///
+/// Includes non-standard `context_length` field used by Open WebUI,
+/// Continue, and other clients to discover the model's context window.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelObject {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    /// Maximum context length in tokens (non-standard, widely supported).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<usize>,
 }
 
 /// Response for `GET /v1/models`.
@@ -694,6 +700,7 @@ mod tests {
                 object: "model".into(),
                 created: 1234567890,
                 owned_by: "hf2q".into(),
+                context_length: Some(262144),
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();

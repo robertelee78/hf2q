@@ -42,6 +42,7 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelListRespons
             object: "model".into(),
             created: state.created_at,
             owned_by: "hf2q".into(),
+            context_length: Some(state.max_seq_len),
         }],
     })
 }
@@ -61,6 +62,7 @@ pub async fn get_model(
             object: "model".into(),
             created: state.created_at,
             owned_by: "hf2q".into(),
+            context_length: Some(state.max_seq_len),
         }))
     } else {
         Err(ApiError::model_not_found(&model_id))
