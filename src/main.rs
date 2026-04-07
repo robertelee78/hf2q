@@ -26,6 +26,8 @@ mod quality;
 mod quantize;
 #[allow(dead_code)]
 mod report;
+#[cfg(feature = "serve")]
+mod serve;
 #[cfg(feature = "mlx-native")]
 #[allow(dead_code)]
 mod tokenizer;
@@ -136,6 +138,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         #[cfg(feature = "mlx-native")]
         Command::Infer(args) => cmd_infer(args),
+        #[cfg(feature = "serve")]
+        Command::Serve(args) => cmd_serve(args),
     }
 }
 
@@ -292,6 +296,124 @@ fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
     );
 
     Ok(())
+}
+
+/// Handle the `serve` subcommand (requires serve feature).
+#[cfg(feature = "serve")]
+fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
+    use console::style;
+    use inference::engine::{EngineConfig, InferenceEngine};
+    use inference::sampler::SamplerConfig;
+
+    // Step 1: Resolve model path
+    let model_dir = hub::download::resolve_model_path(&args.model)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    // Step 2: Validate model directory
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "No config.json found in {}. Is this a valid model directory?",
+            model_dir.display()
+        )));
+    }
+
+    let model_config = inference::models::registry::detect_architecture(&config_path)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {}",
+        style("Architecture:").bold(),
+        model_config.architecture_str
+    );
+
+    // Step 3: Memory estimation
+    let max_seq_len = 4096u64; // Default for serve mode
+    let mem_estimate =
+        inference::memory_estimate::estimate_memory(&model_config, &model_dir, max_seq_len)
+            .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    eprintln!(
+        "{} {:.1} GB (weights: {:.1} GB, KV cache: {:.1} GB)",
+        style("Memory estimate:").bold(),
+        mem_estimate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mem_estimate.weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        mem_estimate.kv_cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+
+    inference::memory_estimate::check_memory(&mem_estimate)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
+
+    // Step 4: Build engine config (defaults for serve mode)
+    let engine_config = EngineConfig {
+        max_tokens: 4096,
+        sampler: SamplerConfig::default(),
+        stop_sequences: Vec::new(),
+    };
+
+    // Step 5: Load model
+    eprintln!("{}", style("Loading model...").dim());
+    let chat_template_override = args.chat_template.as_deref();
+
+    let engine = InferenceEngine::new(&model_dir, engine_config, chat_template_override)
+        .map_err(|e| match &e {
+            inference::engine::EngineError::ChatTemplate(
+                crate::tokenizer::chat_template::ChatTemplateError::NotFound,
+            ) => AppError::Input(anyhow::anyhow!(
+                "No chat template found. Provide one with --chat-template"
+            )),
+            _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
+        })?;
+
+    let engine_max_seq_len = engine.max_seq_len();
+
+    // Step 6: Load tokenizer and chat template separately for the server
+    // (so validation can happen without locking the engine Mutex)
+    let tokenizer = tokenizer::HfTokenizer::from_dir(&model_dir)
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
+
+    let chat_template = if let Some(override_path) = chat_template_override {
+        tokenizer::chat_template::ChatTemplate::from_file(override_path)
+            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?
+    } else {
+        tokenizer::chat_template::ChatTemplate::from_model_dir(&model_dir)
+            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?
+    };
+
+    // Derive model name from directory basename
+    let model_name = model_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown-model".to_string());
+
+    eprintln!(
+        "{} {}",
+        style("Model:").bold(),
+        model_name
+    );
+
+    // Step 7: Start the tokio runtime and run the server
+    let serve_config = serve::ServeConfig {
+        host: args.host,
+        port: args.port,
+        queue_depth: args.queue_depth,
+    };
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::Conversion(anyhow::anyhow!("Failed to create tokio runtime: {}", e)))?;
+
+    rt.block_on(async {
+        serve::run(
+            engine,
+            tokenizer,
+            chat_template,
+            model_name,
+            engine_max_seq_len,
+            serve_config,
+        )
+        .await
+        .map_err(|e| AppError::Conversion(e))
+    })
 }
 
 /// Handle the `convert` subcommand.

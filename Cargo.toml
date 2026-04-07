@@ -17,6 +17,8 @@ coreml-backend = ["dep:coreml-native"]
 ruvector = ["dep:ruvector-core"]
 # Enable mlx-native inference engine (requires Apple Silicon + Metal)
 mlx-native = ["dep:mlx-native", "dep:tokenizers", "dep:minijinja", "dep:rand"]
+# Enable OpenAI-compatible API server
+serve = ["mlx-native", "dep:axum", "dep:tokio", "dep:tower-http", "dep:uuid", "dep:async-stream", "dep:futures"]
 
 [dependencies]
 # Core ML pipeline — optional, requires Metal Toolchain
@@ -44,6 +46,14 @@ minijinja = { version = "2", optional = true }
 
 # Random number generation for sampling — optional, gated behind mlx-native feature
 rand = { version = "0.8", optional = true }
+
+# HTTP server — optional, gated behind serve feature
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+async-stream = { version = "0.3", optional = true }
+futures = { version = "0.3", optional = true }
 
 # CLI framework
 clap = { version = "4.5", features = ["derive"] }
@@ -80,6 +90,9 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 criterion = "0.5"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+http = "1"
 
 [[bench]]
 name = "quantize_bench"

@@ -113,7 +113,7 @@ pub struct InferenceEngine {
     /// Chat template for prompt formatting.
     chat_template: ChatTemplate,
     /// Engine configuration (max_tokens, stop sequences, etc.).
-    config: EngineConfig,
+    pub config: EngineConfig,
 }
 
 impl InferenceEngine {
@@ -345,6 +345,143 @@ impl InferenceEngine {
                 return;
             }
         }
+    }
+
+    /// Generate text from an already-rendered prompt string.
+    ///
+    /// Unlike `generate()`, this method skips chat template rendering and
+    /// expects the caller to have already formatted the prompt (including
+    /// special tokens if needed). This is used by the API server which
+    /// handles multi-message template rendering externally.
+    ///
+    /// The `on_token` callback is invoked for each generated token with the
+    /// decoded text fragment. Return `true` to continue, `false` to stop.
+    pub fn generate_from_formatted_prompt<F>(
+        &mut self,
+        rendered_prompt: &str,
+        on_token: F,
+    ) -> Result<(String, GenerationStats), EngineError>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let total_start = Instant::now();
+
+        // Reset KV cache for the new sequence
+        self.model.reset_cache();
+
+        // Tokenize the already-rendered prompt
+        let prompt_tokens = self.tokenizer.encode_with_special_tokens(rendered_prompt)?;
+        let prompt_len = prompt_tokens.len();
+        debug!(prompt_tokens = prompt_len, "Prompt tokenized");
+
+        if prompt_tokens.is_empty() {
+            return Err(EngineError::Generation {
+                reason: "Prompt tokenized to zero tokens".into(),
+            });
+        }
+
+        // Prefill
+        let prefill_start = Instant::now();
+        let prefill_logits = self.model.forward(&prompt_tokens)?;
+        let prefill_time = prefill_start.elapsed().as_secs_f64();
+
+        let vocab_size = self.model.config().vocab_size;
+        let last_pos_logits =
+            extract_last_position_logits(&prefill_logits, prompt_len, vocab_size)?;
+
+        // Sample first token
+        let mut sampler = Sampler::new(self.config.sampler.clone());
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(self.config.max_tokens);
+        let mut generated_text = String::new();
+        let eos_id = self.tokenizer.eos_id();
+        let decode_start = Instant::now();
+
+        let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
+
+        if Some(first_token) == eos_id {
+            let total_time = total_start.elapsed().as_secs_f64();
+            return Ok((
+                generated_text,
+                GenerationStats {
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    prefill_time_secs: prefill_time,
+                    decode_time_secs: 0.0,
+                    total_time_secs: total_time,
+                },
+            ));
+        }
+
+        generated_ids.push(first_token);
+        let token_text = self.tokenizer.decode(&[first_token]).unwrap_or_default();
+        generated_text.push_str(&token_text);
+
+        if !on_token(&token_text) {
+            let total_time = total_start.elapsed().as_secs_f64();
+            return Ok((
+                generated_text,
+                GenerationStats {
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 1,
+                    prefill_time_secs: prefill_time,
+                    decode_time_secs: decode_start.elapsed().as_secs_f64(),
+                    total_time_secs: total_time,
+                },
+            ));
+        }
+
+        // Decode loop
+        for step in 1..self.config.max_tokens {
+            let step_logits = self.model.forward(&[*generated_ids.last().unwrap()])?;
+            let token_logits = extract_last_position_logits(&step_logits, 1, vocab_size)?;
+            let next_token = sampler.sample_next(&token_logits, &generated_ids);
+
+            if Some(next_token) == eos_id {
+                debug!(step = step, "EOS token generated");
+                break;
+            }
+
+            generated_ids.push(next_token);
+            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            generated_text.push_str(&token_text);
+
+            if self.check_stop_sequences(&generated_text) {
+                self.trim_stop_sequence(&mut generated_text);
+                debug!(step = step, "Stop sequence matched");
+                break;
+            }
+
+            if !on_token(&token_text) {
+                debug!(step = step, "Generation stopped by callback");
+                break;
+            }
+        }
+
+        let decode_time = decode_start.elapsed().as_secs_f64();
+        let total_time = total_start.elapsed().as_secs_f64();
+
+        Ok((
+            generated_text,
+            GenerationStats {
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+                prefill_time_secs: prefill_time,
+                decode_time_secs: decode_time,
+                total_time_secs: total_time,
+            },
+        ))
+    }
+
+    /// Get a reference to the model's maximum sequence length.
+    pub fn max_seq_len(&self) -> usize {
+        self.model.config().max_seq_len
+    }
+
+    /// Get the model name derived from config.
+    pub fn model_name(&self) -> &str {
+        // The model doesn't store its name; this is handled at a higher level.
+        // Return a placeholder; the serve module extracts the name from the path.
+        "unknown"
     }
 }
 

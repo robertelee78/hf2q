@@ -37,6 +37,10 @@ pub enum Command {
     /// Run inference on a model (requires --features mlx-native)
     #[cfg(feature = "mlx-native")]
     Infer(InferArgs),
+
+    /// Start an OpenAI-compatible API server (requires --features serve)
+    #[cfg(feature = "serve")]
+    Serve(ServeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -147,6 +151,31 @@ pub struct InferArgs {
     /// Repetition penalty (1.0 = disabled)
     #[arg(long, default_value = "1.0")]
     pub repetition_penalty: f32,
+
+    /// Path to a custom chat template (Jinja2 format)
+    #[arg(long)]
+    pub chat_template: Option<std::path::PathBuf>,
+}
+
+/// Arguments for the `serve` subcommand.
+#[cfg(feature = "serve")]
+#[derive(clap::Args, Debug)]
+pub struct ServeArgs {
+    /// Model path (local directory) or HuggingFace Hub ID
+    #[arg(long)]
+    pub model: String,
+
+    /// Port to listen on
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
+
+    /// Host address to bind to
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: String,
+
+    /// Maximum concurrent generation requests (queue depth)
+    #[arg(long, default_value = "16")]
+    pub queue_depth: usize,
 
     /// Path to a custom chat template (Jinja2 format)
     #[arg(long)]
