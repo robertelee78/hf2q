@@ -7,7 +7,8 @@
 //!   Pre-allocated to `max_seq_len` but tracks how many positions are filled.
 //!
 //! All cache buffers are pre-allocated at model load time as Metal buffers
-//! (f32, StorageModeShared) to avoid allocation during inference.
+//! (bf16, StorageModeShared) to avoid allocation during inference and to
+//! eliminate bf16↔f32 conversions on the KV cache hot path.
 
 use mlx_native::{DType, MlxBuffer, MlxDevice};
 use tracing::debug;
@@ -43,12 +44,12 @@ pub enum CacheType {
 /// Per-layer KV cache entry.
 #[derive(Debug)]
 pub struct LayerCache {
-    /// Key cache buffer: f32, pre-allocated.
+    /// Key cache buffer: bf16, pre-allocated.
     /// Sliding: `[window, n_kv_heads * head_dim]`
     /// Global: `[max_seq_len, n_kv_heads * head_dim]`
     pub k_cache: MlxBuffer,
 
-    /// Value cache buffer: f32, pre-allocated.
+    /// Value cache buffer: bf16, pre-allocated.
     /// Same shape as k_cache.
     pub v_cache: MlxBuffer,
 
@@ -83,7 +84,7 @@ impl LayerCache {
         };
 
         let row_size = n_kv_heads * head_dim;
-        let byte_len = capacity * row_size * std::mem::size_of::<f32>();
+        let byte_len = capacity * row_size * std::mem::size_of::<u16>(); // bf16 = 2 bytes
 
         if byte_len == 0 {
             return Err(KvCacheError::AllocationFailed {
@@ -92,13 +93,13 @@ impl LayerCache {
         }
 
         let k_cache = device
-            .alloc_buffer(byte_len, DType::F32, vec![capacity, row_size])
+            .alloc_buffer(byte_len, DType::BF16, vec![capacity, row_size])
             .map_err(|e| KvCacheError::AllocationFailed {
                 reason: format!("K cache: {e}"),
             })?;
 
         let v_cache = device
-            .alloc_buffer(byte_len, DType::F32, vec![capacity, row_size])
+            .alloc_buffer(byte_len, DType::BF16, vec![capacity, row_size])
             .map_err(|e| KvCacheError::AllocationFailed {
                 reason: format!("V cache: {e}"),
             })?;
@@ -114,13 +115,14 @@ impl LayerCache {
         })
     }
 
-    /// Append new K and V vectors for one or more sequence positions.
+    /// Append new K and V vectors (bf16 as u16) for one or more sequence positions.
     ///
-    /// `k_new` and `v_new` are f32 buffers of shape `[n_new_positions, n_kv_heads * head_dim]`.
+    /// `k_new` and `v_new` are bf16 (u16) slices of shape `[n_new_positions, n_kv_heads * head_dim]`.
+    /// This is the fast path: no conversion needed since the cache is bf16.
     ///
     /// For sliding layers, positions wrap around the ring buffer.
     /// For global layers, positions are appended sequentially.
-    pub fn append(&mut self, k_new: &[f32], v_new: &[f32]) -> Result<(), KvCacheError> {
+    pub fn append_bf16(&mut self, k_new: &[u16], v_new: &[u16]) -> Result<(), KvCacheError> {
         let row_size = self.n_kv_heads * self.head_dim;
         if k_new.len() % row_size != 0 || v_new.len() % row_size != 0 {
             return Err(KvCacheError::BufferWriteError {
@@ -141,13 +143,13 @@ impl LayerCache {
         }
 
         // Write each new position into the cache
-        let k_slice: &mut [f32] = self
+        let k_slice: &mut [u16] = self
             .k_cache
             .as_mut_slice()
             .map_err(|e| KvCacheError::BufferWriteError {
                 reason: format!("K cache write: {e}"),
             })?;
-        let v_slice: &mut [f32] = self
+        let v_slice: &mut [u16] = self
             .v_cache
             .as_mut_slice()
             .map_err(|e| KvCacheError::BufferWriteError {
@@ -189,6 +191,27 @@ impl LayerCache {
         }
 
         Ok(())
+    }
+
+    /// Append new K and V vectors for one or more sequence positions.
+    ///
+    /// `k_new` and `v_new` are f32 buffers of shape `[n_new_positions, n_kv_heads * head_dim]`.
+    /// Each f32 value is converted to bf16 before storing. Prefer `append_bf16` when
+    /// the data is already in bf16 format.
+    ///
+    /// For sliding layers, positions wrap around the ring buffer.
+    /// For global layers, positions are appended sequentially.
+    pub fn append(&mut self, k_new: &[f32], v_new: &[f32]) -> Result<(), KvCacheError> {
+        // Convert f32 -> bf16 (u16) and delegate to append_bf16
+        let k_bf16: Vec<u16> = k_new
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let v_bf16: Vec<u16> = v_new
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        self.append_bf16(&k_bf16, &v_bf16)
     }
 
     /// Get the current valid sequence length in the cache.
@@ -443,13 +466,15 @@ mod tests {
         assert_eq!(cache.write_position(), 4); // total written
 
         // Verify the ring buffer: position 0 should have been overwritten
-        let k_data: &[f32] = cache.k_cache.as_slice().expect("as_slice");
+        // Cache is bf16, so read as u16 and convert back to f32 for comparison
+        let k_data: &[u16] = cache.k_cache.as_slice().expect("as_slice");
+        let to_f32 = |bits: u16| half::bf16::from_bits(bits).to_f32();
         // Position 0 was overwritten with [7.0, 8.0]
-        assert!((k_data[0] - 7.0).abs() < 1e-6);
-        assert!((k_data[1] - 8.0).abs() < 1e-6);
+        assert!((to_f32(k_data[0]) - 7.0).abs() < 0.1);
+        assert!((to_f32(k_data[1]) - 8.0).abs() < 0.1);
         // Position 1 still has [3.0, 4.0]
-        assert!((k_data[2] - 3.0).abs() < 1e-6);
-        assert!((k_data[3] - 4.0).abs() < 1e-6);
+        assert!((to_f32(k_data[2]) - 3.0).abs() < 0.1);
+        assert!((to_f32(k_data[3]) - 4.0).abs() < 0.1);
     }
 
     #[test]
@@ -541,8 +566,8 @@ mod tests {
 
         let (k_buf, v_buf, seq_len) = cache.keys_values();
         assert_eq!(seq_len, 2);
-        assert_eq!(k_buf.dtype(), DType::F32);
-        assert_eq!(v_buf.dtype(), DType::F32);
+        assert_eq!(k_buf.dtype(), DType::BF16);
+        assert_eq!(v_buf.dtype(), DType::BF16);
     }
 
     #[test]

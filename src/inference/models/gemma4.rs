@@ -1169,13 +1169,23 @@ impl Gemma4Model {
             eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
         }
 
-        // --- Step 4: KV cache append --- (CPU)
-        let k_data = read_buffer_f32(&k_roped)?;
-        let v_data = read_buffer_f32(&v_normed_buf)?;
+        // --- Step 4: KV cache append --- (CPU, bf16 direct — no f32 conversion)
+        let k_data_bf16: Vec<u16> = {
+            let slice: &[u16] = k_roped.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("K roped read bf16: {e}"),
+            })?;
+            slice.to_vec()
+        };
+        let v_data_bf16: Vec<u16> = {
+            let slice: &[u16] = v_normed_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("V normed read bf16: {e}"),
+            })?;
+            slice.to_vec()
+        };
 
         {
             let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
-            layer_cache.append(&k_data, &v_data)?;
+            layer_cache.append_bf16(&k_data_bf16, &v_data_bf16)?;
         }
 
         // --- Step 5: Attention --- (GPU, own encoder -- heavy kernel with CPU reshape)
@@ -1190,19 +1200,21 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data[..5.min(v_data.len())]);
-            eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
+            let v_data_f32: Vec<f32> = v_data_bf16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+            eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data_f32[..5.min(v_data_f32.len())]);
+            eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data_f32.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
 
             let layer_cache_read = self.kv_cache.layer(layer_idx)?;
             let (_k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
-            let v_cache_data: &[f32] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            let v_cache_u16: &[u16] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read v cache: {e}"),
             })?;
-            let v_first5 = &v_cache_data[..5.min(v_cache_data.len())];
+            let v_first5: Vec<f32> = v_cache_u16[..5.min(v_cache_u16.len())].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
             eprintln!("[DIAG] Layer 0 V cache readback pos 0 first 5: {:?}, kv_seq_len={}", v_first5, kv_slen);
 
-            let v_valid = &v_cache_data[..kv_slen * n_kv_heads * head_dim];
-            let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_slen, n_kv_heads, head_dim);
+            let v_valid_u16 = &v_cache_u16[..kv_slen * n_kv_heads * head_dim];
+            let v_valid_f32: Vec<f32> = v_valid_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+            let v_reshaped = reshape_qkv_for_sdpa(&v_valid_f32, kv_slen, n_kv_heads, head_dim);
             eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
 
             let q_ps = read_buffer_f32(&q_roped)?;
@@ -2349,9 +2361,9 @@ impl Gemma4Model {
 
     /// Compute attention for a single layer.
     ///
-    /// Q is bf16 [seq_len, n_heads * head_dim]. K/V are read from the f32 KV cache
-    /// and converted to bf16 at the SDPA boundary. The SDPA bf16 kernel is dispatched
-    /// based on the Q buffer dtype. Output is bf16 [seq_len, n_heads * head_dim].
+    /// Q is bf16 [seq_len, n_heads * head_dim]. K/V are read from the bf16 KV cache
+    /// and reshaped directly as bf16 — no f32 conversion needed.
+    /// Output is bf16 [seq_len, n_heads * head_dim].
     fn compute_attention(
         &mut self,
         layer_idx: usize,
@@ -2391,36 +2403,34 @@ impl Gemma4Model {
             q_buf = q_permuted;
         }
 
-        // K/V cache is f32 [kv_seq_len, n_kv_heads * head_dim].
-        // Read, reshape on CPU, then write as bf16 for the bf16 SDPA kernel.
-        // (KV cache is f32; GPU permute would need cast first, not worth it yet)
-        let k_data: &[f32] = k_cache_buf.as_slice().map_err(|e| {
-            Gemma4Error::ForwardError {
-                reason: format!("K cache read: {e}"),
-            }
-        })?;
-        let k_valid = &k_data[..kv_seq_len * n_kv_heads * head_dim];
-        let k_reshaped = reshape_qkv_for_sdpa(k_valid, kv_seq_len, n_kv_heads, head_dim);
-
-        let v_data: &[f32] = v_cache_buf.as_slice().map_err(|e| {
-            Gemma4Error::ForwardError {
-                reason: format!("V cache read: {e}"),
-            }
-        })?;
-        let v_valid = &v_data[..kv_seq_len * n_kv_heads * head_dim];
-        let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_seq_len, n_kv_heads, head_dim);
-
-        // Allocate bf16 GPU buffers for SDPA (K/V still from CPU reshape)
-        let k_buf = f32_vec_to_bf16_buffer(
-            &self.device,
-            &k_reshaped,
+        // K/V cache is bf16 [capacity, n_kv_heads * head_dim] (Metal shared buffer).
+        // GPU permute_021: [kv_seq_len, n_kv_heads, head_dim] -> [n_kv_heads, kv_seq_len, head_dim]
+        // The cache buffer is larger than needed (pre-allocated to capacity), but the
+        // kernel only reads the first kv_seq_len * n_kv_heads * head_dim elements.
+        let k_buf = self.device.alloc_buffer(
+            kv_seq_len * n_kv_heads * head_dim * 2,
+            DType::BF16,
             vec![1, n_kv_heads, kv_seq_len, head_dim],
         )?;
-        let v_buf = f32_vec_to_bf16_buffer(
-            &self.device,
-            &v_reshaped,
+        let v_buf = self.device.alloc_buffer(
+            kv_seq_len * n_kv_heads * head_dim * 2,
+            DType::BF16,
             vec![1, n_kv_heads, kv_seq_len, head_dim],
         )?;
+        {
+            let mut enc = self.device.command_encoder()?;
+            transpose::permute_021_bf16(
+                &mut enc, &mut self.registry, self.device.metal_device(),
+                k_cache_buf, &k_buf,
+                kv_seq_len, n_kv_heads, head_dim,
+            )?;
+            transpose::permute_021_bf16(
+                &mut enc, &mut self.registry, self.device.metal_device(),
+                v_cache_buf, &v_buf,
+                kv_seq_len, n_kv_heads, head_dim,
+            )?;
+            enc.commit_and_wait()?;
+        }
 
         // Output is bf16 to match the pipeline
         let output_elements = 1 * n_heads * seq_len * head_dim;
@@ -3648,6 +3658,27 @@ fn f32_vec_to_bf16_buffer(
     Ok(buf)
 }
 
+/// Create a bf16 Metal buffer from u16 (bf16 bits) data directly.
+///
+/// No conversion needed — data is already bf16 bits.
+fn u16_vec_to_bf16_buffer(
+    device: &MlxDevice,
+    data: &[u16],
+    shape: Vec<usize>,
+) -> Result<MlxBuffer, Gemma4Error> {
+    let byte_len = data.len() * 2; // bf16 = 2 bytes
+    let mut buf = device.alloc_buffer(byte_len, DType::BF16, shape)?;
+    {
+        let slice: &mut [u16] = buf.as_mut_slice().map_err(|e| {
+            Gemma4Error::ForwardError {
+                reason: format!("bf16 buffer write: {e}"),
+            }
+        })?;
+        slice.copy_from_slice(data);
+    }
+    Ok(buf)
+}
+
 /// Reshape Q/K/V from [seq_len, n_heads * head_dim] to [n_heads, seq_len, head_dim].
 ///
 /// Input layout (row-major):
@@ -3667,6 +3698,31 @@ fn reshape_qkv_for_sdpa(
 ) -> Vec<f32> {
     let total_dim = n_heads * head_dim;
     let mut out = vec![0.0f32; n_heads * seq_len * head_dim];
+
+    for s in 0..seq_len {
+        for h in 0..n_heads {
+            let src_base = s * total_dim + h * head_dim;
+            let dst_base = h * seq_len * head_dim + s * head_dim;
+            out[dst_base..dst_base + head_dim]
+                .copy_from_slice(&data[src_base..src_base + head_dim]);
+        }
+    }
+
+    out
+}
+
+/// Reshape bf16 (u16) data from [seq_len, n_heads * head_dim] to [n_heads, seq_len, head_dim].
+///
+/// Same transpose as `reshape_qkv_for_sdpa` but operates on raw bf16 bits (u16)
+/// to avoid bf16↔f32 conversion overhead on the KV cache hot path.
+fn reshape_qkv_for_sdpa_bf16(
+    data: &[u16],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Vec<u16> {
+    let total_dim = n_heads * head_dim;
+    let mut out = vec![0u16; n_heads * seq_len * head_dim];
 
     for s in 0..seq_len {
         for h in 0..n_heads {
