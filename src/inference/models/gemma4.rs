@@ -16,7 +16,7 @@
 //! - Final logit softcap at 30.0
 
 use mlx_native::ops::{
-    elementwise, embedding, quantized_matmul as qmatmul,
+    elementwise, embedding, gelu, quantized_matmul as qmatmul,
     rms_norm, sdpa, sdpa_sliding, softcap,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
@@ -351,7 +351,8 @@ impl Gemma4Model {
             "Gemma4Model initialized"
         );
 
-        let registry = KernelRegistry::new();
+        let mut registry = KernelRegistry::new();
+        gelu::register(&mut registry);
 
         Ok(Self {
             weights,
@@ -903,59 +904,75 @@ impl Gemma4Model {
         let eps = self.config.rms_norm_eps;
 
         let (normed, q_proj, k_proj, v_proj);
-        {
-            let mut encoder = self.device.command_encoder()?;
 
-            // Step 1: Pre-attention RMS norm
+        // K-eq-V applies to GLOBAL (full_attention) layers only.
+        let use_k_eq_v_check = self.config.attention_k_eq_v
+            && layer_type == LayerAttentionType::Global;
+
+        // Check which projections can use GPU qmatmul. If any projection would
+        // take the CPU fallback path (which commits the encoder internally),
+        // we cannot batch it into a shared encoder.
+        let q_base = format!("model.layers.{layer_idx}.self_attn.q_proj");
+        let k_base = format!("model.layers.{layer_idx}.self_attn.k_proj");
+        let v_base = if use_k_eq_v_check {
+            k_base.clone()
+        } else {
+            format!("model.layers.{layer_idx}.self_attn.v_proj")
+        };
+        let q_gpu = weight_uses_gpu_qmatmul(&self.weights, &q_base);
+        let k_gpu = weight_uses_gpu_qmatmul(&self.weights, &k_base);
+        let v_gpu = weight_uses_gpu_qmatmul(&self.weights, &v_base);
+        let all_gpu = q_gpu && k_gpu && v_gpu;
+
+        if all_gpu {
+            // Fast path: all projections use GPU — batch into one encoder.
+            let mut encoder = self.device.command_encoder()?;
             let norm_name = format!(
                 "model.layers.{layer_idx}.input_layernorm.weight"
             );
             normed = self.apply_rms_norm_with_encoder(&mut encoder, input, &norm_name, seq_len)?;
-
-            // Step 2: Q/K/V projections (each batches cast+qmatmul+cast internally)
             q_proj = self.quantized_projection_with_encoder(
-                &mut encoder,
-                &normed,
-                &format!("model.layers.{layer_idx}.self_attn.q_proj"),
-                seq_len,
-                hidden_size,
-                q_out_dim,
+                &mut encoder, &normed, &q_base, seq_len, hidden_size, q_out_dim,
             )?;
-
             k_proj = self.quantized_projection_with_encoder(
-                &mut encoder,
-                &normed,
-                &format!("model.layers.{layer_idx}.self_attn.k_proj"),
-                seq_len,
-                hidden_size,
-                kv_out_dim,
+                &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
             )?;
-
-            // K-eq-V applies to GLOBAL (full_attention) layers only.
-            let use_k_eq_v_check = self.config.attention_k_eq_v
-                && layer_type == LayerAttentionType::Global;
-
-            v_proj = if use_k_eq_v_check {
-                self.quantized_projection_with_encoder(
-                    &mut encoder,
-                    &normed,
-                    &format!("model.layers.{layer_idx}.self_attn.k_proj"),
-                    seq_len,
-                    hidden_size,
-                    kv_out_dim,
-                )?
-            } else {
-                self.quantized_projection_with_encoder(
-                    &mut encoder,
-                    &normed,
-                    &format!("model.layers.{layer_idx}.self_attn.v_proj"),
-                    seq_len,
-                    hidden_size,
-                    kv_out_dim,
-                )?
-            };
-
+            v_proj = self.quantized_projection_with_encoder(
+                &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
+            )?;
             encoder.commit_and_wait()?;
+        } else {
+            // Slow path: at least one projection needs CPU fallback.
+            // Give each projection its own encoder to avoid double-commit.
+            {
+                let mut encoder = self.device.command_encoder()?;
+                let norm_name = format!(
+                    "model.layers.{layer_idx}.input_layernorm.weight"
+                );
+                normed = self.apply_rms_norm_with_encoder(&mut encoder, input, &norm_name, seq_len)?;
+                encoder.commit_and_wait()?;
+            }
+            {
+                let mut encoder = self.device.command_encoder()?;
+                q_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &normed, &q_base, seq_len, hidden_size, q_out_dim,
+                )?;
+                if q_gpu { encoder.commit_and_wait()?; }
+            }
+            {
+                let mut encoder = self.device.command_encoder()?;
+                k_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
+                )?;
+                if k_gpu { encoder.commit_and_wait()?; }
+            }
+            {
+                let mut encoder = self.device.command_encoder()?;
+                v_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
+                )?;
+                if v_gpu { encoder.commit_and_wait()?; }
+            }
         }
         // GPU results now available for CPU reads
 
@@ -1088,17 +1105,31 @@ impl Gemma4Model {
         // =================================================================
         let (o_proj, residual1);
         {
+            let o_base = format!("model.layers.{layer_idx}.self_attn.o_proj");
+            let o_gpu = weight_uses_gpu_qmatmul(&self.weights, &o_base);
+
             let mut encoder = self.device.command_encoder()?;
 
             // Step 6: Output projection
-            let o_proj_tmp = self.quantized_projection_with_encoder(
-                &mut encoder,
-                &attn_out,
-                &format!("model.layers.{layer_idx}.self_attn.o_proj"),
-                seq_len,
-                n_heads * head_dim,
-                hidden_size,
-            )?;
+            let o_proj_tmp = if o_gpu {
+                // GPU path: batch with following ops
+                self.quantized_projection_with_encoder(
+                    &mut encoder, &attn_out, &o_base,
+                    seq_len, n_heads * head_dim, hidden_size,
+                )?
+            } else {
+                // CPU fallback: o_proj commits encoder, so flush first
+                encoder.commit_and_wait()?;
+                let mut o_enc = self.device.command_encoder()?;
+                let result = self.quantized_projection_with_encoder(
+                    &mut o_enc, &attn_out, &o_base,
+                    seq_len, n_heads * head_dim, hidden_size,
+                )?;
+                // CPU fallback already committed o_enc
+                // Start a new encoder for the rest
+                encoder = self.device.command_encoder()?;
+                result
+            };
 
             // Step 7: Post-attention layernorm and residual add
             let post_attn_norm_name = format!(
@@ -2711,8 +2742,12 @@ impl Gemma4Model {
     /// where `packed_cols = cols * bits / 32`. This method slices the expert's
     /// 2D plane `[rows, packed_cols]` along dim 0, dequantizes, and computes
     /// the gated FFN: `down_proj(GELU(gate_proj(x)) * up_proj(x))`.
+    ///
+    /// When GPU quantized matmul is available (not forced to CPU by
+    /// `HF2Q_CPU_QMATMUL`), the expert FFN is dispatched entirely on GPU
+    /// using `quantized_matmul_simd` + `gelu` + `elementwise_mul` kernels.
     fn expert_ffn_3d(
-        &self,
+        &mut self,
         layer_idx: usize,
         expert_id: usize,
         token_hidden: &[f32],
@@ -2741,15 +2776,31 @@ impl Gemma4Model {
             eprintln!("[DIAG]   down_proj dtype={}, shape={:?}", dw.buffer.dtype(), dw.buffer.shape());
         }
 
-        // gate_proj: [n_experts, intermediate_size, packed_k] where packed_k = hidden_size * bits / 32
+        // --- GPU path: quantized matmul directly on packed expert weights ---
+        let use_cpu = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
+        if !use_cpu {
+            let gate_w = require_weight(&self.weights, &format!("{gate_name}.weight"))?;
+            if let Some(ref qm) = gate_w.quant_meta {
+                let bits = qm.bits as u32;
+                let group_size = qm.group_size as u32;
+                if bits == 4 || bits == 8 {
+                    return self.expert_ffn_3d_gpu(
+                        layer_idx, expert_id, token_hidden,
+                        hidden_size, intermediate_size,
+                        bits, group_size, diag,
+                    );
+                }
+            }
+        }
+
+        // --- CPU fallback path ---
+        // gate_proj: [n_experts, intermediate_size, packed_k]
         let gate_data = self.dequantize_expert_slice(
             &gate_name, expert_id, intermediate_size, hidden_size,
         )?;
-        // up_proj: same shape as gate_proj
         let up_data = self.dequantize_expert_slice(
             &up_name, expert_id, intermediate_size, hidden_size,
         )?;
-        // down_proj: [n_experts, hidden_size, packed_k] where packed_k = intermediate_size * bits / 32
         let down_data = self.dequantize_expert_slice(
             &down_name, expert_id, hidden_size, intermediate_size,
         )?;
@@ -2761,15 +2812,6 @@ impl Gemma4Model {
             eprintln!("[DIAG]   down_data len={} (expect {}x{}={}), first 5: {:?}",
                 down_data.len(), hidden_size, intermediate_size,
                 hidden_size * intermediate_size, &down_data[..5.min(down_data.len())]);
-            let gate_nan = gate_data.iter().filter(|v| v.is_nan()).count();
-            let up_nan = up_data.iter().filter(|v| v.is_nan()).count();
-            let down_nan = down_data.iter().filter(|v| v.is_nan()).count();
-            if gate_nan > 0 || up_nan > 0 || down_nan > 0 {
-                eprintln!("[DIAG]   NaN in dequantized weights! gate={}, up={}, down={}",
-                    gate_nan, up_nan, down_nan);
-            }
-            eprintln!("[DIAG]   input token_hidden first 5: {:?}, len={}",
-                &token_hidden[..5.min(token_hidden.len())], token_hidden.len());
         }
 
         // Round weights and input to bf16 to match MLX's precision
@@ -2778,7 +2820,6 @@ impl Gemma4Model {
         let down_bf16 = round_to_bf16(&down_data);
         let input_bf16 = round_to_bf16(token_hidden);
 
-        // gate_out = gate_proj @ x   [intermediate_size]
         let mut gate_out = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
             let mut sum = 0.0f32;
@@ -2788,13 +2829,6 @@ impl Gemma4Model {
             gate_out[i] = sum;
         }
 
-        if diag {
-            let n = gate_out.len().min(5);
-            eprintln!("[DIAG] expert_ffn_3d L0 E{}: gate_out first {}: {:?}",
-                expert_id, n, &gate_out[..n]);
-        }
-
-        // up_out = up_proj @ x   [intermediate_size]
         let mut up_out = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
             let mut sum = 0.0f32;
@@ -2804,22 +2838,13 @@ impl Gemma4Model {
             up_out[i] = sum;
         }
 
-        // hidden = GELU(gate_out) * up_out
         let mut hidden = vec![0.0f32; intermediate_size];
         for i in 0..intermediate_size {
             hidden[i] = gelu_pytorch_tanh(gate_out[i]) * up_out[i];
         }
 
-        if diag {
-            let n = hidden.len().min(5);
-            eprintln!("[DIAG] expert_ffn_3d L0 E{}: after GELU*up first {}: {:?}",
-                expert_id, n, &hidden[..n]);
-        }
-
-        // Round hidden to bf16 for down_proj matmul
         let hidden_bf16 = round_to_bf16(&hidden);
 
-        // expert_out = down_proj @ hidden   [hidden_size]
         let mut expert_out = vec![0.0f32; hidden_size];
         for i in 0..hidden_size {
             let mut sum = 0.0f32;
@@ -2833,13 +2858,223 @@ impl Gemma4Model {
             let n = expert_out.len().min(5);
             eprintln!("[DIAG] expert_ffn_3d L0 E{}: final expert_out first {}: {:?}",
                 expert_id, n, &expert_out[..n]);
-            let nan_count = expert_out.iter().filter(|v| v.is_nan()).count();
-            if nan_count > 0 {
-                eprintln!("[DIAG]   WARNING: expert_out has {} NaN out of {}", nan_count, expert_out.len());
-            }
         }
 
         Ok(expert_out)
+    }
+
+    /// GPU path for expert FFN: dispatch quantized matmul + GELU + elementwise_mul
+    /// on Metal, avoiding CPU dequantization entirely.
+    ///
+    /// For each projection (gate, up, down), we:
+    /// 1. Extract the expert's sub-slice from the 3D packed weight tensor
+    /// 2. Copy the sub-slice into a GPU buffer
+    /// 3. Dispatch `quantized_matmul_simd` on GPU
+    ///
+    /// Then GELU and elementwise_mul are dispatched on GPU as well.
+    /// All ops are batched into a single command encoder.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_ffn_3d_gpu(
+        &mut self,
+        layer_idx: usize,
+        expert_id: usize,
+        token_hidden: &[f32],
+        hidden_size: usize,
+        intermediate_size: usize,
+        bits: u32,
+        group_size: u32,
+        diag: bool,
+    ) -> Result<Vec<f32>, Gemma4Error> {
+        let base = format!("model.layers.{layer_idx}.experts.switch_glu");
+
+        // Upload token input as f32 buffer [1, hidden_size]
+        let input_buf = f32_vec_to_buffer(
+            &self.device, token_hidden, vec![1, hidden_size],
+        )?;
+
+        // Extract expert sub-buffers for gate_proj, up_proj, down_proj
+        let gate_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.gate_proj"), expert_id,
+            intermediate_size, hidden_size,
+        )?;
+        let up_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.up_proj"), expert_id,
+            intermediate_size, hidden_size,
+        )?;
+        let down_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.down_proj"), expert_id,
+            hidden_size, intermediate_size,
+        )?;
+
+        // --- Dispatch all GPU ops in one command encoder ---
+        let mut encoder = self.device.command_encoder()?;
+
+        // gate_out = gate_proj @ input  [1, intermediate_size]
+        let gate_params = QuantizedMatmulParams {
+            m: 1,
+            k: hidden_size as u32,
+            n: intermediate_size as u32,
+            group_size,
+            bits,
+        };
+        let gate_out = qmatmul::quantized_matmul_simd(
+            &mut encoder, &mut self.registry, &self.device,
+            &input_buf, &gate_bufs.0, &gate_bufs.1, &gate_bufs.2,
+            &gate_params,
+        )?;
+
+        // up_out = up_proj @ input  [1, intermediate_size]
+        let up_out = qmatmul::quantized_matmul_simd(
+            &mut encoder, &mut self.registry, &self.device,
+            &input_buf, &up_bufs.0, &up_bufs.1, &up_bufs.2,
+            &gate_params, // same dimensions as gate
+        )?;
+
+        // GELU on gate_out (f32 -> f32)
+        let gelu_out = self.device.alloc_buffer(
+            intermediate_size * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![1, intermediate_size],
+        )?;
+        gelu::dispatch_gelu(
+            &mut encoder, &mut self.registry,
+            self.device.metal_device(),
+            &gate_out, &gelu_out,
+        )?;
+
+        // hidden = gelu_out * up_out (f32 elementwise mul)
+        let hidden_buf = self.device.alloc_buffer(
+            intermediate_size * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![1, intermediate_size],
+        )?;
+        elementwise::elementwise_mul(
+            &mut encoder, &mut self.registry,
+            self.device.metal_device(),
+            &gelu_out, &up_out, &hidden_buf,
+            intermediate_size, DType::F32,
+        )?;
+
+        // down_out = down_proj @ hidden  [1, hidden_size]
+        let down_params = QuantizedMatmulParams {
+            m: 1,
+            k: intermediate_size as u32,
+            n: hidden_size as u32,
+            group_size,
+            bits,
+        };
+        let down_out = qmatmul::quantized_matmul_simd(
+            &mut encoder, &mut self.registry, &self.device,
+            &hidden_buf, &down_bufs.0, &down_bufs.1, &down_bufs.2,
+            &down_params,
+        )?;
+
+        // Commit and wait for all GPU work
+        encoder.commit_and_wait()?;
+
+        // Read back the f32 result
+        let result = read_buffer_f32(&down_out)?;
+
+        if diag {
+            let n = result.len().min(5);
+            eprintln!("[DIAG] expert_ffn_3d_gpu L0 E{}: output first {}: {:?}",
+                expert_id, n, &result[..n]);
+        }
+
+        Ok(result)
+    }
+
+    /// Extract an expert's quantized sub-buffers from a 3D packed weight tensor.
+    ///
+    /// Returns (weight_buf, scales_buf, biases_buf) for the given expert_id.
+    /// The weight buffer is u32 packed, scales and biases match the original dtype.
+    fn extract_expert_quant_buffers(
+        &self,
+        weight_base: &str,
+        expert_id: usize,
+        rows: usize,
+        _cols: usize,
+    ) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer), Gemma4Error> {
+        let weight_name = format!("{weight_base}.weight");
+        let scales_name = format!("{weight_base}.scales");
+        let biases_name = format!("{weight_base}.biases");
+
+        let loaded = require_weight(&self.weights, &weight_name)?;
+        let scales_w = require_weight(&self.weights, &scales_name)?;
+        let biases_w = require_weight(&self.weights, &biases_name)?;
+
+        let shape = loaded.buffer.shape();
+        let scales_shape = scales_w.buffer.shape();
+
+        // Determine packed_cols and n_groups from the actual tensor shape
+        let packed_cols = if shape.len() == 3 { shape[2] } else { shape[1] };
+        let n_groups = if scales_shape.len() == 3 { scales_shape[2] } else { scales_shape[1] };
+
+        // --- Extract expert's packed weight sub-slice (u32) ---
+        let weight_expert_stride = rows * packed_cols;
+        let w_start = expert_id * weight_expert_stride;
+        let packed_u32: &[u32] = loaded.buffer.as_slice().map_err(|e| {
+            Gemma4Error::ForwardError { reason: format!("read 3D packed weight u32: {e}") }
+        })?;
+        let expert_packed = &packed_u32[w_start..w_start + weight_expert_stride];
+
+        // Create GPU buffer for expert's packed weights
+        let w_byte_len = weight_expert_stride * std::mem::size_of::<u32>();
+        let mut w_buf = self.device.alloc_buffer(
+            w_byte_len, DType::U32, vec![rows, packed_cols],
+        )?;
+        {
+            let dst: &mut [u32] = w_buf.as_mut_slice().map_err(|e| {
+                Gemma4Error::ForwardError { reason: format!("write expert weight buf: {e}") }
+            })?;
+            dst.copy_from_slice(expert_packed);
+        }
+
+        // --- Extract expert's scales sub-slice ---
+        let scales_expert_stride = rows * n_groups;
+        let s_start = expert_id * scales_expert_stride;
+        let scales_dtype = scales_w.buffer.dtype();
+        let scales_elem_size = scales_dtype.size_of();
+        let s_byte_len = scales_expert_stride * scales_elem_size;
+
+        let s_buf = self.device.alloc_buffer(
+            s_byte_len, scales_dtype, vec![rows, n_groups],
+        )?;
+        {
+            let src_ptr = scales_w.buffer.contents_ptr() as *const u8;
+            let dst_ptr = s_buf.contents_ptr() as *mut u8;
+            let src_offset = s_start * scales_elem_size;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_offset),
+                    dst_ptr,
+                    s_byte_len,
+                );
+            }
+        }
+
+        // --- Extract expert's biases sub-slice ---
+        let biases_dtype = biases_w.buffer.dtype();
+        let biases_elem_size = biases_dtype.size_of();
+        let b_byte_len = scales_expert_stride * biases_elem_size;
+
+        let b_buf = self.device.alloc_buffer(
+            b_byte_len, biases_dtype, vec![rows, n_groups],
+        )?;
+        {
+            let src_ptr = biases_w.buffer.contents_ptr() as *const u8;
+            let dst_ptr = b_buf.contents_ptr() as *mut u8;
+            let src_offset = s_start * biases_elem_size;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_offset),
+                    dst_ptr,
+                    b_byte_len,
+                );
+            }
+        }
+
+        Ok((w_buf, s_buf, b_buf))
     }
 
     /// Dequantize a single expert's 2D weight slice from a 3D packed tensor.
@@ -2941,26 +3176,36 @@ impl Gemma4Model {
         }
 
         // Batch gate_proj + up_proj into one command buffer (saves ~5 commits)
+        let gate_base = format!("model.layers.{layer_idx}.mlp.gate_proj");
+        let up_base = format!("model.layers.{layer_idx}.mlp.up_proj");
         let (gate, up);
+        if weight_uses_gpu_qmatmul(&self.weights, &gate_base)
+            && weight_uses_gpu_qmatmul(&self.weights, &up_base)
         {
             let mut encoder = self.device.command_encoder()?;
             gate = self.quantized_projection_with_encoder(
-                &mut encoder,
-                input,
-                &format!("model.layers.{layer_idx}.mlp.gate_proj"),
-                seq_len,
-                hidden_size,
-                intermediate_size,
+                &mut encoder, input, &gate_base, seq_len, hidden_size, intermediate_size,
             )?;
             up = self.quantized_projection_with_encoder(
-                &mut encoder,
-                input,
-                &format!("model.layers.{layer_idx}.mlp.up_proj"),
-                seq_len,
-                hidden_size,
-                intermediate_size,
+                &mut encoder, input, &up_base, seq_len, hidden_size, intermediate_size,
             )?;
             encoder.commit_and_wait()?;
+        } else {
+            // At least one needs CPU fallback — separate encoders
+            {
+                let mut enc = self.device.command_encoder()?;
+                gate = self.quantized_projection_with_encoder(
+                    &mut enc, input, &gate_base, seq_len, hidden_size, intermediate_size,
+                )?;
+                if weight_uses_gpu_qmatmul(&self.weights, &gate_base) { enc.commit_and_wait()?; }
+            }
+            {
+                let mut enc = self.device.command_encoder()?;
+                up = self.quantized_projection_with_encoder(
+                    &mut enc, input, &up_base, seq_len, hidden_size, intermediate_size,
+                )?;
+                if weight_uses_gpu_qmatmul(&self.weights, &up_base) { enc.commit_and_wait()?; }
+            }
         }
 
         if diag {
@@ -2999,19 +3244,19 @@ impl Gemma4Model {
             vec![seq_len, intermediate_size],
         )?;
 
-        // down_proj (bf16 in, bf16 out) -- batched into single encoder
+        // down_proj (bf16 in, bf16 out)
+        let down_base = format!("model.layers.{layer_idx}.mlp.down_proj");
         let result;
         {
             let mut encoder = self.device.command_encoder()?;
             result = self.quantized_projection_with_encoder(
-                &mut encoder,
-                &hidden_buf,
-                &format!("model.layers.{layer_idx}.mlp.down_proj"),
-                seq_len,
-                intermediate_size,
-                hidden_size,
+                &mut encoder, &hidden_buf, &down_base,
+                seq_len, intermediate_size, hidden_size,
             )?;
-            encoder.commit_and_wait()?;
+            if weight_uses_gpu_qmatmul(&self.weights, &down_base) {
+                encoder.commit_and_wait()?;
+            }
+            // CPU fallback already committed the encoder
         }
 
         if diag {
@@ -3426,6 +3671,32 @@ fn cpu_rms_norm_2d(
         output[offset..offset + dim].copy_from_slice(&normed);
     }
     output
+}
+
+/// Check whether a weight at `weight_base` (e.g. `model.layers.0.self_attn.v_proj`)
+/// would take the GPU quantized matmul path in `quantized_projection_with_encoder`.
+///
+/// Returns `true` if the weight is 4-bit or 8-bit quantized and the CPU override
+/// is not set. Returns `false` if the weight would need the CPU fallback (6-bit,
+/// non-quantized, or CPU forced).
+fn weight_uses_gpu_qmatmul(weights: &WeightMap, weight_base: &str) -> bool {
+    let weight_name = format!("{weight_base}.weight");
+    let loaded = match weights.get(&weight_name) {
+        Some(w) => w,
+        None => {
+            let prefixed = format!("language_model.{}", weight_name);
+            match weights.get(&prefixed) {
+                Some(w) => w,
+                None => return false,
+            }
+        }
+    };
+    if std::env::var("HF2Q_CPU_QMATMUL").is_ok() {
+        return false;
+    }
+    loaded.quant_meta.as_ref()
+        .map(|qm| qm.bits == 4 || qm.bits == 8)
+        .unwrap_or(false)
 }
 
 /// GELU activation with PyTorch tanh approximation.
