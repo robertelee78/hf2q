@@ -1263,6 +1263,9 @@ impl Gemma4Model {
         let n_kv_heads = self.config.n_kv_heads(layer_idx);
         let head_dim = self.config.head_dim(layer_idx);
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
+        let diag5 = std::env::var("HF2Q_DIAG5").is_ok() && layer_idx == 5;
+        let timing = std::env::var("HF2Q_TIMING").is_ok() && layer_idx == 0;
+        let t_layer_start = if timing { Some(std::time::Instant::now()) } else { None };
 
         // KV sharing: shared layers skip K/V projection and read from donor cache
         let is_kv_shared = self.config.is_kv_shared_layer(layer_idx);
@@ -1524,7 +1527,13 @@ impl Gemma4Model {
             )?;
 
             // ONE commit_and_wait for the entire attention half of the layer
+            let t_attn_pre = if timing { Some(std::time::Instant::now()) } else { None };
             encoder.commit_and_wait()?;
+            if let (Some(start), Some(pre)) = (t_layer_start, t_attn_pre) {
+                let encode_ms = pre.duration_since(start).as_secs_f64() * 1000.0;
+                let wait_ms = pre.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[TIMING] L0 mega-A: encode={:.2}ms, commit_wait={:.2}ms", encode_ms, wait_ms);
+            }
 
             if diag {
                 let k_raw = read_buffer_f32(&k_proj)?;
@@ -1594,6 +1603,51 @@ impl Gemma4Model {
                 eprintln!("[DIAG] Layer 0 O proj LAST token first 5: {:?}", &o_data[last_o..last_o + 5]);
                 let r1_data = read_buffer_f32(&residual1)?;
                 eprintln!("[DIAG] Layer 0 residual1 LAST token first 5: {:?}", &r1_data[last_o..last_o + 5]);
+            }
+
+            // Deep diagnostics for layer 5 (first Global)
+            if diag5 {
+                let hd = head_dim;
+                let nk = n_kv_heads;
+                let nh = n_heads;
+
+                // Q after RoPE: shape [seq_len, n_heads * head_dim], read last token, head 0
+                let q_all = read_buffer_f32(&q_roped)?;
+                let last_q = (seq_len - 1) * nh * hd;
+                let q_h0 = &q_all[last_q..last_q + 20.min(nh * hd)];
+                eprintln!("[DIAG5] L5 Q after RoPE (head 0, last pos, first 20): {:?}", q_h0);
+
+                // K after RoPE: shape [seq_len, n_kv_heads * head_dim], read last token, head 0
+                let k_all = read_buffer_f32(&k_roped)?;
+                let last_k = (seq_len - 1) * nk * hd;
+                let k_h0 = &k_all[last_k..last_k + 20.min(nk * hd)];
+                eprintln!("[DIAG5] L5 K after RoPE (head 0, last pos, first 20): {:?}", k_h0);
+
+                // V normed: shape [seq_len, n_kv_heads * head_dim]
+                let v_all = read_buffer_f32(&v_normed_buf)?;
+                let last_v = (seq_len - 1) * nk * hd;
+                let v_h0 = &v_all[last_v..last_v + 20.min(nk * hd)];
+                eprintln!("[DIAG5] L5 V normed (head 0, last pos, first 20): {:?}", v_h0);
+
+                // K before RoPE (after k_norm): to isolate RoPE vs norm diff
+                // k_normed is the output of rms_norm on k_proj
+                // But k_normed was consumed by RoPE... we only have k_roped.
+                // Print attention output too
+                let a_all = read_buffer_f32(&attn_out)?;
+                let last_a = (seq_len - 1) * nh * hd;
+                let a_h0 = &a_all[last_a..last_a + 5.min(nh * hd)];
+                eprintln!("[DIAG5] L5 attn output (head 0, last pos, first 5): {:?}", a_h0);
+
+                // O projection output
+                let o_all = read_buffer_f32(&o_proj)?;
+                let last_o_start = (seq_len - 1) * hidden_size;
+                let o_5 = &o_all[last_o_start..last_o_start + 5];
+                eprintln!("[DIAG5] L5 O proj (last pos, first 5): {:?}", o_5);
+
+                // Residual after attention
+                let r1_all = read_buffer_f32(&residual1)?;
+                let r1_5 = &r1_all[last_o_start..last_o_start + 5];
+                eprintln!("[DIAG5] L5 residual1 (last pos, first 5): {:?}", r1_5);
             }
         } else {
             // Slow path: at least one projection needs CPU fallback.
@@ -1912,6 +1966,7 @@ impl Gemma4Model {
             // --- MoE path: two parallel branches ---
             // dense_ffn and moe_ffn both do CPU reads internally, so we batch
             // what we can around them.
+            let t_moe_start = if timing { Some(std::time::Instant::now()) } else { None };
 
             // BATCH 3a: Pre-FFN norms for both paths
             let (pre_ff_normed, pre_ff_normed2);
@@ -2041,6 +2096,10 @@ impl Gemma4Model {
 
                 encoder.commit_and_wait()?;
 
+                if let Some(moe_start) = t_moe_start {
+                    eprintln!("[TIMING] L0 FFN+MoE total: {:.2}ms", moe_start.elapsed().as_secs_f64() * 1000.0);
+                }
+
                 if diag {
                     let d = read_buffer_f32(&mlp_normed)?;
                     let last = (seq_len - 1) * hidden_size;
@@ -2054,6 +2113,10 @@ impl Gemma4Model {
                 let o = read_buffer_f32(&mega_d_output)?;
                 let last = (seq_len - 1) * hidden_size;
                 eprintln!("[DIAG] Layer 0 FINAL output LAST token first 5: {:?}", &o[last..last + 5]);
+            }
+
+            if let Some(start) = t_layer_start {
+                eprintln!("[TIMING] L0 total forward_layer: {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
             }
 
             return Ok(mega_d_output);
