@@ -155,7 +155,7 @@ fn test_dry_run_prints_plan_and_exits_success() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "coreml",
+            "gguf",
             "--quant",
             "q4",
             "--dry-run",
@@ -195,7 +195,7 @@ fn test_dry_run_does_not_write_files() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "coreml",
+            "gguf",
             "--quant",
             "q4",
             "--dry-run",
@@ -240,7 +240,7 @@ fn test_dry_run_shows_quant_config() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "coreml",
+            "gguf",
             "--quant",
             "q4",
             "--dry-run",
@@ -254,7 +254,7 @@ fn test_dry_run_shows_quant_config() {
 }
 
 #[test]
-fn test_dry_run_coreml_without_feature_shows_error() {
+fn test_dry_run_safetensors_format() {
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
 
@@ -274,8 +274,6 @@ fn test_dry_run_coreml_without_feature_shows_error() {
     .unwrap();
     std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
 
-    // Dry-run with coreml format should still show the plan
-    // (preflight passes, but the dry-run plan will note CoreML validation)
     Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -283,7 +281,7 @@ fn test_dry_run_coreml_without_feature_shows_error() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "coreml",
+            "safetensors",
             "--quant",
             "f16",
             "--dry-run",

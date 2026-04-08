@@ -150,17 +150,18 @@ fn check_platform() -> CheckResult {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            CheckResult::Warn(
-                "macOS on Intel — CoreML backend requires Apple Silicon".to_string(),
-                "Use an Apple Silicon Mac (M1 or later) for full functionality.".to_string(),
-            )
+            CheckResult::Pass("macOS on Intel (x86_64)".to_string())
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        CheckResult::Pass("Linux".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         CheckResult::Warn(
-            "Non-macOS platform — CoreML backend unavailable".to_string(),
-            "hf2q requires macOS with Apple Silicon for the CoreML backend.".to_string(),
+            "Unsupported platform".to_string(),
+            "hf2q is tested on macOS (ARM64) and Linux (x86_64).".to_string(),
         )
     }
 }

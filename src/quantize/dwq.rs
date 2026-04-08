@@ -1,14 +1,10 @@
 //! Distilled Weight Quantization (DWQ) calibration engine.
 //!
-//! DWQ improves quantization quality by calibrating against the original model:
-//! 1. Load calibration samples
-//! 2. Run forward passes through the original model via InferenceRunner
-//! 3. Quantize weights using mixed-bit allocation
-//! 4. Run forward passes through the quantized model
-//! 5. Measure KL divergence loss
-//! 6. Adjust non-quantized parameters (scales, biases) to minimize loss
+//! Phase 1: Weight-space calibration (CPU, no inference needed).
+//! For each quantized weight tensor, computes the optimal scale per group:
+//!   optimal_scale = dot(W_original, Q_int) / dot(Q_int, Q_int)
 //!
-//! Requires an InferenceRunner from Story 4.1.
+//! Phase 2 (future): Activation-based calibration via Candle GPU forward passes.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -16,10 +12,8 @@ use std::ops::RangeInclusive;
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::inference::{InferenceError, InferenceRunner};
 use crate::ir::{ModelMetadata, QuantizedModel, QuantizedTensor, TensorMap, TensorRef};
 use crate::progress::ProgressReporter;
-use crate::quality::kl_divergence;
 use crate::quantize::mixed::MixedBitQuantizer;
 use crate::quantize::{LayerQuantConfig, QuantizeError, Quantizer};
 
@@ -29,17 +23,8 @@ pub enum DwqError {
     #[error("Calibration data not available: {reason}")]
     NoCalibrationData { reason: String },
 
-    #[error("Inference runner error during DWQ: {0}")]
-    InferenceError(#[from] InferenceError),
-
-    #[error("KL divergence measurement failed during DWQ: {0}")]
-    KlError(#[from] kl_divergence::KlDivergenceError),
-
     #[error("Quantization error during DWQ: {0}")]
     QuantizeError(#[from] QuantizeError),
-
-    #[error("DWQ calibration requires an inference backend. No backend is currently available.")]
-    BackendRequired,
 }
 
 /// Configuration for DWQ calibration.
@@ -131,27 +116,19 @@ impl Quantizer for DwqQuantizer {
     }
 }
 
-/// Run the full DWQ calibration pipeline with layer-streaming.
+/// Run the DWQ weight-space calibration pipeline.
 ///
-/// Layer-streaming processes one transformer layer at a time to bound memory:
-/// 1. Generate calibration tokens
-/// 2. Load embeddings → compute initial activations
-/// 3. For each layer: load BF16 → reference activations → quantize → compare → adjust scales
-/// 4. Project final activations through lm_head
+/// For each quantized weight tensor, computes the optimal scale per group using
+/// the closed-form solution: optimal_scale = dot(W, Q) / dot(Q, Q).
+/// This is exact — no iterations or inference needed. CPU-only.
 ///
-/// Peak memory: ~1 layer BF16 + 1 layer quantized + activations ≈ 4-6 GB
-/// regardless of total model size.
+/// Phase 2 will add activation-based calibration via Candle GPU forward passes.
 pub fn run_dwq_calibration(
-    runner: &mut dyn InferenceRunner,
     tensor_map: &TensorMap,
     metadata: &ModelMetadata,
     config: &DwqConfig,
     progress: &ProgressReporter,
 ) -> Result<QuantizedModel, DwqError> {
-    if !runner.is_available() {
-        return Err(DwqError::BackendRequired);
-    }
-
     let num_layers = metadata.num_layers as usize;
     let _hidden_size = metadata.hidden_size as usize;
     let total_steps = 2 + (num_layers as u64) * (1 + config.max_iterations as u64) + 1;
@@ -392,121 +369,6 @@ fn adjust_scales_weight_space(
     }
 }
 
-/// Adjust quantization scales to reduce KL divergence.
-///
-/// This is a simplified version of scale adjustment that slightly
-/// modifies the scale factors in the direction that would reduce
-/// the KL divergence between reference and quantized outputs.
-#[allow(dead_code)]
-fn adjust_scales(
-    quantized_tensors: &mut HashMap<String, QuantizedTensor>,
-    reference_logits: &[f32],
-    quantized_logits: &[f32],
-) {
-    // Compute a simple error signal
-    let min_len = reference_logits.len().min(quantized_logits.len());
-    if min_len == 0 {
-        return;
-    }
-
-    let mean_error: f64 = reference_logits[..min_len]
-        .iter()
-        .zip(quantized_logits[..min_len].iter())
-        .map(|(&r, &q)| ((r as f64) - (q as f64)).powi(2))
-        .sum::<f64>()
-        / min_len as f64;
-
-    // Scale adjustment factor (small — we don't want to overshoot)
-    let adjustment = (1.0 + mean_error * 0.001).min(1.01);
-
-    for tensor in quantized_tensors.values_mut() {
-        if let Some(ref mut scales) = tensor.quant_info.scales {
-            // Slightly adjust each scale factor
-            for chunk in scales.chunks_exact_mut(2) {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                let f16_val = half::f16::from_bits(bits);
-                let adjusted = f16_val.to_f32() * adjustment as f32;
-                let new_f16 = half::f16::from_f32(adjusted);
-                let new_bytes = new_f16.to_le_bytes();
-                chunk[0] = new_bytes[0];
-                chunk[1] = new_bytes[1];
-            }
-        }
-    }
-}
-
-/// Build a TensorMap from quantized tensors for inference.
-///
-/// Dequantizes packed weight data back to f16 so the InferenceRunner can
-/// load and run forward passes. This is the inverse of `quantize_weight`:
-/// `float_val = scale * quantized_int` (symmetric dequantization).
-#[allow(dead_code)]
-fn build_tensor_map_from_quantized(
-    quantized: &HashMap<String, QuantizedTensor>,
-) -> TensorMap {
-    use crate::ir::DType;
-
-    let mut tensor_map = TensorMap::new();
-
-    for (name, qt) in quantized {
-        if qt.quant_info.preserved {
-            // Preserved tensor — pass through directly
-            let dtype = match qt.original_dtype {
-                DType::BF16 => DType::F16,
-                other => other,
-            };
-            tensor_map.insert(TensorRef {
-                name: name.clone(),
-                shape: qt.shape.clone(),
-                dtype,
-                data: qt.data.clone(),
-            });
-        } else if let Some(ref scales_raw) = qt.quant_info.scales {
-            // Quantized tensor — dequantize back to f16
-            let bits = qt.quant_info.bits;
-            let group_size = qt.quant_info.group_size;
-            let total_elements: usize = qt.shape.iter().product();
-
-            // Unpack quantized integers from packed bytes
-            let int_values = unpack_quantized(&qt.data, bits, total_elements);
-
-            // Parse scales from f16 bytes
-            let scales: Vec<f32> = scales_raw
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect();
-
-            let effective_group_size = if total_elements < group_size {
-                total_elements
-            } else {
-                group_size
-            };
-
-            // Dequantize: float = scale * int
-            let mut f16_bytes = Vec::with_capacity(total_elements * 2);
-            for (i, &ival) in int_values.iter().enumerate() {
-                let group_idx = i / effective_group_size;
-                let scale = scales.get(group_idx).copied().unwrap_or(0.0);
-                let fval = scale * (ival as f32);
-                let f16_val = half::f16::from_f32(fval);
-                f16_bytes.extend_from_slice(&f16_val.to_le_bytes());
-            }
-
-            tensor_map.insert(TensorRef {
-                name: name.clone(),
-                shape: qt.shape.clone(),
-                dtype: DType::F16,
-                data: f16_bytes,
-            });
-        } else {
-            // Quantized but no scales (shouldn't happen) — skip
-            debug!(tensor = %name, "Skipping quantized tensor without scales");
-        }
-    }
-
-    tensor_map
-}
-
 /// Unpack packed quantized bytes back to signed integers.
 /// Inverse of `pack_quantized` in static_quant.rs.
 fn unpack_quantized(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
@@ -616,72 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tensor_map_from_quantized() {
-        use crate::ir::TensorQuantInfo;
-
-        let mut quantized = HashMap::new();
-        // 4x4 = 16 elements. 4-bit packing: 16/2 = 8 bytes of packed data.
-        // group_size=16 → 1 group → 1 scale (2 bytes f16).
-        quantized.insert(
-            "test.weight".to_string(),
-            QuantizedTensor {
-                name: "test.weight".to_string(),
-                shape: vec![4, 4],
-                original_dtype: DType::F16,
-                data: vec![0u8; 8], // 16 elements packed at 4-bit
-                quant_info: TensorQuantInfo {
-                    method: "q4".to_string(),
-                    bits: 4,
-                    group_size: 16,
-                    preserved: false,
-                    scales: Some(vec![0x00, 0x3C]), // f16 value 1.0 — one group
-                    biases: None,
-                },
-            },
-        );
-
-        let tensor_map = build_tensor_map_from_quantized(&quantized);
-        assert_eq!(tensor_map.len(), 1);
-        let tensor = tensor_map.get("test.weight").unwrap();
-        // Dequantized back to f16
-        assert_eq!(tensor.dtype, DType::F16);
-        // 16 elements * 2 bytes per f16 = 32 bytes
-        assert_eq!(tensor.data.len(), 32);
-    }
-
-    #[test]
-    fn test_adjust_scales_does_not_panic() {
-        use crate::ir::TensorQuantInfo;
-
-        let mut quantized = HashMap::new();
-        quantized.insert(
-            "test.weight".to_string(),
-            QuantizedTensor {
-                name: "test.weight".to_string(),
-                shape: vec![4],
-                original_dtype: DType::F16,
-                data: vec![0u8; 4],
-                quant_info: TensorQuantInfo {
-                    method: "q4".to_string(),
-                    bits: 4,
-                    group_size: 4,
-                    preserved: false,
-                    scales: Some(vec![0x00, 0x3C]), // f16 value 1.0
-                    biases: None,
-                },
-            },
-        );
-
-        let reference = vec![1.0, 2.0, 3.0, 4.0];
-        let quantized_logits = vec![1.1, 2.1, 3.1, 4.1];
-
-        adjust_scales(&mut quantized, &reference, &quantized_logits);
-        // Should not panic
-    }
-
-    #[test]
-    fn test_run_dwq_requires_runner() {
-        let mut runner = crate::inference::stub_runner::StubRunner;
+    fn test_run_dwq_weight_space() {
         let tensor_map = TensorMap::new();
         let metadata = ModelMetadata {
             architecture: "Test".to_string(),
@@ -692,7 +489,7 @@ mod tests {
             layer_types: vec![],
             num_attention_heads: 0,
             num_kv_heads: None,
-            vocab_size: 0,
+            vocab_size: 32000,
             dtype: "float16".to_string(),
             shard_count: 0,
             num_experts: None,
@@ -703,9 +500,10 @@ mod tests {
         let config = DwqConfig::default();
         let progress = ProgressReporter::new();
 
-        let result = run_dwq_calibration(&mut runner, &tensor_map, &metadata, &config, &progress);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("inference backend"), "Error should mention inference backend: {}", err);
+        // Empty model should succeed (no tensors to calibrate)
+        let result = run_dwq_calibration(&tensor_map, &metadata, &config, &progress);
+        assert!(result.is_ok());
+        let model = result.unwrap();
+        assert_eq!(model.quant_method, "dwq-mixed-4-6");
     }
 }

@@ -3,11 +3,8 @@
 //! Trait-based architecture: adding a new format = adding a new file + registry entry.
 //! Every backend validates its output before writing.
 
-pub mod coreml;
-#[allow(dead_code)]
 pub mod gguf;
-#[allow(dead_code)]
-pub mod nvfp4;
+pub mod safetensors_out;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,7 +16,6 @@ use crate::progress::ProgressReporter;
 
 /// Errors from output backend operations.
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum BackendError {
     #[error("Output format not supported: {format}")]
     UnsupportedFormat { format: String },
@@ -40,7 +36,6 @@ pub enum BackendError {
 /// Trait for output format backends.
 ///
 /// All implementations must be Send + Sync for future parallelism.
-#[allow(dead_code)]
 pub trait OutputBackend: Send + Sync {
     /// Human-readable name of this output format.
     fn name(&self) -> &str;

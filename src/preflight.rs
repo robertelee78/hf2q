@@ -294,22 +294,11 @@ fn find_unsupported_layers(
 /// Validate that the output format is compatible with the model architecture.
 fn validate_format_compatibility(
     format: OutputFormat,
-    metadata: &ModelMetadata,
+    _metadata: &ModelMetadata,
 ) -> Result<(), PreflightError> {
     match format {
-        OutputFormat::Coreml => {
-            // CoreML does not support MoE dynamic routing
-            if metadata.is_moe() {
-                return Err(PreflightError::IncompatibleFormat {
-                    format: "coreml".to_string(),
-                    architecture: metadata.architecture.clone(),
-                    reason: "CoreML does not support Mixture of Experts (MoE) models with dynamic routing".to_string(),
-                    suggestion: "Use a format that supports MoE architectures.".to_string(),
-                });
-            }
-        }
-        _ => {
-            // Future formats — validated at CLI level as not-yet-implemented
+        OutputFormat::Gguf | OutputFormat::Safetensors => {
+            // Both formats support all architectures including MoE
         }
     }
 
@@ -393,7 +382,7 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
             5.0 * 1.1
         }
         QuantMethod::DwqMixed46 => 5.0 * 1.1,
-        QuantMethod::Q4Mxfp => 4.5 * 1.1,
+        QuantMethod::Apex => 4.0 * 1.1,
         QuantMethod::Auto => 4.0 * 1.1, // Conservative estimate
     };
 
@@ -529,14 +518,13 @@ mod tests {
     }
 
     #[test]
-    fn test_coreml_moe_incompatible() {
+    fn test_gguf_moe_compatible() {
         let mut metadata = make_test_metadata(4, vec!["attention".to_string(); 4]);
         metadata.num_experts = Some(128);
         metadata.top_k_experts = Some(8);
 
-        let result = validate_format_compatibility(OutputFormat::Coreml, &metadata);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("MoE"));
+        let result = validate_format_compatibility(OutputFormat::Gguf, &metadata);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -639,7 +627,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Coreml,
+            format: OutputFormat::Gguf,
             quant: QuantMethod::Q4,
             sensitive_layers: vec![0..=3],
             calibration_samples: 1024,
@@ -680,7 +668,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Coreml,
+            format: OutputFormat::Gguf,
             quant: QuantMethod::Q4,
             sensitive_layers: Vec::new(),
             calibration_samples: 1024,
@@ -717,7 +705,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Coreml,
+            format: OutputFormat::Gguf,
             quant: QuantMethod::Q4,
             sensitive_layers: Vec::new(),
             calibration_samples: 1024,

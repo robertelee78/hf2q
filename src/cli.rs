@@ -114,21 +114,17 @@ pub struct CompletionsArgs {
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
-    Coreml,
+    /// GGUF format for llama.cpp / Ollama
     Gguf,
-    Nvfp4,
-    Gptq,
-    Awq,
+    /// Quantized safetensors for inferrs / Candle / vLLM
+    Safetensors,
 }
 
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Coreml => write!(f, "coreml"),
             Self::Gguf => write!(f, "gguf"),
-            Self::Nvfp4 => write!(f, "nvfp4"),
-            Self::Gptq => write!(f, "gptq"),
-            Self::Awq => write!(f, "awq"),
+            Self::Safetensors => write!(f, "safetensors"),
         }
     }
 }
@@ -140,7 +136,6 @@ pub enum QuantMethod {
     Q8,
     Q4,
     Q2,
-    Q4Mxfp,
     #[value(name = "mixed-2-6")]
     Mixed26,
     #[value(name = "mixed-3-6")]
@@ -149,6 +144,8 @@ pub enum QuantMethod {
     Mixed46,
     #[value(name = "dwq-mixed-4-6")]
     DwqMixed46,
+    /// Apex: imatrix-calibrated, per-tensor optimal precision (requires Phase 2 GPU support)
+    Apex,
 }
 
 impl std::fmt::Display for QuantMethod {
@@ -159,11 +156,11 @@ impl std::fmt::Display for QuantMethod {
             Self::Q8 => write!(f, "q8"),
             Self::Q4 => write!(f, "q4"),
             Self::Q2 => write!(f, "q2"),
-            Self::Q4Mxfp => write!(f, "q4-mxfp"),
             Self::Mixed26 => write!(f, "mixed-2-6"),
             Self::Mixed36 => write!(f, "mixed-3-6"),
             Self::Mixed46 => write!(f, "mixed-4-6"),
             Self::DwqMixed46 => write!(f, "dwq-mixed-4-6"),
+            Self::Apex => write!(f, "apex"),
         }
     }
 }
@@ -229,9 +226,6 @@ pub struct ConvertConfig {
 
 /// Default group size for quantization.
 pub const DEFAULT_GROUP_SIZE: usize = 64;
-
-/// Default number of output shards.
-pub const DEFAULT_OUTPUT_SHARDS: usize = 4;
 
 /// Parse a sensitive layers specification like "13-24" or "1,5,13-24" into ranges.
 pub fn parse_sensitive_layers(spec: &str) -> anyhow::Result<Vec<std::ops::RangeInclusive<usize>>> {
@@ -321,34 +315,26 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
     // Validate quant method is implemented
     match args.quant {
         QuantMethod::Auto => {
-            // Auto mode is now implemented (Epic 6) — resolve at conversion time
-        }
-        QuantMethod::Q4Mxfp => {
-            anyhow::bail!(
-                "Quantization method '{}' is not yet implemented. \
-                 Available methods: auto, f16, q8, q4, q2, mixed-2-6, mixed-3-6, mixed-4-6, dwq-mixed-4-6",
-                args.quant
-            );
+            // Auto mode — resolve at conversion time
         }
         QuantMethod::Mixed26 | QuantMethod::Mixed36 | QuantMethod::Mixed46 => {
-            // Mixed-bit quantization (Epic 5, Story 5.1)
+            // Mixed-bit quantization
         }
         QuantMethod::DwqMixed46 => {
-            // DWQ calibration (Epic 5, Story 5.2) — requires inference backend
+            // DWQ weight-space calibration (no inference needed)
+        }
+        QuantMethod::Apex => {
+            anyhow::bail!(
+                "Quantization method 'apex' requires Phase 2 GPU support (Candle). \
+                 Available methods: auto, f16, q8, q4, q2, mixed-2-6, mixed-3-6, mixed-4-6, dwq-mixed-4-6"
+            );
         }
         QuantMethod::F16 | QuantMethod::Q8 | QuantMethod::Q4 | QuantMethod::Q2 => {}
     }
 
-    // Validate output format is implemented
+    // Both output formats are implemented
     match args.format {
-        OutputFormat::Coreml => {}
-        OutputFormat::Gguf | OutputFormat::Nvfp4 | OutputFormat::Gptq | OutputFormat::Awq => {
-            anyhow::bail!(
-                "Output format '{}' is not yet implemented. \
-                 Available formats: coreml",
-                args.format
-            );
-        }
+        OutputFormat::Gguf | OutputFormat::Safetensors => {}
     }
 
     Ok(ConvertConfig {

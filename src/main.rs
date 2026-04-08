@@ -1,9 +1,8 @@
-//! hf2q — Pure Rust CLI for converting HuggingFace models to hardware-optimized formats.
+//! hf2q — Pure Rust CLI for quantizing HuggingFace models to GGUF and safetensors.
 //!
 //! Entry point: dispatches clap subcommands to appropriate handlers.
-//! anyhow is used at this level for top-level error handling.
 //!
-//! Exit codes (FR39):
+//! Exit codes:
 //!   0 = success
 //!   1 = conversion error
 //!   2 = quality threshold exceeded
@@ -12,8 +11,6 @@
 mod backends;
 mod cli;
 mod doctor;
-#[allow(dead_code)]
-mod inference;
 mod input;
 mod intelligence;
 mod ir;
@@ -40,7 +37,7 @@ use cli::{Cli, Command};
 /// Global flag set when SIGINT (Ctrl+C) is received.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Exit codes per FR39.
+/// Exit codes.
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_CONVERSION_ERROR: u8 = 1;
 const EXIT_QUALITY_EXCEEDED: u8 = 2;
@@ -49,14 +46,10 @@ const EXIT_INPUT_ERROR: u8 = 3;
 /// Error types for exit code classification.
 #[derive(Debug)]
 enum AppError {
-    /// Input or validation error (exit code 3)
     Input(anyhow::Error),
-    /// Conversion error (exit code 1)
     Conversion(anyhow::Error),
-    /// Quality threshold exceeded (exit code 2)
     #[allow(dead_code)]
     QualityExceeded(anyhow::Error),
-    /// Interrupted by signal (exit code 1)
     Interrupted,
 }
 
@@ -83,8 +76,6 @@ impl std::fmt::Display for AppError {
 }
 
 fn main() -> ExitCode {
-    // Initialize tracing subscriber for structured logging.
-    // All progress/warnings go to stderr so stdout stays clean for --json-report.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -95,7 +86,6 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    // Adjust log level based on -v flags
     if cli.verbose > 0 {
         let level = match cli.verbose {
             1 => "info",
@@ -110,9 +100,7 @@ fn main() -> ExitCode {
         Err(app_err) => {
             let exit_code = app_err.exit_code();
             match &app_err {
-                AppError::Interrupted => {
-                    // Message already printed by the signal handler
-                }
+                AppError::Interrupted => {}
                 _ => {
                     error!("{}", app_err);
                     eprintln!("Error: {}", app_err);
@@ -134,7 +122,8 @@ fn run(cli: Cli) -> Result<(), AppError> {
 
 /// Handle the `convert` subcommand.
 fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
-    use backends::coreml::CoremlBackend;
+    use backends::gguf::GgufBackend;
+    use backends::safetensors_out::SafetensorsBackend;
     use backends::OutputBackend;
     use intelligence::fingerprint::ModelFingerprint;
     use intelligence::hardware::HardwareProfiler;
@@ -170,7 +159,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         )));
     };
 
-    // Phase 0.25: Initialize RuVector (required for all conversions)
+    // Phase 0.25: Initialize RuVector
     let mut ruvector_db = match RuVectorDb::open_default() {
         Ok(db) => db,
         Err(e) => {
@@ -181,7 +170,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     };
 
-    // Flag any records from previous hf2q versions for re-calibration (FR29)
     if let Err(e) = ruvector_db.flag_version_changes() {
         warn!("Failed to check RuVector version flags: {}", e);
     }
@@ -195,7 +183,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("Model fingerprinting failed")
         .map_err(AppError::Conversion)?;
 
-    // Phase 0.4: Auto mode resolution (if --quant auto or default)
+    // Phase 0.4: Auto mode resolution
     let auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
     let resolved_auto = if config.quant == cli::QuantMethod::Auto {
         {
@@ -203,10 +191,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .context("Auto mode resolution failed")
                 .map_err(AppError::Conversion)?;
 
-            // Display the resolved config
             intelligence::display_resolved_config(&resolved);
 
-            // Apply the resolved config to the ConvertConfig
             let resolved_quant = match resolved.quant_method.as_str() {
                 "f16" => cli::QuantMethod::F16,
                 "q8" => cli::QuantMethod::Q8,
@@ -232,7 +218,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 config.group_size = resolved.group_size;
             }
 
-            // Update output dir if it was auto-generated with "auto" in the name
             if args.output.is_none() {
                 let model_name = config
                     .input_dir
@@ -251,16 +236,14 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         None
     };
 
-    // Phase 0.5: Pre-flight validation (Story 2.1)
+    // Phase 0.5: Pre-flight validation
     let preflight_report = preflight::validate(&config, &metadata)
         .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
 
-    // Log preflight warnings
     for warning in &preflight_report.warnings {
         warn!("{}", warning);
     }
 
-    // Log passthrough layers
     for pt in &preflight_report.passthrough_layers {
         warn!(
             "Layer {} (type '{}') will be passed through at f16",
@@ -268,9 +251,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         );
     }
 
-    // If dry run, print plan and exit
     if config.dry_run {
-        // Also show auto mode resolution in dry run
         if let Some(ref resolved) = resolved_auto {
             tracing::info!(
                 "Auto mode resolved to {} (source: {}, confidence: {:.0}%)",
@@ -283,8 +264,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         return Ok(());
     }
 
-    // Set up Ctrl+C handler (Story 2.4)
-    // Track whether the output directory was created by us (not pre-existing)
+    // Set up Ctrl+C handler
     let output_dir_created_by_us = !config.output_dir.exists();
     let output_dir_for_cleanup = Arc::new(config.output_dir.clone());
     let cleanup_dir = output_dir_for_cleanup.clone();
@@ -292,7 +272,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     ctrlc::set_handler(move || {
         INTERRUPTED.store(true, Ordering::SeqCst);
 
-        // Only clean up directories we created
         if output_dir_created_by_us {
             let dir = cleanup_dir.as_ref();
             if dir.exists() {
@@ -314,10 +293,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         } else {
             eprintln!("Conversion interrupted. Pre-existing output directory was not modified.");
         }
-
-        // The ctrlc crate with "termination" feature will terminate the process after this handler
     })
-    .ok(); // Ignore error if handler was already set (e.g., in tests)
+    .ok();
 
     // Phase 1: Read model tensors
     let (_, mut tensor_map) = input::read_model(&config.input_dir, &progress)
@@ -335,15 +312,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         "Model loaded"
     );
 
-    // Phase 2: Convert bf16 -> f16
+    // Phase 2: Create output backend
     let backend: Box<dyn OutputBackend> = match config.format {
-        cli::OutputFormat::Coreml => Box::new(CoremlBackend::new()),
-        other => {
-            return Err(AppError::Conversion(anyhow::anyhow!(
-                "Output format '{}' is not yet implemented",
-                other
-            )));
-        }
+        cli::OutputFormat::Gguf => Box::new(GgufBackend::new()),
+        cli::OutputFormat::Safetensors => Box::new(SafetensorsBackend::new()),
     };
 
     if !backend.requires_native_quantization() {
@@ -360,20 +332,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 3: Quantize (skipped for native backends)
+    // Phase 3: Quantize
     let quant_method_str = config.quant.to_string();
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
     let quantized_model = if backend.requires_native_quantization() {
-        // Skip IR quantization for native backends — they quantize from original tensors
-        // directly in Phase 4. Running IR quantization here would be wasted work since
-        // the native path re-quantizes from the original tensor_map.
         tracing::info!("Skipping IR quantization (native backend handles quantization)");
         None
     } else {
         Some(match config.quant {
             cli::QuantMethod::Mixed26 | cli::QuantMethod::Mixed36 | cli::QuantMethod::Mixed46 => {
-                // Mixed-bit quantization (Story 5.1)
                 let mixed_quantizer = quantize::mixed::MixedBitQuantizer::new(
                     &quant_method_str,
                     &config.sensitive_layers,
@@ -386,7 +354,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     tracing::info!("Mixed-bit quantizer requires calibration data");
                 }
 
-                // Build per-layer bit allocation map for logging
                 let tensor_names: Vec<String> = tensor_map.tensors.keys().cloned().collect();
                 let bits_map =
                     quantize::mixed::build_per_layer_bits_map(&mixed_quantizer, &tensor_names);
@@ -407,15 +374,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .map_err(AppError::Conversion)?
             }
             cli::QuantMethod::DwqMixed46 => {
-                // DWQ calibration (Story 5.2) — requires InferenceRunner
-                let mut runner = inference::create_runner();
-                if !runner.is_available() {
-                    return Err(AppError::Conversion(anyhow::anyhow!(
-                        "DWQ quantization requires an inference backend. \
-                         No inference backend is currently available."
-                    )));
-                }
-
                 let dwq_config = quantize::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
@@ -425,7 +383,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     ..quantize::dwq::DwqConfig::default()
                 };
 
-                // Validate DWQ config by constructing the quantizer
                 let dwq_quantizer = quantize::dwq::DwqQuantizer::new(dwq_config.clone())
                     .context("Failed to create DWQ quantizer")
                     .map_err(AppError::Conversion)?;
@@ -437,7 +394,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 );
 
                 quantize::dwq::run_dwq_calibration(
-                    runner.as_mut(),
                     &tensor_map,
                     &metadata,
                     &dwq_config,
@@ -447,7 +403,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .map_err(AppError::Conversion)?
             }
             _ => {
-                // Static quantization (f16, q8, q4, q2)
                 let quantizer = StaticQuantizer::new(&quant_method_str)
                     .context("Failed to create quantizer")
                     .map_err(AppError::Conversion)?;
@@ -468,14 +423,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 4: Write output (backend was created in Phase 2)
-
-    // Build per-tensor bit overrides from auto_quant plan or sensitive_layers
+    // Phase 4: Write output
     let mut bit_overrides: Option<HashMap<String, u8>> = if let Some(ref plan) = auto_plan {
-        // Auto-quant plan: convert component_overrides to tensor-name -> bits map
         let mut map = HashMap::new();
         for co in &plan.component_overrides {
-            // Match each pattern against actual tensor names
             for tensor_name in tensor_map.tensors.keys() {
                 if tensor_name.contains(&co.pattern) {
                     map.insert(tensor_name.clone(), co.bits);
@@ -495,7 +446,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         None
     };
 
-    // Wire --sensitive-layers for non-auto modes: elevate sensitive layers by +2 bits
     if !config.sensitive_layers.is_empty() && bit_overrides.is_none() {
         let mut map = HashMap::new();
         for range in &config.sensitive_layers {
@@ -503,7 +453,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 let prefix = format!(".layers.{}.", layer_idx);
                 for tensor_name in tensor_map.tensors.keys() {
                     if tensor_name.contains(&prefix) {
-                        // Sensitive layers get +2 bits, capped at 8
                         let elevated = (bits + 2).min(8);
                         map.insert(tensor_name.clone(), elevated);
                     }
@@ -520,8 +469,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     }
 
     let manifest = if backend.requires_native_quantization() {
-        // Native path: backend quantizes directly from original tensors.
-        // Pass auto_quant base_bits (or the configured bits) plus per-tensor overrides.
         let native_bits = if let Some(ref plan) = auto_plan {
             plan.base_bits
         } else {
@@ -542,7 +489,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .context("Native quantization and write failed")
             .map_err(AppError::Conversion)?
     } else {
-        // Standard path: validate pre-quantized model and write
         let quantized = quantized_model.expect(
             "BUG: quantized_model should be Some for non-native backends",
         );
@@ -569,38 +515,19 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 5: Quality measurement (Story 4.2, 4.3)
+    // Phase 5: Quality measurement
+    // Phase 1: quality measurement deferred (requires inference backend, coming in Phase 2)
     let quality_report = if config.skip_quality {
         tracing::info!("Quality measurement skipped (--skip-quality)");
         quality::QualityReport::empty()
     } else {
-        let mut runner = inference::create_runner();
-        if runner.is_available() {
-            match quality::measure_quality(
-                runner.as_mut(),
-                &tensor_map,
-                &tensor_map, // Use original tensors for comparison
-                &metadata,
-                &progress,
-            ) {
-                Ok(qr) => {
-                    quality::print_quality_summary(&qr);
-                    qr
-                }
-                Err(e) => {
-                    warn!("Quality measurement failed: {}. Continuing without quality metrics.", e);
-                    quality::QualityReport::empty()
-                }
-            }
-        } else {
-            tracing::info!(
-                "Quality measurement skipped: no inference backend available."
-            );
-            quality::QualityReport::empty()
-        }
+        tracing::info!(
+            "Quality measurement skipped: requires GPU inference backend (Phase 2)."
+        );
+        quality::QualityReport::empty()
     };
 
-    // Phase 5.5: Store conversion result in RuVector (Story 7.2)
+    // Phase 5.5: Store conversion result in RuVector
     if let Err(e) = ruvector_db.store_conversion(
         &hardware,
         &fingerprint,
@@ -613,11 +540,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             cosine_similarity: quality_report.cosine_sim_average,
         },
     ) {
-        // Storage failure is not fatal — warn but continue
         warn!("Failed to store conversion result in RuVector: {}", e);
     }
 
-    // Phase 6: JSON report generation (Story 4.4)
+    // Phase 6: JSON report generation
     if config.json_report {
         let json_report = report::ReportBuilder::new(
             config.input_dir.display().to_string(),
@@ -640,12 +566,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .build();
 
         if config.yes {
-            // Write to stdout when --json-report + --yes
             report::write_to_stdout(&json_report)
                 .context("Failed to write JSON report to stdout")
                 .map_err(AppError::Conversion)?;
         } else {
-            // Write to file in output directory
             let report_path = config.output_dir.join("report.json");
             report::write_to_file(&json_report, &report_path)
                 .context("Failed to write JSON report")
@@ -654,7 +578,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // Phase 7: Print summary (skip when writing JSON to stdout to keep stdout clean)
+    // Phase 7: Print summary
     if !(config.json_report && config.yes) {
         let model_name = config
             .input_dir
@@ -734,20 +658,6 @@ fn print_dry_run_plan(
         );
     }
 
-    // CoreML-specific validation in dry-run
-    if config.format == cli::OutputFormat::Coreml {
-        match backends::coreml::validate_metadata_for_coreml(metadata) {
-            Ok(coreml_warnings) => {
-                for w in &coreml_warnings {
-                    eprintln!("  Warning: {}", style(&w.message).yellow());
-                }
-            }
-            Err(e) => {
-                eprintln!("  {}: {}", style("ERROR").bold().red(), e);
-            }
-        }
-    }
-
     if !preflight.passthrough_layers.is_empty() {
         eprintln!();
         eprintln!(
@@ -776,11 +686,11 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
         cli::QuantMethod::Q4 => 4,
         cli::QuantMethod::Q2 => 2,
         cli::QuantMethod::Auto => 4,
-        cli::QuantMethod::Q4Mxfp => 4,
         cli::QuantMethod::Mixed26 => 4,
         cli::QuantMethod::Mixed36 => 4,
         cli::QuantMethod::Mixed46 => 4,
         cli::QuantMethod::DwqMixed46 => 4,
+        cli::QuantMethod::Apex => 4,
     }
 }
 
@@ -799,8 +709,6 @@ fn cmd_info(args: cli::InfoArgs) -> Result<()> {
     let metadata = input::config_parser::parse_config(&config_path)
         .context("Failed to parse model config")?;
 
-    // Use eprintln for the header (keeps stdout clean for piping)
-    // But for info command, stdout is the expected output
     println!();
     println!(
         "{}",
@@ -812,7 +720,7 @@ fn cmd_info(args: cli::InfoArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the input directory for the info subcommand, supporting --repo via HF download.
+/// Resolve the input directory for the info subcommand.
 fn resolve_info_input(args: &cli::InfoArgs) -> Result<PathBuf> {
     match (&args.input, &args.repo) {
         (Some(path), None) => {
@@ -822,7 +730,6 @@ fn resolve_info_input(args: &cli::InfoArgs) -> Result<PathBuf> {
             Ok(path.clone())
         }
         (None, Some(repo_id)) => {
-            // Story 3.2: hf2q info --repo org/model for remote inspection
             let progress = progress::ProgressReporter::new();
             let download_dir = input::hf_download::download_model(repo_id, &progress)
                 .context("Failed to download model from HuggingFace Hub")?;

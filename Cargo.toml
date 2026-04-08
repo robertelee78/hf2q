@@ -9,8 +9,6 @@ repository = "https://github.com/robertelee78/hf2q"
 
 [features]
 default = []
-# Enable CoreML output backend (requires Apple Silicon)
-coreml-backend = ["dep:coreml-native"]
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
 
@@ -23,9 +21,6 @@ hf-hub = "0.5"
 
 # Self-learning intelligence — optional
 ruvector-core = { version = "2.1", optional = true }
-
-# CoreML output target — optional
-coreml-native = { version = "0.2", optional = true }
 
 # CLI framework
 clap = { version = "4.5", features = ["derive"] }
