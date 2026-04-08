@@ -63,6 +63,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ir::{ModelMetadata, OutputManifest};
+use crate::quality::regression::QualityGate;
 use crate::quality::QualityReport;
 
 /// Errors from report generation.
@@ -102,6 +103,9 @@ pub struct ConversionReport {
     /// Quality metrics (optional — None when --skip-quality)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality: Option<QualitySummary>,
+    /// Quality gate pass/fail for CI (optional — populated when quality measured)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_gate: Option<QualityGate>,
     /// Output file listing
     pub output_files: Vec<FileSummary>,
     /// Total output size in bytes
@@ -194,6 +198,7 @@ pub struct ReportBuilder {
     group_size: usize,
     per_layer_bits: Option<HashMap<String, u8>>,
     quality: Option<QualityReport>,
+    quality_gate: Option<QualityGate>,
     manifest: Option<OutputManifest>,
     input_size_bytes: u64,
     hardware: Option<HardwareSummary>,
@@ -220,6 +225,7 @@ impl ReportBuilder {
             group_size,
             per_layer_bits: None,
             quality: None,
+            quality_gate: None,
             manifest: None,
             input_size_bytes: 0,
             hardware: None,
@@ -237,6 +243,12 @@ impl ReportBuilder {
     /// Set quality metrics.
     pub fn with_quality(mut self, report: QualityReport) -> Self {
         self.quality = Some(report);
+        self
+    }
+
+    /// Set quality gate result.
+    pub fn with_quality_gate(mut self, gate: QualityGate) -> Self {
+        self.quality_gate = Some(gate);
         self
     }
 
@@ -326,6 +338,7 @@ impl ReportBuilder {
                 per_layer_bits: self.per_layer_bits,
             },
             quality: quality_summary,
+            quality_gate: self.quality_gate,
             output_files,
             total_output_bytes,
             input_size_bytes: self.input_size_bytes,

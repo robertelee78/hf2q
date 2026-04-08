@@ -187,14 +187,32 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .map_err(AppError::Conversion)?;
 
     // Phase 0.4: Auto mode resolution
-    let auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
+    let mut auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
     let resolved_auto = if config.quant == cli::QuantMethod::Auto {
         {
-            let resolved = AutoResolver::resolve(&hardware, &fingerprint, Some(&ruvector_db))
-                .context("Auto mode resolution failed")
-                .map_err(AppError::Conversion)?;
+            // Determine format hint for format-aware auto selection
+            let format_hint = match config.format {
+                cli::OutputFormat::Gguf => {
+                    Some(intelligence::OutputFormatHint::Gguf)
+                }
+                cli::OutputFormat::Safetensors => {
+                    Some(intelligence::OutputFormatHint::Safetensors)
+                }
+            };
+
+            let resolved = AutoResolver::resolve_with_format(
+                &hardware,
+                &fingerprint,
+                Some(&ruvector_db),
+                format_hint,
+            )
+            .context("Auto mode resolution failed")
+            .map_err(AppError::Conversion)?;
 
             intelligence::display_resolved_config(&resolved);
+
+            // Generate the detailed auto-quant plan with component overrides
+            auto_plan = AutoResolver::generate_plan(&hardware, &fingerprint);
 
             let resolved_quant = match resolved.quant_method.as_str() {
                 "f16" => cli::QuantMethod::F16,
@@ -204,6 +222,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 "mixed-4-6" => cli::QuantMethod::Mixed46,
                 "mixed-3-6" => cli::QuantMethod::Mixed36,
                 "mixed-2-6" => cli::QuantMethod::Mixed26,
+                "apex" => cli::QuantMethod::Apex,
+                "dwq-mixed-4-6" => cli::QuantMethod::DwqMixed46,
                 other => {
                     warn!(
                         "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
@@ -600,6 +620,94 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .map_err(AppError::Conversion)?
     };
 
+    // Phase 5.1: Regression detection against previous baseline
+    let quality_gate_result = if quality_report.has_metrics() {
+        let thresholds = quality::QualityThresholds::default();
+        let gate = quality::regression::build_quality_gate(&quality_report, &thresholds);
+
+        // Query RuVector for previous best result for this model
+        if let Ok(Some(baseline_resolved)) = ruvector_db.query_best_config(&hardware, &fingerprint)
+        {
+            let baseline_report =
+                extract_baseline_from_reasoning(&baseline_resolved.reasoning);
+            if baseline_report.has_metrics() {
+                let regression_warnings =
+                    quality::regression::detect_regression(&quality_report, &baseline_report, 0.1);
+                if !regression_warnings.is_empty() {
+                    eprintln!();
+                    for w in &regression_warnings {
+                        let severity_icon = match w.severity {
+                            quality::regression::RegressionSeverity::Error => "ERROR",
+                            quality::regression::RegressionSeverity::Warning => "WARN ",
+                            quality::regression::RegressionSeverity::Info => "INFO ",
+                        };
+                        eprintln!(
+                            "  [{}] Regression on {}: {:.6} -> {:.6} ({:+.1}%)",
+                            severity_icon,
+                            w.metric,
+                            w.baseline_value,
+                            w.current_value,
+                            w.degradation_pct
+                        );
+                    }
+                    eprintln!();
+                }
+                quality::regression::print_comparison(&baseline_report, &quality_report);
+            }
+        }
+
+        // Enforce quality gate if --quality-gate flag is set
+        if config.quality_gate && !gate.passed {
+            eprintln!(
+                "{}",
+                console::style("QUALITY GATE FAILED:").red().bold()
+            );
+            for v in &gate.violations {
+                eprintln!("  - {}", v);
+            }
+            eprintln!();
+
+            // Generate JSON report before exiting, if requested
+            if config.json_report {
+                let json_report = report::ReportBuilder::new(
+                    config.input_dir.display().to_string(),
+                    config.output_dir.display().to_string(),
+                    metadata.clone(),
+                    quant_method_str.clone(),
+                    bits,
+                    config.group_size,
+                )
+                .with_input_size(input_size)
+                .with_quality(quality_report.clone())
+                .with_quality_gate(gate.clone())
+                .with_hardware(report::HardwareSummary {
+                    chip_model: hardware.chip_model.clone(),
+                    total_memory_bytes: hardware.total_memory_bytes,
+                    available_memory_bytes: hardware.available_memory_bytes,
+                    total_cores: hardware.total_cores,
+                })
+                .with_timing(progress.elapsed().as_secs_f64(), None)
+                .build();
+
+                if config.yes {
+                    let _ = report::write_to_stdout(&json_report);
+                } else {
+                    let report_path = config.output_dir.join("report.json");
+                    let _ = report::write_to_file(&json_report, &report_path);
+                }
+            }
+
+            return Err(AppError::QualityExceeded(anyhow::anyhow!(
+                "{} quality threshold(s) exceeded",
+                gate.violations.len()
+            )));
+        }
+
+        Some(gate)
+    } else {
+        None
+    };
+
     // Phase 5.5: Store conversion result in RuVector
     if let Err(e) = ruvector_db.store_conversion(
         &hardware,
@@ -618,7 +726,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     // Phase 6: JSON report generation
     if config.json_report {
-        let json_report = report::ReportBuilder::new(
+        let mut report_builder = report::ReportBuilder::new(
             config.input_dir.display().to_string(),
             config.output_dir.display().to_string(),
             metadata.clone(),
@@ -635,8 +743,13 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             available_memory_bytes: hardware.available_memory_bytes,
             total_cores: hardware.total_cores,
         })
-        .with_timing(progress.elapsed().as_secs_f64(), None)
-        .build();
+        .with_timing(progress.elapsed().as_secs_f64(), None);
+
+        if let Some(gate) = quality_gate_result {
+            report_builder = report_builder.with_quality_gate(gate);
+        }
+
+        let json_report = report_builder.build();
 
         if config.yes {
             report::write_to_stdout(&json_report)
@@ -727,6 +840,39 @@ fn cmd_validate(args: cli::ValidateArgs) -> Result<(), AppError> {
     )
     .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
 
+    // Update RuVector with quality metrics from validation
+    if quality_report.has_metrics() {
+        if let Ok(mut ruvector_db) = intelligence::ruvector::RuVectorDb::open_default() {
+            let hw = intelligence::hardware::HardwareProfiler::detect()
+                .ok()
+                .unwrap_or_else(|| intelligence::hardware::HardwareProfile {
+                    chip_model: "unknown".to_string(),
+                    total_memory_bytes: 0,
+                    available_memory_bytes: 0,
+                    performance_cores: 0,
+                    efficiency_cores: 0,
+                    total_cores: 0,
+                    memory_bandwidth_gbs: 0.0,
+                });
+            if let Ok(fp) = intelligence::fingerprint::ModelFingerprint::from_metadata(&metadata) {
+                let quant_method = detect_quant_method_from_path(&args.quantized);
+                let metrics = intelligence::ruvector::QualityMetrics {
+                    kl_divergence: quality_report.kl_divergence,
+                    perplexity_delta: quality_report.perplexity_delta,
+                    cosine_similarity: quality_report.cosine_sim_average,
+                };
+                if let Err(e) = ruvector_db.update_quality(
+                    &hw.stable_id(),
+                    &fp.stable_id(),
+                    &quant_method,
+                    metrics,
+                ) {
+                    warn!("Could not update RuVector quality metrics: {}", e);
+                }
+            }
+        }
+    }
+
     // Check thresholds
     let thresholds = quality::QualityThresholds {
         max_kl_divergence: args.max_kl,
@@ -735,6 +881,9 @@ fn cmd_validate(args: cli::ValidateArgs) -> Result<(), AppError> {
     };
 
     let violations = quality::check_thresholds(&quality_report, &thresholds);
+
+    // Build quality gate for CI output
+    let quality_gate = quality::regression::build_quality_gate(&quality_report, &thresholds);
 
     // Output
     if args.json {
@@ -747,6 +896,7 @@ fn cmd_validate(args: cli::ValidateArgs) -> Result<(), AppError> {
             },
             "violations": violations,
             "pass": violations.is_empty(),
+            "quality_gate": quality_gate,
         });
         println!(
             "{}",
@@ -860,6 +1010,24 @@ fn print_dry_run_plan(
     eprintln!();
 }
 
+/// Try to detect the quantization method from an output directory path.
+///
+/// Looks for known method names in the directory name (e.g., "model-gguf-q4" -> "q4").
+fn detect_quant_method_from_path(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let known = ["q2", "q4", "q8", "f16", "mixed-2-6", "mixed-3-6", "mixed-4-6", "dwq-mixed-4-6", "apex"];
+    for method in &known {
+        if name.contains(method) {
+            return method.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
 /// Get the default bit width for a quantization method.
 fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
     match method {
@@ -935,4 +1103,34 @@ fn cmd_completions(args: cli::CompletionsArgs) -> Result<()> {
     generate(args.shell, &mut cmd, "hf2q", &mut std::io::stdout());
 
     Ok(())
+}
+
+/// Extract a baseline QualityReport from a RuVector resolved config reasoning string.
+///
+/// The reasoning string has the format:
+///   "Based on stored conversion from <timestamp> (KL divergence: <val>, perplexity delta: <val>)"
+fn extract_baseline_from_reasoning(reasoning: &str) -> quality::QualityReport {
+    let mut report = quality::QualityReport::empty();
+
+    // Parse KL divergence
+    if let Some(start) = reasoning.find("KL divergence: ") {
+        let rest = &reasoning[start + "KL divergence: ".len()..];
+        if let Some(end) = rest.find(',').or_else(|| rest.find(')')) {
+            if let Ok(val) = rest[..end].trim().parse::<f64>() {
+                report.kl_divergence = Some(val);
+            }
+        }
+    }
+
+    // Parse perplexity delta
+    if let Some(start) = reasoning.find("perplexity delta: ") {
+        let rest = &reasoning[start + "perplexity delta: ".len()..];
+        if let Some(end) = rest.find(')').or_else(|| rest.find(',')) {
+            if let Ok(val) = rest[..end].trim().parse::<f64>() {
+                report.perplexity_delta = Some(val);
+            }
+        }
+    }
+
+    report
 }

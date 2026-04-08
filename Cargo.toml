@@ -53,6 +53,9 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # System info
 sysinfo = "0.32"
 
+# File locking (unix)
+libc = "0.2"
+
 # Signal handling
 ctrlc = { version = "3.4", features = ["termination"] }
 

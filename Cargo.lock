@@ -1744,6 +1744,7 @@ dependencies = [
  "half",
  "hf-hub",
  "indicatif 0.17.11",
+ "libc",
  "memmap2",
  "predicates",
  "rayon",

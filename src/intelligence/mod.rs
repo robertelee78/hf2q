@@ -6,7 +6,6 @@
 //! - AutoResolver: RuVector query -> heuristic fallback
 //! - RuVector: self-learning conversion result storage
 
-#[allow(dead_code)]
 pub mod auto_quant;
 pub mod fingerprint;
 pub mod hardware;
@@ -17,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
+use self::auto_quant::{AutoQuantConstraints, AutoQuantPlan};
 use self::fingerprint::ModelFingerprint;
 use self::hardware::HardwareProfile;
 #[allow(unused_imports)]
@@ -87,6 +87,15 @@ impl std::fmt::Display for ResolvedSource {
 /// The auto mode resolver — queries RuVector first, falls back to heuristics.
 pub struct AutoResolver;
 
+/// Optional output format hint for auto mode resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormatHint {
+    /// GGUF format (K-quant types available)
+    Gguf,
+    /// Safetensors format (no K-quant types)
+    Safetensors,
+}
+
 impl AutoResolver {
     /// Resolve the optimal quantization configuration for the given hardware and model.
     ///
@@ -102,10 +111,26 @@ impl AutoResolver {
     /// The `ruvector_db` parameter is optional: if None, it means the ruvector feature
     /// is not enabled or the database is not available (which should be caught earlier
     /// at the preflight/CLI level).
+    /// Convenience wrapper that calls `resolve_with_format` without a format hint.
+    #[allow(dead_code)]
     pub fn resolve(
         hardware: &HardwareProfile,
         fingerprint: &ModelFingerprint,
         ruvector_db: Option<&ruvector::RuVectorDb>,
+    ) -> Result<ResolvedConfig, IntelligenceError> {
+        Self::resolve_with_format(hardware, fingerprint, ruvector_db, None)
+    }
+
+    /// Resolve with an optional output format hint for format-aware selection.
+    ///
+    /// When format is provided:
+    /// - GGUF: prefers Apex (K-quant types) for best quality/size ratio
+    /// - Safetensors: prefers mixed-4-6 or DWQ (K-quant types don't apply)
+    pub fn resolve_with_format(
+        hardware: &HardwareProfile,
+        fingerprint: &ModelFingerprint,
+        ruvector_db: Option<&ruvector::RuVectorDb>,
+        format: Option<OutputFormatHint>,
     ) -> Result<ResolvedConfig, IntelligenceError> {
         info!(
             hardware_id = %hardware.stable_id(),
@@ -143,8 +168,63 @@ impl AutoResolver {
             }
         }
 
-        // Step 2: Fall back to heuristics
-        let heuristic = heuristics::select_quant(hardware, fingerprint)?;
+        // Step 2: Try the sophisticated auto_quant algorithm first
+        let constraints = AutoQuantConstraints::default();
+        match auto_quant::resolve_auto_plan(hardware, fingerprint, &constraints) {
+            Ok(plan) => {
+                // Apply format-aware adjustments
+                let (method, reasoning_suffix) = match format {
+                    Some(OutputFormatHint::Gguf) => {
+                        // GGUF supports K-quant types; prefer Apex for best quality/size
+                        if plan.base_bits <= 6 && fingerprint.total_params >= 3_000_000_000 {
+                            ("apex".to_string(), " Format: GGUF (K-quant types available, Apex recommended).")
+                        } else {
+                            (plan.quant_method.clone(), " Format: GGUF.")
+                        }
+                    }
+                    Some(OutputFormatHint::Safetensors) => {
+                        // Safetensors: no K-quant types, prefer mixed-bit or DWQ
+                        if plan.quant_method == "apex" {
+                            (format!("mixed-{}-6", plan.base_bits.max(2)),
+                             " Format: safetensors (K-quant types not available, using mixed-bit).")
+                        } else {
+                            (plan.quant_method.clone(), " Format: safetensors.")
+                        }
+                    }
+                    None => (plan.quant_method.clone(), ""),
+                };
+
+                let resolved = ResolvedConfig {
+                    quant_method: method,
+                    bits: plan.base_bits,
+                    group_size: plan.group_size,
+                    confidence: plan.confidence,
+                    source: ResolvedSource::Heuristic,
+                    reasoning: format!("{}{}", plan.reasoning, reasoning_suffix),
+                    hardware: hardware.clone(),
+                    fingerprint: fingerprint.clone(),
+                };
+
+                info!(
+                    method = %resolved.quant_method,
+                    confidence = resolved.confidence,
+                    source = "auto_quant",
+                    overrides = plan.component_overrides.len(),
+                    "Auto mode: using auto_quant plan"
+                );
+
+                return Ok(resolved);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Auto-quant plan failed, falling back to basic heuristic"
+                );
+            }
+        }
+
+        // Step 3: Fall back to basic memory-fitting heuristic
+        let heuristic = heuristics::select_quant_with_format(hardware, fingerprint, format)?;
 
         let resolved = ResolvedConfig {
             quant_method: heuristic.quant_method,
@@ -165,6 +245,24 @@ impl AutoResolver {
         );
 
         Ok(resolved)
+    }
+
+    /// Generate an AutoQuantPlan for the given hardware and model.
+    ///
+    /// This is called separately from resolve() so callers can get
+    /// both the resolved config and the detailed plan with component overrides.
+    pub fn generate_plan(
+        hardware: &HardwareProfile,
+        fingerprint: &ModelFingerprint,
+    ) -> Option<AutoQuantPlan> {
+        let constraints = AutoQuantConstraints::default();
+        match auto_quant::resolve_auto_plan(hardware, fingerprint, &constraints) {
+            Ok(plan) => Some(plan),
+            Err(e) => {
+                warn!(error = %e, "Failed to generate auto-quant plan");
+                None
+            }
+        }
     }
 }
 

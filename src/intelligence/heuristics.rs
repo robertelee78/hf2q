@@ -53,9 +53,28 @@ const DEFAULT_GROUP_SIZE: usize = 64;
 /// The heuristic works by estimating model size at various bit widths and
 /// comparing against available memory. It prefers higher quality (more bits)
 /// when memory allows.
+/// Convenience wrapper that calls `select_quant_with_format` without a format hint.
+#[allow(dead_code)]
 pub fn select_quant(
     hardware: &HardwareProfile,
     fingerprint: &ModelFingerprint,
+) -> Result<HeuristicResult, HeuristicsError> {
+    select_quant_with_format(hardware, fingerprint, None)
+}
+
+/// Format-aware and architecture-aware quant selection.
+///
+/// Extends the basic memory-fitting heuristic to also consider:
+/// - Model architecture (MoE models need different treatment)
+/// - Output format (GGUF vs safetensors)
+///
+/// When `format` is provided:
+/// - GGUF: prefers Apex for models where K-quant types give the best quality/size
+/// - Safetensors: prefers mixed-bit or DWQ (K-quant types don't apply)
+pub fn select_quant_with_format(
+    hardware: &HardwareProfile,
+    fingerprint: &ModelFingerprint,
+    format: Option<super::OutputFormatHint>,
 ) -> Result<HeuristicResult, HeuristicsError> {
     let available_bytes = hardware.available_memory_bytes;
     let total_bytes = hardware.total_memory_bytes;
@@ -70,14 +89,49 @@ pub fn select_quant(
     let q4_size = fingerprint.estimated_size_bytes(4);
     let q2_size = fingerprint.estimated_size_bytes(2);
 
+    let is_moe = fingerprint.is_moe();
+
     debug!(
         memory_budget_gb = memory_budget as f64 / 1e9,
         f16_size_gb = f16_size as f64 / 1e9,
         q8_size_gb = q8_size as f64 / 1e9,
         q4_size_gb = q4_size as f64 / 1e9,
         q2_size_gb = q2_size as f64 / 1e9,
+        is_moe = is_moe,
         "Heuristic memory analysis"
     );
+
+    // MoE-specific rule: MoE models benefit from mixed-bit quantization
+    // because router projections need high precision while expert FFNs
+    // are resilient due to redundancy across experts.
+    if is_moe && q4_size as f64 * MEMORY_HEADROOM_FACTOR <= memory_budget as f64 {
+        let method = match format {
+            Some(super::OutputFormatHint::Gguf) => "apex",
+            _ => "mixed-4-6",
+        };
+        let confidence = 0.75;
+        let result = HeuristicResult {
+            quant_method: method.to_string(),
+            bits: 4,
+            group_size: DEFAULT_GROUP_SIZE,
+            confidence,
+            reasoning: format!(
+                "MoE model ({:.1} GB at q4) fits in memory ({:.1} GB). \
+                 {} preserves router precision while compressing expert FFNs. \
+                 Expert redundancy makes this architecture resilient to quantization.",
+                q4_size as f64 / 1e9,
+                memory_budget as f64 / 1e9,
+                method,
+            ),
+        };
+        info!(
+            method = method,
+            confidence = confidence,
+            "Heuristic: {} — MoE architecture with format-aware selection",
+            method
+        );
+        return Ok(result);
+    }
 
     // Rule 1: Model fits comfortably at f16 — no quantization needed
     if f16_size as f64 * GENEROUS_HEADROOM_FACTOR <= memory_budget as f64 {
@@ -125,25 +179,34 @@ pub fn select_quant(
         return Ok(result);
     }
 
-    // Rule 3: Model fits at q8 with headroom — use mixed-4-6 for good quality/size tradeoff
+    // Rule 3: Model fits at q8 with headroom — use mixed-4-6 (or Apex for GGUF)
     if q8_size as f64 * MEMORY_HEADROOM_FACTOR <= memory_budget as f64 {
         let confidence = 0.7;
+        // Format-aware method selection: GGUF benefits from K-quant types via Apex
+        let method = match format {
+            Some(super::OutputFormatHint::Gguf) if fingerprint.total_params >= 3_000_000_000 => {
+                "apex"
+            }
+            _ => "mixed-4-6",
+        };
         let result = HeuristicResult {
-            quant_method: "mixed-4-6".to_string(),
+            quant_method: method.to_string(),
             bits: 4,
             group_size: DEFAULT_GROUP_SIZE,
             confidence,
             reasoning: format!(
                 "Model ({:.1} GB at q8) fits with headroom in available memory ({:.1} GB). \
-                 mixed-4-6 gives good quality with ~4x compression from f16.",
+                 {} gives good quality with ~4x compression from f16.",
                 q8_size as f64 / 1e9,
                 memory_budget as f64 / 1e9,
+                method,
             ),
         };
         info!(
-            method = "mixed-4-6",
+            method = method,
             confidence = confidence,
-            "Heuristic: mixed-4-6 — q8 fits but want better compression"
+            "Heuristic: {} — q8 fits but want better compression",
+            method
         );
         return Ok(result);
     }

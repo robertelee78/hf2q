@@ -88,6 +88,10 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub skip_quality: bool,
 
+    /// Fail with exit code 2 if quality thresholds are exceeded
+    #[arg(long)]
+    pub quality_gate: bool,
+
     /// Run preflight + auto resolution, print plan, exit without converting
     #[arg(long)]
     pub dry_run: bool,
@@ -250,6 +254,8 @@ pub struct ConvertConfig {
     pub json_report: bool,
     /// Whether to skip quality measurement
     pub skip_quality: bool,
+    /// Whether to enforce quality gate (exit code 2 on threshold violation)
+    pub quality_gate: bool,
     /// Whether this is a dry run
     pub dry_run: bool,
     /// Non-interactive mode
@@ -379,6 +385,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         output_dir,
         json_report: args.json_report,
         skip_quality: args.skip_quality,
+        quality_gate: args.quality_gate,
         dry_run: args.dry_run,
         yes: args.yes,
         unsupported_layers: args.unsupported_layers,
