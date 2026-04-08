@@ -10,7 +10,8 @@
 //! (bf16, StorageModeShared) to avoid allocation during inference and to
 //! eliminate bf16↔f32 conversions on the KV cache hot path.
 
-use mlx_native::{DType, MlxBuffer, MlxDevice};
+use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::ops::kv_cache_copy;
 use tracing::debug;
 
 /// Errors from KV cache operations.
@@ -184,6 +185,120 @@ impl LayerCache {
         self.total_written += n_new;
 
         // For sliding, position wraps around capacity
+        if let CacheType::Sliding { window } = self.cache_type {
+            if self.position >= window {
+                self.position %= window;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Append new K and V tensors directly on the GPU, avoiding CPU round-trips.
+    ///
+    /// Both `k_src` and `v_src` must be bf16 `MlxBuffer`s with shape
+    /// `[n_new, n_kv_heads * head_dim]`. The kernel copies data directly from
+    /// the source buffers into the pre-allocated cache buffers at the correct
+    /// write position, handling ring buffer wrapping for sliding window caches.
+    ///
+    /// The encoder is NOT committed here — the caller batches this with other
+    /// GPU work and calls `commit_and_wait()` afterwards. Position tracking
+    /// is updated on the CPU side immediately (safe because positions are
+    /// metadata, not GPU data).
+    ///
+    /// # Arguments
+    ///
+    /// * `k_src`    - Source K buffer (bf16), shape `[n_new, n_kv_heads * head_dim]`.
+    /// * `v_src`    - Source V buffer (bf16), shape `[n_new, n_kv_heads * head_dim]`.
+    /// * `encoder`  - Command encoder to record GPU copy dispatches into.
+    /// * `registry` - Kernel registry (must have `kv_cache_copy` registered).
+    /// * `device`   - Metal device for pipeline compilation.
+    pub fn append_gpu(
+        &mut self,
+        k_src: &MlxBuffer,
+        v_src: &MlxBuffer,
+        encoder: &mut CommandEncoder,
+        registry: &mut KernelRegistry,
+        device: &metal::DeviceRef,
+    ) -> Result<(), KvCacheError> {
+        let row_size = self.n_kv_heads * self.head_dim;
+        if row_size == 0 {
+            return Err(KvCacheError::BufferWriteError {
+                reason: "row_size is zero".into(),
+            });
+        }
+
+        let k_elements = k_src.element_count();
+        let v_elements = v_src.element_count();
+        if k_elements % row_size != 0 || v_elements % row_size != 0 {
+            return Err(KvCacheError::BufferWriteError {
+                reason: format!(
+                    "GPU append: K/V element counts must be multiples of row_size={row_size}, \
+                     got k={k_elements}, v={v_elements}"
+                ),
+            });
+        }
+
+        let n_new = k_elements / row_size;
+        if v_elements / row_size != n_new {
+            return Err(KvCacheError::BufferWriteError {
+                reason: "GPU append: K and V must have the same number of new positions".into(),
+            });
+        }
+
+        let (cache_cap, is_sliding) = match self.cache_type {
+            CacheType::Sliding { window } => (window, true),
+            CacheType::Global { max_seq_len } => {
+                if self.position + n_new > max_seq_len {
+                    return Err(KvCacheError::BufferWriteError {
+                        reason: format!(
+                            "Global cache overflow: position {} + n_new {} > max_seq_len {}",
+                            self.position, n_new, max_seq_len
+                        ),
+                    });
+                }
+                (max_seq_len, false)
+            }
+        };
+
+        // Dispatch GPU copy for K
+        kv_cache_copy::dispatch_kv_cache_copy(
+            encoder,
+            registry,
+            device,
+            k_src,
+            &self.k_cache,
+            self.position as u32,
+            row_size as u32,
+            n_new as u32,
+            cache_cap as u32,
+            is_sliding,
+        )
+        .map_err(|e| KvCacheError::BufferWriteError {
+            reason: format!("GPU K cache copy: {e}"),
+        })?;
+
+        // Dispatch GPU copy for V
+        kv_cache_copy::dispatch_kv_cache_copy(
+            encoder,
+            registry,
+            device,
+            v_src,
+            &self.v_cache,
+            self.position as u32,
+            row_size as u32,
+            n_new as u32,
+            cache_cap as u32,
+            is_sliding,
+        )
+        .map_err(|e| KvCacheError::BufferWriteError {
+            reason: format!("GPU V cache copy: {e}"),
+        })?;
+
+        // Update CPU-side position tracking (same logic as append_bf16)
+        self.position += n_new;
+        self.total_written += n_new;
+
         if let CacheType::Sliding { window } = self.cache_type {
             if self.position >= window {
                 self.position %= window;

@@ -16,10 +16,11 @@
 //! - Final logit softcap at 30.0
 
 use mlx_native::ops::{
-    elementwise, embedding, gelu, quantized_matmul as qmatmul,
-    rms_norm, rope, sdpa, sdpa_sliding, softcap, transpose,
+    elementwise, embedding, gelu, kv_cache_copy, moe_dispatch as moe_ops,
+    quantized_matmul as qmatmul, rms_norm, rope, sdpa, sdpa_sliding, softcap, transpose,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
+use std::collections::HashMap;
 use tracing::{debug, info};
 
 use crate::inference::kv_cache::{CacheType, KvCache, KvCacheError};
@@ -299,6 +300,14 @@ pub struct Gemma4Model {
     device: MlxDevice,
     /// Kernel registry for shader compilation.
     registry: KernelRegistry,
+    /// Cache: layer_idx -> dequantized + bf16-rounded router projection weights.
+    /// Avoids re-dequantizing 360K elements (128 experts x 2816 hidden) on every
+    /// moe_ffn call. ~43MB for 30 layers, but eliminates ~30x redundant work per step.
+    router_proj_cache: HashMap<usize, Vec<f32>>,
+    /// Cache: layer_idx -> pre-scaled router norm weight (scale * hidden_size^(-0.5)).
+    router_norm_cache: HashMap<usize, Vec<f32>>,
+    /// Cache: layer_idx -> per-expert scale factors.
+    per_expert_scale_cache: HashMap<usize, Vec<f32>>,
 }
 
 impl Gemma4Model {
@@ -353,6 +362,7 @@ impl Gemma4Model {
 
         let mut registry = KernelRegistry::new();
         gelu::register(&mut registry);
+        kv_cache_copy::register(&mut registry);
 
         Ok(Self {
             weights,
@@ -360,6 +370,9 @@ impl Gemma4Model {
             config,
             device,
             registry,
+            router_proj_cache: HashMap::new(),
+            router_norm_cache: HashMap::new(),
+            per_expert_scale_cache: HashMap::new(),
         })
     }
 
@@ -502,11 +515,12 @@ impl Gemma4Model {
             eprintln!("[DIAG]   logit stats: min={:.4}, max={:.4}, mean={:.4}, std={:.4}", min, max, mean, std_dev);
         }
 
-        // Step 6: Softcap (CPU path — the GPU softcap kernel produces
-        // incorrect results for very large dispatch grids on some Metal
-        // implementations; CPU is fast enough for this element-wise op).
-        debug!(cap = self.config.final_logit_softcapping, "Softcap");
-        let capped_logits = self.apply_softcap_cpu(&logits, seq_len)?;
+        // Step 6: Softcap on GPU — keeps logits on-device, single readback at
+        // the end.  The kernel now includes bounds checking and uses explicit
+        // threadgroup dispatch to avoid the previous out-of-bounds bug with
+        // non-uniform grid tails.
+        debug!(cap = self.config.final_logit_softcapping, "Softcap (GPU)");
+        let capped_logits = self.apply_softcap(&logits, seq_len)?;
 
         if diag {
             let s: &[f32] = capped_logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
@@ -1259,23 +1273,18 @@ impl Gemma4Model {
             eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
         }
 
-        // --- Step 4: KV cache append --- (CPU, bf16 direct — no f32 conversion)
-        let k_data_bf16: Vec<u16> = {
-            let slice: &[u16] = k_roped.as_slice().map_err(|e| Gemma4Error::ForwardError {
-                reason: format!("K roped read bf16: {e}"),
-            })?;
-            slice.to_vec()
-        };
-        let v_data_bf16: Vec<u16> = {
-            let slice: &[u16] = v_normed_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
-                reason: format!("V normed read bf16: {e}"),
-            })?;
-            slice.to_vec()
-        };
-
+        // --- Step 4: KV cache append --- (GPU direct copy, no CPU round-trip)
         {
+            let mut kv_encoder = self.device.command_encoder()?;
             let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
-            layer_cache.append_bf16(&k_data_bf16, &v_data_bf16)?;
+            layer_cache.append_gpu(
+                &k_roped,
+                &v_normed_buf,
+                &mut kv_encoder,
+                &mut self.registry,
+                self.device.metal_device(),
+            )?;
+            kv_encoder.commit_and_wait()?;
         }
 
         // --- Step 5: Attention --- (GPU, own encoder -- heavy kernel with CPU reshape)
@@ -1290,7 +1299,10 @@ impl Gemma4Model {
         )?;
 
         if diag {
-            let v_data_f32: Vec<f32> = v_data_bf16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+            let v_src_u16: &[u16] = v_normed_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("diag read v_normed: {e}"),
+            })?;
+            let v_data_f32: Vec<f32> = v_src_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
             eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data_f32[..5.min(v_data_f32.len())]);
             eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data_f32.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
 
@@ -2691,32 +2703,38 @@ impl Gemma4Model {
             }
         }
 
-        // Dequantize the router weight once for all tokens in this layer call.
+        // Cache dequantized router projection weights across calls.
         // Router weight is [n_experts, hidden_size], possibly quantized.
-        // Round to bf16 to match MLX's precision.
-        let router_f32_raw = self.dequantize_2d_weight(
-            &format!("model.layers.{layer_idx}.router.proj"),
-            n_experts,
-            hidden_size,
-        )?;
-        let router_bf16 = round_to_bf16(&router_f32_raw);
+        // Dequantizing + bf16 rounding 360K elements is expensive; cache it.
+        if !self.router_proj_cache.contains_key(&layer_idx) {
+            let router_f32_raw = self.dequantize_2d_weight(
+                &format!("model.layers.{layer_idx}.router.proj"),
+                n_experts,
+                hidden_size,
+            )?;
+            self.router_proj_cache.insert(layer_idx, round_to_bf16(&router_f32_raw));
+        }
+        let router_bf16 = self.router_proj_cache.get(&layer_idx).unwrap();
 
-        // Read router.scale [hidden_size] and per_expert_scale [n_experts]
-        // The router's scale weight is used as the RMS norm weight, scaled by hidden_size^(-0.5).
-        // Python: x = rms_norm(x, self.scale * self._root_size, eps)
-        let router_scale_vec = self.read_1d_weight(
-            &format!("model.layers.{layer_idx}.router.scale"),
-            hidden_size,
-        ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
-
-        let per_expert_scale = self.read_1d_weight(
-            &format!("model.layers.{layer_idx}.router.per_expert_scale"),
-            n_experts,
+        // Cache router norm weight (scale * hidden_size^(-0.5)) and per-expert scales.
+        if !self.router_norm_cache.contains_key(&layer_idx) {
+            let router_scale_vec = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.scale"),
+                hidden_size,
+            ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
+            let root_size = (hidden_size as f32).powf(-0.5);
+            let norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
+            self.router_norm_cache.insert(layer_idx, norm_weight);
+        }
+        if !self.per_expert_scale_cache.contains_key(&layer_idx) {
+            let pes = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.per_expert_scale"),
+                n_experts,
         ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
-
-        // Pre-scale the router norm weight: scale * hidden_size^(-0.5)
-        let root_size = (hidden_size as f32).powf(-0.5);
-        let router_norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
+            self.per_expert_scale_cache.insert(layer_idx, pes);
+        }
+        let router_norm_weight = self.router_norm_cache.get(&layer_idx).unwrap();
+        let per_expert_scale = self.per_expert_scale_cache.get(&layer_idx).unwrap();
 
         if diag {
             eprintln!("[DIAG] router_norm_weight first 5: {:?}, per_expert_scale first 5: {:?}",
@@ -2826,19 +2844,93 @@ impl Gemma4Model {
             // ONE commit for ALL expert dispatches
             encoder.commit_and_wait()?;
 
-            // Read back results and accumulate (CPU)
-            for (i, (token_idx, weight, buf)) in gpu_output_bufs.iter().enumerate() {
-                let expert_output = read_buffer_f32(buf)?;
+            // ---------------------------------------------------------------
+            // GPU accumulation: zero output, weighted-sum expert outputs,
+            // cast to bf16 — all on GPU, no CPU round-trip for decode.
+            // Eliminates 240 GPU->CPU copies per step (30 layers x 8 experts).
+            // ---------------------------------------------------------------
 
-                if diag && *token_idx == 0 && i < top_k {
-                    let n = expert_output.len().min(5);
-                    eprintln!("[DIAG] MoE L0 T0 expert output first {}: {:?}", n, &expert_output[..n]);
+            // Allocate per-token f32 accumulator buffers on GPU
+            let mut token_accum_bufs: Vec<MlxBuffer> = Vec::with_capacity(seq_len);
+            for _t in 0..seq_len {
+                token_accum_bufs.push(self.device.alloc_buffer(
+                    hidden_size * std::mem::size_of::<f32>(),
+                    DType::F32,
+                    vec![1, hidden_size],
+                )?);
+            }
+
+            // Allocate bf16 output buffer for final result
+            let bf16_output = self.device.alloc_buffer(
+                seq_len * hidden_size * 2, // bf16 = 2 bytes
+                DType::BF16,
+                vec![seq_len, hidden_size],
+            )?;
+
+            // Second encoder: zero + accumulate + cast
+            let mut accum_encoder = self.device.command_encoder()?;
+
+            // Zero all per-token accumulators
+            for accum_buf in &token_accum_bufs {
+                moe_ops::moe_zero_buffer_encode(
+                    &mut accum_encoder, &mut self.registry,
+                    self.device.metal_device(),
+                    accum_buf, hidden_size,
+                )?;
+            }
+
+            // Weighted accumulation: accum[token] += weight * expert_output
+            for (_i, (token_idx, weight, buf)) in gpu_output_bufs.iter().enumerate() {
+                moe_ops::moe_accumulate_encode(
+                    &mut accum_encoder, &mut self.registry,
+                    self.device.metal_device(),
+                    &token_accum_bufs[*token_idx], buf,
+                    *weight, hidden_size,
+                )?;
+            }
+
+            // Cast each token's f32 accumulator to bf16 in the output buffer.
+            // For single-token decode (seq_len=1), cast directly — fully on GPU.
+            // For multi-token prefill, fall back to per-token CPU assembly
+            // (rare path, but still avoids per-expert readback).
+            if seq_len == 1 {
+                elementwise::cast(
+                    &mut accum_encoder, &mut self.registry,
+                    self.device.metal_device(),
+                    &token_accum_bufs[0], &bf16_output,
+                    hidden_size,
+                    elementwise::CastDirection::F32ToBF16,
+                )?;
+
+                accum_encoder.commit_and_wait()?;
+
+                if diag {
+                    let diag_data = read_buffer_f32(&token_accum_bufs[0])?;
+                    let n = diag_data.len().min(5);
+                    eprintln!("[DIAG] MoE L0 final accumulated output first {}: {:?}", n, &diag_data[..n]);
                 }
 
-                let out_slice = &mut output_data[token_idx * hidden_size..(token_idx + 1) * hidden_size];
-                for (j, &val) in expert_output.iter().enumerate() {
-                    out_slice[j] += weight * val;
+                return Ok(bf16_output);
+            } else {
+                // Multi-token: commit accumulation, read back f32 accumulators
+                accum_encoder.commit_and_wait()?;
+
+                for t in 0..seq_len {
+                    let token_f32 = read_buffer_f32(&token_accum_bufs[t])?;
+                    output_data[t * hidden_size..(t + 1) * hidden_size]
+                        .copy_from_slice(&token_f32);
                 }
+
+                if diag {
+                    let n = output_data.len().min(5);
+                    eprintln!("[DIAG] MoE L0 final accumulated output first {}: {:?}", n, &output_data[..n]);
+                }
+
+                return f32_vec_to_bf16_buffer(
+                    &self.device,
+                    &output_data,
+                    vec![seq_len, hidden_size],
+                );
             }
         } else {
             // CPU fallback path: per-token, per-expert dispatch
@@ -3605,11 +3697,14 @@ impl Gemma4Model {
             vec![seq_len, vocab_size],
         )?;
 
-        // Create params buffer with cap value
+        // Create params buffer with [cap, n_elements_as_bits].
+        // The kernel reads params[1] via as_type<uint> to get n_elements
+        // for bounds checking, avoiding out-of-bounds access when
+        // threadgroup_count * threadgroup_size > n_elements.
         let mut params_buf = self.device.alloc_buffer(
-            std::mem::size_of::<f32>(),
+            2 * std::mem::size_of::<f32>(),
             DType::F32,
-            vec![1],
+            vec![2],
         )?;
         {
             let slice: &mut [f32] = params_buf.as_mut_slice().map_err(|e| {
@@ -3618,6 +3713,7 @@ impl Gemma4Model {
                 }
             })?;
             slice[0] = cap;
+            slice[1] = f32::from_bits(n_elements as u32);
         }
 
         let mut encoder = self.device.command_encoder()?;
