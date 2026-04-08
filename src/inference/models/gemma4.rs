@@ -16,8 +16,9 @@
 //! - Final logit softcap at 30.0
 
 use mlx_native::ops::{
-    elementwise, embedding, gelu, kv_cache_copy, moe_dispatch as moe_ops,
-    quantized_matmul as qmatmul, rms_norm, rope, sdpa, sdpa_sliding, softcap, transpose,
+    elementwise, embedding, fused_head_norm_rope, fused_residual_norm, gelu, kv_cache_copy,
+    moe_dispatch as moe_ops, moe_gate, quantized_matmul as qmatmul, rms_norm, rope, sdpa,
+    sdpa_sliding, softcap, transpose,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
 use std::collections::HashMap;
@@ -308,6 +309,14 @@ pub struct Gemma4Model {
     router_norm_cache: HashMap<usize, Vec<f32>>,
     /// Cache: layer_idx -> per-expert scale factors.
     per_expert_scale_cache: HashMap<usize, Vec<f32>>,
+    /// GPU buffer cache: layer_idx -> router projection weights as f32 GPU buffer.
+    router_proj_gpu_cache: HashMap<usize, MlxBuffer>,
+    /// GPU buffer cache: layer_idx -> router norm weight as f32 GPU buffer.
+    router_norm_gpu_cache: HashMap<usize, MlxBuffer>,
+    /// GPU buffer cache: layer_idx -> per-expert scale as f32 GPU buffer.
+    per_expert_scale_gpu_cache: HashMap<usize, MlxBuffer>,
+    /// GPU buffer cache: layer_idx -> (expert_ids, expert_weights) output buffers.
+    moe_gate_output_cache: HashMap<usize, (MlxBuffer, MlxBuffer)>,
 }
 
 impl Gemma4Model {
@@ -363,6 +372,8 @@ impl Gemma4Model {
         let mut registry = KernelRegistry::new();
         gelu::register(&mut registry);
         kv_cache_copy::register(&mut registry);
+        fused_head_norm_rope::register(&mut registry);
+        fused_residual_norm::register(&mut registry);
 
         Ok(Self {
             weights,
@@ -373,6 +384,10 @@ impl Gemma4Model {
             router_proj_cache: HashMap::new(),
             router_norm_cache: HashMap::new(),
             per_expert_scale_cache: HashMap::new(),
+            router_proj_gpu_cache: HashMap::new(),
+            router_norm_gpu_cache: HashMap::new(),
+            per_expert_scale_gpu_cache: HashMap::new(),
+            moe_gate_output_cache: HashMap::new(),
         })
     }
 
@@ -413,11 +428,8 @@ impl Gemma4Model {
             eprintln!("[DIAG]   total_elements={}, nonzero={}", s.len(), nonzero);
         }
 
-        // Convert embedding output to bf16 for the bf16 pipeline
-        let embed_f32_data = read_buffer_f32(&hidden_f32)?;
-        let mut hidden = f32_vec_to_bf16_buffer(
-            &self.device, &embed_f32_data, vec![seq_len, hidden_size],
-        )?;
+        // Convert embedding output to bf16 for the bf16 pipeline (GPU cast, no CPU round-trip)
+        let mut hidden = self.cast_f32_to_bf16(&hidden_f32, seq_len * hidden_size)?;
 
         // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         // MLX stores this as bf16: embed_scale = bf16(sqrt(hidden_size))
@@ -2456,12 +2468,14 @@ impl Gemma4Model {
         if let Some((bits, _group_size)) = quant_info {
             let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
             if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
-                // GPU path: batch cast + qmatmul + cast into shared encoder
-                let input_f32 = self.ensure_f32_input_with_encoder(encoder, input, seq_len * in_dim)?;
-
-                let loaded = require_weight(&self.weights, &weight_name)?;
-                let scales = require_weight(&self.weights, &scales_name)?;
-                let biases = require_weight(&self.weights, &biases_name)?;
+                // GPU path: direct bf16 qmatmul — no cast chain needed.
+                // Input is bf16, output is bf16. Eliminates 2 cast dispatches per projection.
+                //
+                // Clone weight buffer refs upfront to avoid borrow conflict with &mut self
+                // methods (cast_f32_to_bf16_with_encoder needs &mut self).
+                let weight_buf = clone_buffer(&self.device, &require_weight(&self.weights, &weight_name)?.buffer)?;
+                let scales_buf = clone_buffer(&self.device, &require_weight(&self.weights, &scales_name)?.buffer)?;
+                let biases_buf = clone_buffer(&self.device, &require_weight(&self.weights, &biases_name)?.buffer)?;
 
                 let params = QuantizedMatmulParams {
                     m: seq_len as u32,
@@ -2471,18 +2485,24 @@ impl Gemma4Model {
                     bits: bits as u32,
                 };
 
-                let output_f32 = qmatmul::quantized_matmul_simd(
+                // Ensure input is bf16 for the bf16 kernel (it should already be).
+                let bf16_input = if input.dtype() == DType::BF16 {
+                    clone_buffer(&self.device, input)?
+                } else {
+                    self.cast_f32_to_bf16_with_encoder(encoder, input, seq_len * in_dim)?
+                };
+
+                let output_bf16 = qmatmul::dispatch_quantized_matmul_simd_bf16(
                     encoder,
                     &mut self.registry,
                     &self.device,
-                    &input_f32,
-                    &loaded.buffer,
-                    &scales.buffer,
-                    &biases.buffer,
+                    &bf16_input,
+                    &weight_buf,
+                    &scales_buf,
+                    &biases_buf,
                     &params,
                 )?;
 
-                let output_bf16 = self.cast_f32_to_bf16_with_encoder(encoder, &output_f32, seq_len * out_dim)?;
                 return Ok(output_bf16);
             }
 
@@ -2855,6 +2875,242 @@ impl Gemma4Model {
         Ok(output)
     }
 
+    /// Ensure GPU buffers for MoE router are cached for the given layer.
+    ///
+    /// Populates `router_proj_gpu_cache`, `router_norm_gpu_cache`, and
+    /// `per_expert_scale_gpu_cache` with f32 GPU buffers. Also ensures the
+    /// CPU caches are populated (used as source data for the GPU upload).
+    fn ensure_moe_gate_gpu_caches(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(), Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let n_experts = self.config.num_experts;
+
+        // Ensure CPU caches are populated first
+        if !self.router_proj_cache.contains_key(&layer_idx) {
+            let router_f32_raw = self.dequantize_2d_weight(
+                &format!("model.layers.{layer_idx}.router.proj"),
+                n_experts,
+                hidden_size,
+            )?;
+            self.router_proj_cache.insert(layer_idx, round_to_bf16(&router_f32_raw));
+        }
+        if !self.router_norm_cache.contains_key(&layer_idx) {
+            let router_scale_vec = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.scale"),
+                hidden_size,
+            ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
+            let root_size = (hidden_size as f32).powf(-0.5);
+            let norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
+            self.router_norm_cache.insert(layer_idx, norm_weight);
+        }
+        if !self.per_expert_scale_cache.contains_key(&layer_idx) {
+            let pes = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.per_expert_scale"),
+                n_experts,
+            ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
+            self.per_expert_scale_cache.insert(layer_idx, pes);
+        }
+
+        // Upload to GPU if not already cached
+        if !self.router_proj_gpu_cache.contains_key(&layer_idx) {
+            let cpu_data = self.router_proj_cache.get(&layer_idx).unwrap();
+            let byte_len = cpu_data.len() * std::mem::size_of::<f32>();
+            let mut buf = self.device.alloc_buffer(
+                byte_len, DType::F32, vec![n_experts, hidden_size],
+            )?;
+            {
+                let slice: &mut [f32] = buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("upload router_proj GPU: {e}"),
+                })?;
+                slice.copy_from_slice(cpu_data);
+            }
+            self.router_proj_gpu_cache.insert(layer_idx, buf);
+        }
+        if !self.router_norm_gpu_cache.contains_key(&layer_idx) {
+            let cpu_data = self.router_norm_cache.get(&layer_idx).unwrap();
+            let byte_len = cpu_data.len() * std::mem::size_of::<f32>();
+            let mut buf = self.device.alloc_buffer(
+                byte_len, DType::F32, vec![hidden_size],
+            )?;
+            {
+                let slice: &mut [f32] = buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("upload router_norm GPU: {e}"),
+                })?;
+                slice.copy_from_slice(cpu_data);
+            }
+            self.router_norm_gpu_cache.insert(layer_idx, buf);
+        }
+        if !self.per_expert_scale_gpu_cache.contains_key(&layer_idx) {
+            let cpu_data = self.per_expert_scale_cache.get(&layer_idx).unwrap();
+            let byte_len = cpu_data.len() * std::mem::size_of::<f32>();
+            let mut buf = self.device.alloc_buffer(
+                byte_len, DType::F32, vec![n_experts],
+            )?;
+            {
+                let slice: &mut [f32] = buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("upload per_expert_scale GPU: {e}"),
+                })?;
+                slice.copy_from_slice(cpu_data);
+            }
+            self.per_expert_scale_gpu_cache.insert(layer_idx, buf);
+        }
+
+        Ok(())
+    }
+
+    /// GPU MoE routing via moe_gate kernel. Returns (expert_ids, expert_weights)
+    /// as CPU vectors after reading back the small output buffers.
+    fn gpu_moe_route(
+        &mut self,
+        layer_idx: usize,
+        router_input: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<(Vec<Vec<usize>>, Vec<Vec<f32>>), Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let n_experts = self.config.num_experts;
+        let top_k = self.config.top_k_experts;
+        let eps = self.config.rms_norm_eps;
+
+        self.ensure_moe_gate_gpu_caches(layer_idx)?;
+
+        // Allocate output buffers for expert_ids and expert_weights
+        let ids_buf = self.device.alloc_buffer(
+            seq_len * top_k * std::mem::size_of::<u32>(),
+            DType::U32,
+            vec![seq_len, top_k],
+        )?;
+        let weights_buf = self.device.alloc_buffer(
+            seq_len * top_k * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![seq_len, top_k],
+        )?;
+
+        let params = moe_gate::MoeGateParams {
+            hidden_dim: hidden_size,
+            n_experts,
+            top_k,
+            seq_len,
+            rms_eps: eps,
+        };
+
+        {
+            let mut encoder = self.device.command_encoder()?;
+            let router_proj_buf = self.router_proj_gpu_cache.get(&layer_idx).unwrap();
+            let router_norm_buf = self.router_norm_gpu_cache.get(&layer_idx).unwrap();
+            let per_expert_scale_buf = self.per_expert_scale_gpu_cache.get(&layer_idx).unwrap();
+
+            moe_gate::moe_gate(
+                &mut encoder,
+                &mut self.registry,
+                self.device.metal_device(),
+                router_input,
+                router_proj_buf,
+                router_norm_buf,
+                per_expert_scale_buf,
+                &ids_buf,
+                &weights_buf,
+                &params,
+            )?;
+            encoder.commit_and_wait()?;
+        }
+
+        // Read back small output buffers (seq_len * top_k * 4 bytes each, e.g. 32 bytes for decode)
+        let ids_raw: &[u32] = ids_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("read moe_gate expert_ids: {e}"),
+        })?;
+        let weights_raw: &[f32] = weights_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("read moe_gate expert_weights: {e}"),
+        })?;
+
+        let mut all_expert_ids: Vec<Vec<usize>> = Vec::with_capacity(seq_len);
+        let mut all_routing_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+
+        for t in 0..seq_len {
+            let offset = t * top_k;
+            let ids: Vec<usize> = ids_raw[offset..offset + top_k]
+                .iter()
+                .map(|&id| id as usize)
+                .collect();
+            let weights: Vec<f32> = weights_raw[offset..offset + top_k].to_vec();
+            all_expert_ids.push(ids);
+            all_routing_weights.push(weights);
+        }
+
+        Ok((all_expert_ids, all_routing_weights))
+    }
+
+    /// CPU fallback MoE routing. Used when GPU routing is unavailable or fails.
+    fn cpu_moe_route(
+        &mut self,
+        layer_idx: usize,
+        router_input: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<(Vec<Vec<usize>>, Vec<Vec<f32>>), Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let n_experts = self.config.num_experts;
+        let top_k = self.config.top_k_experts;
+        let eps = self.config.rms_norm_eps;
+
+        let router_data = read_buffer_f32(router_input)?;
+
+        // Ensure CPU caches are populated
+        if !self.router_proj_cache.contains_key(&layer_idx) {
+            let router_f32_raw = self.dequantize_2d_weight(
+                &format!("model.layers.{layer_idx}.router.proj"),
+                n_experts,
+                hidden_size,
+            )?;
+            self.router_proj_cache.insert(layer_idx, round_to_bf16(&router_f32_raw));
+        }
+        if !self.router_norm_cache.contains_key(&layer_idx) {
+            let router_scale_vec = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.scale"),
+                hidden_size,
+            ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
+            let root_size = (hidden_size as f32).powf(-0.5);
+            let norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
+            self.router_norm_cache.insert(layer_idx, norm_weight);
+        }
+        if !self.per_expert_scale_cache.contains_key(&layer_idx) {
+            let pes = self.read_1d_weight(
+                &format!("model.layers.{layer_idx}.router.per_expert_scale"),
+                n_experts,
+            ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
+            self.per_expert_scale_cache.insert(layer_idx, pes);
+        }
+        let router_bf16 = self.router_proj_cache.get(&layer_idx).unwrap();
+        let router_norm_weight = self.router_norm_cache.get(&layer_idx).unwrap();
+        let per_expert_scale = self.per_expert_scale_cache.get(&layer_idx).unwrap();
+
+        let mut all_expert_ids: Vec<Vec<usize>> = Vec::with_capacity(seq_len);
+        let mut all_routing_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+
+        for t in 0..seq_len {
+            let token_router = &router_data[t * hidden_size..(t + 1) * hidden_size];
+            let normed_router = cpu_rms_norm(token_router, router_norm_weight, eps);
+            let normed_bf16 = round_to_bf16(&normed_router);
+
+            let mut logits = vec![0.0f32; n_experts];
+            for e in 0..n_experts {
+                let mut sum = 0.0f32;
+                for k in 0..hidden_size {
+                    sum += router_bf16[e * hidden_size + k] * normed_bf16[k];
+                }
+                logits[e] = sum;
+            }
+
+            let (expert_ids, routing_weights) =
+                top_k_softmax_with_scale(&logits, per_expert_scale, top_k);
+
+            all_expert_ids.push(expert_ids);
+            all_routing_weights.push(routing_weights);
+        }
+
+        Ok((all_expert_ids, all_routing_weights))
+    }
+
     /// MoE FFN for a single layer.
     ///
     /// `router_input` is the un-normed hidden state used for routing (the router
@@ -2874,12 +3130,8 @@ impl Gemma4Model {
         seq_len: usize,
     ) -> Result<MlxBuffer, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
-        let n_experts = self.config.num_experts;
-        let top_k = self.config.top_k_experts;
-        let eps = self.config.rms_norm_eps;
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        let router_data = read_buffer_f32(router_input)?;
         let expert_data = read_buffer_f32(expert_input)?;
 
         if diag {
@@ -2892,97 +3144,39 @@ impl Gemma4Model {
             }
         }
 
-        // Cache dequantized router projection weights across calls.
-        // Router weight is [n_experts, hidden_size], possibly quantized.
-        // Dequantizing + bf16 rounding 360K elements is expensive; cache it.
-        if !self.router_proj_cache.contains_key(&layer_idx) {
-            let router_f32_raw = self.dequantize_2d_weight(
-                &format!("model.layers.{layer_idx}.router.proj"),
-                n_experts,
-                hidden_size,
-            )?;
-            self.router_proj_cache.insert(layer_idx, round_to_bf16(&router_f32_raw));
-        }
-        let router_bf16 = self.router_proj_cache.get(&layer_idx).unwrap();
-
-        // Cache router norm weight (scale * hidden_size^(-0.5)) and per-expert scales.
-        if !self.router_norm_cache.contains_key(&layer_idx) {
-            let router_scale_vec = self.read_1d_weight(
-                &format!("model.layers.{layer_idx}.router.scale"),
-                hidden_size,
-            ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
-            let root_size = (hidden_size as f32).powf(-0.5);
-            let norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
-            self.router_norm_cache.insert(layer_idx, norm_weight);
-        }
-        if !self.per_expert_scale_cache.contains_key(&layer_idx) {
-            let pes = self.read_1d_weight(
-                &format!("model.layers.{layer_idx}.router.per_expert_scale"),
-                n_experts,
-        ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
-            self.per_expert_scale_cache.insert(layer_idx, pes);
-        }
-        let router_norm_weight = self.router_norm_cache.get(&layer_idx).unwrap();
-        let per_expert_scale = self.per_expert_scale_cache.get(&layer_idx).unwrap();
-
-        if diag {
-            eprintln!("[DIAG] router_norm_weight first 5: {:?}, per_expert_scale first 5: {:?}",
-                &router_norm_weight[..5.min(router_norm_weight.len())],
-                &per_expert_scale[..5.min(per_expert_scale.len())]);
-            let n = router_bf16.len().min(10);
-            eprintln!("[DIAG] router_f32 first {}: {:?}", n, &router_bf16[..n]);
-        }
-
         let intermediate_size = self.config.moe_intermediate_size;
 
         // ===================================================================
-        // Phase 1: CPU routing — compute expert IDs and weights for ALL tokens
-        // This is pure CPU work (router norm + matmul + top-K softmax).
+        // Phase 1: GPU MoE routing via moe_gate kernel.
+        // Replaces CPU RMS norm + matmul + top-K softmax with a single GPU dispatch.
+        // Falls back to CPU routing if GPU routing fails (e.g. unsupported config).
         // ===================================================================
-        let mut all_expert_ids: Vec<Vec<usize>> = Vec::with_capacity(seq_len);
-        let mut all_routing_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            let token_router = &router_data[t * hidden_size..(t + 1) * hidden_size];
-            let normed_router = cpu_rms_norm(token_router, &router_norm_weight, eps);
-            let normed_bf16 = round_to_bf16(&normed_router);
-
-            let mut logits = vec![0.0f32; n_experts];
-            for e in 0..n_experts {
-                let mut sum = 0.0f32;
-                for k in 0..hidden_size {
-                    sum += router_bf16[e * hidden_size + k] * normed_bf16[k];
+        let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
+        let (all_expert_ids, all_routing_weights) = if !use_cpu_route {
+            match self.gpu_moe_route(layer_idx, router_input, seq_len) {
+                Ok((ids, weights)) => {
+                    if diag {
+                        let top_k = self.config.top_k_experts;
+                        eprintln!("[DIAG] MoE L{} GPU routing: {} tokens, top-{}", layer_idx, seq_len, top_k);
+                        if !ids.is_empty() {
+                            eprintln!("[DIAG] MoE L{} T0 selected experts: {:?}, weights: {:?}",
+                                layer_idx, ids[0], weights[0]);
+                        }
+                        if seq_len > 1 && ids.len() == seq_len {
+                            eprintln!("[DIAG] MoE L{} T{} (LAST) selected experts: {:?}, weights: {:?}",
+                                layer_idx, seq_len - 1, ids[seq_len - 1], weights[seq_len - 1]);
+                        }
+                    }
+                    (ids, weights)
                 }
-                logits[e] = sum;
+                Err(e) => {
+                    debug!(layer = layer_idx, error = %e, "GPU MoE routing failed, falling back to CPU");
+                    self.cpu_moe_route(layer_idx, router_input, seq_len)?
+                }
             }
-
-            if diag && t == 0 {
-                let mut sorted: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                eprintln!("[DIAG] MoE L0 T0 router logits (pre-softmax) top-5: {:?}",
-                    &sorted[..5.min(sorted.len())]);
-            }
-            if diag && t == seq_len - 1 {
-                let mut sorted: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                eprintln!("[DIAG] MoE L0 T{} (LAST) router top-5: {:?}", t, &sorted[..5.min(sorted.len())]);
-            }
-
-            let (expert_ids, routing_weights) =
-                top_k_softmax_with_scale(&logits, &per_expert_scale, top_k);
-
-            if diag && t == 0 {
-                eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
-                    expert_ids, routing_weights);
-            }
-            if diag && t == seq_len - 1 {
-                eprintln!("[DIAG] MoE L0 T{} (LAST) selected experts: {:?}, weights: {:?}",
-                    t, expert_ids, routing_weights);
-            }
-
-            all_expert_ids.push(expert_ids);
-            all_routing_weights.push(routing_weights);
-        }
+        } else {
+            self.cpu_moe_route(layer_idx, router_input, seq_len)?
+        };
 
         // ===================================================================
         // Phase 2: GPU expert dispatch — ALL tokens, ALL experts, ONE encoder
@@ -3175,74 +3369,29 @@ impl Gemma4Model {
         seq_len: usize,
     ) -> Result<MlxBuffer, Gemma4Error> {
         let hidden_size = self.config.hidden_size;
-        let n_experts = self.config.num_experts;
-        let top_k = self.config.top_k_experts;
-        let eps = self.config.rms_norm_eps;
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        let router_data = read_buffer_f32(router_input)?;
         let expert_data = read_buffer_f32(expert_input)?;
-
-        // Cache dequantized router projection weights across calls.
-        if !self.router_proj_cache.contains_key(&layer_idx) {
-            let router_f32_raw = self.dequantize_2d_weight(
-                &format!("model.layers.{layer_idx}.router.proj"),
-                n_experts,
-                hidden_size,
-            )?;
-            self.router_proj_cache.insert(layer_idx, round_to_bf16(&router_f32_raw));
-        }
-        let router_bf16 = self.router_proj_cache.get(&layer_idx).unwrap();
-
-        if !self.router_norm_cache.contains_key(&layer_idx) {
-            let router_scale_vec = self.read_1d_weight(
-                &format!("model.layers.{layer_idx}.router.scale"),
-                hidden_size,
-            ).unwrap_or_else(|_| vec![1.0f32; hidden_size]);
-            let root_size = (hidden_size as f32).powf(-0.5);
-            let norm_weight: Vec<f32> = router_scale_vec.iter().map(|s| s * root_size).collect();
-            self.router_norm_cache.insert(layer_idx, norm_weight);
-        }
-        if !self.per_expert_scale_cache.contains_key(&layer_idx) {
-            let pes = self.read_1d_weight(
-                &format!("model.layers.{layer_idx}.router.per_expert_scale"),
-                n_experts,
-            ).unwrap_or_else(|_| vec![1.0f32; n_experts]);
-            self.per_expert_scale_cache.insert(layer_idx, pes);
-        }
-        let router_norm_weight = self.router_norm_cache.get(&layer_idx).unwrap();
-        let per_expert_scale = self.per_expert_scale_cache.get(&layer_idx).unwrap();
 
         let intermediate_size = self.config.moe_intermediate_size;
 
-        // Phase 1: CPU routing (same as moe_ffn)
-        let mut all_expert_ids: Vec<Vec<usize>> = Vec::with_capacity(seq_len);
-        let mut all_routing_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            let token_router = &router_data[t * hidden_size..(t + 1) * hidden_size];
-            let normed_router = cpu_rms_norm(token_router, router_norm_weight, eps);
-            let normed_bf16 = round_to_bf16(&normed_router);
-
-            let mut logits = vec![0.0f32; n_experts];
-            for e in 0..n_experts {
-                let mut sum = 0.0f32;
-                for k in 0..hidden_size {
-                    sum += router_bf16[e * hidden_size + k] * normed_bf16[k];
+        // Phase 1: GPU MoE routing (falls back to CPU if GPU fails)
+        let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
+        let (all_expert_ids, all_routing_weights) = if !use_cpu_route {
+            match self.gpu_moe_route(layer_idx, router_input, seq_len) {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(layer = layer_idx, error = %e, "GPU MoE routing failed in encoder path, falling back to CPU");
+                    self.cpu_moe_route(layer_idx, router_input, seq_len)?
                 }
-                logits[e] = sum;
             }
+        } else {
+            self.cpu_moe_route(layer_idx, router_input, seq_len)?
+        };
 
-            let (expert_ids, routing_weights) =
-                top_k_softmax_with_scale(&logits, per_expert_scale, top_k);
-
-            if diag && t == 0 {
-                eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
-                    expert_ids, routing_weights);
-            }
-
-            all_expert_ids.push(expert_ids);
-            all_routing_weights.push(routing_weights);
+        if diag && !all_expert_ids.is_empty() {
+            eprintln!("[DIAG] MoE L0 T0 selected experts: {:?}, weights: {:?}",
+                all_expert_ids[0], all_routing_weights[0]);
         }
 
         // Phase 2: GPU expert dispatch into external encoder
