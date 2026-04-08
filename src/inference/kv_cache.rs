@@ -219,7 +219,7 @@ impl LayerCache {
         v_src: &MlxBuffer,
         encoder: &mut CommandEncoder,
         registry: &mut KernelRegistry,
-        device: &metal::DeviceRef,
+        device: &mlx_native::metal::DeviceRef,
     ) -> Result<(), KvCacheError> {
         let row_size = self.n_kv_heads * self.head_dim;
         if row_size == 0 {
