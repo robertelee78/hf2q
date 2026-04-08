@@ -3897,11 +3897,11 @@ impl Gemma4Model {
         let hidden_size = self.config.hidden_size;
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
-        let expert_data = read_buffer_f32(expert_input)?;
-
         let intermediate_size = self.config.moe_intermediate_for_layer(layer_idx);
 
         // Phase 1: GPU MoE routing (falls back to CPU if GPU fails)
+        // NOTE: gpu_moe_route creates its own encoder and syncs — this is a
+        // known bottleneck (64-byte readback). Future: merge into shared encoder.
         let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
         let (all_expert_ids, all_routing_weights) = if !use_cpu_route {
             match self.gpu_moe_route(layer_idx, router_input, seq_len) {
@@ -3943,13 +3943,35 @@ impl Gemma4Model {
             }
         }
 
+        // For single-token decode, pass the GPU buffer directly to expert FFN
+        // instead of reading to CPU first. This eliminates the expensive
+        // read_buffer_f32 + f32_vec_to_buffer round-trip per expert.
+        let expert_data_cpu;
+        let use_gpu_input = seq_len == 1;
+
+        if !use_gpu_input {
+            expert_data_cpu = Some(read_buffer_f32(expert_input)?);
+        } else {
+            expert_data_cpu = None;
+        }
+
         let mut gpu_output_bufs: Vec<(usize, f32, MlxBuffer)> = Vec::with_capacity(dispatches.len());
         for d in &dispatches {
-            let token_expert = &expert_data[d.token_idx * hidden_size..(d.token_idx + 1) * hidden_size];
-            let out_buf = self.expert_ffn_3d_gpu_with_encoder(
-                encoder, layer_idx, d.expert_id, token_expert,
-                hidden_size, intermediate_size, bits, group_size,
-            )?;
+            let out_buf = if use_gpu_input {
+                // GPU path: expert_input is already on GPU as bf16, pass directly
+                self.expert_ffn_3d_gpu_buf_with_encoder(
+                    encoder, layer_idx, d.expert_id, expert_input,
+                    d.token_idx, hidden_size, intermediate_size, bits, group_size,
+                )?
+            } else {
+                // CPU path: read from CPU buffer (prefill with multiple tokens)
+                let expert_data = expert_data_cpu.as_ref().unwrap();
+                let token_expert = &expert_data[d.token_idx * hidden_size..(d.token_idx + 1) * hidden_size];
+                self.expert_ffn_3d_gpu_with_encoder(
+                    encoder, layer_idx, d.expert_id, token_expert,
+                    hidden_size, intermediate_size, bits, group_size,
+                )?
+            };
             gpu_output_bufs.push((d.token_idx, d.weight, out_buf));
         }
 
@@ -4362,6 +4384,90 @@ impl Gemma4Model {
             encoder, &mut self.registry, &self.device,
             pool_hidden_buf, &down_bufs.0, &down_bufs.1, &down_bufs.2,
             &down_params,
+        )?;
+
+        Ok(down_out)
+    }
+
+    /// Expert FFN that reads input directly from a GPU bf16 buffer.
+    ///
+    /// Same computation as `expert_ffn_3d_gpu_with_encoder` but avoids the
+    /// CPU round-trip by casting bf16→f32 on GPU within the same encoder.
+    /// Used for single-token decode where `expert_input` is [1, hidden_size] bf16.
+    #[allow(clippy::too_many_arguments)]
+    fn expert_ffn_3d_gpu_buf_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        layer_idx: usize,
+        expert_id: usize,
+        expert_input_bf16: &MlxBuffer,
+        token_idx: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        bits: u32,
+        group_size: u32,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let base = format!("model.layers.{layer_idx}.experts.switch_glu");
+
+        // Cast bf16 input to f32 on GPU (no CPU round-trip).
+        // For seq_len=1, token_idx is always 0 and expert_input is [1, hidden_size] bf16.
+        // For multi-token, we'd need to extract the token slice — but this path
+        // is only called for seq_len=1.
+        let _ = token_idx; // always 0 for seq_len=1
+        let n_elems = hidden_size;
+        let input_f32 = self.device.alloc_buffer(
+            n_elems * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![1, hidden_size],
+        )?;
+        elementwise::cast(
+            encoder, &mut self.registry, self.device.metal_device(),
+            expert_input_bf16, &input_f32, n_elems,
+            elementwise::CastDirection::BF16ToF32,
+        )?;
+
+        // From here, same as expert_ffn_3d_gpu_with_encoder but using input_f32
+        let gate_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.gate_proj"), expert_id,
+            intermediate_size, hidden_size,
+        )?;
+        let up_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.up_proj"), expert_id,
+            intermediate_size, hidden_size,
+        )?;
+        let down_bufs = self.extract_expert_quant_buffers(
+            &format!("{base}.down_proj"), expert_id,
+            hidden_size, intermediate_size,
+        )?;
+
+        let gate_params = QuantizedMatmulParams {
+            m: 1, k: hidden_size as u32, n: intermediate_size as u32, group_size, bits,
+        };
+        let gate_out = qmatmul::quantized_matmul_simd(
+            encoder, &mut self.registry, &self.device,
+            &input_f32, &gate_bufs.0, &gate_bufs.1, &gate_bufs.2, &gate_params,
+        )?;
+        let up_out = qmatmul::quantized_matmul_simd(
+            encoder, &mut self.registry, &self.device,
+            &input_f32, &up_bufs.0, &up_bufs.1, &up_bufs.2, &gate_params,
+        )?;
+
+        self.moe_buffer_pool.ensure_allocated(&self.device, intermediate_size, hidden_size)?;
+        let pool_gelu_out = self.moe_buffer_pool.gelu_out();
+        gelu::dispatch_gelu(encoder, &mut self.registry, self.device.metal_device(), &gate_out, pool_gelu_out)?;
+
+        let pool_hidden_buf = self.moe_buffer_pool.hidden_buf();
+        elementwise::elementwise_mul(
+            encoder, &mut self.registry, self.device.metal_device(),
+            pool_gelu_out, &up_out, pool_hidden_buf, intermediate_size, DType::F32,
+        )?;
+
+        let down_params = QuantizedMatmulParams {
+            m: 1, k: intermediate_size as u32, n: hidden_size as u32, group_size, bits,
+        };
+        let down_out = qmatmul::quantized_matmul_simd(
+            encoder, &mut self.registry, &self.device,
+            pool_hidden_buf, &down_bufs.0, &down_bufs.1, &down_bufs.2, &down_params,
         )?;
 
         Ok(down_out)
