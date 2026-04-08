@@ -102,9 +102,14 @@ impl DecodeBuffers {
 
 /// Outcome of processing a single sampled token in the decode loop.
 ///
-/// Used by `process_sampled_token` to signal whether to continue or halt.
+/// Reserved for Phase 3b: when `forward_start` / `forward_wait` are introduced
+/// in gemma4.rs, a helper method will accept a sampled token, do the CPU work,
+/// and return this enum so the outer loop knows whether to issue the next
+/// `forward_start` or stop.
+#[allow(dead_code)]
 enum DecodeControl {
-    /// Continue generating: next token ID is `next_token`.
+    /// Continue generating; caller should issue the next GPU forward pass for
+    /// `next_token` immediately (before waiting on any pending future).
     Continue { next_token: u32 },
     /// Stop generation (EOS, stop sequence, or callback returned false).
     Stop,
@@ -422,38 +427,48 @@ impl InferenceEngine {
             ));
         }
 
-        // Step 5-6: Decode loop
+        // Step 5-6: Double-buffered decode loop.
+        //
+        // Pre-allocate two logit buffers of vocab_size each.  We alternate which
+        // buffer receives the GPU output and which is being sampled on the CPU.
+        // Currently model.forward() is synchronous (commit_and_wait internally),
+        // so sampling and the next GPU pass are still serialized.  The buffer
+        // swap structure is ready for Phase 3b when forward_start / forward_wait
+        // will be introduced in gemma4.rs to achieve true GPU/CPU overlap.
+        let mut bufs = DecodeBuffers::new(vocab_size);
+
+        let mut next_token = *generated_ids.last().unwrap();
         for step in 1..self.config.max_tokens {
-            // Forward pass on the single new token (KV cache reuses previous keys/values)
-            let step_logits = self.model.forward(&[*generated_ids.last().unwrap()])?;
+            // --- GPU phase: forward pass for the current token ---
+            // Phase 3b: replace this with forward_start(next_token) to make it
+            // non-blocking, then do CPU work below, then call forward_wait().
+            let step_logits = self.model.forward(&[next_token])?;
 
-            // Extract logits for the single position
-            let token_logits = extract_last_position_logits(&step_logits, 1, vocab_size)?;
+            // Write GPU output into the "next" buffer, then swap so that
+            // bufs.current holds the fresh logits ready for CPU sampling.
+            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+            bufs.swap();
 
-            // Sample next token
-            let next_token = sampler.sample_next(&token_logits, &generated_ids);
+            // --- CPU phase: sample + decode + stream (overlaps with GPU in Phase 3b) ---
+            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
 
-            // Check EOS
-            if Some(next_token) == eos_id {
+            if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");
                 break;
             }
 
-            generated_ids.push(next_token);
+            generated_ids.push(sampled);
+            next_token = sampled;
 
-            // Decode the new token
-            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            let token_text = self.tokenizer.decode(&[sampled]).unwrap_or_default();
             generated_text.push_str(&token_text);
 
-            // Check stop sequences
             if self.check_stop_sequences(&generated_text) {
-                // Remove the stop sequence from output
                 self.trim_stop_sequence(&mut generated_text);
                 debug!(step = step, "Stop sequence matched");
                 break;
             }
 
-            // Stream token to callback
             if !on_token(&token_text) {
                 debug!(step = step, "Generation stopped by callback");
                 break;
@@ -700,19 +715,29 @@ impl InferenceEngine {
             ));
         }
 
-        // Decode loop
-        for step in 1..self.config.max_tokens {
-            let step_logits = self.model.forward(&[*generated_ids.last().unwrap()])?;
-            let token_logits = extract_last_position_logits(&step_logits, 1, vocab_size)?;
-            let next_token = sampler.sample_next(&token_logits, &generated_ids);
+        // Double-buffered decode loop — see generate() for full design notes.
+        let mut bufs = DecodeBuffers::new(vocab_size);
 
-            if Some(next_token) == eos_id {
+        let mut next_token = *generated_ids.last().unwrap();
+        for step in 1..self.config.max_tokens {
+            // GPU phase — Phase 3b: replace with forward_start / forward_wait.
+            let step_logits = self.model.forward(&[next_token])?;
+
+            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+            bufs.swap();
+
+            // CPU phase — sampling and streaming.
+            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
+
+            if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");
                 break;
             }
 
-            generated_ids.push(next_token);
-            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            generated_ids.push(sampled);
+            next_token = sampled;
+
+            let token_text = self.tokenizer.decode(&[sampled]).unwrap_or_default();
             generated_text.push_str(&token_text);
 
             if self.check_stop_sequences(&generated_text) {
@@ -868,19 +893,30 @@ impl InferenceEngine {
             ));
         }
 
-        // Decode loop (same as text-only -- vision tokens are cached in KV)
-        for step in 1..self.config.max_tokens {
-            let step_logits = self.model.forward(&[*generated_ids.last().unwrap()])?;
-            let token_logits = extract_last_position_logits(&step_logits, 1, vocab_size)?;
-            let next_token = sampler.sample_next(&token_logits, &generated_ids);
+        // Double-buffered decode loop (vision tokens are cached in KV after prefill).
+        // See generate() for full design notes.
+        let mut bufs = DecodeBuffers::new(vocab_size);
 
-            if Some(next_token) == eos_id {
+        let mut next_token = *generated_ids.last().unwrap();
+        for step in 1..self.config.max_tokens {
+            // GPU phase — Phase 3b: replace with forward_start / forward_wait.
+            let step_logits = self.model.forward(&[next_token])?;
+
+            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+            bufs.swap();
+
+            // CPU phase.
+            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
+
+            if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");
                 break;
             }
 
-            generated_ids.push(next_token);
-            let token_text = self.tokenizer.decode(&[next_token]).unwrap_or_default();
+            generated_ids.push(sampled);
+            next_token = sampled;
+
+            let token_text = self.tokenizer.decode(&[sampled]).unwrap_or_default();
             generated_text.push_str(&token_text);
 
             if self.check_stop_sequences(&generated_text) {
@@ -1027,6 +1063,39 @@ fn extract_last_position_logits(
     let start = (seq_len - 1) * vocab_size;
     let end = start + vocab_size;
     Ok(logits[start..end].to_vec())
+}
+
+/// Extract the logits for the last sequence position into a pre-allocated buffer.
+///
+/// Like [`extract_last_position_logits`] but writes into `out` instead of
+/// allocating.  `out` must have length `vocab_size`.
+///
+/// This is the zero-allocation path used by the double-buffered decode loop.
+/// It eliminates one `Vec` allocation per decode step (typically vocab_size ≈
+/// 256 000 f32 = 1 MiB), which matters across hundreds of steps.
+fn extract_last_position_logits_into(
+    logits: &[f32],
+    seq_len: usize,
+    vocab_size: usize,
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    debug_assert_eq!(out.len(), vocab_size, "output buffer must have length vocab_size");
+    let expected_len = seq_len * vocab_size;
+    if logits.len() < expected_len {
+        return Err(EngineError::Generation {
+            reason: format!(
+                "Logits buffer too small: got {} elements, expected {} (seq_len={}, vocab_size={})",
+                logits.len(),
+                expected_len,
+                seq_len,
+                vocab_size
+            ),
+        });
+    }
+
+    let start = (seq_len - 1) * vocab_size;
+    out.copy_from_slice(&logits[start..start + vocab_size]);
+    Ok(())
 }
 
 #[cfg(test)]
