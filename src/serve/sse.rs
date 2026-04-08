@@ -25,6 +25,10 @@ pub enum GenerationEvent {
     Done {
         prompt_tokens: usize,
         completion_tokens: usize,
+        /// Full generation statistics for timing/GPU counter reporting.
+        /// Carried through to the non-streaming handler to populate
+        /// `x_hf2q_timing` in the response.
+        stats: crate::inference::engine::GenerationStats,
     },
     /// Generation failed mid-stream.
     Error(String),
@@ -95,6 +99,7 @@ pub fn generation_events_to_sse(
                 GenerationEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    stats: _,
                 } => {
                     // Emit final chunk with finish_reason "stop"
                     let final_chunk = ChatCompletionChunk {
@@ -332,6 +337,7 @@ pub fn generation_events_to_sse_with_tools(
                 GenerationEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    stats: _,
                 } => {
                     // Finalize the parser to flush any in-progress state
                     let final_events = parser.finalize();
@@ -526,6 +532,17 @@ mod tests {
             GenerationEvent::Done {
                 prompt_tokens: 5,
                 completion_tokens: 2,
+                stats: crate::inference::engine::GenerationStats {
+                    prompt_tokens: 5,
+                    generated_tokens: 2,
+                    prefill_time_secs: 0.0,
+                    decode_time_secs: 0.0,
+                    total_time_secs: 0.0,
+                    cached_tokens: 0,
+                    time_to_first_token_ms: 0.0,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
+                },
             },
         ])
         .await;
@@ -608,6 +625,17 @@ mod tests {
         let body = collect_sse_body(vec![GenerationEvent::Done {
             prompt_tokens: 10,
             completion_tokens: 0,
+            stats: crate::inference::engine::GenerationStats {
+                prompt_tokens: 10,
+                generated_tokens: 0,
+                prefill_time_secs: 0.0,
+                decode_time_secs: 0.0,
+                total_time_secs: 0.0,
+                cached_tokens: 0,
+                time_to_first_token_ms: 0.0,
+                gpu_sync_count: 0,
+                gpu_dispatch_count: 0,
+            },
         }])
         .await;
 
@@ -624,6 +652,17 @@ mod tests {
         let body = collect_sse_body(vec![GenerationEvent::Done {
             prompt_tokens: 10,
             completion_tokens: 20,
+            stats: crate::inference::engine::GenerationStats {
+                prompt_tokens: 10,
+                generated_tokens: 20,
+                prefill_time_secs: 0.0,
+                decode_time_secs: 0.0,
+                total_time_secs: 0.0,
+                cached_tokens: 0,
+                time_to_first_token_ms: 0.0,
+                gpu_sync_count: 0,
+                gpu_dispatch_count: 0,
+            },
         }])
         .await;
 

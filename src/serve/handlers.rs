@@ -240,6 +240,7 @@ pub async fn chat_completions(
         let mut full_text = String::new();
         let mut completion_tokens = 0usize;
         let mut generation_error: Option<String> = None;
+        let mut generation_stats: Option<crate::inference::engine::GenerationStats> = None;
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -250,9 +251,11 @@ pub async fn chat_completions(
                 GenerationEvent::Done {
                     prompt_tokens: _,
                     completion_tokens: ct,
+                    stats,
                 } => {
                     // Use the accurate counts from the engine
                     completion_tokens = ct;
+                    generation_stats = Some(stats);
                     break;
                 }
                 GenerationEvent::Error(msg) => {
@@ -280,6 +283,18 @@ pub async fn chat_completions(
             (Some(full_text), None, "stop".to_string())
         };
 
+        // Build extended timing info from generation stats if available.
+        let x_hf2q_timing = generation_stats.map(|s| TimingInfo {
+            prefill_time_secs: s.prefill_time_secs,
+            decode_time_secs: s.decode_time_secs,
+            total_time_secs: s.total_time_secs,
+            time_to_first_token_ms: s.time_to_first_token_ms,
+            prefill_tokens_per_sec: s.prefill_tokens_per_sec(),
+            decode_tokens_per_sec: s.decode_tokens_per_sec(),
+            gpu_sync_count: s.gpu_sync_count,
+            gpu_dispatch_count: s.gpu_dispatch_count,
+        });
+
         let response = ChatCompletionResponse {
             id: request_id,
             object: "chat.completion".into(),
@@ -301,6 +316,7 @@ pub async fn chat_completions(
                 total_tokens: prompt_token_count + completion_tokens,
                 prompt_tokens_details: None,
             },
+            x_hf2q_timing,
         };
 
         Ok(Json(response).into_response())
@@ -620,6 +636,7 @@ fn run_generation_blocking(
             let _ = tx.blocking_send(GenerationEvent::Done {
                 prompt_tokens: stats.prompt_tokens,
                 completion_tokens: stats.generated_tokens,
+                stats,
             });
         }
         Ok(Err(engine_err)) => {

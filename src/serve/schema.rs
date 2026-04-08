@@ -407,6 +407,23 @@ pub struct ChatCompletionRequest {
 // Chat Completions -- Response (non-streaming)
 // ---------------------------------------------------------------------------
 
+/// Extended timing information returned alongside chat completions (hf2q-specific).
+///
+/// Serialized into the `x_hf2q_timing` field of `ChatCompletionResponse`.
+/// Omitted entirely when not populated (e.g., streaming responses).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimingInfo {
+    pub prefill_time_secs: f64,
+    pub decode_time_secs: f64,
+    pub total_time_secs: f64,
+    /// Time from request start to the first sampled token (milliseconds).
+    pub time_to_first_token_ms: f64,
+    pub prefill_tokens_per_sec: f64,
+    pub decode_tokens_per_sec: f64,
+    pub gpu_sync_count: u64,
+    pub gpu_dispatch_count: u64,
+}
+
 /// Full chat completion response (non-streaming).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionResponse {
@@ -416,6 +433,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: UsageStats,
+    /// Extended timing information (hf2q-specific). Omitted if not available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_hf2q_timing: Option<TimingInfo>,
 }
 
 /// A single choice in a non-streaming response.
@@ -743,6 +763,7 @@ mod tests {
                 total_tokens: 15,
                 prompt_tokens_details: None,
             },
+            x_hf2q_timing: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "chatcmpl-123");

@@ -294,6 +294,12 @@ fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
         stats.decode_tokens_per_sec(),
         stats.total_time_secs,
     );
+    eprintln!(
+        "{} TTFT {:.1} ms, GPU syncs {}",
+        style("Timing:").bold(),
+        stats.time_to_first_token_ms,
+        stats.gpu_sync_count,
+    );
 
     Ok(())
 }

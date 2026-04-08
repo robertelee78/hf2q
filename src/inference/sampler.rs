@@ -84,8 +84,9 @@ impl Sampler {
             apply_top_p(&mut working_logits, self.config.top_p);
         }
 
-        // Step 5: Softmax + categorical sample
-        sample_categorical(&mut self.rng, &working_logits)
+        // Step 5: Compute softmax ONCE, then sample categorically from probabilities
+        let probs = softmax(&working_logits);
+        sample_categorical_from_probs(&mut self.rng, &probs, &working_logits)
     }
 }
 
@@ -115,15 +116,23 @@ fn apply_temperature(logits: &mut [f32], temperature: f32) {
 }
 
 /// Apply top-k filtering: set all logits outside the top k to -infinity.
+///
+/// Uses `select_nth_unstable_by` for O(V) average-case partitioning instead of
+/// O(V log V) full sort. For V=262,144 this saves roughly 4x comparisons.
 fn apply_top_k(logits: &mut [f32], k: usize) {
     if k >= logits.len() {
         return;
     }
 
-    // Find the k-th largest value using partial sort
+    // Build an indexed copy so we can find the k-th largest without sorting fully.
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    // Sort descending by value
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // O(V) partial sort: after this call, indexed[k-1] holds the element that
+    // would be at position k-1 in descending order, and indexed[0..k] contains
+    // (unordered) the top-k elements.
+    indexed.select_nth_unstable_by(k - 1, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let threshold = indexed[k - 1].1;
 
@@ -140,8 +149,15 @@ fn apply_top_k(logits: &mut [f32], k: usize) {
 ///
 /// Sort tokens by descending probability, accumulate until cumulative
 /// probability exceeds p, then mask the rest to -infinity.
+///
+/// Computes softmax internally; the caller in `sample_next` will recompute
+/// softmax once afterwards on the filtered logits so probabilities remain
+/// consistent with whatever tokens survived.
 fn apply_top_p(logits: &mut [f32], p: f32) {
-    // Compute softmax probabilities for sorting
+    // Compute softmax probabilities for sorting decisions only.
+    // A second softmax is computed later on the *filtered* logits to yield
+    // the final sampling distribution — this ensures masked tokens have
+    // exactly probability 0 regardless of floating-point rounding here.
     let probs = softmax(logits);
 
     // Sort by descending probability, tracking original indices
@@ -216,16 +232,18 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Sample from a categorical distribution defined by logits (not probabilities).
+/// Sample from a categorical distribution given pre-computed probabilities.
 ///
-/// Converts logits to probabilities via softmax, then samples proportionally.
-fn sample_categorical(rng: &mut impl Rng, logits: &[f32]) -> u32 {
-    let probs = softmax(logits);
-
+/// `probs` must already be a softmax output (non-negative, sums to ~1).
+/// `logits` is used only as a fallback for argmax when all probs are ~0.
+///
+/// This is the hot path called by `sample_next`; softmax is computed exactly
+/// once upstream and passed in here to avoid redundant work.
+fn sample_categorical_from_probs(rng: &mut impl Rng, probs: &[f32], logits: &[f32]) -> u32 {
     // Build cumulative distribution
     let mut cumulative = Vec::with_capacity(probs.len());
     let mut sum = 0.0f32;
-    for &p in &probs {
+    for &p in probs {
         sum += p;
         cumulative.push(sum);
     }
@@ -250,7 +268,16 @@ fn sample_categorical(rng: &mut impl Rng, logits: &[f32]) -> u32 {
     }
 
     // Fallback: return the last token
-    (logits.len() - 1) as u32
+    (probs.len() - 1) as u32
+}
+
+/// Sample from a categorical distribution defined by logits (not probabilities).
+///
+/// Converts logits to probabilities via softmax, then samples proportionally.
+/// Kept for direct use in tests.
+fn sample_categorical(rng: &mut impl Rng, logits: &[f32]) -> u32 {
+    let probs = softmax(logits);
+    sample_categorical_from_probs(rng, &probs, logits)
 }
 
 /// Return the index of the maximum value (greedy argmax).

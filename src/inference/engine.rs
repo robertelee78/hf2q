@@ -10,6 +10,33 @@
 //!
 //! Runs synchronously for CLI use. A future story will wrap with
 //! `spawn_blocking` + channels for async server integration.
+//!
+//! ## Double-Buffer Pipeline (Phase 3a)
+//!
+//! The decode loop is structured for future async overlap between the GPU
+//! forward pass for token N+1 and CPU sampling/decoding of token N.
+//!
+//! Currently `model.forward()` calls `commit_and_wait()` internally, so the
+//! two steps are still serialized. Phase 3b (handled by a separate agent in
+//! gemma4.rs) will split this into `forward_start()` / `forward_wait()` to
+//! enable true overlap.
+//!
+//! ### ForwardHandle — Future Async Interface (TODO: Phase 3b)
+//!
+//! Once gemma4.rs exposes non-blocking forward passes, the trait will gain:
+//!
+//! ```ignore
+//! /// Begin a GPU forward pass without blocking the CPU.
+//! /// Returns a handle that can be waited on later.
+//! fn forward_start(&mut self, tokens: &[u32]) -> Result<ForwardHandle, Gemma4Error>;
+//!
+//! /// Block until the handle's GPU work completes and return the logits.
+//! fn forward_wait(&mut self, handle: ForwardHandle) -> Result<Vec<f32>, Gemma4Error>;
+//! ```
+//!
+//! The decode loop restructuring is already in place so that inserting
+//! `forward_start` / `forward_wait` calls will achieve true pipeline overlap
+//! without any further loop restructuring.
 
 use std::path::Path;
 use std::time::Instant;
@@ -26,6 +53,66 @@ use crate::tokenizer::chat_template::{ChatTemplate, ChatTemplateError, Message};
 use crate::tokenizer::{HfTokenizer, TokenizerError};
 
 use mlx_native::MlxDevice;
+
+// ---------------------------------------------------------------------------
+// Double-buffer pipeline types
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated logit buffers for the decode loop.
+///
+/// The double-buffer pattern keeps two `Vec<f32>` of exactly `vocab_size`
+/// elements alive for the entire generation run, eliminating per-step heap
+/// allocations.  One buffer holds the logits being sampled (CPU), the other
+/// is ready to receive the next forward-pass output (GPU).
+///
+/// When Phase 3b lands (non-blocking `forward_start` / `forward_wait`), the
+/// CPU can sample from `current` while the GPU writes into `next`, achieving
+/// true pipeline overlap without any allocation.
+struct DecodeBuffers {
+    /// Buffer for the current step's logits (being sampled on CPU).
+    current: Vec<f32>,
+    /// Buffer for the next step's logits (will receive GPU output).
+    next: Vec<f32>,
+}
+
+impl DecodeBuffers {
+    /// Allocate both buffers to `vocab_size` elements, zeroed.
+    fn new(vocab_size: usize) -> Self {
+        Self {
+            current: vec![0.0f32; vocab_size],
+            next: vec![0.0f32; vocab_size],
+        }
+    }
+
+    /// Swap `current` and `next` in place (zero-cost pointer swap).
+    ///
+    /// Call this once per step after the GPU output has been written into
+    /// `next` and before sampling from it:
+    ///
+    /// ```ignore
+    /// // GPU writes into buffers.next ...
+    /// buffers.swap();
+    /// // Now sample from buffers.current (was next).
+    /// ```
+    #[inline]
+    fn swap(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
+    }
+}
+
+/// Outcome of processing a single sampled token in the decode loop.
+///
+/// Used by `process_sampled_token` to signal whether to continue or halt.
+enum DecodeControl {
+    /// Continue generating: next token ID is `next_token`.
+    Continue { next_token: u32 },
+    /// Stop generation (EOS, stop sequence, or callback returned false).
+    Stop,
+}
+
+// ---------------------------------------------------------------------------
+// Errors from the inference engine.
+// ---------------------------------------------------------------------------
 
 /// Errors from the inference engine.
 #[derive(Error, Debug)]
@@ -87,6 +174,12 @@ pub struct GenerationStats {
     /// (skipped during prefill). Zero when prompt caching is disabled
     /// or on a cache miss.
     pub cached_tokens: usize,
+    /// Time to first token (milliseconds). Includes prefill + first sample.
+    pub time_to_first_token_ms: f64,
+    /// Number of GPU sync points (commit_and_wait calls) during this generation.
+    pub gpu_sync_count: u64,
+    /// Number of GPU kernel dispatches during this generation.
+    pub gpu_dispatch_count: u64,
 }
 
 impl GenerationStats {
@@ -271,7 +364,18 @@ impl InferenceEngine {
 
         let decode_start = Instant::now();
 
+        // Reset GPU counters before sampling begins so we capture the full
+        // generation cost (prefill sync + decode dispatches).
+        // TODO(instrumentor-agent): enable once mlx_native::reset_counters lands.
+        #[cfg(feature = "mlx-native")]
+        {
+            // mlx_native::reset_counters();
+        }
+
         let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
+
+        // TTFT: time from generate() entry to first sampled token.
+        let time_to_first_token_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
         // Check stop conditions for first token
         if Some(first_token) == eos_id {
@@ -287,6 +391,9 @@ impl InferenceEngine {
                     decode_time_secs: 0.0,
                     total_time_secs: total_time,
                     cached_tokens,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -308,6 +415,9 @@ impl InferenceEngine {
                     decode_time_secs: decode_start.elapsed().as_secs_f64(),
                     total_time_secs: total_time,
                     cached_tokens,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -358,6 +468,16 @@ impl InferenceEngine {
         let decode_time = decode_start.elapsed().as_secs_f64();
         let total_time = total_start.elapsed().as_secs_f64();
 
+        // Read GPU counters accumulated during this generation.
+        // TODO(instrumentor-agent): enable once mlx_native counter functions land.
+        #[cfg(feature = "mlx-native")]
+        let (gpu_sync_count, gpu_dispatch_count) = {
+            // (mlx_native::sync_count(), mlx_native::dispatch_count())
+            (0u64, 0u64)
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (gpu_sync_count, gpu_dispatch_count) = (0u64, 0u64);
+
         let stats = GenerationStats {
             prompt_tokens: prompt_len,
             generated_tokens: generated_ids.len(),
@@ -365,6 +485,9 @@ impl InferenceEngine {
             decode_time_secs: decode_time,
             total_time_secs: total_time,
             cached_tokens,
+            time_to_first_token_ms,
+            gpu_sync_count,
+            gpu_dispatch_count,
         };
 
         Ok((generated_text, stats))
@@ -523,7 +646,17 @@ impl InferenceEngine {
         let eos_id = self.tokenizer.eos_id();
         let decode_start = Instant::now();
 
+        // Reset GPU counters before sampling begins.
+        // TODO(instrumentor-agent): enable once mlx_native::reset_counters lands.
+        #[cfg(feature = "mlx-native")]
+        {
+            // mlx_native::reset_counters();
+        }
+
         let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
+
+        // TTFT: time from generate_from_formatted_prompt() entry to first sampled token.
+        let time_to_first_token_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
         if Some(first_token) == eos_id {
             self.store_prompt_in_cache(prompt_tokens, false);
@@ -537,6 +670,9 @@ impl InferenceEngine {
                     decode_time_secs: 0.0,
                     total_time_secs: total_time,
                     cached_tokens,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -557,6 +693,9 @@ impl InferenceEngine {
                     decode_time_secs: decode_start.elapsed().as_secs_f64(),
                     total_time_secs: total_time,
                     cached_tokens,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -594,6 +733,16 @@ impl InferenceEngine {
         let decode_time = decode_start.elapsed().as_secs_f64();
         let total_time = total_start.elapsed().as_secs_f64();
 
+        // Read GPU counters accumulated during this generation.
+        // TODO(instrumentor-agent): enable once mlx_native counter functions land.
+        #[cfg(feature = "mlx-native")]
+        let (gpu_sync_count, gpu_dispatch_count) = {
+            // (mlx_native::sync_count(), mlx_native::dispatch_count())
+            (0u64, 0u64)
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (gpu_sync_count, gpu_dispatch_count) = (0u64, 0u64);
+
         Ok((
             generated_text,
             GenerationStats {
@@ -603,6 +752,9 @@ impl InferenceEngine {
                 decode_time_secs: decode_time,
                 total_time_secs: total_time,
                 cached_tokens,
+                time_to_first_token_ms,
+                gpu_sync_count,
+                gpu_dispatch_count,
             },
         ))
     }
@@ -661,7 +813,17 @@ impl InferenceEngine {
         let eos_id = self.tokenizer.eos_id();
         let decode_start = Instant::now();
 
+        // Reset GPU counters before sampling begins.
+        // TODO(instrumentor-agent): enable once mlx_native::reset_counters lands.
+        #[cfg(feature = "mlx-native")]
+        {
+            // mlx_native::reset_counters();
+        }
+
         let first_token = sampler.sample_next(&last_pos_logits, &generated_ids);
+
+        // TTFT: time from generate_from_formatted_prompt_with_vision() entry to first sampled token.
+        let time_to_first_token_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
         if Some(first_token) == eos_id {
             // Store in prompt cache with vision flag
@@ -676,6 +838,9 @@ impl InferenceEngine {
                     decode_time_secs: 0.0,
                     total_time_secs: total_time,
                     cached_tokens: 0,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -696,6 +861,9 @@ impl InferenceEngine {
                     decode_time_secs: decode_start.elapsed().as_secs_f64(),
                     total_time_secs: total_time,
                     cached_tokens: 0,
+                    time_to_first_token_ms,
+                    gpu_sync_count: 0,
+                    gpu_dispatch_count: 0,
                 },
             ));
         }
@@ -732,6 +900,16 @@ impl InferenceEngine {
 
         self.store_prompt_in_cache(prompt_tokens, true);
 
+        // Read GPU counters accumulated during this generation.
+        // TODO(instrumentor-agent): enable once mlx_native counter functions land.
+        #[cfg(feature = "mlx-native")]
+        let (gpu_sync_count, gpu_dispatch_count) = {
+            // (mlx_native::sync_count(), mlx_native::dispatch_count())
+            (0u64, 0u64)
+        };
+        #[cfg(not(feature = "mlx-native"))]
+        let (gpu_sync_count, gpu_dispatch_count) = (0u64, 0u64);
+
         Ok((
             generated_text,
             GenerationStats {
@@ -741,6 +919,9 @@ impl InferenceEngine {
                 decode_time_secs: decode_time,
                 total_time_secs: total_time,
                 cached_tokens: 0,
+                time_to_first_token_ms,
+                gpu_sync_count,
+                gpu_dispatch_count,
             },
         ))
     }
@@ -887,6 +1068,9 @@ mod tests {
             decode_time_secs: 2.5,
             total_time_secs: 3.0,
             cached_tokens: 0,
+            time_to_first_token_ms: 0.0,
+            gpu_sync_count: 0,
+            gpu_dispatch_count: 0,
         };
         assert!((stats.decode_tokens_per_sec() - 20.0).abs() < 1e-6);
         assert!((stats.prefill_tokens_per_sec() - 200.0).abs() < 1e-6);
@@ -901,6 +1085,9 @@ mod tests {
             decode_time_secs: 0.0,
             total_time_secs: 0.0,
             cached_tokens: 0,
+            time_to_first_token_ms: 0.0,
+            gpu_sync_count: 0,
+            gpu_dispatch_count: 0,
         };
         assert_eq!(stats.decode_tokens_per_sec(), 0.0);
         assert_eq!(stats.prefill_tokens_per_sec(), 0.0);
@@ -915,6 +1102,9 @@ mod tests {
             decode_time_secs: 2.5,
             total_time_secs: 2.6,
             cached_tokens: 450,
+            time_to_first_token_ms: 0.0,
+            gpu_sync_count: 0,
+            gpu_dispatch_count: 0,
         };
         // Only 50 tokens were actually prefilled, but prompt_tokens reports
         // the full count for the API response.
