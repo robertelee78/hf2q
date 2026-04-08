@@ -12,8 +12,6 @@
 mod backends;
 mod cli;
 mod doctor;
-#[cfg(feature = "mlx-native")]
-mod hub;
 #[allow(dead_code)]
 mod inference;
 mod input;
@@ -26,11 +24,6 @@ mod quality;
 mod quantize;
 #[allow(dead_code)]
 mod report;
-#[cfg(feature = "serve")]
-mod serve;
-#[cfg(feature = "mlx-native")]
-#[allow(dead_code)]
-mod tokenizer;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -136,320 +129,12 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
-        #[cfg(feature = "mlx-native")]
-        Command::Infer(args) => cmd_infer(args),
-        #[cfg(feature = "serve")]
-        Command::Serve(args) => cmd_serve(args),
     }
-}
-
-/// Handle the `infer` subcommand (requires mlx-native feature).
-#[cfg(feature = "mlx-native")]
-fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
-    use std::io::Write;
-
-    use console::style;
-    use inference::engine::{EngineConfig, InferenceEngine};
-    use inference::sampler::SamplerConfig;
-
-    // Validate sampling parameters
-    if args.temperature < 0.0 {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "Temperature must be >= 0.0, got {}",
-            args.temperature
-        )));
-    }
-    if args.top_p <= 0.0 || args.top_p > 1.0 {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "Top-p must be in (0.0, 1.0], got {}",
-            args.top_p
-        )));
-    }
-    if args.repetition_penalty < 1.0 {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "Repetition penalty must be >= 1.0, got {}",
-            args.repetition_penalty
-        )));
-    }
-
-    // Require a prompt for CLI mode
-    let prompt = args.prompt.as_deref().ok_or_else(|| {
-        AppError::Input(anyhow::anyhow!(
-            "No prompt provided. Use --prompt \"your text here\""
-        ))
-    })?;
-
-    // Step 1: Resolve model path (local or Hub download)
-    let model_dir = hub::download::resolve_model_path(&args.model)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    // Step 2: Detect architecture (for memory estimation display)
-    let config_path = model_dir.join("config.json");
-    if !config_path.exists() {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "No config.json found in {}. Is this a valid model directory?",
-            model_dir.display()
-        )));
-    }
-
-    let model_config = inference::models::registry::detect_architecture(&config_path)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    eprintln!(
-        "{} {}",
-        style("Architecture:").bold(),
-        model_config.architecture_str
-    );
-
-    // Step 3: Memory estimation and fail-fast check
-    let max_tokens = args.max_tokens.unwrap_or(512) as usize;
-    let max_seq_len = (max_tokens as u64).max(4096);
-    let mem_estimate = inference::memory_estimate::estimate_memory(
-        &model_config,
-        &model_dir,
-        max_seq_len,
-    )
-    .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    eprintln!(
-        "{} {:.1} GB (weights: {:.1} GB, KV cache: {:.1} GB)",
-        style("Memory estimate:").bold(),
-        mem_estimate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        mem_estimate.weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        mem_estimate.kv_cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-    eprintln!(
-        "{} {:.1} GB ({:.1}% usage)",
-        style("Available memory:").bold(),
-        mem_estimate.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        mem_estimate.usage_percent(),
-    );
-
-    inference::memory_estimate::check_memory(&mem_estimate)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    // Step 4: Build engine config
-    let sampler_config = SamplerConfig {
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k as usize,
-        repetition_penalty: args.repetition_penalty,
-        ..Default::default()
-    };
-
-    let engine_config = EngineConfig {
-        max_tokens,
-        sampler: sampler_config,
-        stop_sequences: Vec::new(),
-    };
-
-    // Step 5: Create inference engine (loads model, tokenizer, chat template)
-    eprintln!("{}", style("Loading model...").dim());
-    let chat_template_override = args.chat_template.as_deref();
-
-    let mut engine = InferenceEngine::new(&model_dir, engine_config, chat_template_override)
-        .map_err(|e| {
-            // Map chat template not found to a user-friendly message
-            match &e {
-                inference::engine::EngineError::ChatTemplate(
-                    crate::tokenizer::chat_template::ChatTemplateError::NotFound,
-                ) => AppError::Input(anyhow::anyhow!(
-                    "No chat template found. Provide one with --chat-template"
-                )),
-                _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
-            }
-        })?;
-
-    eprintln!("{}", style("Generating...").dim());
-    eprintln!();
-
-    // Step 6: Generate with streaming output
-    let stdout = std::io::stdout();
-    let (text, stats) = engine
-        .generate(prompt, |token_text| {
-            // Stream each token to stdout as it is generated
-            let mut out = stdout.lock();
-            let _ = out.write_all(token_text.as_bytes());
-            let _ = out.flush();
-            true // continue generating
-        })
-        .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
-
-    // Ensure we end on a newline
-    if !text.ends_with('\n') {
-        println!();
-    }
-
-    // Step 7: Print generation statistics
-    eprintln!();
-    eprintln!(
-        "{} {} prompt tokens, {} generated tokens",
-        style("Stats:").bold(),
-        stats.prompt_tokens,
-        stats.generated_tokens,
-    );
-    eprintln!(
-        "{} prefill {:.1} tok/s, decode {:.1} tok/s, total {:.2}s",
-        style("Speed:").bold(),
-        stats.prefill_tokens_per_sec(),
-        stats.decode_tokens_per_sec(),
-        stats.total_time_secs,
-    );
-    eprintln!(
-        "{} TTFT {:.1} ms, GPU syncs {}",
-        style("Timing:").bold(),
-        stats.time_to_first_token_ms,
-        stats.gpu_sync_count,
-    );
-
-    Ok(())
-}
-
-/// Handle the `serve` subcommand (requires serve feature).
-#[cfg(feature = "serve")]
-fn cmd_serve(args: cli::ServeArgs) -> Result<(), AppError> {
-    use console::style;
-    use inference::engine::{EngineConfig, InferenceEngine};
-    use inference::sampler::SamplerConfig;
-
-    // Step 1: Resolve model path
-    let model_dir = hub::download::resolve_model_path(&args.model)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    // Step 2: Validate model directory
-    let config_path = model_dir.join("config.json");
-    if !config_path.exists() {
-        return Err(AppError::Input(anyhow::anyhow!(
-            "No config.json found in {}. Is this a valid model directory?",
-            model_dir.display()
-        )));
-    }
-
-    let model_config = inference::models::registry::detect_architecture(&config_path)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    eprintln!(
-        "{} {}",
-        style("Architecture:").bold(),
-        model_config.architecture_str
-    );
-
-    // Step 3: Memory estimation
-    let max_seq_len = 4096u64; // Default for serve mode
-    let mem_estimate =
-        inference::memory_estimate::estimate_memory(&model_config, &model_dir, max_seq_len)
-            .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    eprintln!(
-        "{} {:.1} GB (weights: {:.1} GB, KV cache: {:.1} GB)",
-        style("Memory estimate:").bold(),
-        mem_estimate.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        mem_estimate.weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        mem_estimate.kv_cache_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-
-    inference::memory_estimate::check_memory(&mem_estimate)
-        .map_err(|e| AppError::Input(anyhow::anyhow!("{}", e)))?;
-
-    // Step 4: Build engine config (defaults for serve mode)
-    let engine_config = EngineConfig {
-        max_tokens: 4096,
-        sampler: SamplerConfig::default(),
-        stop_sequences: Vec::new(),
-    };
-
-    // Step 5: Load model
-    eprintln!("{}", style("Loading model...").dim());
-    let chat_template_override = args.chat_template.as_deref();
-
-    let prompt_cache_config = inference::prompt_cache::PromptCacheConfig {
-        enabled: !args.no_prompt_cache,
-        ..Default::default()
-    };
-
-    let engine = InferenceEngine::new_with_prompt_cache(
-        &model_dir,
-        engine_config,
-        chat_template_override,
-        prompt_cache_config,
-    )
-    .map_err(|e| match &e {
-        inference::engine::EngineError::ChatTemplate(
-            crate::tokenizer::chat_template::ChatTemplateError::NotFound,
-        ) => AppError::Input(anyhow::anyhow!(
-            "No chat template found. Provide one with --chat-template"
-        )),
-        _ => AppError::Conversion(anyhow::anyhow!("{}", e)),
-    })?;
-
-    let engine_max_seq_len = engine.max_seq_len();
-
-    // Step 6: Load tokenizer and chat template separately for the server
-    // (so validation can happen without locking the engine Mutex)
-    let tokenizer = tokenizer::HfTokenizer::from_dir(&model_dir)
-        .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
-
-    let chat_template = if let Some(override_path) = chat_template_override {
-        tokenizer::chat_template::ChatTemplate::from_file(override_path)
-            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?
-    } else {
-        tokenizer::chat_template::ChatTemplate::from_model_dir(&model_dir)
-            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?
-    };
-
-    // Derive model name from directory basename
-    let model_name = model_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown-model".to_string());
-
-    eprintln!(
-        "{} {}",
-        style("Prompt cache:").bold(),
-        if args.no_prompt_cache { "disabled" } else { "enabled" }
-    );
-
-    eprintln!(
-        "{} {}",
-        style("Model:").bold(),
-        model_name
-    );
-
-    // Step 7: Start the tokio runtime and run the server
-    let serve_config = serve::ServeConfig {
-        host: args.host,
-        port: args.port,
-        queue_depth: args.queue_depth,
-        embedding_concurrency: args.embedding_concurrency,
-    };
-
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::Conversion(anyhow::anyhow!("Failed to create tokio runtime: {}", e)))?;
-
-    // Pass the raw model config for vision encoder initialization
-    let raw_config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-
-    rt.block_on(async {
-        serve::run(
-            engine,
-            tokenizer,
-            chat_template,
-            model_name,
-            engine_max_seq_len,
-            serve_config,
-            raw_config.as_ref(),
-        )
-        .await
-        .map_err(|e| AppError::Conversion(e))
-    })
 }
 
 /// Handle the `convert` subcommand.
 fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use backends::coreml::CoremlBackend;
-    use backends::mlx::MlxBackend;
     use backends::OutputBackend;
     use intelligence::fingerprint::ModelFingerprint;
     use intelligence::hardware::HardwareProfiler;
@@ -511,89 +196,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .map_err(AppError::Conversion)?;
 
     // Phase 0.4: Auto mode resolution (if --quant auto or default)
-    //
-    // For MLX output, we use the intelligent auto_quant algorithm which produces
-    // per-tensor bit overrides. For other formats, we use the existing AutoResolver
-    // which returns a simple ResolvedConfig.
-    use intelligence::auto_quant::{resolve_auto_plan, AutoQuantConstraints, QualityPreference};
-
-    let mut auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
+    let auto_plan: Option<intelligence::auto_quant::AutoQuantPlan> = None;
     let resolved_auto = if config.quant == cli::QuantMethod::Auto {
-        if config.format == cli::OutputFormat::Mlx {
-            // MLX path: use intelligent auto_quant for per-tensor bit allocation
-            let constraints = AutoQuantConstraints {
-                min_tok_per_sec: 80.0,
-                quality_preference: QualityPreference::Balanced,
-                ..AutoQuantConstraints::default()
-            };
-
-            let plan = resolve_auto_plan(&hardware, &fingerprint, &constraints)
-                .context("Auto-quant resolution failed")
-                .map_err(AppError::Conversion)?;
-
-            // Log the auto plan
-            tracing::info!(
-                base_bits = plan.base_bits,
-                estimated_tok_s = plan.estimated_tok_per_sec,
-                overrides = plan.component_overrides.len(),
-                "Auto-quant resolved: {}",
-                plan.reasoning
-            );
-
-            // Map the plan's quant_method to our CLI enum
-            let resolved_quant = match plan.quant_method.as_str() {
-                "f16" => cli::QuantMethod::F16,
-                "q8" => cli::QuantMethod::Q8,
-                "q4" => cli::QuantMethod::Q4,
-                "q2" => cli::QuantMethod::Q2,
-                "mixed-4-6" => cli::QuantMethod::Mixed46,
-                "mixed-3-6" => cli::QuantMethod::Mixed36,
-                "mixed-2-6" => cli::QuantMethod::Mixed26,
-                other => {
-                    warn!(
-                        "Auto-quant recommended '{}' which is not a known method. Using q4 as base.",
-                        other
-                    );
-                    cli::QuantMethod::Q4
-                }
-            };
-
-            config.quant = resolved_quant;
-            config.bits = Some(plan.base_bits);
-            if plan.group_size > 0 {
-                config.group_size = plan.group_size;
-            }
-
-            // Build a ResolvedConfig for display and dry-run compatibility
-            let resolved = intelligence::ResolvedConfig {
-                quant_method: plan.quant_method.clone(),
-                bits: plan.base_bits,
-                group_size: plan.group_size,
-                confidence: plan.confidence,
-                source: intelligence::ResolvedSource::Heuristic,
-                reasoning: plan.reasoning.clone(),
-                hardware: hardware.clone(),
-                fingerprint: fingerprint.clone(),
-            };
-            intelligence::display_resolved_config(&resolved);
-
-            // Update output dir if it was auto-generated with "auto" in the name
-            if args.output.is_none() {
-                let model_name = config
-                    .input_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "model".to_string());
-                config.output_dir = std::path::PathBuf::from(format!(
-                    "{}-{}-{}",
-                    model_name, config.format, config.quant
-                ));
-            }
-
-            auto_plan = Some(plan);
-            Some(resolved)
-        } else {
-            // Non-MLX path: use existing AutoResolver (works for CoreML/GGUF)
+        {
             let resolved = AutoResolver::resolve(&hardware, &fingerprint, Some(&ruvector_db))
                 .context("Auto mode resolution failed")
                 .map_err(AppError::Conversion)?;
@@ -730,9 +335,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         "Model loaded"
     );
 
-    // Phase 2: Convert bf16 -> f16 (skip for MLX native path which preserves bf16)
+    // Phase 2: Convert bf16 -> f16
     let backend: Box<dyn OutputBackend> = match config.format {
-        cli::OutputFormat::Mlx => Box::new(MlxBackend::new()),
         cli::OutputFormat::Coreml => Box::new(CoremlBackend::new()),
         other => {
             return Err(AppError::Conversion(anyhow::anyhow!(
@@ -756,7 +360,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
-    // Phase 3: Quantize (skipped for native backends like MLX)
+    // Phase 3: Quantize (skipped for native backends)
     let quant_method_str = config.quant.to_string();
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
@@ -807,8 +411,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 let mut runner = inference::create_runner();
                 if !runner.is_available() {
                     return Err(AppError::Conversion(anyhow::anyhow!(
-                        "DWQ quantization requires the mlx-backend feature. \
-                         Rebuild with: cargo build --features mlx-backend"
+                        "DWQ quantization requires an inference backend. \
+                         No inference backend is currently available."
                     )));
                 }
 
@@ -916,7 +520,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     }
 
     let manifest = if backend.requires_native_quantization() {
-        // Native path (MLX): backend quantizes directly from original tensors.
+        // Native path: backend quantizes directly from original tensors.
         // Pass auto_quant base_bits (or the configured bits) plus per-tensor overrides.
         let native_bits = if let Some(ref plan) = auto_plan {
             plan.base_bits
@@ -990,8 +594,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             }
         } else {
             tracing::info!(
-                "Quality measurement skipped: mlx-backend feature not enabled. \
-                 Rebuild with --features mlx-backend to enable quality measurement."
+                "Quality measurement skipped: no inference backend available."
             );
             quality::QualityReport::empty()
         }

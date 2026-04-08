@@ -1,10 +1,9 @@
-//! Stub inference runner — returns UnsupportedPlatform on non-Apple targets
-//! or when the mlx-backend feature is not enabled.
+//! Stub inference runner — returns errors when no inference backend is available.
 
 use crate::inference::{ForwardOutput, InferenceError, InferenceRunner, TokenInput};
 use crate::ir::{ModelMetadata, TensorMap};
 
-/// Stub runner for platforms without MLX support or when mlx-backend feature is disabled.
+/// Stub runner for when no inference backend is available.
 pub struct StubRunner;
 
 impl InferenceRunner for StubRunner {
@@ -22,17 +21,17 @@ impl InferenceRunner for StubRunner {
         _metadata: &ModelMetadata,
         _memory_budget_bytes: usize,
     ) -> Result<(), InferenceError> {
-        Err(InferenceError::MlxBackendRequired)
+        Err(InferenceError::BackendRequired)
     }
 
     fn unload(&mut self) {}
 
     fn forward(&self, _input: &TokenInput) -> Result<ForwardOutput, InferenceError> {
-        Err(InferenceError::MlxBackendRequired)
+        Err(InferenceError::BackendRequired)
     }
 
     fn logits(&self, _input: &TokenInput) -> Result<Vec<Vec<f32>>, InferenceError> {
-        Err(InferenceError::MlxBackendRequired)
+        Err(InferenceError::BackendRequired)
     }
 }
 
@@ -70,12 +69,6 @@ mod tests {
         };
         let result = runner.load(&tensor_map, &metadata, 1024);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("mlx-backend"),
-            "Error should mention mlx-backend feature: {}",
-            err
-        );
     }
 
     #[test]

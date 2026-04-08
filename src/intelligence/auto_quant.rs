@@ -384,7 +384,7 @@ pub fn resolve_auto_plan(
 
     // Step 3: Search for the best base bit width
     // Candidate bit widths in descending quality order.
-    // We skip odd widths (3, 6) that use slower scalar packing on MLX
+    // We skip odd widths (3, 6) that use slower scalar packing
     // unless the quality preference demands them.
     let candidates: &[u8] = match constraints.quality_preference {
         QualityPreference::Speed => &[4, 3, 2],
@@ -550,7 +550,7 @@ pub fn resolve_auto_plan(
 ///
 /// The strategy: keep attention projections at base bits but elevate the MLP
 /// pathway and critical routing to 8-bit. This matches the approach used by
-/// high-quality community quantizations (e.g., mlx-community 4-bit models)
+/// high-quality community quantizations (e.g., 4-bit models)
 /// and dramatically reduces generation artifacts compared to uniform quantization.
 ///
 /// Override hierarchy (highest priority first):
@@ -575,7 +575,7 @@ fn build_component_overrides(
             reason: "Router misrouting is catastrophic in MoE models".to_string(),
         });
         // Gemma4's router.scale and per_expert_scale are automatically preserved
-        // as non-weight tensors by the MLX backend's should_quantize logic — no override needed.
+        // as non-weight tensors by the backend's should_quantize logic — no override needed.
     }
 
     // Rule 2: MLP layers at 8-bit when base is 4-bit or lower.
@@ -596,8 +596,8 @@ fn build_component_overrides(
     }
 
     // Rule 3: v_proj gets elevated bits (biggest attention component quality impact)
-    // MLX only supports 2, 3, 4, 6, 8 — use next_valid_mlx_bits to clamp
-    let v_proj_bits = next_valid_mlx_bits(base_bits, 2);
+    // Valid bit widths: 2, 3, 4, 6, 8 — use next_valid_bits to clamp
+    let v_proj_bits = next_valid_bits(base_bits, 2);
     if v_proj_bits > base_bits {
         overrides.push(ComponentOverride {
             pattern: "v_proj".to_string(),
@@ -611,7 +611,7 @@ fn build_component_overrides(
 
     // Rule 4: At aggressive quantization (2-3 bit base), protect first/last layers
     if base_bits <= 3 {
-        let elevated = next_valid_mlx_bits(base_bits, 2);
+        let elevated = next_valid_bits(base_bits, 2);
         overrides.push(ComponentOverride {
             pattern: "layers.0.".to_string(),
             bits: elevated,
@@ -629,10 +629,10 @@ fn build_component_overrides(
     overrides
 }
 
-/// Get the next valid MLX bit width that is at least `steps` above `base`.
+/// Get the next valid bit width that is at least `steps` above `base`.
 /// Currently limited to power-of-2 widths (2, 4, 8) which are verified working.
 /// TODO: Enable 3-bit and 6-bit once non-power-of-2 uint32 packing is validated.
-fn next_valid_mlx_bits(base: u8, steps: u8) -> u8 {
+fn next_valid_bits(base: u8, steps: u8) -> u8 {
     const VALID: [u8; 5] = [2, 3, 4, 6, 8];
     let target = base + steps;
     for &v in &VALID {
@@ -712,7 +712,7 @@ pub enum AutoQuantError {
 /// Convert an AutoQuantPlan to the JSON structure written to
 /// `quantization_config.json` in the output directory.
 ///
-/// This produces the format that MLX and other backends expect:
+/// This produces the format that backends expect:
 ///
 /// ```json
 /// {

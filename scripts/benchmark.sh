@@ -4,7 +4,7 @@
 #
 # Runs the hf2q inference engine at multiple prompt lengths and collects
 # performance metrics. Outputs a structured JSON report for comparison
-# against mlx-lm.
+# against other inference engines.
 #
 # Usage:
 #   scripts/benchmark.sh --model /path/to/model
@@ -305,7 +305,7 @@ report = {
             'Benchmarked via HTTP API (includes network overhead).',
             'For raw engine timing, parse server logs for prefill/decode split.',
             'Temperature=0 for deterministic output.',
-            'Same prompts as mlx-lm benchmark for fair comparison.'
+            'Same prompts as reference benchmark for fair comparison.'
         ]
     }
 }

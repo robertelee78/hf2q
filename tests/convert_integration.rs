@@ -53,7 +53,7 @@ fn test_convert_q4_produces_output() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q4",
             "--output",
@@ -96,7 +96,7 @@ fn test_convert_f16_produces_output() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "f16",
             "--output",
@@ -124,7 +124,7 @@ fn test_convert_q8_produces_output() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q8",
             "--output",
@@ -145,7 +145,7 @@ fn test_convert_missing_input_fails() {
             "--input",
             "/nonexistent/path",
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q4",
         ])
@@ -157,7 +157,7 @@ fn test_convert_missing_input_fails() {
 fn test_convert_no_input_fails() {
     Command::cargo_bin("hf2q")
         .unwrap()
-        .args(["convert", "--format", "mlx", "--quant", "q4"])
+        .args(["convert", "--format", "coreml", "--quant", "q4"])
         .assert()
         .failure();
 }
@@ -177,7 +177,7 @@ fn test_convert_auto_quant_resolves() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "auto",
             "--output",
@@ -227,7 +227,7 @@ fn test_convert_mixed_46_produces_output() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "mixed-4-6",
             "--sensitive-layers",
@@ -258,7 +258,7 @@ fn test_convert_mixed_26_produces_output() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "mixed-2-6",
             "--sensitive-layers",
@@ -288,7 +288,7 @@ fn test_convert_with_json_report() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q4",
             "--output",
@@ -327,7 +327,7 @@ fn test_convert_json_report_to_stdout() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q4",
             "--output",
@@ -362,7 +362,7 @@ fn test_convert_skip_quality_flag() {
             "--input",
             input_dir.to_str().unwrap(),
             "--format",
-            "mlx",
+            "coreml",
             "--quant",
             "q4",
             "--output",

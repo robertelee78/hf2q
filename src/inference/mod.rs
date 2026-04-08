@@ -1,44 +1,21 @@
-//! Inference module — wraps mlx-rs for forward passes.
+//! Inference module — wraps inference runners for forward passes.
 //!
 //! Used by both DWQ calibration and quality measurement.
 //! Platform-specific #[cfg] is isolated here.
-//! No other module imports mlx_rs directly.
-
-#[cfg(feature = "mlx-backend")]
-pub mod mlx_runner;
-#[cfg(not(feature = "mlx-backend"))]
-pub mod mlx_runner {
-    //! Placeholder when mlx-backend feature is not enabled.
-}
 
 pub mod models;
 pub mod stub_runner;
-#[cfg(feature = "serve")]
-pub mod vision;
-
-#[cfg(feature = "mlx-native")]
-pub mod weight_loader;
-#[cfg(feature = "mlx-native")]
-pub mod memory_estimate;
-#[cfg(feature = "mlx-native")]
-pub mod kv_cache;
-#[cfg(feature = "mlx-native")]
-pub mod sampler;
-#[cfg(feature = "mlx-native")]
-pub mod prompt_cache;
-#[cfg(feature = "mlx-native")]
-pub mod engine;
 
 use thiserror::Error;
 
 /// Errors from inference operations.
 #[derive(Error, Debug)]
 pub enum InferenceError {
-    #[error("Unsupported platform: MLX requires Apple Silicon with the mlx-backend feature enabled")]
+    #[error("Unsupported platform: no inference backend available")]
     UnsupportedPlatform,
 
-    #[error("Quality measurement requires the mlx-backend feature. Rebuild with: cargo build --features mlx-backend")]
-    MlxBackendRequired,
+    #[error("No inference backend available")]
+    BackendRequired,
 
     #[error("Model loading failed: {reason}")]
     LoadFailed { reason: String },
@@ -256,17 +233,9 @@ fn filter_tensor_map_for_layer(
 
 /// Create the appropriate inference runner for the current platform.
 ///
-/// Returns the MlxRunner if the mlx-backend feature is enabled,
-/// otherwise returns the StubRunner.
+/// Returns the StubRunner (no inference backend available).
 pub fn create_runner() -> Box<dyn InferenceRunner> {
-    #[cfg(feature = "mlx-backend")]
-    {
-        Box::new(mlx_runner::MlxRunner::new())
-    }
-    #[cfg(not(feature = "mlx-backend"))]
-    {
-        Box::new(stub_runner::StubRunner)
-    }
+    Box::new(stub_runner::StubRunner)
 }
 
 #[cfg(test)]
@@ -320,11 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn test_create_runner_returns_stub_without_feature() {
-        // Without mlx-backend feature, this should return a stub
+    fn test_create_runner_returns_stub() {
         let runner = create_runner();
-        // On non-feature builds it's a stub; on feature builds it's MlxRunner
-        // Either way, the runner should have a name
-        assert!(!runner.name().is_empty());
+        assert_eq!(runner.name(), "stub");
+        assert!(!runner.is_available());
     }
 }

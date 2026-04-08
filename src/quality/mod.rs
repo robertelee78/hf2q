@@ -3,7 +3,7 @@
 //! Measures KL divergence, perplexity delta, and cosine similarity
 //! between pre-quant and post-quant model outputs.
 //!
-//! Requires the InferenceRunner — if mlx-backend feature is not enabled,
+//! Requires an InferenceRunner — if no backend is available,
 //! quality measurement returns a clear error.
 
 pub mod cosine_sim;
@@ -19,8 +19,8 @@ use crate::progress::ProgressReporter;
 /// Errors from quality measurement.
 #[derive(Error, Debug)]
 pub enum QualityError {
-    #[error("Quality measurement requires the mlx-backend feature. Rebuild with: cargo build --features mlx-backend")]
-    MlxBackendRequired,
+    #[error("Quality measurement requires an inference backend. No backend is currently available.")]
+    BackendRequired,
 
     #[error("Inference runner not available: {reason}")]
     NoInferenceRunner { reason: String },
@@ -94,8 +94,7 @@ impl QualityReport {
 /// 4. Runs the same forward pass to get quantized logits
 /// 5. Computes KL divergence, perplexity delta, and cosine similarity
 ///
-/// If the runner is not available (e.g., mlx-backend not enabled), this returns
-/// a clear error directing the user to enable the feature.
+/// If the runner is not available, this returns a clear error.
 pub fn measure_quality(
     runner: &mut dyn InferenceRunner,
     original_tensors: &TensorMap,
@@ -104,7 +103,7 @@ pub fn measure_quality(
     progress: &ProgressReporter,
 ) -> Result<QualityReport, QualityError> {
     if !runner.is_available() {
-        return Err(QualityError::MlxBackendRequired);
+        return Err(QualityError::BackendRequired);
     }
 
     let num_layers = metadata.num_layers as u64;
@@ -400,6 +399,6 @@ mod tests {
         let result = measure_quality(&mut runner, &original, &quantized, &metadata, &progress);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("mlx-backend"), "Error should mention mlx-backend: {}", err);
+        assert!(err.contains("inference backend"), "Error should mention inference backend: {}", err);
     }
 }

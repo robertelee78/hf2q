@@ -28,19 +28,11 @@ pub enum Command {
     /// Inspect model metadata before converting
     Info(InfoArgs),
 
-    /// Diagnose RuVector, hardware detection, mlx-rs, and disk space
+    /// Diagnose RuVector, hardware detection, and disk space
     Doctor,
 
     /// Generate shell completions
     Completions(CompletionsArgs),
-
-    /// Run inference on a model (requires --features mlx-native)
-    #[cfg(feature = "mlx-native")]
-    Infer(InferArgs),
-
-    /// Start an OpenAI-compatible API server (requires --features serve)
-    #[cfg(feature = "serve")]
-    Serve(ServeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -120,83 +112,9 @@ pub struct CompletionsArgs {
     pub shell: Shell,
 }
 
-/// Arguments for the `infer` subcommand.
-#[cfg(feature = "mlx-native")]
-#[derive(clap::Args, Debug)]
-pub struct InferArgs {
-    /// Model path (local directory) or HuggingFace Hub ID (e.g., mlx-community/gemma-4-26b-a4b-it-4bit)
-    #[arg(long)]
-    pub model: String,
-
-    /// Prompt text for generation
-    #[arg(long)]
-    pub prompt: Option<String>,
-
-    /// Maximum number of tokens to generate
-    #[arg(long, default_value = "512")]
-    pub max_tokens: Option<u32>,
-
-    /// Sampling temperature (0.0 = greedy, higher = more random)
-    #[arg(long, default_value = "0.7")]
-    pub temperature: f32,
-
-    /// Top-p (nucleus) sampling threshold
-    #[arg(long, default_value = "0.9")]
-    pub top_p: f32,
-
-    /// Top-k sampling (0 = disabled)
-    #[arg(long, default_value = "0")]
-    pub top_k: u32,
-
-    /// Repetition penalty (1.0 = disabled)
-    #[arg(long, default_value = "1.0")]
-    pub repetition_penalty: f32,
-
-    /// Path to a custom chat template (Jinja2 format)
-    #[arg(long)]
-    pub chat_template: Option<std::path::PathBuf>,
-}
-
-/// Arguments for the `serve` subcommand.
-#[cfg(feature = "serve")]
-#[derive(clap::Args, Debug)]
-pub struct ServeArgs {
-    /// Model path (local directory) or HuggingFace Hub ID
-    #[arg(long)]
-    pub model: String,
-
-    /// Port to listen on
-    #[arg(long, default_value = "8080")]
-    pub port: u16,
-
-    /// Host address to bind to
-    #[arg(long, default_value = "0.0.0.0")]
-    pub host: String,
-
-    /// Maximum concurrent generation requests (queue depth)
-    #[arg(long, default_value = "16")]
-    pub queue_depth: usize,
-
-    /// Maximum concurrent embedding requests (independent of generation queue)
-    #[arg(long, default_value = "4")]
-    pub embedding_concurrency: usize,
-
-    /// Path to a custom chat template (Jinja2 format)
-    #[arg(long)]
-    pub chat_template: Option<std::path::PathBuf>,
-
-    /// Disable prompt caching (skip prefix matching between requests).
-    /// By default, multi-turn conversations reuse cached KV state from
-    /// previous turns, reducing time-to-first-token.
-    #[arg(long)]
-    pub no_prompt_cache: bool,
-}
-
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
-    Mlx,
     Coreml,
-    // Future targets — defined now so CLI schema is complete
     Gguf,
     Nvfp4,
     Gptq,
@@ -206,7 +124,6 @@ pub enum OutputFormat {
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mlx => write!(f, "mlx"),
             Self::Coreml => write!(f, "coreml"),
             Self::Gguf => write!(f, "gguf"),
             Self::Nvfp4 => write!(f, "nvfp4"),
@@ -313,7 +230,7 @@ pub struct ConvertConfig {
 /// Default group size for quantization.
 pub const DEFAULT_GROUP_SIZE: usize = 64;
 
-/// Default number of output shards for MLX format.
+/// Default number of output shards.
 pub const DEFAULT_OUTPUT_SHARDS: usize = 4;
 
 /// Parse a sensitive layers specification like "13-24" or "1,5,13-24" into ranges.
@@ -417,18 +334,18 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
             // Mixed-bit quantization (Epic 5, Story 5.1)
         }
         QuantMethod::DwqMixed46 => {
-            // DWQ calibration (Epic 5, Story 5.2) — requires mlx-backend for inference
+            // DWQ calibration (Epic 5, Story 5.2) — requires inference backend
         }
         QuantMethod::F16 | QuantMethod::Q8 | QuantMethod::Q4 | QuantMethod::Q2 => {}
     }
 
     // Validate output format is implemented
     match args.format {
-        OutputFormat::Mlx | OutputFormat::Coreml => {}
+        OutputFormat::Coreml => {}
         OutputFormat::Gguf | OutputFormat::Nvfp4 | OutputFormat::Gptq | OutputFormat::Awq => {
             anyhow::bail!(
                 "Output format '{}' is not yet implemented. \
-                 Available formats: mlx, coreml",
+                 Available formats: coreml",
                 args.format
             );
         }

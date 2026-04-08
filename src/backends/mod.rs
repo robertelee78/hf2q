@@ -6,7 +6,6 @@
 pub mod coreml;
 #[allow(dead_code)]
 pub mod gguf;
-pub mod mlx;
 #[allow(dead_code)]
 pub mod nvfp4;
 
@@ -61,7 +60,7 @@ pub trait OutputBackend: Send + Sync {
 
     /// Quantize original f16 weights using the backend's native algorithm and write output.
     ///
-    /// Some formats (e.g., MLX) have specific quantization algorithms baked into their
+    /// Some formats have specific quantization algorithms baked into their
     /// inference kernels. For these, the backend must perform quantization itself rather
     /// than receiving pre-quantized IR output.
     ///

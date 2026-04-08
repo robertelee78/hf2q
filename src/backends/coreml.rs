@@ -2,7 +2,7 @@
 //!
 //! Behind the `coreml-backend` feature flag:
 //! - With feature: full CoreML model spec generation + compilation via `coreml-native`
-//! - Without feature: clear error message directing user to enable the feature or use `--format mlx`
+//! - Without feature: clear error message directing user to enable the feature
 //!
 //! Validation checks:
 //! - No MoE dynamic routing (CoreML does not support dynamic expert selection)
@@ -78,13 +78,13 @@ pub enum CoremlError {
     #[error(
         "CoreML output backend requires the 'coreml-backend' feature. \
          Recompile with: cargo build --features coreml-backend\n\
-         Alternatively, use --format mlx for MLX output."
+         Alternatively, use a different output format."
     )]
     FeatureNotEnabled,
 
     #[error(
         "Model architecture '{architecture}' is not compatible with CoreML: {reason}\n\
-         Suggestion: use --format mlx instead."
+         Suggestion: try a different output format."
     )]
     IncompatibleArchitecture {
         architecture: String,
@@ -909,7 +909,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Mixture of Experts"));
-        assert!(err.contains("--format mlx"));
+        assert!(err.contains("different output format"));
     }
 
     #[test]
@@ -990,7 +990,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("coreml-backend"));
-        assert!(err.contains("--format mlx"));
+        assert!(err.contains("different output format"));
     }
 
     // When feature is not enabled, write should return clear error

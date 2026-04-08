@@ -1,6 +1,6 @@
 //! hf2q doctor subcommand — diagnoses system health.
 //!
-//! Checks RuVector, hardware detection, mlx-rs Metal, hf CLI, disk space.
+//! Checks RuVector, hardware detection, hf CLI, disk space.
 //! Provides specific remediation steps for each issue found.
 
 use thiserror::Error;
@@ -61,14 +61,7 @@ pub fn run_doctor() -> anyhow::Result<()> {
         _ => {}
     }
 
-    // Check 4: MLX Metal backend
-    let mlx_result = check_mlx();
-    print_check("MLX Metal Backend", &mlx_result);
-    if matches!(mlx_result, CheckResult::Warn(_, _)) {
-        has_warnings = true;
-    }
-
-    // Check 5: hf CLI
+    // Check 4: hf CLI
     let hf_result = check_hf_cli();
     print_check("HuggingFace CLI", &hf_result);
     if matches!(hf_result, CheckResult::Warn(_, _)) {
@@ -158,7 +151,7 @@ fn check_platform() -> CheckResult {
         #[cfg(not(target_arch = "aarch64"))]
         {
             CheckResult::Warn(
-                "macOS on Intel — MLX and CoreML backends require Apple Silicon".to_string(),
+                "macOS on Intel — CoreML backend requires Apple Silicon".to_string(),
                 "Use an Apple Silicon Mac (M1 or later) for full functionality.".to_string(),
             )
         }
@@ -166,8 +159,8 @@ fn check_platform() -> CheckResult {
     #[cfg(not(target_os = "macos"))]
     {
         CheckResult::Warn(
-            "Non-macOS platform — MLX and CoreML backends unavailable".to_string(),
-            "hf2q requires macOS with Apple Silicon for MLX/CoreML backends.".to_string(),
+            "Non-macOS platform — CoreML backend unavailable".to_string(),
+            "hf2q requires macOS with Apple Silicon for the CoreML backend.".to_string(),
         )
     }
 }
@@ -203,20 +196,6 @@ fn check_ruvector() -> CheckResult {
             format_bytes(status.db_size_bytes),
             status.db_path,
         ))
-    }
-}
-
-/// Check MLX Metal backend availability.
-fn check_mlx() -> CheckResult {
-    #[cfg(feature = "mlx-backend")]
-    {
-        CheckResult::Pass("mlx-rs feature enabled".to_string())
-    }
-    #[cfg(not(feature = "mlx-backend"))]
-    {
-        CheckResult::Info(
-            "mlx-rs backend not enabled (requires --features mlx-backend)".to_string(),
-        )
     }
 }
 

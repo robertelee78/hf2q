@@ -38,8 +38,8 @@ pub enum DwqError {
     #[error("Quantization error during DWQ: {0}")]
     QuantizeError(#[from] QuantizeError),
 
-    #[error("DWQ calibration requires the mlx-backend feature. Rebuild with: cargo build --features mlx-backend")]
-    MlxBackendRequired,
+    #[error("DWQ calibration requires an inference backend. No backend is currently available.")]
+    BackendRequired,
 }
 
 /// Configuration for DWQ calibration.
@@ -149,7 +149,7 @@ pub fn run_dwq_calibration(
     progress: &ProgressReporter,
 ) -> Result<QuantizedModel, DwqError> {
     if !runner.is_available() {
-        return Err(DwqError::MlxBackendRequired);
+        return Err(DwqError::BackendRequired);
     }
 
     let num_layers = metadata.num_layers as usize;
@@ -338,7 +338,7 @@ fn tensor_to_f32_safe(tensor: &TensorRef) -> Vec<f32> {
 ///   optimal_scale = dot(W_group, Q_group) / dot(Q_group, Q_group)
 ///
 /// This is the GPTQ approach to scale calibration — exact, not iterative.
-#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
+#[allow(dead_code)]
 fn adjust_scales_weight_space(
     quantized_tensors: &mut HashMap<String, QuantizedTensor>,
     original_tensors: &HashMap<String, TensorRef>,
@@ -397,7 +397,7 @@ fn adjust_scales_weight_space(
 /// This is a simplified version of scale adjustment that slightly
 /// modifies the scale factors in the direction that would reduce
 /// the KL divergence between reference and quantized outputs.
-#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
+#[allow(dead_code)]
 fn adjust_scales(
     quantized_tensors: &mut HashMap<String, QuantizedTensor>,
     reference_logits: &[f32],
@@ -440,7 +440,7 @@ fn adjust_scales(
 /// Dequantizes packed weight data back to f16 so the InferenceRunner can
 /// load and run forward passes. This is the inverse of `quantize_weight`:
 /// `float_val = scale * quantized_int` (symmetric dequantization).
-#[allow(dead_code)] // May be needed for future DWQ-for-MLX path
+#[allow(dead_code)]
 fn build_tensor_map_from_quantized(
     quantized: &HashMap<String, QuantizedTensor>,
 ) -> TensorMap {
@@ -706,6 +706,6 @@ mod tests {
         let result = run_dwq_calibration(&mut runner, &tensor_map, &metadata, &config, &progress);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("mlx-backend"), "Error should mention mlx-backend: {}", err);
+        assert!(err.contains("inference backend"), "Error should mention inference backend: {}", err);
     }
 }

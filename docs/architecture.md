@@ -11,12 +11,12 @@ hf2q is a pure Rust CLI tool that converts HuggingFace model weights to hardware
 - **Trait-based extensibility**: New output formats and quantization methods are added by implementing traits (`OutputBackend`, `Quantizer`), not by modifying existing code.
 - **IR as central contract**: The Intermediate Representation (`TensorMap`, `ModelMetadata`, `QuantizedModel`) is the shared language between all pipeline stages. Input modules produce it, quantizers transform it, backends consume it.
 - **Self-learning auto mode**: The tool remembers conversion results in a local vector database (RuVector) and uses past outcomes to recommend optimal settings for future conversions.
-- **Feature-gated optional dependencies**: Heavy platform-specific dependencies (mlx-rs, coreml-native, ruvector-core) are behind cargo feature flags. The core pipeline works without them.
+- **Feature-gated optional dependencies**: Heavy platform-specific dependencies (coreml-native, ruvector-core) are behind cargo feature flags. The core pipeline works without them.
 
 ### Current State
 
 - ~16,600 lines of Rust across 25+ source files
-- Two implemented output backends: MLX (safetensors), CoreML
+- One implemented output backend: CoreML
 - Four quantization families: static (f16/q8/q4/q2), mixed-bit, DWQ, auto
 - 54+ tests across all modules
 - Targets Apple Silicon (macOS) as primary platform
@@ -55,7 +55,6 @@ flowchart LR
     end
 
     subgraph Output
-        MLX[MLX Safetensors]
         CML[CoreML Package]
         RPT[report.json]
     end
@@ -63,7 +62,6 @@ flowchart LR
     HF --> P0
     CFG --> P0
     ST --> P1
-    P4 --> MLX
     P4 --> CML
     P6 --> RPT
 ```
@@ -104,8 +102,7 @@ flowchart TB
     doctor --> intelligence
 
     subgraph backends[backends/]
-        b_mod[mod.rs] --> b_mlx[mlx.rs]
-        b_mod --> b_coreml[coreml.rs]
+        b_mod[mod.rs] --> b_coreml[coreml.rs]
         b_mod --> b_gguf[gguf.rs]
         b_mod --> b_nvfp4[nvfp4.rs]
     end
@@ -136,8 +133,7 @@ flowchart TB
     end
 
     subgraph inference[inference/]
-        inf_mod[mod.rs] --> inf_mlx[mlx_runner.rs]
-        inf_mod --> inf_stub[stub_runner.rs]
+        inf_mod[mod.rs] --> inf_stub[stub_runner.rs]
     end
 ```
 
@@ -155,7 +151,7 @@ Pure configuration module. Uses clap derive API to define the full argument sche
 
 - `Cli` / `Command` -- top-level parser and subcommand enum
 - `ConvertArgs` -- all convert subcommand arguments
-- `OutputFormat` enum -- `Mlx`, `Coreml`, `Gguf`, `Nvfp4`, `Gptq`, `Awq`
+- `OutputFormat` enum -- `Coreml`, `Gguf`, `Nvfp4`, `Gptq`, `Awq`
 - `QuantMethod` enum -- `Auto`, `F16`, `Q8`, `Q4`, `Q2`, `Q4Mxfp`, `Mixed26`, `Mixed36`, `Mixed46`, `DwqMixed46`
 - `GroupSize` enum -- `G32`, `G64`, `G128`
 - `ConvertConfig` -- resolved configuration struct that flows through the pipeline
@@ -189,7 +185,6 @@ All types are `Send + Sync`. `TensorRef` provides `is_weight()` to determine whi
 ### Backends (`backends/`)
 
 - `mod.rs` -- defines the `OutputBackend` trait and `BackendError` enum
-- `mlx.rs` -- MLX safetensors output (consolidated shards, MLX-compatible config, tokenizer passthrough, quantization_config.json)
 - `coreml.rs` -- CoreML model package output
 - `gguf.rs` -- GGUF format (planned, stub)
 - `nvfp4.rs` -- NVFP4 format (planned, stub)
@@ -219,15 +214,14 @@ All types are `Send + Sync`. `TensorRef` provides `is_weight()` to determine whi
 ### Inference (`inference/`)
 
 - `mod.rs` -- `InferenceRunner` trait, `TokenInput`, `ForwardOutput` types, `create_runner()` factory
-- `mlx_runner.rs` -- MLX Metal inference runner (behind `mlx-backend` feature)
-- `stub_runner.rs` -- no-op stub when `mlx-backend` is not enabled
+- `stub_runner.rs` -- stub runner (no inference backend currently available)
 
 ### Supporting Modules
 
 - `preflight.rs` -- pre-conversion validation (input dir, layer types, format compatibility, sensitive layer ranges, disk space, output dir)
 - `progress.rs` -- progress bars and terminal UX via indicatif/console
 - `report.rs` -- JSON report builder with stable v1 schema for CI consumption
-- `doctor.rs` -- system health diagnostics (RuVector, hardware detection, Metal, disk space)
+- `doctor.rs` -- system health diagnostics (RuVector, hardware detection, disk space)
 
 ---
 
@@ -387,7 +381,7 @@ Assigns different bit widths per layer. Layers specified in `--sensitive-layers`
 
 ### DWQ -- Distilled Weight Quantization (`dwq.rs`)
 
-The most sophisticated quantization method. Requires the `mlx-backend` feature for inference. Uses a calibration process with configurable sample count (`--calibration-samples`, default 1024). The `DwqConfig` struct controls calibration parameters. DWQ uses layer-streaming to bound memory usage: it loads one layer at a time via `InferenceRunner::load_layer()`, runs calibration forward passes, and writes the quantized layer before moving to the next.
+The most sophisticated quantization method. Requires an inference backend. Uses a calibration process with configurable sample count (`--calibration-samples`, default 1024). The `DwqConfig` struct controls calibration parameters. DWQ uses layer-streaming to bound memory usage: it loads one layer at a time via `InferenceRunner::load_layer()`, runs calibration forward passes, and writes the quantized layer before moving to the next.
 
 ### Quantization Dispatch
 
@@ -419,17 +413,6 @@ pub trait OutputBackend: Send + Sync {
 ```
 
 Every backend validates before writing. Validation returns non-fatal `FormatWarning`s or fatal `BackendError`s.
-
-### MLX Backend (`mlx.rs`)
-
-Writes an MLX-compatible model directory:
-
-- **Consolidated safetensors shards**: N input shards are consolidated into 4 output shards (configurable via `DEFAULT_OUTPUT_SHARDS`). Tensors are sorted deterministically and distributed round-robin across shards.
-- **MLX-compatible config.json**: the original `raw_config` from `ModelMetadata`, augmented with quantization metadata.
-- **Tokenizer files**: `tokenizer.json` and `tokenizer_config.json` are copied from the source directory.
-- **quantization_config.json**: per-tensor quantization metadata including method, bits, group_size for each tensor.
-
-Validation checks that the model has tensors and that all tensors with non-zero shapes have data.
 
 ### CoreML Backend (`coreml.rs`)
 
@@ -541,7 +524,7 @@ When the `ruvector` cargo feature is enabled, the crate additionally wraps `ruve
 
 ## 9. Quality Measurement
 
-Quality measurement compares original and quantized model outputs using three metrics. Requires the `mlx-backend` feature for actual inference; without it, quality measurement is skipped with a clear message.
+Quality measurement compares original and quantized model outputs using three metrics. Requires an inference backend; without one, quality measurement is skipped with a clear message.
 
 ### Process
 
@@ -586,7 +569,7 @@ All metrics are collected into a `QualityReport` struct with `Option<f64>` field
 |------|------|---------|-------------|
 | `--input` | `PathBuf` | -- | Local safetensors directory (conflicts with `--repo`) |
 | `--repo` | `String` | -- | HuggingFace repo ID for automatic download |
-| `--format` | `OutputFormat` | required | Output target: `mlx`, `coreml` |
+| `--format` | `OutputFormat` | required | Output target: `coreml` (more planned) |
 | `--quant` | `QuantMethod` | `auto` | Quantization method |
 | `--sensitive-layers` | `String` | -- | Layer ranges for higher precision (e.g., `"13-24"`) |
 | `--calibration-samples` | `u32` | 1024 | Sample count for DWQ calibration |
@@ -660,17 +643,15 @@ Defined in `Cargo.toml`:
 
 | Feature | Dependency | Purpose |
 |---------|------------|---------|
-| `mlx-backend` | `mlx-rs` | MLX Metal inference for quality measurement and DWQ calibration |
 | `coreml-backend` | `coreml-native` | CoreML output backend |
 | `ruvector` | `ruvector-core` | Enhanced vector similarity search for auto mode |
 
 ### Conditional Compilation
 
-- `inference/mod.rs`: `#[cfg(feature = "mlx-backend")]` gates the `mlx_runner` module; without it, the `stub_runner` is used
 - `intelligence/ruvector.rs`: `cfg!(feature = "ruvector")` reports feature status in diagnostics; the JSON-backed store works without the feature, but vector similarity search requires it
 - `backends/coreml.rs`: CoreML-specific functionality gated behind `coreml-backend`
 
-The default feature set is empty (`default = []`). The core pipeline (read, quantize static methods, write MLX safetensors) works without any optional features. Quality measurement and DWQ require `mlx-backend`.
+The default feature set is empty (`default = []`). The core pipeline (read, quantize static methods) works without any optional features.
 
 ---
 
@@ -710,9 +691,9 @@ Architecture support is primarily a `config_parser.rs` concern (parsing architec
 
 ### Linux / NVIDIA Platform Support
 
-Currently macOS-only for inference (MLX requires Apple Silicon). Future Linux support would add:
+Currently macOS-only for CoreML output. Future Linux support would add:
 
-- CUDA-based inference runner (replacing or alongside MLX)
+- CUDA-based inference runner
 - NVIDIA-specific output formats (NVFP4, TensorRT)
 - Cross-platform hardware profiling (NVIDIA GPU detection via nvidia-smi or NVML)
 
@@ -746,7 +727,6 @@ Currently macOS-only for inference (MLX requires Apple Silicon). Future Linux su
 
 | Crate | Feature Flag | Role |
 |-------|-------------|------|
-| `mlx-rs` | `mlx-backend` | MLX Metal bindings for Apple Silicon inference |
 | `coreml-native` | `coreml-backend` | CoreML model compilation and export |
 | `ruvector-core` | `ruvector` | Vector similarity search for auto mode |
 

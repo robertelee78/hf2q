@@ -304,12 +304,9 @@ fn validate_format_compatibility(
                     format: "coreml".to_string(),
                     architecture: metadata.architecture.clone(),
                     reason: "CoreML does not support Mixture of Experts (MoE) models with dynamic routing".to_string(),
-                    suggestion: "Use --format mlx instead, which supports MoE architectures.".to_string(),
+                    suggestion: "Use a format that supports MoE architectures.".to_string(),
                 });
             }
-        }
-        OutputFormat::Mlx => {
-            // MLX supports all architectures
         }
         _ => {
             // Future formats — validated at CLI level as not-yet-implemented
@@ -543,15 +540,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mlx_supports_moe() {
-        let mut metadata = make_test_metadata(4, vec!["attention".to_string(); 4]);
-        metadata.num_experts = Some(128);
-        metadata.top_k_experts = Some(8);
-
-        assert!(validate_format_compatibility(OutputFormat::Mlx, &metadata).is_ok());
-    }
-
-    #[test]
     fn test_estimate_output_size_q4() {
         let metadata = make_test_metadata(32, vec!["attention".to_string(); 32]);
         // 1M params at ~4.4 bits = ~550KB + 10MB overhead
@@ -651,7 +639,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Mlx,
+            format: OutputFormat::Coreml,
             quant: QuantMethod::Q4,
             sensitive_layers: vec![0..=3],
             calibration_samples: 1024,
@@ -692,7 +680,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Mlx,
+            format: OutputFormat::Coreml,
             quant: QuantMethod::Q4,
             sensitive_layers: Vec::new(),
             calibration_samples: 1024,
@@ -729,7 +717,7 @@ mod tests {
 
         let config = ConvertConfig {
             input_dir,
-            format: OutputFormat::Mlx,
+            format: OutputFormat::Coreml,
             quant: QuantMethod::Q4,
             sensitive_layers: Vec::new(),
             calibration_samples: 1024,
