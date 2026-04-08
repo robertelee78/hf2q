@@ -234,6 +234,7 @@ fn cmd_infer(args: cli::InferArgs) -> Result<(), AppError> {
         top_p: args.top_p,
         top_k: args.top_k as usize,
         repetition_penalty: args.repetition_penalty,
+        ..Default::default()
     };
 
     let engine_config = EngineConfig {

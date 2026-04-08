@@ -597,6 +597,7 @@ fn run_generation_blocking(
             top_p,
             top_k: 0,
             repetition_penalty: 1.0,
+            ..Default::default()
         };
 
         engine_guard.config = EngineConfig {

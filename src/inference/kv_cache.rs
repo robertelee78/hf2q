@@ -417,6 +417,11 @@ impl LayerCache {
 pub struct KvCache {
     /// Per-layer cache entries, indexed by layer number.
     layers: Vec<LayerCache>,
+    /// For KV-shared layers, maps layer index -> donor layer index.
+    /// Shared layers still have a LayerCache entry (for position tracking)
+    /// but their K/V buffers are never written to. Instead, attention reads
+    /// from the donor layer's K/V cache.
+    donor_map: Vec<Option<usize>>,
 }
 
 impl KvCache {
@@ -432,6 +437,30 @@ impl KvCache {
         layer_types: &[CacheType],
         layer_kv_configs: &[(usize, usize)],
     ) -> Result<Self, KvCacheError> {
+        Self::new_with_donors(device, layer_types, layer_kv_configs, &[])
+    }
+
+    /// Pre-allocate the KV cache with optional donor layer mapping.
+    ///
+    /// `donor_layers` maps each layer to its donor (if KV-shared).
+    /// Shared layers still get a full cache allocation so the struct stays
+    /// uniform, but their K/V buffers are never written to during inference.
+    /// The `donor_map` is used by the forward pass to read K/V from the
+    /// donor layer instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - Metal device for buffer allocation
+    /// * `layer_types` - Slice of `CacheType` for each layer
+    /// * `layer_kv_configs` - Slice of `(n_kv_heads, head_dim)` per layer
+    /// * `donor_layers` - Slice of `Option<usize>` per layer. `Some(d)` means
+    ///   layer reads K/V from layer `d`. Empty slice means no sharing.
+    pub fn new_with_donors(
+        device: &MlxDevice,
+        layer_types: &[CacheType],
+        layer_kv_configs: &[(usize, usize)],
+        donor_layers: &[Option<usize>],
+    ) -> Result<Self, KvCacheError> {
         if layer_types.len() != layer_kv_configs.len() {
             return Err(KvCacheError::AllocationFailed {
                 reason: format!(
@@ -445,17 +474,50 @@ impl KvCache {
         let num_layers = layer_types.len();
         let mut layers = Vec::with_capacity(num_layers);
 
+        // Build donor map (fill with None if donor_layers is empty)
+        let donor_map: Vec<Option<usize>> = if donor_layers.is_empty() {
+            vec![None; num_layers]
+        } else {
+            if donor_layers.len() != num_layers {
+                return Err(KvCacheError::AllocationFailed {
+                    reason: format!(
+                        "donor_layers length ({}) != num_layers ({})",
+                        donor_layers.len(),
+                        num_layers
+                    ),
+                });
+            }
+            donor_layers.to_vec()
+        };
+
         for (i, (&cache_type, &(n_kv_heads, head_dim))) in
             layer_types.iter().zip(layer_kv_configs.iter()).enumerate()
         {
-            debug!(
-                layer = i,
-                cache_type = ?cache_type,
-                n_kv_heads = n_kv_heads,
-                head_dim = head_dim,
-                "Allocating KV cache for layer"
-            );
-            layers.push(LayerCache::new(device, cache_type, n_kv_heads, head_dim)?);
+            let is_shared = donor_map[i].is_some();
+            if is_shared {
+                debug!(
+                    layer = i,
+                    donor = donor_map[i].unwrap(),
+                    "KV-shared layer (donor reference, skipping buffer allocation)"
+                );
+                // Shared layers get a minimal 1-position cache as a placeholder.
+                // Their K/V buffers are never used; the forward pass reads from
+                // the donor layer's cache instead.
+                let placeholder_type = match cache_type {
+                    CacheType::Sliding { .. } => CacheType::Sliding { window: 1 },
+                    CacheType::Global { .. } => CacheType::Global { max_seq_len: 1 },
+                };
+                layers.push(LayerCache::new(device, placeholder_type, n_kv_heads, head_dim)?);
+            } else {
+                debug!(
+                    layer = i,
+                    cache_type = ?cache_type,
+                    n_kv_heads = n_kv_heads,
+                    head_dim = head_dim,
+                    "Allocating KV cache for layer"
+                );
+                layers.push(LayerCache::new(device, cache_type, n_kv_heads, head_dim)?);
+            }
         }
 
         let total_bytes: usize = layers
@@ -463,13 +525,15 @@ impl KvCache {
             .map(|l| l.k_cache.byte_len() + l.v_cache.byte_len())
             .sum();
 
+        let shared_count = donor_map.iter().filter(|d| d.is_some()).count();
         debug!(
             num_layers = num_layers,
+            shared_layers = shared_count,
             total_mb = total_bytes / (1024 * 1024),
             "KV cache pre-allocated"
         );
 
-        Ok(Self { layers })
+        Ok(Self { layers, donor_map })
     }
 
     /// Get a mutable reference to a specific layer's cache.
@@ -495,7 +559,11 @@ impl KvCache {
 
     /// Reset all layer caches to empty state.
     pub fn reset(&mut self) {
-        for layer in &mut self.layers {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Skip KV-shared layers — they don't own their K/V data
+            if self.donor_map.get(i).copied().flatten().is_some() {
+                continue;
+            }
             layer.reset();
         }
     }
@@ -503,6 +571,27 @@ impl KvCache {
     /// Number of layers in the cache.
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Get the donor layer index for a KV-shared layer, if any.
+    pub fn donor_for(&self, layer_idx: usize) -> Option<usize> {
+        self.donor_map.get(layer_idx).copied().flatten()
+    }
+
+    /// Returns true if this layer is KV-shared (reads K/V from a donor).
+    pub fn is_shared_layer(&self, layer_idx: usize) -> bool {
+        self.donor_for(layer_idx).is_some()
+    }
+
+    /// Get the K/V cache and seq_len for a layer, following donor references.
+    ///
+    /// For shared layers, returns the donor layer's cache. For normal layers,
+    /// returns the layer's own cache. This is the primary API for the forward
+    /// pass to get K/V for attention.
+    pub fn keys_values_for(&self, layer_idx: usize) -> Result<(&MlxBuffer, &MlxBuffer, usize), KvCacheError> {
+        let effective_idx = self.donor_for(layer_idx).unwrap_or(layer_idx);
+        let cache = self.layer(effective_idx)?;
+        Ok(cache.keys_values())
     }
 
     /// Restore all layers' write positions to a given total-written count.
@@ -513,6 +602,10 @@ impl KvCache {
     /// at position `new_total_written`.
     pub fn restore_all_positions(&mut self, new_total_written: usize) -> Result<(), KvCacheError> {
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Skip KV-shared layers — they don't own their K/V data
+            if self.donor_map.get(i).copied().flatten().is_some() {
+                continue;
+            }
             layer.restore_position(new_total_written).map_err(|e| {
                 KvCacheError::BufferWriteError {
                     reason: format!("Layer {i} restore failed: {e}"),

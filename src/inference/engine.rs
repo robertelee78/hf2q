@@ -354,11 +354,11 @@ impl InferenceEngine {
 
         let vocab_size = self.model.config().vocab_size;
 
-        // The prefill_logits contain logits only for the tokens that were
-        // actually encoded (the non-cached portion). We need the last position.
-        let encoded_len = prompt_len - cached_tokens;
+        // After C1, forward() returns only last-position logits ([vocab_size]).
+        // Use seq_len=1 for extraction (logits are already last-position-only).
+        let _encoded_len = prompt_len - cached_tokens;
         let last_pos_logits =
-            extract_last_position_logits(&prefill_logits, encoded_len, vocab_size)?;
+            extract_last_position_logits(&prefill_logits, 1, vocab_size)?;
 
         // Step 4: Create sampler and sample first token
         let mut sampler = Sampler::new(self.config.sampler.clone());
@@ -524,9 +524,15 @@ impl InferenceEngine {
     /// resets the KV cache and encodes all tokens from scratch.
     ///
     /// Returns `(logits, cached_tokens)` where:
-    /// - `logits` contains the forward-pass output for the encoded tokens
-    ///   (shape `[encoded_len, vocab_size]` where `encoded_len = prompt_len - cached_tokens`)
+    /// - `logits` contains the last-position logits only (shape `[vocab_size]`)
+    ///   thanks to the C1 last-token-only lm_head optimisation in `forward()`.
     /// - `cached_tokens` is the number of tokens served from cache (0 on miss)
+    ///
+    /// C2 optimisation: when the tokens to encode exceed `PREFILL_CHUNK_SIZE`
+    /// (2048), the prompt is split into chunks processed sequentially.  The KV
+    /// cache accumulates across chunks and only the final chunk's logits are
+    /// returned.  This prevents OOM on very long prompts by bounding the peak
+    /// attention matrix to `[PREFILL_CHUNK_SIZE, PREFILL_CHUNK_SIZE]`.
     fn prefill_with_cache(
         &mut self,
         prompt_tokens: &[u32],
@@ -575,16 +581,49 @@ impl InferenceEngine {
                     "Prefill: encoding only new tokens after cache hit"
                 );
 
-                let logits = self.model.forward(new_tokens)?;
+                let logits = self.chunked_forward(new_tokens)?;
                 Ok((logits, prefix_len))
             }
             CacheLookup::Miss => {
                 // Full reset and encode from scratch
                 self.model.reset_cache();
-                let logits = self.model.forward(prompt_tokens)?;
+                let logits = self.chunked_forward(prompt_tokens)?;
                 Ok((logits, 0))
             }
         }
+    }
+
+    /// C2 optimisation: process tokens through forward() in chunks of at most
+    /// `PREFILL_CHUNK_SIZE` to bound peak GPU memory.  For short sequences
+    /// (<= PREFILL_CHUNK_SIZE) this is a simple pass-through.  For longer
+    /// sequences, all chunks except the last are processed for their KV cache
+    /// side-effects only (logits discarded); the final chunk's logits are
+    /// returned.
+    fn chunked_forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, EngineError> {
+        const PREFILL_CHUNK_SIZE: usize = 2048;
+
+        if tokens.len() <= PREFILL_CHUNK_SIZE {
+            return self.model.forward(tokens).map_err(|e| EngineError::Forward(e.into()));
+        }
+
+        debug!(
+            total = tokens.len(),
+            chunk_size = PREFILL_CHUNK_SIZE,
+            chunks = (tokens.len() + PREFILL_CHUNK_SIZE - 1) / PREFILL_CHUNK_SIZE,
+            "C2: chunked prefill"
+        );
+
+        // Process all full chunks except the last — discard logits, keep KV cache
+        let mut offset = 0;
+        while offset + PREFILL_CHUNK_SIZE < tokens.len() {
+            let chunk = &tokens[offset..offset + PREFILL_CHUNK_SIZE];
+            let _ = self.model.forward(chunk).map_err(|e| EngineError::Forward(e.into()))?;
+            offset += PREFILL_CHUNK_SIZE;
+        }
+
+        // Process the final (possibly shorter) chunk and return its logits
+        let final_chunk = &tokens[offset..];
+        self.model.forward(final_chunk).map_err(|e| EngineError::Forward(e.into()))
     }
 
     /// Store the prompt token sequence in the cache after a successful
@@ -659,9 +698,10 @@ impl InferenceEngine {
         let prefill_time = prefill_start.elapsed().as_secs_f64();
 
         let vocab_size = self.model.config().vocab_size;
-        let encoded_len = prompt_len - cached_tokens;
+        // After C1, forward() returns only last-position logits ([vocab_size]).
+        let _encoded_len = prompt_len - cached_tokens;
         let last_pos_logits =
-            extract_last_position_logits(&prefill_logits, encoded_len, vocab_size)?;
+            extract_last_position_logits(&prefill_logits, 1, vocab_size)?;
 
         // Sample first token
         let mut sampler = Sampler::new(self.config.sampler.clone());

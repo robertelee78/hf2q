@@ -102,6 +102,12 @@ pub struct Gemma4Config {
     pub tie_word_embeddings: bool,
     /// Maximum sequence length for global KV cache pre-allocation.
     pub max_seq_len: usize,
+    /// Number of KV-shared layers (last N layers reuse K/V from donor layers).
+    /// Default 0 (no sharing). For 27B models, typically 20.
+    pub num_kv_shared_layers: usize,
+    /// MoE intermediate size for KV-shared layers (double-wide).
+    /// Default = moe_intermediate_size * 2 when num_kv_shared_layers > 0.
+    pub moe_intermediate_size_shared: usize,
 }
 
 impl Gemma4Config {
@@ -217,6 +223,20 @@ impl Gemma4Config {
         let max_seq_len =
             get_u64("max_position_embeddings").unwrap_or(8192) as usize;
 
+        // KV sharing: last N layers reuse K/V from earlier donor layers
+        let num_kv_shared_layers = get_u64("num_kv_shared_layers").unwrap_or(0) as usize;
+
+        // Double-wide MoE intermediate size for KV-shared layers
+        let moe_intermediate_size_shared = get_u64("moe_intermediate_size_shared")
+            .map(|v| v as usize)
+            .unwrap_or_else(|| {
+                if num_kv_shared_layers > 0 {
+                    moe_intermediate_size * 2
+                } else {
+                    moe_intermediate_size
+                }
+            });
+
         Ok(Self {
             num_layers,
             hidden_size,
@@ -240,6 +260,8 @@ impl Gemma4Config {
             attention_k_eq_v,
             tie_word_embeddings,
             max_seq_len,
+            num_kv_shared_layers,
+            moe_intermediate_size_shared,
         })
     }
 
@@ -285,6 +307,53 @@ impl Gemma4Config {
             LayerAttentionType::Global => {
                 (self.head_dim_global as f32 * self.partial_rotary_factor_global) as usize
             }
+        }
+    }
+
+    /// Returns true if this layer is a KV-shared layer (reuses K/V from a donor).
+    ///
+    /// KV-shared layers are the last `num_kv_shared_layers` layers. They skip
+    /// K/V projection and read K/V from the most recent earlier (donor) layer
+    /// of the same attention type that is NOT itself a shared layer.
+    pub fn is_kv_shared_layer(&self, layer_idx: usize) -> bool {
+        self.num_kv_shared_layers > 0
+            && layer_idx >= self.num_layers.saturating_sub(self.num_kv_shared_layers)
+    }
+
+    /// For a KV-shared layer, find the donor layer index.
+    ///
+    /// The donor is the most recent earlier layer with the same attention type
+    /// (sliding/global) that is NOT itself a KV-shared layer.
+    /// Returns `None` if `layer_idx` is not a shared layer or no donor exists.
+    pub fn donor_layer_for(&self, layer_idx: usize) -> Option<usize> {
+        if !self.is_kv_shared_layer(layer_idx) {
+            return None;
+        }
+        let my_type = self.layer_type(layer_idx);
+        let first_shared = self.num_layers.saturating_sub(self.num_kv_shared_layers);
+        // Search backwards from the layer just before the shared region
+        // (or from layer_idx - 1 if layer_idx < first_shared, which shouldn't happen)
+        let search_end = layer_idx.min(first_shared);
+        for i in (0..search_end).rev() {
+            if self.layer_type(i) == my_type {
+                return Some(i);
+            }
+        }
+        // If no non-shared donor of the same type exists before the shared region,
+        // search within the shared region for an earlier layer of the same type
+        // that has a donor (chain to its donor). But the simplest correct approach:
+        // search backwards from layer_idx - 1, skipping shared layers.
+        None
+    }
+
+    /// Get the MoE intermediate size for a specific layer.
+    ///
+    /// KV-shared layers use double-wide MoE FFN (intermediate_size * 2).
+    pub fn moe_intermediate_for_layer(&self, layer_idx: usize) -> usize {
+        if self.is_kv_shared_layer(layer_idx) {
+            self.moe_intermediate_size_shared
+        } else {
+            self.moe_intermediate_size
         }
     }
 }
@@ -391,6 +460,25 @@ impl MoeBufferPool {
 }
 
 /// Gemma 4 model holding weights, KV cache, and configuration.
+/// Handle to an in-flight GPU forward pass.
+///
+/// Returned by [`Gemma4Model::forward_start`].  The GPU is executing
+/// asynchronously; call [`Gemma4Model::forward_wait`] to block until
+/// completion and read back the logits.
+///
+/// The handle owns the committed `CommandEncoder` (which in turn owns the
+/// Metal command buffer) and the GPU output buffer, preventing use-after-free.
+pub struct ForwardHandle {
+    /// The Metal command encoder that was committed (not yet waited on).
+    encoder: CommandEncoder,
+    /// Pre-allocated output buffer for capped logits (f32, on GPU).
+    logits_buffer: MlxBuffer,
+    /// Vocab size for the last token's logits slice.
+    vocab_size: usize,
+    /// Sequence length used in this forward pass (needed to locate last-token logits).
+    seq_len: usize,
+}
+
 pub struct Gemma4Model {
     /// Loaded model weights.
     weights: WeightMap,
@@ -438,9 +526,10 @@ impl Gemma4Model {
         // Validate we have the final norm weight
         require_weight(&weights, "model.norm.weight")?;
 
-        // Build KV cache layout
+        // Build KV cache layout with donor mapping for KV-shared layers
         let mut cache_types = Vec::with_capacity(config.num_layers);
         let mut kv_configs = Vec::with_capacity(config.num_layers);
+        let mut donor_layers = Vec::with_capacity(config.num_layers);
 
         for i in 0..config.num_layers {
             let (cache_type, n_kv, hd) = match config.layer_type(i) {
@@ -461,9 +550,22 @@ impl Gemma4Model {
             };
             cache_types.push(cache_type);
             kv_configs.push((n_kv, hd));
+            donor_layers.push(config.donor_layer_for(i));
         }
 
-        let kv_cache = KvCache::new(&device, &cache_types, &kv_configs)?;
+        if config.num_kv_shared_layers > 0 {
+            let shared_count = donor_layers.iter().filter(|d| d.is_some()).count();
+            info!(
+                num_kv_shared_layers = config.num_kv_shared_layers,
+                actual_shared = shared_count,
+                moe_intermediate_shared = config.moe_intermediate_size_shared,
+                "KV sharing enabled"
+            );
+        }
+
+        let kv_cache = KvCache::new_with_donors(
+            &device, &cache_types, &kv_configs, &donor_layers,
+        )?;
 
         info!(
             num_layers = config.num_layers,
@@ -498,7 +600,10 @@ impl Gemma4Model {
 
     /// Run a forward pass on a sequence of token IDs.
     ///
-    /// Returns a flat f32 buffer of shape `[seq_len, vocab_size]` containing logits.
+    /// Returns a flat f32 buffer containing logits for the **last** sequence
+    /// position only (shape `[vocab_size]`).  For prefill (`seq_len > 1`) the
+    /// C1 optimisation extracts only the last token's hidden state before the
+    /// lm_head projection, avoiding ~2 GB of wasted GPU memory.
     ///
     /// Uses CommandEncoder batching: all ops for one layer are encoded into a
     /// single command buffer, then committed before proceeding to the next layer.
@@ -605,19 +710,47 @@ impl Gemma4Model {
             }
         }
 
+        // C1 optimisation: for prefill (seq_len > 1), extract only the last
+        // token's hidden state before the expensive lm_head projection.  This
+        // avoids computing vocab_size logits for every position when only the
+        // last position is used for sampling — saving ~2 GB for a 2048-token
+        // prefill.  For decode (seq_len == 1) the buffer already contains a
+        // single token so no extraction is needed.
+        let (lm_input, lm_seq_len) = if seq_len > 1 {
+            debug!("Extracting last token hidden state for lm_head (prefill optimisation)");
+            let mut last_token_buf = self.device.alloc_buffer(
+                hidden_size * 2, // bf16
+                DType::BF16,
+                vec![1, hidden_size],
+            )?;
+            {
+                let src: &[u16] = normed.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Read normed bf16 for last-token extraction: {e}"),
+                })?;
+                let dst: &mut [u16] = last_token_buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("Write last-token bf16 buffer: {e}"),
+                })?;
+                let last_start = (seq_len - 1) * hidden_size;
+                dst.copy_from_slice(&src[last_start..last_start + hidden_size]);
+            }
+            (last_token_buf, 1usize)
+        } else {
+            (normed, seq_len)
+        };
+
         // Step 5: lm_head (tied embeddings -- transpose embed_tokens and matmul)
-        // lm_head takes bf16 input and returns f32 logits
+        // lm_head takes bf16 input and returns f32 logits.
+        // After C1, lm_seq_len is always 1 — we project only the last token.
         debug!("lm_head projection (tied embeddings)");
-        let logits = self.lm_head_projection(&normed, seq_len)?;
+        let logits = self.lm_head_projection(&lm_input, lm_seq_len)?;
 
         if diag {
             let s: &[f32] = logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read logits: {e}"),
             })?;
-            // Print top-10 logits for the LAST token position
+            // After C1, logits are always [1, vocab_size] — last token only
             let vocab_size = self.config.vocab_size;
-            let last_logits_start = (seq_len - 1) * vocab_size;
-            let last_logits = &s[last_logits_start..last_logits_start + vocab_size];
+            let last_logits = &s[..vocab_size];
             let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             eprintln!("[DIAG] After lm_head, top-10 logit (idx, val) for last token:");
@@ -637,15 +770,14 @@ impl Gemma4Model {
         // threadgroup dispatch to avoid the previous out-of-bounds bug with
         // non-uniform grid tails.
         debug!(cap = self.config.final_logit_softcapping, "Softcap (GPU)");
-        let capped_logits = self.apply_softcap(&logits, seq_len)?;
+        let capped_logits = self.apply_softcap(&logits, lm_seq_len)?;
 
         if diag {
             let s: &[f32] = capped_logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
                 reason: format!("diag read capped logits: {e}"),
             })?;
             let vocab_size = self.config.vocab_size;
-            let last_logits_start = (seq_len - 1) * vocab_size;
-            let last_logits = &s[last_logits_start..last_logits_start + vocab_size];
+            let last_logits = &s[..vocab_size];
             let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             eprintln!("[DIAG] After softcap (cap={}), top-10 logit (idx, val) for last token:",
@@ -659,7 +791,7 @@ impl Gemma4Model {
             eprintln!("[DIAG]   capped stats: min={:.4}, max={:.4}, mean={:.4}", min, max, mean);
         }
 
-        // Read logits to CPU
+        // Read logits to CPU — after C1 this is always [vocab_size] f32s
         let output: &[f32] = capped_logits
             .as_slice()
             .map_err(|e| Gemma4Error::ForwardError {
@@ -1132,6 +1264,9 @@ impl Gemma4Model {
         let head_dim = self.config.head_dim(layer_idx);
         let diag = std::env::var("HF2Q_DIAG").is_ok() && layer_idx == 0;
 
+        // KV sharing: shared layers skip K/V projection and read from donor cache
+        let is_kv_shared = self.config.is_kv_shared_layer(layer_idx);
+
         // =================================================================
         // BATCH 1: Pre-attention norm + Q/K/V projections
         //
@@ -1197,17 +1332,26 @@ impl Gemma4Model {
                 "model.layers.{layer_idx}.input_layernorm.weight"
             );
             normed = self.apply_rms_norm_with_encoder(&mut encoder, input, &norm_name, seq_len)?;
+            // Q projection always happens (shared layers still compute their own Q)
             q_proj = self.quantized_projection_with_encoder(
                 &mut encoder, &normed, &q_base, seq_len, hidden_size, q_out_dim,
             )?;
-            k_proj = self.quantized_projection_with_encoder(
-                &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
-            )?;
-            v_proj = self.quantized_projection_with_encoder(
-                &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
-            )?;
 
-            // Per-head norms + RoPE (same encoder, no commit between)
+            if is_kv_shared {
+                // KV-shared layer: skip K/V projection entirely.
+                // Placeholder buffers to satisfy the let binding.
+                k_proj = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                v_proj = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            } else {
+                k_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
+                )?;
+                v_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
+                )?;
+            }
+
+            // Per-head Q norm (always needed) + K/V norms (skipped for shared)
             let mut norm_params = self.device.alloc_buffer(
                 std::mem::size_of::<[f32; 2]>(), DType::F32, vec![2],
             )?;
@@ -1227,14 +1371,6 @@ impl Gemma4Model {
                     f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
                 }
             };
-            let k_nw = require_weight(&self.weights, &k_norm_name)?;
-            let k_nw_bf16 = match k_nw.buffer.dtype() {
-                DType::BF16 => clone_buffer(&self.device, &k_nw.buffer)?,
-                _ => {
-                    let f32_data = read_weight_as_f32(k_nw)?;
-                    f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
-                }
-            };
 
             let q_normed = self.device.alloc_buffer(
                 seq_len * q_out_dim * 2, DType::BF16, vec![seq_len, q_out_dim],
@@ -1245,25 +1381,43 @@ impl Gemma4Model {
                 (seq_len * n_heads) as u32, head_dim as u32,
             )?;
 
-            let k_normed = self.device.alloc_buffer(
-                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-            )?;
-            rms_norm::dispatch_rms_norm(
-                &mut encoder, &mut self.registry, self.device.metal_device(),
-                &k_proj, &k_nw_bf16, &k_normed, &norm_params,
-                (seq_len * n_kv_heads) as u32, head_dim as u32,
-            )?;
+            // K norm + V norm: only for non-shared layers
+            #[allow(unused_assignments)]
+            let mut k_normed_tmp = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            if is_kv_shared {
+                // KV-shared: skip K/V norms. K/V are in donor cache already.
+                v_normed_buf = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            } else {
+                let k_nw = require_weight(&self.weights, &k_norm_name)?;
+                let k_nw_bf16 = match k_nw.buffer.dtype() {
+                    DType::BF16 => clone_buffer(&self.device, &k_nw.buffer)?,
+                    _ => {
+                        let f32_data = read_weight_as_f32(k_nw)?;
+                        f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
+                    }
+                };
 
-            let v_out = self.device.alloc_buffer(
-                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-            )?;
-            rms_norm::dispatch_rms_norm_no_scale_bf16(
-                &mut encoder, &mut self.registry, self.device.metal_device(),
-                &v_proj, &v_out, &norm_params,
-                (seq_len * n_kv_heads) as u32, head_dim as u32,
-            )?;
-            v_normed_buf = v_out;
+                k_normed_tmp = self.device.alloc_buffer(
+                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                )?;
+                rms_norm::dispatch_rms_norm(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &k_proj, &k_nw_bf16, &k_normed_tmp, &norm_params,
+                    (seq_len * n_kv_heads) as u32, head_dim as u32,
+                )?;
 
+                let v_out = self.device.alloc_buffer(
+                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                )?;
+                rms_norm::dispatch_rms_norm_no_scale_bf16(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &v_proj, &v_out, &norm_params,
+                    (seq_len * n_kv_heads) as u32, head_dim as u32,
+                )?;
+                v_normed_buf = v_out;
+            }
+
+            // RoPE: Q always, K only for non-shared layers
             if rope_dim > 0 && seq_len > 0 {
                 let pos_offset = if self.kv_cache.num_layers() > 0 {
                     let last_layer = self.kv_cache.num_layers() - 1;
@@ -1309,22 +1463,32 @@ impl Gemma4Model {
                 )?;
                 q_roped = q_rope_out;
 
-                let k_rope_out = self.device.alloc_buffer(
-                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-                )?;
-                rope::dispatch_rope_neox_bf16(
-                    &mut encoder, &mut self.registry, self.device.metal_device(),
-                    &k_normed, &k_rope_out, &rope_params, &positions_buf,
-                    seq_len as u32, n_kv_heads as u32, head_dim as u32, rope_dim as u32,
-                )?;
-                k_roped = k_rope_out;
+                if is_kv_shared {
+                    // K already in donor cache with RoPE applied
+                    k_roped = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                } else {
+                    let k_rope_out = self.device.alloc_buffer(
+                        seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                    )?;
+                    rope::dispatch_rope_neox_bf16(
+                        &mut encoder, &mut self.registry, self.device.metal_device(),
+                        &k_normed_tmp, &k_rope_out, &rope_params, &positions_buf,
+                        seq_len as u32, n_kv_heads as u32, head_dim as u32, rope_dim as u32,
+                    )?;
+                    k_roped = k_rope_out;
+                }
             } else {
                 q_roped = q_normed;
-                k_roped = k_normed;
+                if is_kv_shared {
+                    k_roped = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                } else {
+                    k_roped = k_normed_tmp;
+                }
             }
 
             // --- KV cache append (same encoder, no commit) ---
-            {
+            // KV-shared layers skip: they read from donor layer's cache.
+            if !is_kv_shared {
                 let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
                 layer_cache.append_gpu(
                     &k_roped,
@@ -1448,19 +1612,25 @@ impl Gemma4Model {
                 )?;
                 if q_gpu { encoder.commit_and_wait()?; }
             }
-            {
-                let mut encoder = self.device.command_encoder()?;
-                k_proj = self.quantized_projection_with_encoder(
-                    &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
-                )?;
-                if k_gpu { encoder.commit_and_wait()?; }
-            }
-            {
-                let mut encoder = self.device.command_encoder()?;
-                v_proj = self.quantized_projection_with_encoder(
-                    &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
-                )?;
-                if v_gpu { encoder.commit_and_wait()?; }
+            if is_kv_shared {
+                // KV-shared layer: skip K/V projection
+                k_proj = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                v_proj = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            } else {
+                {
+                    let mut encoder = self.device.command_encoder()?;
+                    k_proj = self.quantized_projection_with_encoder(
+                        &mut encoder, &normed, &k_base, seq_len, hidden_size, kv_out_dim,
+                    )?;
+                    if k_gpu { encoder.commit_and_wait()?; }
+                }
+                {
+                    let mut encoder = self.device.command_encoder()?;
+                    v_proj = self.quantized_projection_with_encoder(
+                        &mut encoder, &normed, &v_base, seq_len, hidden_size, kv_out_dim,
+                    )?;
+                    if v_gpu { encoder.commit_and_wait()?; }
+                }
             }
 
             // Per-head norms + RoPE in one encoder
@@ -1484,14 +1654,6 @@ impl Gemma4Model {
                     f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
                 }
             };
-            let k_nw = require_weight(&self.weights, &k_norm_name)?;
-            let k_nw_bf16 = match k_nw.buffer.dtype() {
-                DType::BF16 => clone_buffer(&self.device, &k_nw.buffer)?,
-                _ => {
-                    let f32_data = read_weight_as_f32(k_nw)?;
-                    f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
-                }
-            };
 
             let q_normed = self.device.alloc_buffer(
                 seq_len * q_out_dim * 2, DType::BF16, vec![seq_len, q_out_dim],
@@ -1502,24 +1664,40 @@ impl Gemma4Model {
                 (seq_len * n_heads) as u32, head_dim as u32,
             )?;
 
-            let k_normed = self.device.alloc_buffer(
-                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-            )?;
-            rms_norm::dispatch_rms_norm(
-                &mut encoder, &mut self.registry, self.device.metal_device(),
-                &k_proj, &k_nw_bf16, &k_normed, &norm_params,
-                (seq_len * n_kv_heads) as u32, head_dim as u32,
-            )?;
+            // K norm + V norm: only for non-shared layers
+            #[allow(unused_assignments)]
+            let mut k_normed_slow = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            if is_kv_shared {
+                v_normed_buf = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+            } else {
+                let k_nw = require_weight(&self.weights, &k_norm_name)?;
+                let k_nw_bf16 = match k_nw.buffer.dtype() {
+                    DType::BF16 => clone_buffer(&self.device, &k_nw.buffer)?,
+                    _ => {
+                        let f32_data = read_weight_as_f32(k_nw)?;
+                        f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
+                    }
+                };
 
-            let v_out = self.device.alloc_buffer(
-                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-            )?;
-            rms_norm::dispatch_rms_norm_no_scale_bf16(
-                &mut encoder, &mut self.registry, self.device.metal_device(),
-                &v_proj, &v_out, &norm_params,
-                (seq_len * n_kv_heads) as u32, head_dim as u32,
-            )?;
-            v_normed_buf = v_out;
+                k_normed_slow = self.device.alloc_buffer(
+                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                )?;
+                rms_norm::dispatch_rms_norm(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &k_proj, &k_nw_bf16, &k_normed_slow, &norm_params,
+                    (seq_len * n_kv_heads) as u32, head_dim as u32,
+                )?;
+
+                let v_out = self.device.alloc_buffer(
+                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                )?;
+                rms_norm::dispatch_rms_norm_no_scale_bf16(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &v_proj, &v_out, &norm_params,
+                    (seq_len * n_kv_heads) as u32, head_dim as u32,
+                )?;
+                v_normed_buf = v_out;
+            }
 
             if rope_dim > 0 && seq_len > 0 {
                 let pos_offset = if self.kv_cache.num_layers() > 0 {
@@ -1566,18 +1744,26 @@ impl Gemma4Model {
                 )?;
                 q_roped = q_rope_out;
 
-                let k_rope_out = self.device.alloc_buffer(
-                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
-                )?;
-                rope::dispatch_rope_neox_bf16(
-                    &mut encoder, &mut self.registry, self.device.metal_device(),
-                    &k_normed, &k_rope_out, &rope_params, &positions_buf,
-                    seq_len as u32, n_kv_heads as u32, head_dim as u32, rope_dim as u32,
-                )?;
-                k_roped = k_rope_out;
+                if is_kv_shared {
+                    k_roped = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                } else {
+                    let k_rope_out = self.device.alloc_buffer(
+                        seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                    )?;
+                    rope::dispatch_rope_neox_bf16(
+                        &mut encoder, &mut self.registry, self.device.metal_device(),
+                        &k_normed_slow, &k_rope_out, &rope_params, &positions_buf,
+                        seq_len as u32, n_kv_heads as u32, head_dim as u32, rope_dim as u32,
+                    )?;
+                    k_roped = k_rope_out;
+                }
             } else {
                 q_roped = q_normed;
-                k_roped = k_normed;
+                if is_kv_shared {
+                    k_roped = self.device.alloc_buffer(4, DType::BF16, vec![1, 1])?;
+                } else {
+                    k_roped = k_normed_slow;
+                }
             }
 
             encoder.commit_and_wait()?;
@@ -1586,7 +1772,7 @@ impl Gemma4Model {
             let use_k_eq_v = self.config.attention_k_eq_v
                 && layer_type == LayerAttentionType::Global;
 
-            if diag {
+            if diag && !is_kv_shared {
                 let k_raw = read_buffer_f32(&k_proj)?;
                 let v_raw = read_buffer_f32(&v_proj)?;
                 eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_raw[..5.min(k_raw.len())]);
@@ -1610,7 +1796,8 @@ impl Gemma4Model {
             }
 
             // --- Step 4: KV cache append --- (GPU direct copy, no CPU round-trip)
-            {
+            // KV-shared layers skip: they read from donor layer's cache.
+            if !is_kv_shared {
                 let mut kv_encoder = self.device.command_encoder()?;
                 let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
                 layer_cache.append_gpu(
@@ -2945,12 +3132,13 @@ impl Gemma4Model {
         head_dim: usize,
         layer_type: LayerAttentionType,
     ) -> Result<MlxBuffer, Gemma4Error> {
-        let layer_cache = self.kv_cache.layer(layer_idx)?;
-        let (k_cache_buf, v_cache_buf, kv_seq_len) = layer_cache.keys_values();
+        // For KV-shared layers, read K/V from the donor layer's cache.
+        let (k_cache_buf, v_cache_buf, kv_seq_len) = self.kv_cache.keys_values_for(layer_idx)?;
 
         if kv_seq_len == 0 {
+            let effective = self.kv_cache.donor_for(layer_idx).unwrap_or(layer_idx);
             return Err(Gemma4Error::ForwardError {
-                reason: format!("KV cache is empty for layer {layer_idx}"),
+                reason: format!("KV cache is empty for layer {layer_idx} (effective cache layer {effective})"),
             });
         }
 
@@ -3419,7 +3607,7 @@ impl Gemma4Model {
             }
         }
 
-        let intermediate_size = self.config.moe_intermediate_size;
+        let intermediate_size = self.config.moe_intermediate_for_layer(layer_idx);
 
         // ===================================================================
         // Phase 1: GPU MoE routing via moe_gate kernel.
@@ -3648,7 +3836,7 @@ impl Gemma4Model {
 
         let expert_data = read_buffer_f32(expert_input)?;
 
-        let intermediate_size = self.config.moe_intermediate_size;
+        let intermediate_size = self.config.moe_intermediate_for_layer(layer_idx);
 
         // Phase 1: GPU MoE routing (falls back to CPU if GPU fails)
         let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
@@ -4611,6 +4799,162 @@ impl Gemma4Model {
                 reason: format!("softcap_cpu alloc output: {e}"),
             })
     }
+
+    /// Apply softcap on GPU, committing the command buffer non-blocking.
+    ///
+    /// Returns `(CommandEncoder, MlxBuffer)` where the encoder has been
+    /// committed but NOT waited on.  The caller must call
+    /// `encoder.wait_until_completed()` before reading the output buffer.
+    fn apply_softcap_start(
+        &mut self,
+        logits: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<(CommandEncoder, MlxBuffer), Gemma4Error> {
+        let vocab_size = self.config.vocab_size;
+        let cap = self.config.final_logit_softcapping;
+        let n_elements = seq_len * vocab_size;
+
+        let output_bytes = n_elements * std::mem::size_of::<f32>();
+        let output = self.device.alloc_buffer(
+            output_bytes,
+            DType::F32,
+            vec![seq_len, vocab_size],
+        )?;
+
+        let mut params_buf = self.device.alloc_buffer(
+            2 * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![2],
+        )?;
+        {
+            let slice: &mut [f32] = params_buf.as_mut_slice().map_err(|e| {
+                Gemma4Error::ForwardError {
+                    reason: format!("Softcap params write: {e}"),
+                }
+            })?;
+            slice[0] = cap;
+            slice[1] = f32::from_bits(n_elements as u32);
+        }
+
+        let mut encoder = self.device.command_encoder()?;
+        softcap::dispatch_softcap(
+            &mut encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            logits,
+            &output,
+            &params_buf,
+            cap,
+        )?;
+        // Non-blocking commit — GPU begins executing immediately but CPU continues.
+        encoder.commit();
+
+        Ok((encoder, output))
+    }
+
+    /// Begin an async forward pass: encode all GPU work and commit
+    /// non-blocking.
+    ///
+    /// This performs the full forward pass (embedding, transformer layers,
+    /// final norm, lm_head projection, softcap) but the **last** GPU command
+    /// buffer commit is non-blocking.  The GPU executes asynchronously while
+    /// the CPU can do other work (e.g. sampling the previous token).
+    ///
+    /// Call [`forward_wait`] on the returned [`ForwardHandle`] to block until
+    /// the GPU finishes and read back the logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Gemma4Error` if any step of the forward pass fails to encode
+    /// or if a synchronous mid-pass commit fails (per-layer commits remain
+    /// synchronous for correctness).
+    pub fn forward_start(&mut self, tokens: &[u32]) -> Result<ForwardHandle, Gemma4Error> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(Gemma4Error::ForwardError {
+                reason: "Empty token sequence".into(),
+            });
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+
+        // Step 1: Embedding gather (returns f32), then convert to bf16
+        let hidden_f32 = self.embedding_gather(tokens)?;
+        let mut hidden = self.cast_f32_to_bf16(&hidden_f32, seq_len * hidden_size)?;
+
+        // Step 2: Scale embeddings by sqrt(hidden_size) (Gemma convention)
+        let scale = half::bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+        let n_embed_elements = seq_len * hidden_size;
+        let scaled_embed = self.device.alloc_buffer(
+            n_embed_elements * 2, // bf16
+            DType::BF16,
+            vec![seq_len, hidden_size],
+        )?;
+        {
+            let mut encoder = self.device.command_encoder()?;
+            elementwise::scalar_mul_bf16(
+                &mut encoder,
+                &mut self.registry,
+                self.device.metal_device(),
+                &hidden,
+                &scaled_embed,
+                n_embed_elements,
+                scale,
+            )?;
+            encoder.commit_and_wait()?;
+        }
+        hidden = scaled_embed;
+
+        // Step 3: Process each transformer layer (synchronous per-layer commits)
+        for layer_idx in 0..self.config.num_layers {
+            hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
+        }
+
+        // Step 4: Final RMS norm
+        let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
+
+        // Step 5: lm_head projection (tied embeddings)
+        let logits = self.lm_head_projection(&normed, seq_len)?;
+
+        // Step 6: Softcap — non-blocking commit
+        let (encoder, capped_logits) = self.apply_softcap_start(&logits, seq_len)?;
+
+        Ok(ForwardHandle {
+            encoder,
+            logits_buffer: capped_logits,
+            vocab_size,
+            seq_len,
+        })
+    }
+
+    /// Wait for an in-flight forward pass to complete and read back logits.
+    ///
+    /// Blocks until the GPU finishes executing the command buffer that was
+    /// committed by [`forward_start`], then copies the logits from the GPU
+    /// buffer to a CPU `Vec<f32>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Gemma4Error` if the GPU reports an error or if the buffer
+    /// readback fails.
+    pub fn forward_wait(&mut self, handle: ForwardHandle) -> Result<Vec<f32>, Gemma4Error> {
+        // Block until GPU finishes the softcap command buffer.
+        handle.encoder.wait_until_completed().map_err(|e| {
+            Gemma4Error::ForwardError {
+                reason: format!("GPU async forward wait failed: {e}"),
+            }
+        })?;
+
+        // Read logits from GPU buffer to CPU.
+        let output: &[f32] = handle.logits_buffer.as_slice().map_err(|e| {
+            Gemma4Error::ForwardError {
+                reason: format!("Read async logits: {e}"),
+            }
+        })?;
+
+        Ok(output.to_vec())
+    }
 }
 
 // ---- Helper functions ----
@@ -5299,6 +5643,81 @@ mod tests {
         assert_eq!(config.head_dim(5), 512);
         assert_eq!(config.rope_dim(0), 256); // full rotation
         assert_eq!(config.rope_dim(5), 128); // 0.25 * 512
+
+        // No KV sharing for 12B config (num_kv_shared_layers not set)
+        assert_eq!(config.num_kv_shared_layers, 0);
+        assert!(!config.is_kv_shared_layer(0));
+        assert!(!config.is_kv_shared_layer(29));
+        assert_eq!(config.donor_layer_for(0), None);
+        assert_eq!(config.moe_intermediate_for_layer(0), 704);
+    }
+
+    #[test]
+    fn test_kv_sharing_27b() {
+        // Simulate a 27B config with 30 layers and 20 KV-shared layers
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "text_config": {
+                    "num_hidden_layers": 30,
+                    "hidden_size": 2816,
+                    "vocab_size": 262144,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 8,
+                    "num_global_key_value_heads": 2,
+                    "head_dim": 256,
+                    "global_head_dim": 512,
+                    "sliding_window": 1024,
+                    "num_experts": 128,
+                    "top_k_experts": 8,
+                    "moe_intermediate_size": 704,
+                    "intermediate_size": 2112,
+                    "num_kv_shared_layers": 20,
+                    "layer_types": [
+                        "sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention", "full_attention",
+                        "sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention", "full_attention",
+                        "sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention", "full_attention",
+                        "sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention", "full_attention",
+                        "sliding_attention", "sliding_attention", "sliding_attention",
+                        "sliding_attention", "sliding_attention", "full_attention"
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = Gemma4Config::from_model_config(&json).unwrap();
+        assert_eq!(config.num_kv_shared_layers, 20);
+
+        // First 10 layers (30 - 20 = 10) are NOT shared
+        for i in 0..10 {
+            assert!(!config.is_kv_shared_layer(i), "layer {i} should NOT be shared");
+        }
+        // Last 20 layers (10..30) ARE shared
+        for i in 10..30 {
+            assert!(config.is_kv_shared_layer(i), "layer {i} should be shared");
+        }
+
+        // Donor layer tests:
+        // Layer 10 is sliding, first shared. Donor should be the most recent
+        // non-shared sliding layer before it (searching 0..10).
+        // Layer 9 is sliding -> donor = 9
+        assert_eq!(config.donor_layer_for(10), Some(9));
+
+        // Layer 11 is full_attention (global). Donor should be the most recent
+        // non-shared global layer. In the pattern, layers 5 are global in 0..10.
+        assert_eq!(config.donor_layer_for(11), Some(5));
+
+        // Layer 0 is not shared -> no donor
+        assert_eq!(config.donor_layer_for(0), None);
+
+        // Double-wide MoE for shared layers
+        assert_eq!(config.moe_intermediate_size_shared, 1408); // 704 * 2
+        assert_eq!(config.moe_intermediate_for_layer(0), 704);  // non-shared
+        assert_eq!(config.moe_intermediate_for_layer(10), 1408); // shared
     }
 
     #[test]
