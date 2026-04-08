@@ -1,400 +1,408 @@
 # hf2q Architecture
 
-## 1. Overview
+## Overview
 
-hf2q is a pure Rust CLI tool that converts HuggingFace model weights to hardware-optimized formats. It eliminates Python from the model conversion pipeline entirely, providing a single binary that reads safetensors, quantizes weights, and writes output in formats optimized for specific hardware targets.
+hf2q is a pure-Rust CLI tool that reads HuggingFace model weights in safetensors
+format and writes optimally quantized output in GGUF (for llama.cpp/Ollama) or
+quantized safetensors (for Candle/vLLM). It provides ten quantization methods
+ranging from simple round-to-nearest (F16/Q8/Q4/Q2) through calibration-aware
+mixed-bit (DWQ) and importance-matrix-driven per-tensor optimization (Apex). A
+self-learning database (RuVector) stores past conversion outcomes so that
+`--quant auto` improves over time. The tool is cross-platform (macOS + Linux),
+requires no Python, and produces a single static binary.
 
-### Design Philosophy
+Shaped by ADR-003 (2026-04-08), which stripped the original CoreML/MLX backends
+and built-in inference server to focus entirely on quantization output for the
+formats the ecosystem actually uses.
 
-- **Zero Python**: The entire conversion pipeline runs in Rust. No Python interpreter, no pip dependencies, no virtualenvs.
-- **Pipeline architecture**: Data flows linearly through well-defined phases. Each phase has a single responsibility and clear input/output contracts.
-- **Trait-based extensibility**: New output formats and quantization methods are added by implementing traits (`OutputBackend`, `Quantizer`), not by modifying existing code.
-- **IR as central contract**: The Intermediate Representation (`TensorMap`, `ModelMetadata`, `QuantizedModel`) is the shared language between all pipeline stages. Input modules produce it, quantizers transform it, backends consume it.
-- **Self-learning auto mode**: The tool remembers conversion results in a local vector database (RuVector) and uses past outcomes to recommend optimal settings for future conversions.
-- **Feature-gated optional dependencies**: Heavy platform-specific dependencies (coreml-native, ruvector-core) are behind cargo feature flags. The core pipeline works without them.
 
-### Current State
-
-- ~16,600 lines of Rust across 25+ source files
-- One implemented output backend: CoreML
-- Four quantization families: static (f16/q8/q4/q2), mixed-bit, DWQ, auto
-- 54+ tests across all modules
-- Targets Apple Silicon (macOS) as primary platform
-
----
-
-## 2. System Architecture
-
-### High-Level Pipeline
-
-```mermaid
-flowchart LR
-    subgraph Input
-        HF[HuggingFace Hub / Local Dir]
-        CFG[config.json]
-        ST[*.safetensors]
-    end
-
-    subgraph Pipeline["Convert Pipeline (main.rs)"]
-        direction TB
-        P0["Phase 0: Parse config.json"]
-        P025["Phase 0.25: Init RuVector DB"]
-        P03["Phase 0.3: Hardware + Fingerprint"]
-        P04["Phase 0.4: Auto Resolution"]
-        P05["Phase 0.5: Preflight Validation"]
-        P1["Phase 1: Read Safetensors"]
-        P2["Phase 2: bf16 -> f16"]
-        P3["Phase 3: Quantize"]
-        P4["Phase 4: Backend Write"]
-        P5["Phase 5: Quality Measurement"]
-        P55["Phase 5.5: Store in RuVector"]
-        P6["Phase 6: JSON Report"]
-        P7["Phase 7: Print Summary"]
-
-        P0 --> P025 --> P03 --> P04 --> P05 --> P1 --> P2 --> P3 --> P4 --> P5 --> P55 --> P6 --> P7
-    end
-
-    subgraph Output
-        CML[CoreML Package]
-        RPT[report.json]
-    end
-
-    HF --> P0
-    CFG --> P0
-    ST --> P1
-    P4 --> CML
-    P6 --> RPT
-```
-
-### Module Dependency Graph
-
-```mermaid
-flowchart TB
-    main[main.rs] --> cli[cli.rs]
-    main --> backends
-    main --> input
-    main --> quantize
-    main --> quality
-    main --> intelligence
-    main --> inference
-    main --> preflight[preflight.rs]
-    main --> progress[progress.rs]
-    main --> report[report.rs]
-    main --> doctor[doctor.rs]
-    main --> ir[ir.rs]
-
-    cli --> ir
-    backends --> ir
-    backends --> progress
-    input --> ir
-    input --> progress
-    quantize --> ir
-    quantize --> progress
-    quality --> inference
-    quality --> ir
-    quality --> progress
-    intelligence --> ir
-    inference --> ir
-    preflight --> cli
-    preflight --> ir
-    report --> ir
-    report --> quality
-    doctor --> intelligence
-
-    subgraph backends[backends/]
-        b_mod[mod.rs] --> b_coreml[coreml.rs]
-        b_mod --> b_gguf[gguf.rs]
-        b_mod --> b_nvfp4[nvfp4.rs]
-    end
-
-    subgraph input[input/]
-        i_mod[mod.rs] --> i_cfg[config_parser.rs]
-        i_mod --> i_st[safetensors.rs]
-        i_mod --> i_dl[hf_download.rs]
-    end
-
-    subgraph quantize[quantize/]
-        q_mod[mod.rs] --> q_static[static_quant.rs]
-        q_mod --> q_mixed[mixed.rs]
-        q_mod --> q_dwq[dwq.rs]
-    end
-
-    subgraph quality[quality/]
-        ql_mod[mod.rs] --> ql_kl[kl_divergence.rs]
-        ql_mod --> ql_ppl[perplexity.rs]
-        ql_mod --> ql_cos[cosine_sim.rs]
-    end
-
-    subgraph intelligence[intelligence/]
-        int_mod[mod.rs] --> int_hw[hardware.rs]
-        int_mod --> int_fp[fingerprint.rs]
-        int_mod --> int_heur[heuristics.rs]
-        int_mod --> int_rv[ruvector.rs]
-    end
-
-    subgraph inference[inference/]
-        inf_mod[mod.rs] --> inf_stub[stub_runner.rs]
-    end
-```
-
----
-
-## 3. Module Structure
-
-### Entry Point (`main.rs`)
-
-Dispatches clap subcommands (`convert`, `info`, `doctor`, `completions`) and owns the 7-phase convert pipeline. Contains the `AppError` enum that classifies errors into exit code categories. Installs a SIGINT handler that cleans up partial output directories on Ctrl+C.
-
-### CLI (`cli.rs`)
-
-Pure configuration module. Uses clap derive API to define the full argument schema. Contains:
-
-- `Cli` / `Command` -- top-level parser and subcommand enum
-- `ConvertArgs` -- all convert subcommand arguments
-- `OutputFormat` enum -- `Coreml`, `Gguf`, `Nvfp4`, `Gptq`, `Awq`
-- `QuantMethod` enum -- `Auto`, `F16`, `Q8`, `Q4`, `Q2`, `Q4Mxfp`, `Mixed26`, `Mixed36`, `Mixed46`, `DwqMixed46`
-- `GroupSize` enum -- `G32`, `G64`, `G128`
-- `ConvertConfig` -- resolved configuration struct that flows through the pipeline
-- `resolve_convert_config()` -- validates and resolves CLI args into `ConvertConfig`
-- `parse_sensitive_layers()` -- parses layer range specifications like `"13-24"` or `"1,5,13-24"`
-
-No global state. All environment variable resolution happens here at startup.
-
-### IR (`ir.rs`)
-
-The Intermediate Representation module defines the central data types that flow between pipeline stages:
-
-- `DType` -- tensor element types (F32, F16, BF16, I32, I64, U8, U16, U32, Bool)
-- `TensorRef` -- a single tensor with name, shape, dtype, and data bytes
-- `TensorMap` -- `HashMap<String, TensorRef>`, the primary container for model weights
-- `ModelMetadata` -- architecture info parsed from config.json
-- `QuantizedTensor` -- a tensor after quantization, with per-tensor quant metadata
-- `TensorQuantInfo` -- per-tensor quantization parameters (method, bits, group_size, scales, biases)
-- `QuantizedModel` -- the fully quantized model, ready for backend consumption
-- `OutputManifest` -- list of files written by a backend
-- `FormatWarning` / `WarningSeverity` -- backend validation warnings
-
-All types are `Send + Sync`. `TensorRef` provides `is_weight()` to determine which tensors should be quantized versus preserved at full precision. Non-weight tensors include layernorms, biases, scalars, router scales, and embeddings.
-
-### Input (`input/`)
-
-- `config_parser.rs` -- parses HuggingFace `config.json` into `ModelMetadata`
-- `safetensors.rs` -- reads `.safetensors` files into `TensorMap` using memory-mapped I/O (memmap2)
-- `hf_download.rs` -- downloads models from HuggingFace Hub using the `hf-hub` crate
-
-### Backends (`backends/`)
-
-- `mod.rs` -- defines the `OutputBackend` trait and `BackendError` enum
-- `coreml.rs` -- CoreML model package output
-- `gguf.rs` -- GGUF format (planned, stub)
-- `nvfp4.rs` -- NVFP4 format (planned, stub)
-
-### Quantize (`quantize/`)
-
-- `mod.rs` -- defines the `Quantizer` trait, `LayerQuantConfig`, and the `quantize_model()` orchestrator
-- `static_quant.rs` -- round-to-nearest quantization for f16, q8, q4, q2
-- `mixed.rs` -- mixed-bit quantization with per-layer bit allocation based on `--sensitive-layers`
-- `dwq.rs` -- Distilled Weight Quantization with calibration passes via `InferenceRunner`
-
-### Quality (`quality/`)
-
-- `mod.rs` -- orchestrates quality measurement, defines `QualityReport`
-- `kl_divergence.rs` -- KL divergence between original and quantized logits/activations
-- `perplexity.rs` -- perplexity delta measurement
-- `cosine_sim.rs` -- cosine similarity of per-layer activations
-
-### Intelligence (`intelligence/`)
-
-- `mod.rs` -- `AutoResolver` with RuVector-first, heuristic-fallback resolution
-- `hardware.rs` -- `HardwareProfiler` detecting chip model, memory, core counts via sysinfo
-- `fingerprint.rs` -- `ModelFingerprint` from `ModelMetadata` for stable model identification
-- `heuristics.rs` -- rule-based quantization selection based on memory fitting analysis
-- `ruvector.rs` -- `RuVectorDb` JSON-backed store for conversion results with exact/similar match lookups
-
-### Inference (`inference/`)
-
-- `mod.rs` -- `InferenceRunner` trait, `TokenInput`, `ForwardOutput` types, `create_runner()` factory
-- `stub_runner.rs` -- stub runner (no inference backend currently available)
-
-### Supporting Modules
-
-- `preflight.rs` -- pre-conversion validation (input dir, layer types, format compatibility, sensitive layer ranges, disk space, output dir)
-- `progress.rs` -- progress bars and terminal UX via indicatif/console
-- `report.rs` -- JSON report builder with stable v1 schema for CI consumption
-- `doctor.rs` -- system health diagnostics (RuVector, hardware detection, disk space)
-
----
-
-## 4. Data Flow
-
-### Convert Pipeline Data Transformations
-
-```mermaid
-sequenceDiagram
-    participant CLI as cli.rs
-    participant CFG as config_parser
-    participant HW as HardwareProfiler
-    participant FP as ModelFingerprint
-    participant AR as AutoResolver
-    participant PF as preflight
-    participant ST as safetensors
-    participant IR as TensorMap
-    participant QZ as Quantizer
-    participant QM as QuantizedModel
-    participant BE as OutputBackend
-    participant QL as quality
-    participant RV as RuVectorDb
-    participant RP as report
-
-    CLI->>CLI: resolve_convert_config(args) -> ConvertConfig
-    CLI->>CFG: parse_config(config.json) -> ModelMetadata
-    CLI->>RV: RuVectorDb::open_default()
-    CLI->>HW: HardwareProfiler::detect() -> HardwareProfile
-    CLI->>FP: ModelFingerprint::from_metadata() -> ModelFingerprint
-    CLI->>AR: AutoResolver::resolve(hw, fp, db) -> ResolvedConfig
-    CLI->>PF: validate(config, metadata) -> PreflightReport
-    CLI->>ST: read_model(input_dir) -> (metadata, TensorMap)
-    ST->>IR: TensorMap with raw tensors
-    IR->>IR: convert_bf16_to_f16()
-    IR->>QZ: quantize_model(tensor_map, metadata, quantizer, bits, group_size)
-    QZ->>QM: QuantizedModel with quantized tensors
-    QM->>BE: backend.validate(model)
-    QM->>BE: backend.write(model, input_dir, output_dir) -> OutputManifest
-    IR->>QL: measure_quality(runner, original, quantized, metadata) -> QualityReport
-    QL->>RV: store_conversion(hw, fp, method, bits, group_size, quality)
-    QM->>RP: ReportBuilder.build() -> JSON report
-```
-
-### Type Flow Through Pipeline
+## System Architecture
 
 ```
-config.json  -->  ModelMetadata
-                      |
-                      v
-*.safetensors --> TensorMap (HashMap<String, TensorRef>)
-                      |
-                      | convert_bf16_to_f16()
-                      v
-                  TensorMap (all f16)
-                      |
-                      | quantize_model(quantizer, bits, group_size)
-                      v
-                  QuantizedModel { metadata, tensors: HashMap<String, QuantizedTensor>, ... }
-                      |
-                      | backend.write()
-                      v
-                  OutputManifest { files: Vec<OutputFile>, total_size_bytes, ... }
+                          +---------------------+
+                          |   CLI (src/cli.rs)  |
+                          |  clap derive parser |
+                          +----------+----------+
+                                     |
+                                     v
+                          +---------------------+
+                          | main.rs dispatcher  |
+                          | cmd_convert / info  |
+                          | validate / doctor   |
+                          +----------+----------+
+                                     |
+           +-------------------------+-------------------------+
+           |                         |                         |
+           v                         v                         v
+   +--------------+        +------------------+       +-----------------+
+   |  src/input/  |        | src/intelligence/ |       | src/preflight.rs|
+   | safetensors  |        | auto_quant        |       | pre-conversion  |
+   | config_parser|        | fingerprint       |       | validation      |
+   | hf_download  |        | hardware          |       +-----------------+
+   +-------+------+        | heuristics        |
+           |               | ruvector          |
+           v               +--------+----------+
+   +---------------+                |
+   | IR (src/ir.rs)|                |
+   | TensorMap     |<---------------+  (fingerprint + hardware inform
+   | ModelMetadata |                    auto-quant decisions)
+   +-------+-------+
+           |
+           v
+   +-----------------+     +-----------------------+
+   | src/quantize/   |     | src/gpu/              |
+   | static_quant    |<----| forward.rs (Candle)   |
+   | mixed           |     | tokenizer.rs          |
+   | dwq             |     | mod.rs (device select)|
+   | dwq_activation  |     +-----------------------+
+   | apex            |
+   | sensitivity     |
+   +-------+---------+
+           |
+           v
+   +------------------+
+   | QuantizedModel   |  (IR: packed data + per-tensor TensorQuantInfo)
+   +-------+----------+
+           |
+     +-----+-----+
+     |           |
+     v           v
++----------+ +-----------------+     +------------------+
+| GGUF     | | safetensors_out |     | src/quality/     |
+| backend  | | backend         |     | cosine_sim       |
++----+-----+ +--------+--------+     | kl_divergence    |
+     |                |              | perplexity       |
+     v                v              | regression       |
+  .gguf file    .safetensors +       +--------+---------+
+                quant_config.json             |
+                                              v
+                                     +------------------+
+                                     | src/report.rs    |
+                                     | JSON report (CI) |
+                                     +------------------+
 ```
 
----
+Cross-cutting concerns:
+- `src/progress.rs` -- indicatif progress bars used by every pipeline stage
+- `src/doctor.rs` -- diagnostics subcommand (hardware, RuVector, disk)
+- Signal handling -- SIGINT triggers cleanup of partial output directories
 
-## 5. Intermediate Representation
 
-### TensorRef
+## Module Map
 
-The fundamental unit of model weight data:
+| Module | File | Lines | Purpose | Key Types |
+|--------|------|------:|---------|-----------|
+| **Entry point** | `src/main.rs` | 1136 | CLI dispatch, conversion pipeline orchestration, exit codes | `AppError`, `cmd_convert()` |
+| **CLI** | `src/cli.rs` | 433 | clap derive parser, config resolution | `Cli`, `Command`, `ConvertArgs`, `ConvertConfig`, `OutputFormat`, `QuantMethod` |
+| **IR** | `src/ir.rs` | 529 | Central data contract between stages | `TensorRef`, `TensorMap`, `ModelMetadata`, `QuantizedTensor`, `QuantizedModel`, `TensorQuantInfo`, `OutputManifest` |
+| **Input (mod)** | `src/input/mod.rs` | 71 | Module root, `read_model()` entry point | `InputError` |
+| **Input (safetensors)** | `src/input/safetensors.rs` | 440 | Mmap-based shard reader, safetensors binary format parser | `read_tensors()`, `discover_shards()` |
+| **Input (config)** | `src/input/config_parser.rs` | 397 | HF config.json -> ModelMetadata, nested text_config support | `parse_config()`, `ConfigParseError` |
+| **Input (download)** | `src/input/hf_download.rs` | 557 | HF Hub download via hf-hub crate + CLI fallback | `download_model()`, `DownloadError` |
+| **Quantize (mod)** | `src/quantize/mod.rs` | 138 | `Quantizer` trait, `quantize_model()` pipeline | `Quantizer`, `LayerQuantConfig`, `QuantizeError` |
+| **Quantize (static)** | `src/quantize/static_quant.rs` | 456 | F16/Q8/Q4/Q2 round-to-nearest with per-group scaling | `StaticQuantizer` |
+| **Quantize (mixed)** | `src/quantize/mixed.rs` | 471 | Mixed-bit with sensitive layer protection | `MixedBitQuantizer`, `MixedBitPreset` |
+| **Quantize (DWQ)** | `src/quantize/dwq.rs` | 534 | Weight-space calibrated quantization | `DwqQuantizer`, `DwqConfig`, `run_dwq_calibration()` |
+| **Quantize (DWQ act.)** | `src/quantize/dwq_activation.rs` | 303 | Activation-based DWQ via Candle forward passes | `run_dwq_activation_calibration()` |
+| **Quantize (Apex)** | `src/quantize/apex.rs` | 743 | Imatrix-calibrated per-tensor K-quant selection | `ApexConfig`, `run_apex_quantization()`, `compute_importance_matrix()` |
+| **Quantize (sensitivity)** | `src/quantize/sensitivity.rs` | 245 | Per-layer sensitivity scoring from activations | `LayerSensitivity`, `compute_layer_sensitivity()` |
+| **Backends (mod)** | `src/backends/mod.rs` | 86 | `OutputBackend` trait definition | `OutputBackend`, `BackendError` |
+| **Backends (GGUF)** | `src/backends/gguf.rs` | 752 | GGUF v3 binary writer, HF-to-GGUF tensor naming | `GgufBackend` |
+| **Backends (safetensors)** | `src/backends/safetensors_out.rs` | 595 | Multi-shard safetensors writer with quant_config.json | `SafetensorsBackend` |
+| **GPU (mod)** | `src/gpu/mod.rs` | 242 | Candle device selection, IR-to-Candle tensor conversion | `GpuDevice`, `select_device()`, `tensor_from_ir()` |
+| **GPU (forward)** | `src/gpu/forward.rs` | 507 | Decoder-only transformer forward pass for calibration | `ForwardOutput`, `TransformerLayer`, `RmsNorm` |
+| **GPU (tokenizer)** | `src/gpu/tokenizer.rs` | 121 | Tokenizer loading and calibration text encoding | `load_tokenizer()`, `encode_calibration_text()` |
+| **Intelligence (mod)** | `src/intelligence/mod.rs` | 363 | Auto mode resolver, format-aware dispatch | `AutoResolver`, `ResolvedConfig`, `ResolvedSource`, `OutputFormatHint` |
+| **Intelligence (auto)** | `src/intelligence/auto_quant.rs` | 1018 | Bandwidth-model algorithm, per-component sensitivity | `AutoQuantPlan`, `ComponentOverride`, `AutoQuantConstraints` |
+| **Intelligence (fingerprint)** | `src/intelligence/fingerprint.rs` | 285 | Stable model identity from config.json | `ModelFingerprint`, `stable_id()` |
+| **Intelligence (hardware)** | `src/intelligence/hardware.rs` | 440 | Chip/memory/core detection via sysinfo | `HardwareProfile`, `stable_id()` |
+| **Intelligence (heuristics)** | `src/intelligence/heuristics.rs` | 409 | Memory-fitting rules for quant selection | `HeuristicResult`, `select_quant_with_format()` |
+| **Intelligence (RuVector)** | `src/intelligence/ruvector.rs` | 1193 | JSON-backed self-learning DB at ~/.hf2q/ruvector/ | `RuVectorDb`, `ConversionRecord`, `QualityMetrics` |
+| **Quality (mod)** | `src/quality/mod.rs` | 718 | Orchestrates measurement, dequantize, threshold checks | `QualityReport`, `QualityThresholds`, `measure_quality()` |
+| **Quality (cosine)** | `src/quality/cosine_sim.rs` | 252 | Per-layer weight cosine similarity | `compute_cosine_similarity()` |
+| **Quality (KL)** | `src/quality/kl_divergence.rs` | 267 | KL divergence via Candle forward passes | `compute_kl_divergence()` |
+| **Quality (perplexity)** | `src/quality/perplexity.rs` | 249 | Perplexity measurement via Candle | `compute_perplexity()` |
+| **Quality (regression)** | `src/quality/regression.rs` | 401 | Baseline comparison, quality gate for CI | `QualityGate`, `RegressionWarning`, `detect_regression()` |
+| **Preflight** | `src/preflight.rs` | 731 | Pre-conversion validation (layers, disk, format compat) | `PreflightReport`, `PreflightError`, `validate()` |
+| **Report** | `src/report.rs` | 567 | Structured JSON report (schema v1) for CI pipelines | `ConversionReport`, `ReportBuilder` |
+| **Doctor** | `src/doctor.rs` | 335 | System health diagnostics | `run_doctor()` |
+| **Progress** | `src/progress.rs` | 199 | indicatif wrapper, byte/param formatting | `ProgressReporter`, `format_bytes()` |
+| **Total** | 35 files | 16183 | | |
 
-```rust
-pub struct TensorRef {
-    pub name: String,        // e.g., "model.layers.0.self_attn.q_proj.weight"
-    pub shape: Vec<usize>,   // e.g., [4096, 4096]
-    pub dtype: DType,        // e.g., DType::F16
-    pub data: Vec<u8>,       // raw bytes, may originate from mmap
-}
+
+## Data Flow
+
+What happens when you run:
+
+    hf2q convert --repo google/gemma-3-27b --format gguf --quant apex
+
+### Phase 0: Initialization
+
+1. `Cli::parse()` produces `ConvertArgs`.
+2. `resolve_convert_config()` resolves `--repo` into a local directory via
+   `input::hf_download::download_model()`, which tries the `hf-hub` crate first
+   then falls back to the `hf` CLI. Returns a `ConvertConfig` struct.
+3. `config_parser::parse_config()` reads `config.json` to produce
+   `ModelMetadata` (architecture, layers, MoE info, dtype).
+4. `RuVectorDb::open_default()` opens `~/.hf2q/ruvector/` (required).
+5. `HardwareProfiler::detect()` probes chip model, memory, cores via `sysinfo`.
+6. `ModelFingerprint::from_metadata()` creates a stable hashable identity.
+7. If `--quant auto`: `AutoResolver::resolve_with_format()` queries RuVector
+   for stored results, falls back to `heuristics::select_quant_with_format()`.
+
+### Phase 0.5: Preflight
+
+8. `preflight::validate()` checks: input dir exists, safetensors present,
+   layer types supported, sensitive layer ranges valid, output dir empty,
+   disk space sufficient. Returns `PreflightReport` or actionable error.
+9. If `--dry-run`: print the plan and exit(0).
+
+### Phase 1: Read
+
+10. `input::read_model()` calls `safetensors::read_tensors()`, which:
+    - Discovers shards via `model.safetensors.index.json` or directory scan.
+    - Memory-maps each shard via `memmap2`.
+    - Parses the safetensors header (8-byte length + JSON + data offsets).
+    - Copies tensor data out of each mmap into `TensorRef` structs.
+    - Drops the mmap per shard to bound memory.
+    - Returns `TensorMap` (HashMap<String, TensorRef>).
+
+### Phase 2: Backend Selection and BF16 Conversion
+
+11. Backend instantiated: `GgufBackend::new()` or `SafetensorsBackend::new()`.
+12. Unless the backend requires native quantization, all BF16 tensors are
+    converted to F16 via `TensorMap::convert_bf16_to_f16()`.
+
+### Phase 3: Quantize
+
+13. Dispatch by `QuantMethod`:
+    - **F16/Q8/Q4/Q2**: `StaticQuantizer` -- per-group scale factors,
+      round-to-nearest. Non-weight tensors (norms, biases, embeddings)
+      preserved at original precision via `TensorRef::is_weight()`.
+    - **Mixed-{2,3,4}-6**: `MixedBitQuantizer` -- routes each tensor through
+      a `StaticQuantizer` at either `base_bits` or `sensitive_bits` depending
+      on layer index vs `--sensitive-layers`.
+    - **DWQ-Mixed-4-6**: `DwqQuantizer` -- mixed-bit quantization plus
+      weight-space calibration that computes optimal scale per group:
+      `scale = dot(W, Q) / dot(Q, Q)`. If `tokenizer.json` exists, uses
+      `dwq_activation::run_dwq_activation_calibration()` with Candle forward
+      passes for activation-based sensitivity scoring.
+    - **Apex**: `run_apex_quantization()` -- two-pass pipeline:
+      - Pass 1: `compute_importance_matrix()` runs Candle forward passes to
+        capture activation magnitudes, then computes per-tensor importance as
+        `mean(|activation| * |weight|)`. Falls back to weight-only magnitudes
+        when GPU is unavailable.
+      - Pass 2: Allocates K-quant types (Q2_K through Q6_K) per tensor to
+        meet `--target-bpw` budget, higher-importance tensors get more bits.
+        Stores the chosen GGML type name in `TensorQuantInfo::ggml_type`.
+
+14. Output: `QuantizedModel` containing `HashMap<String, QuantizedTensor>`,
+    each with packed data bytes, shape, and `TensorQuantInfo` (method, bits,
+    group_size, scales, biases, optional ggml_type).
+
+### Phase 4: Quality Measurement
+
+15. Unless `--skip-quality`:
+    - `dequantize_to_tensor_map()` reconstructs approximate f16 weights from
+      quantized data for comparison.
+    - `measure_quality()` computes weight-level cosine similarity per layer.
+    - If tokenizer is available: KL divergence and perplexity via Candle
+      forward passes on both original and quantized weights.
+    - `regression::detect_regression()` compares against stored RuVector
+      baseline (if any) and prints degradation warnings.
+
+### Phase 5: Write Output
+
+16. **GGUF backend** (`gguf.rs`):
+    - Writes GGUF v3 binary: magic + version + header (tensor count, KV count).
+    - Metadata KV pairs: architecture, layer count, vocab size, etc.
+    - Per-tensor: maps HF names to GGUF names (`model.layers.N.self_attn.q_proj.weight`
+      -> `blk.N.attn_q.weight`), selects GGML dtype from bit width or
+      `ggml_type` override, writes data with 32-byte alignment padding.
+    - Produces a single `.gguf` file.
+
+17. **Safetensors backend** (`safetensors_out.rs`):
+    - Builds safetensors header with `__metadata__` containing quant info.
+    - Quantized weights stored as U8 (packed bits); preserved tensors keep
+      original dtype. Scale tensors stored as separate entries.
+    - Multi-shard output for models exceeding 4 GB per shard.
+    - Writes `quantization_config.json` sidecar with per-tensor method,
+      bits, group_size, and preserved flags.
+    - Writes `model.safetensors.index.json` for sharded models.
+    - Copies `config.json` and `tokenizer.json` from input.
+
+### Phase 6: Post-conversion
+
+18. Stores conversion result in RuVector for future `--quant auto` queries.
+19. If `--quality-gate` and thresholds exceeded: exit(2).
+20. If `--json-report`: writes `report.json` (schema v1) to output dir or stdout.
+21. Prints terminal summary: model name, compression ratio, elapsed time.
+
+
+## Intermediate Representation
+
+The IR is the contract between input, quantize, and backend stages. All types
+are in `src/ir.rs` and are `Send + Sync`.
+
+### Input Stage Produces
+
+```
+TensorMap
+  tensors: HashMap<String, TensorRef>
+
+TensorRef
+  name: String          -- e.g., "model.layers.0.self_attn.q_proj.weight"
+  shape: Vec<usize>     -- e.g., [4096, 4096]
+  dtype: DType           -- F32, F16, BF16, I32, I64, U8, U16, U32, Bool
+  data: Vec<u8>          -- raw bytes (copied from mmap)
+
+ModelMetadata
+  architecture: String   -- from config.json "architectures[0]"
+  model_type: String
+  param_count: u64
+  hidden_size: u64
+  num_layers: u32
+  layer_types: Vec<String>
+  num_attention_heads: u32
+  num_kv_heads: Option<u32>
+  vocab_size: u64
+  dtype: String
+  shard_count: u32
+  num_experts: Option<u32>
+  top_k_experts: Option<u32>
+  intermediate_size: Option<u64>
+  raw_config: serde_json::Value
 ```
 
-Key method: `is_weight()` determines whether a tensor should be quantized. Returns `false` for layernorms, biases, scalars, router scales, and embeddings. Returns `true` for multi-dimensional tensors whose name contains "weight", "proj", or "experts.".
+### Quantize Stage Produces
 
-### TensorMap
+```
+QuantizedModel
+  metadata: ModelMetadata
+  tensors: HashMap<String, QuantizedTensor>
+  quant_method: String
+  group_size: usize
+  bits: u8
 
-A `HashMap<String, TensorRef>` that serves as the primary model weight container. Provides:
+QuantizedTensor
+  name: String
+  shape: Vec<usize>
+  original_dtype: DType
+  data: Vec<u8>           -- packed quantized bytes
+  quant_info: TensorQuantInfo
 
-- `convert_bf16_to_f16()` -- in-place bf16-to-f16 conversion of all bf16 tensors
-- `total_size_bytes()` -- sum of all tensor data sizes
-- Standard HashMap operations via the `tensors` field
-
-### ModelMetadata
-
-Architecture metadata extracted from `config.json`:
-
-```rust
-pub struct ModelMetadata {
-    pub architecture: String,       // "Gemma4ForConditionalGeneration"
-    pub model_type: String,         // "gemma4"
-    pub param_count: u64,           // total parameter count
-    pub hidden_size: u64,
-    pub num_layers: u32,
-    pub layer_types: Vec<String>,   // per-layer type names
-    pub num_attention_heads: u32,
-    pub num_kv_heads: Option<u32>,  // for GQA
-    pub vocab_size: u64,
-    pub dtype: String,
-    pub shard_count: u32,
-    pub num_experts: Option<u32>,   // MoE
-    pub top_k_experts: Option<u32>, // MoE
-    pub intermediate_size: Option<u64>,
-    pub raw_config: serde_json::Value,  // passthrough for output
-}
+TensorQuantInfo
+  method: String           -- "q4", "f16", "passthrough"
+  bits: u8
+  group_size: usize
+  preserved: bool          -- true for norms, biases, scalars
+  scales: Option<Vec<u8>>  -- per-group scale factors
+  biases: Option<Vec<u8>>  -- per-group zero points
+  ggml_type: Option<String> -- e.g., "Q4_K_M" (Apex only)
 ```
 
-### QuantizedTensor and QuantizedModel
+### Backend Produces
 
-After quantization, each tensor becomes a `QuantizedTensor` with its own `TensorQuantInfo` recording the quantization parameters (method, bits, group_size, scales, biases, preserved flag). These are collected into a `QuantizedModel` alongside global quant metadata.
-
-### OutputManifest
-
-Produced by backends after writing. Lists all output files with sizes, enabling the JSON report and summary display.
-
----
-
-## 6. Quantization Subsystem
-
-### Quantizer Trait
-
-```rust
-pub trait Quantizer: Send + Sync {
-    fn name(&self) -> &str;
-    fn requires_calibration(&self) -> bool;
-    fn quantize_tensor(
-        &self,
-        tensor: &TensorRef,
-        config: &LayerQuantConfig,
-    ) -> Result<QuantizedTensor, QuantizeError>;
-}
+```
+OutputManifest
+  output_dir: String
+  files: Vec<OutputFile>   -- filename + size_bytes
+  total_size_bytes: u64
+  shard_count: usize
 ```
 
-The `quantize_model()` orchestrator iterates tensors in sorted order (for deterministic output), applies `LayerQuantConfig` per tensor (setting `preserve: true` for non-weight tensors via `is_weight()`), and calls `quantize_tensor()` for each.
+### Weight Classification
 
-### Static Quantization (`static_quant.rs`)
+`TensorRef::is_weight()` determines what gets quantized vs preserved:
 
-Round-to-nearest quantization supporting f16, q8, q4, and q2 bit widths. Non-weight tensors are passed through at their original precision. Weight tensors are quantized per-group: data is divided into groups of `group_size` elements, each group gets its own scale factor stored alongside the quantized values.
+- **Quantized**: 2D+ tensors with "weight", "proj", or "experts." in name
+- **Preserved at f16**: layernorm, rmsnorm, bias, scalars, router scales,
+  embed_tokens, embedding_projection
 
-### Mixed-Bit Quantization (`mixed.rs`)
 
-Assigns different bit widths per layer. Layers specified in `--sensitive-layers` ranges get higher precision (6 bits), while other layers get lower precision (2, 3, or 4 bits depending on the method variant):
+## Quantization Methods
 
-| Method | Base bits | Sensitive bits |
-|--------|-----------|----------------|
-| `mixed-2-6` | 2 | 6 |
-| `mixed-3-6` | 3 | 6 |
-| `mixed-4-6` | 4 | 6 |
+| Method | CLI Flag | Type | Calibration | GPU | Implementation |
+|--------|----------|------|-------------|-----|----------------|
+| F16 | `--quant f16` | Passthrough (bf16->f16) | No | No | `StaticQuantizer` |
+| Q8 | `--quant q8` | Round-to-nearest, 8-bit | No | No | `StaticQuantizer` |
+| Q4 | `--quant q4` | Round-to-nearest, 4-bit | No | No | `StaticQuantizer` |
+| Q2 | `--quant q2` | Round-to-nearest, 2-bit | No | No | `StaticQuantizer` |
+| Mixed-2-6 | `--quant mixed-2-6` | 2-bit base, 6-bit sensitive | No | No | `MixedBitQuantizer` |
+| Mixed-3-6 | `--quant mixed-3-6` | 3-bit base, 6-bit sensitive | No | No | `MixedBitQuantizer` |
+| Mixed-4-6 | `--quant mixed-4-6` | 4-bit base, 6-bit sensitive | No | No | `MixedBitQuantizer` |
+| DWQ-Mixed-4-6 | `--quant dwq-mixed-4-6` | Weight-space calibrated mixed | Weight (CPU) | Optional | `DwqQuantizer` |
+| Apex | `--quant apex` | Imatrix per-tensor K-quant | Forward pass | Optional | `run_apex_quantization()` |
+| Auto | `--quant auto` | Intelligence-selected | Varies | Varies | `AutoResolver` |
 
-### DWQ -- Distilled Weight Quantization (`dwq.rs`)
+### Static Quantization Algorithm
 
-The most sophisticated quantization method. Requires an inference backend. Uses a calibration process with configurable sample count (`--calibration-samples`, default 1024). The `DwqConfig` struct controls calibration parameters. DWQ uses layer-streaming to bound memory usage: it loads one layer at a time via `InferenceRunner::load_layer()`, runs calibration forward passes, and writes the quantized layer before moving to the next.
+For each group of `group_size` elements in a weight tensor:
+1. Compute `absmax = max(|w|)` over the group.
+2. Compute scale: `scale = absmax / ((1 << (bits-1)) - 1)`.
+3. Quantize: `q = round(w / scale)`, clamped to `[-(1<<(bits-1)), (1<<(bits-1))-1]`.
+4. Pack quantized integers and store scale factor.
 
-### Quantization Dispatch
+### DWQ Calibration
 
-The `cmd_convert` function in `main.rs` dispatches to the correct quantizer based on `QuantMethod`:
+After initial quantization, DWQ refines the scale per group:
+`optimal_scale = dot(W_original, Q_int) / dot(Q_int, Q_int)`
 
-- `F16`, `Q8`, `Q4`, `Q2` -- `StaticQuantizer`
-- `Mixed26`, `Mixed36`, `Mixed46` -- `MixedBitQuantizer` through `quantize_model()`
-- `DwqMixed46` -- `DwqQuantizer` through `run_dwq_calibration()`
-- `Auto` -- resolved to one of the above via `AutoResolver` before reaching this dispatch
+This closed-form solution minimizes `||W - scale * Q||^2` without requiring
+forward passes, providing strictly better quality than static quantization.
 
----
+When a tokenizer is available, activation-based calibration runs Candle
+forward passes and uses `sensitivity::compute_layer_sensitivity()` to assign
+bits per layer based on `score = sqrt(variance) * log2(1 + max_magnitude)`.
 
-## 7. Output Backends
+### Apex Algorithm
+
+1. Compute importance matrix: for each weight tensor,
+   `importance = mean(|activation_input| * |weight|)`.
+2. Rank tensors by importance score.
+3. Solve a knapsack-style allocation: assign K-quant types (Q2_K through Q6_K)
+   to meet the `--target-bpw` budget, giving more bits to higher-importance
+   tensors. Each K-quant type has a known bits-per-weight cost:
+   Q2_K=2.5, Q3_K_S=3.0, Q3_K_M=3.5, Q4_K_S=4.2, Q4_K_M=4.5,
+   Q5_K_S=5.0, Q5_K_M=5.5, Q6_K=6.5.
+4. Store the selected GGML type in `TensorQuantInfo::ggml_type` so the GGUF
+   backend writes the correct type ID.
+
+
+## Output Backends
+
+### GGUF Backend (`src/backends/gguf.rs`)
+
+Writes GGUF v3 binary format directly (no external crate dependency at runtime).
+
+- **Magic**: `GGUF` (0x47475546)
+- **Version**: 3
+- **Alignment**: 32 bytes for tensor data
+- **Metadata KV**: architecture, layer count, vocab size, head count, etc.
+  encoded as GGUF string/uint32 types.
+- **Tensor naming**: Maps HuggingFace convention
+  (`model.layers.N.self_attn.q_proj.weight`) to GGUF convention
+  (`blk.N.attn_q.weight`). Unmapped names are hashed to prevent collisions.
+- **GGML dtypes**: F32 (0), F16 (1), Q4_0 (2), Q4_1 (3), Q5_0 (6), Q5_1 (7),
+  Q8_0 (8), Q8_1 (9), Q2_K (10), Q3_K_S-L (11-13), Q4_K_S/M (14-15),
+  Q5_K_S/M (16-17), Q6_K (18), IQ2_XXS/XS (19-20).
+- **Type selection**: Uses `TensorQuantInfo::ggml_type` if set (Apex), otherwise
+  maps from bit width: 2->Q4_0, 4->Q4_0, 8->Q8_0, 16->F16, preserved->F16/F32.
+- Warns on models exceeding 20 GB (single-file limit considerations).
+
+### Safetensors Backend (`src/backends/safetensors_out.rs`)
+
+Writes HuggingFace-compatible quantized safetensors.
+
+- **Sharding**: 4 GB per shard. Single file for small models.
+- **Data storage**: Quantized weights stored as U8 (packed bits) with original
+  shape recorded. Preserved tensors keep original dtype.
+- **Scale tensors**: Stored as separate entries named `{tensor_name}.scales`.
+- **Metadata header**: `__metadata__` with format, quant_method, bits, group_size.
+- **Sidecar files**:
+  - `quantization_config.json`: per-tensor method, bits, group_size, preserved.
+  - `model.safetensors.index.json`: weight map for sharded output.
+  - Copies `config.json`, `tokenizer.json`, `tokenizer_config.json` from input.
 
 ### OutputBackend Trait
 
@@ -402,339 +410,241 @@ The `cmd_convert` function in `main.rs` dispatches to the correct quantizer base
 pub trait OutputBackend: Send + Sync {
     fn name(&self) -> &str;
     fn validate(&self, model: &QuantizedModel) -> Result<Vec<FormatWarning>, BackendError>;
-    fn write(
-        &self,
-        model: &QuantizedModel,
-        input_dir: &Path,
-        output_dir: &Path,
-        progress: &ProgressReporter,
-    ) -> Result<OutputManifest, BackendError>;
+    fn write(&self, model: &QuantizedModel, input_dir: &Path,
+             output_dir: &Path, progress: &ProgressReporter) -> Result<OutputManifest, BackendError>;
+    fn quantize_and_write(...) -> Result<OutputManifest, BackendError>;  // native quant path
+    fn requires_native_quantization(&self) -> bool;  // default: false
 }
 ```
 
-Every backend validates before writing. Validation returns non-fatal `FormatWarning`s or fatal `BackendError`s.
 
-### CoreML Backend (`coreml.rs`)
+## GPU Compute
 
-Writes a CoreML model package. Validates that the model is not MoE (CoreML does not support dynamic expert routing). Uses the `coreml-native` crate when the `coreml-backend` feature is enabled.
+### Candle Integration (`src/gpu/`)
 
-### Planned Backends
+Candle (candle-core 0.10 + candle-nn 0.10) serves as the GPU compute library
+for calibration and quality measurement. It is not used for inference serving.
 
-- `gguf.rs` -- GGUF format for llama.cpp ecosystem
-- `nvfp4.rs` -- NVIDIA FP4 format
+- **Device selection** (`select_device()`): Prefers Metal (feature `metal`) on
+  macOS, CUDA (feature `cuda`) on Linux, falls back to CPU. Both GPU features
+  are optional at compile time.
+- **IR conversion** (`tensor_from_ir()`): Converts `TensorRef` to `candle_core::Tensor`
+  on the selected device. Validates data length matches shape * element_size.
+- **Bulk loading** (`load_tensor_map()`): Converts entire `TensorMap` to
+  `HashMap<String, Tensor>` on device. Unsupported dtypes are skipped.
 
-Both exist as stubs with `#[allow(dead_code)]`.
+### Forward Pass (`src/gpu/forward.rs`)
 
----
+A minimal decoder-only transformer for calibration. Not a full inference engine.
 
-## 8. Intelligence / Auto Mode
+- `RmsNorm`: Upcast to f32, normalize, multiply by weight, downcast.
+- `TransformerLayer`: pre-norm attention (Q/K/V projections, scaled dot-product,
+  O projection) + pre-norm FFN (gate/up/down projections with SiLU activation).
+  No KV cache (calibration runs full sequences).
+- Supports activation capture: returns per-layer hidden states when enabled.
+- Loads weights by matching HuggingFace naming conventions in the TensorMap.
 
-### Architecture
+### Tokenizer (`src/gpu/tokenizer.rs`)
 
-```mermaid
-flowchart TB
-    AUTO["--quant auto"]
-    AUTO --> AR[AutoResolver::resolve]
+Wraps the `tokenizers` crate to load `tokenizer.json` and encode calibration
+text. Provides `load_tokenizer()` and `encode_calibration_text()`. Used by
+DWQ activation calibration and Apex imatrix computation.
 
-    AR -->|Step 1| RV_EXACT["RuVector: exact hw+model match"]
-    AR -->|Step 2| RV_SIMILAR["RuVector: same model, any hw"]
-    AR -->|Step 3| HEUR["Heuristics: memory-based rules"]
 
-    RV_EXACT -->|found| RC[ResolvedConfig]
-    RV_SIMILAR -->|found| RC
-    HEUR --> RC
+## Intelligence System
 
-    RC --> PIPELINE["Continue pipeline with resolved method"]
+### Auto-Quant Algorithm (`src/intelligence/auto_quant.rs`)
 
-    subgraph "Post-conversion"
-        RESULT["Conversion result + quality metrics"]
-        RESULT -->|store| RV_STORE["RuVector::store_conversion()"]
-    end
-```
+Selects optimal quantization when `--quant auto` is specified.
 
-### AutoResolver
+1. **Model classification**: Determines size class and MoE vs dense.
+2. **Bandwidth model**: `tok/s = bandwidth_bytes/s / model_weight_bytes`.
+   For MoE: `effective_bytes = shared + (K/N) * expert_bytes`.
+3. **Memory fitting**: Finds the highest bit width that fits in available
+   memory with 1.3x headroom (1.8x for "generous" fit).
+4. **Per-component overrides**: Assigns higher bits to sensitive components
+   ranked by measured impact: router proj > embed_tokens > lm_head > MLP >
+   v_proj > k_proj > q_proj > o_proj > expert FFN.
+5. **Output**: `AutoQuantPlan` with `base_bits`, `component_overrides`,
+   estimated size, and estimated tok/s.
 
-Resolution order:
+### Resolution Pipeline (`src/intelligence/mod.rs`)
 
-1. Query RuVector for an exact hardware+model match (same chip model, same total memory, same core count, same model architecture/params/layers)
-2. Query RuVector for a similar match (same model on different hardware)
-3. Fall back to rule-based heuristics
+`AutoResolver::resolve_with_format()`:
+1. Query RuVector for exact match (hardware + model fingerprint).
+2. Query RuVector for similar match.
+3. Fall back to `heuristics::select_quant_with_format()`.
 
-The resolver produces a `ResolvedConfig` containing the recommended `quant_method`, `bits`, `group_size`, a `confidence` score (0.0-1.0), the `source` (RuVectorExact, RuVectorSimilar, or Heuristic), and human-readable `reasoning`.
+Returns `ResolvedConfig` with `quant_method`, `bits`, `group_size`,
+`confidence`, `source` (RuVectorExact/Similar/Heuristic).
 
-### HardwareProfiler (`hardware.rs`)
+### Model Fingerprinting (`src/intelligence/fingerprint.rs`)
 
-Detects the current machine via `sysinfo`:
+Creates a `ModelFingerprint` from `ModelMetadata`: architecture name, param
+count, layer count, expert count, attention types, hidden size, dtype, FFN
+size, head counts, vocab size. Produces a deterministic `stable_id()` via
+`DefaultHasher` for RuVector key lookups.
 
-- **Chip model**: on macOS, reads `machdep.cpu.brand_string` via sysctl for Apple Silicon identification
-- **Memory**: total and available unified memory in bytes
-- **Cores**: performance vs efficiency core counts via `hw.perflevel0/1.logicalcpu_max` on macOS
+### Hardware Profiling (`src/intelligence/hardware.rs`)
 
-Produces a `HardwareProfile` with a `stable_id()` based on chip model, total memory, and core count (excludes available memory, which fluctuates).
+`HardwareProfiler::detect()` uses `sysinfo` to capture: chip model string,
+total/available memory, performance/efficiency core counts. Estimates memory
+bandwidth from chip model name (Apple M-series lookup table). Produces
+`stable_id()` from chip + total memory + cores.
 
-### ModelFingerprint (`fingerprint.rs`)
+### RuVector Self-Learning (`src/intelligence/ruvector.rs`)
 
-Creates a stable, hashable identifier from `ModelMetadata`. Includes architecture name, total params, layer count, expert count, attention types, hidden size, dtype, intermediate size, head counts, and vocab size. Used as the key for RuVector lookups.
+JSON-backed database at `~/.hf2q/ruvector/`. Stores `ConversionRecord` entries
+containing hardware profile, model fingerprint, quant method, bits, group size,
+quality metrics (KL, perplexity delta, cosine sim), hf2q version, timestamp.
 
-Provides `estimated_f16_size_bytes()` and `estimated_size_bytes(bits)` for memory fitting calculations.
+Key operations:
+- `store_conversion()`: Save a completed conversion result.
+- `query_best_config()`: Find the best stored config for a hardware+model pair.
+- `update_quality()`: Update quality metrics for an existing record.
+- `flag_version_changes()`: Mark records from older hf2q versions for re-calibration.
+- `check_status()`: Return DB health for `hf2q doctor`.
 
-### Heuristics (`heuristics.rs`)
+When the `ruvector` feature is enabled, wraps `ruvector-core` for vector
+similarity search (similar model lookups). Without the feature, only exact
+match by `stable_id()` is available.
 
-Memory-fitting rules with 1.3x headroom factor (1.8x for "generous" headroom):
+### Heuristics (`src/intelligence/heuristics.rs`)
 
-| Rule | Condition | Result | Confidence |
-|------|-----------|--------|------------|
-| 1 | f16 fits with 1.8x headroom | `f16` | 0.90 |
-| 2 | f16 fits with 1.3x headroom | `q8` | 0.75 |
-| 3 | q8 fits with 1.3x headroom | `mixed-4-6` | 0.70 |
-| 4 | q4 fits with 1.3x headroom | `q4` | 0.65 |
-| 5 | q2 fits with 1.3x headroom | `q2` | 0.50 |
-| 6 | Nothing fits | Error | -- |
+Fallback when RuVector has no data. Memory-fitting rules:
+- Model fits at f16 with 1.8x headroom -> f16
+- Fits at q8 with headroom -> mixed-4-6
+- Fits tight -> q4
+- Fits very tight -> q2
+- Format-aware: GGUF prefers Apex for K-quant; safetensors prefers mixed-bit.
 
-The memory budget is `max(available_memory, total_memory * 0.7)` to account for reclaimable OS file caches.
 
-### RuVector (`ruvector.rs`)
+## Quality Pipeline
 
-A JSON-backed store at `~/.hf2q/ruvector/` that persists conversion records:
+### Measurement (`src/quality/mod.rs`)
 
-```rust
-pub struct ConversionRecord {
-    pub hardware: HardwareProfile,
-    pub fingerprint: ModelFingerprint,
-    pub quant_method: String,
-    pub bits: u8,
-    pub group_size: usize,
-    pub quality: QualityMetrics,     // kl_divergence, perplexity_delta, cosine_similarity
-    pub hf2q_version: String,
-    pub timestamp: String,
-    pub needs_recalibration: bool,
-}
-```
+`measure_quality()` orchestrates all quality metrics:
 
-Query behavior:
+1. **Weight cosine similarity** (`cosine_sim.rs`): Computes per-layer cosine
+   similarity between original and dequantized weight tensors. Works without
+   GPU or tokenizer. Reports average, minimum, and worst-layer index.
 
-- **Exact match**: same `stable_id()` for both hardware and model fingerprint
-- **Similar match**: same model fingerprint on any hardware
-- **Best selection**: among matches, prefers lowest KL divergence, then lowest perplexity delta
-- **Version gating**: records from different hf2q versions are flagged `needs_recalibration` and excluded from queries
+2. **KL divergence** (`kl_divergence.rs`): Runs Candle forward passes on
+   calibration text through both original and quantized weight sets. Computes
+   KL(P_original || P_quantized) from output logit distributions. Requires
+   tokenizer and GPU (falls back gracefully).
 
-When the `ruvector` cargo feature is enabled, the crate additionally wraps `ruvector-core` for vector similarity search across hardware/model configurations.
+3. **Perplexity** (`perplexity.rs`): Computes perplexity on calibration text
+   for both original and quantized models via Candle. Reports pre/post values
+   and delta.
 
----
+### Thresholds and Gates
 
-## 9. Quality Measurement
+`QualityThresholds` (defaults):
+- `max_kl_divergence`: 0.1
+- `max_perplexity_delta`: 2.0
+- `min_cosine_similarity`: 0.95
 
-Quality measurement compares original and quantized model outputs using three metrics. Requires an inference backend; without one, quality measurement is skipped with a clear message.
+`check_thresholds()` returns a list of violation messages. When `--quality-gate`
+is set and violations exist, the tool exits with code 2.
 
-### Process
+### Regression Detection (`src/quality/regression.rs`)
 
-1. Load original weights into `InferenceRunner`
-2. Run forward pass on calibration tokens (32-token synthetic sequence) to get original logits and per-layer activations
-3. Load quantized weights
-4. Run the same forward pass to get quantized logits and activations
-5. Compute metrics by comparing the two sets of outputs
+`detect_regression()` compares current metrics against a stored RuVector
+baseline. Classifies degradation as Info (<50% tolerance), Warning (50-100%),
+or Error (>100% tolerance). `build_quality_gate()` produces a serializable
+`QualityGate` struct for CI JSON output.
 
-### KL Divergence (`kl_divergence.rs`)
 
-Measures the divergence between probability distributions of original and quantized logits. Also computed per-layer from activation vectors. Lower is better; thresholds for display: green < 0.01, yellow < 0.1, red >= 0.1.
+## Configuration and CLI
 
-### Perplexity Delta (`perplexity.rs`)
+### Subcommands
 
-Measures the change in perplexity (next-token prediction quality). Uses calibration tokens shifted by 1 as targets. Reports pre-quant perplexity, post-quant perplexity, and the delta. Thresholds: green < 0.5, yellow < 2.0, red >= 2.0.
-
-### Cosine Similarity (`cosine_sim.rs`)
-
-Measures per-layer activation similarity between original and quantized models. Reports average, minimum, and the index of the worst layer. Thresholds: green > 0.99, yellow > 0.95, red <= 0.95.
-
-### QualityReport
-
-All metrics are collected into a `QualityReport` struct with `Option<f64>` fields (allowing partial measurement when some computations fail). The report feeds into both the terminal summary and the JSON report.
-
----
-
-## 10. CLI Design
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `hf2q convert` | Convert a model to a hardware-optimized format |
-| `hf2q info` | Inspect model metadata without converting |
-| `hf2q doctor` | Diagnose system health (RuVector, hardware, Metal, disk) |
-| `hf2q completions` | Generate shell completions (bash, zsh, fish, powershell) |
+| Subcommand | Description |
+|------------|-------------|
+| `convert` | Convert a HuggingFace model to GGUF or safetensors |
+| `info` | Inspect model metadata (architecture, layers, params, MoE) |
+| `validate` | Compare original vs quantized model quality metrics |
+| `doctor` | Diagnose RuVector, hardware, disk space, hf CLI |
+| `completions` | Generate shell completions (bash/zsh/fish) |
 
 ### Key Convert Flags
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--input` | `PathBuf` | -- | Local safetensors directory (conflicts with `--repo`) |
-| `--repo` | `String` | -- | HuggingFace repo ID for automatic download |
-| `--format` | `OutputFormat` | required | Output target: `coreml` (more planned) |
-| `--quant` | `QuantMethod` | `auto` | Quantization method |
-| `--sensitive-layers` | `String` | -- | Layer ranges for higher precision (e.g., `"13-24"`) |
-| `--calibration-samples` | `u32` | 1024 | Sample count for DWQ calibration |
-| `--bits` | `u8` | method default | Custom bit width (2-8) |
-| `--group-size` | `GroupSize` | 64 | Group size: `32`, `64`, `128` |
-| `--output` | `PathBuf` | auto-generated | Output directory |
-| `--json-report` | `bool` | false | Emit structured JSON report |
-| `--skip-quality` | `bool` | false | Skip quality measurement |
-| `--dry-run` | `bool` | false | Print plan and exit without converting |
-| `--yes` | `bool` | false | Non-interactive mode |
-| `--unsupported-layers` | `Policy` | -- | `passthrough` to pass unsupported layers at f16 |
-| `-v` / `-vv` / `-vvv` | -- | warn | Verbosity: info / debug / trace |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input <dir>` | -- | Local safetensors directory |
+| `--repo <id>` | -- | HuggingFace repo ID (auto-downloads) |
+| `--format <gguf\|safetensors>` | required | Output format |
+| `--quant <method>` | `auto` | Quantization method |
+| `--bits <2-8>` | method default | Override bit width |
+| `--group-size <32\|64\|128>` | 64 | Quantization group size |
+| `--sensitive-layers <spec>` | none | Layer ranges for higher precision |
+| `--target-bpw <float>` | 4.5 | Target bits-per-weight (Apex) |
+| `--calibration-samples <n>` | 1024 | Calibration sample count (DWQ) |
+| `--output <dir>` | auto | Output directory |
+| `--skip-quality` | false | Skip quality measurement |
+| `--quality-gate` | false | Exit code 2 on threshold violation |
+| `--json-report` | false | Emit structured JSON report |
+| `--dry-run` | false | Print plan without converting |
+| `--yes` | false | Non-interactive mode |
+| `--unsupported-layers passthrough` | error | Pass unsupported layers at f16 |
 
-### Config Resolution
+### Exit Codes
 
-`resolve_convert_config()` in `cli.rs` transforms `ConvertArgs` into `ConvertConfig`:
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Conversion error |
+| 2 | Quality threshold exceeded |
+| 3 | Input/validation error |
 
-1. Resolves input path (local dir or HF Hub download)
-2. Parses `--sensitive-layers` into `Vec<RangeInclusive<usize>>`
-3. Resolves group size (default: 64)
-4. Auto-generates output directory name as `{model}-{format}-{quant}` if not specified
-5. Validates that the chosen quant method and output format are implemented
-6. Returns the fully resolved `ConvertConfig` that flows through the pipeline
 
----
+## Dependencies
 
-## 11. Error Handling
-
-### Error Classification
-
-```rust
-enum AppError {
-    Input(anyhow::Error),         // exit code 3
-    Conversion(anyhow::Error),    // exit code 1
-    QualityExceeded(anyhow::Error), // exit code 2
-    Interrupted,                   // exit code 1
-}
-```
-
-### Exit Codes (per FR39 spec)
-
-| Code | Meaning | When |
-|------|---------|------|
-| 0 | Success | Conversion completed |
-| 1 | Conversion error | Quantization failure, backend write failure, interruption |
-| 2 | Quality exceeded | Quality threshold breached (future use) |
-| 3 | Input/validation error | Bad config, missing files, invalid args, preflight failure |
-
-### Error Strategy by Module
-
-- **main.rs**: `anyhow::Result` at the top level, classified into `AppError` for exit code mapping
-- **ir.rs**: `thiserror`-derived `IrError` for type-safe tensor operation errors
-- **backends/**: `BackendError` with `UnsupportedFormat`, `ValidationFailed`, `WriteFailed`, `Io`, `Serialization`
-- **quantize/**: `QuantizeError` with `TensorQuantizeFailed`, `UnsupportedMethod`, `GroupSizeMismatch`
-- **quality/**: `QualityError` wrapping inference, KL, perplexity, and cosine sim errors
-- **intelligence/**: `IntelligenceError` composing hardware, fingerprint, heuristics, and RuVector errors
-- **inference/**: `InferenceError` for platform, loading, forward pass, and logits extraction errors
-- **preflight/**: `PreflightError` with detailed, actionable error messages including suggested fixes
-
-All error messages include context and remediation guidance. The preflight module is particularly thorough, providing multi-line error messages with explicit fix instructions.
-
-### Graceful Interruption
-
-A Ctrl+C handler installed via the `ctrlc` crate sets an `AtomicBool` flag. The pipeline checks `check_interrupted()` between phases. On interruption, the handler cleans up partial output directories (only if created by the current run, not pre-existing).
-
----
-
-## 12. Feature Flags
-
-Defined in `Cargo.toml`:
-
-| Feature | Dependency | Purpose |
-|---------|------------|---------|
-| `coreml-backend` | `coreml-native` | CoreML output backend |
-| `ruvector` | `ruvector-core` | Enhanced vector similarity search for auto mode |
-
-### Conditional Compilation
-
-- `intelligence/ruvector.rs`: `cfg!(feature = "ruvector")` reports feature status in diagnostics; the JSON-backed store works without the feature, but vector similarity search requires it
-- `backends/coreml.rs`: CoreML-specific functionality gated behind `coreml-backend`
-
-The default feature set is empty (`default = []`). The core pipeline (read, quantize static methods) works without any optional features.
-
----
-
-## 13. Future Architecture
-
-### Inference Engine (`hf2q serve`)
-
-A planned inference server with an OpenAI-compatible API. Will use the same `InferenceRunner` trait infrastructure, adding:
-
-- HTTP server (likely axum or actix-web)
-- OpenAI-compatible `/v1/chat/completions` and `/v1/completions` endpoints
-- KV cache management
-- Continuous batching
-- Model loading from hf2q output directories
-
-### Additional Model Architectures
-
-Priority order:
-
-1. **Gemma 4 MoE** -- currently the primary test target
-2. **Llama** -- LlamaForCausalLM
-3. **Mistral** -- MistralForCausalLM
-4. Additional architectures as demand dictates
-
-Architecture support is primarily a `config_parser.rs` concern (parsing architecture-specific config.json fields) and a `TensorRef::is_weight()` concern (knowing which tensor name patterns to quantize).
-
-### Additional Output Backends
-
-| Backend | Target | Status |
-|---------|--------|--------|
-| GGUF | llama.cpp, ollama | Stub exists |
-| NVFP4 | NVIDIA TensorRT | Stub exists |
-| GPTQ | GPU inference engines | CLI enum defined |
-| AWQ | Activation-aware quantization | CLI enum defined |
-| ROCm | AMD GPU inference | Planned |
-| OpenVINO | Intel inference | Planned |
-
-### Linux / NVIDIA Platform Support
-
-Currently macOS-only for CoreML output. Future Linux support would add:
-
-- CUDA-based inference runner
-- NVIDIA-specific output formats (NVFP4, TensorRT)
-- Cross-platform hardware profiling (NVIDIA GPU detection via nvidia-smi or NVML)
-
----
-
-## 14. Dependencies
-
-### Core (always included)
-
-| Crate | Version | Role |
-|-------|---------|------|
-| `safetensors` | 0.7 | Reading `.safetensors` weight files |
-| `half` | 2.4 | bf16/f16 numeric types and conversion |
-| `hf-hub` | 0.5 | HuggingFace Hub model downloads |
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `safetensors` | 0.7 | Read/write safetensors format |
+| `half` | 2.4 | bf16/f16 type conversions |
+| `hf-hub` | 0.5 | HuggingFace Hub API for model downloads |
 | `clap` | 4.5 | CLI argument parsing (derive API) |
 | `clap_complete` | 4.5 | Shell completion generation |
-| `rayon` | 1.10 | Data-parallel processing |
-| `memmap2` | 0.9 | Memory-mapped file I/O for safetensors |
+| `rayon` | 1.10 | Data parallelism for quantization |
+| `memmap2` | 0.9 | Memory-mapped I/O for safetensors reading |
 | `indicatif` | 0.17 | Progress bars |
-| `console` | 0.15 | Terminal styling (colors, bold) |
-| `serde` | 1 | Serialization framework |
-| `serde_json` | 1 | JSON parsing and generation |
-| `anyhow` | 1 | Top-level error handling with context |
-| `thiserror` | 2 | Typed error derivation for library-level modules |
-| `sysinfo` | 0.32 | Hardware detection (CPU, memory, disks) |
-| `ctrlc` | 3.4 | SIGINT handling with process termination |
+| `console` | 0.15 | Terminal styling |
+| `serde` / `serde_json` | 1 | JSON serialization for config, reports, RuVector |
+| `anyhow` | 1 | Error context propagation |
+| `thiserror` | 2 | Typed error definitions |
+| `candle-core` | 0.10 | GPU tensor operations (Metal/CUDA/CPU) |
+| `candle-nn` | 0.10 | Neural network layers (Linear, Embedding) |
+| `tokenizers` | 0.22 | HuggingFace tokenizer for calibration text |
+| `sysinfo` | 0.32 | Hardware detection (CPU, memory, disk) |
 | `tracing` | 0.1 | Structured logging |
-| `tracing-subscriber` | 0.3 | Log subscriber with env-filter |
+| `ctrlc` | 3.4 | SIGINT handling for clean shutdown |
+| `libc` | 0.2 | File locking (unix) |
+| `ruvector-core` | 2.1 | Vector similarity search (optional, feature `ruvector`) |
 
-### Optional
+### Feature Flags
 
-| Crate | Feature Flag | Role |
-|-------|-------------|------|
-| `coreml-native` | `coreml-backend` | CoreML model compilation and export |
-| `ruvector-core` | `ruvector` | Vector similarity search for auto mode |
+| Feature | Effect |
+|---------|--------|
+| `metal` | Enable Metal GPU via candle-core |
+| `cuda` | Enable CUDA GPU via candle-core |
+| `ruvector` | Enable vector similarity in RuVector (adds ruvector-core dep) |
 
-### Dev / Test
 
-| Crate | Role |
-|-------|------|
-| `assert_cmd` | CLI integration testing |
-| `predicates` | Output assertion matching |
-| `tempfile` | Temporary directory management in tests |
-| `criterion` | Benchmarking (`quantize_bench`, `shard_read_bench`) |
+## Future Work
+
+From ADR-003 phased plan:
+
+- **Phase 3 (Intelligence)**: Full auto-quant with per-layer sensitivity profiling
+  from forward passes, RuVector learning from quality outcomes over time,
+  `--quant auto` achieving 90%+ user acceptance without manual tuning.
+
+- **Phase 4 (Advanced Formats)**: GPTQ and AWQ output backends for vLLM
+  optimized CUDA kernel paths. Conditional on benchmarks showing meaningful
+  speed/accuracy improvement over generic quantized safetensors.
+
+- **Ecosystem**: Quantization manifest sidecar for reproducible builds,
+  HuggingFace model card generation, benchmark suite across reference models,
+  plugin architecture for community backends.
