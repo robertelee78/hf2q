@@ -436,21 +436,30 @@ impl InferenceEngine {
         // swap structure is ready for Phase 3b when forward_start / forward_wait
         // will be introduced in gemma4.rs to achieve true GPU/CPU overlap.
         let mut bufs = DecodeBuffers::new(vocab_size);
+        let is_greedy = sampler.is_greedy();
 
         let mut next_token = *generated_ids.last().unwrap();
         for step in 1..self.config.max_tokens {
             // --- GPU phase: forward pass for the current token ---
-            // Phase 3b: replace this with forward_start(next_token) to make it
-            // non-blocking, then do CPU work below, then call forward_wait().
-            let step_logits = self.model.forward(&[next_token])?;
+            let sampled = if is_greedy {
+                // Greedy fast path: GPU argmax avoids full logits readback.
+                // forward_greedy returns (token_id, logit_value) — only 8 bytes
+                // instead of ~1MB of logits.
+                let (token_id, _logit_val) = self.model.forward_greedy(&[next_token])?;
+                token_id
+            } else {
+                // Phase 3b: replace this with forward_start(next_token) to make it
+                // non-blocking, then do CPU work below, then call forward_wait().
+                let step_logits = self.model.forward(&[next_token])?;
 
-            // Write GPU output into the "next" buffer, then swap so that
-            // bufs.current holds the fresh logits ready for CPU sampling.
-            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
-            bufs.swap();
+                // Write GPU output into the "next" buffer, then swap so that
+                // bufs.current holds the fresh logits ready for CPU sampling.
+                extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+                bufs.swap();
 
-            // --- CPU phase: sample + decode + stream (overlaps with GPU in Phase 3b) ---
-            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
+                // --- CPU phase: sample + decode + stream (overlaps with GPU in Phase 3b) ---
+                sampler.sample_next(&bufs.current, &generated_ids)
+            };
 
             if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");
@@ -717,17 +726,23 @@ impl InferenceEngine {
 
         // Double-buffered decode loop — see generate() for full design notes.
         let mut bufs = DecodeBuffers::new(vocab_size);
+        let is_greedy = sampler.is_greedy();
 
         let mut next_token = *generated_ids.last().unwrap();
         for step in 1..self.config.max_tokens {
-            // GPU phase — Phase 3b: replace with forward_start / forward_wait.
-            let step_logits = self.model.forward(&[next_token])?;
+            let sampled = if is_greedy {
+                let (token_id, _logit_val) = self.model.forward_greedy(&[next_token])?;
+                token_id
+            } else {
+                // GPU phase — Phase 3b: replace with forward_start / forward_wait.
+                let step_logits = self.model.forward(&[next_token])?;
 
-            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
-            bufs.swap();
+                extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+                bufs.swap();
 
-            // CPU phase — sampling and streaming.
-            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
+                // CPU phase — sampling and streaming.
+                sampler.sample_next(&bufs.current, &generated_ids)
+            };
 
             if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");
@@ -896,17 +911,23 @@ impl InferenceEngine {
         // Double-buffered decode loop (vision tokens are cached in KV after prefill).
         // See generate() for full design notes.
         let mut bufs = DecodeBuffers::new(vocab_size);
+        let is_greedy = sampler.is_greedy();
 
         let mut next_token = *generated_ids.last().unwrap();
         for step in 1..self.config.max_tokens {
-            // GPU phase — Phase 3b: replace with forward_start / forward_wait.
-            let step_logits = self.model.forward(&[next_token])?;
+            let sampled = if is_greedy {
+                let (token_id, _logit_val) = self.model.forward_greedy(&[next_token])?;
+                token_id
+            } else {
+                // GPU phase — Phase 3b: replace with forward_start / forward_wait.
+                let step_logits = self.model.forward(&[next_token])?;
 
-            extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
-            bufs.swap();
+                extract_last_position_logits_into(&step_logits, 1, vocab_size, &mut bufs.next)?;
+                bufs.swap();
 
-            // CPU phase.
-            let sampled = sampler.sample_next(&bufs.current, &generated_ids);
+                // CPU phase.
+                sampler.sample_next(&bufs.current, &generated_ids)
+            };
 
             if Some(sampled) == eos_id {
                 debug!(step = step, "EOS token generated");

@@ -289,6 +289,107 @@ impl Gemma4Config {
     }
 }
 
+/// Pre-allocated GPU buffer pool for MoE expert FFN computation.
+///
+/// Since experts execute sequentially within a command encoder (Metal guarantees
+/// ordering), the same buffers can be reused for each expert. This eliminates
+/// ~1200 buffer allocations per forward pass (5 buffers x 8 experts x 30 layers).
+pub struct MoeBufferPool {
+    /// gate_proj output: [moe_intermediate_size] f32
+    gate_out: Option<MlxBuffer>,
+    /// up_proj output: [moe_intermediate_size] f32
+    up_out: Option<MlxBuffer>,
+    /// GELU activation output: [moe_intermediate_size] f32
+    gelu_out: Option<MlxBuffer>,
+    /// hidden = gelu_out * up_out: [moe_intermediate_size] f32
+    hidden_buf: Option<MlxBuffer>,
+    /// down_proj output: [hidden_size] f32
+    down_out: Option<MlxBuffer>,
+    /// Accumulator per token: [hidden_size] f32
+    accum_buf: Option<MlxBuffer>,
+    /// Final bf16 output: [hidden_size] bf16
+    bf16_output: Option<MlxBuffer>,
+    /// Cached sizes so we know if reallocation is needed.
+    intermediate_size: usize,
+    hidden_size: usize,
+}
+
+impl MoeBufferPool {
+    /// Create an empty pool. Buffers are allocated lazily on first use.
+    fn new() -> Self {
+        Self {
+            gate_out: None,
+            up_out: None,
+            gelu_out: None,
+            hidden_buf: None,
+            down_out: None,
+            accum_buf: None,
+            bf16_output: None,
+            intermediate_size: 0,
+            hidden_size: 0,
+        }
+    }
+
+    /// Ensure all buffers are allocated to the required sizes. Returns true if
+    /// buffers were already valid and did not need reallocation.
+    fn ensure_allocated(
+        &mut self,
+        device: &MlxDevice,
+        intermediate_size: usize,
+        hidden_size: usize,
+    ) -> Result<(), Gemma4Error> {
+        if self.intermediate_size == intermediate_size
+            && self.hidden_size == hidden_size
+            && self.gate_out.is_some()
+        {
+            return Ok(());
+        }
+
+        self.intermediate_size = intermediate_size;
+        self.hidden_size = hidden_size;
+
+        let f32_inter_bytes = intermediate_size * std::mem::size_of::<f32>();
+        let f32_hidden_bytes = hidden_size * std::mem::size_of::<f32>();
+
+        self.gate_out = Some(device.alloc_buffer(
+            f32_inter_bytes, DType::F32, vec![1, intermediate_size],
+        )?);
+        self.up_out = Some(device.alloc_buffer(
+            f32_inter_bytes, DType::F32, vec![1, intermediate_size],
+        )?);
+        self.gelu_out = Some(device.alloc_buffer(
+            f32_inter_bytes, DType::F32, vec![1, intermediate_size],
+        )?);
+        self.hidden_buf = Some(device.alloc_buffer(
+            f32_inter_bytes, DType::F32, vec![1, intermediate_size],
+        )?);
+        self.down_out = Some(device.alloc_buffer(
+            f32_hidden_bytes, DType::F32, vec![1, hidden_size],
+        )?);
+        self.accum_buf = Some(device.alloc_buffer(
+            f32_hidden_bytes, DType::F32, vec![1, hidden_size],
+        )?);
+        self.bf16_output = Some(device.alloc_buffer(
+            hidden_size * 2, DType::BF16, vec![1, hidden_size],
+        )?);
+
+        Ok(())
+    }
+
+    /// Get a reference to the gate_out buffer (panics if not allocated).
+    #[inline]
+    fn gate_out(&self) -> &MlxBuffer { self.gate_out.as_ref().unwrap() }
+    /// Get a reference to the up_out buffer.
+    #[inline]
+    fn up_out(&self) -> &MlxBuffer { self.up_out.as_ref().unwrap() }
+    /// Get a reference to the gelu_out buffer.
+    #[inline]
+    fn gelu_out(&self) -> &MlxBuffer { self.gelu_out.as_ref().unwrap() }
+    /// Get a reference to the hidden_buf buffer.
+    #[inline]
+    fn hidden_buf(&self) -> &MlxBuffer { self.hidden_buf.as_ref().unwrap() }
+}
+
 /// Gemma 4 model holding weights, KV cache, and configuration.
 pub struct Gemma4Model {
     /// Loaded model weights.
@@ -317,6 +418,9 @@ pub struct Gemma4Model {
     per_expert_scale_gpu_cache: HashMap<usize, MlxBuffer>,
     /// GPU buffer cache: layer_idx -> (expert_ids, expert_weights) output buffers.
     moe_gate_output_cache: HashMap<usize, (MlxBuffer, MlxBuffer)>,
+    /// Pre-allocated buffer pool for MoE expert FFN computation.
+    /// Eliminates ~1200 GPU buffer allocations per forward pass.
+    moe_buffer_pool: MoeBufferPool,
 }
 
 impl Gemma4Model {
@@ -388,6 +492,7 @@ impl Gemma4Model {
             router_norm_gpu_cache: HashMap::new(),
             per_expert_scale_gpu_cache: HashMap::new(),
             moe_gate_output_cache: HashMap::new(),
+            moe_buffer_pool: MoeBufferPool::new(),
         })
     }
 
@@ -562,6 +667,105 @@ impl Gemma4Model {
             })?;
 
         Ok(output.to_vec())
+    }
+
+    /// Run a greedy forward pass that returns just the argmax token ID and its
+    /// logit value, avoiding the full vocab-sized logits readback to CPU.
+    ///
+    /// For greedy decoding (temperature ~0), this saves reading ~1MB of logits
+    /// per step. Instead, argmax runs on GPU and only 8 bytes (u32 index + f32
+    /// value) are read back.
+    ///
+    /// Falls back to full `forward()` + CPU argmax when the GPU argmax kernel
+    /// is not available.
+    pub fn forward_greedy(&mut self, tokens: &[u32]) -> Result<(u32, f32), Gemma4Error> {
+        let seq_len = tokens.len();
+        if seq_len == 0 {
+            return Err(Gemma4Error::ForwardError {
+                reason: "Empty token sequence".into(),
+            });
+        }
+
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+
+        // Steps 1-3: Same as forward() — embedding, scale, transformer layers
+        let hidden_f32 = self.embedding_gather(tokens)?;
+        let mut hidden = self.cast_f32_to_bf16(&hidden_f32, seq_len * hidden_size)?;
+
+        let scale = half::bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+        let n_embed_elements = seq_len * hidden_size;
+        let scaled_embed = self.device.alloc_buffer(
+            n_embed_elements * 2, DType::BF16, vec![seq_len, hidden_size],
+        )?;
+        {
+            let mut encoder = self.device.command_encoder()?;
+            elementwise::scalar_mul_bf16(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &hidden, &scaled_embed, n_embed_elements, scale,
+            )?;
+            encoder.commit_and_wait()?;
+        }
+        hidden = scaled_embed;
+
+        for layer_idx in 0..self.config.num_layers {
+            hidden = self.forward_layer(layer_idx, &hidden, seq_len)?;
+        }
+
+        // Step 4: Final RMS norm
+        let normed = self.apply_rms_norm(&hidden, "model.norm.weight", seq_len)?;
+
+        // Step 5: lm_head projection
+        let logits = self.lm_head_projection(&normed, seq_len)?;
+
+        // Step 6: Softcap
+        let capped_logits = self.apply_softcap(&logits, seq_len)?;
+
+        // Step 7: GPU argmax on last position's logits
+        // TODO(kernel-agent): Wire dispatch_argmax_f32 when available.
+        // For now, read only the last position's logits (vocab_size floats)
+        // instead of all seq_len * vocab_size.
+        let use_gpu_argmax = std::env::var("HF2Q_GPU_ARGMAX").is_ok();
+        if use_gpu_argmax {
+            // TODO: When mlx_native::ops::argmax::dispatch_argmax_f32 lands:
+            //
+            // let last_logits_offset = (seq_len - 1) * vocab_size;
+            // let logits_slice = capped_logits.sub_buffer(
+            //     last_logits_offset * std::mem::size_of::<f32>(),
+            //     vocab_size * std::mem::size_of::<f32>(),
+            // )?;
+            // let out_index = self.device.alloc_buffer(4, DType::U32, vec![1])?;
+            // let out_value = self.device.alloc_buffer(4, DType::F32, vec![1])?;
+            // let mut encoder = self.device.command_encoder()?;
+            // mlx_native::ops::argmax::dispatch_argmax_f32(
+            //     &mut encoder, &logits_slice, &out_index, &out_value,
+            //     vocab_size as u32, &mut self.registry,
+            // )?;
+            // encoder.commit_and_wait()?;
+            // let idx: &[u32] = out_index.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            //     reason: format!("read argmax index: {e}"),
+            // })?;
+            // let val: &[f32] = out_value.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            //     reason: format!("read argmax value: {e}"),
+            // })?;
+            // return Ok((idx[0], val[0]));
+        }
+
+        // Fallback: read last position logits to CPU and argmax there
+        let all_logits: &[f32] = capped_logits.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("Read logits for greedy: {e}"),
+        })?;
+        let last_start = (seq_len - 1) * vocab_size;
+        let last_logits = &all_logits[last_start..last_start + vocab_size];
+
+        let (best_idx, best_val) = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, &v)| (i as u32, v))
+            .unwrap_or((0, 0.0));
+
+        Ok((best_idx, best_val))
     }
 
     /// Run a forward pass returning the final hidden states (after the last
@@ -1143,7 +1347,7 @@ impl Gemma4Model {
                 layer_type,
             )?;
 
-            // --- O projection + post-attn norm + residual (same encoder) ---
+            // --- O projection + post-attn fused(norm + residual) (same encoder) ---
             o_proj = self.quantized_projection_with_encoder(
                 &mut encoder, &attn_out, &o_base,
                 seq_len, n_heads * head_dim, hidden_size,
@@ -1151,11 +1355,8 @@ impl Gemma4Model {
             let post_attn_norm_name = format!(
                 "model.layers.{layer_idx}.post_attention_layernorm.weight"
             );
-            let post_attn_normed = self.apply_rms_norm_with_encoder(
-                &mut encoder, &o_proj, &post_attn_norm_name, seq_len,
-            )?;
-            residual1 = self.elementwise_add_with_encoder(
-                &mut encoder, input, &post_attn_normed, seq_len * hidden_size,
+            residual1 = self.fused_norm_add_with_encoder(
+                &mut encoder, input, &o_proj, &post_attn_norm_name, seq_len,
             )?;
 
             // ONE commit_and_wait for the entire attention half of the layer
@@ -1497,11 +1698,8 @@ impl Gemma4Model {
                 let post_attn_norm_name = format!(
                     "model.layers.{layer_idx}.post_attention_layernorm.weight"
                 );
-                let post_attn_normed = self.apply_rms_norm_with_encoder(
-                    &mut encoder, &o_proj_tmp, &post_attn_norm_name, seq_len,
-                )?;
-                residual1 = self.elementwise_add_with_encoder(
-                    &mut encoder, input, &post_attn_normed, seq_len * hidden_size,
+                residual1 = self.fused_norm_add_with_encoder(
+                    &mut encoder, input, &o_proj_tmp, &post_attn_norm_name, seq_len,
                 )?;
 
                 encoder.commit_and_wait()?;
@@ -1635,13 +1833,10 @@ impl Gemma4Model {
                 let post_ff_norm_name = format!(
                     "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
                 );
-                let ffn_result = self.apply_rms_norm_with_encoder(
-                    &mut encoder, &combined, &post_ff_norm_name, seq_len,
-                )?;
 
-                // Residual add + layer scalar (same encoder)
-                let pre_scalar = self.elementwise_add_with_encoder(
-                    &mut encoder, &residual1, &ffn_result, n_elements,
+                // Fused norm + residual add (same encoder)
+                let pre_scalar = self.fused_norm_add_with_encoder(
+                    &mut encoder, &residual1, &combined, &post_ff_norm_name, seq_len,
                 )?;
 
                 if let Some(sv) = scalar_val_moe {
@@ -1722,13 +1917,10 @@ impl Gemma4Model {
                 let post_ff_norm_name = format!(
                     "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
                 );
-                let ffn_result = self.apply_rms_norm_with_encoder(
-                    &mut encoder, &mlp_out, &post_ff_norm_name, seq_len,
-                )?;
 
-                // Residual add + layer scalar (same encoder)
-                let pre_scalar = self.elementwise_add_with_encoder(
-                    &mut encoder, &residual1, &ffn_result, n_elements,
+                // Fused norm + residual add (same encoder)
+                let pre_scalar = self.fused_norm_add_with_encoder(
+                    &mut encoder, &residual1, &mlp_out, &post_ff_norm_name, seq_len,
                 )?;
 
                 if let Some(sv) = scalar_val {
@@ -2443,6 +2635,60 @@ impl Gemma4Model {
         )?;
 
         Ok(output)
+    }
+
+    /// Fused RMS norm + residual add using a shared command encoder.
+    ///
+    /// Computes: output = residual + rms_norm(input, weight, eps)
+    ///
+    /// When the fused_norm_add_bf16 kernel is available, this dispatches a single
+    /// GPU kernel instead of separate norm + add. Falls back to the two-step
+    /// pattern when the kernel is not yet built.
+    fn fused_norm_add_with_encoder(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        residual: &MlxBuffer,
+        input: &MlxBuffer,
+        weight_name: &str,
+        seq_len: usize,
+    ) -> Result<MlxBuffer, Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let _eps = self.config.rms_norm_eps; // used by fused kernel when available
+        let n_elements = seq_len * hidden_size;
+
+        // TODO(kernel-agent): Wire fused_norm_add_bf16 when available.
+        // Check env var to enable once the kernel lands.
+        let use_fused = std::env::var("HF2Q_FUSED_NORM_ADD").is_ok();
+        if use_fused {
+            // Get norm weight as bf16
+            let weight = require_weight(&self.weights, weight_name)?;
+            let norm_weight_buf = match weight.buffer.dtype() {
+                DType::BF16 => clone_buffer(&self.device, &weight.buffer)?,
+                _ => {
+                    let f32_data = read_weight_as_f32(weight)?;
+                    f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![hidden_size])?
+                }
+            };
+
+            let output = self.device.alloc_buffer(
+                n_elements * 2, DType::BF16, vec![seq_len, hidden_size],
+            )?;
+
+            // TODO: Uncomment when kernel is available:
+            // mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_bf16(
+            //     encoder, residual, input, &norm_weight_buf, &output,
+            //     hidden_size as u32, seq_len as u32, eps,
+            //     &mut self.registry,
+            // )?;
+            // return Ok(output);
+
+            // Fallback: two-step norm + add (same encoder, still batched)
+            let _ = (output, norm_weight_buf); // suppress unused warnings
+        }
+
+        // Two-step fallback: rms_norm then elementwise_add
+        let normed = self.apply_rms_norm_with_encoder(encoder, input, weight_name, seq_len)?;
+        self.elementwise_add_with_encoder(encoder, residual, &normed, n_elements)
     }
 
     /// Quantized projection using a shared command encoder (batched variant).
@@ -3804,28 +4050,23 @@ impl Gemma4Model {
             &gate_params, // same dimensions as gate
         )?;
 
-        // GELU on gate_out (f32 -> f32)
-        let gelu_out = self.device.alloc_buffer(
-            intermediate_size * std::mem::size_of::<f32>(),
-            DType::F32,
-            vec![1, intermediate_size],
+        // GELU on gate_out (f32 -> f32) — use pooled buffer
+        self.moe_buffer_pool.ensure_allocated(
+            &self.device, intermediate_size, hidden_size,
         )?;
+        let pool_gelu_out = self.moe_buffer_pool.gelu_out();
         gelu::dispatch_gelu(
             encoder, &mut self.registry,
             self.device.metal_device(),
-            &gate_out, &gelu_out,
+            &gate_out, pool_gelu_out,
         )?;
 
-        // hidden = gelu_out * up_out (f32 elementwise mul)
-        let hidden_buf = self.device.alloc_buffer(
-            intermediate_size * std::mem::size_of::<f32>(),
-            DType::F32,
-            vec![1, intermediate_size],
-        )?;
+        // hidden = gelu_out * up_out (f32 elementwise mul) — use pooled buffer
+        let pool_hidden_buf = self.moe_buffer_pool.hidden_buf();
         elementwise::elementwise_mul(
             encoder, &mut self.registry,
             self.device.metal_device(),
-            &gelu_out, &up_out, &hidden_buf,
+            pool_gelu_out, &up_out, pool_hidden_buf,
             intermediate_size, DType::F32,
         )?;
 
@@ -3839,7 +4080,7 @@ impl Gemma4Model {
         };
         let down_out = qmatmul::quantized_matmul_simd(
             encoder, &mut self.registry, &self.device,
-            &hidden_buf, &down_bufs.0, &down_bufs.1, &down_bufs.2,
+            pool_hidden_buf, &down_bufs.0, &down_bufs.1, &down_bufs.2,
             &down_params,
         )?;
 

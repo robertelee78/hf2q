@@ -50,6 +50,15 @@ impl Sampler {
         }
     }
 
+    /// Returns true if sampling is greedy (temperature near zero).
+    ///
+    /// When greedy, the GPU argmax path can skip the full logits readback.
+    #[inline]
+    pub fn is_greedy(&self) -> bool {
+        self.config.temperature < 1e-7
+            && self.config.repetition_penalty == 1.0
+    }
+
     /// Sample the next token from logits, given the tokens generated so far.
     ///
     /// Applies the full pipeline: repetition penalty -> temperature -> top-k -> top-p -> sample.
