@@ -36,6 +36,7 @@ pub enum PreflightError {
          \n\
          Suggestion: {suggestion}"
     )]
+    #[allow(dead_code)]
     IncompatibleFormat {
         format: String,
         architecture: String,

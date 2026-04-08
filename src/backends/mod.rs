@@ -21,6 +21,7 @@ pub enum BackendError {
     UnsupportedFormat { format: String },
 
     #[error("Backend validation failed: {reason}")]
+    #[allow(dead_code)]
     ValidationFailed { reason: String },
 
     #[error("Failed to write output: {reason}")]

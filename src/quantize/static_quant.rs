@@ -90,6 +90,7 @@ fn preserve_tensor(tensor: &TensorRef) -> QuantizedTensor {
             preserved: true,
             scales: None,
             biases: None,
+            ggml_type: None,
         },
     }
 }
@@ -134,6 +135,7 @@ fn convert_to_f16(tensor: &TensorRef) -> Result<QuantizedTensor, QuantizeError> 
             preserved: false,
             scales: None,
             biases: None,
+            ggml_type: None,
         },
     })
 }
@@ -222,6 +224,7 @@ fn quantize_weight(
             preserved: false,
             scales: Some(scales_f16),
             biases: None,
+            ggml_type: None,
         },
     })
 }

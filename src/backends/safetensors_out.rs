@@ -440,6 +440,7 @@ mod tests {
                     Some(vec![0u8; 8])
                 },
                 biases: None,
+                ggml_type: None,
             },
         }
     }

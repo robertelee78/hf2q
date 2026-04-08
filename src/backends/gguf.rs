@@ -28,11 +28,26 @@ const ALIGNMENT: u64 = 32;
 const GGUF_TYPE_UINT32: u32 = 4;
 const GGUF_TYPE_STRING: u32 = 8;
 
-// GGML dtype identifiers
+// GGML dtype identifiers (from llama.cpp ggml.h)
+const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q4_1: u32 = 3;
+const GGML_TYPE_Q5_0: u32 = 6;
+const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q8_1: u32 = 9;
 const GGML_TYPE_Q2_K: u32 = 10;
+const GGML_TYPE_Q3_K_S: u32 = 11;
+const GGML_TYPE_Q3_K_M: u32 = 12;
+const GGML_TYPE_Q3_K_L: u32 = 13;
+const GGML_TYPE_Q4_K_S: u32 = 14;
+const GGML_TYPE_Q4_K_M: u32 = 15;
+const GGML_TYPE_Q5_K_S: u32 = 16;
+const GGML_TYPE_Q5_K_M: u32 = 17;
+const GGML_TYPE_Q6_K: u32 = 18;
+const GGML_TYPE_IQ2_XXS: u32 = 19;
+const GGML_TYPE_IQ2_XS: u32 = 20;
 
 /// Maximum single-file GGUF size before we warn (20 GB).
 const LARGE_MODEL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -230,11 +245,61 @@ impl OutputBackend for GgufBackend {
 // GGML dtype mapping
 // ---------------------------------------------------------------------------
 
+/// Map a GGML type name string to its numeric type code.
+///
+/// Supports the full K-quant family plus standard types.
+/// Names are matched case-insensitively with optional "GGML_TYPE_" prefix stripped.
+fn ggml_type_from_name(name: &str) -> Option<u32> {
+    // Normalize: uppercase, strip optional prefix
+    let upper = name.trim().to_uppercase();
+    let key = upper
+        .strip_prefix("GGML_TYPE_")
+        .unwrap_or(&upper);
+    match key {
+        "F32"      => Some(GGML_TYPE_F32),
+        "F16"      => Some(GGML_TYPE_F16),
+        "Q4_0"     => Some(GGML_TYPE_Q4_0),
+        "Q4_1"     => Some(GGML_TYPE_Q4_1),
+        "Q5_0"     => Some(GGML_TYPE_Q5_0),
+        "Q5_1"     => Some(GGML_TYPE_Q5_1),
+        "Q8_0"     => Some(GGML_TYPE_Q8_0),
+        "Q8_1"     => Some(GGML_TYPE_Q8_1),
+        "Q2_K"     => Some(GGML_TYPE_Q2_K),
+        "Q3_K_S"   => Some(GGML_TYPE_Q3_K_S),
+        "Q3_K_M" | "Q3_K" => Some(GGML_TYPE_Q3_K_M),
+        "Q3_K_L"   => Some(GGML_TYPE_Q3_K_L),
+        "Q4_K_S"   => Some(GGML_TYPE_Q4_K_S),
+        "Q4_K_M" | "Q4_K" => Some(GGML_TYPE_Q4_K_M),
+        "Q5_K_S"   => Some(GGML_TYPE_Q5_K_S),
+        "Q5_K_M" | "Q5_K" => Some(GGML_TYPE_Q5_K_M),
+        "Q6_K"     => Some(GGML_TYPE_Q6_K),
+        "IQ2_XXS"  => Some(GGML_TYPE_IQ2_XXS),
+        "IQ2_XS"   => Some(GGML_TYPE_IQ2_XS),
+        _ => None,
+    }
+}
+
 /// Map IR quantization metadata to a GGML type code.
+///
+/// If the tensor has an explicit `ggml_type` name set (e.g., by Apex quantization),
+/// that takes priority. Otherwise falls back to the generic bits-based mapping.
 fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
     if info.preserved {
         return GGML_TYPE_F16;
     }
+
+    // Explicit K-quant type override from Apex
+    if let Some(ref type_name) = info.ggml_type {
+        if let Some(code) = ggml_type_from_name(type_name) {
+            return code;
+        }
+        warn!(
+            "Unknown GGML type name '{}'; falling back to bits-based mapping",
+            type_name
+        );
+    }
+
+    // Generic bits-based fallback
     match info.bits {
         16 => GGML_TYPE_F16,
         8 => GGML_TYPE_Q8_0,
@@ -371,12 +436,18 @@ fn build_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
 }
 
 /// Map global bit width to a GGML file type code.
+///
+/// These correspond to llama.cpp's `llama_ftype` enum values.
+/// For K-quant models the ftype is selected based on the dominant bit width.
 fn ggml_ftype_from_bits(bits: u8) -> u32 {
     match bits {
         16 => 1,  // MOSTLY_F16
         8 => 7,   // MOSTLY_Q8_0
-        4 => 2,   // MOSTLY_Q4_0
+        4 => 15,  // MOSTLY_Q4_K_M (prefer K-quant over plain Q4_0)
+        3 => 12,  // MOSTLY_Q3_K_M
         2 => 10,  // MOSTLY_Q2_K
+        5 => 17,  // MOSTLY_Q5_K_M
+        6 => 18,  // MOSTLY_Q6_K
         _ => 1,   // default to F16
     }
 }
@@ -415,6 +486,7 @@ struct TensorWriteInfo {
     shape: Vec<usize>,
     ggml_type: u32,
     data_offset: u64,
+    #[allow(dead_code)]
     data_len: usize,
 }
 
@@ -481,6 +553,7 @@ mod tests {
             quant_info: TensorQuantInfo {
                 method: if preserved { "passthrough".into() } else { format!("q{}", bits) },
                 bits, group_size: 64, preserved, scales: None, biases: None,
+                ggml_type: None,
             },
         }
     }
@@ -518,6 +591,7 @@ mod tests {
     fn test_dtype_mapping() {
         let qi = |bits, preserved| TensorQuantInfo {
             method: "t".into(), bits, group_size: 64, preserved, scales: None, biases: None,
+            ggml_type: None,
         };
         assert_eq!(quant_info_to_ggml_type(&qi(16, false)), GGML_TYPE_F16);
         assert_eq!(quant_info_to_ggml_type(&qi(8, false)), GGML_TYPE_Q8_0);
@@ -576,5 +650,103 @@ mod tests {
         {
             assert!(keys.contains(&expected), "Missing metadata key: {}", expected);
         }
+    }
+
+    #[test]
+    fn test_ggml_type_from_name_all_kquants() {
+        // Standard types
+        assert_eq!(ggml_type_from_name("F32"), Some(GGML_TYPE_F32));
+        assert_eq!(ggml_type_from_name("F16"), Some(GGML_TYPE_F16));
+        assert_eq!(ggml_type_from_name("Q4_0"), Some(GGML_TYPE_Q4_0));
+        assert_eq!(ggml_type_from_name("Q4_1"), Some(GGML_TYPE_Q4_1));
+        assert_eq!(ggml_type_from_name("Q5_0"), Some(GGML_TYPE_Q5_0));
+        assert_eq!(ggml_type_from_name("Q5_1"), Some(GGML_TYPE_Q5_1));
+        assert_eq!(ggml_type_from_name("Q8_0"), Some(GGML_TYPE_Q8_0));
+        assert_eq!(ggml_type_from_name("Q8_1"), Some(GGML_TYPE_Q8_1));
+
+        // K-quant types
+        assert_eq!(ggml_type_from_name("Q2_K"), Some(GGML_TYPE_Q2_K));
+        assert_eq!(ggml_type_from_name("Q3_K_S"), Some(GGML_TYPE_Q3_K_S));
+        assert_eq!(ggml_type_from_name("Q3_K_M"), Some(GGML_TYPE_Q3_K_M));
+        assert_eq!(ggml_type_from_name("Q3_K_L"), Some(GGML_TYPE_Q3_K_L));
+        assert_eq!(ggml_type_from_name("Q4_K_S"), Some(GGML_TYPE_Q4_K_S));
+        assert_eq!(ggml_type_from_name("Q4_K_M"), Some(GGML_TYPE_Q4_K_M));
+        assert_eq!(ggml_type_from_name("Q5_K_S"), Some(GGML_TYPE_Q5_K_S));
+        assert_eq!(ggml_type_from_name("Q5_K_M"), Some(GGML_TYPE_Q5_K_M));
+        assert_eq!(ggml_type_from_name("Q6_K"), Some(GGML_TYPE_Q6_K));
+        assert_eq!(ggml_type_from_name("IQ2_XXS"), Some(GGML_TYPE_IQ2_XXS));
+        assert_eq!(ggml_type_from_name("IQ2_XS"), Some(GGML_TYPE_IQ2_XS));
+
+        // Aliases: Q3_K → Q3_K_M, Q4_K → Q4_K_M, Q5_K → Q5_K_M
+        assert_eq!(ggml_type_from_name("Q3_K"), Some(GGML_TYPE_Q3_K_M));
+        assert_eq!(ggml_type_from_name("Q4_K"), Some(GGML_TYPE_Q4_K_M));
+        assert_eq!(ggml_type_from_name("Q5_K"), Some(GGML_TYPE_Q5_K_M));
+
+        // Case insensitivity
+        assert_eq!(ggml_type_from_name("q4_k_m"), Some(GGML_TYPE_Q4_K_M));
+        assert_eq!(ggml_type_from_name("q6_k"), Some(GGML_TYPE_Q6_K));
+
+        // With GGML_TYPE_ prefix
+        assert_eq!(ggml_type_from_name("GGML_TYPE_Q4_K_M"), Some(GGML_TYPE_Q4_K_M));
+
+        // Unknown returns None
+        assert_eq!(ggml_type_from_name("Q99_Z"), None);
+        assert_eq!(ggml_type_from_name(""), None);
+    }
+
+    #[test]
+    fn test_ggml_type_override_in_quant_info() {
+        // When ggml_type is set, it takes priority over bits
+        let qi_override = TensorQuantInfo {
+            method: "apex".into(), bits: 4, group_size: 64, preserved: false,
+            scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi_override), GGML_TYPE_Q4_K_M);
+
+        // Q6_K override on a 6-bit tensor
+        let qi_q6k = TensorQuantInfo {
+            method: "apex".into(), bits: 6, group_size: 64, preserved: false,
+            scales: None, biases: None, ggml_type: Some("Q6_K".into()),
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q6_K);
+
+        // Unknown ggml_type falls back to bits-based mapping
+        let qi_unknown = TensorQuantInfo {
+            method: "apex".into(), bits: 4, group_size: 64, preserved: false,
+            scales: None, biases: None, ggml_type: Some("Q99_Z".into()),
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi_unknown), GGML_TYPE_Q4_0);
+
+        // preserved=true always returns F16 regardless of ggml_type
+        let qi_preserved = TensorQuantInfo {
+            method: "passthrough".into(), bits: 16, group_size: 0, preserved: true,
+            scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi_preserved), GGML_TYPE_F16);
+    }
+
+    #[test]
+    fn test_ggml_type_none_falls_back_to_bits() {
+        // Confirms backward compatibility: ggml_type=None uses bits mapping
+        let qi = |bits| TensorQuantInfo {
+            method: "t".into(), bits, group_size: 64, preserved: false,
+            scales: None, biases: None, ggml_type: None,
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi(16)), GGML_TYPE_F16);
+        assert_eq!(quant_info_to_ggml_type(&qi(8)), GGML_TYPE_Q8_0);
+        assert_eq!(quant_info_to_ggml_type(&qi(4)), GGML_TYPE_Q4_0);
+        assert_eq!(quant_info_to_ggml_type(&qi(2)), GGML_TYPE_Q2_K);
+    }
+
+    #[test]
+    fn test_ftype_kquant_bits() {
+        assert_eq!(ggml_ftype_from_bits(16), 1);  // MOSTLY_F16
+        assert_eq!(ggml_ftype_from_bits(8), 7);   // MOSTLY_Q8_0
+        assert_eq!(ggml_ftype_from_bits(4), 15);  // MOSTLY_Q4_K_M
+        assert_eq!(ggml_ftype_from_bits(3), 12);  // MOSTLY_Q3_K_M
+        assert_eq!(ggml_ftype_from_bits(2), 10);  // MOSTLY_Q2_K
+        assert_eq!(ggml_ftype_from_bits(5), 17);  // MOSTLY_Q5_K_M
+        assert_eq!(ggml_ftype_from_bits(6), 18);  // MOSTLY_Q6_K
+        assert_eq!(ggml_ftype_from_bits(1), 1);   // unknown → F16
     }
 }

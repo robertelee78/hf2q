@@ -28,6 +28,9 @@ pub enum Command {
     /// Inspect model metadata before converting
     Info(InfoArgs),
 
+    /// Validate quality of a quantized model against its original
+    Validate(ValidateArgs),
+
     /// Diagnose RuVector, hardware detection, and disk space
     Doctor,
 
@@ -60,6 +63,10 @@ pub struct ConvertArgs {
     /// Sample count for DWQ calibration
     #[arg(long, default_value = "1024")]
     pub calibration_samples: u32,
+
+    /// Target average bits per weight for Apex quantization (e.g., 4.5)
+    #[arg(long, default_value = "4.5")]
+    pub target_bpw: f32,
 
     /// Custom bit width (2-8)
     #[arg(long, value_parser = clap::value_parser!(u8).range(2..=8))]
@@ -110,6 +117,33 @@ pub struct CompletionsArgs {
     /// Shell to generate completions for
     #[arg(long, value_enum)]
     pub shell: Shell,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ValidateArgs {
+    /// Directory containing the original model
+    #[arg(long)]
+    pub original: PathBuf,
+
+    /// Directory containing the quantized model
+    #[arg(long)]
+    pub quantized: PathBuf,
+
+    /// Maximum KL divergence threshold
+    #[arg(long, default_value = "0.1")]
+    pub max_kl: f64,
+
+    /// Maximum perplexity delta threshold
+    #[arg(long, default_value = "2.0")]
+    pub max_ppl_delta: f64,
+
+    /// Minimum cosine similarity threshold
+    #[arg(long, default_value = "0.95")]
+    pub min_cosine: f64,
+
+    /// Emit JSON output
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,10 +358,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
             // DWQ weight-space calibration (no inference needed)
         }
         QuantMethod::Apex => {
-            anyhow::bail!(
-                "Quantization method 'apex' requires Phase 2 GPU support (Candle). \
-                 Available methods: auto, f16, q8, q4, q2, mixed-2-6, mixed-3-6, mixed-4-6, dwq-mixed-4-6"
-            );
+            // Apex: imatrix-calibrated, per-tensor optimal precision quantization
         }
         QuantMethod::F16 | QuantMethod::Q8 | QuantMethod::Q4 | QuantMethod::Q2 => {}
     }

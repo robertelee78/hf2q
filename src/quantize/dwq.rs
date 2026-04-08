@@ -4,7 +4,8 @@
 //! For each quantized weight tensor, computes the optimal scale per group:
 //!   optimal_scale = dot(W_original, Q_int) / dot(Q_int, Q_int)
 //!
-//! Phase 2 (future): Activation-based calibration via Candle GPU forward passes.
+//! Phase 2: Activation-based calibration via Candle GPU forward passes.
+//! Uses per-layer activation statistics to drive mixed-bit allocation.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -25,6 +26,12 @@ pub enum DwqError {
 
     #[error("Quantization error during DWQ: {0}")]
     QuantizeError(#[from] QuantizeError),
+
+    #[error("GPU forward pass failed: {reason}")]
+    GpuError { reason: String },
+
+    #[error("Tokenizer error: {reason}")]
+    TokenizerError { reason: String },
 }
 
 /// Configuration for DWQ calibration.
@@ -45,6 +52,9 @@ pub struct DwqConfig {
     /// KL divergence threshold for convergence
     #[allow(dead_code)] // Will be used when iterative DWQ calibration is enabled
     pub convergence_threshold: f64,
+    /// Whether to use activation-based calibration (requires GPU + tokenizer).
+    /// When false, falls back to weight-space calibration.
+    pub use_activations: bool,
 }
 
 impl Default for DwqConfig {
@@ -57,6 +67,7 @@ impl Default for DwqConfig {
             sensitive_bits: 6,
             max_iterations: 10,
             convergence_threshold: 0.001,
+            use_activations: false,
         }
     }
 }
@@ -287,7 +298,7 @@ fn generate_calibration_tokens(sample_count: u32, vocab_size: u32) -> Vec<u32> {
 }
 
 /// Convert a TensorRef to f32 values, handling BF16/F16/F32.
-fn tensor_to_f32_safe(tensor: &TensorRef) -> Vec<f32> {
+pub(crate) fn tensor_to_f32_safe(tensor: &TensorRef) -> Vec<f32> {
     use crate::ir::DType;
     match tensor.dtype {
         DType::F32 => tensor
@@ -371,7 +382,7 @@ fn adjust_scales_weight_space(
 
 /// Unpack packed quantized bytes back to signed integers.
 /// Inverse of `pack_quantized` in static_quant.rs.
-fn unpack_quantized(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
+pub(crate) fn unpack_quantized(data: &[u8], bits: u8, total_elements: usize) -> Vec<i8> {
     let mut values = Vec::with_capacity(total_elements);
 
     match bits {
@@ -424,6 +435,7 @@ mod tests {
         assert_eq!(config.sensitive_bits, 6);
         assert_eq!(config.group_size, 64);
         assert_eq!(config.max_iterations, 10);
+        assert!(!config.use_activations);
     }
 
     #[test]
@@ -475,6 +487,19 @@ mod tests {
 
         let result = quantizer.quantize_tensor(&tensor, &config).unwrap();
         assert!(!result.quant_info.preserved);
+    }
+
+    #[test]
+    fn test_dwq_error_variants() {
+        let gpu_err = DwqError::GpuError {
+            reason: "test GPU error".to_string(),
+        };
+        assert!(format!("{}", gpu_err).contains("GPU forward pass failed"));
+
+        let tok_err = DwqError::TokenizerError {
+            reason: "test tokenizer error".to_string(),
+        };
+        assert!(format!("{}", tok_err).contains("Tokenizer error"));
     }
 
     #[test]

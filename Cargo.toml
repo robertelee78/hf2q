@@ -11,6 +11,9 @@ repository = "https://github.com/robertelee78/hf2q"
 default = []
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
+# GPU acceleration backends
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
 safetensors = "0.7"
@@ -41,6 +44,11 @@ serde_json = "1"
 # Error handling
 anyhow = "1"
 thiserror = "2"
+
+# GPU compute (Candle)
+candle-core = "0.10"
+candle-nn = "0.10"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # System info
 sysinfo = "0.32"

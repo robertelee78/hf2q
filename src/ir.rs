@@ -336,6 +336,11 @@ pub struct TensorQuantInfo {
     pub scales: Option<Vec<u8>>,
     /// Zero points (for asymmetric quantization) — stored as raw bytes
     pub biases: Option<Vec<u8>>,
+    /// Optional exact GGML type name (e.g., "Q4_K_M", "Q6_K").
+    /// When set, the GGUF backend uses this instead of the generic bits-based mapping.
+    /// Used by Apex quantization to assign per-tensor optimal K-quant types.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ggml_type: Option<String>,
 }
 
 /// A fully quantized model, ready for output backend consumption.

@@ -11,6 +11,8 @@
 mod backends;
 mod cli;
 mod doctor;
+#[allow(dead_code)]
+mod gpu;
 mod input;
 mod intelligence;
 mod ir;
@@ -115,6 +117,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Convert(args) => cmd_convert(args),
         Command::Info(args) => cmd_info(args).map_err(AppError::Input),
+        Command::Validate(args) => cmd_validate(args),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
     }
@@ -374,12 +377,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .map_err(AppError::Conversion)?
             }
             cli::QuantMethod::DwqMixed46 => {
+                // Try loading tokenizer for activation-based calibration
+                let has_tokenizer = config.input_dir.join("tokenizer.json").exists();
+
                 let dwq_config = quantize::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
                     group_size: config.group_size,
                     base_bits: 4,
                     sensitive_bits: 6,
+                    use_activations: has_tokenizer,
                     ..quantize::dwq::DwqConfig::default()
                 };
 
@@ -389,17 +396,64 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 tracing::info!(
                     calibration = dwq_quantizer.requires_calibration(),
                     max_iterations = dwq_quantizer.config().max_iterations,
+                    use_activations = dwq_config.use_activations,
                     "DWQ quantizer initialized: {}",
                     dwq_quantizer.name()
                 );
 
-                quantize::dwq::run_dwq_calibration(
+                if dwq_config.use_activations {
+                    tracing::info!("Tokenizer found, using activation-based DWQ calibration");
+                    match quantize::dwq_activation::run_dwq_activation_calibration(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_config,
+                        &config.input_dir,
+                        &progress,
+                    ) {
+                        Ok(model) => model,
+                        Err(e) => {
+                            warn!(
+                                "Activation-based DWQ failed ({}), falling back to weight-space calibration",
+                                e
+                            );
+                            quantize::dwq::run_dwq_calibration(
+                                &tensor_map,
+                                &metadata,
+                                &dwq_config,
+                                &progress,
+                            )
+                            .context("DWQ weight-space calibration failed")
+                            .map_err(AppError::Conversion)?
+                        }
+                    }
+                } else {
+                    tracing::info!("No tokenizer found, using weight-space DWQ calibration");
+                    quantize::dwq::run_dwq_calibration(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_config,
+                        &progress,
+                    )
+                    .context("DWQ calibration failed")
+                    .map_err(AppError::Conversion)?
+                }
+            }
+            cli::QuantMethod::Apex => {
+                let apex_config = quantize::apex::ApexConfig {
+                    calibration_tokens: config.calibration_samples as usize,
+                    target_bpw: args.target_bpw,
+                    min_type: "Q3_K_S".to_string(),
+                    max_type: "Q6_K".to_string(),
+                };
+
+                quantize::apex::run_apex_quantization(
                     &tensor_map,
                     &metadata,
-                    &dwq_config,
+                    &config.input_dir,
+                    &apex_config,
                     &progress,
                 )
-                .context("DWQ calibration failed")
+                .context("Apex quantization failed")
                 .map_err(AppError::Conversion)?
             }
             _ => {
@@ -468,6 +522,39 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
+    // Phase 4.5: Quality measurement (before write, while quantized_model is available)
+    let quality_report = if config.skip_quality {
+        tracing::info!("Quality measurement skipped (--skip-quality)");
+        quality::QualityReport::empty()
+    } else if let Some(ref qm) = quantized_model {
+        // Build a dequantized TensorMap from the quantized output for comparison
+        let quantized_tensor_map = quality::dequantize_to_tensor_map(qm);
+        match quality::measure_quality(
+            &tensor_map,
+            &quantized_tensor_map,
+            &metadata,
+            &config.input_dir,
+            &progress,
+        ) {
+            Ok(qr) => {
+                quality::print_quality_summary(&qr);
+                qr
+            }
+            Err(e) => {
+                warn!("Quality measurement failed: {}. Continuing.", e);
+                quality::QualityReport::empty()
+            }
+        }
+    } else {
+        // Native backend: quality measurement not available inline
+        tracing::info!("Quality measurement not available for native quantization backend");
+        tracing::info!("Use 'hf2q validate' after conversion to measure quality");
+        quality::QualityReport::empty()
+    };
+
+    check_interrupted()?;
+
+    // Phase 4.6: Write output
     let manifest = if backend.requires_native_quantization() {
         let native_bits = if let Some(ref plan) = auto_plan {
             plan.base_bits
@@ -511,20 +598,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             )
             .context("Failed to write output")
             .map_err(AppError::Conversion)?
-    };
-
-    check_interrupted()?;
-
-    // Phase 5: Quality measurement
-    // Phase 1: quality measurement deferred (requires inference backend, coming in Phase 2)
-    let quality_report = if config.skip_quality {
-        tracing::info!("Quality measurement skipped (--skip-quality)");
-        quality::QualityReport::empty()
-    } else {
-        tracing::info!(
-            "Quality measurement skipped: requires GPU inference backend (Phase 2)."
-        );
-        quality::QualityReport::empty()
     };
 
     // Phase 5.5: Store conversion result in RuVector
@@ -599,6 +672,115 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+/// Handle the `validate` subcommand.
+fn cmd_validate(args: cli::ValidateArgs) -> Result<(), AppError> {
+    use progress::ProgressReporter;
+
+    // Validate directories exist
+    if !args.original.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "Original model directory does not exist: {}",
+            args.original.display()
+        )));
+    }
+    if !args.quantized.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "Quantized model directory does not exist: {}",
+            args.quantized.display()
+        )));
+    }
+
+    let progress = ProgressReporter::new();
+
+    // Read metadata from original model
+    let config_path = args.original.join("config.json");
+    if !config_path.exists() {
+        return Err(AppError::Input(anyhow::anyhow!(
+            "No config.json found in {}. Is this a HuggingFace model directory?",
+            args.original.display()
+        )));
+    }
+
+    let metadata = input::config_parser::parse_config(&config_path)
+        .context("Failed to parse model config")
+        .map_err(AppError::Input)?;
+
+    // Read original model tensors
+    let (_, original_tensors) = input::read_model(&args.original, &progress)
+        .context("Failed to read original model")
+        .map_err(AppError::Conversion)?;
+
+    // Read quantized model tensors
+    let (_, quantized_tensors) = input::read_model(&args.quantized, &progress)
+        .context("Failed to read quantized model")
+        .map_err(AppError::Conversion)?;
+
+    // Run quality measurement
+    let quality_report = quality::measure_quality(
+        &original_tensors,
+        &quantized_tensors,
+        &metadata,
+        &args.original,
+        &progress,
+    )
+    .map_err(|e| AppError::Conversion(anyhow::anyhow!("{}", e)))?;
+
+    // Check thresholds
+    let thresholds = quality::QualityThresholds {
+        max_kl_divergence: args.max_kl,
+        max_perplexity_delta: args.max_ppl_delta,
+        min_cosine_similarity: args.min_cosine,
+    };
+
+    let violations = quality::check_thresholds(&quality_report, &thresholds);
+
+    // Output
+    if args.json {
+        let json_output = serde_json::json!({
+            "report": quality_report,
+            "thresholds": {
+                "max_kl_divergence": thresholds.max_kl_divergence,
+                "max_perplexity_delta": thresholds.max_perplexity_delta,
+                "min_cosine_similarity": thresholds.min_cosine_similarity,
+            },
+            "violations": violations,
+            "pass": violations.is_empty(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_output)
+                .unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        quality::print_quality_summary(&quality_report);
+
+        if violations.is_empty() {
+            eprintln!(
+                "{}",
+                console::style("PASS: All quality thresholds met.").green().bold()
+            );
+        } else {
+            eprintln!(
+                "{}",
+                console::style("FAIL: Quality thresholds exceeded:").red().bold()
+            );
+            for v in &violations {
+                eprintln!("  - {}", v);
+            }
+        }
+        eprintln!();
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::QualityExceeded(anyhow::anyhow!(
+            "{} quality threshold(s) exceeded",
+            violations.len()
+        )))
+    }
 }
 
 /// Check if the process has been interrupted by SIGINT.

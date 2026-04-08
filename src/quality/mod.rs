@@ -1,13 +1,34 @@
 //! Quality measurement module.
 //!
 //! Phase 1: Weight-level cosine similarity (no inference needed).
-//! Phase 2 (future): KL divergence and perplexity via Candle forward passes.
+//! Phase 2: KL divergence, perplexity, and activation cosine similarity via Candle forward passes.
 
 pub mod cosine_sim;
 pub mod kl_divergence;
 pub mod perplexity;
 
-/// Quality measurement report — the complete results of quality analysis.
+use std::path::Path;
+
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+use crate::ir::{DType, ModelMetadata, QuantizedModel, TensorMap, TensorRef};
+use crate::progress::ProgressReporter;
+
+/// Errors from quality measurement.
+#[derive(Error, Debug)]
+pub enum QualityError {
+    #[error("GPU error during quality measurement: {0}")]
+    Gpu(#[from] anyhow::Error),
+
+    #[error("Candle tensor error: {0}")]
+    Candle(#[from] candle_core::Error),
+
+    #[error("Tokenizer not available: {reason}")]
+    TokenizerUnavailable { reason: String },
+}
+
+/// Quality measurement report -- the complete results of quality analysis.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QualityReport {
     /// Overall KL divergence
@@ -52,6 +73,410 @@ impl QualityReport {
             || self.perplexity_pre.is_some()
             || self.cosine_sim_average.is_some()
     }
+}
+
+/// Quality threshold configuration.
+pub struct QualityThresholds {
+    /// Maximum acceptable KL divergence
+    pub max_kl_divergence: f64,
+    /// Maximum acceptable perplexity delta
+    pub max_perplexity_delta: f64,
+    /// Minimum acceptable cosine similarity
+    pub min_cosine_similarity: f64,
+}
+
+impl Default for QualityThresholds {
+    fn default() -> Self {
+        Self {
+            max_kl_divergence: 0.1,
+            max_perplexity_delta: 2.0,
+            min_cosine_similarity: 0.95,
+        }
+    }
+}
+
+/// Check if quality metrics pass thresholds.
+///
+/// Returns a list of violation messages. An empty list means all thresholds pass.
+pub fn check_thresholds(report: &QualityReport, thresholds: &QualityThresholds) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    if let Some(kl) = report.kl_divergence {
+        if kl > thresholds.max_kl_divergence {
+            violations.push(format!(
+                "KL divergence {:.6} exceeds threshold {:.6}",
+                kl, thresholds.max_kl_divergence
+            ));
+        }
+    }
+
+    if let Some(delta) = report.perplexity_delta {
+        if delta > thresholds.max_perplexity_delta {
+            violations.push(format!(
+                "Perplexity delta {:.2} exceeds threshold {:.2}",
+                delta, thresholds.max_perplexity_delta
+            ));
+        }
+    }
+
+    if let Some(avg) = report.cosine_sim_average {
+        if avg < thresholds.min_cosine_similarity {
+            violations.push(format!(
+                "Cosine similarity {:.4} below threshold {:.4}",
+                avg, thresholds.min_cosine_similarity
+            ));
+        }
+    }
+
+    violations
+}
+
+/// Measure quality by comparing original and quantized models via GPU forward passes.
+///
+/// 1. Load tokenizer and encode calibration text
+/// 2. Load original model weights into Candle and run forward pass
+/// 3. Load quantized model weights (dequantized back to float) and run forward pass
+/// 4. Compute KL divergence, perplexity delta, activation cosine similarity
+pub fn measure_quality(
+    original_tensors: &TensorMap,
+    quantized_tensors: &TensorMap,
+    metadata: &ModelMetadata,
+    model_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<QualityReport, QualityError> {
+    use crate::gpu;
+    use crate::gpu::forward::TransformerForward;
+    use crate::gpu::tokenizer as gpu_tok;
+
+    let pb = progress.bar(5, "Quality measurement");
+
+    // Step 1: Load tokenizer and encode calibration text
+    let tokenizer = match gpu_tok::load_tokenizer(model_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(QualityError::TokenizerUnavailable {
+                reason: format!("{}", e),
+            });
+        }
+    };
+
+    let cal_text = gpu_tok::default_calibration_text();
+    let token_ids = gpu_tok::encode_calibration_text(&tokenizer, cal_text)?;
+
+    // Limit token count to avoid OOM on large models
+    let max_tokens = 128;
+    let token_ids: Vec<u32> = if token_ids.len() > max_tokens {
+        token_ids[..max_tokens].to_vec()
+    } else {
+        token_ids
+    };
+
+    if token_ids.len() < 2 {
+        return Err(QualityError::Gpu(anyhow::anyhow!(
+            "Calibration text too short: need at least 2 tokens, got {}",
+            token_ids.len()
+        )));
+    }
+
+    info!(tokens = token_ids.len(), "Encoded calibration text");
+    pb.inc(1);
+
+    // Step 2: Select device and load original model
+    let (device, gpu_device) = gpu::select_device()?;
+    info!(device = %gpu_device, "Using device for quality measurement");
+
+    let original_model = TransformerForward::load(original_tensors, metadata, &device)?;
+    pb.inc(1);
+
+    // Step 3: Run original forward pass with activation capture
+    debug!("Running original model forward pass");
+    let original_output = original_model.forward_with_activations(&token_ids)?;
+    pb.inc(1);
+
+    // Step 4: Load quantized model and run forward pass
+    debug!("Running quantized model forward pass");
+    let quantized_model = TransformerForward::load(quantized_tensors, metadata, &device)?;
+    let quantized_output = quantized_model.forward_with_activations(&token_ids)?;
+    pb.inc(1);
+
+    // Step 5: Compute quality metrics
+    let mut report = QualityReport::empty();
+
+    // 5a: KL divergence from logits
+    let orig_logits_f32 = logits_to_f32(&original_output.logits)?;
+    let quant_logits_f32 = logits_to_f32(&quantized_output.logits)?;
+
+    match compute_kl_from_logits(&orig_logits_f32, &quant_logits_f32) {
+        Ok(kl_result) => {
+            report.kl_divergence = Some(kl_result.overall);
+            report.per_layer_kl = Some(kl_result.per_layer);
+        }
+        Err(e) => {
+            warn!("KL divergence computation failed: {}", e);
+        }
+    }
+
+    // 5b: Perplexity delta
+    // Use tokens[1..] as targets (next-token prediction) and logits[0..n-1] as predictions
+    let targets: Vec<u32> = token_ids[1..].to_vec();
+    match compute_perplexity_delta(&orig_logits_f32, &quant_logits_f32, &targets) {
+        Ok(ppl_result) => {
+            report.perplexity_pre = Some(ppl_result.pre_quant);
+            report.perplexity_post = Some(ppl_result.post_quant);
+            report.perplexity_delta = Some(ppl_result.delta);
+        }
+        Err(e) => {
+            warn!("Perplexity computation failed: {}", e);
+        }
+    }
+
+    // 5c: Activation cosine similarity (per-layer hidden states)
+    if let (Some(ref orig_hs), Some(ref quant_hs)) = (
+        original_output.hidden_states,
+        quantized_output.hidden_states,
+    ) {
+        match compute_activation_cosine_sim(orig_hs, quant_hs) {
+            Ok(cos_result) => {
+                report.per_layer_cosine_sim = Some(cos_result.per_layer.clone());
+                report.cosine_sim_average = Some(cos_result.average);
+                report.cosine_sim_min = Some(cos_result.min);
+                report.cosine_sim_min_layer = Some(cos_result.min_layer_idx);
+            }
+            Err(e) => {
+                warn!("Cosine similarity computation failed: {}", e);
+            }
+        }
+    }
+
+    pb.inc(1);
+    pb.finish_with_message("Quality measurement complete");
+
+    Ok(report)
+}
+
+/// Dequantize a QuantizedModel back into a TensorMap for forward pass comparison.
+///
+/// Preserved (passthrough) tensors are returned as-is. Quantized tensors are
+/// unpacked and dequantized using their stored scales back to f16.
+pub fn dequantize_to_tensor_map(model: &QuantizedModel) -> TensorMap {
+    let mut tensor_map = TensorMap::new();
+
+    for (name, qt) in &model.tensors {
+        let tensor_ref = if qt.quant_info.preserved {
+            // Preserved tensor: data is already in original format (f16 or f32)
+            let dtype = match qt.quant_info.bits {
+                32 => DType::F32,
+                _ => DType::F16,
+            };
+            TensorRef {
+                name: name.clone(),
+                shape: qt.shape.clone(),
+                dtype,
+                data: qt.data.clone(),
+            }
+        } else if qt.quant_info.method == "f16" {
+            TensorRef {
+                name: name.clone(),
+                shape: qt.shape.clone(),
+                dtype: DType::F16,
+                data: qt.data.clone(),
+            }
+        } else {
+            // Dequantize: unpack values, multiply by scales, produce f16 output
+            let numel: usize = qt.shape.iter().product();
+            let bits = qt.quant_info.bits;
+            let group_size = qt.quant_info.group_size;
+
+            let quantized_values = unpack_quantized(&qt.data, numel, bits);
+
+            let scales: Vec<f32> = match &qt.quant_info.scales {
+                Some(s) => s
+                    .chunks_exact(2)
+                    .map(|c| {
+                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                        half::f16::from_bits(bits).to_f32()
+                    })
+                    .collect(),
+                None => {
+                    // No scales: assume passthrough
+                    warn!("No scales for tensor '{}', treating as passthrough", name);
+                    let data: Vec<u8> = vec![0u8; numel * 2]; // zeros as f16
+                    tensor_map.insert(TensorRef {
+                        name: name.clone(),
+                        shape: qt.shape.clone(),
+                        dtype: DType::F16,
+                        data,
+                    });
+                    continue;
+                }
+            };
+
+            let effective_group_size = if numel < group_size {
+                numel
+            } else {
+                group_size
+            };
+
+            // Dequantize: value * scale -> f16
+            let mut f16_data = Vec::with_capacity(numel * 2);
+            for (i, &q_val) in quantized_values.iter().enumerate() {
+                let group_idx = i / effective_group_size;
+                let scale = if group_idx < scales.len() {
+                    scales[group_idx]
+                } else {
+                    0.0
+                };
+                let dequantized = q_val as f32 * scale;
+                let f16_val = half::f16::from_f32(dequantized);
+                f16_data.extend_from_slice(&f16_val.to_le_bytes());
+            }
+
+            TensorRef {
+                name: name.clone(),
+                shape: qt.shape.clone(),
+                dtype: DType::F16,
+                data: f16_data,
+            }
+        };
+
+        tensor_map.insert(tensor_ref);
+    }
+
+    tensor_map
+}
+
+/// Unpack bit-packed quantized values back to i8.
+fn unpack_quantized(data: &[u8], num_elements: usize, bits: u8) -> Vec<i8> {
+    match bits {
+        8 => data.iter().take(num_elements).map(|&v| v as i8).collect(),
+        4 => {
+            let mut values = Vec::with_capacity(num_elements);
+            for &byte in data {
+                if values.len() >= num_elements {
+                    break;
+                }
+                // Low nibble first
+                let lo = (byte & 0x0F) as i8;
+                // Sign-extend from 4 bits
+                let lo = if lo >= 8 { lo - 16 } else { lo };
+                values.push(lo);
+
+                if values.len() >= num_elements {
+                    break;
+                }
+                // High nibble
+                let hi = ((byte >> 4) & 0x0F) as i8;
+                let hi = if hi >= 8 { hi - 16 } else { hi };
+                values.push(hi);
+            }
+            values
+        }
+        2 => {
+            let mut values = Vec::with_capacity(num_elements);
+            for &byte in data {
+                for shift in (0..8).step_by(2) {
+                    if values.len() >= num_elements {
+                        break;
+                    }
+                    let val = ((byte >> shift) & 0x03) as i8;
+                    // Sign-extend from 2 bits
+                    let val = if val >= 2 { val - 4 } else { val };
+                    values.push(val);
+                }
+            }
+            values
+        }
+        _ => data.iter().take(num_elements).map(|&v| v as i8).collect(),
+    }
+}
+
+/// Convert a Candle logits tensor [seq_len, vocab_size] to Vec<Vec<f32>>.
+fn logits_to_f32(
+    logits: &candle_core::Tensor,
+) -> Result<Vec<Vec<f32>>, QualityError> {
+    let dims = logits.dims();
+    if dims.len() != 2 {
+        return Err(QualityError::Gpu(anyhow::anyhow!(
+            "Expected 2D logits tensor, got {}D",
+            dims.len()
+        )));
+    }
+
+    let seq_len = dims[0];
+    let vocab_size = dims[1];
+
+    let flat: Vec<f32> = logits
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    let mut result = Vec::with_capacity(seq_len);
+    for i in 0..seq_len {
+        let start = i * vocab_size;
+        let end = start + vocab_size;
+        result.push(flat[start..end].to_vec());
+    }
+
+    Ok(result)
+}
+
+/// Compute KL divergence from logit sequences, treating each position as a separate
+/// comparison.
+fn compute_kl_from_logits(
+    original: &[Vec<f32>],
+    quantized: &[Vec<f32>],
+) -> Result<kl_divergence::KlDivergenceResult, kl_divergence::KlDivergenceError> {
+    kl_divergence::per_layer_kl_divergence(original, quantized)
+}
+
+/// Compute perplexity delta using logit sequences and target token IDs.
+fn compute_perplexity_delta(
+    original: &[Vec<f32>],
+    quantized: &[Vec<f32>],
+    targets: &[u32],
+) -> Result<perplexity::PerplexityResult, perplexity::PerplexityError> {
+    // Use logits[0..n-1] to predict targets[0..n-1] (next-token prediction)
+    let n = targets.len().min(original.len() - 1).min(quantized.len() - 1);
+    if n == 0 {
+        return Err(perplexity::PerplexityError::EmptySequence);
+    }
+    let orig_logits = &original[..n];
+    let quant_logits = &quantized[..n];
+    let tgt = &targets[..n];
+    perplexity::perplexity_delta(orig_logits, quant_logits, tgt)
+}
+
+/// Compute activation cosine similarity from per-layer hidden state tensors.
+fn compute_activation_cosine_sim(
+    original_hs: &[candle_core::Tensor],
+    quantized_hs: &[candle_core::Tensor],
+) -> Result<cosine_sim::CosineSimilarityResult, cosine_sim::CosineSimilarityError> {
+    let num_layers = original_hs.len().min(quantized_hs.len());
+    let mut orig_vecs = Vec::with_capacity(num_layers);
+    let mut quant_vecs = Vec::with_capacity(num_layers);
+
+    for i in 0..num_layers {
+        let orig_flat: Vec<f32> = match original_hs[i]
+            .to_dtype(candle_core::DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let quant_flat: Vec<f32> = match quantized_hs[i]
+            .to_dtype(candle_core::DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        orig_vecs.push(orig_flat);
+        quant_vecs.push(quant_flat);
+    }
+
+    cosine_sim::per_layer_cosine_similarity(&orig_vecs, &quant_vecs)
 }
 
 /// Print a terminal summary of quality metrics.
@@ -130,5 +555,163 @@ mod tests {
 
         report.kl_divergence = Some(0.05);
         assert!(report.has_metrics());
+    }
+
+    #[test]
+    fn test_thresholds_default() {
+        let thresholds = QualityThresholds::default();
+        assert!((thresholds.max_kl_divergence - 0.1).abs() < f64::EPSILON);
+        assert!((thresholds.max_perplexity_delta - 2.0).abs() < f64::EPSILON);
+        assert!((thresholds.min_cosine_similarity - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_check_thresholds_pass() {
+        let report = QualityReport {
+            kl_divergence: Some(0.05),
+            per_layer_kl: None,
+            perplexity_pre: Some(5.0),
+            perplexity_post: Some(5.5),
+            perplexity_delta: Some(0.5),
+            per_layer_cosine_sim: None,
+            cosine_sim_average: Some(0.98),
+            cosine_sim_min: None,
+            cosine_sim_min_layer: None,
+        };
+        let thresholds = QualityThresholds::default();
+        let violations = check_thresholds(&report, &thresholds);
+        assert!(violations.is_empty(), "Expected no violations: {:?}", violations);
+    }
+
+    #[test]
+    fn test_check_thresholds_fail_kl() {
+        let report = QualityReport {
+            kl_divergence: Some(0.5),
+            per_layer_kl: None,
+            perplexity_pre: None,
+            perplexity_post: None,
+            perplexity_delta: None,
+            per_layer_cosine_sim: None,
+            cosine_sim_average: None,
+            cosine_sim_min: None,
+            cosine_sim_min_layer: None,
+        };
+        let thresholds = QualityThresholds::default();
+        let violations = check_thresholds(&report, &thresholds);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("KL divergence"));
+    }
+
+    #[test]
+    fn test_check_thresholds_fail_all() {
+        let report = QualityReport {
+            kl_divergence: Some(0.5),
+            per_layer_kl: None,
+            perplexity_pre: Some(5.0),
+            perplexity_post: Some(10.0),
+            perplexity_delta: Some(5.0),
+            per_layer_cosine_sim: None,
+            cosine_sim_average: Some(0.80),
+            cosine_sim_min: None,
+            cosine_sim_min_layer: None,
+        };
+        let thresholds = QualityThresholds::default();
+        let violations = check_thresholds(&report, &thresholds);
+        assert_eq!(violations.len(), 3);
+    }
+
+    #[test]
+    fn test_check_thresholds_empty_report() {
+        let report = QualityReport::empty();
+        let thresholds = QualityThresholds::default();
+        let violations = check_thresholds(&report, &thresholds);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_unpack_8bit() {
+        let data = vec![127u8, 0, 255]; // as i8: 127, 0, -1
+        let result = unpack_quantized(&data, 3, 8);
+        assert_eq!(result, vec![127i8, 0, -1]);
+    }
+
+    #[test]
+    fn test_unpack_4bit() {
+        // Byte 0xE3 = lo nibble 3, hi nibble 0xE (14, sign-extend -> -2)
+        let data = vec![0xE3u8];
+        let result = unpack_quantized(&data, 2, 4);
+        assert_eq!(result[0], 3);
+        assert_eq!(result[1], -2);
+    }
+
+    #[test]
+    fn test_unpack_2bit() {
+        // Byte with values: 0b_11_10_01_00 = positions 0=0, 1=1, 2=-2, 3=-1
+        let byte = 0b_11_10_01_00u8;
+        let result = unpack_quantized(&[byte], 4, 2);
+        assert_eq!(result[0], 0);
+        assert_eq!(result[1], 1);
+        assert_eq!(result[2], -2);
+        assert_eq!(result[3], -1);
+    }
+
+    #[test]
+    fn test_dequantize_preserved_tensor() {
+        use std::collections::HashMap;
+
+        let mut tensors = HashMap::new();
+        let f16_data: Vec<u8> = [1.0f32, 2.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        tensors.insert(
+            "test.weight".to_string(),
+            crate::ir::QuantizedTensor {
+                name: "test.weight".to_string(),
+                shape: vec![2],
+                original_dtype: DType::F16,
+                data: f16_data.clone(),
+                quant_info: crate::ir::TensorQuantInfo {
+                    method: "passthrough".to_string(),
+                    bits: 16,
+                    group_size: 0,
+                    preserved: true,
+                    scales: None,
+                    biases: None,
+                    ggml_type: None,
+                },
+            },
+        );
+
+        let model = QuantizedModel {
+            metadata: ModelMetadata {
+                architecture: "test".to_string(),
+                model_type: "test".to_string(),
+                param_count: 2,
+                hidden_size: 2,
+                num_layers: 1,
+                layer_types: vec![],
+                num_attention_heads: 1,
+                num_kv_heads: None,
+                vocab_size: 32000,
+                dtype: "float16".to_string(),
+                shard_count: 1,
+                num_experts: None,
+                top_k_experts: None,
+                intermediate_size: None,
+                raw_config: serde_json::Value::Null,
+            },
+            tensors,
+            quant_method: "passthrough".to_string(),
+            group_size: 64,
+            bits: 16,
+        };
+
+        let result = dequantize_to_tensor_map(&model);
+        assert_eq!(result.len(), 1);
+        let t = result.tensors.get("test.weight").unwrap();
+        assert_eq!(t.dtype, DType::F16);
+        assert_eq!(t.data, f16_data);
     }
 }

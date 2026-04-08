@@ -6,6 +6,7 @@
 //! - AutoResolver: RuVector query -> heuristic fallback
 //! - RuVector: self-learning conversion result storage
 
+#[allow(dead_code)]
 pub mod auto_quant;
 pub mod fingerprint;
 pub mod hardware;

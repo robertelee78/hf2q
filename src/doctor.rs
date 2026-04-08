@@ -23,6 +23,7 @@ enum CheckResult {
     Pass(String),
     Warn(String, String), // message, remediation
     Fail(String, String), // message, remediation
+    #[allow(dead_code)]
     Info(String),
 }
 
