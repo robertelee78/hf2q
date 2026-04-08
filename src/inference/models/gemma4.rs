@@ -2713,9 +2713,11 @@ impl Gemma4Model {
 
         if let Some((bits, _group_size)) = quant_info {
             let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
-            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+            let use_bf16_qmatmul = std::env::var("HF2Q_BF16_QMATMUL").is_ok();
+            if !use_cpu_qmatmul && use_bf16_qmatmul && (bits == 4 || bits == 8) {
                 // GPU path: direct bf16 qmatmul — no cast chain needed.
                 // Input is bf16, output is bf16. Eliminates 2 cast dispatches per projection.
+                // NOTE: Gated behind HF2Q_BF16_QMATMUL=1 until kernel is validated.
                 //
                 // Clone weight buffer refs upfront to avoid borrow conflict with &mut self
                 // methods (cast_f32_to_bf16_with_encoder needs &mut self).
@@ -2749,6 +2751,33 @@ impl Gemma4Model {
                     &params,
                 )?;
 
+                return Ok(output_bf16);
+            }
+            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+                // GPU path: f32 qmatmul with cast chain (default, proven correct).
+                // Cast bf16 input -> f32, run f32 qmatmul, cast f32 output -> bf16.
+                let weight_buf = clone_buffer(&self.device, &require_weight(&self.weights, &weight_name)?.buffer)?;
+                let scales_buf = clone_buffer(&self.device, &require_weight(&self.weights, &scales_name)?.buffer)?;
+                let biases_buf = clone_buffer(&self.device, &require_weight(&self.weights, &biases_name)?.buffer)?;
+
+                let params = QuantizedMatmulParams {
+                    m: seq_len as u32,
+                    k: in_dim as u32,
+                    n: out_dim as u32,
+                    group_size: _group_size as u32,
+                    bits: bits as u32,
+                };
+
+                // Ensure input is f32 for the f32 kernel
+                let f32_input = self.ensure_f32_input_with_encoder(encoder, input, seq_len * in_dim)?;
+
+                let output_f32 = qmatmul::quantized_matmul_simd(
+                    encoder, &mut self.registry, &self.device,
+                    &f32_input, &weight_buf, &scales_buf, &biases_buf, &params,
+                )?;
+
+                // Cast f32 output to bf16
+                let output_bf16 = self.cast_f32_to_bf16_with_encoder(encoder, &output_f32, seq_len * out_dim)?;
                 return Ok(output_bf16);
             }
 
