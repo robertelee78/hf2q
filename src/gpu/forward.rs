@@ -246,6 +246,15 @@ impl TransformerForward {
             num_heads, num_kv_heads, head_dim, num_layers, "Loading transformer"
         );
 
+        // Detect naming convention: some models (e.g. Gemma 4 multimodal) use
+        // "model.language_model.*" instead of "model.*".
+        let model_prefix = if tensor_map.tensors.contains_key("model.language_model.embed_tokens.weight") {
+            "model.language_model"
+        } else {
+            "model"
+        };
+        debug!(model_prefix, "Detected tensor naming prefix");
+
         // Helper to load a tensor by name
         let get = |name: &str| -> Result<Tensor> {
             let tref = tensor_map
@@ -256,13 +265,13 @@ impl TransformerForward {
         };
 
         // Embedding
-        let embed_weight = get("model.embed_tokens.weight")?;
+        let embed_weight = get(&format!("{}.embed_tokens.weight", model_prefix))?;
         let embed = Embedding::new(embed_weight, hidden_size);
 
         // Layers
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            let prefix = format!("model.layers.{}", i);
+            let prefix = format!("{}.layers.{}", model_prefix, i);
 
             let attn_norm = RmsNorm::new(get(&format!("{}.input_layernorm.weight", prefix))?, eps);
 
@@ -299,14 +308,14 @@ impl TransformerForward {
         }
 
         // Final norm
-        let final_norm = RmsNorm::new(get("model.norm.weight")?, eps);
+        let final_norm = RmsNorm::new(get(&format!("{}.norm.weight", model_prefix))?, eps);
 
         // LM head -- some models tie embed and lm_head weights
         let lm_head_weight = if tensor_map.tensors.contains_key("lm_head.weight") {
             get("lm_head.weight")?
         } else {
             debug!("lm_head.weight not found, using tied embed_tokens.weight");
-            get("model.embed_tokens.weight")?
+            get(&format!("{}.embed_tokens.weight", model_prefix))?
         };
         let lm_head = Linear::new(lm_head_weight, None);
 

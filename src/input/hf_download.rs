@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use serde_json;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -205,14 +206,55 @@ fn download_via_hf_hub(
         }
     }
 
-    // Index file
+    // Index file — download FIRST so we know which shards are actually needed
+    let mut needed_shards: Option<Vec<String>> = None;
     if let Some(idx) = index_file {
         files_to_download.push(idx.as_str());
+
+        // Download the index now to discover required shards
+        debug!("Downloading index file to determine required shards");
+        let idx_path = repo.get(idx.as_str()).map_err(|e| {
+            DownloadError::DownloadFailed {
+                reason: format!("Failed to download index file: {}", e),
+            }
+        })?;
+
+        // Parse weight_map to find which shard files are actually referenced
+        if let Ok(content) = std::fs::read_to_string(&idx_path) {
+            if let Ok(index) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) {
+                    let mut shard_names: Vec<String> = weight_map
+                        .values()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    shard_names.sort();
+                    shard_names.dedup();
+                    info!(
+                        total_safetensors = safetensors_files.len(),
+                        needed = shard_names.len(),
+                        "Index specifies {} of {} safetensors files",
+                        shard_names.len(),
+                        safetensors_files.len(),
+                    );
+                    needed_shards = Some(shard_names);
+                }
+            }
+        }
     }
 
-    // Safetensors shards
-    for sf in &safetensors_files {
-        files_to_download.push(sf.as_str());
+    // Only download shards referenced by the index (or all if no index)
+    match &needed_shards {
+        Some(shards) => {
+            for shard in shards {
+                files_to_download.push(shard.as_str());
+            }
+        }
+        None => {
+            // No index file — download all safetensors files
+            for sf in &safetensors_files {
+                files_to_download.push(sf.as_str());
+            }
+        }
     }
 
     // Download all files with progress
@@ -304,7 +346,19 @@ fn download_with_cli_command(cmd: &str, repo_id: &str) -> Result<PathBuf, Downlo
     info!(cmd = %cmd, repo = %repo_id, "Downloading via CLI");
 
     let output = std::process::Command::new(cmd)
-        .args(["download", repo_id])
+        .args([
+            "download",
+            repo_id,
+            "--include", "*.safetensors",
+            "--include", "*.json",
+            "--include", "tokenizer.model",
+            "--exclude", "*.gguf",
+            "--exclude", "*.bin",
+            "--exclude", "*.pt",
+            "--exclude", "*.h5",
+            "--exclude", "*.msgpack",
+            "--exclude", "*.ot",
+        ])
         .output()
         .map_err(|e| DownloadError::CliFallbackFailed {
             reason: format!("Failed to execute '{}': {}", cmd, e),
