@@ -1,112 +1,227 @@
 # hf2q
 
-**Pure Rust CLI for converting HuggingFace models to hardware-optimized formats.**
+Pure-Rust CLI that converts any HuggingFace model into optimally quantized weights for major inference runtimes. One binary, cross-platform, no Python.
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust: 1.81.0+](https://img.shields.io/badge/rust-1.81.0%2B-orange.svg)](https://www.rust-lang.org)
+## Features
 
----
-
-hf2q converts HuggingFace safetensors models to hardware-optimized formats. Pure Rust, zero Python dependencies. Point it at a HuggingFace repo or local directory, get optimized weights.
+- **GGUF output** for llama.cpp and Ollama
+- **Quantized safetensors output** for Candle, inferrs, and vLLM
+- **10 quantization methods** from simple round-to-nearest to calibration-aware mixed-bit
+- **Apex imatrix quantization** -- importance-matrix-calibrated, per-tensor optimal precision
+- **DWQ calibration** -- weight-space and activation-based mixed-bit allocation
+- **Auto-quant intelligence** -- `--quant auto` selects the optimal method based on model architecture, hardware, and past outcomes
+- **Quality validation** -- cosine similarity, KL divergence, and perplexity checks against the original model
+- **GPU acceleration** -- Metal (macOS) and CUDA (Linux) via Candle, with CPU fallback
+- **Self-learning** -- RuVector database stores conversion outcomes so recommendations improve over time
+- **Cross-platform** -- builds and runs on macOS (ARM64) and Linux (x86_64)
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/robertelee78/hf2q.git
-cd hf2q
-cargo build --release
+# Install from source
+cargo install --path .
+
+# Convert a model to GGUF with 4-bit quantization
+hf2q convert --repo meta-llama/Llama-3-8B --format gguf --quant q4
+
+# Convert to quantized safetensors with mixed-bit precision
+hf2q convert --repo google/gemma-2-9b --format safetensors --quant mixed-4-6
+
+# Let hf2q choose the optimal quantization method
+hf2q convert --repo mistralai/Mistral-7B-v0.3 --format gguf --quant auto
 ```
 
-### Convert a model
+## Usage
+
+### convert
+
+Convert a HuggingFace model to a quantized output format.
 
 ```bash
-# Download from HuggingFace and convert to CoreML at 4-bit
-hf2q convert --repo Qwen/Qwen3-8B --format coreml --quant q4
+# From a HuggingFace repo (downloads automatically)
+hf2q convert --repo <hf-repo-id> --format <gguf|safetensors> --quant <method>
 
-# Auto quantization (learns from your hardware over time)
-hf2q convert --input ./my-model --format coreml
+# From a local safetensors directory
+hf2q convert --input ./my-model/ --format gguf --quant q4
 
-# Preview without writing files
-hf2q convert --repo Qwen/Qwen3-8B --format coreml --dry-run
+# Specify output directory
+hf2q convert --repo <hf-repo-id> --format gguf --quant q8 --output ./output-dir/
+
+# Protect sensitive layers at higher precision
+hf2q convert --repo <hf-repo-id> --format gguf --quant mixed-4-6 --sensitive-layers "13-24"
+
+# DWQ with custom calibration sample count
+hf2q convert --repo <hf-repo-id> --format safetensors --quant dwq-mixed-4-6 --calibration-samples 2048
+
+# Apex with target bits-per-weight
+hf2q convert --repo <hf-repo-id> --format gguf --quant apex --target-bpw 4.5
+
+# Custom bit width and group size
+hf2q convert --repo <hf-repo-id> --format safetensors --quant q4 --bits 4 --group-size 128
+
+# Dry run -- print the plan without converting
+hf2q convert --repo <hf-repo-id> --format gguf --quant auto --dry-run
+
+# CI mode -- JSON report, no prompts, quality gate
+hf2q convert --repo <hf-repo-id> --format gguf --quant q4 --json-report --yes --quality-gate
 ```
 
-## Conversion
+### info
 
-### Quantization Methods
+Inspect model metadata before converting.
 
-| Method | Flag | Bits | Description |
-|--------|------|------|-------------|
-| Auto | `auto` | varies | Self-learning selection based on hardware and model (default) |
-| Half precision | `f16` | 16 | Lossless float16, largest output |
-| 8-bit | `q8` | 8 | High quality, moderate compression |
-| 4-bit | `q4` | 4 | Good balance of quality and size |
-| 2-bit | `q2` | 2 | Maximum compression, noticeable quality loss |
-| Mixed 2-6 | `mixed-2-6` | 2-6 | Aggressive mixed-bit |
-| Mixed 3-6 | `mixed-3-6` | 3-6 | Moderate mixed-bit |
-| Mixed 4-6 | `mixed-4-6` | 4-6 | Conservative mixed-bit |
-| DWQ Mixed 4-6 | `dwq-mixed-4-6` | 4-6 | Data-aware calibration for optimal bit allocation |
+```bash
+hf2q info --repo meta-llama/Llama-3-8B
+hf2q info --input ./local-model/
+```
 
-Use `--sensitive-layers` with mixed-bit methods to protect specific layers (e.g., LoRA-modified) at higher precision.
+### validate
 
-### Output Formats
+Check quantization quality by comparing a quantized model against its original.
 
-| Format | Flag | Status |
-|--------|------|--------|
-| CoreML | `coreml` | Available |
-| GGUF | `gguf` | Planned |
-| NVFP4 | `nvfp4` | Planned |
-| GPTQ | `gptq` | Planned |
-| AWQ | `awq` | Planned |
+```bash
+hf2q validate --original ./original-model/ --quantized ./quantized-model/
 
-### Auto Mode
+# Custom thresholds
+hf2q validate --original ./original/ --quantized ./quantized/ \
+    --max-kl 0.05 --max-ppl-delta 1.0 --min-cosine 0.98
 
-With `--quant auto` (the default), hf2q picks quantization settings automatically:
+# JSON output for CI
+hf2q validate --original ./original/ --quantized ./quantized/ --json
+```
 
-1. Checks RuVector for an exact match from a prior conversion on the same hardware
-2. Falls back to similar-model matches, adapting the stored recommendation
-3. If no stored data exists, applies heuristics based on memory, model size, and architecture
+### doctor
 
-Results are stored after each conversion, so auto mode improves over time.
+Diagnose the environment: GPU availability, disk space, RuVector database health.
 
-## Other Commands
+```bash
+hf2q doctor
+```
 
-| Command | Description |
-|---------|-------------|
-| `hf2q info --repo <ID>` | Inspect model metadata |
-| `hf2q doctor` | Diagnose system setup |
-| `hf2q completions --shell <SHELL>` | Generate shell completions (bash, zsh, fish) |
+### completions
+
+Generate shell completions.
+
+```bash
+hf2q completions --shell bash > ~/.bash_completion.d/hf2q
+hf2q completions --shell zsh > ~/.zfunc/_hf2q
+hf2q completions --shell fish > ~/.config/fish/completions/hf2q.fish
+```
+
+## Quantization Methods
+
+| Method | Description | Calibration | GPU Required |
+|--------|-------------|:-----------:|:------------:|
+| `f16` | Float16 passthrough (no quantization) | No | No |
+| `q8` | 8-bit round-to-nearest | No | No |
+| `q4` | 4-bit round-to-nearest | No | No |
+| `q2` | 2-bit round-to-nearest | No | No |
+| `mixed-2-6` | Fixed mixed-bit, 2-6 bits per layer | No | No |
+| `mixed-3-6` | Fixed mixed-bit, 3-6 bits per layer | No | No |
+| `mixed-4-6` | Fixed mixed-bit, 4-6 bits per layer | No | No |
+| `dwq-mixed-4-6` | DWQ weight-space calibrated mixed-bit | Weight-space (CPU) | No |
+| `apex` | imatrix-calibrated, per-tensor optimal precision | Forward pass | Yes |
+| `auto` | Intelligence-selected optimal method | Varies | Varies |
+
+Use `--sensitive-layers` with any mixed-bit method to protect specific layers at higher precision:
+
+```bash
+hf2q convert --repo <id> --format gguf --quant mixed-4-6 --sensitive-layers "1,5,13-24"
+```
+
+## Output Formats
+
+### GGUF
+
+For llama.cpp and Ollama. Produces a single `.gguf` file ready to load.
+
+```bash
+hf2q convert --repo <id> --format gguf --quant q4
+# Output: model-gguf-q4/model.gguf
+```
+
+### Quantized Safetensors
+
+For Candle, inferrs, and vLLM. Produces quantized `.safetensors` files with a `quantization_config.json` sidecar describing per-layer bit assignments, method, and group size.
+
+```bash
+hf2q convert --repo <id> --format safetensors --quant mixed-4-6
+# Output: model-safetensors-mixed-4-6/*.safetensors + quantization_config.json
+```
+
+## Auto Mode
+
+When `--quant auto` is specified, hf2q selects the optimal quantization method through a three-tier decision process:
+
+1. **RuVector lookup** -- queries the self-learning database for past conversion outcomes on similar models (requires the `ruvector` feature)
+2. **auto_quant intelligence** -- analyzes the model fingerprint (architecture, layer count, parameter distribution, MoE structure) against target format and available hardware
+3. **Heuristic fallback** -- applies rule-based defaults when no prior data exists
+
+Auto mode considers model size, target format constraints, available memory, and GPU capabilities. Over time, RuVector learns which methods produce the best quality-to-size ratio for each model family.
+
+## Quality Validation
+
+hf2q measures quantization quality at two levels:
+
+**During conversion** (unless `--skip-quality` is set):
+- Weight-level cosine similarity between original and quantized tensors
+
+**Post-conversion** via `validate`:
+- KL divergence between original and quantized output distributions
+- Perplexity delta on calibration text
+- Activation-level cosine similarity
+
+Use `--quality-gate` to fail the conversion (exit code 2) if quality thresholds are exceeded. Use `--json-report` to emit structured output for CI pipelines.
+
+## GPU Acceleration
+
+hf2q uses Candle for GPU-accelerated operations. GPU is used for calibration-based quantization methods (Apex, activation-based DWQ) and quality validation forward passes.
+
+| Platform | Backend | Feature Flag |
+|----------|---------|-------------|
+| macOS (Apple Silicon) | Metal | `--features metal` |
+| Linux (NVIDIA) | CUDA | `--features cuda` |
+| Any | CPU fallback | default (no flag) |
+
+All CPU-only quantization methods (F16, Q8, Q4, Q2, mixed-bit, DWQ weight-space) work without GPU acceleration.
 
 ## Building
 
 ```bash
-cargo build                              # base conversion only
-cargo build --features coreml-backend    # with CoreML output generation
-cargo build --features ruvector           # with self-learning auto mode
-cargo build --release --all-features     # everything
+# Default build (CPU only)
+cargo build --release
+
+# With Metal GPU support (macOS)
+cargo build --release --features metal
+
+# With CUDA GPU support (Linux)
+cargo build --release --features cuda
+
+# With RuVector self-learning
+cargo build --release --features ruvector
+
+# All features (macOS)
+cargo build --release --features "metal,ruvector"
 ```
 
 ### Feature Flags
 
 | Feature | Description |
 |---------|-------------|
-| `coreml-backend` | CoreML output generation |
-| `ruvector` | Self-learning auto mode |
+| `metal` | Metal GPU acceleration via Candle (macOS / Apple Silicon) |
+| `cuda` | CUDA GPU acceleration via Candle (Linux / NVIDIA) |
+| `ruvector` | RuVector self-learning database for auto-quant intelligence |
 
-### Test & Lint
+### Running Tests
 
 ```bash
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 ```
 
-## Roadmap
+### Minimum Rust Version
 
-- **GGUF output** -- cross-platform format for llama.cpp
-- **NVIDIA formats** -- NVFP4, GPTQ, AWQ for CUDA-based inference
-- **More architectures** -- Llama, Mistral, Qwen, and other model families
-- **Inference server** -- OpenAI-compatible API server
-- **Linux support** -- NVIDIA/ROCm backends
+Rust 1.81.0 or later.
 
 ## License
 
-Apache-2.0 ([LICENSE](LICENSE))
+Apache-2.0
