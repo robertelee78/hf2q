@@ -17,7 +17,7 @@
 
 use mlx_native::ops::{
     elementwise, embedding, gelu, quantized_matmul as qmatmul,
-    rms_norm, sdpa, sdpa_sliding, softcap,
+    rms_norm, rope, sdpa, sdpa_sliding, softcap, transpose,
 };
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice, QuantizedMatmulParams};
 use tracing::{debug, info};
@@ -409,24 +409,34 @@ impl Gemma4Model {
         // Step 2: Scale embeddings by sqrt(hidden_size) as Gemma convention
         // MLX stores this as bf16: embed_scale = bf16(sqrt(hidden_size))
         // Using bf16 scale matches MLX's precision exactly.
+        // GPU scalar_mul_bf16 for the entire buffer.
         let scale = half::bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+        let n_embed_elements = seq_len * hidden_size;
+        let scaled_embed = self.device.alloc_buffer(
+            n_embed_elements * 2, // bf16
+            DType::BF16,
+            vec![seq_len, hidden_size],
+        )?;
         {
-            let slice: &mut [u16] = hidden
-                .as_mut_slice()
-                .map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("Embedding scale bf16: {e}"),
-                })?;
-            for v in slice.iter_mut() {
-                let f = half::bf16::from_bits(*v).to_f32() * scale;
-                *v = half::bf16::from_f32(f).to_bits();
-            }
+            let mut encoder = self.device.command_encoder()?;
+            elementwise::scalar_mul_bf16(
+                &mut encoder,
+                &mut self.registry,
+                self.device.metal_device(),
+                &hidden,
+                &scaled_embed,
+                n_embed_elements,
+                scale,
+            )?;
+            encoder.commit_and_wait()?;
+        }
+        hidden = scaled_embed;
 
-            if diag {
-                let n = slice.len().min(5);
-                let diag_vals: Vec<f32> = slice[..n].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
-                eprintln!("[DIAG] After embedding scale bf16 (factor={:.4}), first {}: {:?}",
-                    scale, n, diag_vals);
-            }
+        if diag {
+            let s = read_buffer_f32(&hidden)?;
+            let n = s.len().min(5);
+            eprintln!("[DIAG] After embedding scale bf16 (factor={:.4}), first {}: {:?}",
+                scale, n, &s[..n]);
         }
 
         // Step 3: Process each transformer layer
@@ -989,56 +999,175 @@ impl Gemma4Model {
         let use_k_eq_v = self.config.attention_k_eq_v
             && layer_type == LayerAttentionType::Global;
 
-        // --- Step 2b: QK norms (per-head RMS norm on Q and K) --- (CPU)
+        // =================================================================
+        // BATCH 1b: QK/V norms + RoPE (all GPU, one command encoder)
+        //
+        // Per-head RMS norms treat [seq_len, n_heads * head_dim] as
+        // [seq_len * n_heads, head_dim]. RoPE is dispatched via the neox
+        // bf16 kernel. One commit replaces 5 separate commits.
+        // =================================================================
         let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
         let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
-
-        let q_norm_weight = read_weight_as_f32(require_weight(&self.weights, &q_norm_name)?)?;
-        let k_norm_weight = read_weight_as_f32(require_weight(&self.weights, &k_norm_name)?)?;
-
-        let q_data = read_buffer_f32(&q_proj)?;
-        let q_normed_data = cpu_per_head_rms_norm(&q_data, &q_norm_weight, seq_len, n_heads, head_dim, eps);
-        let q_normed = f32_vec_to_bf16_buffer(&self.device, &q_normed_data, vec![seq_len, q_out_dim])?;
-
-        let k_data_raw = read_buffer_f32(&k_proj)?;
-        let k_normed_data = cpu_per_head_rms_norm(&k_data_raw, &k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
-        let k_normed = f32_vec_to_bf16_buffer(&self.device, &k_normed_data, vec![seq_len, kv_out_dim])?;
-
-        // --- Step 2c: V norm (scaleless per-head RMS norm on V) --- (CPU)
-        let v_data_raw = read_buffer_f32(&v_proj)?;
-        let v_normed_data = cpu_per_head_rms_norm_no_scale(&v_data_raw, seq_len, n_kv_heads, head_dim, eps);
-        let v_normed_buf = f32_vec_to_bf16_buffer(&self.device, &v_normed_data, vec![seq_len, kv_out_dim])?;
-
-        if diag {
-            eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_data_raw[..5.min(k_data_raw.len())]);
-            eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
-            let k_v_match = k_data_raw.len() == v_data_raw.len() &&
-                k_data_raw.iter().zip(v_data_raw.iter()).take(10).all(|(a, b)| (a - b).abs() < 1e-6);
-            eprintln!("[DIAG]   K==V? {} (k_eq_v={}, k_len={}, v_len={})", k_v_match, use_k_eq_v, k_data_raw.len(), v_data_raw.len());
-
-            let n = q_normed_data.len().min(5);
-            eprintln!("[DIAG] Layer 0 after QK norms, Q first {}: {:?}", n, &q_normed_data[..n]);
-            let n = k_normed_data.len().min(5);
-            eprintln!("[DIAG] Layer 0 after QK norms, K first {}: {:?}", n, &k_normed_data[..n]);
-
-            eprintln!("[DIAG] Layer 0 V raw (k_proj, before v_norm), pos 0 first 5: {:?}", &v_data_raw[..5.min(v_data_raw.len())]);
-            eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_normed_data[..5.min(v_normed_data.len())]);
-            let v_head0 = &v_data_raw[..head_dim];
-            let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
-            eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
-        }
-
-        // --- Step 3: RoPE on Q and K --- (CPU)
         let rope_dim = self.config.rope_dim(layer_idx);
         let theta = self.config.rope_theta(layer_idx);
 
-        let q_roped = self.apply_rope_to_heads(
-            &q_normed, seq_len, n_heads, head_dim, rope_dim, theta,
-        )?;
+        let (q_roped, k_roped, v_normed_buf);
+        {
+            let mut encoder = self.device.command_encoder()?;
 
-        let k_roped = self.apply_rope_to_heads(
-            &k_normed, seq_len, n_kv_heads, head_dim, rope_dim, theta,
-        )?;
+            // Params buffer for per-head norm: [eps, head_dim]
+            let mut norm_params = self.device.alloc_buffer(
+                std::mem::size_of::<[f32; 2]>(), DType::F32, vec![2],
+            )?;
+            {
+                let s: &mut [f32] = norm_params.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                    reason: format!("per-head norm params: {e}"),
+                })?;
+                s[0] = eps;
+                s[1] = head_dim as f32;
+            }
+
+            // Q norm weight -> bf16
+            let q_nw = require_weight(&self.weights, &q_norm_name)?;
+            let q_nw_bf16 = match q_nw.buffer.dtype() {
+                DType::BF16 => clone_buffer(&self.device, &q_nw.buffer)?,
+                _ => {
+                    let f32_data = read_weight_as_f32(q_nw)?;
+                    f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
+                }
+            };
+
+            // K norm weight -> bf16
+            let k_nw = require_weight(&self.weights, &k_norm_name)?;
+            let k_nw_bf16 = match k_nw.buffer.dtype() {
+                DType::BF16 => clone_buffer(&self.device, &k_nw.buffer)?,
+                _ => {
+                    let f32_data = read_weight_as_f32(k_nw)?;
+                    f32_vec_to_bf16_buffer(&self.device, &f32_data, vec![head_dim])?
+                }
+            };
+
+            // Q: rms_norm per head
+            let q_normed = self.device.alloc_buffer(
+                seq_len * q_out_dim * 2, DType::BF16, vec![seq_len, q_out_dim],
+            )?;
+            rms_norm::dispatch_rms_norm(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &q_proj, &q_nw_bf16, &q_normed, &norm_params,
+                (seq_len * n_heads) as u32, head_dim as u32,
+            )?;
+
+            // K: rms_norm per head
+            let k_normed = self.device.alloc_buffer(
+                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+            )?;
+            rms_norm::dispatch_rms_norm(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &k_proj, &k_nw_bf16, &k_normed, &norm_params,
+                (seq_len * n_kv_heads) as u32, head_dim as u32,
+            )?;
+
+            // V: scaleless per-head RMS norm
+            let v_out = self.device.alloc_buffer(
+                seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+            )?;
+            rms_norm::dispatch_rms_norm_no_scale_bf16(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &v_proj, &v_out, &norm_params,
+                (seq_len * n_kv_heads) as u32, head_dim as u32,
+            )?;
+            v_normed_buf = v_out;
+
+            // --- RoPE on Q and K (GPU, same encoder) ---
+            if rope_dim > 0 && seq_len > 0 {
+                // Position offset from last layer's cache (not yet appended)
+                let pos_offset = if self.kv_cache.num_layers() > 0 {
+                    let last_layer = self.kv_cache.num_layers() - 1;
+                    match self.kv_cache.layer(last_layer) {
+                        Ok(cache) => cache.write_position(),
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                };
+
+                // Positions buffer
+                let positions_vec: Vec<u32> = (0..seq_len).map(|i| (pos_offset + i) as u32).collect();
+                let mut positions_buf = self.device.alloc_buffer(
+                    seq_len * std::mem::size_of::<u32>(), DType::U32, vec![seq_len],
+                )?;
+                {
+                    let s: &mut [u32] = positions_buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("RoPE positions: {e}"),
+                    })?;
+                    s.copy_from_slice(&positions_vec);
+                }
+
+                // RoPE params: [theta, head_dim, rope_dim, 0]
+                let mut rope_params = self.device.alloc_buffer(
+                    4 * std::mem::size_of::<f32>(), DType::F32, vec![4],
+                )?;
+                {
+                    let s: &mut [f32] = rope_params.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("RoPE params: {e}"),
+                    })?;
+                    s[0] = theta;
+                    s[1] = head_dim as f32;
+                    s[2] = rope_dim as f32;
+                    s[3] = 0.0;
+                }
+
+                // RoPE on Q
+                let q_rope_out = self.device.alloc_buffer(
+                    seq_len * q_out_dim * 2, DType::BF16, vec![seq_len, q_out_dim],
+                )?;
+                rope::dispatch_rope_neox_bf16(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &q_normed, &q_rope_out, &rope_params, &positions_buf,
+                    seq_len as u32, n_heads as u32, head_dim as u32, rope_dim as u32,
+                )?;
+                q_roped = q_rope_out;
+
+                // RoPE on K
+                let k_rope_out = self.device.alloc_buffer(
+                    seq_len * kv_out_dim * 2, DType::BF16, vec![seq_len, kv_out_dim],
+                )?;
+                rope::dispatch_rope_neox_bf16(
+                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                    &k_normed, &k_rope_out, &rope_params, &positions_buf,
+                    seq_len as u32, n_kv_heads as u32, head_dim as u32, rope_dim as u32,
+                )?;
+                k_roped = k_rope_out;
+            } else {
+                q_roped = q_normed;
+                k_roped = k_normed;
+            }
+
+            encoder.commit_and_wait()?;
+        }
+
+        if diag {
+            let k_raw = read_buffer_f32(&k_proj)?;
+            let v_raw = read_buffer_f32(&v_proj)?;
+            eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_raw[..5.min(k_raw.len())]);
+            eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_raw[..5.min(v_raw.len())]);
+            let k_v_match = k_raw.len() == v_raw.len() &&
+                k_raw.iter().zip(v_raw.iter()).take(10).all(|(a, b)| (a - b).abs() < 1e-6);
+            eprintln!("[DIAG]   K==V? {} (k_eq_v={}, k_len={}, v_len={})", k_v_match, use_k_eq_v, k_raw.len(), v_raw.len());
+
+            let q_rd = read_buffer_f32(&q_roped)?;
+            let n = q_rd.len().min(5);
+            eprintln!("[DIAG] Layer 0 after QK norms+RoPE, Q first {}: {:?}", n, &q_rd[..n]);
+            let k_rd = read_buffer_f32(&k_roped)?;
+            let n = k_rd.len().min(5);
+            eprintln!("[DIAG] Layer 0 after QK norms+RoPE, K first {}: {:?}", n, &k_rd[..n]);
+
+            let v_nd = read_buffer_f32(&v_normed_buf)?;
+            eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_nd[..5.min(v_nd.len())]);
+            let v_head0 = &v_raw[..head_dim];
+            let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
+            eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
+        }
 
         // --- Step 4: KV cache append --- (CPU)
         let k_data = read_buffer_f32(&k_roped)?;
@@ -1296,29 +1425,51 @@ impl Gemma4Model {
         }
 
         // =================================================================
-        // BATCH 4: Final residual add
+        // BATCH 4: Final residual add + layer scalar (GPU)
         //
-        // Single GPU op but still uses shared encoder pattern for consistency.
+        // Residual add and scalar multiply batched into one encoder.
         // =================================================================
-        let pre_scalar;
+        let n_elements = seq_len * hidden_size;
+        let output;
         {
             let mut encoder = self.device.command_encoder()?;
-            pre_scalar = self.elementwise_add_with_encoder(
-                &mut encoder, &residual1, &ffn_out, seq_len * hidden_size,
+            let pre_scalar = self.elementwise_add_with_encoder(
+                &mut encoder, &residual1, &ffn_out, n_elements,
             )?;
+
+            // Layer scalar: multiply by learned per-layer scalar if present
+            let scalar_name = format!("model.layers.{layer_idx}.layer_scalar");
+            match require_weight(&self.weights, &scalar_name) {
+                Ok(w) => {
+                    let scalar_val = if w.buffer.byte_len() >= 4 && w.buffer.dtype() == DType::F32 {
+                        let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                            reason: format!("read layer_scalar: {e}"),
+                        })?;
+                        s[0]
+                    } else {
+                        let raw: &[u16] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                            reason: format!("read layer_scalar bf16: {e}"),
+                        })?;
+                        half::bf16::from_bits(raw[0]).to_f32()
+                    };
+
+                    let scaled = self.device.alloc_buffer(
+                        n_elements * 2, DType::BF16, vec![n_elements],
+                    )?;
+                    elementwise::scalar_mul_bf16(
+                        &mut encoder, &mut self.registry, self.device.metal_device(),
+                        &pre_scalar, &scaled, n_elements, scalar_val,
+                    )?;
+                    output = scaled;
+                }
+                Err(_) => {
+                    // No layer_scalar — just use the residual output
+                    output = pre_scalar;
+                }
+            }
+
             encoder.commit_and_wait()?;
         }
-
-        if diag {
-            let f = read_buffer_f32(&ffn_out)?;
-            let p = read_buffer_f32(&pre_scalar)?;
-            let last = (seq_len - 1) * hidden_size;
-            eprintln!("[DIAG] Layer 0 ffn_out LAST token first 5: {:?}", &f[last..last + 5]);
-            eprintln!("[DIAG] Layer 0 residual2 (r1+ffn) LAST token first 5: {:?}", &p[last..last + 5]);
-        }
-
-        // --- Step 10: Apply layer_scalar --- (CPU: read + multiply + write)
-        let output = self.apply_layer_scalar(layer_idx, &pre_scalar, seq_len * hidden_size)?;
 
         if diag {
             let o = read_buffer_f32(&output)?;
@@ -2124,104 +2275,10 @@ impl Gemma4Model {
             return Ok(clone_buffer(&self.device, input)?);
         }
 
-        let input_data = read_buffer_f32(input)?;
-
-        // Compute starting position from KV cache
-        // The first layer that matches this config gives us the position base
-        // We need to figure out the position offset from the KV cache state.
-        // For now, use 0 as the start position for the first call.
-        // In decode mode (seq_len=1), position = kv_cache.seq_len().
-        // In prefill mode (seq_len>1), positions = [0, 1, 2, ..., seq_len-1].
-        // We compute positions based on how much is already in the cache.
-
-        // Actually, we need the position to be the absolute position in the sequence.
-        // For the first forward pass, this is [0..seq_len).
-        // For subsequent decode steps, position starts at the current cache length
-        // (before this layer's append, but we already appended above, so subtract seq_len).
-        // However, position tracking is cleaner if we look at the first layer.
-        // Since all layers share the same position tracking, we use a simple approach:
-        // the position for the current tokens is based on what was in the cache before
-        // this forward call minus the tokens we just appended.
-        // Actually the append already happened for this layer's KV cache.
-        // The position base is: total_written - seq_len (what was before this call's append).
-        // But this gets called per-layer... Let's use the layer's write_position - seq_len.
-
-        // The simplest correct approach: use the write_position of the current layer's
-        // cache, which reflects the total positions written including the current tokens.
-        // So the positions for the current tokens are:
-        // [write_position - seq_len, ..., write_position - 1]
-
-        // But wait -- we call apply_rope BEFORE appending to cache in the layer's flow.
-        // Looking at forward_layer: we compute Q,K,V, apply RoPE, THEN append.
-        // Actually no -- looking more carefully at the flow above in forward_layer:
-        // Steps 2-3 happen before step 4 (KV cache append).
-        // So at the time of RoPE, the cache has NOT yet been updated for this token.
-        // The correct position base is: cache.write_position() (before append).
-        // But we need to know which layer we're talking about...
-
-        // For correctness, we'll do the RoPE on CPU where we have full control
-        // over positions. The GPU RoPE dispatch expects [seq_len, head_dim] input
-        // with a positions buffer.
-
-        let mut output_data = input_data.clone();
-        let total_dim = n_heads * head_dim;
-
-        // We need the position base. We'll look at the layer cache for the first
-        // layer (all layers advance positions in lockstep, but the cache types differ).
-        // However, this function doesn't know which layer it's being called for.
-        // We need to pass position info in. Let's use a simpler approach:
-        // compute positions as [0..seq_len) for the initial prefill.
-        // For decode mode, the caller would need to track positions.
-        // For now, we compute based on whether seq_len > 1 (prefill vs decode).
-
-        // A better approach: accept an explicit position_offset parameter.
-        // But to avoid changing the signature right now, we look at the "total_written"
-        // of any sliding cache layer (they all advance together).
-        // IMPORTANT: This is called BEFORE the append for this layer, so the cache
-        // reflects the state before this forward call's tokens.
-
-        // Find the first layer's cache to get position offset
-        // (all layers are at the same sequence position)
+        // Compute position offset from the last layer's KV cache (it hasn't
+        // been appended yet during this forward() call, so write_position
+        // reflects the pre-forward state).
         let pos_offset = if self.kv_cache.num_layers() > 0 {
-            // Use layer 0's write_position as the reference.
-            // But wait: in forward_layer, we process layers sequentially.
-            // Layer 0 would have already been appended by the time we get to layer 1.
-            // So for layer N, layers 0..N have already appended, but layer N has not.
-            // The correct position offset is layer N's write_position before append.
-
-            // Actually, we need to rethink. Let me look at forward_layer flow again:
-            // 1. norm
-            // 2. Q/K/V projections
-            // 3. RoPE (we are here)
-            // 4. KV cache append
-            // So for this specific layer, append hasn't happened yet.
-            // But for earlier layers (0..layer_idx), append HAS happened.
-            // However, the position offset should be the same for all layers in a
-            // given forward() call: it's the number of tokens processed before this
-            // forward() invocation.
-
-            // The cleanest way: the first layer that hasn't been appended yet
-            // has write_position equal to the number of tokens before this forward().
-            // Since we process layers 0, 1, 2, ..., and we're currently in layer N,
-            // layer N hasn't been appended yet. So its write_position gives the
-            // correct base.
-            //
-            // But we don't know layer_idx here! Let's just pass it as a parameter.
-            // For now, use the last layer's cache (it hasn't been appended yet if
-            // we process sequentially).
-
-            // Actually, the simplest correct approach: all layers' positions are
-            // determined by the overall sequence position, not per-layer cache state.
-            // In the first forward() call, positions are [0..seq_len).
-            // In subsequent calls, positions are [prev_total..prev_total+seq_len).
-            // The "prev_total" is the last layer's write_position (since it's the
-            // one that hasn't been touched yet when we start a new forward() call).
-
-            // For layer 0 during the current forward, its write_position after append
-            // includes the current tokens. For the last layer, write_position is still
-            // at the pre-forward state.
-
-            // Use the last layer: it hasn't been appended yet during this forward().
             let last_layer = self.kv_cache.num_layers() - 1;
             match self.kv_cache.layer(last_layer) {
                 Ok(cache) => cache.write_position(),
@@ -2231,37 +2288,63 @@ impl Gemma4Model {
             0
         };
 
-        // Apply RoPE per head using non-traditional (Neox/split) convention.
-        // Gemma 4 uses rope_traditional=False, so pairs are (d[i], d[i + half])
-        // instead of consecutive (d[2i], d[2i+1]).
-        let half_rope = rope_dim / 2;
-        for pos in 0..seq_len {
-            let abs_pos = pos_offset + pos;
-            for head in 0..n_heads {
-                let base = pos * total_dim + head * head_dim;
-                // Non-traditional: pair dim i with dim i + half_rope
-                for i in 0..half_rope {
-                    let freq = 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32);
-                    let angle = abs_pos as f32 * freq;
-                    let cos_val = angle.cos();
-                    let sin_val = angle.sin();
-
-                    let idx0 = base + i;
-                    let idx1 = base + i + half_rope;
-                    if idx1 < output_data.len() {
-                        let x0 = input_data[idx0];
-                        let x1 = input_data[idx1];
-                        output_data[idx0] = x0 * cos_val - x1 * sin_val;
-                        output_data[idx1] = x0 * sin_val + x1 * cos_val;
-                    }
-                }
-                // Dimensions [rope_dim..head_dim] pass through unchanged
-                // (already copied from input_data.clone())
-            }
+        // Build positions buffer: [pos_offset, pos_offset+1, ..., pos_offset+seq_len-1]
+        let positions_vec: Vec<u32> = (0..seq_len).map(|i| (pos_offset + i) as u32).collect();
+        let mut positions_buf = self.device.alloc_buffer(
+            seq_len * std::mem::size_of::<u32>(),
+            DType::U32,
+            vec![seq_len],
+        )?;
+        {
+            let s: &mut [u32] = positions_buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("RoPE positions write: {e}"),
+            })?;
+            s.copy_from_slice(&positions_vec);
         }
 
-        // Write to bf16 Metal buffer for the bf16 pipeline
-        f32_vec_to_bf16_buffer(&self.device, &output_data, input.shape().to_vec())
+        // Build params buffer: [theta, head_dim, rope_dim, 0] as f32
+        let mut params_buf = self.device.alloc_buffer(
+            4 * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![4],
+        )?;
+        {
+            let s: &mut [f32] = params_buf.as_mut_slice().map_err(|e| Gemma4Error::ForwardError {
+                reason: format!("RoPE params write: {e}"),
+            })?;
+            s[0] = theta;
+            s[1] = head_dim as f32;
+            s[2] = rope_dim as f32;
+            s[3] = 0.0;
+        }
+
+        // Output buffer: same shape as input (bf16)
+        let total_elements = seq_len * n_heads * head_dim;
+        let output = self.device.alloc_buffer(
+            total_elements * 2, // bf16
+            DType::BF16,
+            input.shape().to_vec(),
+        )?;
+
+        // GPU dispatch: rope_neox_bf16
+        // Input layout [seq_len, n_heads * head_dim] == [seq_len * n_heads, head_dim]
+        let mut encoder = self.device.command_encoder()?;
+        rope::dispatch_rope_neox_bf16(
+            &mut encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            input,
+            &output,
+            &params_buf,
+            &positions_buf,
+            seq_len as u32,
+            n_heads as u32,
+            head_dim as u32,
+            rope_dim as u32,
+        )?;
+        encoder.commit_and_wait()?;
+
+        Ok(output)
     }
 
     /// Compute attention for a single layer.
@@ -2288,14 +2371,29 @@ impl Gemma4Model {
             });
         }
 
-        // Q is bf16 [seq_len, n_heads * head_dim].
+        // Q is bf16 [seq_len, n_heads * head_dim] == [seq_len, n_heads, head_dim].
         // SDPA expects [batch, n_heads, seq_len, head_dim].
-        // Read Q as f32 for reshape, then write as bf16.
-        let q_data = read_buffer_f32(q)?;
-        let q_reshaped = reshape_qkv_for_sdpa(&q_data, seq_len, n_heads, head_dim);
+        // GPU permute_021: [seq_len, n_heads, head_dim] -> [n_heads, seq_len, head_dim]
+        let q_buf;
+        {
+            let q_permuted = self.device.alloc_buffer(
+                seq_len * n_heads * head_dim * 2,
+                DType::BF16,
+                vec![1, n_heads, seq_len, head_dim],
+            )?;
+            let mut enc = self.device.command_encoder()?;
+            transpose::permute_021_bf16(
+                &mut enc, &mut self.registry, self.device.metal_device(),
+                q, &q_permuted,
+                seq_len, n_heads, head_dim,
+            )?;
+            enc.commit_and_wait()?;
+            q_buf = q_permuted;
+        }
 
         // K/V cache is f32 [kv_seq_len, n_kv_heads * head_dim].
-        // Read, reshape, then write as bf16 for the bf16 SDPA kernel.
+        // Read, reshape on CPU, then write as bf16 for the bf16 SDPA kernel.
+        // (KV cache is f32; GPU permute would need cast first, not worth it yet)
         let k_data: &[f32] = k_cache_buf.as_slice().map_err(|e| {
             Gemma4Error::ForwardError {
                 reason: format!("K cache read: {e}"),
@@ -2312,12 +2410,7 @@ impl Gemma4Model {
         let v_valid = &v_data[..kv_seq_len * n_kv_heads * head_dim];
         let v_reshaped = reshape_qkv_for_sdpa(v_valid, kv_seq_len, n_kv_heads, head_dim);
 
-        // Allocate bf16 GPU buffers for SDPA
-        let q_buf = f32_vec_to_bf16_buffer(
-            &self.device,
-            &q_reshaped,
-            vec![1, n_heads, seq_len, head_dim],
-        )?;
+        // Allocate bf16 GPU buffers for SDPA (K/V still from CPU reshape)
         let k_buf = f32_vec_to_bf16_buffer(
             &self.device,
             &k_reshaped,
@@ -2388,15 +2481,23 @@ impl Gemma4Model {
         encoder.commit_and_wait()?;
 
         // Reshape output from [1, n_heads, seq_len, head_dim] back to [seq_len, n_heads * head_dim]
-        // Read bf16 output as f32, reshape, write back as bf16
-        let out_data = read_buffer_f32(&output)?;
-        let out_flat = reshape_sdpa_output(&out_data, seq_len, n_heads, head_dim);
-
-        f32_vec_to_bf16_buffer(
-            &self.device,
-            &out_flat,
+        // GPU permute_021: [n_heads, seq_len, head_dim] -> [seq_len, n_heads, head_dim]
+        let out_flat = self.device.alloc_buffer(
+            n_heads * seq_len * head_dim * 2,
+            DType::BF16,
             vec![seq_len, n_heads * head_dim],
-        )
+        )?;
+        {
+            let mut enc = self.device.command_encoder()?;
+            transpose::permute_021_bf16(
+                &mut enc, &mut self.registry, self.device.metal_device(),
+                &output, &out_flat,
+                n_heads, seq_len, head_dim,
+            )?;
+            enc.commit_and_wait()?;
+        }
+
+        Ok(out_flat)
     }
 
     /// Apply per-layer scalar: output = layer_scalar * input.
@@ -2425,13 +2526,24 @@ impl Gemma4Model {
                     half::bf16::from_bits(raw[0]).to_f32()
                 };
 
-                // Read bf16 input as f32, multiply, write back as bf16
-                let input_data = read_buffer_f32(input)?;
-                let scaled: Vec<f32> = input_data.iter().map(|v| v * scalar_val).collect();
-                f32_vec_to_bf16_buffer(&self.device, &scaled, vec![n_elements])
-                    .map_err(|e| Gemma4Error::ForwardError {
-                        reason: format!("alloc scaled buffer: {e}"),
-                    })
+                // GPU scalar_mul_bf16: multiply all elements by the scalar on GPU
+                let output = self.device.alloc_buffer(
+                    n_elements * 2, // bf16
+                    DType::BF16,
+                    vec![n_elements],
+                )?;
+                let mut encoder = self.device.command_encoder()?;
+                elementwise::scalar_mul_bf16(
+                    &mut encoder,
+                    &mut self.registry,
+                    self.device.metal_device(),
+                    input,
+                    &output,
+                    n_elements,
+                    scalar_val,
+                )?;
+                encoder.commit_and_wait()?;
+                Ok(output)
             }
             Err(_) => {
                 // No layer_scalar for this layer — return input unchanged (clone it)
@@ -3225,24 +3337,45 @@ impl Gemma4Model {
             }
         }
 
-        // GELU(gate) * up (CPU)
-        let gate_data = read_buffer_f32(&gate)?;
-        let up_data = read_buffer_f32(&up)?;
-        let mut hidden_data = vec![0.0f32; seq_len * intermediate_size];
-        for i in 0..hidden_data.len() {
-            hidden_data[i] = gelu_pytorch_tanh(gate_data[i]) * up_data[i];
+        // GELU(gate) * up (GPU: cast bf16->f32, gelu, mul, cast f32->bf16)
+        let n_hidden = seq_len * intermediate_size;
+        let hidden_buf;
+        {
+            let mut encoder = self.device.command_encoder()?;
+
+            // Cast gate and up from bf16 to f32
+            let gate_f32 = self.cast_bf16_to_f32_with_encoder(&mut encoder, &gate, n_hidden)?;
+            let up_f32 = self.cast_bf16_to_f32_with_encoder(&mut encoder, &up, n_hidden)?;
+
+            // GELU on gate (f32)
+            let gelu_out = self.device.alloc_buffer(
+                n_hidden * 4, DType::F32, vec![seq_len, intermediate_size],
+            )?;
+            gelu::dispatch_gelu(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &gate_f32, &gelu_out,
+            )?;
+
+            // elementwise_mul: gelu_gate * up (f32)
+            let mul_out = self.device.alloc_buffer(
+                n_hidden * 4, DType::F32, vec![seq_len, intermediate_size],
+            )?;
+            elementwise::elementwise_mul(
+                &mut encoder, &mut self.registry, self.device.metal_device(),
+                &gelu_out, &up_f32, &mul_out, n_hidden, DType::F32,
+            )?;
+
+            // Cast f32 -> bf16 for down_proj input
+            hidden_buf = self.cast_f32_to_bf16_with_encoder(&mut encoder, &mul_out, n_hidden)?;
+
+            encoder.commit_and_wait()?;
         }
 
         if diag {
+            let hidden_data = read_buffer_f32(&hidden_buf)?;
             let n = hidden_data.len().min(5);
             eprintln!("[DIAG] dense_ffn L0: GELU*up first {}: {:?}", n, &hidden_data[..n]);
         }
-
-        let hidden_buf = f32_vec_to_bf16_buffer(
-            &self.device,
-            &hidden_data,
-            vec![seq_len, intermediate_size],
-        )?;
 
         // down_proj (bf16 in, bf16 out)
         let down_base = format!("model.layers.{layer_idx}.mlp.down_proj");
