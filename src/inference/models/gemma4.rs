@@ -1526,7 +1526,253 @@ impl Gemma4Model {
                 &mut encoder, input, &o_proj, &post_attn_norm_name, seq_len,
             )?;
 
-            // ONE commit_and_wait for the entire attention half of the layer
+            // =============================================================
+            // DECODE FAST PATH (seq_len == 1): Merge attention + FFN into
+            // minimal commits.  MoE layers: 2 commits.  Non-MoE: 1 commit.
+            // Falls through to existing multi-commit path for prefill.
+            // =============================================================
+            if seq_len == 1 {
+                let router_weight_name_fp = format!("model.layers.{layer_idx}.router.proj.weight");
+                let has_moe_fp = self.weights.get(&router_weight_name_fp).is_some()
+                    || self.weights.get(&format!("language_model.{}", router_weight_name_fp)).is_some();
+
+                if has_moe_fp {
+                    // --- MoE decode: 2 commits total ---
+                    // Pre-FFN norms (same MEGA-A encoder)
+                    let pre_ff_norm_name = format!(
+                        "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+                    );
+                    let pre_ff_normed = self.apply_rms_norm_with_encoder(
+                        &mut encoder, &residual1, &pre_ff_norm_name, seq_len,
+                    )?;
+                    let pre_ff_norm2_name = format!(
+                        "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+                    );
+                    let pre_ff_normed2 = self.apply_rms_norm_with_encoder(
+                        &mut encoder, &residual1, &pre_ff_norm2_name, seq_len,
+                    )?;
+
+                    // MoE gate routing (same encoder — GPU dispatches only)
+                    let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
+                    let (route_ids_buf, route_weights_buf) = if !use_cpu_route {
+                        let (ids, wts) = self.gpu_moe_route_encode(
+                            &mut encoder, layer_idx, &residual1, seq_len,
+                        )?;
+                        (Some(ids), Some(wts))
+                    } else {
+                        (None, None)
+                    };
+
+                    // COMMIT 1: MEGA-A + pre-FFN norms + MoE gate
+                    let t_c1_pre = if timing { Some(std::time::Instant::now()) } else { None };
+                    encoder.commit_and_wait()?;
+                    if let (Some(start), Some(pre)) = (t_layer_start, t_c1_pre) {
+                        let encode_ms = pre.duration_since(start).as_secs_f64() * 1000.0;
+                        let wait_ms = pre.elapsed().as_secs_f64() * 1000.0;
+                        eprintln!("[TIMING] L0 decode-fast commit1 (attn+norms+gate): encode={:.2}ms, wait={:.2}ms",
+                            encode_ms, wait_ms);
+                    }
+
+                    // Read back routing results (64 bytes for top-8)
+                    let (all_expert_ids, all_routing_weights) = if let (Some(ref ids), Some(ref wts)) =
+                        (route_ids_buf, route_weights_buf)
+                    {
+                        self.gpu_moe_route_readback(ids, wts, seq_len)?
+                    } else {
+                        self.cpu_moe_route(layer_idx, &residual1, seq_len)?
+                    };
+
+                    // COMMIT 2: Dense FFN + expert dispatch + post-FFN norms + combine + residual + scalar
+                    let t_c2_pre = if timing { Some(std::time::Instant::now()) } else { None };
+                    let mut enc2 = self.device.command_encoder()?;
+
+                    // Dense FFN
+                    let dense_result = self.dense_ffn_with_encoder(
+                        &mut enc2, layer_idx, &pre_ff_normed, seq_len,
+                    )?;
+                    let mlp_out = match dense_result {
+                        Some(buf) => buf,
+                        None => {
+                            // CPU fallback: dense_ffn with its own commits
+                            drop(enc2);
+                            let mlp = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
+                            enc2 = self.device.command_encoder()?;
+                            mlp
+                        }
+                    };
+
+                    // Expert dispatch (inlined from moe_ffn_gpu_with_encoder)
+                    let intermediate_size_fp = self.config.moe_intermediate_for_layer(layer_idx);
+                    let gate_name_fp = format!("model.layers.{layer_idx}.experts.switch_glu.gate_proj.weight");
+                    let gate_w_fp = require_weight(&self.weights, &gate_name_fp)?;
+                    let qm_fp = gate_w_fp.quant_meta.as_ref().ok_or_else(|| Gemma4Error::ForwardError {
+                        reason: "decode fast path: expert weights lack quant_meta".into(),
+                    })?;
+                    let bits_fp = qm_fp.bits as u32;
+                    let group_size_fp = qm_fp.group_size as u32;
+
+                    let mut gpu_output_bufs: Vec<(f32, MlxBuffer)> = Vec::with_capacity(
+                        self.config.top_k_experts,
+                    );
+                    for (rank, &expert_id) in all_expert_ids[0].iter().enumerate() {
+                        let w = all_routing_weights[0][rank];
+                        if w.abs() < 1e-10 { continue; }
+                        let out_buf = self.expert_ffn_3d_gpu_buf_with_encoder(
+                            &mut enc2, layer_idx, expert_id, &pre_ff_normed2,
+                            0, hidden_size, intermediate_size_fp, bits_fp, group_size_fp,
+                        )?;
+                        gpu_output_bufs.push((w, out_buf));
+                    }
+
+                    // MoE accumulation (same encoder)
+                    let accum_buf = self.device.alloc_buffer(
+                        hidden_size * std::mem::size_of::<f32>(),
+                        DType::F32, vec![1, hidden_size],
+                    )?;
+                    moe_ops::moe_zero_buffer_encode(
+                        &mut enc2, &mut self.registry,
+                        self.device.metal_device(),
+                        &accum_buf, hidden_size,
+                    )?;
+                    for (weight, buf) in &gpu_output_bufs {
+                        moe_ops::moe_accumulate_encode(
+                            &mut enc2, &mut self.registry,
+                            self.device.metal_device(),
+                            &accum_buf, buf, *weight, hidden_size,
+                        )?;
+                    }
+                    let moe_out = self.device.alloc_buffer(
+                        hidden_size * 2, DType::BF16, vec![1, hidden_size],
+                    )?;
+                    elementwise::cast(
+                        &mut enc2, &mut self.registry,
+                        self.device.metal_device(),
+                        &accum_buf, &moe_out, hidden_size,
+                        elementwise::CastDirection::F32ToBF16,
+                    )?;
+
+                    // Post-FFN norms + combine + residual + scalar (MEGA-D, same encoder)
+                    let post_ff_norm1_name = format!(
+                        "model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+                    );
+                    let mlp_normed = self.apply_rms_norm_with_encoder(
+                        &mut enc2, &mlp_out, &post_ff_norm1_name, seq_len,
+                    )?;
+                    let post_ff_norm2_name = format!(
+                        "model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+                    );
+                    let moe_normed = self.apply_rms_norm_with_encoder(
+                        &mut enc2, &moe_out, &post_ff_norm2_name, seq_len,
+                    )?;
+                    let combined = self.elementwise_add_with_encoder(
+                        &mut enc2, &mlp_normed, &moe_normed, hidden_size,
+                    )?;
+                    let post_ff_norm_name = format!(
+                        "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                    );
+                    let pre_scalar = self.fused_norm_add_with_encoder(
+                        &mut enc2, &residual1, &combined, &post_ff_norm_name, seq_len,
+                    )?;
+
+                    let scalar_name_fp = format!("model.layers.{layer_idx}.layer_scalar");
+                    let mega_output = match require_weight(&self.weights, &scalar_name_fp) {
+                        Ok(w) => {
+                            let sv = if w.buffer.byte_len() >= 4 && w.buffer.dtype() == DType::F32 {
+                                let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                    reason: format!("read layer_scalar: {e}"),
+                                })?;
+                                s[0]
+                            } else {
+                                let raw: &[u16] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                    reason: format!("read layer_scalar bf16: {e}"),
+                                })?;
+                                half::bf16::from_bits(raw[0]).to_f32()
+                            };
+                            let scaled = self.device.alloc_buffer(
+                                hidden_size * 2, DType::BF16, vec![hidden_size],
+                            )?;
+                            elementwise::scalar_mul_bf16(
+                                &mut enc2, &mut self.registry, self.device.metal_device(),
+                                &pre_scalar, &scaled, hidden_size, sv,
+                            )?;
+                            scaled
+                        }
+                        Err(_) => pre_scalar,
+                    };
+
+                    enc2.commit_and_wait()?;
+                    if let (Some(start), Some(pre)) = (t_layer_start, t_c2_pre) {
+                        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        let c2_ms = pre.elapsed().as_secs_f64() * 1000.0;
+                        eprintln!("[TIMING] L0 decode-fast commit2 (experts+postFFN): {:.2}ms, total: {:.2}ms",
+                            c2_ms, total_ms);
+                    }
+
+                    return Ok(mega_output);
+
+                } else {
+                    // --- Non-MoE decode: 1 commit total ---
+                    let pre_ff_norm_name = format!(
+                        "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+                    );
+                    let pre_ff_normed = self.apply_rms_norm_with_encoder(
+                        &mut encoder, &residual1, &pre_ff_norm_name, seq_len,
+                    )?;
+
+                    let dense_result = self.dense_ffn_with_encoder(
+                        &mut encoder, layer_idx, &pre_ff_normed, seq_len,
+                    )?;
+                    if let Some(mlp_out) = dense_result {
+                        let post_ff_norm_name = format!(
+                            "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                        );
+                        let pre_scalar = self.fused_norm_add_with_encoder(
+                            &mut encoder, &residual1, &mlp_out, &post_ff_norm_name, seq_len,
+                        )?;
+
+                        let scalar_name_fp = format!("model.layers.{layer_idx}.layer_scalar");
+                        let layer_output = match require_weight(&self.weights, &scalar_name_fp) {
+                            Ok(w) => {
+                                let sv = if w.buffer.byte_len() >= 4 && w.buffer.dtype() == DType::F32 {
+                                    let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                        reason: format!("read layer_scalar: {e}"),
+                                    })?;
+                                    s[0]
+                                } else {
+                                    let raw: &[u16] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                        reason: format!("read layer_scalar bf16: {e}"),
+                                    })?;
+                                    half::bf16::from_bits(raw[0]).to_f32()
+                                };
+                                let scaled = self.device.alloc_buffer(
+                                    hidden_size * 2, DType::BF16, vec![hidden_size],
+                                )?;
+                                elementwise::scalar_mul_bf16(
+                                    &mut encoder, &mut self.registry, self.device.metal_device(),
+                                    &pre_scalar, &scaled, hidden_size, sv,
+                                )?;
+                                scaled
+                            }
+                            Err(_) => pre_scalar,
+                        };
+
+                        // ONE commit for the entire non-MoE layer
+                        let t_nm_pre = if timing { Some(std::time::Instant::now()) } else { None };
+                        encoder.commit_and_wait()?;
+                        if let (Some(start), Some(pre)) = (t_layer_start, t_nm_pre) {
+                            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            let wait_ms = pre.elapsed().as_secs_f64() * 1000.0;
+                            eprintln!("[TIMING] L0 decode-fast non-MoE: wait={:.2}ms, total={:.2}ms",
+                                wait_ms, total_ms);
+                        }
+
+                        return Ok(layer_output);
+                    }
+                    // Fall through if dense_ffn needs CPU fallback
+                }
+            }
+
+            // Original prefill path: commit MEGA-A and continue to multi-commit FFN below
             let t_attn_pre = if timing { Some(std::time::Instant::now()) } else { None };
             encoder.commit_and_wait()?;
             if let (Some(start), Some(pre)) = (t_layer_start, t_attn_pre) {
@@ -1820,139 +2066,186 @@ impl Gemma4Model {
                 }
             }
 
-            encoder.commit_and_wait()?;
-
-            // Non-mega: KV append, attention, O-proj, residual as separate encoders
-            let use_k_eq_v = self.config.attention_k_eq_v
-                && layer_type == LayerAttentionType::Global;
-
-            if diag && !is_kv_shared {
-                let k_raw = read_buffer_f32(&k_proj)?;
-                let v_raw = read_buffer_f32(&v_proj)?;
-                eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_raw[..5.min(k_raw.len())]);
-                eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_raw[..5.min(v_raw.len())]);
-                let k_v_match = k_raw.len() == v_raw.len() &&
-                    k_raw.iter().zip(v_raw.iter()).take(10).all(|(a, b)| (a - b).abs() < 1e-6);
-                eprintln!("[DIAG]   K==V? {} (k_eq_v={}, k_len={}, v_len={})", k_v_match, use_k_eq_v, k_raw.len(), v_raw.len());
-
-                let q_rd = read_buffer_f32(&q_roped)?;
-                let n = q_rd.len().min(5);
-                eprintln!("[DIAG] Layer 0 after QK norms+RoPE, Q first {}: {:?}", n, &q_rd[..n]);
-                let k_rd = read_buffer_f32(&k_roped)?;
-                let n = k_rd.len().min(5);
-                eprintln!("[DIAG] Layer 0 after QK norms+RoPE, K first {}: {:?}", n, &k_rd[..n]);
-
-                let v_nd = read_buffer_f32(&v_normed_buf)?;
-                eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_nd[..5.min(v_nd.len())]);
-                let v_head0 = &v_raw[..head_dim];
-                let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
-                eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
-            }
-
-            // --- Step 4: KV cache append --- (GPU direct copy, no CPU round-trip)
-            // KV-shared layers skip: they read from donor layer's cache.
-            if !is_kv_shared {
-                let mut kv_encoder = self.device.command_encoder()?;
-                let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
-                layer_cache.append_gpu(
-                    &k_roped,
-                    &v_normed_buf,
-                    &mut kv_encoder,
-                    &mut self.registry,
-                    self.device.metal_device(),
-                )?;
-                kv_encoder.commit_and_wait()?;
-            }
-
-            // --- Step 5: Attention --- (GPU, own encoder -- heavy kernel with CPU reshape)
-            attn_out = self.compute_attention(
-                layer_idx,
-                &q_roped,
-                seq_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                layer_type,
-            )?;
-
-            if diag {
-                let v_src_u16: &[u16] = v_normed_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("diag read v_normed: {e}"),
-                })?;
-                let v_data_f32: Vec<f32> = v_src_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
-                eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data_f32[..5.min(v_data_f32.len())]);
-                eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data_f32.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
-
-                let layer_cache_read = self.kv_cache.layer(layer_idx)?;
-                let (_k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
-                let v_cache_u16: &[u16] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
-                    reason: format!("diag read v cache: {e}"),
-                })?;
-                let v_first5: Vec<f32> = v_cache_u16[..5.min(v_cache_u16.len())].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
-                eprintln!("[DIAG] Layer 0 V cache readback pos 0 first 5: {:?}, kv_seq_len={}", v_first5, kv_slen);
-
-                let v_valid_u16 = &v_cache_u16[..kv_slen * n_kv_heads * head_dim];
-                let v_valid_f32: Vec<f32> = v_valid_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
-                let v_reshaped = reshape_qkv_for_sdpa(&v_valid_f32, kv_slen, n_kv_heads, head_dim);
-                eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
-
-                let q_ps = read_buffer_f32(&q_roped)?;
-                eprintln!("[DIAG] Layer 0 Q for SDPA (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
-
-                let s = read_buffer_f32(&attn_out)?;
-                let n = s.len().min(5);
-                eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
-                let last_attn_start = (seq_len - 1) * n_heads * head_dim;
-                let last_attn_5 = &s[last_attn_start..last_attn_start + 5.min(s.len() - last_attn_start)];
-                eprintln!("[DIAG] Layer 0 attn output LAST token (head 0, first 5): {:?}", last_attn_5);
-                let q_data_all = read_buffer_f32(&q_roped)?;
-                let last_q_start = (seq_len - 1) * n_heads * head_dim;
-                let last_q_5 = &q_data_all[last_q_start..last_q_start + 5.min(q_data_all.len() - last_q_start)];
-                eprintln!("[DIAG] Layer 0 Q LAST token (head 0, first 5): {:?}", last_q_5);
-                let nan_count = s.iter().filter(|v| v.is_nan()).count();
-                let inf_count = s.iter().filter(|v| v.is_infinite()).count();
-                if nan_count > 0 || inf_count > 0 {
-                    eprintln!("[DIAG]   WARNING attn: NaN={}, Inf={}", nan_count, inf_count);
-                }
-            }
-
-            // O projection + post-attention norm + residual add
-            {
-                let mut encoder = self.device.command_encoder()?;
-
-                let o_proj_tmp = if o_gpu {
-                    self.quantized_projection_with_encoder(
-                        &mut encoder, &attn_out, &o_base,
-                        seq_len, n_heads * head_dim, hidden_size,
-                    )?
-                } else {
-                    encoder.commit_and_wait()?;
-                    let mut o_enc = self.device.command_encoder()?;
-                    let result = self.quantized_projection_with_encoder(
-                        &mut o_enc, &attn_out, &o_base,
-                        seq_len, n_heads * head_dim, hidden_size,
+            // =============================================================
+            // DECODE FAST PATH (slow attn): Merge head norms + RoPE +
+            // KV append + attention + O proj + post-attn norm into ONE
+            // commit instead of 4 separate commits.
+            // =============================================================
+            if seq_len == 1 && o_gpu {
+                // Continue using the head norms + RoPE encoder
+                // KV cache append (same encoder)
+                if !is_kv_shared {
+                    let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
+                    layer_cache.append_gpu(
+                        &k_roped,
+                        &v_normed_buf,
+                        &mut encoder,
+                        &mut self.registry,
+                        self.device.metal_device(),
                     )?;
-                    encoder = self.device.command_encoder()?;
-                    result
-                };
+                }
 
+                // Attention (same encoder)
+                attn_out = self.compute_attention_with_encoder(
+                    &mut encoder,
+                    layer_idx,
+                    &q_roped,
+                    seq_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    layer_type,
+                )?;
+
+                // O projection + post-attn norm (same encoder)
+                o_proj = self.quantized_projection_with_encoder(
+                    &mut encoder, &attn_out, &o_base,
+                    seq_len, n_heads * head_dim, hidden_size,
+                )?;
                 let post_attn_norm_name = format!(
                     "model.layers.{layer_idx}.post_attention_layernorm.weight"
                 );
                 residual1 = self.fused_norm_add_with_encoder(
-                    &mut encoder, input, &o_proj_tmp, &post_attn_norm_name, seq_len,
+                    &mut encoder, input, &o_proj, &post_attn_norm_name, seq_len,
                 )?;
 
+                // ONE commit: head norms + RoPE + KV + attention + O + post-attn
                 encoder.commit_and_wait()?;
-                o_proj = o_proj_tmp;
-            }
+            } else {
+                // Prefill or non-GPU O-proj: original multi-commit path
+                encoder.commit_and_wait()?;
 
-            if diag {
-                let o_data = read_buffer_f32(&o_proj)?;
-                let last_o = (seq_len - 1) * hidden_size;
-                eprintln!("[DIAG] Layer 0 O proj LAST token first 5: {:?}", &o_data[last_o..last_o + 5]);
-                let r1_data = read_buffer_f32(&residual1)?;
-                eprintln!("[DIAG] Layer 0 residual1 LAST token first 5: {:?}", &r1_data[last_o..last_o + 5]);
+                // Non-mega: KV append, attention, O-proj, residual as separate encoders
+                let use_k_eq_v = self.config.attention_k_eq_v
+                    && layer_type == LayerAttentionType::Global;
+
+                if diag && !is_kv_shared {
+                    let k_raw = read_buffer_f32(&k_proj)?;
+                    let v_raw = read_buffer_f32(&v_proj)?;
+                    eprintln!("[DIAG] Layer 0 K raw (before k_norm), pos 0 first 5: {:?}", &k_raw[..5.min(k_raw.len())]);
+                    eprintln!("[DIAG] Layer 0 V raw (before v_norm), pos 0 first 5: {:?}", &v_raw[..5.min(v_raw.len())]);
+                    let k_v_match = k_raw.len() == v_raw.len() &&
+                        k_raw.iter().zip(v_raw.iter()).take(10).all(|(a, b)| (a - b).abs() < 1e-6);
+                    eprintln!("[DIAG]   K==V? {} (k_eq_v={}, k_len={}, v_len={})", k_v_match, use_k_eq_v, k_raw.len(), v_raw.len());
+
+                    let q_rd = read_buffer_f32(&q_roped)?;
+                    let n = q_rd.len().min(5);
+                    eprintln!("[DIAG] Layer 0 after QK norms+RoPE, Q first {}: {:?}", n, &q_rd[..n]);
+                    let k_rd = read_buffer_f32(&k_roped)?;
+                    let n = k_rd.len().min(5);
+                    eprintln!("[DIAG] Layer 0 after QK norms+RoPE, K first {}: {:?}", n, &k_rd[..n]);
+
+                    let v_nd = read_buffer_f32(&v_normed_buf)?;
+                    eprintln!("[DIAG] Layer 0 V normed (after v_norm_no_scale), pos 0 first 5: {:?}", &v_nd[..5.min(v_nd.len())]);
+                    let v_head0 = &v_raw[..head_dim];
+                    let v_rms = (v_head0.iter().map(|v| v * v).sum::<f32>() / head_dim as f32).sqrt();
+                    eprintln!("[DIAG]   V head 0 pos 0: RMS={:.6}, len={}, k_eq_v={}", v_rms, head_dim, use_k_eq_v);
+                }
+
+                // --- Step 4: KV cache append --- (GPU direct copy, no CPU round-trip)
+                if !is_kv_shared {
+                    let mut kv_encoder = self.device.command_encoder()?;
+                    let layer_cache = self.kv_cache.layer_mut(layer_idx)?;
+                    layer_cache.append_gpu(
+                        &k_roped,
+                        &v_normed_buf,
+                        &mut kv_encoder,
+                        &mut self.registry,
+                        self.device.metal_device(),
+                    )?;
+                    kv_encoder.commit_and_wait()?;
+                }
+
+                // --- Step 5: Attention ---
+                attn_out = self.compute_attention(
+                    layer_idx,
+                    &q_roped,
+                    seq_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    layer_type,
+                )?;
+
+                if diag {
+                    let v_src_u16: &[u16] = v_normed_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("diag read v_normed: {e}"),
+                    })?;
+                    let v_data_f32: Vec<f32> = v_src_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+                    eprintln!("[DIAG] Layer 0 V stored in cache (first 5 of pos 0): {:?}", &v_data_f32[..5.min(v_data_f32.len())]);
+                    eprintln!("[DIAG]   V total elements: {}, expected: {}x{}={}", v_data_f32.len(), seq_len, n_kv_heads * head_dim, seq_len * n_kv_heads * head_dim);
+
+                    let layer_cache_read = self.kv_cache.layer(layer_idx)?;
+                    let (_k_cb, v_cb, kv_slen) = layer_cache_read.keys_values();
+                    let v_cache_u16: &[u16] = v_cb.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                        reason: format!("diag read v cache: {e}"),
+                    })?;
+                    let v_first5: Vec<f32> = v_cache_u16[..5.min(v_cache_u16.len())].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+                    eprintln!("[DIAG] Layer 0 V cache readback pos 0 first 5: {:?}, kv_seq_len={}", v_first5, kv_slen);
+
+                    let v_valid_u16 = &v_cache_u16[..kv_slen * n_kv_heads * head_dim];
+                    let v_valid_f32: Vec<f32> = v_valid_u16.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect();
+                    let v_reshaped = reshape_qkv_for_sdpa(&v_valid_f32, kv_slen, n_kv_heads, head_dim);
+                    eprintln!("[DIAG] Layer 0 V reshaped for SDPA (head 0, pos 0, first 5): {:?}", &v_reshaped[..5.min(v_reshaped.len())]);
+
+                    let q_ps = read_buffer_f32(&q_roped)?;
+                    eprintln!("[DIAG] Layer 0 Q for SDPA (pos 0, first 5): {:?}", &q_ps[..5.min(q_ps.len())]);
+
+                    let s = read_buffer_f32(&attn_out)?;
+                    let n = s.len().min(5);
+                    eprintln!("[DIAG] Layer 0 after attention output, first {}: {:?}", n, &s[..n]);
+                    let last_attn_start = (seq_len - 1) * n_heads * head_dim;
+                    let last_attn_5 = &s[last_attn_start..last_attn_start + 5.min(s.len() - last_attn_start)];
+                    eprintln!("[DIAG] Layer 0 attn output LAST token (head 0, first 5): {:?}", last_attn_5);
+                    let q_data_all = read_buffer_f32(&q_roped)?;
+                    let last_q_start = (seq_len - 1) * n_heads * head_dim;
+                    let last_q_5 = &q_data_all[last_q_start..last_q_start + 5.min(q_data_all.len() - last_q_start)];
+                    eprintln!("[DIAG] Layer 0 Q LAST token (head 0, first 5): {:?}", last_q_5);
+                    let nan_count = s.iter().filter(|v| v.is_nan()).count();
+                    let inf_count = s.iter().filter(|v| v.is_infinite()).count();
+                    if nan_count > 0 || inf_count > 0 {
+                        eprintln!("[DIAG]   WARNING attn: NaN={}, Inf={}", nan_count, inf_count);
+                    }
+                }
+
+                // O projection + post-attention norm + residual add
+                {
+                    let mut encoder = self.device.command_encoder()?;
+
+                    let o_proj_tmp = if o_gpu {
+                        self.quantized_projection_with_encoder(
+                            &mut encoder, &attn_out, &o_base,
+                            seq_len, n_heads * head_dim, hidden_size,
+                        )?
+                    } else {
+                        encoder.commit_and_wait()?;
+                        let mut o_enc = self.device.command_encoder()?;
+                        let result = self.quantized_projection_with_encoder(
+                            &mut o_enc, &attn_out, &o_base,
+                            seq_len, n_heads * head_dim, hidden_size,
+                        )?;
+                        encoder = self.device.command_encoder()?;
+                        result
+                    };
+
+                    let post_attn_norm_name = format!(
+                        "model.layers.{layer_idx}.post_attention_layernorm.weight"
+                    );
+                    residual1 = self.fused_norm_add_with_encoder(
+                        &mut encoder, input, &o_proj_tmp, &post_attn_norm_name, seq_len,
+                    )?;
+
+                    encoder.commit_and_wait()?;
+                    o_proj = o_proj_tmp;
+                }
+
+                if diag {
+                    let o_data = read_buffer_f32(&o_proj)?;
+                    let last_o = (seq_len - 1) * hidden_size;
+                    eprintln!("[DIAG] Layer 0 O proj LAST token first 5: {:?}", &o_data[last_o..last_o + 5]);
+                    let r1_data = read_buffer_f32(&residual1)?;
+                    eprintln!("[DIAG] Layer 0 residual1 LAST token first 5: {:?}", &r1_data[last_o..last_o + 5]);
+                }
             }
         } // end !mega_a
 
@@ -1967,6 +2260,178 @@ impl Gemma4Model {
             // dense_ffn and moe_ffn both do CPU reads internally, so we batch
             // what we can around them.
             let t_moe_start = if timing { Some(std::time::Instant::now()) } else { None };
+
+            // =============================================================
+            // DECODE FAST PATH (Step 8): Merge pre-FFN norms + MoE gate
+            // into 1 commit, then dense + experts + post-FFN into 1 commit.
+            // Saves 2 commits per MoE layer vs the original path.
+            // =============================================================
+            if seq_len == 1 {
+                // Pre-FFN norms + MoE gate in ONE encoder
+                let mut norms_gate_enc = self.device.command_encoder()?;
+                let pre_ff_norm_name = format!(
+                    "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
+                );
+                let pre_ff_normed = self.apply_rms_norm_with_encoder(
+                    &mut norms_gate_enc, &residual1, &pre_ff_norm_name, seq_len,
+                )?;
+                let pre_ff_norm2_name = format!(
+                    "model.layers.{layer_idx}.pre_feedforward_layernorm_2.weight"
+                );
+                let pre_ff_normed2 = self.apply_rms_norm_with_encoder(
+                    &mut norms_gate_enc, &residual1, &pre_ff_norm2_name, seq_len,
+                )?;
+
+                // MoE gate routing in the same encoder
+                let use_cpu_route = std::env::var("HF2Q_CPU_MOE_ROUTE").is_ok();
+                let (route_ids_buf, route_weights_buf) = if !use_cpu_route {
+                    let (ids, wts) = self.gpu_moe_route_encode(
+                        &mut norms_gate_enc, layer_idx, &residual1, seq_len,
+                    )?;
+                    (Some(ids), Some(wts))
+                } else {
+                    (None, None)
+                };
+
+                // COMMIT: norms + gate
+                norms_gate_enc.commit_and_wait()?;
+
+                // Read back routing results
+                let (all_expert_ids, all_routing_weights) = if let (Some(ref ids), Some(ref wts)) =
+                    (route_ids_buf, route_weights_buf)
+                {
+                    self.gpu_moe_route_readback(ids, wts, seq_len)?
+                } else {
+                    self.cpu_moe_route(layer_idx, &residual1, seq_len)?
+                };
+
+                // Dense FFN + expert dispatch + MEGA-D in ONE encoder
+                let mut merged_enc = self.device.command_encoder()?;
+                let dense_result = self.dense_ffn_with_encoder(
+                    &mut merged_enc, layer_idx, &pre_ff_normed, seq_len,
+                )?;
+                let mlp_out = match dense_result {
+                    Some(buf) => buf,
+                    None => {
+                        drop(merged_enc);
+                        let mlp = self.dense_ffn(layer_idx, &pre_ff_normed, seq_len)?;
+                        merged_enc = self.device.command_encoder()?;
+                        mlp
+                    }
+                };
+
+                // Expert dispatch (inlined)
+                let intermediate_size_s8 = self.config.moe_intermediate_for_layer(layer_idx);
+                let gate_name_s8 = format!("model.layers.{layer_idx}.experts.switch_glu.gate_proj.weight");
+                let gate_w_s8 = require_weight(&self.weights, &gate_name_s8)?;
+                let qm_s8 = gate_w_s8.quant_meta.as_ref().ok_or_else(|| Gemma4Error::ForwardError {
+                    reason: "step8 decode: expert weights lack quant_meta".into(),
+                })?;
+                let bits_s8 = qm_s8.bits as u32;
+                let group_size_s8 = qm_s8.group_size as u32;
+
+                let mut gpu_output_bufs_s8: Vec<(f32, MlxBuffer)> = Vec::with_capacity(
+                    self.config.top_k_experts,
+                );
+                for (rank, &expert_id) in all_expert_ids[0].iter().enumerate() {
+                    let w = all_routing_weights[0][rank];
+                    if w.abs() < 1e-10 { continue; }
+                    let out_buf = self.expert_ffn_3d_gpu_buf_with_encoder(
+                        &mut merged_enc, layer_idx, expert_id, &pre_ff_normed2,
+                        0, hidden_size, intermediate_size_s8, bits_s8, group_size_s8,
+                    )?;
+                    gpu_output_bufs_s8.push((w, out_buf));
+                }
+
+                // MoE accumulation
+                let accum_buf_s8 = self.device.alloc_buffer(
+                    hidden_size * std::mem::size_of::<f32>(),
+                    DType::F32, vec![1, hidden_size],
+                )?;
+                moe_ops::moe_zero_buffer_encode(
+                    &mut merged_enc, &mut self.registry,
+                    self.device.metal_device(),
+                    &accum_buf_s8, hidden_size,
+                )?;
+                for (weight, buf) in &gpu_output_bufs_s8 {
+                    moe_ops::moe_accumulate_encode(
+                        &mut merged_enc, &mut self.registry,
+                        self.device.metal_device(),
+                        &accum_buf_s8, buf, *weight, hidden_size,
+                    )?;
+                }
+                let moe_out = self.device.alloc_buffer(
+                    hidden_size * 2, DType::BF16, vec![1, hidden_size],
+                )?;
+                elementwise::cast(
+                    &mut merged_enc, &mut self.registry,
+                    self.device.metal_device(),
+                    &accum_buf_s8, &moe_out, hidden_size,
+                    elementwise::CastDirection::F32ToBF16,
+                )?;
+
+                // Post-FFN norms + combine + residual + scalar (MEGA-D in same encoder)
+                let post_ff_norm1_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm_1.weight"
+                );
+                let mlp_normed = self.apply_rms_norm_with_encoder(
+                    &mut merged_enc, &mlp_out, &post_ff_norm1_name, seq_len,
+                )?;
+                let post_ff_norm2_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm_2.weight"
+                );
+                let moe_normed = self.apply_rms_norm_with_encoder(
+                    &mut merged_enc, &moe_out, &post_ff_norm2_name, seq_len,
+                )?;
+                let combined = self.elementwise_add_with_encoder(
+                    &mut merged_enc, &mlp_normed, &moe_normed, hidden_size,
+                )?;
+                let post_ff_norm_name = format!(
+                    "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
+                );
+                let pre_scalar = self.fused_norm_add_with_encoder(
+                    &mut merged_enc, &residual1, &combined, &post_ff_norm_name, seq_len,
+                )?;
+
+                let scalar_name_s8 = format!("model.layers.{layer_idx}.layer_scalar");
+                let mega_d_output = match require_weight(&self.weights, &scalar_name_s8) {
+                    Ok(w) => {
+                        let sv = if w.buffer.byte_len() >= 4 && w.buffer.dtype() == DType::F32 {
+                            let s: &[f32] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                reason: format!("read layer_scalar: {e}"),
+                            })?;
+                            s[0]
+                        } else {
+                            let raw: &[u16] = w.buffer.as_slice().map_err(|e| Gemma4Error::ForwardError {
+                                reason: format!("read layer_scalar bf16: {e}"),
+                            })?;
+                            half::bf16::from_bits(raw[0]).to_f32()
+                        };
+                        let scaled = self.device.alloc_buffer(
+                            hidden_size * 2, DType::BF16, vec![hidden_size],
+                        )?;
+                        elementwise::scalar_mul_bf16(
+                            &mut merged_enc, &mut self.registry, self.device.metal_device(),
+                            &pre_scalar, &scaled, hidden_size, sv,
+                        )?;
+                        scaled
+                    }
+                    Err(_) => pre_scalar,
+                };
+
+                // COMMIT: dense + experts + post-FFN
+                merged_enc.commit_and_wait()?;
+
+                if let Some(moe_start) = t_moe_start {
+                    eprintln!("[TIMING] L0 decode-fast-s8: {:.2}ms", moe_start.elapsed().as_secs_f64() * 1000.0);
+                }
+                if let Some(start) = t_layer_start {
+                    eprintln!("[TIMING] L0 total forward_layer: {:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
+                }
+                return Ok(mega_d_output);
+            }
+
+            // --- Prefill (seq_len > 1) path below ---
 
             // BATCH 3a: Pre-FFN norms for both paths
             let (pre_ff_normed, pre_ff_normed2);
@@ -2008,18 +2473,10 @@ impl Gemma4Model {
                 // Now do MoE CPU routing (reads from Mega-B committed buffers),
                 // then dispatch MoE experts into the SAME encoder.
                 mlp_out = dense_buf;
-                if seq_len == 1 {
-                    // Single-token decode: fully merged path (no CPU readback needed)
-                    moe_out = self.moe_ffn_gpu_with_encoder(
-                        &mut mega_c_encoder, layer_idx, &residual1, &pre_ff_normed2, seq_len,
-                    )?;
-                    mega_c_encoder.commit_and_wait()?;
-                } else {
-                    // Multi-token prefill: commit dense FFN first, then run moe_ffn
-                    // with its own encoder (it needs CPU readback for accumulation).
-                    mega_c_encoder.commit_and_wait()?;
-                    moe_out = self.moe_ffn(layer_idx, &residual1, &pre_ff_normed2, seq_len)?;
-                }
+                // Multi-token prefill: commit dense FFN first, then run moe_ffn
+                // with its own encoder (it needs CPU readback for accumulation).
+                mega_c_encoder.commit_and_wait()?;
+                moe_out = self.moe_ffn(layer_idx, &residual1, &pre_ff_normed2, seq_len)?;
             } else {
                 // Slow path: dense FFN needs CPU fallback.
                 // Drop the encoder (no dispatches were added since dense returned None).
@@ -2516,7 +2973,7 @@ impl Gemma4Model {
             // matching MLX's precision exactly. The kernel dequantizes weights
             // to bf16, truncates input to bf16, and accumulates in f32.
             let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
-            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+            if !use_cpu_qmatmul && (bits == 4 || bits == 6 || bits == 8) {
                 // GPU path (default — matches MLX's bf16 precision)
                 // qmatmul kernel expects f32 input; convert bf16 if needed
                 let input_f32 = self.ensure_f32_input(input, seq_len * in_dim)?;
@@ -2964,7 +3421,7 @@ impl Gemma4Model {
         if let Some((bits, _group_size)) = quant_info {
             let use_cpu_qmatmul = std::env::var("HF2Q_CPU_QMATMUL").is_ok();
             let use_bf16_qmatmul = std::env::var("HF2Q_BF16_QMATMUL").is_ok();
-            if !use_cpu_qmatmul && use_bf16_qmatmul && (bits == 4 || bits == 8) {
+            if !use_cpu_qmatmul && use_bf16_qmatmul && (bits == 4 || bits == 6 || bits == 8) {
                 // GPU path: direct bf16 qmatmul — no cast chain needed.
                 // Input is bf16, output is bf16. Eliminates 2 cast dispatches per projection.
                 // NOTE: Gated behind HF2Q_BF16_QMATMUL=1 until kernel is validated.
@@ -3003,7 +3460,7 @@ impl Gemma4Model {
 
                 return Ok(output_bf16);
             }
-            if !use_cpu_qmatmul && (bits == 4 || bits == 8) {
+            if !use_cpu_qmatmul && (bits == 4 || bits == 6 || bits == 8) {
                 // GPU path: f32 qmatmul with cast chain (default, proven correct).
                 // Cast bf16 input -> f32, run f32 qmatmul, cast f32 output -> bf16.
                 let weight_buf = clone_buffer(&self.device, &require_weight(&self.weights, &weight_name)?.buffer)?;
@@ -3543,6 +4000,100 @@ impl Gemma4Model {
         }
 
         // Read back small output buffers (seq_len * top_k * 4 bytes each, e.g. 32 bytes for decode)
+        let ids_raw: &[u32] = ids_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("read moe_gate expert_ids: {e}"),
+        })?;
+        let weights_raw: &[f32] = weights_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
+            reason: format!("read moe_gate expert_weights: {e}"),
+        })?;
+
+        let mut all_expert_ids: Vec<Vec<usize>> = Vec::with_capacity(seq_len);
+        let mut all_routing_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+
+        for t in 0..seq_len {
+            let offset = t * top_k;
+            let ids: Vec<usize> = ids_raw[offset..offset + top_k]
+                .iter()
+                .map(|&id| id as usize)
+                .collect();
+            let weights: Vec<f32> = weights_raw[offset..offset + top_k].to_vec();
+            all_expert_ids.push(ids);
+            all_routing_weights.push(weights);
+        }
+
+        Ok((all_expert_ids, all_routing_weights))
+    }
+
+    /// Dispatch MoE gate routing into an external command encoder WITHOUT
+    /// committing. Returns the output buffers (expert IDs and weights) which
+    /// must be read back AFTER the caller commits the encoder.
+    ///
+    /// This enables merging the MoE gate dispatch into a larger encoder
+    /// (e.g., MEGA-A) to reduce commit_and_wait count.
+    fn gpu_moe_route_encode(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        layer_idx: usize,
+        router_input: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<(MlxBuffer, MlxBuffer), Gemma4Error> {
+        let hidden_size = self.config.hidden_size;
+        let n_experts = self.config.num_experts;
+        let top_k = self.config.top_k_experts;
+        let eps = self.config.rms_norm_eps;
+
+        self.ensure_moe_gate_gpu_caches(layer_idx)?;
+
+        let ids_buf = self.device.alloc_buffer(
+            seq_len * top_k * std::mem::size_of::<u32>(),
+            DType::U32,
+            vec![seq_len, top_k],
+        )?;
+        let weights_buf = self.device.alloc_buffer(
+            seq_len * top_k * std::mem::size_of::<f32>(),
+            DType::F32,
+            vec![seq_len, top_k],
+        )?;
+
+        let params = moe_gate::MoeGateParams {
+            hidden_dim: hidden_size,
+            n_experts,
+            top_k,
+            seq_len,
+            rms_eps: eps,
+        };
+
+        let router_proj_buf = self.router_proj_gpu_cache.get(&layer_idx).unwrap();
+        let router_norm_buf = self.router_norm_gpu_cache.get(&layer_idx).unwrap();
+        let per_expert_scale_buf = self.per_expert_scale_gpu_cache.get(&layer_idx).unwrap();
+
+        moe_gate::moe_gate(
+            encoder,
+            &mut self.registry,
+            self.device.metal_device(),
+            router_input,
+            router_proj_buf,
+            router_norm_buf,
+            per_expert_scale_buf,
+            &ids_buf,
+            &weights_buf,
+            &params,
+        )?;
+
+        Ok((ids_buf, weights_buf))
+    }
+
+    /// Read back MoE routing results from GPU buffers after commit.
+    /// Must be called AFTER the encoder containing the moe_gate dispatch
+    /// has been committed.
+    fn gpu_moe_route_readback(
+        &self,
+        ids_buf: &MlxBuffer,
+        weights_buf: &MlxBuffer,
+        seq_len: usize,
+    ) -> Result<(Vec<Vec<usize>>, Vec<Vec<f32>>), Gemma4Error> {
+        let top_k = self.config.top_k_experts;
+
         let ids_raw: &[u32] = ids_buf.as_slice().map_err(|e| Gemma4Error::ForwardError {
             reason: format!("read moe_gate expert_ids: {e}"),
         })?;
@@ -4174,7 +4725,7 @@ impl Gemma4Model {
             if let Some(ref qm) = gate_w.quant_meta {
                 let bits = qm.bits as u32;
                 let group_size = qm.group_size as u32;
-                if bits == 4 || bits == 8 {
+                if bits == 4 || bits == 6 || bits == 8 {
                     return self.expert_ffn_3d_gpu(
                         layer_idx, expert_id, token_hidden,
                         hidden_size, intermediate_size,
@@ -5478,7 +6029,7 @@ fn weight_uses_gpu_qmatmul(weights: &WeightMap, weight_base: &str) -> bool {
         return false;
     }
     loaded.quant_meta.as_ref()
-        .map(|qm| qm.bits == 4 || qm.bits == 8)
+        .map(|qm| qm.bits == 4 || qm.bits == 6 || qm.bits == 8)
         .unwrap_or(false)
 }
 
