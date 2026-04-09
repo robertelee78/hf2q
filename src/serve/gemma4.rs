@@ -466,12 +466,21 @@ impl DecoderLayer {
         mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        let profile = std::env::var("HF2Q_PROFILE").is_ok();
+        let t0 = std::time::Instant::now();
+
         // 1. Attention block
         let residual = xs;
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         let xs = (residual + attn_out)?;
+
+        // Force GPU sync for accurate timing if profiling
+        let t_attn = if profile {
+            let _ = xs.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>();
+            t0.elapsed()
+        } else { t0.elapsed() };
 
         // 2. Dense MLP and MoE run in PARALLEL from the same residual
         let residual = &xs;
@@ -481,10 +490,20 @@ impl DecoderLayer {
         let mlp_out = self.mlp.forward(&normed)?;
         let mlp_normed = self.post_feedforward_layernorm_1.forward(&mlp_out)?;
 
+        let t_mlp = if profile {
+            let _ = mlp_normed.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>();
+            t0.elapsed()
+        } else { t0.elapsed() };
+
         // MoE branch (router takes raw residual; experts take pre-normed residual)
         let normed_moe = self.pre_feedforward_layernorm_2.forward(&xs)?;
         let moe_out = self.moe.forward(&normed_moe, &xs)?;
         let moe_normed = self.post_feedforward_layernorm_2.forward(&moe_out)?;
+
+        let t_moe = if profile {
+            let _ = moe_normed.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>();
+            t0.elapsed()
+        } else { t0.elapsed() };
 
         // Sum MLP and MoE outputs, apply final post-FFW norm
         let combined = (mlp_normed + moe_normed)?;
@@ -492,7 +511,22 @@ impl DecoderLayer {
         let xs = (residual + combined)?;
 
         // 3. Layer scalar
-        xs.broadcast_mul(&self.layer_scalar).map_err(Into::into)
+        let result = xs.broadcast_mul(&self.layer_scalar)?;
+
+        if profile {
+            let _ = result.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>();
+            let t_total = t0.elapsed();
+            eprintln!(
+                "[PROFILE] attn={:.1}ms mlp={:.1}ms moe={:.1}ms rest={:.1}ms total={:.1}ms",
+                t_attn.as_secs_f64() * 1000.0,
+                (t_mlp - t_attn).as_secs_f64() * 1000.0,
+                (t_moe - t_mlp).as_secs_f64() * 1000.0,
+                (t_total - t_moe).as_secs_f64() * 1000.0,
+                t_total.as_secs_f64() * 1000.0,
+            );
+        }
+
+        Ok(result)
     }
 
     #[allow(dead_code)]

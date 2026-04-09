@@ -116,16 +116,44 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - [x] Batched expert matmuls (Tensor::stack + batched matmul, 480→60 dispatches per token)
 - [ ] Speed gap: 18 vs 107 tok/s — requires custom Metal mul_mat_id kernel (see below)
 
-#### Phase 1b: Metal mul_mat_id Kernel (PLANNED)
-Custom Metal compute kernels for MoE expert dispatch, leveraging existing mlx-native crate:
-- **Reuse mlx-native infrastructure** (`/opt/mlx-native`): kernel_registry.rs, device.rs, encoder.rs, buffer.rs
-- **moe_gate.metal already exists** — single-kernel GPU-side router (RMS norm → matmul → top-k → softmax → per_expert_scale)
-- **moe_dispatch.metal already exists** — fused GELU+multiply, weighted accumulation for expert FFN
-- **quantized_matmul.metal has dequant helpers** for 4/6/8-bit inline dequantization
-- **New kernel needed**: `moe_expert_qmatmul.metal` — indexed matmul into 3D quantized GGUF tensor, combining moe_dispatch's expert pattern with quantized_matmul's dequant functions
-- Load expert weights as merged 3D QTensors (not dequantized) — kernel indexes directly by expert_id * stride
-- Two approaches possible: (a) use metal-rs directly alongside candle buffers (QMetalStorage::buffer() is public), or (b) add mlx-native as a dependency and use its kernel_registry
-- Expected: close the 6x gap (18→~100 tok/s) by reducing to 2 kernel dispatches per MoE layer
+#### Phase 1b: Speed Optimization (PLANNED)
+
+**Profiled decode breakdown (per layer, single token, M5 Max):**
+| Component | Time | % | Notes |
+|-----------|------|---|-------|
+| Attention (sliding) | 0.6ms | 19% | Fast, QMatMul efficient |
+| Attention (global, every 6th) | 5-8ms | — | 10x spike, needs investigation |
+| Dense MLP | 0.4ms | 13% | Fast |
+| MoE experts | 1.5-8ms | 55-65% | #1 bottleneck, high variance from Tensor::stack allocs |
+| Rest (norms, residual) | 0.3ms | 9% | Negligible |
+| **Total per layer** | **2.6-4.0ms** | | 30 layers → ~90ms/token → ~11 tok/s (18 without profiling overhead) |
+
+**1b.1: Custom Metal mul_mat_id kernel for MoE** (highest impact)
+- Port llama.cpp's `kernel_mul_mv_id` (MV decode path) — indexed matmul into 3D quantized GGUF tensor
+- Leverage mlx-native crate (`/opt/mlx-native`): kernel_registry.rs, device.rs, encoder.rs, buffer.rs
+- Reuse mlx-native's moe_gate.metal (GPU-side router), moe_dispatch.metal (fused GELU+accumulate)
+- New kernel: `moe_expert_qmatmul.metal` with inline ggml dequant (Q4_K, Q6_K, Q8_0)
+- Load expert weights as merged 3D QTensors (not dequantized) — kernel indexes by expert_id * stride
+- Dispatch via metal-rs alongside candle buffers (QMetalStorage::buffer() is public)
+- Expected: MoE from ~2.5ms/layer to ~0.5ms/layer → ~60ms saved across 30 layers
+
+**1b.2: Pre-allocate MoE expert weight stacks** (medium impact, easy)
+- Current `Tensor::stack` allocates a new [top_k, hidden, intermediate*2] tensor per token per layer
+- Pre-allocate a reusable buffer at model load time, copy selected expert weights into it
+- Eliminates allocation jitter (MoE variance 1.4-8.0ms → stable ~1.5ms)
+
+**1b.3: Global attention layer spikes — CONFIRMED WARMUP ONLY** (low priority)
+- Global attention layers (every 6th) spike to 5-13ms on first decode token only
+- By second decode token, global layers are 0.5ms (same as sliding) — this is Metal kernel compilation warmup
+- Could add a warmup token at startup, but not a sustained bottleneck
+- No action needed for speed parity
+
+**Steady-state decode breakdown (confirmed, token 2+):**
+- Attention: 0.5ms/layer (fast, stable)
+- MLP: 0.3ms/layer (fast, stable)
+- MoE: 1.5-2.5ms/layer (60-70% of total, high variance from stack allocs)
+- Total: ~80ms/30 layers = ~12 tok/s with profiling, 18 tok/s without
+- Target: llama.cpp ~3.1ms/layer = 93ms/30 layers = 107 tok/s
 
 ### Phase 2: HTTP Server
 - Restore spec-layer code (schema, SSE, tool parsing) from git history after deep review
