@@ -36,6 +36,12 @@ pub enum Command {
 
     /// Generate shell completions
     Completions(CompletionsArgs),
+
+    /// Run text generation from a GGUF model
+    Generate(GenerateArgs),
+
+    /// Serve a GGUF model via OpenAI-compatible HTTP API
+    Serve(ServeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -76,7 +82,7 @@ pub struct ConvertArgs {
     #[arg(long, value_enum)]
     pub group_size: Option<GroupSize>,
 
-    /// Output directory (default: ./model-{format}-{quant}/)
+    /// Output path: .gguf file for GGUF format, directory for safetensors
     #[arg(long, short)]
     pub output: Option<PathBuf>,
 
@@ -148,6 +154,72 @@ pub struct ValidateArgs {
     /// Emit JSON output
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct GenerateArgs {
+    /// Path to GGUF model file
+    #[arg(long)]
+    pub model: PathBuf,
+
+    /// Path to tokenizer.json (if not alongside GGUF)
+    #[arg(long)]
+    pub tokenizer: Option<PathBuf>,
+
+    /// Path to config.json (if not alongside GGUF)
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// Prompt text
+    #[arg(long)]
+    pub prompt: String,
+
+    /// Maximum tokens to generate
+    #[arg(long, default_value = "256")]
+    pub max_tokens: usize,
+
+    /// Sampling temperature (0.0 = greedy)
+    #[arg(long, default_value = "0.7")]
+    pub temperature: f64,
+
+    /// Top-p nucleus sampling
+    #[arg(long, default_value = "0.9")]
+    pub top_p: f64,
+
+    /// Top-k sampling (0 = disabled)
+    #[arg(long, default_value = "50")]
+    pub top_k: usize,
+
+    /// Repetition penalty (1.0 = disabled)
+    #[arg(long, default_value = "1.0")]
+    pub repetition_penalty: f64,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ServeArgs {
+    /// Path to GGUF model file
+    #[arg(long)]
+    pub model: PathBuf,
+
+    /// Path to tokenizer.json (if not alongside GGUF)
+    #[arg(long)]
+    pub tokenizer: Option<PathBuf>,
+
+    /// Path to config.json (if not alongside GGUF)
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// Host to bind to
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: String,
+
+    /// Port to listen on
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
+
+    /// Maximum sequence length
+    #[arg(long, default_value = "4096")]
+    pub max_seq_len: usize,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,7 +420,10 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "model".to_string());
-            PathBuf::from(format!("{}-{}-{}", model_name, args.format, args.quant))
+            match args.format {
+                OutputFormat::Gguf => PathBuf::from(format!("{}-{}.gguf", model_name, args.quant)),
+                _ => PathBuf::from(format!("{}-{}-{}", model_name, args.format, args.quant)),
+            }
         }
     };
 

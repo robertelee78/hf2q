@@ -331,7 +331,19 @@ fn validate_sensitive_layers(
 }
 
 /// Validate the output directory does not already exist with content.
+/// For GGUF file paths (ending in .gguf), the existing file will be overwritten.
 fn validate_output_dir(output_dir: &Path, warnings: &mut Vec<String>) -> Result<(), PreflightError> {
+    // If output is a .gguf file path, allow overwriting the existing file
+    if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        if output_dir.exists() {
+            warnings.push(format!(
+                "Output file '{}' already exists and will be overwritten",
+                output_dir.display()
+            ));
+        }
+        return Ok(());
+    }
+
     if output_dir.exists() {
         // Check if directory is non-empty
         let is_empty = std::fs::read_dir(output_dir)

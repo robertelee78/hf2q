@@ -23,6 +23,7 @@ mod quality;
 mod quantize;
 #[allow(dead_code)]
 mod report;
+mod serve;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -120,6 +121,11 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Validate(args) => cmd_validate(args),
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
+        Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
+        Command::Serve(_args) => {
+            eprintln!("Serve mode not yet implemented. Use `generate` for now.");
+            Ok(())
+        }
     }
 }
 
@@ -247,10 +253,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "model".to_string());
-                config.output_dir = std::path::PathBuf::from(format!(
-                    "{}-{}-{}",
-                    model_name, config.format, config.quant
-                ));
+                config.output_dir = match config.format {
+                    crate::cli::OutputFormat::Gguf => std::path::PathBuf::from(format!(
+                        "{}-{}.gguf",
+                        model_name, config.quant
+                    )),
+                    _ => std::path::PathBuf::from(format!(
+                        "{}-{}-{}",
+                        model_name, config.format, config.quant
+                    )),
+                };
             }
 
             Some(resolved)
@@ -296,25 +308,31 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         INTERRUPTED.store(true, Ordering::SeqCst);
 
         if output_dir_created_by_us {
-            let dir = cleanup_dir.as_ref();
-            if dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(dir) {
+            let path = cleanup_dir.as_ref();
+            if path.exists() {
+                // For .gguf file paths, remove the partial file; for directories, remove the whole dir
+                let result = if path.is_file() {
+                    std::fs::remove_file(path)
+                } else {
+                    std::fs::remove_dir_all(path)
+                };
+                if let Err(e) = result {
                     eprintln!(
-                        "Warning: Failed to clean up partial output directory '{}': {}",
-                        dir.display(),
+                        "Warning: Failed to clean up partial output '{}': {}",
+                        path.display(),
                         e
                     );
                 } else {
                     eprintln!(
                         "Conversion interrupted. Partial output cleaned up: {}",
-                        dir.display()
+                        path.display()
                     );
                 }
             } else {
                 eprintln!("Conversion interrupted.");
             }
         } else {
-            eprintln!("Conversion interrupted. Pre-existing output directory was not modified.");
+            eprintln!("Conversion interrupted. Pre-existing output was not modified.");
         }
     })
     .ok();

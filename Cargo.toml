@@ -50,6 +50,14 @@ candle-core = "0.10"
 candle-nn = "0.10"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
+# Async runtime + HTTP server (for `serve` subcommand)
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+async-stream = "0.3"
+
 # System info
 sysinfo = "0.32"
 

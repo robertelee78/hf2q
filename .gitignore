@@ -10,3 +10,11 @@ _bmad-output/
 
 # Claude Code local config
 .claude/
+.claude-flow/
+.mcp.json
+.swarm/
+CLAUDE.md
+
+# Logs and examples
+logs/
+examples/
