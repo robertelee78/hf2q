@@ -159,8 +159,17 @@ impl OutputBackend for GgufBackend {
         };
         info!("Writing GGUF to {}", out_path.display());
 
-        // Collect tensors in deterministic order
-        let mut tensor_names: Vec<&String> = model.tensors.keys().collect();
+        // Collect tensors in deterministic order.
+        // Filter out vision/audio tensors — llama.cpp expects those in a separate
+        // mmproj GGUF file, not in the text model GGUF. If they're included, the
+        // text model loader rejects the file with "wrong number of tensors".
+        let mut tensor_names: Vec<&String> = model.tensors.keys()
+            .filter(|name| {
+                // Skip vision/audio tensors — they belong in a separate mmproj GGUF
+                let n = name.as_str();
+                !(n.contains("vision_tower") || n.contains("embed_vision") || n.contains("audio_tower"))
+            })
+            .collect();
         tensor_names.sort();
 
         // Generate synthetic tensors (e.g., rope_freqs for Gemma4 partial RoPE)
