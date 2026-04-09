@@ -1304,7 +1304,7 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
 
 /// Generate synthetic tensors that aren't in the safetensors but are required by llama.cpp.
 ///
-/// For Gemma4: generates `blk.{N}.rope_freqs.weight` — frequency scaling factors for
+/// For Gemma4: generates `rope_freqs.weight` — frequency scaling factors for
 /// partial RoPE on the first full-attention layer. llama.cpp loads it per-layer:
 ///   layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), ...)
 /// The first non-SWA layer gets the tensor with flag=0 (required), subsequent ones
@@ -1335,7 +1335,7 @@ fn generate_synthetic_tensors(
                 arr.iter().position(|v| v.as_str() == Some("full_attention"))
             });
 
-        if let Some(layer_idx) = first_full_layer {
+        if first_full_layer.is_some() {
             // n_rot = floor(global_head_dim * partial_rotary_factor / 2)
             // n_unrot = global_head_dim / 2 - n_rot
             let half_dim = global_head_dim / 2;
@@ -1350,10 +1350,10 @@ fn generate_synthetic_tensors(
             // Serialize as raw f32 bytes
             let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-            // Name the tensor for the first full-attention layer so llama.cpp finds it
-            // at the correct layer index and duplicates it for subsequent full-attention layers.
+            // llama.cpp expects global "rope_freqs.weight" (no blk.N prefix).
+            // The tensor name pattern has no %d placeholder — it's shared across layers.
             result.push((
-                format!("blk.{}.rope_freqs.weight", layer_idx),
+                "rope_freqs.weight".to_string(),
                 data,
                 vec![half_dim],
                 GGML_TYPE_F32,
