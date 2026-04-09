@@ -163,11 +163,17 @@ impl OutputBackend for GgufBackend {
         let mut tensor_names: Vec<&String> = model.tensors.keys().collect();
         tensor_names.sort();
 
-        let pb = progress.bar(tensor_names.len() as u64, "Writing GGUF tensors");
+        // Generate synthetic tensors (e.g., rope_freqs for Gemma4 partial RoPE)
+        let synthetic_tensors = generate_synthetic_tensors(&model.metadata);
+
+        let pb = progress.bar(
+            (tensor_names.len() + synthetic_tensors.len()) as u64,
+            "Writing GGUF tensors",
+        );
 
         // Build metadata key-value pairs
         let metadata = build_metadata(model, input_dir);
-        let tensor_count = tensor_names.len() as u64;
+        let tensor_count = (tensor_names.len() + synthetic_tensors.len()) as u64;
         let kv_count = metadata.len() as u64;
 
         let file = File::create(&out_path).map_err(|e| BackendError::WriteFailed {
@@ -220,6 +226,19 @@ impl OutputBackend for GgufBackend {
             tensor_data_offset += repacked_size as u64;
         }
 
+        // Add synthetic tensor infos
+        for (name, data, shape, ggml_type) in &synthetic_tensors {
+            tensor_data_offset = align_up(tensor_data_offset, ALIGNMENT);
+            tensor_infos.push(TensorWriteInfo {
+                gguf_name: name.clone(),
+                shape: shape.clone(),
+                ggml_type: *ggml_type,
+                data_offset: tensor_data_offset,
+                data_len: data.len(),
+            });
+            tensor_data_offset += data.len() as u64;
+        }
+
         // Write tensor info entries
         for info in &tensor_infos {
             write_tensor_info(&mut w, info)?;
@@ -257,6 +276,18 @@ impl OutputBackend for GgufBackend {
             })?;
             w.write_all(&data)?;
             // `data` is dropped here — no accumulation
+            pb.inc(1);
+        }
+
+        // --- Write synthetic tensors ---
+        for (name, data, _shape, _ggml_type) in &synthetic_tensors {
+            let current = w.stream_position()?;
+            let info = tensor_infos.iter().find(|i| &i.gguf_name == name).unwrap();
+            let target = data_block_start + info.data_offset;
+            if current < target {
+                w.write_all(&vec![0u8; (target - current) as usize])?;
+            }
+            w.write_all(data)?;
             pb.inc(1);
         }
 
@@ -629,6 +660,53 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
         // we never reach here for types we don't support.
         _ => total_elements * 2, // fallback to f16 sizing
     }
+}
+
+/// Generate synthetic tensors that aren't in the safetensors but are required by llama.cpp.
+///
+/// For Gemma4: generates `rope_freqs.weight` — frequency scaling factors for partial RoPE
+/// on full-attention layers. Rotated dims get 1.0, unrotated get 1e30 to zero them out.
+fn generate_synthetic_tensors(
+    metadata: &crate::ir::ModelMetadata,
+) -> Vec<(String, Vec<u8>, Vec<usize>, u32)> {
+    let mut result = Vec::new();
+    let arch = &metadata.model_type;
+
+    if arch == "gemma4" {
+        // Extract partial_rotary_factor and global_head_dim from raw_config
+        let tc = metadata.raw_config.get("text_config").cloned().unwrap_or_default();
+        let global_head_dim = tc.get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as usize;
+        let partial_rotary_factor = tc.get("rope_parameters")
+            .and_then(|rp| rp.get("full_attention"))
+            .and_then(|fa| fa.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.25);
+
+        // n_rot = floor(global_head_dim * partial_rotary_factor / 2)
+        // n_unrot = global_head_dim / 2 - n_rot
+        let half_dim = global_head_dim / 2;
+        let n_rot = (global_head_dim as f64 * partial_rotary_factor / 2.0).floor() as usize;
+        let n_unrot = half_dim - n_rot;
+
+        // Build frequency factors: [1.0]*n_rot + [1e30]*n_unrot
+        let mut values: Vec<f32> = Vec::with_capacity(half_dim);
+        values.extend(std::iter::repeat(1.0f32).take(n_rot));
+        values.extend(std::iter::repeat(1e30f32).take(n_unrot));
+
+        // Serialize as raw f32 bytes
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        result.push((
+            "rope_freqs.weight".to_string(),
+            data,
+            vec![half_dim],
+            GGML_TYPE_F32,
+        ));
+    }
+
+    result
 }
 
 /// Map IR quantization metadata to a GGML type code.
