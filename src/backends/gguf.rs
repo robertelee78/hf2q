@@ -41,15 +41,14 @@ const GGML_TYPE_Q5_0: u32 = 6;
 const GGML_TYPE_Q5_1: u32 = 7;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_Q8_1: u32 = 9;
+// K-quant type codes (match ggml.h exactly)
 const GGML_TYPE_Q2_K: u32 = 10;
-const GGML_TYPE_Q3_K_S: u32 = 11;
-const GGML_TYPE_Q3_K_M: u32 = 12;
-const GGML_TYPE_Q3_K_L: u32 = 13;
-const GGML_TYPE_Q4_K_S: u32 = 14;
-const GGML_TYPE_Q4_K_M: u32 = 15;
-const GGML_TYPE_Q5_K_S: u32 = 16;
-const GGML_TYPE_Q5_K_M: u32 = 17;
-const GGML_TYPE_Q6_K: u32 = 18;
+const GGML_TYPE_Q3_K: u32 = 11;
+const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q5_K: u32 = 13;
+const GGML_TYPE_Q6_K: u32 = 14;
+#[allow(dead_code)]
+const GGML_TYPE_Q8_K: u32 = 15;
 const GGML_TYPE_IQ2_XXS: u32 = 19;
 const GGML_TYPE_IQ2_XS: u32 = 20;
 
@@ -745,13 +744,9 @@ fn ggml_type_from_name(name: &str) -> Option<u32> {
         "Q8_0"     => Some(GGML_TYPE_Q8_0),
         "Q8_1"     => Some(GGML_TYPE_Q8_1),
         "Q2_K"     => Some(GGML_TYPE_Q2_K),
-        "Q3_K_S"   => Some(GGML_TYPE_Q3_K_S),
-        "Q3_K_M" | "Q3_K" => Some(GGML_TYPE_Q3_K_M),
-        "Q3_K_L"   => Some(GGML_TYPE_Q3_K_L),
-        "Q4_K_S"   => Some(GGML_TYPE_Q4_K_S),
-        "Q4_K_M" | "Q4_K" => Some(GGML_TYPE_Q4_K_M),
-        "Q5_K_S"   => Some(GGML_TYPE_Q5_K_S),
-        "Q5_K_M" | "Q5_K" => Some(GGML_TYPE_Q5_K_M),
+        "Q3_K_S" | "Q3_K_M" | "Q3_K_L" | "Q3_K" => Some(GGML_TYPE_Q3_K),
+        "Q4_K_S" | "Q4_K_M" | "Q4_K" => Some(GGML_TYPE_Q4_K),
+        "Q5_K_S" | "Q5_K_M" | "Q5_K" => Some(GGML_TYPE_Q5_K),
         "Q6_K"     => Some(GGML_TYPE_Q6_K),
         "IQ2_XXS"  => Some(GGML_TYPE_IQ2_XXS),
         "IQ2_XS"   => Some(GGML_TYPE_IQ2_XS),
@@ -2210,7 +2205,7 @@ fn ggml_ftype_from_bits(bits: u8) -> u32 {
     match bits {
         16 => 1,  // MOSTLY_F16
         8 => 7,   // MOSTLY_Q8_0
-        4 => 15,  // MOSTLY_Q4_K_M (prefer K-quant over plain Q4_0)
+        4 => 15,  // MOSTLY_Q4_K_M
         3 => 12,  // MOSTLY_Q3_K_M
         2 => 10,  // MOSTLY_Q2_K
         5 => 17,  // MOSTLY_Q5_K_M
@@ -2572,30 +2567,28 @@ mod tests {
         assert_eq!(ggml_type_from_name("Q8_0"), Some(GGML_TYPE_Q8_0));
         assert_eq!(ggml_type_from_name("Q8_1"), Some(GGML_TYPE_Q8_1));
 
-        // K-quant types
+        // K-quant types (all S/M/L variants map to same unified type)
         assert_eq!(ggml_type_from_name("Q2_K"), Some(GGML_TYPE_Q2_K));
-        assert_eq!(ggml_type_from_name("Q3_K_S"), Some(GGML_TYPE_Q3_K_S));
-        assert_eq!(ggml_type_from_name("Q3_K_M"), Some(GGML_TYPE_Q3_K_M));
-        assert_eq!(ggml_type_from_name("Q3_K_L"), Some(GGML_TYPE_Q3_K_L));
-        assert_eq!(ggml_type_from_name("Q4_K_S"), Some(GGML_TYPE_Q4_K_S));
-        assert_eq!(ggml_type_from_name("Q4_K_M"), Some(GGML_TYPE_Q4_K_M));
-        assert_eq!(ggml_type_from_name("Q5_K_S"), Some(GGML_TYPE_Q5_K_S));
-        assert_eq!(ggml_type_from_name("Q5_K_M"), Some(GGML_TYPE_Q5_K_M));
+        assert_eq!(ggml_type_from_name("Q3_K_S"), Some(GGML_TYPE_Q3_K));
+        assert_eq!(ggml_type_from_name("Q3_K_M"), Some(GGML_TYPE_Q3_K));
+        assert_eq!(ggml_type_from_name("Q3_K_L"), Some(GGML_TYPE_Q3_K));
+        assert_eq!(ggml_type_from_name("Q3_K"), Some(GGML_TYPE_Q3_K));
+        assert_eq!(ggml_type_from_name("Q4_K_S"), Some(GGML_TYPE_Q4_K));
+        assert_eq!(ggml_type_from_name("Q4_K_M"), Some(GGML_TYPE_Q4_K));
+        assert_eq!(ggml_type_from_name("Q4_K"), Some(GGML_TYPE_Q4_K));
+        assert_eq!(ggml_type_from_name("Q5_K_S"), Some(GGML_TYPE_Q5_K));
+        assert_eq!(ggml_type_from_name("Q5_K_M"), Some(GGML_TYPE_Q5_K));
+        assert_eq!(ggml_type_from_name("Q5_K"), Some(GGML_TYPE_Q5_K));
         assert_eq!(ggml_type_from_name("Q6_K"), Some(GGML_TYPE_Q6_K));
         assert_eq!(ggml_type_from_name("IQ2_XXS"), Some(GGML_TYPE_IQ2_XXS));
         assert_eq!(ggml_type_from_name("IQ2_XS"), Some(GGML_TYPE_IQ2_XS));
 
-        // Aliases: Q3_K → Q3_K_M, Q4_K → Q4_K_M, Q5_K → Q5_K_M
-        assert_eq!(ggml_type_from_name("Q3_K"), Some(GGML_TYPE_Q3_K_M));
-        assert_eq!(ggml_type_from_name("Q4_K"), Some(GGML_TYPE_Q4_K_M));
-        assert_eq!(ggml_type_from_name("Q5_K"), Some(GGML_TYPE_Q5_K_M));
-
         // Case insensitivity
-        assert_eq!(ggml_type_from_name("q4_k_m"), Some(GGML_TYPE_Q4_K_M));
+        assert_eq!(ggml_type_from_name("q4_k_m"), Some(GGML_TYPE_Q4_K));
         assert_eq!(ggml_type_from_name("q6_k"), Some(GGML_TYPE_Q6_K));
 
         // With GGML_TYPE_ prefix
-        assert_eq!(ggml_type_from_name("GGML_TYPE_Q4_K_M"), Some(GGML_TYPE_Q4_K_M));
+        assert_eq!(ggml_type_from_name("GGML_TYPE_Q4_K_M"), Some(GGML_TYPE_Q4_K));
 
         // Unknown returns None
         assert_eq!(ggml_type_from_name("Q99_Z"), None);
