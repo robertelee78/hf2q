@@ -1732,7 +1732,7 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     // Required: tokenizer model name
     kv.push((
         "tokenizer.ggml.model".into(),
-        MetaValue::String(tokenizer_model_name),
+        MetaValue::String(tokenizer_model_name.clone()),
     ));
 
     // Token strings
@@ -1796,6 +1796,29 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         "tokenizer.ggml.add_space_prefix".into(),
         MetaValue::Bool(false),
     ));
+
+    // Pre-tokenizer type — used by llama.cpp to select the right pre-tokenizer
+    kv.push((
+        "tokenizer.ggml.pre".into(),
+        MetaValue::String(tokenizer_model_name.clone()),
+    ));
+
+    // Chat template — read from chat_template.jinja or tokenizer_config.json
+    let chat_template_path = input_dir.join("chat_template.jinja");
+    let template_str: Option<String> = if chat_template_path.exists() {
+        std::fs::read_to_string(&chat_template_path).ok()
+    } else {
+        tokenizer_config.as_ref()
+            .and_then(|c: &serde_json::Value| c.get("chat_template"))
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .map(|s| s.to_string())
+    };
+    if let Some(tmpl) = template_str {
+        kv.push((
+            "tokenizer.chat_template".into(),
+            MetaValue::String(tmpl),
+        ));
+    }
 
     info!(
         "Tokenizer metadata: {} tokens, {} merges, bos={:?}, eos={:?}, unk={:?}, pad={:?}",
