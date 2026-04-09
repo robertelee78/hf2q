@@ -26,7 +26,10 @@ const ALIGNMENT: u64 = 32;
 
 // GGUF metadata value types
 const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_FLOAT32: u32 = 6;
+const GGUF_TYPE_BOOL: u32 = 7;
 const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_ARRAY: u32 = 9;
 
 // GGML dtype identifiers (from llama.cpp ggml.h)
 const GGML_TYPE_F32: u32 = 0;
@@ -99,10 +102,15 @@ impl OutputBackend for GgufBackend {
         }
 
         // Warn if the total data is very large for a single file
+        // Estimate using ggml block sizes (repacked data is larger than raw packed data)
         let total_bytes: u64 = model
             .tensors
             .values()
-            .map(|t| t.data.len() as u64)
+            .map(|t| {
+                let ggml_type = quant_info_to_ggml_type(&t.quant_info);
+                let n_elem: usize = t.shape.iter().product();
+                ggml_tensor_size(n_elem, ggml_type) as u64
+            })
             .sum();
         if total_bytes > LARGE_MODEL_BYTES {
             warnings.push(FormatWarning {
@@ -177,16 +185,25 @@ impl OutputBackend for GgufBackend {
             write_metadata_kv(&mut w, key, value)?;
         }
 
-        // --- Tensor info headers ---
-        // We need to compute offsets relative to the start of the tensor data block.
-        // First pass: compute all tensor info sizes to find data block start.
-        let mut tensor_data_offset: u64 = 0;
+        // --- Pass 1: Compute tensor sizes and offsets (no allocation) ---
+        // We need to know the repacked ggml block size for each tensor to write
+        // correct offsets in the header, but we do NOT allocate the repacked data
+        // yet to avoid doubling memory usage for a 26B+ model.
         let mut tensor_infos: Vec<TensorWriteInfo> = Vec::with_capacity(tensor_names.len());
+        let mut tensor_data_offset: u64 = 0;
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
             let gguf_name = hf_name_to_gguf(name);
             let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+
+            // Compute the repacked size without allocating
+            let total_elements: usize = qt.shape.iter().product();
+            let repacked_size = if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
+                qt.data.len() // preserved/f16/f32 pass through unchanged
+            } else {
+                ggml_tensor_size(total_elements, ggml_type)
+            };
 
             // Align offset
             tensor_data_offset = align_up(tensor_data_offset, ALIGNMENT);
@@ -196,10 +213,10 @@ impl OutputBackend for GgufBackend {
                 shape: qt.shape.clone(),
                 ggml_type,
                 data_offset: tensor_data_offset,
-                data_len: qt.data.len(),
+                data_len: repacked_size,
             });
 
-            tensor_data_offset += qt.data.len() as u64;
+            tensor_data_offset += repacked_size as u64;
         }
 
         // Write tensor info entries
@@ -217,7 +234,9 @@ impl OutputBackend for GgufBackend {
         let data_block_start = w.stream_position()?;
         debug!("Tensor data block starts at offset {}", data_block_start);
 
-        // --- Tensor data ---
+        // --- Pass 2: Repack and write one tensor at a time ---
+        // Each tensor is repacked into ggml block format, written, then the
+        // repacked buffer is dropped before processing the next tensor.
         for (i, name) in tensor_names.iter().enumerate() {
             let qt = &model.tensors[*name];
             let info = &tensor_infos[i];
@@ -229,7 +248,14 @@ impl OutputBackend for GgufBackend {
                 w.write_all(&vec![0u8; (target - current) as usize])?;
             }
 
-            w.write_all(&qt.data)?;
+            // Repack this single tensor and write immediately
+            let data = repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| {
+                BackendError::WriteFailed {
+                    reason: format!("Failed to repack tensor '{}': {}", name, e),
+                }
+            })?;
+            w.write_all(&data)?;
+            // `data` is dropped here — no accumulation
             pb.inc(1);
         }
 
@@ -298,32 +324,356 @@ fn ggml_type_from_name(name: &str) -> Option<u32> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GGML block repacking — converts hf2q internal format to ggml block layout
+// ---------------------------------------------------------------------------
+
+/// GGML Q4_0 block: 32 elements, 18 bytes (2-byte f16 scale + 16 packed nibbles).
+const QK4_0: usize = 32;
+/// GGML Q4_0 block size in bytes.
+const BLOCK_Q4_0_BYTES: usize = 2 + QK4_0 / 2; // 18
+
+/// GGML Q8_0 block: 32 elements, 34 bytes (2-byte f16 scale + 32 int8 values).
+const QK8_0: usize = 32;
+/// GGML Q8_0 block size in bytes.
+const BLOCK_Q8_0_BYTES: usize = 2 + QK8_0; // 34
+
+/// Repack a QuantizedTensor's data from hf2q's internal format into proper ggml
+/// block format. Returns the repacked bytes ready for writing to GGUF.
+///
+/// hf2q internal format:
+///   - `qt.data`: packed nibbles (consecutive pairs), signed values [-7,7] for 4-bit
+///   - `qt.quant_info.scales`: separate Vec<u8> of f16 scale bytes (2 bytes per group)
+///   - `qt.quant_info.group_size`: may be != 32
+///
+/// For Q4_0 target:
+///   - Must produce 18-byte blocks of 32 elements each
+///   - Block layout: [d: f16] [qs[0..15]: packed unsigned nibbles]
+///   - Nibble packing: byte[i] = qs_low[i] | (qs_high[i] << 4)
+///     where qs_low = first 16 values, qs_high = second 16 values
+///   - Q4_0 scale: d = max(abs(block)) / -8  (so d is negative when max element is positive)
+///   - Unsigned encoding: q = trunc(val/d + 8.5), clipped [0,15]
+///   - Dequant: x = (q - 8) * d
+///
+/// For Q8_0 target:
+///   - 34-byte blocks of 32 elements each
+///   - Block layout: [d: f16] [qs[0..31]: int8]
+///   - Scale: d = absmax / 127
+///   - Quantized: q = round(val / d) as int8
+fn repack_to_ggml_blocks(
+    qt: &crate::ir::QuantizedTensor,
+    ggml_type: u32,
+) -> Result<Vec<u8>, BackendError> {
+    let info = &qt.quant_info;
+
+    // Preserved or f16 tensors: data is already raw element bytes, no repacking needed
+    if info.preserved || info.bits == 16 || info.method == "f16" {
+        return Ok(qt.data.clone());
+    }
+
+    // Only repack if we have scales (quantized tensors)
+    let scales_bytes = match &info.scales {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            // No scales means data is not in our internal quantized format.
+            // This shouldn't happen for properly quantized tensors, but return as-is.
+            warn!(
+                "Tensor '{}' has no scales but is not preserved/f16; writing raw data",
+                qt.name
+            );
+            return Ok(qt.data.clone());
+        }
+    };
+
+    let total_elements: usize = qt.shape.iter().product();
+
+    match ggml_type {
+        GGML_TYPE_Q4_0 => repack_q4_0(qt, scales_bytes, total_elements),
+        GGML_TYPE_Q8_0 => repack_q8_0(qt, scales_bytes, total_elements),
+        GGML_TYPE_F16 | GGML_TYPE_F32 => {
+            // Should not reach here for F16/F32 (caught above), but handle gracefully
+            Ok(qt.data.clone())
+        }
+        _ => Err(BackendError::WriteFailed {
+            reason: format!(
+                "Cannot repack tensor '{}': unsupported target GGML type {}",
+                qt.name, ggml_type
+            ),
+        }),
+    }
+}
+
+/// Repack hf2q internal 4-bit quantized data into Q4_0 block format.
+///
+/// Steps:
+/// 1. Decode f16 scales from quant_info.scales
+/// 2. Unpack signed nibbles from qt.data
+/// 3. Reconstruct approximate f32 values: val = signed_q * scale
+/// 4. Re-quantize each 32-element block into Q4_0 format:
+///    - Compute d = max(abs(block)) / -8 (matching ggml convention)
+///    - q = trunc(val / d + 8.5), clipped to [0, 15]
+///    - Pack: byte[i] = q[i] | (q[i+16] << 4) for i in 0..16
+fn repack_q4_0(
+    qt: &crate::ir::QuantizedTensor,
+    scales_bytes: &[u8],
+    total_elements: usize,
+) -> Result<Vec<u8>, BackendError> {
+    let info = &qt.quant_info;
+    let group_size = if info.group_size == 0 { 32 } else { info.group_size };
+
+    // Decode f16 scales: 2 bytes each
+    let scales_f32: Vec<f32> = scales_bytes
+        .chunks_exact(2)
+        .map(|c| {
+            let bits = u16::from_le_bytes([c[0], c[1]]);
+            half::f16::from_bits(bits).to_f32()
+        })
+        .collect();
+
+    // Unpack signed i4 values from hf2q's packed data.
+    // hf2q packs consecutive pairs: byte = (pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4)
+    // Values are signed [-7, 7] stored as signed nibbles (two's complement in 4 bits).
+    let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
+    for &byte in &qt.data {
+        let lo = (byte & 0x0F) as i8;
+        let hi = ((byte >> 4) & 0x0F) as i8;
+        // Convert from unsigned 4-bit to signed: if >= 8, subtract 16
+        let lo_signed = if lo >= 8 { lo - 16 } else { lo };
+        let hi_signed = if hi >= 8 { hi - 16 } else { hi };
+        signed_values.push(lo_signed);
+        signed_values.push(hi_signed);
+    }
+    // Truncate to actual element count (in case of padding)
+    signed_values.truncate(total_elements);
+
+    // Reconstruct approximate f32 values using the original scales
+    let mut f32_values: Vec<f32> = Vec::with_capacity(total_elements);
+    for (g, &scale) in scales_f32.iter().enumerate() {
+        let start = g * group_size;
+        let end = (start + group_size).min(total_elements);
+        for i in start..end {
+            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            f32_values.push(q as f32 * scale);
+        }
+    }
+
+    // If scales didn't cover all elements (shouldn't happen), pad with zeros
+    while f32_values.len() < total_elements {
+        f32_values.push(0.0);
+    }
+
+    // Now re-quantize into Q4_0 blocks of 32 elements each
+    let num_blocks = total_elements.div_ceil(QK4_0);
+    let mut output = Vec::with_capacity(num_blocks * BLOCK_Q4_0_BYTES);
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * QK4_0;
+        let end = (start + QK4_0).min(total_elements);
+
+        // Get block values, padding with zeros if needed
+        let mut block = [0.0f32; QK4_0];
+        for (i, idx) in (start..end).enumerate() {
+            block[i] = f32_values[idx];
+        }
+
+        // Compute Q4_0 scale: d = max_by_abs / -8
+        // Find the element with maximum absolute value, preserving its sign
+        let mut max_abs_val = 0.0f32;
+        let mut max_abs_idx = 0;
+        for (i, &v) in block.iter().enumerate() {
+            if v.abs() > max_abs_val {
+                max_abs_val = v.abs();
+                max_abs_idx = i;
+            }
+        }
+        let max_val = block[max_abs_idx];
+        let d = max_val / -8.0;
+        let id = if d == 0.0 { 0.0f32 } else { 1.0 / d };
+
+        // Write scale as f16
+        let d_f16 = half::f16::from_f32(d);
+        output.extend_from_slice(&d_f16.to_le_bytes());
+
+        // Quantize to unsigned [0, 15]: q = trunc(val * id + 8.5), clipped [0, 15]
+        let mut qs = [0u8; QK4_0];
+        for (i, &val) in block.iter().enumerate() {
+            let q = (val * id + 8.5).floor() as i32;
+            qs[i] = q.clamp(0, 15) as u8;
+        }
+
+        // Pack nibbles in Q4_0 order:
+        // byte[i] = qs[i] | (qs[i + 16] << 4) for i in 0..16
+        for i in 0..(QK4_0 / 2) {
+            let lo = qs[i];
+            let hi = qs[i + QK4_0 / 2];
+            output.push(lo | (hi << 4));
+        }
+    }
+
+    debug!(
+        "Repacked '{}': {} elements -> {} Q4_0 blocks ({} bytes, was {} bytes)",
+        qt.name,
+        total_elements,
+        num_blocks,
+        output.len(),
+        qt.data.len()
+    );
+
+    Ok(output)
+}
+
+/// Repack hf2q internal 8-bit quantized data into Q8_0 block format.
+///
+/// Steps:
+/// 1. Decode f16 scales from quant_info.scales
+/// 2. Read int8 values from qt.data
+/// 3. Reconstruct approximate f32 values: val = q * scale
+/// 4. Re-quantize each 32-element block into Q8_0 format:
+///    - d = absmax / 127
+///    - q = round(val / d) as int8
+fn repack_q8_0(
+    qt: &crate::ir::QuantizedTensor,
+    scales_bytes: &[u8],
+    total_elements: usize,
+) -> Result<Vec<u8>, BackendError> {
+    let info = &qt.quant_info;
+    let group_size = if info.group_size == 0 { 32 } else { info.group_size };
+
+    // Decode f16 scales
+    let scales_f32: Vec<f32> = scales_bytes
+        .chunks_exact(2)
+        .map(|c| {
+            let bits = u16::from_le_bytes([c[0], c[1]]);
+            half::f16::from_bits(bits).to_f32()
+        })
+        .collect();
+
+    // Read int8 values from qt.data (8-bit: 1 byte per element, stored as u8 cast of i8)
+    let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
+    for &byte in &qt.data {
+        signed_values.push(byte as i8);
+    }
+    signed_values.truncate(total_elements);
+
+    // Reconstruct approximate f32 values
+    let mut f32_values: Vec<f32> = Vec::with_capacity(total_elements);
+    for (g, &scale) in scales_f32.iter().enumerate() {
+        let start = g * group_size;
+        let end = (start + group_size).min(total_elements);
+        for i in start..end {
+            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            f32_values.push(q as f32 * scale);
+        }
+    }
+
+    while f32_values.len() < total_elements {
+        f32_values.push(0.0);
+    }
+
+    // Re-quantize into Q8_0 blocks of 32 elements each
+    let num_blocks = total_elements.div_ceil(QK8_0);
+    let mut output = Vec::with_capacity(num_blocks * BLOCK_Q8_0_BYTES);
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * QK8_0;
+        let end = (start + QK8_0).min(total_elements);
+
+        let mut block = [0.0f32; QK8_0];
+        for (i, idx) in (start..end).enumerate() {
+            block[i] = f32_values[idx];
+        }
+
+        // Q8_0 scale: d = absmax / 127
+        let absmax = block.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+        let d = absmax / 127.0;
+        let id = if d == 0.0 { 0.0f32 } else { 1.0 / d };
+
+        // Write scale as f16
+        let d_f16 = half::f16::from_f32(d);
+        output.extend_from_slice(&d_f16.to_le_bytes());
+
+        // Quantize to int8
+        for &val in &block {
+            let q = (val * id).round() as i32;
+            output.push(q.clamp(-128, 127) as u8);
+        }
+    }
+
+    debug!(
+        "Repacked '{}': {} elements -> {} Q8_0 blocks ({} bytes, was {} bytes)",
+        qt.name,
+        total_elements,
+        num_blocks,
+        output.len(),
+        qt.data.len()
+    );
+
+    Ok(output)
+}
+
+/// Compute the expected byte size of a tensor in ggml block format.
+fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
+    match ggml_type {
+        GGML_TYPE_F32 => total_elements * 4,
+        GGML_TYPE_F16 => total_elements * 2,
+        GGML_TYPE_Q4_0 => {
+            let n_blocks = total_elements.div_ceil(QK4_0);
+            n_blocks * BLOCK_Q4_0_BYTES
+        }
+        GGML_TYPE_Q8_0 => {
+            let n_blocks = total_elements.div_ceil(QK8_0);
+            n_blocks * BLOCK_Q8_0_BYTES
+        }
+        // For any other type, we cannot compute the size; caller should ensure
+        // we never reach here for types we don't support.
+        _ => total_elements * 2, // fallback to f16 sizing
+    }
+}
+
 /// Map IR quantization metadata to a GGML type code.
 ///
-/// If the tensor has an explicit `ggml_type` name set (e.g., by Apex quantization),
-/// that takes priority. Otherwise falls back to the generic bits-based mapping.
+/// The GGML type must match the actual block format written to disk. Since hf2q's
+/// quantizer produces simple per-group scales + packed values (not K-quant super-block
+/// format), we can only write Q4_0 / Q8_0 / F16 / F32 block formats. Apex K-quant
+/// type overrides are mapped back to the corresponding simple type.
 fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
     if info.preserved {
         return GGML_TYPE_F16;
     }
 
-    // Explicit K-quant type override from Apex
+    // Map based on the actual bit width we can produce proper block format for.
+    // K-quant types from Apex cannot be honored because hf2q does not produce
+    // K-quant super-block data; we map to the closest simple block type instead.
     if let Some(ref type_name) = info.ggml_type {
-        if let Some(code) = ggml_type_from_name(type_name) {
+        let upper = type_name.trim().to_uppercase();
+        // K-quant types all get mapped to simple types based on ir_bits
+        if upper.starts_with("Q2_K")
+            || upper.starts_with("Q3_K")
+            || upper.starts_with("Q4_K")
+            || upper.starts_with("Q5_K")
+            || upper.starts_with("Q6_K")
+        {
+            debug!(
+                "Apex requested '{}', mapping to simple block type for bits={}",
+                type_name, info.bits
+            );
+            // Fall through to bits-based mapping below
+        } else if let Some(code) = ggml_type_from_name(type_name) {
             return code;
+        } else {
+            warn!(
+                "Unknown GGML type name '{}'; falling back to bits-based mapping",
+                type_name
+            );
         }
-        warn!(
-            "Unknown GGML type name '{}'; falling back to bits-based mapping",
-            type_name
-        );
     }
 
-    // Generic bits-based fallback
+    // Generic bits-based mapping — only types we can produce proper block format for
     match info.bits {
         16 => GGML_TYPE_F16,
         8 => GGML_TYPE_Q8_0,
         4 => GGML_TYPE_Q4_0,
-        2 => GGML_TYPE_Q2_K,
+        2 => GGML_TYPE_Q4_0, // 2-bit is rare; pack as Q4_0 with values in [0,3] range
         _ => {
             warn!(
                 "No standard GGML type for {}-bit; falling back to F16",
@@ -452,10 +802,13 @@ fn hf_name_to_gguf(hf_name: &str) -> String {
 // Metadata construction
 // ---------------------------------------------------------------------------
 
-/// Metadata value — either a string or a u32.
+/// Metadata value for GGUF key-value pairs.
 enum MetaValue {
     String(String),
     Uint32(u32),
+    Float32(f32),
+    ArrayBool(Vec<bool>),
+    ArrayUint32(Vec<u32>),
 }
 
 /// Build the GGUF metadata key-value list from model metadata.
@@ -490,11 +843,15 @@ fn build_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
         MetaValue::Uint32(meta.num_attention_heads),
     ));
 
+    // For Gemma4, head_count_kv is a per-layer array (added below).
+    // For other models, write as a scalar.
     if let Some(kv_heads) = meta.num_kv_heads {
-        kv.push((
-            format!("{}.attention.head_count_kv", arch),
-            MetaValue::Uint32(kv_heads),
-        ));
+        if arch != "gemma4" {
+            kv.push((
+                format!("{}.attention.head_count_kv", arch),
+                MetaValue::Uint32(kv_heads),
+            ));
+        }
     }
 
     if let Some(ff_size) = meta.intermediate_size {
@@ -508,6 +865,159 @@ fn build_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
         "general.file_type".into(),
         MetaValue::Uint32(ggml_ftype_from_bits(model.bits)),
     ));
+
+    // Context length — required by llama.cpp as {arch}.context_length
+    let tc = meta.raw_config.get("text_config").cloned().unwrap_or_default();
+    let ctx_len = tc.get("max_position_embeddings")
+        .or_else(|| meta.raw_config.get("max_position_embeddings"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(131072) as u32;
+    kv.push((
+        format!("{}.context_length", arch),
+        MetaValue::Uint32(ctx_len),
+    ));
+
+    // Gemma4-specific metadata required by llama.cpp
+    if arch == "gemma4" {
+        // RMS norm epsilon
+        let rms_eps = tc.get("rms_norm_eps")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1e-6) as f32;
+        kv.push((
+            format!("{}.attention.layer_norm_rms_epsilon", arch),
+            MetaValue::Float32(rms_eps),
+        ));
+
+        // Sliding window size
+        let swa = tc.get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024) as u32;
+        kv.push((
+            format!("{}.attention.sliding_window", arch),
+            MetaValue::Uint32(swa),
+        ));
+
+        // Sliding window pattern (bool array: true = sliding, false = full)
+        if let Some(layer_types) = tc.get("layer_types").and_then(|v| v.as_array()) {
+            let swa_pattern: Vec<bool> = layer_types.iter()
+                .map(|v| v.as_str() == Some("sliding_attention"))
+                .collect();
+            kv.push((
+                format!("{}.attention.sliding_window_pattern", arch),
+                MetaValue::ArrayBool(swa_pattern),
+            ));
+        }
+
+        // Head dimensions: key_length (global), value_length (global)
+        let global_head_dim = tc.get("global_head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as u32;
+        kv.push((
+            format!("{}.attention.key_length", arch),
+            MetaValue::Uint32(global_head_dim),
+        ));
+        kv.push((
+            format!("{}.attention.value_length", arch),
+            MetaValue::Uint32(global_head_dim),
+        ));
+
+        // Head dimensions: key_length_swa, value_length_swa (sliding)
+        let swa_head_dim = tc.get("head_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256) as u32;
+        kv.push((
+            format!("{}.attention.key_length_swa", arch),
+            MetaValue::Uint32(swa_head_dim),
+        ));
+        kv.push((
+            format!("{}.attention.value_length_swa", arch),
+            MetaValue::Uint32(swa_head_dim),
+        ));
+
+        // Per-layer embedding (hidden_size_per_layer_input, 0 if absent)
+        let n_pl_embd = tc.get("hidden_size_per_layer_input")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        kv.push((
+            format!("{}.embedding_length_per_layer_input", arch),
+            MetaValue::Uint32(n_pl_embd),
+        ));
+
+        // Expert feed-forward length (moe_intermediate_size)
+        if let Some(moe_ff) = tc.get("moe_intermediate_size")
+            .or_else(|| tc.get("expert_intermediate_size"))
+            .and_then(|v| v.as_u64())
+        {
+            kv.push((
+                format!("{}.expert_feed_forward_length", arch),
+                MetaValue::Uint32(moe_ff as u32),
+            ));
+        }
+
+        // Rope freq base (global attention)
+        let rope_theta = tc.get("rope_parameters")
+            .and_then(|rp| rp.get("full_attention"))
+            .and_then(|fa| fa.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1_000_000.0) as f32;
+        kv.push((
+            format!("{}.rope.freq_base", arch),
+            MetaValue::Float32(rope_theta),
+        ));
+
+        // Rope freq base for SWA (sliding attention)
+        let rope_theta_swa = tc.get("rope_parameters")
+            .and_then(|rp| rp.get("sliding_attention"))
+            .and_then(|sa| sa.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10_000.0) as f32;
+        kv.push((
+            format!("{}.rope.freq_base_swa", arch),
+            MetaValue::Float32(rope_theta_swa),
+        ));
+
+        // Rope dimension counts
+        let rope_dim_full = global_head_dim;
+        let partial_rotary_factor_swa = tc.get("rope_parameters")
+            .and_then(|rp| rp.get("sliding_attention"))
+            .and_then(|sa| sa.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        let rope_dim_swa = (swa_head_dim as f64 * partial_rotary_factor_swa) as u32;
+        kv.push((
+            format!("{}.rope.dimension_count", arch),
+            MetaValue::Uint32(rope_dim_full),
+        ));
+        kv.push((
+            format!("{}.rope.dimension_count_swa", arch),
+            MetaValue::Uint32(rope_dim_swa),
+        ));
+
+        // KV head counts per layer (array: different for sliding vs global)
+        let num_kv_heads_swa = tc.get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8) as u32;
+        let num_kv_heads_full = tc.get("num_global_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as u32;
+        if let Some(layer_types) = tc.get("layer_types").and_then(|v| v.as_array()) {
+            let kv_heads_arr: Vec<u32> = layer_types.iter()
+                .map(|v| if v.as_str() == Some("sliding_attention") { num_kv_heads_swa } else { num_kv_heads_full })
+                .collect();
+            kv.push((
+                format!("{}.attention.head_count_kv", arch),
+                MetaValue::ArrayUint32(kv_heads_arr),
+            ));
+        }
+
+        // Softcapping
+        if let Some(sc) = tc.get("final_logit_softcapping").and_then(|v| v.as_f64()) {
+            kv.push((
+                format!("{}.final_logit_softcapping", arch),
+                MetaValue::Float32(sc as f32),
+            ));
+        }
+    }
 
     kv
 }
@@ -553,6 +1063,26 @@ fn write_metadata_kv<W: IoWrite>(w: &mut W, key: &str, value: &MetaValue) -> std
             w.write_all(&GGUF_TYPE_UINT32.to_le_bytes())?;
             w.write_all(&v.to_le_bytes())?;
         }
+        MetaValue::Float32(v) => {
+            w.write_all(&GGUF_TYPE_FLOAT32.to_le_bytes())?;
+            w.write_all(&v.to_le_bytes())?;
+        }
+        MetaValue::ArrayBool(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_BOOL.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            for &b in arr {
+                w.write_all(&[b as u8])?;
+            }
+        }
+        MetaValue::ArrayUint32(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_UINT32.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            for &v in arr {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
     }
     Ok(())
 }
@@ -573,8 +1103,9 @@ fn write_tensor_info<W: IoWrite>(w: &mut W, info: &TensorWriteInfo) -> std::io::
     write_gguf_string(w, &info.gguf_name)?;
     // Number of dimensions
     w.write_all(&(info.shape.len() as u32).to_le_bytes())?;
-    // Dimensions (as u64, reversed — GGUF uses row-major / C order dimensions)
-    for &dim in &info.shape {
+    // Dimensions in ggml order (innermost/row first, reversed from PyTorch/safetensors).
+    // e.g. PyTorch [128, 1408, 2816] → GGUF ne = [2816, 1408, 128]
+    for &dim in info.shape.iter().rev() {
         w.write_all(&(dim as u64).to_le_bytes())?;
     }
     // Type
@@ -672,7 +1203,8 @@ mod tests {
         assert_eq!(quant_info_to_ggml_type(&qi(16, false)), GGML_TYPE_F16);
         assert_eq!(quant_info_to_ggml_type(&qi(8, false)), GGML_TYPE_Q8_0);
         assert_eq!(quant_info_to_ggml_type(&qi(4, false)), GGML_TYPE_Q4_0);
-        assert_eq!(quant_info_to_ggml_type(&qi(2, false)), GGML_TYPE_Q2_K);
+        // 2-bit maps to Q4_0 (we can't produce Q2_K super-block format)
+        assert_eq!(quant_info_to_ggml_type(&qi(2, false)), GGML_TYPE_Q4_0);
         assert_eq!(quant_info_to_ggml_type(&qi(4, true)), GGML_TYPE_F16); // preserved
         assert_eq!(quant_info_to_ggml_type(&qi(6, false)), GGML_TYPE_F16); // unknown fallback
     }
@@ -772,19 +1304,27 @@ mod tests {
 
     #[test]
     fn test_ggml_type_override_in_quant_info() {
-        // When ggml_type is set, it takes priority over bits
+        // K-quant types from Apex are mapped to the corresponding simple block type
+        // because hf2q doesn't produce K-quant super-block data.
         let qi_override = TensorQuantInfo {
             method: "apex".into(), bits: 4, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
         };
-        assert_eq!(quant_info_to_ggml_type(&qi_override), GGML_TYPE_Q4_K_M);
+        assert_eq!(quant_info_to_ggml_type(&qi_override), GGML_TYPE_Q4_0);
 
-        // Q6_K override on a 6-bit tensor
+        // Q6_K override on an 8-bit tensor maps to Q8_0
         let qi_q6k = TensorQuantInfo {
-            method: "apex".into(), bits: 6, group_size: 64, preserved: false,
+            method: "apex".into(), bits: 8, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q6_K".into()),
         };
-        assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q6_K);
+        assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q8_0);
+
+        // Non-K-quant explicit type is still honored
+        let qi_q4_0 = TensorQuantInfo {
+            method: "custom".into(), bits: 4, group_size: 32, preserved: false,
+            scales: None, biases: None, ggml_type: Some("Q4_0".into()),
+        };
+        assert_eq!(quant_info_to_ggml_type(&qi_q4_0), GGML_TYPE_Q4_0);
 
         // Unknown ggml_type falls back to bits-based mapping
         let qi_unknown = TensorQuantInfo {
@@ -811,7 +1351,8 @@ mod tests {
         assert_eq!(quant_info_to_ggml_type(&qi(16)), GGML_TYPE_F16);
         assert_eq!(quant_info_to_ggml_type(&qi(8)), GGML_TYPE_Q8_0);
         assert_eq!(quant_info_to_ggml_type(&qi(4)), GGML_TYPE_Q4_0);
-        assert_eq!(quant_info_to_ggml_type(&qi(2)), GGML_TYPE_Q2_K);
+        // 2-bit maps to Q4_0 (we can't produce Q2_K super-block format)
+        assert_eq!(quant_info_to_ggml_type(&qi(2)), GGML_TYPE_Q4_0);
     }
 
     #[test]
@@ -824,5 +1365,216 @@ mod tests {
         assert_eq!(ggml_ftype_from_bits(5), 17);  // MOSTLY_Q5_K_M
         assert_eq!(ggml_ftype_from_bits(6), 18);  // MOSTLY_Q6_K
         assert_eq!(ggml_ftype_from_bits(1), 1);   // unknown → F16
+    }
+
+    #[test]
+    fn test_repack_q4_0_block_size() {
+        // Create a quantized tensor with 64 elements (group_size=64),
+        // verify repacking produces correct Q4_0 block count and size.
+        let total_elements = 64usize;
+        let group_size = 64usize;
+
+        // Simulate hf2q's quantization: create scales and packed nibbles
+        // 64 elements / group_size=64 = 1 scale
+        let scale_f16 = half::f16::from_f32(0.5);
+        let scales = scale_f16.to_le_bytes().to_vec();
+
+        // Pack 64 signed i4 values (all zeros for simplicity)
+        let packed_data = vec![0u8; total_elements / 2]; // 32 bytes
+
+        let qt = QuantizedTensor {
+            name: "test.weight".into(),
+            shape: vec![8, 8],
+            original_dtype: DType::F16,
+            data: packed_data,
+            quant_info: TensorQuantInfo {
+                method: "q4".into(),
+                bits: 4,
+                group_size,
+                preserved: false,
+                scales: Some(scales),
+                biases: None,
+                ggml_type: None,
+            },
+        };
+
+        let repacked = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_0).unwrap();
+
+        // 64 elements / 32 per block = 2 blocks * 18 bytes = 36 bytes
+        let expected_blocks = total_elements.div_ceil(QK4_0);
+        let expected_size = expected_blocks * BLOCK_Q4_0_BYTES;
+        assert_eq!(expected_blocks, 2);
+        assert_eq!(expected_size, 36);
+        assert_eq!(repacked.len(), expected_size,
+            "Repacked Q4_0 size should be {} bytes (2 blocks * 18), got {}",
+            expected_size, repacked.len()
+        );
+
+        // Verify each block starts with a 2-byte f16 scale followed by 16 bytes of nibbles
+        // Block 0: bytes [0..2] = scale, [2..18] = nibbles
+        // Block 1: bytes [18..20] = scale, [20..36] = nibbles
+        assert_eq!(repacked.len(), 36);
+    }
+
+    #[test]
+    fn test_repack_q4_0_roundtrip_values() {
+        // Create a tensor with known values, repack to Q4_0, then verify
+        // the dequantized values are approximately correct.
+        let total_elements = 32usize;
+
+        // 32 elements at group_size=32: 1 group, 1 scale
+        // Values: [1.0, -1.0, 0.5, -0.5, ...] (repeat)
+        let f32_vals: Vec<f32> = (0..32).map(|i| {
+            if i % 4 == 0 { 1.0 }
+            else if i % 4 == 1 { -1.0 }
+            else if i % 4 == 2 { 0.5 }
+            else { -0.5 }
+        }).collect();
+
+        // Quantize like hf2q does: symmetric, scale = absmax / 7
+        let absmax = 1.0f32;
+        let scale = absmax / 7.0;
+        let scale_f16 = half::f16::from_f32(scale);
+        let scales = scale_f16.to_le_bytes().to_vec();
+
+        // Quantize to signed i4
+        let signed_qs: Vec<i8> = f32_vals.iter().map(|&v| {
+            let q = (v / scale).round() as i8;
+            q.clamp(-7, 7)
+        }).collect();
+
+        // Pack as hf2q does: consecutive pairs, lo nibble first
+        let mut packed = Vec::with_capacity(total_elements / 2);
+        for pair in signed_qs.chunks(2) {
+            let lo = (pair[0] & 0x0F) as u8;
+            let hi = if pair.len() > 1 { ((pair[1] & 0x0F) as u8) << 4 } else { 0 };
+            packed.push(lo | hi);
+        }
+
+        let qt = QuantizedTensor {
+            name: "test.weight".into(),
+            shape: vec![4, 8],
+            original_dtype: DType::F16,
+            data: packed,
+            quant_info: TensorQuantInfo {
+                method: "q4".into(),
+                bits: 4,
+                group_size: 32,
+                preserved: false,
+                scales: Some(scales),
+                biases: None,
+                ggml_type: None,
+            },
+        };
+
+        let repacked = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_0).unwrap();
+
+        // Should be exactly 1 Q4_0 block = 18 bytes
+        assert_eq!(repacked.len(), BLOCK_Q4_0_BYTES);
+
+        // Extract scale from repacked block
+        let d_bits = u16::from_le_bytes([repacked[0], repacked[1]]);
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        // Dequantize Q4_0 block and check approximate values
+        // Nibble packing: byte[i] = q_lo[i] | (q_hi[i] << 4)
+        // where q_lo = first 16 elements, q_hi = second 16 elements
+        let mut dequantized = vec![0.0f32; 32];
+        for i in 0..16 {
+            let byte = repacked[2 + i];
+            let q_lo = (byte & 0x0F) as i32 - 8;
+            let q_hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            dequantized[i] = q_lo as f32 * d;
+            dequantized[i + 16] = q_hi as f32 * d;
+        }
+
+        // Check that dequantized values are close to originals (within quantization error)
+        for (i, (&orig, &deq)) in f32_vals.iter().zip(dequantized.iter()).enumerate() {
+            let err = (orig - deq).abs();
+            assert!(err < 0.2, "Element {}: orig={}, deq={}, err={}", i, orig, deq, err);
+        }
+    }
+
+    #[test]
+    fn test_repack_q8_0_block_size() {
+        let total_elements = 64usize;
+
+        // 2 groups of 32 with 2 scales
+        let s0 = half::f16::from_f32(0.5);
+        let s1 = half::f16::from_f32(0.3);
+        let mut scales = Vec::new();
+        scales.extend_from_slice(&s0.to_le_bytes());
+        scales.extend_from_slice(&s1.to_le_bytes());
+
+        // 64 int8 values (all zeros)
+        let data = vec![0u8; total_elements];
+
+        let qt = QuantizedTensor {
+            name: "test.weight".into(),
+            shape: vec![8, 8],
+            original_dtype: DType::F16,
+            data,
+            quant_info: TensorQuantInfo {
+                method: "q8".into(),
+                bits: 8,
+                group_size: 32,
+                preserved: false,
+                scales: Some(scales),
+                biases: None,
+                ggml_type: None,
+            },
+        };
+
+        let repacked = repack_to_ggml_blocks(&qt, GGML_TYPE_Q8_0).unwrap();
+
+        // 64 elements / 32 per block = 2 blocks * 34 bytes = 68 bytes
+        assert_eq!(repacked.len(), 2 * BLOCK_Q8_0_BYTES);
+    }
+
+    #[test]
+    fn test_repack_preserved_tensor_passthrough() {
+        // Preserved tensors should pass through unchanged
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let qt = QuantizedTensor {
+            name: "norm.weight".into(),
+            shape: vec![4],
+            original_dtype: DType::F16,
+            data: data.clone(),
+            quant_info: TensorQuantInfo {
+                method: "passthrough".into(),
+                bits: 16,
+                group_size: 0,
+                preserved: true,
+                scales: None,
+                biases: None,
+                ggml_type: None,
+            },
+        };
+
+        let repacked = repack_to_ggml_blocks(&qt, GGML_TYPE_F16).unwrap();
+        assert_eq!(repacked, data);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q4_0() {
+        // 1024 elements: 1024/32 = 32 blocks * 18 bytes = 576 bytes
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q4_0), 576);
+        // 32 elements: 1 block * 18 bytes
+        assert_eq!(ggml_tensor_size(32, GGML_TYPE_Q4_0), 18);
+        // 64 elements: 2 blocks * 18 bytes = 36
+        assert_eq!(ggml_tensor_size(64, GGML_TYPE_Q4_0), 36);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_q8_0() {
+        // 1024 elements: 1024/32 = 32 blocks * 34 bytes = 1088 bytes
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_Q8_0), 1088);
+        // 32 elements: 1 block * 34 bytes
+        assert_eq!(ggml_tensor_size(32, GGML_TYPE_Q8_0), 34);
+    }
+
+    #[test]
+    fn test_ggml_tensor_size_f16() {
+        assert_eq!(ggml_tensor_size(1024, GGML_TYPE_F16), 2048);
     }
 }

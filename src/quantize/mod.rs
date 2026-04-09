@@ -117,8 +117,12 @@ pub fn quantize_model(
         let config = LayerQuantConfig {
             bits,
             group_size,
-            preserve: !tensor.is_weight(),
+            preserve: !tensor.is_weight() || tensor.is_vision_tensor(),
         };
+
+        if tensor.is_vision_tensor() && tensor.is_weight() {
+            tracing::debug!("Preserving vision tensor as F16: {}", name);
+        }
 
         let quantized = quantizer.quantize_tensor(tensor, &config)?;
         quantized_tensors.insert(name.clone(), quantized);
@@ -135,4 +139,79 @@ pub fn quantize_model(
         group_size,
         bits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+    use crate::quantize::static_quant::StaticQuantizer;
+
+    fn dummy_metadata() -> ModelMetadata {
+        ModelMetadata {
+            architecture: "TestArch".to_string(),
+            model_type: "test".to_string(),
+            param_count: 1000,
+            hidden_size: 64,
+            num_layers: 1,
+            layer_types: vec!["attention".to_string()],
+            num_attention_heads: 4,
+            num_kv_heads: None,
+            vocab_size: 256,
+            dtype: "float16".to_string(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(128),
+            raw_config: serde_json::Value::Null,
+        }
+    }
+
+    /// Create a fake F16 weight tensor with valid data for the given shape.
+    fn make_tensor(name: &str, shape: Vec<usize>) -> TensorRef {
+        let numel: usize = shape.iter().product();
+        TensorRef {
+            name: name.to_string(),
+            shape,
+            dtype: DType::F16,
+            data: vec![0u8; numel * 2], // F16 = 2 bytes per element
+        }
+    }
+
+    #[test]
+    fn test_vision_tensor_preserved() {
+        let mut tensor_map = TensorMap::new();
+
+        // Vision weight tensor — should be preserved despite being a weight
+        tensor_map.insert(make_tensor(
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            vec![64, 64],
+        ));
+
+        // Regular weight tensor — should be quantized
+        tensor_map.insert(make_tensor(
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![64, 64],
+        ));
+
+        let metadata = dummy_metadata();
+        let quantizer = StaticQuantizer::new("q4").unwrap();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let result = quantize_model(&tensor_map, &metadata, &quantizer, 4, 32, &progress).unwrap();
+
+        // Vision tensor should be preserved (F16)
+        let vision_t = &result.tensors["model.vision_tower.encoder.layers.0.self_attn.q_proj.weight"];
+        assert!(
+            vision_t.quant_info.preserved,
+            "Vision weight tensor should be preserved at full precision"
+        );
+
+        // Regular weight tensor should NOT be preserved (quantized)
+        let regular_t = &result.tensors["model.layers.0.self_attn.q_proj.weight"];
+        assert!(
+            !regular_t.quant_info.preserved,
+            "Regular weight tensor should be quantized, not preserved"
+        );
+    }
 }

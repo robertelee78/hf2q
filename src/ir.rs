@@ -117,6 +117,25 @@ impl TensorRef {
         self.numel() * self.dtype.element_size()
     }
 
+    /// Whether this tensor belongs to a vision encoder or multimodal projector.
+    /// Vision tensors should be preserved at full precision (F16) regardless of
+    /// whether they pass `is_weight()`, because quantizing vision components
+    /// degrades image understanding quality significantly.
+    pub fn is_vision_tensor(&self) -> bool {
+        let n = &self.name;
+        // Check raw HF names (before any prefix stripping)
+        if n.contains("vision_tower") || n.contains("embed_vision") {
+            return true;
+        }
+        // After language_model. prefix strip, these would start with vision_tower / embed_vision
+        if let Some(rest) = n.strip_prefix("language_model.") {
+            if rest.starts_with("vision_tower") || rest.starts_with("embed_vision") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether this tensor is a weight tensor (as opposed to a norm, bias, scalar, etc.)
     /// Used to decide what to quantize vs preserve at full precision.
     pub fn is_weight(&self) -> bool {
@@ -503,6 +522,38 @@ mod tests {
         assert_eq!(map.len(), 1);
         assert!(map.get("a").is_some());
         assert!(map.get("b").is_none());
+    }
+
+    #[test]
+    fn test_is_vision_tensor() {
+        let make = |name: &str| TensorRef {
+            name: name.to_string(),
+            shape: vec![4096, 4096],
+            dtype: DType::F16,
+            data: vec![],
+        };
+
+        // Vision tensors — should return true
+        assert!(make("model.vision_tower.encoder.layers.0.self_attn.q_proj.weight").is_vision_tensor());
+        assert!(make("model.vision_tower.patch_embedder.input_proj.weight").is_vision_tensor());
+        assert!(make("model.embed_vision.embedding_projection.weight").is_vision_tensor());
+
+        // Non-vision tensors — should return false
+        assert!(!make("model.layers.0.self_attn.q_proj.weight").is_vision_tensor());
+        assert!(!make("model.embed_tokens.weight").is_vision_tensor());
+    }
+
+    #[test]
+    fn test_vision_weight_tensor_classification() {
+        // A vision weight tensor should pass both is_weight() and is_vision_tensor()
+        let vt = TensorRef {
+            name: "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight".to_string(),
+            shape: vec![4096, 4096],
+            dtype: DType::F16,
+            data: vec![],
+        };
+        assert!(vt.is_weight(), "vision weight should pass is_weight()");
+        assert!(vt.is_vision_tensor(), "vision weight should pass is_vision_tensor()");
     }
 
     #[test]

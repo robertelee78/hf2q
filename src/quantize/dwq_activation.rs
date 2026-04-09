@@ -174,7 +174,7 @@ pub fn run_dwq_activation_calibration(
         let layer_config = LayerQuantConfig {
             bits,
             group_size: config.group_size,
-            preserve: !tensor.is_weight(),
+            preserve: !tensor.is_weight() || tensor.is_vision_tensor(),
         };
 
         let quantized = mixed_quantizer.quantize_tensor(tensor, &layer_config)?;
