@@ -67,29 +67,28 @@ pub fn run_dwq_activation_calibration(
     info!(tokens = token_ids.len(), "Calibration text encoded");
     pb.inc(1);
 
-    // Step 3: Select GPU device and load model
-    pb.set_message("Loading model onto GPU");
+    // Step 3: Select GPU device
+    pb.set_message("Selecting GPU device");
     let (device, gpu_kind) = crate::gpu::select_device().map_err(|e| DwqError::GpuError {
         reason: format!("Device selection failed: {}", e),
     })?;
     info!(device = %gpu_kind, "GPU device selected for activation calibration");
-
-    let transformer =
-        crate::gpu::forward::TransformerForward::load(tensor_map, metadata, &device).map_err(
-            |e| DwqError::GpuError {
-                reason: format!("Failed to load transformer: {}", e),
-            },
-        )?;
     pb.inc(1);
 
-    // Step 4: Run forward pass with activation capture
-    pb.set_message("Running forward pass (capturing activations)");
+    // Step 4: Run layer-streaming forward pass with activation capture.
+    // This loads one transformer layer at a time instead of all at once,
+    // reducing peak GPU memory from ~100GB to ~6GB for 26B+ models.
+    pb.set_message("Running streaming forward pass (capturing activations)");
     let output =
-        transformer
-            .forward_with_activations(&token_ids)
-            .map_err(|e| DwqError::GpuError {
-                reason: format!("Forward pass failed: {}", e),
-            })?;
+        crate::gpu::forward::TransformerForward::forward_with_activations_streaming(
+            tensor_map,
+            metadata,
+            &device,
+            &token_ids,
+        )
+        .map_err(|e| DwqError::GpuError {
+            reason: format!("Streaming forward pass failed: {}", e),
+        })?;
 
     let activations = output.hidden_states.ok_or_else(|| DwqError::GpuError {
         reason: "Forward pass did not capture hidden states".to_string(),

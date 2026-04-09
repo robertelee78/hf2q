@@ -779,6 +779,177 @@ fn apply_causal_mask(attn_weights: &Tensor, seq_len: usize) -> Result<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
+// Gemma4 single-layer loader (for streaming forward pass)
+// ---------------------------------------------------------------------------
+
+/// Load a single Gemma4 layer from the TensorMap into GPU tensors.
+///
+/// When the caller drops the returned `Gemma4Layer`, all GPU tensors are freed.
+/// This is the key to the layer-streaming forward pass: only one layer's worth
+/// of GPU memory (~3GB) is live at a time.
+fn load_gemma4_layer(
+    tensor_map: &TensorMap,
+    device: &candle_core::Device,
+    layer_idx: usize,
+    model_prefix: &str,
+    config: &Gemma4Config,
+    rope_sliding: &RotaryEmbedding,
+    rope_global: &RotaryEmbedding,
+    eps: f64,
+) -> Result<Gemma4Layer> {
+    let get = |name: &str| -> Result<Tensor> {
+        let tref = tensor_map
+            .tensors
+            .get(name)
+            .with_context(|| format!("Missing tensor: {}", name))?;
+        tensor_from_ir(tref, device)
+    };
+    let try_get = |name: &str| -> Option<Tensor> {
+        tensor_map
+            .tensors
+            .get(name)
+            .and_then(|tref| tensor_from_ir(tref, device).ok())
+    };
+
+    let prefix = format!("{}.layers.{}", model_prefix, layer_idx);
+    let is_full = config.is_full_attention(layer_idx);
+    let head_dim = config.head_dim_for_layer(layer_idx);
+    let num_kv_heads = config.num_kv_heads_for_layer(layer_idx);
+    let k_eq_v = is_full && config.attention_k_eq_v;
+    let activation = Activation::Gelu;
+
+    // Select RoPE for this layer (clone the sin/cos tensors — cheap, just refcounts)
+    let rotary_emb = if is_full {
+        RotaryEmbedding {
+            sin: rope_global.sin.clone(),
+            cos: rope_global.cos.clone(),
+            rotary_dim: rope_global.rotary_dim,
+        }
+    } else {
+        RotaryEmbedding {
+            sin: rope_sliding.sin.clone(),
+            cos: rope_sliding.cos.clone(),
+            rotary_dim: rope_sliding.rotary_dim,
+        }
+    };
+
+    // Attention projections
+    let q_proj =
+        TransformerForward::load_linear(&get, &format!("{}.self_attn.q_proj", prefix))?;
+    let k_proj =
+        TransformerForward::load_linear(&get, &format!("{}.self_attn.k_proj", prefix))?;
+    let v_proj = if k_eq_v {
+        // V is tied to K — create a dummy (never used in forward)
+        let k_w = get(&format!("{}.self_attn.k_proj.weight", prefix))?;
+        let k_b_key = format!("{}.self_attn.k_proj.bias", prefix);
+        let k_b = try_get(&k_b_key);
+        Linear::new(k_w, k_b)
+    } else {
+        TransformerForward::load_linear(&get, &format!("{}.self_attn.v_proj", prefix))?
+    };
+    let o_proj =
+        TransformerForward::load_linear(&get, &format!("{}.self_attn.o_proj", prefix))?;
+
+    // Q/K norms
+    let q_norm = RmsNorm::new(
+        get(&format!("{}.self_attn.q_norm.weight", prefix))?,
+        eps,
+    );
+    let k_norm = RmsNorm::new(
+        get(&format!("{}.self_attn.k_norm.weight", prefix))?,
+        eps,
+    );
+
+    // Dense MLP
+    let mlp_gate_proj =
+        TransformerForward::load_linear(&get, &format!("{}.mlp.gate_proj", prefix))?;
+    let mlp_up_proj =
+        TransformerForward::load_linear(&get, &format!("{}.mlp.up_proj", prefix))?;
+    let mlp_down_proj =
+        TransformerForward::load_linear(&get, &format!("{}.mlp.down_proj", prefix))?;
+
+    // MoE block
+    let router_proj =
+        TransformerForward::load_linear(&get, &format!("{}.router.proj", prefix))?;
+    let router_scale = get(&format!("{}.router.scale", prefix))?;
+    let per_expert_scale = get(&format!("{}.router.per_expert_scale", prefix))?;
+    let expert_gate_up = get(&format!("{}.experts.gate_up_proj", prefix))?;
+    let expert_down = get(&format!("{}.experts.down_proj", prefix))?;
+
+    let moe = MoeBlock {
+        router_proj,
+        router_scale,
+        per_expert_scale,
+        expert_gate_up,
+        expert_down,
+        num_experts: config.num_experts,
+        top_k: config.top_k_experts,
+        moe_intermediate_size: config.moe_intermediate_size,
+        activation,
+    };
+
+    // All 7 norm layers
+    let input_layernorm = RmsNorm::new(
+        get(&format!("{}.input_layernorm.weight", prefix))?,
+        eps,
+    );
+    let post_attention_layernorm = RmsNorm::new(
+        get(&format!("{}.post_attention_layernorm.weight", prefix))?,
+        eps,
+    );
+    let pre_feedforward_layernorm = RmsNorm::new(
+        get(&format!("{}.pre_feedforward_layernorm.weight", prefix))?,
+        eps,
+    );
+    let post_feedforward_layernorm = RmsNorm::new(
+        get(&format!("{}.post_feedforward_layernorm.weight", prefix))?,
+        eps,
+    );
+    let pre_feedforward_layernorm_2 = RmsNorm::new(
+        get(&format!("{}.pre_feedforward_layernorm_2.weight", prefix))?,
+        eps,
+    );
+    let post_feedforward_layernorm_1 = RmsNorm::new(
+        get(&format!("{}.post_feedforward_layernorm_1.weight", prefix))?,
+        eps,
+    );
+    let post_feedforward_layernorm_2 = RmsNorm::new(
+        get(&format!("{}.post_feedforward_layernorm_2.weight", prefix))?,
+        eps,
+    );
+
+    // Layer scalar (optional)
+    let layer_scalar = try_get(&format!("{}.layer_scalar.weight", prefix));
+
+    Ok(Gemma4Layer {
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        num_heads: config.num_attention_heads,
+        num_kv_heads,
+        head_dim,
+        k_eq_v,
+        rotary_emb,
+        mlp_gate_proj,
+        mlp_up_proj,
+        mlp_down_proj,
+        moe,
+        input_layernorm,
+        post_attention_layernorm,
+        pre_feedforward_layernorm,
+        post_feedforward_layernorm,
+        pre_feedforward_layernorm_2,
+        post_feedforward_layernorm_1,
+        post_feedforward_layernorm_2,
+        layer_scalar,
+        activation,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Full transformer forward pass
 // ---------------------------------------------------------------------------
 
@@ -1330,6 +1501,162 @@ impl TransformerForward {
             ModelVariant::Generic { layers } => layers.len(),
             ModelVariant::Gemma4 { layers, .. } => layers.len(),
         }
+    }
+
+    /// Layer-streaming forward pass for Gemma4 models that avoids OOM on 26B+ models.
+    ///
+    /// Instead of loading all 30 layers into GPU memory simultaneously (~48GB of
+    /// Candle tensors), this loads one layer at a time from the TensorMap, runs the
+    /// forward pass through it, captures the hidden state, then drops the layer
+    /// before loading the next. Peak GPU memory: ~6GB (permanent tensors + one layer)
+    /// instead of ~48GB (all layers).
+    ///
+    /// This is a static method — it does not require a `TransformerForward` instance.
+    /// The TensorMap stays in host memory; only one layer's GPU tensors are live at
+    /// a time.
+    ///
+    /// For non-Gemma4 models or models that fit in memory, use the regular
+    /// `TransformerForward::load()` + `forward_with_activations()` path.
+    pub fn forward_with_activations_streaming(
+        tensor_map: &TensorMap,
+        metadata: &ModelMetadata,
+        device: &candle_core::Device,
+        token_ids: &[u32],
+    ) -> Result<ForwardOutput> {
+        if token_ids.is_empty() {
+            bail!("Cannot run forward pass with empty token sequence");
+        }
+
+        let hidden_size = metadata.hidden_size as usize;
+        let num_layers = metadata.num_layers as usize;
+        let eps = Self::extract_rms_eps(metadata);
+
+        // Detect naming convention
+        let model_prefix =
+            if tensor_map
+                .tensors
+                .contains_key("model.language_model.embed_tokens.weight")
+            {
+                "model.language_model"
+            } else {
+                "model"
+            };
+        debug!(model_prefix, "Streaming forward: detected tensor naming prefix");
+
+        // Helper to load a tensor by name
+        let get = |name: &str| -> Result<Tensor> {
+            let tref = tensor_map
+                .tensors
+                .get(name)
+                .with_context(|| format!("Missing tensor: {}", name))?;
+            tensor_from_ir(tref, device)
+        };
+
+        // Extract Gemma4 config
+        let cfg = Gemma4Config::from_metadata(metadata)?;
+
+        debug!(
+            hidden_size,
+            num_heads = cfg.num_attention_heads,
+            num_layers,
+            "Streaming forward: loading permanent tensors"
+        );
+
+        // --- Permanent tensors (~3GB total, stay loaded for entire forward pass) ---
+
+        // Embedding
+        let embed_weight = get(&format!("{}.embed_tokens.weight", model_prefix))?;
+        let embed = Embedding::new(embed_weight, hidden_size);
+
+        // Final norm
+        let final_norm =
+            RmsNorm::new(get(&format!("{}.norm.weight", model_prefix))?, eps);
+
+        // LM head — Gemma4 ties embed and lm_head
+        let lm_head_weight =
+            if tensor_map.tensors.contains_key("lm_head.weight") {
+                get("lm_head.weight")?
+            } else {
+                debug!(
+                    "lm_head.weight not found, using tied embed_tokens.weight"
+                );
+                get(&format!("{}.embed_tokens.weight", model_prefix))?
+            };
+        let lm_head = Linear::new(lm_head_weight, None);
+
+        // --- Shared RoPE tables (~8MB total, stay loaded) ---
+
+        let max_rope_len = 8192usize;
+        let rope_sliding = RotaryEmbedding::new_standard(
+            cfg.head_dim,
+            max_rope_len,
+            cfg.rope_theta_sliding,
+            device,
+        )?;
+        let rope_global = RotaryEmbedding::new_partial(
+            cfg.global_head_dim,
+            max_rope_len,
+            cfg.rope_theta_global,
+            cfg.partial_rotary_factor,
+            device,
+        )?;
+
+        // --- Embedding lookup ---
+
+        let seq_len = token_ids.len();
+        let ids: Vec<u32> = token_ids.to_vec();
+        let input = Tensor::from_vec(ids, (seq_len,), device)?;
+        let mut hidden = embed.forward(&input)?;
+
+        // Gemma4: scale embeddings by sqrt(hidden_size)
+        hidden = (hidden * (cfg.hidden_size as f64).sqrt())?;
+
+        // Accumulate per-layer hidden states for sensitivity analysis
+        let mut hidden_states = Vec::with_capacity(num_layers + 1);
+        hidden_states.push(hidden.clone());
+
+        // --- Stream through layers: load one, forward, capture, drop ---
+
+        for i in 0..num_layers {
+            debug!("Streaming layer {}/{}", i + 1, num_layers);
+
+            // Load this layer's tensors from TensorMap onto GPU (~3GB)
+            let layer = load_gemma4_layer(
+                tensor_map,
+                device,
+                i,
+                model_prefix,
+                &cfg,
+                &rope_sliding,
+                &rope_global,
+                eps,
+            )?;
+
+            // Forward through this layer
+            hidden = layer.forward(&hidden)?;
+
+            // Capture hidden state (~5.5MB per layer)
+            hidden_states.push(hidden.clone());
+
+            // `layer` is dropped here — all its GPU tensors (~3GB) are freed
+            drop(layer);
+        }
+
+        // --- Final norm + LM head ---
+
+        hidden = final_norm.forward(&hidden)?;
+        let logits = lm_head.forward(&hidden)?;
+
+        // Apply logit softcapping if configured
+        let logits = match cfg.final_logit_softcapping {
+            Some(sc) => ((logits / sc)?.tanh()? * sc)?,
+            None => logits,
+        };
+
+        Ok(ForwardOutput {
+            logits,
+            hidden_states: Some(hidden_states),
+        })
     }
 }
 
