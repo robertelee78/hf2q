@@ -243,6 +243,40 @@ impl OutputBackend for GgufBackend {
                 ggml_type = GGML_TYPE_F32;
             }
 
+            // Block-quantized K-quant types (block_size=256) require ne[0] % 256 == 0.
+            // ne[0] is the last PyTorch dim (innermost, becomes first after GGUF reversal).
+            // When incompatible, use llama.cpp's standard fallback chain from
+            // tensor_type_fallback() in llama-quant.cpp:362-408:
+            //   Q6_K → Q8_0, Q5_K → Q5_1, Q4_K → Q5_0, Q3_K/Q2_K → Q4_0
+            if !qt.shape.is_empty() {
+                let row_dim = *qt.shape.last().unwrap();
+                if row_dim % QK6_K != 0 {
+                    let fallback = match ggml_type {
+                        GGML_TYPE_Q6_K => Some(GGML_TYPE_Q8_0),
+                        GGML_TYPE_Q5_K => Some(GGML_TYPE_Q5_1),
+                        GGML_TYPE_Q4_K => Some(GGML_TYPE_Q5_0),
+                        GGML_TYPE_Q3_K | GGML_TYPE_Q2_K => Some(GGML_TYPE_Q4_0),
+                        _ => None,
+                    };
+                    if let Some(fb) = fallback {
+                        if row_dim % QK4_0 == 0 {
+                            debug!(
+                                "Tensor '{}': ne[0]={} not K-quant compatible, {} → {}",
+                                gguf_name, row_dim,
+                                ggml_type_name(ggml_type), ggml_type_name(fb)
+                            );
+                            ggml_type = fb;
+                        } else {
+                            debug!(
+                                "Tensor '{}': ne[0]={} not block-aligned at all, using F16",
+                                gguf_name, row_dim
+                            );
+                            ggml_type = GGML_TYPE_F16;
+                        }
+                    }
+                }
+            }
+
             // Compute the repacked size without allocating
             let total_elements: usize = qt.shape.iter().product();
             let repacked_size = if needs_f32 {
@@ -1272,6 +1306,17 @@ fn repack_q6_k(
     );
 
     Ok(output)
+}
+
+/// Human-readable name for a GGML type code (for debug logging).
+fn ggml_type_name(t: u32) -> &'static str {
+    match t {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1",
+        6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
+        10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
+        14 => "Q6_K", 15 => "Q8_K",
+        _ => "unknown",
+    }
 }
 
 /// Compute the expected byte size of a tensor in ggml block format.
