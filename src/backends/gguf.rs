@@ -1261,6 +1261,20 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         ));
     }
 
+    // Expert count and used count (MoE models)
+    if let Some(n_expert) = meta.num_experts {
+        kv.push((
+            format!("{}.expert_count", arch),
+            MetaValue::Uint32(n_expert),
+        ));
+    }
+    if let Some(n_used) = meta.top_k_experts {
+        kv.push((
+            format!("{}.expert_used_count", arch),
+            MetaValue::Uint32(n_used),
+        ));
+    }
+
     kv.push((
         "general.file_type".into(),
         MetaValue::Uint32(ggml_ftype_from_bits(model.bits)),
