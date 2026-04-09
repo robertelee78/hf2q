@@ -90,7 +90,7 @@ impl OutputBackend for GgufBackend {
         // Check for unsupported bit widths
         for (name, tensor) in &model.tensors {
             let bits = tensor.quant_info.bits;
-            if !tensor.quant_info.preserved && !matches!(bits, 2 | 4 | 8 | 16) {
+            if !tensor.quant_info.preserved && !matches!(bits, 2 | 4 | 6 | 8 | 16) {
                 warnings.push(FormatWarning {
                     message: format!(
                         "Tensor '{}' has {}-bit quantization which has no standard GGML type; \
@@ -175,14 +175,37 @@ impl OutputBackend for GgufBackend {
         // Generate synthetic tensors (e.g., rope_freqs for Gemma4 partial RoPE)
         let synthetic_tensors = generate_synthetic_tensors(&model.metadata);
 
+        // For Gemma4 full-attention layers, V is tied to K (no separate v_proj in safetensors).
+        // llama.cpp expects attn_v.weight to exist. Duplicate K data as V for these layers.
+        let mut v_duplicates: Vec<(String, &String)> = Vec::new(); // (gguf_v_name, source_k_hf_name)
+        if model.metadata.model_type == "gemma4" {
+            let tc = model.metadata.raw_config.get("text_config").cloned().unwrap_or_default();
+            let k_eq_v = tc.get("attention_k_eq_v").and_then(|v| v.as_bool()).unwrap_or(true);
+            if k_eq_v {
+                let layer_types = tc.get("layer_types").and_then(|v| v.as_array());
+                if let Some(lt) = layer_types {
+                    for (i, lt_val) in lt.iter().enumerate() {
+                        if lt_val.as_str() == Some("full_attention") {
+                            // Find the K tensor for this layer
+                            let k_hf_suffix = format!("layers.{}.self_attn.k_proj.weight", i);
+                            if let Some(k_name) = tensor_names.iter().find(|n| n.ends_with(&k_hf_suffix)) {
+                                let v_gguf_name = format!("blk.{}.attn_v.weight", i);
+                                v_duplicates.push((v_gguf_name, k_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let pb = progress.bar(
-            (tensor_names.len() + synthetic_tensors.len()) as u64,
+            (tensor_names.len() + synthetic_tensors.len() + v_duplicates.len()) as u64,
             "Writing GGUF tensors",
         );
 
         // Build metadata key-value pairs
         let metadata = build_metadata(model, input_dir);
-        let tensor_count = (tensor_names.len() + synthetic_tensors.len()) as u64;
+        let tensor_count = (tensor_names.len() + synthetic_tensors.len() + v_duplicates.len()) as u64;
         let kv_count = metadata.len() as u64;
 
         let file = File::create(&out_path).map_err(|e| BackendError::WriteFailed {
@@ -258,6 +281,31 @@ impl OutputBackend for GgufBackend {
             tensor_data_offset += data.len() as u64;
         }
 
+        // Add V=K duplicate tensor infos (for Gemma4 full-attention layers)
+        for (v_name, k_hf_name) in &v_duplicates {
+            let k_qt = &model.tensors[*k_hf_name];
+            let k_ggml_type = quant_info_to_ggml_type(&k_qt.quant_info);
+            let total_elements: usize = k_qt.shape.iter().product();
+            let needs_f32 = k_qt.quant_info.preserved && k_qt.shape.len() <= 1;
+            let effective_type = if needs_f32 && k_ggml_type == GGML_TYPE_F16 { GGML_TYPE_F32 } else { k_ggml_type };
+            let repacked_size = if needs_f32 {
+                total_elements * 4
+            } else if k_qt.quant_info.preserved || effective_type == GGML_TYPE_F16 || effective_type == GGML_TYPE_F32 {
+                k_qt.data.len()
+            } else {
+                ggml_tensor_size(total_elements, effective_type)
+            };
+            tensor_data_offset = align_up(tensor_data_offset, ALIGNMENT);
+            tensor_infos.push(TensorWriteInfo {
+                gguf_name: v_name.clone(),
+                shape: k_qt.shape.clone(),
+                ggml_type: effective_type,
+                data_offset: tensor_data_offset,
+                data_len: repacked_size,
+            });
+            tensor_data_offset += repacked_size as u64;
+        }
+
         // Write tensor info entries
         for info in &tensor_infos {
             write_tensor_info(&mut w, info)?;
@@ -307,6 +355,31 @@ impl OutputBackend for GgufBackend {
                 w.write_all(&vec![0u8; (target - current) as usize])?;
             }
             w.write_all(data)?;
+            pb.inc(1);
+        }
+
+        // --- Write V=K duplicate tensors (Gemma4 full-attention layers) ---
+        for (v_name, k_hf_name) in &v_duplicates {
+            let k_qt = &model.tensors[*k_hf_name];
+            let info = tensor_infos.iter().find(|i| i.gguf_name == *v_name).unwrap();
+
+            // Pad to alignment
+            let current = w.stream_position()?;
+            let target = data_block_start + info.data_offset;
+            if current < target {
+                w.write_all(&vec![0u8; (target - current) as usize])?;
+            }
+
+            // Repack K tensor data (same repack as the K tensor gets) and write as V
+            let data = repack_to_ggml_blocks(k_qt, info.ggml_type).map_err(|e| {
+                BackendError::WriteFailed {
+                    reason: format!(
+                        "Failed to repack V=K duplicate tensor '{}' from '{}': {}",
+                        v_name, k_hf_name, e
+                    ),
+                }
+            })?;
+            w.write_all(&data)?;
             pb.inc(1);
         }
 
@@ -700,6 +773,12 @@ const QK8_0: usize = 32;
 /// GGML Q8_0 block size in bytes.
 const BLOCK_Q8_0_BYTES: usize = 2 + QK8_0; // 34
 
+/// GGML Q6_K super-block: 256 elements, 210 bytes.
+/// Layout: ql[128] + qh[64] + scales[16] + d[2 bytes f16] = 210 bytes.
+const QK6_K: usize = 256;
+/// GGML Q6_K block size in bytes.
+const BLOCK_Q6_K_BYTES: usize = 128 + 64 + 16 + 2; // 210
+
 /// Repack a QuantizedTensor's data from hf2q's internal format into proper ggml
 /// block format. Returns the repacked bytes ready for writing to GGUF.
 ///
@@ -759,6 +838,11 @@ fn repack_to_ggml_blocks(
     };
 
     let total_elements: usize = qt.shape.iter().product();
+
+    // 6-bit quantized tensors need Q6_K block format
+    if ggml_type == GGML_TYPE_Q6_K {
+        return repack_q6_k(qt, scales_bytes, total_elements);
+    }
 
     match ggml_type {
         GGML_TYPE_Q4_0 => repack_q4_0(qt, scales_bytes, total_elements),
@@ -984,6 +1068,217 @@ fn repack_q8_0(
     Ok(output)
 }
 
+/// Repack hf2q internal 6-bit quantized data into Q6_K super-block format.
+///
+/// Q6_K block: 256 elements, 210 bytes.
+/// Layout: ql[128] (lower 4 bits) + qh[64] (upper 2 bits) + scales[16] (int8) + d (f16)
+///
+/// Steps:
+/// 1. Decode f16 scales from quant_info.scales
+/// 2. Read signed i8 values from qt.data (6-bit values stored as 1 byte each)
+/// 3. Reconstruct approximate f32 values: val = signed_q * f16_scale
+/// 4. Re-quantize each 256-element super-block into Q6_K format following
+///    the exact algorithm from llama.cpp's quantize_row_q6_K_ref.
+fn repack_q6_k(
+    qt: &crate::ir::QuantizedTensor,
+    scales_bytes: &[u8],
+    total_elements: usize,
+) -> Result<Vec<u8>, BackendError> {
+    let info = &qt.quant_info;
+    let group_size = if info.group_size == 0 { 64 } else { info.group_size };
+
+    // Decode f16 scales: 2 bytes each
+    let scales_f32: Vec<f32> = scales_bytes
+        .chunks_exact(2)
+        .map(|c| {
+            let bits = u16::from_le_bytes([c[0], c[1]]);
+            half::f16::from_bits(bits).to_f32()
+        })
+        .collect();
+
+    // Read signed i8 values from qt.data (6-bit: 1 byte per element, stored as u8 cast of i8)
+    let mut signed_values: Vec<i8> = Vec::with_capacity(total_elements);
+    for &byte in &qt.data {
+        signed_values.push(byte as i8);
+    }
+    signed_values.truncate(total_elements);
+
+    // Reconstruct approximate f32 values using the original scales
+    let mut f32_values: Vec<f32> = Vec::with_capacity(total_elements);
+    for (g, &scale) in scales_f32.iter().enumerate() {
+        let start = g * group_size;
+        let end = (start + group_size).min(total_elements);
+        for i in start..end {
+            let q = if i < signed_values.len() { signed_values[i] } else { 0 };
+            f32_values.push(q as f32 * scale);
+        }
+    }
+
+    // If scales didn't cover all elements, pad with zeros
+    while f32_values.len() < total_elements {
+        f32_values.push(0.0);
+    }
+
+    // Re-quantize into Q6_K super-blocks of 256 elements each.
+    // Follows llama.cpp quantize_row_q6_K_ref exactly.
+    let num_blocks = total_elements.div_ceil(QK6_K);
+    let mut output = Vec::with_capacity(num_blocks * BLOCK_Q6_K_BYTES);
+
+    // Threshold below which a sub-block is considered all-zero
+    const GROUP_MAX_EPS: f32 = 1e-15;
+
+    for block_idx in 0..num_blocks {
+        let start = block_idx * QK6_K;
+        let end = (start + QK6_K).min(total_elements);
+
+        // Get block values, padding with zeros if needed
+        let mut x = [0.0f32; QK6_K];
+        for (i, idx) in (start..end).enumerate() {
+            x[i] = f32_values[idx];
+        }
+
+        // Step 1: Compute per-sub-block scales (16 sub-blocks of 16 elements)
+        let mut sub_scales = [0.0f32; 16];
+        let mut l_values = [0i8; QK6_K]; // quantized values in [-32, 31] range
+
+        let mut max_scale: f32 = 0.0;
+        let mut max_abs_scale: f32 = 0.0;
+
+        for ib in 0..16 {
+            let sub_start = ib * 16;
+            let sub_end = sub_start + 16;
+
+            // Find the element with maximum absolute value in this sub-block
+            let mut amax: f32 = 0.0;
+            let mut max_val: f32 = 0.0;
+            for i in sub_start..sub_end {
+                let ax = x[i].abs();
+                if ax > amax {
+                    amax = ax;
+                    max_val = x[i];
+                }
+            }
+
+            if amax < GROUP_MAX_EPS {
+                sub_scales[ib] = 0.0;
+                for i in sub_start..sub_end {
+                    l_values[i] = 0;
+                }
+                continue;
+            }
+
+            // Compute initial scale using make_qx_quants logic (rmse_type=1):
+            // iscale = -nmax / max, then weighted least squares refinement.
+            // For re-quantization from already-quantized data, the simple approach
+            // (scale = amax / 32) matches well. But to exactly match llama.cpp's
+            // quantize_row_q6_K_ref which uses make_qx_quants(16, 32, x, L, 1, NULL),
+            // we implement the rmse_type=1 weighted optimization.
+            let iscale = -32.0 / max_val;
+            let mut sumlx: f64 = 0.0;
+            let mut suml2: f64 = 0.0;
+            for i in sub_start..sub_end {
+                let l = (iscale * x[i]).round() as i32;
+                let l = l.clamp(-32, 31);
+                l_values[i] = l as i8;
+                let lu = (l + 32) as i64; // unsigned offset form for weighted computation
+                // rmse_type=1: weight = x[i]^2
+                let w = (x[i] as f64) * (x[i] as f64);
+                sumlx += w * (x[i] as f64) * ((lu - 32) as f64);
+                suml2 += w * ((lu - 32) as f64) * ((lu - 32) as f64);
+            }
+            let scale = if suml2 > 0.0 { (sumlx / suml2) as f32 } else { 1.0 / iscale };
+
+            sub_scales[ib] = scale;
+
+            let abs_scale = scale.abs();
+            if abs_scale > max_abs_scale {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+        }
+
+        // Step 2: Handle all-zero block
+        if max_abs_scale < GROUP_MAX_EPS {
+            output.extend_from_slice(&[0u8; BLOCK_Q6_K_BYTES]);
+            continue;
+        }
+
+        // Step 3: Compute super-block scale d and quantize sub-block scales to int8
+        let iscale = -128.0f32 / max_scale;
+        let d = 1.0f32 / iscale;
+        let d_f16 = half::f16::from_f32(d);
+
+        let mut int8_scales = [0i8; 16];
+        for ib in 0..16 {
+            let qs = (iscale * sub_scales[ib]).round() as i32;
+            int8_scales[ib] = qs.clamp(-128, 127) as i8;
+        }
+
+        // Step 4: Re-quantize each element using the final d and int8 scales
+        // to get unsigned L values in [0, 63]
+        let mut big_l = [0u8; QK6_K];
+        for j in 0..16 {
+            let scale_f = half::f16::from_bits(d_f16.to_bits()).to_f32() * (int8_scales[j] as f32);
+            if scale_f == 0.0 {
+                // Leave L values as 0 (which means quantized value = 0 - 32 = -32, dequant = 0)
+                for ii in 0..16 {
+                    big_l[16 * j + ii] = 32; // 0 + 32 unsigned offset
+                }
+                continue;
+            }
+            for ii in 0..16 {
+                let l = (x[16 * j + ii] / scale_f).round() as i32;
+                let l = l.clamp(-32, 31);
+                big_l[16 * j + ii] = (l + 32) as u8;
+            }
+        }
+
+        // Step 5: Pack into ql[128] + qh[64] + scales[16] + d[2]
+        // Following llama.cpp's exact packing from quantize_row_q6_K_ref:
+        // Process in two halves of 128 elements (j=0 and j=128)
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+
+        let mut ql_idx = 0usize;
+        let mut qh_idx = 0usize;
+        for j in (0..QK6_K).step_by(128) {
+            for l in 0..32 {
+                let q1 = big_l[j + l] & 0xF;
+                let q2 = big_l[j + l + 32] & 0xF;
+                let q3 = big_l[j + l + 64] & 0xF;
+                let q4 = big_l[j + l + 96] & 0xF;
+                ql[ql_idx + l] = q1 | (q3 << 4);
+                ql[ql_idx + l + 32] = q2 | (q4 << 4);
+                qh[qh_idx + l] = (big_l[j + l] >> 4)
+                    | ((big_l[j + l + 32] >> 4) << 2)
+                    | ((big_l[j + l + 64] >> 4) << 4)
+                    | ((big_l[j + l + 96] >> 4) << 6);
+            }
+            ql_idx += 64;
+            qh_idx += 32;
+        }
+
+        // Write block: ql[128] + qh[64] + scales[16] + d[2]
+        output.extend_from_slice(&ql);
+        output.extend_from_slice(&qh);
+        for &s in &int8_scales {
+            output.push(s as u8);
+        }
+        output.extend_from_slice(&d_f16.to_le_bytes());
+    }
+
+    debug!(
+        "Repacked '{}': {} elements -> {} Q6_K blocks ({} bytes, was {} bytes)",
+        qt.name,
+        total_elements,
+        num_blocks,
+        output.len(),
+        qt.data.len()
+    );
+
+    Ok(output)
+}
+
 /// Compute the expected byte size of a tensor in ggml block format.
 fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
     match ggml_type {
@@ -997,6 +1292,10 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
             let n_blocks = total_elements.div_ceil(QK8_0);
             n_blocks * BLOCK_Q8_0_BYTES
         }
+        GGML_TYPE_Q6_K => {
+            let n_blocks = total_elements.div_ceil(QK6_K);
+            n_blocks * BLOCK_Q6_K_BYTES
+        }
         // For any other type, we cannot compute the size; caller should ensure
         // we never reach here for types we don't support.
         _ => total_elements * 2, // fallback to f16 sizing
@@ -1005,8 +1304,12 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
 
 /// Generate synthetic tensors that aren't in the safetensors but are required by llama.cpp.
 ///
-/// For Gemma4: generates `rope_freqs.weight` — frequency scaling factors for partial RoPE
-/// on full-attention layers. Rotated dims get 1.0, unrotated get 1e30 to zero them out.
+/// For Gemma4: generates `blk.{N}.rope_freqs.weight` — frequency scaling factors for
+/// partial RoPE on the first full-attention layer. llama.cpp loads it per-layer:
+///   layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), ...)
+/// The first non-SWA layer gets the tensor with flag=0 (required), subsequent ones
+/// get TENSOR_DUPLICATED (shared data). So we only need one tensor named for the
+/// first full-attention layer index.
 fn generate_synthetic_tensors(
     metadata: &crate::ir::ModelMetadata,
 ) -> Vec<(String, Vec<u8>, Vec<usize>, u32)> {
@@ -1025,26 +1328,37 @@ fn generate_synthetic_tensors(
             .and_then(|v| v.as_f64())
             .unwrap_or(0.25);
 
-        // n_rot = floor(global_head_dim * partial_rotary_factor / 2)
-        // n_unrot = global_head_dim / 2 - n_rot
-        let half_dim = global_head_dim / 2;
-        let n_rot = (global_head_dim as f64 * partial_rotary_factor / 2.0).floor() as usize;
-        let n_unrot = half_dim - n_rot;
+        // Find the first full-attention layer index from layer_types
+        let first_full_layer = tc.get("layer_types")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().position(|v| v.as_str() == Some("full_attention"))
+            });
 
-        // Build frequency factors: [1.0]*n_rot + [1e30]*n_unrot
-        let mut values: Vec<f32> = Vec::with_capacity(half_dim);
-        values.extend(std::iter::repeat(1.0f32).take(n_rot));
-        values.extend(std::iter::repeat(1e30f32).take(n_unrot));
+        if let Some(layer_idx) = first_full_layer {
+            // n_rot = floor(global_head_dim * partial_rotary_factor / 2)
+            // n_unrot = global_head_dim / 2 - n_rot
+            let half_dim = global_head_dim / 2;
+            let n_rot = (global_head_dim as f64 * partial_rotary_factor / 2.0).floor() as usize;
+            let n_unrot = half_dim - n_rot;
 
-        // Serialize as raw f32 bytes
-        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            // Build frequency factors: [1.0]*n_rot + [1e30]*n_unrot
+            let mut values: Vec<f32> = Vec::with_capacity(half_dim);
+            values.extend(std::iter::repeat(1.0f32).take(n_rot));
+            values.extend(std::iter::repeat(1e30f32).take(n_unrot));
 
-        result.push((
-            "rope_freqs.weight".to_string(),
-            data,
-            vec![half_dim],
-            GGML_TYPE_F32,
-        ));
+            // Serialize as raw f32 bytes
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+            // Name the tensor for the first full-attention layer so llama.cpp finds it
+            // at the correct layer index and duplicates it for subsequent full-attention layers.
+            result.push((
+                format!("blk.{}.rope_freqs.weight", layer_idx),
+                data,
+                vec![half_dim],
+                GGML_TYPE_F32,
+            ));
+        }
     }
 
     result
@@ -1066,12 +1380,16 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
     // K-quant super-block data; we map to the closest simple block type instead.
     if let Some(ref type_name) = info.ggml_type {
         let upper = type_name.trim().to_uppercase();
-        // K-quant types all get mapped to simple types based on ir_bits
+        // Q6_K can now be produced directly — honor it when explicitly requested
+        if upper.starts_with("Q6_K") {
+            return GGML_TYPE_Q6_K;
+        }
+        // Other K-quant types get mapped to simple types based on ir_bits
+        // (hf2q does not produce Q2_K-Q5_K super-block data)
         if upper.starts_with("Q2_K")
             || upper.starts_with("Q3_K")
             || upper.starts_with("Q4_K")
             || upper.starts_with("Q5_K")
-            || upper.starts_with("Q6_K")
         {
             debug!(
                 "Apex requested '{}', mapping to simple block type for bits={}",
@@ -1092,6 +1410,7 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
     match info.bits {
         16 => GGML_TYPE_F16,
         8 => GGML_TYPE_Q8_0,
+        6 => GGML_TYPE_Q6_K,
         4 => GGML_TYPE_Q4_0,
         2 => GGML_TYPE_Q4_0, // 2-bit is rare; pack as Q4_0 with values in [0,3] range
         _ => {
@@ -2160,7 +2479,7 @@ mod tests {
         // 2-bit maps to Q4_0 (we can't produce Q2_K super-block format)
         assert_eq!(quant_info_to_ggml_type(&qi(2, false)), GGML_TYPE_Q4_0);
         assert_eq!(quant_info_to_ggml_type(&qi(4, true)), GGML_TYPE_F16); // preserved
-        assert_eq!(quant_info_to_ggml_type(&qi(6, false)), GGML_TYPE_F16); // unknown fallback
+        assert_eq!(quant_info_to_ggml_type(&qi(6, false)), GGML_TYPE_Q6_K); // 6-bit uses Q6_K super-block
     }
 
     #[test]
@@ -2169,10 +2488,13 @@ mod tests {
         // Clean model: no warnings
         let w = backend.validate(&model(vec![("t1", 4, false), ("t2", 16, true)], 4)).unwrap();
         assert!(w.is_empty(), "Expected no warnings: {:?}", w);
-        // Unsupported bit width: 1 warning
+        // 6-bit is now supported (Q6_K) — no warnings
         let w = backend.validate(&model(vec![("odd", 6, false)], 6)).unwrap();
+        assert!(w.is_empty(), "6-bit should produce no warnings: {:?}", w);
+        // Truly unsupported bit width (e.g. 3-bit): 1 warning
+        let w = backend.validate(&model(vec![("odd", 3, false)], 3)).unwrap();
         assert_eq!(w.len(), 1);
-        assert!(w[0].message.contains("6-bit"));
+        assert!(w[0].message.contains("3-bit"));
         assert_eq!(w[0].severity, WarningSeverity::Warning);
     }
 
@@ -2267,12 +2589,12 @@ mod tests {
         };
         assert_eq!(quant_info_to_ggml_type(&qi_override), GGML_TYPE_Q4_0);
 
-        // Q6_K override on an 8-bit tensor maps to Q8_0
+        // Q6_K override is now honored directly (we can produce Q6_K blocks)
         let qi_q6k = TensorQuantInfo {
             method: "apex".into(), bits: 8, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q6_K".into()),
         };
-        assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q8_0);
+        assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q6_K);
 
         // Non-K-quant explicit type is still honored
         let qi_q4_0 = TensorQuantInfo {
