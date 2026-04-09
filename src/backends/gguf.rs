@@ -211,11 +211,21 @@ impl OutputBackend for GgufBackend {
         for name in &tensor_names {
             let qt = &model.tensors[*name];
             let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
-            let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+            let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+
+            // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
+            // assume F32 for element-wise operations (router.scale, per_expert_scale,
+            // layer_scalar, norms). Override F16→F32 for these.
+            let needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1;
+            if needs_f32 && ggml_type == GGML_TYPE_F16 {
+                ggml_type = GGML_TYPE_F32;
+            }
 
             // Compute the repacked size without allocating
             let total_elements: usize = qt.shape.iter().product();
-            let repacked_size = if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
+            let repacked_size = if needs_f32 {
+                total_elements * 4 // F32 = 4 bytes per element
+            } else if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
                 qt.data.len() // preserved/f16/f32 pass through unchanged
             } else {
                 ggml_tensor_size(total_elements, ggml_type)
@@ -718,8 +728,19 @@ fn repack_to_ggml_blocks(
 ) -> Result<Vec<u8>, BackendError> {
     let info = &qt.quant_info;
 
-    // Preserved or f16 tensors: data is already raw element bytes, no repacking needed
+    // Preserved or f16 tensors: data is already raw element bytes
     if info.preserved || info.bits == 16 || info.method == "f16" {
+        // If target is F32 but data is F16, convert
+        if ggml_type == GGML_TYPE_F32 && qt.data.len() == qt.shape.iter().product::<usize>() * 2 {
+            // F16→F32 conversion
+            let mut f32_data = Vec::with_capacity(qt.data.len() * 2);
+            for chunk in qt.data.chunks_exact(2) {
+                let f16_val = half::f16::from_le_bytes([chunk[0], chunk[1]]);
+                let f32_val: f32 = f16_val.to_f32();
+                f32_data.extend_from_slice(&f32_val.to_le_bytes());
+            }
+            return Ok(f32_data);
+        }
         return Ok(qt.data.clone());
     }
 
