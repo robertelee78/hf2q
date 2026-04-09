@@ -128,32 +128,95 @@ Deep review of the deleted code is required before restoring to confirm each fil
 | Rest (norms, residual) | 0.3ms | 9% | Negligible |
 | **Total per layer** | **2.6-4.0ms** | | 30 layers → ~90ms/token → ~11 tok/s (18 without profiling overhead) |
 
-**1b.1: Custom Metal mul_mat_id kernel for MoE** (highest impact)
+**Steady-state decode breakdown (confirmed via profiling, token 2+):**
+- Attention: 0.5ms/layer (fast, stable)
+- MLP: 0.3ms/layer (fast, stable)
+- MoE: 1.5-2.5ms/layer (60-70% of total, high variance from Tensor::stack allocs)
+- Total: ~80ms/30 layers = ~12 tok/s with profiling, 18 tok/s without
+- Target: llama.cpp ~0.31ms/layer = 9.3ms/30 layers = 107 tok/s
+- **Gap is ~6x per layer across ALL components, not just MoE. No silver bullet — need 10-15 optimizations.**
+
+**Approach: measure → change → measure. Profile after every optimization.**
+
+#### Tier 1: MoE dispatch (biggest single bottleneck, 60-70% of decode)
+
+**1b.1: Custom Metal mul_mat_id kernel** (highest impact, hardest)
 - Port llama.cpp's `kernel_mul_mv_id` (MV decode path) — indexed matmul into 3D quantized GGUF tensor
 - Leverage mlx-native crate (`/opt/mlx-native`): kernel_registry.rs, device.rs, encoder.rs, buffer.rs
 - Reuse mlx-native's moe_gate.metal (GPU-side router), moe_dispatch.metal (fused GELU+accumulate)
 - New kernel: `moe_expert_qmatmul.metal` with inline ggml dequant (Q4_K, Q6_K, Q8_0)
 - Load expert weights as merged 3D QTensors (not dequantized) — kernel indexes by expert_id * stride
 - Dispatch via metal-rs alongside candle buffers (QMetalStorage::buffer() is public)
-- Expected: MoE from ~2.5ms/layer to ~0.5ms/layer → ~60ms saved across 30 layers
+- Expected: MoE from ~2.0ms/layer to ~0.3ms/layer
 
 **1b.2: Pre-allocate MoE expert weight stacks** (medium impact, easy)
 - Current `Tensor::stack` allocates a new [top_k, hidden, intermediate*2] tensor per token per layer
 - Pre-allocate a reusable buffer at model load time, copy selected expert weights into it
-- Eliminates allocation jitter (MoE variance 1.4-8.0ms → stable ~1.5ms)
+- Eliminates allocation jitter (MoE variance 1.3-3.9ms → stable ~1.3ms)
 
-**1b.3: Global attention layer spikes — CONFIRMED WARMUP ONLY** (Phase 2, easy)
-- Global attention layers (every 6th) spike to 5-13ms on first decode token only (~37ms extra TTFT)
-- By second decode token, global layers are 0.5ms (same as sliding) — Metal kernel compilation warmup
-- Fix: run a dummy warmup token at server startup before accepting requests (Phase 2)
-- Not a throughput issue, but matters for TTFT in server context
+**1b.3: Keep expert weights as 3D QTensor** (memory, comes with 1b.1)
+- Currently dequantize 3D → BF16 → pre-slice at load (~45 GB). With 1b.1, keep as quantized 3D (~28 GB)
+- Saves ~17 GB GPU memory
 
-**Steady-state decode breakdown (confirmed, token 2+):**
-- Attention: 0.5ms/layer (fast, stable)
-- MLP: 0.3ms/layer (fast, stable)
-- MoE: 1.5-2.5ms/layer (60-70% of total, high variance from stack allocs)
-- Total: ~80ms/30 layers = ~12 tok/s with profiling, 18 tok/s without
-- Target: llama.cpp ~3.1ms/layer = 93ms/30 layers = 107 tok/s
+#### Tier 2: Reduce per-op overhead across all layers
+
+**1b.4: Eliminate F32↔BF16 round-trips in QLinear** (medium impact, easy)
+- Every QLinear does: BF16→F32 (input cast) → QMatMul(F32) → F32→BF16 (output cast)
+- 4 attention + 3 MLP + 1 router = 8 cast pairs per layer = 480 casts per token
+- Option A: run entire forward in F32 (tested — same output, no precision issue)
+- Option B: check if candle's Metal QMatMul actually needs F32 or if BF16 works on M5
+
+**1b.5: Reduce unnecessary `.contiguous()` calls** (small-medium impact, easy)
+- Each `.contiguous()` is a GPU memcpy. Audit all contiguous calls in forward path
+- Some may be needed (Metal kernel requirements), some may be defensive
+
+**1b.6: Profile and eliminate hidden GPU syncs** (unknown impact, investigation)
+- candle may internally call `commit_and_wait` more than we realize
+- Use Metal GPU capture or Instruments to count actual command buffer commits per token
+
+#### Tier 3: Attention and KV cache
+
+**1b.7: Pre-allocated KV cache (fixed max_seq_len)** (medium impact)
+- Currently `Tensor::cat` on every decode step creates a new tensor
+- Pre-allocate [max_seq_len, heads, head_dim] and write to a slice each step
+- Eliminates allocation + copy per layer per token
+
+**1b.8: Flash attention** (medium impact for long sequences)
+- candle supports flash attention — reduces memory bandwidth for attention computation
+- Biggest win during prefill (many tokens) and long-context decode
+
+**1b.9: Sliding window attention** (medium impact)
+- Sliding attention layers (24 of 30) only attend to last 1024 tokens
+- Currently attend to full KV cache — wasted computation for long sequences
+- Implement sliding window mask to skip old KV entries
+
+#### Tier 4: Fused kernels
+
+**1b.10: Fused RmsNorm + residual add** (small impact)
+- 7 RmsNorm calls per layer, each a separate kernel dispatch
+- Fuse norm + residual add into single kernel (mlx-native has fused_residual_norm_bf16.metal)
+
+**1b.11: Fused GELU + element-wise multiply in MLP/MoE** (small impact)
+- gate → GELU → mul(up) currently 3 ops, could be 1 (mlx-native has fused_gelu_mul in moe_dispatch.metal)
+
+**1b.12: Use F16 intermediates instead of BF16** (small impact)
+- Metal is generally faster with F16 than BF16 for element-wise ops
+- Would need validation that F16 precision is sufficient
+
+#### Tier 5: Infrastructure
+
+**1b.13: Command buffer batching** (unknown impact)
+- Submit multiple operations to Metal command encoder before committing
+- Reduces driver overhead per operation
+
+**1b.14: Warmup dummy token at server startup** (TTFT, Phase 2)
+- Global attention layers spike 5-13ms on first decode token (~37ms extra TTFT)
+- Run dummy BOS token through model at startup, clear KV cache
+- Zero cost to steady-state throughput
+
+**1b.15: Eliminate per-token MoE loop for prefill** (prefill speed)
+- During prefill, all tokens could be processed together through MoE
+- Currently each token loops independently — N×8 expert matmuls instead of batched
 
 ### Phase 2: HTTP Server
 - Restore spec-layer code (schema, SSE, tool parsing) from git history after deep review
