@@ -26,6 +26,7 @@ const ALIGNMENT: u64 = 32;
 
 // GGUF metadata value types
 const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_INT32: u32 = 5;
 const GGUF_TYPE_FLOAT32: u32 = 6;
 const GGUF_TYPE_BOOL: u32 = 7;
 const GGUF_TYPE_STRING: u32 = 8;
@@ -129,7 +130,7 @@ impl OutputBackend for GgufBackend {
     fn write(
         &self,
         model: &QuantizedModel,
-        _input_dir: &Path,
+        input_dir: &Path,
         output_dir: &Path,
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError> {
@@ -165,7 +166,7 @@ impl OutputBackend for GgufBackend {
         let pb = progress.bar(tensor_names.len() as u64, "Writing GGUF tensors");
 
         // Build metadata key-value pairs
-        let metadata = build_metadata(model);
+        let metadata = build_metadata(model, input_dir);
         let tensor_count = tensor_names.len() as u64;
         let kv_count = metadata.len() as u64;
 
@@ -194,7 +195,7 @@ impl OutputBackend for GgufBackend {
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let gguf_name = hf_name_to_gguf(name);
+            let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
             let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // Compute the repacked size without allocating
@@ -685,16 +686,81 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// HF → GGUF tensor name mapping
+// HF → GGUF tensor name mapping (architecture-aware)
 // ---------------------------------------------------------------------------
 
+/// Build the per-layer mapping table for a given architecture.
+///
+/// The same HF tensor suffix can map to different GGUF names depending on the
+/// model architecture. For example `post_attention_layernorm.weight` maps to
+/// `ffn_norm.weight` for LLaMA-family models (where it is the only post-attention
+/// norm and acts as the FFN pre-norm), but to `post_attention_norm.weight` for
+/// Gemma4 (which has a separate `pre_feedforward_layernorm` for the FFN pre-norm).
+fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
+    // Shared entries — identical across all architectures
+    let shared: &[(&str, &str)] = &[
+        ("self_attn.q_proj.weight", "attn_q.weight"),
+        ("self_attn.k_proj.weight", "attn_k.weight"),
+        ("self_attn.v_proj.weight", "attn_v.weight"),
+        ("self_attn.o_proj.weight", "attn_output.weight"),
+        ("mlp.gate_proj.weight", "ffn_gate.weight"),
+        ("mlp.up_proj.weight", "ffn_up.weight"),
+        ("mlp.down_proj.weight", "ffn_down.weight"),
+        ("input_layernorm.weight", "attn_norm.weight"),
+        ("self_attn.q_norm.weight", "attn_q_norm.weight"),
+        ("self_attn.k_norm.weight", "attn_k_norm.weight"),
+    ];
+
+    let mut map = Vec::with_capacity(shared.len() + 12);
+    map.extend_from_slice(shared);
+
+    match arch {
+        // Gemma family: post_attention_layernorm is a distinct post-attention norm,
+        // NOT the FFN pre-norm. The FFN pre-norm is pre_feedforward_layernorm.
+        "gemma4" | "gemma3" | "gemma2" => {
+            map.extend_from_slice(&[
+                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+                // pre_feedforward_layernorm is FFN_PRE_NORM (alias of FFN_NORM)
+                ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
+                // MoE norms
+                ("post_feedforward_layernorm_1.weight", "post_ffw_norm_1.weight"),
+                ("post_feedforward_layernorm_2.weight", "post_ffw_norm_2.weight"),
+                ("pre_feedforward_layernorm_2.weight", "pre_ffw_norm_2.weight"),
+                ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+                // MoE routing
+                ("router.proj.weight", "ffn_gate_inp.weight"),
+                ("router.scale", "ffn_gate_inp.scale"),
+                ("experts.gate_up_proj", "ffn_gate_up_exps.weight"),
+                ("experts.down_proj", "ffn_down_exps.weight"),
+                ("router.per_expert_scale", "ffn_down_exps.scale"),
+                // Layer scalar
+                ("layer_scalar", "layer_output_scale.weight"),
+            ]);
+        }
+        // LLaMA-like default: covers llama, mistral, qwen2, qwen3, phi, etc.
+        // post_attention_layernorm IS the FFN pre-norm (there is no separate
+        // pre_feedforward_layernorm in these architectures).
+        _ => {
+            map.extend_from_slice(&[
+                ("post_attention_layernorm.weight", "ffn_norm.weight"),
+            ]);
+        }
+    }
+
+    map
+}
+
 /// Convert a HuggingFace tensor name to its GGUF equivalent.
-fn hf_name_to_gguf(hf_name: &str) -> String {
+///
+/// `arch` is the model architecture string (e.g. "llama", "gemma4", "qwen3")
+/// from `model.metadata.model_type`. Different architectures use different
+/// GGUF names for the same HF tensor suffixes.
+fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
     // Strip language_model. prefix (Gemma4 conditional-generation models)
     let hf_name = hf_name.replace("language_model.", "");
     let hf_name = hf_name.as_str();
 
-    // Static patterns (no layer number)
+    // Static patterns (no layer number) — consistent across all architectures
     let static_map: &[(&str, &str)] = &[
         ("model.embed_tokens.weight", "token_embd.weight"),
         ("model.norm.weight", "output_norm.weight"),
@@ -714,31 +780,8 @@ fn hf_name_to_gguf(hf_name: &str) -> String {
     }
 
     // Layer-indexed patterns: model.layers.N.<suffix> → blk.N.<gguf_suffix>
-    let layer_map: &[(&str, &str)] = &[
-        ("self_attn.q_proj.weight", "attn_q.weight"),
-        ("self_attn.k_proj.weight", "attn_k.weight"),
-        ("self_attn.v_proj.weight", "attn_v.weight"),
-        ("self_attn.o_proj.weight", "attn_output.weight"),
-        ("mlp.gate_proj.weight", "ffn_gate.weight"),
-        ("mlp.up_proj.weight", "ffn_up.weight"),
-        ("mlp.down_proj.weight", "ffn_down.weight"),
-        ("input_layernorm.weight", "attn_norm.weight"),
-        ("post_attention_layernorm.weight", "ffn_norm.weight"),
-        // Gemma4 MoE-specific mappings
-        ("post_feedforward_layernorm_1.weight", "post_ffw_norm_1.weight"),
-        ("post_feedforward_layernorm_2.weight", "post_ffw_norm_2.weight"),
-        ("pre_feedforward_layernorm_2.weight", "pre_ffw_norm_2.weight"),
-        ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
-        ("pre_feedforward_layernorm.weight", "pre_ffw_norm.weight"),
-        ("router.proj.weight", "ffn_gate_inp.weight"),
-        ("router.scale", "ffn_gate_inp.scale"),
-        ("experts.gate_up_proj", "ffn_gate_up_exps.weight"),
-        ("experts.down_proj", "ffn_down_exps.weight"),
-        ("router.per_expert_scale", "ffn_down_exps.scale"),
-        ("layer_scalar", "layer_output_scale.weight"),
-        ("self_attn.q_norm.weight", "attn_q_norm.weight"),
-        ("self_attn.k_norm.weight", "attn_k_norm.weight"),
-    ];
+    // Architecture-aware: the same HF suffix maps to different GGUF names depending on arch.
+    let layer_map = layer_map_for_arch(arch);
 
     // Vision encoder layer patterns: model.vision_tower.encoder.layers.N.<suffix> → v.blk.N.<gguf_suffix>
     let vision_layer_map: &[(&str, &str)] = &[
@@ -782,7 +825,7 @@ fn hf_name_to_gguf(hf_name: &str) -> String {
             // Verify it is actually a number
             if layer_num.chars().all(|c| c.is_ascii_digit()) {
                 let suffix = &rest[dot_pos + 1..];
-                for &(hf_suffix, gguf_suffix) in layer_map {
+                for &(hf_suffix, gguf_suffix) in &layer_map {
                     if suffix == hf_suffix {
                         return format!("blk.{}.{}", layer_num, gguf_suffix);
                     }
@@ -807,12 +850,369 @@ enum MetaValue {
     String(String),
     Uint32(u32),
     Float32(f32),
+    Bool(bool),
     ArrayBool(Vec<bool>),
     ArrayUint32(Vec<u32>),
+    ArrayString(Vec<String>),
+    ArrayFloat32(Vec<f32>),
+    ArrayInt32(Vec<i32>),
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer metadata
+// ---------------------------------------------------------------------------
+
+// Token type constants matching llama.cpp's TokenType enum
+const TOKEN_TYPE_NORMAL: i32 = 1;
+// TOKEN_TYPE_UNKNOWN = 2 — not used; <unk> is in added_tokens with special=true,
+// so it gets TOKEN_TYPE_CONTROL like in llama.cpp's LlamaHfVocab.get_token_type().
+const TOKEN_TYPE_CONTROL: i32 = 3;
+const TOKEN_TYPE_USER_DEFINED: i32 = 4;
+const TOKEN_TYPE_BYTE: i32 = 6;
+
+/// Load tokenizer metadata from the model input directory and return GGUF
+/// metadata key-value pairs for embedding into the GGUF file.
+///
+/// Parses `tokenizer.json` and `tokenizer_config.json` from `input_dir`.
+/// Returns `None` if `tokenizer.json` is missing (graceful skip).
+fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, MetaValue)>> {
+    let tokenizer_path = input_dir.join("tokenizer.json");
+    if !tokenizer_path.exists() {
+        warn!(
+            "No tokenizer.json found in {}; skipping tokenizer embedding",
+            input_dir.display()
+        );
+        return None;
+    }
+
+    let tokenizer_json: serde_json::Value = match std::fs::read_to_string(&tokenizer_path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to parse tokenizer.json: {}; skipping tokenizer embedding", e);
+                return None;
+            }
+        },
+        Err(e) => {
+            warn!("Failed to read tokenizer.json: {}; skipping tokenizer embedding", e);
+            return None;
+        }
+    };
+
+    // Parse tokenizer_config.json for special token definitions
+    let config_path = input_dir.join("tokenizer_config.json");
+    let tokenizer_config: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    let model_section = tokenizer_json.get("model")?;
+
+    // Determine tokenizer model name
+    let tokenizer_model_name = determine_tokenizer_model_name(model_section, arch);
+    info!("Tokenizer model type: {}", tokenizer_model_name);
+
+    // Extract vocab: HashMap<String, u32> -> sorted Vec<String> by ID
+    let vocab_obj = model_section.get("vocab")?.as_object()?;
+    let vocab_size = vocab_obj.len();
+    let mut vocab_entries: Vec<(String, u32)> = vocab_obj
+        .iter()
+        .filter_map(|(k, v)| v.as_u64().map(|id| (k.clone(), id as u32)))
+        .collect();
+    vocab_entries.sort_by_key(|(_, id)| *id);
+
+    // Build ordered token string list
+    // Fill gaps with empty strings (shouldn't happen for well-formed vocabs)
+    let max_id = vocab_entries.last().map(|(_, id)| *id as usize).unwrap_or(0);
+    let total_tokens = max_id + 1;
+    let mut tokens: Vec<String> = vec![String::new(); total_tokens];
+    for (token, id) in &vocab_entries {
+        tokens[*id as usize] = token.clone();
+    }
+    info!("Loaded {} vocab tokens (max ID: {})", vocab_size, max_id);
+
+    // Extract merges: may be Vec<Vec<String>> (new format) or Vec<String> (old format)
+    let merges = extract_merges(model_section);
+    info!("Loaded {} merges", merges.len());
+
+    // Build set of added token IDs and special token IDs
+    let added_tokens_arr = tokenizer_json.get("added_tokens").and_then(|v| v.as_array());
+    let mut special_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    if let Some(added) = added_tokens_arr {
+        for entry in added {
+            let is_special = entry.get("special").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_special {
+                if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
+                    special_ids.insert(id as u32);
+                }
+            }
+        }
+    }
+
+    // Gemma4 set_vocab marks certain tokens as USER_DEFINED for chat parser visibility
+    let visible_tokens: std::collections::HashSet<&str> = [
+        "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>",
+        "<|tool_response>", "<tool_response|>", "<|\"|>",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    // Compute scores and token types for each token
+    // LlamaHfVocab.get_token_score() returns -1000.0 for all tokens
+    let scores: Vec<f32> = vec![-1000.0; total_tokens];
+
+    let token_types: Vec<i32> = tokens
+        .iter()
+        .enumerate()
+        .map(|(id, token)| {
+            let id_u32 = id as u32;
+            // Gemma4 overrides: certain visible tokens → USER_DEFINED
+            if arch == "gemma4" && visible_tokens.contains(token.as_str()) {
+                return TOKEN_TYPE_USER_DEFINED;
+            }
+            // Byte fallback tokens like <0x00>, <0xAB>
+            if is_byte_token(token) {
+                return TOKEN_TYPE_BYTE;
+            }
+            // Special/control tokens
+            if special_ids.contains(&id_u32) {
+                return TOKEN_TYPE_CONTROL;
+            }
+            TOKEN_TYPE_NORMAL
+        })
+        .collect();
+
+    // Look up special token IDs from tokenizer_config.json
+    let bos_id = resolve_special_token_id("bos_token", &tokenizer_config, &vocab_entries);
+    let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
+    let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
+    let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
+
+    // Build metadata KV pairs
+    let mut kv: Vec<(String, MetaValue)> = Vec::new();
+
+    // Required: tokenizer model name
+    kv.push((
+        "tokenizer.ggml.model".into(),
+        MetaValue::String(tokenizer_model_name),
+    ));
+
+    // Token strings
+    kv.push((
+        "tokenizer.ggml.tokens".into(),
+        MetaValue::ArrayString(tokens),
+    ));
+
+    // Scores
+    kv.push((
+        "tokenizer.ggml.scores".into(),
+        MetaValue::ArrayFloat32(scores),
+    ));
+
+    // Token types
+    kv.push((
+        "tokenizer.ggml.token_type".into(),
+        MetaValue::ArrayInt32(token_types),
+    ));
+
+    // Merges
+    if !merges.is_empty() {
+        kv.push((
+            "tokenizer.ggml.merges".into(),
+            MetaValue::ArrayString(merges),
+        ));
+    }
+
+    // Special token IDs
+    if let Some(id) = bos_id {
+        kv.push((
+            "tokenizer.ggml.bos_token_id".into(),
+            MetaValue::Uint32(id),
+        ));
+    }
+    if let Some(id) = eos_id {
+        kv.push((
+            "tokenizer.ggml.eos_token_id".into(),
+            MetaValue::Uint32(id),
+        ));
+    }
+    if let Some(id) = unk_id {
+        kv.push((
+            "tokenizer.ggml.unknown_token_id".into(),
+            MetaValue::Uint32(id),
+        ));
+    }
+    if let Some(id) = pad_id {
+        kv.push((
+            "tokenizer.ggml.padding_token_id".into(),
+            MetaValue::Uint32(id),
+        ));
+    }
+
+    // Bool flags
+    kv.push((
+        "tokenizer.ggml.add_bos_token".into(),
+        MetaValue::Bool(true),
+    ));
+    kv.push((
+        "tokenizer.ggml.add_space_prefix".into(),
+        MetaValue::Bool(false),
+    ));
+
+    info!(
+        "Tokenizer metadata: {} tokens, {} merges, bos={:?}, eos={:?}, unk={:?}, pad={:?}",
+        total_tokens,
+        kv.iter()
+            .find(|(k, _)| k == "tokenizer.ggml.merges")
+            .map(|(_, v)| match v {
+                MetaValue::ArrayString(a) => a.len(),
+                _ => 0,
+            })
+            .unwrap_or(0),
+        bos_id,
+        eos_id,
+        unk_id,
+        pad_id,
+    );
+
+    Some(kv)
+}
+
+/// Check if a token string matches the byte fallback pattern `<0xNN>` where NN
+/// is exactly two hexadecimal digits (case insensitive).
+fn is_byte_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 6
+        && bytes[0] == b'<'
+        && bytes[1] == b'0'
+        && bytes[2] == b'x'
+        && bytes[3].is_ascii_hexdigit()
+        && bytes[4].is_ascii_hexdigit()
+        && bytes[5] == b'>'
+}
+
+/// Determine the GGUF tokenizer model name based on tokenizer.json contents and arch.
+///
+/// Mapping follows llama.cpp's convert_hf_to_gguf.py:
+/// - Gemma4 with BPE + byte_fallback → "gemma4"
+/// - Other BPE + byte_fallback + Sequence decoder → "llama" (SentencePiece-style)
+/// - BPE without byte_fallback (ByteLevel decoder) → "gpt2"
+fn determine_tokenizer_model_name(model_section: &serde_json::Value, arch: &str) -> String {
+    let model_type = model_section
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let byte_fallback = model_section
+        .get("byte_fallback")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if arch == "gemma4" {
+        return "gemma4".into();
+    }
+
+    if model_type == "BPE" {
+        if byte_fallback {
+            // BPE with byte_fallback = SentencePiece-style → "llama"
+            "llama".into()
+        } else {
+            // BPE without byte_fallback → GPT-2 style
+            "gpt2".into()
+        }
+    } else {
+        // Default to "llama" for SentencePiece/Unigram models
+        "llama".into()
+    }
+}
+
+/// Extract merges from the tokenizer.json model section.
+///
+/// Handles both old format (`Vec<String>`: `["a b", ...]`) and new format
+/// (`Vec<Vec<String>>`: `[["a","b"], ...]`). In the new format, spaces within
+/// merge parts are encoded as chr(288) per llama.cpp convention.
+fn extract_merges(model_section: &serde_json::Value) -> Vec<String> {
+    let merges_val = match model_section.get("merges") {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    let merges_arr = match merges_val.as_array() {
+        Some(a) if !a.is_empty() => a,
+        _ => return Vec::new(),
+    };
+
+    // Detect format from first element
+    if merges_arr[0].is_string() {
+        // Old format: Vec<String> with "a b" format
+        merges_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    } else if merges_arr[0].is_array() {
+        // New format: Vec<Vec<String>> — each element is a 2-element array
+        // Per llama.cpp SpecialVocab: spaces in merge parts are encoded as chr(288)
+        let space_replacement = '\u{0120}'; // chr(ord(' ') + 256) = chr(288) = 'Ġ'
+
+        merges_arr
+            .iter()
+            .filter_map(|pair| {
+                let arr = pair.as_array()?;
+                if arr.len() != 2 {
+                    return None;
+                }
+                let left = arr[0].as_str()?;
+                let right = arr[1].as_str()?;
+
+                // Check if any part contains spaces and encode them
+                let left_encoded: String = left
+                    .chars()
+                    .map(|c| if c == ' ' { space_replacement } else { c })
+                    .collect();
+                let right_encoded: String = right
+                    .chars()
+                    .map(|c| if c == ' ' { space_replacement } else { c })
+                    .collect();
+
+                Some(format!("{} {}", left_encoded, right_encoded))
+            })
+            .collect()
+    } else {
+        warn!("Unknown merges format in tokenizer.json");
+        Vec::new()
+    }
+}
+
+/// Resolve a special token name (e.g., "bos_token") from tokenizer_config.json
+/// to its vocabulary ID.
+///
+/// The config value may be a plain string (e.g., `"<bos>"`) or an object with
+/// a `content` field (e.g., `{"content": "<bos>"}`).
+fn resolve_special_token_id(
+    token_key: &str,
+    config: &Option<serde_json::Value>,
+    vocab_entries: &[(String, u32)],
+) -> Option<u32> {
+    let config = config.as_ref()?;
+    let token_val = config.get(token_key)?;
+
+    // Extract the token string — it can be a string or an object with "content"
+    let token_str = if let Some(s) = token_val.as_str() {
+        s
+    } else if let Some(content) = token_val.get("content").and_then(|v| v.as_str()) {
+        content
+    } else {
+        return None;
+    };
+
+    // Look up token string in vocab to find its ID
+    vocab_entries
+        .iter()
+        .find(|(tok, _)| tok == token_str)
+        .map(|(_, id)| *id)
 }
 
 /// Build the GGUF metadata key-value list from model metadata.
-fn build_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
+fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, MetaValue)> {
     let meta = &model.metadata;
     let arch = &meta.model_type; // e.g. "llama", "gemma4"
 
@@ -1019,6 +1419,11 @@ fn build_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
         }
     }
 
+    // Load and embed tokenizer metadata from input directory
+    if let Some(tok_kv) = load_tokenizer_metadata(input_dir, arch) {
+        kv.extend(tok_kv);
+    }
+
     kv
 }
 
@@ -1075,9 +1480,37 @@ fn write_metadata_kv<W: IoWrite>(w: &mut W, key: &str, value: &MetaValue) -> std
                 w.write_all(&[b as u8])?;
             }
         }
+        MetaValue::Bool(v) => {
+            w.write_all(&GGUF_TYPE_BOOL.to_le_bytes())?;
+            w.write_all(&[*v as u8])?;
+        }
         MetaValue::ArrayUint32(arr) => {
             w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
             w.write_all(&GGUF_TYPE_UINT32.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            for &v in arr {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+        MetaValue::ArrayString(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_STRING.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            for s in arr {
+                write_gguf_string(w, s)?;
+            }
+        }
+        MetaValue::ArrayFloat32(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_FLOAT32.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            for &v in arr {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+        MetaValue::ArrayInt32(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_INT32.to_le_bytes())?;
             w.write_all(&(arr.len() as u64).to_le_bytes())?;
             for &v in arr {
                 w.write_all(&v.to_le_bytes())?;
@@ -1171,12 +1604,12 @@ mod tests {
     }
 
     #[test]
-    fn test_name_mapping() {
-        // Static mappings
-        assert_eq!(hf_name_to_gguf("model.embed_tokens.weight"), "token_embd.weight");
-        assert_eq!(hf_name_to_gguf("model.norm.weight"), "output_norm.weight");
-        assert_eq!(hf_name_to_gguf("lm_head.weight"), "output.weight");
-        // Layer mappings
+    fn test_name_mapping_llama() {
+        // Static mappings (arch-independent)
+        assert_eq!(hf_name_to_gguf("model.embed_tokens.weight", "llama"), "token_embd.weight");
+        assert_eq!(hf_name_to_gguf("model.norm.weight", "llama"), "output_norm.weight");
+        assert_eq!(hf_name_to_gguf("lm_head.weight", "llama"), "output.weight");
+        // Layer mappings for LLaMA-family
         let cases = [
             ("model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
             ("model.layers.15.self_attn.k_proj.weight", "blk.15.attn_k.weight"),
@@ -1188,10 +1621,98 @@ mod tests {
             ("model.layers.0.input_layernorm.weight", "blk.0.attn_norm.weight"),
             ("model.layers.0.post_attention_layernorm.weight", "blk.0.ffn_norm.weight"),
         ];
-        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf(hf), gguf, "mapping failed for {}", hf); }
+        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf(hf, "llama"), gguf, "mapping failed for {}", hf); }
         // Unknown passthrough
-        assert_eq!(hf_name_to_gguf("model.layers.5.some_new.weight"), "blk.5.some_new.weight");
-        assert_eq!(hf_name_to_gguf("decoder.block.0.weight"), "decoder.block.0.weight");
+        assert_eq!(hf_name_to_gguf("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
+        assert_eq!(hf_name_to_gguf("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
+        // Verify LLaMA-like archs all behave the same
+        for arch in &["mistral", "qwen3", "qwen2", "phi"] {
+            assert_eq!(
+                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                "blk.0.ffn_norm.weight",
+                "LLaMA-like arch '{}' should map post_attention_layernorm to ffn_norm", arch,
+            );
+        }
+    }
+
+    #[test]
+    fn test_name_mapping_gemma4() {
+        // Gemma4: post_attention_layernorm is a distinct norm, NOT ffn_norm
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma4"),
+            "blk.0.post_attention_norm.weight",
+        );
+        // Gemma4: pre_feedforward_layernorm IS ffn_norm
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            "blk.0.ffn_norm.weight",
+        );
+        // MoE norms
+        assert_eq!(
+            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
+            "blk.5.post_ffw_norm_1.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
+            "blk.5.post_ffw_norm_2.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
+            "blk.5.pre_ffw_norm_2.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm.weight", "gemma4"),
+            "blk.5.post_ffw_norm.weight",
+        );
+        // MoE routing
+        assert_eq!(
+            hf_name_to_gguf("model.layers.3.router.proj.weight", "gemma4"),
+            "blk.3.ffn_gate_inp.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.3.router.scale", "gemma4"),
+            "blk.3.ffn_gate_inp.scale",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.3.experts.gate_up_proj", "gemma4"),
+            "blk.3.ffn_gate_up_exps.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.3.experts.down_proj", "gemma4"),
+            "blk.3.ffn_down_exps.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.3.router.per_expert_scale", "gemma4"),
+            "blk.3.ffn_down_exps.scale",
+        );
+        // Layer scalar
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.layer_scalar", "gemma4"),
+            "blk.0.layer_output_scale.weight",
+        );
+        // Shared entries still work for Gemma4
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.self_attn.q_proj.weight", "gemma4"),
+            "blk.0.attn_q.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.input_layernorm.weight", "gemma4"),
+            "blk.0.attn_norm.weight",
+        );
+        // Gemma3/Gemma2 behave the same as Gemma4
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma3"),
+            "blk.0.post_attention_norm.weight",
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma2"),
+            "blk.0.post_attention_norm.weight",
+        );
+        // language_model. prefix stripping still works
+        assert_eq!(
+            hf_name_to_gguf("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            "blk.0.ffn_norm.weight",
+        );
     }
 
     #[test]
@@ -1250,7 +1771,8 @@ mod tests {
 
     #[test]
     fn test_metadata_keys() {
-        let kv = build_metadata(&model(vec![], 4));
+        let tmp = tempfile::tempdir().unwrap();
+        let kv = build_metadata(&model(vec![], 4), tmp.path());
         let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
         for expected in ["general.architecture", "general.name", "llama.block_count",
             "llama.embedding_length", "llama.attention.head_count",
