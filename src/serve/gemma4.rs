@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, D};
+use candle_core::quantized::QMatMul;
 use candle_nn::{Embedding, Module};
 use std::sync::Arc;
 
@@ -169,35 +170,28 @@ impl KvCache {
 }
 
 // ---------------------------------------------------------------------------
-// Linear layer (dequantized weights — MVP, no QMatMul yet)
+// QLinear layer (quantized weights via candle QMatMul)
 // ---------------------------------------------------------------------------
 
-struct Linear {
-    weight: Tensor,
+struct QLinear {
+    inner: QMatMul,
     bias: Option<Tensor>,
 }
 
-impl Linear {
-    fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+impl QLinear {
+    fn new(qmatmul: QMatMul, bias: Option<Tensor>) -> Self {
+        Self { inner: qmatmul, bias }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // GGUF stores weights as [in_features, out_features]
-        // Handle batched input: reshape [b, s, h] → [b*s, h], matmul, reshape back
-        let dims = x.dims().to_vec();
-        let result = if dims.len() == 3 {
-            let (b, s, h) = (dims[0], dims[1], dims[2]);
-            let flat = x.reshape((b * s, h))?;
-            let out = flat.matmul(&self.weight)?;
-            let out_dim = out.dim(1)?;
-            out.reshape((b, s, out_dim))?
-        } else {
-            x.matmul(&self.weight)?
-        };
+        // Metal QMatMul kernels require F32 input; cast and cast back
+        let in_dtype = x.dtype();
+        let x_f32 = if in_dtype != DType::F32 { x.to_dtype(DType::F32)? } else { x.clone() };
+        let out = self.inner.forward(&x_f32)?;
+        let out = if in_dtype != DType::F32 { out.to_dtype(in_dtype)? } else { out };
         match &self.bias {
-            Some(b) => result.broadcast_add(b).map_err(Into::into),
-            None => Ok(result),
+            Some(b) => out.broadcast_add(b).map_err(Into::into),
+            None => Ok(out),
         }
     }
 }
@@ -207,10 +201,10 @@ impl Linear {
 // ---------------------------------------------------------------------------
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -230,12 +224,9 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        Gemma4Model::nan_check(xs, "    attn input")?;
         let q_raw = self.q_proj.forward(xs)?;
-        Gemma4Model::nan_check(&q_raw, "    q_proj out")?;
         let q = q_raw.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
         let k_raw = self.k_proj.forward(xs)?;
-        Gemma4Model::nan_check(&k_raw, "    k_proj out")?;
         let k = k_raw.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
         let v = if self.k_eq_v {
             k.clone()
@@ -313,15 +304,15 @@ impl Attention {
 // ---------------------------------------------------------------------------
 
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: QLinear,
+    up_proj: QLinear,
+    down_proj: QLinear,
 }
 
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = candle_nn::Activation::Gelu.forward(&gate)?;
+        let gate = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
         let fused = (gate * up)?;
         self.down_proj.forward(&fused)
@@ -329,82 +320,115 @@ impl Mlp {
 }
 
 // ---------------------------------------------------------------------------
-// MoE (Mixture of Experts) with Sigmoid Routing
+// MoE (Mixture of Experts) with Softmax Routing
 // ---------------------------------------------------------------------------
 
 struct MoeBlock {
     /// Router projection: hidden_size → num_experts
-    router_proj: Linear,
-    /// Per-hidden-dim scale applied before routing
+    router_proj: QLinear,
+    /// Per-hidden-dim learned scale for router input
     router_scale: Tensor,
-    /// Per-expert scale/bias
+    /// Per-expert scale applied to selected weights after softmax
+    #[allow(dead_code)]
     per_expert_scale: Tensor,
-    /// Expert weights: gate_up [hidden, intermediate*2, num_experts] dequantized
-    expert_gate_up: Tensor,
-    /// Expert weights: down [intermediate, hidden, num_experts] dequantized
-    expert_down: Tensor,
+    /// Cached CPU copy of per_expert_scale (avoids GPU→CPU sync every forward)
+    per_expert_scale_cpu: Vec<f32>,
+    /// Per-expert pre-sliced contiguous weight pairs: (gate_up, down)
+    /// gate_up: [hidden, intermediate*2], down: [intermediate, hidden]
+    experts: Vec<(Tensor, Tensor)>,
     #[allow(dead_code)]
     num_experts: usize,
     top_k: usize,
     moe_intermediate_size: usize,
+    hidden_size: usize,
 }
 
 impl MoeBlock {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Forward pass. `x` is the pre-normed expert input, `router_input` is
+    /// the raw residual for the router (router applies its own RMS norm).
+    fn forward(&self, x: &Tensor, router_input: &Tensor) -> Result<Tensor> {
         let (b_sz, seq_len, hidden) = x.dims3()?;
         let x_flat = x.reshape((b_sz * seq_len, hidden))?;
+        let router_flat = router_input.reshape((b_sz * seq_len, hidden))?;
 
-        // Router: h_scaled = h * scale, logits = h_scaled @ proj, weighted by per_expert_scale
-        let x_scaled = x_flat.broadcast_mul(&self.router_scale)?;
-        let logits = self.router_proj.forward(&x_scaled)?; // [tokens, num_experts]
-        let logits = logits.broadcast_mul(&self.per_expert_scale)?;
+        // Router: unit_rms_norm(residual) * learned_scale * (1/sqrt(hidden)) → project → softmax
+        let router_normed = Attention::rms_norm_unit(&router_flat)?;
+        let scale_factor = (self.hidden_size as f64).powf(-0.5);
+        let router_scaled = (router_normed.broadcast_mul(&self.router_scale)? * scale_factor)?;
+        let logits = self.router_proj.forward(&router_scaled)?; // [tokens, num_experts]
 
-        // Sigmoid gating (not softmax)
-        let weights = candle_nn::ops::sigmoid(&logits)?; // [tokens, num_experts]
+        // Softmax gating
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?; // [tokens, num_experts]
 
-        // Process tokens — for MVP, loop over tokens
-        let weights_cpu: Vec<Vec<f32>> = weights.to_dtype(DType::F32)?.to_vec2()?;
+        // --- GPU-side top-k selection (avoids full probs GPU→CPU sync) ---
+        let probs_f32 = probs.to_dtype(DType::F32)?;
+        // arg_sort descending on GPU: first k indices are the top-k experts
+        let sorted_indices = probs_f32.contiguous()?.arg_sort_last_dim(false)?;
+        let top_k_indices = sorted_indices.narrow(D::Minus1, 0, self.top_k)?.contiguous()?;
+        // Gather the top-k probabilities on GPU
+        let top_k_probs = probs_f32.contiguous()?.gather(&top_k_indices, D::Minus1)?;
+        // Normalize: divide by sum of top-k probs (on GPU)
+        let top_k_sum = top_k_probs.sum_keepdim(D::Minus1)?;
+        let top_k_weights = top_k_probs.broadcast_div(&top_k_sum)?;
+        // Pull ONLY the tiny top-k results to CPU (top_k values per token, not 128)
+        let top_k_indices_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2()?;
+        let top_k_weights_cpu: Vec<Vec<f32>> = top_k_weights.to_vec2()?;
+        let per_expert_scale_cpu = &self.per_expert_scale_cpu;
         let num_tokens = b_sz * seq_len;
         let device = x.device();
         let dtype = x.dtype();
         let mut outputs: Vec<Tensor> = Vec::with_capacity(num_tokens);
 
         for tok_idx in 0..num_tokens {
-            let token_weights = &weights_cpu[tok_idx];
-
-            // Select top-k experts
-            let mut indexed: Vec<(usize, f32)> = token_weights.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            indexed.truncate(self.top_k);
-
-            let sum: f32 = indexed.iter().map(|&(_, w)| w).sum();
             let token_vec = x_flat.narrow(0, tok_idx, 1)?; // [1, hidden]
+            let top_k_actual = self.top_k;
 
-            let mut combined = Tensor::zeros((1, hidden), dtype, device)?;
+            // --- Batched expert forward: 2 GPU dispatches instead of 16 ---
 
-            for &(expert_idx, weight) in &indexed {
-                // Expert gate_up_proj: [hidden, intermediate*2, num_experts]
-                // Slice and squeeze to get [hidden, intermediate*2] as contiguous
-                let gate_up_w = self.expert_gate_up.narrow(2, expert_idx, 1)?
-                    .squeeze(2)?
-                    .contiguous()?; // [hidden, intermediate*2]
-                let gate_up = token_vec.matmul(&gate_up_w)?; // [1, intermediate*2]
+            // Stack selected expert gate_up weights: [top_k, hidden, intermediate*2]
+            let gate_up_refs: Vec<&Tensor> = (0..self.top_k)
+                .map(|k| &self.experts[top_k_indices_cpu[tok_idx][k] as usize].0)
+                .collect();
+            let stacked_gu = Tensor::stack(&gate_up_refs, 0)?;
 
-                let gate = gate_up.narrow(1, 0, self.moe_intermediate_size)?;
-                let up = gate_up.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
+            // Expand token to batch dim: [1, 1, hidden] -> [top_k, 1, hidden]
+            let token_3d = token_vec.unsqueeze(0)?;
+            let token_expanded = token_3d.expand(&[top_k_actual, 1, hidden])?;
 
-                let gate_act = candle_nn::Activation::Gelu.forward(&gate)?;
-                let fused = (gate_act * up)?;
+            // Batched matmul: [top_k, 1, hidden] @ [top_k, hidden, intermediate*2]
+            //              -> [top_k, 1, intermediate*2]
+            let all_gate_up = token_expanded.contiguous()?.matmul(&stacked_gu)?;
 
-                // down_proj: [intermediate, hidden, num_experts] → [intermediate, hidden]
-                let down_w = self.expert_down.narrow(2, expert_idx, 1)?
-                    .squeeze(2)?
-                    .contiguous()?; // [intermediate, hidden]
-                let expert_out = fused.matmul(&down_w)?; // [1, hidden]
+            // Split gate/up, apply GELU activation, fuse
+            let all_gate = all_gate_up.narrow(2, 0, self.moe_intermediate_size)?;
+            let all_up = all_gate_up.narrow(2, self.moe_intermediate_size, self.moe_intermediate_size)?;
+            let all_gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&all_gate)?;
+            let all_fused = (all_gate_act * all_up)?; // [top_k, 1, intermediate]
 
-                let scaled = (expert_out * (weight / sum) as f64)?;
-                combined = (combined + scaled)?;
-            }
+            // Stack selected expert down weights: [top_k, intermediate, hidden]
+            let down_refs: Vec<&Tensor> = (0..self.top_k)
+                .map(|k| &self.experts[top_k_indices_cpu[tok_idx][k] as usize].1)
+                .collect();
+            let stacked_down = Tensor::stack(&down_refs, 0)?;
+
+            // Batched matmul: [top_k, 1, intermediate] @ [top_k, intermediate, hidden]
+            //              -> [top_k, 1, hidden]
+            let all_expert_out = all_fused.contiguous()?.matmul(&stacked_down)?;
+
+            // Build combined per-expert scale: (normalized_weight * per_expert_scale)
+            // as a [top_k, 1, 1] tensor for broadcasting
+            let weights_data: Vec<f32> = (0..self.top_k)
+                .map(|k| {
+                    let eidx = top_k_indices_cpu[tok_idx][k] as usize;
+                    top_k_weights_cpu[tok_idx][k] * per_expert_scale_cpu[eidx]
+                })
+                .collect();
+            let weights_tensor = Tensor::from_vec(weights_data, (top_k_actual, 1, 1), device)?
+                .to_dtype(dtype)?;
+
+            // Weight and sum across experts: [top_k, 1, hidden] -> [1, hidden]
+            let all_weighted = all_expert_out.broadcast_mul(&weights_tensor)?;
+            let combined = all_weighted.sum(0)?; // [1, hidden]
 
             outputs.push(combined);
         }
@@ -446,28 +470,28 @@ impl DecoderLayer {
         let residual = xs;
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset)?;
-        Gemma4Model::nan_check(&attn_out, "  attn_out")?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         let xs = (residual + attn_out)?;
 
-        // 2. Dense MLP block
+        // 2. Dense MLP and MoE run in PARALLEL from the same residual
         let residual = &xs;
+
+        // Dense MLP branch
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        Gemma4Model::nan_check(&mlp_out, "  mlp_out")?;
-        let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        let xs = (residual + mlp_out)?;
+        let mlp_normed = self.post_feedforward_layernorm_1.forward(&mlp_out)?;
 
-        // 3. MoE block
-        let residual = &xs;
-        let normed = self.pre_feedforward_layernorm_2.forward(&xs)?;
-        let moe_out = self.moe.forward(&normed)?;
-        Gemma4Model::nan_check(&moe_out, "  moe_out")?;
-        let moe_out = self.post_feedforward_layernorm_1.forward(&moe_out)?;
-        let moe_out = self.post_feedforward_layernorm_2.forward(&moe_out)?;
-        let xs = (residual + moe_out)?;
+        // MoE branch (router takes raw residual; experts take pre-normed residual)
+        let normed_moe = self.pre_feedforward_layernorm_2.forward(&xs)?;
+        let moe_out = self.moe.forward(&normed_moe, &xs)?;
+        let moe_normed = self.post_feedforward_layernorm_2.forward(&moe_out)?;
 
-        // 4. Layer scalar
+        // Sum MLP and MoE outputs, apply final post-FFW norm
+        let combined = (mlp_normed + moe_normed)?;
+        let combined = self.post_feedforward_layernorm.forward(&combined)?;
+        let xs = (residual + combined)?;
+
+        // 3. Layer scalar
         xs.broadcast_mul(&self.layer_scalar).map_err(Into::into)
     }
 
@@ -527,19 +551,19 @@ impl Gemma4Model {
 
             // Attention
             let k_eq_v = is_full && cfg.attention_k_eq_v;
-            let k_proj = load_linear(gguf, &format!("{}.attn_k", lp))?;
+            let k_proj = load_qlinear(gguf, &format!("{}.attn_k", lp))?;
             let v_proj = if k_eq_v {
                 // V is tied to K — create a dummy (never used in forward)
-                Linear::new(k_proj.weight.clone(), k_proj.bias.clone())
+                QLinear::new(k_proj.inner.clone(), k_proj.bias.clone())
             } else {
-                load_linear(gguf, &format!("{}.attn_v", lp))?
+                load_qlinear(gguf, &format!("{}.attn_v", lp))?
             };
 
             let attn = Attention {
-                q_proj: load_linear(gguf, &format!("{}.attn_q", lp))?,
+                q_proj: load_qlinear(gguf, &format!("{}.attn_q", lp))?,
                 k_proj,
                 v_proj,
-                o_proj: load_linear(gguf, &format!("{}.attn_output", lp))?,
+                o_proj: load_qlinear(gguf, &format!("{}.attn_output", lp))?,
                 q_norm: load_rms_norm(gguf, &format!("{}.attn_q_norm", lp), cfg.rms_norm_eps)?,
                 k_norm: load_rms_norm(gguf, &format!("{}.attn_k_norm", lp), cfg.rms_norm_eps)?,
                 num_heads: cfg.num_attention_heads,
@@ -552,27 +576,54 @@ impl Gemma4Model {
 
             // Dense MLP
             let mlp = Mlp {
-                gate_proj: load_linear(gguf, &format!("{}.ffn_gate", lp))?,
-                up_proj: load_linear(gguf, &format!("{}.ffn_up", lp))?,
-                down_proj: load_linear(gguf, &format!("{}.ffn_down", lp))?,
+                gate_proj: load_qlinear(gguf, &format!("{}.ffn_gate", lp))?,
+                up_proj: load_qlinear(gguf, &format!("{}.ffn_up", lp))?,
+                down_proj: load_qlinear(gguf, &format!("{}.ffn_down", lp))?,
             };
 
-            // MoE
-            let expert_gate_up = gguf.get_tensor(
+            // MoE — pre-slice expert weights at load time to avoid per-token
+            // narrow/squeeze/contiguous overhead during forward pass.
+            // GGUF stores expert weights as 3D: candle reads dims as [num_experts, out, in]
+            // (GGUF dimensions are stored in reverse order from the logical layout).
+            let expert_gate_up_3d = gguf.get_tensor(
                 &format!("{}.ffn_gate_up_exps.weight", lp), MODEL_DTYPE,
             )?;
-            let expert_down = gguf.get_tensor(
+            let expert_down_3d = gguf.get_tensor(
                 &format!("{}.ffn_down_exps.weight", lp), MODEL_DTYPE,
             )?;
+
+            if i == 0 {
+                tracing::info!(
+                    "Expert gate_up shape: {:?}, down shape: {:?}",
+                    expert_gate_up_3d.shape(), expert_down_3d.shape()
+                );
+            }
+
+            // Slice on dim 0 (expert axis as loaded by candle).
+            // Each slice is [out_features, in_features], transpose to [in, out] for matmul.
+            let mut experts = Vec::with_capacity(cfg.num_experts);
+            for e in 0..cfg.num_experts {
+                let gu = expert_gate_up_3d.narrow(0, e, 1)?.squeeze(0)?
+                    .t()?.contiguous()?;  // [hidden, intermediate*2]
+                let d = expert_down_3d.narrow(0, e, 1)?.squeeze(0)?
+                    .t()?.contiguous()?;  // [intermediate, hidden]
+                experts.push((gu, d));
+            }
+            // Drop the 3D tensors — only pre-sliced copies are kept
+            drop(expert_gate_up_3d);
+            drop(expert_down_3d);
+
             let moe = MoeBlock {
-                router_proj: load_linear(gguf, &format!("{}.ffn_gate_inp", lp))?,
+                router_proj: load_qlinear(gguf, &format!("{}.ffn_gate_inp", lp))?,
                 router_scale: gguf.get_tensor(&format!("{}.ffn_gate_inp.scale", lp), MODEL_DTYPE)?,
                 per_expert_scale: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?,
-                expert_gate_up,
-                expert_down,
+                per_expert_scale_cpu: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?
+                    .to_dtype(DType::F32)?.to_vec1::<f32>()?,
+                experts,
                 num_experts: cfg.num_experts,
                 top_k: cfg.top_k_experts,
                 moe_intermediate_size: cfg.moe_intermediate_size,
+                hidden_size: cfg.hidden_size,
             };
 
             let layer = DecoderLayer {
@@ -580,8 +631,8 @@ impl Gemma4Model {
                 mlp,
                 moe,
                 input_layernorm: load_rms_norm(gguf, &format!("{}.attn_norm", lp), cfg.rms_norm_eps)?,
-                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps)?,
-                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.pre_ffw_norm", lp), cfg.rms_norm_eps)?,
+                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.post_attention_norm", lp), cfg.rms_norm_eps)?,
+                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps)?,
                 post_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.post_ffw_norm", lp), cfg.rms_norm_eps)?,
                 pre_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.pre_ffw_norm_2", lp), cfg.rms_norm_eps)?,
                 post_feedforward_layernorm_1: load_rms_norm(gguf, &format!("{}.post_ffw_norm_1", lp), cfg.rms_norm_eps)?,
@@ -617,7 +668,6 @@ impl Gemma4Model {
         // Embed and scale
         let mut xs = self.embed_tokens.forward(input_ids)?;
         xs = (xs * (self.hidden_size as f64).sqrt())?;
-        Self::nan_check(&xs, "post-embed")?;
 
         // Build causal mask for prefill (skip for single-token decode)
         let mask = if seq_len > 1 {
@@ -627,11 +677,8 @@ impl Gemma4Model {
         };
 
         // Transformer layers
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (_i, layer) in self.layers.iter_mut().enumerate() {
             xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?;
-            if i < 3 || Self::has_nan(&xs) {
-                Self::nan_check(&xs, &format!("layer-{}", i))?;
-            }
         }
 
         // Final norm + lm_head (last token only)
@@ -657,6 +704,7 @@ impl Gemma4Model {
         }
     }
 
+    #[allow(dead_code)]
     fn has_nan(t: &Tensor) -> bool {
         t.to_dtype(DType::F32)
             .and_then(|t| t.flatten_all())
@@ -665,6 +713,7 @@ impl Gemma4Model {
             .unwrap_or(true)
     }
 
+    #[allow(dead_code)]
     fn nan_check(t: &Tensor, label: &str) -> Result<()> {
         let flat = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let nan_count = flat.iter().filter(|v| v.is_nan()).count();
@@ -694,13 +743,463 @@ impl Gemma4Model {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn load_linear(gguf: &GgufModel, prefix: &str) -> Result<Linear> {
-    let weight = gguf.get_tensor(&format!("{}.weight", prefix), MODEL_DTYPE)?;
+fn load_qlinear(gguf: &GgufModel, prefix: &str) -> Result<QLinear> {
+    let qt = gguf.get_qtensor(&format!("{}.weight", prefix))?;
+    let qmm = QMatMul::from_arc(qt)?;
     let bias = gguf.try_get_tensor(&format!("{}.bias", prefix), MODEL_DTYPE)?;
-    Ok(Linear::new(weight, bias))
+    Ok(QLinear::new(qmm, bias))
 }
 
 fn load_rms_norm(gguf: &GgufModel, prefix: &str, eps: f64) -> Result<RmsNorm> {
     let weight = gguf.get_tensor(&format!("{}.weight", prefix), MODEL_DTYPE)?;
     Ok(RmsNorm::new(weight, eps))
+}
+
+// ---------------------------------------------------------------------------
+// Debug Forward-Pass Component Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+    use candle_core::quantized::QMatMul;
+    use std::path::Path;
+
+    const GGUF_PATH: &str =
+        "models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf";
+    const CONFIG_PATH: &str = "models/gemma4/config.json";
+
+    /// Helper: print first N f32 values from a tensor (flattened).
+    fn first_n(t: &Tensor, n: usize) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map(|v| v.into_iter().take(n).collect())
+            .unwrap_or_default()
+    }
+
+    /// Helper: max absolute difference between two tensors.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a_flat: Vec<f32> = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let b_flat: Vec<f32> = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        a_flat.iter().zip(b_flat.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn load_test_fixtures() -> (GgufModel, Gemma4Config, Device) {
+        let device = Device::new_metal(0).expect("Metal device required for these tests");
+        let gguf = GgufModel::load(Path::new(GGUF_PATH), &device)
+            .expect("Failed to load GGUF model");
+        let cfg = Gemma4Config::from_config_json(Path::new(CONFIG_PATH))
+            .expect("Failed to load config");
+        (gguf, cfg, device)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: Embedding lookup + scale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_01_embedding() {
+        let (gguf, cfg, _device) = load_test_fixtures();
+
+        let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE).unwrap();
+        // Transpose if GGUF stored as [hidden, vocab]
+        let embed_w = if embed_w.dim(0).unwrap() == cfg.hidden_size
+            && embed_w.dim(1).unwrap() == cfg.vocab_size
+        {
+            embed_w.t().unwrap().contiguous().unwrap()
+        } else {
+            embed_w
+        };
+
+        println!("\n=== Test 1: Embedding ===");
+        println!("token_embd.weight shape: {:?}", embed_w.shape());
+
+        // Look up token ID 2 (BOS)
+        let embed = candle_nn::Embedding::new(embed_w, cfg.hidden_size);
+        let token_ids = Tensor::new(&[2u32], embed.embeddings().device()).unwrap();
+        let token_ids = token_ids.unsqueeze(0).unwrap(); // [1, 1]
+        let emb = embed.forward(&token_ids).unwrap(); // [1, 1, hidden]
+
+        let scale = (cfg.hidden_size as f64).sqrt();
+        let scaled = (&emb * scale).unwrap();
+
+        println!("BOS embedding (raw) first 5: {:?}", first_n(&emb, 5));
+        println!("Scale factor: {}", scale);
+        println!("BOS embedding (scaled) first 5: {:?}", first_n(&scaled, 5));
+        println!("Embedding dtype: {:?}", scaled.dtype());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: QMatMul vs dequantized matmul
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_02_qmatmul_vs_dequant() {
+        let (gguf, _cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 2: QMatMul vs Dequantize ===");
+
+        // Load as QMatMul
+        let qt = gguf.get_qtensor("blk.0.attn_q.weight").unwrap();
+        let qmm = QMatMul::from_arc(qt).unwrap();
+
+        // Load as dequantized tensor
+        let deq_w = gguf.get_tensor("blk.0.attn_q.weight", DType::F32).unwrap();
+        println!("Dequantized weight shape: {:?}", deq_w.shape());
+
+        // Input: ones(1, 2816)
+        let input = Tensor::ones((1, 2816), DType::F32, &device).unwrap();
+
+        // QMatMul forward (does x @ W^T internally)
+        let qmm_out = qmm.forward(&input).unwrap();
+        println!("QMatMul output shape: {:?}", qmm_out.shape());
+        println!("QMatMul first 5: {:?}", first_n(&qmm_out, 5));
+
+        // Manual: input @ deq_w.T
+        let manual_out = input.matmul(&deq_w.t().unwrap()).unwrap();
+        println!("Dequant+matmul output shape: {:?}", manual_out.shape());
+        println!("Dequant+matmul first 5: {:?}", first_n(&manual_out, 5));
+
+        let diff = max_abs_diff(&qmm_out, &manual_out);
+        println!("Max abs diff: {}", diff);
+        assert!(diff < 1.0, "QMatMul vs dequant+matmul differ by more than 1.0: {}", diff);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: RmsNorm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_03_rmsnorm() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 3: RmsNorm ===");
+
+        let norm_w = gguf.get_tensor("blk.0.attn_norm.weight", MODEL_DTYPE).unwrap();
+        println!("attn_norm.weight shape: {:?}", norm_w.shape());
+        println!("attn_norm.weight first 5: {:?}", first_n(&norm_w, 5));
+
+        let norm = RmsNorm::new(norm_w, cfg.rms_norm_eps);
+
+        // Input: ones(1, 2816)
+        let input = Tensor::ones((1, 2816), MODEL_DTYPE, &device).unwrap();
+        let output = norm.forward(&input).unwrap();
+        println!("RmsNorm(ones) first 5: {:?}", first_n(&output, 5));
+        println!("  (should equal the norm weight values since ones are normalized to 1.0)");
+
+        // Input: arange for non-trivial test
+        let arange = Tensor::arange(0u32, 2816, &device).unwrap()
+            .to_dtype(DType::F32).unwrap()
+            .unsqueeze(0).unwrap()
+            .to_dtype(MODEL_DTYPE).unwrap();
+        let output2 = norm.forward(&arange).unwrap();
+        println!("RmsNorm(arange) first 5: {:?}", first_n(&output2, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: Single attention layer Q/K/V projections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_04_attention_projections() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 4: Attention Projections (layer 0) ===");
+
+        // Layer 0 is sliding attention
+        let is_full = cfg.is_full_attention(0);
+        let head_dim = cfg.head_dim_for_layer(0);
+        let num_kv_heads = cfg.num_kv_heads_for_layer(0);
+        println!("Layer 0: is_full={}, head_dim={}, num_heads={}, num_kv_heads={}",
+            is_full, head_dim, cfg.num_attention_heads, num_kv_heads);
+
+        // Load Q, K, V projections
+        let q_proj = load_qlinear(&gguf, "blk.0.attn_q").unwrap();
+        let k_proj = load_qlinear(&gguf, "blk.0.attn_k").unwrap();
+        let v_proj = load_qlinear(&gguf, "blk.0.attn_v").unwrap();
+
+        // Get the BOS embedding as input
+        let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE).unwrap();
+        let embed_w = if embed_w.dim(0).unwrap() == cfg.hidden_size
+            && embed_w.dim(1).unwrap() == cfg.vocab_size
+        {
+            embed_w.t().unwrap().contiguous().unwrap()
+        } else {
+            embed_w
+        };
+        let embed = candle_nn::Embedding::new(embed_w, cfg.hidden_size);
+        let token_ids = Tensor::new(&[2u32], &device).unwrap().unsqueeze(0).unwrap();
+        let emb = embed.forward(&token_ids).unwrap();
+        let scale = (cfg.hidden_size as f64).sqrt();
+        let input = (&emb * scale).unwrap(); // [1, 1, hidden]
+        println!("Input (scaled BOS) shape: {:?}, first 5: {:?}", input.shape(), first_n(&input, 5));
+
+        // Q projection
+        let q_out = q_proj.forward(&input.squeeze(0).unwrap()).unwrap();
+        let expected_q_dim = cfg.num_attention_heads * head_dim;
+        println!("Q projection output shape: {:?} (expected [1, {}])", q_out.shape(), expected_q_dim);
+        println!("Q first 5: {:?}", first_n(&q_out, 5));
+
+        // K projection
+        let k_out = k_proj.forward(&input.squeeze(0).unwrap()).unwrap();
+        let expected_k_dim = num_kv_heads * head_dim;
+        println!("K projection output shape: {:?} (expected [1, {}])", k_out.shape(), expected_k_dim);
+        println!("K first 5: {:?}", first_n(&k_out, 5));
+
+        // V projection
+        let v_out = v_proj.forward(&input.squeeze(0).unwrap()).unwrap();
+        println!("V projection output shape: {:?} (expected [1, {}])", v_out.shape(), expected_k_dim);
+        println!("V first 5: {:?}", first_n(&v_out, 5));
+
+        // Q/K norms
+        let q_norm = load_rms_norm(&gguf, "blk.0.attn_q_norm", cfg.rms_norm_eps).unwrap();
+        let k_norm = load_rms_norm(&gguf, "blk.0.attn_k_norm", cfg.rms_norm_eps).unwrap();
+
+        // Reshape Q to [1, 1, num_heads, head_dim] for norm
+        let q_reshaped = q_out.reshape((1, 1, cfg.num_attention_heads, head_dim)).unwrap();
+        let q_normed = q_norm.forward(&q_reshaped).unwrap();
+        println!("Q after norm, first 5: {:?}", first_n(&q_normed, 5));
+
+        let k_reshaped = k_out.reshape((1, 1, num_kv_heads, head_dim)).unwrap();
+        let k_normed = k_norm.forward(&k_reshaped).unwrap();
+        println!("K after norm, first 5: {:?}", first_n(&k_normed, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: MoE router
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_05_moe_router() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 5: MoE Router (layer 0) ===");
+
+        // Load router weights
+        let router_proj = load_qlinear(&gguf, "blk.0.ffn_gate_inp").unwrap();
+        let router_scale = gguf.get_tensor("blk.0.ffn_gate_inp.scale", MODEL_DTYPE).unwrap();
+        println!("Router scale shape: {:?}, first 5: {:?}", router_scale.shape(), first_n(&router_scale, 5));
+
+        let per_expert_scale = gguf.get_tensor("blk.0.ffn_down_exps.scale", MODEL_DTYPE).unwrap();
+        println!("Per-expert scale shape: {:?}, first 5: {:?}", per_expert_scale.shape(), first_n(&per_expert_scale, 5));
+
+        // Create a simple hidden state: ones(1, hidden)
+        let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
+
+        // Router pipeline: unit_rms_norm → scale → (1/sqrt(hidden)) → project → softmax
+        let normed = Attention::rms_norm_unit(&input).unwrap();
+        println!("After unit rms_norm first 5: {:?}", first_n(&normed, 5));
+
+        let scale_factor = (cfg.hidden_size as f64).powf(-0.5);
+        println!("Scale factor (1/sqrt({})): {}", cfg.hidden_size, scale_factor);
+
+        let scaled = (normed.broadcast_mul(&router_scale).unwrap() * scale_factor).unwrap();
+        println!("After scale first 5: {:?}", first_n(&scaled, 5));
+
+        let logits = router_proj.forward(&scaled).unwrap();
+        println!("Router logits shape: {:?}", logits.shape());
+        println!("Router logits first 5: {:?}", first_n(&logits, 5));
+
+        let probs = candle_nn::ops::softmax_last_dim(&logits).unwrap();
+        println!("Router probs first 5: {:?}", first_n(&probs, 5));
+
+        // Find top-8 experts
+        let probs_vec: Vec<f32> = probs.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let per_expert_vec: Vec<f32> = per_expert_scale.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+
+        let mut indexed: Vec<(usize, f32)> = probs_vec.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        println!("Top-8 experts:");
+        let sum: f32 = indexed.iter().take(cfg.top_k_experts).map(|(_, w)| w).sum();
+        for &(idx, weight) in indexed.iter().take(cfg.top_k_experts) {
+            let normalized = weight / sum;
+            let expert_scale = if idx < per_expert_vec.len() { per_expert_vec[idx] } else { 1.0 };
+            println!("  Expert {}: raw_prob={:.6}, normalized={:.6}, per_expert_scale={:.6}",
+                idx, weight, normalized, expert_scale);
+        }
+        println!("Sum of top-{} probs: {:.6}", cfg.top_k_experts, sum);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: Expert forward (expert 0, layer 0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_06_expert() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 6: Expert Forward (expert 0, layer 0) ===");
+
+        // Load 3D expert weights
+        let gate_up_3d = gguf.get_tensor("blk.0.ffn_gate_up_exps.weight", MODEL_DTYPE).unwrap();
+        let down_3d = gguf.get_tensor("blk.0.ffn_down_exps.weight", MODEL_DTYPE).unwrap();
+
+        println!("gate_up_exps raw shape (candle): {:?}", gate_up_3d.shape());
+        println!("down_exps raw shape (candle): {:?}", down_3d.shape());
+
+        // Slice expert 0, transpose to [in, out] for matmul
+        let gate_up_e0 = gate_up_3d.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+        println!("Expert 0 gate_up slice shape: {:?}", gate_up_e0.shape());
+        let gate_up_w = gate_up_e0.t().unwrap().contiguous().unwrap();
+        println!("Expert 0 gate_up (transposed) shape: {:?}", gate_up_w.shape());
+
+        let down_e0 = down_3d.narrow(0, 0, 1).unwrap().squeeze(0).unwrap();
+        println!("Expert 0 down slice shape: {:?}", down_e0.shape());
+        let down_w = down_e0.t().unwrap().contiguous().unwrap();
+        println!("Expert 0 down (transposed) shape: {:?}", down_w.shape());
+
+        // Input: ones(1, hidden)
+        let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
+
+        // gate_up = input @ gate_up_w
+        let gate_up = input.matmul(&gate_up_w).unwrap();
+        println!("gate_up output shape: {:?} (expected [1, {}])",
+            gate_up.shape(), cfg.moe_intermediate_size * 2);
+        println!("gate_up first 5: {:?}", first_n(&gate_up, 5));
+
+        // Split into gate and up
+        let gate = gate_up.narrow(1, 0, cfg.moe_intermediate_size).unwrap();
+        let up = gate_up.narrow(1, cfg.moe_intermediate_size, cfg.moe_intermediate_size).unwrap();
+        println!("gate shape: {:?}, first 5: {:?}", gate.shape(), first_n(&gate, 5));
+        println!("up shape: {:?}, first 5: {:?}", up.shape(), first_n(&up, 5));
+
+        // Apply GELU to gate, multiply by up
+        let gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&gate).unwrap();
+        println!("gate after GELU first 5: {:?}", first_n(&gate_act, 5));
+
+        let fused = (&gate_act * &up).unwrap();
+        println!("fused (gate*up) shape: {:?}, first 5: {:?}", fused.shape(), first_n(&fused, 5));
+
+        // down = fused @ down_w
+        let down_out = fused.matmul(&down_w).unwrap();
+        println!("down output shape: {:?} (expected [1, {}])", down_out.shape(), cfg.hidden_size);
+        println!("down first 5: {:?}", first_n(&down_out, 5));
+
+        // Check for NaN/Inf
+        let flat: Vec<f32> = down_out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let nan_count = flat.iter().filter(|v| v.is_nan()).count();
+        let inf_count = flat.iter().filter(|v| v.is_infinite()).count();
+        println!("NaN count: {}, Inf count: {}", nan_count, inf_count);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: Full layer 0 forward pass (dense MLP branch only)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_07_dense_mlp() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 7: Dense MLP (layer 0) ===");
+
+        // Load MLP weights
+        let gate_proj = load_qlinear(&gguf, "blk.0.ffn_gate").unwrap();
+        let up_proj = load_qlinear(&gguf, "blk.0.ffn_up").unwrap();
+        let down_proj = load_qlinear(&gguf, "blk.0.ffn_down").unwrap();
+
+        let mlp = Mlp { gate_proj, up_proj, down_proj };
+
+        // Input: ones(1, hidden)
+        let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
+
+        let gate_out = mlp.gate_proj.forward(&input).unwrap();
+        println!("gate_proj output shape: {:?}, first 5: {:?}", gate_out.shape(), first_n(&gate_out, 5));
+
+        let up_out = mlp.up_proj.forward(&input).unwrap();
+        println!("up_proj output shape: {:?}, first 5: {:?}", up_out.shape(), first_n(&up_out, 5));
+
+        let mlp_out = mlp.forward(&input).unwrap();
+        println!("Dense MLP output shape: {:?}, first 5: {:?}", mlp_out.shape(), first_n(&mlp_out, 5));
+
+        // NaN/Inf check
+        let flat: Vec<f32> = mlp_out.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let nan_count = flat.iter().filter(|v| v.is_nan()).count();
+        let inf_count = flat.iter().filter(|v| v.is_infinite()).count();
+        println!("NaN count: {}, Inf count: {}", nan_count, inf_count);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: Layer scalar + norms pipeline
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_08_layer_scalar_and_norms() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 8: Layer Scalar and Post-Norms (layer 0) ===");
+
+        let layer_scalar = gguf.get_tensor("blk.0.layer_output_scale.weight", MODEL_DTYPE).unwrap();
+        println!("layer_scalar shape: {:?}, first 5: {:?}", layer_scalar.shape(), first_n(&layer_scalar, 5));
+
+        let post_attn_norm = load_rms_norm(&gguf, "blk.0.post_attention_norm", cfg.rms_norm_eps).unwrap();
+        let post_ffw_norm = load_rms_norm(&gguf, "blk.0.post_ffw_norm", cfg.rms_norm_eps).unwrap();
+        let post_ffw_norm_1 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_1", cfg.rms_norm_eps).unwrap();
+        let post_ffw_norm_2 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_2", cfg.rms_norm_eps).unwrap();
+
+        // Test post-attention norm with ones
+        let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
+        let normed = post_attn_norm.forward(&input).unwrap();
+        println!("post_attention_norm(ones) first 5: {:?}", first_n(&normed, 5));
+
+        // Test layer scalar multiplication
+        let scaled = input.broadcast_mul(&layer_scalar).unwrap();
+        println!("ones * layer_scalar first 5: {:?}", first_n(&scaled, 5));
+
+        // Print all post-FFW norm weights for comparison
+        println!("post_ffw_norm weight first 5: {:?}", first_n(&post_ffw_norm.weight, 5));
+        println!("post_ffw_norm_1 weight first 5: {:?}", first_n(&post_ffw_norm_1.weight, 5));
+        println!("post_ffw_norm_2 weight first 5: {:?}", first_n(&post_ffw_norm_2.weight, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: End-to-end single token (BOS) through full model
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore]
+    fn test_forward_09_single_token_e2e() {
+        let (gguf, cfg, device) = load_test_fixtures();
+
+        println!("\n=== Test 9: Single Token (BOS) End-to-End ===");
+
+        let mut model = Gemma4Model::load(&cfg, &gguf, &device)
+            .expect("Failed to load full model");
+
+        let input_ids = Tensor::new(&[2u32], &device).unwrap().unsqueeze(0).unwrap();
+        println!("Input token IDs: [2] (BOS)");
+
+        let logits = model.forward(&input_ids, 0).unwrap();
+        println!("Logits shape: {:?}", logits.shape());
+
+        let logits_flat: Vec<f32> = logits.to_dtype(DType::F32).unwrap()
+            .flatten_all().unwrap().to_vec1().unwrap();
+
+        println!("Logits first 5: {:?}", &logits_flat[..5.min(logits_flat.len())]);
+
+        // Find top-5 token predictions
+        let mut indexed: Vec<(usize, f32)> = logits_flat.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        println!("Top-5 predicted tokens:");
+        for &(idx, logit) in indexed.iter().take(5) {
+            println!("  token {}: logit {:.4}", idx, logit);
+        }
+
+        // NaN/Inf check
+        let nan_count = logits_flat.iter().filter(|v| v.is_nan()).count();
+        let inf_count = logits_flat.iter().filter(|v| v.is_infinite()).count();
+        println!("NaN count: {}, Inf count: {} (out of {})", nan_count, inf_count, logits_flat.len());
+    }
 }

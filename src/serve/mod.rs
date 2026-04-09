@@ -113,16 +113,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let gguf = GgufModel::load(model_path, &device)?;
 
     // Load model weights from GGUF
-    eprintln!("Loading model weights from GGUF (this dequantizes ~13GB)...");
+    eprintln!("Loading model weights from GGUF (quantized QMatMul)...");
     let mut model = Gemma4Model::load(&cfg, &gguf, &device)?;
 
     // Load tokenizer
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-    // Encode prompt with chat template
+    // Encode prompt using GGUF-style control tokens for Gemma4
+    // Template: <bos> <|turn> system \n <|think|> <turn|> \n <|turn> user \n {prompt} <turn|> \n <|turn> model \n
     let prompt_text = format!(
-        "<bos><start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+        "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{}<turn|>\n<|turn>model\n",
         args.prompt
     );
     let encoding = tokenizer.encode(prompt_text.as_str(), false)
@@ -147,29 +148,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let input = Tensor::new(prompt_tokens.as_slice(), &device)?
         .unsqueeze(0)?;  // [1, seq_len]
     let mut logits = model.forward(&input, 0)?;
-    // Debug: inspect logits
-    {
-        let l = logits.to_dtype(candle_core::DType::F32)?.squeeze(0)?.squeeze(0)?;
-        let l_vec: Vec<f32> = l.to_vec1()?;
-        let max_val = l_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let min_val = l_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let nan_count = l_vec.iter().filter(|v| v.is_nan()).count();
-        let inf_count = l_vec.iter().filter(|v| v.is_infinite()).count();
-        let argmax = l_vec.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map(|(i,_)| i).unwrap_or(0);
-        eprintln!("[DEBUG] logits: min={:.4}, max={:.4}, nan={}, inf={}, argmax={}, vocab_size={}",
-            min_val, max_val, nan_count, inf_count, argmax, l_vec.len());
-        // Show top-5 tokens
-        let mut indexed: Vec<(usize, f32)> = l_vec.iter().copied().enumerate().collect();
-        indexed.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-        eprintln!("[DEBUG] top-5: {:?}", &indexed[..5.min(indexed.len())]);
-    }
 
     let mut next_token = sampler::sample_token(&logits, &params, &[])?;
     all_tokens.push(next_token);
 
     let token_str = tokenizer.decode(&[next_token], false)
         .unwrap_or_default();
-    eprintln!("[DEBUG] first token: id={}, str={:?}", next_token, token_str);
     print!("{}", token_str);
     std::io::stdout().flush()?;
 
@@ -191,9 +175,6 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
         let token_str = tokenizer.decode(&[next_token], false)
             .unwrap_or_default();
-        if generated <= 5 {
-            eprintln!("[DEBUG] token {}: id={}, str={:?}", generated, next_token, token_str);
-        }
         print!("{}", token_str);
         std::io::stdout().flush()?;
     }

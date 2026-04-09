@@ -65,7 +65,6 @@ impl GgufModel {
     }
 
     /// Load a QTensor (quantized form, stays compressed on device).
-    #[allow(dead_code)]
     pub fn get_qtensor(&self, name: &str) -> Result<Arc<QTensor>> {
         // Check cache first
         {
