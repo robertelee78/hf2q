@@ -111,9 +111,21 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - [x] 6 forward pass bugs fixed: GELU variant, MLP/MoE parallel, softmax routing, router input processing, per-expert scale, norm assignments
 - [x] 2 GGUF norm name mismatches fixed (post_attention_norm, ffn_norm)
 - [x] Chat template: uses GGUF Jinja-style control tokens (<|turn>, <|think|>, <turn|>)
-- [x] Benchmarked: 14 tok/s decode (M5 Max) — llama.cpp does 107 tok/s on same hardware
-- [ ] MoE expert weights still dequantized (merged 3D GGUF; per-expert QMatMul requires format change — not worth it per research)
-- [ ] Speed gap: 14 vs 107 tok/s — need GPU sync reduction, batched MoE, attention optimization
+- [x] Benchmarked: 18 tok/s decode (M5 Max) after GPU routing + batched MoE — llama.cpp does 107 tok/s
+- [x] GPU-side top-k routing (arg_sort + gather on GPU, only 8 values pulled to CPU)
+- [x] Batched expert matmuls (Tensor::stack + batched matmul, 480→60 dispatches per token)
+- [ ] Speed gap: 18 vs 107 tok/s — requires custom Metal mul_mat_id kernel (see below)
+
+#### Phase 1b: Metal mul_mat_id Kernel (PLANNED)
+Custom Metal compute kernels for MoE expert dispatch, leveraging existing mlx-native crate:
+- **Reuse mlx-native infrastructure** (`/opt/mlx-native`): kernel_registry.rs, device.rs, encoder.rs, buffer.rs
+- **moe_gate.metal already exists** — single-kernel GPU-side router (RMS norm → matmul → top-k → softmax → per_expert_scale)
+- **moe_dispatch.metal already exists** — fused GELU+multiply, weighted accumulation for expert FFN
+- **quantized_matmul.metal has dequant helpers** for 4/6/8-bit inline dequantization
+- **New kernel needed**: `moe_expert_qmatmul.metal` — indexed matmul into 3D quantized GGUF tensor, combining moe_dispatch's expert pattern with quantized_matmul's dequant functions
+- Load expert weights as merged 3D QTensors (not dequantized) — kernel indexes directly by expert_id * stride
+- Two approaches possible: (a) use metal-rs directly alongside candle buffers (QMetalStorage::buffer() is public), or (b) add mlx-native as a dependency and use its kernel_registry
+- Expected: close the 6x gap (18→~100 tok/s) by reducing to 2 kernel dispatches per MoE layer
 
 ### Phase 2: HTTP Server
 - Restore spec-layer code (schema, SSE, tool parsing) from git history after deep review
