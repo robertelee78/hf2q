@@ -125,15 +125,29 @@ impl OutputBackend for GgufBackend {
         output_dir: &Path,
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError> {
-        std::fs::create_dir_all(output_dir)?;
-
-        let filename = format!(
-            "{}-Q{}_{}.gguf",
-            sanitize_model_type(&model.metadata.model_type),
-            model.bits,
-            model.group_size,
-        );
-        let out_path = output_dir.join(&filename);
+        // If output_dir is a .gguf file path, use it directly; otherwise treat as directory
+        let (out_path, filename) = if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            if let Some(parent) = output_dir.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            let fname = output_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            (output_dir.to_path_buf(), fname)
+        } else {
+            std::fs::create_dir_all(output_dir)?;
+            let fname = format!(
+                "{}-Q{}_{}.gguf",
+                sanitize_model_type(&model.metadata.model_type),
+                model.bits,
+                model.group_size,
+            );
+            (output_dir.join(&fname), fname)
+        };
         info!("Writing GGUF to {}", out_path.display());
 
         // Collect tensors in deterministic order
@@ -229,8 +243,13 @@ impl OutputBackend for GgufBackend {
             file_size as f64 / (1024.0 * 1024.0)
         );
 
+        let manifest_dir = if output_dir.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            output_dir.parent().unwrap_or(output_dir).to_string_lossy().into_owned()
+        } else {
+            output_dir.to_string_lossy().into_owned()
+        };
         Ok(OutputManifest {
-            output_dir: output_dir.to_string_lossy().into_owned(),
+            output_dir: manifest_dir,
             files: vec![OutputFile {
                 filename,
                 size_bytes: file_size,
@@ -321,11 +340,21 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
 
 /// Convert a HuggingFace tensor name to its GGUF equivalent.
 fn hf_name_to_gguf(hf_name: &str) -> String {
+    // Strip language_model. prefix (Gemma4 conditional-generation models)
+    let hf_name = hf_name.replace("language_model.", "");
+    let hf_name = hf_name.as_str();
+
     // Static patterns (no layer number)
     let static_map: &[(&str, &str)] = &[
         ("model.embed_tokens.weight", "token_embd.weight"),
         ("model.norm.weight", "output_norm.weight"),
         ("lm_head.weight", "output.weight"),
+        // Vision static tensors
+        ("model.vision_tower.patch_embedder.input_proj.weight", "v.patch_embd.weight"),
+        ("model.vision_tower.patch_embedder.position_embedding_table", "v.position_embd.weight"),
+        ("model.vision_tower.std_bias", "v.std_bias"),
+        ("model.vision_tower.std_scale", "v.std_scale"),
+        ("model.embed_vision.embedding_projection.weight", "mm.0.weight"),
     ];
 
     for &(hf, gguf) in static_map {
@@ -345,7 +374,55 @@ fn hf_name_to_gguf(hf_name: &str) -> String {
         ("mlp.down_proj.weight", "ffn_down.weight"),
         ("input_layernorm.weight", "attn_norm.weight"),
         ("post_attention_layernorm.weight", "ffn_norm.weight"),
+        // Gemma4 MoE-specific mappings
+        ("post_feedforward_layernorm_1.weight", "post_ffw_norm_1.weight"),
+        ("post_feedforward_layernorm_2.weight", "post_ffw_norm_2.weight"),
+        ("pre_feedforward_layernorm_2.weight", "pre_ffw_norm_2.weight"),
+        ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+        ("pre_feedforward_layernorm.weight", "pre_ffw_norm.weight"),
+        ("router.proj.weight", "ffn_gate_inp.weight"),
+        ("router.scale", "ffn_gate_inp.scale"),
+        ("experts.gate_up_proj", "ffn_gate_up_exps.weight"),
+        ("experts.down_proj", "ffn_down_exps.weight"),
+        ("router.per_expert_scale", "ffn_down_exps.scale"),
+        ("layer_scalar", "layer_output_scale.weight"),
+        ("self_attn.q_norm.weight", "attn_q_norm.weight"),
+        ("self_attn.k_norm.weight", "attn_k_norm.weight"),
     ];
+
+    // Vision encoder layer patterns: model.vision_tower.encoder.layers.N.<suffix> → v.blk.N.<gguf_suffix>
+    let vision_layer_map: &[(&str, &str)] = &[
+        ("self_attn.q_proj.linear.weight", "attn_q.weight"),
+        ("self_attn.k_proj.linear.weight", "attn_k.weight"),
+        ("self_attn.v_proj.linear.weight", "attn_v.weight"),
+        ("self_attn.o_proj.linear.weight", "attn_output.weight"),
+        ("self_attn.q_norm.weight", "attn_q_norm.weight"),
+        ("self_attn.k_norm.weight", "attn_k_norm.weight"),
+        ("input_layernorm.weight", "ln1.weight"),
+        ("post_attention_layernorm.weight", "ln2.weight"),
+        ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
+        ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+        ("mlp.gate_proj.linear.weight", "ffn_gate.weight"),
+        ("mlp.up_proj.linear.weight", "ffn_up.weight"),
+        ("mlp.down_proj.linear.weight", "ffn_down.weight"),
+    ];
+
+    const VISION_LAYER_PREFIX: &str = "model.vision_tower.encoder.layers.";
+    if let Some(rest) = hf_name.strip_prefix(VISION_LAYER_PREFIX) {
+        if let Some(dot_pos) = rest.find('.') {
+            let layer_num = &rest[..dot_pos];
+            if layer_num.chars().all(|c| c.is_ascii_digit()) {
+                let suffix = &rest[dot_pos + 1..];
+                for &(hf_suffix, gguf_suffix) in vision_layer_map {
+                    if suffix == hf_suffix {
+                        return format!("v.blk.{}.{}", layer_num, gguf_suffix);
+                    }
+                }
+                // Pass through unknown vision layer suffixes with best-effort mapping
+                return format!("v.blk.{}.{}", layer_num, suffix);
+            }
+        }
+    }
 
     // Parse "model.layers.N.<suffix>" without regex
     const LAYER_PREFIX: &str = "model.layers.";
@@ -532,7 +609,6 @@ fn sanitize_model_type(model_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::ir::{DType, ModelMetadata, QuantizedModel, QuantizedTensor, TensorQuantInfo};
 
     fn meta() -> ModelMetadata {
