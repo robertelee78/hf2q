@@ -142,11 +142,11 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - Pre-allocate a reusable buffer at model load time, copy selected expert weights into it
 - Eliminates allocation jitter (MoE variance 1.4-8.0ms → stable ~1.5ms)
 
-**1b.3: Global attention layer spikes — CONFIRMED WARMUP ONLY** (low priority)
-- Global attention layers (every 6th) spike to 5-13ms on first decode token only
-- By second decode token, global layers are 0.5ms (same as sliding) — this is Metal kernel compilation warmup
-- Could add a warmup token at startup, but not a sustained bottleneck
-- No action needed for speed parity
+**1b.3: Global attention layer spikes — CONFIRMED WARMUP ONLY** (Phase 2, easy)
+- Global attention layers (every 6th) spike to 5-13ms on first decode token only (~37ms extra TTFT)
+- By second decode token, global layers are 0.5ms (same as sliding) — Metal kernel compilation warmup
+- Fix: run a dummy warmup token at server startup before accepting requests (Phase 2)
+- Not a throughput issue, but matters for TTFT in server context
 
 **Steady-state decode breakdown (confirmed, token 2+):**
 - Attention: 0.5ms/layer (fast, stable)
