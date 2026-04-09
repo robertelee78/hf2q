@@ -149,12 +149,12 @@ impl OutputBackend for GgufBackend {
             (output_dir.to_path_buf(), fname)
         } else {
             std::fs::create_dir_all(output_dir)?;
-            let fname = format!(
-                "{}-Q{}_{}.gguf",
-                sanitize_model_type(&model.metadata.model_type),
-                model.bits,
-                model.group_size,
-            );
+            // Use the output directory name as the base filename
+            let dir_name = output_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| sanitize_model_type(&model.metadata.model_type));
+            let fname = format!("{}.gguf", dir_name);
             (output_dir.join(&fname), fname)
         };
         info!("Writing GGUF to {}", out_path.display());
@@ -315,16 +315,327 @@ impl OutputBackend for GgufBackend {
         } else {
             output_dir.to_string_lossy().into_owned()
         };
+
+        let mut output_files = vec![OutputFile {
+            filename,
+            size_bytes: file_size,
+        }];
+        let mut total_size = file_size;
+
+        // Check for vision tensors and write mmproj GGUF if present
+        let has_vision = model.tensors.keys().any(|name| {
+            let n = name.as_str();
+            n.contains("vision_tower") || n.contains("embed_vision")
+        });
+
+        if has_vision {
+            let mmproj_result = write_mmproj_gguf(model, &out_path, progress)?;
+            total_size += mmproj_result.size_bytes;
+            output_files.push(mmproj_result);
+        }
+
         Ok(OutputManifest {
             output_dir: manifest_dir,
-            files: vec![OutputFile {
-                filename,
-                size_bytes: file_size,
-            }],
-            total_size_bytes: file_size,
+            files: output_files,
+            total_size_bytes: total_size,
             shard_count: 1,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mmproj (vision) GGUF writer
+// ---------------------------------------------------------------------------
+
+/// Derive the mmproj output path from the text GGUF path.
+///
+/// Inserts `-mmproj` before the `.gguf` extension:
+///   `model-text.gguf` -> `model-text-mmproj.gguf`
+fn mmproj_path_from_text(text_path: &Path) -> std::path::PathBuf {
+    let stem = text_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let new_name = format!("{}-mmproj.gguf", stem);
+    text_path.with_file_name(new_name)
+}
+
+/// Build mmproj-specific GGUF metadata from the model's vision config.
+///
+/// The mmproj GGUF uses `general.architecture = "clip"` and `general.type = "mmproj"`,
+/// with all vision parameters under the `clip.vision.*` namespace. This matches the
+/// format expected by llama.cpp's clip.cpp loader.
+fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
+    let meta = &model.metadata;
+    let vc = meta.raw_config.get("vision_config").cloned().unwrap_or_default();
+    let tc = meta.raw_config.get("text_config").cloned().unwrap_or_default();
+
+    let mut kv: Vec<(String, MetaValue)> = Vec::new();
+
+    // Core identification — mmproj uses "clip" architecture
+    kv.push((
+        "general.architecture".into(),
+        MetaValue::String("clip".into()),
+    ));
+    kv.push((
+        "general.type".into(),
+        MetaValue::String("mmproj".into()),
+    ));
+    kv.push((
+        "general.file_type".into(),
+        MetaValue::Uint32(ggml_ftype_from_bits(model.bits)),
+    ));
+
+    // clip.has_vision_encoder = true
+    kv.push((
+        "clip.has_vision_encoder".into(),
+        MetaValue::Bool(true),
+    ));
+
+    // Projector type — Gemma4 uses "gemma4v"
+    let projector_type = match meta.model_type.as_str() {
+        "gemma4" => "gemma4v",
+        "gemma3" => "gemma3",
+        _ => "mlp",
+    };
+    kv.push((
+        "clip.vision.projector_type".into(),
+        MetaValue::String(projector_type.into()),
+    ));
+
+    // Vision geometry parameters from vision_config
+    let image_size = vc.get("image_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(224) as u32;
+    kv.push((
+        "clip.vision.image_size".into(),
+        MetaValue::Uint32(image_size),
+    ));
+
+    let patch_size = vc.get("patch_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(14) as u32;
+    kv.push((
+        "clip.vision.patch_size".into(),
+        MetaValue::Uint32(patch_size),
+    ));
+
+    let vision_hidden_size = vc.get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1024) as u32;
+    kv.push((
+        "clip.vision.embedding_length".into(),
+        MetaValue::Uint32(vision_hidden_size),
+    ));
+
+    let vision_intermediate_size = vc.get("intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096) as u32;
+    kv.push((
+        "clip.vision.feed_forward_length".into(),
+        MetaValue::Uint32(vision_intermediate_size),
+    ));
+
+    let vision_block_count = vc.get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(24) as u32;
+    kv.push((
+        "clip.vision.block_count".into(),
+        MetaValue::Uint32(vision_block_count),
+    ));
+
+    let vision_head_count = vc.get("num_attention_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(16) as u32;
+    kv.push((
+        "clip.vision.attention.head_count".into(),
+        MetaValue::Uint32(vision_head_count),
+    ));
+
+    // Layer norm epsilon
+    let layer_norm_eps = vc.get("layer_norm_eps")
+        .or_else(|| vc.get("rms_norm_eps"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
+    kv.push((
+        "clip.vision.attention.layer_norm_epsilon".into(),
+        MetaValue::Float32(layer_norm_eps),
+    ));
+
+    // Projection dimension = text model hidden size (the target dim for the projection)
+    let text_hidden_size = tc.get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .or_else(|| meta.raw_config.get("hidden_size").and_then(|v| v.as_u64()))
+        .unwrap_or(meta.hidden_size as u64) as u32;
+    kv.push((
+        "clip.vision.projection_dim".into(),
+        MetaValue::Uint32(text_hidden_size),
+    ));
+
+    // Image mean/std — Gemma4 uses standardization via tensors (std_bias/std_scale),
+    // but llama.cpp still expects these metadata fields. Use [0.5, 0.5, 0.5] as the
+    // default for Gemma4 (ImageNet-style normalization when no preprocessor_config).
+    kv.push((
+        "clip.vision.image_mean".into(),
+        MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
+    ));
+    kv.push((
+        "clip.vision.image_std".into(),
+        MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
+    ));
+
+    kv
+}
+
+/// Write a separate mmproj GGUF file containing vision encoder and multimodal
+/// projection tensors. Returns the `OutputFile` entry for the manifest.
+///
+/// The mmproj file contains only tensors with vision-related HF names
+/// (`vision_tower.*`, `embed_vision.*`) — exactly the tensors filtered OUT of
+/// the text GGUF. Tensor names are mapped using the same `hf_name_to_gguf()`
+/// function which already handles `v.blk.N.*` and `mm.0.*` patterns.
+fn write_mmproj_gguf(
+    model: &QuantizedModel,
+    text_path: &Path,
+    progress: &ProgressReporter,
+) -> Result<OutputFile, BackendError> {
+    let mmproj_path = mmproj_path_from_text(text_path);
+    let mmproj_filename = mmproj_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    info!("Writing mmproj GGUF to {}", mmproj_path.display());
+
+    // Collect vision tensors in deterministic order
+    let mut vision_tensor_names: Vec<&String> = model.tensors.keys()
+        .filter(|name| {
+            let n = name.as_str();
+            n.contains("vision_tower") || n.contains("embed_vision")
+        })
+        .collect();
+    vision_tensor_names.sort();
+
+    if vision_tensor_names.is_empty() {
+        return Err(BackendError::WriteFailed {
+            reason: "No vision tensors found for mmproj GGUF".into(),
+        });
+    }
+
+    info!(
+        "Mmproj: {} vision tensors to write",
+        vision_tensor_names.len()
+    );
+
+    let pb = progress.bar(
+        vision_tensor_names.len() as u64,
+        "Writing mmproj GGUF tensors",
+    );
+
+    // Build mmproj metadata
+    let metadata = build_mmproj_metadata(model);
+    let tensor_count = vision_tensor_names.len() as u64;
+    let kv_count = metadata.len() as u64;
+
+    let file = File::create(&mmproj_path).map_err(|e| BackendError::WriteFailed {
+        reason: format!("Failed to create {}: {}", mmproj_path.display(), e),
+    })?;
+    let mut w = BufWriter::new(file);
+
+    // --- Header ---
+    w.write_all(&GGUF_MAGIC)?;
+    w.write_all(&GGUF_VERSION.to_le_bytes())?;
+    w.write_all(&tensor_count.to_le_bytes())?;
+    w.write_all(&kv_count.to_le_bytes())?;
+
+    // --- Metadata KV pairs ---
+    for (key, value) in &metadata {
+        write_metadata_kv(&mut w, key, value)?;
+    }
+
+    // --- Pass 1: Compute tensor sizes and offsets ---
+    let mut tensor_infos: Vec<TensorWriteInfo> = Vec::with_capacity(vision_tensor_names.len());
+    let mut tensor_data_offset: u64 = 0;
+
+    for name in &vision_tensor_names {
+        let qt = &model.tensors[*name];
+        let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
+        let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+
+        // Vision tensors are preserved as F16 — no repacking needed, data passes through
+        let total_elements: usize = qt.shape.iter().product();
+        let repacked_size = if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
+            qt.data.len()
+        } else {
+            ggml_tensor_size(total_elements, ggml_type)
+        };
+
+        tensor_data_offset = align_up(tensor_data_offset, ALIGNMENT);
+
+        tensor_infos.push(TensorWriteInfo {
+            gguf_name,
+            shape: qt.shape.clone(),
+            ggml_type,
+            data_offset: tensor_data_offset,
+            data_len: repacked_size,
+        });
+
+        tensor_data_offset += repacked_size as u64;
+    }
+
+    // Write tensor info entries
+    for info in &tensor_infos {
+        write_tensor_info(&mut w, info)?;
+    }
+
+    // --- Padding to alignment before tensor data ---
+    let header_end = w.stream_position()?;
+    let padding_needed = align_up(header_end, ALIGNMENT) - header_end;
+    if padding_needed > 0 {
+        w.write_all(&vec![0u8; padding_needed as usize])?;
+    }
+
+    let data_block_start = w.stream_position()?;
+    debug!("Mmproj tensor data block starts at offset {}", data_block_start);
+
+    // --- Pass 2: Repack and write one tensor at a time ---
+    for (i, name) in vision_tensor_names.iter().enumerate() {
+        let qt = &model.tensors[*name];
+        let info = &tensor_infos[i];
+
+        // Pad to alignment
+        let current = w.stream_position()?;
+        let target = data_block_start + info.data_offset;
+        if current < target {
+            w.write_all(&vec![0u8; (target - current) as usize])?;
+        }
+
+        // Repack and write (vision tensors are typically preserved F16, so this
+        // is usually a passthrough copy)
+        let data = repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| {
+            BackendError::WriteFailed {
+                reason: format!("Failed to repack vision tensor '{}': {}", name, e),
+            }
+        })?;
+        w.write_all(&data)?;
+        pb.inc(1);
+    }
+
+    w.flush()?;
+    pb.finish_with_message("Mmproj GGUF tensors written");
+
+    let file_size = std::fs::metadata(&mmproj_path)?.len();
+    info!(
+        "Mmproj GGUF file written: {} ({:.2} MB)",
+        mmproj_path.display(),
+        file_size as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(OutputFile {
+        filename: mmproj_filename,
+        size_bytes: file_size,
+    })
 }
 
 // ---------------------------------------------------------------------------
