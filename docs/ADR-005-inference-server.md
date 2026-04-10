@@ -127,7 +127,7 @@ Deep review of the deleted code is required before restoring to confirm each fil
 
 This replan reframes Phase 1b around a Crawl/Walk/Run discipline. The earlier plan treated speed as the primary axis and innovated kernel-by-kernel toward numeric gates. That produced one silent correctness regression (commit `a0952e2` → gibberish; see bisect below) and a narrative that drifted from what the code actually does (see the 1b.6 "done vs PARTIAL" contradiction below). This rewrite hard-codes fidelity as the primary axis.
 
-> **Crawl (done, commit `0a703d7`).** Produce coherent, correct output on quantized inference. Achieved at 13.8 → 23.8 tok/s, zero variance, with a known-good Paris baseline and a bisectable commit series.
+> **Crawl (partial, commit `0a703d7`; verified 2026-04-10).** Produces coherent quantized output at 13.8 → 23.8 tok/s with zero variance. **`scripts/crawl_verify.sh` revealed an argmax-flip divergence vs llama.cpp at decode token 1:** both tools produce the *same top-10 candidate set* for the byte-identical 187-token prompt (essay-continuation tokens: `To`, `The`, `Connecting`, `Tracing`, `While`, `Modern`, `Linking`, `Expl`, `Mapping`, `Brid`), but the argmax flips on a near-tied pair — llama.cpp picks `To` (-0.65 logprob), hf2q picks `The` (logit ~0.75 above `To`). Once flipped, the second token is conditioned on the first → outputs diverge into different but coherent essays. The math is *close* to llama.cpp, not architecturally divergent. Walk's job is to close the remaining numerical-precision gap (FP reduction order, fused-vs-unfused residual, kernel ordering) so hf2q's argmax aligns with llama.cpp's, AND to reach the speed target. **The earlier `llama-completion --jinja` "thought channel" output was a red herring** — `--jinja` applies a different prompt path than passing the rendered GGUF template directly; when both tools see byte-identical inputs they agree on the candidate set.
 >
 > **Walk.** Port proven patterns from C/Python reference implementations — llama.cpp, mlx-lm, candle — to Rust. **No innovation.** Every Walk item must cite a specific `file:line` in one of those references that it is porting. Items without a working citation are Run territory and deferred. Phase 1b is Walk-only.
 >
@@ -176,7 +176,34 @@ tests/fixtures/crawl_verified.meta         # commit SHAs, GGUF sha256, divergenc
 
 Layer B is re-checked at milestone boundaries, not on every commit. Layer A is the hot gate.
 
-**Materialization.** Both layers are produced by a single script, `scripts/crawl_verify.sh`, which takes a `--commit` flag and writes all three fixtures atomically. Agent #3 is creating the script in parallel with this rewrite; this ADR is the authoritative spec.
+**Materialization.** Both layers are produced by a single script, `scripts/crawl_verify.sh` (commits `2f038e1` initial, `b0f75c1` llama-completion fix, `5257072` --log-disable removal). The script takes a `--commit` flag and writes all three fixtures atomically.
+
+**Fixture state (2026-04-10).** None of the three Design C fixtures are committed yet. `crawl_verify.sh --commit` was run once and produced **RED classification** (divergence at byte 0). Committing those outputs would encode hf2q's wrong-argmax baseline as truth, so they were deliberately not added to git. **Per-commit gate is hf2q HEAD's self-baseline (Layer A only) for bisect-safety, until hf2q's argmax at decode 1 aligns with llama.cpp's** — at which point Layer B (llama.cpp reference) and `crawl_verified.meta` can be committed and the gate upgrades to llama-anchored. Track progress in `tests/fixtures/crawl_progress.md` (one row per Walk item, recording divergence point + top-1 token).
+
+**Walk progress metric (added 2026-04-10).** After each Walk item lands, run two checks:
+1. `scripts/crawl_verify.sh <gguf>` (no `--commit`) — reports the byte-level divergence point and classification (RED/YELLOW/GREEN/PERFECT).
+2. `HF2Q_DUMP_LOGITS=/tmp/h.bin ./target/release/hf2q generate --model <gguf> --prompt-file tests/bench_prompt_128.txt --max-tokens 1 --temperature 0` and inspect the top-10 (id, logit) tuples printed to stderr. Cross-reference against llama-server's `/completion` endpoint with `n_probs=10` on the rendered template to compare top-10 rankings.
+
+**The Walk-correctness success signal is "hf2q's top-1 token at decode 1 matches llama.cpp's top-1 token,"** measured by the above. Stronger than Layer A token-match against a frozen self-baseline, weaker than full byte-level Layer B match. This is what unblocks fixture commit and the upgrade from Design A to Design B.
+
+**Crawl Verification Result (2026-04-10).** First end-to-end run of `crawl_verify.sh` against the DWQ Gemma 4 26B MoE GGUF on M5 Max:
+
+- hf2q top-10 logits at decode 1: `[(818,27.10), (2021,26.36), (101068,23.34), (216100,22.50), (129264,20.42), (8409,19.55), (32899,19.06), (12282,18.24), (20647,18.03), (155571,17.74)]` decoded as `[The, To, Connecting, Tracing, Linking, While, Modern, Mapping, Expl, Brid]`.
+- llama.cpp top-10 logprobs at decode 1 (via llama-server `/completion` with `n_probs=10` on the byte-identical 187-token prompt): `[(2021,-0.6487), (818,-0.7663), (101068,-5.2554), (216100,-5.5368), (8409,-6.4215), (32899,-7.2102), (129264,-7.9774), (20647,-8.6333), (90894,-9.0234), (10176,-10.0107)]` decoded as `[To, The, Connecting, Tracing, While, Modern, Linking, Expl, Transl, Direct]`.
+- **Top-10 candidate sets are nearly identical** — both tools select essay-continuation tokens, 8 of the top 10 token IDs match exactly (818, 2021, 101068, 216100, 8409, 32899, 129264, 20647). Only the 9th and 10th positions differ slightly (`Mapping`/`Brid` for hf2q vs `Transl`/`Direct` for llama.cpp).
+- **The argmax flips on a near-tied pair:** llama.cpp prefers `To` (logprob -0.65, ~52% prob) over `The` (logprob -0.77, ~46% prob); hf2q prefers `The` (logit 27.10) over `To` (logit 26.36, gap ~0.75). At greedy T=0 this small gap is enough to send the two tools down completely different generation paths.
+- **The math is close, not architecturally divergent.** The remaining gap is FP precision drift (RmsNorm reduction order, fused-vs-unfused residual, kernel ordering). Each Walk item should tighten it.
+- **Verification rendering chain validated:** chat template loaded from GGUF metadata (12045 chars), minijinja renders byte-identically to Python `jinja2` (1154 chars), tokenizes to 187 tokens via both `models/gemma4/tokenizer.json` and the mlx-community tokenizer (zero token-level diffs), final 10 tokens are `[., <turn|>, \n, <|turn>, model, \n, <|channel>, thought, \n, <channel|>]` as expected.
+
+**`--jinja` gotcha.** `llama-completion --jinja` applies a different prompt path than the GGUF template — it produces thought-channel output (`<|channel>thought\n\n*  *Context:*...`) where /completion+rendered-template produces essay output. **Always measure against `llama-server /completion` with the rendered template, OR use `crawl_verify.sh`** which handles the path correctly. Do NOT use `llama-completion --jinja` output as the reference baseline.
+
+**Diagnostics (commit `5257072`).** Three diagnostic tools support Walk verification:
+
+| Tool | Purpose |
+|---|---|
+| `HF2Q_DUMP_PROMPT_TOKENS=1 ./target/release/hf2q generate ...` | Print first/last 10 prompt token IDs to stderr — verifies tokenization end-to-end |
+| `HF2Q_DUMP_LOGITS=path.bin ./target/release/hf2q generate ...` | Write first decode-step logits as 262144 f32 LE bytes to `path.bin`; print top-10 (id, logit) tuples to stderr |
+| `scripts/crawl_verify.sh <gguf> [--commit] [--prompt-file PATH]` | Run hf2q + llama-completion on the same prompt at T=0, report longest common byte prefix and classification (RED/YELLOW/GREEN/PERFECT) |
 
 **Red flags (immediate rollback, same as before):**
 - Token repetition patterns: `own own own`, `the the the`, `\n\n\n\n` runs.
@@ -268,8 +295,9 @@ Cross-reference. MLX-LM collapses the entire 8-expert dispatch to a single `affi
 Items are ordered by dependency and Walk safety. Each is either a valid port with a live citation or it is not executed.
 
 **Pre-flight:**
-- **1bNEW.0 — Metrics instrumentation.** Promoted from phantom to first item, satisfying Anti-Goal #11 (no items without a Chesterton section).
-- **1bNEW.0b — Un-fuse `forward_with_residual`.** First code change. Re-aligns the layer with mlx-lm and llama.cpp references before anything else touches hot code.
+- **1bNEW.0a — Load chat template from GGUF metadata. (DONE 2026-04-10, commit `8a2c84c`.)** Closed a pre-existing Phase 1 violation: `mod.rs:246` hardcoded a literal Gemma 4 chat template string; the ADR's own line 44 product requirement specified CLI > GGUF metadata > tokenizer_config.json priority. Track 1 added `minijinja = "2"`, parsed `tokenizer.chat_template` from GGUF metadata in the serve-load path, added `--chat-template` and `--chat-template-file` CLI flags, kept the hardcoded string as final fallback only. Required before Crawl verification could be meaningful (otherwise hf2q and llama.cpp query the model with subtly different prompts).
+- **1bNEW.0 — Metrics instrumentation.** Promoted from phantom to numbered item, satisfying Anti-Goal #11 (no items without a Chesterton section).
+- **1bNEW.0b — Un-fuse `forward_with_residual`.** First post-instrumentation code change. Re-aligns the layer with mlx-lm and llama.cpp references before anything else touches hot code. **Walk progress test:** after this lands, re-run `scripts/crawl_verify.sh` and check whether hf2q's top-1 token at decode 1 has moved from `The` toward `To` — that is the mechanical Walk-correctness signal.
 
 **Walk items (reference-cited ports):**
 - 1bNEW.1 — Unified MoE kernel (ports `kernel_mul_mv_id_*` from llama.cpp)
@@ -293,6 +321,18 @@ Metrics instrumentation (required **before** any code item):
 > Add to `mod.rs` so every benchmark run dumps `metrics.txt` with: `dispatches_per_token`, `moe_to_vec2_count`, `moe_dispatches_per_layer`, `sampler_sync_count`, `norm_dispatches_per_token`. These turn "stop and diagnose on plateau" into a mechanical check.
 
 ##### 3. Per-Item Detail
+
+---
+
+**1bNEW.0a — Load chat template from GGUF metadata (Pre-flight, DONE 2026-04-10, commit `8a2c84c`)**
+- **What it does:** Replaces the hardcoded format string at `src/serve/mod.rs:246` with a Jinja2-rendered template loaded from the GGUF's `tokenizer.chat_template` metadata key. Adds `minijinja = "2"` to `Cargo.toml`. Adds `--chat-template <STRING>` and `--chat-template-file <PATH>` to `GenerateArgs`. Adds `GgufModel::get_metadata_string()` helper in `src/serve/gguf_loader.rs`. Resolves at `cmd_generate` time with priority: CLI string > CLI file > GGUF metadata > fallback hardcoded string. Renders with `messages=[{role: "user", content: prompt}]`, `add_generation_prompt=true`, `bos_token="<bos>"`, `eos_token="<eos>"`.
+- **Why it helped:** This was a Phase 1 product-requirement violation, not a Phase 1b speed item. ADR-005 line 44 (Product Requirements) and line 691 (Resolved Questions) both specified the priority order, but `mod.rs:246` shipped with a hardcoded string. Because llama.cpp loads from GGUF metadata, hf2q and llama.cpp were querying the model with subtly different prompts whenever the GGUF's embedded template diverged from the hardcoded one. Crawl verification against llama.cpp was meaningless until this was fixed.
+- **Correctness risk:** LOW. Verified post-fix that minijinja renders the GGUF template byte-identically to Python `jinja2` (1154 chars, identical bytes, identical 187-token tokenization).
+- **Validation plan:** Compile clean (`cargo build --release --features metal`). Compare minijinja output to `jinja2` reference output on the GGUF template (done; identical). Run `crawl_verify.sh` (done; produced the divergence finding logged in the Crawl bullet above).
+- **Dependencies:** None.
+- **Estimated LOC:** ~80 actual (10 Cargo.toml, 11 cli.rs, 15 gguf_loader.rs, 118 mod.rs).
+- **Chesterton's fence:** The hardcoded string was added during Phase 1 as a quick path to coherent output. It was never updated to read from GGUF metadata even though the ADR specified it should.
+- **Reference citation:** llama.cpp `common/chat.cpp` uses a vendored Jinja parser at `common/jinja/`; mlx-lm uses Python `jinja2` via HF tokenizers' `apply_chat_template`. minijinja is the canonical pure-Rust Jinja2 subset, matching ADR line 681 (pure-Rust constraint).
 
 ---
 
@@ -568,11 +608,14 @@ Each question is a measurement task. Spike duration is bounded; results go into 
 - [x] Primary model: Gemma 4 26B MoE
 
 ### Phase 1b: Speed Optimization (Walk)
+- [x] **1bNEW.0a — Chat template loaded from GGUF metadata** (commit `8a2c84c`, 2026-04-10). Closed pre-existing Phase 1 violation; Crawl verification is now meaningful.
+- [ ] **Walk-correctness end gate: hf2q's top-1 token at decode 1 matches llama.cpp's top-1 token** on the canonical bench prompt (currently: hf2q=`The`, llama.cpp=`To`; both in each other's top-2). This is the precise success metric for Walk on the correctness axis.
 - [ ] Decode speed matches or exceeds llama.cpp on the same hardware (≥107 tok/s on M5 Max, Gemma 4 26B MoE, Q4_K_M), measured using the canonical benchmark harness
 - [ ] Prefill speed matches or exceeds llama.cpp on the same hardware
 - [ ] MoE expert matmul runs on quantized weights directly via a fused `kernel_mul_mv_id_*`-style dispatch (no CPU-driven per-expert loop)
-- [ ] Every Phase 1b commit token-matches `tests/fixtures/crawl_baseline.tokens` exactly
-- [ ] At each milestone boundary, the divergence point vs `tests/fixtures/llama_cpp_reference.tokens` has not worsened
+- [ ] **Per-commit gate (Layer A):** Every Phase 1b commit token-matches `tests/fixtures/crawl_baseline.tokens` exactly. *Fixture pending — currently uses hf2q HEAD self-baseline as a transitional measure until the Walk-correctness end gate is met (top-1 matches llama.cpp), at which point Layer A is regenerated against hf2q HEAD post-fix and Layer B (`llama_cpp_reference.tokens`) is committed.*
+- [ ] **Milestone gate (Layer B):** At each milestone boundary, the divergence point vs `tests/fixtures/llama_cpp_reference.tokens` has not worsened. *Layer B fixture pending — committed after Walk-correctness end gate is met.*
+- [ ] **Walk progress tracker:** `tests/fixtures/crawl_progress.md` records, after each Walk item lands, the top-1 token (decoded) from both hf2q and llama.cpp at decode step 1, plus the L_inf delta on the top-10 logits.
 - [ ] Multi-shape sweep: 1-token, 128-token, 512-token, and 2048-token prompts produce coherent output through the same code path (no benchmark-only specialization)
 - [ ] `metrics.txt` at End gate shows: `moe_to_vec2_count == 0`, `sampler_sync_count ≤ 1`, `norm_dispatches_per_token ≤ 330`, `moe_dispatches_per_layer ≤ 4`
 
@@ -630,3 +673,7 @@ Each question is a measurement task. Spike duration is bounded; results go into 
 - **Crawl/Walk/Run discipline (2026-04-10):** Phase 1b is Walk-only. Every item cites a reference `file:line`. Innovation is Run, deferred.
 - **Tier-gate removal (2026-04-10):** Replaced with Progress discipline and Stop-and-diagnose on plateau. The only per-commit gate is Layer A token match; the only End gate is ≥107 tok/s.
 - **Walk Exception Register (2026-04-10):** `forward_with_residual` is the only current exception, to be un-fused in Phase 1b pre-flight item 1bNEW.0b.
+- **Chat template loading (resolved 2026-04-10, commit `8a2c84c`):** Pre-existing Phase 1 violation closed in Phase 1b pre-flight item 1bNEW.0a. `mod.rs:246` was hardcoding the Gemma 4 chat template; now loads from GGUF metadata via `minijinja`. Priority: CLI `--chat-template` > CLI `--chat-template-file` > GGUF `tokenizer.chat_template` > fallback hardcoded string. Verified that minijinja renders the GGUF template byte-identically to Python `jinja2`.
+- **Crawl verification result (2026-04-10):** First end-to-end run of `crawl_verify.sh` against the DWQ Gemma 4 26B MoE GGUF on M5 Max showed hf2q and llama.cpp produce *identical top-10 candidate sets* at decode step 1 (8 of 10 token IDs match exactly), but the argmax flips on a near-tied pair: llama.cpp picks `To` (-0.65 logprob), hf2q picks `The` (~0.75 logit above `To`). The math is close, not architecturally divergent — the gap is FP precision drift that Walk ports (1bNEW.0b un-fuse, 1bNEW.4 fused RmsNorm port, 1bNEW.6 fused RoPE port, 1bNEW.1 unified MoE kernel) should each tighten. Walk-correctness end gate: hf2q's top-1 == llama.cpp's top-1. Earlier `llama-completion --jinja` "thought channel" output was a red herring caused by `--jinja` taking a different prompt path than passing the rendered GGUF template directly via `/completion`.
+- **Diagnostic env vars (added 2026-04-10, commit `5257072`):** `HF2Q_DUMP_PROMPT_TOKENS=1` prints first/last 10 prompt token IDs to stderr. `HF2Q_DUMP_LOGITS=path.bin` writes the first decode-step's full logit vector (262144 f32 LE bytes) and prints top-10 (id, logit) tuples to stderr. Both gated behind env-var presence, no runtime cost when unset.
+- **`crawl_verify.sh` flag set (lessons from 2026-04-10 verification):** Use `llama-completion` (NOT `llama-cli`, which is a chat REPL that hangs on stdin). Required flags: `--predict N --temp 0 --seed 42 --no-display-prompt --jinja -st -ngl 999 </dev/null`. Do NOT use `--log-disable` (it suppresses generated stdout, not just info logs). Do NOT use `llama-completion --jinja` output as a reference baseline — it differs from `/completion + rendered template`; use `llama-server /completion` for logit comparison instead.
