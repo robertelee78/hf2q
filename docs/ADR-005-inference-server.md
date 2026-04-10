@@ -47,7 +47,7 @@ hf2q can now quantize HuggingFace models to llama.cpp-compatible GGUF format. Th
    - QMatMul on quantized tensors (no dequantize-to-float)
    - If candle lacks Metal QMatMul kernels for specific K-quant types, we write our own Metal kernels
    - Metal GPU acceleration (primary)
-   - Current baseline: 100 tok/s decode on M4 via llama.cpp with our GGUF
+   - Current baseline: 107 tok/s decode on M5 Max via llama.cpp with our GGUF (Q4_K_M, Gemma 4 26B MoE). Baseline is hardware-specific — re-measure on each target chip
 
 7. **Concurrency:** continuous batching (vLLM-style) — batch multiple requests through the model simultaneously for maximum throughput
 
@@ -102,10 +102,10 @@ Deep review of the deleted code is required before restoring to confirm each fil
 
 ## Implementation Phases
 
-### Phase 1: Text Inference (candle QMatMul) -- COMPLETE (2026-04-09)
+### Phase 1: Text Inference (candle QMatMul) -- COMPLETE (correctness, 2026-04-09)
 - [x] Load GGUF with candle's quantized tensor system
-- [x] Forward pass using QMatMul (no dequantize) for all linear layers (attention, MLP, MoE router)
-- [x] MoE expert weights pre-sliced at load time (eliminates per-token narrow/squeeze/contiguous)
+- [x] Forward pass using QMatMul (no dequantize) for attention, MLP, and MoE router linear layers
+- [x] MoE expert weights dequantized to BF16 and pre-sliced at load time (eliminates per-token narrow/squeeze/contiguous; quantized expert matmul deferred to 1b.1)
 - [x] KV cache for efficient decode
 - [x] `hf2q generate` CLI working, produces coherent correct output
 - [x] 6 forward pass bugs fixed: GELU variant, MLP/MoE parallel, softmax routing, router input processing, per-expert scale, norm assignments
@@ -113,110 +113,155 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - [x] Chat template: uses GGUF Jinja-style control tokens (<|turn>, <|think|>, <turn|>)
 - [x] Benchmarked: 18 tok/s decode (M5 Max) after GPU routing + batched MoE — llama.cpp does 107 tok/s
 - [x] GPU-side top-k routing (arg_sort + gather on GPU, only 8 values pulled to CPU)
-- [x] Batched expert matmuls (Tensor::stack + batched matmul, 480→60 dispatches per token)
-- [ ] Speed gap: 18 vs 107 tok/s — requires custom Metal mul_mat_id kernel (see below)
+- [x] Batched expert matmuls (Tensor::stack + batched BF16 matmul, reduced per-token dispatch count)
+- [ ] Speed gap: 18 vs 107 tok/s — deferred to Phase 1b (see below)
 
-#### Phase 1b: Speed Optimization (PLANNED)
+#### Phase 1b: Speed Optimization (IN PROGRESS — implementation batch 1 complete)
 
-**Profiled decode breakdown (per layer, single token, M5 Max):**
-| Component | Time | % | Notes |
-|-----------|------|---|-------|
-| Attention (sliding) | 0.6ms | 19% | Fast, QMatMul efficient |
-| Attention (global, every 6th) | 5-8ms | — | 10x spike, needs investigation |
-| Dense MLP | 0.4ms | 13% | Fast |
-| MoE experts | 1.5-8ms | 55-65% | #1 bottleneck, high variance from Tensor::stack allocs |
-| Rest (norms, residual) | 0.3ms | 9% | Negligible |
-| **Total per layer** | **2.6-4.0ms** | | 30 layers → ~90ms/token → ~11 tok/s (18 without profiling overhead) |
+**Profiled decode breakdown (per layer, single token, M5 Max, Gemma 4 26B MoE Q4_K_M, 30 layers):**
 
-**Steady-state decode breakdown (confirmed via profiling, token 2+):**
-- Attention: 0.5ms/layer (fast, stable)
-- MLP: 0.3ms/layer (fast, stable)
-- MoE: 1.5-2.5ms/layer (60-70% of total, high variance from Tensor::stack allocs)
-- Total: ~80ms/30 layers = ~12 tok/s with profiling, 18 tok/s without
+Note: "profiled" timings include `to_scalar` GPU sync per component (~7ms overhead total). The 18 tok/s baseline is CPU-loop throughput without forced GPU sync; actual GPU-complete throughput is unknown without Metal instrumentation.
+
+| Component | Time | % | vs llama.cpp target (0.31ms/layer) |
+|-----------|------|---|-------------------------------------|
+| Attention (sliding) | 0.5-0.6ms | 19% | ~2x over budget |
+| Attention (global, every 6th) | 5-8ms | — | 16-26x over budget; see 1b.16 |
+| Dense MLP | 0.3-0.4ms | 13% | ~1x (at target) |
+| MoE experts | 1.5-2.5ms steady / up to 8ms spike | 60-70% | 5-8x over budget; #1 bottleneck |
+| Rest (norms, residual) | 0.3ms | 9% | ~1x |
+| **Total per layer (steady-state)** | **~2.6ms** | | ~80ms/30 layers = ~12 tok/s (profiled), 18 tok/s (unprofiled) |
+
 - Target: llama.cpp ~0.31ms/layer = 9.3ms/30 layers = 107 tok/s
-- **Gap is ~6x per layer across ALL components, not just MoE. No silver bullet — need 10-15 optimizations.**
+- **Gap is ~8x per layer. MoE is the biggest single target, but attention and overhead also need reduction. No silver bullet — need 10-15 optimizations.**
 
-**Approach: measure → change → measure. Profile after every optimization.**
+**Approach: measure → change → measure. Profile after every optimization using the canonical benchmark (see below).**
+
+**Canonical Benchmark Harness:**
+- Model: Gemma 4 26B MoE Q4_K_M GGUF
+- Hardware: M5 Max (report chip variant and memory)
+- Prompt: 128 tokens (fixed test prompt, committed to repo)
+- Generation: 128 tokens, greedy (temperature=0)
+- Runs: 5 consecutive, report median tok/s and p95
+- Metric: decode tok/s (exclude first-token latency)
+- Tool: `hf2q generate --model <gguf> --prompt-file <test_prompt> --max-tokens 128 --temperature 0 --benchmark`
+
+**Tier Gates:**
+- After Tier 1: must reach ≥40 tok/s decode before starting Tier 2 (validates MoE kernel + core overhead reductions)
+- After Tier 2: must reach ≥70 tok/s decode before starting Tier 3 (validates per-op overhead elimination)
+- After Tier 3+4: target ≥100 tok/s decode (parity with llama.cpp)
+- If a tier's gate is not met, investigate root cause before proceeding — do not skip tiers
 
 #### Tier 1: MoE dispatch (biggest single bottleneck, 60-70% of decode)
 
-**1b.1: Custom Metal mul_mat_id kernel** (highest impact, hardest)
-- Port llama.cpp's `kernel_mul_mv_id` (MV decode path) — indexed matmul into 3D quantized GGUF tensor
-- Leverage mlx-native crate (`/opt/mlx-native`): kernel_registry.rs, device.rs, encoder.rs, buffer.rs
-- Reuse mlx-native's moe_gate.metal (GPU-side router), moe_dispatch.metal (fused GELU+accumulate)
-- New kernel: `moe_expert_qmatmul.metal` with inline ggml dequant (Q4_K, Q6_K, Q8_0)
-- Load expert weights as merged 3D QTensors (not dequantized) — kernel indexes by expert_id * stride
-- Dispatch via metal-rs alongside candle buffers (QMetalStorage::buffer() is public)
-- Expected: MoE from ~2.0ms/layer to ~0.3ms/layer
+**1b.1: Per-expert QMatMul via candle's optimized Metal kernels** (highest impact)
+- Load each expert's weights as a `QMatMul` object (128 per layer, stays quantized)
+- For decode: call `qmatmul.forward()` for each of the top_k=8 selected experts using candle's SIMD-optimized Metal kernels (same kernels used for dense layers)
+- For prefill: batch tokens per expert, call `qmatmul.forward()` on the batch
+- Eliminates F32 dequantization at load time; expert weights stay as Q6_K/Q8_0 in GPU memory (~20 GB vs ~45 GB dequantized)
 
-**1b.2: Pre-allocate MoE expert weight stacks** (medium impact, easy)
-- Current `Tensor::stack` allocates a new [top_k, hidden, intermediate*2] tensor per token per layer
-- Pre-allocate a reusable buffer at model load time, copy selected expert weights into it
-- Eliminates allocation jitter (MoE variance 1.3-3.9ms → stable ~1.3ms)
+**Key learning from llama.cpp study (2026-04-09):** llama.cpp's `kernel_mul_mv_id` is a thin wrapper that redirects pointers into the merged expert weight buffer and delegates to the SAME optimized `kernel_mul_mv_q6_K_f32` used for dense layers. The SIMD optimization is in the base matmul kernel, not the MoE dispatch. Writing custom scalar dequant kernels (attempted and reverted) was fundamentally wrong — the right approach reuses existing optimized matmul kernels.
 
-**1b.3: Keep expert weights as 3D QTensor** (memory, comes with 1b.1)
-- Currently dequantize 3D → BF16 → pre-slice at load (~45 GB). With 1b.1, keep as quantized 3D (~28 GB)
-- Saves ~17 GB GPU memory
+**Failed approach (reverted):** A custom Metal shader (`moe_expert_q4k.metal`) with scalar dot-product dequant was written but benchmarked slower than candle's built-in QMatMul. Scalar dot product (1 thread per output element) cannot compete with SIMD-optimized matmul (2 simdgroups × 32 threads per row). The custom kernel also required handling multiple quant formats (Q4_K, Q6_K, Q8_0), non-256-aligned dimensions, and atomic accumulation — complexity without payoff.
+
+**Future optimization: fused mul_mat_id kernel** — once the per-expert QMatMul approach is validated and benchmarked, a fused kernel (llama.cpp-style single dispatch for all experts, grid Z = n_experts) could eliminate the 8 separate kernel launches per layer. This is only worth doing after the QMatMul baseline proves the remaining gap is in dispatch overhead, not in the matmul itself.
+
+**1b.2: Pre-allocate MoE expert weight stacks** (medium impact, done)
+- Replaced per-token `Tensor::stack` with pre-stacked tensors + `index_select`
+- **Note:** Superseded by 1b.1's QMatMul approach which doesn't need pre-stacked F32 tensors
+
+**1b.3: Keep expert weights quantized** (memory + load speed, comes with 1b.1)
+- Expert weights stored as QMatMul objects (~20 GB quantized) instead of dequantized F32 (~45 GB)
+- Model load time reduced from ~3 minutes to ~30 seconds (no per-expert dequant + transpose + contiguous)
 
 #### Tier 2: Reduce per-op overhead across all layers
 
-**1b.4: Eliminate F32↔BF16 round-trips in QLinear** (medium impact, easy)
-- Every QLinear does: BF16→F32 (input cast) → QMatMul(F32) → F32→BF16 (output cast)
-- 4 attention + 3 MLP + 1 router = 8 cast pairs per layer = 480 casts per token
-- Option A: run entire forward in F32 (tested — same output, no precision issue)
-- Option B: check if candle's Metal QMatMul actually needs F32 or if BF16 works on M5
+**1b.4: Run entire forward pass in F32** (medium impact, done)
+- Changed `MODEL_DTYPE` from BF16 to F32, eliminating ~690 GPU dtype cast dispatches per token
+- candle's QMatMul Metal kernels require F32 input and output F32 — the BF16 round-trips were pure waste
+- Trade-off: 2x activation memory bandwidth, but vastly fewer kernel dispatches
 
-**1b.5: Reduce unnecessary `.contiguous()` calls** (small-medium impact, easy)
-- Each `.contiguous()` is a GPU memcpy. Audit all contiguous calls in forward path
-- Some may be needed (Metal kernel requirements), some may be defensive
+**1b.5: Reduce unnecessary `.contiguous()` calls** (small impact, done)
+- Audited all contiguous calls in forward path: removed 3 unnecessary GPU memcpy, kept 9 with justification
 
-**1b.6: Profile and eliminate hidden GPU syncs** (unknown impact, investigation)
-- candle may internally call `commit_and_wait` more than we realize
-- Use Metal GPU capture or Instruments to count actual command buffer commits per token
+**1b.6: Eliminate MoE routing GPU syncs** (high impact, done — investigation + fix)
+- **Finding:** 35 GPU syncs per decode token, 34 from MoE routing `to_vec2()` calls (one per layer)
+- Each sync is a full `waitUntilCompleted` pipeline stall — estimated 17-34ms wasted per token
+- **Fix:** GPU-side routing via `index_select` + `gather` for combined weights, passed as GPU Tensors to Metal kernel. Reduces to 1 irreducible sync (sampler argmax)
+- **1b.13 (command buffer batching) confirmed unnecessary** — candle already batches 50 dispatches per command buffer; the problem was the forced flushes from `to_vec2()`, not commit frequency
 
 #### Tier 3: Attention and KV cache
 
-**1b.7: Pre-allocated KV cache (fixed max_seq_len)** (medium impact)
-- Currently `Tensor::cat` on every decode step creates a new tensor
-- Pre-allocate [max_seq_len, heads, head_dim] and write to a slice each step
-- Eliminates allocation + copy per layer per token
+**1b.7: Pre-allocated KV cache** (medium impact, done)
+- Pre-allocate `[1, num_kv_heads, 4096, head_dim]` buffers at model load, write via `slice_scatter`
+- Eliminates per-token GPU allocation; auto-grows at 2x if sequence exceeds buffer
+- `reset()` is O(1) — just resets position counter, no GPU deallocation
 
-**1b.8: Flash attention** (medium impact for long sequences)
-- candle supports flash attention — reduces memory bandwidth for attention computation
-- Biggest win during prefill (many tokens) and long-context decode
+**1b.8: SDPA fused attention** (medium impact, done for decode)
+- Decode (seq_len=1): uses `candle_nn::ops::sdpa()` with native GQA — no repeat_kv expansion needed. This is the fused Metal SDPA vector kernel.
+- Prefill (seq_len>1): manual attention with repeat_kv. Candle's SDPA "full" kernel exceeds 32KB threadgroup memory limit for head_dim=512 (global attention layers). **TODO:** Write tiled prefill attention kernel that handles head_dim=512 within memory budget.
+- **Gemma 4 specifics:** scale=1.0 (Q/K are RmsNorm'd), softcapping=1.0 (candle convention for "disabled" — 0.0 would cause division by zero)
 
-**1b.9: Sliding window attention** (medium impact)
-- Sliding attention layers (24 of 30) only attend to last 1024 tokens
-- Currently attend to full KV cache — wasted computation for long sequences
-- Implement sliding window mask to skip old KV entries
+**1b.9: Sliding window KV cache truncation** (correctness fix + perf, done)
+- Sliding layers now expose only the last `sliding_window` (1024) tokens from KV cache
+- Previously both sliding and global layers attended to full history — a correctness bug
+- KvCache `sliding_window: Option<usize>` parameter controls truncation per layer
 
 #### Tier 4: Fused kernels
 
-**1b.10: Fused RmsNorm + residual add** (small impact)
-- 7 RmsNorm calls per layer, each a separate kernel dispatch
-- Fuse norm + residual add into single kernel (mlx-native has fused_residual_norm_bf16.metal)
+**1b.10: Fused RmsNorm + residual add** (small impact, done)
+- `RmsNorm::forward_with_residual()` combines residual add + normalize in one pass
+- Applied at 2 sites per decoder layer = ~60 fewer GPU dispatches per forward pass
 
-**1b.11: Fused GELU + element-wise multiply in MLP/MoE** (small impact)
-- gate → GELU → mul(up) currently 3 ops, could be 1 (mlx-native has fused_gelu_mul in moe_dispatch.metal)
+**1b.11: Fused GELU + element-wise multiply in MLP/MoE** (small impact, skipped)
+- Saves only 1 dispatch out of ~120 per forward pass — not worth the Metal plumbing
+- The fused op already exists for MoE in the (reverted) custom kernel; can be extracted later if needed
 
-**1b.12: Use F16 intermediates instead of BF16** (small impact)
-- Metal is generally faster with F16 than BF16 for element-wise ops
-- Would need validation that F16 precision is sufficient
+**1b.12: F16 intermediates** (superseded by 1b.4)
+- The F32 forward pass decision makes F16 intermediates moot
 
 #### Tier 5: Infrastructure
 
-**1b.13: Command buffer batching** (unknown impact)
-- Submit multiple operations to Metal command encoder before committing
-- Reduces driver overhead per operation
+**1b.13: Command buffer batching** (not needed)
+- candle already batches up to 50 dispatches per command buffer before auto-commit
+- The real bottleneck was forced `waitUntilCompleted` syncs from MoE routing (fixed in 1b.6)
 
-**1b.14: Warmup dummy token at server startup** (TTFT, Phase 2)
-- Global attention layers spike 5-13ms on first decode token (~37ms extra TTFT)
-- Run dummy BOS token through model at startup, clear KV cache
-- Zero cost to steady-state throughput
+**1b.14: Warmup dummy token at model load** (TTFT improvement, done)
+- Runs dummy BOS token through model at load time to force Metal shader compilation
+- Eliminates ~37ms first-token latency spike from global attention layers
 
-**1b.15: Eliminate per-token MoE loop for prefill** (prefill speed)
-- During prefill, all tokens could be processed together through MoE
-- Currently each token loops independently — N×8 expert matmuls instead of batched
+**1b.15: Batched MoE prefill** (prefill speed, done)
+- Groups tokens by expert and dispatches batched matmuls (one per active expert)
+- Reduces GPU dispatches from `num_tokens * 2` to `num_active_experts * 2` per layer
+
+**1b.16: Global attention 10x spike** (investigation complete)
+- **Root causes identified:**
+  1. QMatMul kernel performance cliff at 8192 dims (q_proj/o_proj for global layers)
+  2. `repeat_kv` forces full contiguous copy of expanded KV cache (8x for global layers)
+  3. Sliding window was not enforced (fixed in 1b.9)
+- **Fixes applied:** 1b.9 (sliding window), 1b.8 (SDPA eliminates repeat_kv for decode)
+- **Remaining:** QMatMul kernel profiling at 8192 dims to confirm if it's a candle kernel issue
+
+#### Phase 1b Implementation Status (2026-04-09, updated 2026-04-10)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| 1b.1 | REWRITE NEEDED | Custom scalar Metal kernel was wrong approach. Correct approach: per-expert QMatMul using candle's optimized Metal kernels. See `docs/design-mul-mat-id-kernel.md`. |
+| 1b.2 | DONE (superseded) | Pre-stacked + index_select works but superseded by 1b.1's QMatMul approach |
+| 1b.3 | BLOCKED on 1b.1 | Expert weights must stay quantized; requires 1b.1 rewrite to QMatMul objects |
+| 1b.4 | DONE | F32 forward pass, ~690 GPU dtype casts eliminated |
+| 1b.5 | DONE | 3 unnecessary `.contiguous()` removed |
+| 1b.6 | DONE | 35→1 GPU syncs per token via GPU-side routing |
+| 1b.7 | DONE | Pre-allocated KV cache with `slice_scatter`, auto-grow |
+| 1b.8 | DONE (decode) | SDPA for decode (vector path); manual attention for prefill (head_dim=512 exceeds 32KB threadgroup) |
+| 1b.9 | DONE | Sliding window KV truncation (correctness fix) |
+| 1b.10 | DONE | Fused RmsNorm + residual, ~60 fewer dispatches |
+| 1b.11 | SKIPPED | 1 dispatch saved, not worth Metal plumbing |
+| 1b.12 | N/A | Superseded by 1b.4 (F32 forward) |
+| 1b.13 | N/A | Not needed — candle already batches; syncs were the problem (1b.6) |
+| 1b.14 | DONE | Warmup dummy token at load |
+| 1b.15 | DONE | Batched MoE prefill (per-expert token grouping) |
+| 1b.16 | DONE | Root causes identified, fixes applied (1b.8, 1b.9) |
+| Benchmark | DONE | `--benchmark` + `--prompt-file` flags, 5-run median/p95 reporting |
 
 ### Phase 2: HTTP Server
 - Restore spec-layer code (schema, SSE, tool parsing) from git history after deep review
@@ -245,13 +290,20 @@ Deep review of the deleted code is required before restoring to confirm each fil
 
 ## Acceptance Criteria
 
-### Phase 1 + 3: Inference Engine (Text + Vision)
-- [ ] `hf2q generate --model ./models/gemma4/ --prompt "..."` produces correct, coherent text output
-- [ ] Vision: `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output
-- [ ] Benchmarked decode speed matches or exceeds llama.cpp and mlx-lm on the same hardware (M5 Max, Gemma 4 26B MoE, Q4_K_M)
-- [ ] Benchmarked prefill speed matches or exceeds same baselines
-- [ ] All K-quant types produced by hf2q load and infer correctly (no dequantize fallback)
-- [ ] Primary model: Gemma 4 26B MoE. Fast follow: Qwen3.5 and additional architectures
+### Phase 1: Inference Engine (Correctness) — DONE
+- [x] `hf2q generate --model ./models/gemma4/ --prompt "..."` produces correct, coherent text output
+- [x] All K-quant types produced by hf2q load and infer correctly via candle QMatMul (attention, MLP, router)
+- [x] Primary model: Gemma 4 26B MoE
+
+### Phase 1b: Speed Optimization
+- [ ] Decode speed matches or exceeds llama.cpp on the same hardware (≥107 tok/s on M5 Max, Gemma 4 26B MoE, Q4_K_M), measured using the canonical benchmark harness
+- [ ] Prefill speed matches or exceeds llama.cpp on the same hardware
+- [ ] MoE expert matmul runs on quantized weights directly (no dequantize-to-BF16 at load time)
+- [ ] Tier gates met: ≥40 tok/s after Tier 1, ≥70 tok/s after Tier 2, ≥100 tok/s after Tier 3+4
+
+### Phase 3: Vision
+- [ ] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output
+- [ ] Fast follow: Qwen3.5 and additional architectures
 
 ### Phase 2: HTTP Server
 - [ ] OpenAI Python/JS SDK clients connect and work (chat completions, streaming, tool calling, embeddings)
@@ -285,3 +337,6 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - **Model implementations:** Use candle-transformers when they meet our performance bar. Write our own only for unsupported architectures or state-of-the-art optimization on specific models.
 - **CoreML/ANE:** Keep as a later phase. Requires dedicated research to find where ANE beats Metal GPU — no arbitrary size cutoff. coreml-native crate is available when ready.
 - **GGUF provenance:** Detect hf2q origin via GGUF metadata. Serve any valid GGUF regardless of who made it. Apply hf2q-specific optimizations (trusted metadata, skip extra validation) when provenance is confirmed.
+- **MoE kernel quant format (2026-04-09):** Write ggml K-quant dequant kernels, not MLX affine. Rationale: hf2q produces K-quant GGUF; llama.cpp proves K-quants are fast on Metal; switching formats would break ecosystem compatibility. mlx-native's infrastructure (device, encoder, registry, dispatch patterns) is reusable; only the innermost dequant loop differs.
+- **SDPA scale omission (2026-04-09):** Gemma 4 intentionally uses `scaling = 1.0` (no `1/sqrt(head_dim)`). Per-head Q/K RmsNorm normalizes dot-product magnitudes, making the traditional scale unnecessary. Verified against HuggingFace `modeling_gemma4.py`.
+- **Phase 1 vs 1b boundary (2026-04-09):** Phase 1 = correctness (functional inference, coherent output). Phase 1b = performance (match llama.cpp speed). These are separate milestones with separate acceptance criteria.

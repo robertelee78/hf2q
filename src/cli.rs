@@ -170,9 +170,17 @@ pub struct GenerateArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Prompt text
+    /// Prompt text (required unless --prompt-file is given)
+    #[arg(long, required_unless_present = "prompt_file")]
+    pub prompt: Option<String>,
+
+    /// Path to file containing prompt text
+    #[arg(long, conflicts_with = "prompt")]
+    pub prompt_file: Option<PathBuf>,
+
+    /// Run benchmark mode: 5 consecutive runs, report median and p95 tok/s
     #[arg(long)]
-    pub prompt: String,
+    pub benchmark: bool,
 
     /// Maximum tokens to generate
     #[arg(long, default_value = "256")]

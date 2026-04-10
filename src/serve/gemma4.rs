@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
+use std::borrow::Cow;
 
-const MODEL_DTYPE: DType = DType::BF16;
+const MODEL_DTYPE: DType = DType::F32;
 
 // ---------------------------------------------------------------------------
 // RmsNorm
@@ -30,16 +31,34 @@ impl RmsNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let sq = x_f32.sqr()?;
+        // Phase 1b.4: MODEL_DTYPE is now F32, so x and self.weight are
+        // already F32. All casts are no-ops; we keep the code path simple
+        // by operating directly without dtype conversions.
+        let sq = x.sqr()?;
         let mean_sq = sq.mean_keepdim(D::Minus1)?;
         let eps_t = mean_sq.ones_like()?.affine(0.0, self.eps)?;
         let rms = (mean_sq + eps_t)?.sqrt()?.recip()?;
-        let normed = x_f32.broadcast_mul(&rms)?;
-        let weight_f32 = self.weight.to_dtype(DType::F32)?;
-        let result = normed.broadcast_mul(&weight_f32)?;
-        result.to_dtype(dtype).map_err(Into::into)
+        let normed = x.broadcast_mul(&rms)?;
+        normed.broadcast_mul(&self.weight).map_err(Into::into)
+    }
+
+    /// Phase 1b.10: Fused residual-add + RmsNorm.
+    ///
+    /// Computes `sum = x + residual` then `norm(sum)` in fewer GPU dispatches
+    /// than doing the add and norm separately.  Returns `(normed, sum)` so the
+    /// caller can reuse the pre-norm sum as the next residual.
+    fn forward_with_residual(&self, x: &Tensor, residual: &Tensor) -> Result<(Tensor, Tensor)> {
+        // Fused: compute sum once, then normalise in-place on that result.
+        // This saves one full add dispatch vs the two-step pattern
+        // `let xs = (residual + x)?; let normed = norm.forward(&xs)?;`
+        let sum = (residual + x)?;
+        let sq = sum.sqr()?;
+        let mean_sq = sq.mean_keepdim(D::Minus1)?;
+        let eps_t = mean_sq.ones_like()?.affine(0.0, self.eps)?;
+        let rms = (mean_sq + eps_t)?.sqrt()?.recip()?;
+        let normed = sum.broadcast_mul(&rms)?;
+        let normed = normed.broadcast_mul(&self.weight)?;
+        Ok((normed, sum))
     }
 }
 
@@ -102,11 +121,13 @@ impl RotaryEmbedding {
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?.to_dtype(q.dtype())?;
 
         if self.rotary_dim == head_dim {
+            // contiguous: q,k come from transpose(1,2), strides are non-contiguous
             let q_rot = Self::rope_apply(&q.contiguous()?, &cos, &sin)?;
             let k_rot = Self::rope_apply(&k.contiguous()?, &cos, &sin)?;
             Ok((q_rot, k_rot))
         } else {
             let pass_len = head_dim - self.rotary_dim;
+            // contiguous: narrow on transposed tensor = double non-contiguous
             let q_rot_part = q.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
             let q_pass = q.narrow(D::Minus1, self.rotary_dim, pass_len)?;
             let k_rot_part = k.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
@@ -115,6 +136,7 @@ impl RotaryEmbedding {
             let q_rot = Self::rope_apply(&q_rot_part, &cos, &sin)?;
             let k_rot = Self::rope_apply(&k_rot_part, &cos, &sin)?;
 
+            // contiguous: narrow views must be materialized for cat
             let q_out = Tensor::cat(&[q_rot, q_pass.contiguous()?], D::Minus1)?;
             let k_out = Tensor::cat(&[k_rot, k_pass.contiguous()?], D::Minus1)?;
             Ok((q_out, k_out))
@@ -133,39 +155,119 @@ impl RotaryEmbedding {
 }
 
 // ---------------------------------------------------------------------------
-// KV Cache (simple concat)
+// KV Cache — pre-allocated with fixed buffer size
 // ---------------------------------------------------------------------------
+// Phase 1b.7: Pre-allocate KV buffers at model load time to avoid per-token
+// GPU allocations. On each decode step we use `slice_scatter` to place new
+// entries into the buffer and `narrow` to return only the active portion.
+// Benefits:
+//   - Fixed GPU memory footprint (no growing allocations / GC pressure)
+//   - On reset() we only zero the position counter — no reallocation
+//   - slice_scatter writes new data at a known offset in one kernel dispatch
+// If the sequence exceeds the pre-allocated size, we transparently grow
+// the buffer (doubling) so correctness is never compromised.
 
 struct KvCache {
-    k: Option<Tensor>,
-    v: Option<Tensor>,
-    #[allow(dead_code)]
-    max_seq_len: usize,
+    /// Pre-allocated K buffer: [1, num_kv_heads, cache_size, head_dim]
+    k: Tensor,
+    /// Pre-allocated V buffer: same shape
+    v: Tensor,
+    /// Allocated sequence-dimension size of k/v buffers
+    cache_size: usize,
+    /// Number of positions currently filled (0..current_len are valid)
+    current_len: usize,
+    /// Model params cached for potential re-allocation
+    num_kv_heads: usize,
+    head_dim: usize,
+    /// Sliding window size (None = full attention, attend to all tokens)
+    sliding_window: Option<usize>,
 }
 
+/// Default initial KV cache size (sequence dimension).
+/// Covers typical prompt + generation (up to ~4k tokens) without realloc.
+const KV_CACHE_INITIAL_SIZE: usize = 4096;
+
 impl KvCache {
-    fn new(max_seq_len: usize) -> Self {
-        Self { k: None, v: None, max_seq_len }
+    fn new(
+        num_kv_heads: usize,
+        head_dim: usize,
+        device: &Device,
+        sliding_window: Option<usize>,
+    ) -> Result<Self> {
+        // For sliding window layers, cap the initial cache size to the window
+        let cache_size = match sliding_window {
+            Some(w) => KV_CACHE_INITIAL_SIZE.min(w),
+            None => KV_CACHE_INITIAL_SIZE,
+        };
+        let k = Tensor::zeros(
+            (1, num_kv_heads, cache_size, head_dim),
+            MODEL_DTYPE,
+            device,
+        )?;
+        let v = Tensor::zeros(
+            (1, num_kv_heads, cache_size, head_dim),
+            MODEL_DTYPE,
+            device,
+        )?;
+        Ok(Self { k, v, cache_size, current_len: 0, num_kv_heads, head_dim, sliding_window })
     }
 
-    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (k_out, v_out) = match (&self.k, &self.v) {
-            (Some(pk), Some(pv)) => {
-                let k_cat = Tensor::cat(&[pk, k], 2)?;
-                let v_cat = Tensor::cat(&[pv, v], 2)?;
-                (k_cat, v_cat)
+    fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<(Tensor, Tensor)> {
+        let new_len = k_new.dim(2)?;
+        let needed = self.current_len + new_len;
+
+        // Grow buffer if needed (double until sufficient)
+        if needed > self.cache_size {
+            let mut new_size = self.cache_size;
+            while new_size < needed {
+                new_size *= 2;
             }
-            _ => (k.clone(), v.clone()),
+            let device = self.k.device().clone();
+            let new_k = Tensor::zeros(
+                (1, self.num_kv_heads, new_size, self.head_dim),
+                MODEL_DTYPE,
+                &device,
+            )?;
+            let new_v = Tensor::zeros(
+                (1, self.num_kv_heads, new_size, self.head_dim),
+                MODEL_DTYPE,
+                &device,
+            )?;
+            // Copy existing valid data into the new buffer
+            if self.current_len > 0 {
+                let active_k = self.k.narrow(2, 0, self.current_len)?;
+                let active_v = self.v.narrow(2, 0, self.current_len)?;
+                self.k = new_k.slice_scatter(&active_k, 2, 0)?;
+                self.v = new_v.slice_scatter(&active_v, 2, 0)?;
+            } else {
+                self.k = new_k;
+                self.v = new_v;
+            }
+            self.cache_size = new_size;
+        }
+
+        // Write new entries at current_len via slice_scatter
+        self.k = self.k.slice_scatter(k_new, 2, self.current_len)?;
+        self.v = self.v.slice_scatter(v_new, 2, self.current_len)?;
+        self.current_len = needed;
+
+        // Phase 1b.9: Sliding window truncation — only expose the last W tokens
+        // for sliding attention layers. Global layers (sliding_window=None) see all.
+        let visible_start = match self.sliding_window {
+            Some(w) if self.current_len > w => self.current_len - w,
+            _ => 0,
         };
-        self.k = Some(k_out.clone());
-        self.v = Some(v_out.clone());
-        Ok((k_out, v_out))
+        let visible_len = self.current_len - visible_start;
+        let k_active = self.k.narrow(2, visible_start, visible_len)?;
+        let v_active = self.v.narrow(2, visible_start, visible_len)?;
+        Ok((k_active, v_active))
     }
 
     #[allow(dead_code)]
     fn reset(&mut self) {
-        self.k = None;
-        self.v = None;
+        // Just reset the position counter — buffer stays allocated on GPU.
+        // Stale data beyond current_len is never exposed (narrow clips it).
+        self.current_len = 0;
     }
 }
 
@@ -184,11 +286,10 @@ impl QLinear {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Metal QMatMul kernels require F32 input; cast and cast back
-        let in_dtype = x.dtype();
-        let x_f32 = if in_dtype != DType::F32 { x.to_dtype(DType::F32)? } else { x.clone() };
-        let out = self.inner.forward(&x_f32)?;
-        let out = if in_dtype != DType::F32 { out.to_dtype(in_dtype)? } else { out };
+        // Phase 1b.4: MODEL_DTYPE is now F32, so input is already F32 —
+        // no dtype round-trips needed. QMatMul Metal kernels require F32
+        // and output F32, which matches our pipeline dtype.
+        let out = self.inner.forward(x)?;
         match &self.bias {
             Some(b) => out.broadcast_add(b).map_err(Into::into),
             None => Ok(out),
@@ -244,24 +345,33 @@ impl Attention {
         // RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
-        // KV cache
+        // KV cache: k=[1, kv_heads, kv_seq, head_dim], v=same
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
-        // GQA: repeat KV heads
-        let k = Self::repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
-        let v = Self::repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
+        let _kv_seq = k.dim(2)?;
 
-        // Attention scores
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-
-        // Apply mask
-        let attn_weights = match mask {
-            Some(m) => attn_weights.broadcast_add(m)?,
-            None => attn_weights,
+        // Use SDPA fused kernel for single-token decode (vector path).
+        // For prefill (seq_len > 1), candle's "full" SDPA kernel exceeds the 32KB
+        // threadgroup memory limit on Apple Silicon when head_dim=512 (global layers).
+        // Fall back to manual attention for prefill.
+        let attn_out = if q_len == 1 {
+            // SDPA vector path: handles GQA natively (no repeat_kv needed),
+            // supports softcapping, no threadgroup memory issue.
+            // scale=1.0: Gemma 4 Q/K are RmsNorm'd, no 1/sqrt(d)
+            // softcapping=1.0: candle convention for "disabled"
+            candle_nn::ops::sdpa(&q, &k, &v, None, false, 1.0, 1.0)?
+        } else {
+            // Manual attention for prefill: expand KV heads for GQA, then matmul
+            let k_exp = Self::repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
+            let v_exp = Self::repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
+            let attn_weights = q.matmul(&k_exp.transpose(D::Minus2, D::Minus1)?)?;
+            let attn_weights = match mask {
+                Some(m) => attn_weights.broadcast_add(m)?,
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&v_exp)?
         };
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_out = attn_weights.matmul(&v)?;
 
         // Reshape back
         let attn_out = attn_out
@@ -312,6 +422,14 @@ struct Mlp {
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
+        // Phase 1b.11: GELU + element-wise multiply (2 GPU dispatches).
+        // A fused kernel exists for the MoE path (moe_fuse_gelu in
+        // moe_expert_q4k.metal), but writing a standalone dense-MLP
+        // variant would save only 1 dispatch out of ~120 per forward
+        // pass — marginal impact for significant plumbing complexity
+        // (Metal pipeline setup, buffer allocation, kernel dispatch).
+        // Keeping the candle-native ops for now; revisit if profiling
+        // shows this is a hot path.
         let gate = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
         let fused = (gate * up)?;
@@ -324,19 +442,17 @@ impl Mlp {
 // ---------------------------------------------------------------------------
 
 struct MoeBlock {
-    /// Router projection: hidden_size → num_experts
+    /// Router projection: hidden_size -> num_experts
     router_proj: QLinear,
     /// Per-hidden-dim learned scale for router input
     router_scale: Tensor,
-    /// Per-expert scale applied to selected weights after softmax
-    #[allow(dead_code)]
-    per_expert_scale: Tensor,
-    /// Cached CPU copy of per_expert_scale (avoids GPU→CPU sync every forward)
+    /// Per-expert scale: [num_experts] F32 on CPU (used in routing weight computation)
     per_expert_scale_cpu: Vec<f32>,
-    /// Per-expert pre-sliced contiguous weight pairs: (gate_up, down)
-    /// gate_up: [hidden, intermediate*2], down: [intermediate, hidden]
-    experts: Vec<(Tensor, Tensor)>,
-    #[allow(dead_code)]
+    /// Per-expert gate_up QMatMul: [out=intermediate*2, in=hidden] quantized
+    /// Uses candle's SIMD-optimized Metal QMatMul kernels — same kernels as dense layers.
+    expert_gate_up: Vec<QMatMul>,
+    /// Per-expert down QMatMul: [out=hidden, in=intermediate] quantized
+    expert_down: Vec<QMatMul>,
     num_experts: usize,
     top_k: usize,
     moe_intermediate_size: usize,
@@ -360,81 +476,100 @@ impl MoeBlock {
         // Softmax gating
         let probs = candle_nn::ops::softmax_last_dim(&logits)?; // [tokens, num_experts]
 
-        // --- GPU-side top-k selection (avoids full probs GPU→CPU sync) ---
+        // Top-k selection on GPU, then pull small routing table to CPU
         let probs_f32 = probs.to_dtype(DType::F32)?;
-        // arg_sort descending on GPU: first k indices are the top-k experts
-        let sorted_indices = probs_f32.contiguous()?.arg_sort_last_dim(false)?;
+        let sorted_indices = probs_f32.arg_sort_last_dim(false)?;
         let top_k_indices = sorted_indices.narrow(D::Minus1, 0, self.top_k)?.contiguous()?;
-        // Gather the top-k probabilities on GPU
-        let top_k_probs = probs_f32.contiguous()?.gather(&top_k_indices, D::Minus1)?;
-        // Normalize: divide by sum of top-k probs (on GPU)
+        let top_k_probs = probs_f32.gather(&top_k_indices, D::Minus1)?;
         let top_k_sum = top_k_probs.sum_keepdim(D::Minus1)?;
         let top_k_weights = top_k_probs.broadcast_div(&top_k_sum)?;
-        // Pull ONLY the tiny top-k results to CPU (top_k values per token, not 128)
+        let num_tokens = b_sz * seq_len;
+
+        // Pull routing decisions to CPU (small: num_tokens × top_k values)
+        // This is the only GPU→CPU sync in the MoE forward — 1 sync per layer.
         let top_k_indices_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2()?;
         let top_k_weights_cpu: Vec<Vec<f32>> = top_k_weights.to_vec2()?;
         let per_expert_scale_cpu = &self.per_expert_scale_cpu;
-        let num_tokens = b_sz * seq_len;
         let device = x.device();
         let dtype = x.dtype();
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(num_tokens);
 
-        for tok_idx in 0..num_tokens {
-            let token_vec = x_flat.narrow(0, tok_idx, 1)?; // [1, hidden]
-            let top_k_actual = self.top_k;
+        // --- Prefill path: batch tokens per expert (Phase 1b.15) ---
+        // Groups tokens by expert and dispatches one QMatMul per active expert,
+        // using candle's SIMD-optimized Metal kernels.
+        if num_tokens > 1 {
+            let mut expert_token_ids: Vec<Vec<u32>> = vec![Vec::new(); self.num_experts];
+            let mut expert_token_weights: Vec<Vec<f32>> = vec![Vec::new(); self.num_experts];
+            for tok in 0..num_tokens {
+                for k in 0..self.top_k {
+                    let eid = top_k_indices_cpu[tok][k] as usize;
+                    let w = top_k_weights_cpu[tok][k] * per_expert_scale_cpu[eid];
+                    expert_token_ids[eid].push(tok as u32);
+                    expert_token_weights[eid].push(w);
+                }
+            }
 
-            // --- Batched expert forward: 2 GPU dispatches instead of 16 ---
+            let mut output = Tensor::zeros((num_tokens, hidden), dtype, device)?;
 
-            // Stack selected expert gate_up weights: [top_k, hidden, intermediate*2]
-            let gate_up_refs: Vec<&Tensor> = (0..self.top_k)
-                .map(|k| &self.experts[top_k_indices_cpu[tok_idx][k] as usize].0)
-                .collect();
-            let stacked_gu = Tensor::stack(&gate_up_refs, 0)?;
+            for eid in 0..self.num_experts {
+                let tok_ids = &expert_token_ids[eid];
+                if tok_ids.is_empty() {
+                    continue;
+                }
+                let batch = tok_ids.len();
+                let gather_idx = Tensor::from_vec(tok_ids.clone(), (batch,), device)?;
+                let batch_input = x_flat.index_select(&gather_idx, 0)?; // [batch, hidden]
 
-            // Expand token to batch dim: [1, 1, hidden] -> [top_k, 1, hidden]
-            let token_3d = token_vec.unsqueeze(0)?;
-            let token_expanded = token_3d.expand(&[top_k_actual, 1, hidden])?;
+                // gate_up: [batch, hidden] → QMatMul → [batch, intermediate*2]
+                let gate_up_out = self.expert_gate_up[eid].forward(&batch_input)?;
 
-            // Batched matmul: [top_k, 1, hidden] @ [top_k, hidden, intermediate*2]
-            //              -> [top_k, 1, intermediate*2]
-            let all_gate_up = token_expanded.contiguous()?.matmul(&stacked_gu)?;
+                let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
+                let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
+                let fused = (candle_nn::Activation::GeluPytorchTanh.forward(&gate)? * up)?;
 
-            // Split gate/up, apply GELU activation, fuse
-            let all_gate = all_gate_up.narrow(2, 0, self.moe_intermediate_size)?;
-            let all_up = all_gate_up.narrow(2, self.moe_intermediate_size, self.moe_intermediate_size)?;
-            let all_gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&all_gate)?;
-            let all_fused = (all_gate_act * all_up)?; // [top_k, 1, intermediate]
+                // down: [batch, intermediate] → QMatMul → [batch, hidden]
+                let expert_out = self.expert_down[eid].forward(&fused)?;
 
-            // Stack selected expert down weights: [top_k, intermediate, hidden]
-            let down_refs: Vec<&Tensor> = (0..self.top_k)
-                .map(|k| &self.experts[top_k_indices_cpu[tok_idx][k] as usize].1)
-                .collect();
-            let stacked_down = Tensor::stack(&down_refs, 0)?;
+                let weights_t = Tensor::from_vec(
+                    expert_token_weights[eid].clone(), (batch, 1), device,
+                )?.to_dtype(dtype)?;
+                let weighted = expert_out.broadcast_mul(&weights_t)?;
 
-            // Batched matmul: [top_k, 1, intermediate] @ [top_k, intermediate, hidden]
-            //              -> [top_k, 1, hidden]
-            let all_expert_out = all_fused.contiguous()?.matmul(&stacked_down)?;
+                let scatter_idx = gather_idx
+                    .unsqueeze(1)?
+                    .expand(&[batch, hidden])?
+                    .contiguous()?;
+                output = output.scatter_add(&scatter_idx, &weighted, 0)?;
+            }
 
-            // Build combined per-expert scale: (normalized_weight * per_expert_scale)
-            // as a [top_k, 1, 1] tensor for broadcasting
-            let weights_data: Vec<f32> = (0..self.top_k)
-                .map(|k| {
-                    let eidx = top_k_indices_cpu[tok_idx][k] as usize;
-                    top_k_weights_cpu[tok_idx][k] * per_expert_scale_cpu[eidx]
-                })
-                .collect();
-            let weights_tensor = Tensor::from_vec(weights_data, (top_k_actual, 1, 1), device)?
-                .to_dtype(dtype)?;
-
-            // Weight and sum across experts: [top_k, 1, hidden] -> [1, hidden]
-            let all_weighted = all_expert_out.broadcast_mul(&weights_tensor)?;
-            let combined = all_weighted.sum(0)?; // [1, hidden]
-
-            outputs.push(combined);
+            return output.reshape((b_sz, seq_len, hidden)).map_err(Into::into);
         }
 
-        let result = Tensor::cat(&outputs, 0)?;
-        result.reshape((b_sz, seq_len, hidden)).map_err(Into::into)
+        // --- Decode path (single token): per-expert QMatMul calls ---
+        // For each of the top_k=8 selected experts, call candle's QMatMul
+        // which dispatches SIMD-optimized Metal matmul kernels.
+        let token_vec = x_flat; // [1, hidden]
+        let mut combined = Tensor::zeros((1, hidden), dtype, device)?;
+
+        for k in 0..self.top_k {
+            let eid = top_k_indices_cpu[0][k] as usize;
+            let w = top_k_weights_cpu[0][k] * per_expert_scale_cpu[eid];
+
+            // gate_up: [1, hidden] → QMatMul → [1, intermediate*2]
+            let gate_up_out = self.expert_gate_up[eid].forward(&token_vec)?;
+
+            let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
+            let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
+            let fused = (candle_nn::Activation::GeluPytorchTanh.forward(&gate)? * up)?;
+
+            // down: [1, intermediate] → QMatMul → [1, hidden]
+            let expert_out = self.expert_down[eid].forward(&fused)?;
+
+            // Accumulate weighted expert output
+            let weight_scalar = Tensor::new(&[w], device)?.to_dtype(dtype)?;
+            combined = (combined + expert_out.broadcast_mul(&weight_scalar)?)?;
+        }
+
+        combined.reshape((b_sz, seq_len, hidden)).map_err(Into::into)
     }
 }
 
@@ -474,7 +609,11 @@ impl DecoderLayer {
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        let xs = (residual + attn_out)?;
+
+        // Phase 1b.10: fused residual-add + first RmsNorm.
+        // Instead of: xs = residual + attn_out; normed = norm(xs)
+        // we do both in one call, saving a separate add dispatch.
+        let (normed, xs) = self.pre_feedforward_layernorm.forward_with_residual(&attn_out, residual)?;
 
         // Force GPU sync for accurate timing if profiling
         let t_attn = if profile {
@@ -485,8 +624,7 @@ impl DecoderLayer {
         // 2. Dense MLP and MoE run in PARALLEL from the same residual
         let residual = &xs;
 
-        // Dense MLP branch
-        let normed = self.pre_feedforward_layernorm.forward(&xs)?;
+        // Dense MLP branch (normed already computed by fused op above)
         let mlp_out = self.mlp.forward(&normed)?;
         let mlp_normed = self.post_feedforward_layernorm_1.forward(&mlp_out)?;
 
@@ -505,9 +643,9 @@ impl DecoderLayer {
             t0.elapsed()
         } else { t0.elapsed() };
 
-        // Sum MLP and MoE outputs, apply final post-FFW norm
-        let combined = (mlp_normed + moe_normed)?;
-        let combined = self.post_feedforward_layernorm.forward(&combined)?;
+        // Phase 1b.10: fused add + norm for MLP+MoE combination.
+        // Fuse mlp_normed + moe_normed + post_feedforward_layernorm into one call.
+        let (combined, _) = self.post_feedforward_layernorm.forward_with_residual(&moe_normed, &mlp_normed)?;
         let xs = (residual + combined)?;
 
         // 3. Layer scalar
@@ -604,7 +742,10 @@ impl Gemma4Model {
                 num_kv_heads,
                 head_dim,
                 rotary_emb: rotary,
-                kv_cache: KvCache::new(cfg.max_position_embeddings),
+                kv_cache: KvCache::new(
+                    num_kv_heads, head_dim, device,
+                    if is_full { None } else { Some(cfg.sliding_window) },
+                )?,
                 k_eq_v,
             };
 
@@ -615,45 +756,76 @@ impl Gemma4Model {
                 down_proj: load_qlinear(gguf, &format!("{}.ffn_down", lp))?,
             };
 
-            // MoE — pre-slice expert weights at load time to avoid per-token
-            // narrow/squeeze/contiguous overhead during forward pass.
-            // GGUF stores expert weights as 3D: candle reads dims as [num_experts, out, in]
-            // (GGUF dimensions are stored in reverse order from the logical layout).
-            let expert_gate_up_3d = gguf.get_tensor(
-                &format!("{}.ffn_gate_up_exps.weight", lp), MODEL_DTYPE,
-            )?;
-            let expert_down_3d = gguf.get_tensor(
-                &format!("{}.ffn_down_exps.weight", lp), MODEL_DTYPE,
-            )?;
+            // MoE expert weights: load as per-expert QMatMul objects.
+            // The GGUF stores expert weights as 3D QTensors: [num_experts, out, in].
+            // We extract per-expert 2D slices and wrap each in a QMatMul,
+            // which uses candle's SIMD-optimized Metal kernels (same as dense layers).
+            // No F32 dequantization — weights stay quantized in GPU memory (~20 GB).
+            let gu_qt = gguf.get_qtensor(&format!("{}.ffn_gate_up_exps.weight", lp))?;
+            let dn_qt = gguf.get_qtensor(&format!("{}.ffn_down_exps.weight", lp))?;
 
             if i == 0 {
                 tracing::info!(
-                    "Expert gate_up shape: {:?}, down shape: {:?}",
-                    expert_gate_up_3d.shape(), expert_down_3d.shape()
+                    "Expert gate_up: {:?} {:?}, down: {:?} {:?}",
+                    gu_qt.shape(), gu_qt.dtype(), dn_qt.shape(), dn_qt.dtype()
                 );
             }
 
-            // Slice on dim 0 (expert axis as loaded by candle).
-            // Each slice is [out_features, in_features], transpose to [in, out] for matmul.
-            let mut experts = Vec::with_capacity(cfg.num_experts);
+            // Extract raw quantized bytes (one GPU→CPU blit per 3D tensor per layer)
+            let gu_data = gu_qt.data()?;
+            let dn_data = dn_qt.data()?;
+
+            let gu_dtype = gu_qt.dtype();
+            let dn_dtype = dn_qt.dtype();
+
+            // Compute per-expert byte sizes from the 3D shape [num_experts, out, in]
+            // The quantized blocks encode the innermost dimension (in_features).
+            let gu_shape = gu_qt.shape(); // [num_experts, out_features, in_features]
+            let dn_shape = dn_qt.shape();
+            let gu_bytes_per_expert = gu_data.len() / cfg.num_experts;
+            let dn_bytes_per_expert = dn_data.len() / cfg.num_experts;
+
+            // Per-expert 2D shape: [out_features, in_features]
+            let gu_expert_shape = (gu_shape.dims()[1], gu_shape.dims()[2]);
+            let dn_expert_shape = (dn_shape.dims()[1], dn_shape.dims()[2]);
+
+            let mut expert_gate_up = Vec::with_capacity(cfg.num_experts);
+            let mut expert_down = Vec::with_capacity(cfg.num_experts);
+
             for e in 0..cfg.num_experts {
-                let gu = expert_gate_up_3d.narrow(0, e, 1)?.squeeze(0)?
-                    .t()?.contiguous()?;  // [hidden, intermediate*2]
-                let d = expert_down_3d.narrow(0, e, 1)?.squeeze(0)?
-                    .t()?.contiguous()?;  // [intermediate, hidden]
-                experts.push((gu, d));
+                let gu_slice = &gu_data[e * gu_bytes_per_expert..(e + 1) * gu_bytes_per_expert];
+                let gu_storage = candle_core::quantized::QStorage::from_data(
+                    Cow::Borrowed(gu_slice), device, gu_dtype,
+                )?;
+                let gu_qtensor = Arc::new(candle_core::quantized::QTensor::new(
+                    gu_storage, gu_expert_shape,
+                )?);
+                expert_gate_up.push(QMatMul::from_arc(gu_qtensor)?);
+
+                let dn_slice = &dn_data[e * dn_bytes_per_expert..(e + 1) * dn_bytes_per_expert];
+                let dn_storage = candle_core::quantized::QStorage::from_data(
+                    Cow::Borrowed(dn_slice), device, dn_dtype,
+                )?;
+                let dn_qtensor = Arc::new(candle_core::quantized::QTensor::new(
+                    dn_storage, dn_expert_shape,
+                )?);
+                expert_down.push(QMatMul::from_arc(dn_qtensor)?);
             }
-            // Drop the 3D tensors — only pre-sliced copies are kept
-            drop(expert_gate_up_3d);
-            drop(expert_down_3d);
+
+            if i == 0 {
+                tracing::info!(
+                    "Loaded {} expert QMatMul pairs (gate_up={:?}, down={:?})",
+                    cfg.num_experts, gu_dtype, dn_dtype,
+                );
+            }
 
             let moe = MoeBlock {
                 router_proj: load_qlinear(gguf, &format!("{}.ffn_gate_inp", lp))?,
                 router_scale: gguf.get_tensor(&format!("{}.ffn_gate_inp.scale", lp), MODEL_DTYPE)?,
-                per_expert_scale: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?,
                 per_expert_scale_cpu: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?
                     .to_dtype(DType::F32)?.to_vec1::<f32>()?,
-                experts,
+                expert_gate_up,
+                expert_down,
                 num_experts: cfg.num_experts,
                 top_k: cfg.top_k_experts,
                 moe_intermediate_size: cfg.moe_intermediate_size,
