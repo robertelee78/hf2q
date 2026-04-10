@@ -194,6 +194,88 @@ fn p95(sorted: &[f64]) -> f64 {
     sorted[rank]
 }
 
+/// Hardcoded fallback chat template used ONLY when no GGUF-embedded template
+/// exists and the user has not passed `--chat-template` / `--chat-template-file`.
+///
+/// This exists as a last-resort compatibility path for older/incomplete GGUFs
+/// that predate the Phase 1 chat-template fix. For the primary Gemma 4 path,
+/// the template comes from GGUF metadata (`tokenizer.chat_template`), matching
+/// llama.cpp behavior.
+const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
+    "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n";
+
+/// Resolve the chat template per ADR-005 Phase 1 priority order:
+///
+///   1. CLI `--chat-template STRING`
+///   2. CLI `--chat-template-file FILE`
+///   3. GGUF `tokenizer.chat_template` metadata
+///   4. Hardcoded fallback string (last resort)
+///
+/// Renders the resolved template with minijinja using the HuggingFace chat
+/// format (single-turn user message). On any render error from an embedded or
+/// CLI-supplied template, returns the error; the hardcoded fallback path does
+/// NOT go through jinja (it uses simple placeholder substitution) so it cannot
+/// itself fail.
+fn render_chat_template(
+    gguf: &GgufModel,
+    args: &cli::GenerateArgs,
+    user_prompt: &str,
+) -> Result<String> {
+    // Priority 1: CLI --chat-template string
+    if let Some(tmpl) = args.chat_template.as_deref() {
+        tracing::info!("Chat template: using CLI --chat-template override");
+        return render_jinja_template(tmpl, user_prompt);
+    }
+
+    // Priority 2: CLI --chat-template-file
+    if let Some(path) = args.chat_template_file.as_deref() {
+        tracing::info!("Chat template: loading from --chat-template-file {}", path.display());
+        let tmpl = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read --chat-template-file {}", path.display()))?;
+        return render_jinja_template(&tmpl, user_prompt);
+    }
+
+    // Priority 3: GGUF metadata `tokenizer.chat_template`
+    if let Some(tmpl) = gguf.get_metadata_string("tokenizer.chat_template") {
+        tracing::info!(
+            "Chat template: using GGUF metadata tokenizer.chat_template ({} chars)",
+            tmpl.len()
+        );
+        return render_jinja_template(&tmpl, user_prompt);
+    }
+
+    // Priority 4: hardcoded fallback — last resort, simple substitution
+    tracing::warn!(
+        "Chat template: no GGUF metadata tokenizer.chat_template and no CLI override; \
+         falling back to hardcoded Gemma4 template"
+    );
+    Ok(FALLBACK_GEMMA4_CHAT_TEMPLATE.replace("{{PROMPT}}", user_prompt))
+}
+
+/// Render a Jinja2 chat template using minijinja.
+///
+/// Passes HuggingFace-standard variables: `messages`, `add_generation_prompt`,
+/// `bos_token`, `eos_token`. Gemma 4's template should only reference these.
+fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("chat", template_str)
+        .context("Failed to parse chat template as Jinja2")?;
+    let tmpl = env
+        .get_template("chat")
+        .context("Failed to load parsed chat template")?;
+    let rendered = tmpl
+        .render(minijinja::context! {
+            messages => vec![
+                minijinja::context! { role => "user", content => user_prompt }
+            ],
+            add_generation_prompt => true,
+            bos_token => "<bos>",
+            eos_token => "<eos>",
+        })
+        .context("Failed to render chat template")?;
+    Ok(rendered)
+}
+
 /// Run the `generate` subcommand.
 pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let model_path = &args.model;
@@ -241,11 +323,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // Resolve prompt from --prompt or --prompt-file
     let prompt_text_raw = resolve_prompt(&args)?;
 
-    // Encode prompt using GGUF-style control tokens for Gemma4
-    let prompt_text = format!(
-        "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{}<turn|>\n<|turn>model\n",
-        prompt_text_raw
-    );
+    // Resolve the chat template per ADR-005 Phase 1 priority:
+    //   CLI --chat-template > CLI --chat-template-file > GGUF metadata > fallback
+    // The final fallback matches llama.cpp's behavior only when no template was
+    // embedded in the GGUF and the user has not overridden it.
+    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+
     let encoding = tokenizer.encode(prompt_text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
@@ -337,5 +420,33 @@ fn select_device() -> Result<Device> {
     {
         tracing::info!("Using CPU (no GPU features enabled)");
         Ok(Device::Cpu)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_jinja_template;
+
+    /// Minimal Gemma-like template: verifies minijinja rendering of a single
+    /// user message with `add_generation_prompt`.
+    #[test]
+    fn jinja_template_renders_single_user_turn() {
+        let tmpl = "{{ bos_token }}{% for m in messages %}<|turn|>{{ m.role }}\n{{ m.content }}<|end|>\n{% endfor %}{% if add_generation_prompt %}<|turn|>model\n{% endif %}";
+        let out = render_jinja_template(tmpl, "hello").expect("render ok");
+        assert!(out.starts_with("<bos>"), "output should start with bos_token: {out}");
+        assert!(out.contains("<|turn|>user\nhello<|end|>"), "user turn missing: {out}");
+        assert!(out.ends_with("<|turn|>model\n"), "generation prompt missing: {out}");
+    }
+
+    /// Parse failure on an invalid Jinja template should surface as an error.
+    #[test]
+    fn jinja_template_parse_error_is_reported() {
+        let tmpl = "{% unclosed"; // invalid
+        let err = render_jinja_template(tmpl, "x").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse") || msg.contains("Jinja") || msg.contains("template"),
+            "expected parse error, got: {msg}"
+        );
     }
 }

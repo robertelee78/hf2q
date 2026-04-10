@@ -71,6 +71,10 @@ ctrlc = { version = "3.4", features = ["termination"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
+# common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
+minijinja = "2"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

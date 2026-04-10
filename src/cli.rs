@@ -201,6 +201,17 @@ pub struct GenerateArgs {
     /// Repetition penalty (1.0 = disabled)
     #[arg(long, default_value = "1.0")]
     pub repetition_penalty: f64,
+
+    /// Override chat template with a Jinja2 string
+    ///
+    /// Priority order (per ADR-005 Phase 1): this flag > --chat-template-file >
+    /// GGUF `tokenizer.chat_template` metadata > hardcoded fallback.
+    #[arg(long)]
+    pub chat_template: Option<String>,
+
+    /// Override chat template by reading from a file containing a Jinja2 template
+    #[arg(long, conflicts_with = "chat_template")]
+    pub chat_template_file: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]

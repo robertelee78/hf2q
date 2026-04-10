@@ -95,4 +95,19 @@ impl GgufModel {
     pub fn device(&self) -> &Device {
         &self.device
     }
+
+    /// Read a string value from GGUF metadata, returning `None` if the key is
+    /// missing or not a string.
+    ///
+    /// Mirrors the reader side of the writer at `backends/gguf.rs:1846-1858`,
+    /// which stores `tokenizer.chat_template` from `chat_template.jinja` or
+    /// `tokenizer_config.json`. Per ADR-005 Phase 1 (lines 44, 691), the
+    /// serve/load path must read this key so inference matches llama.cpp.
+    pub fn get_metadata_string(&self, key: &str) -> Option<String> {
+        self.content
+            .metadata
+            .get(key)
+            .and_then(|v| v.to_string().ok())
+            .cloned()
+    }
 }
