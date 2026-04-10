@@ -116,7 +116,7 @@ Deep review of the deleted code is required before restoring to confirm each fil
 - [x] Batched expert matmuls (Tensor::stack + batched BF16 matmul, reduced per-token dispatch count)
 - [ ] Speed gap: 18 vs 107 tok/s — deferred to Phase 1b (see below)
 
-#### Phase 1b: Speed Optimization (IN PROGRESS — implementation batch 1 complete)
+#### Phase 1b: Speed Optimization (IN PROGRESS — 23.8 tok/s correct, target 107 tok/s)
 
 **Profiled decode breakdown (per layer, single token, M5 Max, Gemma 4 26B MoE Q4_K_M, 30 layers):**
 
@@ -241,27 +241,54 @@ Note: "profiled" timings include `to_scalar` GPU sync per component (~7ms overhe
 - **Fixes applied:** 1b.9 (sliding window), 1b.8 (SDPA eliminates repeat_kv for decode)
 - **Remaining:** QMatMul kernel profiling at 8192 dims to confirm if it's a candle kernel issue
 
-#### Phase 1b Implementation Status (2026-04-09, updated 2026-04-10)
+#### Phase 1b Implementation Status (2026-04-10)
+
+**Current benchmark result: 23.8 tok/s median** (M5 Max, Gemma 4 26B MoE Q6K/Q8_0 DWQ, 5 runs with zero variance, coherent output). Up from baseline 13.8 tok/s (~1.7x). llama.cpp target: 107 tok/s. Gap: ~4.5x remaining.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| 1b.1 | REWRITE NEEDED | Custom scalar Metal kernel was wrong approach. Correct approach: per-expert QMatMul using candle's optimized Metal kernels. See `docs/design-mul-mat-id-kernel.md`. |
-| 1b.2 | DONE (superseded) | Pre-stacked + index_select works but superseded by 1b.1's QMatMul approach |
-| 1b.3 | BLOCKED on 1b.1 | Expert weights must stay quantized; requires 1b.1 rewrite to QMatMul objects |
+| 1b.1 | DONE | Per-expert QMatMul via candle's SIMD-optimized Metal kernels. Expert weights byte-sliced from 3D GGUF QTensor into 128 2D QMatMul objects per layer. Skips F32 dequantization entirely — experts stay quantized in GPU memory. |
+| 1b.2 | N/A | Superseded by 1b.1 (no per-token Tensor::stack needed with QMatMul) |
+| 1b.3 | DONE | Expert weights stay quantized as QMatMul (Q6K gate_up + Q8_0 down, ~20 GB vs ~45 GB dequantized F32) |
 | 1b.4 | DONE | F32 forward pass, ~690 GPU dtype casts eliminated |
 | 1b.5 | DONE | 3 unnecessary `.contiguous()` removed |
-| 1b.6 | DONE | 35→1 GPU syncs per token via GPU-side routing |
-| 1b.7 | DONE | Pre-allocated KV cache with `slice_scatter`, auto-grow |
-| 1b.8 | DONE (decode) | SDPA for decode (vector path); manual attention for prefill (head_dim=512 exceeds 32KB threadgroup) |
-| 1b.9 | DONE | Sliding window KV truncation (correctness fix) |
-| 1b.10 | DONE | Fused RmsNorm + residual, ~60 fewer dispatches |
+| 1b.6 | PARTIAL | MoE routing still does 1 `to_vec2()` sync per layer (30/token). GPU-only routing path deferred until fused mul_mv_id kernel lands. |
+| 1b.7 | DONE | Pre-allocated KV cache with `slice_scatter`, auto-grow 2x. **Critical gotcha found**: slice_scatter on dim ≠ 0 uses a transpose trick that produces non-standard strides — returned view has position stride = `num_kv_heads * head_dim` instead of `head_dim`. Requires `.contiguous()` on the narrow'd view before SDPA can read it correctly. |
+| 1b.8 | DONE (decode) | SDPA vector path for decode (native GQA, no repeat_kv needed). Manual attention for prefill (candle's SDPA full kernel exceeds 32KB threadgroup mem for head_dim=512). Requires `softcapping=1.0` (candle convention for disabled, NOT 0.0). |
+| 1b.9 | DONE | Sliding window KV truncation — sliding layers only expose last 1024 tokens (correctness fix) |
+| 1b.10 | DONE | `RmsNorm::forward_with_residual()` fuses residual add into norm, ~60 fewer dispatches per forward pass |
 | 1b.11 | SKIPPED | 1 dispatch saved, not worth Metal plumbing |
-| 1b.12 | N/A | Superseded by 1b.4 (F32 forward) |
-| 1b.13 | N/A | Not needed — candle already batches; syncs were the problem (1b.6) |
-| 1b.14 | DONE | Warmup dummy token at load |
-| 1b.15 | DONE | Batched MoE prefill (per-expert token grouping) |
-| 1b.16 | DONE | Root causes identified, fixes applied (1b.8, 1b.9) |
+| 1b.12 | N/A | Superseded by 1b.4 (F32 forward pass) |
+| 1b.13 | N/A | Not needed — candle already batches dispatches; the real problem was forced `waitUntilCompleted` from `to_vec2()` (addressed by 1b.6 direction) |
+| 1b.14 | DONE | Warmup dummy token at load (eliminates ~37ms TTFT spike from Metal shader compilation) |
+| 1b.15 | DONE | Batched MoE prefill: tokens grouped per expert, one QMatMul per active expert (was num_tokens × 2 dispatches, now num_active_experts × 2) |
+| 1b.16 | DONE | Root causes identified: QMatMul kernel behavior at large dims, repeat_kv contiguous copy, sliding window not enforced. Fixes applied via 1b.8 (SDPA eliminates repeat_kv for decode) and 1b.9 (sliding window). |
 | Benchmark | DONE | `--benchmark` + `--prompt-file` flags, 5-run median/p95 reporting |
+
+#### Correctness Regression Bisect (2026-04-10)
+
+An initial Phase 1b implementation (commit `a0952e2`) reached 26.3 tok/s but produced **gibberish output** — token repetition, nonsense characters, no coherent reasoning. Speed without correctness is worthless. Systematic bisect from the baseline (commit `0a703d7`) applying one change at a time:
+
+| Test | Change Added | Correct? | tok/s |
+|------|--------------|----------|-------|
+| 1 | Baseline only | ✓ | 13.8 |
+| 2 | + F32 forward (1b.4) | ✓ | 8.9 |
+| 3 | + QMatMul per-expert MoE (1b.1) | ✓ | 27.3 |
+| 4 | + F32 + QMatMul | ✓ | 26.4 |
+| 5 | + Pre-allocated KV cache (1b.7) | ✓ | 22.9 |
+| 6 | + SDPA decode (naive port of 1b.8) | ✗ **gibberish** | — |
+| 7 | + SDPA with `.contiguous()` fix | ✓ | 23.4 |
+| 8 | + Sliding window (1b.9) | ✓ | 26.1 |
+| 9 | + Fused norm+residual (1b.10) | ✓ | 26.0 |
+| 10 | Final (all + benchmark harness) | ✓ | **23.8 median** |
+
+**Root cause**: `Tensor::slice_scatter` on dim ≠ 0 internally does `transpose(0, dim).slice_scatter0().transpose(0, dim)`. After this sequence, the tensor has shape `[1, heads, seq, hd]` but its underlying memory is laid out as `[seq, heads, 1, hd]` contiguous. The strides become `[hd, hd, heads*hd, 1]` — position stride is `num_kv_heads * head_dim`, not `head_dim`.
+
+Candle's SDPA vector kernel (`scaled_dot_product_attention.metal`) reads keys with constant stride `BN * D` where `D = head_dim`, assuming positions are contiguous in memory. Our slice_scatter'd KV cache violated this assumption, so the kernel read garbage from between-position gaps in the pre-allocated buffer.
+
+**Fix**: Call `.contiguous()` on the narrow'd view before returning from `KvCache::append`. This copies only the active portion per decode step (small: `num_kv_heads * current_len * head_dim` elements) while preserving the fast slice_scatter write path on the full buffer.
+
+This is a general lesson: when combining candle's Tensor ops with its raw Metal kernels, verify the stride assumptions hold. Ops that return "fast views" may not match what hand-written kernels expect.
 
 ### Phase 2: HTTP Server
 - Restore spec-layer code (schema, SSE, tool parsing) from git history after deep review
