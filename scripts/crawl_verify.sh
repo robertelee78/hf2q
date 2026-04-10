@@ -48,12 +48,15 @@ done
 [[ -f "$PROMPT_FILE" ]] || err "Prompt file not found: $PROMPT_FILE"
 [[ -x "$HF2Q_BIN"    ]] || err "hf2q binary not found at $HF2Q_BIN (run: cargo build --release)"
 
-if command -v llama-cli >/dev/null 2>&1; then
-  LLAMA_BIN="$(command -v llama-cli)"
-elif [[ -x "/opt/llama.cpp/build/bin/llama-cli" ]]; then
-  LLAMA_BIN="/opt/llama.cpp/build/bin/llama-cli"
+# llama-completion is the headless single-shot binary; llama-cli is the chat
+# REPL and will hang waiting for stdin even with prompt-from-file. We MUST use
+# llama-completion to get a deterministic 128-token output and then exit.
+if command -v llama-completion >/dev/null 2>&1; then
+  LLAMA_BIN="$(command -v llama-completion)"
+elif [[ -x "/opt/llama.cpp/build/bin/llama-completion" ]]; then
+  LLAMA_BIN="/opt/llama.cpp/build/bin/llama-completion"
 else
-  err "llama-cli not found on PATH or at /opt/llama.cpp/build/bin/llama-cli"
+  err "llama-completion not found on PATH or at /opt/llama.cpp/build/bin/llama-completion"
 fi
 
 if   command -v shasum    >/dev/null 2>&1; then SHA256_CMD=(shasum -a 256)
@@ -68,24 +71,32 @@ echo "GGUF:        $GGUF_PATH"
 echo "GGUF sha256: $GGUF_SHA256"
 echo "Prompt:      $PROMPT_FILE"
 echo "hf2q:        $HF2Q_BIN"
-echo "llama-cli:   $LLAMA_BIN"
+echo "llama-comp:  $LLAMA_BIN"
 echo "git HEAD:    $GIT_HEAD"
 echo
 echo "--- Chat template probe (best-effort) ---"
 if command -v strings >/dev/null 2>&1; then
-  strings "$GGUF_PATH" 2>/dev/null | grep -m1 -i "chat_template" || \
+  # `set -o pipefail` + `grep -m1` produces SIGPIPE on `strings` once grep exits,
+  # which trips the `||` even when grep matched. Capture into a variable first.
+  CHAT_PROBE="$(strings "$GGUF_PATH" 2>/dev/null | grep -m1 -i "chat_template" || true)"
+  if [[ -n "$CHAT_PROBE" ]]; then
+    echo "$CHAT_PROBE"
+  else
     echo "(no tokenizer.chat_template string found via 'strings')"
+  fi
 else
   echo "(strings not available; skipping template probe)"
 fi
 echo
 
-# Run llama-cli and hf2q -----------------------------------------------------
-echo "--- Running llama-cli (T=0 greedy, 128 tokens) ---"
+# Run llama-completion and hf2q ---------------------------------------------
+echo "--- Running llama-completion (T=0 greedy, 128 tokens) ---"
 if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$PROMPT_FILE" \
-      -n 128 --temp 0 -no-cnv --log-disable -ngl 999 -s 42 \
+      --predict 128 --temp 0 --seed 42 \
+      --log-disable --no-display-prompt --no-warmup --jinja \
+      -ngl 999 \
       >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
-  echo "llama-cli failed. See $LOG_LLAMA" >&2; exit 3
+  echo "llama-completion failed. See $LOG_LLAMA" >&2; exit 3
 fi
 
 echo "--- Running hf2q (T=0 greedy, 128 tokens) ---"
