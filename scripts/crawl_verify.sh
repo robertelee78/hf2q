@@ -90,12 +90,17 @@ fi
 echo
 
 # Run llama-completion and hf2q ---------------------------------------------
+# Notes:
+#   -st / --single-turn   : exit after one turn (otherwise waits for stdin)
+#   </dev/null            : explicit EOF on stdin so no interactive prompt
+#   --jinja               : apply the GGUF's tokenizer.chat_template (matches hf2q)
+#   --no-display-prompt   : stdout = generated text only, no echo
 echo "--- Running llama-completion (T=0 greedy, 128 tokens) ---"
 if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$PROMPT_FILE" \
       --predict 128 --temp 0 --seed 42 \
-      --log-disable --no-display-prompt --no-warmup --jinja \
-      -ngl 999 \
-      >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
+      --no-display-prompt --jinja \
+      -st -ngl 999 \
+      </dev/null >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
   echo "llama-completion failed. See $LOG_LLAMA" >&2; exit 3
 fi
 

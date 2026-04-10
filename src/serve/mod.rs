@@ -119,6 +119,23 @@ fn run_single_generation(
         .unsqueeze(0)?;  // [1, seq_len]
     let mut logits = model.forward(&input, 0)?;
 
+    // Debug: dump first decode-step logits to a file for cross-tool comparison.
+    // Set HF2Q_DUMP_LOGITS=path.bin to write 262144 f32 LE bytes (vocab_size).
+    if let Ok(dump_path) = std::env::var("HF2Q_DUMP_LOGITS") {
+        let logits_f32 = logits.to_dtype(candle_core::DType::F32)?;
+        let flat = logits_f32.flatten_all()?;
+        let v: Vec<f32> = flat.to_vec1::<f32>()?;
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for f in &v { bytes.extend_from_slice(&f.to_le_bytes()); }
+        std::fs::write(&dump_path, &bytes)?;
+        eprintln!("HF2Q_DUMP_LOGITS: wrote {} f32 values ({} bytes) to {}",
+            v.len(), bytes.len(), dump_path);
+        // Also print top-10 by logit
+        let mut idx_val: Vec<(usize, f32)> = v.iter().enumerate().map(|(i, &x)| (i, x)).collect();
+        idx_val.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("HF2Q top-10 logits: {:?}", &idx_val[..10]);
+    }
+
     let mut next_token = sampler::sample_token(&logits, params, &[])?;
     all_tokens.push(next_token);
 
@@ -333,6 +350,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
     tracing::info!("Prompt: {} tokens", prompt_tokens.len());
+    if std::env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok() {
+        eprintln!("HF2Q_DUMP_PROMPT_TOKENS: first10={:?} last10={:?} total={}",
+            &prompt_tokens[..prompt_tokens.len().min(10)],
+            &prompt_tokens[prompt_tokens.len().saturating_sub(10)..],
+            prompt_tokens.len());
+    }
 
     let params = SamplingParams {
         temperature: args.temperature,
