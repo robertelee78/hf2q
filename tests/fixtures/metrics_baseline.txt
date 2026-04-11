@@ -66,3 +66,59 @@ norm_dispatches_per_token: 3521.00
 #   dispatches/token 7513   → 5653    (−1860, −24.8%)
 #   sampler_sync_count unchanged — owned by 1bNEW.3
 #   norm_dispatches_per_token unchanged — owned by 1bNEW.4
+
+# ============================================================
+# ADR-005 1bNEW.3 — windowed async-drain greedy sampler
+# Captured 2026-04-10, post-commit Phase A.
+# Invocation: `--benchmark --max-tokens 128 --temperature 0` (unchanged).
+# GREEDY_WINDOW=4: every 4 decoded tokens is one forced sync.
+# The pre-timing drain of the first post-prefill token (1 extra sync,
+# outside the decode timer) plus 32 loop drains = 33 total syncs per
+# 128-token run.
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 37.03
+p95_tok_per_sec: 37.09
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 717870
+total_moe_to_vec2: 0
+total_moe_dispatches: 160020
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 447167
+
+# Per-token averages — 1bNEW.3 batched greedy path
+dispatches_per_token: 5652.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 42.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 3521.00
+
+# 1bNEW.3 deltas vs 1bNEW.1 Phase C:
+#   tok/s median      36.78 → 37.03   (+0.25 tok/s, +0.68%)
+#   p95               36.82 → 37.09   (+0.27 tok/s, +0.74%)
+#   sampler_sync      128   → 33      (−95, −74.2%)  [drain-every-4 + 1 pre-timing]
+#   dispatches/token 5653   → 5653    (≈ unchanged; +0.5 from cat+flatten in drain_window)
+#   moe_to_vec2       0     → 0       unchanged
+#   moe_per_layer     42    → 42      unchanged
+#   norm_dispatches   3521  → 3521    unchanged — owned by 1bNEW.4
+#
+# The tok/s delta is materially smaller than the ADR's 3-6 tok/s
+# estimate because that estimate extrapolated from Q3's 7.51 ms
+# pre-1bNEW.1 sampler-sync measurement. Post-1bNEW.1 the sampler
+# sync consolidates the full forward-pass tail (~19 ms/call), and
+# that time is unavoidable GPU compute — candle's `to_cpu` path
+# calls `flush_and_wait` on the whole command pool, which drains
+# every in-flight buffer regardless of which tensor is being
+# read. Queuing more forwards ahead of the drain does not overlap
+# them with the sync; it just extends the drain wait. The primitive
+# (greedy_argmax_lazy + run_decode_greedy_batched + drain_window)
+# is in place for a future candle patch that exposes per-buffer
+# wait semantics, at which point the ADR's projected gain would
+# materialize without any call-site changes.
