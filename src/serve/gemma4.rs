@@ -437,7 +437,6 @@ impl Attention {
     fn forward(
         &mut self,
         xs: &Tensor,
-        mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -476,26 +475,63 @@ impl Attention {
         let (k, v) = self.kv_cache.append(&k, &v)?;
         self.counters.dispatches_per_token.fetch_add(6, Ordering::Relaxed);
 
-        // SDPA for single-token decode (native GQA); manual attention for prefill
-        // (candle's SDPA full kernel exceeds 32KB threadgroup mem for head_dim=512).
+        // ADR-005 1bNEW.10 — BF16 prefill SDPA at head_dim=512 (Walk item, 2026-04-10).
+        //
+        // Decode (`q_len == 1`) routes to candle's SDPA vector path in F32 — unchanged
+        // from Phase 1 1b.8; GQA is native; no `repeat_kv` copy.
+        //
+        // Prefill (`q_len > 1`) previously ran a manual `repeat_kv + matmul + softmax
+        // + matmul` chain because an earlier Phase 1 comment claimed candle's SDPA
+        // full kernel "exceeds 32KB threadgroup mem for head_dim=512." That claim is
+        // STALE as of candle's reduced-tile selection: `candle-metal-kernels/src/
+        // kernels/sdpa.rs:86-94` picks tile `(bq=8, bk=8, wm=1, wn=1)` for `bd=512`
+        // in f16/bf16, totalling 24.1 KB threadgroup memory — well under the 32 KB
+        // limit. F32 is rejected for `bd=512` at `sdpa.rs:87-92`, but bf16 input is
+        // supported. The four compiled instantiations live at `candle-metal-kernels/
+        // src/metal_src/scaled_dot_product_attention.metal:2332-2337`
+        // (`steel_attention_{float16,bfloat16}_bq8_bk8_bd512_wm1_wn1_mask{matching,bool}`).
+        // Sliding layers (head_dim=256) use the larger `(bq=32,bk=16,wm=4,wn=1)` tile
+        // that candle already compiles for every supported head-dim × input-dtype.
+        //
+        // Strategy (per ADR-005 Q4 + Q8 resolutions):
+        //   1. Cast Q/K/V from F32 → BF16 at the SDPA boundary (decode stays F32).
+        //   2. Call `candle_nn::ops::sdpa(..., mask=None, do_causal=true, scale=1.0,
+        //      softcapping=1.0)`. `mask=None` sidesteps candle-nn's `mask_type ==
+        //      itype` constraint at `candle-nn/src/ops.rs:1178-1179`. `do_causal=true`
+        //      reproduces the lower-triangular mask the manual path used to build,
+        //      byte-equivalently at `seqlen_offset = 0` (the only prefill entry point
+        //      in the current decode-loop architecture).
+        //   3. Cast the output back to F32 so downstream norms/projections stay
+        //      consistent with `MODEL_DTYPE = F32`.
+        //
+        // Q4 spike (2026-04-10, `docs/spike-Q3Q4Q5-results.md`) pre-validated the
+        // numerics: argmax identical, top-5 order identical, ≥9/10 top-10 set
+        // overlap, needle-recall preserved on a 638-token adversarial prompt, max
+        // `|Δp post-softmax|` = 1.12e-3 on the needle, 1.63e-2 on the 187-token
+        // bench prompt (concentrated on the near-tied `The(818)`/`To(2021)` pair).
+        //
+        // Incidental fix: the prefill path no longer builds a `[1,1,seq,kv]` F32
+        // mask buffer, which removes the shape-mismatch crash site that used to
+        // trip when `q_len > sliding_window = 1024` (Walk Exception Register entry,
+        // 1bNEW.1 Phase D worked around it by shrinking the adversarial fixture).
         let attn_out = if q_len == 1 {
-            // One SDPA dispatch.
+            // One SDPA dispatch. Decode path unchanged: F32 in, F32 out.
             self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
             candle_nn::ops::sdpa(&q, &k, &v, None, false, 1.0, 1.0)?
         } else {
-            let k_exp = Self::repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
-            let v_exp = Self::repeat_kv(&v, self.num_heads / self.num_kv_heads)?;
-            let attn_weights = q.matmul(&k_exp.transpose(D::Minus2, D::Minus1)?)?;
-            let attn_weights = match mask {
-                Some(m) => attn_weights.broadcast_add(m)?,
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let out = attn_weights.matmul(&v_exp)?;
-            // repeat_kv × 2 (unsqueeze+expand+reshape = 3 each) + matmul +
-            // transpose + optional bcast_add + softmax + matmul ≈ 11 ops.
-            self.counters.dispatches_per_token.fetch_add(11, Ordering::Relaxed);
-            out
+            // BF16 cast at the prefill SDPA boundary only. `.contiguous()` so the
+            // fused kernel sees standard strides; `KvCache::append` already
+            // contiguous-ifies k/v, but `RotaryEmbedding::apply` may hand back a
+            // `cat`-produced tensor whose strides are standard — the extra guard
+            // is cheap and matches the spike build exactly.
+            let q_bf16 = q.to_dtype(DType::BF16)?.contiguous()?;
+            let k_bf16 = k.to_dtype(DType::BF16)?.contiguous()?;
+            let v_bf16 = v.to_dtype(DType::BF16)?.contiguous()?;
+            let out_bf16 = candle_nn::ops::sdpa(&q_bf16, &k_bf16, &v_bf16, None, true, 1.0, 1.0)?;
+            // 3 dtype casts + 3 contiguous + 1 SDPA + 1 cast back = 8 ops.
+            // (Replaces the prior ~11 ops from the manual matmul chain.)
+            self.counters.dispatches_per_token.fetch_add(8, Ordering::Relaxed);
+            out_bf16.to_dtype(DType::F32)?
         };
 
         // Reshape back (transpose + reshape = 2 ops)
@@ -505,16 +541,6 @@ impl Attention {
         self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
         self.o_proj.forward(&attn_out)
-    }
-
-    fn repeat_kv(x: &Tensor, repeats: usize) -> Result<Tensor> {
-        if repeats == 1 {
-            return Ok(x.clone());
-        }
-        let (b, kv_heads, seq, dim) = x.dims4()?;
-        let x = x.unsqueeze(2)?;
-        let x = x.expand((b, kv_heads, repeats, seq, dim))?;
-        x.reshape((b, kv_heads * repeats, seq, dim)).map_err(Into::into)
     }
 
     #[allow(dead_code)]
@@ -1033,12 +1059,11 @@ impl DecoderLayer {
     fn forward(
         &mut self,
         xs: &Tensor,
-        mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         // 1. Attention block
         let normed = self.input_layernorm.forward(xs)?;
-        let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset)?;
+        let attn_out = self.self_attn.forward(&normed, seqlen_offset)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         // ADR-005 1bNEW.0b — Walk Exception unwind.
         //
@@ -1372,16 +1397,13 @@ impl Gemma4Model {
         xs = (xs * (self.hidden_size as f64).sqrt())?;
         self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
-        // Build causal mask for prefill (skip for single-token decode)
-        let mask = if seq_len > 1 {
-            Some(Self::causal_mask(seq_len, seqlen_offset, &self.device, xs.dtype())?)
-        } else {
-            None
-        };
+        // ADR-005 1bNEW.10: no mask buffer is built for prefill — candle's SDPA
+        // full kernel handles causal masking internally via `do_causal=true` inside
+        // `Attention::forward`. Decode (`seq_len == 1`) never needs a mask.
 
         // Transformer layers
         for (_i, layer) in self.layers.iter_mut().enumerate() {
-            xs = layer.forward(&xs, mask.as_ref(), seqlen_offset)?;
+            xs = layer.forward(&xs, seqlen_offset)?;
         }
 
         // Final norm + lm_head (last token only)
@@ -1434,19 +1456,6 @@ impl Gemma4Model {
         Ok(())
     }
 
-    fn causal_mask(seq_len: usize, offset: usize, dev: &Device, dtype: DType) -> Result<Tensor> {
-        let kv_len = seq_len + offset;
-        let mask: Vec<f32> = (0..seq_len)
-            .flat_map(|i| {
-                (0..kv_len).map(move |j| {
-                    if j > i + offset { f32::NEG_INFINITY } else { 0.0 }
-                })
-            })
-            .collect();
-        Tensor::from_vec(mask, (1, 1, seq_len, kv_len), dev)?
-            .to_dtype(dtype)
-            .map_err(Into::into)
-    }
 }
 
 // ---------------------------------------------------------------------------
