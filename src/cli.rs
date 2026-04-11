@@ -213,13 +213,13 @@ pub struct GenerateArgs {
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
 
-    /// MoE expert dispatch mode. `loop` (default) keeps the Phase-1 baseline
-    /// per-expert `QMatMul::forward` loop with two forced `to_vec2()` routing
-    /// syncs per layer. `fused` routes layer 0 only through the fused
-    /// `kernel_mul_mv_id_*` path behind the ADR-005 1bNEW.1 Phase B gate; once
-    /// Phase C lands the same path sweeps every layer. Default stays on
-    /// `loop` until 1bNEW.1 completes all four phases.
-    #[arg(long, value_enum, default_value = "loop")]
+    /// MoE expert dispatch mode. `fused` (default, post-ADR-005 1bNEW.1
+    /// Phase D) routes every layer through the fused
+    /// `kernel_mul_mv_id_*` path, eliminating all 60 routing syncs per
+    /// token and delivering +54.8% decode speedup on the canonical
+    /// benchmark. `loop` preserves the Phase-1 baseline per-expert
+    /// `QMatMul::forward` loop for bisect-safety and fallback.
+    #[arg(long, value_enum, default_value = "fused")]
     pub moe_kernel: MoeKernelMode,
 }
 
