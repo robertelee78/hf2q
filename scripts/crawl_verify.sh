@@ -18,6 +18,9 @@ HF2Q_BIN="target/release/hf2q"
 OUT_HF2Q="/tmp/crawl_hf2q.txt"; LOG_HF2Q="/tmp/crawl_hf2q.log"
 OUT_LLAMA="/tmp/crawl_llama.txt"; LOG_LLAMA="/tmp/crawl_llama.log"
 RENDERED_PROMPT="/tmp/crawl_rendered_prompt.txt"; LOG_RENDER="/tmp/crawl_render.log"
+# 1bNEW.19: BOS-stripped copy of the rendered prompt for llama-completion. See
+# the long comment block at the llama-completion invocation for the why.
+RENDERED_PROMPT_LLAMA="/tmp/crawl_rendered_prompt_nobos.txt"
 
 usage() {
   cat <<EOF
@@ -111,6 +114,74 @@ fi
 [[ -s "$RENDERED_PROMPT" ]] || err "hf2q render produced empty $RENDERED_PROMPT (see $LOG_RENDER)"
 echo "hf2q rendered prompt: $(wc -c < "$RENDERED_PROMPT" | tr -d ' ') bytes"
 
+# 1bNEW.19: strip the leading literal `<bos>` text for the llama-completion
+# input. Rationale (full Chesterton-fence trace):
+#
+#   * hf2q's rendered prompt begins with the 5 literal bytes `<bos>` followed
+#     by `<|turn>user\n...`. hf2q's tokenizer parses `<bos>` as the special
+#     BOS token (id 2), giving a 187-token sequence `[2, 105, 2364, ...]`.
+#   * 1bNEW.0c switched to feeding the same rendered file to llama-completion
+#     via `--file` (so both tools see byte-identical input). It correctly
+#     dropped `--jinja` and added `-no-cnv` so llama-completion would NOT
+#     re-apply the chat template.
+#   * What 0c missed: llama-completion's prompt path still calls
+#     `common_tokenize(ctx, prompt, /*add_special=*/true, /*parse_special=*/true)`
+#     at /opt/llama.cpp/tools/completion/completion.cpp:322. With
+#     `add_special=true` and `parse_special=true`:
+#       - `parse_special=true` makes the literal `<bos>` text resolve to BOS
+#         token id 2 (the same way hf2q does it).
+#       - `add_special=true` AND vocab `add_bos=true` makes
+#         /opt/llama.cpp/src/llama-vocab.cpp:3081 push another BOS token at
+#         position 0 BEFORE the parsed-special BOS.
+#     Result: llama.cpp's token sequence is `[2, 2, 105, 2364, ...]` (188
+#     tokens, two BOS) while hf2q's is `[2, 105, 2364, ...]` (187 tokens,
+#     one BOS). Every position index is shifted by one, every per-position
+#     hidden state is non-comparable, and the byte-prefix classification is
+#     stuck at the BOS-shift artifact.
+#   * llama-vocab.cpp itself prints
+#       check_double_bos_eos: Added a BOS token to the prompt as specified
+#       by the model but the prompt also starts with a BOS token. So now
+#       the final prompt starts with 2 BOS tokens.
+#     when it hits this case (llama-vocab.cpp:3111-3115).
+#   * Why we don't use `--override-kv tokenizer.ggml.add_bos_token=bool:false`:
+#     Gemma 4 has a hardcoded workaround at
+#     /opt/llama.cpp/src/llama-vocab.cpp:2329-2335 that re-forces
+#     `add_bos = true` for `LLAMA_VOCAB_PRE_TYPE_GEMMA4` regardless of
+#     metadata, so the override is silently ignored.
+#   * Why we don't use `--prompt` instead of `--file`: same call site, same
+#     `common_tokenize(..., true, true)` invocation, same auto-BOS.
+#   * Why we don't use llama-server: heavier dependency change, separate
+#     prompt path, defeats the "byte-identical input" guarantee 0c
+#     established.
+#
+# Fix: rewrite the rendered prompt with the leading `<bos>` (5 bytes) stripped
+# off. llama.cpp then auto-prepends exactly one BOS via add_special=true and
+# we get the same `[2, 105, 2364, ...]` 187-token sequence as hf2q.
+#
+# Citations:
+#   - Spike C report: docs/spike-C-results.md:173-218 ("Prompt alignment
+#     (CRITICAL — pre-existing crawl_verify.sh hazard)")
+#   - llama-completion tokenize call: /opt/llama.cpp/tools/completion/completion.cpp:322
+#   - SPM auto-BOS gating logic: /opt/llama.cpp/src/llama-vocab.cpp:3081
+#   - SPM double-BOS warning: /opt/llama.cpp/src/llama-vocab.cpp:3111-3115
+#   - Gemma 4 forced add_bos workaround: /opt/llama.cpp/src/llama-vocab.cpp:2329-2335
+echo "--- Stripping leading <bos> text for llama-completion ($RENDERED_PROMPT_LLAMA) ---"
+python3 - "$RENDERED_PROMPT" "$RENDERED_PROMPT_LLAMA" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, "rb").read()
+if not data.startswith(b"<bos>"):
+    sys.stderr.write(
+        "error: rendered prompt does not start with literal '<bos>'; "
+        "hf2q chat template changed and the 1bNEW.19 BOS-strip assumption "
+        "is no longer valid. Re-investigate before proceeding.\n"
+    )
+    sys.exit(1)
+open(dst, "wb").write(data[5:])
+PY
+[[ -s "$RENDERED_PROMPT_LLAMA" ]] || err "BOS-stripped prompt is empty"
+echo "BOS-stripped prompt: $(wc -c < "$RENDERED_PROMPT_LLAMA" | tr -d ' ') bytes (was $(wc -c < "$RENDERED_PROMPT" | tr -d ' '))"
+
 # Run llama-completion and hf2q ----------------------------------------------
 # Notes:
 #   -st / --single-turn   : exit after one turn (otherwise waits for stdin)
@@ -122,14 +193,35 @@ echo "hf2q rendered prompt: $(wc -c < "$RENDERED_PROMPT" | tr -d ' ') bytes"
 #                           already-rendered input and aborts with
 #                           "this custom template is not supported".
 #   NO --jinja            : we pass the already-rendered prompt as a raw file,
-#                           so llama-completion must NOT re-apply the template
-echo "--- Running llama-completion (T=0 greedy, 128 tokens, pre-rendered prompt) ---"
-if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$RENDERED_PROMPT" \
+#                           so llama-completion must NOT re-apply the template.
+#   --file <stripped>     : 1bNEW.19 — feed the BOS-stripped copy so
+#                           llama-completion's auto-BOS produces exactly one
+#                           BOS at position 0, matching hf2q's 187-token
+#                           sequence. See long comment above.
+echo "--- Running llama-completion (T=0 greedy, 128 tokens, BOS-stripped prompt) ---"
+if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$RENDERED_PROMPT_LLAMA" \
       --predict 128 --temp 0 --seed 42 \
       --no-display-prompt -no-cnv \
       -st -ngl 999 \
       </dev/null >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
   echo "llama-completion failed. See $LOG_LLAMA" >&2; exit 3
+fi
+
+# 1bNEW.19 sanity gate: llama.cpp must report exactly the same prompt token
+# count as hf2q (187 on the canonical bench prompt). If we ever see a
+# mismatch here, the comparison is structurally invalid and the byte-prefix
+# classification is meaningless — fail loudly instead of silently producing
+# a wrong RED/YELLOW/GREEN reading.
+LLAMA_PROMPT_TOKENS="$(grep -oE 'prompt eval time =[^/]*/[[:space:]]*[0-9]+ tokens' "$LOG_LLAMA" | grep -oE '[0-9]+ tokens' | head -1 | awk '{print $1}')"
+if [[ -z "$LLAMA_PROMPT_TOKENS" ]]; then
+  echo "warn: could not parse llama-completion prompt token count from $LOG_LLAMA" >&2
+else
+  echo "llama-completion prompt tokens: $LLAMA_PROMPT_TOKENS"
+fi
+if grep -q "prompt also starts with a BOS token" "$LOG_LLAMA"; then
+  echo "error: llama-completion still reports double-BOS — 1bNEW.19 fix is broken." >&2
+  echo "       See $LOG_LLAMA for the check_double_bos_eos warning." >&2
+  exit 4
 fi
 
 echo "--- Running hf2q (T=0 greedy, 128 tokens) ---"
