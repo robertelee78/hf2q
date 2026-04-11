@@ -6,12 +6,30 @@ top-1 token and top-10 logits at decode 1 on the canonical 187-token prompt
 (`tests/bench_prompt_128.txt`), and the byte-level `crawl_verify.sh`
 classification against llama.cpp's reference output.
 
-The Crawl-verify classification is known to read **RED** across every row
-below because `llama-completion --jinja` applies a different prompt path
-than the rendered GGUF template — this is the `--jinja` gotcha documented
-at ADR-005 line 198. The real Walk-correctness gate is the `hf2q_top1`
-column moving from `The` to `To`, which will unblock the Layer B fixture
-commit (ADR-005 line 181).
+The Crawl-verify classification reads **RED** across every row through
+1bNEW.17 because of two stacked artifacts in `crawl_verify.sh`:
+1. Pre-1bNEW.0c, `llama-completion --jinja` applied a different prompt
+   path than the rendered GGUF template (the `--jinja` gotcha documented
+   at ADR-005 line 198 — fixed in 1bNEW.0c, commit `a5fc398`).
+2. Pre-1bNEW.19, even with the rendered prompt fed via `--file`,
+   `llama-completion`'s `add_special=true` tokenize call double-BOS'd the
+   literal `<bos>` text in hf2q's rendered output — producing 188 tokens
+   on llama.cpp vs 187 on hf2q, shifting every position by one and
+   making the per-position comparison non-equivalent. **Spike C
+   (`docs/spike-C-results.md:173-218`) discovered this and 1bNEW.19
+   (commit `d02dfc0`) fixed it by stripping the leading `<bos>` from
+   the rendered prompt before passing it to `llama-completion`.**
+
+**End-gate update (2026-04-11, post-1bNEW.19):** the historical "hf2q
+picks `The`, llama.cpp picks `To`" disagreement was substantially a
+measurement artifact of the BOS shift. **On byte-identical 187-token
+input, llama.cpp also picks `The` (818) at decode 1**, matching hf2q.
+The Walk-correctness End gate "hf2q top-1 == llama.cpp top-1 at decode
+1" is **MET** as of 1bNEW.19 (verified at HEAD `bad3a05` + `d02dfc0`).
+The honest residual drift is now a byte-level continuation divergence
+at decode token ~15 (`modern` microprocessors vs `the` transistor-based
+microprocessor) owned by the RoPE freq_factors mis-port that Spike C
+localized to layer 5 — scope of 1bNEW.18.
 
 GGUF: `models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf`
 (sha256 `ae19574dab588e0a742a8cfa1282ccf358ed8a58c5a3483f2bf596020a4f8e6f`)
@@ -41,6 +59,7 @@ Tool: `HF2Q_DUMP_LOGITS=/tmp/h.bin ./target/release/hf2q generate --model <gguf>
 | 1bNEW.17 Phase A | `0565c69` | (no forward-pass change) | (n/a) | (n/a) | (n/a) | (n/a) | (n/a) | New `src/serve/lm_head_kernel.rs` module with `LmHeadKernelMode { Loop, Fused }` enum, `lm_head_forward_fused` helper, and 3 Phase A unit tests at ε=1e-3 (wider than 1bNEW.1/4/6's 1e-5 because the reduction order deliberately changes — F32-cumulative vs MLX F16 gemm). All 3 tests pass: single-token decode shape max\|Δ\|=3.402e-4, multi-token prefill shape max\|Δ\|=3.402e-4, dtype-guardrail test rejects F32 weight / F16 input. `LmHeadKernelMode` CLI flag plumbed through `load_with_modes` alongside the three existing kernel-mode flags; new `lm_head_f16_weight: Option<Tensor>` field on `Gemma4Model`, populated at load time when mode is `Fused`. No forward-pass changes — loop-mode byte-identity re-verified on the real GGUF at `(818, 27.11075)` top-1. |
 | 1bNEW.17 Phase B | `0e36b1c` | `The` (818) | 27.110750 (loop) / 27.108929 (fused, Δ ≈ −1.8e-3 on top-1) | `To` (2021) | -0.6487 | byte 0 | RED | Fused F16 gemm wired into `Gemma4Model::forward` at `gemma4.rs:1879` behind `--lm-head-kernel=fused` (default stays `loop` in Phase B for bisect-safety). Top-10 ID set AND order byte-identical across both modes. `The`/`To` gap: loop +0.77016, fused +0.77102 — nearly flat (delta +0.00086 toward `The`). **The F16 reduction-order shift did NOT flip the argmax.** Walk-correctness drift owner is NOT the lm_head (the ADR's two-for-one hope was wrong). Median bench: loop 48.7 tok/s (byte-flat vs 1bNEW.6 Phase C), fused **58.49 tok/s (+9.78 tok/s, +20.1%)**. 5-run variance 0.2 (58.4–58.6). Metrics under fused: `dispatches_per_token` 2192.52 → 2194.52 (+2 exactly from the cast pair; no new weight traffic), other counters unchanged. gen128 byte-identical across modes: same 128-token "The evolution of computing—from mechanical calculators..." technical prose. 827-token adversarial `Melthorn-by-the-Sea` needle recall **PRESERVED** — F16 lm_head has no adverse interaction with long-context attention. |
 | 1bNEW.17 Phase C | (pending) | `The` (818) | 27.108929 (fused default) | `To` (2021) | -0.6487 | byte 0 | RED | Default flipped from `loop` to `fused`. Re-ran 5-run canonical bench under new default: **median 58.51 tok/s, p95 58.57**, variance 0.1 (58.5–58.6). Loop fallback retained behind `--lm-head-kernel=loop` and re-verified at 48.7 tok/s median (byte-flat vs 1bNEW.6 Phase C). Metrics at fused default: `dispatches_per_token=2194.52` (+2 vs 1bNEW.6 Phase C from the cast pair), other counters unchanged. Walk-correctness top-1 still `The` — 1bNEW.17 alone did not flip the argmax. The 1bNEW.17 item was proposed as a candidate Walk-correctness two-for-one in the post-Walk re-spike, but empirically the lm_head F16 reduction-order delta produces only ~2e-3 logit drift on the top-1 position, three orders of magnitude too small to close the ~0.77 `The`/`To` gap. The drift owner is still open. Speed delta: cumulative 1bNEW post-Walk progress is now 23.76 → 58.51 tok/s (+146.2% over the pre-Walk baseline; post-Walk alone 48.71 → 58.51, +20.1%). |
+| 1bNEW.19 | `d02dfc0` | `The` (818) | 27.108929 (unchanged from 1bNEW.17 Phase C — script-only fix, no forward-pass change) | **`The` (818)** (post-fix) | (n/a — see note) | **byte 60** (~15 tokens) | **YELLOW** | **Comparison-harness fix; no `src/` change; decode median unchanged at 58.51 tok/s by construction.** Spike C (`docs/spike-C-results.md:173-218`) discovered that `crawl_verify.sh` post-1bNEW.0c was producing 187 tokens on hf2q but **188** tokens on llama.cpp for the same rendered prompt file because `llama-completion --file <rendered>` calls `common_tokenize(..., /*add_special=*/true, /*parse_special=*/true)` at `/opt/llama.cpp/tools/completion/completion.cpp:322`. With both flags true, `parse_special=true` resolves the literal `<bos>` text in hf2q's rendered output to BOS id 2 AND `add_special=true` adds another BOS at position 0 via `/opt/llama.cpp/src/llama-vocab.cpp:3081` (forced on for Gemma 4 at `/opt/llama.cpp/src/llama-vocab.cpp:2329-2335` regardless of `--override-kv`). llama-vocab.cpp itself prints `check_double_bos_eos` at `:3111-3115` when this happens — the warning was right there in stderr the whole time. **Fix:** strip the leading 5-byte `<bos>` from the rendered prompt before passing to `llama-completion`, plus an exit-4 sanity-gate if the warning ever reappears. **Measured before/after at HEAD `bad3a05`:** llama-completion prompt tokens 188 → **187**; classification RED → **YELLOW**; common byte prefix 1 → **60 bytes (~15 tokens of agreement)**; hf2q top-1 unchanged at `The` (818); **llama.cpp top-1 changed from `To` (2021) → `The` (818)** when re-run with the BOS-stripped prompt at `--predict 1`. **Cross-cutting implication:** the historical "hf2q=`The` vs llama.cpp=`To`" disagreement across every row above is **substantially an artifact of the 188-vs-187 BOS shift**, not a math disagreement. **Walk-correctness End gate (ADR-005 line ~760) is MET on byte-identical input as of this row.** The honest residual drift is now visible at decode token ~15: hf2q continues `to **the** transistor-based microprocessor`, llama.cpp continues `to **modern** microprocessors`. This mid-decode divergence is owned by the per-layer RoPE freq_factors mis-port Spike C localized to layer 5 (`max |Δ|` step-change 4e-3 → 8e-1) — scope of **1bNEW.18 (Gemma4 RoPE `rope_freqs` port)**. The llama_top1_logprob column is left blank because `llama-completion --predict 1` does not emit logprobs by default; the reproducible single-token check is the post-fix `llama-completion ... --predict 1 ... </dev/null` invocation against `/tmp/crawl_rendered_prompt_nobos.txt`, which prints `OUT='The'` on stdout and `prompt eval time = ... / 187 tokens` on stderr. |
 
 ## hf2q top-10 at the Crawl baseline (and all rows through 1bNEW.0b)
 
@@ -89,9 +108,26 @@ RmsNorm, 1bNEW.6 Fused RoPE) could plausibly flip it.
 ## Commit policy
 
 Per ADR-005 line 181, neither `crawl_baseline.tokens` nor
-`llama_cpp_reference.tokens` is committed yet. They will be committed
-as golden fixtures — **and the per-commit gate will upgrade from
-"hf2q HEAD self-baseline" to "llama.cpp reference"** — only when the
-`hf2q_top1` column in this table first shows `To` (2021) instead of
-`The` (818). Until then, this markdown file is the primary Walk-
-progress record.
+`llama_cpp_reference.tokens` is committed yet.
+
+**Pre-1bNEW.19 framing (now superseded):** the original commit policy
+said the fixtures would be committed as golden references "only when
+the `hf2q_top1` column in this table first shows `To` (2021) instead of
+`The` (818)". That framing was based on the artifact-inflated
+"llama.cpp picks `To`" measurement that 1bNEW.19 (commit `d02dfc0`)
+revealed to be a BOS-shift artifact: on byte-identical 187-token input
+**llama.cpp also picks `The` (818)**, so the original gate was
+unreachable as written.
+
+**Post-1bNEW.19 framing (current):** the End gate "hf2q top-1 ==
+llama.cpp top-1 at decode 1" is now MET. Layer A and Layer B fixture
+commit is gated on the **byte-level continuation** matching to a
+useful prefix length — currently 60 bytes (~15 tokens) at the 1bNEW.19
+row. The honest residual divergence at decode token ~15 is owned by
+the RoPE freq_factors mis-port Spike C localized to layer 5; scope of
+**1bNEW.18 (Gemma4 RoPE `rope_freqs` port)**. Fixture commit is queued
+for the post-1bNEW.18 row when `crawl_verify.sh` reports a long enough
+common prefix to make `llama_cpp_reference.tokens` meaningful as a
+per-commit gate (target: GREEN classification per the script's existing
+thresholds, common prefix ≥ 200 bytes). Until then, this markdown file
+remains the primary Walk-progress record.
