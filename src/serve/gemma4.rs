@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
+use super::lm_head_kernel::LmHeadKernelMode as LmHeadKernelModeImpl;
 use super::moe_kernel;
 use super::rms_norm_kernel::{self, RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
 use super::rope_kernel::{self, RopeKernel, RopeKernelMode as RopeKernelModeImpl, RopeVariant};
@@ -1517,6 +1518,28 @@ pub struct Gemma4Model {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head_weight: Tensor,
+    /// ADR-005 1bNEW.17 — parallel F16 copy of `lm_head_weight`.
+    /// `None` under `--lm-head-kernel=loop`; `Some(f16_tensor)` under
+    /// `--lm-head-kernel=fused`, where `Gemma4Model::forward` routes
+    /// the final vocab projection through
+    /// `lm_head_kernel::lm_head_forward_fused` instead of the dense
+    /// F32 `lm_head_weight.matmul(.t())` path. The F32 copy is
+    /// retained alongside so `loop` mode stays byte-identical (same
+    /// pattern as `--moe-kernel=loop` keeping the per-expert
+    /// `QMatMul::forward` vec).
+    ///
+    /// `dead_code` allowed in Phase A — populated at load time but
+    /// not yet read by the forward pass. Phase B wires it into
+    /// `Gemma4Model::forward` behind the mode branch.
+    #[allow(dead_code)]
+    lm_head_f16_weight: Option<Tensor>,
+    /// ADR-005 1bNEW.17 — which of the two paths the forward pass
+    /// should take. Resolved at model load time from the CLI flag.
+    ///
+    /// `dead_code` allowed in Phase A — populated at load time but
+    /// not yet read. Phase B wires it into the forward-pass branch.
+    #[allow(dead_code)]
+    lm_head_mode: LmHeadKernelModeImpl,
     hidden_size: usize,
     final_logit_softcapping: Option<f64>,
     device: Device,
@@ -1552,6 +1575,7 @@ impl Gemma4Model {
             MoeKernelMode::Loop,
             RmsKernelMode::Loop,
             RopeKernelModeImpl::Loop,
+            LmHeadKernelModeImpl::Loop,
         )
     }
 
@@ -1572,6 +1596,7 @@ impl Gemma4Model {
             moe_mode,
             RmsKernelMode::Loop,
             RopeKernelModeImpl::Loop,
+            LmHeadKernelModeImpl::Loop,
         )
     }
 
@@ -1593,6 +1618,7 @@ impl Gemma4Model {
         moe_mode: MoeKernelMode,
         rms_norm_mode: RmsKernelMode,
         rope_mode: RopeKernelModeImpl,
+        lm_head_mode: LmHeadKernelModeImpl,
     ) -> Result<Self> {
         // ADR-005 1bNEW.0: shared dispatch counters. Every sub-structure that
         // issues candle ops holds a clone of this Arc.
@@ -1835,11 +1861,47 @@ impl Gemma4Model {
         // lm_head is tied to embed_tokens
         let lm_head_weight = embed_w;
 
+        // ADR-005 1bNEW.17 — parallel F16 copy of the tied lm_head
+        // weight for the fused path. Under `Loop` mode we pay no
+        // extra allocation; under `Fused` we allocate a 1.48 GB F16
+        // tensor alongside the existing 2.95 GB F32 `lm_head_weight`
+        // copy, so `--lm-head-kernel=loop` remains byte-identical to
+        // pre-1bNEW.17 and bisect-safe.
+        //
+        // The cast is `embed_w.to_dtype(DType::F16)`, which runs a
+        // single F32→F16 conversion pass on the device. The source
+        // `embed_w` is already on the target device at this point
+        // (it's the Embedding's weight, loaded at `gemma4.rs:1636`).
+        // `token_embd.weight` is physically F16 in the Gemma 4 DWQ
+        // GGUF (`n_bytes=1_476_395_008`, verified via gguf.GGUFReader),
+        // so the F16 Metal tensor bit-matches the original GGUF
+        // storage modulo the F32-round-trip through the existing
+        // `get_tensor` dequant path. A later item can thread the F16
+        // load directly from GGUF without the F32 intermediate; for
+        // Phase A/B/C the one-time load-time cast is the simpler
+        // bisect-safe change.
+        let lm_head_f16_weight: Option<Tensor> = match lm_head_mode {
+            LmHeadKernelModeImpl::Loop => None,
+            LmHeadKernelModeImpl::Fused => {
+                tracing::info!(
+                    "lm_head_kernel: allocating F16 copy of token_embd.weight \
+                     ({} × {} = {:.2} GB)",
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                    (cfg.vocab_size as f64 * cfg.hidden_size as f64 * 2.0) / 1e9,
+                );
+                Some(lm_head_weight.to_dtype(DType::F16)?)
+            }
+        };
+        tracing::info!("lm_head dispatch mode: {:?}", lm_head_mode);
+
         Ok(Self {
             embed_tokens: embed,
             layers,
             norm,
             lm_head_weight,
+            lm_head_f16_weight,
+            lm_head_mode,
             hidden_size: cfg.hidden_size,
             final_logit_softcapping: cfg.final_logit_softcapping,
             device: device.clone(),

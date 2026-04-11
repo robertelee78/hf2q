@@ -3,6 +3,7 @@
 pub mod config;
 pub mod gemma4;
 pub mod gguf_loader;
+pub mod lm_head_kernel;
 pub mod moe_kernel;
 pub mod rms_norm_kernel;
 pub mod rope_kernel;
@@ -685,9 +686,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // in Phase B (bisect-safety); Phase C flips the default to
     // `fused` after the 5-run benchmark gate validates it.
     let rope_mode: rope_kernel::RopeKernelMode = args.rope_kernel.into();
+    // ADR-005 1bNEW.17 Phase B: `--lm-head-kernel` plumbs the same way.
+    // Default is `loop` in Phase B (bisect-safety); Phase C flips the
+    // default to `fused` after the coherence + recall gates pass.
+    let lm_head_mode: lm_head_kernel::LmHeadKernelMode = args.lm_head_kernel.into();
     tracing::info!("MoE dispatch mode: {:?}", moe_mode);
     let mut model = Gemma4Model::load_with_modes(
-        &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode,
+        &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode, lm_head_mode,
     )?;
 
     // Warmup: run two dummy forwards to force Metal shader compilation for

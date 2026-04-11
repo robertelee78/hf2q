@@ -251,6 +251,27 @@ pub struct GenerateArgs {
     /// `rope_apply` chain for bisect-safety.
     #[arg(long, value_enum, default_value = "fused")]
     pub rope_kernel: RopeKernelMode,
+
+    /// lm_head dispatch mode. `fused` (default, post-ADR-005 1bNEW.17
+    /// Phase C) replaces the dense F32 matmul at the final vocab
+    /// projection site with a native F16 gemm dispatched through
+    /// candle's existing `call_mlx_gemm` path against a 1.48 GB F16
+    /// copy of `token_embd.weight` — halving the per-token weight-
+    /// memory traffic at the lm_head site from 2.95 GB F32 to 1.48 GB
+    /// F16 and eliminating the single biggest remaining Walk-faithful
+    /// cost in Phase 1b per the post-Walk re-spike
+    /// (`docs/spike-post-walk-results.md`, ~7.14 ms/token measured
+    /// forced-sync wall-clock at `gemma4.rs:1879`). Ports llama.cpp
+    /// `build_lm_head` at `/opt/llama.cpp/src/models/gemma4-iswa.cpp:248`,
+    /// which calls `ggml_mul_mat` on the quantized `model.output`
+    /// tensor (tied to `token_embd.weight` per
+    /// `llama-model.cpp:4973-5610` when `output.weight` is absent,
+    /// which is the case for every Gemma 4 GGUF including DWQ).
+    /// `loop` preserves the Phase-1 dense F32 matmul for bisect-
+    /// safety; the 2.95 GB F32 copy is held alongside the 1.48 GB
+    /// F16 copy in `Fused` mode to keep the fallback path hot.
+    #[arg(long, value_enum, default_value = "loop")]
+    pub lm_head_kernel: LmHeadKernelMode,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,6 +325,27 @@ pub enum RopeKernelMode {
 }
 
 impl std::fmt::Display for RopeKernelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loop => write!(f, "loop"),
+            Self::Fused => write!(f, "fused"),
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LmHeadKernelMode {
+    /// Phase-1 baseline — dense F32 matmul against the 2.95 GB
+    /// dequantized `token_embd.weight` copy at
+    /// `src/serve/gemma4.rs:1879`.
+    Loop,
+    /// ADR-005 1bNEW.17 — native F16 `call_mlx_gemm` dispatch
+    /// against a parallel 1.48 GB F16 copy of `token_embd.weight`,
+    /// via `src/serve/lm_head_kernel::lm_head_forward_fused`.
+    Fused,
+}
+
+impl std::fmt::Display for LmHeadKernelMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Loop => write!(f, "loop"),
