@@ -341,9 +341,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     model.clear_kv_cache();
     eprintln!("Warmup complete.");
 
-    // Load tokenizer
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+    // Load tokenizer. Disable the truncation policy baked into some tokenizer.json
+    // files (Gemma 4's ships with `truncation.max_length: 256`), which would otherwise
+    // silently truncate every prompt past 256 tokens and make bench/llama.cpp
+    // comparisons meaningless. We always want the full prompt; if a caller needs
+    // truncation, they can enforce it at a higher layer.
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+    tokenizer
+        .with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {}", e))?;
+    let tokenizer = tokenizer;
 
     // Resolve prompt from --prompt or --prompt-file
     let prompt_text_raw = resolve_prompt(&args)?;
