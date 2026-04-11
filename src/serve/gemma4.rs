@@ -973,9 +973,21 @@ impl Attention {
         // 1bNEW.6 so the Attention call site is mode-agnostic.
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
 
-        // KV cache append — slice_scatter × 2 + narrow × 2 + contiguous × 2 = 6 ops
+        // KV cache append — ADR-005 1bNEW.20 mode-aware dispatch count.
+        // `SliceScatter` counts 6 ops (2 `slice_scatter` + 2 `narrow` +
+        // 2 `contiguous`). `InPlace` counts 3 ops (1 `v.contiguous()`
+        // + 2 `slice_set`; the 2 `narrow` returns are pure view ops
+        // with zero Metal dispatches). The reduction from 6→3 per
+        // layer per token aligns with the measured +26.7 tok/s speed
+        // win; see ADR-005 1bNEW.20 Phase B bench table.
+        let kv_ops: u64 = match self.kv_cache.mode {
+            KvCacheKernelMode::SliceScatter => 6,
+            KvCacheKernelMode::InPlace => 3,
+        };
         let (k, v) = self.kv_cache.append(&k, &v)?;
-        self.counters.dispatches_per_token.fetch_add(6, Ordering::Relaxed);
+        self.counters
+            .dispatches_per_token
+            .fetch_add(kv_ops, Ordering::Relaxed);
 
         // ADR-005 1bNEW.10 — BF16 prefill SDPA at head_dim=512 (Walk item, 2026-04-10,
         // refined post-9cc522d empirical measurement to split by head_dim).
@@ -1037,8 +1049,8 @@ impl Attention {
             // One SDPA dispatch. Decode path unchanged: F32 in, F32 out.
             self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
             candle_nn::ops::sdpa(&q, &k, &v, None, false, 1.0, 1.0)?
-        } else if self.head_dim == 512 && std::env::var("HF2Q_SPIKE_D_NO_BF16").is_err() {
-            // SPIKE_D scratch gate (reverted before return). Global attention layers (bd=512): cast Q/K/V to BF16 and dispatch
+        } else if self.head_dim == 512 {
+            // Global attention layers (bd=512): cast Q/K/V to BF16 and dispatch
             // through candle's fused SDPA full kernel. bd=512 is the **only**
             // prefill head_dim where candle's fused path is usable for hf2q:
             //   - `candle-metal-kernels/src/kernels/sdpa.rs:86-94` selects the
@@ -1147,17 +1159,7 @@ impl Attention {
                 .collect();
             let m = Tensor::from_vec(mask_vec, (1, 1, q_seq, q_seq), dev)?;
             let attn_weights = attn_weights.broadcast_add(&m)?;
-            // SPIKE_D Phase B scratch: two-pass manual F32 softmax matching
-            // llama.cpp's `kernel_soft_max_f32` at ggml-metal.metal:1886-1948.
-            let attn_weights = if std::env::var("HF2Q_SPIKE_D_MANUAL_SOFTMAX").is_ok() {
-                let max_ = attn_weights.max_keepdim(D::Minus1)?;
-                let shifted = attn_weights.broadcast_sub(&max_)?;
-                let ex = shifted.exp()?;
-                let sum_ = ex.sum_keepdim(D::Minus1)?;
-                ex.broadcast_div(&sum_)?
-            } else {
-                candle_nn::ops::softmax_last_dim(&attn_weights)?
-            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             let out = attn_weights.matmul(&v_exp)?;
             // repeat_kv × 2 (3 ops each) + matmul + transpose + mask-build +
             // broadcast_add + softmax + matmul ≈ 12 ops.
@@ -1680,22 +1682,7 @@ impl MoeBlock {
         self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
 
         // --- Sum over top_k → [num_tokens, hidden] → reshape to output -----
-        // SPIKE_D Phase C scratch: if HF2Q_SPIKE_D_SEQ_MOE_SUM is set, replace
-        // the tree-reduced `sum(1)` with a left-associative sequential add
-        // chain matching llama.cpp's `build_moe_ffn` at
-        // /opt/llama.cpp/src/llama-graph.cpp:1604-1608 exactly:
-        //   moe_out = cur_experts[0];
-        //   for i in 1..n_expert_used: moe_out = moe_out + cur_experts[i];
-        let summed = if std::env::var("HF2Q_SPIKE_D_SEQ_MOE_SUM").is_ok() {
-            let mut acc = weighted.narrow(1, 0, 1)?.squeeze(1)?;
-            for i in 1..top_k {
-                let ei = weighted.narrow(1, i, 1)?.squeeze(1)?;
-                acc = (acc + ei)?;
-            }
-            acc
-        } else {
-            weighted.sum(1)?
-        }; // [num_tokens, hidden]
+        let summed = weighted.sum(1)?; // [num_tokens, hidden]
         let out = summed
             .reshape((b_sz, seq_len, hidden))?
             .to_dtype(out_dtype)?;

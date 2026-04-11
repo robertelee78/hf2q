@@ -279,22 +279,28 @@ pub struct GenerateArgs {
     #[arg(long, value_enum, default_value = "fused")]
     pub lm_head_kernel: LmHeadKernelMode,
 
-    /// KV cache append mode. `slice_scatter` (Phase A/B default) preserves
-    /// the pre-ADR-005 1bNEW.20 path: two `Tensor::slice_scatter` calls
-    /// followed by `narrow` + `contiguous` on the active region (6 candle
-    /// ops per layer per token). `in_place` is the 1bNEW.20 Walk-KERNEL-PORT
-    /// of llama.cpp's `llama_kv_cache::cpy_k` / `cpy_v` pattern at
-    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285` — direct in-place
-    /// `copy2d` into the pre-allocated cache buffer via candle's
-    /// `Tensor::slice_set` primitive (`tensor_cat.rs:246`), returning a
-    /// stride-aware narrowed view that the SDPA vector kernel reads
-    /// correctly without a `.contiguous()` bounce (the vector kernel
-    /// explicitly consumes `k_stride[1]` and `v_stride[1]` per
-    /// `candle-metal-kernels/src/kernels/sdpa.rs:278-279`). Eliminates
-    /// the contiguous copy of the entire `[1, kv_heads, visible_len, hd]`
-    /// active region on every decode step. Phase C flips the default to
-    /// `in_place` after the 5-run canonical bench gate validates it.
-    #[arg(long, value_enum, default_value = "slice-scatter")]
+    /// KV cache append mode. `in-place` (default, post-ADR-005 1bNEW.20
+    /// Phase B) is the Walk-KERNEL-PORT of llama.cpp's
+    /// `llama_kv_cache::cpy_k` / `cpy_v` pattern at
+    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285` — direct
+    /// in-place `copy2d` into the pre-allocated cache buffer via
+    /// candle's `Tensor::slice_set` primitive (`tensor_cat.rs:246`),
+    /// returning a stride-aware narrowed view that the SDPA vector
+    /// kernel reads correctly without a `.contiguous()` bounce (the
+    /// vector kernel explicitly consumes `k_stride[1]` and `v_stride[1]`
+    /// per `candle-metal-kernels/src/kernels/sdpa.rs:278-279`).
+    /// Eliminates the contiguous copy of the entire
+    /// `[1, kv_heads, visible_len, hd]` active region on every decode
+    /// step. Phase B bench: 58.5 → 85.6 tok/s median (+27.1 tok/s,
+    /// +46.3%), top-10 byte-identical, gen128 output byte-identical,
+    /// 827-token `Melthorn-by-the-Sea` adversarial recall preserved.
+    /// `slice-scatter` preserves the pre-1bNEW.20 path (two
+    /// `Tensor::slice_scatter` calls + `narrow` + `contiguous` on the
+    /// active region — 6 candle ops per layer per token) for
+    /// bisect-safety; the `.contiguous()` at the end is load-bearing
+    /// under that mode (see `gemma4.rs::KvCache::append_slice_scatter`
+    /// doc and ADR-005 line 229 for the a0952e2 stride-gotcha history).
+    #[arg(long, value_enum, default_value = "in-place")]
     pub kv_cache_kernel: KvCacheKernelMode,
 }
 
