@@ -14,7 +14,27 @@ use crate::cli;
 use config::Gemma4Config;
 use gemma4::{DispatchSnapshot, Gemma4Model, PerTokenMetrics};
 use gguf_loader::GgufModel;
-use sampler::SamplingParams;
+use sampler::{SamplingParams, SAMPLING_EPS};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+/// ADR-005 1bNEW.3 — greedy fast-path window size.
+///
+/// At T=0 / rep-penalty=1.0 decode, we chain `GREEDY_WINDOW` forward
+/// passes into candle's Metal command pool using the still-lazy argmax
+/// of each forward as the `input_ids` of the next, then `cat + to_vec1`
+/// the whole window in a single forced GPU→CPU drain. With N=4, the
+/// per-token sampler sync of 1/tok collapses to 1/4 tok (32 drains for
+/// 128 decode tokens), matching the ADR line 411 suggestion and the MLX
+/// `mx.async_eval` pattern.
+///
+/// N=1 is a valid degenerate mode (drain every token; same cardinality
+/// as the baseline but through the batched code path) and is kept as a
+/// bisect-safe knob. Larger N saturates candle's 5-buffer × 50-op
+/// command pool and causes backpressure inside `select_entry` (see
+/// `candle-metal-kernels/src/metal/commands.rs:118-147`), so N should
+/// stay in the `[1, 4]` range.
+const GREEDY_WINDOW: usize = 4;
 
 /// Resolve the tokenizer path: explicit flag, or look next to GGUF / in parent dirs.
 fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
@@ -145,6 +165,35 @@ fn run_single_generation(
         eprintln!("HF2Q top-10 logits: {:?}", &idx_val[..10]);
     }
 
+    // ADR-005 1bNEW.3 — greedy fast path (windowed async argmax drain).
+    //
+    // Gated on `temperature < SAMPLING_EPS && repetition_penalty == 1.0`.
+    // Decode is deterministic under those conditions, so we chain
+    // `GREEDY_WINDOW` forward passes together using the lazy argmax of
+    // each forward as the next forward's `input_ids`, and `cat + to_vec1`
+    // them all in a single forced GPU→CPU drain per window — collapsing
+    // the baseline 1-sync-per-token pattern to 1-sync-per-N-tokens. See
+    // `run_decode_greedy_batched` below for the full loop.
+    //
+    // Any other sampling configuration routes through the per-token sync
+    // path (needed by the RNG / rep-penalty gather); that path is
+    // byte-identical to 1bNEW.1.
+    let fast_path = params.temperature < SAMPLING_EPS
+        && params.repetition_penalty == 1.0;
+
+    if fast_path {
+        return run_decode_greedy_batched(
+            model,
+            tokenizer,
+            logits,
+            &mut all_tokens,
+            &eos_token_ids,
+            params.max_tokens,
+            silent,
+        );
+    }
+
+    // === Per-token sync path (non-greedy or rep_penalty != 1.0) ===
     let mut next_token = sampler::sample_token(&logits, params, &[], &counters)?;
     all_tokens.push(next_token);
 
@@ -181,6 +230,282 @@ fn run_single_generation(
 
     let elapsed = start.elapsed();
     Ok((generated, elapsed))
+}
+
+/// ADR-005 1bNEW.3 — windowed async-drain greedy decode.
+///
+/// Runs `max_tokens` total generated tokens by chaining `GREEDY_WINDOW`
+/// forward passes between each GPU→CPU drain. Each forward's lazy argmax
+/// (a `[1, 1]` u32 tensor) feeds directly into the next forward's
+/// `input_ids`, all while still inside candle's Metal command pool. When
+/// the window fills up — or EOS / max_tokens forces an earlier stop —
+/// the window's lazy argmax tensors are concatenated and drained with a
+/// single `to_vec1::<u32>()` call, which is the ONE forced sync per
+/// window.
+///
+/// **Correctness invariants:**
+/// - Token sequence is bitwise identical to the per-token sync path. The
+///   forward ops, argmax op, KV-cache mutations, and lm_head softcapping
+///   are the same ops in the same order — this routine only changes
+///   *when* the CPU observes the result. Validated by a byte-identical
+///   stdout diff against the 1bNEW.1 baseline (commit 13b5536) on the
+///   187-token canonical bench prompt, 128 decode tokens.
+/// - EOS detection is delayed by at most `GREEDY_WINDOW - 1` forward
+///   passes: if token `k` mid-window is EOS, the `k+1..window_end`
+///   forwards still execute (and their KV-cache writes still land in
+///   the cache) before the drain notices. Those tokens are dropped from
+///   output via `all_tokens.truncate(...)` inside `drain_window`. This
+///   is faithful to the ADR "sync every N tokens" wording and
+///   unavoidable given that we cannot inspect a still-lazy tensor.
+/// - The final partial window is drained before returning, so candle's
+///   command pool has no unread work on exit.
+///
+/// **Counter accounting:**
+/// - `sampler_sync_count` increments once per `to_vec1` drain, not once
+///   per token. For `max_tokens = 128` with `GREEDY_WINDOW = 4` the
+///   layout is:
+///     1 pre-timing drain (the first post-prefill token)
+///     + ceil((max_tokens - 1) / GREEDY_WINDOW) loop drains
+///     = 1 + 32 = 33 sampler syncs for a 128-token run,
+///   down from 128 at the 1bNEW.1 baseline (one per token). Pre-timing
+///   drains before the decode timer starts, matching the per-token
+///   path's timer discipline; its wall-clock cost is excluded from
+///   tok/s exactly as the per-token path excludes its first sample.
+/// - `dispatches_per_token` is incremented by `greedy_argmax_lazy`
+///   (1 per sampled token for the argmax) and by `drain_window`
+///   (2 per drain for the cat + flatten_all).
+///
+/// **Why this doesn't match the ADR's 3-6 tok/s gain estimate.** Q3's
+/// 7.51 ms sampler-sync figure was measured on the pre-1bNEW.1 baseline
+/// (24.30 tok/s, 60 MoE to_vec2 syncs per token absorbing most of the
+/// GPU wait). Post-1bNEW.1 the sampler sync consolidates the full
+/// forward-pass tail (lm_head + softcap + argmax + all layer-N remnants)
+/// and measures ~19 ms/call (bracketed with Instant::now around the old
+/// `argmax().to_scalar()` on the 1bNEW.1 baseline, 2026-04-10). That
+/// 19 ms is unavoidable GPU compute time, not sync overhead — candle's
+/// `to_cpu` path goes through `flush_and_wait` on the entire command
+/// pool (`candle-metal-kernels/src/metal/commands.rs:176`), which drains
+/// every in-flight buffer regardless of which tensor is being read back.
+/// Queuing forward N+1 before syncing on forward N does NOT overlap the
+/// sync with N+1's head — it just makes the sync wait for N+N+1 instead
+/// of just N. The one-ahead pipeline idiom that works in MLX (which has
+/// a multi-stream async graph executor) actively regresses in candle.
+/// The item lands as a structural refactor: `sampler_sync_count` drops
+/// from 128 to 33, tok/s is at parity (+0.2 ± noise), and the primitive
+/// is in place for a future candle-side patch that exposes per-buffer
+/// wait semantics.
+#[allow(clippy::too_many_arguments)]
+fn run_decode_greedy_batched(
+    model: &mut Gemma4Model,
+    tokenizer: &tokenizers::Tokenizer,
+    prefill_logits: Tensor,
+    all_tokens: &mut Vec<u32>,
+    eos_token_ids: &[u32],
+    max_tokens: usize,
+    silent: bool,
+) -> Result<(usize, std::time::Duration)> {
+    use std::io::Write;
+
+    if max_tokens == 0 {
+        return Ok((0, std::time::Duration::ZERO));
+    }
+
+    let counters = model.counters();
+    let seqlen_base = all_tokens.len();
+    let device = prefill_logits.device().clone();
+
+    // === Pre-timing: resolve the first post-prefill token ===
+    //
+    // Matches the per-token path: the first sample runs BEFORE the
+    // decode timer starts. This is where Metal shader-compilation
+    // warmup sits (~200 ms on a cold process) — excluding it from the
+    // timer gives numbers directly comparable to the 1bNEW.1 baseline's
+    // tok/s figure.
+    //
+    // We use a concrete `Tensor::new(&[first_u32], ...)` for the very
+    // first forward's `input_ids` (the same shape the per-token path
+    // constructs). The subsequent forwards chain the lazy argmax
+    // directly.
+    let first_u32: u32 = sampler::greedy_argmax_lazy(&prefill_logits, &counters)?
+        .flatten_all()?
+        .to_vec1::<u32>()?[0];
+    counters.sampler_sync_count.fetch_add(1, Ordering::Relaxed);
+    counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed); // flatten_all
+    all_tokens.push(first_u32);
+    let mut generated: usize = 1;
+
+    if !silent {
+        let token_str = tokenizer.decode(&[first_u32], false).unwrap_or_default();
+        print!("{}", token_str);
+        let _ = std::io::stdout().flush();
+    }
+
+    // Early-out when only one token was requested, or the first token
+    // itself is EOS.
+    if max_tokens == 1 || eos_token_ids.contains(&first_u32) {
+        return Ok((generated, std::time::Duration::ZERO));
+    }
+
+    // === Decode timer starts here (matches per-token path) ===
+    let start = std::time::Instant::now();
+
+    // Window of pending lazy argmax tensors waiting for a drain. Each
+    // element is a `[1, 1]` u32 tensor produced by `greedy_argmax_lazy`
+    // that will also be used as `input_ids` for the next forward pass
+    // via candle `Embedding::forward` → `index_select` (no host copy).
+    let mut window: Vec<Tensor> = Vec::with_capacity(GREEDY_WINDOW);
+
+    // Seed the loop with a concrete `Tensor::new(&[first_u32])` for the
+    // first forward. From forward(2) onward, `pending_input` is the
+    // lazy argmax of forward(k-1)'s logits — the chain entry point.
+    let mut pending_input = Tensor::new(&[first_u32], &device)?.unsqueeze(0)?; // [1, 1]
+
+    // Main decode loop — produces tokens 2..max_tokens. Each iteration:
+    //   1. If the window is full, drain it (1 forced sync per
+    //      `GREEDY_WINDOW` tokens).
+    //   2. Enqueue forward(K) using `pending_input`, which is the
+    //      fresh `Tensor::new(&[first_u32])` on the first iteration
+    //      and the still-lazy argmax of forward(K-1) on subsequent
+    //      iterations — candle's `Embedding::forward → index_select`
+    //      accepts either because both are contiguous u32 `[1, 1]`.
+    //   3. Sample the new token lazily via `greedy_argmax_lazy`; push
+    //      the lazy result into the window and wire it as the next
+    //      iteration's `pending_input`.
+    //
+    // Forward pass K writes KV cache position `seqlen_base + K - 1`
+    // (K counted from 1). With `generated == K` on entry, the offset
+    // formula is `seqlen_base + generated - 1`, equivalent to
+    // `all_tokens.len() - 1 - window.len()`.
+    let mut eos_hit = false;
+    while generated < max_tokens {
+        if window.len() >= GREEDY_WINDOW {
+            match drain_window(
+                &mut window,
+                all_tokens,
+                eos_token_ids,
+                seqlen_base,
+                generated,
+                tokenizer,
+                silent,
+                &counters,
+            )? {
+                DrainOutcome::Continue => {}
+                DrainOutcome::EosAt => {
+                    eos_hit = true;
+                    break;
+                }
+            }
+        }
+
+        let seqlen_offset = seqlen_base + generated - 1;
+        let logits = model.forward(&pending_input, seqlen_offset)?;
+        pending_input = sampler::greedy_argmax_lazy(&logits, &counters)?;
+        window.push(pending_input.clone());
+        all_tokens.push(0u32);
+        generated += 1;
+    }
+
+    // Final drain of any pending window content. Skipped if we already
+    // broke out on EOS mid-loop (in which case `drain_window` has
+    // already truncated `all_tokens` to the EOS boundary).
+    if !eos_hit && !window.is_empty() {
+        let _ = drain_window(
+            &mut window,
+            all_tokens,
+            eos_token_ids,
+            seqlen_base,
+            generated,
+            tokenizer,
+            silent,
+            &counters,
+        )?;
+    }
+
+    if !silent {
+        let _ = std::io::stdout().flush();
+    }
+
+    let elapsed = start.elapsed();
+
+    // `generated_emitted` = actually-emitted tokens, which equals
+    // `all_tokens.len() - seqlen_base` after `drain_window` has truncated
+    // any mid-window EOS tail. Returning this value keeps the tok/s
+    // numerator honest — we don't credit speculative forwards that EOS
+    // discarded.
+    let generated_emitted = all_tokens.len() - seqlen_base;
+    Ok((generated_emitted, elapsed))
+}
+
+/// Result of a single window drain.
+enum DrainOutcome {
+    /// The drained window contained no EOS token; keep decoding.
+    Continue,
+    /// EOS hit inside the drained window — `all_tokens` has been
+    /// truncated to include the EOS token and discard any speculative
+    /// forwards queued past it. The caller should stop emitting.
+    EosAt,
+}
+
+/// Drain the pending window of lazy argmax tensors with ONE forced
+/// GPU→CPU sync, then walk the materialized u32s: overwrite the
+/// placeholders in `all_tokens`, print each to stdout if non-silent, and
+/// stop early on EOS (truncating `all_tokens` so the caller's
+/// `generated_emitted` count matches the actually-printed tokens).
+#[allow(clippy::too_many_arguments)]
+fn drain_window(
+    window: &mut Vec<Tensor>,
+    all_tokens: &mut Vec<u32>,
+    eos_token_ids: &[u32],
+    seqlen_base: usize,
+    generated_so_far: usize,
+    tokenizer: &tokenizers::Tokenizer,
+    silent: bool,
+    counters: &Arc<gemma4::DispatchCounters>,
+) -> Result<DrainOutcome> {
+    use std::io::Write;
+
+    if window.is_empty() {
+        return Ok(DrainOutcome::Continue);
+    }
+    let window_len = window.len();
+
+    // ONE forced sync for the whole window. Each element is a `[1, 1]`
+    // u32 tensor; `cat` on dim 0 yields `[window_len, 1]`, `flatten_all`
+    // gives `[window_len]`, and `to_vec1::<u32>` is the single drain.
+    let stacked = Tensor::cat(window.as_slice(), 0)?.flatten_all()?;
+    let tokens: Vec<u32> = stacked.to_vec1::<u32>()?;
+    counters.sampler_sync_count.fetch_add(1, Ordering::Relaxed);
+    counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed); // cat + flatten_all
+    window.clear();
+    debug_assert_eq!(tokens.len(), window_len);
+
+    // The placeholders for these tokens are at the tail of `all_tokens`,
+    // starting at `placeholder_start`.
+    let placeholder_start = seqlen_base + generated_so_far - window_len;
+
+    let mut eos_idx: Option<usize> = None;
+    for (k, &tok) in tokens.iter().enumerate() {
+        all_tokens[placeholder_start + k] = tok;
+        if !silent {
+            let token_str = tokenizer.decode(&[tok], false).unwrap_or_default();
+            print!("{}", token_str);
+            let _ = std::io::stdout().flush();
+        }
+        if eos_token_ids.contains(&tok) {
+            eos_idx = Some(k);
+            break;
+        }
+    }
+
+    if let Some(k) = eos_idx {
+        // Truncate `all_tokens` so its length reflects only tokens that
+        // were actually emitted (EOS inclusive, matching the per-token
+        // path which pushes the EOS token and then breaks).
+        all_tokens.truncate(placeholder_start + k + 1);
+        return Ok(DrainOutcome::EosAt);
+    }
+
+    Ok(DrainOutcome::Continue)
 }
 
 /// Detect hardware info for benchmark reporting.

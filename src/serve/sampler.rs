@@ -30,7 +30,53 @@ impl Default for SamplingParams {
     }
 }
 
-const SAMPLING_EPS: f64 = 1e-5;
+pub const SAMPLING_EPS: f64 = 1e-5;
+
+/// ADR-005 1bNEW.3 fast-path: run `argmax` on greedy-decode logits WITHOUT
+/// calling `to_scalar`, so the result stays a lazy `[1, 1]` u32 tensor.
+///
+/// The returned tensor is shaped to be handed straight to the next
+/// `model.forward` as `input_ids`: candle's `Embedding::forward` calls
+/// `index_select` on the indices tensor, which is a GPU op that takes any
+/// contiguous u32 tensor — no host roundtrip required. Callers chain
+/// `forward(N+1)` on the lazy argmax of `forward(N)`, accumulate a window
+/// of argmax tensors, and drain them all at once via `cat + to_vec1`:
+/// ONE forced GPU→CPU sync for the whole window instead of one per token.
+/// See `mod.rs::run_decode_greedy_batched`.
+///
+/// This function does NOT itself force a GPU→CPU sync. The
+/// `counters.sampler_sync_count` increment is deferred to the caller's
+/// drain (one per drained window, not one per token).
+///
+/// Op chain is `squeeze(0) → squeeze(0) → argmax(0) → reshape((1,1))` —
+/// bitwise-identical to the non-batched `sample_token` greedy fast path
+/// (which does `squeeze → squeeze → argmax → to_scalar`). Only the
+/// terminal `to_scalar` is skipped; the three view rewrites and the
+/// argmax kernel dispatch are the same.
+///
+/// Gated on greedy T=0 with `repetition_penalty == 1.0`; any other
+/// sampling configuration must route through the per-token `sample_token`
+/// path, which needs the previous u32 before sampling the next one
+/// (for RNG draws and the rep-penalty gather).
+pub fn greedy_argmax_lazy(
+    logits: &Tensor,
+    counters: &Arc<DispatchCounters>,
+) -> Result<Tensor> {
+    let logits = logits.squeeze(0)?;
+    let logits = if logits.dims().len() > 1 {
+        logits.squeeze(0)?
+    } else {
+        logits
+    };
+    let arg_scalar = logits.argmax(0)?; // shape: [], dtype: u32
+    debug_assert_eq!(arg_scalar.dtype(), DType::U32, "candle argmax must return U32");
+    let next_input = arg_scalar.reshape((1, 1))?;
+    // argmax is the only real dispatch; squeeze and reshape are view
+    // rewrites on contiguous storage. Counted as 1 real dispatch to keep
+    // per-token averages meaningful.
+    counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+    Ok(next_input)
+}
 
 /// Sample a token from logits.
 ///
