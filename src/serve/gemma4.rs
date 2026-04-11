@@ -9,11 +9,132 @@ use candle_core::{DType, Device, Tensor, D};
 use candle_core::quantized::QMatMul;
 use candle_nn::{Embedding, Module};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
 
 const MODEL_DTYPE: DType = DType::F32;
+
+// ---------------------------------------------------------------------------
+// DispatchCounters — ADR-005 1bNEW.0 (pre-flight metrics instrumentation)
+// ---------------------------------------------------------------------------
+//
+// Observe-only per-forward-pass counters used by the Walk progress discipline
+// (ADR-005 line 157, stop-and-diagnose rule). Each counter is an AtomicU64
+// incremented at the corresponding dispatch-issuance site in the forward path.
+//
+// Semantics:
+//   - `dispatches_per_token`      : total candle/Metal op calls issued by one
+//                                    `Gemma4Model::forward` pass. Coarse — the
+//                                    sum of every other counter plus the ops
+//                                    that don't fit another bucket (embedding
+//                                    lookup, final matmul, softcapping).
+//   - `moe_to_vec2_count`         : `Tensor::to_vec2()` calls inside
+//                                    `MoeBlock::forward` (gemma4.rs:428-429).
+//                                    Each is a forced `waitUntilCompleted`.
+//                                    Baseline expectation: 2 × num_layers.
+//   - `moe_dispatches`            : total candle ops inside every MoeBlock
+//                                    forward across all layers.
+//   - `moe_layer_invocations`     : number of MoeBlock forward calls this
+//                                    pass (used to average moe_dispatches).
+//   - `sampler_sync_count`        : `argmax().to_scalar()` forced GPU→CPU
+//                                    syncs in the sampler (sampler.rs:49).
+//                                    Baseline: 1 per decoded token.
+//   - `norm_dispatches_per_token` : total candle ops inside RmsNorm::forward
+//                                    and Attention::rms_norm_unit (norm-path
+//                                    dispatches).
+//   - `forward_count`             : number of `Gemma4Model::forward` calls
+//                                    since the last reset. Used as the divisor
+//                                    when computing per-token averages.
+//
+// All increments are `Ordering::Relaxed` — we only need atomicity, not a
+// happens-before relation, because the counters are never read during a
+// forward pass, only after the benchmark loop completes.
+//
+// Chesterton's fence: no counters exist today. Phase 1 shipped with a single
+// `Instant::now()` measurement at the `generate()` boundary in mod.rs; this
+// struct is pure visibility, not a replacement for a hidden mechanism.
+#[derive(Default)]
+pub struct DispatchCounters {
+    pub dispatches_per_token: AtomicU64,
+    pub moe_to_vec2_count: AtomicU64,
+    pub moe_dispatches: AtomicU64,
+    pub moe_layer_invocations: AtomicU64,
+    pub sampler_sync_count: AtomicU64,
+    pub norm_dispatches_per_token: AtomicU64,
+    pub forward_count: AtomicU64,
+}
+
+impl DispatchCounters {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Zero every field. Called once before the decode loop so that counters
+    /// reflect only the timed region (decode), not prefill or warmup.
+    pub fn reset(&self) {
+        self.dispatches_per_token.store(0, Ordering::Relaxed);
+        self.moe_to_vec2_count.store(0, Ordering::Relaxed);
+        self.moe_dispatches.store(0, Ordering::Relaxed);
+        self.moe_layer_invocations.store(0, Ordering::Relaxed);
+        self.sampler_sync_count.store(0, Ordering::Relaxed);
+        self.norm_dispatches_per_token.store(0, Ordering::Relaxed);
+        self.forward_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Convenience snapshot of the current values.
+    pub fn snapshot(&self) -> DispatchSnapshot {
+        DispatchSnapshot {
+            dispatches_per_token: self.dispatches_per_token.load(Ordering::Relaxed),
+            moe_to_vec2_count: self.moe_to_vec2_count.load(Ordering::Relaxed),
+            moe_dispatches: self.moe_dispatches.load(Ordering::Relaxed),
+            moe_layer_invocations: self.moe_layer_invocations.load(Ordering::Relaxed),
+            sampler_sync_count: self.sampler_sync_count.load(Ordering::Relaxed),
+            norm_dispatches_per_token: self.norm_dispatches_per_token.load(Ordering::Relaxed),
+            forward_count: self.forward_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Plain-value snapshot of counters. Used for averaging and report emission.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatchSnapshot {
+    pub dispatches_per_token: u64,
+    pub moe_to_vec2_count: u64,
+    pub moe_dispatches: u64,
+    pub moe_layer_invocations: u64,
+    pub sampler_sync_count: u64,
+    pub norm_dispatches_per_token: u64,
+    pub forward_count: u64,
+}
+
+impl DispatchSnapshot {
+    /// Per-forward-pass (= per decoded token) average. Division by zero is
+    /// guarded with `forward_count.max(1)` so an un-reset run still reports
+    /// well-formed numbers.
+    pub fn per_token(&self) -> PerTokenMetrics {
+        let n = self.forward_count.max(1) as f64;
+        let moe_layers = self.moe_layer_invocations.max(1) as f64;
+        PerTokenMetrics {
+            dispatches_per_token: self.dispatches_per_token as f64 / n,
+            moe_to_vec2_count: self.moe_to_vec2_count as f64 / n,
+            moe_dispatches_per_layer: self.moe_dispatches as f64 / moe_layers,
+            sampler_sync_count: self.sampler_sync_count as f64 / n,
+            norm_dispatches_per_token: self.norm_dispatches_per_token as f64 / n,
+        }
+    }
+}
+
+/// Per-token averages (the numbers written to `metrics.txt`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerTokenMetrics {
+    pub dispatches_per_token: f64,
+    pub moe_to_vec2_count: f64,
+    pub moe_dispatches_per_layer: f64,
+    pub sampler_sync_count: f64,
+    pub norm_dispatches_per_token: f64,
+}
 
 // ---------------------------------------------------------------------------
 // RmsNorm
@@ -22,11 +143,12 @@ const MODEL_DTYPE: DType = DType::F32;
 struct RmsNorm {
     weight: Tensor,
     eps: f64,
+    counters: Arc<DispatchCounters>,
 }
 
 impl RmsNorm {
-    fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+    fn new(weight: Tensor, eps: f64, counters: Arc<DispatchCounters>) -> Self {
+        Self { weight, eps, counters }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -39,13 +161,24 @@ impl RmsNorm {
         let normed = x_f32.broadcast_mul(&rms)?;
         let weight_f32 = self.weight.to_dtype(DType::F32)?;
         let result = normed.broadcast_mul(&weight_f32)?;
-        result.to_dtype(dtype).map_err(Into::into)
+        let out = result.to_dtype(dtype)?;
+        // 11 candle ops above: to_dtype, sqr, mean_keepdim, ones_like+affine (1),
+        // (mean_sq + eps_t) (1), sqrt, recip, broadcast_mul, to_dtype(weight),
+        // broadcast_mul, to_dtype(out). Counted as 11 dispatches; the trailing
+        // to_dtype is a no-op at F32 steady state but still counts as a call
+        // into candle (matches ADR-005 line 284 accounting).
+        self.counters.norm_dispatches_per_token.fetch_add(11, Ordering::Relaxed);
+        self.counters.dispatches_per_token.fetch_add(11, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Phase 1b.10: Fused residual add + RmsNorm.
     /// Computes `sum = x + residual` then `norm(sum)`, returning both.
     fn forward_with_residual(&self, x: &Tensor, residual: &Tensor) -> Result<(Tensor, Tensor)> {
         let sum = (x + residual)?;
+        // The residual add itself is a dispatch; `forward` accounts for the
+        // norm ops below.
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
         let normed = self.forward(&sum)?;
         Ok((normed, sum))
     }
@@ -230,11 +363,12 @@ impl KvCache {
 struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
+    counters: Arc<DispatchCounters>,
 }
 
 impl QLinear {
-    fn new(qmatmul: QMatMul, bias: Option<Tensor>) -> Self {
-        Self { inner: qmatmul, bias }
+    fn new(qmatmul: QMatMul, bias: Option<Tensor>, counters: Arc<DispatchCounters>) -> Self {
+        Self { inner: qmatmul, bias, counters }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -243,10 +377,16 @@ impl QLinear {
         let x_f32 = if in_dtype != DType::F32 { x.to_dtype(DType::F32)? } else { x.clone() };
         let out = self.inner.forward(&x_f32)?;
         let out = if in_dtype != DType::F32 { out.to_dtype(in_dtype)? } else { out };
-        match &self.bias {
-            Some(b) => out.broadcast_add(b).map_err(Into::into),
-            None => Ok(out),
-        }
+        // At F32 steady state (MODEL_DTYPE == F32), the dtype casts short-circuit
+        // to clones; the only real dispatches are the QMatMul itself and the
+        // optional bias add.
+        let mut ops: u64 = 1;
+        let result = match &self.bias {
+            Some(b) => { ops += 1; out.broadcast_add(b)? }
+            None => out,
+        };
+        self.counters.dispatches_per_token.fetch_add(ops, Ordering::Relaxed);
+        Ok(result)
     }
 }
 
@@ -267,6 +407,7 @@ struct Attention {
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
     k_eq_v: bool,
+    counters: Arc<DispatchCounters>,
 }
 
 impl Attention {
@@ -288,22 +429,35 @@ impl Attention {
             self.v_proj.forward(xs)?
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
         };
+        // 2 reshapes + 1 optional reshape (if not k_eq_v) — just metadata ops in
+        // candle, but count as dispatches for discipline.
+        self.counters.dispatches_per_token.fetch_add(
+            if self.k_eq_v { 2 } else { 3 },
+            Ordering::Relaxed,
+        );
 
         // Apply Q/K norms before transpose
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?;
         // V gets a unit RMSNorm (just normalize, no learned weight)
-        let v = Self::rms_norm_unit(&v)?.transpose(1, 2)?;
+        let v = rms_norm_unit(&v, &self.counters)?.transpose(1, 2)?;
+        self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
 
-        // RoPE
+        // RoPE (apply internally calls narrow/to_dtype/contiguous/rope_apply —
+        // 6-10 ops depending on rotary_dim == head_dim). Count 10 as a
+        // conservative upper bound; we care about relative, not absolute.
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
+        self.counters.dispatches_per_token.fetch_add(10, Ordering::Relaxed);
 
-        // KV cache
+        // KV cache append — slice_scatter × 2 + narrow × 2 + contiguous × 2 = 6 ops
         let (k, v) = self.kv_cache.append(&k, &v)?;
+        self.counters.dispatches_per_token.fetch_add(6, Ordering::Relaxed);
 
         // SDPA for single-token decode (native GQA); manual attention for prefill
         // (candle's SDPA full kernel exceeds 32KB threadgroup mem for head_dim=512).
         let attn_out = if q_len == 1 {
+            // One SDPA dispatch.
+            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
             candle_nn::ops::sdpa(&q, &k, &v, None, false, 1.0, 1.0)?
         } else {
             let k_exp = Self::repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
@@ -314,13 +468,18 @@ impl Attention {
                 None => attn_weights,
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v_exp)?
+            let out = attn_weights.matmul(&v_exp)?;
+            // repeat_kv × 2 (unsqueeze+expand+reshape = 3 each) + matmul +
+            // transpose + optional bcast_add + softmax + matmul ≈ 11 ops.
+            self.counters.dispatches_per_token.fetch_add(11, Ordering::Relaxed);
+            out
         };
 
-        // Reshape back
+        // Reshape back (transpose + reshape = 2 ops)
         let attn_out = attn_out
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
         self.o_proj.forward(&attn_out)
     }
@@ -335,22 +494,29 @@ impl Attention {
         x.reshape((b, kv_heads * repeats, seq, dim)).map_err(Into::into)
     }
 
-    /// Unit RMSNorm (no learned weight, just normalize).
-    fn rms_norm_unit(x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let sq = x_f32.sqr()?;
-        let mean_sq = sq.mean_keepdim(D::Minus1)?;
-        let eps_t = mean_sq.ones_like()?.affine(0.0, 1e-6)?;
-        let rms = (mean_sq + eps_t)?.sqrt()?.recip()?;
-        let normed = x_f32.broadcast_mul(&rms)?;
-        normed.to_dtype(dtype).map_err(Into::into)
-    }
-
     #[allow(dead_code)]
     fn clear_cache(&mut self) {
         self.kv_cache.reset();
     }
+}
+
+/// Unit RMSNorm (no learned weight, just normalize). Extracted out of
+/// `Attention` as a free function so both `Attention::forward` and
+/// `MoeBlock::forward` can share it while still counting dispatches into the
+/// caller's counter Arc.
+fn rms_norm_unit(x: &Tensor, counters: &Arc<DispatchCounters>) -> Result<Tensor> {
+    let dtype = x.dtype();
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let sq = x_f32.sqr()?;
+    let mean_sq = sq.mean_keepdim(D::Minus1)?;
+    let eps_t = mean_sq.ones_like()?.affine(0.0, 1e-6)?;
+    let rms = (mean_sq + eps_t)?.sqrt()?.recip()?;
+    let normed = x_f32.broadcast_mul(&rms)?;
+    let out = normed.to_dtype(dtype)?;
+    // 9 candle ops (no weight broadcast_mul vs RmsNorm::forward).
+    counters.norm_dispatches_per_token.fetch_add(9, Ordering::Relaxed);
+    counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +527,7 @@ struct Mlp {
     gate_proj: QLinear,
     up_proj: QLinear,
     down_proj: QLinear,
+    counters: Arc<DispatchCounters>,
 }
 
 impl Mlp {
@@ -369,7 +536,11 @@ impl Mlp {
         let gate = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
         let fused = (gate * up)?;
-        self.down_proj.forward(&fused)
+        let out = self.down_proj.forward(&fused)?;
+        // gelu (1) + elementwise mul (1) — the QMatMul calls self-count via
+        // QLinear::forward.
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+        Ok(out)
     }
 }
 
@@ -395,24 +566,34 @@ struct MoeBlock {
     top_k: usize,
     moe_intermediate_size: usize,
     hidden_size: usize,
+    counters: Arc<DispatchCounters>,
 }
 
 impl MoeBlock {
     /// Forward pass. `x` is the pre-normed expert input, `router_input` is
     /// the raw residual for the router (router applies its own RMS norm).
     fn forward(&self, x: &Tensor, router_input: &Tensor) -> Result<Tensor> {
+        // Track per-layer invocation; moe_dispatches is a total across all
+        // MoeBlock forward calls this pass, and `per_token()` divides by
+        // moe_layer_invocations to report per-layer.
+        self.counters.moe_layer_invocations.fetch_add(1, Ordering::Relaxed);
+        let start_dispatches = self.counters.dispatches_per_token.load(Ordering::Relaxed);
+
         let (b_sz, seq_len, hidden) = x.dims3()?;
         let x_flat = x.reshape((b_sz * seq_len, hidden))?;
         let router_flat = router_input.reshape((b_sz * seq_len, hidden))?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
         // Router: unit_rms_norm(residual) * learned_scale * (1/sqrt(hidden)) → project → softmax
-        let router_normed = Attention::rms_norm_unit(&router_flat)?;
+        let router_normed = rms_norm_unit(&router_flat, &self.counters)?;
         let scale_factor = (self.hidden_size as f64).powf(-0.5);
         let router_scaled = (router_normed.broadcast_mul(&self.router_scale)? * scale_factor)?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed); // broadcast_mul + scalar mul
         let logits = self.router_proj.forward(&router_scaled)?; // [tokens, num_experts]
 
         // Softmax gating
         let probs = candle_nn::ops::softmax_last_dim(&logits)?; // [tokens, num_experts]
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
 
         // --- GPU-side top-k selection (avoids full probs GPU→CPU sync) ---
         let probs_f32 = probs.to_dtype(DType::F32)?;
@@ -424,9 +605,18 @@ impl MoeBlock {
         // Normalize: divide by sum of top-k probs (on GPU)
         let top_k_sum = top_k_probs.sum_keepdim(D::Minus1)?;
         let top_k_weights = top_k_probs.broadcast_div(&top_k_sum)?;
+        // to_dtype + contiguous + arg_sort + narrow + contiguous + contiguous
+        // + gather + sum_keepdim + broadcast_div = 9 ops.
+        self.counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
+
         // Pull ONLY the tiny top-k results to CPU (top_k values per token, not 128)
+        // These two calls are the forced `waitUntilCompleted` syncs ADR-005
+        // 1bNEW.0 instruments. Each is ALSO a dispatch (the transfer itself).
         let top_k_indices_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2()?;
         let top_k_weights_cpu: Vec<Vec<f32>> = top_k_weights.to_vec2()?;
+        self.counters.moe_to_vec2_count.fetch_add(2, Ordering::Relaxed);
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+
         let per_expert_scale_cpu = &self.per_expert_scale_cpu;
         let num_tokens = b_sz * seq_len;
         let device = x.device();
@@ -441,6 +631,8 @@ impl MoeBlock {
 
             // Accumulate weighted expert outputs for this token
             let mut combined = Tensor::zeros((1, hidden), DType::F32, device)?;
+            // narrow + to_dtype + zeros = 3 ops per token.
+            self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
             for k in 0..self.top_k {
                 let eid = top_k_indices_cpu[tok_idx][k] as usize;
                 let w = top_k_weights_cpu[tok_idx][k] * per_expert_scale_cpu[eid];
@@ -458,14 +650,29 @@ impl MoeBlock {
                 // Scalar weight
                 let w_t = Tensor::new(&[w], device)?;
                 combined = (combined + expert_out.broadcast_mul(&w_t)?)?;
+                // gate_up QMatMul (1) + 2 narrows + gelu + mul + down QMatMul (1)
+                // + Tensor::new + broadcast_mul + add = 9 ops per expert.
+                self.counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
             }
 
             // Cast back to original dtype (BF16)
             outputs.push(combined.to_dtype(dtype)?);
+            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
         }
 
         let result = Tensor::cat(&outputs, 0)?;
-        result.reshape((b_sz, seq_len, hidden)).map_err(Into::into)
+        let out = result.reshape((b_sz, seq_len, hidden))?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed); // cat + reshape
+
+        // Attribute every dispatch counted during this MoeBlock::forward call
+        // to `moe_dispatches` as well. We subtract the starting value so we
+        // capture only the delta — this keeps `moe_dispatches` an exact
+        // subset of `dispatches_per_token` restricted to MoE scope.
+        let end_dispatches = self.counters.dispatches_per_token.load(Ordering::Relaxed);
+        let moe_delta = end_dispatches.saturating_sub(start_dispatches);
+        self.counters.moe_dispatches.fetch_add(moe_delta, Ordering::Relaxed);
+
+        Ok(out)
     }
 }
 
@@ -488,6 +695,7 @@ struct DecoderLayer {
     post_feedforward_layernorm_1: RmsNorm,
     post_feedforward_layernorm_2: RmsNorm,
     layer_scalar: Tensor,
+    counters: Arc<DispatchCounters>,
 }
 
 impl DecoderLayer {
@@ -522,7 +730,11 @@ impl DecoderLayer {
         let xs = (residual + combined)?;
 
         // 3. Layer scalar
-        xs.broadcast_mul(&self.layer_scalar).map_err(Into::into)
+        let out = xs.broadcast_mul(&self.layer_scalar)?;
+        // 2 adds above + 1 broadcast_mul = 3 ops outside the sub-module
+        // self-count.
+        self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
+        Ok(out)
     }
 
     #[allow(dead_code)]
@@ -543,11 +755,24 @@ pub struct Gemma4Model {
     hidden_size: usize,
     final_logit_softcapping: Option<f64>,
     device: Device,
+    counters: Arc<DispatchCounters>,
+}
+
+impl Gemma4Model {
+    /// Shared handle to the dispatch counters so callers (benchmark harness,
+    /// sampler) can reset and snapshot them.
+    pub fn counters(&self) -> Arc<DispatchCounters> {
+        self.counters.clone()
+    }
 }
 
 impl Gemma4Model {
     /// Load model from GGUF + config.
     pub fn load(cfg: &Gemma4Config, gguf: &GgufModel, device: &Device) -> Result<Self> {
+        // ADR-005 1bNEW.0: shared dispatch counters. Every sub-structure that
+        // issues candle ops holds a clone of this Arc.
+        let counters = DispatchCounters::new();
+
         // Embedding — GGUF stores as [hidden, vocab]; Candle Embedding wants [vocab, hidden]
         let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE)?;
         let embed_w = if embed_w.dim(0)? == cfg.hidden_size && embed_w.dim(1)? == cfg.vocab_size {
@@ -581,21 +806,21 @@ impl Gemma4Model {
 
             // Attention
             let k_eq_v = is_full && cfg.attention_k_eq_v;
-            let k_proj = load_qlinear(gguf, &format!("{}.attn_k", lp))?;
+            let k_proj = load_qlinear(gguf, &format!("{}.attn_k", lp), &counters)?;
             let v_proj = if k_eq_v {
                 // V is tied to K — create a dummy (never used in forward)
-                QLinear::new(k_proj.inner.clone(), k_proj.bias.clone())
+                QLinear::new(k_proj.inner.clone(), k_proj.bias.clone(), counters.clone())
             } else {
-                load_qlinear(gguf, &format!("{}.attn_v", lp))?
+                load_qlinear(gguf, &format!("{}.attn_v", lp), &counters)?
             };
 
             let attn = Attention {
-                q_proj: load_qlinear(gguf, &format!("{}.attn_q", lp))?,
+                q_proj: load_qlinear(gguf, &format!("{}.attn_q", lp), &counters)?,
                 k_proj,
                 v_proj,
-                o_proj: load_qlinear(gguf, &format!("{}.attn_output", lp))?,
-                q_norm: load_rms_norm(gguf, &format!("{}.attn_q_norm", lp), cfg.rms_norm_eps)?,
-                k_norm: load_rms_norm(gguf, &format!("{}.attn_k_norm", lp), cfg.rms_norm_eps)?,
+                o_proj: load_qlinear(gguf, &format!("{}.attn_output", lp), &counters)?,
+                q_norm: load_rms_norm(gguf, &format!("{}.attn_q_norm", lp), cfg.rms_norm_eps, &counters)?,
+                k_norm: load_rms_norm(gguf, &format!("{}.attn_k_norm", lp), cfg.rms_norm_eps, &counters)?,
                 num_heads: cfg.num_attention_heads,
                 num_kv_heads,
                 head_dim,
@@ -605,13 +830,15 @@ impl Gemma4Model {
                     if is_full { None } else { Some(cfg.sliding_window) },
                 )?,
                 k_eq_v,
+                counters: counters.clone(),
             };
 
             // Dense MLP
             let mlp = Mlp {
-                gate_proj: load_qlinear(gguf, &format!("{}.ffn_gate", lp))?,
-                up_proj: load_qlinear(gguf, &format!("{}.ffn_up", lp))?,
-                down_proj: load_qlinear(gguf, &format!("{}.ffn_down", lp))?,
+                gate_proj: load_qlinear(gguf, &format!("{}.ffn_gate", lp), &counters)?,
+                up_proj: load_qlinear(gguf, &format!("{}.ffn_up", lp), &counters)?,
+                down_proj: load_qlinear(gguf, &format!("{}.ffn_down", lp), &counters)?,
+                counters: counters.clone(),
             };
 
             // MoE: load per-expert QMatMul from byte-sliced 3D QTensor.
@@ -662,7 +889,7 @@ impl Gemma4Model {
             }
 
             let moe = MoeBlock {
-                router_proj: load_qlinear(gguf, &format!("{}.ffn_gate_inp", lp))?,
+                router_proj: load_qlinear(gguf, &format!("{}.ffn_gate_inp", lp), &counters)?,
                 router_scale: gguf.get_tensor(&format!("{}.ffn_gate_inp.scale", lp), MODEL_DTYPE)?,
                 per_expert_scale: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?,
                 per_expert_scale_cpu: gguf.get_tensor(&format!("{}.ffn_down_exps.scale", lp), MODEL_DTYPE)?
@@ -673,20 +900,22 @@ impl Gemma4Model {
                 top_k: cfg.top_k_experts,
                 moe_intermediate_size: cfg.moe_intermediate_size,
                 hidden_size: cfg.hidden_size,
+                counters: counters.clone(),
             };
 
             let layer = DecoderLayer {
                 self_attn: attn,
                 mlp,
                 moe,
-                input_layernorm: load_rms_norm(gguf, &format!("{}.attn_norm", lp), cfg.rms_norm_eps)?,
-                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.post_attention_norm", lp), cfg.rms_norm_eps)?,
-                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps)?,
-                post_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.post_ffw_norm", lp), cfg.rms_norm_eps)?,
-                pre_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.pre_ffw_norm_2", lp), cfg.rms_norm_eps)?,
-                post_feedforward_layernorm_1: load_rms_norm(gguf, &format!("{}.post_ffw_norm_1", lp), cfg.rms_norm_eps)?,
-                post_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.post_ffw_norm_2", lp), cfg.rms_norm_eps)?,
+                input_layernorm: load_rms_norm(gguf, &format!("{}.attn_norm", lp), cfg.rms_norm_eps, &counters)?,
+                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.post_attention_norm", lp), cfg.rms_norm_eps, &counters)?,
+                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps, &counters)?,
+                post_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.post_ffw_norm", lp), cfg.rms_norm_eps, &counters)?,
+                pre_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.pre_ffw_norm_2", lp), cfg.rms_norm_eps, &counters)?,
+                post_feedforward_layernorm_1: load_rms_norm(gguf, &format!("{}.post_ffw_norm_1", lp), cfg.rms_norm_eps, &counters)?,
+                post_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.post_ffw_norm_2", lp), cfg.rms_norm_eps, &counters)?,
                 layer_scalar: gguf.get_tensor(&format!("{}.layer_output_scale.weight", lp), MODEL_DTYPE)?,
+                counters: counters.clone(),
             };
 
             layers.push(layer);
@@ -694,7 +923,7 @@ impl Gemma4Model {
         eprintln!("\r  Loaded {}/{} layers.    ", cfg.num_hidden_layers, cfg.num_hidden_layers);
 
         // Final norm
-        let norm = load_rms_norm(gguf, "output_norm", cfg.rms_norm_eps)?;
+        let norm = load_rms_norm(gguf, "output_norm", cfg.rms_norm_eps, &counters)?;
 
         // lm_head is tied to embed_tokens
         let lm_head_weight = embed_w;
@@ -707,16 +936,22 @@ impl Gemma4Model {
             hidden_size: cfg.hidden_size,
             final_logit_softcapping: cfg.final_logit_softcapping,
             device: device.clone(),
+            counters,
         })
     }
 
     /// Forward pass: [batch, seq_len] → logits [batch, 1, vocab_size].
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        // ADR-005 1bNEW.0: count every forward call so per-token averages
+        // divide correctly.
+        self.counters.forward_count.fetch_add(1, Ordering::Relaxed);
+
         let (_b_sz, seq_len) = input_ids.dims2()?;
 
-        // Embed and scale
+        // Embed and scale (embedding lookup + scalar mul = 2 ops)
         let mut xs = self.embed_tokens.forward(input_ids)?;
         xs = (xs * (self.hidden_size as f64).sqrt())?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
         // Build causal mask for prefill (skip for single-token decode)
         let mask = if seq_len > 1 {
@@ -738,10 +973,17 @@ impl Gemma4Model {
         let normed_2d = normed.reshape((1, self.hidden_size))?;
         let logits = normed_2d.matmul(&self.lm_head_weight.t()?)?;
         let logits = logits.unsqueeze(0)?; // [1, 1, vocab]
+        // narrow + reshape + matmul + t + unsqueeze = 5 ops (norm self-counts).
+        self.counters.dispatches_per_token.fetch_add(5, Ordering::Relaxed);
 
         // Softcapping
         match self.final_logit_softcapping {
-            Some(sc) => ((logits / sc)?.tanh()? * sc).map_err(Into::into),
+            Some(sc) => {
+                let out = ((logits / sc)?.tanh()? * sc)?;
+                // div, tanh, mul = 3 ops.
+                self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
+                Ok(out)
+            }
             None => Ok(logits),
         }
     }
@@ -792,16 +1034,25 @@ impl Gemma4Model {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn load_qlinear(gguf: &GgufModel, prefix: &str) -> Result<QLinear> {
+fn load_qlinear(
+    gguf: &GgufModel,
+    prefix: &str,
+    counters: &Arc<DispatchCounters>,
+) -> Result<QLinear> {
     let qt = gguf.get_qtensor(&format!("{}.weight", prefix))?;
     let qmm = QMatMul::from_arc(qt)?;
     let bias = gguf.try_get_tensor(&format!("{}.bias", prefix), MODEL_DTYPE)?;
-    Ok(QLinear::new(qmm, bias))
+    Ok(QLinear::new(qmm, bias, counters.clone()))
 }
 
-fn load_rms_norm(gguf: &GgufModel, prefix: &str, eps: f64) -> Result<RmsNorm> {
+fn load_rms_norm(
+    gguf: &GgufModel,
+    prefix: &str,
+    eps: f64,
+    counters: &Arc<DispatchCounters>,
+) -> Result<RmsNorm> {
     let weight = gguf.get_tensor(&format!("{}.weight", prefix), MODEL_DTYPE)?;
-    Ok(RmsNorm::new(weight, eps))
+    Ok(RmsNorm::new(weight, eps, counters.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1095,12 @@ mod forward_tests {
         let cfg = Gemma4Config::from_config_json(Path::new(CONFIG_PATH))
             .expect("Failed to load config");
         (gguf, cfg, device)
+    }
+
+    /// Per-test throwaway counters — none of these tests care about dispatch
+    /// counting, but the constructors now require a counter Arc.
+    fn test_counters() -> Arc<DispatchCounters> {
+        DispatchCounters::new()
     }
 
     // -----------------------------------------------------------------------
@@ -935,7 +1192,7 @@ mod forward_tests {
         println!("attn_norm.weight shape: {:?}", norm_w.shape());
         println!("attn_norm.weight first 5: {:?}", first_n(&norm_w, 5));
 
-        let norm = RmsNorm::new(norm_w, cfg.rms_norm_eps);
+        let norm = RmsNorm::new(norm_w, cfg.rms_norm_eps, test_counters());
 
         // Input: ones(1, 2816)
         let input = Tensor::ones((1, 2816), MODEL_DTYPE, &device).unwrap();
@@ -971,9 +1228,10 @@ mod forward_tests {
             is_full, head_dim, cfg.num_attention_heads, num_kv_heads);
 
         // Load Q, K, V projections
-        let q_proj = load_qlinear(&gguf, "blk.0.attn_q").unwrap();
-        let k_proj = load_qlinear(&gguf, "blk.0.attn_k").unwrap();
-        let v_proj = load_qlinear(&gguf, "blk.0.attn_v").unwrap();
+        let ctrs = test_counters();
+        let q_proj = load_qlinear(&gguf, "blk.0.attn_q", &ctrs).unwrap();
+        let k_proj = load_qlinear(&gguf, "blk.0.attn_k", &ctrs).unwrap();
+        let v_proj = load_qlinear(&gguf, "blk.0.attn_v", &ctrs).unwrap();
 
         // Get the BOS embedding as input
         let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE).unwrap();
@@ -1009,8 +1267,8 @@ mod forward_tests {
         println!("V first 5: {:?}", first_n(&v_out, 5));
 
         // Q/K norms
-        let q_norm = load_rms_norm(&gguf, "blk.0.attn_q_norm", cfg.rms_norm_eps).unwrap();
-        let k_norm = load_rms_norm(&gguf, "blk.0.attn_k_norm", cfg.rms_norm_eps).unwrap();
+        let q_norm = load_rms_norm(&gguf, "blk.0.attn_q_norm", cfg.rms_norm_eps, &ctrs).unwrap();
+        let k_norm = load_rms_norm(&gguf, "blk.0.attn_k_norm", cfg.rms_norm_eps, &ctrs).unwrap();
 
         // Reshape Q to [1, 1, num_heads, head_dim] for norm
         let q_reshaped = q_out.reshape((1, 1, cfg.num_attention_heads, head_dim)).unwrap();
@@ -1034,7 +1292,8 @@ mod forward_tests {
         println!("\n=== Test 5: MoE Router (layer 0) ===");
 
         // Load router weights
-        let router_proj = load_qlinear(&gguf, "blk.0.ffn_gate_inp").unwrap();
+        let ctrs = test_counters();
+        let router_proj = load_qlinear(&gguf, "blk.0.ffn_gate_inp", &ctrs).unwrap();
         let router_scale = gguf.get_tensor("blk.0.ffn_gate_inp.scale", MODEL_DTYPE).unwrap();
         println!("Router scale shape: {:?}, first 5: {:?}", router_scale.shape(), first_n(&router_scale, 5));
 
@@ -1045,7 +1304,7 @@ mod forward_tests {
         let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
 
         // Router pipeline: unit_rms_norm → scale → (1/sqrt(hidden)) → project → softmax
-        let normed = Attention::rms_norm_unit(&input).unwrap();
+        let normed = rms_norm_unit(&input, &ctrs).unwrap();
         println!("After unit rms_norm first 5: {:?}", first_n(&normed, 5));
 
         let scale_factor = (cfg.hidden_size as f64).powf(-0.5);
@@ -1154,11 +1413,12 @@ mod forward_tests {
         println!("\n=== Test 7: Dense MLP (layer 0) ===");
 
         // Load MLP weights
-        let gate_proj = load_qlinear(&gguf, "blk.0.ffn_gate").unwrap();
-        let up_proj = load_qlinear(&gguf, "blk.0.ffn_up").unwrap();
-        let down_proj = load_qlinear(&gguf, "blk.0.ffn_down").unwrap();
+        let ctrs = test_counters();
+        let gate_proj = load_qlinear(&gguf, "blk.0.ffn_gate", &ctrs).unwrap();
+        let up_proj = load_qlinear(&gguf, "blk.0.ffn_up", &ctrs).unwrap();
+        let down_proj = load_qlinear(&gguf, "blk.0.ffn_down", &ctrs).unwrap();
 
-        let mlp = Mlp { gate_proj, up_proj, down_proj };
+        let mlp = Mlp { gate_proj, up_proj, down_proj, counters: ctrs };
 
         // Input: ones(1, hidden)
         let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
@@ -1193,10 +1453,11 @@ mod forward_tests {
         let layer_scalar = gguf.get_tensor("blk.0.layer_output_scale.weight", MODEL_DTYPE).unwrap();
         println!("layer_scalar shape: {:?}, first 5: {:?}", layer_scalar.shape(), first_n(&layer_scalar, 5));
 
-        let post_attn_norm = load_rms_norm(&gguf, "blk.0.post_attention_norm", cfg.rms_norm_eps).unwrap();
-        let post_ffw_norm = load_rms_norm(&gguf, "blk.0.post_ffw_norm", cfg.rms_norm_eps).unwrap();
-        let post_ffw_norm_1 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_1", cfg.rms_norm_eps).unwrap();
-        let post_ffw_norm_2 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_2", cfg.rms_norm_eps).unwrap();
+        let ctrs = test_counters();
+        let post_attn_norm = load_rms_norm(&gguf, "blk.0.post_attention_norm", cfg.rms_norm_eps, &ctrs).unwrap();
+        let post_ffw_norm = load_rms_norm(&gguf, "blk.0.post_ffw_norm", cfg.rms_norm_eps, &ctrs).unwrap();
+        let post_ffw_norm_1 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_1", cfg.rms_norm_eps, &ctrs).unwrap();
+        let post_ffw_norm_2 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_2", cfg.rms_norm_eps, &ctrs).unwrap();
 
         // Test post-attention norm with ones
         let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();

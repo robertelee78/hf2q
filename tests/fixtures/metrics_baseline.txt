@@ -1,0 +1,28 @@
+# ADR-005 Phase 1b 1bNEW.0 — dispatch counter report
+# Emitted by hf2q `generate --benchmark`
+# Counters cover the decode loop only (reset after prefill).
+# Last benchmark run of 5 is reported; at T=0 greedy each run
+# is deterministic, so per-token averages are stable.
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 24.17
+p95_tok_per_sec: 24.22
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 954153
+total_moe_to_vec2: 7620
+total_moe_dispatches: 396240
+moe_layer_invocations: 3810
+total_sampler_sync: 128
+total_norm_dispatches: 447167
+
+# Per-token averages (= total / forward_count)
+dispatches_per_token: 7513.02
+moe_to_vec2_count: 60.00
+moe_dispatches_per_layer: 104.00
+sampler_sync_count: 1.01
+norm_dispatches_per_token: 3521.00

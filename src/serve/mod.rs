@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::cli;
 use config::Gemma4Config;
-use gemma4::Gemma4Model;
+use gemma4::{DispatchSnapshot, Gemma4Model, PerTokenMetrics};
 use gguf_loader::GgufModel;
 use sampler::SamplingParams;
 
@@ -110,6 +110,7 @@ fn run_single_generation(
 
     let eos_token_ids: Vec<u32> = vec![1, 106]; // Gemma EOS tokens
     let mut all_tokens = prompt_tokens.to_vec();
+    let counters = model.counters();
 
     // Prefill (not timed — benchmark measures decode only)
     if !silent {
@@ -118,6 +119,13 @@ fn run_single_generation(
     let input = Tensor::new(prompt_tokens, device)?
         .unsqueeze(0)?;  // [1, seq_len]
     let mut logits = model.forward(&input, 0)?;
+
+    // ADR-005 1bNEW.0 (metrics instrumentation):
+    // Reset counters AFTER prefill so per-token averages describe only the
+    // decode-loop region — matching what the `--benchmark` tok/s number
+    // measures. Prefill has a different dispatch profile (seq_len > 1 path
+    // through Attention, mask construction, etc.).
+    counters.reset();
 
     // Debug: dump first decode-step logits to a file for cross-tool comparison.
     // Set HF2Q_DUMP_LOGITS=path.bin to write 262144 f32 LE bytes (vocab_size).
@@ -136,7 +144,7 @@ fn run_single_generation(
         eprintln!("HF2Q top-10 logits: {:?}", &idx_val[..10]);
     }
 
-    let mut next_token = sampler::sample_token(&logits, params, &[])?;
+    let mut next_token = sampler::sample_token(&logits, params, &[], &counters)?;
     all_tokens.push(next_token);
 
     if !silent {
@@ -158,7 +166,7 @@ fn run_single_generation(
             .unsqueeze(0)?;  // [1, 1]
         let seqlen_offset = all_tokens.len() - 1;
         logits = model.forward(&input, seqlen_offset)?;
-        next_token = sampler::sample_token(&logits, params, &all_tokens)?;
+        next_token = sampler::sample_token(&logits, params, &all_tokens, &counters)?;
         all_tokens.push(next_token);
         generated += 1;
 
@@ -378,6 +386,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             NUM_RUNS, args.max_tokens, args.temperature);
 
         let mut tok_per_sec_runs: Vec<f64> = Vec::with_capacity(NUM_RUNS);
+        // ADR-005 1bNEW.0: snapshot counters from the final run (each run's
+        // prefill-then-decode loop resets counters at the start of decode in
+        // `run_single_generation`, so snapshot-after-run reflects that run's
+        // decode region).
+        let mut last_snapshot: DispatchSnapshot = DispatchSnapshot::default();
 
         for run in 1..=NUM_RUNS {
             model.clear_kv_cache();
@@ -385,6 +398,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             let (generated, elapsed) = run_single_generation(
                 &mut model, &tokenizer, &prompt_tokens, &params, &device, true,
             )?;
+            last_snapshot = model.counters().snapshot();
 
             let tps = generated as f64 / elapsed.as_secs_f64();
             tok_per_sec_runs.push(tps);
@@ -413,6 +427,76 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         println!();
         println!("Median: {:.1} tok/s", med);
         println!("P95:    {:.1} tok/s", p95_val);
+
+        // ADR-005 1bNEW.0 — dispatch counter report.
+        //
+        // Written to `metrics.txt` in the current working directory. The
+        // ADR phrasing is "alongside `bench.log`", but no `bench.log` exists
+        // in the current code path — the benchmark harness prints to stdout
+        // only. Emitting next to `bench.log` therefore means "in the CWD
+        // where `bench.log` would land if/when it is added," which is the
+        // same directory the user invoked hf2q from.
+        //
+        // The per-token averages divide by `forward_count` (the number of
+        // decode forward calls that happened after the counters were reset).
+        // At T=0 greedy with max-tokens=128 and a stop-at-EOS that typically
+        // does not trigger in-prompt, forward_count ≈ 127 (first token from
+        // prefill, then 127 decode steps). Counters are per-decode-step.
+        let per_token: PerTokenMetrics = last_snapshot.per_token();
+        let metrics_path = std::path::PathBuf::from("metrics.txt");
+        let metrics_body = format!(
+            "# ADR-005 Phase 1b 1bNEW.0 — dispatch counter report\n\
+             # Emitted by hf2q `generate --benchmark`\n\
+             # Counters cover the decode loop only (reset after prefill).\n\
+             # Last benchmark run of {} is reported; at T=0 greedy each run\n\
+             # is deterministic, so per-token averages are stable.\n\
+             model: {}\n\
+             hardware: {}, {} GB\n\
+             prompt_tokens: {}\n\
+             max_tokens: {}\n\
+             runs: {}\n\
+             median_tok_per_sec: {:.2}\n\
+             p95_tok_per_sec: {:.2}\n\
+             \n\
+             # Raw totals over the decode loop ({} forward calls)\n\
+             forward_count: {}\n\
+             total_dispatches: {}\n\
+             total_moe_to_vec2: {}\n\
+             total_moe_dispatches: {}\n\
+             moe_layer_invocations: {}\n\
+             total_sampler_sync: {}\n\
+             total_norm_dispatches: {}\n\
+             \n\
+             # Per-token averages (= total / forward_count)\n\
+             dispatches_per_token: {:.2}\n\
+             moe_to_vec2_count: {:.2}\n\
+             moe_dispatches_per_layer: {:.2}\n\
+             sampler_sync_count: {:.2}\n\
+             norm_dispatches_per_token: {:.2}\n",
+            NUM_RUNS,
+            model_filename,
+            chip, mem_gb,
+            prompt_tokens.len(),
+            args.max_tokens,
+            NUM_RUNS,
+            med, p95_val,
+            last_snapshot.forward_count,
+            last_snapshot.forward_count,
+            last_snapshot.dispatches_per_token,
+            last_snapshot.moe_to_vec2_count,
+            last_snapshot.moe_dispatches,
+            last_snapshot.moe_layer_invocations,
+            last_snapshot.sampler_sync_count,
+            last_snapshot.norm_dispatches_per_token,
+            per_token.dispatches_per_token,
+            per_token.moe_to_vec2_count,
+            per_token.moe_dispatches_per_layer,
+            per_token.sampler_sync_count,
+            per_token.norm_dispatches_per_token,
+        );
+        std::fs::write(&metrics_path, metrics_body)
+            .with_context(|| format!("Failed to write {}", metrics_path.display()))?;
+        eprintln!("Wrote dispatch counter report → {}", metrics_path.display());
     } else {
         // === Normal single-run generation with streaming output ===
         let (generated, elapsed) = run_single_generation(

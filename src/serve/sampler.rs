@@ -2,6 +2,10 @@
 
 use anyhow::Result;
 use candle_core::{DType, Tensor};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use super::gemma4::DispatchCounters;
 
 /// Sampling parameters for a generation request.
 #[derive(Debug, Clone)]
@@ -29,10 +33,17 @@ impl Default for SamplingParams {
 const SAMPLING_EPS: f64 = 1e-5;
 
 /// Sample a token from logits.
+///
+/// `counters` is ADR-005 1bNEW.0 instrumentation — the greedy fast-path issues
+/// exactly one forced GPU→CPU sync (`argmax(...).to_scalar()`), which this
+/// function counts into `counters.sampler_sync_count`. Non-greedy paths pull
+/// the full probs vector back to CPU via `to_vec1()`, which is also a sync
+/// and is counted.
 pub fn sample_token(
     logits: &Tensor,
     params: &SamplingParams,
     previous_tokens: &[u32],
+    counters: &Arc<DispatchCounters>,
 ) -> Result<u32> {
     // Flatten to 1D
     let logits = logits.squeeze(0)?;
@@ -46,7 +57,12 @@ pub fn sample_token(
     if params.temperature < SAMPLING_EPS
         && (params.repetition_penalty == 1.0 || previous_tokens.is_empty())
     {
+        // argmax + to_scalar forces one waitUntilCompleted. This is the
+        // baseline `sampler_sync_count == 1` per token referenced in
+        // ADR-005 1bNEW.0.
         let token_id = logits.argmax(0)?.to_scalar::<u32>()?;
+        counters.sampler_sync_count.fetch_add(1, Ordering::Relaxed);
+        counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
         return Ok(token_id);
     }
 
@@ -64,7 +80,10 @@ pub fn sample_token(
 
     // Softmax → probabilities
     let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+    // Full probs pull is a forced sync on the non-greedy path.
     let probs_vec: Vec<f32> = probs.to_vec1()?;
+    counters.sampler_sync_count.fetch_add(1, Ordering::Relaxed);
+    counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
     let mut indexed: Vec<(usize, f32)> = probs_vec.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -18,3 +18,9 @@ CLAUDE.md
 # Logs and examples
 logs/
 examples/
+
+# Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
+# instrumentation). The committed baseline lives at
+# tests/fixtures/metrics_baseline.txt — this repo-root file is the live
+# per-run report and must not be committed.
+/metrics.txt
