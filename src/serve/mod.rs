@@ -3,6 +3,7 @@
 pub mod config;
 pub mod gemma4;
 pub mod gguf_loader;
+pub mod moe_kernel;
 pub mod sampler;
 
 use anyhow::{Context, Result};
