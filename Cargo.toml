@@ -109,3 +109,20 @@ harness = false
 [patch.crates-io]
 candle-nn = { path = "vendor/candle-nn" }
 
+# ADR-005 Phase 1b 1bNEW.21 vendor patch (2026-04-11): bump
+# DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER from 50 to 100 in
+# candle-metal-kernels/src/metal/commands.rs. Empirical sweep on Apple
+# M5 Max showed +0.9 tok/s reproducible across 3 independent trials
+# (85.0 → 85.9 median on the canonical Gemma 4 26B MoE DWQ bench). The
+# upstream 50 value has no empirical rationale in candle's commit
+# history — it is a historical carryover from pre-refactor single-
+# buffer code (candle commits 0cf516d1 Sept-2025 and db08cc0a Nov-2025).
+# Chesterton's fence cleared: neither `commands_rotation_threshold`
+# nor `commands_concurrent_acquisition` in candle's own tests depends
+# on the default being 50 (both override via env var). See
+# /opt/hf2q/vendor/candle-metal-kernels/src/metal/commands.rs header
+# comment and docs/spike-post-1bNEW20-results.md for the full sweep.
+# Drop this override once an upstream candle release re-validates the
+# default at 100 or higher.
+candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
+
