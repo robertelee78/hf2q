@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
-use super::lm_head_kernel::LmHeadKernelMode as LmHeadKernelModeImpl;
+use super::lm_head_kernel::{self, LmHeadKernelMode as LmHeadKernelModeImpl};
 use super::moe_kernel;
 use super::rms_norm_kernel::{self, RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
 use super::rope_kernel::{self, RopeKernel, RopeKernelMode as RopeKernelModeImpl, RopeVariant};
@@ -1527,18 +1527,9 @@ pub struct Gemma4Model {
     /// retained alongside so `loop` mode stays byte-identical (same
     /// pattern as `--moe-kernel=loop` keeping the per-expert
     /// `QMatMul::forward` vec).
-    ///
-    /// `dead_code` allowed in Phase A — populated at load time but
-    /// not yet read by the forward pass. Phase B wires it into
-    /// `Gemma4Model::forward` behind the mode branch.
-    #[allow(dead_code)]
     lm_head_f16_weight: Option<Tensor>,
     /// ADR-005 1bNEW.17 — which of the two paths the forward pass
     /// should take. Resolved at model load time from the CLI flag.
-    ///
-    /// `dead_code` allowed in Phase A — populated at load time but
-    /// not yet read. Phase B wires it into the forward-pass branch.
-    #[allow(dead_code)]
     lm_head_mode: LmHeadKernelModeImpl,
     hidden_size: usize,
     final_logit_softcapping: Option<f64>,
@@ -1938,10 +1929,50 @@ impl Gemma4Model {
         // lm_head is tied to embed_tokens which is [vocab, hidden]
         // logits = normed @ lm_head.T  →  [1,1,hidden] @ [hidden, vocab]
         let normed_2d = normed.reshape((1, self.hidden_size))?;
-        let logits = normed_2d.matmul(&self.lm_head_weight.t()?)?;
+        // ADR-005 1bNEW.17 Phase B — branch on `--lm-head-kernel`.
+        //
+        // Loop (Phase-1 baseline): dense F32 matmul against the 2.95 GB
+        //   dequantized `token_embd.weight` copy, reading 2.95 GB/token.
+        //   2 dispatches: `t()` (view-only in candle, but accounted for
+        //   bookkeeping parity) + `matmul`. Counted as 2 ops.
+        //
+        // Fused (ADR-005 1bNEW.17): native F16 gemm against the 1.48 GB
+        //   F16 copy, reading 1.48 GB/token. Via
+        //   `lm_head_kernel::lm_head_forward_fused` which is `to_dtype(F16)`
+        //   + `t()` + `matmul` + `to_dtype(F32)` = 4 candle ops. The 2
+        //   extra ops are negligible (cast on [1, 2816] and [1, 262144]
+        //   tensors, no weight reads). Counted as 4 ops so metrics.txt
+        //   stays honest. The matmul kernel is candle's `call_mlx_gemm`
+        //   GemmDType::F16 path at `candle-core/src/metal_backend/mod.rs:1695-1709`.
+        let (logits, lm_head_ops): (Tensor, u64) = match self.lm_head_mode {
+            LmHeadKernelModeImpl::Loop => {
+                let logits = normed_2d.matmul(&self.lm_head_weight.t()?)?;
+                (logits, 2)
+            }
+            LmHeadKernelModeImpl::Fused => {
+                // `lm_head_f16_weight` is populated at load time when
+                // `lm_head_mode == Fused`; unwrapping here is correct by
+                // construction and panicking on `None` would indicate a
+                // load-path bug (Anti-Goal #7 — fail loud, no silent
+                // fallback).
+                let w_f16 = self.lm_head_f16_weight.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "1bNEW.17: lm_head_mode == Fused but lm_head_f16_weight is None"
+                    )
+                })?;
+                let logits = lm_head_kernel::lm_head_forward_fused(&normed_2d, w_f16)?;
+                (logits, 4)
+            }
+        };
         let logits = logits.unsqueeze(0)?; // [1, 1, vocab]
-        // narrow + reshape + matmul + t + unsqueeze = 5 ops (norm self-counts).
-        self.counters.dispatches_per_token.fetch_add(5, Ordering::Relaxed);
+        // narrow + reshape + (lm_head branch) + unsqueeze ops (norm self-counts).
+        // Phase-1 accounting kept 5 ops (narrow+reshape+matmul+t+unsqueeze =
+        // 5). The `Loop` branch here issues the same 5. The `Fused` branch
+        // issues 7 (narrow+reshape+to_f16+matmul+t+to_f32+unsqueeze). The
+        // +2 is bookkeeping-only — no weight traffic, no new kernels.
+        self.counters
+            .dispatches_per_token
+            .fetch_add(3 + lm_head_ops, Ordering::Relaxed);
 
         // Softcapping
         match self.final_logit_softcapping {

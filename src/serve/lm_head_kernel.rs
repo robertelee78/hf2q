@@ -129,13 +129,6 @@ impl From<crate::cli::LmHeadKernelMode> for LmHeadKernelMode {
 /// Perform `logits = normed_f32 @ W_f16^T` via a native F16 matmul,
 /// returning an F32 logits tensor.
 ///
-/// Phase A lands this helper and its unit tests; Phase B wires it
-/// into `Gemma4Model::forward`. `allow(dead_code)` matches the 1bNEW.1
-/// / 1bNEW.4 / 1bNEW.6 Phase A pattern — the fused helper is built
-/// and exercised by tests before the live forward-pass branch is
-/// turned on behind the `--lm-head-kernel=fused` flag.
-#[allow(dead_code)]
-///
 /// # Arguments
 /// - `normed_2d`: the F32 input `[1, hidden]` — the output of the
 ///   final RmsNorm at `gemma4.rs:1875`.
