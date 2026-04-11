@@ -122,3 +122,87 @@ norm_dispatches_per_token: 3521.00
 # is in place for a future candle patch that exposes per-buffer
 # wait semantics, at which point the ADR's projected gain would
 # materialize without any call-site changes.
+
+# ============================================================
+# ADR-005 1bNEW.10 + 1bNEW.12 — BF16 prefill SDPA at bd=512 + extended warmup
+# Captured 2026-04-10, post-commit b8def90 (on top of 29b84ef + 9cc522d).
+# Invocation: `--benchmark --max-tokens 128 --temperature 0` (canonical).
+#
+# 1bNEW.10 (9cc522d + 29b84ef): splits the prefill attention path
+# by head_dim. Global layers (head_dim=512, 5/30 layers in Gemma 4
+# 26B MoE) cast Q/K/V to BF16 and dispatch through candle's fused
+# SDPA full kernel `steel_attention_bfloat16_bq8_bk8_bd512_wm1_wn1
+# _maskbfloat16_t` with mask=None, do_causal=true. Sliding layers
+# (head_dim=256, 25/30 layers) retain the pre-existing manual
+# `repeat_kv + matmul + causal_mask + softmax + matmul` chain —
+# the bd=256 F32 fused kernel exceeds candle's 32 KB threadgroup
+# memory limit (requests 53760 B), and the bd=256 BF16 fused
+# kernel produces NaN on a sawtooth of q_seq values (observed at
+# q_seq ∈ [13..16, 33..48]). Both are upstream candle blockers
+# handed off to a follow-up item; this commit strictly ADDS the
+# bd=512 fused path without regressing bd=256.
+#
+# 1bNEW.12 (b8def90): adds a 10-token prefill warmup pass after
+# the existing single-token decode warmup, with a forced GPU
+# sync (to_vec1 read on the warmup logits) to prevent candle's
+# lazy command pool from double-dipping the warmup dispatches
+# onto the first real request. q_seq=10 pre-compiles the
+# `align_Q=false, align_K=false` PSO variant (the common case
+# for chat-templated prompts). Also adds a `Prefill complete
+# in N.N ms` stderr eprintln on every prefill so TTFT is
+# visible outside --benchmark mode.
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 37.06
+p95_tok_per_sec: 37.08
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 717870
+total_moe_to_vec2: 0
+total_moe_dispatches: 160020
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 447167
+
+# Per-token averages — decode counters are byte-identical to
+# post-1bNEW.3 because both 1bNEW.10 and 1bNEW.12 target prefill
+# and/or model-load warmup; neither touches the decode loop.
+# The prefill dispatch delta from 1bNEW.10 (11→8 ops per global
+# attention layer, 5 layers × 30 decode steps saved in theory
+# but actually 0 because counters reset after prefill at
+# `mod.rs:149`) is invisible here by design.
+dispatches_per_token: 5652.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 42.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 3521.00
+
+# 1bNEW.10+1bNEW.12 deltas vs 1bNEW.3:
+#   tok/s median       37.03 → 37.06  (+0.03 tok/s, noise)
+#   p95                37.09 → 37.08  (−0.01 tok/s, noise)
+#   dispatches/token   5652  → 5652    unchanged — decode path unmodified
+#   moe_to_vec2         0    → 0       unchanged
+#   sampler_sync       33    → 33      unchanged (per-5-run total)
+#   norm_dispatches   3521   → 3521    unchanged — owned by 1bNEW.4
+#
+# TTFT deltas (from the separate 14-token "Hi" cold-prefill run;
+# not recorded in `metrics.txt`, which is decode-loop only):
+#   14-token  "Hi" prompt:  40.5 ms → 36.6 ms  (−3.9 ms median)
+#   50-token prompt:        65.9 ms → 60.4 ms  (−5.5 ms median)
+#   187-token bench prompt: 171.6 ms → 167.1 ms (−4.5 ms median)
+#
+# Why the TTFT delta is below the ADR's prior −37 to −100 ms
+# upper-bound prediction: most prefill kernels (QMatMul, RmsNorm,
+# softmax, RoPE, 1bNEW.1's fused `kernel_mul_mv_id_*` MoE) are
+# already warmed by the pre-existing single-token decode warmup.
+# Only the new bd=512 BF16 SDPA full PSO from 1bNEW.10 is
+# prefill-specific, and its cold-compile cost is ~5 ms, not
+# 40+ ms. The improvement is consistent in sign and magnitude
+# across prompt lengths; the bimodal distribution in the 20-run
+# sample is GPU thermal/power-state variance independent of
+# warmup strategy.
