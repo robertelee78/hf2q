@@ -13,6 +13,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
+use super::moe_kernel;
+
+// ADR-005 1bNEW.1 — type alias for the quantized dtype tag used by
+// `call_quantized_matmul_mv_id_t`. Kept in sync with candle-core's
+// `quantized::GgmlDType` at `QTensor::dtype()` return time.
+#[cfg(feature = "metal")]
+use candle_metal_kernels::GgmlDType as MetalGgmlDType;
+
+/// Per-model switch for the MoE expert dispatch path. Populated from the
+/// CLI `--moe-kernel` flag (see `cli::MoeKernelMode`) at `Gemma4Model::load`
+/// time and propagated down to each `MoeBlock` based on the layer index.
+///
+/// Phase B (ADR-005 1bNEW.1, 2026-04-10): `Fused` activates the fused
+/// `kernel_mul_mv_id_*` path for layer 0 ONLY; every other layer keeps
+/// the `Loop` baseline. Phase C will widen `Fused` to all layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeKernelMode {
+    Loop,
+    Fused,
+}
+
+impl From<crate::cli::MoeKernelMode> for MoeKernelMode {
+    fn from(v: crate::cli::MoeKernelMode) -> Self {
+        match v {
+            crate::cli::MoeKernelMode::Loop => Self::Loop,
+            crate::cli::MoeKernelMode::Fused => Self::Fused,
+        }
+    }
+}
 
 const MODEL_DTYPE: DType = DType::F32;
 
@@ -547,25 +576,53 @@ struct MoeBlock {
     router_proj: QLinear,
     /// Per-hidden-dim learned scale for router input
     router_scale: Tensor,
-    /// Per-expert scale applied to selected weights after softmax
-    #[allow(dead_code)]
+    /// Per-expert scale applied to selected weights after softmax.
+    /// Used by the `Fused` path (GPU gather by top_k_indices); the `Loop`
+    /// path reads `per_expert_scale_cpu` instead.
     per_expert_scale: Tensor,
-    /// Cached CPU copy of per_expert_scale (avoids GPU→CPU sync every forward)
+    /// Cached CPU copy of per_expert_scale (avoids GPU→CPU sync every forward).
+    /// Used ONLY by the `Loop` path. The `Fused` path gathers from the
+    /// GPU `per_expert_scale` tensor above.
     per_expert_scale_cpu: Vec<f32>,
-    /// Per-expert gate_up QMatMul (TEST: QMatMul from byte-sliced 3D QTensor)
+    /// Per-expert gate_up QMatMul (Loop path fallback — byte-sliced from the
+    /// 3D GGUF source tensor).
     expert_gate_up: Vec<QMatMul>,
     expert_down: Vec<QMatMul>,
-    #[allow(dead_code)]
     num_experts: usize,
     top_k: usize,
     moe_intermediate_size: usize,
     hidden_size: usize,
     counters: Arc<DispatchCounters>,
+
+    // --- ADR-005 1bNEW.1 fused dispatch state (populated iff use_fused) ---
+    /// Raw 3D gate_up weight storage `[num_experts, 2*moe_intermediate, hidden]`
+    /// retained alongside the per-expert `Vec<QMatMul>` so the fused path
+    /// can pass its Metal buffer pointer directly to `kernel_mul_mv_id_*`.
+    /// `None` when this layer runs in Loop mode.
+    #[cfg(feature = "metal")]
+    fused_gate_up: Option<candle_core::quantized::QStorage>,
+    /// Raw 3D down weight storage `[num_experts, hidden, moe_intermediate]`.
+    #[cfg(feature = "metal")]
+    fused_down: Option<candle_core::quantized::QStorage>,
+    /// GGML dtype of the gate_up 3D storage — selects the fused kernel
+    /// symbol (`kernel_mul_mv_id_q6_K_f32` etc.). Only meaningful if
+    /// `fused_gate_up` is `Some`.
+    #[cfg(feature = "metal")]
+    fused_gate_up_dtype: MetalGgmlDType,
+    #[cfg(feature = "metal")]
+    fused_down_dtype: MetalGgmlDType,
+    /// Which dispatch path this layer runs. `Loop` = Phase-1 baseline,
+    /// `Fused` = ADR-005 1bNEW.1 fused kernel.
+    mode: MoeKernelMode,
 }
 
 impl MoeBlock {
     /// Forward pass. `x` is the pre-normed expert input, `router_input` is
     /// the raw residual for the router (router applies its own RMS norm).
+    ///
+    /// Dispatches on `self.mode`:
+    ///   - `Loop`:  Phase-1 baseline, per-expert `QMatMul::forward` loop.
+    ///   - `Fused`: ADR-005 1bNEW.1 fused `kernel_mul_mv_id_*` dispatch.
     fn forward(&self, x: &Tensor, router_input: &Tensor) -> Result<Tensor> {
         // Track per-layer invocation; moe_dispatches is a total across all
         // MoeBlock forward calls this pass, and `per_token()` divides by
@@ -573,90 +630,55 @@ impl MoeBlock {
         self.counters.moe_layer_invocations.fetch_add(1, Ordering::Relaxed);
         let start_dispatches = self.counters.dispatches_per_token.load(Ordering::Relaxed);
 
+        // Router + GPU top-k. Both paths share this prefix — it stays on
+        // the GPU end-to-end (no `to_vec2`). The `Loop` path then drains
+        // the top-k indices/weights to CPU for its sequential expert loop;
+        // the `Fused` path keeps them on the GPU and passes the index
+        // buffer straight into the kernel.
         let (b_sz, seq_len, hidden) = x.dims3()?;
         let x_flat = x.reshape((b_sz * seq_len, hidden))?;
         let router_flat = router_input.reshape((b_sz * seq_len, hidden))?;
         self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
-        // Router: unit_rms_norm(residual) * learned_scale * (1/sqrt(hidden)) → project → softmax
         let router_normed = rms_norm_unit(&router_flat, &self.counters)?;
         let scale_factor = (self.hidden_size as f64).powf(-0.5);
         let router_scaled = (router_normed.broadcast_mul(&self.router_scale)? * scale_factor)?;
-        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed); // broadcast_mul + scalar mul
-        let logits = self.router_proj.forward(&router_scaled)?; // [tokens, num_experts]
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+        let logits = self.router_proj.forward(&router_scaled)?;
 
-        // Softmax gating
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?; // [tokens, num_experts]
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
         self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
 
-        // --- GPU-side top-k selection (avoids full probs GPU→CPU sync) ---
         let probs_f32 = probs.to_dtype(DType::F32)?;
-        // arg_sort descending on GPU: first k indices are the top-k experts
         let sorted_indices = probs_f32.contiguous()?.arg_sort_last_dim(false)?;
         let top_k_indices = sorted_indices.narrow(D::Minus1, 0, self.top_k)?.contiguous()?;
-        // Gather the top-k probabilities on GPU
         let top_k_probs = probs_f32.contiguous()?.gather(&top_k_indices, D::Minus1)?;
-        // Normalize: divide by sum of top-k probs (on GPU)
         let top_k_sum = top_k_probs.sum_keepdim(D::Minus1)?;
         let top_k_weights = top_k_probs.broadcast_div(&top_k_sum)?;
-        // to_dtype + contiguous + arg_sort + narrow + contiguous + contiguous
-        // + gather + sum_keepdim + broadcast_div = 9 ops.
         self.counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
 
-        // Pull ONLY the tiny top-k results to CPU (top_k values per token, not 128)
-        // These two calls are the forced `waitUntilCompleted` syncs ADR-005
-        // 1bNEW.0 instruments. Each is ALSO a dispatch (the transfer itself).
-        let top_k_indices_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2()?;
-        let top_k_weights_cpu: Vec<Vec<f32>> = top_k_weights.to_vec2()?;
-        self.counters.moe_to_vec2_count.fetch_add(2, Ordering::Relaxed);
-        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
-
-        let per_expert_scale_cpu = &self.per_expert_scale_cpu;
-        let num_tokens = b_sz * seq_len;
-        let device = x.device();
-        let dtype = x.dtype();
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(num_tokens);
-
-        for tok_idx in 0..num_tokens {
-            let token_vec = x_flat.narrow(0, tok_idx, 1)?; // [1, hidden], BF16
-
-            // Cast input to F32 for QMatMul (Metal kernels require F32)
-            let token_f32 = token_vec.to_dtype(DType::F32)?;
-
-            // Accumulate weighted expert outputs for this token
-            let mut combined = Tensor::zeros((1, hidden), DType::F32, device)?;
-            // narrow + to_dtype + zeros = 3 ops per token.
-            self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
-            for k in 0..self.top_k {
-                let eid = top_k_indices_cpu[tok_idx][k] as usize;
-                let w = top_k_weights_cpu[tok_idx][k] * per_expert_scale_cpu[eid];
-
-                // gate_up: [1, hidden] @ W^T -> [1, intermediate*2]
-                let gate_up_out = self.expert_gate_up[eid].forward(&token_f32)?;
-                let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
-                let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
-                let gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
-                let fused = (gate_act * up)?;
-
-                // down: [1, intermediate] @ W^T -> [1, hidden]
-                let expert_out = self.expert_down[eid].forward(&fused)?;
-
-                // Scalar weight
-                let w_t = Tensor::new(&[w], device)?;
-                combined = (combined + expert_out.broadcast_mul(&w_t)?)?;
-                // gate_up QMatMul (1) + 2 narrows + gelu + mul + down QMatMul (1)
-                // + Tensor::new + broadcast_mul + add = 9 ops per expert.
-                self.counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
+        let out = match self.mode {
+            MoeKernelMode::Loop => {
+                self.forward_loop(&x_flat, &top_k_indices, &top_k_weights, b_sz, seq_len, hidden, x.dtype())?
             }
-
-            // Cast back to original dtype (BF16)
-            outputs.push(combined.to_dtype(dtype)?);
-            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let result = Tensor::cat(&outputs, 0)?;
-        let out = result.reshape((b_sz, seq_len, hidden))?;
-        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed); // cat + reshape
+            MoeKernelMode::Fused => {
+                #[cfg(feature = "metal")]
+                {
+                    self.forward_fused(&x_flat, &top_k_indices, &top_k_weights, b_sz, seq_len, hidden, x.dtype())?
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    // Walk discipline: no CPU/non-metal fallback
+                    // (feedback_gpu_everything.md). If metal is disabled,
+                    // `Fused` is an invalid configuration, not a silent
+                    // downgrade.
+                    anyhow::bail!(
+                        "MoeKernelMode::Fused requires the `metal` feature. \
+                         Rebuild with `--features metal` or pass `--moe-kernel=loop`."
+                    );
+                }
+            }
+        };
 
         // Attribute every dispatch counted during this MoeBlock::forward call
         // to `moe_dispatches` as well. We subtract the starting value so we
@@ -665,6 +687,321 @@ impl MoeBlock {
         let end_dispatches = self.counters.dispatches_per_token.load(Ordering::Relaxed);
         let moe_delta = end_dispatches.saturating_sub(start_dispatches);
         self.counters.moe_dispatches.fetch_add(moe_delta, Ordering::Relaxed);
+
+        Ok(out)
+    }
+
+    /// Phase-1 baseline expert dispatch path. Drains `top_k_indices` /
+    /// `top_k_weights` to CPU via two forced `to_vec2()` syncs (the very
+    /// ones instrumented by `moe_to_vec2_count`), then runs a CPU-driven
+    /// per-token, per-expert `QMatMul::forward` loop.
+    ///
+    /// Preserved verbatim from commit `6ff446e` so the `loop` mode stays
+    /// byte-identical to the Phase-1 baseline — the `fused` mode is
+    /// compared against THIS path in Phase A/B token-match gates.
+    fn forward_loop(
+        &self,
+        x_flat: &Tensor,
+        top_k_indices: &Tensor,
+        top_k_weights: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        hidden: usize,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        let top_k_indices_cpu: Vec<Vec<u32>> = top_k_indices.to_vec2()?;
+        let top_k_weights_cpu: Vec<Vec<f32>> = top_k_weights.to_vec2()?;
+        self.counters.moe_to_vec2_count.fetch_add(2, Ordering::Relaxed);
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+
+        let per_expert_scale_cpu = &self.per_expert_scale_cpu;
+        let num_tokens = b_sz * seq_len;
+        let device = x_flat.device();
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(num_tokens);
+
+        for tok_idx in 0..num_tokens {
+            let token_vec = x_flat.narrow(0, tok_idx, 1)?; // [1, hidden]
+            let token_f32 = token_vec.to_dtype(DType::F32)?;
+
+            let mut combined = Tensor::zeros((1, hidden), DType::F32, device)?;
+            self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
+            for k in 0..self.top_k {
+                let eid = top_k_indices_cpu[tok_idx][k] as usize;
+                let w = top_k_weights_cpu[tok_idx][k] * per_expert_scale_cpu[eid];
+
+                let gate_up_out = self.expert_gate_up[eid].forward(&token_f32)?;
+                let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
+                let up = gate_up_out.narrow(1, self.moe_intermediate_size, self.moe_intermediate_size)?;
+                let gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
+                let fused = (gate_act * up)?;
+
+                let expert_out = self.expert_down[eid].forward(&fused)?;
+
+                let w_t = Tensor::new(&[w], device)?;
+                combined = (combined + expert_out.broadcast_mul(&w_t)?)?;
+                self.counters.dispatches_per_token.fetch_add(9, Ordering::Relaxed);
+            }
+
+            outputs.push(combined.to_dtype(out_dtype)?);
+            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let result = Tensor::cat(&outputs, 0)?;
+        let out = result.reshape((b_sz, seq_len, hidden))?;
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// ADR-005 1bNEW.1 fused expert dispatch.
+    ///
+    /// Replaces the CPU-driven per-expert loop with two fused
+    /// `kernel_mul_mv_id_*` Metal dispatches (one for gate_up, one for
+    /// down) plus candle Tensor ops for GELU, SwiGLU, scale gather and
+    /// top-k reduction. The routing sync (`to_vec2`) is eliminated: the
+    /// top-k index and weight tensors stay resident on the GPU and are
+    /// consumed directly by the kernel / downstream broadcast.
+    ///
+    /// Shape summary (n_tokens = `b_sz * seq_len`):
+    ///   x_flat:        [n_tokens, hidden]        (f32 or bf16)
+    ///   top_k_indices: [n_tokens, top_k]         (u32 — byte-identical to i32)
+    ///   top_k_weights: [n_tokens, top_k]         (f32)
+    ///   gate_up_out:   [n_tokens, top_k, 2*int]  (f32, from fused kernel)
+    ///   gate/up:       [n_tokens, top_k, int]    (slices of gate_up_out)
+    ///   fused:         [n_tokens, top_k, int]    (GELU(gate) * up)
+    ///   down_out:      [n_tokens, top_k, hidden] (f32, from fused kernel)
+    ///   scale:         [n_tokens, top_k]         (GPU gather of per_expert_scale)
+    ///   w_total:       [n_tokens, top_k, 1]      (top_k_weights * scale, broadcast-ready)
+    ///   weighted:      [n_tokens, top_k, hidden] (down_out * w_total)
+    ///   out:           [b_sz, seq_len, hidden]   (sum over top_k, reshape)
+    ///
+    /// Reference citations (verified in candle's vendored `quantized.metal`
+    /// and llama.cpp host code):
+    ///   - candle `kernel_mul_mv_id` template: quantized.metal:7544-7618
+    ///   - llama.cpp host caller (kargs layout):
+    ///     ggml-metal-ops.cpp:2393-2414
+    ///   - mlx-lm dispatch shape cross-ref:
+    ///     mlx_lm/models/switch_layers.py:76-90 (`mx.gather_qmm`)
+    #[cfg(feature = "metal")]
+    fn forward_fused(
+        &self,
+        x_flat: &Tensor,
+        top_k_indices: &Tensor,
+        top_k_weights: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        hidden: usize,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        use candle_core::quantized::QStorage;
+        use candle_core::Storage;
+
+        let num_tokens = b_sz * seq_len;
+        let top_k = self.top_k;
+        let intermediate = self.moe_intermediate_size;
+
+        // --- Fused gate_up dispatch (Q6_K kernel_mul_mv_id) --------------
+        // The input must be f32 and contiguous. Cast + contiguous lazily.
+        let x_f32 = x_flat.to_dtype(DType::F32)?.contiguous()?;
+        // `x_f32` is `[num_tokens, hidden]`.
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+
+        // Pull the underlying Metal buffers from the candle tensors via the
+        // public `storage_and_layout` hatch.
+        let (x_storage, x_layout) = x_f32.storage_and_layout();
+        let Storage::Metal(x_metal) = &*x_storage else {
+            anyhow::bail!("forward_fused: x_f32 must be on Metal");
+        };
+        let src1_buf = x_metal.buffer().clone();
+        let src1_offset = x_layout.start_offset() * DType::F32.size_in_bytes();
+
+        let ids_contig = top_k_indices.contiguous()?;
+        let (ids_storage, ids_layout) = ids_contig.storage_and_layout();
+        let Storage::Metal(ids_metal) = &*ids_storage else {
+            anyhow::bail!("forward_fused: top_k_indices must be on Metal");
+        };
+        let ids_buf = ids_metal.buffer().clone();
+        // `top_k_indices` is U32; the kernel reads the same 32-bit slots
+        // as i32, which is safe for positive expert ids < num_experts
+        // (see Q1 resolution in ADR-005 lines 526-527).
+        assert_eq!(ids_layout.start_offset(), 0,
+            "forward_fused: top_k_indices must start at offset 0");
+
+        // Metal device plumbing.
+        let Device::Metal(metal_device) = x_f32.device() else {
+            anyhow::bail!("forward_fused: device must be Metal");
+        };
+        let metal_device = metal_device.clone();
+
+        // --- Fetch the 3D gate_up and down buffers -----------------------
+        let gu_storage = self.fused_gate_up.as_ref()
+            .expect("forward_fused: fused_gate_up must be Some when mode == Fused");
+        let QStorage::Metal(gu_metal) = gu_storage else {
+            anyhow::bail!("forward_fused: fused_gate_up must be a Metal QStorage");
+        };
+        let dn_storage = self.fused_down.as_ref()
+            .expect("forward_fused: fused_down must be Some when mode == Fused");
+        let QStorage::Metal(dn_metal) = dn_storage else {
+            anyhow::bail!("forward_fused: fused_down must be a Metal QStorage");
+        };
+
+        // --- Allocate gate_up destination buffer -------------------------
+        // Output shape [num_tokens, top_k, 2*intermediate], f32.
+        let gu_out_elems = num_tokens * top_k * (2 * intermediate);
+        let gu_dst_buf = metal_device.new_buffer(
+            gu_out_elems, DType::F32, "moe_fused_gate_up_dst",
+        )?;
+
+        // --- Dispatch gate_up fused kernel -------------------------------
+        {
+            let encoder = metal_device.command_encoder()?;
+            moe_kernel::call_quantized_matmul_mv_id_t(
+                metal_device.device(),
+                &encoder,
+                metal_device.kernels(),
+                self.fused_gate_up_dtype,
+                moe_kernel::MoeDispatchShape {
+                    num_experts: self.num_experts,
+                    n: 2 * intermediate,
+                    k: hidden,
+                    n_tokens: num_tokens,
+                    n_expert_used: top_k,
+                },
+                gu_metal.buffer(),
+                &src1_buf,
+                src1_offset,
+                &ids_buf,
+                &gu_dst_buf,
+                0,
+            ).map_err(|e| anyhow::anyhow!("fused gate_up dispatch: {e:?}"))?;
+            // Compute encoder drops at block end — see Phase A notes.
+        }
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+
+        // Wrap the gate_up dst buffer in a candle Tensor so we can use the
+        // regular Tensor op graph (narrow, gelu, mul, etc.) for the rest
+        // of the fused path. This does NOT copy — the Tensor aliases the
+        // buffer we just wrote.
+        let gu_storage = candle_core::MetalStorage::new(
+            gu_dst_buf,
+            metal_device.clone(),
+            gu_out_elems,
+            DType::F32,
+        );
+        let gate_up_out = Tensor::from_storage(
+            Storage::Metal(gu_storage),
+            (num_tokens, top_k, 2 * intermediate),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+
+        // --- SwiGLU: gate, up → GELU(gate) * up --------------------------
+        let gate = gate_up_out.narrow(D::Minus1, 0, intermediate)?;
+        let up = gate_up_out.narrow(D::Minus1, intermediate, intermediate)?;
+        let gate_act = candle_nn::Activation::GeluPytorchTanh.forward(&gate)?;
+        let swiglu = (gate_act * up)?.contiguous()?; // [num_tokens, top_k, intermediate]
+        self.counters.dispatches_per_token.fetch_add(4, Ordering::Relaxed);
+
+        // --- Fused down dispatch (Q8_0 kernel_mul_mv_id) -----------------
+        // Input to the down kernel is `swiglu` flattened to 2D.
+        let swiglu_2d = swiglu.reshape((num_tokens * top_k, intermediate))?;
+        let (sw_storage, sw_layout) = swiglu_2d.storage_and_layout();
+        let Storage::Metal(sw_metal) = &*sw_storage else {
+            anyhow::bail!("forward_fused: swiglu must be on Metal");
+        };
+        let sw_buf = sw_metal.buffer().clone();
+        let sw_offset = sw_layout.start_offset() * DType::F32.size_in_bytes();
+
+        // IMPORTANT: the down kernel needs one input row per (token, slot)
+        // pair, not one per token. To reuse the same `kernel_mul_mv_id`
+        // wrapper, we bind `ids` as an identity index buffer
+        // `[num_tokens*top_k, 1] = [0, 1, 2, ..., num_tokens*top_k - 1]`
+        // with `n_expert_used = 1` and `n_tokens = num_tokens*top_k`. That
+        // tells the kernel to index expert `i` using swiglu row `i` and
+        // write to dst row `i`. Wait — that's wrong: we need each (token,
+        // slot) to dispatch to a DIFFERENT expert, which is `top_k_indices`.
+        //
+        // Correct approach: use `top_k_indices` flat-shaped to
+        // `[num_tokens*top_k, 1]` so `n_expert_used = 1` (one expert per
+        // swiglu row) and `n_tokens = num_tokens*top_k`. The swiglu rows
+        // are already arranged as [tok0_slot0, tok0_slot1, tok1_slot0, ...]
+        // which is the same order the gate_up kernel wrote them in — and
+        // the same order a flat view of `top_k_indices` iterates.
+        let ids_flat = top_k_indices.reshape((num_tokens * top_k, 1))?.contiguous()?;
+        let (idf_storage, idf_layout) = ids_flat.storage_and_layout();
+        let Storage::Metal(idf_metal) = &*idf_storage else {
+            anyhow::bail!("forward_fused: ids_flat must be on Metal");
+        };
+        let idf_buf = idf_metal.buffer().clone();
+        assert_eq!(idf_layout.start_offset(), 0);
+
+        // Allocate the down destination buffer `[num_tokens*top_k, 1, hidden]`,
+        // which is logically equivalent to `[num_tokens, top_k, hidden]`.
+        let dn_out_elems = num_tokens * top_k * hidden;
+        let dn_dst_buf = metal_device.new_buffer(
+            dn_out_elems, DType::F32, "moe_fused_down_dst",
+        )?;
+
+        {
+            let encoder = metal_device.command_encoder()?;
+            moe_kernel::call_quantized_matmul_mv_id_t(
+                metal_device.device(),
+                &encoder,
+                metal_device.kernels(),
+                self.fused_down_dtype,
+                moe_kernel::MoeDispatchShape {
+                    num_experts: self.num_experts,
+                    n: hidden,
+                    k: intermediate,
+                    n_tokens: num_tokens * top_k,
+                    n_expert_used: 1,
+                },
+                dn_metal.buffer(),
+                &sw_buf,
+                sw_offset,
+                &idf_buf,
+                &dn_dst_buf,
+                0,
+            ).map_err(|e| anyhow::anyhow!("fused down dispatch: {e:?}"))?;
+        }
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+
+        let dn_storage = candle_core::MetalStorage::new(
+            dn_dst_buf,
+            metal_device.clone(),
+            dn_out_elems,
+            DType::F32,
+        );
+        let down_out = Tensor::from_storage(
+            Storage::Metal(dn_storage),
+            (num_tokens, top_k, hidden),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+
+        // --- GPU per_expert_scale gather via top_k_indices ---------------
+        // `per_expert_scale` is `[num_experts]` f32 on device. We want
+        // `gathered_scale[i, k] = per_expert_scale[top_k_indices[i, k]]`,
+        // shape `[num_tokens, top_k]`.
+        let top_k_indices_flat = top_k_indices.reshape((num_tokens * top_k,))?;
+        let per_expert_scale_f32 = self.per_expert_scale.to_dtype(DType::F32)?;
+        let gathered_flat = per_expert_scale_f32.index_select(&top_k_indices_flat, 0)?;
+        let gathered_scale = gathered_flat.reshape((num_tokens, top_k))?;
+        self.counters.dispatches_per_token.fetch_add(4, Ordering::Relaxed);
+
+        // --- Combine softmax top-k weights with per-expert scale ---------
+        // Both `top_k_weights` and `gathered_scale` are f32 `[num_tokens, top_k]`.
+        let w_total = (top_k_weights * gathered_scale)?; // [num_tokens, top_k]
+        // Broadcast-ready shape for per-hidden multiply.
+        let w_total_3d = w_total.unsqueeze(D::Minus1)?; // [num_tokens, top_k, 1]
+        let weighted = down_out.broadcast_mul(&w_total_3d)?; // [num_tokens, top_k, hidden]
+        self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
+
+        // --- Sum over top_k → [num_tokens, hidden] → reshape to output -----
+        let summed = weighted.sum(1)?; // [num_tokens, hidden]
+        let out = summed
+            .reshape((b_sz, seq_len, hidden))?
+            .to_dtype(out_dtype)?;
+        self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
 
         Ok(out)
     }
@@ -785,8 +1122,28 @@ impl Gemma4Model {
 }
 
 impl Gemma4Model {
-    /// Load model from GGUF + config.
+    /// Load model from GGUF + config. Backward-compatible entry point
+    /// that defaults to the Phase-1 `Loop` MoE path for every layer.
+    /// Kept for existing call sites (tests, older bins) that pre-date
+    /// the ADR-005 1bNEW.1 `--moe-kernel` flag.
+    #[allow(dead_code)]
     pub fn load(cfg: &Gemma4Config, gguf: &GgufModel, device: &Device) -> Result<Self> {
+        Self::load_with_moe_mode(cfg, gguf, device, MoeKernelMode::Loop)
+    }
+
+    /// Load model from GGUF + config with an explicit MoE dispatch mode.
+    ///
+    /// Under Phase B (ADR-005 1bNEW.1), `Fused` activates the fused
+    /// `kernel_mul_mv_id_*` path for LAYER 0 ONLY; every other layer keeps
+    /// the `Loop` baseline regardless of this flag. Phase C widens `Fused`
+    /// to every layer. The per-layer gating lives in this method so the
+    /// forward pass itself is oblivious to phase boundaries.
+    pub fn load_with_moe_mode(
+        cfg: &Gemma4Config,
+        gguf: &GgufModel,
+        device: &Device,
+        moe_mode: MoeKernelMode,
+    ) -> Result<Self> {
         // ADR-005 1bNEW.0: shared dispatch counters. Every sub-structure that
         // issues candle ops holds a clone of this Arc.
         let counters = DispatchCounters::new();
@@ -906,6 +1263,39 @@ impl Gemma4Model {
                 expert_down.push(QMatMul::from_arc(dn_qtensor)?);
             }
 
+            // ADR-005 1bNEW.1 Phase B: decide this layer's MoE mode.
+            //
+            // Phase B gate: `Fused` model-wide means layer 0 ONLY; every
+            // other layer stays on `Loop` so the comparison fixture can
+            // bisect a single-layer change. Phase C will drop the `== 0`
+            // check (see the C commit for the widened condition).
+            let layer_mode = match moe_mode {
+                MoeKernelMode::Loop => MoeKernelMode::Loop,
+                MoeKernelMode::Fused if i == 0 => MoeKernelMode::Fused,
+                MoeKernelMode::Fused => MoeKernelMode::Loop,
+            };
+
+            // Optionally construct the 3D fused weight storages. We only
+            // pay the allocation when this layer is actually running in
+            // `Fused` mode — keeps the `Loop` baseline byte-identical.
+            #[cfg(feature = "metal")]
+            let (fused_gate_up, fused_down, fused_gate_up_dtype, fused_down_dtype) = if layer_mode == MoeKernelMode::Fused {
+                let gu_3d = candle_core::quantized::QStorage::from_data(
+                    std::borrow::Cow::Borrowed(&gu_data), device, gu_dtype,
+                )?;
+                let dn_3d = candle_core::quantized::QStorage::from_data(
+                    std::borrow::Cow::Borrowed(&dn_data), device, dn_dtype,
+                )?;
+                // Map candle_core::quantized::GgmlDType → the
+                // candle_metal_kernels tag the fused wrapper uses.
+                let gu_tag = core_to_metal_ggml(gu_dtype)?;
+                let dn_tag = core_to_metal_ggml(dn_dtype)?;
+                (Some(gu_3d), Some(dn_3d), gu_tag, dn_tag)
+            } else {
+                // Placeholder tags — never read when mode is Loop.
+                (None, None, MetalGgmlDType::F32, MetalGgmlDType::F32)
+            };
+
             let moe = MoeBlock {
                 router_proj: load_qlinear(gguf, &format!("{}.ffn_gate_inp", lp), &counters)?,
                 router_scale: gguf.get_tensor(&format!("{}.ffn_gate_inp.scale", lp), MODEL_DTYPE)?,
@@ -919,6 +1309,15 @@ impl Gemma4Model {
                 moe_intermediate_size: cfg.moe_intermediate_size,
                 hidden_size: cfg.hidden_size,
                 counters: counters.clone(),
+                #[cfg(feature = "metal")]
+                fused_gate_up,
+                #[cfg(feature = "metal")]
+                fused_down,
+                #[cfg(feature = "metal")]
+                fused_gate_up_dtype,
+                #[cfg(feature = "metal")]
+                fused_down_dtype,
+                mode: layer_mode,
             };
 
             let layer = DecoderLayer {
@@ -1071,6 +1470,39 @@ fn load_rms_norm(
 ) -> Result<RmsNorm> {
     let weight = gguf.get_tensor(&format!("{}.weight", prefix), MODEL_DTYPE)?;
     Ok(RmsNorm::new(weight, eps, counters.clone()))
+}
+
+/// Map `candle_core::quantized::GgmlDType` to the sister
+/// `candle_metal_kernels::GgmlDType` tag used by
+/// `moe_kernel::call_quantized_matmul_mv_id_t`. The two enums are
+/// logically identical but live in separate crates that do not have a
+/// `From` impl, so we do the mapping explicitly here.
+///
+/// Only the quant types actually shipped by the Gemma 4 A4B MoE experts
+/// (`Q6K` for `ffn_gate_up_exps`, `Q8_0` for `ffn_down_exps`) are
+/// supported in the fused path. Adding a new type is a one-line change
+/// under Walk discipline.
+#[cfg(feature = "metal")]
+fn core_to_metal_ggml(
+    t: candle_core::quantized::GgmlDType,
+) -> Result<MetalGgmlDType> {
+    use candle_core::quantized::GgmlDType as CoreT;
+    Ok(match t {
+        CoreT::Q4_0 => MetalGgmlDType::Q4_0,
+        CoreT::Q4_1 => MetalGgmlDType::Q4_1,
+        CoreT::Q5_0 => MetalGgmlDType::Q5_0,
+        CoreT::Q5_1 => MetalGgmlDType::Q5_1,
+        CoreT::Q8_0 => MetalGgmlDType::Q8_0,
+        CoreT::Q2K => MetalGgmlDType::Q2K,
+        CoreT::Q3K => MetalGgmlDType::Q3K,
+        CoreT::Q4K => MetalGgmlDType::Q4K,
+        CoreT::Q5K => MetalGgmlDType::Q5K,
+        CoreT::Q6K => MetalGgmlDType::Q6K,
+        other => anyhow::bail!(
+            "core_to_metal_ggml: dtype {other:?} not supported by fused MoE dispatch. \
+             Gemma 4 experts ship as Q6K (gate_up) + Q8_0 (down)."
+        ),
+    })
 }
 
 // ---------------------------------------------------------------------------

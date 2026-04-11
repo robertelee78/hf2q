@@ -212,6 +212,32 @@ pub struct GenerateArgs {
     /// Override chat template by reading from a file containing a Jinja2 template
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
+
+    /// MoE expert dispatch mode. `loop` (default) keeps the Phase-1 baseline
+    /// per-expert `QMatMul::forward` loop with two forced `to_vec2()` routing
+    /// syncs per layer. `fused` routes layer 0 only through the fused
+    /// `kernel_mul_mv_id_*` path behind the ADR-005 1bNEW.1 Phase B gate; once
+    /// Phase C lands the same path sweeps every layer. Default stays on
+    /// `loop` until 1bNEW.1 completes all four phases.
+    #[arg(long, value_enum, default_value = "loop")]
+    pub moe_kernel: MoeKernelMode,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeKernelMode {
+    /// Phase-1 baseline — per-expert `QMatMul::forward` loop (slow, correct).
+    Loop,
+    /// ADR-005 1bNEW.1 — fused `kernel_mul_mv_id_*` dispatch.
+    Fused,
+}
+
+impl std::fmt::Display for MoeKernelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loop => write!(f, "loop"),
+            Self::Fused => write!(f, "fused"),
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]

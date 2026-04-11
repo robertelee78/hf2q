@@ -331,9 +331,13 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     eprintln!("Loading GGUF model...");
     let gguf = GgufModel::load(model_path, &device)?;
 
-    // Load model weights from GGUF
+    // Load model weights from GGUF. ADR-005 1bNEW.1 Phase B: pass the
+    // `--moe-kernel` mode down so `Gemma4Model::load_with_moe_mode` can
+    // wire the fused path on layer 0 only (or the full sweep in Phase C).
     eprintln!("Loading model weights from GGUF (quantized QMatMul)...");
-    let mut model = Gemma4Model::load(&cfg, &gguf, &device)?;
+    let moe_mode: gemma4::MoeKernelMode = args.moe_kernel.into();
+    tracing::info!("MoE dispatch mode: {:?}", moe_mode);
+    let mut model = Gemma4Model::load_with_moe_mode(&cfg, &gguf, &device, moe_mode)?;
 
     // Warmup: run dummy token to force Metal shader compilation
     eprintln!("Warming up model...");
