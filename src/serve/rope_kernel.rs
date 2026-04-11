@@ -521,7 +521,8 @@ fn metal_device_of(device: &Device) -> Result<MetalDevice> {
 /// rotated; elements `[n_dims, head_dim)` are copied verbatim
 /// (partial RoPE pass-through, matching llama.cpp's kernel body and
 /// HF's `rotate_half` behavior). Passing `n_dims == head_dim`
-/// recovers full RoPE with no pass-through.
+/// recovers full RoPE with no pass-through. Gemma 4 always passes
+/// `n_dims == head_dim` post-1bNEW.18.
 ///
 /// **Positions:** A simple `seqlen_offset` scalar — the kernel is
 /// dispatched with a `[seq_len]` i32 buffer of absolute positions
@@ -530,13 +531,22 @@ fn metal_device_of(device: &Device) -> Result<MetalDevice> {
 /// does not need to hand in a pre-built positions Tensor, and the
 /// hf2q KV-cache model uses per-step `seqlen_offset` anyway.
 ///
-/// **Frequency scaling:** `freq_base` is the kernel's effective base.
-/// For Gemma 4's proportional scaling with `rotary_dim < head_dim`,
-/// the caller must pass `freq_base = rope_theta^(rotary_dim/head_dim)`
-/// so the kernel's `pow(freq_base, -i0/n_dims)` produces the same
-/// angle as hf2q's `1/rope_theta^(2k/head_dim)` inv_freq formula.
-/// See the module-level "Frequency scaling" comment for the
-/// derivation.
+/// **Frequency scaling:** `freq_base` is passed through verbatim to
+/// the kernel's `pow(freq_base, -i0/n_dims)`. Post-1bNEW.18 the
+/// caller always passes `n_dims == head_dim` for Gemma 4 and
+/// `freq_base == rope_theta` (no effective-base folding), because
+/// the old proportional-scaling fold was a consequence of the
+/// `rotary_dim < head_dim` misreading that 1bNEW.18 removes.
+///
+/// **`freq_factors`:** optional `[head_dim/2]` F32 tensor, bound as
+/// `src2` on the Metal kernel when `Some`. The kernel body at
+/// `:319` then reads `freq_factor = src2[ic]` per pair and divides
+/// `theta / freq_factor` — byte-identical to llama.cpp's
+/// `kernel_rope_neox` at `ggml-metal.metal:4353-4355`. When `None`
+/// the kernel's `args.src2 != 0` gate short-circuits and every pair
+/// uses `freq_factor = 1.0` (identity division). This is the
+/// ADR-005 1bNEW.18 `rope_freqs.weight` port — see
+/// `docs/spike-C-results.md` Parts 3-5 for the root cause analysis.
 pub fn rope_fused(
     pipelines: &RopePipelines,
     input: &Tensor,
@@ -544,6 +554,7 @@ pub fn rope_fused(
     n_dims: usize,
     freq_base: f32,
     variant: RopeVariant,
+    freq_factors: Option<&Tensor>,
 ) -> Result<Tensor> {
     // --- Validation ---------------------------------------------------
     if input.dtype() != DType::F32 {
@@ -617,6 +628,66 @@ pub fn rope_fused(
         }
     };
     let src0_offset = src0_layout.start_offset() * DType::F32.size_in_bytes();
+
+    // --- Optional freq_factors buffer (src2) --------------------------
+    //
+    // ADR-005 1bNEW.18 (2026-04-11): when the caller passes
+    // `Some(freq_factors_tensor)`, bind it as the kernel's `src2`
+    // input. The kernel branch at `:319` already reads this correctly
+    // as a byte-port of llama.cpp's `kernel_rope_neox` at
+    // `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:4353-4355`:
+    //
+    //   `freq_factor = (args.src2 != 0) ? ((device const float *)src2)[ic] : 1.0f`
+    //   `rope_yarn(theta/freq_factor, ...)`
+    //
+    // When `None`, we keep the pre-1bNEW.18 behavior of binding the
+    // input buffer as a placeholder (the kernel never dereferences it
+    // because `args.src2 == 0` short-circuits) and set `args.src2 = 0`.
+    //
+    // The `(guard, Option<&Buffer>)` tuple keeps the storage lock
+    // alive through the encode scope (same pattern as `src0` above
+    // and as `rms_norm_kernel::rms_norm_fused` at
+    // `/opt/hf2q/src/serve/rms_norm_kernel.rs:511-520`).
+    let ff_guard_layout = match freq_factors {
+        Some(t) => {
+            if t.dtype() != DType::F32 {
+                return Err(anyhow!(
+                    "rope_kernel: freq_factors must be F32, got {:?}",
+                    t.dtype()
+                ));
+            }
+            let expected = head_dim / 2;
+            // The kernel indexes `src2[ic]` for `ic ∈ [0, n_dims/2)`;
+            // require at least that many elements. For Gemma 4 global
+            // layers this is exactly 256 on head_dim=512.
+            if t.elem_count() < expected {
+                return Err(anyhow!(
+                    "rope_kernel: freq_factors has {} elements but \
+                     head_dim/2 = {} required (n_dims/2 = {})",
+                    t.elem_count(),
+                    expected,
+                    n_dims / 2
+                ));
+            }
+            Some(t.storage_and_layout())
+        }
+        None => None,
+    };
+    let ff_buf_and_offset: Option<(&Buffer, usize)> = match ff_guard_layout.as_ref() {
+        Some((storage, layout)) => match &**storage {
+            Storage::Metal(ms) => Some((
+                ms.buffer(),
+                layout.start_offset() * DType::F32.size_in_bytes(),
+            )),
+            other => {
+                return Err(anyhow!(
+                    "rope_kernel: freq_factors storage must be Metal, got {other:?}"
+                ));
+            }
+        },
+        None => None,
+    };
+    let src2_flag: i32 = if ff_buf_and_offset.is_some() { 1 } else { 0 };
 
     // --- Positions buffer (src1) --------------------------------------
     // llama.cpp feeds an int32 positions buffer; we allocate one per
@@ -718,7 +789,13 @@ pub fn rope_fused(
         sect_1: 0,
         sect_2: 0,
         sect_3: 0,
-        src2: 0, // no freq_factors buffer
+        // ADR-005 1bNEW.18: `src2 = 1` when `freq_factors: Some(_)`,
+        // which activates the `args.src2 != 0` branch inside the
+        // ported `kernel_rope_neox` at `rope_kernel.rs:319` so each
+        // per-pair `theta` is divided by `src2[ic]`. Sliding layers
+        // pass `None` → `src2 = 0` → every pair divides by `1.0f`
+        // (byte-identical to pre-1bNEW.18 behavior on sliding layers).
+        src2: src2_flag,
     };
 
     // --- Pipeline selection ------------------------------------------
@@ -747,10 +824,26 @@ pub fn rope_fused(
         encoder.set_bytes(0, &kargs);
         encoder.set_buffer(1, Some(src0_buf_ref), src0_offset);
         encoder.set_buffer(2, Some(pos_buf_arc.as_ref()), 0);
-        // src2 (freq_factors) is unused — bind the input buffer as
-        // a placeholder so the kernel's `args.src2 != 0` gate
-        // short-circuits and the binding is never dereferenced.
-        encoder.set_buffer(3, Some(src0_buf_ref), src0_offset);
+        // src2 binding:
+        //   - `Some((buf, off))`: global layer — bind the
+        //     `rope_freqs.weight` buffer. Kernel reads `src2[ic]`
+        //     per pair and divides `theta / freq_factor`. This is
+        //     ADR-005 1bNEW.18 — the caller-side fix to activate the
+        //     already-correct kernel branch at `:319`.
+        //   - `None`: sliding layer — bind the input buffer as a
+        //     placeholder so the kernel's `args.src2 != 0` gate
+        //     short-circuits without dereferencing an invalid
+        //     binding. `args.src2 = 0` above guarantees the kernel
+        //     never reads through this pointer.
+        match ff_buf_and_offset {
+            Some((ff_buf, ff_off)) => {
+                encoder.set_buffer(3, Some(ff_buf), ff_off);
+                encoder.use_resource(ff_buf, MTLResourceUsage::Read);
+            }
+            None => {
+                encoder.set_buffer(3, Some(src0_buf_ref), src0_offset);
+            }
+        }
         encoder.set_buffer(4, Some(dst_buf_arc.as_ref()), 0);
 
         encoder.use_resource(src0_buf_ref, MTLResourceUsage::Read);
@@ -785,24 +878,46 @@ pub fn rope_fused(
 }
 
 // ---------------------------------------------------------------------------
-// Phase A unit tests — numerical parity vs the reference rope_apply
+// Phase A unit tests — first-principles numerical parity vs
+// llama.cpp's `kernel_rope_neox` formula
 // ---------------------------------------------------------------------------
 //
-// Each test builds an F32 Q (or K) tensor on the Metal device, runs
-// BOTH the fused kernel and the candle-chain reference (`rope_apply`
-// + partial-rotary split/cat exactly as gemma4.rs:351-384 does it),
-// and compares element-by-element at ε=1e-5. The tests cover:
+// **ADR-005 1bNEW.18 (2026-04-11):** these tests REPLACE the
+// pre-1bNEW.18 set that compared the fused kernel against hf2q's
+// own `reference_rope_apply`. Spike C (`docs/spike-C-results.md`
+// Part 3.5) demonstrated that `reference_rope_apply` was buggy in
+// the *same* way the pre-1bNEW.18 fused kernel caller was: both
+// paths omitted `freq_factors` and both used the wrong pair offset
+// (`rotary_dim/2 = 64` instead of `head_dim/2 = 256` on Gemma 4
+// global layers). They agreed with each other bit-for-bit, which
+// is why every pre-1bNEW.18 Phase A test passed on the broken code.
 //
-//   1. Decode shape, full RoPE  — [1,16,1,256], n_dims=256 (sliding)
-//   2. Decode shape, partial    — [1,16,1,512], n_dims=256 (global)
-//   3. Prefill shape, partial   — [1,16,128,512], n_dims=256 (stride test)
-//   4. Decode at pos>0          — seqlen_offset=42, [1,16,1,256]
-//   5. Neox on interleaved      — synthetic [1,8,1,64] against an
-//                                  interleaved-pair reference
-//   6. `norm` variant sanity    — [1,8,1,64] against a GPT-J
-//                                  interleaved reference (same
-//                                  synthetic — port-only coverage,
-//                                  hf2q does not dispatch this path)
+// Post-1bNEW.18 the tests compare against a **first-principles
+// scalar reference** that implements llama.cpp's exact formula
+// from `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:4353-4410`:
+//
+//   for ic in [0, n_dims/2):
+//       theta = pos * pow(freq_base, -2*ic/n_dims) / freq_factor[ic]
+//       x0 = src[ic]
+//       x1 = src[ic + n_dims/2]
+//       dst[ic]              = x0 * cos(theta) - x1 * sin(theta)
+//       dst[ic + n_dims/2]   = x0 * sin(theta) + x1 * cos(theta)
+//   for i in [n_dims, head_dim): dst[i] = src[i]
+//
+// The reference does NOT use candle tensor ops; it walks the flat
+// buffer with doubled-precision trig and writes to an `expected:
+// Vec<f32>` that is then wrapped as a candle Tensor only for the
+// comparison phase. This eliminates any FP-reduction-order
+// interaction with candle's broadcast_mul + matmul path that could
+// mask a kernel bug.
+//
+// ε is widened from 1e-5 to 1e-4 because the reference does scalar
+// `(pos as f64) * (base as f64).powf(-2.0*ic/n_dims)` whereas the
+// kernel does `theta_base * pow(freq_base, -2*ic/n_dims)` in F32
+// and then divides by `freq_factor` as F32. The resulting
+// per-element drift is up to ~1e-5 on its own; accumulated through
+// the `cos * x0 - sin * x1` rotation at large `|x|` values it
+// stays below ~5e-5 but we leave headroom at 1e-4 for Walk-safety.
 //
 // Run with:
 //   `cargo test --features metal --release -p hf2q -- rope_kernel::tests --nocapture`
@@ -826,57 +941,75 @@ mod tests {
             .collect()
     }
 
-    /// Reference implementation — matches `gemma4.rs::RotaryEmbedding`
-    /// exactly. Builds the sin/cos cache with hf2q's proportional
-    /// inv_freq (`1 / rope_theta^(2k/head_dim)`), applies partial
-    /// rotary via narrow/split-half/cat, and returns the full
-    /// `[B,H,S,D]` tensor (including the pass-through tail).
-    fn reference_rope_apply(
-        x: &Tensor,
+    /// First-principles scalar reference for `kernel_rope_neox`.
+    ///
+    /// Implements llama.cpp's formula at
+    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:4353-4410`
+    /// *directly*, without going through any candle tensor ops, and
+    /// without using hf2q's own `rope_apply` helper. The return
+    /// value is a flat `Vec<f32>` of length `b*h*s*head_dim`, in the
+    /// same row-major `[B,H,S,D]` layout as the input.
+    ///
+    /// For each (batch, head, token, pair_ic):
+    ///   theta = pos * pow(freq_base, -(2*ic)/n_dims) / freq_factor[ic]
+    ///   x0 = src[ic]
+    ///   x1 = src[ic + n_dims/2]
+    ///   dst[ic]              = x0*cos(theta) - x1*sin(theta)
+    ///   dst[ic + n_dims/2]   = x0*sin(theta) + x1*cos(theta)
+    /// Elements [n_dims, head_dim) are copied verbatim.
+    ///
+    /// Sliding layers pass `freq_factors_host = None` (every
+    /// divisor is 1.0). Global layers pass the real
+    /// `[1.0]×64 + [1e+30]×192` pattern so the [64..256) pairs
+    /// rotate to identity via `theta/1e30 ≈ 0`.
+    fn reference_rope_neox_scalar(
+        input_flat: &[f32],
+        b: usize,
+        h: usize,
+        s: usize,
         head_dim: usize,
-        rotary_dim: usize,
+        n_dims: usize,
         rope_theta: f64,
         seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        use candle_core::D;
-        let dev = x.device();
-        let half = rotary_dim / 2;
-        let (_b, _h, seq_len, _d) = x.dims4()?;
-
-        // Build inv_freq and cos/sin for the needed positions.
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|i| 1f32 / rope_theta.powf(2.0 * i as f64 / head_dim as f64) as f32)
-            .collect();
-        let inv_freq_t = Tensor::from_vec(inv_freq, (1, half), dev)?;
-        let t = Tensor::arange(0u32, (seqlen_offset + seq_len) as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape(((seqlen_offset + seq_len), 1))?;
-        let freqs = t.matmul(&inv_freq_t)?;
-        let sin_full = freqs.sin()?;
-        let cos_full = freqs.cos()?;
-        let cos = cos_full.narrow(0, seqlen_offset, seq_len)?;
-        let sin = sin_full.narrow(0, seqlen_offset, seq_len)?;
-
-        let rope_split = |x_part: &Tensor| -> Result<Tensor> {
-            let h = x_part.dim(D::Minus1)? / 2;
-            let x1 = x_part.narrow(D::Minus1, 0, h)?;
-            let x2 = x_part.narrow(D::Minus1, h, h)?;
-            let r1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
-            let r2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
-            Ok(Tensor::cat(&[r1, r2], D::Minus1)?)
-        };
-
-        if rotary_dim == head_dim {
-            let x_c = x.contiguous()?;
-            let rot = rope_split(&x_c)?;
-            Ok(rot)
-        } else {
-            let pass_len = head_dim - rotary_dim;
-            let x_rot_part = x.narrow(D::Minus1, 0, rotary_dim)?.contiguous()?;
-            let x_pass = x.narrow(D::Minus1, rotary_dim, pass_len)?.contiguous()?;
-            let rot = rope_split(&x_rot_part)?;
-            Ok(Tensor::cat(&[rot, x_pass], D::Minus1)?)
+        freq_factors_host: Option<&[f32]>,
+    ) -> Vec<f32> {
+        assert_eq!(input_flat.len(), b * h * s * head_dim);
+        assert!(n_dims <= head_dim && n_dims % 2 == 0);
+        if let Some(ff) = freq_factors_host {
+            assert!(
+                ff.len() >= n_dims / 2,
+                "freq_factors needs at least n_dims/2 = {} elements, got {}",
+                n_dims / 2,
+                ff.len()
+            );
         }
+        let mut out = input_flat.to_vec();
+        let half = n_dims / 2;
+        for bi in 0..b {
+            for hi in 0..h {
+                for si in 0..s {
+                    let row_off = ((bi * h + hi) * s + si) * head_dim;
+                    let pos = (seqlen_offset + si) as f64;
+                    for ic in 0..half {
+                        // theta = pos * freq_base^(-2*ic/n_dims) / freq_factor
+                        let exponent = -(2.0 * ic as f64) / n_dims as f64;
+                        let ff = freq_factors_host
+                            .map(|v| v[ic] as f64)
+                            .unwrap_or(1.0);
+                        let theta = pos * rope_theta.powf(exponent) / ff;
+                        let (st, ct) = theta.sin_cos();
+                        let x0 = input_flat[row_off + ic] as f64;
+                        let x1 = input_flat[row_off + ic + half] as f64;
+                        out[row_off + ic] = (x0 * ct - x1 * st) as f32;
+                        out[row_off + ic + half] = (x0 * st + x1 * ct) as f32;
+                    }
+                    // Elements [n_dims, head_dim) are passed through
+                    // verbatim — `out` was initialized to a copy of
+                    // the input, so nothing to do.
+                }
+            }
+        }
+        out
     }
 
     fn device_and_pipelines() -> Option<(CoreDevice, RopePipelines)> {
@@ -895,9 +1028,7 @@ mod tests {
         Some((device, pipelines))
     }
 
-    fn compare(ref_out: &Tensor, fused_out: &Tensor, label: &str, eps: f32) {
-        let ref_flat = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let fused_flat = fused_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    fn compare_flat(ref_flat: &[f32], fused_flat: &[f32], label: &str, eps: f32) {
         assert_eq!(
             ref_flat.len(),
             fused_flat.len(),
@@ -943,133 +1074,247 @@ mod tests {
         );
         assert!(
             max_abs < eps && n_diff == 0,
-            "fused RoPE {label} disagrees with reference at ε={eps}; \
+            "fused RoPE {label} disagrees with first-principles reference at ε={eps}; \
              max|Δ|={max_abs}, {n_diff} mismatched elements"
         );
     }
 
-    /// Build a contiguous [B, H, S, D] F32 tensor on the Metal
-    /// device, seeded deterministically.
     fn build_input(
         device: &CoreDevice,
         shape: (usize, usize, usize, usize),
         seed: u64,
-    ) -> Tensor {
+    ) -> (Tensor, Vec<f32>) {
         let (b, h, s, d) = shape;
-        let n = b * h * s * d;
-        let v = make_f32_vec(n, seed);
-        Tensor::from_vec(v, (b, h, s, d), device).unwrap()
+        let v = make_f32_vec(b * h * s * d, seed);
+        let t = Tensor::from_vec(v.clone(), (b, h, s, d), device).unwrap();
+        (t, v)
     }
 
-    /// Map `(rope_theta, rotary_dim, head_dim)` → the effective
-    /// `freq_base` the kernel should use to produce hf2q's
-    /// proportional-RoPE angles. Derivation in the module header:
-    /// `freq_base_eff = rope_theta ^ (rotary_dim / head_dim)`.
-    fn effective_freq_base(rope_theta: f64, rotary_dim: usize, head_dim: usize) -> f32 {
-        rope_theta.powf(rotary_dim as f64 / head_dim as f64) as f32
+    /// The real Gemma 4 `rope_freqs.weight` pattern verified against
+    /// the shipping GGUF via `gguf.GGUFReader` on 2026-04-11:
+    /// `[1.0] × 64 + [1e+30] × 192` for `head_dim = 512 → half = 256`.
+    fn gemma4_global_freq_factors(half: usize) -> Vec<f32> {
+        // `half` may differ from 256 when running a smaller test
+        // shape, but we always pattern `[1.0] × (half/4) + [1e+30] × rest`
+        // so the structural divisor mask is exercised regardless of
+        // the specific `half` chosen.
+        let identity_count = half / 4;
+        let mut v = vec![1.0_f32; half];
+        for i in identity_count..half {
+            v[i] = 1e30;
+        }
+        v
     }
 
-    /// Test 1: decode shape, full rotary (sliding layer).
-    ///   shape [1,16,1,256], rotary_dim = head_dim = 256, theta=10000.
+    /// Test 1: decode shape, full rotary, sliding layer (no
+    /// freq_factors). Shape `[1, 16, 1, 256]`, `n_dims = head_dim =
+    /// 256`, `rope_theta = 10_000`, `seqlen_offset = 0`. Mirrors the
+    /// per-forward Gemma 4 sliding-attention call shape.
     #[test]
-    fn rope_neox_decode_full_rotary_sliding() {
+    fn rope_neox_decode_full_rotary_sliding_scalar() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
         let head_dim = 256;
-        let rotary_dim = 256;
+        let n_dims = 256;
         let rope_theta = 10_000.0_f64;
-        let input = build_input(&device, (1, 16, 1, head_dim), 0x51DE_51DE);
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let fused = rope_fused(&pipelines, &input, 0, rotary_dim, fb, RopeVariant::Neox).unwrap();
-        let reference = reference_rope_apply(&input, head_dim, rotary_dim, rope_theta, 0).unwrap();
-        compare(&reference, &fused, "decode_full_rotary_sliding", 1e-5);
+        let shape = (1, 16, 1, head_dim);
+        let (input, input_flat) = build_input(&device, shape, 0x51DE_51DE);
+        let fused =
+            rope_fused(&pipelines, &input, 0, n_dims, rope_theta as f32, RopeVariant::Neox, None)
+                .unwrap();
+        let expected = reference_rope_neox_scalar(
+            &input_flat, shape.0, shape.1, shape.2, head_dim, n_dims, rope_theta, 0, None,
+        );
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(&expected, &fused_flat, "decode_full_rotary_sliding_scalar", 1e-4);
     }
 
-    /// Test 2: decode shape, PARTIAL rotary (global layer, head_dim=512
-    /// with rotary_dim=256). This is the exact shape where
-    /// `project_coherence_bug.md` lived pre-refactor; Gemma 4 global
-    /// layers MUST rotate only the first half of each head.
+    /// Test 2: decode shape, full rotary, **global layer with
+    /// real Gemma 4 `rope_freqs` mask**. Shape `[1, 16, 1, 512]`,
+    /// `n_dims = head_dim = 512`, `rope_theta = 1_000_000`,
+    /// `freq_factors = [1.0]×64 + [1e+30]×192`. This is the exact
+    /// site Spike C localized; the test must catch any attempt to
+    /// regress either the full-head rotation or the freq_factors
+    /// mask.
     #[test]
-    fn rope_neox_decode_partial_rotary_global() {
+    fn rope_neox_decode_full_rotary_global_with_mask() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
         let head_dim = 512;
-        let rotary_dim = 256;
+        let n_dims = 512;
         let rope_theta = 1_000_000.0_f64;
-        let input = build_input(&device, (1, 16, 1, head_dim), 0xCAFE_BABE);
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let fused = rope_fused(&pipelines, &input, 0, rotary_dim, fb, RopeVariant::Neox).unwrap();
-        let reference = reference_rope_apply(&input, head_dim, rotary_dim, rope_theta, 0).unwrap();
-        compare(&reference, &fused, "decode_partial_rotary_global", 1e-5);
+        let shape = (1, 16, 1, head_dim);
+        let (input, input_flat) = build_input(&device, shape, 0xCAFE_BABE);
+        let freq_factors_host = gemma4_global_freq_factors(head_dim / 2);
+        let ff_tensor = Tensor::from_vec(freq_factors_host.clone(), (head_dim / 2,), &device).unwrap();
+        let fused = rope_fused(
+            &pipelines,
+            &input,
+            0,
+            n_dims,
+            rope_theta as f32,
+            RopeVariant::Neox,
+            Some(&ff_tensor),
+        )
+        .unwrap();
+        let expected = reference_rope_neox_scalar(
+            &input_flat,
+            shape.0,
+            shape.1,
+            shape.2,
+            head_dim,
+            n_dims,
+            rope_theta,
+            0,
+            Some(&freq_factors_host),
+        );
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(
+            &expected,
+            &fused_flat,
+            "decode_full_rotary_global_with_mask",
+            1e-4,
+        );
     }
 
-    /// Test 3: prefill shape, PARTIAL rotary. Stresses multi-token
-    /// stride handling — each token gets its own position and the
-    /// kernel reads `pos[i2]` across the full seq_len axis.
+    /// Test 3: **prefill** shape, full rotary, global layer with
+    /// mask. Shape `[1, 16, 128, 512]`. Exercises per-token `pos[i2]`
+    /// indexing AND the mask interaction at non-trivial positions.
+    /// This is the test that pre-1bNEW.18 would have caught the wrong
+    /// pair offset (`rotary_dim/2 = 64` vs correct `head_dim/2 = 256`)
+    /// — the per-position `max|Δ|` pattern from Spike C Table at
+    /// `docs/spike-C-results.md:360-369` scales linearly with
+    /// position only when the wrong pair offset is applied.
     #[test]
-    fn rope_neox_prefill_partial_rotary_global() {
+    fn rope_neox_prefill_full_rotary_global_with_mask() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
         let head_dim = 512;
-        let rotary_dim = 256;
+        let n_dims = 512;
         let rope_theta = 1_000_000.0_f64;
-        let input = build_input(&device, (1, 16, 128, head_dim), 0x1234_5678);
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let fused = rope_fused(&pipelines, &input, 0, rotary_dim, fb, RopeVariant::Neox).unwrap();
-        let reference = reference_rope_apply(&input, head_dim, rotary_dim, rope_theta, 0).unwrap();
-        compare(&reference, &fused, "prefill_partial_rotary_global", 1e-5);
+        let shape = (1, 16, 128, head_dim);
+        let (input, input_flat) = build_input(&device, shape, 0x1234_5678);
+        let freq_factors_host = gemma4_global_freq_factors(head_dim / 2);
+        let ff_tensor = Tensor::from_vec(freq_factors_host.clone(), (head_dim / 2,), &device).unwrap();
+        let fused = rope_fused(
+            &pipelines,
+            &input,
+            0,
+            n_dims,
+            rope_theta as f32,
+            RopeVariant::Neox,
+            Some(&ff_tensor),
+        )
+        .unwrap();
+        let expected = reference_rope_neox_scalar(
+            &input_flat,
+            shape.0,
+            shape.1,
+            shape.2,
+            head_dim,
+            n_dims,
+            rope_theta,
+            0,
+            Some(&freq_factors_host),
+        );
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(
+            &expected,
+            &fused_flat,
+            "prefill_full_rotary_global_with_mask",
+            1e-4,
+        );
     }
 
-    /// Test 4: decode at position > 0. Exercises `seqlen_offset`
-    /// indexing — the kernel's `pos[i2] = seqlen_offset + i2` matches
-    /// hf2q's `cos/sin.narrow(0, seqlen_offset, seq_len)`.
+    /// Test 4: decode at `seqlen_offset = 42` with the global
+    /// mask. Verifies the positions buffer indexes `pos[i2] =
+    /// seqlen_offset + i2` correctly under the post-1bNEW.18
+    /// signature. Also exercises a non-zero position with the
+    /// `1e+30` mask to confirm the identity-rotation pairs stay
+    /// identity regardless of position.
     #[test]
-    fn rope_neox_decode_at_offset() {
+    fn rope_neox_decode_at_offset_with_mask() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
-        let head_dim = 256;
-        let rotary_dim = 256;
-        let rope_theta = 10_000.0_f64;
-        let input = build_input(&device, (1, 16, 1, head_dim), 0x0BAD_BEEF);
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let fused = rope_fused(&pipelines, &input, 42, rotary_dim, fb, RopeVariant::Neox).unwrap();
-        let reference = reference_rope_apply(&input, head_dim, rotary_dim, rope_theta, 42).unwrap();
-        compare(&reference, &fused, "decode_at_offset_42", 1e-5);
+        let head_dim = 512;
+        let n_dims = 512;
+        let rope_theta = 1_000_000.0_f64;
+        let shape = (1, 16, 1, head_dim);
+        let (input, input_flat) = build_input(&device, shape, 0x0BAD_BEEF);
+        let freq_factors_host = gemma4_global_freq_factors(head_dim / 2);
+        let ff_tensor = Tensor::from_vec(freq_factors_host.clone(), (head_dim / 2,), &device).unwrap();
+        let fused = rope_fused(
+            &pipelines,
+            &input,
+            42,
+            n_dims,
+            rope_theta as f32,
+            RopeVariant::Neox,
+            Some(&ff_tensor),
+        )
+        .unwrap();
+        let expected = reference_rope_neox_scalar(
+            &input_flat,
+            shape.0,
+            shape.1,
+            shape.2,
+            head_dim,
+            n_dims,
+            rope_theta,
+            42,
+            Some(&freq_factors_host),
+        );
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(&expected, &fused_flat, "decode_at_offset_with_mask", 1e-4);
     }
 
-    /// Test 5: prefill with partial rotary at head_dim=256. Exercises
-    /// an intermediate shape the canonical Gemma 4 config does not
-    /// use (sliding layers are full rotary) but that the kernel must
-    /// still handle — Anti-Goal #6 (no benchmark-only specialization).
+    /// Test 5: identity-rotation invariant. Set
+    /// `freq_factors = [1e+30; half]` so every pair rotates to
+    /// identity — the output must equal the input bit-for-bit
+    /// (modulo scalar f32 noise in the `cos(0) * x - sin(0) * x`
+    /// path, which is at the ~1e-7 floor). This is a structural
+    /// sanity gate that would catch any future regression that
+    /// silently disables the mask division inside the kernel.
     #[test]
-    fn rope_neox_prefill_partial_rotary_generic() {
+    fn rope_neox_full_mask_is_identity() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
-        let head_dim = 256;
-        let rotary_dim = 128;
-        let rope_theta = 10_000.0_f64;
-        let input = build_input(&device, (1, 16, 32, head_dim), 0xF00D_BABE);
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let fused = rope_fused(&pipelines, &input, 0, rotary_dim, fb, RopeVariant::Neox).unwrap();
-        let reference = reference_rope_apply(&input, head_dim, rotary_dim, rope_theta, 0).unwrap();
-        compare(&reference, &fused, "prefill_partial_generic", 1e-5);
+        let head_dim = 512;
+        let n_dims = 512;
+        let rope_theta = 1_000_000.0_f64;
+        let shape = (1, 16, 8, head_dim);
+        let (input, input_flat) = build_input(&device, shape, 0xABAD_CAFE);
+        let freq_factors_host = vec![1e30_f32; head_dim / 2];
+        let ff_tensor =
+            Tensor::from_vec(freq_factors_host.clone(), (head_dim / 2,), &device).unwrap();
+        let fused = rope_fused(
+            &pipelines,
+            &input,
+            0,
+            n_dims,
+            rope_theta as f32,
+            RopeVariant::Neox,
+            Some(&ff_tensor),
+        )
+        .unwrap();
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(&input_flat, &fused_flat, "full_mask_is_identity", 1e-5);
     }
 
-    /// Test 6: `norm` (GPT-J interleaved-pair) variant. hf2q does not
-    /// dispatch this in production, but the port must compile and
-    /// produce correct interleaved-pair rotation. Reference is a
-    /// direct in-test GPT-J rotation.
+    /// Test 6: `norm` (GPT-J interleaved-pair) variant with the
+    /// new first-principles reference. hf2q does not dispatch this
+    /// path in production (Gemma 4 is Neox), but the port is kept
+    /// for reference parity and the test guards against accidental
+    /// algebra bugs in `kernel_rope_norm`.
     #[test]
     fn rope_norm_variant_interleaved_sanity() {
         let Some((device, pipelines)) = device_and_pipelines() else { return };
         let head_dim = 64;
-        let rotary_dim = 64;
+        let n_dims = 64;
         let rope_theta = 10_000.0_f64;
         let shape = (1, 8, 1, head_dim);
-        let input = build_input(&device, shape, 0xBEEF_CAFE);
+        let (input, input_vec) = build_input(&device, shape, 0xBEEF_CAFE);
 
-        // Reference: GPT-J interleaved-pair RoPE.
-        //   For each i0 = 0, 2, ..., n_dims-2:
-        //     theta = pos * freq_base^(-i0/n_dims)
-        //     (x0, x1) = (src[i0], src[i0+1])
-        //     (y0, y1) = (x0*cos - x1*sin, x0*sin + x1*cos)
-        let fb = effective_freq_base(rope_theta, rotary_dim, head_dim);
-        let input_vec = input.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Reference: GPT-J interleaved-pair RoPE. For each
+        // `i0 ∈ {0, 2, ..., n_dims-2}` on each (batch, head, token):
+        //   theta = pos * freq_base^(-i0/n_dims)
+        //   (x0, x1) = (src[i0], src[i0+1])
+        //   (y0, y1) = (x0*cos - x1*sin, x0*sin + x1*cos)
         let (b, h, s, d) = shape;
         let mut expected = input_vec.clone();
         for bi in 0..b {
@@ -1078,21 +1323,29 @@ mod tests {
                     let pos = si as f64;
                     let row_off = ((bi * h + hi) * s + si) * d;
                     let mut i0 = 0usize;
-                    while i0 < rotary_dim {
-                        let theta = pos * (fb as f64).powf(-(i0 as f64) / rotary_dim as f64);
-                        let ct = theta.cos() as f32;
-                        let st = theta.sin() as f32;
-                        let x0 = input_vec[row_off + i0];
-                        let x1 = input_vec[row_off + i0 + 1];
-                        expected[row_off + i0] = x0 * ct - x1 * st;
-                        expected[row_off + i0 + 1] = x0 * st + x1 * ct;
+                    while i0 < n_dims {
+                        let theta = pos * rope_theta.powf(-(i0 as f64) / n_dims as f64);
+                        let (st, ct) = theta.sin_cos();
+                        let x0 = input_vec[row_off + i0] as f64;
+                        let x1 = input_vec[row_off + i0 + 1] as f64;
+                        expected[row_off + i0] = (x0 * ct - x1 * st) as f32;
+                        expected[row_off + i0 + 1] = (x0 * st + x1 * ct) as f32;
                         i0 += 2;
                     }
                 }
             }
         }
-        let expected_t = Tensor::from_vec(expected, shape, &device).unwrap();
-        let fused = rope_fused(&pipelines, &input, 0, rotary_dim, fb, RopeVariant::Norm).unwrap();
-        compare(&expected_t, &fused, "norm_variant_interleaved", 1e-5);
+        let fused = rope_fused(
+            &pipelines,
+            &input,
+            0,
+            n_dims,
+            rope_theta as f32,
+            RopeVariant::Norm,
+            None,
+        )
+        .unwrap();
+        let fused_flat = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        compare_flat(&expected, &fused_flat, "norm_variant_interleaved", 1e-4);
     }
 }

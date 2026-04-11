@@ -311,39 +311,51 @@ impl RmsNorm {
 // ---------------------------------------------------------------------------
 
 struct RotaryEmbedding {
-    /// Cached sin table `[max_seq_len, rotary_dim/2]` — only used by
+    /// Cached sin table `[max_seq_len, head_dim/2]` — only used by
     /// the `loop` dispatch path. `Fused` mode computes angles
-    /// on-the-fly inside the kernel body, so this allocation is pure
-    /// fallback cost when `--rope-kernel=fused` is active. Left in
-    /// place unconditionally for bisect-safety.
+    /// on-the-fly inside the kernel body, so this allocation is
+    /// pure fallback cost when `--rope-kernel=fused` is active.
+    /// Left in place unconditionally for bisect-safety.
+    ///
+    /// **ADR-005 1bNEW.18 (2026-04-11):** for global layers this
+    /// table is built with each per-pair `inv_freq[i]` pre-divided
+    /// by `freq_factors[i]` from `rope_freqs.weight` (the F32 `[256]`
+    /// tensor llama.cpp calls `model.layers[il].rope_freqs` at
+    /// `/opt/llama.cpp/src/models/gemma4-iswa.cpp:55-59,73-75,97-98`).
+    /// Pair indices with `freq_factors[i] == 1e+30` produce
+    /// `freqs[pos, i] ≈ 0 → cos=1, sin=0 → identity rotation`, which
+    /// is numerically equivalent to what the Metal kernel computes
+    /// via `theta / freq_factors[ic]` at runtime
+    /// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:4353`).
     sin: Tensor,
     /// Cached cos table, same shape and caveat as `sin`.
     cos: Tensor,
-    /// Number of rotated element-indices per head. For full RoPE
-    /// (sliding layers) `rotary_dim == head_dim`; for partial RoPE
-    /// (Gemma 4 global layers, `partial_rotary_factor=0.5`) it's
-    /// `head_dim / 2`.
-    rotary_dim: usize,
-    /// Full head_dim this RoPE is paired with. The fused path
-    /// reads the effective head_dim from the input tensor's last
-    /// dimension at dispatch time, so this field is kept for
-    /// construction-time validation and self-documentation only.
-    /// `Loop` mode never reads it; the 9-op chain infers head_dim
-    /// from the tensor shape directly.
-    #[allow(dead_code)]
+    /// Full head_dim this RoPE is paired with. `Loop` mode splits
+    /// `q[..head_dim]` in half at offset `head_dim/2`; fused mode
+    /// passes `head_dim` as both `ne0` and `n_dims` so llama.cpp's
+    /// kernel pairs `(q[ic], q[ic + head_dim/2])` — the canonical
+    /// HF neox layout. Note: pre-1bNEW.18, there was a separate
+    /// `rotary_dim` field that could differ from `head_dim` under
+    /// a misreading of Gemma 4's "partial rotary"; the field was
+    /// deleted and the two-value-distinction collapsed to `head_dim`
+    /// only. See `docs/spike-C-results.md` Part 5 for the root cause.
     head_dim: usize,
-    /// Effective RoPE frequency base to feed the Metal kernel.
-    /// Derivation: llama.cpp's kernel uses `n_dims` (rotary_dim) in
-    /// the denominator of `pow(freq_base, -i0/n_dims)`, whereas
-    /// Gemma 4's HF-origin proportional scaling uses `head_dim` in
-    /// the denominator of `1/rope_theta^(2k/head_dim)`. Folding the
-    /// mismatch into an effective base:
-    ///   `freq_base_eff = rope_theta^(rotary_dim / head_dim)`
-    /// keeps the kernel byte-identical to llama.cpp while matching
-    /// hf2q's existing cached cos/sin values to 1 ULP. See the
-    /// module-level comment in `rope_kernel.rs` for the full
-    /// derivation and the Phase A unit test evidence.
-    freq_base_eff: f32,
+    /// RoPE base frequency as read from GGUF metadata
+    /// (`gemma4.rope.freq_base` = 1e6 for global,
+    /// `gemma4.rope.freq_base_swa` = 10000 for sliding). The fused
+    /// kernel path passes this verbatim as `freq_base` to the ported
+    /// `kernel_rope_neox`, which computes
+    /// `theta = pos * pow(freq_base, -i0/n_dims) / freq_factor`.
+    rope_theta: f32,
+    /// Global-layer frequency mask loaded from `rope_freqs.weight`.
+    /// Shape `[head_dim/2]` F32 on device, populated on global
+    /// `RotaryEmbedding` instances only; `None` on sliding instances.
+    /// When present, bound as `src2` to the fused kernel so the
+    /// `args.src2 != 0` branch at `rope_kernel.rs:319` activates.
+    /// Reference: `/opt/llama.cpp/src/models/gemma4-iswa.cpp:55-59`
+    /// — `freq_factors = model.layers[il].rope_freqs` on non-SWA
+    /// layers only.
+    freq_factors: Option<Tensor>,
     /// Which RoPE pair layout this instance dispatches. Gemma 4 is
     /// always `Neox` (llama.cpp's split-half `LLAMA_ROPE_TYPE_NEOX`
     /// at `src/llama-model.cpp:9134`). Stored as a struct field so
@@ -361,43 +373,85 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new_standard(
+    /// Construct a RoPE embedding with full-head rotation.
+    ///
+    /// **Sliding layers:** `freq_factors = None`, which is numerically
+    /// equivalent to passing `[1.0; head_dim/2]` — every pair
+    /// rotates at its natural per-index angle.
+    ///
+    /// **Global layers (Gemma 4 full-attention):** `freq_factors =
+    /// Some(rope_freqs_host)` where `rope_freqs_host` is the F32
+    /// vector loaded from `rope_freqs.weight` in the GGUF. Pair
+    /// indices with a `1e+30` mask value effectively have their
+    /// rotation angle driven to 0 (identity rotation), matching
+    /// llama.cpp's `theta / freq_factors[ic]` runtime division at
+    /// `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:4353`.
+    ///
+    /// The `Tensor` form of `freq_factors` is also retained on the
+    /// struct for the fused kernel path (bound as `src2`).
+    fn new(
         head_dim: usize,
         max_seq_len: usize,
         rope_theta: f64,
+        freq_factors_host: Option<Vec<f32>>,
         dev: &Device,
         kernel: RopeKernel,
         counters: Arc<DispatchCounters>,
     ) -> Result<Self> {
-        Self::build(head_dim, head_dim, max_seq_len, rope_theta, dev, kernel, counters)
-    }
-
-    fn new_partial(
-        head_dim: usize,
-        max_seq_len: usize,
-        rope_theta: f64,
-        partial_rotary_factor: f64,
-        dev: &Device,
-        kernel: RopeKernel,
-        counters: Arc<DispatchCounters>,
-    ) -> Result<Self> {
-        let rope_angles = ((partial_rotary_factor * head_dim as f64 / 2.0).floor() as usize).min(head_dim / 2);
-        let rotary_dim = rope_angles * 2;
-        Self::build(head_dim, rotary_dim, max_seq_len, rope_theta, dev, kernel, counters)
+        Self::build(
+            head_dim,
+            max_seq_len,
+            rope_theta,
+            freq_factors_host,
+            dev,
+            kernel,
+            counters,
+        )
     }
 
     fn build(
         head_dim: usize,
-        rotary_dim: usize,
         max_seq_len: usize,
         rope_theta: f64,
+        freq_factors_host: Option<Vec<f32>>,
         dev: &Device,
         kernel: RopeKernel,
         counters: Arc<DispatchCounters>,
     ) -> Result<Self> {
-        let half = rotary_dim / 2;
+        let half = head_dim / 2;
+
+        // Validate shape contract up-front so a bad GGUF never
+        // silently slices past the end of the freq_factors vector.
+        if let Some(ref ff) = freq_factors_host {
+            if ff.len() != half {
+                return Err(anyhow::anyhow!(
+                    "rope_freqs.weight length {} does not match head_dim/2 = {}",
+                    ff.len(),
+                    half,
+                ));
+            }
+        }
+
+        // Loop-path sin/cos cache.
+        //
+        // llama.cpp's kernel computes `theta = pos * pow(freq_base,
+        // -2*ic/head_dim) / freq_factor[ic]` for pair `ic ∈ [0, half)`.
+        // hf2q's loop path pre-computes a `[max_seq_len, half]` table
+        // from `freqs[pos, i] = pos * inv_freq[i]`, so we fold the
+        // freq_factors division directly into `inv_freq[i]`. For
+        // `freq_factors[i] = 1e+30`, `inv_freq_eff[i] ≈ 0`, which gives
+        // `cos = 1, sin = 0` — identity rotation, matching the mask's
+        // intent. Sliding layers pass `None` (treated as identity
+        // division) so their cached values are byte-identical to the
+        // pre-1bNEW.18 table.
         let inv_freq: Vec<f32> = (0..half)
-            .map(|i| 1f32 / rope_theta.powf(2.0 * i as f64 / head_dim as f64) as f32)
+            .map(|i| {
+                let base = 1f32 / rope_theta.powf(2.0 * i as f64 / head_dim as f64) as f32;
+                match freq_factors_host.as_ref() {
+                    Some(ff) => base / ff[i],
+                    None => base,
+                }
+            })
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq, (1, half), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
@@ -406,17 +460,21 @@ impl RotaryEmbedding {
         let freqs = t.matmul(&inv_freq)?;
         let sin = freqs.sin()?;
         let cos = freqs.cos()?;
-        // freq_base_eff = rope_theta^(rotary_dim / head_dim). For
-        // sliding layers rotary_dim == head_dim so this degenerates
-        // to rope_theta; for global layers with partial_rotary_factor=0.5
-        // and rope_theta=1_000_000 this gives 1000.
-        let freq_base_eff = rope_theta.powf(rotary_dim as f64 / head_dim as f64) as f32;
+
+        // Fused-path freq_factors buffer. Kept as an on-device F32
+        // `[half]` tensor so the encoder can bind its Metal buffer
+        // directly as `src2` without a per-dispatch host→device copy.
+        let freq_factors_tensor = match freq_factors_host {
+            Some(ff) => Some(Tensor::from_vec(ff, (half,), dev)?),
+            None => None,
+        };
+
         Ok(Self {
             sin,
             cos,
-            rotary_dim,
             head_dim,
-            freq_base_eff,
+            rope_theta: rope_theta as f32,
+            freq_factors: freq_factors_tensor,
             // Gemma 4 is always Neox. If a future non-Gemma4 caller
             // needs Norm, add a `new_norm_variant` constructor rather
             // than threading it through the signature (Anti-Goal #7 —
@@ -437,30 +495,42 @@ impl RotaryEmbedding {
             // leaves them non-contiguous. This absorbs the old
             // 1bNEW.8 stride-aware-prelude win (ADR-005:322-326).
             //
-            // For partial rotary (Gemma 4 global, rotary_dim=256 vs
-            // head_dim=512) we pass the FULL head_dim as ne0 and
-            // only rotary_dim as n_dims. The kernel's `i0 >= n_dims`
-            // branch copies the pass-through tail verbatim, so no
-            // narrow/cat dance is needed on the Rust side either.
-            // That's the exact code area where `project_coherence_bug.md`
-            // lived; Phase A unit tests 2 and 3 validate byte/ULP
-            // fidelity on `[1,16,1,512]` and `[1,16,128,512]`.
+            // **ADR-005 1bNEW.18 (2026-04-11):** for global layers
+            // `self.freq_factors = Some(rope_freqs_device_tensor)` is
+            // propagated into the kernel via `src2`. The kernel branch
+            // at `rope_kernel.rs:319` is already a byte-port of
+            // llama.cpp's `freq_factor = (args.src2 != 0) ? src2[ic]
+            // : 1.0f` gate — it was correct pre-landing; only the
+            // caller needed fixing. Sliding layers pass
+            // `freq_factors = None`, preserving identity-division
+            // semantics exactly.
+            //
+            // Full-head rotation: both sliding and global pass
+            // `n_dims = head_dim`, so llama.cpp's kernel rotates every
+            // pair `(q[ic], q[ic + head_dim/2])` for ic ∈ [0, half).
+            // No pass-through tail. The global mask's `1e+30` entries
+            // at indices [64..256) collapse those pair rotations to
+            // identity via the runtime `theta / freq_factor` division
+            // inside the kernel, exactly matching the per-pair mask
+            // behavior Gemma 4's GGUF encodes.
             let pipelines = self.kernel.pipelines.as_ref().expect("is_fused");
             let q_rot = rope_kernel::rope_fused(
                 pipelines,
                 q,
                 seqlen_offset,
-                self.rotary_dim,
-                self.freq_base_eff,
+                self.head_dim,
+                self.rope_theta,
                 self.variant,
+                self.freq_factors.as_ref(),
             )?;
             let k_rot = rope_kernel::rope_fused(
                 pipelines,
                 k,
                 seqlen_offset,
-                self.rotary_dim,
-                self.freq_base_eff,
+                self.head_dim,
+                self.rope_theta,
                 self.variant,
+                self.freq_factors.as_ref(),
             )?;
             // Two dispatches total for one Q + one K. The old loop
             // path used ~10 ops (see `fetch_add(10)` at the call site
@@ -478,30 +548,25 @@ impl RotaryEmbedding {
         // consistent without the outside-site having to know which
         // path ran. Preserve the `10` ops accounting for loop mode
         // so the baseline metrics.txt numbers don't drift.
+        //
+        // **1bNEW.18:** the old loop path had two sub-branches
+        // (`rotary_dim == head_dim` and `rotary_dim < head_dim`),
+        // each counted as `10`. Post-landing there is only the
+        // full-head branch, so the count stays `10`.
         self.counters.dispatches_per_token.fetch_add(10, Ordering::Relaxed);
 
         let (_b, _h, seq_len, head_dim) = q.dims4()?;
+        debug_assert_eq!(head_dim, self.head_dim, "RoPE head_dim mismatch");
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?.to_dtype(q.dtype())?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?.to_dtype(q.dtype())?;
 
-        if self.rotary_dim == head_dim {
-            let q_rot = Self::rope_apply(&q.contiguous()?, &cos, &sin)?;
-            let k_rot = Self::rope_apply(&k.contiguous()?, &cos, &sin)?;
-            Ok((q_rot, k_rot))
-        } else {
-            let pass_len = head_dim - self.rotary_dim;
-            let q_rot_part = q.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
-            let q_pass = q.narrow(D::Minus1, self.rotary_dim, pass_len)?;
-            let k_rot_part = k.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
-            let k_pass = k.narrow(D::Minus1, self.rotary_dim, pass_len)?;
-
-            let q_rot = Self::rope_apply(&q_rot_part, &cos, &sin)?;
-            let k_rot = Self::rope_apply(&k_rot_part, &cos, &sin)?;
-
-            let q_out = Tensor::cat(&[q_rot, q_pass.contiguous()?], D::Minus1)?;
-            let k_out = Tensor::cat(&[k_rot, k_pass.contiguous()?], D::Minus1)?;
-            Ok((q_out, k_out))
-        }
+        // Full-head rotation — sin/cos tables were built with
+        // `freq_factors` already folded into `inv_freq`, so for
+        // global layers the pairs at ic ∈ [64..256) have
+        // `sin ≈ 0, cos ≈ 1` and rotate to identity.
+        let q_rot = Self::rope_apply(&q.contiguous()?, &cos, &sin)?;
+        let k_rot = Self::rope_apply(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_rot, k_rot))
     }
 
     /// Standard RoPE rotation: split x into (x1,x2), rotate.
@@ -1658,17 +1723,83 @@ impl Gemma4Model {
         };
         let embed = Embedding::new(embed_w.clone(), cfg.hidden_size);
 
-        // Rotary embeddings (shared across same-type layers)
-        // Cap max seq len for RoPE tables to something reasonable for startup
+        // Rotary embeddings (shared across same-type layers).
+        // Cap max seq len for RoPE tables to something reasonable for startup.
+        //
+        // **ADR-005 1bNEW.18 (2026-04-11):** load `rope_freqs.weight`
+        // from the GGUF and attach it to the global `RotaryEmbedding`
+        // as a per-pair frequency mask. llama.cpp uses this tensor
+        // on non-SWA (full-attention) layers only — see
+        // `/opt/llama.cpp/src/models/gemma4-iswa.cpp:55-59`:
+        //   `ggml_tensor * freq_factors = nullptr;`
+        //   `if (!hparams.is_swa(il)) {`
+        //   `    freq_factors = model.layers[il].rope_freqs;`
+        //   `}`
+        // The tensor is a global-scope (no `blk.N` prefix) F32 tensor
+        // of shape `[head_dim/2]`, loaded in llama.cpp at
+        // `/opt/llama.cpp/src/llama-model.cpp:4311-4313`. For Gemma 4
+        // 26B MoE it's `[256]` with the pattern
+        // `[1.0]×64 + [1e+30]×192` — the first 64 pairs rotate at
+        // their natural angles, the remaining 192 rotate to identity
+        // because `theta / 1e+30 → 0 → cos=1, sin=0`. Sliding layers
+        // pass `freq_factors = None`, preserving their pre-1bNEW.18
+        // sin/cos tables byte-identically.
+        //
+        // We load via `get_tensor("rope_freqs.weight", DType::F32)`
+        // and immediately move to host as a `Vec<f32>` so the `build`
+        // helper can fold the mask into `inv_freq` for the loop path
+        // AND keep a `[half]` device tensor for fused-path `src2`
+        // binding. See `docs/spike-C-results.md` Parts 3-5 for the
+        // full end-to-end root cause analysis that led to this
+        // change.
         let max_rope_len = cfg.max_position_embeddings.min(8192);
-        let rope_sliding = Arc::new(RotaryEmbedding::new_standard(
-            cfg.head_dim, max_rope_len, cfg.rope_theta_sliding, device,
-            rope_kernel.clone(), counters.clone(),
+
+        let rope_freqs_host: Vec<f32> = {
+            let t = gguf
+                .get_tensor("rope_freqs.weight", DType::F32)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "ADR-005 1bNEW.18: failed to load `rope_freqs.weight` \
+                         from GGUF — required for Gemma 4 global-layer RoPE \
+                         per /opt/llama.cpp/src/models/gemma4-iswa.cpp:55-59: {e}"
+                    )
+                })?;
+            let t = t.to_device(&Device::Cpu)?.flatten_all()?;
+            t.to_vec1::<f32>()?
+        };
+        let expected_half = cfg.global_head_dim / 2;
+        if rope_freqs_host.len() != expected_half {
+            anyhow::bail!(
+                "rope_freqs.weight has {} elements but global_head_dim/2 = {}",
+                rope_freqs_host.len(),
+                expected_half,
+            );
+        }
+        tracing::info!(
+            "rope_freqs.weight: {} elements, ones@[0..{}), 1e+30@[{}..{})",
+            rope_freqs_host.len(),
+            rope_freqs_host.iter().take_while(|v| **v < 1e20).count(),
+            rope_freqs_host.iter().take_while(|v| **v < 1e20).count(),
+            rope_freqs_host.len(),
+        );
+
+        let rope_sliding = Arc::new(RotaryEmbedding::new(
+            cfg.head_dim,
+            max_rope_len,
+            cfg.rope_theta_sliding,
+            None, // sliding layers do not use freq_factors
+            device,
+            rope_kernel.clone(),
+            counters.clone(),
         )?);
-        let rope_global = Arc::new(RotaryEmbedding::new_partial(
-            cfg.global_head_dim, max_rope_len, cfg.rope_theta_global,
-            cfg.partial_rotary_factor_global, device,
-            rope_kernel.clone(), counters.clone(),
+        let rope_global = Arc::new(RotaryEmbedding::new(
+            cfg.global_head_dim,
+            max_rope_len,
+            cfg.rope_theta_global,
+            Some(rope_freqs_host),
+            device,
+            rope_kernel.clone(),
+            counters.clone(),
         )?);
 
         // Layers

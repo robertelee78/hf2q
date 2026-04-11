@@ -28,7 +28,22 @@ pub struct Gemma4Config {
     pub rms_norm_eps: f64,
     pub rope_theta_sliding: f64,
     pub rope_theta_global: f64,
-    pub partial_rotary_factor_global: f64,
+    // ADR-005 1bNEW.18 (2026-04-11): `partial_rotary_factor_global` REMOVED.
+    //
+    // The field and its default value of `0.25` were introduced under the
+    // misreading that Gemma 4 global-layer RoPE rotates only the first
+    // `head_dim * partial_rotary_factor` elements of each head vector.
+    // llama.cpp's Gemma 4 path (`src/models/gemma4-iswa.cpp:49,73-75,97-98`)
+    // and the GGUF metadata (`gemma4.rope.dimension_count = 512 = head_dim`)
+    // show the opposite: global layers rotate the FULL head_dim with a
+    // per-pair `freq_factors` mask loaded from `rope_freqs.weight`
+    // (`src/llama-model.cpp:4311-4313`). Elements [64..256) of the mask
+    // are `1e+30`, which drives their rotation angle to ~0 via
+    // `theta / freq_factor`, producing identity rotation on those pair
+    // indices — numerically equivalent to "partial rotary" but structurally
+    // a full-head rotation with a frequency mask, not a truncated rotary
+    // dim. See `docs/spike-C-results.md` Parts 3.1-3.3 and 5 for the full
+    // root-cause derivation and fix direction.
     pub sliding_window: usize,
     pub max_position_embeddings: usize,
     pub final_logit_softcapping: Option<f64>,
@@ -85,7 +100,6 @@ impl Gemma4Config {
             rms_norm_eps: tc.rms_norm_eps.unwrap_or(1e-6),
             rope_theta_sliding: sliding_rope.rope_theta.unwrap_or(10000.0),
             rope_theta_global: full_rope.rope_theta.unwrap_or(1000000.0),
-            partial_rotary_factor_global: full_rope.partial_rotary_factor.unwrap_or(0.25),
             sliding_window: tc.sliding_window.unwrap_or(1024),
             max_position_embeddings: tc.max_position_embeddings.unwrap_or(262144),
             final_logit_softcapping: tc.final_logit_softcapping,
@@ -155,5 +169,12 @@ struct RopeParameters {
 #[derive(Debug, Deserialize, Default)]
 struct RopeEntry {
     rope_theta: Option<f64>,
-    partial_rotary_factor: Option<f64>,
+    // ADR-005 1bNEW.18: `partial_rotary_factor` intentionally NOT deserialized.
+    // Gemma 4 global-layer RoPE uses full-head rotation with a frequency
+    // mask loaded from `rope_freqs.weight`, not a reduced `rotary_dim`.
+    // Serde's default is to ignore unknown JSON fields, so any
+    // `partial_rotary_factor` key in config.json will simply be dropped on
+    // parse. See the removed-field comment on
+    // `Gemma4Config::partial_rotary_factor_global` above and
+    // `docs/spike-C-results.md` Parts 3-5 for the full derivation.
 }
