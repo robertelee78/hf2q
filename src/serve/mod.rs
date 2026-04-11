@@ -133,13 +133,24 @@ fn run_single_generation(
     let mut all_tokens = prompt_tokens.to_vec();
     let counters = model.counters();
 
-    // Prefill (not timed — benchmark measures decode only)
+    // Prefill (not counted in benchmark tok/s, but timed + reported so
+    // TTFT deltas from warmup coverage are visible; see ADR-005 1bNEW.12).
     if !silent {
         eprintln!("Prefilling {} tokens...", prompt_tokens.len());
     }
     let input = Tensor::new(prompt_tokens, device)?
         .unsqueeze(0)?;  // [1, seq_len]
+    let prefill_start = std::time::Instant::now();
     let mut logits = model.forward(&input, 0)?;
+    let prefill_elapsed = prefill_start.elapsed();
+    if !silent {
+        eprintln!(
+            "Prefill complete in {:.1} ms ({} tokens, {:.1} tok/s).",
+            prefill_elapsed.as_secs_f64() * 1000.0,
+            prompt_tokens.len(),
+            prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64(),
+        );
+    }
 
     // ADR-005 1bNEW.0 (metrics instrumentation):
     // Reset counters AFTER prefill so per-token averages describe only the
@@ -664,10 +675,83 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     tracing::info!("MoE dispatch mode: {:?}", moe_mode);
     let mut model = Gemma4Model::load_with_moe_mode(&cfg, &gguf, &device, moe_mode)?;
 
-    // Warmup: run dummy token to force Metal shader compilation
-    eprintln!("Warming up model...");
-    let warmup_input = Tensor::new(&[2u32], &device)?.unsqueeze(0)?; // BOS token
-    let _ = model.forward(&warmup_input, 0)?;
+    // Warmup: run two dummy forwards to force Metal shader compilation for
+    // both the decode and prefill code paths at model-load time.
+    //
+    // ADR-005 1bNEW.14 (Phase 1 baseline): the single-token warmup below
+    // triggers PSO compilation for the decode-time vector SDPA kernel
+    // (`q_len == 1` branch in `Attention::forward`), eliminating a ~37 ms
+    // cold-compile spike on the first decode token.
+    //
+    // ADR-005 1bNEW.12 (this change, 2026-04-10): the decode warmup alone
+    // does NOT cover the prefill code path, which has its own kernel
+    // variants:
+    //   - Global layers (head_dim=512) now route through candle's fused
+    //     BF16 SDPA full kernel at `bd=512, bq=8, bk=8` (1bNEW.10,
+    //     commit 29b84ef). First dispatch cold-compiles
+    //     `steel_attention_bfloat16_bq8_bk8_bd512_wm1_wn1_maskbfloat16_t`.
+    //   - Prefill MoE `kernel_mul_mv_id_*` batched matmul (1bNEW.1):
+    //     first multi-token dispatch pre-compiles the per-token offset
+    //     code path that decode `n_tokens=1` never exercises.
+    //   - Prefill softmax over a multi-row `attn_weights` matrix on the
+    //     bd=256 manual path — first call cold-compiles the F32
+    //     `softmax_last_dim` kernel shape that decode never sees.
+    //
+    // Running a short multi-token forward pass at load time pre-compiles
+    // all prefill PSOs so the first real request pays only the model's
+    // actual compute cost, not the shader-compile wait. Matches the
+    // spirit of llama.cpp's pre-built `.metallib` at build time; hf2q
+    // cannot ship a pre-compiled metallib from Rust, so runtime warmup
+    // is the nearest equivalent.
+    //
+    // Warmup length of 8 tokens is chosen as a comfortable multiple of
+    // `bq=8` (the bd=512 tile row count) that exercises the full bd=512
+    // tiled path including an aligned last row batch. Sliding-layer
+    // (bd=256) prefill uses the manual F32 path after 1bNEW.10's
+    // head_dim split, so any q_len ≥ 2 covers its PSOs identically.
+    //
+    // Cleanup via `clear_kv_cache()` after each warmup pass so prefill
+    // for the first real request starts from a clean cache state.
+    eprintln!("Warming up model (decode path)...");
+    let warmup_decode = Tensor::new(&[2u32], &device)?.unsqueeze(0)?; // BOS token
+    let _ = model.forward(&warmup_decode, 0)?;
+    model.clear_kv_cache();
+
+    eprintln!("Warming up model (prefill path)...");
+    // 10-token dummy input — deliberately NOT a multiple of `bq=8`.
+    //
+    // Candle's SDPA full kernel selects its compute pipeline via
+    // `load_pipeline_with_constants` at
+    // `candle-metal-kernels/src/kernels/sdpa.rs:126-133` with four boolean
+    // function_constants: `align_Q` (id 200), `align_K` (id 201),
+    // `has_mask` (id 300), `do_causal` (id 301). Distinct constant
+    // combinations compile to distinct PSOs — so a bq=8-aligned warmup
+    // (e.g. `q_seq=8`) would compile `align_Q=true, align_K=true`, which
+    // is NOT the PSO a real 14-token chat-templated prompt needs
+    // (`align_Q=false, align_K=false`). `q_seq=10` exercises the
+    // non-aligned variant: `10 % 8 = 2 → align_Q=false`,
+    // `10 % 8 = 2 → align_K=false`. Most real chat-template-rendered
+    // prompt lengths land in this common case, so this is the PSO
+    // worth pre-compiling. `has_mask=false, do_causal=true` are fixed by
+    // the call site at `gemma4.rs::Attention::forward` prefill branch
+    // and thus shared with every real request.
+    let warmup_prefill_ids: [u32; 10] = [2, 105, 2364, 107, 10979, 106, 107, 2, 2, 2];
+    let warmup_prefill = Tensor::new(&warmup_prefill_ids, &device)?.unsqueeze(0)?;
+    let warmup_prefill_logits = model.forward(&warmup_prefill, 0)?;
+    // Force a GPU sync so the warmup pass fully completes before the first
+    // real request begins. Without this, candle's lazy command pool keeps
+    // the warmup dispatches pending and the first real prefill forward
+    // `flush_and_wait`s behind them, double-dipping on latency: empirically
+    // measured at ~−5.5 ms → +5 ms delta (regression) without the sync on
+    // Apple M5 Max, 2026-04-10. Reading a single scalar from the warmup
+    // logits is the lightest available sync primitive — anything that
+    // reaches `Tensor::to_vec*` or `to_scalar` triggers
+    // `candle_metal_kernels::commands::flush_and_wait`
+    // (`candle-metal-kernels/src/metal/commands.rs:176-202`).
+    let _ = warmup_prefill_logits
+        .to_dtype(candle_core::DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     model.clear_kv_cache();
     eprintln!("Warmup complete.");
 
