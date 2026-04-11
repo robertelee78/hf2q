@@ -71,6 +71,7 @@ use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, MetalDevice, Storage, Tensor};
 use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
 use objc2_metal::{MTLResourceUsage, MTLSize};
+use std::sync::Arc;
 
 /// MSL source compiled at model-load time via
 /// `Device::new_library_with_source`. Byte-for-byte port of
@@ -262,6 +263,63 @@ pub struct RmsNormPipelines {
     pipe_f32_4_1: ComputePipeline,
     pipe_f32_4_2: ComputePipeline,
     pipe_f32_4_3: ComputePipeline,
+}
+
+/// Per-model switch for the RmsNorm dispatch path. `Loop` preserves the
+/// 11/9-op manual candle chain from `gemma4.rs::RmsNorm::forward` and
+/// `rms_norm_unit`, exactly as of HEAD pre-1bNEW.4. `Fused` routes every
+/// call site through the runtime-compiled kernel in this file.
+///
+/// Plumbed from the CLI `--rms-norm-kernel` flag (`cli::RmsNormKernelMode`)
+/// through `Gemma4Model::load_with_modes` into every `RmsNorm`,
+/// `Attention`, and `MoeBlock` that issues a norm call. Kept as a knob
+/// (not a compile-time feature) for bisect-safety: 1bNEW.1 and 1bNEW.3
+/// both keep their `loop` fallbacks, and 1bNEW.4 follows the same
+/// discipline. The bisect path matters more than the LOC saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmsNormKernelMode {
+    Loop,
+    Fused,
+}
+
+/// Cloneable bundle of `(mode, Option<Arc<RmsNormPipelines>>)`.
+///
+/// Every `RmsNorm` / `Attention` / `MoeBlock` in `Gemma4Model` carries a
+/// clone of this so they can dispatch on `self.kernel.mode` without a
+/// global switch. `Loop` mode carries `None` for pipelines (no compile
+/// cost paid when the fused path is disabled) and `Fused` mode carries
+/// `Some(Arc<RmsNormPipelines>)` pointing at a single library compiled
+/// once at model-load time.
+#[derive(Clone)]
+pub struct RmsNormKernel {
+    pub mode: RmsNormKernelMode,
+    pub pipelines: Option<Arc<RmsNormPipelines>>,
+}
+
+impl RmsNormKernel {
+    pub fn loop_mode() -> Self {
+        Self {
+            mode: RmsNormKernelMode::Loop,
+            pipelines: None,
+        }
+    }
+
+    /// Construct the `Fused` bundle by compiling the MSL library once.
+    ///
+    /// Safe to call many times — Metal's `newLibraryWithSource:` is
+    /// idempotent per-device per-source but we nevertheless call this
+    /// exactly once at `Gemma4Model::load_with_modes` and clone the
+    /// resulting `Arc` into every sub-structure.
+    pub fn fused_mode(metal_device: &MetalDevice) -> Result<Self> {
+        Ok(Self {
+            mode: RmsNormKernelMode::Fused,
+            pipelines: Some(Arc::new(RmsNormPipelines::new(metal_device)?)),
+        })
+    }
+
+    pub fn is_fused(&self) -> bool {
+        matches!(self.mode, RmsNormKernelMode::Fused) && self.pipelines.is_some()
+    }
 }
 
 impl RmsNormPipelines {

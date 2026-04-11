@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
 use super::moe_kernel;
+use super::rms_norm_kernel::{self, RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
 
 // ADR-005 1bNEW.1 — type alias for the quantized dtype tag used by
 // `call_quantized_matmul_mv_id_t`. Kept in sync with candle-core's
@@ -39,6 +40,15 @@ impl From<crate::cli::MoeKernelMode> for MoeKernelMode {
         match v {
             crate::cli::MoeKernelMode::Loop => Self::Loop,
             crate::cli::MoeKernelMode::Fused => Self::Fused,
+        }
+    }
+}
+
+impl From<crate::cli::RmsNormKernelMode> for RmsKernelMode {
+    fn from(v: crate::cli::RmsNormKernelMode) -> Self {
+        match v {
+            crate::cli::RmsNormKernelMode::Loop => Self::Loop,
+            crate::cli::RmsNormKernelMode::Fused => Self::Fused,
         }
     }
 }
@@ -173,14 +183,41 @@ struct RmsNorm {
     weight: Tensor,
     eps: f64,
     counters: Arc<DispatchCounters>,
+    /// ADR-005 1bNEW.4: per-site dispatch mode plumbed from the CLI
+    /// `--rms-norm-kernel` flag. `Fused` carries an `Arc<RmsNormPipelines>`;
+    /// `Loop` carries `None`.
+    kernel: RmsNormKernel,
 }
 
 impl RmsNorm {
-    fn new(weight: Tensor, eps: f64, counters: Arc<DispatchCounters>) -> Self {
-        Self { weight, eps, counters }
+    fn new(
+        weight: Tensor,
+        eps: f64,
+        counters: Arc<DispatchCounters>,
+        kernel: RmsNormKernel,
+    ) -> Self {
+        Self { weight, eps, counters, kernel }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.kernel.is_fused() {
+            // ADR-005 1bNEW.4 — single dispatch replaces the 11-op chain.
+            // Caller must hand in an F32 contiguous input; every hf2q
+            // RmsNorm site already meets this invariant post-1b.4.
+            let pipelines = self.kernel.pipelines.as_ref().expect("is_fused");
+            let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+            let out = rms_norm_kernel::rms_norm_fused(
+                pipelines,
+                &x_c,
+                Some(&self.weight),
+                None,
+                self.eps as f32,
+            )?;
+            self.counters.norm_dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
+        }
+
         let dtype = x.dtype();
         let x_f32 = x.to_dtype(DType::F32)?;
         let sq = x_f32.sqr()?;
@@ -198,6 +235,57 @@ impl RmsNorm {
         // into candle (matches ADR-005 line 284 accounting).
         self.counters.norm_dispatches_per_token.fetch_add(11, Ordering::Relaxed);
         self.counters.dispatches_per_token.fetch_add(11, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// ADR-005 1bNEW.4 F=3 fused path: norm(x) then add residual, in a
+    /// single dispatch when the fused kernel is wired. Used by the one
+    /// NORM→ADD site in `DecoderLayer::forward` at the post-FFW
+    /// combiner. In `Loop` mode this degenerates to the explicit
+    /// two-op pattern `xs = residual + forward(x)` that 1bNEW.0b
+    /// un-fused from the old `forward_with_residual` — preserving
+    /// that reference-citable lay-out when the fused path is off.
+    ///
+    /// Walk Exception Register note: 1bNEW.0b un-fused the
+    /// ADD-THEN-NORM pattern at the *pre-FFW* site (which still stays
+    /// un-fused — see `DecoderLayer::forward`). This method handles
+    /// the NORM-THEN-ADD pattern at the *post-FFW combiner* site
+    /// (gemma4.rs:1228-1229 pre-1bNEW.4), which is a DIFFERENT
+    /// operation and IS present in both mlx-lm and llama.cpp
+    /// references as NORM-first. The fused F=3 kernel computes exactly
+    /// `(x*scale)*w + residual`, matching the reference order
+    /// byte-for-byte.
+    fn forward_with_post_residual(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        if self.kernel.is_fused() {
+            let pipelines = self.kernel.pipelines.as_ref().expect("is_fused");
+            let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+            let r_c = if residual.is_contiguous() {
+                residual.clone()
+            } else {
+                residual.contiguous()?
+            };
+            let out = rms_norm_kernel::rms_norm_fused(
+                pipelines,
+                &x_c,
+                Some(&self.weight),
+                Some(&r_c),
+                self.eps as f32,
+            )?;
+            self.counters.norm_dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+            self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+            return Ok(out);
+        }
+
+        // Loop mode: explicit NORM-THEN-ADD two-op pattern, same as the
+        // inlined pattern at the pre-1bNEW.4 call site. Counted ops:
+        // the forward() call self-counts 11; the add is 1.
+        let normed = self.forward(x)?;
+        let out = (residual + normed)?;
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
         Ok(out)
     }
 
@@ -431,6 +519,8 @@ struct Attention {
     kv_cache: KvCache,
     k_eq_v: bool,
     counters: Arc<DispatchCounters>,
+    /// ADR-005 1bNEW.4 — passed to `rms_norm_unit` for the V-norm call.
+    rms_kernel: RmsNormKernel,
 }
 
 impl Attention {
@@ -462,7 +552,7 @@ impl Attention {
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?;
         // V gets a unit RMSNorm (just normalize, no learned weight)
-        let v = rms_norm_unit(&v, &self.counters)?.transpose(1, 2)?;
+        let v = rms_norm_unit(&v, &self.counters, &self.rms_kernel)?.transpose(1, 2)?;
         self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
 
         // RoPE (apply internally calls narrow/to_dtype/contiguous/rope_apply —
@@ -672,7 +762,31 @@ impl Attention {
 /// `Attention` as a free function so both `Attention::forward` and
 /// `MoeBlock::forward` can share it while still counting dispatches into the
 /// caller's counter Arc.
-fn rms_norm_unit(x: &Tensor, counters: &Arc<DispatchCounters>) -> Result<Tensor> {
+///
+/// ADR-005 1bNEW.4: accepts a `&RmsNormKernel` so the caller can
+/// dispatch on `kernel.mode` without a global switch. `Fused` routes to
+/// `rms_norm_kernel::rms_norm_fused(.., weight=None, residual=None, eps=1e-6)`
+/// (F=1); `Loop` runs the pre-1bNEW.4 9-op manual chain unchanged.
+fn rms_norm_unit(
+    x: &Tensor,
+    counters: &Arc<DispatchCounters>,
+    kernel: &RmsNormKernel,
+) -> Result<Tensor> {
+    if kernel.is_fused() {
+        let pipelines = kernel.pipelines.as_ref().expect("is_fused");
+        let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let out = rms_norm_kernel::rms_norm_fused(
+            pipelines,
+            &x_c,
+            None,
+            None,
+            1e-6_f32,
+        )?;
+        counters.norm_dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+        counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+        return Ok(out);
+    }
+
     let dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
     let sq = x_f32.sqr()?;
@@ -759,6 +873,8 @@ struct MoeBlock {
     /// Which dispatch path this layer runs. `Loop` = Phase-1 baseline,
     /// `Fused` = ADR-005 1bNEW.1 fused kernel.
     mode: MoeKernelMode,
+    /// ADR-005 1bNEW.4 — passed to `rms_norm_unit` for the router norm.
+    rms_kernel: RmsNormKernel,
 }
 
 impl MoeBlock {
@@ -785,7 +901,7 @@ impl MoeBlock {
         let router_flat = router_input.reshape((b_sz * seq_len, hidden))?;
         self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
 
-        let router_normed = rms_norm_unit(&router_flat, &self.counters)?;
+        let router_normed = rms_norm_unit(&router_flat, &self.counters, &self.rms_kernel)?;
         let scale_factor = (self.hidden_size as f64).powf(-0.5);
         let router_scaled = (router_normed.broadcast_mul(&self.router_scale)? * scale_factor)?;
         self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
@@ -1223,16 +1339,36 @@ impl DecoderLayer {
         let moe_out = self.moe.forward(&normed_moe, &xs)?;
         let moe_normed = self.post_feedforward_layernorm_2.forward(&moe_out)?;
 
-        // Sum MLP and MoE outputs, apply final post-FFW norm
+        // Sum MLP and MoE outputs, apply final post-FFW norm.
+        //
+        // ADR-005 1bNEW.4: this is the single NORM→ADD site per layer
+        // that maps to the F=3 fused kernel variant. In `fused` mode
+        // `forward_with_post_residual` dispatches the kernel once for
+        // the `(combined*scale)*w + residual` pattern; in `loop` mode
+        // it falls back to the explicit two-op sequence
+        // `t = norm(combined); xs = residual + t` — same as the
+        // pre-1bNEW.4 inlined ops. This is NOT a re-fuse of
+        // `forward_with_residual` (1bNEW.0b Walk Exception unwind);
+        // that site is the *pre-attention-norm* residual add which
+        // stays ADD-THEN-NORM. This site is the post-FFW combiner,
+        // which is NORM-THEN-ADD in both mlx-lm and llama.cpp
+        // references — see `forward_with_post_residual` docstring for
+        // the citation walk.
         let combined = (mlp_normed + moe_normed)?;
-        let combined = self.post_feedforward_layernorm.forward(&combined)?;
-        let xs = (residual + combined)?;
+        let xs = self
+            .post_feedforward_layernorm
+            .forward_with_post_residual(&combined, residual)?;
 
         // 3. Layer scalar
         let out = xs.broadcast_mul(&self.layer_scalar)?;
-        // 2 adds above + 1 broadcast_mul = 3 ops outside the sub-module
-        // self-count.
-        self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
+        // Outside-self-count ops:
+        //   - 1 mlp+moe add (the `(mlp_normed + moe_normed)` above).
+        //   - 1 broadcast_mul (layer_scalar).
+        //   - `forward_with_post_residual` self-counts its own dispatches
+        //     (1 for the fused F=3 path, 12 for the loop path — self +
+        //     explicit residual add).
+        // Total outside sub-modules: 2.
+        self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
         Ok(out)
     }
 
@@ -1255,6 +1391,13 @@ pub struct Gemma4Model {
     final_logit_softcapping: Option<f64>,
     device: Device,
     counters: Arc<DispatchCounters>,
+    /// ADR-005 1bNEW.4 — retained handle to the runtime-compiled
+    /// RmsNorm library + pipelines. Every `RmsNorm` in the model
+    /// carries a clone of this bundle; holding the master copy on the
+    /// model ensures the `Arc<RmsNormPipelines>` strong count never
+    /// drops to zero while a forward pass is in flight.
+    #[allow(dead_code)]
+    rms_kernel: RmsNormKernel,
 }
 
 impl Gemma4Model {
@@ -1272,25 +1415,61 @@ impl Gemma4Model {
     /// the ADR-005 1bNEW.1 `--moe-kernel` flag.
     #[allow(dead_code)]
     pub fn load(cfg: &Gemma4Config, gguf: &GgufModel, device: &Device) -> Result<Self> {
-        Self::load_with_moe_mode(cfg, gguf, device, MoeKernelMode::Loop)
+        Self::load_with_modes(cfg, gguf, device, MoeKernelMode::Loop, RmsKernelMode::Loop)
     }
 
-    /// Load model from GGUF + config with an explicit MoE dispatch mode.
-    ///
-    /// Under Phase B (ADR-005 1bNEW.1), `Fused` activates the fused
-    /// `kernel_mul_mv_id_*` path for LAYER 0 ONLY; every other layer keeps
-    /// the `Loop` baseline regardless of this flag. Phase C widens `Fused`
-    /// to every layer. The per-layer gating lives in this method so the
-    /// forward pass itself is oblivious to phase boundaries.
+    /// Back-compat wrapper retained so existing callers (tests, older
+    /// bin entry points) keep working without knowing about the
+    /// `--rms-norm-kernel` knob. Equivalent to `load_with_modes(.., Loop)`.
+    #[allow(dead_code)]
     pub fn load_with_moe_mode(
         cfg: &Gemma4Config,
         gguf: &GgufModel,
         device: &Device,
         moe_mode: MoeKernelMode,
     ) -> Result<Self> {
+        Self::load_with_modes(cfg, gguf, device, moe_mode, RmsKernelMode::Loop)
+    }
+
+    /// Load model from GGUF + config with explicit MoE and RmsNorm
+    /// dispatch modes.
+    ///
+    /// ADR-005 1bNEW.1 Phase C widened `MoeKernelMode::Fused` to every
+    /// layer. ADR-005 1bNEW.4 Phase B adds `RmsNormKernelMode::Fused`,
+    /// which, when set, compiles the downstream MSL library once via
+    /// `rms_norm_kernel::RmsNormPipelines::new(metal_device)` and clones
+    /// the resulting `Arc` into every `RmsNorm`, `Attention`, and
+    /// `MoeBlock` sub-structure. `Loop` mode leaves the pipelines
+    /// field `None` and pays no compile cost, matching the pre-1bNEW.4
+    /// baseline byte-for-byte under Layer A token match.
+    pub fn load_with_modes(
+        cfg: &Gemma4Config,
+        gguf: &GgufModel,
+        device: &Device,
+        moe_mode: MoeKernelMode,
+        rms_norm_mode: RmsKernelMode,
+    ) -> Result<Self> {
         // ADR-005 1bNEW.0: shared dispatch counters. Every sub-structure that
         // issues candle ops holds a clone of this Arc.
         let counters = DispatchCounters::new();
+
+        // ADR-005 1bNEW.4 — compile the fused RmsNorm library at model
+        // load time so every forward pass sees a warm PSO (no
+        // first-call spike, matching 1bNEW.12's warmup discipline).
+        // Under `Loop` mode we skip the compile entirely — the
+        // `RmsNormKernel` bundle carries `pipelines = None` and the
+        // per-site `is_fused()` check short-circuits to the 11-op
+        // manual chain unchanged.
+        let rms_kernel = match rms_norm_mode {
+            RmsKernelMode::Loop => RmsNormKernel::loop_mode(),
+            RmsKernelMode::Fused => match device {
+                Device::Metal(md) => RmsNormKernel::fused_mode(md)?,
+                other => anyhow::bail!(
+                    "--rms-norm-kernel=fused requires a Metal device, got {other:?}"
+                ),
+            },
+        };
+        tracing::info!("RmsNorm dispatch mode: {:?}", rms_norm_mode);
 
         // Embedding — GGUF stores as [hidden, vocab]; Candle Embedding wants [vocab, hidden]
         let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE)?;
@@ -1338,8 +1517,8 @@ impl Gemma4Model {
                 k_proj,
                 v_proj,
                 o_proj: load_qlinear(gguf, &format!("{}.attn_output", lp), &counters)?,
-                q_norm: load_rms_norm(gguf, &format!("{}.attn_q_norm", lp), cfg.rms_norm_eps, &counters)?,
-                k_norm: load_rms_norm(gguf, &format!("{}.attn_k_norm", lp), cfg.rms_norm_eps, &counters)?,
+                q_norm: load_rms_norm(gguf, &format!("{}.attn_q_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                k_norm: load_rms_norm(gguf, &format!("{}.attn_k_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
                 num_heads: cfg.num_attention_heads,
                 num_kv_heads,
                 head_dim,
@@ -1350,6 +1529,7 @@ impl Gemma4Model {
                 )?,
                 k_eq_v,
                 counters: counters.clone(),
+                rms_kernel: rms_kernel.clone(),
             };
 
             // Dense MLP
@@ -1464,19 +1644,20 @@ impl Gemma4Model {
                 #[cfg(feature = "metal")]
                 fused_down_dtype,
                 mode: layer_mode,
+                rms_kernel: rms_kernel.clone(),
             };
 
             let layer = DecoderLayer {
                 self_attn: attn,
                 mlp,
                 moe,
-                input_layernorm: load_rms_norm(gguf, &format!("{}.attn_norm", lp), cfg.rms_norm_eps, &counters)?,
-                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.post_attention_norm", lp), cfg.rms_norm_eps, &counters)?,
-                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps, &counters)?,
-                post_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.post_ffw_norm", lp), cfg.rms_norm_eps, &counters)?,
-                pre_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.pre_ffw_norm_2", lp), cfg.rms_norm_eps, &counters)?,
-                post_feedforward_layernorm_1: load_rms_norm(gguf, &format!("{}.post_ffw_norm_1", lp), cfg.rms_norm_eps, &counters)?,
-                post_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.post_ffw_norm_2", lp), cfg.rms_norm_eps, &counters)?,
+                input_layernorm: load_rms_norm(gguf, &format!("{}.attn_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                post_attention_layernorm: load_rms_norm(gguf, &format!("{}.post_attention_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                pre_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.ffn_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                post_feedforward_layernorm: load_rms_norm(gguf, &format!("{}.post_ffw_norm", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                pre_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.pre_ffw_norm_2", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                post_feedforward_layernorm_1: load_rms_norm(gguf, &format!("{}.post_ffw_norm_1", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
+                post_feedforward_layernorm_2: load_rms_norm(gguf, &format!("{}.post_ffw_norm_2", lp), cfg.rms_norm_eps, &counters, &rms_kernel)?,
                 layer_scalar: gguf.get_tensor(&format!("{}.layer_output_scale.weight", lp), MODEL_DTYPE)?,
                 counters: counters.clone(),
             };
@@ -1486,7 +1667,7 @@ impl Gemma4Model {
         eprintln!("\r  Loaded {}/{} layers.    ", cfg.num_hidden_layers, cfg.num_hidden_layers);
 
         // Final norm
-        let norm = load_rms_norm(gguf, "output_norm", cfg.rms_norm_eps, &counters)?;
+        let norm = load_rms_norm(gguf, "output_norm", cfg.rms_norm_eps, &counters, &rms_kernel)?;
 
         // lm_head is tied to embed_tokens
         let lm_head_weight = embed_w;
@@ -1500,6 +1681,7 @@ impl Gemma4Model {
             final_logit_softcapping: cfg.final_logit_softcapping,
             device: device.clone(),
             counters,
+            rms_kernel,
         })
     }
 
@@ -1597,9 +1779,10 @@ fn load_rms_norm(
     prefix: &str,
     eps: f64,
     counters: &Arc<DispatchCounters>,
+    kernel: &RmsNormKernel,
 ) -> Result<RmsNorm> {
     let weight = gguf.get_tensor(&format!("{}.weight", prefix), MODEL_DTYPE)?;
-    Ok(RmsNorm::new(weight, eps, counters.clone()))
+    Ok(RmsNorm::new(weight, eps, counters.clone(), kernel.clone()))
 }
 
 /// Map `candle_core::quantized::GgmlDType` to the sister
@@ -1681,6 +1864,14 @@ mod forward_tests {
     /// counting, but the constructors now require a counter Arc.
     fn test_counters() -> Arc<DispatchCounters> {
         DispatchCounters::new()
+    }
+
+    /// Per-test throwaway RmsNorm kernel bundle. All of these tests
+    /// are `#[ignore]` and exercise the `loop` path for compile
+    /// coverage only; the fused kernel has its own unit tests in
+    /// `rms_norm_kernel::tests`.
+    fn test_rms_kernel() -> RmsNormKernel {
+        RmsNormKernel::loop_mode()
     }
 
     // -----------------------------------------------------------------------
@@ -1772,7 +1963,7 @@ mod forward_tests {
         println!("attn_norm.weight shape: {:?}", norm_w.shape());
         println!("attn_norm.weight first 5: {:?}", first_n(&norm_w, 5));
 
-        let norm = RmsNorm::new(norm_w, cfg.rms_norm_eps, test_counters());
+        let norm = RmsNorm::new(norm_w, cfg.rms_norm_eps, test_counters(), test_rms_kernel());
 
         // Input: ones(1, 2816)
         let input = Tensor::ones((1, 2816), MODEL_DTYPE, &device).unwrap();
@@ -1847,8 +2038,9 @@ mod forward_tests {
         println!("V first 5: {:?}", first_n(&v_out, 5));
 
         // Q/K norms
-        let q_norm = load_rms_norm(&gguf, "blk.0.attn_q_norm", cfg.rms_norm_eps, &ctrs).unwrap();
-        let k_norm = load_rms_norm(&gguf, "blk.0.attn_k_norm", cfg.rms_norm_eps, &ctrs).unwrap();
+        let rk = test_rms_kernel();
+        let q_norm = load_rms_norm(&gguf, "blk.0.attn_q_norm", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
+        let k_norm = load_rms_norm(&gguf, "blk.0.attn_k_norm", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
 
         // Reshape Q to [1, 1, num_heads, head_dim] for norm
         let q_reshaped = q_out.reshape((1, 1, cfg.num_attention_heads, head_dim)).unwrap();
@@ -1884,7 +2076,7 @@ mod forward_tests {
         let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();
 
         // Router pipeline: unit_rms_norm → scale → (1/sqrt(hidden)) → project → softmax
-        let normed = rms_norm_unit(&input, &ctrs).unwrap();
+        let normed = rms_norm_unit(&input, &ctrs, &test_rms_kernel()).unwrap();
         println!("After unit rms_norm first 5: {:?}", first_n(&normed, 5));
 
         let scale_factor = (cfg.hidden_size as f64).powf(-0.5);
@@ -2034,10 +2226,11 @@ mod forward_tests {
         println!("layer_scalar shape: {:?}, first 5: {:?}", layer_scalar.shape(), first_n(&layer_scalar, 5));
 
         let ctrs = test_counters();
-        let post_attn_norm = load_rms_norm(&gguf, "blk.0.post_attention_norm", cfg.rms_norm_eps, &ctrs).unwrap();
-        let post_ffw_norm = load_rms_norm(&gguf, "blk.0.post_ffw_norm", cfg.rms_norm_eps, &ctrs).unwrap();
-        let post_ffw_norm_1 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_1", cfg.rms_norm_eps, &ctrs).unwrap();
-        let post_ffw_norm_2 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_2", cfg.rms_norm_eps, &ctrs).unwrap();
+        let rk = test_rms_kernel();
+        let post_attn_norm = load_rms_norm(&gguf, "blk.0.post_attention_norm", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
+        let post_ffw_norm = load_rms_norm(&gguf, "blk.0.post_ffw_norm", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
+        let post_ffw_norm_1 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_1", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
+        let post_ffw_norm_2 = load_rms_norm(&gguf, "blk.0.post_ffw_norm_2", cfg.rms_norm_eps, &ctrs, &rk).unwrap();
 
         // Test post-attention norm with ones
         let input = Tensor::ones((1, cfg.hidden_size), MODEL_DTYPE, &device).unwrap();

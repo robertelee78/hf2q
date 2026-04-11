@@ -669,12 +669,18 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let gguf = GgufModel::load(model_path, &device)?;
 
     // Load model weights from GGUF. ADR-005 1bNEW.1 Phase B: pass the
-    // `--moe-kernel` mode down so `Gemma4Model::load_with_moe_mode` can
-    // wire the fused path on layer 0 only (or the full sweep in Phase C).
+    // `--moe-kernel` mode down so `Gemma4Model::load_with_modes` can
+    // wire the fused path on every layer (Phase C widened from layer 0
+    // only). ADR-005 1bNEW.4 Phase B: `--rms-norm-kernel` plumbs the
+    // same way; `fused` compiles the downstream MSL library once at
+    // load time and clones the `Arc<RmsNormPipelines>` into every
+    // RmsNorm call site. Default is `loop` (Phase B bisect-safety);
+    // Phase C flips the default to `fused`.
     eprintln!("Loading model weights from GGUF (quantized QMatMul)...");
     let moe_mode: gemma4::MoeKernelMode = args.moe_kernel.into();
+    let rms_mode: rms_norm_kernel::RmsNormKernelMode = args.rms_norm_kernel.into();
     tracing::info!("MoE dispatch mode: {:?}", moe_mode);
-    let mut model = Gemma4Model::load_with_moe_mode(&cfg, &gguf, &device, moe_mode)?;
+    let mut model = Gemma4Model::load_with_modes(&cfg, &gguf, &device, moe_mode, rms_mode)?;
 
     // Warmup: run two dummy forwards to force Metal shader compilation for
     // both the decode and prefill code paths at model-load time.

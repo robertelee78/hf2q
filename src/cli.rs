@@ -221,6 +221,19 @@ pub struct GenerateArgs {
     /// `QMatMul::forward` loop for bisect-safety and fallback.
     #[arg(long, value_enum, default_value = "fused")]
     pub moe_kernel: MoeKernelMode,
+
+    /// RmsNorm dispatch mode. `fused` routes every RmsNorm call site
+    /// (input/output norms, q/k/v norms, router norm, final norm)
+    /// through a runtime-compiled Metal kernel that ports llama.cpp's
+    /// `kernel_rms_norm_fuse_impl<F>` at F=1/F=2/F=3 — replacing the
+    /// 11-op manual candle chain with a single dispatch per site, and
+    /// folding the post-FFW NORM→ADD residual add into the same
+    /// dispatch via F=3. `loop` preserves the Phase-1 11-op candle
+    /// chain for bisect-safety and fallback. See ADR-005 1bNEW.4 for
+    /// the item detail. Phase B default is `loop`; Phase C flips the
+    /// default to `fused` after the full-bench token-match gate passes.
+    #[arg(long, value_enum, default_value = "loop")]
+    pub rms_norm_kernel: RmsNormKernelMode,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +245,26 @@ pub enum MoeKernelMode {
 }
 
 impl std::fmt::Display for MoeKernelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loop => write!(f, "loop"),
+            Self::Fused => write!(f, "fused"),
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RmsNormKernelMode {
+    /// Phase-1 baseline — 11-op manual candle chain inside
+    /// `gemma4.rs::RmsNorm::forward` (and 9-op chain in `rms_norm_unit`).
+    Loop,
+    /// ADR-005 1bNEW.4 — runtime-compiled
+    /// `kernel_rms_norm_fuse_impl<F>` dispatch at F=1 (unit),
+    /// F=2 (weighted), and F=3 (weighted + post-norm residual add).
+    Fused,
+}
+
+impl std::fmt::Display for RmsNormKernelMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Loop => write!(f, "loop"),
