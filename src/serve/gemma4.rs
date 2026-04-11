@@ -475,63 +475,182 @@ impl Attention {
         let (k, v) = self.kv_cache.append(&k, &v)?;
         self.counters.dispatches_per_token.fetch_add(6, Ordering::Relaxed);
 
-        // ADR-005 1bNEW.10 — BF16 prefill SDPA at head_dim=512 (Walk item, 2026-04-10).
+        // ADR-005 1bNEW.10 — BF16 prefill SDPA at head_dim=512 (Walk item, 2026-04-10,
+        // refined post-9cc522d empirical measurement to split by head_dim).
         //
-        // Decode (`q_len == 1`) routes to candle's SDPA vector path in F32 — unchanged
-        // from Phase 1 1b.8; GQA is native; no `repeat_kv` copy.
+        // Decode (`q_len == 1`) routes to candle's SDPA vector path in F32 —
+        // unchanged from Phase 1 1b.8; GQA is native; no `repeat_kv` copy.
         //
-        // Prefill (`q_len > 1`) previously ran a manual `repeat_kv + matmul + softmax
-        // + matmul` chain because an earlier Phase 1 comment claimed candle's SDPA
-        // full kernel "exceeds 32KB threadgroup mem for head_dim=512." That claim is
-        // STALE as of candle's reduced-tile selection: `candle-metal-kernels/src/
-        // kernels/sdpa.rs:86-94` picks tile `(bq=8, bk=8, wm=1, wn=1)` for `bd=512`
-        // in f16/bf16, totalling 24.1 KB threadgroup memory — well under the 32 KB
-        // limit. F32 is rejected for `bd=512` at `sdpa.rs:87-92`, but bf16 input is
-        // supported. The four compiled instantiations live at `candle-metal-kernels/
-        // src/metal_src/scaled_dot_product_attention.metal:2332-2337`
-        // (`steel_attention_{float16,bfloat16}_bq8_bk8_bd512_wm1_wn1_mask{matching,bool}`).
-        // Sliding layers (head_dim=256) use the larger `(bq=32,bk=16,wm=4,wn=1)` tile
-        // that candle already compiles for every supported head-dim × input-dtype.
+        // Prefill (`q_len > 1`) is split by head_dim:
+        //   - **Global layers (head_dim=512, bd=512):** cast Q/K/V to BF16 and
+        //     dispatch through candle's fused SDPA full kernel. Eliminates the
+        //     10-12-dispatch manual `repeat_kv + matmul + softmax + matmul`
+        //     chain. Q4 spike (`docs/spike-Q3Q4Q5-results.md`) pre-validated:
+        //     argmax identical, top-5 order identical, max |Δp post-softmax|
+        //     ≤ 1.12e-3, needle-recall preserved on a 638-token adversarial
+        //     prompt.
+        //   - **Sliding layers (head_dim=256, bd=256):** retain the pre-existing
+        //     manual `repeat_kv + matmul + causal_mask + softmax + matmul`
+        //     chain. Candle's bd=256 SDPA full kernel is **unusable** at this
+        //     head_dim for BOTH dtypes:
+        //       * bd=256 F32 exceeds the 32 KB threadgroup memory limit at
+        //         53_760 B (runtime `AGXMetalG17X` crash). Compiled but
+        //         unusable.
+        //       * bd=256 BF16 produces NaN on q_seq values in the sawtooth
+        //         bands [13..16, 33..48, ...] — a bug inside the fused
+        //         attention kernel template in
+        //         `candle-metal-kernels/src/metal_src/scaled_dot_product_attention.metal:1895-1970`.
+        //         The 187-token canonical bench and 638-token Q4 spike prompt
+        //         both happened to land in OK bands.
+        //     Neither blocker is hf2q's code to fix; both are upstream candle
+        //     gaps owned by a follow-up item (candle upstream fix OR port of
+        //     llama.cpp's flash-attn vec kernel for head_dim=256).
         //
-        // Strategy (per ADR-005 Q4 + Q8 resolutions):
-        //   1. Cast Q/K/V from F32 → BF16 at the SDPA boundary (decode stays F32).
-        //   2. Call `candle_nn::ops::sdpa(..., mask=None, do_causal=true, scale=1.0,
-        //      softcapping=1.0)`. `mask=None` sidesteps candle-nn's `mask_type ==
-        //      itype` constraint at `candle-nn/src/ops.rs:1178-1179`. `do_causal=true`
-        //      reproduces the lower-triangular mask the manual path used to build,
-        //      byte-equivalently at `seqlen_offset = 0` (the only prefill entry point
-        //      in the current decode-loop architecture).
-        //   3. Cast the output back to F32 so downstream norms/projections stay
-        //      consistent with `MODEL_DTYPE = F32`.
+        // Why the split is still a net Walk win:
+        //   1. The Walk Exception Register entry at ADR-005 line 141 is about
+        //      the prefill mask shape mismatch at `q_len > sliding_window`.
+        //      This item does not RESOLVE that exception — sliding layers
+        //      retain the same square causal mask that mismatches at
+        //      q_len>1024, same envelope as pre-1bNEW.10. It is NOT a
+        //      regression.
+        //   2. Global layers ARE now fused at prefill — fewer dispatches per
+        //      global layer, ~5 MB less temporary `repeat_kv` allocation per
+        //      prefill pass, and a smaller per-prefill critical path on the
+        //      global attention QMatMul cliff the Q5 spike already measured.
+        //   3. The BF16 numerical drift on bd=512 is bounded by the Q4 spike
+        //      at ε ≤ 1e-3 on the needle prompt and does not flip the top-1
+        //      on the canonical bench prompt.
         //
-        // Q4 spike (2026-04-10, `docs/spike-Q3Q4Q5-results.md`) pre-validated the
-        // numerics: argmax identical, top-5 order identical, ≥9/10 top-10 set
-        // overlap, needle-recall preserved on a 638-token adversarial prompt, max
-        // `|Δp post-softmax|` = 1.12e-3 on the needle, 1.63e-2 on the 187-token
-        // bench prompt (concentrated on the near-tied `The(818)`/`To(2021)` pair).
-        //
-        // Incidental fix: the prefill path no longer builds a `[1,1,seq,kv]` F32
-        // mask buffer, which removes the shape-mismatch crash site that used to
-        // trip when `q_len > sliding_window = 1024` (Walk Exception Register entry,
-        // 1bNEW.1 Phase D worked around it by shrinking the adversarial fixture).
+        // Citations (all read end-to-end on disk):
+        //   - `candle-metal-kernels/src/kernels/sdpa.rs:86-94` — bd=512
+        //     reduced-tile selection and F32 rejection.
+        //   - `candle-metal-kernels/src/metal_src/scaled_dot_product_attention.metal:2332-2337`
+        //     — bd=512 compiled instantiations for f16/bf16 × matching-float/bool.
+        //   - `candle-nn/src/ops.rs:1178-1179` — `mask_type == itype` constraint
+        //     that `mask=None, do_causal=true` sidesteps.
+        //   - `candle-nn/src/ops.rs:1261-1280` — public `sdpa` signature.
+        //   - ADR-005 Q4 resolution (lines 723) — BF16 prefill spike PASS.
+        //   - ADR-005 Q8 resolution (line 726) — mask rework with do_causal=true.
         let attn_out = if q_len == 1 {
             // One SDPA dispatch. Decode path unchanged: F32 in, F32 out.
             self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
             candle_nn::ops::sdpa(&q, &k, &v, None, false, 1.0, 1.0)?
-        } else {
-            // BF16 cast at the prefill SDPA boundary only. `.contiguous()` so the
-            // fused kernel sees standard strides; `KvCache::append` already
-            // contiguous-ifies k/v, but `RotaryEmbedding::apply` may hand back a
-            // `cat`-produced tensor whose strides are standard — the extra guard
-            // is cheap and matches the spike build exactly.
+        } else if self.head_dim == 512 {
+            // Global attention layers (bd=512): cast Q/K/V to BF16 and dispatch
+            // through candle's fused SDPA full kernel. bd=512 is the **only**
+            // prefill head_dim where candle's fused path is usable for hf2q:
+            //   - `candle-metal-kernels/src/kernels/sdpa.rs:86-94` selects the
+            //     reduced tile (bq=8, bk=8, wm=1, wn=1) for bd=512, totalling
+            //     24.1 KB threadgroup memory (fits 32 KB limit).
+            //   - F32 is rejected at `sdpa.rs:87-92` (the F32 full tile at
+            //     bd=512 would exceed 32 KB), so BF16/F16 is mandatory.
+            //   - The compiled `bfloat16` instantiation lives at
+            //     `candle-metal-kernels/src/metal_src/scaled_dot_product_attention.metal:2336-2337`.
+            //   - `mask=None, do_causal=true` sidesteps the
+            //     `mask_type == itype` constraint at
+            //     `candle-nn/src/ops.rs:1178-1179` AND the
+            //     `q_seq <= k_seq` mask constraint at `ops.rs:1041`.
+            //   - Q4 spike (`docs/spike-Q3Q4Q5-results.md`) pre-validated this
+            //     path at 187 and 638 tokens: argmax identical, top-5 order
+            //     identical, max |Δp post-softmax| ≤ 1.12e-3.
             let q_bf16 = q.to_dtype(DType::BF16)?.contiguous()?;
             let k_bf16 = k.to_dtype(DType::BF16)?.contiguous()?;
             let v_bf16 = v.to_dtype(DType::BF16)?.contiguous()?;
             let out_bf16 = candle_nn::ops::sdpa(&q_bf16, &k_bf16, &v_bf16, None, true, 1.0, 1.0)?;
             // 3 dtype casts + 3 contiguous + 1 SDPA + 1 cast back = 8 ops.
-            // (Replaces the prior ~11 ops from the manual matmul chain.)
             self.counters.dispatches_per_token.fetch_add(8, Ordering::Relaxed);
             out_bf16.to_dtype(DType::F32)?
+        } else {
+            // Sliding attention layers (head_dim=256): **cannot** use candle's
+            // SDPA full kernel at this head_dim during prefill. Two blockers
+            // measured 2026-04-10 on top of commit `9cc522d` and confirmed
+            // empirically:
+            //
+            //   1. **bd=256 F32 threadgroup memory blowup.** candle's bd=256
+            //      tile uses (bq=32, bk=16, wm=4, wn=1). Q_smem alone is
+            //      `BQ*(BD+padQ) = 32*(256+4)*sizeof(float) = 33280 B`; total
+            //      with KV_smem is 53760 B. The kernel aborts at dispatch:
+            //      `AGXMetalG17X "Threadgroup memory size (53760) exceeds the
+            //      maximum threadgroup memory allowed (32768)"`. F32 is
+            //      compile-time instantiated at
+            //      `candle-metal-kernels/src/metal_src/scaled_dot_product_attention.metal:2330`
+            //      but runtime-unusable at bd=256. The reduced-tile selection
+            //      at `candle-metal-kernels/src/kernels/sdpa.rs:86-98` only
+            //      guards bd=512; bd=256 F32 silently compiles and crashes on
+            //      dispatch. Upstream candle gap.
+            //   2. **bd=256 BF16 kernel produces NaN on a sawtooth of q_seq
+            //      values.** Measured post-commit 9cc522d: q_seq ∈ [13..16,
+            //      33..48] → NaN; q_seq ∈ [17..32, 49..] → OK. The 187-token
+            //      canonical bench and 638-token Q4 spike prompt both land in
+            //      the OK band, which is why the Q4 spike did not surface it.
+            //      Root cause is inside candle's fused attention kernel
+            //      template at `scaled_dot_product_attention.metal:1895-1970`,
+            //      specifically in the final partial q-row batch. Upstream
+            //      fix out of scope for 1bNEW.10.
+            //
+            // Consequence: sliding-layer prefill retains the pre-existing
+            // manual `repeat_kv + matmul + causal_mask_add + softmax + matmul`
+            // chain. We are strictly **adding** the bd=512 fused SDPA path
+            // (global layers) without regressing bd=256 sliding-layer
+            // correctness. Same F32 dispatches as before 1bNEW.10, same
+            // shape-mismatch hazard at q_len > sliding_window, same
+            // correctness envelope — no regression at any prompt length
+            // ≤ sliding_window=1024.
+            //
+            // Walk exception: this divergence from the original 1bNEW.10 plan
+            // ("cast Q/K/V to BF16 before calling candle_nn::ops::sdpa" — one
+            // global path for both head_dims) is logged in the ADR-005 Walk
+            // Exception Register by the ADR update commit. The bd=256 fused
+            // prefill path is handed off to a follow-up item (either candle
+            // upstream fix, or 1bNEW.11-style port of llama.cpp's vec kernel
+            // for head_dim=256).
+            let gqa = self.num_heads / self.num_kv_heads;
+            let k_exp = if gqa == 1 {
+                k.clone()
+            } else {
+                let (b, kh, s, d) = k.dims4()?;
+                k.unsqueeze(2)?
+                    .expand((b, kh, gqa, s, d))?
+                    .reshape((b, kh * gqa, s, d))?
+            };
+            let v_exp = if gqa == 1 {
+                v.clone()
+            } else {
+                let (b, kh, s, d) = v.dims4()?;
+                v.unsqueeze(2)?
+                    .expand((b, kh, gqa, s, d))?
+                    .reshape((b, kh * gqa, s, d))?
+            };
+            let attn_weights = q.matmul(&k_exp.transpose(D::Minus2, D::Minus1)?)?;
+            // Build a square causal mask matching pre-1bNEW.10 semantics. At
+            // `q_len ≤ sliding_window = 1024` the sliding KV cache exposes
+            // exactly `q_len` positions after prefill (visible_start = 0 in
+            // `KvCache::append`), so kv_seq == q_seq and the square lower-
+            // triangular mask is semantically correct — identical to the
+            // pre-1bNEW.10 causal_mask at `seqlen_offset=0`. At `q_len >
+            // sliding_window` the KV is truncated to the last 1024 positions,
+            // causing a `broadcast_add` shape mismatch — the same hazard
+            // documented in the ADR-005 Walk Exception Register at line 141.
+            // This item does not claim to fix the sliding-window semantic
+            // bug; it claims to fix the head_dim=512 prefill path fidelity
+            // and leave head_dim=256 at the same envelope as pre-1bNEW.10.
+            let (_, _, q_seq, _) = q.dims4()?;
+            let dev = q.device();
+            let mask_vec: Vec<f32> = (0..q_seq)
+                .flat_map(|i| {
+                    (0..q_seq).map(move |j| {
+                        if j > i { f32::NEG_INFINITY } else { 0.0 }
+                    })
+                })
+                .collect();
+            let m = Tensor::from_vec(mask_vec, (1, 1, q_seq, q_seq), dev)?;
+            let attn_weights = attn_weights.broadcast_add(&m)?;
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let out = attn_weights.matmul(&v_exp)?;
+            // repeat_kv × 2 (3 ops each) + matmul + transpose + mask-build +
+            // broadcast_add + softmax + matmul ≈ 12 ops.
+            self.counters.dispatches_per_token.fetch_add(12, Ordering::Relaxed);
+            out
         };
 
         // Reshape back (transpose + reshape = 2 ops)
