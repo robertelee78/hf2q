@@ -172,16 +172,10 @@ impl RmsNorm {
         Ok(out)
     }
 
-    /// Phase 1b.10: Fused residual add + RmsNorm.
-    /// Computes `sum = x + residual` then `norm(sum)`, returning both.
-    fn forward_with_residual(&self, x: &Tensor, residual: &Tensor) -> Result<(Tensor, Tensor)> {
-        let sum = (x + residual)?;
-        // The residual add itself is a dispatch; `forward` accounts for the
-        // norm ops below.
-        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
-        let normed = self.forward(&sum)?;
-        Ok((normed, sum))
-    }
+    // ADR-005 1bNEW.0b: the previous `forward_with_residual` helper (Phase 1
+    // 1b.10, lines 47-51 of `0a703d7`) has been removed. References unfuse
+    // the post-attention residual add from the pre-FFW norm; see the inline
+    // call site in `DecoderLayer::forward` for citations.
 }
 
 // ---------------------------------------------------------------------------
@@ -709,8 +703,32 @@ impl DecoderLayer {
         let normed = self.input_layernorm.forward(xs)?;
         let attn_out = self.self_attn.forward(&normed, mask, seqlen_offset)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        // Phase 1b.10: fused residual-add + pre-FFW norm
-        let (normed, xs) = self.pre_feedforward_layernorm.forward_with_residual(&attn_out, xs)?;
+        // ADR-005 1bNEW.0b — Walk Exception unwind.
+        //
+        // Previously this was a single fused call (Phase 1 1b.10):
+        //   let (normed, xs) = self.pre_feedforward_layernorm
+        //       .forward_with_residual(&attn_out, xs)?;
+        // which computed `sum = xs + attn_out` and `normed = norm(sum)`
+        // inside `RmsNorm::forward_with_residual`. References:
+        //   - mlx-lm gemma4_text.py:339-340
+        //       h = self.post_attention_layernorm(h)
+        //       h = residual + h
+        //   - llama.cpp src/models/gemma4-iswa.cpp:117-122
+        //       cur = build_norm(cur, model.layers[il].attn_post_norm, ...);
+        //       ggml_tensor * attn_out = ggml_add(ctx0, cur, inpL);
+        // Both references apply the post-attention norm, then the residual
+        // add as separate ops. `pre_feedforward_layernorm` is in a different
+        // position in the graph (mlx-lm line 345, llama.cpp separate norm
+        // call later) but the immediate pattern here — ADD residual then
+        // NORM — is faithful to both. We restore Walk fidelity now; any
+        // re-fusion is Run territory (ADR-005 Anti-Goal #14 + Walk Exception
+        // Register).
+        let xs = (xs + &attn_out)?;
+        // The explicit add is one candle op; the RmsNorm::forward call below
+        // self-counts its 11 ops into both `dispatches_per_token` and
+        // `norm_dispatches_per_token`.
+        self.counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
+        let normed = self.pre_feedforward_layernorm.forward(&xs)?;
 
         // 2. Dense MLP and MoE run in PARALLEL from the same residual
         let residual = &xs;
