@@ -530,3 +530,207 @@ norm_dispatches_per_token: 331.00
 #      - lm_head_f16_matches_f32_single_token    max|Δ|=3.402e-4, argmax OK
 #      - lm_head_f16_matches_f32_multi_token     max|Δ|=3.402e-4, argmax OK
 #      - lm_head_f16_rejects_wrong_dtypes        guardrails OK
+
+# ============================================================
+# ADR-005 1bNEW.18 Phase B/C — RoPE freq_factors + full-head
+# rotation for Gemma 4 global layers (ports llama.cpp
+# `gemma4-iswa.cpp:55-59,73-75,97-98` + `rope_freqs` tensor
+# binding at `llama-model.cpp:4311-4313`).
+# Captured 2026-04-11, commit 08a2c75 (Phase A+B).
+# Invocation:
+#   `./target/release/hf2q generate \
+#      --model models/gemma-4-26B-A4B-it-ara-abliterated-dwq/...gguf \
+#      --prompt-file tests/bench_prompt_128.txt \
+#      --max-tokens 128 --temperature 0 --benchmark`
+# Defaults: `--moe-kernel=fused --rms-norm-kernel=fused
+#            --rope-kernel=fused --lm-head-kernel=fused`
+# The freq_factors buffer is loaded unconditionally from the GGUF
+# at model-load time; there is NO new CLI flag — the change is
+# structural, not a toggle.
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 58.27
+p95_tok_per_sec: 58.45
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 278704
+total_moe_to_vec2: 0
+total_moe_dispatches: 129540
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 42037
+
+# Per-token averages — 1bNEW.18 Phase B/C fused default
+dispatches_per_token: 2194.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 34.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 331.00
+
+# 1bNEW.18 Phase B/C deltas vs 1bNEW.17 Phase C baseline:
+#   tok/s median       58.51   → 58.27   (−0.24 tok/s, within
+#                                          5-run noise envelope;
+#                                          speed-neutral as
+#                                          projected — one [256]
+#                                          F32 binding per global-
+#                                          layer RoPE dispatch,
+#                                          cached at decode)
+#   p95                58.57   → 58.45   (−0.12)
+#   dispatches/token   2194.52 → 2194.52 unchanged — the extra
+#                                          freq_factors buffer
+#                                          binding is not a
+#                                          candle dispatch op,
+#                                          it's a per-encoder
+#                                          `set_buffer` call
+#                                          inside `rope_fused`.
+#   total_dispatches   278704  → 278704  unchanged
+#   norm_dispatches    331     → 331     unchanged
+#   moe_to_vec2        0       → 0       unchanged
+#   sampler_sync       33      → 33      unchanged
+#   moe_dispatches/layer 34    → 34      unchanged
+#
+# Phase A unit test correctness (first-principles scalar oracle,
+# NOT the buggy `reference_rope_apply` that passed the old
+# 1bNEW.6 tests on broken code):
+#   1. decode_full_rotary_sliding_scalar        max|Δ|=0.000e0 (bit-exact)
+#   2. decode_full_rotary_global_with_mask      max|Δ|=0.000e0 (bit-exact)
+#   3. prefill_full_rotary_global_with_mask     max|Δ|=8.941e-6 (~1 ULP)
+#   4. decode_at_offset_with_mask               max|Δ|=2.578e-6
+#   5. full_mask_is_identity                    max|Δ|=0.000e0 (strict 1e-5)
+#   6. norm_variant_interleaved                 max|Δ|=0.000e0 (bit-exact)
+# Reference formula (from `ggml-metal.metal:4353-4410`):
+#   theta = pos * pow(freq_base, -2*ic/n_dims) / freq_factor[ic]
+#   x0 = src[ic]
+#   x1 = src[ic + n_dims/2]
+#   dst[ic]            = x0*cos(theta) - x1*sin(theta)
+#   dst[ic + n_dims/2] = x0*sin(theta) + x1*cos(theta)
+#
+# Live-forward decode-1 top-10 on the 187-token canonical bench
+# (post-1bNEW.19 BOS-stripped input):
+#   pre-1bNEW.18 (commit d4469e4):
+#     [(818,27.108929),(2021,26.337908),(101068,23.337055),
+#      (216100,22.498186),(129264,20.415514),(8409,19.550251),
+#      (32899,19.057167),(12282,18.244814),(20647,18.029692),
+#      (155571,17.744995)]
+#     The/To gap = +0.77102 raw-logit
+#   post-1bNEW.18 (commit 08a2c75):
+#     [(818,27.43411),(2021,26.82725),(216100,22.235836),
+#      (101068,22.172247),(32899,20.723919),(129264,19.485794),
+#      (20647,18.714884),(8409,18.061455),(90894,17.810465),
+#      (12282,17.769943)]
+#     The/To gap = +0.60686 raw-logit
+#   llama.cpp top-10 on the same BOS-stripped input (llama-server
+#   /completion, n_probs=10, temperature=1.0, top_k=0):
+#     [The(-0.4410),To(-1.0591),Connecting(-5.4655),Tracing(-5.5308),
+#      Modern(-7.1152),Linking(-8.2223),Expl(-8.8394),While(-9.3401),
+#      Transl(-9.8196),Mapping(-9.9916)]
+#     The/To gap = +0.6181 (logprob, ≈ raw-logit gap)
+#
+# All 10 tokens now match llama.cpp's top-10 post-fix, with one
+# positional swap at positions 3/4 (Tracing/Connecting — llama's
+# own logprob gap at that pair is 0.065, a near-tie). `Transl`
+# (90894) appeared in hf2q's top-10 for the first time post-fix
+# (was outside top-10 pre-fix).
+#
+# The/To gap delta:
+#   pre-fix drift vs llama.cpp: 0.77102 − 0.6181 = 0.153 (hf2q too
+#                                                         confident
+#                                                         in The)
+#   post-fix drift vs llama.cpp: 0.60686 − 0.6181 = −0.011 (within
+#                                                            f32
+#                                                            floor)
+# **The fix closed 93% of the pre-fix decode-1 drift.**
+#
+# Per-layer hidden-state bisect (scratch instrumentation reverted
+# before the Phase A+B commit) vs Spike C's llama.cpp baseline on
+# the 187-token prompt:
+#   layer  4 (last sliding): 4.118e-3 → 3.288e-3
+#   layer  5 (first global): 8.078e-1 → 2.032e-2  (97.5% reduction)
+#   layer 11 (2nd global):   1.709e+0 → 8.521e-2  (95.0% reduction)
+#   layer 17 (3rd global):   2.909e+0 → 1.099e-1  (96.2% reduction)
+#   layer 23 (4th global):   8.706e-1 → 9.939e-2  (88.6% reduction)
+#   layer 29 (5th global):   1.770e+0 → 4.095e-1  (76.9% reduction)
+#   final post-norm:         3.194e+0 → 7.081e-1  (77.8% reduction)
+#
+# At position 0 (where RoPE is mathematically identity) layer 5
+# sits at 2.953e-3 — within the layer 4 floor (2.159e-3), NO step-
+# change. The pre-fix position-proportional signature
+# (0 → 17 at pos 100) is gone. The residual ~0.02 at position 186
+# is downstream f32 reduction-order drift carried in from the
+# sliding layers via the residual stream and amplified by the
+# global-attention layer's larger summation envelope
+# (head_dim=512 vs 256). It is NOT owned by RoPE — the RoPE
+# kernel output is bit-exact against the first-principles oracle
+# on synthetic inputs (Phase A Test 2, max|Δ|=0.000e0).
+#
+# Phase B correctness gates (all passed, 2026-04-11):
+#   1. Loop-mode bisect safety: first 32 decoded tokens
+#      byte-identical across `--rope-kernel=loop` and
+#      `--rope-kernel=fused`:
+#        "The evolution of computing—from mechanical calculators
+#         to the transistor revolution—is not merely a linear
+#         progression of speed; it is a journey of **abstraction
+#         and specialization**."
+#   2. Fused-mode top-1 at decode 1: `The` (818) — preserved.
+#      All 10 top-tokens match llama.cpp's order modulo the
+#      Tracing/Connecting near-tie swap at positions 3/4.
+#   3. gen128 coherent under fused:
+#        "The evolution of computing—from mechanical calculators to
+#         the transistor revolution—is not merely a linear
+#         progression of speed; it is a journey of **abstraction
+#         and specialization**. To understand modern GPU (Graphics
+#         Processing Unit) architectures used for Large Language
+#         Model (LLM) inference, we must trace how these historical
+#         milestones dictated the transition from general-purpose
+#         logic to massive parallelism.\n\nHere is how those
+#         specific historical developments influence modern GPU
+#         design:\n\n### 1. From Mechanical Logic to Mathematical
+#         Abstraction\nThe work of Pascal and Leibniz established
+#         the concept of **discrete state manipulation**. They
+#         proved that complex mathematical operations could be
+#         broken down into a series of"
+#   4. 5-run bench: median 58.27, p95 58.45, variance 0.3
+#      (58.0–58.5 spread).
+#   5. 827-token adversarial recall (`Melthorn-by-the-Sea`
+#      needle): PRESERVED — decode output
+#      `The name of the hidden city is Melthorn-by-the-Sea.<turn|>`.
+#      Confirms the global-layer full-head RoPE rotation is
+#      correct at high seq_len.
+#
+# Phase B Gate 4 (`crawl_verify.sh` classification): YELLOW
+# (60-byte common prefix) — **UNCHANGED** vs the pre-1bNEW.18
+# d4469e4 baseline. Both tools agree on the first 60 bytes
+# (`"The evolution of computing—from mechanical calculators to "`)
+# and diverge at decode token ~15:
+#   llama.cpp: `modern microprocessors—...`
+#   hf2q:      `the transistor revolution—...`
+#
+# Pre-1bNEW.18 hf2q's divergence text was
+#   `the transistor-based microprocessor—...`
+# so 1bNEW.18 DID shift hf2q's post-divergence output (the bytes
+# after position 14 are different from pre-fix), just not in the
+# direction that agrees with llama.cpp at the divergence point
+# itself. At decode step 14 both pre- and post-1bNEW.18 hf2q pick
+# `the` over `modern`, while llama.cpp picks `modern`. This
+# specific argmax flip is NOT owned by the layer-5 RoPE drift
+# (which is now 97% reduced at layer 5 last-token). It is owned
+# by the residual f32-reduction-order drift that compounds
+# through the 30-layer stack and is dominated by candle's
+# attention and MoE summation order, not RoPE.
+#
+# A future Walk item can address the residual continuation drift
+# — candidate sources per Spike C / spike-post-1bNEW17 are
+# RmsNorm reduction accumulator type, attention softmax
+# reduction order, or MoE per-expert weight accumulator. 1bNEW.18
+# is the RoPE-owner fix; closing the continuation gap to the
+# GREEN/PERFECT classification is out of scope.
+#
+# Walk-correctness End gate status (ADR-005 line ~760, "hf2q
+# top-1 == llama.cpp top-1 at decode 1"): **STILL MET**, and now
+# 10-deep with one near-tied positional swap. Decode-1 drift is
+# below the f32 noise floor post-landing.
