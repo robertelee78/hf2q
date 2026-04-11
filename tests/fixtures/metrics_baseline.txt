@@ -206,3 +206,104 @@ norm_dispatches_per_token: 3521.00
 # across prompt lengths; the bimodal distribution in the 20-run
 # sample is GPU thermal/power-state variance independent of
 # warmup strategy.
+
+# ============================================================
+# ADR-005 1bNEW.4 Phase C — fused RmsNorm kernel, all 11 sites × 30 layers
+# Captured 2026-04-10, default flipped from `loop` → `fused`.
+# Invocation: `--benchmark --max-tokens 128 --temperature 0`
+# (default mode is fused after Phase C; `--rms-norm-kernel=loop`
+# is the bisect-safe fallback, runs the pre-1bNEW.4 11-op chain).
+#
+# Phase C ports llama.cpp's `kernel_rms_norm_fuse_impl<T, F>` template
+# (/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:2980-3050) as a
+# runtime-compiled Metal library via `Device::new_library_with_source`
+# (candle-metal-kernels/src/metal/device.rs:91-102, ADR Q2 resolution).
+# Three fuse modes land in one commit:
+#   F=1 : y = x * scale              — 2 sites/layer (v-norm, router)
+#   F=2 : y = (x*scale) * w          — 8 sites/layer (input, post_attn,
+#                                      pre_ffw, post_ffw_1, pre_ffw_2,
+#                                      post_ffw_2, q_norm, k_norm)
+#   F=3 : y = (x*scale) * w + r      — 1 site/layer (post_ffw combiner)
+#   + 1 final model-level F=2 norm.
+#
+# Total: 11 fused dispatches per layer × 30 layers + 1 tail = 331.
+# (The ADR-005 item estimate of ≤ 330 was a miscount — it forgot the
+# tail model-level norm. 331 is the correct end-state number and
+# matches the physical call-site count exactly.)
+#
+# The F=3 site is the *post-FFW combiner* NORM-THEN-ADD pattern at
+# `gemma4.rs::DecoderLayer::forward` (post_feedforward_layernorm +
+# residual add), NOT the Walk Exception 1bNEW.0b un-fuse site (which
+# is ADD-THEN-NORM at the pre-FFW position and stays un-fused in both
+# loop and fused modes). See the commit body for 3290dcf for the
+# detailed citation walk.
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 44.55
+p95_tok_per_sec: 44.63
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 308930
+total_moe_to_vec2: 0
+total_moe_dispatches: 129540
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 42037
+
+# Per-token averages — Phase C fused path (default)
+dispatches_per_token: 2432.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 34.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 331.00
+
+# 1bNEW.4 Phase C deltas vs 1bNEW.10+1bNEW.12 baseline:
+#   tok/s median       37.06 → 44.55  (+7.49 tok/s, +20.2%)
+#   p95                37.08 → 44.63  (+7.55 tok/s, +20.4%)
+#   dispatches/token   5652  → 2432   (−3220, −56.9%)
+#   total_dispatches   717870 → 308930 (−408940, −56.9%)
+#   norm_dispatches    3521  → 331    (−3190, −90.6%)
+#   total_norm_disp    447167 → 42037 (−405130, −90.6%)
+#   moe_dispatches_per_layer 42 → 34  (−8; the `rms_norm_unit` inside
+#                                      MoeBlock::forward for the
+#                                      router norm dropped from 9 ops
+#                                      to 1, exactly)
+#   moe_to_vec2        0     → 0      unchanged — owned by 1bNEW.1
+#   sampler_sync       33    → 33     unchanged — owned by 1bNEW.3
+#
+# Phase C correctness gates (all passed, 2026-04-10):
+#   1. Per-commit Layer A token match on loop mode: byte-identical
+#      stdout against pre-1bNEW.4 baseline. `loop`-mode
+#      `dispatches_per_token` counter is 5652.52 (matches pre-1bNEW.4
+#      byte-for-byte — the outside-ops accounting shifted from +3 to
+#      +2 at DecoderLayer::forward but `forward_with_post_residual`'s
+#      loop path self-counts +12 instead of the old +11, so the
+#      per-layer total is the same).
+#   2. Fused mode top-1 at decode 1: `The` (818) — preserved. Top-10
+#      ID set AND order byte-identical to loop mode. Max |Δ| on any
+#      top-10 logit = 4.1e-3 (well under the 0.02 envelope).
+#   3. `The`/`To` gap: loop +0.7451, fused +0.7552 — small drift,
+#      direction mixed across candidates, not uniformly toward `To`,
+#      so 1bNEW.4 alone does not flip the Walk-correctness argmax
+#      (consistent with a byte-for-byte port of llama.cpp's reduction
+#      order — the gap to llama.cpp is tighter than it was under the
+#      candle manual chain but still non-zero; the remaining gap is
+#      owned by 1bNEW.6 fused RoPE).
+#   4. 128-token decoded output coherent: "The evolution of
+#      computing—from mechanical calculators to the transistor-based
+#      microprocessor—is not merely a linear progression of speed;
+#      it is a journey of moving from **general-purpose logic** to
+#      **specialized mathematical throughput**..." (first 28 tokens
+#      byte-identical to loop mode; compounding FP drift at token 29
+#      sends the essay down a different but equally coherent path).
+#   5. 5-run variance ≈ 0 (4 runs at 44.6, 2 at 44.5 tok/s — all
+#      within 0.1 tok/s of median).
+#   6. `norm_dispatches_per_token == 331` hits the ADR acceptance
+#      criterion (corrected from the item's ≤ 330 estimate).
+#   7. Short-prompt spot check on `"Hi"` (14-token prefill, 5-token
+#      decode): "Hi there! Welcome to" — no short-prompt regression.

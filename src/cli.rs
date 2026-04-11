@@ -222,17 +222,17 @@ pub struct GenerateArgs {
     #[arg(long, value_enum, default_value = "fused")]
     pub moe_kernel: MoeKernelMode,
 
-    /// RmsNorm dispatch mode. `fused` routes every RmsNorm call site
-    /// (input/output norms, q/k/v norms, router norm, final norm)
-    /// through a runtime-compiled Metal kernel that ports llama.cpp's
-    /// `kernel_rms_norm_fuse_impl<F>` at F=1/F=2/F=3 — replacing the
-    /// 11-op manual candle chain with a single dispatch per site, and
-    /// folding the post-FFW NORM→ADD residual add into the same
-    /// dispatch via F=3. `loop` preserves the Phase-1 11-op candle
-    /// chain for bisect-safety and fallback. See ADR-005 1bNEW.4 for
-    /// the item detail. Phase B default is `loop`; Phase C flips the
-    /// default to `fused` after the full-bench token-match gate passes.
-    #[arg(long, value_enum, default_value = "loop")]
+    /// RmsNorm dispatch mode. `fused` (default, post-ADR-005 1bNEW.4
+    /// Phase C) routes every RmsNorm call site (input/output norms,
+    /// q/k/v norms, router norm, final norm) through a runtime-compiled
+    /// Metal kernel that ports llama.cpp's `kernel_rms_norm_fuse_impl<F>`
+    /// at F=1/F=2/F=3 — replacing the 11-op manual candle chain with a
+    /// single dispatch per site, and folding the post-FFW NORM→ADD
+    /// residual add into the same dispatch via F=3. Phase C bench:
+    /// 37.06 → 44.51 tok/s median (+20.1%), `norm_dispatches_per_token`
+    /// 3521 → 331 (−90.6%), coherent output preserved. `loop`
+    /// preserves the Phase-1 11-op candle chain for bisect-safety.
+    #[arg(long, value_enum, default_value = "fused")]
     pub rms_norm_kernel: RmsNormKernelMode,
 }
 
