@@ -278,6 +278,24 @@ pub struct GenerateArgs {
     /// needle recall preserved.
     #[arg(long, value_enum, default_value = "fused")]
     pub lm_head_kernel: LmHeadKernelMode,
+
+    /// KV cache append mode. `slice_scatter` (Phase A/B default) preserves
+    /// the pre-ADR-005 1bNEW.20 path: two `Tensor::slice_scatter` calls
+    /// followed by `narrow` + `contiguous` on the active region (6 candle
+    /// ops per layer per token). `in_place` is the 1bNEW.20 Walk-KERNEL-PORT
+    /// of llama.cpp's `llama_kv_cache::cpy_k` / `cpy_v` pattern at
+    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285` — direct in-place
+    /// `copy2d` into the pre-allocated cache buffer via candle's
+    /// `Tensor::slice_set` primitive (`tensor_cat.rs:246`), returning a
+    /// stride-aware narrowed view that the SDPA vector kernel reads
+    /// correctly without a `.contiguous()` bounce (the vector kernel
+    /// explicitly consumes `k_stride[1]` and `v_stride[1]` per
+    /// `candle-metal-kernels/src/kernels/sdpa.rs:278-279`). Eliminates
+    /// the contiguous copy of the entire `[1, kv_heads, visible_len, hd]`
+    /// active region on every decode step. Phase C flips the default to
+    /// `in_place` after the 5-run canonical bench gate validates it.
+    #[arg(long, value_enum, default_value = "slice-scatter")]
+    pub kv_cache_kernel: KvCacheKernelMode,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +374,33 @@ impl std::fmt::Display for LmHeadKernelMode {
         match self {
             Self::Loop => write!(f, "loop"),
             Self::Fused => write!(f, "fused"),
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCacheKernelMode {
+    /// Phase-1 baseline — two `Tensor::slice_scatter` writes into the
+    /// pre-allocated cache followed by `narrow` + `contiguous` on the
+    /// active region. `slice_scatter` on dim=2 internally uses a
+    /// transpose trick that produces a non-standard stride layout,
+    /// forcing a full contiguous copy of `[1, kv_heads, visible_len, hd]`
+    /// on every decode step — see the comment at `KvCache::append` in
+    /// `src/serve/gemma4.rs` for the a0952e2 regression history.
+    SliceScatter,
+    /// ADR-005 1bNEW.20 — in-place `Tensor::slice_set` write into the
+    /// pre-allocated cache at `current_len`, returning a stride-aware
+    /// narrowed view without a `.contiguous()` bounce. Ports llama.cpp
+    /// `llama_kv_cache::cpy_k` / `cpy_v` at
+    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285`.
+    InPlace,
+}
+
+impl std::fmt::Display for KvCacheKernelMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SliceScatter => write!(f, "slice-scatter"),
+            Self::InPlace => write!(f, "in-place"),
         }
     }
 }

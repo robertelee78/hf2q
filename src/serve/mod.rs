@@ -690,9 +690,15 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // Default is `loop` in Phase B (bisect-safety); Phase C flips the
     // default to `fused` after the coherence + recall gates pass.
     let lm_head_mode: lm_head_kernel::LmHeadKernelMode = args.lm_head_kernel.into();
+    // ADR-005 1bNEW.20 Phase A/B: `--kv-cache-kernel` plumbs the same
+    // way. Default is `slice_scatter` in Phase A/B (bisect-safety);
+    // Phase C flips the default to `in_place` after the 5-run canonical
+    // bench gate, 128-token coherence gate, and adversarial-recall gate
+    // all pass.
+    let kv_cache_mode: gemma4::KvCacheKernelMode = args.kv_cache_kernel.into();
     tracing::info!("MoE dispatch mode: {:?}", moe_mode);
     let mut model = Gemma4Model::load_with_modes(
-        &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode, lm_head_mode,
+        &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode, lm_head_mode, kv_cache_mode,
     )?;
 
     // Warmup: run two dummy forwards to force Metal shader compilation for
