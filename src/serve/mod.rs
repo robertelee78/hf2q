@@ -5,6 +5,7 @@ pub mod gemma4;
 pub mod gguf_loader;
 pub mod moe_kernel;
 pub mod rms_norm_kernel;
+pub mod rope_kernel;
 pub mod sampler;
 
 use anyhow::{Context, Result};
