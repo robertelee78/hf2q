@@ -17,6 +17,7 @@ DEFAULT_PROMPT="tests/bench_prompt_128.txt"
 HF2Q_BIN="target/release/hf2q"
 OUT_HF2Q="/tmp/crawl_hf2q.txt"; LOG_HF2Q="/tmp/crawl_hf2q.log"
 OUT_LLAMA="/tmp/crawl_llama.txt"; LOG_LLAMA="/tmp/crawl_llama.log"
+RENDERED_PROMPT="/tmp/crawl_rendered_prompt.txt"; LOG_RENDER="/tmp/crawl_render.log"
 
 usage() {
   cat <<EOF
@@ -89,16 +90,43 @@ else
 fi
 echo
 
-# Run llama-completion and hf2q ---------------------------------------------
+# Pre-render the chat template via hf2q -------------------------------------
+# ADR-005 1bNEW.0c: the previous version of this script passed `--jinja` to
+# llama-completion, which routes through a different prompt path than the one
+# hf2q uses — producing thought-channel output (`<|channel>thought\n\n*`)
+# regardless of hf2q's actual correctness state. The byte-prefix classification
+# was structurally stuck at RED (byte 0) (see ADR line 198).
+#
+# Fix: hf2q has HF2Q_DUMP_RENDERED_PROMPT=<path> which writes its fully
+# chat-templated prompt to the given file and exits. We then feed the
+# rendered text to llama-completion WITHOUT `--jinja`, so both tools see
+# the byte-identical rendered prompt.
+echo "--- Pre-rendering chat template via hf2q ($RENDERED_PROMPT) ---"
+if ! HF2Q_DUMP_RENDERED_PROMPT="$RENDERED_PROMPT" \
+      "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt-file "$PROMPT_FILE" \
+        --max-tokens 1 --temperature 0 \
+        >/dev/null 2>"$LOG_RENDER"; then
+  echo "hf2q render-only failed. See $LOG_RENDER" >&2; exit 3
+fi
+[[ -s "$RENDERED_PROMPT" ]] || err "hf2q render produced empty $RENDERED_PROMPT (see $LOG_RENDER)"
+echo "hf2q rendered prompt: $(wc -c < "$RENDERED_PROMPT" | tr -d ' ') bytes"
+
+# Run llama-completion and hf2q ----------------------------------------------
 # Notes:
 #   -st / --single-turn   : exit after one turn (otherwise waits for stdin)
 #   </dev/null            : explicit EOF on stdin so no interactive prompt
-#   --jinja               : apply the GGUF's tokenizer.chat_template (matches hf2q)
 #   --no-display-prompt   : stdout = generated text only, no echo
-echo "--- Running llama-completion (T=0 greedy, 128 tokens) ---"
-if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$PROMPT_FILE" \
+#   -no-cnv               : disable conversation mode (auto-enabled when the
+#                           GGUF has a chat template). Without this, llama-
+#                           completion tries to re-apply the template to our
+#                           already-rendered input and aborts with
+#                           "this custom template is not supported".
+#   NO --jinja            : we pass the already-rendered prompt as a raw file,
+#                           so llama-completion must NOT re-apply the template
+echo "--- Running llama-completion (T=0 greedy, 128 tokens, pre-rendered prompt) ---"
+if ! "$LLAMA_BIN" --model "$GGUF_PATH" --file "$RENDERED_PROMPT" \
       --predict 128 --temp 0 --seed 42 \
-      --no-display-prompt --jinja \
+      --no-display-prompt -no-cnv \
       -st -ngl 999 \
       </dev/null >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
   echo "llama-completion failed. See $LOG_LLAMA" >&2; exit 3

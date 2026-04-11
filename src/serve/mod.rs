@@ -354,6 +354,23 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // embedded in the GGUF and the user has not overridden it.
     let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
 
+    // ADR-005 1bNEW.0c: write the fully-rendered prompt to a file and exit,
+    // so scripts/crawl_verify.sh can feed the byte-identical rendered text to
+    // llama-completion without `--jinja` (which routes through a different
+    // prompt path than hf2q — see ADR line 198). Presence-gated, no runtime
+    // cost when unset. Uses the same pattern as HF2Q_DUMP_LOGITS /
+    // HF2Q_DUMP_PROMPT_TOKENS.
+    if let Ok(dump_path) = std::env::var("HF2Q_DUMP_RENDERED_PROMPT") {
+        std::fs::write(&dump_path, prompt_text.as_bytes())
+            .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
+        eprintln!(
+            "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
+            prompt_text.len(),
+            dump_path
+        );
+        return Ok(());
+    }
+
     let encoding = tokenizer.encode(prompt_text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
