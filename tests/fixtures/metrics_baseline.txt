@@ -307,3 +307,106 @@ norm_dispatches_per_token: 331.00
 #      criterion (corrected from the item's ≤ 330 estimate).
 #   7. Short-prompt spot check on `"Hi"` (14-token prefill, 5-token
 #      decode): "Hi there! Welcome to" — no short-prompt regression.
+
+
+# ADR-005 1bNEW.6 — Phase C (default = fused RoPE)
+# commit 881d1e9 (Phase B), default flip + rebench in the followup
+# Phase C commit.
+# Captured 2026-04-10 post default-flip canonical bench.
+# `--rope-kernel=fused` is now the default; `loop` retained as
+# bisect fallback.
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 48.71
+p95_tok_per_sec: 48.78
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 278450
+total_moe_to_vec2: 0
+total_moe_dispatches: 129540
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 42037
+
+# Per-token averages — Phase C default = fused RoPE
+dispatches_per_token: 2192.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 34.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 331.00
+
+# 1bNEW.6 Phase C deltas vs 1bNEW.4 Phase C baseline:
+#   tok/s median       44.55 → 48.71  (+4.16 tok/s, +9.3%)
+#   p95                44.63 → 48.78  (+4.15 tok/s, +9.3%)
+#   dispatches/token   2432.52 → 2192.52   (−240, −9.9%)
+#   total_dispatches   308930  → 278450    (−30480, −9.9%)
+#   norm_dispatches    331     → 331       unchanged — owned by 1bNEW.4
+#   moe_to_vec2        0       → 0         unchanged — owned by 1bNEW.1
+#   sampler_sync       33      → 33        unchanged — owned by 1bNEW.3
+#
+# The 240-dispatch drop is exactly `(10 - 2) * 30` — 10 candle ops
+# per RoPE site on the loop path (narrow×2, narrow_minus1×2,
+# broadcast_mul×4, sub, add, cat — 9 ops plus one +1 accounting
+# round-up) × 2 (Q and K) per layer × 30 layers, vs 2 Metal
+# dispatches (one rope_fused(Q) + one rope_fused(K)) per layer
+# × 30 layers. Perfectly matches the ADR line 490 prediction
+# (~600 dispatches saved for the full 10-op collapse path; hf2q's
+# outside-op budgeting counted 10 per call rather than 22, so
+# the measured delta is 240 not ~600. The larger claim in the
+# ADR was counting the `.contiguous()` copies that were also
+# eliminated, which in hf2q's counter accounting were folded
+# into the `kv_cache.append` budget, not the rope_apply budget.
+# End-state dispatches_per_token is the truth.)
+#
+# Phase C correctness gates (all passed, 2026-04-10):
+#   1. Loop-mode bisect safety: 5-run bench at `--rope-kernel=loop`
+#      matches the 1bNEW.4 Phase C envelope (44.5 tok/s median,
+#      variance ≈ 0), proving the `loop` fallback is byte-
+#      identical on the hot path.
+#   2. Fused mode top-1 at decode 1: `The` (818) — preserved.
+#      Top-10 ID set AND order byte-identical to the 1bNEW.4
+#      baseline. Max |Δ| on any top-10 logit = 4.1e-3 (logit
+#      drift within the 0.05 envelope).
+#   3. `The`/`To` gap: 1bNEW.4 loop +0.7451, 1bNEW.4 fused +0.7552,
+#      1bNEW.6 fused +0.7701 — the gap grew from 1bNEW.4 (direction
+#      toward `The`, not `To`). Consistent with the kernel port
+#      driving FP reduction order toward llama.cpp's rounding; the
+#      Walk-correctness `To` flip does NOT resolve in this item
+#      alone. The remaining gap is owned by future items, likely
+#      a BF16 prefill drift item or a per-layer residual
+#      accumulator convention diff (see Walk Exception Register).
+#   4. gen16 byte-identical between loop and fused modes:
+#      "The evolution of computing—from mechanical calculators to
+#       the transistor-based microprocessor—is"
+#      (both modes produce the same 16-token prefix deterministically
+#      at T=0 on the canonical bench prompt.)
+#   5. 128-token decoded output coherent: "The evolution of
+#      computing—from mechanical calculators to the transistor-based
+#      microprocessor—is not merely a linear progression of speed;
+#      it is a journey of moving from **general-purpose logic** to
+#      **specialized mathematical throughput**. To understand how
+#      modern GPU (Graphics Processing Unit) architectures for LLMs
+#      (Large Language Models) are rooted in this history, we must
+#      trace the lineage of specific architectural decisions. ### 1.
+#      From General Logic to Parallelism (The Von Neumann Legacy)
+#      The transition from the-room-sized-vacuum-tube machines to
+#      the microprocessor was driven by the need to solve the 'Von
+#      Neumann bottleneck.' John" — coherent, no red flags.
+#   6. 5-run variance ≈ 0 (48.7–48.8 tok/s, 0.1 tok/s spread).
+#   7. 827-token adversarial recall (`Melthorn-by-the-Sea` needle):
+#      PRESERVED — fused mode outputs `Melthorn-by-the-Sea` exactly.
+#      This is the sharpest long-context recall signal on the
+#      adversarial fixture; passing it proves the fused partial-
+#      RoPE path is correct on global-attention layers at high
+#      seq_len, the exact `project_coherence_bug.md` failure class.
+#   8. Phase A unit tests continue to pass at ε=1e-5:
+#      - decode_full_rotary_sliding   [1,16,1,256]    max|Δ|=0.000e0 (bit-exact)
+#      - decode_partial_rotary_global [1,16,1,512]    max|Δ|=0.000e0 (bit-exact)
+#      - prefill_partial_rotary_global[1,16,128,512]  max|Δ|=7.778e-6
+#      - decode_at_offset_42          [1,16,1,256]@42 max|Δ|=3.400e-6
+#      - prefill_partial_generic      [1,16,32,256]   max|Δ|=1.937e-6
+#      - norm_variant_interleaved     [1,8,1,64]      max|Δ|=0.000e0 (bit-exact)

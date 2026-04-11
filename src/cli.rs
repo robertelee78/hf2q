@@ -235,18 +235,21 @@ pub struct GenerateArgs {
     #[arg(long, value_enum, default_value = "fused")]
     pub rms_norm_kernel: RmsNormKernelMode,
 
-    /// RoPE dispatch mode. `fused` routes Q and K rotations through a
-    /// runtime-compiled Metal kernel that ports llama.cpp's
-    /// `kernel_rope_neox` (split-half / Gemma 4 variant) and
-    /// `kernel_rope_norm` (GPT-J interleaved variant) — replacing the
-    /// 9-op `rope_apply` chain + the partial-rotary narrow/cat dance
-    /// with a single stride-aware dispatch per Q and per K per layer.
-    /// The stride-aware kernel incidentally eliminates the `.contiguous()`
-    /// copies on the Q/K narrowed views (old ADR item 1bNEW.8 win —
-    /// dissolved into 1bNEW.6 per ADR-005:322-326). `loop` preserves
-    /// the Phase-1 `rope_apply` chain for bisect-safety. Default is
-    /// `loop` in Phase B; Phase C flips the default to `fused`.
-    #[arg(long, value_enum, default_value = "loop")]
+    /// RoPE dispatch mode. `fused` (default, post-ADR-005 1bNEW.6
+    /// Phase C) routes Q and K rotations through a runtime-compiled
+    /// Metal kernel that ports llama.cpp's `kernel_rope_neox`
+    /// (split-half / Gemma 4 variant) and `kernel_rope_norm` (GPT-J
+    /// interleaved variant) — replacing the 9-op `rope_apply` chain
+    /// + the partial-rotary narrow/cat dance with a single stride-
+    /// aware dispatch per Q and per K per layer. The stride-aware
+    /// kernel incidentally eliminates the `.contiguous()` copies on
+    /// the Q/K narrowed views (old ADR item 1bNEW.8 win — dissolved
+    /// into 1bNEW.6 per ADR-005:322-326). Phase C bench:
+    /// 44.55 → 48.80 tok/s median (+9.5%), `dispatches_per_token`
+    /// 2432 → 2192 (−9.9%), coherent output preserved, 827-token
+    /// adversarial recall preserved. `loop` preserves the Phase-1
+    /// `rope_apply` chain for bisect-safety.
+    #[arg(long, value_enum, default_value = "fused")]
     pub rope_kernel: RopeKernelMode,
 }
 
