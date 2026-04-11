@@ -195,8 +195,8 @@ fn run_single_generation(
     let fast_path = params.temperature < SAMPLING_EPS
         && params.repetition_penalty == 1.0;
 
-    if fast_path {
-        return run_decode_greedy_batched(
+    let (generated, elapsed) = if fast_path {
+        run_decode_greedy_batched(
             model,
             tokenizer,
             logits,
@@ -204,35 +204,11 @@ fn run_single_generation(
             &eos_token_ids,
             params.max_tokens,
             silent,
-        );
-    }
-
-    // === Per-token sync path (non-greedy or rep_penalty != 1.0) ===
-    let mut next_token = sampler::sample_token(&logits, params, &[], &counters)?;
-    all_tokens.push(next_token);
-
-    if !silent {
-        let token_str = tokenizer.decode(&[next_token], false)
-            .unwrap_or_default();
-        print!("{}", token_str);
-        std::io::stdout().flush()?;
-    }
-
-    // Decode loop — timed separately from prefill
-    let start = std::time::Instant::now();
-    let mut generated = 1usize;
-    for _ in 1..params.max_tokens {
-        if eos_token_ids.contains(&next_token) {
-            break;
-        }
-
-        let input = Tensor::new(&[next_token], device)?
-            .unsqueeze(0)?;  // [1, 1]
-        let seqlen_offset = all_tokens.len() - 1;
-        logits = model.forward(&input, seqlen_offset)?;
-        next_token = sampler::sample_token(&logits, params, &all_tokens, &counters)?;
+        )?
+    } else {
+        // === Per-token sync path (non-greedy or rep_penalty != 1.0) ===
+        let mut next_token = sampler::sample_token(&logits, params, &[], &counters)?;
         all_tokens.push(next_token);
-        generated += 1;
 
         if !silent {
             let token_str = tokenizer.decode(&[next_token], false)
@@ -240,9 +216,54 @@ fn run_single_generation(
             print!("{}", token_str);
             std::io::stdout().flush()?;
         }
+
+        // Decode loop — timed separately from prefill
+        let start = std::time::Instant::now();
+        let mut generated = 1usize;
+        for _ in 1..params.max_tokens {
+            if eos_token_ids.contains(&next_token) {
+                break;
+            }
+
+            let input = Tensor::new(&[next_token], device)?
+                .unsqueeze(0)?;  // [1, 1]
+            let seqlen_offset = all_tokens.len() - 1;
+            logits = model.forward(&input, seqlen_offset)?;
+            next_token = sampler::sample_token(&logits, params, &all_tokens, &counters)?;
+            all_tokens.push(next_token);
+            generated += 1;
+
+            if !silent {
+                let token_str = tokenizer.decode(&[next_token], false)
+                    .unwrap_or_default();
+                print!("{}", token_str);
+                std::io::stdout().flush()?;
+            }
+        }
+
+        (generated, start.elapsed())
+    };
+
+    // Debug: dump the full generated token sequence (prompt + decoded) as
+    // u32 LE for offline diffing against llama.cpp. Set
+    // `HF2Q_DUMP_TOKEN_SEQUENCE=path.bin` to enable. Prompt length is
+    // reported via stderr so the caller can slice out the decoded tail.
+    if let Ok(dump_path) = std::env::var("HF2Q_DUMP_TOKEN_SEQUENCE") {
+        let mut bytes = Vec::with_capacity(all_tokens.len() * 4);
+        for &t in &all_tokens {
+            bytes.extend_from_slice(&t.to_le_bytes());
+        }
+        std::fs::write(&dump_path, &bytes)?;
+        eprintln!(
+            "HF2Q_DUMP_TOKEN_SEQUENCE: wrote {} u32 values ({} bytes) to {} (prompt_len={}, decode_len={})",
+            all_tokens.len(),
+            bytes.len(),
+            dump_path,
+            prompt_tokens.len(),
+            all_tokens.len() - prompt_tokens.len(),
+        );
     }
 
-    let elapsed = start.elapsed();
     Ok((generated, elapsed))
 }
 
