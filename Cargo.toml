@@ -94,3 +94,18 @@ harness = false
 name = "shard_read_bench"
 harness = false
 
+# ADR-005 1bNEW.20.FIX — vendored candle-nn with SDPA Metal offset fix.
+# Upstream candle-nn 0.10.2 (crates.io + HEAD) passes `layout.start_offset()`
+# (an element count) where Metal's `setBuffer:offset:atIndex:` expects bytes,
+# at all three SDPA dispatch paths (vector / vector_2pass / full). The bug is
+# latent whenever SDPA inputs have `start_offset == 0`, which is every other
+# candle consumer. hf2q's 1bNEW.20 in-place KV cache path hands SDPA a narrow
+# view with non-zero start_offset once `current_len > sliding_window`, which
+# exposes the bug as a coherence flip at exactly token ~1024 on Gemma-4.
+# Vendor patch applies the same `* dtype.size_in_bytes()` pattern the rest of
+# candle-nn already uses for its Metal ops. See /opt/hf2q/vendor/candle-nn/
+# src/ops.rs header for the full bug analysis. Drop this override once the
+# upstream fix lands in a candle release.
+[patch.crates-io]
+candle-nn = { path = "vendor/candle-nn" }
+

@@ -2672,6 +2672,133 @@ mod kv_cache_in_place_tests {
             v_view.stride()
         );
     }
+
+    /// ADR-005 1bNEW.20.FIX — SDPA must produce identical output when
+    /// fed a non-contiguous K/V view with **non-zero** `start_offset`
+    /// vs. the same data re-contiguified to zero offset.
+    ///
+    /// This test exists because the 1bNEW.20 Phase B gates (byte-identical
+    /// 128-token decode, 827-token adversarial recall) all operated below
+    /// the sliding-window boundary where `visible_start == 0`, so they
+    /// never exercised a SDPA dispatch against a `start_offset > 0`
+    /// view. A Gemma-4 sourdough-instruction prompt at `max_tokens=20000`
+    /// flipped from coherent to garbage at exactly the sliding-window
+    /// boundary (~decode token 1024), and the bisect landed on
+    /// `candle_nn/src/ops.rs` passing `layout.start_offset()` directly
+    /// into `candle_metal_kernels::call_sdpa_vector` et al. without the
+    /// `* dtype.size_in_bytes()` multiplication that every other Metal
+    /// op in candle applies. Metal interprets the value as a byte
+    /// offset, so the kernel bound q/k/v at a garbage memory address
+    /// whenever the narrow view had a non-zero element-count offset.
+    ///
+    /// The fix is vendored as `/opt/hf2q/vendor/candle-nn/src/ops.rs`
+    /// (nine substitution sites across the three dispatch branches).
+    /// This test would have failed on the stock candle-nn-0.10.2 and
+    /// must continue to pass on the vendored patch. If the test starts
+    /// failing, either the candle-nn patch was dropped or an upstream
+    /// bump re-introduced the bug.
+    ///
+    /// The test is deliberately NOT coupled to `KvCache` — it
+    /// constructs K/V directly via `narrow` on a pre-allocated
+    /// contiguous tensor with `start > 0`. That isolates the bug to
+    /// the exact dispatch-path condition that matters (SDPA input
+    /// with `start_offset > 0`), without any KV-cache plumbing noise.
+    #[test]
+    fn test_candle_sdpa_honors_nonzero_start_offset() {
+        use candle_nn::ops::sdpa;
+
+        let device = Device::new_metal(0).expect("Metal device required");
+
+        // Decode-path shapes: q_len=1, non-trivial K/V sequence, Gemma-4
+        // sliding head_dim=256 (the exact path the sourdough bug hit).
+        let num_q_heads = 16_usize;
+        let num_kv_heads = 16_usize;
+        let head_dim = 256_usize;
+        let cache_size = 128_usize; // simulates the pre-allocated cache
+        let visible_start = 37_usize; // simulates `current_len - sliding_window`
+        let visible_len = 64_usize; // simulates `sliding_window`
+        assert!(visible_start + visible_len <= cache_size);
+
+        // Deterministic fill. Every element unique so a stride gotcha is
+        // observable in the output, not masked by collisions.
+        let ntotal = num_kv_heads * cache_size * head_dim;
+        let k_full: Vec<f32> = (0..ntotal).map(|i| (i as f32) * 1e-4).collect();
+        let v_full: Vec<f32> =
+            (0..ntotal).map(|i| ((i + 1_000_000) as f32) * 1e-4).collect();
+        let k_base =
+            Tensor::from_vec(k_full, (1, num_kv_heads, cache_size, head_dim), &device).unwrap();
+        let v_base =
+            Tensor::from_vec(v_full, (1, num_kv_heads, cache_size, head_dim), &device).unwrap();
+
+        // Stride-aware narrow with `visible_start > 0` — this is the
+        // layout `KvCache::append_in_place` returns once a sliding
+        // layer has advanced past its window.
+        let k_view = k_base.narrow(2, visible_start, visible_len).unwrap();
+        let v_view = v_base.narrow(2, visible_start, visible_len).unwrap();
+
+        // Sanity: the narrow view is non-contiguous and carries a
+        // non-zero layout `start_offset` in **elements**.
+        assert!(!k_view.is_contiguous(), "k_view should not be contiguous");
+        assert!(!v_view.is_contiguous(), "v_view should not be contiguous");
+
+        // Control: re-materialize the same data with `start_offset == 0`.
+        // The data is element-identical to `k_view` / `v_view`.
+        let k_ref = k_view.contiguous().unwrap();
+        let v_ref = v_view.contiguous().unwrap();
+        assert!(k_ref.is_contiguous());
+        assert!(v_ref.is_contiguous());
+
+        // Query tensor — typical decode shape. Must be contiguous
+        // (candle-nn SDPA contract).
+        let q_total = num_q_heads * head_dim;
+        let q_data: Vec<f32> = (0..q_total).map(|i| ((i + 2_000_000) as f32) * 1e-4).collect();
+        let q = Tensor::from_vec(q_data, (1, num_q_heads, 1, head_dim), &device)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        // Two SDPA calls on the SAME data, differing only in whether
+        // the K/V arguments have `start_offset > 0`. If candle-nn's
+        // dispatch converts element-offset to byte-offset correctly,
+        // both calls produce bit-identical output.
+        let out_view = sdpa(&q, &k_view, &v_view, None, false, scale, 1.0).unwrap();
+        let out_ref = sdpa(&q, &k_ref, &v_ref, None, false, scale, 1.0).unwrap();
+
+        let flat_view: Vec<f32> =
+            out_view.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let flat_ref: Vec<f32> =
+            out_ref.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(flat_view.len(), flat_ref.len());
+
+        let max_diff = flat_view
+            .iter()
+            .zip(flat_ref.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0.0_f32, f32::max);
+        let max_abs_ref = flat_ref.iter().copied().fold(0.0_f32, f32::max);
+
+        eprintln!(
+            "[sdpa-offset] visible_start={visible_start} visible_len={visible_len} \
+             max_diff={max_diff:.6e} max_abs_ref={max_abs_ref:.6e}"
+        );
+
+        // Tight tolerance: SDPA vector kernels are deterministic at
+        // equal inputs, so the only allowed divergence is floating
+        // accumulation order within a simdgroup, which is identical
+        // between the two calls because the tensor shape is identical
+        // and the only difference is the base buffer offset. Expect
+        // bit-identical (0.0), assert with a wide safety margin so
+        // any real divergence screams.
+        assert!(
+            max_diff < 1e-5,
+            "SDPA output diverges between stride-aware narrow view and \
+             contiguous ref (max_diff={max_diff:.6e}). Likely candle-nn \
+             SDPA dispatch regressed on element-offset → byte-offset fix. \
+             See /opt/hf2q/vendor/candle-nn/src/ops.rs header."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
