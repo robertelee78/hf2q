@@ -734,3 +734,151 @@ norm_dispatches_per_token: 331.00
 # top-1 == llama.cpp top-1 at decode 1"): **STILL MET**, and now
 # 10-deep with one near-tied positional swap. Decode-1 drift is
 # below the f32 noise floor post-landing.
+
+# ============================================================
+# ADR-005 1bNEW.20 Phase B — KV cache in-place append (Walk-KERNEL-PORT)
+# Captured 2026-04-10, commit `834b8ed` (Phase B).
+# Ports llama.cpp `llama_kv_cache::cpy_k` / `cpy_v` at
+# `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285` via candle's
+# `Tensor::slice_set` primitive (`tensor_cat.rs:246`). Replaces the
+# two `slice_scatter` + two `narrow` + two `contiguous` (6 ops per
+# layer per token) with one `v.contiguous()` + two `slice_set` +
+# two `narrow` (3 ops), and drops the decode-path contiguous copy
+# of the entire `[1, kv_heads, visible_len, hd]` active region on
+# every decode step. SDPA vector kernel reads the cache's
+# `k_stride[1]`/`v_stride[1]` directly
+# (`candle-metal-kernels/src/kernels/sdpa.rs:278-279`) so the
+# stride-aware narrowed view is correct by construction.
+# Invocation: `--kv-cache-kernel=in-place` (Phase B default) with
+# `--benchmark --max-tokens 128 --temperature 0` unchanged.
+# Slice-scatter control: 58.1 tok/s median (matches pre-1bNEW.20
+# 58.27 baseline within ±0.3 noise envelope).
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 85.10
+p95_tok_per_sec: 85.20
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 267274
+total_moe_to_vec2: 0
+total_moe_dispatches: 129540
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 42037
+
+# Per-token averages — 1bNEW.20 Phase B in-place default
+dispatches_per_token: 2104.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 34.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 331.00
+
+# 1bNEW.20 Phase B deltas vs 1bNEW.18 Phase B/C baseline:
+#   tok/s median      58.27 → 85.10   (+26.83, +46.0%)
+#   tok/s p95         58.45 → 85.20   (+26.75)
+#   5-run variance    0.3   → 0.5 tok/s (85.1-85.2 range across 5 runs)
+#   dispatches/token 2194.52 → 2104.52 (−90.00 = 3 ops/layer × 30 layers)
+#   moe_to_vec2_count unchanged — owned by 1bNEW.1 Phase C
+#   sampler_sync_count unchanged — owned by 1bNEW.3
+#   norm_dispatches_per_token unchanged — owned by 1bNEW.4
+#
+# Phase B gates (all PASS):
+#   1. Decode-1 top-10 logit match (`HF2Q_DUMP_LOGITS`, canonical
+#      187-token bench prompt, `--max-tokens 1 --temperature 0`):
+#        slice-scatter top-10: [(818,27.43411), (2021,26.82725),
+#          (216100,22.235836), (101068,22.172247), (32899,20.723919),
+#          (129264,19.485794), (20647,18.714884), (8409,18.061455),
+#          (90894,17.810465), (12282,17.769943)]
+#        in-place top-10:      [(818,27.43411), (2021,26.82725),
+#          (216100,22.235836), (101068,22.172247), (32899,20.723919),
+#          (129264,19.485794), (20647,18.714884), (8409,18.061455),
+#          (90894,17.810465), (12282,17.769943)]
+#      Byte-identical. Top-1 = `The` (818) at 27.43411, matching
+#      the post-1bNEW.18 reference in the Phase A task spec exactly.
+#      max |Δ| = 0.0 (not ε-bounded; the math is literally identical).
+#   2. gen128 byte-identical across both modes:
+#        "The evolution of computing—from mechanical calculators to
+#        the transistor revolution—is not merely a linear progression
+#        of speed; it is a journey of **abstraction and specialization**.
+#        To understand modern GPU (Graphics Processing Unit)
+#        architectures used for Large Language Model (LLM)
+#        inference, we must trace how these historical milestones
+#        dictated the transition from general-purpose logic to
+#        massive parallelism.\n\nHere is how those specific
+#        historical developments influence modern GPU design:\n\n### 1.
+#        From Mechanical Logic to Mathematical Abstraction\nThe work
+#        of Pascal and Leibniz established the concept of **discrete
+#        state manipulation**. They proved that complex mathematical
+#        operations could be broken down into a series of"
+#      No a0952e2 signature (no `own own own`, no control-token
+#      floods, no non-ASCII gibberish). Identical to the
+#      post-1bNEW.18 gen128 reference text stored above.
+#   3. 5-run bench: SEE TABLE ABOVE. PASS at variance 0.5 tok/s,
+#      median 85.10, p95 85.20. Control run at `--kv-cache-kernel=slice-scatter`
+#      confirms the baseline hasn't drifted: 58.1 median
+#      (58.0-58.3 spread), within ±0.3 of spec's 58.27 baseline.
+#   4. Sliding-layer KV: the canonical 187-token prompt prefills
+#      through 25 sliding-attention layers and the 128-decode
+#      phase touches every sliding layer 128 times; all 128 decode
+#      steps produce output byte-identical to slice-scatter.
+#      Additionally, `test_kv_in_place_sliding_decode` and
+#      `test_kv_in_place_sliding_truncation` unit tests from Phase
+#      A exercise the sliding path at the primitive level at
+#      max|Δ| = 0.000e0. Sliding manual prefill path at
+#      `Attention::forward` works without modification: candle's
+#      `reshape` auto-copies non-contiguous input
+#      (`candle-core/src/tensor.rs:2545-2550`).
+#   5. 827-token `Melthorn-by-the-Sea` adversarial recall
+#      (`tests/fixtures/adversarial_1000.txt`, 64 max-tokens, T=0):
+#        "The name of the hidden city is Melthorn-by-the-Sea.<turn|>"
+#      PRESERVED, byte-identical to slice-scatter on the same
+#      prompt. The deep-buried needle survives the full
+#      827→844 token context without corruption — the single best
+#      end-to-end KV fidelity test, because any stride gotcha would
+#      smear across the sliding-window truncation boundary at
+#      position 1024 and corrupt the Melthorn tokens.
+#
+# **Projection vs actual.** The 1bNEW.20 task spec projected
+# 0.3-0.5 tok/s from eliminating the per-decode-step contiguous
+# copy of the full active KV region. Actual delivered: +26.83 tok/s
+# (~90× the projection). Two effects compound in the actual
+# measurement that the 0.3-0.5 projection did not account for:
+#   (a) Direct: eliminating 2 contiguous copies of
+#       `[1, kv_heads, visible_len, hd]` per layer per token over
+#       30 layers is ~60 copies per decode step eliminated. The
+#       projection assumed each copy was ~5-8 µs; actual
+#       per-copy cost post-elimination appears larger, possibly
+#       because candle's pool-wide flush-and-wait at
+#       `candle-metal-kernels/src/metal/commands.rs:176-202`
+#       serialized enqueue behind each copy's drain.
+#   (b) Indirect: the greedy windowed-drain path at
+#       `src/serve/mod.rs::run_decode_greedy_batched` could not
+#       chain forward passes as densely as designed while the
+#       KV-append chain was producing intermediate tensors with
+#       unfulfilled contiguous dependencies on the encoder queue.
+#       Removing the contiguous calls unblocks tighter decode-loop
+#       kernel packing. This is the same mechanism 1bNEW.3's
+#       original post-landing note described at ADR-005 line 922
+#       ("pool-wide flush_and_wait serializes enqueue behind each
+#       drain — this is the same mechanism that made 1bNEW.3
+#       deliver only +0.25 tok/s instead of the projected 3-6").
+#   The projection was made in a linear-model assumption; the
+#   actual speedup reflects the underlying pool-serialization
+#   structure the earlier items were already paying a cost for.
+#
+# **crawl_verify.sh classification: unchanged.** The kv-append
+# change is a pure op-sequence restructure — no numerical change
+# to the math, no shift in reduction order — so the residual
+# f32-reduction-order drift Spike C localized to non-RoPE
+# components (candle attention softmax accumulator, MoE per-expert
+# weight sum order, RmsNorm reduction order) is unchanged, and
+# `crawl_verify.sh` classification remains YELLOW (60-byte common
+# prefix, same divergence at decode token 14 where hf2q picks
+# `the` over llama.cpp's `modern`). 1bNEW.20 is a speed item;
+# closing the classification to GREEN/PERFECT requires the
+# follow-up Walk item on the residual continuation drift owner.
