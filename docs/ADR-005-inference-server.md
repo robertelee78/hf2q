@@ -938,6 +938,42 @@ The static analysis in this session compared candle's `kernel_mul_mv_q4_0_f32` a
 
 **Mantra discipline reminder** (load-bearing for the next session): pre-spike microbenchmarks are mandatory before any further patch work. Cost of a refuted patch: ~3 hours (1bNEW.22 sticky encoder). Cost of a pre-spike microbench: ~30 minutes. Always measure first.
 
+#### Update — 2026-04-11 PM cfa swarm `swarm-1775949388026-7eii34` (1bNEW.29 pre-microbench session)
+
+**Three concurrent measurement workers ran the mandatory pre-spike for 1bNEW.29.** Full synthesis at `docs/spike-1bNEW29-pre-microbench-results.md`; per-worker raw data at `docs/spike-1bNEW29-{nsg-sweep-data,llamacpp-timings,research-notes}.md`. Three load-bearing findings:
+
+1. **NSG hypothesis empirically falsified.** Agent #1 ran 8 production dispatch shapes × 4 NSG values × 4 independent 1000-iter sweeps on M5 Max. Largest reproducible margin = 1.08% (well below per-shape jitter floor); the run-1 21% outlier on `k_proj sliding @ nsg=8` did not reproduce on runs 2/3/4. Coherence gate not triggered (no NSG≠2 produced ≥5% speedup). Agent #3's static read predicted this independently — both candle and llama.cpp use `N_SG_Q4_0 = N_SG_Q6_K = 2` (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:11-72` vs `quantized.metal:2307`/`:5215`). NSG joins sticky-encoder in the falsified register. **1bNEW.22-v2 NSG-selection port: 0 tok/s envelope, NOT pursuing.**
+
+2. **End gate target value (107 tok/s) is suspect.** Agent #2's fresh 5-run llama.cpp re-measurement on the same M5 Max, same DWQ GGUF, same canonical bench prompt, same `llama-completion` flag set lands at **102.01 tok/s median**, not 107. Source of the historical 107 figure is unverified (possibilities: different llama.cpp build, different thermal state, different hardware config, or aspirational rather than measured). The actual gap to peer is **~17 tok/s (84.9 → 102), not 21.6 tok/s (84.9 → 107)**. Walk discipline = match peer; if peer measures 102 today, the End gate cannot honestly require ≥107. **Recommendation: re-baseline ADR-005:836 to ≥102 (or to "match llama.cpp on the day, on the hardware") with the source-of-107 investigation as a follow-up.** Decision pending user sign-off.
+
+3. **Coherence is solid; remaining work is purely speed.** Agent #2 confirmed **byte-identical 16-token greedy generation** between hf2q and llama.cpp at T=0 on the canonical prompt: `The evolution of computing—from mechanical calculators to modern microprocessors—is not merely`. This is strictly stronger evidence than the prior top-1-token-match End gate.
+
+**Sub-hypothesis falsifier (separate from #1 and #2):** Agent #2 measured llama.cpp's ggml graph at **2652 nodes per Gemma 4 26B MoE forward** vs hf2q's **2104 dispatches**. llama.cpp runs MORE nodes, not fewer. The "cut hf2q's dispatch count from 2104 to ~1000 to match llama.cpp" framing at `docs/spike-1bNEW22-instrumentation.md:23` is wrong — the 1000 figure was an estimate the actual measurement contradicts. **Dispatch-count reduction is not the lever.**
+
+**Two prior framing corrections:**
+- candle's quantized kernels are a **modified older snapshot of llama.cpp's ggml-metal.m**, not MLX-derived as `docs/spike-1bNEW22-instrumentation.md:309-310` and `docs/spike-post-walk-results.md` both assumed. Speed gaps are best framed as snapshot drift between two evolving llama.cpp ports, not novel kernel R&D. (Citation: ggml-style in-file references at `quantized.metal:215`, `:241`, `:1724`, `:1829`, `:1911`, `:1959`; no MLX attribution in this file.)
+- ADR-005:902 conflated "llama.cpp has function-constant infrastructure" with "llama.cpp uses function constants for shape-dependent NSG tuning". Actual code at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp:702-879` reads `nsg = N_SG_<TYPE>` unconditionally for all quant types — no `ne00/ne01` branching.
+
+**Identified live levers (none yet runtime-measured):**
+- **Q6_K NR0=2 row-loop port** (Agent #3 min-port estimate ~120 LOC, projected +1.3-2.5 tok/s). llama.cpp templates `nr0 = 2` (2 rows/simdgroup, `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7924-8017` + `ggml-metal-impl.h:44`); candle hardcodes 1 row/simdgroup at `quantized.metal:5215`. **Candle dispatches 2× more Q6_K threadgroups.** Net wall-clock effect on M5 Max is occupancy-dependent — must be runtime-measured before any port lands.
+- **Q4_0 `kernel_mul_mv_ext_q4_0_f32_r1_2_nxpsg=16` extended variant** (Agent #2). No candle equivalent; used by current llama.cpp for Gemma 4 MLP gate/up/down.
+- **Fused `rms_norm_mul_f32_4` / `rms_norm_mul_add_f32_4` boundary** (Agent #2). Partially overlaps with hf2q's existing 1bNEW.4 fused F=2/F=3 RmsNorm but with a different fusion boundary.
+- **Flash Attention `kernel_flash_attn_ext_f16_dk512_dv512_nsg=8`** (Agent #2). Compile-time-specialized for global Gemma 4 attention layers at head_dim=512; **candle has no equivalent for this head_dim/dtype combo**. Separately scoped Walk-KERNEL-PORT item, NOT in the original 1bNEW.22-29 roadmap.
+
+**Recommended next concrete Walk action (synthesizer's pick, user decision pending):**
+- **A.** Re-baseline End gate to 102 (~30 min, honest accounting independent of any other decision)
+- **B.** Plumb per-kernel timing in both candle + ggml-metal (~1 day each side, single highest-information-density measurement)
+- **C.** Build Q6_K NR0=2 standalone Metal microbench FIRST (~30 min, mantra-aligned), GO/NO-GO on full port from microbench result (~1 day if GO)
+- **D.** Accept Walk done at current state (84.9 tok/s, byte-identical 16-token gen, all correctness gates met), pivot to Run scope
+
+Synthesizer recommends **A → C → revisit B if C lands a win → D if B yields nothing**. The Q6_K NR0=2 lever has the highest static-evidence-to-cost ratio of the four; everything else should gate on per-kernel timing data.
+
+**Honest contamination disclosure for this swarm session:** Agent #1 (vendor patches + cargo build) and Agent #2 (cargo build of hf2q which compiles the same vendored crate) ran in parallel, sharing `target/`, vendored source files, and build artifacts. Agent #2 explicitly observed Agent #1's mid-sweep 308-line patch in `quantized.metal` appearing and disappearing during its own measurement runs. This is a real interference, not theoretical. The data survived only because Agent #1's 4-run median methodology absorbed the noise (run-1 outlier dismissed by runs 2/3/4) and Agent #2 measured the hf2q baseline twice (as-found 85.8, clean-vendor 84.9) — both within noise of the prior 85.4. Saved as feedback memory: **swarm workers that share a build dir are not parallel-safe even if their source-file claims are disjoint**. Future spikes must sequence build-touching workers.
+
+**Cumulative falsified register update:** added items 6 (NSG selection has wall-clock headroom — falsified by Agent #1 + #3), 7 (hf2q dispatch count is high vs llama.cpp — falsified by Agent #2's 2652-vs-2104 measurement), 8 (llama.cpp peer measures 107 today on this hardware — refuted by Agent #2's 102.01 measurement). Full register at `docs/spike-1bNEW29-pre-microbench-results.md`.
+
+**Microbench harness:** Agent #1 added `vendor/candle-metal-kernels/examples/metal_benchmarks.rs` (490 lines, NSG-microbench subcommand and supporting functions). Currently gitignore-shadowed by global `examples/` rule at `.gitignore:20`; this commit adds a `!vendor/candle-metal-kernels/examples/` exception so the harness is preserved as a permanent test asset. The 308-line NSG variant kernels added to `quantized.metal` for the sweep are NOT being committed (dead code post-spike). The harness is preserved-for-followup-on-different-hardware; running it post-commit on M5 Max requires re-applying the variant kernels per the methodology section of `docs/spike-1bNEW29-nsg-sweep-data.md`.
+
 ### Phase 2: HTTP Server
 - [ ] OpenAI Python/JS SDK clients connect and work (chat completions, streaming, tool calling, embeddings)
 - [ ] Open WebUI connects and provides full multi-turn chat experience (streaming, vision, tool use)

@@ -18,6 +18,9 @@ CLAUDE.md
 # Logs and examples
 logs/
 examples/
+# Exception: vendored crate examples are permanent test assets (added 2026-04-11
+# for the 1bNEW.29 NSG sweep microbench harness — see docs/spike-1bNEW29-*.md)
+!vendor/candle-metal-kernels/examples/
 
 # Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
 # instrumentation). The committed baseline lives at
