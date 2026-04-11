@@ -680,8 +680,15 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     eprintln!("Loading model weights from GGUF (quantized QMatMul)...");
     let moe_mode: gemma4::MoeKernelMode = args.moe_kernel.into();
     let rms_mode: rms_norm_kernel::RmsNormKernelMode = args.rms_norm_kernel.into();
+    // ADR-005 1bNEW.6 Phase B: `--rope-kernel` plumbs the same way
+    // as `--moe-kernel` and `--rms-norm-kernel`. Default is `loop`
+    // in Phase B (bisect-safety); Phase C flips the default to
+    // `fused` after the 5-run benchmark gate validates it.
+    let rope_mode: rope_kernel::RopeKernelMode = args.rope_kernel.into();
     tracing::info!("MoE dispatch mode: {:?}", moe_mode);
-    let mut model = Gemma4Model::load_with_modes(&cfg, &gguf, &device, moe_mode, rms_mode)?;
+    let mut model = Gemma4Model::load_with_modes(
+        &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode,
+    )?;
 
     // Warmup: run two dummy forwards to force Metal shader compilation for
     // both the decode and prefill code paths at model-load time.

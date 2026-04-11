@@ -15,6 +15,7 @@ use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
 use super::moe_kernel;
 use super::rms_norm_kernel::{self, RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
+use super::rope_kernel::{self, RopeKernel, RopeKernelMode as RopeKernelModeImpl, RopeVariant};
 
 // ADR-005 1bNEW.1 — type alias for the quantized dtype tag used by
 // `call_quantized_matmul_mv_id_t`. Kept in sync with candle-core's
@@ -49,6 +50,15 @@ impl From<crate::cli::RmsNormKernelMode> for RmsKernelMode {
         match v {
             crate::cli::RmsNormKernelMode::Loop => Self::Loop,
             crate::cli::RmsNormKernelMode::Fused => Self::Fused,
+        }
+    }
+}
+
+impl From<crate::cli::RopeKernelMode> for RopeKernelModeImpl {
+    fn from(v: crate::cli::RopeKernelMode) -> Self {
+        match v {
+            crate::cli::RopeKernelMode::Loop => Self::Loop,
+            crate::cli::RopeKernelMode::Fused => Self::Fused,
         }
     }
 }
@@ -300,9 +310,53 @@ impl RmsNorm {
 // ---------------------------------------------------------------------------
 
 struct RotaryEmbedding {
+    /// Cached sin table `[max_seq_len, rotary_dim/2]` — only used by
+    /// the `loop` dispatch path. `Fused` mode computes angles
+    /// on-the-fly inside the kernel body, so this allocation is pure
+    /// fallback cost when `--rope-kernel=fused` is active. Left in
+    /// place unconditionally for bisect-safety.
     sin: Tensor,
+    /// Cached cos table, same shape and caveat as `sin`.
     cos: Tensor,
+    /// Number of rotated element-indices per head. For full RoPE
+    /// (sliding layers) `rotary_dim == head_dim`; for partial RoPE
+    /// (Gemma 4 global layers, `partial_rotary_factor=0.5`) it's
+    /// `head_dim / 2`.
     rotary_dim: usize,
+    /// Full head_dim this RoPE is paired with. The fused path
+    /// reads the effective head_dim from the input tensor's last
+    /// dimension at dispatch time, so this field is kept for
+    /// construction-time validation and self-documentation only.
+    /// `Loop` mode never reads it; the 9-op chain infers head_dim
+    /// from the tensor shape directly.
+    #[allow(dead_code)]
+    head_dim: usize,
+    /// Effective RoPE frequency base to feed the Metal kernel.
+    /// Derivation: llama.cpp's kernel uses `n_dims` (rotary_dim) in
+    /// the denominator of `pow(freq_base, -i0/n_dims)`, whereas
+    /// Gemma 4's HF-origin proportional scaling uses `head_dim` in
+    /// the denominator of `1/rope_theta^(2k/head_dim)`. Folding the
+    /// mismatch into an effective base:
+    ///   `freq_base_eff = rope_theta^(rotary_dim / head_dim)`
+    /// keeps the kernel byte-identical to llama.cpp while matching
+    /// hf2q's existing cached cos/sin values to 1 ULP. See the
+    /// module-level comment in `rope_kernel.rs` for the full
+    /// derivation and the Phase A unit test evidence.
+    freq_base_eff: f32,
+    /// Which RoPE pair layout this instance dispatches. Gemma 4 is
+    /// always `Neox` (llama.cpp's split-half `LLAMA_ROPE_TYPE_NEOX`
+    /// at `src/llama-model.cpp:9134`). Stored as a struct field so
+    /// future model families using GPT-J interleaved rotation can
+    /// share the same pipelines via `RopeVariant::Norm`.
+    variant: RopeVariant,
+    /// Per-site dispatch mode plumbed from the CLI `--rope-kernel`
+    /// flag. `Fused` carries an `Arc<RopePipelines>`; `Loop` carries
+    /// `None` — mirrors `RmsNormKernel` from 1bNEW.4.
+    kernel: RopeKernel,
+    /// Shared counter Arc. `Loop` mode increments the old 9-or-10-
+    /// op count; `Fused` mode increments `+1` per dispatch to match
+    /// 1bNEW.1 / 1bNEW.4 accounting discipline.
+    counters: Arc<DispatchCounters>,
 }
 
 impl RotaryEmbedding {
@@ -311,8 +365,10 @@ impl RotaryEmbedding {
         max_seq_len: usize,
         rope_theta: f64,
         dev: &Device,
+        kernel: RopeKernel,
+        counters: Arc<DispatchCounters>,
     ) -> Result<Self> {
-        Self::build(head_dim, head_dim, max_seq_len, rope_theta, dev)
+        Self::build(head_dim, head_dim, max_seq_len, rope_theta, dev, kernel, counters)
     }
 
     fn new_partial(
@@ -321,10 +377,12 @@ impl RotaryEmbedding {
         rope_theta: f64,
         partial_rotary_factor: f64,
         dev: &Device,
+        kernel: RopeKernel,
+        counters: Arc<DispatchCounters>,
     ) -> Result<Self> {
         let rope_angles = ((partial_rotary_factor * head_dim as f64 / 2.0).floor() as usize).min(head_dim / 2);
         let rotary_dim = rope_angles * 2;
-        Self::build(head_dim, rotary_dim, max_seq_len, rope_theta, dev)
+        Self::build(head_dim, rotary_dim, max_seq_len, rope_theta, dev, kernel, counters)
     }
 
     fn build(
@@ -333,6 +391,8 @@ impl RotaryEmbedding {
         max_seq_len: usize,
         rope_theta: f64,
         dev: &Device,
+        kernel: RopeKernel,
+        counters: Arc<DispatchCounters>,
     ) -> Result<Self> {
         let half = rotary_dim / 2;
         let inv_freq: Vec<f32> = (0..half)
@@ -345,10 +405,80 @@ impl RotaryEmbedding {
         let freqs = t.matmul(&inv_freq)?;
         let sin = freqs.sin()?;
         let cos = freqs.cos()?;
-        Ok(Self { sin, cos, rotary_dim })
+        // freq_base_eff = rope_theta^(rotary_dim / head_dim). For
+        // sliding layers rotary_dim == head_dim so this degenerates
+        // to rope_theta; for global layers with partial_rotary_factor=0.5
+        // and rope_theta=1_000_000 this gives 1000.
+        let freq_base_eff = rope_theta.powf(rotary_dim as f64 / head_dim as f64) as f32;
+        Ok(Self {
+            sin,
+            cos,
+            rotary_dim,
+            head_dim,
+            freq_base_eff,
+            // Gemma 4 is always Neox. If a future non-Gemma4 caller
+            // needs Norm, add a `new_norm_variant` constructor rather
+            // than threading it through the signature (Anti-Goal #7 —
+            // no speculative flexibility).
+            variant: RopeVariant::Neox,
+            kernel,
+            counters,
+        })
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+        if self.kernel.is_fused() {
+            // ADR-005 1bNEW.6 — single Metal dispatch per Q and per K
+            // per layer. The ported `kernel_rope_neox` reads source
+            // strides from the transposed `[B,H,S,D]` view directly
+            // via `args.nb00..nb03`, so NO `.contiguous()` bounce is
+            // required on either Q or K even though `transpose(1,2)`
+            // leaves them non-contiguous. This absorbs the old
+            // 1bNEW.8 stride-aware-prelude win (ADR-005:322-326).
+            //
+            // For partial rotary (Gemma 4 global, rotary_dim=256 vs
+            // head_dim=512) we pass the FULL head_dim as ne0 and
+            // only rotary_dim as n_dims. The kernel's `i0 >= n_dims`
+            // branch copies the pass-through tail verbatim, so no
+            // narrow/cat dance is needed on the Rust side either.
+            // That's the exact code area where `project_coherence_bug.md`
+            // lived; Phase A unit tests 2 and 3 validate byte/ULP
+            // fidelity on `[1,16,1,512]` and `[1,16,128,512]`.
+            let pipelines = self.kernel.pipelines.as_ref().expect("is_fused");
+            let q_rot = rope_kernel::rope_fused(
+                pipelines,
+                q,
+                seqlen_offset,
+                self.rotary_dim,
+                self.freq_base_eff,
+                self.variant,
+            )?;
+            let k_rot = rope_kernel::rope_fused(
+                pipelines,
+                k,
+                seqlen_offset,
+                self.rotary_dim,
+                self.freq_base_eff,
+                self.variant,
+            )?;
+            // Two dispatches total for one Q + one K. The old loop
+            // path used ~10 ops (see `fetch_add(10)` at the call site
+            // below) — the per-token saving per layer is the old
+            // outside-ops count (~10) minus 2 = ~8 per layer × 30 =
+            // ~240 dispatches/token.
+            self.counters.dispatches_per_token.fetch_add(2, Ordering::Relaxed);
+            return Ok((q_rot, k_rot));
+        }
+
+        // Loop-mode dispatch accounting: the call site at
+        // `Attention::forward` used to add `+10` as a conservative
+        // upper bound; we moved the counting into this function so
+        // the fused branch can add its own `+2` and the totals stay
+        // consistent without the outside-site having to know which
+        // path ran. Preserve the `10` ops accounting for loop mode
+        // so the baseline metrics.txt numbers don't drift.
+        self.counters.dispatches_per_token.fetch_add(10, Ordering::Relaxed);
+
         let (_b, _h, seq_len, head_dim) = q.dims4()?;
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?.to_dtype(q.dtype())?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?.to_dtype(q.dtype())?;
@@ -555,11 +685,11 @@ impl Attention {
         let v = rms_norm_unit(&v, &self.counters, &self.rms_kernel)?.transpose(1, 2)?;
         self.counters.dispatches_per_token.fetch_add(3, Ordering::Relaxed);
 
-        // RoPE (apply internally calls narrow/to_dtype/contiguous/rope_apply —
-        // 6-10 ops depending on rotary_dim == head_dim). Count 10 as a
-        // conservative upper bound; we care about relative, not absolute.
+        // RoPE: `rotary_emb.apply` self-counts `+10` in loop mode
+        // (matching the pre-1bNEW.6 fetch_add here) and `+2` in
+        // fused mode. The counting moved INTO the function in
+        // 1bNEW.6 so the Attention call site is mode-agnostic.
         let (q, k) = self.rotary_emb.apply(&q, &k, seqlen_offset)?;
-        self.counters.dispatches_per_token.fetch_add(10, Ordering::Relaxed);
 
         // KV cache append — slice_scatter × 2 + narrow × 2 + contiguous × 2 = 6 ops
         let (k, v) = self.kv_cache.append(&k, &v)?;
@@ -1415,7 +1545,14 @@ impl Gemma4Model {
     /// the ADR-005 1bNEW.1 `--moe-kernel` flag.
     #[allow(dead_code)]
     pub fn load(cfg: &Gemma4Config, gguf: &GgufModel, device: &Device) -> Result<Self> {
-        Self::load_with_modes(cfg, gguf, device, MoeKernelMode::Loop, RmsKernelMode::Loop)
+        Self::load_with_modes(
+            cfg,
+            gguf,
+            device,
+            MoeKernelMode::Loop,
+            RmsKernelMode::Loop,
+            RopeKernelModeImpl::Loop,
+        )
     }
 
     /// Back-compat wrapper retained so existing callers (tests, older
@@ -1428,7 +1565,14 @@ impl Gemma4Model {
         device: &Device,
         moe_mode: MoeKernelMode,
     ) -> Result<Self> {
-        Self::load_with_modes(cfg, gguf, device, moe_mode, RmsKernelMode::Loop)
+        Self::load_with_modes(
+            cfg,
+            gguf,
+            device,
+            moe_mode,
+            RmsKernelMode::Loop,
+            RopeKernelModeImpl::Loop,
+        )
     }
 
     /// Load model from GGUF + config with explicit MoE and RmsNorm
@@ -1448,6 +1592,7 @@ impl Gemma4Model {
         device: &Device,
         moe_mode: MoeKernelMode,
         rms_norm_mode: RmsKernelMode,
+        rope_mode: RopeKernelModeImpl,
     ) -> Result<Self> {
         // ADR-005 1bNEW.0: shared dispatch counters. Every sub-structure that
         // issues candle ops holds a clone of this Arc.
@@ -1471,6 +1616,22 @@ impl Gemma4Model {
         };
         tracing::info!("RmsNorm dispatch mode: {:?}", rms_norm_mode);
 
+        // ADR-005 1bNEW.6 — compile the fused RoPE library at model
+        // load time so every forward pass sees a warm PSO (no first-
+        // call spike, matching 1bNEW.4's RmsNorm and 1bNEW.12's
+        // warmup discipline). `Loop` mode skips the compile and
+        // leaves `pipelines = None`, matching pre-1bNEW.6 exactly.
+        let rope_kernel = match rope_mode {
+            RopeKernelModeImpl::Loop => RopeKernel::loop_mode(),
+            RopeKernelModeImpl::Fused => match device {
+                Device::Metal(md) => RopeKernel::fused_mode(md)?,
+                other => anyhow::bail!(
+                    "--rope-kernel=fused requires a Metal device, got {other:?}"
+                ),
+            },
+        };
+        tracing::info!("RoPE dispatch mode: {:?}", rope_mode);
+
         // Embedding — GGUF stores as [hidden, vocab]; Candle Embedding wants [vocab, hidden]
         let embed_w = gguf.get_tensor("token_embd.weight", MODEL_DTYPE)?;
         let embed_w = if embed_w.dim(0)? == cfg.hidden_size && embed_w.dim(1)? == cfg.vocab_size {
@@ -1485,10 +1646,12 @@ impl Gemma4Model {
         let max_rope_len = cfg.max_position_embeddings.min(8192);
         let rope_sliding = Arc::new(RotaryEmbedding::new_standard(
             cfg.head_dim, max_rope_len, cfg.rope_theta_sliding, device,
+            rope_kernel.clone(), counters.clone(),
         )?);
         let rope_global = Arc::new(RotaryEmbedding::new_partial(
             cfg.global_head_dim, max_rope_len, cfg.rope_theta_global,
             cfg.partial_rotary_factor_global, device,
+            rope_kernel.clone(), counters.clone(),
         )?);
 
         // Layers
