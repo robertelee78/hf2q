@@ -285,3 +285,38 @@ Three places this spike could have been lazy and weren't:
 - Proposed 7-item roadmap 1bNEW.22-29 sequenced from low-risk smallest fusions (MoE topk, residual+norm, fan-in) through medium-risk larger fusions (RmsNorm-into-matmul, fused QKV) up to the End-gate-closing item 1bNEW.29 (port llama.cpp's hand-tuned Q-kernels for the dense projection sites). Expected combined: **96-98 tok/s after 22-28**, plus **+5 to +10 tok/s speculative from item 29** to close the End gate.
 - Pre-1bNEW.29 validation spike required: microbenchmark candle's QMatMul vs llama.cpp's `kernel_mul_mv_q4_0_f32` on the exact MLP gate_proj shape. Item 29 is justified iff llama.cpp's variant is ≥10% faster at the relevant shape on M5 Max.
 - Spike instrumentation reverted; no `src/` deltas in mainline beyond this doc.
+
+---
+
+## ADDENDUM (2026-04-11, after this report was written) — encoder-creation hypothesis empirically falsified
+
+The original draft of this spike concluded that "the 2.37 ms gap to llama.cpp is dominated by GPU per-kernel launch overhead at 2104 dispatches × ~1 μs". I tested that hypothesis directly by building a sticky-encoder vendor patch on top of `vendor/candle-metal-kernels/`:
+
+- **Patch design**: `EntryState::sticky_compute: Option<ComputeCommandEncoder>` holds the active compute encoder per pool entry. `Commands::command_encoder()` returns a `shared_clone()` (sticky=true, Drop is no-op) of the existing owner instead of creating a fresh encoder via `[commandBuffer computeCommandEncoder]`. The actual `endEncoding` happens once at `commit_swap_locked` time. Mirrors `ggml_metal_op`'s pattern at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:42-67`.
+- **Patch implementation**: ~150 LOC across `vendor/candle-metal-kernels/src/metal/{commands.rs, encoder.rs}`. Required splitting `end_encoding` into `end_metal_encoding_only()` (no semaphore signal) to avoid a deadlock with `flush()`'s `wait_until(Available)` guard. Required marking the owner-instance sticky=true to prevent double-end on Drop.
+- **Correctness verified**: 59/59 vendored candle-metal-kernels tests pass (including `commands_creation_and_encoder`, `commands_rotation_threshold`, `commands_concurrent_acquisition`); 307/307 hf2q tests pass; sourdough gate passes at 3095 byte common prefix unchanged from pre-patch.
+- **Reuse counter verification**: Added `STICKY_DEBUG_FRESH` / `STICKY_DEBUG_REUSED` atomics to confirm the sticky path was actually being taken at runtime. Per 5-run bench: **fresh=1730, reused=168232, total=169962, reuse_ratio=98.98%**. The patch is doing exactly what it claims — only ~13 fresh encoders per decode token (matches `dispatches_per_token / compute_per_buffer = 2104 / 100 ≈ 21` commit/swap cycles per token, with the rest being view-only ops that don't dispatch).
+- **Speed result**: **85.4 tok/s, identical to pre-patch (within noise envelope of 0.4 tok/s).** No measurable speedup despite 168k saved encoder creations per bench run.
+
+**Falsification math**: 168k saved `[commandBuffer computeCommandEncoder]` calls × ~50 ns each (the actual cost on Apple Silicon, evidently) = ~8 ms total saved across 5 runs = ~12 μs per decode token = **0.10% improvement, well below the 0.5 tok/s noise floor**. My pre-spike estimate of "1 μs per encoder creation" was off by a factor of ~20.
+
+**Lesson learned (mantra: measure 3x cut once)**: I should have written a 5-line microbenchmark to time `[commandBuffer computeCommandEncoder]` directly BEFORE building the 150-LOC sticky-encoder vendor patch. The microbench would have shown ~50 ns per call, made the math, and immediately falsified the hypothesis without burning hours on the patch implementation. **Cost of skipping the microbench: ~3 hours of patch work + this addendum.** I have updated my mental model accordingly: on Apple Silicon Metal, encoder creation is essentially free.
+
+**Patch reverted**: `git checkout HEAD -- vendor/candle-metal-kernels/src/metal/{commands.rs, encoder.rs}` returns the vendored files to the post-1bNEW.21 baseline (with `compute_per_buffer = 100`). The sticky encoder code does not ship.
+
+**Where the 2.37 ms gap actually lives** (revised hypothesis ranking):
+
+1. **Per-kernel GPU compute time** — kernel implementation efficiency. The most likely bucket. llama.cpp's hand-tuned `kernel_mul_mv_q4_0_f32` and `kernel_mul_mv_q6_K_f32` may achieve higher effective M5 Max bandwidth than candle's MLX-derived `call_quantized_matmul_mv_t` path on the specific shapes hf2q dispatches. To verify, run llama-bench in verbose mode + Xcode Instruments → Metal System Trace on llama.cpp running the same canonical bench, extract per-kernel times, compare to hf2q bracketed at the same call sites. This is the original 1bNEW.29 candidate but now with much higher confidence it's the actual lever.
+2. **GPU command buffer commit latency** — each `MTLCommandBuffer::commit()` call schedules work to the GPU. Maybe llama.cpp pays less per-commit cost. Hard to test without per-commit timing in candle. The 1bNEW.21 buffer-tuning sweep already explored this and found 100 dispatches/buffer optimal — going larger or smaller regressed.
+3. **Sampler windowed drain overhead** — at 33 sampler syncs per 127 forwards (1bNEW.3 windowed pattern), each sync is a `flush_and_wait` that drains the entire pool. Maybe llama.cpp doesn't have this pattern. Worth a one-shot experiment: bypass the windowed drain (force per-token sync) and re-bench. If parity, drain is irrelevant. If regression, drain is helping by an unexpected amount.
+4. **GPU memory bandwidth saturation** — kernel access patterns. Same as #1 but specifically about memory layout. Subset of #1.
+
+The next concrete next-spike action is **#1 — per-kernel timing comparison via Xcode Instruments / ggml-metal verbose mode**. Until that data lands, any further kernel-port work is speculation built on a hypothesis that has now been falsified once already.
+
+**Updated 1bNEW.22-29 roadmap status**: The original 22-28 dispatch-count-reduction items lose much of their projected gain (the +6 tok/s envelope was based on dispatch count → CPU+GPU launch overhead reduction; with encoder creation falsified as the GPU lever, the realistic envelope drops to +1 to +3 tok/s). Item 29 (port llama.cpp Q-kernels) becomes the *only* identified path to closing the End gate, but it requires the per-kernel timing measurement first to confirm the kernels are actually faster on M5 Max at hf2q's shapes.
+
+**Honest current End-gate status**: under Walk discipline with the existing data, hf2q has **no identified +20 tok/s lever**. The path to 107 requires either:
+(a) the per-kernel measurement showing llama.cpp's Q-kernels are substantially faster at hf2q's shapes, justifying a kernel port (1bNEW.29-style), or
+(b) a structural change in how candle dispatches work (e.g., command-buffer-per-forward, novel kernel fusion patterns) that does NOT have a direct reference in either llama.cpp or mlx-lm — which would be Run scope under the sharpened Walk/Run definition.
+
+**Pre-spike microbenchmarks now mandatory** for any further candidate items. Costing: ~30 min per microbench, vs ~3 hours per refuted patch. The mantra discipline is non-negotiable from this point.
