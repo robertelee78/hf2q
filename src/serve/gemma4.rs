@@ -1263,16 +1263,18 @@ impl Gemma4Model {
                 expert_down.push(QMatMul::from_arc(dn_qtensor)?);
             }
 
-            // ADR-005 1bNEW.1 Phase B: decide this layer's MoE mode.
+            // ADR-005 1bNEW.1 Phase C: every layer runs the fused path.
             //
-            // Phase B gate: `Fused` model-wide means layer 0 ONLY; every
-            // other layer stays on `Loop` so the comparison fixture can
-            // bisect a single-layer change. Phase C will drop the `== 0`
-            // check (see the C commit for the widened condition).
+            // Phase B gated on `i == 0` to bisect a single-layer change;
+            // with Phase B token-matched bit-exact (top-1 preserved,
+            // top-10 Δ ≤ 1.5e-5), Phase C widens the gate to every layer.
+            // The per-layer `Fused` branch is a trivial identity map now,
+            // but the match is kept so future phases (e.g. skip global
+            // attention layers, conditional fusion) can revert to a
+            // per-layer decision without changing the call sites.
             let layer_mode = match moe_mode {
                 MoeKernelMode::Loop => MoeKernelMode::Loop,
-                MoeKernelMode::Fused if i == 0 => MoeKernelMode::Fused,
-                MoeKernelMode::Fused => MoeKernelMode::Loop,
+                MoeKernelMode::Fused => MoeKernelMode::Fused,
             };
 
             // Optionally construct the 3D fused weight storages. We only

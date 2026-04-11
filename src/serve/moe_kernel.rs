@@ -119,28 +119,42 @@ pub struct MoeDispatchShape {
 #[allow(dead_code)]
 fn bytes_per_expert(dtype: GgmlDType, n: usize, k: usize) -> usize {
     // row_elems * (type_size / block_size); multiply by n rows.
-    // Values copied verbatim from llama.cpp ggml-common.h so the numbers
-    // are traceable to a reference file.
+    // Values cross-checked against candle-core's k_quants.rs compile-time
+    // asserts (lines 63-170) and llama.cpp's ggml-common.h — the two
+    // references agree by construction since candle vendored from ggml.
     let (block_size, type_size) = match dtype {
-        // ggml-common.h: `#define QK_K 256`, `sizeof(block_q6_K) == 210`
-        GgmlDType::Q6K => (256, 210),
-        // ggml-common.h: `#define QK8_0 32`, `sizeof(block_q8_0) == 34`
+        // k_quants.rs:63 — `sizeof(BlockQ4_0) == 18` (QK=32)
+        GgmlDType::Q4_0 => (32, 18),
+        // k_quants.rs:72 — `sizeof(BlockQ4_1) == 20`
+        GgmlDType::Q4_1 => (32, 20),
+        // k_quants.rs:81 — `sizeof(BlockQ5_0) == 22`
+        GgmlDType::Q5_0 => (32, 22),
+        // k_quants.rs:91 — `sizeof(BlockQ5_1) == 24`
+        GgmlDType::Q5_1 => (32, 24),
+        // k_quants.rs:99 — `sizeof(BlockQ8_0) == 34`
         GgmlDType::Q8_0 => (32, 34),
-        // Include Q4K/Q5K for completeness even though Gemma 4 experts are
-        // Q6K/Q8_0; the fused path is type-generic and the kernel is already
-        // compiled for them.
-        // ggml-common.h: `sizeof(block_q4_K) == 144`  (K_SCALE_SIZE=12 + 2*2 + 128)
+        // k_quants.rs:108 — `sizeof(BlockQ8_1) == 36`
+        GgmlDType::Q8_1 => (32, 36),
+        // k_quants.rs:118 — Q2K = QK_K/16 + QK_K/4 + 4  (QK_K=256)
+        GgmlDType::Q2K => (256, 84),
+        // k_quants.rs:128 — Q3K = QK_K/8 + QK_K/4 + 12 + 2
+        GgmlDType::Q3K => (256, 110),
+        // k_quants.rs:139 — Q4K = QK_K/2 + K_SCALE_SIZE(12) + 4
         GgmlDType::Q4K => (256, 144),
-        // ggml-common.h: `sizeof(block_q5_K) == 176`  (K_SCALE_SIZE=12 + 2*2 + 32 + 128)
+        // k_quants.rs:151 — Q5K = QK_K/8 + QK_K/2 + 4 + K_SCALE_SIZE(12)
         GgmlDType::Q5K => (256, 176),
+        // k_quants.rs:161 — Q6K = 3*QK_K/4 + QK_K/16 + 2
+        GgmlDType::Q6K => (256, 210),
+        // k_quants.rs:170 — Q8K = 4 + QK_K + 2*QK_K/16
+        GgmlDType::Q8K => (256, 292),
         other => {
-            // Any other quant type is either (a) not used by hf2q today, or
-            // (b) requires measuring the correct `type_size` against the
-            // llama.cpp ggml-common.h values before being added here. Per
-            // Anti-Goal #7 (no stubs), refuse rather than guess.
+            // No kernel_mul_mv_id_* symbol exists for F16/BF16/F32 in
+            // candle's vendored quantized.metal (only the quant block
+            // variants are templated). Per Anti-Goal #7 (no stubs),
+            // refuse rather than guess.
             panic!(
                 "moe_kernel::bytes_per_expert: dtype {other:?} not supported. \
-                 Add the (block_size, type_size) pair with a ggml-common.h citation \
+                 Add the (block_size, type_size) pair with a k_quants.rs citation \
                  before dispatching."
             );
         }

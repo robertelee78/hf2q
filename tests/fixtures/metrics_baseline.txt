@@ -26,3 +26,43 @@ moe_to_vec2_count: 60.00
 moe_dispatches_per_layer: 104.00
 sampler_sync_count: 1.01
 norm_dispatches_per_token: 3521.00
+
+# ============================================================
+# ADR-005 1bNEW.1 Phase C — fused MoE kernel for all 30 layers
+# Captured 2026-04-10, commit queued (Phase C)
+# Invocation: `--moe-kernel=fused --benchmark --max-tokens 128`
+# Loop-mode baseline above is the comparison point; every Phase
+# C run was preceded by a loop-mode sanity run to guard against
+# kernel-cache warmup skew.
+# ============================================================
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 36.78
+p95_tok_per_sec: 36.82
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 717933
+total_moe_to_vec2: 0
+total_moe_dispatches: 160020
+moe_layer_invocations: 3810
+total_sampler_sync: 128
+total_norm_dispatches: 447167
+
+# Per-token averages — Phase C fused path
+dispatches_per_token: 5653.02
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 42.00
+sampler_sync_count: 1.01
+norm_dispatches_per_token: 3521.00
+
+# Phase C deltas vs baseline:
+#   tok/s median      23.76 → 36.78   (+54.8%)
+#   moe_to_vec2       60.00 → 0.00    (−60, every routing sync eliminated)
+#   moe_per_layer    104.00 → 42.00   (−62, sequential CPU loop → fused)
+#   dispatches/token 7513   → 5653    (−1860, −24.8%)
+#   sampler_sync_count unchanged — owned by 1bNEW.3
+#   norm_dispatches_per_token unchanged — owned by 1bNEW.4
