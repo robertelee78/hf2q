@@ -410,3 +410,123 @@ norm_dispatches_per_token: 331.00
 #      - decode_at_offset_42          [1,16,1,256]@42 max|Δ|=3.400e-6
 #      - prefill_partial_generic      [1,16,32,256]   max|Δ|=1.937e-6
 #      - norm_variant_interleaved     [1,8,1,64]      max|Δ|=0.000e0 (bit-exact)
+
+
+# ADR-005 1bNEW.17 — Phase C (default = fused F16 lm_head)
+# Phase A commit 0565c69, Phase B commit 0e36b1c, Phase C (this section)
+# Captured 2026-04-10 post default-flip canonical bench.
+# `--lm-head-kernel=fused` is now the default; `loop` retained as
+# bisect fallback.
+#
+# Ports llama.cpp `build_lm_head` at
+# `/opt/llama.cpp/src/models/gemma4-iswa.cpp:248` on the tied-
+# embedding path (`llama-model.cpp:4973-5610`). Replaces the dense
+# F32 matmul at `gemma4.rs:1879` with a native F16 gemm against a
+# parallel 1.48 GB F16 copy of `token_embd.weight`, dispatched via
+# candle's existing `call_mlx_gemm` GemmDType::F16 path at
+# `candle-core/src/metal_backend/mod.rs:1695-1709` — no new Metal
+# kernel.
+model: gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+hardware: Apple M5 Max, 128 GB
+prompt_tokens: 187
+max_tokens: 128
+runs: 5
+median_tok_per_sec: 58.51
+p95_tok_per_sec: 58.57
+
+# Raw totals over the decode loop (127 forward calls)
+forward_count: 127
+total_dispatches: 278704
+total_moe_to_vec2: 0
+total_moe_dispatches: 129540
+moe_layer_invocations: 3810
+total_sampler_sync: 33
+total_norm_dispatches: 42037
+
+# Per-token averages — Phase C default = fused F16 lm_head
+dispatches_per_token: 2194.52
+moe_to_vec2_count: 0.00
+moe_dispatches_per_layer: 34.00
+sampler_sync_count: 0.26
+norm_dispatches_per_token: 331.00
+
+# 1bNEW.17 Phase C deltas vs 1bNEW.6 Phase C baseline:
+#   tok/s median       48.71   → 58.51   (+9.80 tok/s, +20.1%)
+#   p95                48.78   → 58.57   (+9.79 tok/s, +20.1%)
+#   dispatches/token   2192.52 → 2194.52 (+2 exactly — bookkeeping
+#                                          from the F32→F16 and F16→F32
+#                                          casts around the matmul; no
+#                                          new weight traffic)
+#   total_dispatches   278450  → 278704  (+254 = +2 × 127 forwards)
+#   norm_dispatches    331     → 331     unchanged — owned by 1bNEW.4
+#   moe_to_vec2        0       → 0       unchanged — owned by 1bNEW.1
+#   sampler_sync       33      → 33      unchanged — owned by 1bNEW.3
+#   moe_dispatches/layer 34    → 34      unchanged — owned by 1bNEW.1
+#
+# The +9.80 tok/s speedup maps cleanly onto the bandwidth-bound
+# prediction from the post-Walk re-spike:
+#   lm_head F32 path: 262144 × 2816 × 4 bytes = 2.95 GB / token
+#   lm_head F16 path: 262144 × 2816 × 2 bytes = 1.48 GB / token
+#   bandwidth saving: 1.47 GB / token
+#   at ~400 GB/s M5 Max effective: ~3.67 ms/token
+#   projected: 1000 / (20.48 − 3.67) = 59.5 tok/s
+#   measured:  58.51 tok/s (within 2% of projection)
+#
+# The ADR-005 1bNEW.17 item text (pre-landing) projected ~67 tok/s
+# under a Q6_K assumption. Empirically `token_embd.weight` in the
+# Gemma 4 DWQ GGUF is F16, not Q6_K — verified via gguf.GGUFReader
+# reporting `n_bytes=1_476_395_008` (exact 262144 × 2816 × 2 match).
+# There is no `output.weight` tensor in the GGUF either, so llama.cpp
+# falls back to tied embeddings at `llama-model.cpp:4973-5610` and
+# reads the same F16 tensor at its own lm_head site. The F16-vs-Q6_K
+# gap is a spike measurement error, not a plan change. Still the
+# single biggest remaining Walk-faithful lift in Phase 1b.
+#
+# Phase C correctness gates (all passed, 2026-04-10):
+#   1. Loop-mode bisect safety: 5-run bench at `--lm-head-kernel=loop`
+#      produces 48.8/48.7/48.7/48.7/48.7 tok/s — median 48.7, p95 48.8,
+#      byte-flat vs the pre-1bNEW.17 baseline (48.71 tok/s). The loop
+#      fallback is the authoritative byte-match path for any future
+#      bisect.
+#   2. Fused mode top-1 at decode 1: `The` (818) — preserved.
+#      Top-10 ID set AND order byte-identical to the 1bNEW.6 Phase C
+#      baseline. Per-position logit drift ≤ 3.2e-3 (well within the
+#      0.5 Phase B envelope). The `The`/`To` gap grew from +0.77016
+#      (loop) to +0.77102 (fused) — delta +0.00086 toward `The`,
+#      the direction OPPOSITE to llama.cpp's `To`. The F16 reduction-
+#      order shift did NOT flip the argmax. Walk-correctness drift
+#      owner is NOT the lm_head.
+#   3. `The`/`To` gap progression:
+#        1bNEW.4 loop    +0.7451
+#        1bNEW.4 fused   +0.7552
+#        1bNEW.6 fused   +0.7701
+#        1bNEW.17 fused  +0.77102  (this item, nearly flat vs 1bNEW.6)
+#      The lm_head F16 port is NOT the drift owner — the gap is
+#      essentially identical pre- and post-landing. The drift owner
+#      is most likely the BF16 prefill SDPA path (1bNEW.10) or the
+#      per-layer residual accumulation convention (see Walk Exception
+#      Register). 1bNEW.17 is a pure speed win, not the two-for-one
+#      the ADR text hoped for.
+#   4. gen128 byte-identical between loop and fused modes: YES.
+#      Both modes produce:
+#        "The evolution of computing—from mechanical calculators to
+#         the transistor-based microprocessor—is not merely a linear
+#         progression of speed; it is a journey of moving from
+#         **general-purpose logic** to **specialized mathematical
+#         throughput**.\n\nTo understand how modern GPU (Graphics
+#         Processing Unit) architectures for LLMs (Large Language
+#         Models) are rooted in this history, we must trace the
+#         lineage of specific architectural decisions.\n\n### 1.
+#         From General Logic to Parallelism (The Von Neumann Legacy)
+#         \nThe transition from the-room-sized-vacuum-tube machines
+#         to the microprocessor was driven by the need to solve the
+#         \"Von Neumann bottleneck.\" John"
+#   5. 5-run variance ≈ 0.1 tok/s (58.5–58.6) — deterministic.
+#   6. 827-token adversarial recall (`Melthorn-by-the-Sea` needle):
+#      PRESERVED — fused mode outputs `Melthorn-by-the-Sea<turn|>`
+#      byte-identically. Confirms F16 lm_head has no adverse
+#      interaction with long-context attention.
+#   7. Phase A unit tests continue to pass at ε=1e-3:
+#      - lm_head_f16_matches_f32_single_token    max|Δ|=3.402e-4, argmax OK
+#      - lm_head_f16_matches_f32_multi_token     max|Δ|=3.402e-4, argmax OK
+#      - lm_head_f16_rejects_wrong_dtypes        guardrails OK

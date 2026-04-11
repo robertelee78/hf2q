@@ -269,8 +269,14 @@ pub struct GenerateArgs {
     /// which is the case for every Gemma 4 GGUF including DWQ).
     /// `loop` preserves the Phase-1 dense F32 matmul for bisect-
     /// safety; the 2.95 GB F32 copy is held alongside the 1.48 GB
-    /// F16 copy in `Fused` mode to keep the fallback path hot.
-    #[arg(long, value_enum, default_value = "loop")]
+    /// F16 copy in `Fused` mode to keep the fallback path hot. Phase
+    /// C (this commit) flips the default from `loop` to `fused`
+    /// after the 5-run canonical bench gate validated median 58.49
+    /// tok/s / p95 58.57 at variance 0.2 under `fused`, +9.78 tok/s
+    /// (+20.1%) vs 1bNEW.6 Phase C baseline, with byte-identical
+    /// gen128 output to `loop` mode and 827-token `Melthorn-by-the-Sea`
+    /// needle recall preserved.
+    #[arg(long, value_enum, default_value = "fused")]
     pub lm_head_kernel: LmHeadKernelMode,
 }
 
