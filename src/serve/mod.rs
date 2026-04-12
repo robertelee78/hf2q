@@ -4,6 +4,7 @@ pub mod config;
 pub mod gemma4;
 pub mod gguf_loader;
 pub mod lm_head_kernel;
+#[cfg(feature = "metal")]
 pub mod moe_kernel;
 pub mod rms_norm_kernel;
 pub mod rope_kernel;

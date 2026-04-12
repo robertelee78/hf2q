@@ -118,9 +118,13 @@
 //!   bubble up verbatim; the caller (`RotaryEmbedding::apply`)
 //!   holds the `loop` vs `fused` mode knob.
 
+#[cfg(feature = "metal")]
 use anyhow::{anyhow, Result};
+#[cfg(feature = "metal")]
 use candle_core::{DType, Device, MetalDevice, Storage, Tensor};
+#[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
+#[cfg(feature = "metal")]
 use objc2_metal::{MTLResourceUsage, MTLSize};
 use std::sync::Arc;
 
@@ -143,6 +147,7 @@ use std::sync::Arc;
 ///     threadgroup grid walk, the per-i0 branch (`i0 < n_dims` rotate
 ///     / `i0 >= n_dims` pass-through), and the `rope_yarn*` helpers
 ///     are copied verbatim.
+#[cfg(feature = "metal")]
 const ROPE_MSL: &str = r#"
 #include <metal_stdlib>
 
@@ -360,6 +365,7 @@ template [[host_name("hf2q_rope_neox_f32")]] kernel kernel_rope_neox_t kernel_ro
 /// and `sect_*` fields are passed through for faithfulness but
 /// effectively dead at every Gemma 4 call site (we do not use MRoPE
 /// and n_past is only used by host-side validation).
+#[cfg(feature = "metal")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct RopeArgs {
@@ -402,6 +408,7 @@ struct RopeArgs {
 /// first forward pass never pays a cold-compile spike (matches the
 /// 1bNEW.4 RmsNorm pattern and the 1bNEW.12 extended warmup
 /// discipline).
+#[cfg(feature = "metal")]
 pub struct RopePipelines {
     _library: Library,
     /// `kernel_rope_norm<float>` — GPT-J interleaved-pair variant.
@@ -410,6 +417,9 @@ pub struct RopePipelines {
     /// live path for Gemma 4.
     pipe_neox_f32: ComputePipeline,
 }
+
+#[cfg(not(feature = "metal"))]
+pub struct RopePipelines;
 
 /// Per-model switch for the RoPE dispatch path. `Loop` preserves the
 /// 9-op manual `rope_apply` chain from `gemma4.rs::RotaryEmbedding`
@@ -435,7 +445,9 @@ pub enum RopeKernelMode {
 /// `None` and pays no compile cost.
 #[derive(Clone)]
 pub struct RopeKernel {
+    #[allow(dead_code)]
     pub mode: RopeKernelMode,
+    #[allow(dead_code)]
     pub pipelines: Option<Arc<RopePipelines>>,
 }
 
@@ -451,6 +463,7 @@ impl RopeKernel {
     /// once. Safe to call many times but the hf2q load path calls
     /// it exactly once per model and clones the resulting `Arc` into
     /// every `RotaryEmbedding`.
+    #[cfg(feature = "metal")]
     pub fn fused_mode(metal_device: &MetalDevice) -> Result<Self> {
         Ok(Self {
             mode: RopeKernelMode::Fused,
@@ -458,11 +471,13 @@ impl RopeKernel {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_fused(&self) -> bool {
         matches!(self.mode, RopeKernelMode::Fused) && self.pipelines.is_some()
     }
 }
 
+#[cfg(feature = "metal")]
 impl RopePipelines {
     /// Compile the MSL source and instantiate both pipeline symbols.
     pub fn new(metal_device: &MetalDevice) -> Result<Self> {
@@ -495,10 +510,14 @@ impl RopePipelines {
 /// current model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeVariant {
+    /// GPT-J interleaved-pair variant. Not used by Gemma 4 but compiled
+    /// for completeness; may be needed by future model families.
+    #[allow(dead_code)]
     Norm,
     Neox,
 }
 
+#[cfg(feature = "metal")]
 fn metal_device_of(device: &Device) -> Result<MetalDevice> {
     match device {
         Device::Metal(md) => Ok(md.clone()),
@@ -547,6 +566,7 @@ fn metal_device_of(device: &Device) -> Result<MetalDevice> {
 /// uses `freq_factor = 1.0` (identity division). This is the
 /// ADR-005 1bNEW.18 `rope_freqs.weight` port — see
 /// `docs/spike-C-results.md` Parts 3-5 for the root cause analysis.
+#[cfg(feature = "metal")]
 pub fn rope_fused(
     pipelines: &RopePipelines,
     input: &Tensor,
@@ -922,7 +942,7 @@ pub fn rope_fused(
 // Run with:
 //   `cargo test --features metal --release -p hf2q -- rope_kernel::tests --nocapture`
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::*;
     use candle_core::Device as CoreDevice;

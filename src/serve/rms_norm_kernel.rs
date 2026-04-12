@@ -67,9 +67,13 @@
 //!   because it feeds a residual add or a parallel branch, so we never
 //!   exercise the in-place path and never wrote the knob for it.
 
+#[cfg(feature = "metal")]
 use anyhow::{anyhow, Result};
+#[cfg(feature = "metal")]
 use candle_core::{DType, Device, MetalDevice, Storage, Tensor};
+#[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{Buffer, ComputePipeline, Library};
+#[cfg(feature = "metal")]
 use objc2_metal::{MTLResourceUsage, MTLSize};
 use std::sync::Arc;
 
@@ -90,6 +94,7 @@ use std::sync::Arc;
 /// template (mean-centered variant) that shares the same args struct —
 /// hf2q does not use it, and keeping this source short keeps the
 /// runtime compile time low.
+#[cfg(feature = "metal")]
 const RMS_NORM_FUSE_MSL: &str = r#"
 #include <metal_stdlib>
 
@@ -221,6 +226,7 @@ template [[host_name("hf2q_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fus
 /// direct `set_bytes(0, &kargs)` binds a layout the Metal compiler
 /// understands. Cross-checked against the C struct field-by-field — the
 /// `[3]` arrays pack identically under C and `#[repr(C)]` Rust.
+#[cfg(feature = "metal")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct RmsNormKargs {
@@ -255,6 +261,7 @@ struct RmsNormKargs {
 /// load time so each call site holds a direct reference to the six
 /// pipelines without walking through a `RwLock` or the candle kernel
 /// cache.
+#[cfg(feature = "metal")]
 pub struct RmsNormPipelines {
     _library: Library,
     pipe_f32_1: ComputePipeline,
@@ -264,6 +271,9 @@ pub struct RmsNormPipelines {
     pipe_f32_4_2: ComputePipeline,
     pipe_f32_4_3: ComputePipeline,
 }
+
+#[cfg(not(feature = "metal"))]
+pub struct RmsNormPipelines;
 
 /// Per-model switch for the RmsNorm dispatch path. `Loop` preserves the
 /// 11/9-op manual candle chain from `gemma4.rs::RmsNorm::forward` and
@@ -292,7 +302,9 @@ pub enum RmsNormKernelMode {
 /// once at model-load time.
 #[derive(Clone)]
 pub struct RmsNormKernel {
+    #[allow(dead_code)]
     pub mode: RmsNormKernelMode,
+    #[allow(dead_code)]
     pub pipelines: Option<Arc<RmsNormPipelines>>,
 }
 
@@ -310,6 +322,7 @@ impl RmsNormKernel {
     /// idempotent per-device per-source but we nevertheless call this
     /// exactly once at `Gemma4Model::load_with_modes` and clone the
     /// resulting `Arc` into every sub-structure.
+    #[cfg(feature = "metal")]
     pub fn fused_mode(metal_device: &MetalDevice) -> Result<Self> {
         Ok(Self {
             mode: RmsNormKernelMode::Fused,
@@ -317,11 +330,13 @@ impl RmsNormKernel {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_fused(&self) -> bool {
         matches!(self.mode, RmsNormKernelMode::Fused) && self.pipelines.is_some()
     }
 }
 
+#[cfg(feature = "metal")]
 impl RmsNormPipelines {
     /// Compile the MSL source and instantiate all six pipeline symbols.
     ///
@@ -361,6 +376,7 @@ impl RmsNormPipelines {
 /// `anyhow::Error` when the device is not Metal — the caller is
 /// responsible for never invoking this on CPU/CUDA tensors. Every hf2q
 /// RmsNorm site runs on Metal (1b.4 forced the forward pass to Metal-only).
+#[cfg(feature = "metal")]
 fn metal_device_of(device: &Device) -> Result<MetalDevice> {
     match device {
         Device::Metal(md) => Ok(md.clone()),
@@ -394,6 +410,7 @@ fn metal_device_of(device: &Device) -> Result<MetalDevice> {
 /// via a `&DispatchCounters` handle passed by the caller. The caller
 /// must NOT also increment the counters for ops the manual chain used
 /// to do — this dispatch is one dispatch, full stop.
+#[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_fused(
     pipelines: &RmsNormPipelines,
@@ -688,7 +705,7 @@ pub fn rms_norm_fused(
 // with `--features metal` and run with
 //   `cargo test --features metal --release -p hf2q -- rms_norm_kernel::tests --nocapture`
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::*;
     use candle_core::Device as CoreDevice;

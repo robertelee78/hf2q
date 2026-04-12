@@ -14,9 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::config::Gemma4Config;
 use super::gguf_loader::GgufModel;
 use super::lm_head_kernel::{self, LmHeadKernelMode as LmHeadKernelModeImpl};
+#[cfg(feature = "metal")]
 use super::moe_kernel;
-use super::rms_norm_kernel::{self, RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
-use super::rope_kernel::{self, RopeKernel, RopeKernelMode as RopeKernelModeImpl, RopeVariant};
+#[cfg(feature = "metal")]
+use super::rms_norm_kernel;
+use super::rms_norm_kernel::{RmsNormKernel, RmsNormKernelMode as RmsKernelMode};
+#[cfg(feature = "metal")]
+use super::rope_kernel;
+use super::rope_kernel::{RopeKernel, RopeKernelMode as RopeKernelModeImpl, RopeVariant};
 
 // ADR-005 1bNEW.1 — type alias for the quantized dtype tag used by
 // `call_quantized_matmul_mv_id_t`. Kept in sync with candle-core's
@@ -245,7 +250,9 @@ struct RmsNorm {
     counters: Arc<DispatchCounters>,
     /// ADR-005 1bNEW.4: per-site dispatch mode plumbed from the CLI
     /// `--rms-norm-kernel` flag. `Fused` carries an `Arc<RmsNormPipelines>`;
-    /// `Loop` carries `None`.
+    /// `Loop` carries `None`. Kept alive for `Arc` reference counting
+    /// even when the fused path is cfg-gated out.
+    #[allow(dead_code)]
     kernel: RmsNormKernel,
 }
 
@@ -260,6 +267,7 @@ impl RmsNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
         if self.kernel.is_fused() {
             // ADR-005 1bNEW.4 — single dispatch replaces the 11-op chain.
             // Caller must hand in an F32 contiguous input; every hf2q
@@ -320,6 +328,7 @@ impl RmsNorm {
         x: &Tensor,
         residual: &Tensor,
     ) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
         if self.kernel.is_fused() {
             let pipelines = self.kernel.pipelines.as_ref().expect("is_fused");
             let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
@@ -395,6 +404,7 @@ struct RotaryEmbedding {
     /// kernel path passes this verbatim as `freq_base` to the ported
     /// `kernel_rope_neox`, which computes
     /// `theta = pos * pow(freq_base, -i0/n_dims) / freq_factor`.
+    #[allow(dead_code)]
     rope_theta: f32,
     /// Global-layer frequency mask loaded from `rope_freqs.weight`.
     /// Shape `[head_dim/2]` F32 on device, populated on global
@@ -404,16 +414,19 @@ struct RotaryEmbedding {
     /// Reference: `/opt/llama.cpp/src/models/gemma4-iswa.cpp:55-59`
     /// — `freq_factors = model.layers[il].rope_freqs` on non-SWA
     /// layers only.
+    #[allow(dead_code)]
     freq_factors: Option<Tensor>,
     /// Which RoPE pair layout this instance dispatches. Gemma 4 is
     /// always `Neox` (llama.cpp's split-half `LLAMA_ROPE_TYPE_NEOX`
     /// at `src/llama-model.cpp:9134`). Stored as a struct field so
     /// future model families using GPT-J interleaved rotation can
     /// share the same pipelines via `RopeVariant::Norm`.
+    #[allow(dead_code)]
     variant: RopeVariant,
     /// Per-site dispatch mode plumbed from the CLI `--rope-kernel`
     /// flag. `Fused` carries an `Arc<RopePipelines>`; `Loop` carries
     /// `None` — mirrors `RmsNormKernel` from 1bNEW.4.
+    #[allow(dead_code)]
     kernel: RopeKernel,
     /// Shared counter Arc. `Loop` mode increments the old 9-or-10-
     /// op count; `Fused` mode increments `+1` per dispatch to match
@@ -535,6 +548,7 @@ impl RotaryEmbedding {
     }
 
     fn apply(&self, q: &Tensor, k: &Tensor, seqlen_offset: usize) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "metal")]
         if self.kernel.is_fused() {
             // ADR-005 1bNEW.6 — single Metal dispatch per Q and per K
             // per layer. The ported `kernel_rope_neox` reads source
@@ -1196,6 +1210,7 @@ fn rms_norm_unit(
     counters: &Arc<DispatchCounters>,
     kernel: &RmsNormKernel,
 ) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
     if kernel.is_fused() {
         let pipelines = kernel.pipelines.as_ref().expect("is_fused");
         let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
@@ -1210,6 +1225,7 @@ fn rms_norm_unit(
         counters.dispatches_per_token.fetch_add(1, Ordering::Relaxed);
         return Ok(out);
     }
+    let _ = &kernel; // suppress unused-variable warning when metal is off
 
     let dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
@@ -1261,7 +1277,9 @@ struct MoeBlock {
     router_scale: Tensor,
     /// Per-expert scale applied to selected weights after softmax.
     /// Used by the `Fused` path (GPU gather by top_k_indices); the `Loop`
-    /// path reads `per_expert_scale_cpu` instead.
+    /// path reads `per_expert_scale_cpu` instead. Kept alive for
+    /// `Arc` reference counting even when the fused path is cfg-gated out.
+    #[allow(dead_code)]
     per_expert_scale: Tensor,
     /// Cached CPU copy of per_expert_scale (avoids GPU→CPU sync every forward).
     /// Used ONLY by the `Loop` path. The `Fused` path gathers from the
@@ -1271,6 +1289,7 @@ struct MoeBlock {
     /// 3D GGUF source tensor).
     expert_gate_up: Vec<QMatMul>,
     expert_down: Vec<QMatMul>,
+    #[allow(dead_code)]
     num_experts: usize,
     top_k: usize,
     moe_intermediate_size: usize,
@@ -1826,6 +1845,9 @@ pub struct Gemma4Model {
     lm_head_mode: LmHeadKernelModeImpl,
     hidden_size: usize,
     final_logit_softcapping: Option<f64>,
+    /// Retained for `Arc` reference counting — the Metal device handle
+    /// may be needed during future mlx-native migration (Phase 5).
+    #[allow(dead_code)]
     device: Device,
     counters: Arc<DispatchCounters>,
     /// ADR-005 1bNEW.4 — retained handle to the runtime-compiled
@@ -1920,12 +1942,17 @@ impl Gemma4Model {
         // manual chain unchanged.
         let rms_kernel = match rms_norm_mode {
             RmsKernelMode::Loop => RmsNormKernel::loop_mode(),
+            #[cfg(feature = "metal")]
             RmsKernelMode::Fused => match device {
                 Device::Metal(md) => RmsNormKernel::fused_mode(md)?,
                 other => anyhow::bail!(
                     "--rms-norm-kernel=fused requires a Metal device, got {other:?}"
                 ),
             },
+            #[cfg(not(feature = "metal"))]
+            RmsKernelMode::Fused => anyhow::bail!(
+                "--rms-norm-kernel=fused requires the metal feature"
+            ),
         };
         tracing::info!("RmsNorm dispatch mode: {:?}", rms_norm_mode);
 
@@ -1936,12 +1963,17 @@ impl Gemma4Model {
         // leaves `pipelines = None`, matching pre-1bNEW.6 exactly.
         let rope_kernel = match rope_mode {
             RopeKernelModeImpl::Loop => RopeKernel::loop_mode(),
+            #[cfg(feature = "metal")]
             RopeKernelModeImpl::Fused => match device {
                 Device::Metal(md) => RopeKernel::fused_mode(md)?,
                 other => anyhow::bail!(
                     "--rope-kernel=fused requires a Metal device, got {other:?}"
                 ),
             },
+            #[cfg(not(feature = "metal"))]
+            RopeKernelModeImpl::Fused => anyhow::bail!(
+                "--rope-kernel=fused requires the metal feature"
+            ),
         };
         tracing::info!("RoPE dispatch mode: {:?}", rope_mode);
         // ADR-005 1bNEW.20 — KV cache append mode is a pure selector
