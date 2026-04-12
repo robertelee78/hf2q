@@ -275,6 +275,15 @@ pub struct MlxMoeWeights {
     /// Per-expert down projection: Vec of MlxQWeight, one per expert.
     /// Each expert's down is `[hidden_size, moe_intermediate_size]`.
     pub expert_down: Vec<MlxQWeight>,
+    /// Stacked gate_up weights: all experts concatenated into `[n_experts, N, packed_K]`.
+    /// Used for the fused `quantized_matmul_id_ggml` dispatch.
+    pub stacked_gate_up: Option<MlxBuffer>,
+    /// Stacked down weights: all experts concatenated into `[n_experts, N, packed_K]`.
+    pub stacked_down: Option<MlxBuffer>,
+    /// Byte stride between expert slices in the stacked gate_up buffer.
+    pub gate_up_expert_stride: u64,
+    /// Byte stride between expert slices in the stacked down buffer.
+    pub down_expert_stride: u64,
     /// Router projection weight (quantized).
     pub router_proj: MlxQWeight,
     /// Router learned scale `[hidden_size]` F32.
@@ -395,6 +404,14 @@ pub struct MlxActivationBuffers {
     pub moe_softmax_params: MlxBuffer,
     /// MoE scratch: norm output for router `[1, hidden_size]` F32.
     pub moe_norm_out: MlxBuffer,
+    /// MoE scratch: expert ids buffer for _id kernel `[top_k]` U32.
+    pub moe_expert_ids: MlxBuffer,
+    /// MoE scratch: gate_up _id output `[top_k, 2*moe_intermediate]` F32.
+    pub moe_gate_up_id_out: MlxBuffer,
+    /// MoE scratch: down _id output `[top_k, hidden_size]` F32.
+    pub moe_down_id_out: MlxBuffer,
+    /// MoE scratch: swiglu output for _id path `[top_k, moe_intermediate]` F32.
+    pub moe_swiglu_id_out: MlxBuffer,
     /// F16 scratch for lm_head GPU path: hidden state cast to F16 `[1, hidden_size]`.
     pub hidden_f16: MlxBuffer,
     /// F16 scratch for lm_head GPU path: logits output `[1, vocab_size]`.
@@ -580,9 +597,56 @@ impl MlxModelWeights {
                 moe_refs.per_expert_scale, mlx_device,
             )?;
 
+            // Build stacked expert weight buffers for fused _id dispatch.
+            // Each expert's buffer is concatenated: [expert0, expert1, ..., expertN-1].
+            let (stacked_gate_up, gate_up_expert_stride) = {
+                let per_expert = expert_gate_up[0].buffer.byte_len();
+                let total = per_expert * cfg.num_experts;
+                match mlx_device.alloc_buffer(total, mlx_native::DType::U32, vec![total / 4]) {
+                    Ok(mut stacked) => {
+                        let dst: &mut [u8] = stacked.as_mut_slice()
+                            .map_err(|e| anyhow::anyhow!("stacked gate_up: {e}"))?;
+                        for (e, qw) in expert_gate_up.iter().enumerate() {
+                            let src: &[u8] = qw.buffer.as_slice()
+                                .map_err(|e| anyhow::anyhow!("expert gate_up read: {e}"))?;
+                            dst[e * per_expert..(e + 1) * per_expert].copy_from_slice(src);
+                        }
+                        (Some(stacked), per_expert as u64)
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: could not allocate stacked gate_up buffer: {e}");
+                        (None, 0u64)
+                    }
+                }
+            };
+            let (stacked_down, down_expert_stride) = {
+                let per_expert = expert_down[0].buffer.byte_len();
+                let total = per_expert * cfg.num_experts;
+                match mlx_device.alloc_buffer(total, mlx_native::DType::U32, vec![total / 4]) {
+                    Ok(mut stacked) => {
+                        let dst: &mut [u8] = stacked.as_mut_slice()
+                            .map_err(|e| anyhow::anyhow!("stacked down: {e}"))?;
+                        for (e, qw) in expert_down.iter().enumerate() {
+                            let src: &[u8] = qw.buffer.as_slice()
+                                .map_err(|e| anyhow::anyhow!("expert down read: {e}"))?;
+                            dst[e * per_expert..(e + 1) * per_expert].copy_from_slice(src);
+                        }
+                        (Some(stacked), per_expert as u64)
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: could not allocate stacked down buffer: {e}");
+                        (None, 0u64)
+                    }
+                }
+            };
+
             let moe = MlxMoeWeights {
                 expert_gate_up,
                 expert_down,
+                stacked_gate_up,
+                stacked_down,
+                gate_up_expert_stride,
+                down_expert_stride,
                 router_proj,
                 router_scale,
                 per_expert_scale,
@@ -1226,6 +1290,9 @@ impl MlxModelWeights {
         // =====================================================================
         // SESSION 4: All expert dispatches in ONE session.
         // =====================================================================
+        // If stacked weight buffers are available, use the fused _id kernel
+        // path (2 qmatmul dispatches instead of 2*top_k). Otherwise fall
+        // back to the per-expert loop.
 
         // Zero the accumulator on CPU (fast for 2816 elements)
         {
@@ -1236,59 +1303,175 @@ impl MlxModelWeights {
 
         let s4_start = Instant::now();
         let mut s4_dispatches = 0usize;
-        {
-            let (exec, reg) = gpu.split();
-            let dev = exec.device();
-            let metal_dev = dev.metal_device();
-            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
 
-            // Zero the accumulator on GPU
-            mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.moe_accum, hs,
-            ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
-            s4_dispatches += 1;
+        let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
+            && self.layers[layer_idx].moe.stacked_down.is_some();
 
-            for k_idx in 0..top_k {
-                let eid = top_k_indices[k_idx] as usize;
-                let w = top_k_weights[k_idx] * per_expert_scale[eid];
+        if use_fused_id {
+            // --- Fused _id path: 2 qmatmul_id dispatches ---
 
-                if w.abs() < 1e-10 {
-                    continue;
+            // Write expert ids to GPU buffer
+            {
+                let ids_dst: &mut [u32] = self.activations.moe_expert_ids.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("moe_expert_ids write: {e}"))?;
+                for k_idx in 0..top_k {
+                    ids_dst[k_idx] = top_k_indices[k_idx];
                 }
-
-                // gate_up matmul
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
-                    &self.layers[layer_idx].moe.expert_gate_up[eid],
-                    &mut self.activations.moe_gate_up_out, 1)?;
-                s4_dispatches += 1;
-
-                // GPU SwiGLU
-                mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_gate_up_out,
-                    &self.activations.mlp_fused,
-                    moe_int,
-                ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
-                s4_dispatches += 1;
-
-                // down matmul
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                    &self.layers[layer_idx].moe.expert_down[eid],
-                    &mut self.activations.moe_expert_out, 1)?;
-                s4_dispatches += 1;
-
-                // GPU weighted accumulate
-                mlx_native::ops::moe_dispatch::moe_accumulate_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_accum,
-                    &self.activations.moe_expert_out,
-                    w, hs,
-                ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
-                s4_dispatches += 1;
             }
 
-            s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
+            let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                self.layers[layer_idx].moe.expert_gate_up[0].info.ggml_dtype)?;
+            let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                self.layers[layer_idx].moe.expert_down[0].info.ggml_dtype)?;
+
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
+
+                // Zero the accumulator on GPU
+                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_accum, hs,
+                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
+                s4_dispatches += 1;
+
+                // 1) gate_up _id: input=[1,K] ids=[top_k] -> output=[top_k, 2*moe_int]
+                let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: 1,
+                    top_k: top_k as u32,
+                    n: (2 * moe_int) as u32,
+                    k: hs as u32,
+                    n_experts: self.num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                    ggml_type: ggml_type_gu,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_norm_out,
+                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_gate_up_id_out,
+                    &gu_params,
+                ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
+                s4_dispatches += 1;
+
+                // 2) SwiGLU for each expert slot.
+                // gate_up_id_out is [top_k, 2*moe_int] flat. Each slot's gate_up
+                // is at offset slot * 2*moe_int. We use byte-offset slicing.
+                for k_idx in 0..top_k {
+                    let offset_bytes = k_idx * 2 * moe_int * std::mem::size_of::<f32>();
+                    let swiglu_out_offset = k_idx * moe_int * std::mem::size_of::<f32>();
+                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode_offset(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_gate_up_id_out,
+                        offset_bytes,
+                        &self.activations.moe_swiglu_id_out,
+                        swiglu_out_offset,
+                        moe_int,
+                    ).map_err(|e| anyhow::anyhow!("moe swiglu _id: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                // 3) down _id: input=[top_k, moe_int] ids=[top_k] -> output=[top_k, hs]
+                // Treat each expert slot as a separate "token" with top_k_param=1.
+                let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: top_k as u32,
+                    top_k: 1,
+                    n: hs as u32,
+                    k: moe_int as u32,
+                    n_experts: self.num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                    ggml_type: ggml_type_dn,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_swiglu_id_out,
+                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_down_id_out,
+                    &dn_params,
+                ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
+                s4_dispatches += 1;
+
+                // 4) Weighted accumulate for each expert slot.
+                // down_id_out is [top_k, hs]. Each slot's output is at offset slot*hs.
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
+                    if w.abs() < 1e-10 {
+                        continue;
+                    }
+                    let offset_bytes = k_idx * hs * std::mem::size_of::<f32>();
+                    mlx_native::ops::moe_dispatch::moe_accumulate_encode_offset(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_accum,
+                        &self.activations.moe_down_id_out,
+                        offset_bytes,
+                        w, hs,
+                    ).map_err(|e| anyhow::anyhow!("moe accumulate _id: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
+            }
+        } else {
+            // --- Fallback: per-expert loop (original path) ---
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
+
+                // Zero the accumulator on GPU
+                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_accum, hs,
+                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
+                s4_dispatches += 1;
+
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
+
+                    if w.abs() < 1e-10 {
+                        continue;
+                    }
+
+                    // gate_up matmul
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
+                        &self.layers[layer_idx].moe.expert_gate_up[eid],
+                        &mut self.activations.moe_gate_up_out, 1)?;
+                    s4_dispatches += 1;
+
+                    // GPU SwiGLU
+                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_gate_up_out,
+                        &self.activations.mlp_fused,
+                        moe_int,
+                    ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
+                    s4_dispatches += 1;
+
+                    // down matmul
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                        &self.layers[layer_idx].moe.expert_down[eid],
+                        &mut self.activations.moe_expert_out, 1)?;
+                    s4_dispatches += 1;
+
+                    // GPU weighted accumulate
+                    mlx_native::ops::moe_dispatch::moe_accumulate_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_accum,
+                        &self.activations.moe_expert_out,
+                        w, hs,
+                    ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
+            }
         }
         let s4_us = s4_start.elapsed().as_secs_f64() * 1e6;
 
@@ -1580,6 +1763,11 @@ fn alloc_activation_buffers(
         moe_accum: alloc_f32(hs, "moe_accum")?,
         moe_softmax_params,
         moe_norm_out: alloc_f32(hs, "moe_norm_out")?,
+        // Fused _id dispatch buffers (sized for top_k = cfg.top_k_experts)
+        moe_expert_ids: alloc_u32(cfg.top_k_experts, "moe_expert_ids")?,
+        moe_gate_up_id_out: alloc_f32(cfg.top_k_experts * 2 * moe_interm, "moe_gate_up_id_out")?,
+        moe_down_id_out: alloc_f32(cfg.top_k_experts * hs, "moe_down_id_out")?,
+        moe_swiglu_id_out: alloc_f32(cfg.top_k_experts * moe_interm, "moe_swiglu_id_out")?,
         hidden_f16: device.alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
             .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
         logits_f16: device.alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
