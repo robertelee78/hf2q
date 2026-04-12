@@ -248,26 +248,22 @@ impl MlxModelWeights {
         eprintln!("  Loading mlx-native weights from candle model...");
 
         // Embedding weight (F32)
+        eprintln!("  Loading embed_weight...");
         let embed_weight = gpu::candle_tensor_to_mlx_buffer(
             model.embed_weight(),
             mlx_device,
         )?;
 
+        eprintln!("  Loading final_norm...");
         // Final norm weight (F32)
         let final_norm = gpu::candle_tensor_to_mlx_buffer(
             model.final_norm_weight(),
             mlx_device,
         )?;
 
-        // lm_head weights
-        let lm_head_f32 = gpu::candle_tensor_to_mlx_buffer(
-            model.lm_head_weight(),
-            mlx_device,
-        )?;
-        let lm_head_f16 = match model.lm_head_f16() {
-            Some(t) => Some(gpu::candle_tensor_f16_to_mlx_buffer(t, mlx_device)?),
-            None => None,
-        };
+        // lm_head is tied to embed_weight; reuse the same buffer for CPU matmul.
+        // Skip F16 copy for now (Phase 5b will add GPU lm_head path).
+        eprintln!("  lm_head tied to embed_weight (no separate copy).");
 
         // Per-layer config
         let num_layers = model.num_layers();
@@ -277,8 +273,9 @@ impl MlxModelWeights {
         let mut num_kv_heads_vec = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
-            eprint!("\r  Loading mlx-native layer weights {}/{}...", i + 1, num_layers);
+            eprintln!("  mlx layer {}/{}: attn+mlp weights...", i + 1, num_layers);
             let refs = model.layer_weights(i);
+            eprintln!("  mlx layer {}/{}: moe weights...", i + 1, num_layers);
             let moe_refs = model.moe_weights(i);
 
             // Attention QMatMul weights
@@ -318,6 +315,10 @@ impl MlxModelWeights {
             let mut expert_gate_up = Vec::with_capacity(cfg.num_experts);
             let mut expert_down = Vec::with_capacity(cfg.num_experts);
             for e in 0..cfg.num_experts {
+                if e % 32 == 0 {
+                    eprint!("\r  Loading mlx-native layer {}/{} experts {}/{}...",
+                        i + 1, num_layers, e, cfg.num_experts);
+                }
                 let gu = load_qweight(
                     &moe_refs.expert_gate_up[e],
                     mlx_device,
@@ -432,12 +433,16 @@ impl MlxModelWeights {
         // Allocate activation buffers
         let activations = alloc_activation_buffers(mlx_device, cfg)?;
 
+        // Dummy 1-element buffer for lm_head_f32 field — actual lm_head uses embed_weight.
+        let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
+            .map_err(|e| anyhow::anyhow!("lm_head dummy: {e}"))?;
+
         Ok(Self {
             embed_weight,
             layers,
             final_norm,
-            lm_head_f16,
-            lm_head_f32,
+            lm_head_f16: None,
+            lm_head_f32: lm_head_f32_dummy,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
