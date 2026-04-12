@@ -3,6 +3,8 @@
 pub mod config;
 pub mod gemma4;
 pub mod gguf_loader;
+#[cfg(feature = "mlx-native-backend")]
+pub mod gpu;
 pub mod lm_head_kernel;
 #[cfg(feature = "metal")]
 pub mod moe_kernel;

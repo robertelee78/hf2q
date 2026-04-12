@@ -14,6 +14,9 @@ ruvector = ["dep:ruvector-core"]
 # GPU acceleration backends
 metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# ADR-006 Phase 5: mlx-native GPU compute backend (per-op cutover from candle).
+# Opt-in during migration; will become the sole backend post-migration.
+mlx-native-backend = ["dep:mlx-native"]
 
 [dependencies]
 safetensors = "0.7"
@@ -53,6 +56,8 @@ candle-nn = "0.10"
 # the `metal` feature is enabled so that non-Metal builds stay lean.
 candle-metal-kernels = { version = "0.10", optional = true }
 objc2-metal = { version = "0.3", optional = true }
+# ADR-006 Phase 5: mlx-native GPU compute backend.
+mlx-native = { path = "/opt/mlx-native", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # Async runtime + HTTP server (for `serve` subcommand)
