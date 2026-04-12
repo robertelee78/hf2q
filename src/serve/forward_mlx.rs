@@ -14,12 +14,12 @@
 //!
 //! # Status
 //!
-//! Phase 5 step 1: quantized matmul (QLinear projections) wired.
-//! Steps 2-8 (SDPA, RoPE, RmsNorm, MoE, etc.) are documented as TODOs.
+//! Phase 5 step 1: weight loading + quantized matmul dispatch wired.
+//! Remaining ops documented as TODOs at the end of this file.
 
 use anyhow::Result;
 use mlx_native::{
-    GgmlQuantizedMatmulParams, GgmlType, GraphSession, MlxBuffer, MlxDevice,
+    GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
 };
 
 use super::gpu::{self, GpuContext, QuantWeightInfo};
@@ -84,9 +84,6 @@ pub struct MlxDecoderLayerWeights {
     pub norms: MlxLayerNorms,
     pub layer_scalar: MlxBuffer,
     // MoE weights: TODO Phase 5 step 8
-    // pub moe_router: MlxQWeight,
-    // pub moe_expert_gate_up_3d: MlxBuffer,
-    // pub moe_expert_down_3d: MlxBuffer,
 }
 
 /// All mlx-native weights for the full Gemma 4 model.
@@ -94,50 +91,158 @@ pub struct MlxModelWeights {
     pub embed_weight: MlxBuffer,
     pub layers: Vec<MlxDecoderLayerWeights>,
     pub final_norm: MlxBuffer,
-    pub lm_head_f16: MlxBuffer,
+    pub lm_head_f16: Option<MlxBuffer>,
+    pub lm_head_f32: MlxBuffer,
     pub hidden_size: usize,
     pub rms_norm_eps: f32,
     pub final_logit_softcapping: Option<f32>,
 }
 
 impl MlxModelWeights {
-    /// Load all model weights from candle's QMatMul/Tensor objects into
+    /// Load all model weights from the candle-based Gemma4Model into
     /// mlx-native MlxBuffers.
     ///
     /// This is called once at model load time.  Each weight is copied from
     /// candle's Metal buffer into a fresh mlx-native Metal allocation.
-    ///
-    /// # Arguments
-    ///
-    /// * `model` - The loaded candle-based Gemma4Model (for weight access)
-    /// * `mlx_device` - The mlx-native device for buffer allocation
-    /// * `cfg` - Model configuration
-    ///
-    /// # Current limitations
-    ///
-    /// MoE expert weights are not yet loaded (Phase 5 step 8).
+    /// The copy cost is one-time and does not affect inference throughput.
     pub fn load_from_candle(
         model: &super::gemma4::Gemma4Model,
-        _cfg: &super::config::Gemma4Config,
-        _mlx_device: &MlxDevice,
+        cfg: &super::config::Gemma4Config,
+        mlx_device: &MlxDevice,
     ) -> Result<Self> {
-        // Phase 5 step 1: weight loading infrastructure is ready.
-        // The actual weight extraction requires exposing model internals
-        // from Gemma4Model (currently private fields).
-        //
-        // This will be wired in a follow-up commit that adds pub(crate)
-        // accessors to Gemma4Model's weight fields.
-        let _ = model;
-        anyhow::bail!(
-            "MlxModelWeights::load_from_candle is not yet implemented. \
-             Phase 5 weight loading requires pub(crate) accessors on \
-             Gemma4Model fields (layers, embed_tokens, norm, etc.)."
-        )
+        eprintln!("  Loading mlx-native weights from candle model...");
+
+        // Embedding weight (F32)
+        let embed_weight = gpu::candle_tensor_to_mlx_buffer(
+            model.embed_weight(),
+            mlx_device,
+        )?;
+
+        // Final norm weight (F32)
+        let final_norm = gpu::candle_tensor_to_mlx_buffer(
+            model.final_norm_weight(),
+            mlx_device,
+        )?;
+
+        // lm_head weights
+        let lm_head_f32 = gpu::candle_tensor_to_mlx_buffer(
+            model.lm_head_weight(),
+            mlx_device,
+        )?;
+        let lm_head_f16 = match model.lm_head_f16() {
+            Some(t) => Some(gpu::candle_tensor_f16_to_mlx_buffer(t, mlx_device)?),
+            None => None,
+        };
+
+        // Per-layer weights
+        let num_layers = model.num_layers();
+        let mut layers = Vec::with_capacity(num_layers);
+
+        for i in 0..num_layers {
+            eprint!("\r  Loading mlx-native layer weights {}/{}...", i + 1, num_layers);
+            let refs = model.layer_weights(i);
+
+            // Attention QMatMul weights
+            let q_proj = load_qweight(refs.q_proj, mlx_device, "q_proj")?;
+            let k_proj = load_qweight(refs.k_proj, mlx_device, "k_proj")?;
+            let v_proj = match refs.v_proj {
+                Some(qm) => Some(load_qweight(qm, mlx_device, "v_proj")?),
+                None => None,
+            };
+            let o_proj = load_qweight(refs.o_proj, mlx_device, "o_proj")?;
+
+            // Attention norm weights (F32)
+            let q_norm_weight = gpu::candle_tensor_to_mlx_buffer(refs.q_norm, mlx_device)?;
+            let k_norm_weight = gpu::candle_tensor_to_mlx_buffer(refs.k_norm, mlx_device)?;
+
+            let attn = MlxAttentionWeights {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm_weight,
+                k_norm_weight,
+            };
+
+            // Dense MLP QMatMul weights
+            let gate_proj = load_qweight(refs.gate_proj, mlx_device, "gate_proj")?;
+            let up_proj = load_qweight(refs.up_proj, mlx_device, "up_proj")?;
+            let down_proj = load_qweight(refs.down_proj, mlx_device, "down_proj")?;
+
+            let mlp = MlxMlpWeights {
+                gate_proj,
+                up_proj,
+                down_proj,
+            };
+
+            // Norm weights (F32)
+            let norms = MlxLayerNorms {
+                input_layernorm: gpu::candle_tensor_to_mlx_buffer(
+                    refs.input_layernorm, mlx_device,
+                )?,
+                post_attention_layernorm: gpu::candle_tensor_to_mlx_buffer(
+                    refs.post_attention_layernorm, mlx_device,
+                )?,
+                pre_feedforward_layernorm: gpu::candle_tensor_to_mlx_buffer(
+                    refs.pre_feedforward_layernorm, mlx_device,
+                )?,
+                post_feedforward_layernorm: gpu::candle_tensor_to_mlx_buffer(
+                    refs.post_feedforward_layernorm, mlx_device,
+                )?,
+                pre_feedforward_layernorm_2: gpu::candle_tensor_to_mlx_buffer(
+                    refs.pre_feedforward_layernorm_2, mlx_device,
+                )?,
+                post_feedforward_layernorm_1: gpu::candle_tensor_to_mlx_buffer(
+                    refs.post_feedforward_layernorm_1, mlx_device,
+                )?,
+                post_feedforward_layernorm_2: gpu::candle_tensor_to_mlx_buffer(
+                    refs.post_feedforward_layernorm_2, mlx_device,
+                )?,
+            };
+
+            // Layer scalar (F32)
+            let layer_scalar = gpu::candle_tensor_to_mlx_buffer(
+                refs.layer_scalar, mlx_device,
+            )?;
+
+            layers.push(MlxDecoderLayerWeights {
+                attn,
+                mlp,
+                norms,
+                layer_scalar,
+            });
+        }
+        eprintln!(
+            "\r  Loaded {}/{} mlx-native layer weights.    ",
+            num_layers, num_layers
+        );
+
+        Ok(Self {
+            embed_weight,
+            layers,
+            final_norm,
+            lm_head_f16,
+            lm_head_f32,
+            hidden_size: model.hidden_size_val(),
+            rms_norm_eps: cfg.rms_norm_eps as f32,
+            final_logit_softcapping: model.softcapping().map(|v| v as f32),
+        })
     }
 }
 
+/// Helper: load a candle QMatMul into an MlxQWeight.
+fn load_qweight(
+    qmatmul: &candle_core::quantized::QMatMul,
+    mlx_device: &MlxDevice,
+    name: &str,
+) -> Result<MlxQWeight> {
+    let (buffer, info) = gpu::load_qmatmul_to_mlx_buffer(qmatmul, mlx_device)
+        .map_err(|e| anyhow::anyhow!("Failed to load {} into MlxBuffer: {}", name, e))?;
+    Ok(MlxQWeight { buffer, info })
+}
+
 // ---------------------------------------------------------------------------
-// Forward pass dispatch
+// Forward pass dispatch helpers
 // ---------------------------------------------------------------------------
 
 /// Run one quantized matmul through the GraphSession.
@@ -147,6 +252,7 @@ impl MlxModelWeights {
 ///
 /// Takes `registry` and `device` separately to avoid borrow conflicts on
 /// `GpuContext` (registry is `&mut`, device is `&`).
+#[allow(dead_code)]
 pub fn dispatch_qmatmul(
     session: &mut GraphSession<'_>,
     registry: &mut mlx_native::KernelRegistry,
@@ -175,13 +281,16 @@ pub fn dispatch_qmatmul(
 // these ops to be wired through GraphSession, in order:
 //
 // DONE:
-// - [x] quantized_matmul_ggml (Q/K/V/O projections, gate/up/down MLP, lm_head)
 // - [x] Weight bridge: candle QTensor/Tensor -> MlxBuffer (gpu.rs)
 // - [x] GpuContext creation and lifecycle (gpu.rs)
 // - [x] --backend CLI flag (cli.rs)
 // - [x] Backend selection in cmd_generate (mod.rs)
+// - [x] Weight loading from candle model (MlxModelWeights::load_from_candle)
+// - [x] Gemma4Model pub(crate) accessors for weight extraction
+// - [x] quantized_matmul_ggml dispatch helper
 //
-// TODO (wired in mlx-native's GraphSession API, need integration here):
+// TODO (ops available in mlx-native's GraphSession, need forward orchestration):
+// - [ ] Full forward pass orchestrator (forward_mlx_pass function)
 // - [ ] rms_norm (7 per layer + 1 final + V unit norm)
 // - [ ] rope (Q and K per layer)
 // - [ ] sdpa (vector kernel for decode)
@@ -198,7 +307,12 @@ pub fn dispatch_qmatmul(
 // - [ ] scalar_mul (embedding scale by sqrt(hidden_size))
 // - [ ] transpose (Q/K/V reshape for attention)
 // - [ ] narrow (last-token extraction before lm_head)
+// - [ ] MoE weight loading (3D expert gate_up/down buffers)
 //
-// The forward pass orchestrator will be added once Gemma4Model exposes
-// pub(crate) accessors to its weight fields, or alternatively, the
-// MlxModelWeights are loaded directly from the GGUF during model construction.
+// BLOCKERS documented:
+// 1. candle-metal-kernels vendors its own `metal::Buffer` type, preventing
+//    zero-copy buffer sharing.  Resolved with load-time copy.
+// 2. KV cache state management: the mlx-native path needs its own KV cache
+//    buffers (MlxBuffer) separate from candle's.  Not yet implemented.
+// 3. Activation buffer pool: the forward pass needs transient MlxBuffer
+//    allocations from MlxBufferPool for intermediate results.

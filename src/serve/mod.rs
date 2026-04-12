@@ -731,15 +731,22 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let backend = args.backend;
     tracing::info!("Inference backend: {}", backend);
     #[cfg(feature = "mlx-native-backend")]
-    let _gpu_ctx: Option<gpu::GpuContext> = match backend {
+    let (_gpu_ctx, _mlx_weights): (
+        Option<gpu::GpuContext>,
+        Option<forward_mlx::MlxModelWeights>,
+    ) = match backend {
         cli::InferenceBackend::MlxNative => {
             eprintln!("Initializing mlx-native GPU context...");
             let ctx = gpu::GpuContext::new()
                 .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
-            eprintln!("mlx-native backend: {} ({})", ctx.gpu_name(), "ready");
-            Some(ctx)
+            eprintln!("mlx-native backend: {} (loading weights...)", ctx.gpu_name());
+            let weights = forward_mlx::MlxModelWeights::load_from_candle(
+                &model, &cfg, ctx.device(),
+            )?;
+            eprintln!("mlx-native weights loaded ({} layers).", weights.layers.len());
+            (Some(ctx), Some(weights))
         }
-        cli::InferenceBackend::Candle => None,
+        cli::InferenceBackend::Candle => (None, None),
     };
     #[cfg(not(feature = "mlx-native-backend"))]
     if matches!(backend, cli::InferenceBackend::MlxNative) {

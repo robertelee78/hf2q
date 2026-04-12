@@ -1865,6 +1865,106 @@ impl Gemma4Model {
     pub fn counters(&self) -> Arc<DispatchCounters> {
         self.counters.clone()
     }
+
+    // --- ADR-006 Phase 5: accessors for mlx-native weight extraction ---
+
+    /// Number of decoder layers.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Borrow the embedding weight tensor.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn embed_weight(&self) -> &Tensor {
+        self.embed_tokens.embeddings()
+    }
+
+    /// Borrow the final norm weight tensor.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn final_norm_weight(&self) -> &Tensor {
+        &self.norm.weight
+    }
+
+    /// Borrow the lm_head F16 weight tensor (for the fused lm_head path).
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn lm_head_f16(&self) -> Option<&Tensor> {
+        self.lm_head_f16_weight.as_ref()
+    }
+
+    /// Borrow the lm_head F32 weight tensor.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn lm_head_weight(&self) -> &Tensor {
+        &self.lm_head_weight
+    }
+
+    /// Model hidden size.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn hidden_size_val(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Final logit softcapping value.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn softcapping(&self) -> Option<f64> {
+        self.final_logit_softcapping
+    }
+
+    /// Access per-layer QLinear weight QMatMul objects for mlx-native extraction.
+    ///
+    /// Returns (q_proj, k_proj, v_proj_option, o_proj, gate, up, down) QMatMul refs
+    /// plus norm weight tensors for the given layer.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn layer_weights(&self, idx: usize) -> LayerWeightRefs<'_> {
+        let layer = &self.layers[idx];
+        LayerWeightRefs {
+            q_proj: &layer.self_attn.q_proj.inner,
+            k_proj: &layer.self_attn.k_proj.inner,
+            v_proj: if layer.self_attn.k_eq_v {
+                None
+            } else {
+                Some(&layer.self_attn.v_proj.inner)
+            },
+            o_proj: &layer.self_attn.o_proj.inner,
+            q_norm: &layer.self_attn.q_norm.weight,
+            k_norm: &layer.self_attn.k_norm.weight,
+            gate_proj: &layer.mlp.gate_proj.inner,
+            up_proj: &layer.mlp.up_proj.inner,
+            down_proj: &layer.mlp.down_proj.inner,
+            input_layernorm: &layer.input_layernorm.weight,
+            post_attention_layernorm: &layer.post_attention_layernorm.weight,
+            pre_feedforward_layernorm: &layer.pre_feedforward_layernorm.weight,
+            post_feedforward_layernorm: &layer.post_feedforward_layernorm.weight,
+            pre_feedforward_layernorm_2: &layer.pre_feedforward_layernorm_2.weight,
+            post_feedforward_layernorm_1: &layer.post_feedforward_layernorm_1.weight,
+            post_feedforward_layernorm_2: &layer.post_feedforward_layernorm_2.weight,
+            layer_scalar: &layer.layer_scalar,
+        }
+    }
+}
+
+/// Borrowed references to a single decoder layer's weight tensors.
+///
+/// Used by `forward_mlx` to extract weights for the mlx-native path.
+#[cfg(feature = "mlx-native-backend")]
+pub(crate) struct LayerWeightRefs<'a> {
+    pub q_proj: &'a QMatMul,
+    pub k_proj: &'a QMatMul,
+    pub v_proj: Option<&'a QMatMul>,
+    pub o_proj: &'a QMatMul,
+    pub q_norm: &'a Tensor,
+    pub k_norm: &'a Tensor,
+    pub gate_proj: &'a QMatMul,
+    pub up_proj: &'a QMatMul,
+    pub down_proj: &'a QMatMul,
+    pub input_layernorm: &'a Tensor,
+    pub post_attention_layernorm: &'a Tensor,
+    pub pre_feedforward_layernorm: &'a Tensor,
+    pub post_feedforward_layernorm: &'a Tensor,
+    pub pre_feedforward_layernorm_2: &'a Tensor,
+    pub post_feedforward_layernorm_1: &'a Tensor,
+    pub post_feedforward_layernorm_2: &'a Tensor,
+    pub layer_scalar: &'a Tensor,
 }
 
 impl Gemma4Model {
