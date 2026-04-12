@@ -906,13 +906,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         eprintln!("Running mlx-native forward pass...");
         let eos_token_ids: Vec<u32> = vec![1, 106];
 
+        // Profiling support
+        let mut profiler = forward_mlx::ProfileAccumulator::new(2);
+
         // Prefill: process prompt tokens one at a time through mlx-native.
         // (Full prefill with seq_len>1 is a Phase 5b optimization.)
         eprintln!("Prefilling {} tokens (mlx-native, per-token)...", prompt_tokens.len());
         let prefill_start = std::time::Instant::now();
         let mut last_token = 0u32;
         for (i, &tok) in prompt_tokens.iter().enumerate() {
-            last_token = mlx_w.forward_decode(tok, i, mlx_gpu)?;
+            let mut p = None; // don't profile prefill
+            last_token = mlx_w.forward_decode(tok, i, mlx_gpu, &mut p)?;
         }
         let prefill_elapsed = prefill_start.elapsed();
         eprintln!(
@@ -939,7 +943,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 break;
             }
             let pos = all_tokens.len() - 1;
-            next_token = mlx_w.forward_decode(next_token, pos, mlx_gpu)?;
+            let mut p = profiler.start_token();
+            next_token = mlx_w.forward_decode(next_token, pos, mlx_gpu, &mut p)?;
+            profiler.finish_token(p);
             all_tokens.push(next_token);
             generated += 1;
             {
@@ -954,6 +960,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             "\n\n--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---",
             generated, decode_elapsed.as_secs_f64(), tok_per_sec,
         );
+
+        // Print profiling summary if enabled
+        profiler.print_summary();
 
         return Ok(());
     }

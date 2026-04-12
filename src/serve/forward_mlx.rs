@@ -29,9 +29,201 @@ use mlx_native::ops::sdpa::SdpaParams;
 use mlx_native::ops::sdpa_sliding::SdpaSlidingParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
+use std::time::Instant;
 
 use super::config::{Gemma4Config, LayerType};
 use super::gpu::{self, GpuContext, QuantWeightInfo};
+
+// ---------------------------------------------------------------------------
+// Profiling support (HF2Q_MLX_PROFILE=1)
+// ---------------------------------------------------------------------------
+
+/// Check if profiling is enabled via environment variable.
+fn profiling_enabled() -> bool {
+    std::env::var("HF2Q_MLX_PROFILE").map_or(false, |v| v == "1")
+}
+
+/// Accumulated timing data for one token's forward pass.
+#[derive(Default, Clone)]
+pub struct TokenProfile {
+    /// Per-layer session timings (wall-clock, includes GPU wait).
+    pub layer_s1_us: Vec<f64>,    // QKV projections
+    pub layer_cpu1_us: Vec<f64>,  // head norms, RoPE, KV cache
+    pub layer_s2_us: Vec<f64>,    // SDPA + MLP
+    pub layer_cpu2_us: Vec<f64>,  // post-FF norm, MoE routing prep
+    pub layer_s3_us: Vec<f64>,    // router proj
+    pub layer_cpu3_us: Vec<f64>,  // softmax + top-k
+    pub layer_s4_us: Vec<f64>,    // MoE experts
+    pub layer_cpu4_us: Vec<f64>,  // post-MoE norms, combine, scalar
+    pub head_session_us: f64,     // lm_head session
+    pub head_cpu_us: f64,         // softcap + argmax CPU
+    pub total_us: f64,
+    /// Dispatch counts per session type.
+    pub s1_dispatches: Vec<usize>,
+    pub s2_dispatches: Vec<usize>,
+    pub s3_dispatches: Vec<usize>,
+    pub s4_dispatches: Vec<usize>,
+    pub head_dispatches: usize,
+}
+
+/// Multi-token profiling accumulator.
+pub struct ProfileAccumulator {
+    pub tokens: Vec<TokenProfile>,
+    pub warmup_count: usize,
+    pub enabled: bool,
+}
+
+impl ProfileAccumulator {
+    pub fn new(warmup: usize) -> Self {
+        Self {
+            tokens: Vec::new(),
+            warmup_count: warmup,
+            enabled: profiling_enabled(),
+        }
+    }
+
+    pub fn start_token(&self) -> Option<TokenProfile> {
+        if self.enabled {
+            Some(TokenProfile::default())
+        } else {
+            None
+        }
+    }
+
+    pub fn finish_token(&mut self, profile: Option<TokenProfile>) {
+        if let Some(p) = profile {
+            self.tokens.push(p);
+        }
+    }
+
+    /// Print summary after generation is complete.
+    pub fn print_summary(&self) {
+        if !self.enabled || self.tokens.is_empty() {
+            return;
+        }
+        let skip = self.warmup_count.min(self.tokens.len().saturating_sub(1));
+        let measured: Vec<&TokenProfile> = self.tokens.iter().skip(skip).collect();
+        if measured.is_empty() {
+            eprintln!("[PROFILE] No tokens after warmup to report.");
+            return;
+        }
+        let n = measured.len();
+        let num_layers = measured[0].layer_s1_us.len();
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════╗");
+        eprintln!("║  MLX-NATIVE FORWARD PASS PROFILE ({n} tokens, {skip} warmup skipped)  ║");
+        eprintln!("╠══════════════════════════════════════════════════════════╣");
+
+        // Per-session-type averages across all layers and tokens
+        let avg = |getter: &dyn Fn(&TokenProfile) -> &Vec<f64>| -> f64 {
+            let total: f64 = measured.iter()
+                .map(|t| getter(t).iter().sum::<f64>())
+                .sum();
+            total / n as f64
+        };
+
+        let s1_avg = avg(&|t| &t.layer_s1_us);
+        let cpu1_avg = avg(&|t| &t.layer_cpu1_us);
+        let s2_avg = avg(&|t| &t.layer_s2_us);
+        let cpu2_avg = avg(&|t| &t.layer_cpu2_us);
+        let s3_avg = avg(&|t| &t.layer_s3_us);
+        let cpu3_avg = avg(&|t| &t.layer_cpu3_us);
+        let s4_avg = avg(&|t| &t.layer_s4_us);
+        let cpu4_avg = avg(&|t| &t.layer_cpu4_us);
+        let head_gpu_avg: f64 = measured.iter().map(|t| t.head_session_us).sum::<f64>() / n as f64;
+        let head_cpu_avg: f64 = measured.iter().map(|t| t.head_cpu_us).sum::<f64>() / n as f64;
+        let total_avg: f64 = measured.iter().map(|t| t.total_us).sum::<f64>() / n as f64;
+
+        let gpu_total = s1_avg + s2_avg + s3_avg + s4_avg + head_gpu_avg;
+        let cpu_total = cpu1_avg + cpu2_avg + cpu3_avg + cpu4_avg + head_cpu_avg;
+
+        eprintln!("║ {num_layers} layers x 4 sessions + 1 head = {} sessions/token", num_layers * 4 + 1);
+        eprintln!("║");
+        eprintln!("║ Session breakdown (avg across {num_layers} layers, {n} tokens):");
+        eprintln!("║   S1 (QKV proj):      {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
+        eprintln!("║   CPU1 (norms+RoPE):   {:8.1} us ({:5.2} ms total)", cpu1_avg / num_layers as f64, cpu1_avg / 1000.0);
+        eprintln!("║   S2 (SDPA+MLP):      {:8.1} us ({:5.2} ms total)", s2_avg / num_layers as f64, s2_avg / 1000.0);
+        eprintln!("║   CPU2 (post-FF):      {:8.1} us ({:5.2} ms total)", cpu2_avg / num_layers as f64, cpu2_avg / 1000.0);
+        eprintln!("║   S3 (router proj):   {:8.1} us ({:5.2} ms total)", s3_avg / num_layers as f64, s3_avg / 1000.0);
+        eprintln!("║   CPU3 (softmax+topk): {:8.1} us ({:5.2} ms total)", cpu3_avg / num_layers as f64, cpu3_avg / 1000.0);
+        eprintln!("║   S4 (MoE experts):   {:8.1} us ({:5.2} ms total)", s4_avg / num_layers as f64, s4_avg / 1000.0);
+        eprintln!("║   CPU4 (post-MoE):     {:8.1} us ({:5.2} ms total)", cpu4_avg / num_layers as f64, cpu4_avg / 1000.0);
+        eprintln!("║   Head GPU:            {:8.1} us ({:5.2} ms)", head_gpu_avg, head_gpu_avg / 1000.0);
+        eprintln!("║   Head CPU:            {:8.1} us ({:5.2} ms)", head_cpu_avg, head_cpu_avg / 1000.0);
+        eprintln!("║");
+        eprintln!("║ Total: {:8.1} us ({:5.2} ms)", total_avg, total_avg / 1000.0);
+        eprintln!("║   GPU sessions: {:8.1} us ({:5.1}%)", gpu_total, gpu_total / total_avg * 100.0);
+        eprintln!("║   CPU ops:      {:8.1} us ({:5.1}%)", cpu_total, cpu_total / total_avg * 100.0);
+        let overhead = total_avg - gpu_total - cpu_total;
+        if overhead.abs() > 10.0 {
+            eprintln!("║   Unaccounted:  {:8.1} us ({:5.1}%)", overhead, overhead / total_avg * 100.0);
+        }
+
+        // Dispatch counts
+        let avg_dispatches = |getter: &dyn Fn(&TokenProfile) -> &Vec<usize>| -> f64 {
+            let total: usize = measured.iter()
+                .map(|t| getter(t).iter().sum::<usize>())
+                .sum();
+            total as f64 / n as f64
+        };
+        let s1_disp = avg_dispatches(&|t| &t.s1_dispatches);
+        let s2_disp = avg_dispatches(&|t| &t.s2_dispatches);
+        let s3_disp = avg_dispatches(&|t| &t.s3_dispatches);
+        let s4_disp = avg_dispatches(&|t| &t.s4_dispatches);
+        let head_disp: f64 = measured.iter().map(|t| t.head_dispatches as f64).sum::<f64>() / n as f64;
+        let total_disp = s1_disp + s2_disp + s3_disp + s4_disp + head_disp;
+
+        eprintln!("║");
+        eprintln!("║ Dispatch counts per token:");
+        eprintln!("║   S1: {s1_disp:.0}  S2: {s2_disp:.0}  S3: {s3_disp:.0}  S4: {s4_disp:.0}  Head: {head_disp:.0}");
+        eprintln!("║   Total: {total_disp:.0} dispatches/token");
+        eprintln!("║   (candle Phase 0 baseline: ~105 dispatches/token)");
+        eprintln!("║   Ratio: {:.1}x more dispatches", total_disp / 105.0);
+
+        // Per-layer detail for first 3 layers + last layer
+        eprintln!("║");
+        eprintln!("║ Per-layer detail (avg over {n} tokens, us):");
+        eprintln!("║   Layer |   S1   |  CPU1  |   S2   |  CPU2  |   S3   |  CPU3  |   S4   |  CPU4  | Total");
+        eprintln!("║   ------|--------|--------|--------|--------|--------|--------|--------|--------|------");
+        let detail_layers: Vec<usize> = {
+            let mut v: Vec<usize> = (0..3.min(num_layers)).collect();
+            if num_layers > 3 { v.push(num_layers - 1); }
+            v
+        };
+        for &li in &detail_layers {
+            let s1: f64 = measured.iter().map(|t| t.layer_s1_us[li]).sum::<f64>() / n as f64;
+            let c1: f64 = measured.iter().map(|t| t.layer_cpu1_us[li]).sum::<f64>() / n as f64;
+            let s2: f64 = measured.iter().map(|t| t.layer_s2_us[li]).sum::<f64>() / n as f64;
+            let c2: f64 = measured.iter().map(|t| t.layer_cpu2_us[li]).sum::<f64>() / n as f64;
+            let s3: f64 = measured.iter().map(|t| t.layer_s3_us[li]).sum::<f64>() / n as f64;
+            let c3: f64 = measured.iter().map(|t| t.layer_cpu3_us[li]).sum::<f64>() / n as f64;
+            let s4: f64 = measured.iter().map(|t| t.layer_s4_us[li]).sum::<f64>() / n as f64;
+            let c4: f64 = measured.iter().map(|t| t.layer_cpu4_us[li]).sum::<f64>() / n as f64;
+            let layer_type = if (li + 1) % 6 == 0 { "G" } else { "S" };
+            eprintln!("║   {:>2} ({}) | {:6.0} | {:6.0} | {:6.0} | {:6.0} | {:6.0} | {:6.0} | {:6.0} | {:6.0} | {:6.0}",
+                li, layer_type, s1, c1, s2, c2, s3, c3, s4, c4,
+                s1 + c1 + s2 + c2 + s3 + c3 + s4 + c4);
+        }
+
+        // Session time per dispatch (to compare with candle per-kernel times)
+        eprintln!("║");
+        eprintln!("║ Avg time per dispatch (session_time / dispatches):");
+        if s1_disp > 0.0 {
+            eprintln!("║   S1 (QKV matmuls): {:.1} us/dispatch", s1_avg / s1_disp);
+        }
+        if s2_disp > 0.0 {
+            eprintln!("║   S2 (SDPA+MLP):    {:.1} us/dispatch", s2_avg / s2_disp);
+        }
+        if s3_disp > 0.0 {
+            eprintln!("║   S3 (router):      {:.1} us/dispatch", s3_avg / s3_disp);
+        }
+        if s4_disp > 0.0 {
+            eprintln!("║   S4 (MoE):         {:.1} us/dispatch", s4_avg / s4_disp);
+        }
+
+        eprintln!("╚══════════════════════════════════════════════════════════╝");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Weight storage for the mlx-native forward path
@@ -527,6 +719,7 @@ impl MlxModelWeights {
     ///   - input_token: the token ID to embed
     ///   - seq_pos: position in the sequence (for RoPE and KV cache)
     ///   - gpu: the GpuContext holding the executor and registry
+    ///   - profile: optional per-token profile accumulator
     ///
     /// Returns: the next token ID (greedy decode)
     pub fn forward_decode(
@@ -534,13 +727,29 @@ impl MlxModelWeights {
         input_token: u32,
         seq_pos: usize,
         gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
     ) -> Result<u32> {
+        let token_start = Instant::now();
         let hidden_size = self.hidden_size;
         let num_layers = self.layers.len();
 
+        // Pre-allocate profile vectors if profiling
+        if let Some(ref mut p) = profile {
+            p.layer_s1_us = vec![0.0; num_layers];
+            p.layer_cpu1_us = vec![0.0; num_layers];
+            p.layer_s2_us = vec![0.0; num_layers];
+            p.layer_cpu2_us = vec![0.0; num_layers];
+            p.layer_s3_us = vec![0.0; num_layers];
+            p.layer_cpu3_us = vec![0.0; num_layers];
+            p.layer_s4_us = vec![0.0; num_layers];
+            p.layer_cpu4_us = vec![0.0; num_layers];
+            p.s1_dispatches = vec![0; num_layers];
+            p.s2_dispatches = vec![0; num_layers];
+            p.s3_dispatches = vec![0; num_layers];
+            p.s4_dispatches = vec![0; num_layers];
+        }
+
         // --- 1. Embedding lookup (CPU copy for single token) ---
-        // For decode, embedding is a single row read from the F32 table.
-        // We copy it directly into the hidden activation buffer.
         {
             let embed_src: &[f32] = self.embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice: {e}"))?;
@@ -556,7 +765,7 @@ impl MlxModelWeights {
             hidden_dst[..hidden_size].copy_from_slice(&embed_src[offset..offset + hidden_size]);
         }
 
-        // Scale embedding by sqrt(hidden_size) — CPU multiply for single token.
+        // Scale embedding by sqrt(hidden_size)
         {
             let scale = (hidden_size as f32).sqrt();
             let hidden: &mut [f32] = self.activations.hidden.as_mut_slice()
@@ -568,11 +777,15 @@ impl MlxModelWeights {
 
         // --- 2. Transformer layers ---
         for layer_idx in 0..num_layers {
-            self.forward_decode_layer(layer_idx, seq_pos, gpu)?;
+            self.forward_decode_layer(layer_idx, seq_pos, gpu, profile)?;
         }
 
         // --- 3. Final norm + lm_head + softcap + argmax ---
-        let token_id = self.forward_decode_head(gpu)?;
+        let token_id = self.forward_decode_head(gpu, profile)?;
+
+        if let Some(ref mut p) = profile {
+            p.total_us = token_start.elapsed().as_secs_f64() * 1e6;
+        }
 
         Ok(token_id)
     }
@@ -596,6 +809,7 @@ impl MlxModelWeights {
         layer_idx: usize,
         seq_pos: usize,
         gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
     ) -> Result<()> {
         let hs = self.hidden_size;
         let hd = self.head_dims[layer_idx];
@@ -615,24 +829,35 @@ impl MlxModelWeights {
         // =====================================================================
         // SESSION 1: Q, K, V projections (3 GPU matmuls in one encoder)
         // =====================================================================
+        let s1_start = Instant::now();
+        let mut s1_dispatches = 0usize;
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S1 begin: {e}"))?;
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+            s1_dispatches += 1;
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+            s1_dispatches += 1;
             let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
             if !v_is_k {
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
                     &mut self.activations.moe_expert_out, 1)?;
+                s1_dispatches += 1;
             }
             s.finish().map_err(|e| anyhow::anyhow!("S1 finish: {e}"))?;
         }
+        let s1_elapsed = s1_start.elapsed();
+        if let Some(ref mut p) = profile {
+            p.layer_s1_us[layer_idx] = s1_elapsed.as_secs_f64() * 1e6;
+            p.s1_dispatches[layer_idx] = s1_dispatches;
+        }
 
         // -- CPU: Q/K head norms --
+        let cpu1_start = Instant::now();
         {
             let q: &mut [f32] = self.activations.attn_q.as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("q: {e}"))?;
@@ -712,11 +937,17 @@ impl MlxModelWeights {
         self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
             .min(kv_capacity);
         let kv_seq_len = self.kv_caches[layer_idx].seq_len;
+        let cpu1_elapsed = cpu1_start.elapsed();
+        if let Some(ref mut p) = profile {
+            p.layer_cpu1_us[layer_idx] = cpu1_elapsed.as_secs_f64() * 1e6;
+        }
 
         // =====================================================================
         // SESSION 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
         //            → GPU-norm(pre-FF) → gate → up → GPU-GELU → GPU-mul → down
         // =====================================================================
+        let s2_start = Instant::now();
+        let mut s2_dispatches = 0usize;
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
@@ -746,10 +977,12 @@ impl MlxModelWeights {
                     &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
                 ).map_err(|e| anyhow::anyhow!("sdpa: {e}"))?;
             }
+            s2_dispatches += 1; // SDPA
 
             // O-proj: sdpa_out → attn_out
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
                 &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+            s2_dispatches += 1; // O-proj
 
             // GPU post-attention norm: attn_out → norm_out
             s.rms_norm(
@@ -760,6 +993,7 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU post-attn norm: {e}"))?;
+            s2_dispatches += 1; // rms_norm
 
             // GPU residual add: hidden + norm_out → residual
             s.elementwise_add(
@@ -767,6 +1001,7 @@ impl MlxModelWeights {
                 &self.activations.hidden, &self.activations.norm_out,
                 &self.activations.residual, hs, mlx_native::DType::F32,
             ).map_err(|e| anyhow::anyhow!("GPU residual add: {e}"))?;
+            s2_dispatches += 1; // add
 
             // GPU pre-feedforward norm: residual → norm_out
             s.rms_norm(
@@ -777,18 +1012,22 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm: {e}"))?;
+            s2_dispatches += 1; // rms_norm
 
             // Dense MLP: gate and up projections (norm_out → mlp_gate, mlp_up)
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+            s2_dispatches += 1; // gate
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+            s2_dispatches += 1; // up
 
             // GPU GELU on gate: mlp_gate → mlp_fused (same element count)
             s.gelu(
                 reg, metal_dev,
                 &self.activations.mlp_gate, &self.activations.mlp_fused,
             ).map_err(|e| anyhow::anyhow!("GPU GELU: {e}"))?;
+            s2_dispatches += 1; // gelu
 
             // GPU mul: mlp_fused * mlp_up → mlp_fused (SwiGLU)
             s.elementwise_mul(
@@ -797,15 +1036,23 @@ impl MlxModelWeights {
                 &self.activations.mlp_fused, self.intermediate_size,
                 mlx_native::DType::F32,
             ).map_err(|e| anyhow::anyhow!("GPU SwiGLU mul: {e}"))?;
+            s2_dispatches += 1; // mul
 
             // down_proj: mlp_fused → mlp_down
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
                 &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+            s2_dispatches += 1; // down
 
             s.finish().map_err(|e| anyhow::anyhow!("S2 finish: {e}"))?;
         }
+        let s2_elapsed = s2_start.elapsed();
+        if let Some(ref mut p) = profile {
+            p.layer_s2_us[layer_idx] = s2_elapsed.as_secs_f64() * 1e6;
+            p.s2_dispatches[layer_idx] = s2_dispatches;
+        }
 
         // -- CPU: Post-feedforward norm 1 on mlp_down --
+        let cpu2_start = Instant::now();
         cpu_rms_norm_weighted(
             &self.activations.mlp_down, &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
             &mut self.activations.norm_out, hs, eps,
@@ -817,7 +1064,8 @@ impl MlxModelWeights {
         }
 
         // -- MoE path (sessions 3-4) --
-        self.forward_decode_moe(layer_idx, gpu)?;
+        let (s3_us, cpu3_us, s4_us, s3_disp, s4_disp) =
+            self.forward_decode_moe(layer_idx, gpu)?;
 
         // -- Combine MLP + MoE, final norm, residual, layer scalar (CPU) --
         {
@@ -830,8 +1078,6 @@ impl MlxModelWeights {
             &self.activations.attn_out, &self.layers[layer_idx].norms.post_feedforward_layernorm,
             &mut self.activations.norm_out, hs, eps,
         )?;
-        // Note: residual was written by GPU in session 2. After S2 finish(),
-        // it's readable by CPU. xs = residual + normed_combined
         cpu_add(&self.activations.residual, &self.activations.norm_out, &mut self.activations.hidden, hs)?;
         // Layer scalar
         {
@@ -845,6 +1091,19 @@ impl MlxModelWeights {
             } else {
                 for i in 0..hs { hidden[i] *= scalar[i]; }
             }
+        }
+        let cpu2_and_4_elapsed = cpu2_start.elapsed();
+        if let Some(ref mut p) = profile {
+            // cpu2 = total elapsed minus S3+CPU3+S4 times (which are measured inside forward_decode_moe)
+            let total_cpu2_4 = cpu2_and_4_elapsed.as_secs_f64() * 1e6;
+            let cpu4_us = total_cpu2_4 - s3_us - cpu3_us - s4_us;
+            p.layer_cpu2_us[layer_idx] = cpu4_us.max(0.0); // pre-MoE CPU norm + post-MoE combine
+            p.layer_s3_us[layer_idx] = s3_us;
+            p.layer_cpu3_us[layer_idx] = cpu3_us;
+            p.layer_s4_us[layer_idx] = s4_us;
+            p.layer_cpu4_us[layer_idx] = cpu4_us.max(0.0);
+            p.s3_dispatches[layer_idx] = s3_disp;
+            p.s4_dispatches[layer_idx] = s4_disp;
         }
 
         Ok(())
@@ -864,11 +1123,12 @@ impl MlxModelWeights {
     /// executes compute dispatches in order, so buffer reuse between experts
     /// is safe — each dispatch completes before the next reads the same buffer.
     /// This eliminates 2*top_k = 16 sessions per layer.
+    /// Returns (s3_us, cpu3_us, s4_us, s3_dispatches, s4_dispatches).
     fn forward_decode_moe(
         &mut self,
         layer_idx: usize,
         gpu: &mut GpuContext,
-    ) -> Result<()> {
+    ) -> Result<(f64, f64, f64, usize, usize)> {
         let hs = self.hidden_size;
         let top_k = self.layers[layer_idx].moe.top_k;
         let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
@@ -887,6 +1147,7 @@ impl MlxModelWeights {
         // SESSION 3: Router projection
         // =====================================================================
         // CPU: prepare router input (unit norm + scale on residual)
+        let s3_start = Instant::now();
         let (top_k_indices, top_k_weights) = {
             let residual: &[f32] = self.activations.residual.as_slice()
                 .map_err(|e| anyhow::anyhow!("router residual: {e}"))?;
@@ -901,8 +1162,7 @@ impl MlxModelWeights {
                 router_input[i] *= router_scale[i] * scale_factor;
             }
 
-            // Write scaled router input into norm_out (NOT moe_norm_out, which
-            // holds the pre_feedforward_layernorm_2 output needed by experts).
+            // Write scaled router input into norm_out
             {
                 let dst: &mut [f32] = self.activations.norm_out.as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("ri: {e}"))?;
@@ -924,7 +1184,6 @@ impl MlxModelWeights {
             let num_experts = self.num_experts;
 
             let max_val = logits[..num_experts].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            // Safety: handle NaN/Inf in logits gracefully
             if max_val.is_nan() || max_val.is_infinite() {
                 anyhow::bail!(
                     "Router logits corrupted at layer {layer_idx}: max_val={max_val}"
@@ -950,6 +1209,13 @@ impl MlxModelWeights {
 
             (top_indices, top_weights)
         };
+        // S3 includes the GPU session + CPU softmax/topk
+        let s3_total_elapsed = s3_start.elapsed().as_secs_f64() * 1e6;
+        // We can't separate S3 GPU from CPU3 perfectly here, but S3 GPU is
+        // just 1 qmatmul (128 outputs, ~10us), so attribute most to GPU.
+        // For now, we'll report the whole block as S3 (GPU-dominated).
+        let s3_us = s3_total_elapsed;
+        let cpu3_us = 0.0; // Included in s3_us for simplicity
 
         let per_expert_scale: Vec<f32> = {
             let s: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
@@ -959,12 +1225,6 @@ impl MlxModelWeights {
 
         // =====================================================================
         // SESSION 4: All expert dispatches in ONE session.
-        //
-        // Within one Metal command buffer, compute dispatches execute in
-        // encoded order.  Each dispatch sees the results of all prior
-        // dispatches.  So we can reuse the same gate_up_out / mlp_fused /
-        // expert_out scratch buffers across all experts — the qmatmul for
-        // expert k+1 runs AFTER the accumulate for expert k completes.
         // =====================================================================
 
         // Zero the accumulator on CPU (fast for 2816 elements)
@@ -974,6 +1234,8 @@ impl MlxModelWeights {
             accum[..hs].fill(0.0);
         }
 
+        let s4_start = Instant::now();
+        let mut s4_dispatches = 0usize;
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
@@ -985,45 +1247,50 @@ impl MlxModelWeights {
                 s.encoder_mut(), reg, metal_dev,
                 &self.activations.moe_accum, hs,
             ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
+            s4_dispatches += 1;
 
             for k_idx in 0..top_k {
                 let eid = top_k_indices[k_idx] as usize;
                 let w = top_k_weights[k_idx] * per_expert_scale[eid];
 
-                // Skip experts with near-zero routing weight
                 if w.abs() < 1e-10 {
                     continue;
                 }
 
-                // gate_up matmul: moe_norm_out → moe_gate_up_out [2*moe_int]
+                // gate_up matmul
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
                     &self.layers[layer_idx].moe.expert_gate_up[eid],
                     &mut self.activations.moe_gate_up_out, 1)?;
+                s4_dispatches += 1;
 
-                // GPU SwiGLU: gelu(gate_up[0:N]) * gate_up[N:2N] → mlp_fused [moe_int]
+                // GPU SwiGLU
                 mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.moe_gate_up_out,
                     &self.activations.mlp_fused,
                     moe_int,
                 ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
+                s4_dispatches += 1;
 
-                // down matmul: mlp_fused → moe_expert_out [hs]
+                // down matmul
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
                     &self.layers[layer_idx].moe.expert_down[eid],
                     &mut self.activations.moe_expert_out, 1)?;
+                s4_dispatches += 1;
 
-                // GPU weighted accumulate: moe_accum += w * moe_expert_out
+                // GPU weighted accumulate
                 mlx_native::ops::moe_dispatch::moe_accumulate_encode(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.moe_accum,
                     &self.activations.moe_expert_out,
                     w, hs,
                 ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
+                s4_dispatches += 1;
             }
 
             s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
         }
+        let s4_us = s4_start.elapsed().as_secs_f64() * 1e6;
 
         // Post-feedforward norm 2 on MoE output (CPU)
         cpu_rms_norm_weighted(
@@ -1038,7 +1305,7 @@ impl MlxModelWeights {
             dst[..hs].copy_from_slice(&src[..hs]);
         }
 
-        Ok(())
+        Ok((s3_us, cpu3_us, s4_us, 1usize, s4_dispatches))
     }
 
     /// Final norm + GPU lm_head (dense GEMM F16) + softcap + argmax.
@@ -1048,6 +1315,7 @@ impl MlxModelWeights {
     fn forward_decode_head(
         &mut self,
         gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
     ) -> Result<u32> {
         let hs = self.hidden_size;
         let vocab_size = self.vocab_size;
@@ -1059,24 +1327,23 @@ impl MlxModelWeights {
         )?;
 
         // LM head: GPU dense GEMM (F16) or CPU fallback
+        let head_gpu_start = Instant::now();
+        let mut head_dispatches = 0usize;
         if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            // GPU path: cast hidden F32→F16, GEMM, cast logits F16→F32
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let metal_dev = dev.metal_device();
             let mut s = exec.begin().map_err(|e| anyhow::anyhow!("lm_head begin: {e}"))?;
 
-            // Cast norm_out (F32, hs elements) → hidden_f16 (F16)
             mlx_native::ops::elementwise::cast(
                 s.encoder_mut(), reg, metal_dev,
                 &self.activations.norm_out,
                 &self.activations.hidden_f16,
                 hs,
                 CastDirection::F32ToF16,
-            ).map_err(|e| anyhow::anyhow!("cast F32→F16: {e}"))?;
+            ).map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
+            head_dispatches += 1;
 
-            // Dense GEMM: logits_f16 = hidden_f16 @ lm_head_f16.T
-            // A = [1, hs] f16, B = [vocab_size, hs] f16, C = [1, vocab_size] f16
             let gemm_params = DenseGemmF16Params {
                 m: 1,
                 n: vocab_size as u32,
@@ -1089,23 +1356,25 @@ impl MlxModelWeights {
                 &self.activations.logits_f16,
                 &gemm_params,
             ).map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
+            head_dispatches += 1;
 
-            // Cast logits_f16 (F16, vocab_size) → logits (F32)
             mlx_native::ops::elementwise::cast(
                 s.encoder_mut(), reg, metal_dev,
                 &self.activations.logits_f16,
                 &self.activations.logits,
                 vocab_size,
                 CastDirection::F16ToF32,
-            ).map_err(|e| anyhow::anyhow!("cast F16→F32: {e}"))?;
+            ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
+            head_dispatches += 1;
 
             s.finish().map_err(|e| anyhow::anyhow!("lm_head finish: {e}"))?;
         } else {
-            // CPU fallback (kept for safety)
             self.lm_head_cpu()?;
         }
+        let head_gpu_us = head_gpu_start.elapsed().as_secs_f64() * 1e6;
 
-        // Softcapping (CPU — vocab_size elements, fast)
+        // Softcapping + Argmax (CPU)
+        let head_cpu_start = Instant::now();
         if let Some(cap) = self.final_logit_softcapping {
             let logits: &mut [f32] = self.activations.logits.as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("softcap logits: {e}"))?;
@@ -1114,7 +1383,6 @@ impl MlxModelWeights {
             }
         }
 
-        // Argmax on CPU (single row of vocab_size, fast)
         let logits: &[f32] = self.activations.logits.as_slice()
             .map_err(|e| anyhow::anyhow!("argmax logits: {e}"))?;
         let mut best_idx = 0u32;
@@ -1124,6 +1392,13 @@ impl MlxModelWeights {
                 best_val = logits[i];
                 best_idx = i as u32;
             }
+        }
+        let head_cpu_us = head_cpu_start.elapsed().as_secs_f64() * 1e6;
+
+        if let Some(ref mut p) = profile {
+            p.head_session_us = head_gpu_us;
+            p.head_cpu_us = head_cpu_us;
+            p.head_dispatches = head_dispatches;
         }
 
         Ok(best_idx)
