@@ -1,6 +1,8 @@
 //! Inference engine for GGUF models — load, generate, and serve.
 
 pub mod config;
+#[cfg(feature = "mlx-native-backend")]
+pub mod forward_mlx;
 pub mod gemma4;
 pub mod gguf_loader;
 #[cfg(feature = "mlx-native-backend")]
@@ -724,6 +726,28 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let mut model = Gemma4Model::load_with_modes(
         &cfg, &gguf, &device, moe_mode, rms_mode, rope_mode, lm_head_mode, kv_cache_mode,
     )?;
+
+    // ADR-006 Phase 5: backend selection.
+    let backend = args.backend;
+    tracing::info!("Inference backend: {}", backend);
+    #[cfg(feature = "mlx-native-backend")]
+    let _gpu_ctx: Option<gpu::GpuContext> = match backend {
+        cli::InferenceBackend::MlxNative => {
+            eprintln!("Initializing mlx-native GPU context...");
+            let ctx = gpu::GpuContext::new()
+                .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+            eprintln!("mlx-native backend: {} ({})", ctx.gpu_name(), "ready");
+            Some(ctx)
+        }
+        cli::InferenceBackend::Candle => None,
+    };
+    #[cfg(not(feature = "mlx-native-backend"))]
+    if matches!(backend, cli::InferenceBackend::MlxNative) {
+        anyhow::bail!(
+            "--backend mlx-native requires the mlx-native-backend feature. \
+             Rebuild with: cargo build --features metal,mlx-native-backend"
+        );
+    }
 
     // Warmup: run two dummy forwards to force Metal shader compilation for
     // both the decode and prefill code paths at model-load time.

@@ -302,6 +302,37 @@ pub struct GenerateArgs {
     /// doc and ADR-005 line 229 for the a0952e2 stride-gotcha history).
     #[arg(long, value_enum, default_value = "in-place")]
     pub kv_cache_kernel: KvCacheKernelMode,
+
+    /// GPU compute backend for the forward pass.
+    ///
+    /// `candle` (default): existing candle-based forward pass with per-op
+    /// kernel dispatches through candle's Metal command pool.
+    ///
+    /// `mlx-native`: ADR-006 Phase 5 — routes the entire forward pass
+    /// through mlx-native's `GraphExecutor`, encoding all ops into a
+    /// single Metal command buffer with one `commit_and_wait` per token.
+    /// Requires `--features mlx-native-backend` at build time. Target:
+    /// >=102 tok/s with coherence preserved.
+    #[arg(long, value_enum, default_value = "candle")]
+    pub backend: InferenceBackend,
+}
+
+/// GPU compute backend for inference.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceBackend {
+    /// Existing candle-based forward pass (default).
+    Candle,
+    /// ADR-006 Phase 5: mlx-native single-encoder forward pass.
+    MlxNative,
+}
+
+impl std::fmt::Display for InferenceBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candle => write!(f, "candle"),
+            Self::MlxNative => write!(f, "mlx-native"),
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
