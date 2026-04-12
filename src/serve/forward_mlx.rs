@@ -231,6 +231,10 @@ pub struct MlxModelWeights {
     pub moe_intermediate_size: usize,
     /// k_eq_v flag.
     pub k_eq_v: bool,
+    /// Global-layer RoPE frequency factors from `rope_freqs.weight`.
+    /// Shape `[global_head_dim/2]`.  Each value divides the per-pair
+    /// frequency: `1.0` means normal rotation, `1e+30` → identity.
+    pub rope_freq_factors: Vec<f32>,
 }
 
 impl MlxModelWeights {
@@ -461,6 +465,7 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             moe_intermediate_size: cfg.moe_intermediate_size,
             k_eq_v: cfg.attention_k_eq_v,
+            rope_freq_factors: model.rope_freqs_host().to_vec(),
         })
     }
 
@@ -612,13 +617,16 @@ impl MlxModelWeights {
 
         // -- f. RoPE (CPU) --
         let theta = if is_sliding { self.rope_theta_sliding } else { self.rope_theta_global };
+        // Global layers use freq_factors to mask certain rotation pairs to identity.
+        // Sliding layers pass None (all pairs rotate normally).
+        let ff = if is_sliding { None } else { Some(self.rope_freq_factors.as_slice()) };
         apply_rope_neox_cpu(
             self.activations.attn_q.as_mut_slice().map_err(|e| anyhow::anyhow!("rq: {e}"))?,
-            nh, hd, seq_pos, theta,
+            nh, hd, seq_pos, theta, ff,
         );
         apply_rope_neox_cpu(
             self.activations.attn_k.as_mut_slice().map_err(|e| anyhow::anyhow!("rk: {e}"))?,
-            nkv, hd, seq_pos, theta,
+            nkv, hd, seq_pos, theta, ff,
         );
 
         // -- g. KV cache update (CPU) --
@@ -666,6 +674,7 @@ impl MlxModelWeights {
                     n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
                     seq_len: 1, kv_seq_len: kv_seq_len as u32,
                     window_size: self.sliding_window as u32, scale: 1.0,
+                    kv_capacity: kv_capacity as u32,
                 };
                 mlx_native::ops::sdpa_sliding::sdpa_sliding(
                     s.encoder_mut(), reg, dev,
@@ -676,6 +685,7 @@ impl MlxModelWeights {
                 let p = SdpaParams {
                     n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
                     seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
+                    kv_capacity: kv_capacity as u32,
                 };
                 s.sdpa(reg, dev, &self.activations.attn_q, &self.kv_caches[layer_idx].k,
                     &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
@@ -825,9 +835,10 @@ impl MlxModelWeights {
                 router_input[i] *= router_scale[i] * scale_factor;
             }
 
-            // Write scaled input, then GPU router matmul
+            // Write scaled router input into norm_out (NOT moe_norm_out, which
+            // holds the pre_feedforward_layernorm_2 output needed by experts).
             {
-                let dst: &mut [f32] = self.activations.moe_norm_out.as_mut_slice()
+                let dst: &mut [f32] = self.activations.norm_out.as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("ri: {e}"))?;
                 dst[..hs].copy_from_slice(&router_input);
             }
@@ -835,7 +846,7 @@ impl MlxModelWeights {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("router begin: {e}"))?;
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].moe.router_proj,
                     &mut self.activations.moe_router_logits, 1)?;
                 s.finish().map_err(|e| anyhow::anyhow!("router finish: {e}"))?;
@@ -1225,18 +1236,28 @@ fn rms_norm_unit_cpu(x: &mut [f32], eps: f32) {
 /// Apply Neox-convention RoPE in-place for a single position.
 /// data layout: [num_heads, head_dim] contiguous.
 /// Neox pairs (d[i], d[i + half_dim]) for i in 0..half_dim.
+///
+/// `freq_factors`: optional per-pair frequency divisor `[half_dim]`.
+/// For global layers, pair indices with `freq_factors[i] == 1e+30` produce
+/// `theta ≈ 0 → cos=1, sin=0 → identity rotation`.  For sliding layers,
+/// pass `None` (equivalent to all-ones).
 fn apply_rope_neox_cpu(
     data: &mut [f32],
     num_heads: usize,
     head_dim: usize,
     pos: usize,
     theta: f32,
+    freq_factors: Option<&[f32]>,
 ) {
     let half_dim = head_dim / 2;
     for h in 0..num_heads {
         let base = h * head_dim;
         for i in 0..half_dim {
-            let freq = (pos as f32) / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let base_freq = (pos as f32) / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let freq = match freq_factors {
+                Some(ff) => base_freq / ff[i],
+                None => base_freq,
+            };
             let cos_val = freq.cos();
             let sin_val = freq.sin();
             let x0 = data[base + i];

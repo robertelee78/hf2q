@@ -1857,6 +1857,10 @@ pub struct Gemma4Model {
     /// drops to zero while a forward pass is in flight.
     #[allow(dead_code)]
     rms_kernel: RmsNormKernel,
+    /// Global-layer RoPE frequency factors loaded from `rope_freqs.weight`.
+    /// Shape `[global_head_dim/2]`.  Stored for mlx-native weight extraction.
+    #[cfg(feature = "mlx-native-backend")]
+    rope_freqs_host: Vec<f32>,
 }
 
 impl Gemma4Model {
@@ -1896,6 +1900,13 @@ impl Gemma4Model {
     #[cfg(feature = "mlx-native-backend")]
     pub(crate) fn lm_head_weight(&self) -> &Tensor {
         &self.lm_head_weight
+    }
+
+    /// Global-layer RoPE frequency factors (`rope_freqs.weight`).
+    /// Shape `[global_head_dim/2]` — `1.0` for active pairs, `1e+30` for masked.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn rope_freqs_host(&self) -> &[f32] {
+        &self.rope_freqs_host
     }
 
     /// Model hidden size.
@@ -2191,6 +2202,10 @@ impl Gemma4Model {
             rope_kernel.clone(),
             counters.clone(),
         )?);
+        // Clone freq_factors before moving into RotaryEmbedding — the mlx-native
+        // weight extractor needs the host-side copy for its CPU RoPE path.
+        #[cfg(feature = "mlx-native-backend")]
+        let rope_freqs_host_clone = rope_freqs_host.clone();
         let rope_global = Arc::new(RotaryEmbedding::new(
             cfg.global_head_dim,
             max_rope_len,
@@ -2429,6 +2444,8 @@ impl Gemma4Model {
             device: device.clone(),
             counters,
             rms_kernel,
+            #[cfg(feature = "mlx-native-backend")]
+            rope_freqs_host: rope_freqs_host_clone,
         })
     }
 
