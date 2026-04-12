@@ -14,11 +14,12 @@
 //!
 //! # Status
 //!
-//! Phase 5 step 3: session-collapse optimization.
+//! Phase 5 step 4: MoE single-session optimization.
 //! - Dense MLP path merged into 1 session (SDPA→down in 1 session).
 //! - GPU norms, adds, GELU, mul in merged sessions.
 //! - GPU dense GEMM for lm_head (F16) replaces CPU matmul.
-//! - MoE experts: per-expert sequential (batching had aliasing bug).
+//! - MoE experts: ALL experts in ONE session using GPU SwiGLU + accumulate.
+//!   Eliminates 16 sessions/layer → 1, for 4 sessions/layer total.
 
 use anyhow::Result;
 use mlx_native::{
@@ -578,7 +579,7 @@ impl MlxModelWeights {
 
     /// Run one decoder layer with session-collapsed GPU dispatch.
     ///
-    /// Session structure (3 + 2*top_k sessions per layer):
+    /// Session structure (4 sessions per layer):
     ///   Session 1: Q/K/V projections
     ///   CPU: head norms, V norm, RoPE, KV cache update
     ///   Session 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
@@ -587,9 +588,8 @@ impl MlxModelWeights {
     ///   CPU: post-FF-norm1, pre-FF-norm2, MoE routing prep
     ///   Session 3: router_proj
     ///   CPU: softmax + top-k
-    ///   Per-expert loop (top_k=8 iterations):
-    ///     Session: gate_up matmul → CPU GELU*up → Session: down matmul
-    ///     CPU: weighted accumulate
+    ///   Session 4: zero(accum) + for each expert:
+    ///     gate_up matmul → GPU-SwiGLU → down matmul → GPU-accumulate
     ///   CPU: post-FF-norm2, combine, layer scalar
     fn forward_decode_layer(
         &mut self,
@@ -816,7 +816,7 @@ impl MlxModelWeights {
             dst[..hs].copy_from_slice(&src[..hs]);
         }
 
-        // -- MoE path (sessions 3-5) --
+        // -- MoE path (sessions 3-4) --
         self.forward_decode_moe(layer_idx, gpu)?;
 
         // -- Combine MLP + MoE, final norm, residual, layer scalar (CPU) --
@@ -852,19 +852,18 @@ impl MlxModelWeights {
 
     /// MoE forward pass for one layer.
     ///
-    /// Session structure (2 + 2*top_k sessions):
+    /// Session structure (2 sessions):
     ///   Session 3: router_proj
-    ///   CPU: softmax + top-k
-    ///   Per-expert loop (top_k iterations):
-    ///     Session: gate_up matmul
-    ///     CPU: GELU*up
-    ///     Session: down matmul
-    ///     CPU: weighted accumulate
+    ///   CPU: softmax + top-k (128 elements, microseconds)
+    ///   Session 4: zero_buffer(accum) + for each expert:
+    ///     qmatmul(gate_up) → moe_swiglu_fused → qmatmul(down) → moe_accumulate
     ///   CPU: post-FF-norm2
     ///
-    /// Note: Batching all expert matmuls into a single session was attempted
-    /// but caused a coherence regression — only 2 output buffers were allocated
-    /// for top_k=8 experts, causing buffer aliasing.
+    /// Optimization: all expert ops (gate_up, SwiGLU, down, accumulate) are
+    /// encoded into a SINGLE GPU session.  Within one command buffer, Metal
+    /// executes compute dispatches in order, so buffer reuse between experts
+    /// is safe — each dispatch completes before the next reads the same buffer.
+    /// This eliminates 2*top_k = 16 sessions per layer.
     fn forward_decode_moe(
         &mut self,
         layer_idx: usize,
@@ -925,6 +924,12 @@ impl MlxModelWeights {
             let num_experts = self.num_experts;
 
             let max_val = logits[..num_experts].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            // Safety: handle NaN/Inf in logits gracefully
+            if max_val.is_nan() || max_val.is_infinite() {
+                anyhow::bail!(
+                    "Router logits corrupted at layer {layer_idx}: max_val={max_val}"
+                );
+            }
             let mut probs = vec![0.0f32; num_experts];
             let mut sum = 0.0f32;
             for i in 0..num_experts {
@@ -936,7 +941,7 @@ impl MlxModelWeights {
             }
 
             let mut indices: Vec<usize> = (0..num_experts).collect();
-            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
             let top_indices: Vec<u32> = indices[..top_k].iter().map(|&i| i as u32).collect();
             let top_probs: Vec<f32> = indices[..top_k].iter().map(|&i| probs[i]).collect();
 
@@ -946,65 +951,78 @@ impl MlxModelWeights {
             (top_indices, top_weights)
         };
 
-        // Zero the accumulator
+        let per_expert_scale: Vec<f32> = {
+            let s: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
+                .map_err(|e| anyhow::anyhow!("per_expert_scale: {e}"))?;
+            s.to_vec()
+        };
+
+        // =====================================================================
+        // SESSION 4: All expert dispatches in ONE session.
+        //
+        // Within one Metal command buffer, compute dispatches execute in
+        // encoded order.  Each dispatch sees the results of all prior
+        // dispatches.  So we can reuse the same gate_up_out / mlp_fused /
+        // expert_out scratch buffers across all experts — the qmatmul for
+        // expert k+1 runs AFTER the accumulate for expert k completes.
+        // =====================================================================
+
+        // Zero the accumulator on CPU (fast for 2816 elements)
         {
             let accum: &mut [f32] = self.activations.moe_accum.as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("moe accum zero: {e}"))?;
             accum[..hs].fill(0.0);
         }
 
-        let per_expert_scale: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
-            .map_err(|e| anyhow::anyhow!("per_expert_scale: {e}"))?;
+        {
+            let (exec, reg) = gpu.split();
+            let dev = exec.device();
+            let metal_dev = dev.metal_device();
+            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
 
-        // Per-expert sequential dispatch.
-        // Note: batching all experts into 2 sessions was attempted but caused
-        // coherence regression — only 2 output buffers for top_k=8 experts
-        // caused buffer aliasing (experts 2-7 clobbered expert 1's output).
-        for k_idx in 0..top_k {
-            let eid = top_k_indices[k_idx] as usize;
-            let w = top_k_weights[k_idx] * per_expert_scale[eid];
+            // Zero the accumulator on GPU
+            mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.moe_accum, hs,
+            ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
 
-            // GPU: gate_up matmul
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("moe gu begin: {e}"))?;
+            for k_idx in 0..top_k {
+                let eid = top_k_indices[k_idx] as usize;
+                let w = top_k_weights[k_idx] * per_expert_scale[eid];
+
+                // Skip experts with near-zero routing weight
+                if w.abs() < 1e-10 {
+                    continue;
+                }
+
+                // gate_up matmul: moe_norm_out → moe_gate_up_out [2*moe_int]
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
                     &self.layers[layer_idx].moe.expert_gate_up[eid],
                     &mut self.activations.moe_gate_up_out, 1)?;
-                s.finish().map_err(|e| anyhow::anyhow!("moe gu finish: {e}"))?;
-            }
 
-            // CPU: gelu(gate) * up
-            {
-                let gu: &[f32] = self.activations.moe_gate_up_out.as_slice()
-                    .map_err(|e| anyhow::anyhow!("gu: {e}"))?;
-                let fused: &mut [f32] = self.activations.mlp_fused.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("fu: {e}"))?;
-                for i in 0..moe_int {
-                    fused[i] = gelu_tanh(gu[i]) * gu[moe_int + i];
-                }
-            }
+                // GPU SwiGLU: gelu(gate_up[0:N]) * gate_up[N:2N] → mlp_fused [moe_int]
+                mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_gate_up_out,
+                    &self.activations.mlp_fused,
+                    moe_int,
+                ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
 
-            // GPU: down matmul
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("moe dn begin: {e}"))?;
+                // down matmul: mlp_fused → moe_expert_out [hs]
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
                     &self.layers[layer_idx].moe.expert_down[eid],
                     &mut self.activations.moe_expert_out, 1)?;
-                s.finish().map_err(|e| anyhow::anyhow!("moe dn finish: {e}"))?;
+
+                // GPU weighted accumulate: moe_accum += w * moe_expert_out
+                mlx_native::ops::moe_dispatch::moe_accumulate_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_accum,
+                    &self.activations.moe_expert_out,
+                    w, hs,
+                ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
             }
 
-            // CPU: weighted accumulate
-            {
-                let out: &[f32] = self.activations.moe_expert_out.as_slice()
-                    .map_err(|e| anyhow::anyhow!("eo: {e}"))?;
-                let acc: &mut [f32] = self.activations.moe_accum.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("ac: {e}"))?;
-                for i in 0..hs { acc[i] += w * out[i]; }
-            }
+            s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
         }
 
         // Post-feedforward norm 2 on MoE output (CPU)
@@ -1412,8 +1430,6 @@ fn gelu_tanh(x: f32) -> f32 {
 //       - Merged SDPA + O-proj + GPU-norm + GPU-add + GPU-norm
 //         + gate + up + GPU-GELU + GPU-mul + down into 1 session
 //       - Router proj in its own session (CPU softmax/top-k between)
-//       - MoE experts: per-expert sequential (2 sessions/expert)
-//         Batching was attempted but had aliasing bug (2 buffers for 8 experts).
 // - [x] GPU lm_head via dense_gemm_f16 (replaces CPU 262K×2816 dot products)
 //       - F16 embed weight created at load time
 //       - Cast F32→F16 + GEMM + cast F16→F32 in one GPU session
@@ -1422,9 +1438,17 @@ fn gelu_tanh(x: f32) -> f32 {
 // - [x] GPU rms_norm for post-attn and pre-FF norms (encoded in merged session 2)
 // - [x] GPU elementwise_add for residual (encoded in merged session 2)
 //
+// DONE (Phase 5 step 4 — MoE single-session):
+// - [x] GPU moe_swiglu_fused: gelu(gate_up[0:N]) * gate_up[N:2N] in one kernel
+// - [x] All expert ops (gate_up, SwiGLU, down, accumulate) in ONE session
+//       - Eliminated 2*top_k = 16 sessions per MoE layer
+//       - Buffer reuse is safe: Metal dispatches execute in order within
+//         a single command buffer
+//       - Total sessions: 4 per layer (QKV, SDPA+MLP, router, experts) + 1 head
+//       - 30 layers × 4 + 1 = 121 sessions per token (down from 571)
+//
 // OPTIMIZATIONS deferred to Phase 5c:
 // - [ ] GPU RoPE with freq_factors support (needs new kernel)
-// - [ ] GPU MoE GELU on gate half (needs slice-aware kernel)
 // - [ ] GPU embedding via embedding_gather kernel
 // - [ ] GPU MoE routing (softmax + argsort on GPU)
 // - [ ] GPU argmax via dispatch_argmax_f32
