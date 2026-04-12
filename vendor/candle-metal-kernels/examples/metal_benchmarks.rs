@@ -450,6 +450,507 @@ fn run_nsg_microbench(iters: usize, warmup: usize) -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// 1bNEW.29 Option C — Q6_K NR0=2 microbench
+//
+// Times the candle Q6_K Metal matmul kernel (Variant A, production) vs a
+// byte-for-byte port of llama.cpp's nr0=2 row-loop variant (Variant B, added
+// to quantized.metal as `kernel_mul_mv_q6_K_f32_nr2`) at the exact dispatch
+// shapes hf2q runs in production for Gemma 4 26B attention.
+//
+// Variant A is the existing `kernel_mul_mv_q6_K_f32` at
+// vendor/candle-metal-kernels/src/metal_src/quantized.metal:5186-5294 —
+// 1 row per simdgroup, dispatched as ne01/(1*NSG) = ne01/2 threadgroups.
+//
+// Variant B is the new `kernel_mul_mv_q6_K_f32_nr2` added after line 5294 —
+// 2 rows per simdgroup (byte-for-byte port of llama.cpp's `nr0 = 2`), dispatched
+// as ne01/(2*NSG) = ne01/4 threadgroups. Uses a real `nb01` byte stride to
+// advance per-row src0 pointers inside the kernel; host must pass
+// nb01 = sizeof(block_q6_K) * (k/QK_K).
+//
+// Decision rule: GO if Variant B is >=10% faster on any production shape AND
+// correctness sanity check passes (max|Δ| <= 1e-5 relative). NO-GO otherwise.
+//
+// Methodology mirrors `run_one_shape_nsg` (NSG sweep from spike 1bNEW.29 Agent
+// #1): per-dispatch commit+waitUntilCompleted, 1000 timed iters per cell,
+// median across cross-run medians.
+// =============================================================================
+
+/// Byte-size of one Q6_K super-block (matches the Metal struct layout:
+/// ql[128] + qh[64] + scales[16] + sizeof(half)=2 = 210 bytes).
+const Q6K_BLOCK_BYTES: usize = 210;
+/// Q6_K super-block element count (QK_K = 256).
+const Q6K_QK_K: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum Q6KVariant {
+    /// Existing production candle kernel: 1 row per simdgroup.
+    ControlA,
+    /// llama.cpp byte-for-byte port: 2 rows per simdgroup (nr0=2).
+    Nr2VariantB,
+}
+
+impl Q6KVariant {
+    fn kernel_name(self) -> &'static str {
+        match self {
+            Q6KVariant::ControlA => "kernel_mul_mv_q6_K_f32",
+            Q6KVariant::Nr2VariantB => "kernel_mul_mv_q6_K_f32_nr2",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Q6KVariant::ControlA => "A (nr0=1)",
+            Q6KVariant::Nr2VariantB => "B (nr0=2)",
+        }
+    }
+    /// Rows per simdgroup for this variant.
+    fn nr0(self) -> usize {
+        match self {
+            Q6KVariant::ControlA => 1,
+            Q6KVariant::Nr2VariantB => 2,
+        }
+    }
+}
+
+/// Shapes for the Q6_K microbench — reused from nsg_microbench_shapes, filtered
+/// to Q6_K only. The 6 production shapes from docs/ADR-005-inference-server.md:
+/// attention q_proj/k_proj/o_proj × {sliding, global}.
+fn q6k_microbench_shapes() -> Vec<Shape> {
+    nsg_microbench_shapes()
+        .into_iter()
+        .filter(|s| matches!(s.qtype, QType::Q6K))
+        .collect()
+}
+
+/// Dispatch ONE timed iteration of a Q6_K variant at the given shape.
+/// Returns elapsed wall-clock ns for a single commit + waitUntilCompleted.
+#[allow(clippy::too_many_arguments)]
+fn q6k_dispatch_once(
+    queue: &candle_metal_kernels::metal::CommandQueue,
+    pipeline: &candle_metal_kernels::metal::ComputePipeline,
+    variant: Q6KVariant,
+    weight: &candle_metal_kernels::metal::Buffer,
+    lhs: &candle_metal_kernels::metal::Buffer,
+    dst: &candle_metal_kernels::metal::Buffer,
+    n: usize,
+    k: usize,
+) -> Result<u128> {
+    let m = 1i64;
+    let b = 1i64;
+
+    // Real byte stride per row of Q6_K weights. For n×k with block_k=256, each
+    // row has k/256 blocks × 210 bytes. Variant B requires this stride be
+    // non-zero (it advances per-row pointers by it). Variant A ignores nb01
+    // entirely, so passing the real stride to both is safe.
+    let blocks_per_row = (k / Q6K_QK_K) as i64;
+    let nb01_bytes = blocks_per_row * Q6K_BLOCK_BYTES as i64;
+
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b;
+    let nb00: i64 = 0;
+    let nb02: i64 = 0;
+    let ne10 = k as i64;
+    let ne11 = m;
+    let ne12 = b;
+    let nb10: i64 = 0;
+    let nb11: i64 = 0;
+    let nb12: i64 = 0;
+    let ne0 = n as i64;
+    let ne1 = m;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    // Threadgroup grid: NSG=2, nr0=1 for control, nr0=2 for nr2 variant.
+    // Rows per threadgroup = NSG * nr0 = 2 or 4.
+    let rows_per_tg = 2 * variant.nr0();
+    let threadgroup_count = MTLSize {
+        width: ceil_div(n, rows_per_tg),
+        height: m as usize,
+        depth: b as usize,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 32 * 2, // NSG=2 → 64 threads/tg = 2 simdgroups × 32 lanes
+        height: 1,
+        depth: 1,
+    };
+
+    let semaphore = Arc::new(CommandSemaphore::new());
+    let cb = create_command_buffer(queue, semaphore)?;
+    let encoder = cb.compute_command_encoder();
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(weight), 0);
+    encoder.set_buffer(1, Some(lhs), 0);
+    encoder.set_buffer(2, Some(dst), 0);
+    encoder.set_bytes(3, &ne00);
+    encoder.set_bytes(4, &ne01);
+    encoder.set_bytes(5, &ne02);
+    encoder.set_bytes(6, &nb00);
+    encoder.set_bytes(7, &nb01_bytes);
+    encoder.set_bytes(8, &nb02);
+    encoder.set_bytes(9, &ne10);
+    encoder.set_bytes(10, &ne11);
+    encoder.set_bytes(11, &ne12);
+    encoder.set_bytes(12, &nb10);
+    encoder.set_bytes(13, &nb11);
+    encoder.set_bytes(14, &nb12);
+    encoder.set_bytes(15, &ne0);
+    encoder.set_bytes(16, &ne1);
+    encoder.set_bytes(17, &r2);
+    encoder.set_bytes(18, &r3);
+    use objc2_metal::MTLResourceUsage;
+    encoder.use_resource(weight, MTLResourceUsage::Read);
+    encoder.use_resource(lhs, MTLResourceUsage::Read);
+    encoder.use_resource(dst, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(threadgroup_count, threads_per_threadgroup);
+    encoder.end_encoding();
+    let t0 = std::time::Instant::now();
+    cb.commit();
+    cb.wait_until_completed();
+    Ok(t0.elapsed().as_nanos())
+}
+
+/// Allocate + deterministically fill a (weight, lhs, dst) triplet for a Q6_K
+/// matmul of shape [1, k] @ [n, k] (weight in column-row layout, laid out as
+/// `n` rows of `(k/QK_K)` Q6_K blocks). Output is a `[1, n]` f32 vector.
+///
+/// This isn't a semantically valid Q6_K tensor (quant scales are random bytes),
+/// but the kernels don't validate — they compute a deterministic function of
+/// the bytes, so as long as both variants see the SAME bytes they will produce
+/// numerically-comparable results. This is the correctness-sanity-check
+/// foundation: if Variant B's NR0=2 port is correct, both variants will sum
+/// the same dot-product terms over the same bytes and output the same values.
+#[allow(clippy::type_complexity)]
+fn q6k_alloc_buffers(
+    device: &Device,
+    n: usize,
+    k: usize,
+) -> Result<(
+    candle_metal_kernels::metal::Buffer,
+    candle_metal_kernels::metal::Buffer,
+    candle_metal_kernels::metal::Buffer,
+)> {
+    assert_eq!(k % Q6K_QK_K, 0, "k must be a multiple of QK_K=256");
+    let blocks_per_row = k / Q6K_QK_K;
+    let weight_bytes = n * blocks_per_row * Q6K_BLOCK_BYTES;
+    let lhs_bytes = k * std::mem::size_of::<f32>();
+    let dst_bytes = n * std::mem::size_of::<f32>();
+
+    let weight = device.new_buffer(weight_bytes, RESOURCE_OPTIONS)?;
+    let lhs = device.new_buffer(lhs_bytes, RESOURCE_OPTIONS)?;
+    let dst = device.new_buffer(dst_bytes, RESOURCE_OPTIONS)?;
+
+    // Deterministic fill with REALISTIC block_q6_K layout (not just garbage
+    // bytes) so the kernels produce finite outputs we can meaningfully compare.
+    //
+    // block_q6_K = ql[128] + qh[64] + scales[16] + half d  = 210 bytes per
+    // super-block of QK_K=256 weights. Layout (see quantized.metal:198-203):
+    //   offset   0..128  : ql  (uint8_t[128]  — lower 4 bits of quants)
+    //   offset 128..192  : qh  (uint8_t[64]   — upper 2 bits of quants)
+    //   offset 192..208  : sc  ( int8_t[16]   — scales, i8)
+    //   offset 208..210  : d   (half          — super-block scale)
+    //
+    // We fill ql/qh with a low-entropy Knuth-hash pattern, set scales to
+    // small i8 values (±8 range), and force d = 0.0625 (half bit pattern
+    // 0x2C00) so the per-block scale × dot-product products stay well within
+    // f32 range. This guarantees finite outputs for both variants.
+    unsafe {
+        let w_ptr = weight.contents();
+        let total_blocks = n * blocks_per_row;
+        for block_idx in 0..total_blocks {
+            let base = block_idx * Q6K_BLOCK_BYTES;
+            // ql: 128 bytes
+            for j in 0..128 {
+                *w_ptr.add(base + j) =
+                    ((block_idx.wrapping_mul(2654435761).wrapping_add(j)) & 0xFF) as u8;
+            }
+            // qh: 64 bytes
+            for j in 0..64 {
+                *w_ptr.add(base + 128 + j) =
+                    ((block_idx.wrapping_mul(40503).wrapping_add(j)) & 0xFF) as u8;
+            }
+            // scales: 16 i8 values, pattern in -8..+8
+            for j in 0..16 {
+                let v = (((block_idx.wrapping_mul(7919) + j) & 0x0F) as i32) - 8;
+                *(w_ptr.add(base + 192 + j) as *mut i8) = v as i8;
+            }
+            // d (half): bit pattern 0x2C00 = 0.0625. Little-endian = [0x00, 0x2C].
+            *w_ptr.add(base + 208) = 0x00;
+            *w_ptr.add(base + 209) = 0x2C;
+        }
+
+        let l_ptr = lhs.contents() as *mut f32;
+        for i in 0..k {
+            // Small, non-uniform lhs values. Range ~[-0.5, +0.5).
+            *l_ptr.add(i) = (((i & 0xFF) as f32) / 256.0) - 0.5;
+        }
+        // Zero dst so partial writes by mis-behaving kernels are visible.
+        let d_ptr = dst.contents() as *mut f32;
+        for i in 0..n {
+            *d_ptr.add(i) = 0.0;
+        }
+    }
+
+    Ok((weight, lhs, dst))
+}
+
+/// Run one (shape, variant) cell. Returns (median_ns, mean_ns).
+#[allow(clippy::too_many_arguments)]
+fn q6k_run_one_cell(
+    device: &Device,
+    kernels: &Kernels,
+    queue: &candle_metal_kernels::metal::CommandQueue,
+    shape: &Shape,
+    variant: Q6KVariant,
+    iters: usize,
+    warmup: usize,
+) -> Result<(u128, u128)> {
+    let (n, k) = (shape.n, shape.k);
+    // Variant B requires n divisible by rows_per_tg = NSG*nr0 = 4. All 6
+    // Q6_K production shapes (4096, 8192, 2048, 1024, 2816) are multiples of 4.
+    let rows_per_tg = 2 * variant.nr0();
+    if n % rows_per_tg != 0 {
+        anyhow::bail!(
+            "shape '{}' n={} not divisible by rows_per_tg={} (variant={:?})",
+            shape.label, n, rows_per_tg, variant
+        );
+    }
+
+    let (weight, lhs, dst) = q6k_alloc_buffers(device, n, k)?;
+    let pipeline = kernels
+        .load_pipeline(device, Source::Quantized, variant.kernel_name())
+        .map_err(|e| anyhow::anyhow!("load_pipeline({}) failed: {e:?}", variant.kernel_name()))?;
+
+    // Warmup.
+    for _ in 0..warmup {
+        let _ = q6k_dispatch_once(queue, &pipeline, variant, &weight, &lhs, &dst, n, k)?;
+    }
+    // Timed iterations.
+    let mut samples: Vec<u128> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        samples.push(q6k_dispatch_once(queue, &pipeline, variant, &weight, &lhs, &dst, n, k)?);
+    }
+    samples.sort_unstable();
+    let median = samples[iters / 2];
+    let mean = samples.iter().copied().sum::<u128>() / (iters as u128);
+    Ok((median, mean))
+}
+
+/// Correctness sanity check: dispatch both variants against IDENTICAL input
+/// buffers, read out their dst vectors, compute max|Δ| and max relative |Δ|.
+/// Returns (max_abs, max_rel, pass) — pass is true iff max_rel <= 1e-5 OR
+/// max_abs is below a conservative epsilon (1e-3) for values that are
+/// essentially zero.
+fn q6k_correctness_check(
+    device: &Device,
+    kernels: &Kernels,
+    queue: &candle_metal_kernels::metal::CommandQueue,
+    shape: &Shape,
+) -> Result<(f32, f32, bool, Vec<f32>, Vec<f32>)> {
+    let (n, k) = (shape.n, shape.k);
+
+    // Allocate TWO independent buffer triplets so the two variant runs don't
+    // observe each other's dst writes. The weight + lhs buffers are filled
+    // with the identical deterministic pattern (q6k_alloc_buffers is pure).
+    let (weight_a, lhs_a, dst_a) = q6k_alloc_buffers(device, n, k)?;
+    let (weight_b, lhs_b, dst_b) = q6k_alloc_buffers(device, n, k)?;
+
+    let pipe_a = kernels
+        .load_pipeline(device, Source::Quantized, Q6KVariant::ControlA.kernel_name())
+        .map_err(|e| anyhow::anyhow!("load_pipeline(A) failed: {e:?}"))?;
+    let pipe_b = kernels
+        .load_pipeline(device, Source::Quantized, Q6KVariant::Nr2VariantB.kernel_name())
+        .map_err(|e| anyhow::anyhow!("load_pipeline(B) failed: {e:?}"))?;
+
+    // One dispatch each.
+    let _ = q6k_dispatch_once(queue, &pipe_a, Q6KVariant::ControlA, &weight_a, &lhs_a, &dst_a, n, k)?;
+    let _ = q6k_dispatch_once(queue, &pipe_b, Q6KVariant::Nr2VariantB, &weight_b, &lhs_b, &dst_b, n, k)?;
+
+    // Read back.
+    let mut out_a = vec![0f32; n];
+    let mut out_b = vec![0f32; n];
+    unsafe {
+        let src_a = dst_a.contents() as *const f32;
+        let src_b = dst_b.contents() as *const f32;
+        for i in 0..n {
+            out_a[i] = *src_a.add(i);
+            out_b[i] = *src_b.add(i);
+        }
+    }
+
+    // Max absolute and max relative delta. Also require no NaN or Inf — any
+    // garbage output is a correctness failure, not a pass.
+    let mut max_abs: f32 = 0.0;
+    let mut max_rel: f32 = 0.0;
+    let mut any_nan_or_inf = false;
+    let mut nan_inf_count = 0;
+    for i in 0..n {
+        let a = out_a[i];
+        let b = out_b[i];
+        if !a.is_finite() || !b.is_finite() {
+            any_nan_or_inf = true;
+            nan_inf_count += 1;
+            continue;
+        }
+        let d = (a - b).abs();
+        if d > max_abs { max_abs = d; }
+        let denom = a.abs().max(b.abs());
+        if denom > 1e-6 {
+            let r = d / denom;
+            if r > max_rel { max_rel = r; }
+        }
+    }
+
+    if any_nan_or_inf {
+        println!("# correctness check: {nan_inf_count}/{n} elements are NaN/Inf — check lhs magnitude / quant bytes");
+    }
+
+    // Pass criteria: all finite, max relative delta under 1e-5 OR max absolute
+    // delta under a small epsilon (covers the all-zero-output case).
+    let pass = !any_nan_or_inf && (max_rel <= 1e-5 || max_abs <= 1e-6);
+    Ok((max_abs, max_rel, pass, out_a, out_b))
+}
+
+fn run_q6k_microbench(iters: usize, warmup: usize, runs: usize) -> Result<()> {
+    let device = Device::system_default().expect("no Metal device");
+    let kernels = Kernels::new();
+    let queue = device.new_command_queue()?;
+
+    println!("# 1bNEW.29 Option C — Q6_K NR0=2 microbench");
+    println!("# device:        {}", device.architecture_name());
+    println!("# device_type:   {:?}", device.device_type());
+    println!("# iters/sample:  {iters}");
+    println!("# warmup:        {warmup}");
+    println!("# runs:          {runs} (cross-run median)");
+    println!("# methodology:   per-dispatch commit+waitUntilCompleted, fresh");
+    println!("#                CommandBuffer per call, median across iters,");
+    println!("#                then median across {runs} independent runs.");
+    println!("# variants:      A = kernel_mul_mv_q6_K_f32 (candle production,");
+    println!("#                    1 row/simdgroup)");
+    println!("#                B = kernel_mul_mv_q6_K_f32_nr2 (llama.cpp port,");
+    println!("#                    2 rows/simdgroup — nr0=2)");
+    println!();
+
+    let shapes = q6k_microbench_shapes();
+
+    // -------------------------------------------------------------------
+    // Phase 1: correctness sanity check on one representative shape.
+    // -------------------------------------------------------------------
+    println!("# Phase 1: correctness sanity check (Attn q_proj sliding)");
+    let sanity_shape = shapes
+        .iter()
+        .find(|s| s.label.contains("q_proj sliding"))
+        .expect("q_proj sliding shape missing")
+        .clone();
+    let (max_abs, max_rel, pass, out_a, out_b) =
+        q6k_correctness_check(&device, &kernels, &queue, &sanity_shape)?;
+    println!("#   shape:       {}", sanity_shape.label);
+    println!("#   out_a[0..4]: {:?}", &out_a[..4.min(out_a.len())]);
+    println!("#   out_b[0..4]: {:?}", &out_b[..4.min(out_b.len())]);
+    println!("#   max|Δ|:      {max_abs:.6e}");
+    println!("#   max rel|Δ|:  {max_rel:.6e}");
+    println!("#   verdict:     {}", if pass { "PASS" } else { "FAIL" });
+    if !pass {
+        println!();
+        println!("# FAIL: correctness check failed — Variant B port is WRONG.");
+        println!("# NOT proceeding to timing data (would be meaningless).");
+        anyhow::bail!("Q6_K nr2 correctness check failed: max|Δ|={max_abs}, max rel|Δ|={max_rel}");
+    }
+    println!();
+
+    // -------------------------------------------------------------------
+    // Phase 2: timing sweep — Variant A vs Variant B across 6 shapes.
+    // -------------------------------------------------------------------
+    println!("# Phase 2: timing sweep");
+    println!(
+        "{:<48} {:>12} {:>12} {:>10}",
+        "shape", "A µs (med)", "B µs (med)", "A/B ratio"
+    );
+    println!("{:-<86}", "");
+
+    let mut all_results: Vec<(Shape, u128, u128, f64)> = Vec::new();
+
+    for shape in &shapes {
+        // Collect medians from each run.
+        let mut a_runs: Vec<u128> = Vec::with_capacity(runs);
+        let mut b_runs: Vec<u128> = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let (med_a, _) = q6k_run_one_cell(
+                &device, &kernels, &queue, shape, Q6KVariant::ControlA, iters, warmup,
+            )?;
+            let (med_b, _) = q6k_run_one_cell(
+                &device, &kernels, &queue, shape, Q6KVariant::Nr2VariantB, iters, warmup,
+            )?;
+            a_runs.push(med_a);
+            b_runs.push(med_b);
+        }
+        a_runs.sort_unstable();
+        b_runs.sort_unstable();
+        let a_med = a_runs[runs / 2];
+        let b_med = b_runs[runs / 2];
+        let ratio = if b_med == 0 {
+            f64::INFINITY
+        } else {
+            (a_med as f64) / (b_med as f64)
+        };
+        println!(
+            "{:<48} {:>11.2} {:>11.2} {:>9.3}x",
+            shape.label,
+            (a_med as f64) / 1000.0,
+            (b_med as f64) / 1000.0,
+            ratio,
+        );
+        all_results.push((*shape, a_med, b_med, ratio));
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 3: verdict — GO if any shape shows >=10% speedup, NO-GO otherwise.
+    // -------------------------------------------------------------------
+    println!();
+    println!("# Phase 3: per-shape verdict (GO threshold: Variant B >=10% faster)");
+    println!(
+        "{:<48} {:>10} {:>10}",
+        "shape", "speedup", "decision"
+    );
+    println!("{:-<72}", "");
+    let mut any_go = false;
+    let mut best_ratio = 0.0_f64;
+    let mut best_shape = "";
+    for (shape, _a, _b, ratio) in &all_results {
+        let speedup_pct = (*ratio - 1.0) * 100.0;
+        let decision = if *ratio >= 1.10 {
+            any_go = true;
+            if *ratio > best_ratio {
+                best_ratio = *ratio;
+                best_shape = shape.label;
+            }
+            "GO"
+        } else {
+            "NO-GO"
+        };
+        println!(
+            "{:<48} {:>+9.1}% {:>10}",
+            shape.label, speedup_pct, decision,
+        );
+    }
+
+    println!();
+    if any_go {
+        println!(
+            "# OVERALL VERDICT: GO — best shape is '{}' at {:.3}x ({:+.1}%)",
+            best_shape,
+            best_ratio,
+            (best_ratio - 1.0) * 100.0
+        );
+    } else {
+        println!("# OVERALL VERDICT: NO-GO — all shapes < 10% speedup.");
+        println!("# Hypothesis (llama.cpp's nr0=2 port gains wall-clock on M5 Max");
+        println!("# at hf2q Q6_K shapes) is EMPIRICALLY FALSIFIED.");
+    }
+
+    Ok(())
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum Task {
     Gemm,
@@ -461,6 +962,19 @@ enum Task {
         /// Number of untimed warmup iterations per cell.
         #[arg(long, default_value_t = 50)]
         warmup: usize,
+    },
+    /// 1bNEW.29 Option C — Q6_K nr0=2 row-loop port microbench.
+    /// Compares production candle kernel vs llama.cpp byte-for-byte port.
+    Q6kMicrobench {
+        /// Number of timed iterations per (shape, variant) cell.
+        #[arg(long, default_value_t = 1000)]
+        iters: usize,
+        /// Number of untimed warmup iterations per cell.
+        #[arg(long, default_value_t = 100)]
+        warmup: usize,
+        /// Number of independent full sweeps; per-shape cross-run median.
+        #[arg(long, default_value_t = 4)]
+        runs: usize,
     },
 }
 
@@ -484,6 +998,9 @@ fn main() -> Result<()> {
         }
         Task::NsgMicrobench { iters, warmup } => {
             run_nsg_microbench(iters, warmup)?;
+        }
+        Task::Q6kMicrobench { iters, warmup, runs } => {
+            run_q6k_microbench(iters, warmup, runs)?;
         }
     }
     Ok(())
