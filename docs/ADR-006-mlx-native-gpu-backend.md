@@ -8,6 +8,41 @@
 
 ---
 
+## Engineering Mantra (load-bearing — read before every session)
+
+Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the discipline this ADR — and every spike, every commit, every decision under it — must be executed against. It supersedes any tactical convenience that conflicts with it.
+
+> **DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.**
+
+**Operational reading for this ADR specifically** (how the mantra constrains every phase of the candle → mlx-native migration plan):
+
+- **DO NOT BE LAZY / no short cuts** — Phase 0 (per-kernel timing diagnosis) is mandatory before Phase 4 (Build Phase) starts. Skipping Phase 0 to "just port the framework patterns and hope" would be exactly the lazy pattern the 1bNEW.22 sticky encoder ($3-hour refuted patch) cost demonstrated. Phase 0 is cheap insurance against multi-week refuted patches.
+- **Plenty of time** — the 4-7 week migration estimate is the right size, not "too long". Compressing it via shortcuts would violate this directly. If Phase 0 reveals the work is bigger than 4-7 weeks, the timeline expands; the bar does not move.
+- **Never make assumptions** — every borrowed kernel in Phase 3 (Borrow Phase) gets a bitwise correctness validation against the candle source. Every framework pattern in Phase 4 (Build Phase) gets a microbench validation before integration. Every per-op cutover in Phase 5 (Integration) gets a sourdough gate run. No "looks right, ship it".
+- **Dive deep / use search as needed** — Phase 1's Chesterton's fence work on candle, mlx-native, coreml-native, and ggml-metal is non-negotiable scaffolding for the migration. Phase 2 reads coreml-native's full PRD as the maturation template, not a summary.
+- **Measure 3x, cut once** — Phase 0 measures both stacks (3+ runs each). Phase 3 validates each borrowed op against multiple references where possible (candle source AND mlx-native's existing implementation, picking the more correct one). Phase 4 validates each framework pattern against an isolated microbench BEFORE integrating. Phase 6 runs a 5-run canonical bench median, not a single-shot.
+- **No fallback / no stub** — Phase 5's per-op cutover deletes the candle paths after each op is validated on mlx-native. There is no "leave it as a fallback in case mlx-native breaks". The migration ends with a clean stack, not a dual-backend morass. The Option D (hybrid: candle + mlx-native behind a feature flag forever) was rejected for exactly this reason.
+- **Pure excellence, done right** — every Phase 3 borrow gets license attribution + source `file:line` citation in a header comment. Every Phase 4 port gets ggml-metal `file:line` citation. Every commit follows the project's commit + push cadence (`feedback_commit_push_cadence.md`). The "v0.2.0 prepared for crates.io" target for mlx-native (Phase 2) is the bar, not a stretch goal — it's what coreml-native already executed once and the template we're following.
+- **Chesterton's fence** — Phase 1 understands candle's hot path before deprecating it. Phase 2 understands mlx-native's existing kernels before borrowing on top of them. Phase 3 validates mlx-native's existing implementations against candle's borrows before deciding which to keep. Phase 4 understands ggml-metal's framework patterns before porting them. Every step understands what currently works before changing it.
+
+**Falsified hypothesis register** (cumulative across the 2026-04-11 session that motivated this ADR — each is evidence the mantra discipline works, and each is a reason this ADR proposes measure-first Phase 0 rather than jumping straight to Phase 4 patch work):
+
+1. CPU dispatch overhead is the bottleneck (1bNEW.22 instrumentation spike)
+2. Pool-tuning has multi-tok/s headroom (1bNEW.21 sweep landed +0.7 tok/s, not multi-tok/s)
+3. Single-command-buffer-per-forward is faster (empirical: 5000 dispatches/buffer regressed 85.0 → 79.4)
+4. Encoder creation is the bottleneck (1bNEW.22 sticky encoder: 168k saved encoder creations × ~50 ns each = 0.10% improvement, well below noise; ~3 hours of refuted patch work)
+5. Per-buffer wait semantics is the dominant lever (dissolved by 1bNEW.20 via a different mechanism)
+6. Per-shape NSG selection has wall-clock headroom on hf2q's M5 Max shapes (1bNEW.22-v2 NSG sweep + Agent #3 static prediction converged on NULL across 8 shapes × 4 NSG values × 4 runs)
+7. hf2q dispatch count (2104) is high vs llama.cpp (Agent #2: ggml graph has 2652 nodes per forward — llama.cpp does MORE work and is still faster)
+8. llama.cpp peer measures 107 tok/s today on this hardware (Agent #2 5-run re-measurement: 102.01 median; End gate re-baselined per `feedback_ground_truth_is_what_we_can_measure_now.md`)
+9. Q6_K NR0=2 row-loop port has wall-clock envelope on M5 Max (Agent C1: bitwise-correct port, `max|Δ|=0.000000e0`, two independent 4-run sweeps converged on ±0.4% noise — the 2× threadgroup reduction trades off ~1:1 against doubled per-simdgroup work)
+
+Each one is a hypothesis that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 84.9 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
+
+**Cross-reference:** the same mantra section appears verbatim in [ADR-005](ADR-005-inference-server.md). Both ADRs should remain in sync if the mantra source file is updated.
+
+---
+
 ## Problem Statement
 
 hf2q's Phase 1b End gate (per ADR-005:162, re-baselined 2026-04-11) requires decode speed `≥102 tok/s` on M5 Max, Gemma 4 26B MoE, Q4_K_M, with byte-identical greedy generation vs llama.cpp at T=0. Coherence is met; speed is not. Current baseline: **84.9 tok/s post-1bNEW.22**, gap **17 tok/s** to peer.

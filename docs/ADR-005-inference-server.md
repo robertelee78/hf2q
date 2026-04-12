@@ -4,6 +4,39 @@
 **Date:** 2026-04-09 (original), 2026-04-10 (comprehensive Walk-discipline rewrite)  
 **Decision Makers:** Robert, Claude
 
+## Engineering Mantra (load-bearing — read before every session)
+
+Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the discipline this ADR — and every spike, every commit, every decision under it — must be executed against. It supersedes any tactical convenience that conflicts with it.
+
+> **DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.**
+
+**Operational reading** (how to apply, not how to interpret — the text above is the source of truth):
+
+- **DO NOT BE LAZY / no short cuts** — when a hypothesis is hard to test, plumb the instrumentation; don't substitute static analysis for measurement. The cost of a refuted patch (1bNEW.22 sticky encoder, ~3 hours) is always larger than the cost of a pre-spike microbench (~30 minutes).
+- **Plenty of time** — 4-7 week migration plans are acceptable when the alternative is shortcuts that compound debt. Walk closure is the bar, not "fast enough for now".
+- **Never make assumptions** — three consecutive static-evidence kernel hypotheses falsified on M5 Max in this codebase. The base rate of "static evidence → measurable speedup" is now 0/3. Diagnose before patching.
+- **Dive deep / use search as needed** — Chesterton's fence on candle, mlx-native, ggml-metal, and coreml-native each before any migration step. Read the source, run the tests, measure the behavior. No vibes-based architectural decisions.
+- **Measure 3x, cut once** — the canonical pattern of this project: pre-spike microbench → multi-run validation → bitwise correctness check → only then patch. Every Phase 1b speed item that landed (1bNEW.1, 1bNEW.4, 1bNEW.6, 1bNEW.17, 1bNEW.20) followed it; every item that didn't land (1bNEW.22 sticky encoder, 1bNEW.22-v2 NSG sweep, 1bNEW.29-C Q6_K NR0=2) was killed cheaply by it.
+- **No fallback / no stub** — Phase 5's per-op cutover deletes the candle paths after each op migrates; no "leave it as a fallback in case mlx-native breaks". The migration must produce a clean stack, not a coexisting two-backend morass. The 12 escape-hatch ("ship at 75-85 tok/s") was REJECTED 2026-04-10 for the same reason.
+- **Pure excellence, done right** — coherence > speed (`project_crawl_walk_run_mental_model.md`); a speedup that breaks the sourdough gate is a regression, not progress.
+- **Chesterton's fence** — understand WHY each existing thing exists before changing it. Every vendor patch in this project has a Chesterton's fence note in its commit message (1bNEW.21 cleared the fence on candle's `compute_per_buffer = 50` default by reading the introducing commit `0cf516d1`; 1bNEW.20.FIX cleared the fence on candle-nn's SDPA byte-offset semantics).
+
+**Falsified hypothesis register as of 2026-04-11 (cumulative, mantra-aligned discipline outcomes):**
+
+1. CPU dispatch overhead is the bottleneck (1bNEW.22 instrumentation)
+2. Pool-tuning has multi-tok/s headroom (1bNEW.21 sweep)
+3. Single-command-buffer-per-forward is faster (empirical, 5000 dispatches/buffer regressed)
+4. Encoder creation is the bottleneck (1bNEW.22 sticky encoder, 168k saved encoder creations × ~50 ns each)
+5. Per-buffer wait semantics is the dominant lever (dissolved by 1bNEW.20 via different mechanism)
+6. NSG selection has wall-clock headroom (1bNEW.22-v2 sweep + Agent #3 static prediction)
+7. hf2q dispatch count is high vs llama.cpp (Agent #2: 2104 vs 2652 — llama.cpp has MORE)
+8. llama.cpp peer measures 107 today on this hardware (Agent #2: 102.01 measured)
+9. Q6_K NR0=2 row-loop port has wall-clock envelope (Agent C1: bitwise-correct port, ±0.4% noise across 8 runs)
+
+Each falsification is evidence for the mantra working — these were all ideas that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the reason hf2q is at 84.9 tok/s coherent rather than at some hypothetical "faster but broken" state.
+
+**Cross-reference:** the same mantra section appears verbatim in [ADR-006](ADR-006-mlx-native-gpu-backend.md). Both ADRs should remain in sync if the mantra source file is updated.
+
 ## Problem Statement
 
 There is no pure-Rust pipeline that takes a HuggingFace model from download through quantization to inference serving. Existing tools (ollama, llama.cpp server, vLLM) are separate programs in C++/Python that each handle one piece. Users stitch them together manually, and developers can't extend or embed the pipeline in their own Rust applications.
