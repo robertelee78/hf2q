@@ -1967,6 +1967,38 @@ pub(crate) struct LayerWeightRefs<'a> {
     pub layer_scalar: &'a Tensor,
 }
 
+/// Borrowed references to a single decoder layer's MoE weight tensors.
+///
+/// Used by `forward_mlx` to extract MoE weights for the mlx-native path.
+#[cfg(feature = "mlx-native-backend")]
+pub(crate) struct MoeWeightRefs<'a> {
+    /// Per-expert gate_up QMatMul weights.
+    pub expert_gate_up: Vec<&'a QMatMul>,
+    /// Per-expert down QMatMul weights.
+    pub expert_down: Vec<&'a QMatMul>,
+    /// Router projection weight.
+    pub router_proj: &'a QMatMul,
+    /// Router scale tensor.
+    pub router_scale: &'a Tensor,
+    /// Per-expert scale tensor.
+    pub per_expert_scale: &'a Tensor,
+}
+
+impl Gemma4Model {
+    /// Access per-layer MoE weight references for mlx-native extraction.
+    #[cfg(feature = "mlx-native-backend")]
+    pub(crate) fn moe_weights(&self, idx: usize) -> MoeWeightRefs<'_> {
+        let moe = &self.layers[idx].moe;
+        MoeWeightRefs {
+            expert_gate_up: moe.expert_gate_up.iter().collect(),
+            expert_down: moe.expert_down.iter().collect(),
+            router_proj: &moe.router_proj.inner,
+            router_scale: &moe.router_scale,
+            per_expert_scale: &moe.per_expert_scale,
+        }
+    }
+}
+
 impl Gemma4Model {
     /// Load model from GGUF + config. Backward-compatible entry point
     /// that defaults to the Phase-1 `Loop` MoE path for every layer.

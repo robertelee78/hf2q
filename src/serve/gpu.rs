@@ -42,7 +42,15 @@ pub struct GpuContext {
     pub executor: GraphExecutor,
     /// Pre-compiled shader pipeline cache.
     pub registry: KernelRegistry,
+    /// Raw pointer to the Metal device, cached to avoid borrow conflicts.
+    /// SAFETY: the metal device lives as long as the executor (which owns it).
+    /// This pointer is never dereferenced after the executor is dropped.
+    metal_device_ptr: *const mlx_native::metal::DeviceRef,
 }
+
+// SAFETY: The metal::DeviceRef is Send+Sync (MTLDevice is thread-safe).
+unsafe impl Send for GpuContext {}
+unsafe impl Sync for GpuContext {}
 
 #[cfg(feature = "mlx-native-backend")]
 impl GpuContext {
@@ -58,10 +66,19 @@ impl GpuContext {
     pub fn new() -> mlx_native::Result<Self> {
         let device = MlxDevice::new()?;
         let gpu_name = device.name();
+        let metal_device_ptr: *const mlx_native::metal::DeviceRef = device.metal_device();
         let executor = GraphExecutor::new(device);
         let registry = KernelRegistry::new();
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
-        Ok(Self { executor, registry })
+        Ok(Self { executor, registry, metal_device_ptr })
+    }
+
+    /// Get a reference to the metal device without borrowing executor.
+    ///
+    /// SAFETY: the returned reference is valid for the lifetime of this GpuContext.
+    #[inline]
+    pub fn metal_device_ref(&self) -> &mlx_native::metal::DeviceRef {
+        unsafe { &*self.metal_device_ptr }
     }
 
     /// Borrow the underlying `MlxDevice`.
@@ -73,6 +90,14 @@ impl GpuContext {
     /// Human-readable GPU name (e.g. "Apple M5 Max").
     pub fn gpu_name(&self) -> String {
         self.device().name()
+    }
+
+    /// Split borrow: returns (&GraphExecutor, &mut KernelRegistry) to avoid
+    /// conflicting borrows when methods need both the device (from executor)
+    /// and mutable access to the registry.
+    #[inline]
+    pub fn split(&mut self) -> (&GraphExecutor, &mut KernelRegistry) {
+        (&self.executor, &mut self.registry)
     }
 }
 

@@ -731,7 +731,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let backend = args.backend;
     tracing::info!("Inference backend: {}", backend);
     #[cfg(feature = "mlx-native-backend")]
-    let (_gpu_ctx, _mlx_weights): (
+    let (mut mlx_gpu_ctx, mut mlx_weights): (
         Option<gpu::GpuContext>,
         Option<forward_mlx::MlxModelWeights>,
     ) = match backend {
@@ -892,6 +892,71 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         repetition_penalty: args.repetition_penalty,
         max_tokens: args.max_tokens,
     };
+
+    // --- mlx-native backend: use the mlx-native forward pass ---
+    #[cfg(feature = "mlx-native-backend")]
+    if matches!(backend, cli::InferenceBackend::MlxNative) {
+        use std::io::Write;
+
+        let mlx_gpu = mlx_gpu_ctx.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("mlx-native GPU context not initialized"))?;
+        let mlx_w = mlx_weights.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("mlx-native weights not loaded"))?;
+
+        eprintln!("Running mlx-native forward pass...");
+        let eos_token_ids: Vec<u32> = vec![1, 106];
+
+        // Prefill: process prompt tokens one at a time through mlx-native.
+        // (Full prefill with seq_len>1 is a Phase 5b optimization.)
+        eprintln!("Prefilling {} tokens (mlx-native, per-token)...", prompt_tokens.len());
+        let prefill_start = std::time::Instant::now();
+        let mut last_token = 0u32;
+        for (i, &tok) in prompt_tokens.iter().enumerate() {
+            last_token = mlx_w.forward_decode(tok, i, mlx_gpu)?;
+        }
+        let prefill_elapsed = prefill_start.elapsed();
+        eprintln!(
+            "Prefill complete in {:.1} ms ({} tokens, {:.1} tok/s).",
+            prefill_elapsed.as_secs_f64() * 1000.0,
+            prompt_tokens.len(),
+            prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64(),
+        );
+
+        // Decode
+        let mut all_tokens = prompt_tokens.to_vec();
+        let mut next_token = last_token;
+        all_tokens.push(next_token);
+        {
+            let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+            print!("{}", token_str);
+            std::io::stdout().flush()?;
+        }
+
+        let decode_start = std::time::Instant::now();
+        let mut generated = 1usize;
+        for _ in 1..params.max_tokens {
+            if eos_token_ids.contains(&next_token) {
+                break;
+            }
+            let pos = all_tokens.len() - 1;
+            next_token = mlx_w.forward_decode(next_token, pos, mlx_gpu)?;
+            all_tokens.push(next_token);
+            generated += 1;
+            {
+                let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+                print!("{}", token_str);
+                std::io::stdout().flush()?;
+            }
+        }
+        let decode_elapsed = decode_start.elapsed();
+        let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
+        eprintln!(
+            "\n\n--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---",
+            generated, decode_elapsed.as_secs_f64(), tok_per_sec,
+        );
+
+        return Ok(());
+    }
 
     if args.benchmark {
         // === Benchmark mode: 5 consecutive runs ===
