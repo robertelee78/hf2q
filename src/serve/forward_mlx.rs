@@ -290,6 +290,11 @@ pub struct MlxMoeWeights {
     pub router_scale: MlxBuffer,
     /// Per-expert scale `[num_experts]` F32.
     pub per_expert_scale: MlxBuffer,
+    /// GGML quant type for gate_up experts (stored separately so we can
+    /// drop the individual expert Vec after stacking).
+    pub gate_up_ggml_dtype: candle_core::quantized::GgmlDType,
+    /// GGML quant type for down experts.
+    pub down_ggml_dtype: candle_core::quantized::GgmlDType,
     /// Number of experts to select per token.
     pub top_k: usize,
     /// MoE intermediate size per expert.
@@ -597,6 +602,10 @@ impl MlxModelWeights {
                 moe_refs.per_expert_scale, mlx_device,
             )?;
 
+            // Capture GGML dtypes before potentially dropping expert vecs.
+            let gate_up_ggml_dtype = expert_gate_up[0].info.ggml_dtype;
+            let down_ggml_dtype = expert_down[0].info.ggml_dtype;
+
             // Build stacked expert weight buffers for fused _id dispatch.
             // Each expert's buffer is concatenated: [expert0, expert1, ..., expertN-1].
             let (stacked_gate_up, gate_up_expert_stride) = {
@@ -640,9 +649,25 @@ impl MlxModelWeights {
                 }
             };
 
+            // Drop individual expert buffers after stacking to save ~12.9 GB.
+            // The _id kernel dispatches via stacked buffers only; individual
+            // buffers are dead weight once stacking completes.
+            let expert_gate_up_live = if stacked_gate_up.is_some() {
+                drop(expert_gate_up);
+                Vec::new()
+            } else {
+                expert_gate_up  // fallback path uses individual buffers
+            };
+            let expert_down_live = if stacked_down.is_some() {
+                drop(expert_down);
+                Vec::new()
+            } else {
+                expert_down
+            };
+
             let moe = MlxMoeWeights {
-                expert_gate_up,
-                expert_down,
+                expert_gate_up: expert_gate_up_live,
+                expert_down: expert_down_live,
                 stacked_gate_up,
                 stacked_down,
                 gate_up_expert_stride,
@@ -650,6 +675,8 @@ impl MlxModelWeights {
                 router_proj,
                 router_scale,
                 per_expert_scale,
+                gate_up_ggml_dtype,
+                down_ggml_dtype,
                 top_k: cfg.top_k_experts,
                 moe_intermediate_size: cfg.moe_intermediate_size,
             };
@@ -692,9 +719,13 @@ impl MlxModelWeights {
             num_kv_heads_vec.push(nkv);
 
             // KV cache: sliding layers use sliding_window capacity,
-            // global layers use max_position_embeddings.
+            // global layers cap at a practical limit to avoid OOM.
+            // 262144 × 5 global layers × 2(K+V) × 2 heads × 512 dim × 4 bytes = 10.7 GB
+            // which OOMs a 64 GB machine. Cap at 8192 for now; expand if
+            // longer-context generation is needed.
+            let max_global_kv = 8192;
             let capacity = if is_full {
-                cfg.max_position_embeddings
+                cfg.max_position_embeddings.min(max_global_kv)
             } else {
                 cfg.sliding_window
             };
@@ -1320,9 +1351,9 @@ impl MlxModelWeights {
             }
 
             let ggml_type_gu = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.expert_gate_up[0].info.ggml_dtype)?;
+                self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
             let ggml_type_dn = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.expert_down[0].info.ggml_dtype)?;
+                self.layers[layer_idx].moe.down_ggml_dtype)?;
 
             {
                 let (exec, reg) = gpu.split();
