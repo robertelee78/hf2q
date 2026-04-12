@@ -1,5 +1,6 @@
 use crate::metal::{
-    BlitCommandEncoder, CommandBuffer, CommandSemaphore, CommandStatus, ComputeCommandEncoder,
+    instrument, BlitCommandEncoder, CommandBuffer, CommandSemaphore, CommandStatus,
+    ComputeCommandEncoder,
 };
 use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -240,6 +241,15 @@ impl Commands {
                 Self::ensure_completed(&cb)?;
             }
         }
+
+        // hf2q ADR-006 Phase 0 vendor patch (2026-04-11): resolve any
+        // pending counter-sample entries now that every in-flight
+        // command buffer is completed. This is the only safe point to
+        // read MTLCounterSampleBuffer contents because stage-boundary
+        // samples are only written after the encoder's command buffer
+        // finishes executing on the GPU. `resolve_and_maybe_dump` is a
+        // no-op when instrumentation is disabled.
+        instrument::resolve_and_maybe_dump();
 
         Ok(())
     }

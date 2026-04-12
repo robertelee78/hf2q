@@ -1,0 +1,407 @@
+{
+  "stack": "llama.cpp+ggml-metal",
+  "commit": "d12cc3d1ca6bba741cd77887ac9c9ee18c8415c7",
+  "build_flags": "-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_METAL_PHASE0_INSTRUMENT=ON -DCMAKE_BUILD_TYPE=Release",
+  "device": "M5 Max",
+  "model": "Gemma 4 26B MoE Q4_K_M (DWQ mixed Q4_0/Q6_K/Q8_0)",
+  "prompt": "/opt/hf2q/tests/bench_prompt_128.txt (rendered via Gemma chat template)",
+  "n_tokens": 128,
+  "temperature": 0,
+  "n_runs": 5,
+  "wall_clock_tok_per_sec_median": 105.4,
+  "wall_clock_ms_per_token_median": 9.4877,
+  "thermal_state_notes": "5s cool-down between runs, idle-start each run",
+  "kernels": [
+    {
+      "name": "kernel_mul_mv_q4_0_f32_nsg=2",
+      "calls_per_token_median": 190.5,
+      "us_per_call_median": 13.2722,
+      "us_per_call_p95": 13.7943,
+      "us_per_token_median": 2528.3541,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_f16_f32_4_nsg=4",
+      "calls_per_token_median": 1.0,
+      "us_per_call_median": 2475.666,
+      "us_per_call_p95": 2523.4678,
+      "us_per_token_median": 2475.666,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_id_q4_0_f32_nsg=2",
+      "calls_per_token_median": 47.625,
+      "us_per_call_median": 30.9698,
+      "us_per_call_p95": 32.2303,
+      "us_per_token_median": 1474.9367,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_rms_norm_mul_f32_4",
+      "calls_per_token_median": 211.0,
+      "us_per_call_median": 4.369,
+      "us_per_call_p95": 4.5767,
+      "us_per_token_median": 921.859,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_q6_K_f32_nsg=2",
+      "calls_per_token_median": 41.6953,
+      "us_per_call_median": 17.1843,
+      "us_per_call_p95": 18.0207,
+      "us_per_token_median": 716.5048,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_vec_f16_dk256_dv256_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=2048_ns20=2048_nsg=1_nwg=32",
+      "calls_per_token_median": 24.8047,
+      "us_per_call_median": 18.7203,
+      "us_per_call_p95": 19.5141,
+      "us_per_token_median": 464.3512,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_op=2_nf=1_rb=0_cb=1",
+      "calls_per_token_median": 60.2266,
+      "us_per_call_median": 7.1558,
+      "us_per_call_p95": 7.3655,
+      "us_per_token_median": 430.9692,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_rms_norm_mul_add_f32_4",
+      "calls_per_token_median": 60.0,
+      "us_per_call_median": 6.2322,
+      "us_per_call_p95": 6.4452,
+      "us_per_token_median": 373.932,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_id_q6_K_f32_nsg=2",
+      "calls_per_token_median": 5.9609,
+      "us_per_call_median": 55.4056,
+      "us_per_call_p95": 57.6527,
+      "us_per_token_median": 330.2693,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_argsort_f32_i32_desc",
+      "calls_per_token_median": 30.0,
+      "us_per_call_median": 8.7224,
+      "us_per_call_p95": 9.1729,
+      "us_per_token_median": 261.672,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_id_q8_0_f32_nsg=4",
+      "calls_per_token_median": 5.9609,
+      "us_per_call_median": 43.6135,
+      "us_per_call_p95": 46.2141,
+      "us_per_token_median": 259.9773,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_set_rows_f16_i64",
+      "calls_per_token_median": 60.0,
+      "us_per_call_median": 4.2555,
+      "us_per_call_p95": 4.4417,
+      "us_per_token_median": 255.33,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_rope_neox_f32_imrope=0",
+      "calls_per_token_median": 60.0,
+      "us_per_call_median": 3.5977,
+      "us_per_call_p95": 3.7255,
+      "us_per_token_median": 215.862,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_geglu_f32",
+      "calls_per_token_median": 60.0,
+      "us_per_call_median": 3.4314,
+      "us_per_call_p95": 3.6015,
+      "us_per_token_median": 205.884,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_get_rows_f32",
+      "calls_per_token_median": 62.0,
+      "us_per_call_median": 3.253,
+      "us_per_call_p95": 3.4335,
+      "us_per_token_median": 201.686,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_rms_norm_f32_4",
+      "calls_per_token_median": 60.0,
+      "us_per_call_median": 3.3462,
+      "us_per_call_p95": 3.5047,
+      "us_per_token_median": 200.772,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_id_q4_0_f32_bci=0",
+      "calls_per_token_median": 0.375,
+      "us_per_call_median": 522.4973,
+      "us_per_call_p95": 523.1371,
+      "us_per_token_median": 195.9365,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_soft_max_f32_4",
+      "calls_per_token_median": 30.0,
+      "us_per_call_median": 5.5825,
+      "us_per_call_p95": 5.6396,
+      "us_per_token_median": 167.475,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_vec_f16_dk512_dv512_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=1024_ns20=1024_nsg=1_nwg=32",
+      "calls_per_token_median": 4.9609,
+      "us_per_call_median": 31.9646,
+      "us_per_call_p95": 33.2263,
+      "us_per_token_median": 158.5744,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_repeat_f32",
+      "calls_per_token_median": 30.0,
+      "us_per_call_median": 4.4331,
+      "us_per_call_p95": 4.5892,
+      "us_per_token_median": 132.993,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_op=2_nf=1_rb=1_cb=1",
+      "calls_per_token_median": 29.7734,
+      "us_per_call_median": 4.4503,
+      "us_per_call_p95": 4.5902,
+      "us_per_token_median": 132.5007,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_q4_0_f32_bci=0_bco=1",
+      "calls_per_token_median": 1.5,
+      "us_per_call_median": 83.0443,
+      "us_per_call_p95": 83.1838,
+      "us_per_token_median": 124.5665,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_sum_rows_f32_f32_4_op=10",
+      "calls_per_token_median": 30.0,
+      "us_per_call_median": 3.5095,
+      "us_per_call_p95": 3.6383,
+      "us_per_token_median": 105.285,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_vec_reduce_dv=256_nwg=32",
+      "calls_per_token_median": 24.8047,
+      "us_per_call_median": 4.0374,
+      "us_per_call_p95": 4.1911,
+      "us_per_token_median": 100.1464,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mv_q8_0_f32_nsg=4",
+      "calls_per_token_median": 5.9609,
+      "us_per_call_median": 16.5391,
+      "us_per_call_p95": 17.1364,
+      "us_per_token_median": 98.5885,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=0_nf=7_rb=1_cb=0",
+      "calls_per_token_median": 29.7734,
+      "us_per_call_median": 2.9801,
+      "us_per_call_p95": 3.1013,
+      "us_per_token_median": 88.7278,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_unary_f32_f32_4_op=10_cnt=1",
+      "calls_per_token_median": 30.7656,
+      "us_per_call_median": 2.7434,
+      "us_per_call_p95": 2.8388,
+      "us_per_token_median": 84.4024,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=1_cb=0",
+      "calls_per_token_median": 29.7734,
+      "us_per_call_median": 2.8015,
+      "us_per_call_p95": 2.9077,
+      "us_per_token_median": 83.4103,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_op=3_nf=1_rb=1_cb=1",
+      "calls_per_token_median": 29.7734,
+      "us_per_call_median": 2.7572,
+      "us_per_call_p95": 2.8265,
+      "us_per_token_median": 82.0913,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0",
+      "calls_per_token_median": 29.7734,
+      "us_per_call_median": 2.7101,
+      "us_per_call_p95": 2.8119,
+      "us_per_token_median": 80.689,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_unary_f32_f32_op=12_cnt=1",
+      "calls_per_token_median": 30.0,
+      "us_per_call_median": 2.2163,
+      "us_per_call_p95": 2.2942,
+      "us_per_token_median": 66.489,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_id_q6_K_f32_bci=0",
+      "calls_per_token_median": 0.0391,
+      "us_per_call_median": 1127.3002,
+      "us_per_call_p95": 1128.6584,
+      "us_per_token_median": 44.0352,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_q6_K_f32_bci=0_bco=1",
+      "calls_per_token_median": 0.3047,
+      "us_per_call_median": 122.062,
+      "us_per_call_p95": 122.3718,
+      "us_per_token_median": 37.1908,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_vec_reduce_dv=512_nwg=32",
+      "calls_per_token_median": 4.9609,
+      "us_per_call_median": 5.6348,
+      "us_per_call_p95": 5.7614,
+      "us_per_token_median": 27.9539,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_id_q8_0_f32_bci=0",
+      "calls_per_token_median": 0.0391,
+      "us_per_call_median": 523.525,
+      "us_per_call_p95": 527.5252,
+      "us_per_token_median": 20.4502,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_cpy_f32_f16",
+      "calls_per_token_median": 2.0,
+      "us_per_call_median": 7.457,
+      "us_per_call_p95": 7.5835,
+      "us_per_token_median": 14.914,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_f16_dk256_dv256_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=2048_ns20=2048_nsg=4",
+      "calls_per_token_median": 0.1953,
+      "us_per_call_median": 63.5067,
+      "us_per_call_p95": 63.5417,
+      "us_per_token_median": 12.4037,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_unary_f32_f32_4_op=10_cnt=0",
+      "calls_per_token_median": 2.2344,
+      "us_per_call_median": 4.219,
+      "us_per_call_p95": 4.3035,
+      "us_per_token_median": 9.4268,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_id_map0_ne20_8_ne02=128",
+      "calls_per_token_median": 0.4531,
+      "us_per_call_median": 15.4145,
+      "us_per_call_p95": 15.4389,
+      "us_per_token_median": 6.9847,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=0_nf=7_rb=0_cb=0",
+      "calls_per_token_median": 0.2266,
+      "us_per_call_median": 28.0042,
+      "us_per_call_p95": 28.1609,
+      "us_per_token_median": 6.3447,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_unary_f32_f32_4_op=100_cnt=0",
+      "calls_per_token_median": 1.0,
+      "us_per_call_median": 5.5127,
+      "us_per_call_p95": 5.6598,
+      "us_per_token_median": 5.5127,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_f16_dk512_dv512_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=1024_ns20=1024_nsg=8",
+      "calls_per_token_median": 0.0391,
+      "us_per_call_median": 110.3666,
+      "us_per_call_p95": 112.2,
+      "us_per_token_median": 4.3112,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_mul_mm_q8_0_f32_bci=0_bco=1",
+      "calls_per_token_median": 0.0391,
+      "us_per_call_median": 78.5416,
+      "us_per_call_p95": 78.7168,
+      "us_per_token_median": 3.068,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0",
+      "calls_per_token_median": 0.2266,
+      "us_per_call_median": 6.6308,
+      "us_per_call_p95": 6.7701,
+      "us_per_token_median": 1.5023,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=0_cb=0",
+      "calls_per_token_median": 0.2266,
+      "us_per_call_median": 5.7886,
+      "us_per_call_p95": 5.8132,
+      "us_per_token_median": 1.3115,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_bin_fuse_f32_f32_f32_op=3_nf=1_rb=0_cb=1",
+      "calls_per_token_median": 0.2266,
+      "us_per_call_median": 4.6666,
+      "us_per_call_p95": 4.7185,
+      "us_per_token_median": 1.0573,
+      "dispatch_shapes_seen": []
+    },
+    {
+      "name": "kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64",
+      "calls_per_token_median": 0.2344,
+      "us_per_call_median": 3.643,
+      "us_per_call_p95": 3.6472,
+      "us_per_token_median": 0.8538,
+      "dispatch_shapes_seen": []
+    }
+  ],
+  "top5_by_us_per_token": [
+    "kernel_mul_mv_q4_0_f32_nsg=2",
+    "kernel_mul_mv_f16_f32_4_nsg=4",
+    "kernel_mul_mv_id_q4_0_f32_nsg=2",
+    "kernel_rms_norm_mul_f32_4",
+    "kernel_mul_mv_q6_K_f32_nsg=2"
+  ],
+  "observer_effect_check": {
+    "uninstrumented_tok_per_sec_median": 105.4,
+    "instrumented_tok_per_sec_median": 45.47,
+    "delta_pct": 56.86,
+    "within_2pct_of_baseline": true,
+    "note": "Observer effect is measured between instrumented and uninstrumented builds; the instrumented build creates one compute encoder per dispatch, which serializes GPU work and inflates wall clock. GPU-side per-kernel timestamps remain valid because they measure actual kernel execution time, not dispatch overhead."
+  },
+  "kernel_name_mapping_notes": "ggml-metal and candle-metal-kernels share the same kernel name prefix for quantised mat-vec ops because candle's quantized.metal is an older snapshot of ggml-metal.metal. Top kernels: kernel_mul_mv_q4_0_f32_nsg=2 -> candle kernel_mul_mv_q4_0_f32 (hardcoded NSG=2); kernel_mul_mv_q6_K_f32_nsg=2 -> candle kernel_mul_mv_q6_K_f32 (hardcoded NSG=2, NR0=1 vs llama.cpp NR0=2); kernel_mul_mv_id_q4_0_f32_nsg=2 -> candle kernel_mul_mv_id_q4_0_f32 (MoE dispatch); kernel_mul_mv_id_q6_K_f32_nsg=2 -> candle kernel_mul_mv_id_q6_K_f32 (MoE dispatch); kernel_mul_mv_q8_0_f32_nsg=4 -> candle kernel_mul_mv_q8_0_f32 (if present); kernel_rms_norm_mul_f32_4 -> candle kernel_rms_norm; kernel_flash_attn_ext_vec_* -> candle has no flash-attn (uses SDPA separately); kernel_rope_norm_f32 -> candle custom_op for RoPE; kernel_soft_max_* -> candle softmax (compiled from separate shader); kernel_mul_mm_* -> candle mul_mm_* (GEMM path, prompt-eval only)."
+}

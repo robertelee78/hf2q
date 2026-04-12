@@ -159,6 +159,21 @@ impl Kernels {
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+            // hf2q ADR-006 Phase 0 vendor patch (2026-04-11): register
+            // this pipeline's Metal function name in the instrument
+            // module's side-table so `metal::instrument` can read it
+            // back at `set_compute_pipeline_state` time.
+            // MTLComputePipelineState has no setLabel accessor (only
+            // the descriptor side does) and no `computeFunction`
+            // accessor, so a raw-pointer-keyed side-table is the only
+            // kernel-identity channel we have. Registration is a
+            // one-shot at pipeline-cache-miss time — the pipelines are
+            // cached in `pipelines: RwLock<HashMap>`, so the cost is
+            // paid exactly once per (kernel name, constants) pair.
+            crate::metal::instrument::register_pipeline_name(
+                pipeline.as_ref() as *const _ as *const () as usize,
+                name.as_ref().to_string(),
+            );
             pipelines.insert((name, constants), pipeline.clone());
 
             Ok(pipeline)

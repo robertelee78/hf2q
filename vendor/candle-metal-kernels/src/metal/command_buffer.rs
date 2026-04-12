@@ -1,3 +1,4 @@
+use crate::metal::instrument;
 use crate::{BlitCommandEncoder, ComputeCommandEncoder};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
@@ -75,6 +76,31 @@ impl CommandBuffer {
     }
 
     pub fn compute_command_encoder(&self) -> ComputeCommandEncoder {
+        // hf2q ADR-006 Phase 0 vendor patch (2026-04-11): when
+        // instrumentation is enabled, try to create the encoder via a
+        // `MTLComputePassDescriptor` carrying the shared counter sample
+        // buffer so the pass emits start/end GPU timestamps at stage
+        // boundary (the only sampling point M5 Max supports). If the
+        // instrumented path fails for any reason — slot pool exhausted,
+        // descriptor alloc failure, newCommand encoder returns nil —
+        // fall back to the byte-identical pre-patch path.
+        //
+        // The env probe in `instrument::is_enabled()` short-circuits to
+        // an atomic bool load on the hot path, so the uninstrumented
+        // build pays for one Acquire load per encoder creation and
+        // nothing else. This keeps the observer-effect gate achievable:
+        // the phase0 bench script runs 5 runs with the env var UNSET
+        // and asserts median tok/s is within ±2% of the 84.9 baseline.
+        if instrument::is_enabled() {
+            if let Some(inst) = instrument::make_instrumented_encoder(self) {
+                return ComputeCommandEncoder::new_instrumented(
+                    inst.raw,
+                    Arc::clone(&self.semaphore),
+                    inst.start_slot,
+                    inst.end_slot,
+                );
+            }
+        }
         self.as_ref()
             .computeCommandEncoder()
             .map(|raw| ComputeCommandEncoder::new(raw, Arc::clone(&self.semaphore)))

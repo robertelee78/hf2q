@@ -1,7 +1,7 @@
 # ADR-006: mlx-native as hf2q's GPU Compute Backend (migrate from candle)
 
-**Status:** Proposed
-**Date:** 2026-04-11
+**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`)
+**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted)
 **Decision Makers:** Robert, Claude
 **Supersedes (implicitly):** the original "use candle" decision from hf2q's early Crawl phase, never written as an ADR
 **Related ADRs:** ADR-005 (Inference Server, Phase 1b speed gap context), ADR-004 (GGUF compatibility — mlx-native must preserve all of it)
@@ -493,5 +493,5 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 | Role | Name | Date | Status |
 |---|---|---|---|
 | Author | Claude | 2026-04-11 | Drafted |
-| Decision maker | Robert | _pending_ | _pending_ |
-| Status | _Proposed_ | _flips to Accepted after Phase 0_ | |
+| Decision maker | Robert | 2026-04-12 | Accepted — Phase 0 verdict: framework-overhead-dominated |
+| Status | **Accepted** | Phase 0 complete 2026-04-12 | Phase 4 scope: graph scheduler (primary) |
