@@ -398,13 +398,14 @@ impl MlxModelWeights {
             } else {
                 cfg.sliding_window
             };
-            let row_size = nkv * hd;
-            let cache_bytes = capacity * row_size * std::mem::size_of::<f32>();
+            // KV cache shape: [num_kv_heads, capacity, head_dim] — head-major
+            let cache_elements = nkv * capacity * hd;
+            let cache_bytes = cache_elements * std::mem::size_of::<f32>();
             let k_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F32, vec![capacity, row_size],
+                cache_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd],
             ).map_err(|e| anyhow::anyhow!("KV cache K alloc failed: {e}"))?;
             let v_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F32, vec![capacity, row_size],
+                cache_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd],
             ).map_err(|e| anyhow::anyhow!("KV cache V alloc failed: {e}"))?;
             kv_caches.push(MlxKvCache {
                 k: k_cache,
@@ -621,24 +622,34 @@ impl MlxModelWeights {
         );
 
         // -- g. KV cache update (CPU) --
-        let kv_row = nkv * hd;
+        // Cache layout: [num_kv_heads, capacity, head_dim] — head-major so SDPA
+        // can read each head's positions contiguously as [kv_seq_len, head_dim].
         let kv_is_sliding = self.kv_caches[layer_idx].is_sliding;
         let kv_write_pos = self.kv_caches[layer_idx].write_pos;
         let kv_capacity = self.kv_caches[layer_idx].capacity;
-        let wo = if kv_is_sliding {
-            (kv_write_pos % kv_capacity) * kv_row
+        let cache_pos = if kv_is_sliding {
+            kv_write_pos % kv_capacity
         } else {
-            kv_write_pos * kv_row
+            kv_write_pos
         };
         {
             let ks: &[f32] = self.activations.attn_k.as_slice().map_err(|e| anyhow::anyhow!("ks: {e}"))?;
             let kc: &mut [f32] = self.kv_caches[layer_idx].k.as_mut_slice().map_err(|e| anyhow::anyhow!("kc: {e}"))?;
-            kc[wo..wo+kv_row].copy_from_slice(&ks[..kv_row]);
+            // K input is [num_kv_heads, head_dim] flat. Write into [head, cache_pos, :].
+            for h in 0..nkv {
+                let src_start = h * hd;
+                let dst_start = h * kv_capacity * hd + cache_pos * hd;
+                kc[dst_start..dst_start + hd].copy_from_slice(&ks[src_start..src_start + hd]);
+            }
         }
         {
             let vs: &[f32] = self.activations.moe_expert_out.as_slice().map_err(|e| anyhow::anyhow!("vs: {e}"))?;
             let vc: &mut [f32] = self.kv_caches[layer_idx].v.as_mut_slice().map_err(|e| anyhow::anyhow!("vc: {e}"))?;
-            vc[wo..wo+kv_row].copy_from_slice(&vs[..kv_row]);
+            for h in 0..nkv {
+                let src_start = h * hd;
+                let dst_start = h * kv_capacity * hd + cache_pos * hd;
+                vc[dst_start..dst_start + hd].copy_from_slice(&vs[src_start..src_start + hd]);
+            }
         }
         self.kv_caches[layer_idx].write_pos += 1;
         self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
