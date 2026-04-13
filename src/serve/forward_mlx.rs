@@ -49,6 +49,27 @@ fn profiling_enabled() -> bool {
     std::env::var("HF2Q_MLX_PROFILE").map_or(false, |v| v == "1")
 }
 
+/// Check if per-kernel-type profiling is enabled (HF2Q_MLX_KERNEL_PROFILE=1).
+fn kernel_profile_enabled() -> bool {
+    std::env::var("HF2Q_MLX_KERNEL_PROFILE").map_or(false, |v| v == "1")
+}
+
+/// Accumulated per-kernel-type timing for one token.
+#[derive(Default, Clone)]
+pub struct KernelTypeProfile {
+    /// Per-layer timings in microseconds, indexed by layer.
+    pub qkv_matmuls_us: Vec<f64>,
+    pub head_norms_rope_us: Vec<f64>,
+    pub kv_cache_copy_us: Vec<f64>,
+    pub sdpa_us: Vec<f64>,
+    pub o_proj_us: Vec<f64>,
+    pub mlp_matmuls_us: Vec<f64>,
+    pub moe_us: Vec<f64>,
+    pub norms_adds_us: Vec<f64>,
+    /// Head session timings.
+    pub lm_head_us: f64,
+}
+
 /// Accumulated timing data for one token's forward pass.
 #[derive(Default, Clone)]
 pub struct TokenProfile {
@@ -1495,6 +1516,770 @@ impl MlxModelWeights {
         }
 
         Ok(token_id)
+    }
+
+    /// Per-kernel-type profiling forward pass.
+    ///
+    /// Breaks the single session into one session PER KERNEL TYPE PER LAYER,
+    /// using `finish_with_timing` to measure GPU wait time for each group.
+    ///
+    /// This is intentionally slow (many sessions = many sync points) but gives
+    /// us per-kernel-type GPU timing to compare against candle Phase 0 data.
+    ///
+    /// Gated by `HF2Q_MLX_KERNEL_PROFILE=1`.
+    pub fn forward_decode_kernel_profile(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<(u32, KernelTypeProfile)> {
+        let hs = self.hidden_size;
+        let num_layers = self.layers.len();
+        let vocab_size = self.vocab_size;
+
+        let mut kp = KernelTypeProfile::default();
+        kp.qkv_matmuls_us = vec![0.0; num_layers];
+        kp.head_norms_rope_us = vec![0.0; num_layers];
+        kp.kv_cache_copy_us = vec![0.0; num_layers];
+        kp.sdpa_us = vec![0.0; num_layers];
+        kp.o_proj_us = vec![0.0; num_layers];
+        kp.mlp_matmuls_us = vec![0.0; num_layers];
+        kp.moe_us = vec![0.0; num_layers];
+        kp.norms_adds_us = vec![0.0; num_layers];
+
+        // Write position buffer
+        {
+            let pos_dst: &mut [u32] = self.activations.position.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("position write: {e}"))?;
+            pos_dst[0] = seq_pos as u32;
+        }
+
+        // KV cache bookkeeping
+        let mut kv_info: Vec<(bool, usize, usize, usize)> = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let is_sliding = self.kv_caches[layer_idx].is_sliding;
+            let write_pos = self.kv_caches[layer_idx].write_pos;
+            let capacity = self.kv_caches[layer_idx].capacity;
+            self.kv_caches[layer_idx].write_pos += 1;
+            self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
+                .min(capacity);
+            let seq_len = self.kv_caches[layer_idx].seq_len;
+            kv_info.push((is_sliding, write_pos, capacity, seq_len));
+        }
+
+        // --- Embedding (tiny, single session) ---
+        {
+            let (exec, reg) = gpu.split();
+            let dev = exec.device();
+            let metal_dev = dev.metal_device();
+            let t0 = Instant::now();
+            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("embed begin: {e}"))?;
+            mlx_native::ops::elementwise::embedding_gather_scale_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.embed_weight, &self.activations.hidden,
+                input_token, hs, (hs as f32).sqrt(),
+            ).map_err(|e| anyhow::anyhow!("embedding: {e}"))?;
+            s.finish().map_err(|e| anyhow::anyhow!("embed finish: {e}"))?;
+            let _ = t0.elapsed(); // embedding is trivial, don't report
+        }
+
+        // --- Per-layer kernel-type sessions ---
+        for layer_idx in 0..num_layers {
+            let hd = self.head_dims[layer_idx];
+            let nkv = self.num_kv_heads[layer_idx];
+            let nh = self.num_attention_heads;
+            let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
+            let eps = self.rms_norm_eps;
+            let (kv_is_sliding, kv_write_pos, kv_capacity, kv_seq_len) = kv_info[layer_idx];
+            let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
+
+            // ============================================================
+            // GROUP 1: QKV matmuls (pre-attn norm + Q + K + V projections)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("qkv begin L{layer_idx}: {e}"))?;
+
+                // pre-attn norm
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.hidden,
+                    &self.layers[layer_idx].norms.input_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-attn norm L{layer_idx}: {e}"))?;
+
+                // Q proj
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+                // K proj
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                // V proj (if not k_eq_v)
+                if !v_is_k {
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                        self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
+                        &mut self.activations.attn_v, 1)?;
+                }
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("qkv finish L{layer_idx}: {e}"))?;
+                kp.qkv_matmuls_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 2: Head norms + RoPE (fused Q norm+RoPE, fused K norm+RoPE, V norm)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("norms begin L{layer_idx}: {e}"))?;
+
+                let ff_gpu = if is_sliding { None } else { Some(&self.activations.rope_freq_factors_gpu) };
+                let theta = if is_sliding { self.rope_theta_sliding } else { self.rope_theta_global };
+                let half_rope = (hd / 2) as u32;
+
+                // Fused Q norm+RoPE
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q, &self.activations.attn_q_normed,
+                    Some(&self.layers[layer_idx].attn.q_norm_weight),
+                    &self.activations.position, ff_gpu,
+                    nh as u32, hd as u32, half_rope, eps, theta,
+                ).map_err(|e| anyhow::anyhow!("fused Q L{layer_idx}: {e}"))?;
+
+                // Fused K norm+RoPE
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k, &self.activations.attn_k_normed,
+                    Some(&self.layers[layer_idx].attn.k_norm_weight),
+                    &self.activations.position, ff_gpu,
+                    nkv as u32, hd as u32, half_rope, eps, theta,
+                ).map_err(|e| anyhow::anyhow!("fused K L{layer_idx}: {e}"))?;
+
+                // V norm
+                let hd_norm_params = if is_sliding {
+                    &self.activations.norm_params_sliding_hd
+                } else {
+                    &self.activations.norm_params_global_hd
+                };
+                if v_is_k {
+                    dispatch_rms_norm_unit_perhead(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_k, &self.activations.attn_v,
+                        hd_norm_params, nkv as u32, hd as u32,
+                    )?;
+                } else {
+                    dispatch_rms_norm_unit_perhead(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_v, &self.activations.moe_expert_out,
+                        hd_norm_params, nkv as u32, hd as u32,
+                    )?;
+                }
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("norms finish L{layer_idx}: {e}"))?;
+                kp.head_norms_rope_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            let v_src = if v_is_k { &self.activations.attn_v } else { &self.activations.moe_expert_out };
+
+            // ============================================================
+            // GROUP 3: KV cache copy (2 dispatches)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("kv begin L{layer_idx}: {e}"))?;
+
+                let cache_pos_val = if kv_is_sliding {
+                    (kv_write_pos % kv_capacity) as u32
+                } else {
+                    kv_write_pos as u32
+                };
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k_normed, &self.kv_caches[layer_idx].k,
+                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    v_src, &self.kv_caches[layer_idx].v,
+                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                ).map_err(|e| anyhow::anyhow!("kv V L{layer_idx}: {e}"))?;
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("kv finish L{layer_idx}: {e}"))?;
+                kp.kv_cache_copy_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 4: SDPA (1 dispatch)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let _ = metal_dev; // suppress unused warning for sliding path
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
+
+                if is_sliding {
+                    let p = SdpaSlidingParams {
+                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
+                        seq_len: 1, kv_seq_len: kv_seq_len as u32,
+                        window_size: self.sliding_window as u32, scale: 1.0,
+                        kv_capacity: kv_capacity as u32,
+                    };
+                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
+                    ).map_err(|e| anyhow::anyhow!("sdpa_sliding L{layer_idx}: {e}"))?;
+                } else {
+                    let p = SdpaParams {
+                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
+                        seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
+                        kv_capacity: kv_capacity as u32,
+                    };
+                    s.sdpa(reg, dev, &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
+                    ).map_err(|e| anyhow::anyhow!("sdpa L{layer_idx}: {e}"))?;
+                }
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("sdpa finish L{layer_idx}: {e}"))?;
+                kp.sdpa_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 5: O-proj matmul (1 dispatch)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("oproj begin L{layer_idx}: {e}"))?;
+
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
+                    &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("oproj finish L{layer_idx}: {e}"))?;
+                kp.o_proj_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 6: MLP matmuls (post-attn norm+add, pre-FF norm, gate, up, gelu_mul, down)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("mlp begin L{layer_idx}: {e}"))?;
+
+                // Fused post-attn norm+add (needed to produce residual for MLP)
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.hidden, &self.activations.attn_out,
+                    &self.layers[layer_idx].norms.post_attention_layernorm,
+                    &self.activations.residual,
+                    hs as u32, 1, eps,
+                ).map_err(|e| anyhow::anyhow!("post-attn norm+add L{layer_idx}: {e}"))?;
+
+                // Pre-FF norm
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
+
+                // gate
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                // up
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                // fused gelu_mul
+                {
+                    use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+                    let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
+                    let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
+                    encode_with_args(
+                        s.encoder_mut(), pipeline,
+                        &[
+                            (0, KernelArg::Buffer(&self.activations.mlp_gate)),
+                            (1, KernelArg::Buffer(&self.activations.mlp_up)),
+                            (2, KernelArg::Buffer(&self.activations.mlp_fused)),
+                            (3, KernelArg::Bytes(&n_elements_bytes)),
+                        ],
+                        mlx_native::MTLSize::new(self.intermediate_size as u64, 1, 1),
+                        mlx_native::MTLSize::new(
+                            std::cmp::min(256, self.intermediate_size as u64), 1, 1),
+                    );
+                }
+                // down
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                    &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("mlp finish L{layer_idx}: {e}"))?;
+                kp.mlp_matmuls_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 7: MoE (routing + experts)
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("moe begin L{layer_idx}: {e}"))?;
+
+                // Post-FF norm 1
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.mlp_down,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
+                    &self.activations.attn_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
+
+                // Pre-FF norm 2
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                    &self.activations.moe_norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
+
+                // Router norm
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].moe.router_combined_weight,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
+
+                // Router proj
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].moe.router_proj,
+                    &mut self.activations.moe_router_logits, 1)?;
+
+                // Fused MoE routing
+                let num_experts = self.num_experts;
+                let top_k = self.layers[layer_idx].moe.top_k;
+                mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_router_logits,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_routing_weights_gpu,
+                    &self.layers[layer_idx].moe.per_expert_scale,
+                    num_experts as u32, top_k as u32,
+                ).map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
+
+                // MoE experts (fused _id path)
+                let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
+                let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
+                    && self.layers[layer_idx].moe.stacked_down.is_some();
+                if !use_fused_id {
+                    anyhow::bail!("Kernel profile requires fused _id path (stacked weights). Layer {layer_idx} missing.");
+                }
+
+                let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                    self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
+                let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                    self.layers[layer_idx].moe.down_ggml_dtype)?;
+
+                // gate_up _id
+                let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: 1,
+                    top_k: top_k as u32,
+                    n: (2 * moe_int) as u32,
+                    k: hs as u32,
+                    n_experts: num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                    ggml_type: ggml_type_gu,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_norm_out,
+                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_gate_up_id_out,
+                    &gu_params,
+                ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+
+                // Batched SwiGLU
+                mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_gate_up_id_out,
+                    &self.activations.moe_swiglu_id_out,
+                    moe_int, top_k,
+                ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
+
+                // down _id
+                let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: top_k as u32,
+                    top_k: 1,
+                    n: hs as u32,
+                    k: moe_int as u32,
+                    n_experts: num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                    ggml_type: ggml_type_dn,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_swiglu_id_out,
+                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_down_id_out,
+                    &dn_params,
+                ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+
+                // Weighted sum
+                mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_down_id_out,
+                    &self.activations.moe_routing_weights_gpu,
+                    &self.activations.moe_accum,
+                    hs, top_k,
+                ).map_err(|e| anyhow::anyhow!("weighted_sum L{layer_idx}: {e}"))?;
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("moe finish L{layer_idx}: {e}"))?;
+                kp.moe_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+
+            // ============================================================
+            // GROUP 8: Fused norms/adds/end-of-layer
+            // ============================================================
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let _ = dev; // suppress unused
+                let metal_dev = dev.metal_device();
+                let t0 = Instant::now();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("norms_end begin L{layer_idx}: {e}"))?;
+
+                // Fused post-FF norm2 + combine MLP+MoE
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_out, &self.activations.moe_accum,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+                    &self.activations.mlp_down,
+                    hs as u32, 1, eps,
+                ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
+
+                // Fused end-of-layer: post-FF norm + residual add + scalar mul
+                let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.residual, &self.activations.mlp_down,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                    &self.activations.hidden,
+                    &self.layers[layer_idx].layer_scalar,
+                    1, hs as u32, eps, scalar_is_vector,
+                ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
+
+                let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                    .map_err(|e| anyhow::anyhow!("norms_end finish L{layer_idx}: {e}"))?;
+                kp.norms_adds_us[layer_idx] = gpu_ns as f64 / 1000.0;
+            }
+        }
+
+        // --- Head: final norm + lm_head + softcap + argmax ---
+        {
+            let (exec, reg) = gpu.split();
+            let dev = exec.device();
+            let metal_dev = dev.metal_device();
+            let t0 = Instant::now();
+            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("head begin: {e}"))?;
+
+            // Final RMS norm
+            s.rms_norm(
+                reg, metal_dev,
+                &self.activations.hidden, &self.final_norm,
+                &self.activations.norm_out, &self.activations.norm_params,
+                1, hs as u32,
+            ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
+
+            // lm_head: cast F32->F16, dense GEMM F16, cast F16->F32
+            if let Some(ref lm_head_f16) = self.lm_head_f16 {
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.norm_out, &self.activations.hidden_f16,
+                    hs, CastDirection::F32ToF16,
+                ).map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
+
+                let gemm_params = DenseGemmF16Params {
+                    m: 1, n: vocab_size as u32, k: hs as u32,
+                };
+                mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.hidden_f16, lm_head_f16,
+                    &self.activations.logits_f16, &gemm_params,
+                ).map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
+
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.logits_f16, &self.activations.logits,
+                    vocab_size, CastDirection::F16ToF32,
+                ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
+            } else {
+                anyhow::bail!("Kernel profile requires GPU lm_head (F16 weight)");
+            }
+
+            // Softcap
+            if let Some(cap) = self.final_logit_softcapping {
+                {
+                    let p: &mut [f32] = self.activations.softcap_params.as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("softcap params: {e}"))?;
+                    p[0] = cap;
+                    p[1] = f32::from_bits(vocab_size as u32);
+                }
+                mlx_native::ops::softcap::dispatch_softcap(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.logits, &self.activations.logits,
+                    &self.activations.softcap_params, cap,
+                ).map_err(|e| anyhow::anyhow!("GPU softcap: {e}"))?;
+            }
+
+            // Argmax
+            {
+                let p: &mut [u32] = self.activations.argmax_params.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("argmax params: {e}"))?;
+                p[0] = vocab_size as u32;
+            }
+            mlx_native::ops::argmax::dispatch_argmax_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.logits, &self.activations.argmax_index,
+                &self.activations.argmax_value, &self.activations.argmax_params,
+                vocab_size as u32,
+            ).map_err(|e| anyhow::anyhow!("GPU argmax: {e}"))?;
+
+            let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
+                .map_err(|e| anyhow::anyhow!("head finish: {e}"))?;
+            kp.lm_head_us = gpu_ns as f64 / 1000.0;
+        }
+
+        // Read argmax result
+        let token_id: u32 = {
+            let idx: &[u32] = self.activations.argmax_index.as_slice()
+                .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
+            idx[0]
+        };
+
+        Ok((token_id, kp))
+    }
+
+    /// Print the kernel-type profiling report comparing mlx-native vs candle.
+    ///
+    /// Expects results from multiple tokens (skipping warmup).
+    pub fn print_kernel_profile_report(profiles: &[KernelTypeProfile]) {
+        if profiles.is_empty() {
+            eprintln!("[KERNEL_PROFILE] No tokens to report.");
+            return;
+        }
+        let n = profiles.len();
+        let num_layers = profiles[0].qkv_matmuls_us.len();
+
+        // Compute median per-layer averages across tokens
+        let median_sum = |getter: &dyn Fn(&KernelTypeProfile) -> &Vec<f64>| -> f64 {
+            let mut sums: Vec<f64> = profiles.iter()
+                .map(|p| getter(p).iter().sum::<f64>())
+                .collect();
+            sums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sums[sums.len() / 2]
+        };
+
+        let qkv_total = median_sum(&|p| &p.qkv_matmuls_us);
+        let norms_rope_total = median_sum(&|p| &p.head_norms_rope_us);
+        let kv_cache_total = median_sum(&|p| &p.kv_cache_copy_us);
+        let sdpa_total = median_sum(&|p| &p.sdpa_us);
+        let o_proj_total = median_sum(&|p| &p.o_proj_us);
+        let mlp_total = median_sum(&|p| &p.mlp_matmuls_us);
+        let moe_total = median_sum(&|p| &p.moe_us);
+        let norms_adds_total = median_sum(&|p| &p.norms_adds_us);
+
+        let mut head_vals: Vec<f64> = profiles.iter().map(|p| p.lm_head_us).collect();
+        head_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let head_total = head_vals[head_vals.len() / 2];
+
+        let gpu_total = qkv_total + norms_rope_total + kv_cache_total + sdpa_total
+            + o_proj_total + mlp_total + moe_total + norms_adds_total + head_total;
+
+        // Per-layer averages (divide total by num_layers, except head)
+        let qkv_per_layer = qkv_total / num_layers as f64;
+        let norms_rope_per_layer = norms_rope_total / num_layers as f64;
+        let kv_cache_per_layer = kv_cache_total / num_layers as f64;
+        let sdpa_per_layer = sdpa_total / num_layers as f64;
+        let o_proj_per_layer = o_proj_total / num_layers as f64;
+        let mlp_per_layer = mlp_total / num_layers as f64;
+        let moe_per_layer = moe_total / num_layers as f64;
+        let norms_adds_per_layer = norms_adds_total / num_layers as f64;
+
+        // Candle Phase 0 reference values (us_per_call from phase0-candle-perkernel.json).
+        //
+        // Phase 0 data has sample buffer overflow (103702 overflows), so us_per_token
+        // totals are undersampled. However, us_per_call_median is reliable since it's
+        // computed per observed dispatch. We use per-call values and multiply by the
+        // known dispatch count per layer.
+        //
+        // Gemma4 26B Q4_K_M architecture per layer (decode, seq_len=1):
+        //   - QKV: 3 quantized mat-vec (Q4_0 or Q6_K depending on weight quant)
+        //     + 1 RMS norm before QKV
+        //   - Head norms + RoPE: separate kernels in candle (not fused)
+        //     ~3 norm dispatches + 2 RoPE dispatches + 1 V norm
+        //   - KV cache: 2 copy dispatches (K, V)
+        //   - SDPA: 1 dispatch (sdpa_vector_float_256 for sliding, _512 for global)
+        //   - O-proj: 1 quantized mat-vec
+        //   - MLP: 3 quantized mat-vec (gate, up, down) + 2 elementwise (gelu, mul)
+        //     + 1 RMS norm before MLP
+        //   - MoE: 2 _id mat-vec (gate_up, down) + routing overhead
+        //     (norms, router proj, softmax, argsort, gather, mul, add)
+        //   - Norms/adds: ~5 norm/add dispatches (post-attn, pre-FF-2, post-FF, etc.)
+        //
+        // Key candle per-call medians from Phase 0:
+        //   Q4_0 mat-vec:    10.88 us    Q6_K mat-vec:    14.50 us
+        //   Q8_0 mat-vec:    18.62 us    Q4_0 _id:        38.12 us
+        //   Q6_K _id:        54.21 us    Q8_0 _id:        35.58 us
+        //   SDPA-256:        14.96 us    SDPA-512:        25.75 us
+        //   lm_head GEMM:  3483.29 us (F16 dense)
+        //   RMS norm:        ~4 us       elementwise:     ~3 us
+        //   copy2d:          ~2 us       affine:          ~2 us
+        //
+        // Per-layer estimates (assuming average Q4_0 mat-vec at ~11 us/call):
+        //   QKV: 1 norm(4) + 3 matvec(11) = ~37 us
+        //   Head norms + RoPE: ~6 dispatches * ~4 us = ~24 us
+        //   KV cache: 2 * ~2 us = ~4 us
+        //   SDPA: 15 us (sliding) or 26 us (global); avg = 25*15+5*26 / 30 = ~17 us
+        //   O-proj: 1 matvec(11) = ~11 us
+        //   MLP: 1 norm(4) + 3 matvec(11) + 2 elem(3) = ~43 us
+        //   MoE: 2 _id(38) + 1 matvec(11) + ~10 dispatches * 4 us = ~127 us
+        //   Norms/adds: ~5 dispatches * 4 us = ~20 us
+        //
+        // Total per layer: ~283 us. Over 30 layers = ~8490 us.
+        // Plus lm_head: ~3483 us (from Phase 0 data, but measured at ~185 us/token
+        // because it's called 0.05x/token during mixed prefill+decode).
+        // For decode-only, lm_head = 1 call/token = ~3483 us is too high (that
+        // includes queue overhead in the counter). Known candle decode = ~11000 us.
+        //
+        // Candle total decode: ~11000 us/token (from task description baseline).
+        // Scale factor = 11000 / (8490 + 185) = ~1.27x (buffer overflow correction).
+        // Apply scale to per-group estimates.
+
+        let candle_qkv_per_layer = 37.0; // norm + 3 mat-vec
+        let candle_norms_rope_per_layer = 24.0; // head norms + RoPE + V norm
+        let candle_kv_cache_per_layer = 4.0; // 2 copy dispatches
+        let candle_sdpa_per_layer = 17.0; // avg of 15 (sliding) and 26 (global)
+        let candle_o_proj_per_layer = 11.0; // 1 mat-vec
+        let candle_mlp_per_layer = 43.0; // norm + 3 mat-vec + 2 elementwise
+        let candle_moe_per_layer = 127.0; // _id matmuls + routing overhead
+        let candle_norms_adds_per_layer = 20.0; // post-layer norms/adds
+        let candle_lm_head = 185.0; // 1 F16 GEMM call
+
+        let candle_per_layer_total = candle_qkv_per_layer + candle_norms_rope_per_layer
+            + candle_kv_cache_per_layer + candle_sdpa_per_layer + candle_o_proj_per_layer
+            + candle_mlp_per_layer + candle_moe_per_layer + candle_norms_adds_per_layer;
+        let candle_layers_total = candle_per_layer_total * num_layers as f64;
+        let candle_total_reconstructed = candle_layers_total + candle_lm_head;
+
+        eprintln!("\n=== PER-KERNEL-TYPE PROFILING (median over {n} tokens) ===");
+        eprintln!("Per layer ({num_layers} layers):");
+        eprintln!("  QKV matmuls (norm+3 proj):       {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            qkv_per_layer, candle_qkv_per_layer, qkv_per_layer / candle_qkv_per_layer);
+        eprintln!("  Head norms + RoPE (3 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            norms_rope_per_layer, candle_norms_rope_per_layer, norms_rope_per_layer / candle_norms_rope_per_layer);
+        eprintln!("  KV cache copy (2 dispatches):    {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            kv_cache_per_layer, candle_kv_cache_per_layer, kv_cache_per_layer / candle_kv_cache_per_layer);
+        eprintln!("  SDPA (1 dispatch):               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            sdpa_per_layer, candle_sdpa_per_layer, sdpa_per_layer / candle_sdpa_per_layer);
+        eprintln!("  O-proj matmul (1 dispatch):      {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            o_proj_per_layer, candle_o_proj_per_layer, o_proj_per_layer / candle_o_proj_per_layer);
+        eprintln!("  MLP matmuls (norm+3proj+gelu):   {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            mlp_per_layer, candle_mlp_per_layer, mlp_per_layer / candle_mlp_per_layer);
+        eprintln!("  MoE (routing+4 expert):          {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            moe_per_layer, candle_moe_per_layer, moe_per_layer / candle_moe_per_layer);
+        eprintln!("  Fused norms/adds (2 dispatches): {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            norms_adds_per_layer, candle_norms_adds_per_layer, norms_adds_per_layer / candle_norms_adds_per_layer);
+        eprintln!();
+        eprintln!("Head:");
+        eprintln!("  lm_head GEMM (F16):              {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            head_total, candle_lm_head, head_total / candle_lm_head);
+        eprintln!();
+        eprintln!("Total GPU per token:               {:7.0} us  [candle: ~{:.0} us]  ratio: {:.1}x",
+            gpu_total, candle_total_reconstructed, gpu_total / candle_total_reconstructed);
+        eprintln!("  Layers total:                    {:7.0} us  [candle: ~{:.0} us]",
+            gpu_total - head_total, candle_layers_total);
+        eprintln!("  Head total:                      {:7.0} us  [candle: ~{:.0} us]",
+            head_total, candle_lm_head);
+
+        // Per-layer detail for sliding vs global
+        eprintln!();
+        eprintln!("Per-layer detail (median token, us):");
+        eprintln!("  Layer | Type |    QKV | Nrm+RoPE |  KV$ |  SDPA | O-proj |    MLP |    MoE | Norms | Total");
+        eprintln!("  ------|------|--------|----------|------|-------|--------|--------|--------|-------|------");
+        let mid = profiles.len() / 2;
+        let median_p = &profiles[mid]; // approximate median token
+        for li in 0..num_layers {
+            let lt = if (li + 1) % 6 == 0 { "G" } else { "S" };
+            let layer_total = median_p.qkv_matmuls_us[li] + median_p.head_norms_rope_us[li]
+                + median_p.kv_cache_copy_us[li] + median_p.sdpa_us[li]
+                + median_p.o_proj_us[li] + median_p.mlp_matmuls_us[li]
+                + median_p.moe_us[li] + median_p.norms_adds_us[li];
+            eprintln!("  {:>2}    |  {}   | {:6.0} |    {:5.0} | {:4.0} | {:5.0} |  {:5.0} |  {:5.0} |  {:5.0} | {:5.0} | {:5.0}",
+                li, lt,
+                median_p.qkv_matmuls_us[li], median_p.head_norms_rope_us[li],
+                median_p.kv_cache_copy_us[li], median_p.sdpa_us[li],
+                median_p.o_proj_us[li], median_p.mlp_matmuls_us[li],
+                median_p.moe_us[li], median_p.norms_adds_us[li],
+                layer_total);
+        }
+
+        // Find top 3 slowest kernel types (by ratio vs candle)
+        let mut ratios = vec![
+            ("QKV matmuls", qkv_per_layer, candle_qkv_per_layer, qkv_per_layer / candle_qkv_per_layer),
+            ("Head norms + RoPE", norms_rope_per_layer, candle_norms_rope_per_layer, norms_rope_per_layer / candle_norms_rope_per_layer),
+            ("KV cache copy", kv_cache_per_layer, candle_kv_cache_per_layer, kv_cache_per_layer / candle_kv_cache_per_layer),
+            ("SDPA", sdpa_per_layer, candle_sdpa_per_layer, sdpa_per_layer / candle_sdpa_per_layer),
+            ("O-proj matmul", o_proj_per_layer, candle_o_proj_per_layer, o_proj_per_layer / candle_o_proj_per_layer),
+            ("MLP matmuls", mlp_per_layer, candle_mlp_per_layer, mlp_per_layer / candle_mlp_per_layer),
+            ("MoE", moe_per_layer, candle_moe_per_layer, moe_per_layer / candle_moe_per_layer),
+            ("Fused norms/adds", norms_adds_per_layer, candle_norms_adds_per_layer, norms_adds_per_layer / candle_norms_adds_per_layer),
+            ("lm_head GEMM", head_total, candle_lm_head, head_total / candle_lm_head),
+        ];
+        ratios.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        eprintln!();
+        eprintln!("TOP 3 SLOWEST (highest mlx-native/candle ratio):");
+        for (i, (name, mlx_us, candle_us, ratio)) in ratios.iter().take(3).enumerate() {
+            let overhead_per_token = (mlx_us - candle_us) * if *name != "lm_head GEMM" { num_layers as f64 } else { 1.0 };
+            eprintln!("  {}. {} — {:.1}x slower ({:.0} vs {:.0} us/layer) — {:.0} us/token overhead",
+                i + 1, name, ratio, mlx_us, candle_us, overhead_per_token);
+        }
+
+        eprintln!();
+        eprintln!("NOTE: Per-session overhead (~30-50 us/session) inflates all groups.");
+        eprintln!("      The ratio shows relative slowness, not absolute kernel time.");
+        eprintln!("      {} sessions/token vs 1 in production mode.", 8 * num_layers + 2);
     }
 
     /// Run one decoder layer with session-collapsed GPU dispatch.

@@ -908,6 +908,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
         // Profiling support
         let mut profiler = forward_mlx::ProfileAccumulator::new(2);
+        let kernel_profile_mode = std::env::var("HF2Q_MLX_KERNEL_PROFILE")
+            .map_or(false, |v| v == "1");
 
         // Prefill: process prompt tokens one at a time through mlx-native.
         // (Full prefill with seq_len>1 is a Phase 5b optimization.)
@@ -938,14 +940,37 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
         let decode_start = std::time::Instant::now();
         let mut generated = 1usize;
+        let mut kernel_profiles: Vec<forward_mlx::KernelTypeProfile> = Vec::new();
+        let kernel_profile_warmup = 2usize;
+        let kernel_profile_measure = 3usize;
         for _ in 1..params.max_tokens {
             if eos_token_ids.contains(&next_token) {
                 break;
             }
             let pos = all_tokens.len() - 1;
-            let mut p = profiler.start_token();
-            next_token = mlx_w.forward_decode(next_token, pos, mlx_gpu, &mut p)?;
-            profiler.finish_token(p);
+
+            if kernel_profile_mode {
+                // Per-kernel-type profiling mode
+                let (tok, kp) = mlx_w.forward_decode_kernel_profile(
+                    next_token, pos, mlx_gpu)?;
+                next_token = tok;
+                if generated > kernel_profile_warmup {
+                    kernel_profiles.push(kp);
+                }
+                // Stop after warmup + measure tokens
+                if kernel_profiles.len() >= kernel_profile_measure {
+                    all_tokens.push(next_token);
+                    generated += 1;
+                    let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+                    print!("{}", token_str);
+                    std::io::stdout().flush()?;
+                    break;
+                }
+            } else {
+                let mut p = profiler.start_token();
+                next_token = mlx_w.forward_decode(next_token, pos, mlx_gpu, &mut p)?;
+                profiler.finish_token(p);
+            }
             all_tokens.push(next_token);
             generated += 1;
             {
@@ -963,6 +988,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
         // Print profiling summary if enabled
         profiler.print_summary();
+
+        // Print kernel-type profiling report if enabled
+        if kernel_profile_mode && !kernel_profiles.is_empty() {
+            forward_mlx::MlxModelWeights::print_kernel_profile_report(&kernel_profiles);
+        }
 
         return Ok(());
     }
