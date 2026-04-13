@@ -816,13 +816,15 @@ impl MlxModelWeights {
                 cfg.sliding_window
             };
             // KV cache shape: [num_kv_heads, capacity, head_dim] — head-major
+            // Phase 4a: F16 KV cache halves memory bandwidth for SDPA reads.
+            // Reference: llama.cpp stores KV cache in F16 for bandwidth-bound decode.
             let cache_elements = nkv * capacity * hd;
-            let cache_bytes = cache_elements * std::mem::size_of::<f32>();
+            let cache_bytes = cache_elements * 2; // F16 = 2 bytes per element
             let k_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd],
+                cache_bytes, mlx_native::DType::F16, vec![nkv, capacity, hd],
             ).map_err(|e| anyhow::anyhow!("KV cache K alloc failed: {e}"))?;
             let v_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd],
+                cache_bytes, mlx_native::DType::F16, vec![nkv, capacity, hd],
             ).map_err(|e| anyhow::anyhow!("KV cache V alloc failed: {e}"))?;
             kv_caches.push(MlxKvCache {
                 k: k_cache,
@@ -1145,14 +1147,15 @@ impl MlxModelWeights {
                     } else {
                         kv_write_pos as u32
                     };
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    // Phase 4a: F32→F16 cast on write, halving KV cache bandwidth.
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.attn_k_normed,
                         &self.kv_caches[layer_idx].k,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                     ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                         s.encoder_mut(), reg, metal_dev,
                         v_src,
                         &self.kv_caches[layer_idx].v,
@@ -1574,11 +1577,12 @@ impl MlxModelWeights {
             total_dispatches += 1;
 
             // === ONE finish() for the entire forward pass ===
+            let barrier_count = s.barrier_count();
             let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
                 .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
             if std::env::var("HF2Q_MLX_TIMING").is_ok() {
-                eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={}",
-                    enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches);
+                eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
+                    enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
             }
         }
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;

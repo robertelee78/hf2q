@@ -1,7 +1,7 @@
 # ADR-006: mlx-native as hf2q's GPU Compute Backend (migrate from candle)
 
-**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`)
-**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted)
+**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13 after mlx-native integration and barrier/kernel profiling (see `docs/spike-barrier-perf-measurements.md`).
+**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised)
 **Decision Makers:** Robert, Claude
 **Supersedes (implicitly):** the original "use candle" decision from hf2q's early Crawl phase, never written as an ADR
 **Related ADRs:** ADR-005 (Inference Server, Phase 1b speed gap context), ADR-004 (GGUF compatibility — mlx-native must preserve all of it)
@@ -36,8 +36,12 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the
 7. hf2q dispatch count (2104) is high vs llama.cpp (Agent #2: ggml graph has 2652 nodes per forward — llama.cpp does MORE work and is still faster)
 8. llama.cpp peer measures 107 tok/s today on this hardware (Agent #2 5-run re-measurement: 102.01 median; End gate re-baselined per `feedback_ground_truth_is_what_we_can_measure_now.md`)
 9. Q6_K NR0=2 row-loop port has wall-clock envelope on M5 Max (Agent C1: bitwise-correct port, `max|Δ|=0.000000e0`, two independent 4-run sweeps converged on ±0.4% noise — the 2× threadgroup reduction trades off ~1:1 against doubled per-simdgroup work)
+10. The 17 tok/s gap lives in candle's individual kernel implementations (Phase 0 FALSIFIED: per-call GPU times show candle's kernels are comparable or faster than ggml's in 7/9 matched families — the gap was framework dispatch patterns)
+11. Barrier count is the bottleneck on mlx-native (2026-04-13 barrier profiling FALSIFIED: hf2q has 606 barriers/token, llama.cpp has 759 — more barriers yet faster. All 606 barriers are true RAW dependencies; none removable. Buffer aliasing ruled out via exhaustive audit — all activation buffers are physically distinct `MTLBuffer` allocations. See `docs/spike-barrier-alias-audit.md`)
+12. Dispatches-per-barrier ratio explains the speed gap (2026-04-13 PARTIALLY FALSIFIED: ratio is 1.44 vs 2.38, but per-kernel profiling showed the gap is kernel execution speed, not pipelining. MoE/MLP/lm_head/norms are all faster than ggml. Only SDPA and dense matmul are slower — due to F32 KV cache and Q8_0 NSG=2)
+13. Framework overhead is still the dominant gap after mlx-native migration (2026-04-13 FALSIFIED: mlx-native's single-session concurrent dispatch closed the framework gap to +2.6% vs candle. Remaining 15.5 tok/s is kernel-implementation-dominated — F32 KV cache and Q8_0 threadgroup width)
 
-Each one is a hypothesis that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 84.9 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
+Each one is a hypothesis that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 89.8 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
 
 **Cross-reference:** the same mantra section appears verbatim in [ADR-005](ADR-005-inference-server.md). Both ADRs should remain in sync if the mantra source file is updated.
 
@@ -45,7 +49,13 @@ Each one is a hypothesis that *sounded* right in static analysis and would have 
 
 ## Problem Statement
 
-hf2q's Phase 1b End gate (per ADR-005:162, re-baselined 2026-04-11) requires decode speed `≥102 tok/s` on M5 Max, Gemma 4 26B MoE, Q4_K_M, with byte-identical greedy generation vs llama.cpp at T=0. Coherence is met; speed is not. Current baseline: **84.9 tok/s post-1bNEW.22**, gap **17 tok/s** to peer.
+hf2q's Phase 1b End gate (per ADR-005:162, re-baselined 2026-04-11) requires decode speed `≥102 tok/s` on M5 Max, Gemma 4 26B MoE, Q4_K_M, with byte-identical greedy generation vs llama.cpp at T=0. Coherence is met; speed is not.
+
+**Baseline progression:**
+- 2026-04-11 (pre-ADR-006): 84.9 tok/s on candle backend. Gap: 17 tok/s.
+- 2026-04-13 (post-mlx-native migration): 89.8 tok/s on mlx-native backend (candle: 87.5). Gap: **15.5 tok/s** to llama.cpp's 105.25 tok/s.
+
+The mlx-native migration closed 2.3 tok/s of the gap (framework overhead win). The remaining 15.5 tok/s is now precisely attributed to kernel-level implementation differences (see §Phase 4 Revision below).
 
 In a single 2026-04-11 session, three consecutive static-evidence-driven kernel-port hypotheses were empirically falsified on M5 Max:
 
@@ -300,37 +310,86 @@ Each sub-phase ends with a commit that includes:
 - Candle's kernel ABI may not map cleanly to mlx-native's `CommandEncoder` ABI; some borrow ports may need argument-passing adaptation. Mitigation: do the ABI work as part of the port; document the adapter pattern.
 - mlx-native's existing kernel implementations (e.g., its own Q6_K) may diverge from candle's borrowed version. Mitigation: validate every borrow against BOTH the candle source AND mlx-native's existing implementation; if they diverge, pick the one with the clearest correctness story and document why.
 
-### Phase 4 — Build Phase (port what llama.cpp/ggml has that candle doesn't)
+### Phase 4 — Build Phase (kernel-level parity with llama.cpp)
 
-**Goal:** Add the framework-level patterns to mlx-native that Phase 0's diagnosis identified as the actual gap, scoped to whatever Phase 0 said.
+**Goal:** Close the remaining 15.5 tok/s gap by bringing two specific kernel implementations to ggml-metal parity.
 
-**Why this phase exists:** Phase 3 brings mlx-native to *parity* with candle. Parity is not enough — we need to *exceed* candle for the migration to be worth it. The exceeding work is patterns ggml-metal has that candle doesn't, and Phase 0 tells us which patterns matter.
+**Why this phase exists:** The mlx-native migration (Phases 3+5, now complete) brought framework-level parity — mlx-native's single-session concurrent dispatch eliminated candle's per-dispatch encoder overhead. The remaining gap is **kernel-implementation-dominated**, not framework-overhead-dominated. This was confirmed by comprehensive profiling on 2026-04-13 (see `docs/spike-barrier-perf-measurements.md` and `docs/spike-barrier-alias-audit.md`).
 
-**Possible scope (depends on Phase 0):**
+**What the profiling proved:**
+- **Not the bottleneck:** Barriers (606/token vs llama.cpp's 759 — we have fewer), buffer aliasing (ruled out — all activation buffers are physically distinct `MTLBuffer` allocations), CPU encode overhead (0.50ms = 4.5% of total), barrier count, pipelining structure.
+- **Already faster than ggml:** MoE (0.84x), MLP (0.84x), lm_head (0.87x), norms (0.89-0.93x), KV cache copy (0.94x).
+- **The gap (two kernels):**
 
-If Phase 0 says **framework-overhead-dominated:**
-- **ggml graph scheduler with topological dispatch.** Build a graph builder API in mlx-native (`MlxGraph`, `MlxNode`) that lets the caller submit a whole forward pass and let mlx-native schedule it. Reference: `ggml_metal_graph_compute` family in `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp`.
-- **Per-graph memory allocator.** Compute the maximum tensor live-set across the graph, allocate one big buffer, slice into it. Reference: `ggml_gallocr_*` family in `/opt/llama.cpp/ggml/src/ggml-alloc.c`.
-- **Encoder-per-command-buffer pattern.** One compute encoder per command buffer, all dispatches share it. mlx-native already has its own `CommandEncoder` (294 LOC); restructure it to match ggml-metal's lifecycle from day one.
-- **Graph-rewrite-time kernel fusion.** Pattern-match `MlxGraph` nodes for known fusable sequences (`norm → matmul`, `rope → cat`, `gelu → mul`) and rewrite them as single dispatches before the graph executes. Reference: `ggml_metal_graph_optimize` if it exists, or write the pattern matcher from scratch.
+| Kernel | mlx-native | ggml | Root cause | μs/token overhead |
+|--------|-----------|------|-----------|-------------------|
+| SDPA (`flash_attn_vec`) | 40 μs/layer | 15.5 μs/layer | **F32 KV cache** (ggml uses F16 — 2x bandwidth), fixed NSG=1 (ggml scales to NSG=4) | 736 (44.6% of gap) |
+| Dense quantized matmul (Q8_0 layers) | NSG=2 (64 threads/tg) | NSG=4 (128 threads/tg) | **Half the threadgroup width** for Q8_0 quant type | 652 (39.5% of gap) |
 
-If Phase 0 says **distributed-kernel-implementation-dominated:**
-- Port the specific candle-vs-llama.cpp kernel deltas Agent #2 identified: Q4_0 `kernel_mul_mv_ext_*_r1_2_nxpsg=16`, fused `rms_norm_mul_f32_4` / `rms_norm_mul_add_f32_4`, Flash Attention `kernel_flash_attn_ext_f16_dk512_dv512_nsg=8`. Each as a separate sub-phase with microbench-first discipline (per `feedback_mantra.md` — never patch without measuring first).
+**Phase 4 scope (concrete, measured, ordered by leverage):**
 
-If Phase 0 says **mixed:**
-- Both, in the order Phase 0's attribution table prioritizes by ms/token contribution.
+#### 4a — F16 KV cache (highest leverage)
 
-**Attribution discipline:** same as Phase 3. Every ported pattern from ggml-metal gets a header comment with `file:line` source citation and the LICENSE notice (ggml is MIT-licensed; the dual MIT-or-Apache in mlx-native covers it).
+Convert KV cache from F32 to F16. This halves memory bandwidth for SDPA's K/V reads — the dominant cost in a bandwidth-bound decode-path attention kernel at batch=1.
 
-**Deliverable:** mlx-native commits implementing the Phase 0-identified patterns. Microbench in mlx-native showing each pattern produces measurable speedup vs the borrowed-kernels-only baseline at hf2q's shapes. Updated `docs/spike-1bNEW30-per-kernel-attribution.md` showing the gap shrinks toward zero as each pattern lands.
+**Changes:**
+1. `forward_mlx.rs:820-826`: KV cache allocation `DType::F32` → `DType::F16`, halve `cache_bytes`
+2. `kv_cache_copy.metal`: new F32→F16 cast-and-store variant (or template the existing kernel)
+3. `flash_attn_vec.metal`: change K/V buffer types from `device const float *` to `device const half *`, add `float4(half4(...))` at load time. The kernel already uses `half` for Q in shared memory — the infrastructure exists.
+4. `kv_cache_copy.rs` dispatch: adjust byte sizes for F16 output
+5. `flash_attn_vec.rs` dispatch: no change needed (buffer bindings are type-agnostic)
 
-**Gate to next phase:** Standalone mlx-native microbench (running the same hf2q dispatch shapes against both the borrowed-kernels-only baseline and the borrowed-kernels-plus-framework-patterns build) shows measurable, mantra-aligned speedup: ≥10% per pattern, validated across 4 independent runs (matching Agent #1's NSG sweep methodology).
+**Expected payoff:** ~736 μs/token. If this alone reaches ggml SDPA parity, predicted tok/s: ~96.5.
+**Side benefit:** KV cache memory halved (from 10.7 GB at max capacity to 5.35 GB).
+**Coherence risk:** F16 has 3 decimal digits of precision vs F32's 7. The sourdough gate must pass after this change. If it fails, the cast point may need to be after the norm (which reduces the dynamic range).
+**Estimated:** 1-2 days.
 
-**Estimated:** 1-2 weeks (highly dependent on Phase 0's findings — if framework patterns are the dominant gap, this is the longest phase; if individual kernels are the dominant gap, it's shorter).
+#### 4b — Q8_0 threadgroup width NSG=2→4
+
+Change `N_SIMDGROUP` from 2 to 4 for Q8_0 matmul kernel. llama.cpp uses `N_SG_Q8_0=4` (128 threads per threadgroup) vs our 2 (64 threads). This directly doubles the threadgroup width for every Q8_0 layer in the mixed Q4/Q8 model.
+
+**Changes:**
+1. `quantized_matmul_ggml.metal`: add Q8_0-specific `N_SIMDGROUP_Q8 = 4` or template the kernel
+2. `quantized_matmul_ggml.rs` dispatch: change `nth0 × nth1` for Q8_0 from `(8, 8)` to `(8, 16)` or `(32, 4)` (must equal 128 threads = 4 simdgroups)
+3. Verify threadgroup memory allocation scales correctly with wider dispatch
+
+**Expected payoff:** substantial portion of 652 μs/token on Q8_0 layers. Exact amount depends on what fraction of dense matmuls in this model use Q8_0 vs Q4_0.
+**Estimated:** 0.5-1 day.
+
+#### 4c — Dynamic NSG scaling for flash_attn_vec
+
+After 4a lands, measure the remaining SDPA gap. If significant at longer sequences, add dynamic NSG scaling (1→4 based on KV seq len) matching llama.cpp's `while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) nsg *= 2` logic.
+
+**Changes:**
+1. `flash_attn_vec.metal`: template for NSG=1/2/4 (or use function constants)
+2. `flash_attn_vec.rs` dispatch: select NSG based on `kv_seq_len` at dispatch time
+3. Shared memory allocation must scale with NSG
+
+**Expected payoff:** matters primarily at longer sequences (512+ tokens). May be unnecessary if 4a closes the gap.
+**Estimated:** 1 day.
+
+#### 4d — Incremental: loop unrolling and function constants (if needed)
+
+After 4a-4c, if a gap remains:
+- Add `FOR_UNROLL` equivalent (`#pragma unroll`) to inner loops in quantized matmul kernels
+- Convert runtime constants (`N_SIMDGROUP`, `N_DST`) to Metal function constants for PSO-level optimization
+- Port Q4_0 row-pointer pre-computation pattern from llama.cpp's `mul_vec_q_n_f32_impl`
+
+**Expected payoff:** incremental (estimated 1-3% each). Only pursue if 4a+4b don't reach 102 tok/s.
+**Estimated:** 1-2 days if needed.
+
+**Attribution discipline:** same as Phase 3. Every ported pattern from ggml-metal gets a header comment with `file:line` source citation and the LICENSE notice.
+
+**Deliverable:** mlx-native commits implementing each sub-phase. Each commit includes a 3-run benchmark showing tok/s progression toward 102. Updated `docs/spike-barrier-perf-measurements.md` with post-fix measurements.
+
+**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing. If 4a+4b don't reach 102, proceed to 4c/4d. If all four don't reach 102, the gap is in pipelining structure (Class D from the spike) and requires the graph reordering work originally proposed for this phase.
+
+**Estimated total:** 3-5 days (vs original 1-2 weeks — scope is now concrete and bounded).
 
 **Risks:**
-- A pattern shown to win in microbench may not win in integration if other parts of the dispatch path bottleneck before it. Mitigation: validate each pattern at the integration level via Phase 5's per-op cutover, not just standalone microbench.
-- The graph scheduler is a substantial new API surface. Mitigation: copy ggml's API shape literally where possible; don't invent.
+- F16 KV cache may introduce subtle precision loss that fails the sourdough gate. Mitigation: validate with sourdough gate immediately after 4a; if it fails, investigate whether the precision loss is in the cast (fixable by casting after norm) or in the attention computation (deeper issue).
+- Q8_0 NSG=4 may not fit in threadgroup memory on some dispatch shapes. Mitigation: check `maxTotalThreadsPerThreadgroup` for the pipeline before dispatching; fall back to NSG=2 if constrained.
+- The 2.6x symmetry between SDPA and dense matmul gaps may share a common root cause (e.g., a dispatch overhead per kernel). If F16 KV closes more of the dense matmul gap than expected, 4b may become unnecessary. Remeasure after each sub-phase.
 
 ### Phase 5 — Integration into hf2q
 
@@ -470,6 +529,10 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 - `feedback_no_shortcuts.md` / `feedback_correct_outcomes.md` — never accept partial outcomes
 - `feedback_prove_in_code.md` — never assume from memory/docs; read the code and test to verify
 
+### Spike reports from the 2026-04-13 session (Phase 4 revision)
+- `docs/spike-barrier-perf-measurements.md` — comprehensive per-kernel profiling on mlx-native: gap attribution to F16 KV + Q8_0 NSG
+- `docs/spike-barrier-alias-audit.md` — exhaustive buffer alias audit proving all 606 barriers are necessary and no cross-layer aliasing exists
+
 ### Spike reports from the 2026-04-11 session
 - `docs/spike-1bNEW22-instrumentation.md` — sticky encoder hypothesis falsified; CPU/GPU framing corrected
 - `docs/spike-1bNEW29-pre-microbench-results.md` — synthesis of three-worker pre-microbench session
@@ -494,4 +557,5 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 |---|---|---|---|
 | Author | Claude | 2026-04-11 | Drafted |
 | Decision maker | Robert | 2026-04-12 | Accepted — Phase 0 verdict: framework-overhead-dominated |
-| Status | **Accepted** | Phase 0 complete 2026-04-12 | Phase 4 scope: graph scheduler (primary) |
+| Phase 4 revision | Claude | 2026-04-13 | Phase 4 scope revised: kernel-implementation-dominated (F16 KV + Q8_0 NSG). See `docs/spike-barrier-perf-measurements.md` |
+| Status | **Accepted** | Phase 4 revised 2026-04-13 | Phase 4 scope: F16 KV cache (primary), Q8_0 NSG (secondary) |
