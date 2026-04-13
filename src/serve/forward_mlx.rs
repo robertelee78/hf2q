@@ -1524,7 +1524,12 @@ impl MlxModelWeights {
             total_dispatches += 1;
 
             // === ONE finish() for the entire forward pass ===
-            s.finish().map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
+            let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
+                .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
+            if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={}",
+                    enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches);
+            }
         }
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
 
