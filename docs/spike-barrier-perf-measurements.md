@@ -192,3 +192,57 @@ If SDPA + dense matmul reach ggml parity, the corrected total drops to ~9,861 μ
 - Calibration accuracy: 0.9% error (11,249 predicted vs 11,150 measured)
 - Phase 0 ggml data is from 2026-04-12 (1 day old), same hardware, same model
 - llama.cpp version: build 15f786e65 (homebrew, latest)
+
+---
+
+## 9. Post-Implementation Measurements (2026-04-13, continued)
+
+### Phase 4a: F16 KV cache — IMPLEMENTED
+
+| Metric | Before (F32 KV) | After (F16 KV) |
+|--------|-----------------|----------------|
+| 128-tok decode | 89.8 tok/s | 91.0 tok/s (+1.3%) |
+| 512-tok decode | 88.0 tok/s | 89.7 tok/s (+1.9%) |
+| Coherence | 3095 byte prefix | 3095 byte prefix (identical) |
+| KV memory | ~10.7 GB | ~5.35 GB (-50%) |
+
+### Phase 4b: Q8_0 NSG=4 — IMPLEMENTED, NEUTRAL
+
+Only 12/300 quantized tensors are Q8_0 (4%). Model is 80% Q4_0. No measurable impact.
+
+### Barrier stall spike — NO-BARRIERS experiment
+
+| Mode | gpu_wait | Barrier stall cost | Per-barrier |
+|------|----------|-------------------|-------------|
+| Normal (606 barriers) | 10.55ms | 4.67ms | 7.7μs |
+| No barriers (broken) | 5.88ms | 0ms | — |
+
+**44% of GPU time is barrier stalls.** Raw compute floor is 5.88ms (170 tok/s theoretical). llama.cpp at ~9.0ms pays ~3.1ms barrier cost (4.1μs/barrier).
+
+### ConflictTracker — IMPLEMENTED
+
+Automatic barrier elision via buffer-range conflict detection. Result: 606/606 barriers still needed — the computation graph is a strict chain with true RAW dependencies at every barrier point. No false barriers to elide.
+
+### llama.cpp graph reorder analysis
+
+llama.cpp's `ggml_metal_graph_optimize_reorder` moves **70-79% of nodes** (1406-1599 out of 2020). Key pattern: it interleaves independent ops from different stages of the transformer. Example: V proj moved after Q head norm (they use disjoint buffers), increasing the concurrent window size.
+
+### Dispatch reorder experiment — V proj after Q norm
+
+Moved V proj to execute concurrently with Q norm (disjoint buffers: Q norm reads attn_q/writes attn_q_normed, V proj reads norm_out/writes attn_v). Result: **119 tok/s on 5 tokens** (up from 112) — 6% improvement. BUT: **correctness failure** (all `<pad>` tokens). Root cause under investigation — the dependency analysis says the reorder is safe (Metal barriers are full memory fences), but output is wrong. Suspected subtle dependency not captured in the buffer-range model. Reverted.
+
+### Revised gap attribution
+
+| Source | μs/token | % of gap |
+|--------|----------|----------|
+| Barrier stall overhead (4.67ms vs llama.cpp's ~3.1ms) | ~1,570 | ~95% |
+| Kernel execution speed | ~80 | ~5% |
+| **Total gap** | **~1,650** | **100%** |
+
+The gap is almost entirely barrier stall cost, not kernel speed. The kernels are at parity (confirmed by no-barriers experiment: both stacks converge to ~5.9ms raw compute). The fix is increasing dispatches-per-barrier ratio through graph reordering, matching llama.cpp's 70-79% node reorder rate.
+
+### Next steps
+
+1. Debug the V-proj reorder correctness failure — understand why the dependency analysis is wrong
+2. Implement broader dispatch reordering following llama.cpp's pattern (lookahead up to 64 nodes)
+3. Consider double-buffering of `hidden` state for cross-layer overlap
