@@ -2591,6 +2591,7 @@ dependencies = [
  "bytemuck",
  "memmap2",
  "metal 0.33.0",
+ "objc",
  "safetensors 0.7.0",
  "serde",
  "serde_json",

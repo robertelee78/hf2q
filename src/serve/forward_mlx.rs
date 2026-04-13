@@ -995,6 +995,9 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("embedding_gather_scale: {e}"))?;
             total_dispatches += 1;
 
+            // Barrier: pre-attn norm reads `hidden` written by embedding
+            s.barrier();
+
             // --- 2. Transformer layers ---
             for layer_idx in 0..num_layers {
                 let hd = self.head_dims[layer_idx];
@@ -1015,7 +1018,10 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("GPU pre-attn norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- QKV projections --
+                // Barrier: Q/K/V projections read `norm_out` written by pre-attn norm
+                s.barrier();
+
+                // -- QKV projections (CONCURRENT: all read norm_out, write separate buffers) --
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
                 total_dispatches += 1;
@@ -1030,9 +1036,12 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // -- Fused per-head RMS norm + RoPE on Q and K --
+                // Barrier: head norms read attn_q/k written by projections above
+                s.barrier();
+
+                // -- Fused per-head RMS norm + RoPE on Q and K (CONCURRENT) --
                 // Replaces 4 separate dispatches (Q norm, K norm, Q RoPE, K RoPE)
-                // with 2 fused dispatches.
+                // with 2 fused dispatches.  Q, K, and V norms can overlap.
                 let ff_gpu = if is_sliding {
                     None
                 } else {
@@ -1104,7 +1113,10 @@ impl MlxModelWeights {
                     &self.activations.moe_expert_out
                 };
 
-                // -- GPU KV cache update --
+                // Barrier: KV cache reads normed K/V written by head norms above
+                s.barrier();
+
+                // -- GPU KV cache update (CONCURRENT: K and V copies are independent) --
                 // After fused norm+RoPE, the rotated K is in attn_k_normed.
                 {
                     let cache_pos_val = if kv_is_sliding {
@@ -1128,6 +1140,9 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // Barrier: SDPA reads KV cache + attn_q_normed written above
+                s.barrier();
+
                 // -- SDPA (flash_attn_vec) --
                 // After fused norm+RoPE, the rotated Q is in attn_q_normed.
                 {
@@ -1150,10 +1165,16 @@ impl MlxModelWeights {
                 }
                 total_dispatches += 2; // main + reduce
 
+                // Barrier: O_proj reads sdpa_out written by SDPA
+                s.barrier();
+
                 // -- O-proj --
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
                     &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
                 total_dispatches += 1;
+
+                // Barrier: fused_norm_add reads attn_out written by O_proj
+                s.barrier();
 
                 // -- Fused post-attention norm + residual add --
                 // norm(attn_out, post_attn_weight) + hidden → residual
@@ -1168,6 +1189,9 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
+                // Barrier: pre-FF norm reads residual written by fused_norm_add
+                s.barrier();
+
                 // -- GPU pre-feedforward norm --
                 s.rms_norm(
                     reg, metal_dev,
@@ -1179,13 +1203,20 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- Dense MLP: gate, up, fused SwiGLU, down --
+                // Barrier: gate/up read norm_out written by pre-FF norm
+                s.barrier();
+
+                // -- Dense MLP: gate, up, fused SwiGLU, down (gate + up CONCURRENT) --
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
                 total_dispatches += 1;
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
                 total_dispatches += 1;
+
+                // Barrier: fused_gelu_mul reads mlp_gate + mlp_up written above
+                s.barrier();
+
                 {
                     use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
                     let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
@@ -1204,9 +1235,16 @@ impl MlxModelWeights {
                     );
                 }
                 total_dispatches += 1;
+
+                // Barrier: down_proj reads mlp_fused written by fused_gelu_mul
+                s.barrier();
+
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
                     &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
                 total_dispatches += 1;
+
+                // Barrier: post-FF norm 1 reads mlp_down written by down_proj
+                s.barrier();
 
                 // -- GPU post-feedforward norm 1: mlp_down → attn_out --
                 s.rms_norm(
@@ -1219,6 +1257,9 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
+                // Barrier: norm_params shared with post-FF norm 1 above
+                s.barrier();
+
                 // -- GPU pre-feedforward norm 2: residual → moe_norm_out --
                 s.rms_norm(
                     reg, metal_dev,
@@ -1230,6 +1271,9 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
+                // Barrier: norm_params shared with pre-FF norm 2 above
+                s.barrier();
+
                 // -- GPU router input prep + projection --
                 s.rms_norm(
                     reg, metal_dev,
@@ -1240,10 +1284,17 @@ impl MlxModelWeights {
                     1, hs as u32,
                 ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
+
+                // Barrier: router_proj reads norm_out written by router norm
+                s.barrier();
+
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].moe.router_proj,
                     &mut self.activations.moe_router_logits, 1)?;
                 total_dispatches += 1;
+
+                // Barrier: fused MoE routing reads router_logits
+                s.barrier();
 
                 // ============================================================
                 // Fused GPU MoE routing: softmax + argsort + gather (1 dispatch)
@@ -1260,6 +1311,9 @@ impl MlxModelWeights {
                     num_experts as u32, top_k as u32,
                 ).map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
+
+                // Barrier: expert dispatches read moe_expert_ids + routing_weights
+                s.barrier();
 
                 // ============================================================
                 // MoE expert dispatches (was S4, now in same session)
@@ -1294,6 +1348,9 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
 
+                    // Barrier: SwiGLU reads gate_up_id output
+                    s.barrier();
+
                     // Batched SwiGLU
                     mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
                         s.encoder_mut(), reg, metal_dev,
@@ -1302,6 +1359,9 @@ impl MlxModelWeights {
                         moe_int, top_k,
                     ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
+
+                    // Barrier: down_id reads swiglu output
+                    s.barrier();
 
                     // down _id
                     let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
@@ -1322,6 +1382,9 @@ impl MlxModelWeights {
                         &dn_params,
                     ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
+
+                    // Barrier: weighted_sum reads down_id output
+                    s.barrier();
 
                     // Weighted sum
                     mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
@@ -1350,6 +1413,9 @@ impl MlxModelWeights {
                     );
                 }
 
+                // Barrier: post-MoE ops read moe_accum + attn_out
+                s.barrier();
+
                 // ============================================================
                 // GPU post-MoE: norm, combine MLP+MoE, final norm, residual, scalar
                 // ============================================================
@@ -1367,6 +1433,9 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
+                // Barrier: end-of-layer reads mlp_down written by fused_norm_add
+                s.barrier();
+
                 // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
                 // Computes: hidden = (residual + rms_norm(mlp_down, post_ff_weight)) * scalar
                 // Norm is on mlp_down ALONE, then added to residual, then scaled.
@@ -1383,6 +1452,9 @@ impl MlxModelWeights {
                     scalar_is_vector,
                 ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
+
+                // Barrier: next layer's pre-attn norm (or final norm) reads `hidden`
+                s.barrier();
 
                 if let Some(ref mut p) = profile {
                     // All layer ops in single session — attribute everything to S1
@@ -1403,6 +1475,9 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
             total_dispatches += 1;
 
+            // Barrier: cast reads norm_out written by final norm
+            s.barrier();
+
             // GPU lm_head: cast F32→F16 + dense_gemm_f16 + cast F16→F32
             if let Some(ref lm_head_f16) = self.lm_head_f16 {
                 mlx_native::ops::elementwise::cast(
@@ -1413,6 +1488,9 @@ impl MlxModelWeights {
                     CastDirection::F32ToF16,
                 ).map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
                 total_dispatches += 1;
+
+                // Barrier: gemm reads hidden_f16 written by cast
+                s.barrier();
 
                 let gemm_params = DenseGemmF16Params {
                     m: 1,
@@ -1428,6 +1506,9 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
                 total_dispatches += 1;
 
+                // Barrier: cast reads logits_f16 written by gemm
+                s.barrier();
+
                 mlx_native::ops::elementwise::cast(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.logits_f16,
@@ -1439,6 +1520,9 @@ impl MlxModelWeights {
             } else {
                 anyhow::bail!("Single-session forward requires GPU lm_head (F16 weight)");
             }
+
+            // Barrier: softcap/argmax reads logits written by cast
+            s.barrier();
 
             // GPU softcap (if configured)
             if let Some(cap) = self.final_logit_softcapping {
@@ -1457,6 +1541,9 @@ impl MlxModelWeights {
                     cap,
                 ).map_err(|e| anyhow::anyhow!("GPU softcap: {e}"))?;
                 total_dispatches += 1;
+
+                // Barrier: argmax reads logits written by softcap
+                s.barrier();
             }
 
             // GPU argmax
