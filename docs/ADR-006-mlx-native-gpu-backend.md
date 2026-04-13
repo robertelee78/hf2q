@@ -1,7 +1,7 @@
 # ADR-006: mlx-native as hf2q's GPU Compute Backend (migrate from candle)
 
-**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13 after mlx-native integration and barrier/kernel profiling (see `docs/spike-barrier-perf-measurements.md`).
-**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised)
+**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13: kernel-level changes (4a F16 KV, 4b Q8_0 NSG) implemented; gap re-attributed to barrier stall cost. Phase 4 scope revised again 2026-04-13: dispatch reordering is the remaining lever.
+**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised twice)
 **Decision Makers:** Robert, Claude
 **Supersedes (implicitly):** the original "use candle" decision from hf2q's early Crawl phase, never written as an ADR
 **Related ADRs:** ADR-005 (Inference Server, Phase 1b speed gap context), ADR-004 (GGUF compatibility — mlx-native must preserve all of it)
@@ -40,6 +40,10 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the
 11. Barrier count is the bottleneck on mlx-native (2026-04-13 barrier profiling FALSIFIED: hf2q has 606 barriers/token, llama.cpp has 759 — more barriers yet faster. All 606 barriers are true RAW dependencies; none removable. Buffer aliasing ruled out via exhaustive audit — all activation buffers are physically distinct `MTLBuffer` allocations. See `docs/spike-barrier-alias-audit.md`)
 12. Dispatches-per-barrier ratio explains the speed gap (2026-04-13 PARTIALLY FALSIFIED: ratio is 1.44 vs 2.38, but per-kernel profiling showed the gap is kernel execution speed, not pipelining. MoE/MLP/lm_head/norms are all faster than ggml. Only SDPA and dense matmul are slower — due to F32 KV cache and Q8_0 NSG=2)
 13. Framework overhead is still the dominant gap after mlx-native migration (2026-04-13 FALSIFIED: mlx-native's single-session concurrent dispatch closed the framework gap to +2.6% vs candle. Remaining 15.5 tok/s is kernel-implementation-dominated — F32 KV cache and Q8_0 threadgroup width)
+14. SDPA and dense matmul kernel speed are 2.6x slower than ggml (2026-04-13 FALSIFIED by no-barriers experiment: removing all 606 barriers drops gpu_wait from 10.55ms to 5.88ms, matching llama.cpp's compute floor. The per-kernel profiling session overhead inflated the apparent kernel gap. The real gap is 4.67ms of barrier stall cost, not kernel speed.)
+15. Q8_0 NSG=2→4 will close the dense matmul gap (2026-04-13 FALSIFIED: model is 80% Q4_0, 16% Q6_K, 4% Q8_0. NSG=4 change correctness-verified but performance-neutral.)
+16. ConflictTracker barrier elision will reduce barrier count (2026-04-13 FALSIFIED: all 606 barriers are true RAW dependencies with physically distinct buffers. The computation graph is a strict chain — no barriers can be elided without changing dispatch ORDER, not just dispatch TIMING.)
+17. V-proj reorder is safe because buffer ranges are disjoint (2026-04-13 PARTIALLY FALSIFIED: V-proj after Q-norm showed 6% speedup (119 tok/s) but produced all-pad output. The dependency analysis says the reorder is safe — Metal barriers are full memory fences — but output is wrong. Hidden dependency not yet identified. Investigation required before any reorder work proceeds.)
 
 Each one is a hypothesis that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 89.8 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
 
@@ -53,9 +57,10 @@ hf2q's Phase 1b End gate (per ADR-005:162, re-baselined 2026-04-11) requires dec
 
 **Baseline progression:**
 - 2026-04-11 (pre-ADR-006): 84.9 tok/s on candle backend. Gap: 17 tok/s.
-- 2026-04-13 (post-mlx-native migration): 89.8 tok/s on mlx-native backend (candle: 87.5). Gap: **15.5 tok/s** to llama.cpp's 105.25 tok/s.
+- 2026-04-13 (post-mlx-native migration): 89.8 tok/s on mlx-native backend (candle: 87.5). Gap: 15.5 tok/s.
+- 2026-04-13 (post-Phase 4a F16 KV + 4b Q8_0 NSG): **91.0 tok/s**. Gap: **15.0 tok/s** to llama.cpp's 106.0 tok/s.
 
-The mlx-native migration closed 2.3 tok/s of the gap (framework overhead win). The remaining 15.5 tok/s is now precisely attributed to kernel-level implementation differences (see §Phase 4 Revision below).
+The mlx-native migration closed 2.3 tok/s (framework overhead). F16 KV cache closed 1.2 tok/s (bandwidth). Q8_0 NSG=4 was neutral (only 4% of tensors). The remaining **15.0 tok/s is entirely barrier stall cost** — raw GPU compute matches llama.cpp at ~5.9ms, but our barriers cost 4.67ms vs their ~3.1ms. See §Phase 4 Revision below.
 
 In a single 2026-04-11 session, three consecutive static-evidence-driven kernel-port hypotheses were empirically falsified on M5 Max:
 
@@ -382,14 +387,59 @@ After 4a-4c, if a gap remains:
 
 **Deliverable:** mlx-native commits implementing each sub-phase. Each commit includes a 3-run benchmark showing tok/s progression toward 102. Updated `docs/spike-barrier-perf-measurements.md` with post-fix measurements.
 
-**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing. If 4a+4b don't reach 102, proceed to 4c/4d. If all four don't reach 102, the gap is in pipelining structure (Class D from the spike) and requires the graph reordering work originally proposed for this phase.
+#### 4a — F16 KV cache — DONE (89.8→91.0 tok/s, +1.3%)
 
-**Estimated total:** 3-5 days (vs original 1-2 weeks — scope is now concrete and bounded).
+Implemented and verified. KV cache allocation F32→F16, `kv_cache_copy_batch_f32_to_f16` kernel, `flash_attn_vec` templated for `KV_T=half`. Byte-identical output for 3094 bytes. KV memory halved.
+
+#### 4b — Q8_0 NSG=4 — DONE (neutral — model is 80% Q4_0)
+
+Implemented and verified correct. Only 12/300 quantized tensors are Q8_0 (4%). No measurable impact on this model.
+
+#### 4a/4b post-mortem: gap re-attributed to barrier stalls
+
+The initial profiling (per-kernel session overhead inflated SDPA/matmul apparent gaps) led to the wrong conclusion. A no-barriers experiment proved:
+
+| Mode | gpu_wait | Raw compute |
+|------|----------|-------------|
+| Normal (606 barriers) | 10.55ms | 5.88ms compute + 4.67ms barrier stalls |
+| No barriers (broken output) | 5.88ms | 5.88ms compute |
+| llama.cpp | ~9.0ms | ~5.9ms compute + ~3.1ms barrier stalls |
+
+**The kernels are at parity.** The 15 tok/s gap is 4.67ms vs 3.1ms barrier stall cost. Each of our 606 barriers costs 7.7μs; llama.cpp's 759 barriers cost 4.1μs each. llama.cpp pays less per barrier because its graph reordering puts more dispatches between barriers (2.38 vs our 1.44).
+
+**Infrastructure implemented:**
+- `ConflictTracker` in `mlx-native/src/graph.rs` — automatic buffer-range-based barrier elision matching llama.cpp's `ggml_mem_ranges` system
+- All `s.barrier()` calls in `forward_mlx.rs` converted to `s.barrier_between(reads, writes)` — correctly emits 606/606 barriers (all true RAW conflicts confirmed)
+
+#### 4e — Dispatch reordering (the remaining lever)
+
+**Goal:** Reduce per-barrier stall cost from 7.7μs to ~4μs by increasing the dispatches-per-barrier ratio from 1.44 to ~2.4, matching llama.cpp's graph reorder strategy.
+
+**Why this is the lever:** No-barriers experiment proves raw compute matches llama.cpp (~5.9ms). The entire gap is barrier stall overhead. llama.cpp's `ggml_metal_graph_optimize_reorder` moves 70-79% of graph nodes (measured via instrumented build), interleaving independent ops to fill concurrent windows between barriers.
+
+**What llama.cpp reorders (from graph dump):**
+- V proj moved after Q head norm (disjoint buffers: Q norm uses `attn_q`/`attn_q_normed`, V proj uses `norm_out`/`attn_v`)
+- Dense MLP gate/up interleaved with MoE routing operations (different buffer sets)
+- Pre-FF norm 2 pulled forward to overlap with MoE argsort/topk
+- Attention mask computation pulled forward to overlap with norm/QKV chain
+
+**V-proj reorder experiment (2026-04-13):** Moving V proj after Q norm showed **6% speedup (119 tok/s on 5 tokens, up from 112)** — confirming reordering works. However, output was all `<pad>` tokens — **correctness failure**. The buffer-range analysis says the reorder is safe (Metal barriers are full memory fences ensuring all prior writes are visible), but a hidden dependency exists. **Root cause investigation required before any reorder can land.**
+
+**Changes needed:**
+1. **Debug the V-proj reorder correctness failure** — the load-bearing blocker. Suspected causes: (a) a buffer not tracked in the `barrier_between` call (e.g., `norm_params` or `position` used as both read and implicit-write), (b) the Metal barrier fence not covering all memory regions as assumed, (c) a GPU compiler reordering issue specific to M5 Max.
+2. **Implement targeted reorders** that the ConflictTracker validates. The infrastructure is ready — changing dispatch order in the imperative code and letting `barrier_between` determine where barriers are actually needed.
+3. **Consider double-buffering** of `hidden` state for cross-layer overlap if intra-layer reorder doesn't close the gap fully.
+
+**Expected payoff:** The V-proj experiment showed 6% on 5 tokens. Broader reordering matching llama.cpp's 70-79% reorder rate should close ~1.5ms of the 1.6ms gap → ~100-104 tok/s.
+
+**Estimated:** 2-4 days (dominated by debugging the correctness failure, not writing code).
+
+**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing and byte-identical output for 3094 bytes.
 
 **Risks:**
-- F16 KV cache may introduce subtle precision loss that fails the sourdough gate. Mitigation: validate with sourdough gate immediately after 4a; if it fails, investigate whether the precision loss is in the cast (fixable by casting after norm) or in the attention computation (deeper issue).
-- Q8_0 NSG=4 may not fit in threadgroup memory on some dispatch shapes. Mitigation: check `maxTotalThreadsPerThreadgroup` for the pipeline before dispatching; fall back to NSG=2 if constrained.
-- The 2.6x symmetry between SDPA and dense matmul gaps may share a common root cause (e.g., a dispatch overhead per kernel). If F16 KV closes more of the dense matmul gap than expected, 4b may become unnecessary. Remeasure after each sub-phase.
+- The V-proj correctness failure may indicate a fundamental limitation of imperative dispatch reordering vs llama.cpp's DAG-based approach. Mitigation: if imperative reorder proves unreliable, consider building a lightweight dispatch list (buffer + op description) that gets reordered before encoding, matching llama.cpp's graph-then-encode architecture.
+- Metal barrier semantics may be subtler than documented — some M-series GPUs may have per-encoder-type fence behavior. Mitigation: test on multiple hardware if the correctness failure doesn't have an obvious buffer-range explanation.
+- Double-buffering `hidden` doubles the most-accessed activation buffer's memory. On this model that's 3584 × 4 = 14 KB — negligible. But the code complexity of alternating buffers across the layer loop is non-trivial.
 
 ### Phase 5 — Integration into hf2q
 
@@ -557,5 +607,7 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 |---|---|---|---|
 | Author | Claude | 2026-04-11 | Drafted |
 | Decision maker | Robert | 2026-04-12 | Accepted — Phase 0 verdict: framework-overhead-dominated |
-| Phase 4 revision | Claude | 2026-04-13 | Phase 4 scope revised: kernel-implementation-dominated (F16 KV + Q8_0 NSG). See `docs/spike-barrier-perf-measurements.md` |
-| Status | **Accepted** | Phase 4 revised 2026-04-13 | Phase 4 scope: F16 KV cache (primary), Q8_0 NSG (secondary) |
+| Phase 4 revision 1 | Claude | 2026-04-13 | Scope: kernel-implementation (F16 KV + Q8_0 NSG) |
+| Phase 4a/4b | Claude | 2026-04-13 | DONE — F16 KV (+1.3%), Q8_0 NSG (neutral). 91.0 tok/s. |
+| Phase 4 revision 2 | Claude | 2026-04-13 | Gap re-attributed: barrier stalls (4.67ms, 44% of GPU time). Dispatch reorder is the lever. |
+| Status | **Accepted** | Phase 4e in progress | Next: debug V-proj reorder correctness failure, then broader dispatch reordering |
