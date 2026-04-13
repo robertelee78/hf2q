@@ -14,14 +14,18 @@
 //!
 //! # Status
 //!
-//! Phase 5d: S1+S2 merge — QKV + head norms + RoPE + KV cache + SDPA + MLP
-//! + router all in ONE session per layer.
-//! - GPU per-head RMS norm on Q, K; GPU unit norm on V.
-//! - GPU RoPE neox f32 with freq_factors (all layer types on GPU).
-//! - GPU KV cache copy f32 per-head (new kernel for F32 caches).
-//! - Dense MLP, norms, lm_head all on GPU.
-//! - MoE experts in second session (S4) — needs GPU accumulate for full merge.
-//!   2 sessions/layer total: S1(QKV+norms+RoPE+KV+SDPA+MLP+router), S4(experts).
+//! Phase 5e: fused kernel dispatch reduction — 1082 → 842 dispatches/token.
+//!
+//! Six kernel fusions applied per layer (single session, all ops on GPU):
+//! - Fused Q head-norm + RoPE (f32, with freq_factors): 2 dispatches → 1
+//! - Fused K head-norm + RoPE (f32, with freq_factors): 2 dispatches → 1
+//! - Fused post-attention norm + residual add: 2 dispatches → 1
+//! - Fused post-FF norm 2 + MLP+MoE combine add: 2 dispatches → 1
+//! - Fused end-of-layer norm + residual add + scalar mul: 3 dispatches → 1
+//! - Fused MoE routing (softmax + argsort + gather_topk): 3 dispatches → 1
+//!
+//! Total: 8 dispatches/layer saved × 30 layers = 240 fewer dispatches.
+//! Coherence preserved (byte-identical output to Phase 5d baseline).
 
 use anyhow::Result;
 use mlx_native::{
@@ -1001,32 +1005,54 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // -- GPU per-head RMS norm on Q and K --
+                // -- Fused per-head RMS norm + RoPE on Q and K --
+                // Replaces 4 separate dispatches (Q norm, K norm, Q RoPE, K RoPE)
+                // with 2 fused dispatches.
+                let ff_gpu = if is_sliding {
+                    None
+                } else {
+                    Some(&self.activations.rope_freq_factors_gpu)
+                };
+                let theta = if is_sliding {
+                    self.rope_theta_sliding
+                } else {
+                    self.rope_theta_global
+                };
+                let half_rope = (hd / 2) as u32;
+
+                // Fused Q: attn_q → attn_q_normed (norm + RoPE in one dispatch)
+                // SDPA and KV cache updated below to read from attn_q_normed / attn_k_normed.
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q,
+                    &self.activations.attn_q_normed,
+                    Some(&self.layers[layer_idx].attn.q_norm_weight),
+                    &self.activations.position,
+                    ff_gpu,
+                    nh as u32, hd as u32, half_rope,
+                    eps, theta,
+                ).map_err(|e| anyhow::anyhow!("fused Q norm+RoPE L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // Fused K: attn_k → attn_k_normed (norm + RoPE in one dispatch)
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k,
+                    &self.activations.attn_k_normed,
+                    Some(&self.layers[layer_idx].attn.k_norm_weight),
+                    &self.activations.position,
+                    ff_gpu,
+                    nkv as u32, hd as u32, half_rope,
+                    eps, theta,
+                ).map_err(|e| anyhow::anyhow!("fused K norm+RoPE L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- GPU V norm (unchanged — no RoPE on V) --
                 let hd_norm_params = if is_sliding {
                     &self.activations.norm_params_sliding_hd
                 } else {
                     &self.activations.norm_params_global_hd
                 };
-                dispatch_rms_norm_perhead(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_q,
-                    &self.layers[layer_idx].attn.q_norm_weight,
-                    &self.activations.attn_q_normed,
-                    hd_norm_params,
-                    nh as u32, hd as u32,
-                )?;
-                total_dispatches += 1;
-                dispatch_rms_norm_perhead(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k,
-                    &self.layers[layer_idx].attn.k_norm_weight,
-                    &self.activations.attn_k_normed,
-                    hd_norm_params,
-                    nkv as u32, hd as u32,
-                )?;
-                total_dispatches += 1;
-
-                // -- GPU V norm --
                 if v_is_k {
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
@@ -1053,35 +1079,8 @@ impl MlxModelWeights {
                     &self.activations.moe_expert_out
                 };
 
-                // -- GPU RoPE (neox f32 with freq_factors) --
-                let rope_params = if is_sliding {
-                    &self.activations.rope_params_sliding_neox
-                } else {
-                    &self.activations.rope_params_global_neox
-                };
-                let ff_gpu = if is_sliding {
-                    None
-                } else {
-                    Some(&self.activations.rope_freq_factors_gpu)
-                };
-                dispatch_rope_neox_f32_unchecked(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_q_normed,
-                    &self.activations.attn_q,
-                    rope_params, &self.activations.position, ff_gpu,
-                    1, nh as u32, hd as u32, hd as u32,
-                )?;
-                total_dispatches += 1;
-                dispatch_rope_neox_f32_unchecked(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k_normed,
-                    &self.activations.attn_k,
-                    rope_params, &self.activations.position, ff_gpu,
-                    1, nkv as u32, hd as u32, hd as u32,
-                )?;
-                total_dispatches += 1;
-
                 // -- GPU KV cache update --
+                // After fused norm+RoPE, the rotated K is in attn_k_normed.
                 {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
@@ -1090,7 +1089,7 @@ impl MlxModelWeights {
                     };
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
                         s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_k,
+                        &self.activations.attn_k_normed,
                         &self.kv_caches[layer_idx].k,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                     ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
@@ -1105,6 +1104,7 @@ impl MlxModelWeights {
                 }
 
                 // -- SDPA --
+                // After fused norm+RoPE, the rotated Q is in attn_q_normed.
                 if is_sliding {
                     let p = SdpaSlidingParams {
                         n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
@@ -1114,7 +1114,7 @@ impl MlxModelWeights {
                     };
                     mlx_native::ops::sdpa_sliding::sdpa_sliding(
                         s.encoder_mut(), reg, dev,
-                        &self.activations.attn_q, &self.kv_caches[layer_idx].k,
+                        &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
                         &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
                     ).map_err(|e| anyhow::anyhow!("sdpa_sliding L{layer_idx}: {e}"))?;
                 } else {
@@ -1123,7 +1123,7 @@ impl MlxModelWeights {
                         seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
                         kv_capacity: kv_capacity as u32,
                     };
-                    s.sdpa(reg, dev, &self.activations.attn_q, &self.kv_caches[layer_idx].k,
+                    s.sdpa(reg, dev, &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
                         &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
                     ).map_err(|e| anyhow::anyhow!("sdpa L{layer_idx}: {e}"))?;
                 }
@@ -1134,23 +1134,17 @@ impl MlxModelWeights {
                     &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
                 total_dispatches += 1;
 
-                // -- GPU post-attention norm --
-                s.rms_norm(
-                    reg, metal_dev,
+                // -- Fused post-attention norm + residual add --
+                // norm(attn_out, post_attn_weight) + hidden → residual
+                // Replaces 2 separate dispatches with 1.
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.hidden,
                     &self.activations.attn_out,
                     &self.layers[layer_idx].norms.post_attention_layernorm,
-                    &self.activations.norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("post-attn norm L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // -- GPU residual add: hidden + norm_out → residual --
-                s.elementwise_add(
-                    reg, metal_dev,
-                    &self.activations.hidden, &self.activations.norm_out,
-                    &self.activations.residual, hs, mlx_native::DType::F32,
-                ).map_err(|e| anyhow::anyhow!("residual add L{layer_idx}: {e}"))?;
+                    &self.activations.residual,
+                    hs as u32, 1, eps,
+                ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
                 // -- GPU pre-feedforward norm --
@@ -1231,40 +1225,19 @@ impl MlxModelWeights {
                 total_dispatches += 1;
 
                 // ============================================================
-                // GPU MoE routing: softmax + argsort + gather (NO CPU readback)
+                // Fused GPU MoE routing: softmax + argsort + gather (1 dispatch)
                 // ============================================================
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
 
-                // GPU softmax on router logits [1, num_experts]
-                mlx_native::ops::softmax::dispatch_softmax(
+                mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.moe_router_logits,
-                    &self.activations.moe_probs,
-                    &self.activations.moe_softmax_params_gpu,
-                    1, num_experts as u32,
-                ).map_err(|e| anyhow::anyhow!("GPU softmax L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // GPU argsort descending on softmax probs
-                mlx_native::ops::argsort::dispatch_argsort_desc_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_probs,
-                    &self.activations.moe_sorted_indices,
-                    1, num_experts as u32,
-                ).map_err(|e| anyhow::anyhow!("GPU argsort L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // GPU gather top-K weights + per_expert_scale + renormalize
-                mlx_native::ops::moe_dispatch::moe_gather_topk_weights_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_probs,
-                    &self.activations.moe_sorted_indices,
-                    &self.layers[layer_idx].moe.per_expert_scale,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_routing_weights_gpu,
-                    num_experts, top_k,
-                ).map_err(|e| anyhow::anyhow!("GPU gather_topk L{layer_idx}: {e}"))?;
+                    &self.layers[layer_idx].moe.per_expert_scale,
+                    num_experts as u32, top_k as u32,
+                ).map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
                 // ============================================================
@@ -1360,75 +1333,34 @@ impl MlxModelWeights {
                 // GPU post-MoE: norm, combine MLP+MoE, final norm, residual, scalar
                 // ============================================================
 
-                // GPU post-feedforward norm 2 on MoE output: moe_accum → moe_norm_out
-                s.rms_norm(
-                    reg, metal_dev,
+                // -- Fused post-FF norm 2 + combine MLP+MoE --
+                // norm(moe_accum, post_ff_2_weight) + attn_out → mlp_down
+                // Replaces 2 separate dispatches with 1.
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_out,
                     &self.activations.moe_accum,
                     &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
-                    &self.activations.moe_norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("post-FF norm 2 L{layer_idx}: {e}"))?;
+                    &self.activations.mlp_down,
+                    hs as u32, 1, eps,
+                ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // GPU combine MLP + MoE: attn_out + moe_norm_out → mlp_down
-                s.elementwise_add(
-                    reg, metal_dev,
-                    &self.activations.attn_out, &self.activations.moe_norm_out,
-                    &self.activations.mlp_down, hs, mlx_native::DType::F32,
-                ).map_err(|e| anyhow::anyhow!("combine MLP+MoE L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // GPU post-feedforward norm: mlp_down → norm_out
-                s.rms_norm(
-                    reg, metal_dev,
+                // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
+                // Computes: hidden = (residual + rms_norm(mlp_down, post_ff_weight)) * scalar
+                // Norm is on mlp_down ALONE, then added to residual, then scaled.
+                // Replaces 3 separate dispatches with 1.
+                let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.residual,
                     &self.activations.mlp_down,
                     &self.layers[layer_idx].norms.post_feedforward_layernorm,
-                    &self.activations.norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("post-FF norm L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // GPU residual + norm_out → hidden (but we also need scalar multiply)
-                // Two cases for layer scalar:
-                //   1. scalar.len() == 1: scalar broadcast multiply
-                //   2. scalar.len() == hs: elementwise multiply
-                // First: residual + norm_out → mlp_down (reuse as scratch)
-                s.elementwise_add(
-                    reg, metal_dev,
-                    &self.activations.residual, &self.activations.norm_out,
-                    &self.activations.mlp_down, hs, mlx_native::DType::F32,
-                ).map_err(|e| anyhow::anyhow!("residual add2 L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // GPU layer scalar: mlp_down * scalar → hidden
-                let scalar_len = self.layers[layer_idx].layer_scalar.element_count();
-                if scalar_len == 1 {
-                    // Need to read the scalar value.  Since this buffer was written
-                    // at load time (not by GPU in this session), CPU can read it
-                    // without a sync.
-                    let scalar_val: f32 = {
-                        let sv: &[f32] = self.layers[layer_idx].layer_scalar.as_slice()
-                            .map_err(|e| anyhow::anyhow!("scalar read L{layer_idx}: {e}"))?;
-                        sv[0]
-                    };
-                    mlx_native::ops::elementwise::scalar_mul_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.mlp_down,
-                        &self.activations.hidden,
-                        hs, scalar_val,
-                    ).map_err(|e| anyhow::anyhow!("scalar_mul L{layer_idx}: {e}"))?;
-                } else {
-                    // Vector scalar: elementwise multiply
-                    s.elementwise_mul(
-                        reg, metal_dev,
-                        &self.activations.mlp_down,
-                        &self.layers[layer_idx].layer_scalar,
-                        &self.activations.hidden,
-                        hs, mlx_native::DType::F32,
-                    ).map_err(|e| anyhow::anyhow!("scalar_mul_vec L{layer_idx}: {e}"))?;
-                }
+                    &self.activations.hidden,
+                    &self.layers[layer_idx].layer_scalar,
+                    1, hs as u32, eps,
+                    scalar_is_vector,
+                ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
                 if let Some(ref mut p) = profile {
