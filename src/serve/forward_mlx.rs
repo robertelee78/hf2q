@@ -448,6 +448,8 @@ pub struct MlxActivationBuffers {
     pub attn_k_normed: MlxBuffer,
     /// MoE softmax params for GPU dispatch: `[num_experts, 0]` F32.
     pub moe_softmax_params_gpu: MlxBuffer,
+    /// MoE scratch: pre-scaled routing weights for weighted_sum kernel `[top_k]` F32.
+    pub moe_routing_weights_gpu: MlxBuffer,
 }
 
 /// All mlx-native weights for the full Gemma 4 model.
@@ -1143,72 +1145,34 @@ impl MlxModelWeights {
             )?;
             s1_dispatches += 1;
 
-            // -- GPU KV cache update --
+            // -- GPU KV cache update (batched — 2 dispatches for all heads) --
             // Cache layout: [num_kv_heads, capacity, head_dim] (head-major).
             // K/V source layout: [num_kv_heads * head_dim] (flat, 1 token).
-            // We dispatch one kv_cache_copy_f32 per head, using buffer offsets
-            // to address the correct head slice in both src and cache.
+            // Single dispatch per K and V copies all heads at once.
             {
-                let kv_copy_pipeline = reg.get_pipeline("kv_cache_copy_f32", metal_dev)?;
-                let f32_sz = std::mem::size_of::<f32>();
-                let row_size = hd as u32;
                 let cache_pos_val = if kv_is_sliding {
                     (kv_write_pos % kv_capacity) as u32
                 } else {
                     kv_write_pos as u32
                 };
-                let is_sliding_val: u32 = 0; // We handle sliding via cache_pos_val
-                // For per-head dispatch, we copy 1 token of hd elements,
-                // with n_new=1 and wrapping already computed in cache_pos_val.
 
-                for h in 0..nkv {
-                    let src_byte_offset = (h * hd * f32_sz) as u64;
-                    let cache_byte_offset = (h * kv_capacity * hd * f32_sz) as u64;
+                // K cache copy (all heads, 1 dispatch)
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k,
+                    &self.kv_caches[layer_idx].k,
+                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                ).map_err(|e| anyhow::anyhow!("kv_cache_copy_batch K: {e}"))?;
+                s1_dispatches += 1;
 
-                    // K cache copy
-                    {
-                        use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
-                        let total_elements = hd as u64;
-                        encode_with_args(
-                            s.encoder_mut(),
-                            kv_copy_pipeline,
-                            &[
-                                (0, KernelArg::BufferWithOffset(&self.activations.attn_k, src_byte_offset)),
-                                (1, KernelArg::BufferWithOffset(&self.kv_caches[layer_idx].k, cache_byte_offset)),
-                                (2, KernelArg::Bytes(&cache_pos_val.to_ne_bytes())),
-                                (3, KernelArg::Bytes(&row_size.to_ne_bytes())),
-                                (4, KernelArg::Bytes(&1u32.to_ne_bytes())),     // n_new = 1
-                                (5, KernelArg::Bytes(&(kv_capacity as u32).to_ne_bytes())),
-                                (6, KernelArg::Bytes(&is_sliding_val.to_ne_bytes())),
-                            ],
-                            mlx_native::MTLSize::new(total_elements, 1, 1),
-                            mlx_native::MTLSize::new(std::cmp::min(256, total_elements), 1, 1),
-                        );
-                    }
-                    s1_dispatches += 1;
-
-                    // V cache copy
-                    {
-                        use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
-                        let total_elements = hd as u64;
-                        encode_with_args(
-                            s.encoder_mut(),
-                            kv_copy_pipeline,
-                            &[
-                                (0, KernelArg::BufferWithOffset(v_src, src_byte_offset)),
-                                (1, KernelArg::BufferWithOffset(&self.kv_caches[layer_idx].v, cache_byte_offset)),
-                                (2, KernelArg::Bytes(&cache_pos_val.to_ne_bytes())),
-                                (3, KernelArg::Bytes(&row_size.to_ne_bytes())),
-                                (4, KernelArg::Bytes(&1u32.to_ne_bytes())),     // n_new = 1
-                                (5, KernelArg::Bytes(&(kv_capacity as u32).to_ne_bytes())),
-                                (6, KernelArg::Bytes(&is_sliding_val.to_ne_bytes())),
-                            ],
-                            mlx_native::MTLSize::new(total_elements, 1, 1),
-                            mlx_native::MTLSize::new(std::cmp::min(256, total_elements), 1, 1),
-                        );
-                    }
-                    s1_dispatches += 1;
-                }
+                // V cache copy (all heads, 1 dispatch)
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    v_src,
+                    &self.kv_caches[layer_idx].v,
+                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                ).map_err(|e| anyhow::anyhow!("kv_cache_copy_batch V: {e}"))?;
+                s1_dispatches += 1;
             }
 
             // -- SDPA (was start of old S2) --
@@ -1279,21 +1243,25 @@ impl MlxModelWeights {
                 &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
             s1_dispatches += 1; // up
 
-            // GPU GELU on gate: mlp_gate → mlp_fused (same element count)
-            s.gelu(
-                reg, metal_dev,
-                &self.activations.mlp_gate, &self.activations.mlp_fused,
-            ).map_err(|e| anyhow::anyhow!("GPU GELU: {e}"))?;
-            s1_dispatches += 1; // gelu
-
-            // GPU mul: mlp_fused * mlp_up → mlp_fused (SwiGLU)
-            s.elementwise_mul(
-                reg, metal_dev,
-                &self.activations.mlp_fused, &self.activations.mlp_up,
-                &self.activations.mlp_fused, self.intermediate_size,
-                mlx_native::DType::F32,
-            ).map_err(|e| anyhow::anyhow!("GPU SwiGLU mul: {e}"))?;
-            s1_dispatches += 1; // mul
+            // Fused SwiGLU: GELU(mlp_gate) * mlp_up → mlp_fused (1 dispatch)
+            {
+                use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+                let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
+                let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
+                encode_with_args(
+                    s.encoder_mut(), pipeline,
+                    &[
+                        (0, KernelArg::Buffer(&self.activations.mlp_gate)),
+                        (1, KernelArg::Buffer(&self.activations.mlp_up)),
+                        (2, KernelArg::Buffer(&self.activations.mlp_fused)),
+                        (3, KernelArg::Bytes(&n_elements_bytes)),
+                    ],
+                    mlx_native::MTLSize::new(self.intermediate_size as u64, 1, 1),
+                    mlx_native::MTLSize::new(
+                        std::cmp::min(256, self.intermediate_size as u64), 1, 1),
+                );
+            }
+            s1_dispatches += 1; // fused gelu*mul
 
             // down_proj: mlp_fused → mlp_down
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
@@ -1557,18 +1525,21 @@ impl MlxModelWeights {
             let ggml_type_dn = gpu::candle_ggml_to_mlx(
                 self.layers[layer_idx].moe.down_ggml_dtype)?;
 
+            // Write pre-scaled routing weights to GPU buffer for weighted_sum
+            {
+                let w_dst: &mut [f32] = self.activations.moe_routing_weights_gpu.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("moe_routing_weights write: {e}"))?;
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    w_dst[k_idx] = top_k_weights[k_idx] * per_expert_scale[eid];
+                }
+            }
+
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
                 let metal_dev = dev.metal_device();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
-
-                // Zero the accumulator on GPU
-                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_accum, hs,
-                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
-                s4_dispatches += 1;
 
                 // 1) gate_up _id: input=[1,K] ids=[top_k] -> output=[top_k, 2*moe_int]
                 let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
@@ -1590,25 +1561,16 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
                 s4_dispatches += 1;
 
-                // 2) SwiGLU for each expert slot.
-                // gate_up_id_out is [top_k, 2*moe_int] flat. Each slot's gate_up
-                // is at offset slot * 2*moe_int. We use byte-offset slicing.
-                for k_idx in 0..top_k {
-                    let offset_bytes = k_idx * 2 * moe_int * std::mem::size_of::<f32>();
-                    let swiglu_out_offset = k_idx * moe_int * std::mem::size_of::<f32>();
-                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode_offset(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_id_out,
-                        offset_bytes,
-                        &self.activations.moe_swiglu_id_out,
-                        swiglu_out_offset,
-                        moe_int,
-                    ).map_err(|e| anyhow::anyhow!("moe swiglu _id: {e}"))?;
-                    s4_dispatches += 1;
-                }
+                // 2) Batched SwiGLU for all expert slots (1 dispatch).
+                mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_gate_up_id_out,
+                    &self.activations.moe_swiglu_id_out,
+                    moe_int, top_k,
+                ).map_err(|e| anyhow::anyhow!("moe swiglu batch: {e}"))?;
+                s4_dispatches += 1;
 
                 // 3) down _id: input=[top_k, moe_int] ids=[top_k] -> output=[top_k, hs]
-                // Treat each expert slot as a separate "token" with top_k_param=1.
                 let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
                     n_tokens: top_k as u32,
                     top_k: 1,
@@ -1628,24 +1590,15 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
                 s4_dispatches += 1;
 
-                // 4) Weighted accumulate for each expert slot.
-                // down_id_out is [top_k, hs]. Each slot's output is at offset slot*hs.
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
-                    if w.abs() < 1e-10 {
-                        continue;
-                    }
-                    let offset_bytes = k_idx * hs * std::mem::size_of::<f32>();
-                    mlx_native::ops::moe_dispatch::moe_accumulate_encode_offset(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_accum,
-                        &self.activations.moe_down_id_out,
-                        offset_bytes,
-                        w, hs,
-                    ).map_err(|e| anyhow::anyhow!("moe accumulate _id: {e}"))?;
-                    s4_dispatches += 1;
-                }
+                // 4) Weighted sum of all expert outputs (1 dispatch, replaces zero+accumulate).
+                mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_down_id_out,
+                    &self.activations.moe_routing_weights_gpu,
+                    &self.activations.moe_accum,
+                    hs, top_k,
+                ).map_err(|e| anyhow::anyhow!("moe weighted_sum: {e}"))?;
+                s4_dispatches += 1;
 
                 s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
             }
@@ -1811,18 +1764,23 @@ impl MlxModelWeights {
             let ggml_type_dn = gpu::candle_ggml_to_mlx(
                 self.layers[layer_idx].moe.down_ggml_dtype)?;
 
+            // Write pre-scaled routing weights to GPU buffer for weighted_sum
+            {
+                let w_dst: &mut [f32] = self.activations.moe_routing_weights_gpu.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("moe_routing_weights write: {e}"))?;
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    w_dst[k_idx] = top_k_weights[k_idx] * per_expert_scale[eid];
+                }
+            }
+
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
                 let metal_dev = dev.metal_device();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
 
-                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_accum, hs,
-                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
-                s4_dispatches += 1;
-
+                // 1) gate_up _id
                 let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
                     n_tokens: 1,
                     top_k: top_k as u32,
@@ -1842,20 +1800,16 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
                 s4_dispatches += 1;
 
-                for k_idx in 0..top_k {
-                    let offset_bytes = k_idx * 2 * moe_int * std::mem::size_of::<f32>();
-                    let swiglu_out_offset = k_idx * moe_int * std::mem::size_of::<f32>();
-                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode_offset(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_id_out,
-                        offset_bytes,
-                        &self.activations.moe_swiglu_id_out,
-                        swiglu_out_offset,
-                        moe_int,
-                    ).map_err(|e| anyhow::anyhow!("moe swiglu _id: {e}"))?;
-                    s4_dispatches += 1;
-                }
+                // 2) Batched SwiGLU (1 dispatch)
+                mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_gate_up_id_out,
+                    &self.activations.moe_swiglu_id_out,
+                    moe_int, top_k,
+                ).map_err(|e| anyhow::anyhow!("moe swiglu batch: {e}"))?;
+                s4_dispatches += 1;
 
+                // 3) down _id
                 let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
                     n_tokens: top_k as u32,
                     top_k: 1,
@@ -1875,27 +1829,22 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
                 s4_dispatches += 1;
 
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
-                    if w.abs() < 1e-10 {
-                        continue;
-                    }
-                    let offset_bytes = k_idx * hs * std::mem::size_of::<f32>();
-                    mlx_native::ops::moe_dispatch::moe_accumulate_encode_offset(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_accum,
-                        &self.activations.moe_down_id_out,
-                        offset_bytes,
-                        w, hs,
-                    ).map_err(|e| anyhow::anyhow!("moe accumulate _id: {e}"))?;
-                    s4_dispatches += 1;
-                }
+                // 4) Weighted sum (1 dispatch, replaces zero+accumulate)
+                mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_down_id_out,
+                    &self.activations.moe_routing_weights_gpu,
+                    &self.activations.moe_accum,
+                    hs, top_k,
+                ).map_err(|e| anyhow::anyhow!("moe weighted_sum: {e}"))?;
+                s4_dispatches += 1;
 
                 s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
             }
         } else {
-            // --- Fallback: per-expert loop ---
+            // --- Fallback: per-expert loop (no _id kernels) ---
+            // Note: fallback path still uses per-expert loop (not batched)
+            // since the individual expert weight buffers are separate.
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
@@ -2416,6 +2365,7 @@ fn alloc_activation_buffers(
             p[1] = 0.0;
             buf
         },
+        moe_routing_weights_gpu: alloc_f32(cfg.top_k_experts, "moe_routing_weights_gpu")?,
     })
 }
 
