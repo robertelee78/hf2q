@@ -14,13 +14,14 @@
 //!
 //! # Status
 //!
-//! Phase 5c: S3 merge — router_proj merged into S2.
-//! - Dense MLP path merged into 1 session (SDPA→down in 1 session).
-//! - GPU norms, adds, GELU, mul in merged sessions.
-//! - GPU dense GEMM for lm_head (F16) replaces CPU matmul.
-//! - MoE experts: ALL experts in ONE session using GPU SwiGLU + accumulate.
-//! - Router proj + input prep merged into S2 (eliminates 30 S3 sessions).
-//!   3 sessions/layer total: S1(QKV), S2(SDPA+MLP+router), S4(experts).
+//! Phase 5d: S1+S2 merge — QKV + head norms + RoPE + KV cache + SDPA + MLP
+//! + router all in ONE session per layer.
+//! - GPU per-head RMS norm on Q, K; GPU unit norm on V.
+//! - GPU RoPE neox f32 with freq_factors (all layer types on GPU).
+//! - GPU KV cache copy f32 per-head (new kernel for F32 caches).
+//! - Dense MLP, norms, lm_head all on GPU.
+//! - MoE experts in second session (S4) — needs GPU accumulate for full merge.
+//!   2 sessions/layer total: S1(QKV+norms+RoPE+KV+SDPA+MLP+router), S4(experts).
 
 use anyhow::Result;
 use mlx_native::{
@@ -138,11 +139,11 @@ impl ProfileAccumulator {
         let gpu_total = s1_avg + s2_avg + s3_avg + s4_avg + head_gpu_avg;
         let cpu_total = cpu1_avg + cpu2_avg + cpu3_avg + cpu4_avg + head_cpu_avg;
 
-        eprintln!("║ {num_layers} layers x 3 sessions + 1 head = {} sessions/token", num_layers * 3 + 1);
+        eprintln!("║ {num_layers} layers x 2 sessions + 1 head = {} sessions/token", num_layers * 2 + 1);
         eprintln!("║");
         eprintln!("║ Session breakdown (avg across {num_layers} layers, {n} tokens):");
-        eprintln!("║   S1 (QKV proj):      {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
-        eprintln!("║   CPU1 (norms+RoPE):   {:8.1} us ({:5.2} ms total)", cpu1_avg / num_layers as f64, cpu1_avg / 1000.0);
+        eprintln!("║   S1 (QKV+attn+MLP):  {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
+        eprintln!("║   CPU1 (eliminated):   {:8.1} us ({:5.2} ms total)", cpu1_avg / num_layers as f64, cpu1_avg / 1000.0);
         eprintln!("║   S2 (SDPA+MLP):      {:8.1} us ({:5.2} ms total)", s2_avg / num_layers as f64, s2_avg / 1000.0);
         eprintln!("║   CPU2 (post-FF):      {:8.1} us ({:5.2} ms total)", cpu2_avg / num_layers as f64, cpu2_avg / 1000.0);
         eprintln!("║   S3 (router proj):   {:8.1} us ({:5.2} ms total)", s3_avg / num_layers as f64, s3_avg / 1000.0);
@@ -210,10 +211,10 @@ impl ProfileAccumulator {
         eprintln!("║");
         eprintln!("║ Avg time per dispatch (session_time / dispatches):");
         if s1_disp > 0.0 {
-            eprintln!("║   S1 (QKV matmuls): {:.1} us/dispatch", s1_avg / s1_disp);
+            eprintln!("║   S1 (QKV+attn+MLP): {:.1} us/dispatch", s1_avg / s1_disp);
         }
         if s2_disp > 0.0 {
-            eprintln!("║   S2 (SDPA+MLP):    {:.1} us/dispatch", s2_avg / s2_disp);
+            eprintln!("║   S2 (unused):     {:.1} us/dispatch", s2_avg / s2_disp);
         }
         if s3_disp > 0.0 {
             eprintln!("║   S3 (router):      {:.1} us/dispatch", s3_avg / s3_disp);
@@ -427,6 +428,26 @@ pub struct MlxActivationBuffers {
     pub hidden_f16: MlxBuffer,
     /// F16 scratch for lm_head GPU path: logits output `[1, vocab_size]`.
     pub logits_f16: MlxBuffer,
+    // --- Session merge buffers (S1+S2 collapse) ---
+    /// Per-head norm params for sliding layers: `[eps, sliding_head_dim]` F32.
+    pub norm_params_sliding_hd: MlxBuffer,
+    /// Per-head norm params for global layers: `[eps, global_head_dim]` F32.
+    pub norm_params_global_hd: MlxBuffer,
+    /// NeoX RoPE params for sliding layers: `[theta, head_dim, rope_dim, 0]` F32.
+    pub rope_params_sliding_neox: MlxBuffer,
+    /// NeoX RoPE params for global layers: `[theta, head_dim, rope_dim, 0]` F32.
+    pub rope_params_global_neox: MlxBuffer,
+    /// GPU buffer holding global-layer freq_factors `[global_head_dim/2]` F32.
+    pub rope_freq_factors_gpu: MlxBuffer,
+    /// Dedicated V projection output buffer `[max_kv_heads * max_hd]` F32.
+    /// Separates V from moe_expert_out to avoid aliasing in merged session.
+    pub attn_v: MlxBuffer,
+    /// Scratch buffer for Q after per-head norm `[num_heads * max_hd]` F32.
+    pub attn_q_normed: MlxBuffer,
+    /// Scratch buffer for K after per-head norm `[max_kv_heads * max_hd]` F32.
+    pub attn_k_normed: MlxBuffer,
+    /// MoE softmax params for GPU dispatch: `[num_experts, 0]` F32.
+    pub moe_softmax_params_gpu: MlxBuffer,
 }
 
 /// All mlx-native weights for the full Gemma 4 model.
@@ -791,7 +812,24 @@ impl MlxModelWeights {
         );
 
         // Allocate activation buffers
-        let activations = alloc_activation_buffers(mlx_device, cfg)?;
+        let mut activations = alloc_activation_buffers(mlx_device, cfg)?;
+
+        // Populate freq_factors GPU buffer from model weights.
+        {
+            let ff_host = model.rope_freqs_host();
+            if !ff_host.is_empty() {
+                let n = ff_host.len();
+                let mut buf = mlx_device.alloc_buffer(
+                    n * std::mem::size_of::<f32>(),
+                    mlx_native::DType::F32,
+                    vec![n],
+                ).map_err(|e| anyhow::anyhow!("rope_freq_factors_gpu alloc: {e}"))?;
+                let dst: &mut [f32] = buf.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("rope_freq_factors_gpu write: {e}"))?;
+                dst[..n].copy_from_slice(ff_host);
+                activations.rope_freq_factors_gpu = buf;
+            }
+        }
 
         // Dummy 1-element buffer for lm_head_f32 field — kept for compatibility.
         let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
@@ -915,16 +953,15 @@ impl MlxModelWeights {
 
     /// Run one decoder layer with session-collapsed GPU dispatch.
     ///
-    /// Session structure (3 sessions per layer — Phase 5c):
-    ///   Session 1: Q/K/V projections
-    ///   CPU: head norms, V norm, RoPE, KV cache update
-    ///   Session 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
-    ///              → GPU-norm(pre-FF) → gate → up → GPU-GELU(gate) → GPU-mul
-    ///              → down → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2)
+    /// Session structure (2 sessions per layer — S1+S2 merged):
+    ///   Session 1: QKV matmuls → GPU per-head norms → GPU RoPE (neox f32
+    ///              with freq_factors) → GPU V norm → GPU KV cache copy
+    ///              → SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
+    ///              → GPU-norm(pre-FF) → gate → up → GPU-GELU → GPU-mul → down
+    ///              → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2)
     ///              → GPU-norm(router) → router_proj
-    ///   CPU: softmax + top-k on router logits
-    ///   Session 3 (was S4): zero(accum) + for each expert:
-    ///     gate_up matmul → GPU-SwiGLU → down matmul → GPU-accumulate
+    ///   CPU: softmax + top-k on router logits (128 elements, microseconds)
+    ///   Session 2 (was S4): zero(accum) + expert _id dispatches + accumulate
     ///   CPU: post-FF-norm2, combine, layer scalar
     fn forward_decode_layer(
         &mut self,
@@ -948,15 +985,44 @@ impl MlxModelWeights {
             hs, eps,
         )?;
 
+        // -- b. Update position buffer for this token --
+        {
+            let pos_dst: &mut [u32] = self.activations.position.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("position write: {e}"))?;
+            pos_dst[0] = seq_pos as u32;
+        }
+
+        // -- c. KV cache bookkeeping (compute positions before GPU session) --
+        let kv_is_sliding = self.kv_caches[layer_idx].is_sliding;
+        let kv_write_pos = self.kv_caches[layer_idx].write_pos;
+        let kv_capacity = self.kv_caches[layer_idx].capacity;
+        self.kv_caches[layer_idx].write_pos += 1;
+        self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
+            .min(kv_capacity);
+        let kv_seq_len = self.kv_caches[layer_idx].seq_len;
+
         // =====================================================================
-        // SESSION 1: Q, K, V projections (3 GPU matmuls in one encoder)
+        // MERGED SESSION 1: QKV + head norms + RoPE + KV cache + SDPA + MLP
+        //                    + router prep + router_proj
+        //
+        // Phase 5d: S1+S2 merged into a single GPU session. All ops from
+        // QKV projections through router proj execute in one command buffer.
+        // Only one commit_and_wait per layer (down from 2 in Phase 5c).
+        //
+        // Head norms:    GPU rms_norm per-head on Q, K
+        // V norm:        GPU rms_norm_no_scale per-head (unit norm) on V
+        // RoPE:          GPU rope_neox_f32 with freq_factors support
+        // KV cache:      GPU kv_cache_copy_f32 per-head (strided cache layout)
         // =====================================================================
         let s1_start = Instant::now();
         let mut s1_dispatches = 0usize;
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
+            let metal_dev = dev.metal_device();
             let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S1 begin: {e}"))?;
+
+            // -- QKV projections --
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
             s1_dispatches += 1;
@@ -967,123 +1033,185 @@ impl MlxModelWeights {
             if !v_is_k {
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                    &mut self.activations.moe_expert_out, 1)?;
+                    &mut self.activations.attn_v, 1)?;
                 s1_dispatches += 1;
             }
-            s.finish().map_err(|e| anyhow::anyhow!("S1 finish: {e}"))?;
-        }
-        let s1_elapsed = s1_start.elapsed();
-        if let Some(ref mut p) = profile {
-            p.layer_s1_us[layer_idx] = s1_elapsed.as_secs_f64() * 1e6;
-            p.s1_dispatches[layer_idx] = s1_dispatches;
-        }
 
-        // -- CPU: Q/K head norms --
-        let cpu1_start = Instant::now();
-        {
-            let q: &mut [f32] = self.activations.attn_q.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("q: {e}"))?;
-            let qw: &[f32] = self.layers[layer_idx].attn.q_norm_weight.as_slice()
-                .map_err(|e| anyhow::anyhow!("qw: {e}"))?;
-            for h in 0..nh {
-                rms_norm_cpu(&mut q[h*hd..(h+1)*hd], &qw[..hd], eps);
+            // -- GPU per-head RMS norm on Q: attn_q → attn_q_normed --
+            // Uses perhead helper to bypass element_count validation (buffer
+            // is allocated for max head_dim but actual dim may be smaller).
+            let hd_norm_params = if is_sliding {
+                &self.activations.norm_params_sliding_hd
+            } else {
+                &self.activations.norm_params_global_hd
+            };
+            dispatch_rms_norm_perhead(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.attn_q,
+                &self.layers[layer_idx].attn.q_norm_weight,
+                &self.activations.attn_q_normed,
+                hd_norm_params,
+                nh as u32, hd as u32,
+            )?;
+            s1_dispatches += 1;
+
+            // -- GPU per-head RMS norm on K: attn_k → attn_k_normed --
+            dispatch_rms_norm_perhead(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.attn_k,
+                &self.layers[layer_idx].attn.k_norm_weight,
+                &self.activations.attn_k_normed,
+                hd_norm_params,
+                nkv as u32, hd as u32,
+            )?;
+            s1_dispatches += 1;
+
+            // -- GPU V: copy from K if k_eq_v, then per-head unit norm --
+            if v_is_k {
+                // With k_eq_v: V_proj == K_proj, so attn_k holds the raw
+                // matmul output. K was normed into attn_k_normed (not in-place),
+                // so attn_k still has the raw values. Dispatch unit norm on
+                // attn_k → attn_v.
+                dispatch_rms_norm_unit_perhead(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k,
+                    &self.activations.attn_v,
+                    hd_norm_params,
+                    nkv as u32, hd as u32,
+                )?;
+                s1_dispatches += 1;
+            } else {
+                // V was projected into attn_v; apply unit norm per head.
+                // Output to moe_expert_out (scratch) since we can't do in-place.
+                dispatch_rms_norm_unit_perhead(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_v,
+                    &self.activations.moe_expert_out,
+                    hd_norm_params,
+                    nkv as u32, hd as u32,
+                )?;
+                s1_dispatches += 1;
             }
-        }
-        {
-            let k: &mut [f32] = self.activations.attn_k.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("k: {e}"))?;
-            let kw: &[f32] = self.layers[layer_idx].attn.k_norm_weight.as_slice()
-                .map_err(|e| anyhow::anyhow!("kw: {e}"))?;
-            for h in 0..nkv {
-                rms_norm_cpu(&mut k[h*hd..(h+1)*hd], &kw[..hd], eps);
+
+            // The V source for KV cache: attn_v if k_eq_v (unit norm wrote there),
+            // moe_expert_out if not k_eq_v (unit norm wrote there).
+            let v_src = if v_is_k {
+                &self.activations.attn_v
+            } else {
+                &self.activations.moe_expert_out
+            };
+
+            // -- GPU RoPE (neox f32 with freq_factors) on Q and K --
+            let rope_params = if is_sliding {
+                &self.activations.rope_params_sliding_neox
+            } else {
+                &self.activations.rope_params_global_neox
+            };
+            let ff_gpu = if is_sliding {
+                None
+            } else {
+                Some(&self.activations.rope_freq_factors_gpu)
+            };
+
+            // RoPE on Q: attn_q_normed → attn_q (reuse for in-session output)
+            dispatch_rope_neox_f32_unchecked(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.attn_q_normed,
+                &self.activations.attn_q,
+                rope_params,
+                &self.activations.position,
+                ff_gpu,
+                1, // seq_len = 1 for decode
+                nh as u32,
+                hd as u32,
+                hd as u32, // rope_dim = head_dim (full rotation)
+            )?;
+            s1_dispatches += 1;
+
+            // RoPE on K: attn_k_normed → attn_k (reuse for in-session output)
+            dispatch_rope_neox_f32_unchecked(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.attn_k_normed,
+                &self.activations.attn_k,
+                rope_params,
+                &self.activations.position,
+                ff_gpu,
+                1, // seq_len = 1 for decode
+                nkv as u32,
+                hd as u32,
+                hd as u32, // rope_dim = head_dim (full rotation)
+            )?;
+            s1_dispatches += 1;
+
+            // -- GPU KV cache update --
+            // Cache layout: [num_kv_heads, capacity, head_dim] (head-major).
+            // K/V source layout: [num_kv_heads * head_dim] (flat, 1 token).
+            // We dispatch one kv_cache_copy_f32 per head, using buffer offsets
+            // to address the correct head slice in both src and cache.
+            {
+                let kv_copy_pipeline = reg.get_pipeline("kv_cache_copy_f32", metal_dev)?;
+                let f32_sz = std::mem::size_of::<f32>();
+                let row_size = hd as u32;
+                let cache_pos_val = if kv_is_sliding {
+                    (kv_write_pos % kv_capacity) as u32
+                } else {
+                    kv_write_pos as u32
+                };
+                let is_sliding_val: u32 = 0; // We handle sliding via cache_pos_val
+                // For per-head dispatch, we copy 1 token of hd elements,
+                // with n_new=1 and wrapping already computed in cache_pos_val.
+
+                for h in 0..nkv {
+                    let src_byte_offset = (h * hd * f32_sz) as u64;
+                    let cache_byte_offset = (h * kv_capacity * hd * f32_sz) as u64;
+
+                    // K cache copy
+                    {
+                        use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+                        let total_elements = hd as u64;
+                        encode_with_args(
+                            s.encoder_mut(),
+                            kv_copy_pipeline,
+                            &[
+                                (0, KernelArg::BufferWithOffset(&self.activations.attn_k, src_byte_offset)),
+                                (1, KernelArg::BufferWithOffset(&self.kv_caches[layer_idx].k, cache_byte_offset)),
+                                (2, KernelArg::Bytes(&cache_pos_val.to_ne_bytes())),
+                                (3, KernelArg::Bytes(&row_size.to_ne_bytes())),
+                                (4, KernelArg::Bytes(&1u32.to_ne_bytes())),     // n_new = 1
+                                (5, KernelArg::Bytes(&(kv_capacity as u32).to_ne_bytes())),
+                                (6, KernelArg::Bytes(&is_sliding_val.to_ne_bytes())),
+                            ],
+                            mlx_native::MTLSize::new(total_elements, 1, 1),
+                            mlx_native::MTLSize::new(std::cmp::min(256, total_elements), 1, 1),
+                        );
+                    }
+                    s1_dispatches += 1;
+
+                    // V cache copy
+                    {
+                        use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+                        let total_elements = hd as u64;
+                        encode_with_args(
+                            s.encoder_mut(),
+                            kv_copy_pipeline,
+                            &[
+                                (0, KernelArg::BufferWithOffset(v_src, src_byte_offset)),
+                                (1, KernelArg::BufferWithOffset(&self.kv_caches[layer_idx].v, cache_byte_offset)),
+                                (2, KernelArg::Bytes(&cache_pos_val.to_ne_bytes())),
+                                (3, KernelArg::Bytes(&row_size.to_ne_bytes())),
+                                (4, KernelArg::Bytes(&1u32.to_ne_bytes())),     // n_new = 1
+                                (5, KernelArg::Bytes(&(kv_capacity as u32).to_ne_bytes())),
+                                (6, KernelArg::Bytes(&is_sliding_val.to_ne_bytes())),
+                            ],
+                            mlx_native::MTLSize::new(total_elements, 1, 1),
+                            mlx_native::MTLSize::new(std::cmp::min(256, total_elements), 1, 1),
+                        );
+                    }
+                    s1_dispatches += 1;
+                }
             }
-        }
 
-        // -- CPU: V = copy from K if k_eq_v, then unit norm --
-        let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
-        if v_is_k {
-            let k: &[f32] = self.activations.attn_k.as_slice()
-                .map_err(|e| anyhow::anyhow!("v=k: {e}"))?;
-            let v: &mut [f32] = self.activations.moe_expert_out.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("v: {e}"))?;
-            v[..nkv*hd].copy_from_slice(&k[..nkv*hd]);
-        }
-        {
-            let v: &mut [f32] = self.activations.moe_expert_out.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("vnorm: {e}"))?;
-            for h in 0..nkv {
-                rms_norm_unit_cpu(&mut v[h*hd..(h+1)*hd], eps);
-            }
-        }
-
-        // -- CPU: RoPE (freq_factors for global layers require CPU path) --
-        let theta = if is_sliding { self.rope_theta_sliding } else { self.rope_theta_global };
-        let ff = if is_sliding { None } else { Some(self.rope_freq_factors.as_slice()) };
-        apply_rope_neox_cpu(
-            self.activations.attn_q.as_mut_slice().map_err(|e| anyhow::anyhow!("rq: {e}"))?,
-            nh, hd, seq_pos, theta, ff,
-        );
-        apply_rope_neox_cpu(
-            self.activations.attn_k.as_mut_slice().map_err(|e| anyhow::anyhow!("rk: {e}"))?,
-            nkv, hd, seq_pos, theta, ff,
-        );
-
-        // -- CPU: KV cache update --
-        let kv_is_sliding = self.kv_caches[layer_idx].is_sliding;
-        let kv_write_pos = self.kv_caches[layer_idx].write_pos;
-        let kv_capacity = self.kv_caches[layer_idx].capacity;
-        let cache_pos = if kv_is_sliding {
-            kv_write_pos % kv_capacity
-        } else {
-            kv_write_pos
-        };
-        {
-            let ks: &[f32] = self.activations.attn_k.as_slice().map_err(|e| anyhow::anyhow!("ks: {e}"))?;
-            let kc: &mut [f32] = self.kv_caches[layer_idx].k.as_mut_slice().map_err(|e| anyhow::anyhow!("kc: {e}"))?;
-            for h in 0..nkv {
-                let src_start = h * hd;
-                let dst_start = h * kv_capacity * hd + cache_pos * hd;
-                kc[dst_start..dst_start + hd].copy_from_slice(&ks[src_start..src_start + hd]);
-            }
-        }
-        {
-            let vs: &[f32] = self.activations.moe_expert_out.as_slice().map_err(|e| anyhow::anyhow!("vs: {e}"))?;
-            let vc: &mut [f32] = self.kv_caches[layer_idx].v.as_mut_slice().map_err(|e| anyhow::anyhow!("vc: {e}"))?;
-            for h in 0..nkv {
-                let src_start = h * hd;
-                let dst_start = h * kv_capacity * hd + cache_pos * hd;
-                vc[dst_start..dst_start + hd].copy_from_slice(&vs[src_start..src_start + hd]);
-            }
-        }
-        self.kv_caches[layer_idx].write_pos += 1;
-        self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
-            .min(kv_capacity);
-        let kv_seq_len = self.kv_caches[layer_idx].seq_len;
-        let cpu1_elapsed = cpu1_start.elapsed();
-        if let Some(ref mut p) = profile {
-            p.layer_cpu1_us[layer_idx] = cpu1_elapsed.as_secs_f64() * 1e6;
-        }
-
-        // =====================================================================
-        // SESSION 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
-        //            → GPU-norm(pre-FF) → gate → up → GPU-GELU → GPU-mul → down
-        //            → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2) → GPU-norm(router)
-        //            → router_proj
-        //
-        // Phase 5c optimization: S3 (router_proj) merged into S2.
-        // The router input prep (unit_norm + scale) is done by GPU rms_norm
-        // using the pre-computed router_combined_weight. This eliminates
-        // 30 sessions per token (one S3 per layer).
-        // =====================================================================
-        let s2_start = Instant::now();
-        let mut s2_dispatches = 0usize;
-        {
-            let (exec, reg) = gpu.split();
-            let dev = exec.device();
-            let metal_dev = dev.metal_device();
-            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S2 begin: {e}"))?;
-
-            // SDPA
+            // -- SDPA (was start of old S2) --
             if is_sliding {
                 let p = SdpaSlidingParams {
                     n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
@@ -1106,12 +1234,12 @@ impl MlxModelWeights {
                     &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
                 ).map_err(|e| anyhow::anyhow!("sdpa: {e}"))?;
             }
-            s2_dispatches += 1; // SDPA
+            s1_dispatches += 1; // SDPA
 
             // O-proj: sdpa_out → attn_out
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
                 &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
-            s2_dispatches += 1; // O-proj
+            s1_dispatches += 1; // O-proj
 
             // GPU post-attention norm: attn_out → norm_out
             s.rms_norm(
@@ -1122,7 +1250,7 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU post-attn norm: {e}"))?;
-            s2_dispatches += 1; // rms_norm
+            s1_dispatches += 1; // rms_norm
 
             // GPU residual add: hidden + norm_out → residual
             s.elementwise_add(
@@ -1130,7 +1258,7 @@ impl MlxModelWeights {
                 &self.activations.hidden, &self.activations.norm_out,
                 &self.activations.residual, hs, mlx_native::DType::F32,
             ).map_err(|e| anyhow::anyhow!("GPU residual add: {e}"))?;
-            s2_dispatches += 1; // add
+            s1_dispatches += 1; // add
 
             // GPU pre-feedforward norm: residual → norm_out
             s.rms_norm(
@@ -1141,22 +1269,22 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm: {e}"))?;
-            s2_dispatches += 1; // rms_norm
+            s1_dispatches += 1; // rms_norm
 
             // Dense MLP: gate and up projections (norm_out → mlp_gate, mlp_up)
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
-            s2_dispatches += 1; // gate
+            s1_dispatches += 1; // gate
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
-            s2_dispatches += 1; // up
+            s1_dispatches += 1; // up
 
             // GPU GELU on gate: mlp_gate → mlp_fused (same element count)
             s.gelu(
                 reg, metal_dev,
                 &self.activations.mlp_gate, &self.activations.mlp_fused,
             ).map_err(|e| anyhow::anyhow!("GPU GELU: {e}"))?;
-            s2_dispatches += 1; // gelu
+            s1_dispatches += 1; // gelu
 
             // GPU mul: mlp_fused * mlp_up → mlp_fused (SwiGLU)
             s.elementwise_mul(
@@ -1165,16 +1293,15 @@ impl MlxModelWeights {
                 &self.activations.mlp_fused, self.intermediate_size,
                 mlx_native::DType::F32,
             ).map_err(|e| anyhow::anyhow!("GPU SwiGLU mul: {e}"))?;
-            s2_dispatches += 1; // mul
+            s1_dispatches += 1; // mul
 
             // down_proj: mlp_fused → mlp_down
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
                 &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
-            s2_dispatches += 1; // down
+            s1_dispatches += 1; // down
 
-            // ---- Phase 5c: merged S3 ops (router prep + router proj) ----
+            // ---- Merged S3 ops (router prep + router proj) ----
             // GPU post-feedforward norm 1: mlp_down → attn_out (reuse as scratch)
-            // This replaces the CPU post-FF norm 1 that was between S2 and S3.
             s.rms_norm(
                 reg, metal_dev,
                 &self.activations.mlp_down,
@@ -1183,10 +1310,9 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU post-FF norm 1: {e}"))?;
-            s2_dispatches += 1; // post-FF norm 1
+            s1_dispatches += 1; // post-FF norm 1
 
             // GPU pre-feedforward norm 2: residual → moe_norm_out (MoE expert input)
-            // This replaces the CPU pre-FF norm 2 that was at the top of forward_decode_moe.
             s.rms_norm(
                 reg, metal_dev,
                 &self.activations.residual,
@@ -1195,11 +1321,9 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm 2: {e}"))?;
-            s2_dispatches += 1; // pre-FF norm 2
+            s1_dispatches += 1; // pre-FF norm 2
 
             // GPU router input prep: unit_norm(residual) * router_combined_weight → norm_out
-            // The pre-computed router_combined_weight = router_scale * hs^-0.5,
-            // so rms_norm(residual, router_combined_weight) gives exactly the router input.
             s.rms_norm(
                 reg, metal_dev,
                 &self.activations.residual,
@@ -1208,34 +1332,39 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("GPU router input prep: {e}"))?;
-            s2_dispatches += 1; // router norm
+            s1_dispatches += 1; // router norm
 
-            // Router projection: norm_out → moe_router_logits (was Session 3)
+            // Router projection: norm_out → moe_router_logits
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                 &self.layers[layer_idx].moe.router_proj,
                 &mut self.activations.moe_router_logits, 1)?;
-            s2_dispatches += 1; // router proj
+            s1_dispatches += 1; // router proj
 
-            s.finish().map_err(|e| anyhow::anyhow!("S2 finish: {e}"))?;
+            s.finish().map_err(|e| anyhow::anyhow!("S1 finish: {e}"))?;
         }
-        let s2_elapsed = s2_start.elapsed();
+        let s1_elapsed = s1_start.elapsed();
         if let Some(ref mut p) = profile {
-            p.layer_s2_us[layer_idx] = s2_elapsed.as_secs_f64() * 1e6;
-            p.s2_dispatches[layer_idx] = s2_dispatches;
+            // S1 now contains everything that was S1+CPU1+S2 (merged session).
+            // Report S1 timing for the merged session, zero out S2/CPU1.
+            p.layer_s1_us[layer_idx] = s1_elapsed.as_secs_f64() * 1e6;
+            p.s1_dispatches[layer_idx] = s1_dispatches;
+            p.layer_cpu1_us[layer_idx] = 0.0; // CPU1 eliminated (GPU norms+RoPE+KV)
+            p.layer_s2_us[layer_idx] = 0.0;   // S2 merged into S1
+            p.s2_dispatches[layer_idx] = 0;
         }
 
-        // -- CPU: softmax + top-k on router logits (replaces S3+CPU3) --
-        // Post-FF norm 1 result is now in attn_out (GPU wrote it in S2).
-        // MoE norm input is now in moe_norm_out (GPU wrote it in S2).
-        // Router logits are now in moe_router_logits (GPU wrote it in S2).
+        // -- CPU: softmax + top-k on router logits --
+        // Post-FF norm 1 result is now in attn_out (GPU wrote it in S1).
+        // MoE norm input is now in moe_norm_out (GPU wrote it in S1).
+        // Router logits are now in moe_router_logits (GPU wrote it in S1).
         let cpu2_start = Instant::now();
 
-        // -- MoE path (session 4 only — S3 was merged into S2) --
+        // -- MoE path (session 2 — the only remaining session break per layer) --
         let (s4_us, s4_disp) =
             self.forward_decode_moe_no_router(layer_idx, gpu)?;
 
         // -- Combine MLP + MoE, final norm, residual, layer scalar (CPU) --
-        // Note: normed mlp_down is now in attn_out (GPU wrote post-FF norm 1 there in S2).
+        // Normed mlp_down is now in attn_out (GPU wrote post-FF norm 1 there in S1).
         {
             let mlp: &[f32] = self.activations.attn_out.as_slice().map_err(|e| anyhow::anyhow!("m: {e}"))?;
             let moe: &[f32] = self.activations.moe_accum.as_slice().map_err(|e| anyhow::anyhow!("mo: {e}"))?;
@@ -1262,15 +1391,15 @@ impl MlxModelWeights {
         }
         let cpu2_and_4_elapsed = cpu2_start.elapsed();
         if let Some(ref mut p) = profile {
-            // S3 is now merged into S2, so s3_us and cpu3_us are zero.
+            // S1+S2 merged, S3 merged previously. Only S4 (MoE experts) remains.
             let total_cpu2_4 = cpu2_and_4_elapsed.as_secs_f64() * 1e6;
             let cpu4_us = total_cpu2_4 - s4_us;
             p.layer_cpu2_us[layer_idx] = cpu4_us.max(0.0);
-            p.layer_s3_us[layer_idx] = 0.0;  // S3 merged into S2
-            p.layer_cpu3_us[layer_idx] = 0.0; // CPU softmax/topk now in CPU2
+            p.layer_s3_us[layer_idx] = 0.0;  // S3 merged into S1
+            p.layer_cpu3_us[layer_idx] = 0.0;
             p.layer_s4_us[layer_idx] = s4_us;
             p.layer_cpu4_us[layer_idx] = cpu4_us.max(0.0);
-            p.s3_dispatches[layer_idx] = 0; // S3 merged into S2
+            p.s3_dispatches[layer_idx] = 0;
             p.s4_dispatches[layer_idx] = s4_disp;
         }
 
@@ -1970,6 +2099,124 @@ fn load_qweight(
 // Forward pass dispatch helpers
 // ---------------------------------------------------------------------------
 
+/// Dispatch per-head RMS norm (f32) without element count validation.
+///
+/// The standard `dispatch_rms_norm` validates that input.element_count() ==
+/// rows * dim, which fails when using over-sized buffers (e.g. Q buffer
+/// allocated for max head_dim but used with smaller sliding head_dim).
+///
+/// This helper dispatches the kernel directly, processing only the first
+/// `rows * dim` elements.  Safe because: (1) the buffer is at least as
+/// large as rows*dim, and (2) the kernel reads/writes exactly rows*dim
+/// elements controlled by its grid size (one threadgroup per row).
+fn dispatch_rms_norm_perhead(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &mlx_native::metal::DeviceRef,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    let pipeline = registry.get_pipeline("rms_norm_f32", device)
+        .map_err(|e| anyhow::anyhow!("rms_norm_f32 pipeline: {e}"))?;
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, weight), (2, output), (3, params_buf)],
+        &[(0, shared_mem_bytes)],
+        mlx_native::MTLSize::new(rows as u64, 1, 1),
+        mlx_native::MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
+/// Dispatch per-head RMS norm without learned scale (unit norm, f32).
+///
+/// Same as `dispatch_rms_norm_perhead` but uses `rms_norm_no_scale_f32`
+/// (no weight buffer — just unit normalization).
+fn dispatch_rms_norm_unit_perhead(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &mlx_native::metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32", device)
+        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32 pipeline: {e}"))?;
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, output), (2, params_buf)],
+        &[(0, shared_mem_bytes)],
+        mlx_native::MTLSize::new(rows as u64, 1, 1),
+        mlx_native::MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
+/// Dispatch NeoX RoPE f32 with freq_factors, bypassing element count validation.
+///
+/// Same as `dispatch_rope_neox_f32` but tolerates over-sized buffers.
+/// Safe because the kernel grid is sized to (rope_dim/2, seq_len*n_heads)
+/// and only accesses the first seq_len*n_heads*head_dim elements.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_rope_neox_f32_unchecked(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &mlx_native::metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    positions_buf: &MlxBuffer,
+    freq_factors: Option<&MlxBuffer>,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rope_dim: u32,
+) -> Result<()> {
+    use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+
+    let pipeline = registry.get_pipeline("rope_neox_f32", device)
+        .map_err(|e| anyhow::anyhow!("rope_neox_f32 pipeline: {e}"))?;
+    let half_rope = rope_dim / 2;
+    let n_rows = (seq_len as usize) * (n_heads as usize);
+
+    let has_ff: u32 = if freq_factors.is_some() { 1 } else { 0 };
+    // Pack [n_heads, has_freq_factors] as 2 x u32 = 8 bytes
+    let mut param_bytes = [0u8; 8];
+    param_bytes[0..4].copy_from_slice(&n_heads.to_ne_bytes());
+    param_bytes[4..8].copy_from_slice(&has_ff.to_ne_bytes());
+
+    let ff_buf = freq_factors.unwrap_or(input);
+
+    let tg_x = std::cmp::min(64, half_rope as u64);
+    let tg_y = std::cmp::min(4, n_rows as u64);
+
+    encode_with_args(
+        encoder,
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(params_buf)),
+            (3, KernelArg::Buffer(positions_buf)),
+            (4, KernelArg::Bytes(&param_bytes)),
+            (5, KernelArg::Buffer(ff_buf)),
+        ],
+        mlx_native::MTLSize::new(half_rope as u64, n_rows as u64, 1),
+        mlx_native::MTLSize::new(tg_x, tg_y, 1),
+    );
+    Ok(())
+}
+
 /// Run one quantized matmul through the GraphSession.
 ///
 /// Dispatches `output = input @ weight.T` where weight is in GGML block format.
@@ -2116,6 +2363,59 @@ fn alloc_activation_buffers(
             .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
         logits_f16: device.alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
             .map_err(|e| anyhow::anyhow!("alloc logits_f16 ({vocab} f16): {e}"))?,
+        // --- Session merge buffers (S1+S2 collapse) ---
+        norm_params_sliding_hd: {
+            let sliding_hd = cfg.head_dim;
+            let mut buf = alloc_f32(2, "norm_params_sliding_hd")?;
+            let p: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("norm_params_sliding_hd init: {e}"))?;
+            p[0] = cfg.rms_norm_eps as f32;
+            p[1] = sliding_hd as f32;
+            buf
+        },
+        norm_params_global_hd: {
+            let global_hd = cfg.global_head_dim;
+            let mut buf = alloc_f32(2, "norm_params_global_hd")?;
+            let p: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("norm_params_global_hd init: {e}"))?;
+            p[0] = cfg.rms_norm_eps as f32;
+            p[1] = global_hd as f32;
+            buf
+        },
+        rope_params_sliding_neox: {
+            let sliding_hd = cfg.head_dim;
+            let mut buf = alloc_f32(4, "rope_params_sliding_neox")?;
+            let p: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("rope_params_sliding_neox init: {e}"))?;
+            p[0] = cfg.rope_theta_sliding as f32;
+            p[1] = sliding_hd as f32;
+            p[2] = sliding_hd as f32; // rope_dim = head_dim (full rotation)
+            p[3] = 0.0;
+            buf
+        },
+        rope_params_global_neox: {
+            let global_hd = cfg.global_head_dim;
+            let mut buf = alloc_f32(4, "rope_params_global_neox")?;
+            let p: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("rope_params_global_neox init: {e}"))?;
+            p[0] = cfg.rope_theta_global as f32;
+            p[1] = global_hd as f32;
+            p[2] = global_hd as f32; // rope_dim = head_dim (full rotation)
+            p[3] = 0.0;
+            buf
+        },
+        rope_freq_factors_gpu: alloc_f32(1, "rope_freq_factors_gpu_placeholder")?,
+        attn_v: alloc_f32(max_kv_heads * max_hd, "attn_v")?,
+        attn_q_normed: alloc_f32(num_heads * max_hd, "attn_q_normed")?,
+        attn_k_normed: alloc_f32(max_kv_heads * max_hd, "attn_k_normed")?,
+        moe_softmax_params_gpu: {
+            let mut buf = alloc_f32(2, "moe_softmax_params_gpu")?;
+            let p: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("moe_softmax_params_gpu init: {e}"))?;
+            p[0] = num_experts as f32; // cols
+            p[1] = 0.0;
+            buf
+        },
     })
 }
 
@@ -2261,12 +2561,19 @@ fn gelu_tanh(x: f32) -> f32 {
 //       - GPU router input prep via rms_norm with pre-computed combined weight
 //       - Router matmul now dispatched at end of S2
 //       - Eliminates 30 sessions/token (S3 was 1 dispatch per session per layer)
-//       - Total sessions: 3 per layer (QKV, SDPA+MLP+router, experts) + 1 head
-//       - 30 layers × 3 + 1 = 91 sessions per token (down from 121)
+//
+// DONE (Phase 5d — S1+S2 merge):
+// - [x] Merged S1 (QKV) into S2 (SDPA+MLP+router):
+//       - GPU per-head RMS norm on Q and K (rms_norm rows=nh/nkv, dim=hd)
+//       - GPU per-head unit RMS norm on V (rms_norm_no_scale_f32)
+//       - GPU RoPE neox f32 with freq_factors on Q and K
+//       - GPU KV cache copy f32 per-head (new kv_cache_copy_f32 kernel)
+//       - V output separated from moe_expert_out (dedicated attn_v buffer)
+//       - Eliminates CPU head norms, RoPE, V norm, KV cache update
+//       - Total sessions: 2 per layer (merged, experts) + 1 head
+//       - 30 layers × 2 + 1 = 61 sessions per token (down from 91)
 //
 // OPTIMIZATIONS deferred:
-// - [ ] GPU RoPE with freq_factors support (needs new kernel)
+// - [ ] Merge S1+S2 with MoE (S4): needs GPU-side accumulate with GPU weights
 // - [ ] GPU embedding via embedding_gather kernel
 // - [ ] GPU argmax via dispatch_argmax_f32
-// - [ ] GPU KV cache update via dispatch_kv_cache_copy
-// - [ ] Merge S1 into S2 (needs GPU head norms + RoPE)
