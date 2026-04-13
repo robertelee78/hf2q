@@ -139,7 +139,13 @@ impl ProfileAccumulator {
         let gpu_total = s1_avg + s2_avg + s3_avg + s4_avg + head_gpu_avg;
         let cpu_total = cpu1_avg + cpu2_avg + cpu3_avg + cpu4_avg + head_cpu_avg;
 
-        eprintln!("║ {num_layers} layers x 2 sessions + 1 head = {} sessions/token", num_layers * 2 + 1);
+        // Count actual sessions used (non-zero timings indicate a session was used)
+        let actual_sessions = if s2_avg + s3_avg + s4_avg + head_gpu_avg < 1.0 {
+            1  // Single session for entire forward pass
+        } else {
+            num_layers * 2 + 1
+        };
+        eprintln!("║ {} session(s)/token (single-session mode)", actual_sessions);
         eprintln!("║");
         eprintln!("║ Session breakdown (avg across {num_layers} layers, {n} tokens):");
         eprintln!("║   S1 (QKV+attn+MLP):  {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
@@ -893,8 +899,9 @@ impl MlxModelWeights {
         profile: &mut Option<TokenProfile>,
     ) -> Result<u32> {
         let token_start = Instant::now();
-        let hidden_size = self.hidden_size;
+        let hs = self.hidden_size;
         let num_layers = self.layers.len();
+        let vocab_size = self.vocab_size;
 
         // Pre-allocate profile vectors if profiling
         if let Some(ref mut p) = profile {
@@ -912,41 +919,641 @@ impl MlxModelWeights {
             p.s4_dispatches = vec![0; num_layers];
         }
 
-        // --- 1. Embedding lookup (CPU copy for single token) ---
+        // --- Pre-session CPU work ---
+        // Write position buffer (same for all layers)
         {
-            let embed_src: &[f32] = self.embed_weight.as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice: {e}"))?;
-            let offset = input_token as usize * hidden_size;
-            if offset + hidden_size > embed_src.len() {
-                anyhow::bail!(
-                    "Token {} out of range for embedding table (size {})",
-                    input_token, embed_src.len() / hidden_size,
-                );
-            }
-            let hidden_dst: &mut [f32] = self.activations.hidden.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("hidden as_mut_slice: {e}"))?;
-            hidden_dst[..hidden_size].copy_from_slice(&embed_src[offset..offset + hidden_size]);
+            let pos_dst: &mut [u32] = self.activations.position.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("position write: {e}"))?;
+            pos_dst[0] = seq_pos as u32;
         }
 
-        // Scale embedding by sqrt(hidden_size)
-        {
-            let scale = (hidden_size as f32).sqrt();
-            let hidden: &mut [f32] = self.activations.hidden.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("hidden scale: {e}"))?;
-            for v in hidden[..hidden_size].iter_mut() {
-                *v *= scale;
-            }
-        }
-
-        // --- 2. Transformer layers ---
+        // KV cache bookkeeping for all layers (CPU counters only, no GPU buffers)
+        let mut kv_info: Vec<(bool, usize, usize, usize)> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
-            self.forward_decode_layer(layer_idx, seq_pos, gpu, profile)?;
+            let is_sliding = self.kv_caches[layer_idx].is_sliding;
+            let write_pos = self.kv_caches[layer_idx].write_pos;
+            let capacity = self.kv_caches[layer_idx].capacity;
+            self.kv_caches[layer_idx].write_pos += 1;
+            self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
+                .min(capacity);
+            let seq_len = self.kv_caches[layer_idx].seq_len;
+            kv_info.push((is_sliding, write_pos, capacity, seq_len));
         }
 
-        // --- 3. Final norm + lm_head + softcap + argmax ---
-        let token_id = self.forward_decode_head(gpu, profile)?;
+        // =====================================================================
+        // SINGLE SESSION: Embedding + All 30 Layers + Head
+        //
+        // ONE begin() → all GPU dispatches → ONE finish().
+        // Zero CPU readbacks.  All norms, adds, MoE routing, scalar multiplies,
+        // softcap, and argmax run on GPU.
+        // =====================================================================
+        let session_start = Instant::now();
+        let mut total_dispatches = 0usize;
+        {
+            let (exec, reg) = gpu.split();
+            let dev = exec.device();
+            let metal_dev = dev.metal_device();
+            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("single session begin: {e}"))?;
+
+            // --- 1. Embedding gather + scale (GPU) ---
+            mlx_native::ops::elementwise::embedding_gather_scale_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.embed_weight,
+                &self.activations.hidden,
+                input_token,
+                hs,
+                (hs as f32).sqrt(),
+            ).map_err(|e| anyhow::anyhow!("embedding_gather_scale: {e}"))?;
+            total_dispatches += 1;
+
+            // --- 2. Transformer layers ---
+            for layer_idx in 0..num_layers {
+                let hd = self.head_dims[layer_idx];
+                let nkv = self.num_kv_heads[layer_idx];
+                let nh = self.num_attention_heads;
+                let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
+                let eps = self.rms_norm_eps;
+                let (kv_is_sliding, kv_write_pos, kv_capacity, kv_seq_len) = kv_info[layer_idx];
+
+                // -- Pre-attention norm (GPU) --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.hidden,
+                    &self.layers[layer_idx].norms.input_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("GPU pre-attn norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- QKV projections --
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+                total_dispatches += 1;
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                total_dispatches += 1;
+                let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
+                if !v_is_k {
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                        self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
+                        &mut self.activations.attn_v, 1)?;
+                    total_dispatches += 1;
+                }
+
+                // -- GPU per-head RMS norm on Q and K --
+                let hd_norm_params = if is_sliding {
+                    &self.activations.norm_params_sliding_hd
+                } else {
+                    &self.activations.norm_params_global_hd
+                };
+                dispatch_rms_norm_perhead(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q,
+                    &self.layers[layer_idx].attn.q_norm_weight,
+                    &self.activations.attn_q_normed,
+                    hd_norm_params,
+                    nh as u32, hd as u32,
+                )?;
+                total_dispatches += 1;
+                dispatch_rms_norm_perhead(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k,
+                    &self.layers[layer_idx].attn.k_norm_weight,
+                    &self.activations.attn_k_normed,
+                    hd_norm_params,
+                    nkv as u32, hd as u32,
+                )?;
+                total_dispatches += 1;
+
+                // -- GPU V norm --
+                if v_is_k {
+                    dispatch_rms_norm_unit_perhead(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_k,
+                        &self.activations.attn_v,
+                        hd_norm_params,
+                        nkv as u32, hd as u32,
+                    )?;
+                    total_dispatches += 1;
+                } else {
+                    dispatch_rms_norm_unit_perhead(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_v,
+                        &self.activations.moe_expert_out,
+                        hd_norm_params,
+                        nkv as u32, hd as u32,
+                    )?;
+                    total_dispatches += 1;
+                }
+
+                let v_src = if v_is_k {
+                    &self.activations.attn_v
+                } else {
+                    &self.activations.moe_expert_out
+                };
+
+                // -- GPU RoPE (neox f32 with freq_factors) --
+                let rope_params = if is_sliding {
+                    &self.activations.rope_params_sliding_neox
+                } else {
+                    &self.activations.rope_params_global_neox
+                };
+                let ff_gpu = if is_sliding {
+                    None
+                } else {
+                    Some(&self.activations.rope_freq_factors_gpu)
+                };
+                dispatch_rope_neox_f32_unchecked(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q_normed,
+                    &self.activations.attn_q,
+                    rope_params, &self.activations.position, ff_gpu,
+                    1, nh as u32, hd as u32, hd as u32,
+                )?;
+                total_dispatches += 1;
+                dispatch_rope_neox_f32_unchecked(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_k_normed,
+                    &self.activations.attn_k,
+                    rope_params, &self.activations.position, ff_gpu,
+                    1, nkv as u32, hd as u32, hd as u32,
+                )?;
+                total_dispatches += 1;
+
+                // -- GPU KV cache update --
+                {
+                    let cache_pos_val = if kv_is_sliding {
+                        (kv_write_pos % kv_capacity) as u32
+                    } else {
+                        kv_write_pos as u32
+                    };
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_k,
+                        &self.kv_caches[layer_idx].k,
+                        nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                    ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        v_src,
+                        &self.kv_caches[layer_idx].v,
+                        nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                    ).map_err(|e| anyhow::anyhow!("kv V L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                }
+
+                // -- SDPA --
+                if is_sliding {
+                    let p = SdpaSlidingParams {
+                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
+                        seq_len: 1, kv_seq_len: kv_seq_len as u32,
+                        window_size: self.sliding_window as u32, scale: 1.0,
+                        kv_capacity: kv_capacity as u32,
+                    };
+                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q, &self.kv_caches[layer_idx].k,
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
+                    ).map_err(|e| anyhow::anyhow!("sdpa_sliding L{layer_idx}: {e}"))?;
+                } else {
+                    let p = SdpaParams {
+                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
+                        seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
+                        kv_capacity: kv_capacity as u32,
+                    };
+                    s.sdpa(reg, dev, &self.activations.attn_q, &self.kv_caches[layer_idx].k,
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
+                    ).map_err(|e| anyhow::anyhow!("sdpa L{layer_idx}: {e}"))?;
+                }
+                total_dispatches += 1;
+
+                // -- O-proj --
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
+                    &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+                total_dispatches += 1;
+
+                // -- GPU post-attention norm --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.attn_out,
+                    &self.layers[layer_idx].norms.post_attention_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("post-attn norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- GPU residual add: hidden + norm_out → residual --
+                s.elementwise_add(
+                    reg, metal_dev,
+                    &self.activations.hidden, &self.activations.norm_out,
+                    &self.activations.residual, hs, mlx_native::DType::F32,
+                ).map_err(|e| anyhow::anyhow!("residual add L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- GPU pre-feedforward norm --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- Dense MLP: gate, up, fused SwiGLU, down --
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                total_dispatches += 1;
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                total_dispatches += 1;
+                {
+                    use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+                    let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
+                    let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
+                    encode_with_args(
+                        s.encoder_mut(), pipeline,
+                        &[
+                            (0, KernelArg::Buffer(&self.activations.mlp_gate)),
+                            (1, KernelArg::Buffer(&self.activations.mlp_up)),
+                            (2, KernelArg::Buffer(&self.activations.mlp_fused)),
+                            (3, KernelArg::Bytes(&n_elements_bytes)),
+                        ],
+                        mlx_native::MTLSize::new(self.intermediate_size as u64, 1, 1),
+                        mlx_native::MTLSize::new(
+                            std::cmp::min(256, self.intermediate_size as u64), 1, 1),
+                    );
+                }
+                total_dispatches += 1;
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                    &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                total_dispatches += 1;
+
+                // -- GPU post-feedforward norm 1: mlp_down → attn_out --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.mlp_down,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
+                    &self.activations.attn_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- GPU pre-feedforward norm 2: residual → moe_norm_out --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                    &self.activations.moe_norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- GPU router input prep + projection --
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].moe.router_combined_weight,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                    &self.layers[layer_idx].moe.router_proj,
+                    &mut self.activations.moe_router_logits, 1)?;
+                total_dispatches += 1;
+
+                // ============================================================
+                // GPU MoE routing: softmax + argsort + gather (NO CPU readback)
+                // ============================================================
+                let num_experts = self.num_experts;
+                let top_k = self.layers[layer_idx].moe.top_k;
+
+                // GPU softmax on router logits [1, num_experts]
+                mlx_native::ops::softmax::dispatch_softmax(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_router_logits,
+                    &self.activations.moe_probs,
+                    &self.activations.moe_softmax_params_gpu,
+                    1, num_experts as u32,
+                ).map_err(|e| anyhow::anyhow!("GPU softmax L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU argsort descending on softmax probs
+                mlx_native::ops::argsort::dispatch_argsort_desc_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_probs,
+                    &self.activations.moe_sorted_indices,
+                    1, num_experts as u32,
+                ).map_err(|e| anyhow::anyhow!("GPU argsort L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU gather top-K weights + per_expert_scale + renormalize
+                mlx_native::ops::moe_dispatch::moe_gather_topk_weights_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_probs,
+                    &self.activations.moe_sorted_indices,
+                    &self.layers[layer_idx].moe.per_expert_scale,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_routing_weights_gpu,
+                    num_experts, top_k,
+                ).map_err(|e| anyhow::anyhow!("GPU gather_topk L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // ============================================================
+                // MoE expert dispatches (was S4, now in same session)
+                // ============================================================
+                let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
+                let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
+                    && self.layers[layer_idx].moe.stacked_down.is_some();
+
+                if use_fused_id {
+                    let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                        self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
+                    let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                        self.layers[layer_idx].moe.down_ggml_dtype)?;
+
+                    // gate_up _id
+                    let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                        n_tokens: 1,
+                        top_k: top_k as u32,
+                        n: (2 * moe_int) as u32,
+                        k: hs as u32,
+                        n_experts: num_experts as u32,
+                        expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                        ggml_type: ggml_type_gu,
+                    };
+                    s.quantized_matmul_id_ggml(
+                        reg, dev,
+                        &self.activations.moe_norm_out,
+                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                        &self.activations.moe_expert_ids,
+                        &mut self.activations.moe_gate_up_id_out,
+                        &gu_params,
+                    ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // Batched SwiGLU
+                    mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_gate_up_id_out,
+                        &self.activations.moe_swiglu_id_out,
+                        moe_int, top_k,
+                    ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // down _id
+                    let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                        n_tokens: top_k as u32,
+                        top_k: 1,
+                        n: hs as u32,
+                        k: moe_int as u32,
+                        n_experts: num_experts as u32,
+                        expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                        ggml_type: ggml_type_dn,
+                    };
+                    s.quantized_matmul_id_ggml(
+                        reg, dev,
+                        &self.activations.moe_swiglu_id_out,
+                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                        &self.activations.moe_expert_ids,
+                        &mut self.activations.moe_down_id_out,
+                        &dn_params,
+                    ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // Weighted sum
+                    mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_down_id_out,
+                        &self.activations.moe_routing_weights_gpu,
+                        &self.activations.moe_accum,
+                        hs, top_k,
+                    ).map_err(|e| anyhow::anyhow!("weighted_sum L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                } else {
+                    // Fallback: per-expert loop (all in same session)
+                    mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_accum, hs,
+                    ).map_err(|e| anyhow::anyhow!("zero_buffer L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // Note: fallback path still needs CPU to read expert_ids.
+                    // For now, this path is unused (all layers have stacked weights).
+                    // If needed, we'd add a finish/begin here, but the fused _id path
+                    // is always available for Gemma4.
+                    anyhow::bail!(
+                        "Single-session forward requires fused _id path (stacked weights). \
+                         Layer {layer_idx} missing stacked weights."
+                    );
+                }
+
+                // ============================================================
+                // GPU post-MoE: norm, combine MLP+MoE, final norm, residual, scalar
+                // ============================================================
+
+                // GPU post-feedforward norm 2 on MoE output: moe_accum → moe_norm_out
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.moe_accum,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+                    &self.activations.moe_norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("post-FF norm 2 L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU combine MLP + MoE: attn_out + moe_norm_out → mlp_down
+                s.elementwise_add(
+                    reg, metal_dev,
+                    &self.activations.attn_out, &self.activations.moe_norm_out,
+                    &self.activations.mlp_down, hs, mlx_native::DType::F32,
+                ).map_err(|e| anyhow::anyhow!("combine MLP+MoE L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU post-feedforward norm: mlp_down → norm_out
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.mlp_down,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("post-FF norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU residual + norm_out → hidden (but we also need scalar multiply)
+                // Two cases for layer scalar:
+                //   1. scalar.len() == 1: scalar broadcast multiply
+                //   2. scalar.len() == hs: elementwise multiply
+                // First: residual + norm_out → mlp_down (reuse as scratch)
+                s.elementwise_add(
+                    reg, metal_dev,
+                    &self.activations.residual, &self.activations.norm_out,
+                    &self.activations.mlp_down, hs, mlx_native::DType::F32,
+                ).map_err(|e| anyhow::anyhow!("residual add2 L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // GPU layer scalar: mlp_down * scalar → hidden
+                let scalar_len = self.layers[layer_idx].layer_scalar.element_count();
+                if scalar_len == 1 {
+                    // Need to read the scalar value.  Since this buffer was written
+                    // at load time (not by GPU in this session), CPU can read it
+                    // without a sync.
+                    let scalar_val: f32 = {
+                        let sv: &[f32] = self.layers[layer_idx].layer_scalar.as_slice()
+                            .map_err(|e| anyhow::anyhow!("scalar read L{layer_idx}: {e}"))?;
+                        sv[0]
+                    };
+                    mlx_native::ops::elementwise::scalar_mul_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.mlp_down,
+                        &self.activations.hidden,
+                        hs, scalar_val,
+                    ).map_err(|e| anyhow::anyhow!("scalar_mul L{layer_idx}: {e}"))?;
+                } else {
+                    // Vector scalar: elementwise multiply
+                    s.elementwise_mul(
+                        reg, metal_dev,
+                        &self.activations.mlp_down,
+                        &self.layers[layer_idx].layer_scalar,
+                        &self.activations.hidden,
+                        hs, mlx_native::DType::F32,
+                    ).map_err(|e| anyhow::anyhow!("scalar_mul_vec L{layer_idx}: {e}"))?;
+                }
+                total_dispatches += 1;
+
+                if let Some(ref mut p) = profile {
+                    // All layer ops in single session — attribute everything to S1
+                    p.s1_dispatches[layer_idx] = total_dispatches;
+                }
+            }
+
+            // --- 3. Final norm + lm_head + softcap + argmax (all GPU) ---
+
+            // GPU final RMS norm: hidden → norm_out
+            s.rms_norm(
+                reg, metal_dev,
+                &self.activations.hidden,
+                &self.final_norm,
+                &self.activations.norm_out,
+                &self.activations.norm_params,
+                1, hs as u32,
+            ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
+            total_dispatches += 1;
+
+            // GPU lm_head: cast F32→F16 + dense_gemm_f16 + cast F16→F32
+            if let Some(ref lm_head_f16) = self.lm_head_f16 {
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.norm_out,
+                    &self.activations.hidden_f16,
+                    hs,
+                    CastDirection::F32ToF16,
+                ).map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
+                total_dispatches += 1;
+
+                let gemm_params = DenseGemmF16Params {
+                    m: 1,
+                    n: vocab_size as u32,
+                    k: hs as u32,
+                };
+                mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.hidden_f16,
+                    lm_head_f16,
+                    &self.activations.logits_f16,
+                    &gemm_params,
+                ).map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
+                total_dispatches += 1;
+
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.logits_f16,
+                    &self.activations.logits,
+                    vocab_size,
+                    CastDirection::F16ToF32,
+                ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
+                total_dispatches += 1;
+            } else {
+                anyhow::bail!("Single-session forward requires GPU lm_head (F16 weight)");
+            }
+
+            // GPU softcap (if configured)
+            if let Some(cap) = self.final_logit_softcapping {
+                // Write softcap params: [cap, n_elements_as_f32_bits]
+                {
+                    let p: &mut [f32] = self.activations.softcap_params.as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("softcap params: {e}"))?;
+                    p[0] = cap;
+                    p[1] = f32::from_bits(vocab_size as u32);
+                }
+                mlx_native::ops::softcap::dispatch_softcap(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.logits,
+                    &self.activations.logits,  // in-place
+                    &self.activations.softcap_params,
+                    cap,
+                ).map_err(|e| anyhow::anyhow!("GPU softcap: {e}"))?;
+                total_dispatches += 1;
+            }
+
+            // GPU argmax
+            {
+                let p: &mut [u32] = self.activations.argmax_params.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("argmax params write: {e}"))?;
+                // argmax_params is allocated as f32 but we write u32 — same size
+                p[0] = vocab_size as u32;
+            }
+            mlx_native::ops::argmax::dispatch_argmax_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.logits,
+                &self.activations.argmax_index,
+                &self.activations.argmax_value,
+                &self.activations.argmax_params,
+                vocab_size as u32,
+            ).map_err(|e| anyhow::anyhow!("GPU argmax: {e}"))?;
+            total_dispatches += 1;
+
+            // === ONE finish() for the entire forward pass ===
+            s.finish().map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
+        }
+        let session_us = session_start.elapsed().as_secs_f64() * 1e6;
+
+        // Read the argmax result (8 bytes: 1 u32 index + 1 f32 value)
+        let token_id: u32 = {
+            let idx: &[u32] = self.activations.argmax_index.as_slice()
+                .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
+            idx[0]
+        };
 
         if let Some(ref mut p) = profile {
+            // Single session — report all time in S1, zero everything else
+            let per_layer_us = session_us / num_layers as f64;
+            for li in 0..num_layers {
+                p.layer_s1_us[li] = per_layer_us;
+                p.layer_cpu1_us[li] = 0.0;
+                p.layer_s2_us[li] = 0.0;
+                p.layer_cpu2_us[li] = 0.0;
+                p.layer_s3_us[li] = 0.0;
+                p.layer_cpu3_us[li] = 0.0;
+                p.layer_s4_us[li] = 0.0;
+                p.layer_cpu4_us[li] = 0.0;
+                p.s2_dispatches[li] = 0;
+                p.s3_dispatches[li] = 0;
+                p.s4_dispatches[li] = 0;
+            }
+            p.head_session_us = 0.0; // included in single session
+            p.head_cpu_us = 0.0;
+            p.head_dispatches = total_dispatches;
             p.total_us = token_start.elapsed().as_secs_f64() * 1e6;
         }
 
