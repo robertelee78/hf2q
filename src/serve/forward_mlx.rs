@@ -31,6 +31,7 @@ use anyhow::Result;
 use mlx_native::{
     GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
 };
+use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::sdpa::SdpaParams;
 use mlx_native::ops::sdpa_sliding::SdpaSlidingParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
@@ -408,6 +409,9 @@ pub struct MlxActivationBuffers {
     /// Scratch buffer for SDPA output `[1, num_heads, 1, head_dim]` F32.
     /// Sized for largest head config (16 heads * 512 head_dim for global).
     pub sdpa_out: MlxBuffer,
+    /// Temporary buffer for flash_attn_vec workgroup partial results.
+    /// Sized for max(sliding, global) head config.
+    pub flash_attn_tmp: MlxBuffer,
     /// RMS norm params buffer `[eps, dim]` as F32.
     pub norm_params: MlxBuffer,
     /// RoPE params buffer `[theta, head_dim, 0, 0]` as F32.
@@ -1124,31 +1128,27 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // -- SDPA --
+                // -- SDPA (flash_attn_vec) --
                 // After fused norm+RoPE, the rotated Q is in attn_q_normed.
-                if is_sliding {
-                    let p = SdpaSlidingParams {
-                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                        seq_len: 1, kv_seq_len: kv_seq_len as u32,
-                        window_size: self.sliding_window as u32, scale: 1.0,
+                {
+                    let p = FlashAttnVecParams {
+                        num_heads: nh as u32,
+                        num_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        kv_seq_len: kv_seq_len as u32,
                         kv_capacity: kv_capacity as u32,
+                        scale: 1.0,
+                        mask_type: if is_sliding { 2 } else { 1 },
+                        sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                        softcap: 0.0,
                     };
-                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
-                        s.encoder_mut(), reg, dev,
+                    s.flash_attn_vec(reg, dev,
                         &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                    ).map_err(|e| anyhow::anyhow!("sdpa_sliding L{layer_idx}: {e}"))?;
-                } else {
-                    let p = SdpaParams {
-                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                        seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
-                        kv_capacity: kv_capacity as u32,
-                    };
-                    s.sdpa(reg, dev, &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                    ).map_err(|e| anyhow::anyhow!("sdpa L{layer_idx}: {e}"))?;
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
+                        &self.activations.flash_attn_tmp, &p,
+                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec L{layer_idx}: {e}"))?;
                 }
-                total_dispatches += 1;
+                total_dispatches += 2; // main + reduce
 
                 // -- O-proj --
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
@@ -1732,31 +1732,27 @@ impl MlxModelWeights {
                 let t0 = Instant::now();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
-                if is_sliding {
-                    let p = SdpaSlidingParams {
-                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                        seq_len: 1, kv_seq_len: kv_seq_len as u32,
-                        window_size: self.sliding_window as u32, scale: 1.0,
+                {
+                    let p = FlashAttnVecParams {
+                        num_heads: nh as u32,
+                        num_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        kv_seq_len: kv_seq_len as u32,
                         kv_capacity: kv_capacity as u32,
+                        scale: 1.0,
+                        mask_type: if is_sliding { 2 } else { 1 },
+                        sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                        softcap: 0.0,
                     };
-                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
-                        s.encoder_mut(), reg, dev,
+                    s.flash_attn_vec(reg, dev,
                         &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                    ).map_err(|e| anyhow::anyhow!("sdpa_sliding L{layer_idx}: {e}"))?;
-                } else {
-                    let p = SdpaParams {
-                        n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                        seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
-                        kv_capacity: kv_capacity as u32,
-                    };
-                    s.sdpa(reg, dev, &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                    ).map_err(|e| anyhow::anyhow!("sdpa L{layer_idx}: {e}"))?;
+                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
+                        &self.activations.flash_attn_tmp, &p,
+                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec L{layer_idx}: {e}"))?;
                 }
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
-                    .map_err(|e| anyhow::anyhow!("sdpa finish L{layer_idx}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("flash_attn_vec finish L{layer_idx}: {e}"))?;
                 kp.sdpa_us[layer_idx] = gpu_ns as f64 / 1000.0;
             }
 
@@ -2504,30 +2500,26 @@ impl MlxModelWeights {
                 s1_dispatches += 1;
             }
 
-            // -- SDPA (was start of old S2) --
-            if is_sliding {
-                let p = SdpaSlidingParams {
-                    n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                    seq_len: 1, kv_seq_len: kv_seq_len as u32,
-                    window_size: self.sliding_window as u32, scale: 1.0,
+            // -- SDPA (flash_attn_vec, was start of old S2) --
+            {
+                let p = FlashAttnVecParams {
+                    num_heads: nh as u32,
+                    num_kv_heads: nkv as u32,
+                    head_dim: hd as u32,
+                    kv_seq_len: kv_seq_len as u32,
                     kv_capacity: kv_capacity as u32,
+                    scale: 1.0,
+                    mask_type: if is_sliding { 2 } else { 1 },
+                    sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                    softcap: 0.0,
                 };
-                mlx_native::ops::sdpa_sliding::sdpa_sliding(
-                    s.encoder_mut(), reg, dev,
+                s.flash_attn_vec(reg, dev,
                     &self.activations.attn_q, &self.kv_caches[layer_idx].k,
-                    &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                ).map_err(|e| anyhow::anyhow!("sdpa_sliding: {e}"))?;
-            } else {
-                let p = SdpaParams {
-                    n_heads: nh as u32, n_kv_heads: nkv as u32, head_dim: hd as u32,
-                    seq_len: 1, kv_seq_len: kv_seq_len as u32, scale: 1.0,
-                    kv_capacity: kv_capacity as u32,
-                };
-                s.sdpa(reg, dev, &self.activations.attn_q, &self.kv_caches[layer_idx].k,
-                    &self.kv_caches[layer_idx].v, &self.activations.sdpa_out, &p, 1,
-                ).map_err(|e| anyhow::anyhow!("sdpa: {e}"))?;
+                    &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
+                    &self.activations.flash_attn_tmp, &p,
+                ).map_err(|e| anyhow::anyhow!("flash_attn_vec: {e}"))?;
             }
-            s1_dispatches += 1; // SDPA
+            s1_dispatches += 2; // flash_attn_vec main + reduce
 
             // O-proj: sdpa_out → attn_out
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
@@ -3612,6 +3604,14 @@ fn alloc_activation_buffers(
         mlp_fused_1: alloc_f32(moe_interm, "mlp_fused_1")?,
         mlp_down: alloc_f32(hs, "mlp_down")?,
         sdpa_out: alloc_f32(num_heads * max_hd, "sdpa_out")?,
+        flash_attn_tmp: {
+            // Sized for the largest head config (global: 16 heads * dk512).
+            let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+                num_heads as u32, max_hd as u32,
+            );
+            let tmp_elems = tmp_bytes / std::mem::size_of::<f32>();
+            alloc_f32(tmp_elems, "flash_attn_tmp")?
+        },
         norm_params,
         rope_params_sliding,
         rope_params_global,
