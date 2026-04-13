@@ -872,7 +872,7 @@ impl MlxModelWeights {
         let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
             .map_err(|e| anyhow::anyhow!("lm_head dummy: {e}"))?;
 
-        Ok(Self {
+        let mut result = Ok(Self {
             embed_weight,
             layers,
             final_norm,
@@ -896,7 +896,28 @@ impl MlxModelWeights {
             moe_intermediate_size: cfg.moe_intermediate_size,
             k_eq_v: cfg.attention_k_eq_v,
             rope_freq_factors: model.rope_freqs_host().to_vec(),
-        })
+        });
+
+        // Pre-initialize constant param buffers so we never write them
+        // inside the hot forward_decode path.  Writing to a shared Metal
+        // buffer mid-session can force CPU-GPU synchronization.
+        if let Ok(ref mut w) = result {
+            // Softcap params: [cap, n_elements_as_f32_bits]
+            if let Some(cap) = w.final_logit_softcapping {
+                let p: &mut [f32] = w.activations.softcap_params.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("softcap_params init: {e}"))?;
+                p[0] = cap;
+                p[1] = f32::from_bits(w.vocab_size as u32);
+            }
+            // Argmax params: [vocab_size]
+            {
+                let p: &mut [u32] = w.activations.argmax_params.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
+                p[0] = w.vocab_size as u32;
+            }
+        }
+
+        result
     }
 
     /// Clear all KV caches (for new generation).
@@ -1257,8 +1278,8 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // Barrier: norm_params shared with post-FF norm 1 above
-                s.barrier();
+                // No barrier needed: post-FF norm 1 and pre-FF norm 2 have
+                // disjoint read/write sets (norm_params is read-only).
 
                 // -- GPU pre-feedforward norm 2: residual → moe_norm_out --
                 s.rms_norm(
@@ -1271,8 +1292,8 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // Barrier: norm_params shared with pre-FF norm 2 above
-                s.barrier();
+                // No barrier needed: pre-FF norm 2 and router norm have
+                // disjoint read/write sets (norm_params + residual are read-only).
 
                 // -- GPU router input prep + projection --
                 s.rms_norm(
@@ -1525,14 +1546,8 @@ impl MlxModelWeights {
             s.barrier();
 
             // GPU softcap (if configured)
+            // softcap_params pre-initialized at model load time (constant values).
             if let Some(cap) = self.final_logit_softcapping {
-                // Write softcap params: [cap, n_elements_as_f32_bits]
-                {
-                    let p: &mut [f32] = self.activations.softcap_params.as_mut_slice()
-                        .map_err(|e| anyhow::anyhow!("softcap params: {e}"))?;
-                    p[0] = cap;
-                    p[1] = f32::from_bits(vocab_size as u32);
-                }
                 mlx_native::ops::softcap::dispatch_softcap(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.logits,
@@ -1547,12 +1562,7 @@ impl MlxModelWeights {
             }
 
             // GPU argmax
-            {
-                let p: &mut [u32] = self.activations.argmax_params.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("argmax params write: {e}"))?;
-                // argmax_params is allocated as f32 but we write u32 — same size
-                p[0] = vocab_size as u32;
-            }
+            // argmax_params pre-initialized at model load time (constant vocab_size).
             mlx_native::ops::argmax::dispatch_argmax_f32(
                 s.encoder_mut(), reg, metal_dev,
                 &self.activations.logits,
@@ -2131,14 +2141,8 @@ impl MlxModelWeights {
                 anyhow::bail!("Kernel profile requires GPU lm_head (F16 weight)");
             }
 
-            // Softcap
+            // Softcap (params pre-initialized at model load time)
             if let Some(cap) = self.final_logit_softcapping {
-                {
-                    let p: &mut [f32] = self.activations.softcap_params.as_mut_slice()
-                        .map_err(|e| anyhow::anyhow!("softcap params: {e}"))?;
-                    p[0] = cap;
-                    p[1] = f32::from_bits(vocab_size as u32);
-                }
                 mlx_native::ops::softcap::dispatch_softcap(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.logits, &self.activations.logits,
@@ -2146,12 +2150,7 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("GPU softcap: {e}"))?;
             }
 
-            // Argmax
-            {
-                let p: &mut [u32] = self.activations.argmax_params.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("argmax params: {e}"))?;
-                p[0] = vocab_size as u32;
-            }
+            // Argmax (params pre-initialized at model load time)
             mlx_native::ops::argmax::dispatch_argmax_f32(
                 s.encoder_mut(), reg, metal_dev,
                 &self.activations.logits, &self.activations.argmax_index,
