@@ -14,12 +14,13 @@
 //!
 //! # Status
 //!
-//! Phase 5 step 4: MoE single-session optimization.
+//! Phase 5c: S3 merge — router_proj merged into S2.
 //! - Dense MLP path merged into 1 session (SDPA→down in 1 session).
 //! - GPU norms, adds, GELU, mul in merged sessions.
 //! - GPU dense GEMM for lm_head (F16) replaces CPU matmul.
 //! - MoE experts: ALL experts in ONE session using GPU SwiGLU + accumulate.
-//!   Eliminates 16 sessions/layer → 1, for 4 sessions/layer total.
+//! - Router proj + input prep merged into S2 (eliminates 30 S3 sessions).
+//!   3 sessions/layer total: S1(QKV), S2(SDPA+MLP+router), S4(experts).
 
 use anyhow::Result;
 use mlx_native::{
@@ -137,7 +138,7 @@ impl ProfileAccumulator {
         let gpu_total = s1_avg + s2_avg + s3_avg + s4_avg + head_gpu_avg;
         let cpu_total = cpu1_avg + cpu2_avg + cpu3_avg + cpu4_avg + head_cpu_avg;
 
-        eprintln!("║ {num_layers} layers x 4 sessions + 1 head = {} sessions/token", num_layers * 4 + 1);
+        eprintln!("║ {num_layers} layers x 3 sessions + 1 head = {} sessions/token", num_layers * 3 + 1);
         eprintln!("║");
         eprintln!("║ Session breakdown (avg across {num_layers} layers, {n} tokens):");
         eprintln!("║   S1 (QKV proj):      {:8.1} us ({:5.2} ms total)", s1_avg / num_layers as f64, s1_avg / 1000.0);
@@ -299,6 +300,11 @@ pub struct MlxMoeWeights {
     pub top_k: usize,
     /// MoE intermediate size per expert.
     pub moe_intermediate_size: usize,
+    /// Pre-computed router combined weight: `router_scale[i] * (hidden_size^-0.5)`.
+    /// Used by GPU `rms_norm` to compute the router input in one dispatch:
+    ///   `output = unit_norm(residual) * router_combined_weight`
+    /// This replaces the 3-step CPU sequence: unit_norm → scale → mul.
+    pub router_combined_weight: MlxBuffer,
 }
 
 /// Per-layer norm weights (7 RmsNorm per layer).
@@ -665,6 +671,27 @@ impl MlxModelWeights {
                 expert_down
             };
 
+            // Pre-compute router combined weight for GPU router input prep:
+            //   router_combined_weight[i] = router_scale[i] * (hidden_size ^ -0.5)
+            // This allows a single GPU rms_norm dispatch to replace the 3-step
+            // CPU sequence (unit_norm + scale + mul).
+            let router_combined_weight = {
+                let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
+                let rs: &[f32] = router_scale.as_slice()
+                    .map_err(|e| anyhow::anyhow!("router_scale read for combined weight: {e}"))?;
+                let mut combined = mlx_device.alloc_buffer(
+                    cfg.hidden_size * std::mem::size_of::<f32>(),
+                    mlx_native::DType::F32,
+                    vec![cfg.hidden_size],
+                ).map_err(|e| anyhow::anyhow!("router_combined_weight alloc: {e}"))?;
+                let dst: &mut [f32] = combined.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("router_combined_weight write: {e}"))?;
+                for j in 0..cfg.hidden_size {
+                    dst[j] = rs[j] * scale_factor;
+                }
+                combined
+            };
+
             let moe = MlxMoeWeights {
                 expert_gate_up: expert_gate_up_live,
                 expert_down: expert_down_live,
@@ -679,6 +706,7 @@ impl MlxModelWeights {
                 down_ggml_dtype,
                 top_k: cfg.top_k_experts,
                 moe_intermediate_size: cfg.moe_intermediate_size,
+                router_combined_weight,
             };
 
             // Norm weights (F32)
@@ -887,16 +915,15 @@ impl MlxModelWeights {
 
     /// Run one decoder layer with session-collapsed GPU dispatch.
     ///
-    /// Session structure (4 sessions per layer):
+    /// Session structure (3 sessions per layer — Phase 5c):
     ///   Session 1: Q/K/V projections
     ///   CPU: head norms, V norm, RoPE, KV cache update
     ///   Session 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
     ///              → GPU-norm(pre-FF) → gate → up → GPU-GELU(gate) → GPU-mul
-    ///              → down
-    ///   CPU: post-FF-norm1, pre-FF-norm2, MoE routing prep
-    ///   Session 3: router_proj
-    ///   CPU: softmax + top-k
-    ///   Session 4: zero(accum) + for each expert:
+    ///              → down → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2)
+    ///              → GPU-norm(router) → router_proj
+    ///   CPU: softmax + top-k on router logits
+    ///   Session 3 (was S4): zero(accum) + for each expert:
     ///     gate_up matmul → GPU-SwiGLU → down matmul → GPU-accumulate
     ///   CPU: post-FF-norm2, combine, layer scalar
     fn forward_decode_layer(
@@ -1040,6 +1067,13 @@ impl MlxModelWeights {
         // =====================================================================
         // SESSION 2: SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
         //            → GPU-norm(pre-FF) → gate → up → GPU-GELU → GPU-mul → down
+        //            → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2) → GPU-norm(router)
+        //            → router_proj
+        //
+        // Phase 5c optimization: S3 (router_proj) merged into S2.
+        // The router input prep (unit_norm + scale) is done by GPU rms_norm
+        // using the pre-computed router_combined_weight. This eliminates
+        // 30 sessions per token (one S3 per layer).
         // =====================================================================
         let s2_start = Instant::now();
         let mut s2_dispatches = 0usize;
@@ -1138,6 +1172,50 @@ impl MlxModelWeights {
                 &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
             s2_dispatches += 1; // down
 
+            // ---- Phase 5c: merged S3 ops (router prep + router proj) ----
+            // GPU post-feedforward norm 1: mlp_down → attn_out (reuse as scratch)
+            // This replaces the CPU post-FF norm 1 that was between S2 and S3.
+            s.rms_norm(
+                reg, metal_dev,
+                &self.activations.mlp_down,
+                &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
+                &self.activations.attn_out,  // output to attn_out (scratch)
+                &self.activations.norm_params,
+                1, hs as u32,
+            ).map_err(|e| anyhow::anyhow!("GPU post-FF norm 1: {e}"))?;
+            s2_dispatches += 1; // post-FF norm 1
+
+            // GPU pre-feedforward norm 2: residual → moe_norm_out (MoE expert input)
+            // This replaces the CPU pre-FF norm 2 that was at the top of forward_decode_moe.
+            s.rms_norm(
+                reg, metal_dev,
+                &self.activations.residual,
+                &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                &self.activations.moe_norm_out,
+                &self.activations.norm_params,
+                1, hs as u32,
+            ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm 2: {e}"))?;
+            s2_dispatches += 1; // pre-FF norm 2
+
+            // GPU router input prep: unit_norm(residual) * router_combined_weight → norm_out
+            // The pre-computed router_combined_weight = router_scale * hs^-0.5,
+            // so rms_norm(residual, router_combined_weight) gives exactly the router input.
+            s.rms_norm(
+                reg, metal_dev,
+                &self.activations.residual,
+                &self.layers[layer_idx].moe.router_combined_weight,
+                &self.activations.norm_out,
+                &self.activations.norm_params,
+                1, hs as u32,
+            ).map_err(|e| anyhow::anyhow!("GPU router input prep: {e}"))?;
+            s2_dispatches += 1; // router norm
+
+            // Router projection: norm_out → moe_router_logits (was Session 3)
+            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                &self.layers[layer_idx].moe.router_proj,
+                &mut self.activations.moe_router_logits, 1)?;
+            s2_dispatches += 1; // router proj
+
             s.finish().map_err(|e| anyhow::anyhow!("S2 finish: {e}"))?;
         }
         let s2_elapsed = s2_start.elapsed();
@@ -1146,31 +1224,26 @@ impl MlxModelWeights {
             p.s2_dispatches[layer_idx] = s2_dispatches;
         }
 
-        // -- CPU: Post-feedforward norm 1 on mlp_down --
+        // -- CPU: softmax + top-k on router logits (replaces S3+CPU3) --
+        // Post-FF norm 1 result is now in attn_out (GPU wrote it in S2).
+        // MoE norm input is now in moe_norm_out (GPU wrote it in S2).
+        // Router logits are now in moe_router_logits (GPU wrote it in S2).
         let cpu2_start = Instant::now();
-        cpu_rms_norm_weighted(
-            &self.activations.mlp_down, &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
-            &mut self.activations.norm_out, hs, eps,
-        )?;
-        {
-            let src: &[f32] = self.activations.norm_out.as_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            let dst: &mut [f32] = self.activations.mlp_down.as_mut_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            dst[..hs].copy_from_slice(&src[..hs]);
-        }
 
-        // -- MoE path (sessions 3-4) --
-        let (s3_us, cpu3_us, s4_us, s3_disp, s4_disp) =
-            self.forward_decode_moe(layer_idx, gpu)?;
+        // -- MoE path (session 4 only — S3 was merged into S2) --
+        let (s4_us, s4_disp) =
+            self.forward_decode_moe_no_router(layer_idx, gpu)?;
 
         // -- Combine MLP + MoE, final norm, residual, layer scalar (CPU) --
+        // Note: normed mlp_down is now in attn_out (GPU wrote post-FF norm 1 there in S2).
         {
-            let mlp: &[f32] = self.activations.mlp_down.as_slice().map_err(|e| anyhow::anyhow!("m: {e}"))?;
+            let mlp: &[f32] = self.activations.attn_out.as_slice().map_err(|e| anyhow::anyhow!("m: {e}"))?;
             let moe: &[f32] = self.activations.moe_accum.as_slice().map_err(|e| anyhow::anyhow!("mo: {e}"))?;
-            let combined: &mut [f32] = self.activations.attn_out.as_mut_slice().map_err(|e| anyhow::anyhow!("c: {e}"))?;
+            let combined: &mut [f32] = self.activations.mlp_down.as_mut_slice().map_err(|e| anyhow::anyhow!("c: {e}"))?;
             for i in 0..hs { combined[i] = mlp[i] + moe[i]; }
         }
         cpu_rms_norm_weighted(
-            &self.activations.attn_out, &self.layers[layer_idx].norms.post_feedforward_layernorm,
+            &self.activations.mlp_down, &self.layers[layer_idx].norms.post_feedforward_layernorm,
             &mut self.activations.norm_out, hs, eps,
         )?;
         cpu_add(&self.activations.residual, &self.activations.norm_out, &mut self.activations.hidden, hs)?;
@@ -1189,15 +1262,15 @@ impl MlxModelWeights {
         }
         let cpu2_and_4_elapsed = cpu2_start.elapsed();
         if let Some(ref mut p) = profile {
-            // cpu2 = total elapsed minus S3+CPU3+S4 times (which are measured inside forward_decode_moe)
+            // S3 is now merged into S2, so s3_us and cpu3_us are zero.
             let total_cpu2_4 = cpu2_and_4_elapsed.as_secs_f64() * 1e6;
-            let cpu4_us = total_cpu2_4 - s3_us - cpu3_us - s4_us;
-            p.layer_cpu2_us[layer_idx] = cpu4_us.max(0.0); // pre-MoE CPU norm + post-MoE combine
-            p.layer_s3_us[layer_idx] = s3_us;
-            p.layer_cpu3_us[layer_idx] = cpu3_us;
+            let cpu4_us = total_cpu2_4 - s4_us;
+            p.layer_cpu2_us[layer_idx] = cpu4_us.max(0.0);
+            p.layer_s3_us[layer_idx] = 0.0;  // S3 merged into S2
+            p.layer_cpu3_us[layer_idx] = 0.0; // CPU softmax/topk now in CPU2
             p.layer_s4_us[layer_idx] = s4_us;
             p.layer_cpu4_us[layer_idx] = cpu4_us.max(0.0);
-            p.s3_dispatches[layer_idx] = s3_disp;
+            p.s3_dispatches[layer_idx] = 0; // S3 merged into S2
             p.s4_dispatches[layer_idx] = s4_disp;
         }
 
@@ -1520,6 +1593,246 @@ impl MlxModelWeights {
         }
 
         Ok((s3_us, cpu3_us, s4_us, 1usize, s4_dispatches))
+    }
+
+    /// MoE forward pass WITHOUT router projection (S3 merged into S2).
+    ///
+    /// Preconditions (set by S2):
+    /// - `moe_router_logits` contains router logits (from GPU router proj in S2)
+    /// - `moe_norm_out` contains pre-FF-norm-2 of residual (from GPU norm in S2)
+    ///
+    /// Session structure (1 session):
+    ///   CPU: softmax + top-k on router logits
+    ///   Session 4: zero_buffer(accum) + expert _id dispatches + accumulate
+    ///   CPU: post-FF-norm2
+    ///
+    /// Returns (s4_us, s4_dispatches).
+    fn forward_decode_moe_no_router(
+        &mut self,
+        layer_idx: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<(f64, usize)> {
+        let hs = self.hidden_size;
+        let top_k = self.layers[layer_idx].moe.top_k;
+        let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
+
+        // CPU: softmax + top-k on router logits (already in moe_router_logits from S2)
+        let logits: &[f32] = self.activations.moe_router_logits.as_slice()
+            .map_err(|e| anyhow::anyhow!("router logits read: {e}"))?;
+        let num_experts = self.num_experts;
+
+        let max_val = logits[..num_experts].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if max_val.is_nan() || max_val.is_infinite() {
+            anyhow::bail!(
+                "Router logits corrupted at layer {layer_idx}: max_val={max_val}"
+            );
+        }
+        let mut probs = vec![0.0f32; num_experts];
+        let mut sum = 0.0f32;
+        for i in 0..num_experts {
+            probs[i] = (logits[i] - max_val).exp();
+            sum += probs[i];
+        }
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+
+        let mut indices: Vec<usize> = (0..num_experts).collect();
+        indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+        let top_k_indices: Vec<u32> = indices[..top_k].iter().map(|&i| i as u32).collect();
+        let top_probs: Vec<f32> = indices[..top_k].iter().map(|&i| probs[i]).collect();
+
+        let top_sum: f32 = top_probs.iter().sum();
+        let top_k_weights: Vec<f32> = top_probs.iter().map(|p| p / top_sum).collect();
+
+        let per_expert_scale: Vec<f32> = {
+            let s: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
+                .map_err(|e| anyhow::anyhow!("per_expert_scale: {e}"))?;
+            s.to_vec()
+        };
+
+        // Zero the accumulator on CPU (fast for 2816 elements)
+        {
+            let accum: &mut [f32] = self.activations.moe_accum.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("moe accum zero: {e}"))?;
+            accum[..hs].fill(0.0);
+        }
+
+        // =====================================================================
+        // SESSION 4: All expert dispatches in ONE session.
+        // =====================================================================
+        let s4_start = Instant::now();
+        let mut s4_dispatches = 0usize;
+
+        let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
+            && self.layers[layer_idx].moe.stacked_down.is_some();
+
+        if use_fused_id {
+            // Write expert ids to GPU buffer
+            {
+                let ids_dst: &mut [u32] = self.activations.moe_expert_ids.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("moe_expert_ids write: {e}"))?;
+                for k_idx in 0..top_k {
+                    ids_dst[k_idx] = top_k_indices[k_idx];
+                }
+            }
+
+            let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
+            let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                self.layers[layer_idx].moe.down_ggml_dtype)?;
+
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
+
+                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_accum, hs,
+                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
+                s4_dispatches += 1;
+
+                let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: 1,
+                    top_k: top_k as u32,
+                    n: (2 * moe_int) as u32,
+                    k: hs as u32,
+                    n_experts: self.num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                    ggml_type: ggml_type_gu,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_norm_out,
+                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_gate_up_id_out,
+                    &gu_params,
+                ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
+                s4_dispatches += 1;
+
+                for k_idx in 0..top_k {
+                    let offset_bytes = k_idx * 2 * moe_int * std::mem::size_of::<f32>();
+                    let swiglu_out_offset = k_idx * moe_int * std::mem::size_of::<f32>();
+                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode_offset(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_gate_up_id_out,
+                        offset_bytes,
+                        &self.activations.moe_swiglu_id_out,
+                        swiglu_out_offset,
+                        moe_int,
+                    ).map_err(|e| anyhow::anyhow!("moe swiglu _id: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
+                    n_tokens: top_k as u32,
+                    top_k: 1,
+                    n: hs as u32,
+                    k: moe_int as u32,
+                    n_experts: self.num_experts as u32,
+                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                    ggml_type: ggml_type_dn,
+                };
+                s.quantized_matmul_id_ggml(
+                    reg, dev,
+                    &self.activations.moe_swiglu_id_out,
+                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                    &self.activations.moe_expert_ids,
+                    &mut self.activations.moe_down_id_out,
+                    &dn_params,
+                ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
+                s4_dispatches += 1;
+
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
+                    if w.abs() < 1e-10 {
+                        continue;
+                    }
+                    let offset_bytes = k_idx * hs * std::mem::size_of::<f32>();
+                    mlx_native::ops::moe_dispatch::moe_accumulate_encode_offset(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_accum,
+                        &self.activations.moe_down_id_out,
+                        offset_bytes,
+                        w, hs,
+                    ).map_err(|e| anyhow::anyhow!("moe accumulate _id: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
+            }
+        } else {
+            // --- Fallback: per-expert loop ---
+            {
+                let (exec, reg) = gpu.split();
+                let dev = exec.device();
+                let metal_dev = dev.metal_device();
+                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
+
+                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.moe_accum, hs,
+                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
+                s4_dispatches += 1;
+
+                for k_idx in 0..top_k {
+                    let eid = top_k_indices[k_idx] as usize;
+                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
+
+                    if w.abs() < 1e-10 {
+                        continue;
+                    }
+
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
+                        &self.layers[layer_idx].moe.expert_gate_up[eid],
+                        &mut self.activations.moe_gate_up_out, 1)?;
+                    s4_dispatches += 1;
+
+                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_gate_up_out,
+                        &self.activations.mlp_fused,
+                        moe_int,
+                    ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
+                    s4_dispatches += 1;
+
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                        &self.layers[layer_idx].moe.expert_down[eid],
+                        &mut self.activations.moe_expert_out, 1)?;
+                    s4_dispatches += 1;
+
+                    mlx_native::ops::moe_dispatch::moe_accumulate_encode(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_accum,
+                        &self.activations.moe_expert_out,
+                        w, hs,
+                    ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
+                    s4_dispatches += 1;
+                }
+
+                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
+            }
+        }
+        let s4_us = s4_start.elapsed().as_secs_f64() * 1e6;
+
+        // Post-feedforward norm 2 on MoE output (CPU)
+        cpu_rms_norm_weighted(
+            &self.activations.moe_accum,
+            &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+            &mut self.activations.moe_norm_out,
+            hs, self.rms_norm_eps,
+        )?;
+        {
+            let src: &[f32] = self.activations.moe_norm_out.as_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
+            let dst: &mut [f32] = self.activations.moe_accum.as_mut_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
+            dst[..hs].copy_from_slice(&src[..hs]);
+        }
+
+        Ok((s4_us, s4_dispatches))
     }
 
     /// Final norm + GPU lm_head (dense GEMM F16) + softcap + argmax.
@@ -1941,9 +2254,19 @@ fn gelu_tanh(x: f32) -> f32 {
 //       - Total sessions: 4 per layer (QKV, SDPA+MLP, router, experts) + 1 head
 //       - 30 layers × 4 + 1 = 121 sessions per token (down from 571)
 //
-// OPTIMIZATIONS deferred to Phase 5c:
+// DONE (Phase 5c — S3 merge):
+// - [x] Merged S3 (router_proj) into S2:
+//       - GPU post-FF norm 1 (mlp_down → attn_out) replaces CPU norm
+//       - GPU pre-FF norm 2 (residual → moe_norm_out) replaces CPU norm
+//       - GPU router input prep via rms_norm with pre-computed combined weight
+//       - Router matmul now dispatched at end of S2
+//       - Eliminates 30 sessions/token (S3 was 1 dispatch per session per layer)
+//       - Total sessions: 3 per layer (QKV, SDPA+MLP+router, experts) + 1 head
+//       - 30 layers × 3 + 1 = 91 sessions per token (down from 121)
+//
+// OPTIMIZATIONS deferred:
 // - [ ] GPU RoPE with freq_factors support (needs new kernel)
 // - [ ] GPU embedding via embedding_gather kernel
-// - [ ] GPU MoE routing (softmax + argsort on GPU)
 // - [ ] GPU argmax via dispatch_argmax_f32
 // - [ ] GPU KV cache update via dispatch_kv_cache_copy
+// - [ ] Merge S1 into S2 (needs GPU head norms + RoPE)
