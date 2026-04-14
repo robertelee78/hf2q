@@ -1040,6 +1040,14 @@ impl MlxModelWeights {
             total_dispatches += 1;
             s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
 
+            // --- H3 Dual buffer: split encoding at a layer boundary ---
+            // If HF2Q_DUAL_BUFFER=N, commit buffer 0 after layer N and start
+            // buffer 1. GPU executes buffer 0 while CPU encodes buffer 1.
+            let dual_buffer_split: Option<usize> = std::env::var("HF2Q_DUAL_BUFFER")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0 && n < num_layers);
+
             // --- 2. Transformer layers ---
             for layer_idx in 0..num_layers {
                 let hd = self.head_dims[layer_idx];
@@ -1559,6 +1567,20 @@ impl MlxModelWeights {
                 if let Some(ref mut p) = profile {
                     // All layer ops in single session — attribute everything to S1
                     p.s1_dispatches[layer_idx] = total_dispatches;
+                }
+
+                // H3 dual-buffer split: commit buffer 0 after N layers, start buffer 1
+                if dual_buffer_split == Some(layer_idx + 1) {
+                    let b0_barriers = s.barrier_count();
+                    let _old = s.commit(); // commit buffer 0, GPU starts executing
+                    // Create fresh session for buffer 1 — Metal FIFO guarantees ordering
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("dual-buffer begin: {e}"))?;
+                    // New tracker starts clean — the commit acts as a full barrier
+                    s.track_dispatch(&[], &[&self.activations.hidden]); // hidden was written by prev layer
+                    if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                        eprintln!("  [DUAL_BUFFER] split at layer {} — buf0: {} dispatches, {} barriers",
+                            layer_idx + 1, total_dispatches, b0_barriers);
+                    }
                 }
             }
 
