@@ -1,7 +1,7 @@
 # ADR-006: mlx-native as hf2q's GPU Compute Backend (migrate from candle)
 
-**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13: kernel-level changes (4a F16 KV, 4b Q8_0 NSG) implemented; gap re-attributed to barrier stall cost. Phase 4e revised 2026-04-13: proper computation graph architecture (graph IR + fusion + reorder + dual command buffer encoding) — porting llama.cpp's full Metal execution pipeline.
-**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised: computation graph architecture)
+**Status:** Accepted. Phase 0.5 fresh diagnosis 2026-04-14: **94.7 tok/s** (median, σ=3.0) vs llama.cpp **104.58** (σ=0.54). Gap: 9.9 tok/s = 1.00ms/token. Decomposition: 58% barrier singleton overhead (51% singletons vs llama.cpp's ~40%), 40% CPU encode serial overhead (0.40ms not overlapped). Compute floor at parity (5.88ms). 20 hypotheses falsified. See `docs/spike-phase05-fresh-diagnosis.md`.
+**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised) → 2026-04-14 (Phase 0.5: fresh diagnosis, End gate re-baselined to ≥104.58)
 **Decision Makers:** Robert, Claude
 **Supersedes (implicitly):** the original "use candle" decision from hf2q's early Crawl phase, never written as an ADR
 **Related ADRs:** ADR-005 (Inference Server, Phase 1b speed gap context), ADR-004 (GGUF compatibility — mlx-native must preserve all of it)
@@ -45,7 +45,11 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim. This is the
 16. ConflictTracker barrier elision will reduce barrier count (2026-04-13 FALSIFIED: all 606 barriers are true RAW dependencies with physically distinct buffers. The computation graph is a strict chain — no barriers can be elided without changing dispatch ORDER, not just dispatch TIMING.)
 17. V-proj reorder is safe because buffer ranges are disjoint (2026-04-13 PARTIALLY FALSIFIED: V-proj after Q-norm showed 6% speedup (119 tok/s) but produced all-pad output. The dependency analysis says the reorder is safe — Metal barriers are full memory fences — but output is wrong. Hidden dependency not yet identified. Investigation required before any reorder work proceeds.)
 
-Each one is a hypothesis that *sounded* right in static analysis and would have produced multi-day patch refutation cycles without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 89.8 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
+18. Imperative dispatch reordering is equivalent to graph-level reorder + sequential encoding (2026-04-13 FALSIFIED by the V-proj experiment — they produce different behavior on Apple Silicon's Metal concurrent encoder)
+19. Graph-level fusion+reorder+dual-buffer will close the barrier stall gap (2026-04-14 FALSIFIED: 0.0 tok/s improvement. The forward pass already has hand-fused kernels and the 7% reorderable nodes don't change the barrier cost profile.)
+20. The gap is ~1.5 tok/s and essentially at parity (2026-04-14 mid-session estimate FALSIFIED by proper 7-run benchmark: cherry-picked warm outlier runs (100.6, 101.4 tok/s) do not represent the median (94.7 tok/s, σ=3.0). The actual gap is 9.9 tok/s to llama.cpp's 104.58. Lesson: never report outlier runs as the measurement — always take median of 5+ runs with warmup discarded.)
+
+Each one is a hypothesis that *sounded* right in static analysis (or in the case of #20, sounded right from a small sample) and would have produced multi-day wasted work or premature Walk closure without the measure-first discipline. The mantra is the load-bearing reason hf2q is at 94.7 tok/s *coherent* rather than at some hypothetical "faster but broken" state. **This ADR's 6-phase plan is structured around the same discipline: measure (Phase 0) before deciding the Phase 4 scope, validate (Phase 3 bitwise) before integrating (Phase 5), and measure again (Phase 6) before declaring Walk done.**
 
 **Cross-reference:** the same mantra section appears verbatim in [ADR-005](ADR-005-inference-server.md). Both ADRs should remain in sync if the mantra source file is updated.
 
@@ -53,14 +57,16 @@ Each one is a hypothesis that *sounded* right in static analysis and would have 
 
 ## Problem Statement
 
-hf2q's Phase 1b End gate (per ADR-005:162, re-baselined 2026-04-11) requires decode speed `≥102 tok/s` on M5 Max, Gemma 4 26B MoE, Q4_K_M, with byte-identical greedy generation vs llama.cpp at T=0. Coherence is met; speed is not.
+hf2q's Phase 1b End gate (per ADR-005:195, re-baselined 2026-04-14) requires decode speed `≥104.58 tok/s` on M5 Max, Gemma 4 26B MoE, Q4_K_M, with byte-identical greedy generation vs llama.cpp at T=0. Coherence is met (sourdough gate 3095≥3094, byte-identical through 830+ decode tokens); speed is not.
 
 **Baseline progression:**
 - 2026-04-11 (pre-ADR-006): 84.9 tok/s on candle backend. Gap: 17 tok/s.
 - 2026-04-13 (post-mlx-native migration): 89.8 tok/s on mlx-native backend (candle: 87.5). Gap: 15.5 tok/s.
-- 2026-04-13 (post-Phase 4a F16 KV + 4b Q8_0 NSG): **91.0 tok/s**. Gap: **15.0 tok/s** to llama.cpp's 106.0 tok/s.
+- 2026-04-13 (post-Phase 4a F16 KV + 4b Q8_0 NSG): 91.0 tok/s. Gap: 15.0 tok/s to llama.cpp's 106.0 tok/s.
+- 2026-04-13 (post-router/MLP interleave): 93.6 tok/s. 606→486 barriers.
+- 2026-04-14 (Phase 0.5 fresh diagnosis, 7-run benchmark): **94.7 tok/s** (median, σ=3.0). llama.cpp: **104.58 tok/s** (σ=0.54). Gap: **9.9 tok/s** (1.00 ms/token).
 
-The mlx-native migration closed 2.3 tok/s (framework overhead). F16 KV cache closed 1.2 tok/s (bandwidth). Q8_0 NSG=4 was neutral (only 4% of tensors). The remaining **15.0 tok/s is entirely barrier stall cost** — raw GPU compute matches llama.cpp at ~5.9ms, but our barriers cost 4.67ms vs their ~3.1ms. See §Phase 4 Revision below.
+The mlx-native migration closed 2.3 tok/s (framework overhead). F16 KV cache closed 1.2 tok/s (bandwidth). Q8_0 NSG=4 was neutral (only 4% of tensors). Router/MLP interleave closed 3.5 tok/s (120 fewer barriers). Graph optimization closed 0 tok/s (Phase 4e falsified). The remaining **9.9 tok/s decomposes as**: barrier singleton overhead ~0.58ms (58% of gap) + CPU encode serial overhead ~0.40ms (40% of gap). Raw GPU compute matches llama.cpp at ~5.88ms. See `docs/spike-phase05-fresh-diagnosis.md`.
 
 In a single 2026-04-11 session, three consecutive static-evidence-driven kernel-port hypotheses were empirically falsified on M5 Max:
 
@@ -867,4 +873,6 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 | Phase 4e results | Claude | 2026-04-14 | **Honest result: graph optimization provides NO measurable speedup.** 3-run median: baseline 92.2 tok/s, graph-opt 91.8 tok/s (within noise). fusions=0 (model already uses hand-fused kernels), reordered=60/872 (7%), dual-buffer net zero (0.3ms saved by overlap, 0.3ms added by encode overhead). |
 | Phase 4e falsified | Claude | 2026-04-14 | 19. Graph-level fusion+reorder+dual-buffer will close the barrier stall gap (FALSIFIED: 0.0 tok/s improvement. The forward pass already has hand-fused kernels and the 7% reorderable nodes don't change the barrier cost profile. The remaining 13 tok/s gap to llama.cpp (91.8 vs 104.9) is NOT in dispatch ordering.) |
 | Phase 4e partial | Claude | 2026-04-13 | Router/MLP interleaving: 120 barriers eliminated (606→486), 90.1→93.6 tok/s (+3.9%). Sourdough gate PASS (3095≥3094). New `router_norm_out` buffer avoids WAW on `norm_out`. |
-| Status | **Accepted** | Phase 4e complete | **Gap: 13.1 tok/s to llama.cpp (91.8 vs 104.9). Graph optimization infrastructure built but speedup is zero. The remaining gap lives somewhere other than dispatch ordering — needs fresh Phase 0-style investigation.** |
+| Phase 0.5 diagnosis | Claude | 2026-04-14 | 7-run benchmark (5 measurement + 2 warmup): hf2q **94.7 tok/s** (median, σ=3.0), llama.cpp **104.58 tok/s** (σ=0.54). Gap: **9.9 tok/s** (1.00 ms/token), 3.3σ statistically significant. No-barriers compute floor: 5.88ms (at parity). Barrier stalls: 4.28ms (516 barriers × 8.3μs) vs llama.cpp ~3.7ms (759 × 4.9μs). CPU encode: 0.40ms serial. Singletons: 51% of groups. See `docs/spike-phase05-fresh-diagnosis.md`. Earlier mid-session report of 98.7 tok/s was an outlier — corrected to 94.7 median. |
+| Phase 0.5 finding | Claude | 2026-04-14 | Gap decomposition: 58% barrier stalls (0.58ms — per-barrier cost 8.3μs vs llama.cpp 4.9μs, caused by 51% singleton groups vs their ~40%), 40% CPU encode overlap (0.40ms serial vs overlapped). Kernels at parity. Graph reorder doesn't help (Phase 4e). The lever is reducing singleton fraction — 30 fewer singletons = ~0.25ms saved. |
+| Status | **Accepted** | Phase 0.5 complete | **Gap: 9.9 tok/s to llama.cpp (94.7 vs 104.58). Two contributors: barrier singleton fraction (51% vs ~40%, 0.58ms) and CPU encode overlap (0.40ms). Next: identify which barrier_between calls generate false-positive singletons.** |
