@@ -1,7 +1,7 @@
 # ADR-006: mlx-native as hf2q's GPU Compute Backend (migrate from candle)
 
-**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13: kernel-level changes (4a F16 KV, 4b Q8_0 NSG) implemented; gap re-attributed to barrier stall cost. Phase 4 scope revised again 2026-04-13: dispatch reordering is the remaining lever.
-**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised twice)
+**Status:** Accepted (Phase 0 complete 2026-04-12; verdict: framework-overhead-dominated; see `docs/spike-1bNEW30-per-kernel-attribution.md`). Phase 4 scope revised 2026-04-13: kernel-level changes (4a F16 KV, 4b Q8_0 NSG) implemented; gap re-attributed to barrier stall cost. Phase 4e revised 2026-04-13: proper computation graph architecture (graph IR + fusion + reorder + dual command buffer encoding) — porting llama.cpp's full Metal execution pipeline.
+**Date:** 2026-04-11 (Proposed) → 2026-04-12 (Accepted) → 2026-04-13 (Phase 4 revised: computation graph architecture)
 **Decision Makers:** Robert, Claude
 **Supersedes (implicitly):** the original "use candle" decision from hf2q's early Crawl phase, never written as an ADR
 **Related ADRs:** ADR-005 (Inference Server, Phase 1b speed gap context), ADR-004 (GGUF compatibility — mlx-native must preserve all of it)
@@ -411,71 +411,285 @@ The initial profiling (per-kernel session overhead inflated SDPA/matmul apparent
 - `ConflictTracker` in `mlx-native/src/graph.rs` — automatic buffer-range-based barrier elision matching llama.cpp's `ggml_mem_ranges` system
 - All `s.barrier()` calls in `forward_mlx.rs` converted to `s.barrier_between(reads, writes)` — correctly emits 606/606 barriers (all true RAW conflicts confirmed)
 
-#### 4e — Closing the barrier stall gap (the remaining lever)
+#### 4e — Computation graph with fusion, reorder, and dual-buffer encoding
 
-**Goal:** Reduce barrier stall cost from 4.67ms to ≤3.1ms (matching llama.cpp), closing the 13.4 tok/s gap (90.1 → 103.5 tok/s).
+**Goal:** Close the remaining barrier stall gap (4.67ms → ≤3.1ms) by porting llama.cpp's full Metal execution architecture: graph IR → fusion pass → reorder pass → dual command buffer encoding. Target: 93.6 → ≥102 tok/s.
 
 **Measured baselines (2026-04-13, clean GPU, 3-run median each):**
-- hf2q: **90.1 tok/s**, encode=0.53ms, gpu_wait=10.52ms, 841 dispatches, 606 barriers, ratio=1.39
+- hf2q: **93.6 tok/s** (post router/MLP interleave), encode=0.53ms, gpu_wait=10.52ms, 486 barriers, ratio≈1.73
 - llama.cpp: **103.5 tok/s**, 9.66 ms/token, ~1811 nodes, 759 barriers, ratio=2.39
 
 **Concurrent group histogram (measured):**
 - hf2q: 456 × size-1 (75%), 65 × size-2 (11%), 85 × size-3 (14%), 0 × size-4+
 - llama.cpp: ~40% singletons, ~50% size-3+, groups up to size-4
 
-**Why llama.cpp's barriers cost less (measured, not inferred):**
+---
 
-Three structural differences confirmed by reading llama.cpp source (`ggml-metal-common.cpp`, `ggml-metal-context.m`, `ggml-metal-ops.cpp`) and capturing its graph debug output (`GGML_METAL_GRAPH_DEBUG=1`):
+##### Deep analysis of llama.cpp's Metal execution architecture
 
-1. **Graph pre-reorder** (`ggml_metal_graph_optimize_reorder` at `ggml-metal-common.cpp:209-373`): Before encoding, llama.cpp reorders the computation graph with a greedy 64-node lookahead. This pulls independent ops forward to fill concurrent windows. Key concurrent groups achieved:
-   - QKV matmul: 3 concurrent (same as hf2q)
-   - Q/K/V head norms: 3 concurrent (same as hf2q)
-   - RoPE(Q) + RoPE(K) + SET_ROWS(cache_v): 3 concurrent (hf2q can't — RoPE is fused into norm)
-   - SOFTMAX + 2 pre-FF norms: 3 concurrent (pulled forward by reorder)
-   - ARGSORT + REPEAT + dense_gate + dense_up: 4 concurrent (dense MLP interleaved with MoE routing)
-   - GET_ROWS + GLU + SUM_ROWS + GLU: 4 concurrent (MoE weight + activation interleaved)
-   - MUL_MAT + CLAMP + MUL_MAT_ID: 3 concurrent (dense_down + MoE_down + weight_clamp)
+Source study completed 2026-04-13. Every claim below is cited to a specific file and line range in `/opt/llama.cpp/ggml/src/ggml-metal/`.
 
-   hf2q dispatches in fixed code order and can only elide barriers (via `barrier_between`) — it cannot create new concurrent groups.
+**Execution pipeline (4 stages):**
 
-2. **Dual command buffer** (`ggml-metal-context.m:467-572`): llama.cpp splits the graph into 2 command buffers:
-   - Main thread: 181 nodes (~3 layers), committed immediately to GPU
-   - Async thread: 1630 nodes (~27 layers), encoded while GPU executes the first buffer
-   - Measured: `[GGML_BARRIERS] nodes=181 barriers=74` + `nodes=1630 barriers=685`
-   
-   hf2q uses 1 command buffer for all 841 dispatches, committed at the end. The GPU sits idle for 0.53ms during CPU encoding.
+```
+graph_build → graph_optimize → encode → GPU execute
+   (ggml)     (ggml-metal-      (ggml-metal-    (Metal
+               common.cpp)       context.m)      hardware)
+```
 
-3. **Dense MLP / MoE interleaving** (consequence of graph reorder): llama.cpp's reorder pulls dense MLP operations (gate+up projection, GLU, down projection) forward to run concurrently with MoE operations (routing, expert dispatch, weight normalization). hf2q runs them strictly sequentially: dense MLP first, then MoE.
+**Stage 1: Graph construction** — ggml builds `ggml_cgraph` during the forward pass. Each tensor operation is a node (`ggml_tensor *`) with `src[0..GGML_MAX_SRC]` input pointers and an implicit output (the tensor itself). The graph is a DAG — dependencies are structural through pointer relationships, not explicit edges.
 
-**V-proj reorder experiment (2026-04-13, 2 attempts):**
-- Attempt 1 (earlier session): moved V proj after Q norm, got 6% speedup but all-pad output. Code not committed.
-- Attempt 2 (this session): clean reimplementation of the same reorder. Same result: all-pad output. Adding an explicit forced `s.barrier()` before the reordered V proj fixes correctness.
-- Root cause: **imperative dispatch reordering within a single Metal concurrent encoder produces different execution semantics than llama.cpp's graph-level reorder followed by sequential encoding**. The buffer-range analysis says the reorder is safe, but the GPU disagrees. llama.cpp reorders nodes in a graph data structure, then encodes them sequentially into the command buffer — the encoder sees them in the new order as if that was always the intended order. Our imperative approach changes the code-level dispatch sequence, which may interact differently with Metal's concurrent dispatch scheduler.
+**Stage 2: Graph optimization** (`ggml_graph_optimize` at `ggml-metal-common.cpp:375-473`) — runs once per forward pass BEFORE any Metal encoding. Two sub-passes:
+
+*Sub-pass 2a — Fusion* (`ggml-metal-common.cpp:386-432`):
+- Scans consecutive nodes for fusable sequences starting with `ADD`, `NORM`, or `RMS_NORM`.
+- Uses `ggml_can_fuse()` (`ggml-impl.h:693-706`) which validates: all nodes same shape, all intermediate nodes have exactly 1 consumer, each node is a src of the next.
+- Fused sequences are packed into `node_info.fused` — the fused nodes travel as an atomic unit through the reorder pass. This prevents reorder from breaking fusion groups.
+- Concrete fused kernel pipelines (`ggml-metal-device.cpp:1592-1633`):
+  - `kernel_rms_norm_f32` (n_fuse=1, unfused baseline)
+  - `kernel_rms_norm_mul_f32` (n_fuse=2: RMS_NORM + MUL in one dispatch)
+  - `kernel_rms_norm_mul_add_f32` (n_fuse=3: RMS_NORM + MUL + ADD in one dispatch)
+  - Same for NORM: `kernel_norm_f32`, `kernel_norm_mul_f32`, `kernel_norm_mul_add_f32`
+  - Binary ops: `kernel_bin_fuse_f32_f32_f32` with function constants for op type, fuse count, row-broadcast, column-broadcast (`ggml-metal-device.cpp:1467-1511`)
+  - Each fusion eliminates 1-2 dispatches AND 1-2 barriers between them.
+
+*Sub-pass 2b — Reorder* (`ggml_metal_graph_optimize_reorder` at `ggml-metal-common.cpp:209-373`):
+- Greedy algorithm with 64-node lookahead (`N_FORWARD = 64`).
+- Maintains two memory range sets:
+  - `mrs0`: ranges of the current concurrent group (nodes that will execute between the same pair of barriers)
+  - `mrs1`: ranges of skipped-over nodes (nodes between the current position and the reorder candidate)
+- When node `i0` conflicts with `mrs0` (would need a barrier), the algorithm looks forward up to 64 nodes for any node `i1` that satisfies BOTH:
+  - `h_check(mrs0, node1)` — concurrent with the existing concurrent set
+  - `h_check(mrs1, node1)` — concurrent with all unprocessed nodes between `i0` and `i1`
+- Reorderable nodes are pulled forward into the current concurrent set. Marked `used[i1] = true` so they're skipped when the main loop reaches them.
+- Safety whitelist (`h_safe` at `ggml-metal-common.cpp:259-291`): only MUL_MAT, MUL_MAT_ID, ROPE, NORM, RMS_NORM, L2_NORM, SUM_ROWS, CLAMP, MUL, ADD, SUB, DIV, GLU, SCALE, UNARY, GET_ROWS, SET_ROWS, SET, CPY, CONT, REPEAT. NOT SDPA, NOT SOFTMAX — those are treated as barriers to reordering.
+- Memory range conflict check (`ggml_mem_ranges_check` at `ggml-metal-common.cpp:124-153`): ranges identified by `(buffer_id, p0, p1, type)`. Two SRC (read) ranges in the same buffer: OK. Any SRC overlapping a DST, or any DST overlapping anything: CONFLICT. Uses `view_src` to resolve tensor views to their base allocation. This is functionally identical to our `ConflictTracker::conflicts()`.
+- The output is a permutation `Vec<int>` of node indices. The original `gf->nodes[]` array is rewritten in the new order (`ggml-metal-common.cpp:461-472`), with fused sub-nodes unpacked inline.
+
+**Stage 3: Encoding** (`ggml_metal_graph_compute` at `ggml-metal-context.m:441-644`):
+- Default `n_cb = 1` (set at `ggml-metal.cpp:602`), meaning 2 command buffers total.
+- `n_nodes_0 = MAX(64, 0.1 * gf->n_nodes)` ≈ 181 nodes for our graph size. These are encoded by the main thread into `cmd_bufs[n_cb]` and committed immediately via `[cmd_buf enqueue]` + `[cmd_buf commit]` (`ggml-metal-context.m:531-545`).
+- The remaining `n_nodes_1` ≈ 1630 nodes are encoded into `cmd_bufs[0]` by a separate thread via `dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async)` (`ggml-metal-context.m:572`).
+- The GPU starts executing cmd_buf[n_cb] while the async thread is still encoding cmd_buf[0]. This overlaps ~0.5ms of CPU encode time with GPU execution.
+- Each command buffer uses `MTLDispatchTypeConcurrent` encoder (`ggml-metal-device.m:850-851`).
+- During encoding, `ggml_metal_op_concurrency_check` (`ggml-metal-ops.cpp:227`) runs the SAME buffer-range conflict check as the reorder pass. If conflict → `ggml_metal_op_concurrency_reset` emits `memoryBarrierWithScope:MTLBarrierScopeBuffers` and resets ranges. If no conflict → dispatch runs concurrently with the previous dispatches in the group.
+- Because the graph was pre-reordered in Stage 2, nodes arrive at the encoder in an order that maximizes concurrent groups. The encoder's conflict check confirms what the reorder already arranged.
+
+**Stage 4: GPU execution** — Metal's hardware scheduler executes dispatches within a concurrent group in parallel (subject to resource availability). Barriers are full memory fences that serialize across groups.
+
+---
+
+##### Why imperative reorder failed (V-proj experiment)
+
+Two clean attempts to reorder V-proj after Q-norm in our imperative forward pass produced all-pad output, despite the buffer ranges being disjoint. Adding a forced barrier before the reordered dispatch fixed correctness.
+
+The root cause is now understood: llama.cpp's reorder happens at the **graph data structure level** — it changes the order nodes appear in `gf->nodes[]`. The encoder then walks this array linearly, encoding each node sequentially. The encoder's `ggml_metal_op_concurrency_check` decides per-node whether to emit a barrier. The Metal concurrent encoder sees a single linear stream of dispatches interspersed with barriers.
+
+Our imperative approach changes the **Rust source code order** of dispatch calls within a concurrent encoder. This is semantically different — Metal's concurrent dispatch scheduler may process imperative dispatches with different timing/ordering guarantees than graph-scheduled dispatches. The graph-then-encode pattern is the only one llama.cpp has validated at scale.
 
 **Falsified:**
-- 17. V-proj reorder with disjoint buffers is safe under imperative concurrent dispatch (2026-04-13 FALSIFIED: 2 clean implementations produce all-pad output; forced barrier fixes it; the dependency is not buffer-range-visible)
+- 17. V-proj reorder with disjoint buffers is safe under imperative concurrent dispatch (2026-04-13 FALSIFIED: 2 clean implementations produce all-pad output; forced barrier fixes it)
+- 18. Imperative dispatch reordering is equivalent to graph-level reorder + sequential encoding (2026-04-13 FALSIFIED by the same evidence — they produce different behavior on Apple Silicon's Metal concurrent encoder)
 
-**Approach for Phase 4e (revised based on measured data):**
+---
 
-The naive "reorder dispatches in imperative code" approach is unreliable on Apple Silicon's Metal concurrent encoder. Two alternative approaches match what llama.cpp actually does:
+##### Architecture for mlx-native computation graph
 
-**Option A — Lightweight dispatch list (graph-then-encode):**
-Build a `Vec<DispatchOp>` during the forward pass instead of dispatching immediately. Each `DispatchOp` records the kernel, buffers (reads + writes), and parameters. After the full forward pass is recorded, apply llama.cpp's reorder algorithm to the list, then encode the reordered list into the Metal command buffer sequentially. This matches llama.cpp's architecture exactly: static graph → reorder → encode → barriers at encode time.
+Port llama.cpp's full execution architecture. No shortcuts, no half-measures.
 
-**Option B — Dual command buffer (pipelining):**
-Split the forward pass into 2 sessions: session 1 encodes layers 0-2 (~84 dispatches) and commits immediately. Session 2 encodes layers 3-29 on the same thread but into a second command buffer. The GPU starts executing session 1 while session 2 is being encoded. This doesn't change the per-barrier ratio but overlaps CPU encoding with GPU execution, saving ~0.5ms.
+**4e.1 — Graph IR** (`mlx-native/src/graph.rs`, new `ComputeGraph` type)
 
-**Option C — Kernel fusion (reduce dispatch count):**
-Fuse small sequential ops into larger kernels to reduce both dispatch count and barrier count. Candidates:
-- MoE router path: 4 serial single-dispatch groups (norm → scale → mul → matmul) could be fused
-- End-of-layer: fused_norm_add + fused_norm_add_scalar could be combined
-- Per-layer savings: each fused pair eliminates 1 barrier
+```rust
+/// A recorded kernel dispatch — the graph node.
+pub struct GraphNode {
+    /// Which pipeline state object to bind.
+    pipeline: metal::ComputePipelineState,
+    /// Kernel argument bindings: (slot_index, buffer_or_bytes).
+    bindings: SmallVec<[(u64, BindingKind); 8]>,
+    /// Threadgroup dispatch dimensions.
+    threads_per_grid: MTLSize,
+    threads_per_threadgroup: MTLSize,
+    /// Optional threadgroup memory size.
+    threadgroup_memory: Option<(u64, u64)>,
+    /// Read buffer ranges: (contents_ptr, byte_len) — for conflict detection.
+    reads: SmallVec<[(usize, usize); 4]>,
+    /// Write buffer ranges: (contents_ptr, byte_len) — for conflict detection.
+    writes: SmallVec<[(usize, usize); 2]>,
+    /// Fused sub-nodes (travel as atomic unit through reorder).
+    fused: SmallVec<[usize; 2]>,
+    /// Op tag for the safety whitelist (can this node be reordered?).
+    op_kind: OpKind,
+}
 
-Options A and B are independent and can be combined. Option C is incremental.
+pub enum OpKind {
+    MatMul, MatMulId, Norm, Rope, Elementwise, Copy, Gather,
+    Sdpa,       // NOT reorderable
+    Softmax,    // NOT reorderable
+    Other,      // NOT reorderable
+}
+```
 
-**Estimated:** 3-5 days for Option A, 1-2 days for Option B, 1 day per fusion in Option C.
+The forward pass calls `graph.record_*()` methods instead of dispatching directly. Each method mirrors the existing `GraphSession` op methods but pushes a `GraphNode` onto a `Vec<GraphNode>` instead of encoding into a Metal command encoder.
 
-**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing.
+`ConflictTracker` is reused as-is — the conflict detection logic is identical to llama.cpp's `ggml_mem_ranges_check`. It's used at both reorder time (to validate reorder candidates) and encode time (to decide barrier placement).
+
+**4e.2 — Fusion pass** (runs after forward pass finishes recording)
+
+Scan the recorded `Vec<GraphNode>` for fusable sequences:
+
+- `RMS_NORM + MUL` → replace 2 nodes with 1 node dispatching `kernel_rms_norm_mul_f32`
+- `RMS_NORM + MUL + ADD` → replace 3 nodes with 1 node dispatching `kernel_rms_norm_mul_add_f32`
+
+Fusion rules (matching `ggml_can_fuse_ext` at `ggml-impl.h:663-689`):
+- All nodes must be same shape
+- All intermediate nodes must have exactly 1 consumer (no other node reads their output)
+- Each node must be a src of the next node
+- No node can have the OUTPUT flag set
+
+Consumer-count tracking: during graph recording, maintain a `HashMap<usize, u32>` mapping each buffer's `contents_ptr` to the number of nodes that read from it. A node has 1 consumer if its write buffer appears in exactly 1 subsequent node's read set.
+
+New fused Metal kernels needed in mlx-native:
+- `kernel_rms_norm_mul_f32` / `kernel_rms_norm_mul_f32_4` (4-wide vectorized variant for ne00 % 4 == 0)
+- `kernel_rms_norm_mul_add_f32` / `kernel_rms_norm_mul_add_f32_4`
+
+These can be ported directly from llama.cpp's `ggml-metal.metal` with attribution (Apache-2.0). The kernel takes the norm input, the scale weights (MUL src[1]), and optionally the bias weights (ADD src[1]), producing the fused output in one pass over shared memory. This eliminates the intermediate buffer allocation AND the barrier between norm and mul.
+
+Each fusion for Gemma4's forward pass saves 1-2 dispatches and 1-2 barriers per layer × 30 layers = 30-60 fewer barriers per token.
+
+**4e.3 — Reorder pass** (runs after fusion, before encoding)
+
+Port `ggml_metal_graph_optimize_reorder` (`ggml-metal-common.cpp:209-373`) to Rust:
+
+```rust
+fn reorder(nodes: &[GraphNode]) -> Vec<usize> {
+    let n = nodes.len();
+    let mut result = Vec::with_capacity(n);
+    let mut used = vec![false; n];
+    let mut mrs0 = ConflictTracker::new(); // current concurrent set
+    let mut mrs1 = ConflictTracker::new(); // skipped-over nodes
+
+    for i0 in 0..n {
+        if used[i0] { continue; }
+        let node0 = &nodes[i0];
+
+        if !node0.is_empty() && mrs0.conflicts_node(node0) {
+            mrs1.reset();
+            mrs1.add_node(node0);
+
+            // 64-node lookahead
+            for i1 in (i0 + 1)..min(i0 + 64, n) {
+                if used[i1] { continue; }
+                let node1 = &nodes[i1];
+                if !node1.op_kind.is_reorderable() { break; }
+
+                let is_empty = node1.is_empty();
+                if (is_empty || !mrs0.conflicts_node(node1))
+                    && !mrs1.conflicts_node(node1)
+                {
+                    mrs0.add_node(node1);
+                    result.push(i1);
+                    used[i1] = true;
+                } else {
+                    mrs1.add_node(node1);
+                }
+            }
+            mrs0.reset(); // emit barrier boundary
+        }
+
+        mrs0.add_node(node0);
+        result.push(i0);
+    }
+    result
+}
+```
+
+The reorderable-op whitelist (matching `h_safe` at `ggml-metal-common.cpp:259-291`): MatMul, MatMulId, Rope, Norm, Elementwise (add/mul/sub/div/scale/unary/gelu), Copy, Gather, SumRows, Clamp. NOT Sdpa, NOT Softmax.
+
+**4e.4 — Dual command buffer encoding** (runs after reorder)
+
+Port `ggml_metal_graph_compute` (`ggml-metal-context.m:441-644`) to Rust:
+
+```rust
+fn encode_and_execute(device: &MlxDevice, nodes: &[GraphNode], order: &[usize]) {
+    let n = order.len();
+    let n0 = max(64, n / 10);  // ~10% for immediate commit
+
+    // Command buffer 0: first n0 nodes, committed immediately
+    let mut enc0 = device.command_encoder()?;
+    let mut tracker0 = ConflictTracker::new();
+    for &idx in &order[..n0] {
+        if tracker0.conflicts_node(&nodes[idx]) {
+            enc0.memory_barrier();
+            tracker0.reset();
+        }
+        nodes[idx].encode_into(&mut enc0);
+        tracker0.add_node(&nodes[idx]);
+    }
+    enc0.commit(); // GPU starts executing immediately
+
+    // Command buffer 1: remaining nodes, encoded while GPU runs cmd_buf_0
+    let mut enc1 = device.command_encoder()?;
+    let mut tracker1 = ConflictTracker::new();
+    for &idx in &order[n0..] {
+        if tracker1.conflicts_node(&nodes[idx]) {
+            enc1.memory_barrier();
+            tracker1.reset();
+        }
+        nodes[idx].encode_into(&mut enc1);
+        tracker1.add_node(&nodes[idx]);
+    }
+    enc1.commit_and_wait()?; // wait for both buffers to complete
+}
+```
+
+The key insight: `enc0.commit()` (without wait) submits to the GPU immediately. `enc1` is then encoded on the CPU while `enc0` executes on the GPU. The 0.53ms CPU encode time now overlaps with GPU execution instead of serializing.
+
+**4e.5 — Integration into GraphSession**
+
+The existing `GraphSession` API changes from "encode directly" to "record then optimize then encode":
+
+```rust
+impl GraphSession {
+    // Existing op methods change internally: push GraphNode instead of dispatch
+    pub fn rms_norm(...) { self.graph.record_rms_norm(...); }
+    pub fn quantized_matmul(...) { self.graph.record_quantized_matmul(...); }
+    // etc.
+
+    // New: optimize and execute the recorded graph
+    pub fn finish(self) -> Result<()> {
+        let mut graph = self.graph;
+        graph.fuse();           // 4e.2
+        let order = graph.reorder(); // 4e.3
+        graph.encode_dual_buffer(&self.device, &order)?; // 4e.4
+        Ok(())
+    }
+}
+```
+
+The forward pass in `forward_mlx.rs` requires NO CHANGES — it calls the same `s.rms_norm()`, `s.quantized_matmul()`, `s.barrier_between()` methods. The difference is purely internal: those methods now record instead of dispatching. `barrier_between()` becomes a no-op at record time (barriers are computed from the optimized graph at encode time).
+
+---
+
+##### Execution plan
+
+| Sub-phase | Deliverable | Estimated |
+|-----------|-------------|-----------|
+| 4e.1 | `GraphNode`, `ComputeGraph`, `OpKind` types in `graph.rs`. `record_*()` methods. Forward pass unchanged. | 2 days |
+| 4e.2 | Fusion pass + `kernel_rms_norm_mul_f32` + `kernel_rms_norm_mul_add_f32` Metal shaders (ported from llama.cpp with attribution). Unit tests proving fused output matches sequential. | 2 days |
+| 4e.3 | Reorder pass (Rust port of `ggml_metal_graph_optimize_reorder`). Debug output matching llama.cpp's `GGML_REORDER_DUMP` format for validation. | 1-2 days |
+| 4e.4 | Dual command buffer encoding. Benchmark showing CPU/GPU overlap. | 1 day |
+| 4e.5 | Integration: `GraphSession::finish()` runs fuse→reorder→encode. Forward pass unchanged. Full benchmark + sourdough gate. | 1-2 days |
+
+**Total estimated: 7-9 days.**
+
+**Validation at each sub-phase:**
+- 4e.1: Record-then-encode produces identical output to direct-encode (byte-identical sourdough gate)
+- 4e.2: Fused kernels match unfused sequential output at ε ≤ 1e-5; dispatch count drops measurably
+- 4e.3: Reorder changes group size histogram toward llama.cpp's distribution; sourdough gate passes
+- 4e.4: `encode_ns` drops measurably (CPU/GPU overlap)
+- 4e.5: 3-run median tok/s ≥ 102 with sourdough gate passing
+
+**Gate to Phase 5:** 3-run median tok/s ≥ 102 with sourdough gate ≥ 3094 byte common prefix.
 
 ### Phase 5 — Integration into hf2q
 
@@ -647,5 +861,7 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 | Phase 4a/4b | Claude | 2026-04-13 | DONE — F16 KV (+1.3%), Q8_0 NSG (neutral). 91.0 tok/s. |
 | Phase 4 revision 2 | Claude | 2026-04-13 | Gap re-attributed: barrier stalls (4.67ms, 44% of GPU time). Dispatch reorder is the lever. |
 | Phase 4 revision 3 | Claude | 2026-04-13 | V-proj imperative reorder FALSIFIED (2 clean attempts → all-pad). Root cause: Metal concurrent encoder doesn't guarantee imperative reorder safety even with disjoint buffers. Need graph-then-encode (Option A) or dual command buffer (Option B). Re-measured: hf2q 90.1 tok/s, llama.cpp 103.5 tok/s, gap=13.4 tok/s. |
+| Phase 4e revision 4 | Claude | 2026-04-13 | Deep study of llama.cpp's full Metal execution architecture. Replaced Options A/B/C with proper graph IR + fusion + reorder + dual command buffer — the same architecture llama.cpp uses, not a shortcut. 5 sub-phases, 7-9 days estimated. |
+| Phase 4e.1-4e.4 | Claude | 2026-04-13 | DONE — mlx-native commit 904d186. Graph IR (capture mode), fusion pass (RmsNorm+MUL→fused kernel), reorder pass (64-node lookahead), dual command buffer encoding. 1,815 lines across 11 files. Queen-reviewed each phase; barrier recomputation bug caught and fixed in 4e.3. Integration (4e.5) remains. |
 | Phase 4e partial | Claude | 2026-04-13 | Router/MLP interleaving: 120 barriers eliminated (606→486), 90.1→93.6 tok/s (+3.9%). Sourdough gate PASS (3095≥3094). New `router_norm_out` buffer avoids WAW on `norm_out`. |
 | Status | **Accepted** | Phase 4e in progress | Gap: 9.9 tok/s to llama.cpp (93.6 vs 103.5). Next: dual command buffer pipelining + additional MoE/MLP interleaving. |
