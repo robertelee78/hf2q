@@ -1008,9 +1008,27 @@ impl MlxModelWeights {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let metal_dev = dev.metal_device();
-            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("single session begin: {e}"))?;
+            let use_graph_opt = std::env::var("HF2Q_GRAPH_OPT").map_or(false, |v| v == "1");
+            let mut s = if use_graph_opt {
+                exec.begin_recorded().map_err(|e| anyhow::anyhow!("recorded session begin: {e}"))?
+            } else {
+                exec.begin().map_err(|e| anyhow::anyhow!("single session begin: {e}"))?
+            };
 
             // --- 1. Embedding gather + scale (GPU) ---
+            // Set pending buffer ranges for graph capture (Phase 4e.5): the
+            // embedding dispatch reads embed_weight and writes hidden.
+            if use_graph_opt {
+                let read_ranges = vec![{
+                    let s_ptr = self.embed_weight.contents_ptr() as usize;
+                    (s_ptr, s_ptr + self.embed_weight.byte_len())
+                }];
+                let write_ranges = vec![{
+                    let s_ptr = self.activations.hidden.contents_ptr() as usize;
+                    (s_ptr, s_ptr + self.activations.hidden.byte_len())
+                }];
+                s.encoder_mut().set_pending_buffer_ranges(read_ranges, write_ranges);
+            }
             mlx_native::ops::elementwise::embedding_gather_scale_f32(
                 s.encoder_mut(), reg, metal_dev,
                 &self.embed_weight,
@@ -1643,11 +1661,24 @@ impl MlxModelWeights {
 
             // === ONE finish() for the entire forward pass ===
             let barrier_count = s.barrier_count();
-            let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
-                .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
-            if std::env::var("HF2Q_MLX_TIMING").is_ok() {
-                eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
-                    enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
+            let is_recording = s.is_recording();
+            if is_recording {
+                let (enc_ns, gpu_ns, fusions, reordered, b0, b1) =
+                    s.finish_optimized_with_timing(reg, metal_dev, session_start)
+                        .map_err(|e| anyhow::anyhow!("optimized session finish: {e}"))?;
+                if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                    eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
+                        enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
+                    eprintln!("  [GRAPH_OPT] fusions={} reordered={} barriers={}+{}",
+                        fusions, reordered, b0, b1);
+                }
+            } else {
+                let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
+                    .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
+                if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                    eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
+                        enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
+                }
             }
         }
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
