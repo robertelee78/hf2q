@@ -451,6 +451,9 @@ pub struct MlxActivationBuffers {
     pub moe_softmax_params: MlxBuffer,
     /// MoE scratch: norm output for router `[1, hidden_size]` F32.
     pub moe_norm_out: MlxBuffer,
+    /// Router norm output `[1, hidden_size]` F32 — separate from `norm_out` to
+    /// allow router norm to run concurrent with pre-FF norm 1 (which writes norm_out).
+    pub router_norm_out: MlxBuffer,
     /// MoE scratch: expert ids buffer for _id kernel `[top_k]` U32.
     pub moe_expert_ids: MlxBuffer,
     /// MoE scratch: gate_up _id output `[top_k, 2*moe_intermediate]` F32.
@@ -1237,7 +1240,22 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- GPU pre-feedforward norm --
+                // ============================================================
+                // Dense MLP + MoE routing INTERLEAVED dispatch
+                // (ADR-006 Phase 4e: matches llama.cpp's graph reorder pattern)
+                //
+                // Group B8:  pre-FF norm1 + pre-FF norm2 + router norm  [3 concurrent]
+                // Group B9:  dense gate + dense up + router logits      [3 concurrent]
+                // Group B10: fused_gelu_mul + fused_moe_routing          [2 concurrent]
+                // Group B11: dense down + gate_up_id                     [2 concurrent]
+                //   ... then sequential MoE chain + post-processing
+                // ============================================================
+
+                let num_experts = self.num_experts;
+                let top_k = self.layers[layer_idx].moe.top_k;
+
+                // -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 concurrent] --
+                // All three read `residual`, write to disjoint buffers.
                 s.barrier_between(
                     &[&self.activations.residual],
                     &[&self.activations.norm_out],
@@ -1252,7 +1270,36 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- Dense MLP: gate, up, fused SwiGLU, down --
+                s.barrier_between(
+                    &[&self.activations.residual],
+                    &[&self.activations.moe_norm_out],
+                );
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                    &self.activations.moe_norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                s.barrier_between(
+                    &[&self.activations.residual],
+                    &[&self.activations.router_norm_out],
+                );
+                s.rms_norm(
+                    reg, metal_dev,
+                    &self.activations.residual,
+                    &self.layers[layer_idx].moe.router_combined_weight,
+                    &self.activations.router_norm_out,
+                    &self.activations.norm_params,
+                    1, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- B9: dense gate + dense up + router logits [3 concurrent] --
+                // gate/up read norm_out; router logits reads router_norm_out. All disjoint writes.
                 s.barrier_between(
                     &[&self.activations.norm_out, &self.layers[layer_idx].mlp.gate_proj.buffer],
                     &[&self.activations.mlp_gate],
@@ -1260,6 +1307,7 @@ impl MlxModelWeights {
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
                 total_dispatches += 1;
+
                 s.barrier_between(
                     &[&self.activations.norm_out, &self.layers[layer_idx].mlp.up_proj.buffer],
                     &[&self.activations.mlp_up],
@@ -1268,6 +1316,16 @@ impl MlxModelWeights {
                     &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
                 total_dispatches += 1;
 
+                s.barrier_between(
+                    &[&self.activations.router_norm_out, &self.layers[layer_idx].moe.router_proj.buffer],
+                    &[&self.activations.moe_router_logits],
+                );
+                dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
+                    &self.layers[layer_idx].moe.router_proj,
+                    &mut self.activations.moe_router_logits, 1)?;
+                total_dispatches += 1;
+
+                // -- B10: fused_gelu_mul + fused_moe_routing [2 concurrent] --
                 s.barrier_between(
                     &[&self.activations.mlp_gate, &self.activations.mlp_up],
                     &[&self.activations.mlp_fused],
@@ -1290,76 +1348,6 @@ impl MlxModelWeights {
                     );
                 }
                 total_dispatches += 1;
-
-                s.barrier_between(
-                    &[&self.activations.mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
-                    &[&self.activations.mlp_down],
-                );
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                    &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
-                total_dispatches += 1;
-
-                // -- GPU post-feedforward norm 1: mlp_down → attn_out --
-                s.barrier_between(
-                    &[&self.activations.mlp_down],
-                    &[&self.activations.attn_out],
-                );
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.mlp_down,
-                    &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
-                    &self.activations.attn_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // -- GPU pre-feedforward norm 2: residual → moe_norm_out --
-                // barrier_between will detect no conflict (disjoint write sets)
-                s.barrier_between(
-                    &[&self.activations.residual],
-                    &[&self.activations.moe_norm_out],
-                );
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.residual,
-                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-                    &self.activations.moe_norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                // -- GPU router norm + projection --
-                // barrier_between will detect no conflict with norm2 (disjoint write sets)
-                s.barrier_between(
-                    &[&self.activations.residual],
-                    &[&self.activations.norm_out],
-                );
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.residual,
-                    &self.layers[layer_idx].moe.router_combined_weight,
-                    &self.activations.norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-
-                s.barrier_between(
-                    &[&self.activations.norm_out, &self.layers[layer_idx].moe.router_proj.buffer],
-                    &[&self.activations.moe_router_logits],
-                );
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].moe.router_proj,
-                    &mut self.activations.moe_router_logits, 1)?;
-                total_dispatches += 1;
-
-                // ============================================================
-                // Fused GPU MoE routing: softmax + argsort + gather (1 dispatch)
-                // ============================================================
-                let num_experts = self.num_experts;
-                let top_k = self.layers[layer_idx].moe.top_k;
 
                 s.barrier_between(
                     &[&self.activations.moe_router_logits],
@@ -1388,7 +1376,19 @@ impl MlxModelWeights {
                     let ggml_type_dn = gpu::candle_ggml_to_mlx(
                         self.layers[layer_idx].moe.down_ggml_dtype)?;
 
-                    // gate_up _id
+                    // -- B11: dense down + gate_up_id [2 concurrent] --
+                    // dense_down reads mlp_fused (from B10), gate_up_id reads moe_norm_out
+                    // (from B8) + moe_expert_ids (from B10). Disjoint writes.
+                    s.barrier_between(
+                        &[&self.activations.mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
+                        &[&self.activations.mlp_down],
+                    );
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                        &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                    total_dispatches += 1;
+
+                    let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                        self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
                     s.barrier_between(
                         &[&self.activations.moe_norm_out, &self.activations.moe_expert_ids,
                           self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
@@ -1413,7 +1413,7 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
 
-                    // Batched SwiGLU
+                    // -- B12: swiglu (singleton) --
                     s.barrier_between(
                         &[&self.activations.moe_gate_up_id_out],
                         &[&self.activations.moe_swiglu_id_out],
@@ -1426,7 +1426,11 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
 
-                    // down _id
+                    // -- B13: down_id + post-FF norm1 [2 concurrent] --
+                    // down_id reads moe_swiglu_id_out (from B12). post-FF norm1 reads
+                    // mlp_down (from B11). Disjoint writes.
+                    let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                        self.layers[layer_idx].moe.down_ggml_dtype)?;
                     s.barrier_between(
                         &[&self.activations.moe_swiglu_id_out, &self.activations.moe_expert_ids,
                           self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
@@ -1451,7 +1455,22 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
 
-                    // Weighted sum
+                    // post-FF norm1: mlp_down → attn_out (concurrent with down_id)
+                    s.barrier_between(
+                        &[&self.activations.mlp_down],
+                        &[&self.activations.attn_out],
+                    );
+                    s.rms_norm(
+                        reg, metal_dev,
+                        &self.activations.mlp_down,
+                        &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
+                        &self.activations.attn_out,
+                        &self.activations.norm_params,
+                        1, hs as u32,
+                    ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // -- B14: weighted_sum (singleton) --
                     s.barrier_between(
                         &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
                         &[&self.activations.moe_accum],
@@ -3768,6 +3787,7 @@ fn alloc_activation_buffers(
         moe_accum: alloc_f32(hs, "moe_accum")?,
         moe_softmax_params,
         moe_norm_out: alloc_f32(hs, "moe_norm_out")?,
+        router_norm_out: alloc_f32(hs, "router_norm_out")?,
         // Fused _id dispatch buffers (sized for top_k = cfg.top_k_experts)
         moe_expert_ids: alloc_u32(cfg.top_k_experts, "moe_expert_ids")?,
         moe_gate_up_id_out: alloc_f32(cfg.top_k_experts * 2 * moe_interm, "moe_gate_up_id_out")?,

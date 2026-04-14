@@ -411,35 +411,71 @@ The initial profiling (per-kernel session overhead inflated SDPA/matmul apparent
 - `ConflictTracker` in `mlx-native/src/graph.rs` — automatic buffer-range-based barrier elision matching llama.cpp's `ggml_mem_ranges` system
 - All `s.barrier()` calls in `forward_mlx.rs` converted to `s.barrier_between(reads, writes)` — correctly emits 606/606 barriers (all true RAW conflicts confirmed)
 
-#### 4e — Dispatch reordering (the remaining lever)
+#### 4e — Closing the barrier stall gap (the remaining lever)
 
-**Goal:** Reduce per-barrier stall cost from 7.7μs to ~4μs by increasing the dispatches-per-barrier ratio from 1.44 to ~2.4, matching llama.cpp's graph reorder strategy.
+**Goal:** Reduce barrier stall cost from 4.67ms to ≤3.1ms (matching llama.cpp), closing the 13.4 tok/s gap (90.1 → 103.5 tok/s).
 
-**Why this is the lever:** No-barriers experiment proves raw compute matches llama.cpp (~5.9ms). The entire gap is barrier stall overhead. llama.cpp's `ggml_metal_graph_optimize_reorder` moves 70-79% of graph nodes (measured via instrumented build), interleaving independent ops to fill concurrent windows between barriers.
+**Measured baselines (2026-04-13, clean GPU, 3-run median each):**
+- hf2q: **90.1 tok/s**, encode=0.53ms, gpu_wait=10.52ms, 841 dispatches, 606 barriers, ratio=1.39
+- llama.cpp: **103.5 tok/s**, 9.66 ms/token, ~1811 nodes, 759 barriers, ratio=2.39
 
-**What llama.cpp reorders (from graph dump):**
-- V proj moved after Q head norm (disjoint buffers: Q norm uses `attn_q`/`attn_q_normed`, V proj uses `norm_out`/`attn_v`)
-- Dense MLP gate/up interleaved with MoE routing operations (different buffer sets)
-- Pre-FF norm 2 pulled forward to overlap with MoE argsort/topk
-- Attention mask computation pulled forward to overlap with norm/QKV chain
+**Concurrent group histogram (measured):**
+- hf2q: 456 × size-1 (75%), 65 × size-2 (11%), 85 × size-3 (14%), 0 × size-4+
+- llama.cpp: ~40% singletons, ~50% size-3+, groups up to size-4
 
-**V-proj reorder experiment (2026-04-13):** Moving V proj after Q norm showed **6% speedup (119 tok/s on 5 tokens, up from 112)** — confirming reordering works. However, output was all `<pad>` tokens — **correctness failure**. The buffer-range analysis says the reorder is safe (Metal barriers are full memory fences ensuring all prior writes are visible), but a hidden dependency exists. **Root cause investigation required before any reorder can land.**
+**Why llama.cpp's barriers cost less (measured, not inferred):**
 
-**Changes needed:**
-1. **Debug the V-proj reorder correctness failure** — the load-bearing blocker. Suspected causes: (a) a buffer not tracked in the `barrier_between` call (e.g., `norm_params` or `position` used as both read and implicit-write), (b) the Metal barrier fence not covering all memory regions as assumed, (c) a GPU compiler reordering issue specific to M5 Max.
-2. **Implement targeted reorders** that the ConflictTracker validates. The infrastructure is ready — changing dispatch order in the imperative code and letting `barrier_between` determine where barriers are actually needed.
-3. **Consider double-buffering** of `hidden` state for cross-layer overlap if intra-layer reorder doesn't close the gap fully.
+Three structural differences confirmed by reading llama.cpp source (`ggml-metal-common.cpp`, `ggml-metal-context.m`, `ggml-metal-ops.cpp`) and capturing its graph debug output (`GGML_METAL_GRAPH_DEBUG=1`):
 
-**Expected payoff:** The V-proj experiment showed 6% on 5 tokens. Broader reordering matching llama.cpp's 70-79% reorder rate should close ~1.5ms of the 1.6ms gap → ~100-104 tok/s.
+1. **Graph pre-reorder** (`ggml_metal_graph_optimize_reorder` at `ggml-metal-common.cpp:209-373`): Before encoding, llama.cpp reorders the computation graph with a greedy 64-node lookahead. This pulls independent ops forward to fill concurrent windows. Key concurrent groups achieved:
+   - QKV matmul: 3 concurrent (same as hf2q)
+   - Q/K/V head norms: 3 concurrent (same as hf2q)
+   - RoPE(Q) + RoPE(K) + SET_ROWS(cache_v): 3 concurrent (hf2q can't — RoPE is fused into norm)
+   - SOFTMAX + 2 pre-FF norms: 3 concurrent (pulled forward by reorder)
+   - ARGSORT + REPEAT + dense_gate + dense_up: 4 concurrent (dense MLP interleaved with MoE routing)
+   - GET_ROWS + GLU + SUM_ROWS + GLU: 4 concurrent (MoE weight + activation interleaved)
+   - MUL_MAT + CLAMP + MUL_MAT_ID: 3 concurrent (dense_down + MoE_down + weight_clamp)
 
-**Estimated:** 2-4 days (dominated by debugging the correctness failure, not writing code).
+   hf2q dispatches in fixed code order and can only elide barriers (via `barrier_between`) — it cannot create new concurrent groups.
 
-**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing and byte-identical output for 3094 bytes.
+2. **Dual command buffer** (`ggml-metal-context.m:467-572`): llama.cpp splits the graph into 2 command buffers:
+   - Main thread: 181 nodes (~3 layers), committed immediately to GPU
+   - Async thread: 1630 nodes (~27 layers), encoded while GPU executes the first buffer
+   - Measured: `[GGML_BARRIERS] nodes=181 barriers=74` + `nodes=1630 barriers=685`
+   
+   hf2q uses 1 command buffer for all 841 dispatches, committed at the end. The GPU sits idle for 0.53ms during CPU encoding.
 
-**Risks:**
-- The V-proj correctness failure may indicate a fundamental limitation of imperative dispatch reordering vs llama.cpp's DAG-based approach. Mitigation: if imperative reorder proves unreliable, consider building a lightweight dispatch list (buffer + op description) that gets reordered before encoding, matching llama.cpp's graph-then-encode architecture.
-- Metal barrier semantics may be subtler than documented — some M-series GPUs may have per-encoder-type fence behavior. Mitigation: test on multiple hardware if the correctness failure doesn't have an obvious buffer-range explanation.
-- Double-buffering `hidden` doubles the most-accessed activation buffer's memory. On this model that's 3584 × 4 = 14 KB — negligible. But the code complexity of alternating buffers across the layer loop is non-trivial.
+3. **Dense MLP / MoE interleaving** (consequence of graph reorder): llama.cpp's reorder pulls dense MLP operations (gate+up projection, GLU, down projection) forward to run concurrently with MoE operations (routing, expert dispatch, weight normalization). hf2q runs them strictly sequentially: dense MLP first, then MoE.
+
+**V-proj reorder experiment (2026-04-13, 2 attempts):**
+- Attempt 1 (earlier session): moved V proj after Q norm, got 6% speedup but all-pad output. Code not committed.
+- Attempt 2 (this session): clean reimplementation of the same reorder. Same result: all-pad output. Adding an explicit forced `s.barrier()` before the reordered V proj fixes correctness.
+- Root cause: **imperative dispatch reordering within a single Metal concurrent encoder produces different execution semantics than llama.cpp's graph-level reorder followed by sequential encoding**. The buffer-range analysis says the reorder is safe, but the GPU disagrees. llama.cpp reorders nodes in a graph data structure, then encodes them sequentially into the command buffer — the encoder sees them in the new order as if that was always the intended order. Our imperative approach changes the code-level dispatch sequence, which may interact differently with Metal's concurrent dispatch scheduler.
+
+**Falsified:**
+- 17. V-proj reorder with disjoint buffers is safe under imperative concurrent dispatch (2026-04-13 FALSIFIED: 2 clean implementations produce all-pad output; forced barrier fixes it; the dependency is not buffer-range-visible)
+
+**Approach for Phase 4e (revised based on measured data):**
+
+The naive "reorder dispatches in imperative code" approach is unreliable on Apple Silicon's Metal concurrent encoder. Two alternative approaches match what llama.cpp actually does:
+
+**Option A — Lightweight dispatch list (graph-then-encode):**
+Build a `Vec<DispatchOp>` during the forward pass instead of dispatching immediately. Each `DispatchOp` records the kernel, buffers (reads + writes), and parameters. After the full forward pass is recorded, apply llama.cpp's reorder algorithm to the list, then encode the reordered list into the Metal command buffer sequentially. This matches llama.cpp's architecture exactly: static graph → reorder → encode → barriers at encode time.
+
+**Option B — Dual command buffer (pipelining):**
+Split the forward pass into 2 sessions: session 1 encodes layers 0-2 (~84 dispatches) and commits immediately. Session 2 encodes layers 3-29 on the same thread but into a second command buffer. The GPU starts executing session 1 while session 2 is being encoded. This doesn't change the per-barrier ratio but overlaps CPU encoding with GPU execution, saving ~0.5ms.
+
+**Option C — Kernel fusion (reduce dispatch count):**
+Fuse small sequential ops into larger kernels to reduce both dispatch count and barrier count. Candidates:
+- MoE router path: 4 serial single-dispatch groups (norm → scale → mul → matmul) could be fused
+- End-of-layer: fused_norm_add + fused_norm_add_scalar could be combined
+- Per-layer savings: each fused pair eliminates 1 barrier
+
+Options A and B are independent and can be combined. Option C is incremental.
+
+**Estimated:** 3-5 days for Option A, 1-2 days for Option B, 1 day per fusion in Option C.
+
+**Gate to next phase:** 3-run median tok/s ≥ 102 with sourdough gate passing.
 
 ### Phase 5 — Integration into hf2q
 
@@ -610,4 +646,6 @@ If any phase produces evidence that refutes this ADR (e.g., Phase 0 shows the ga
 | Phase 4 revision 1 | Claude | 2026-04-13 | Scope: kernel-implementation (F16 KV + Q8_0 NSG) |
 | Phase 4a/4b | Claude | 2026-04-13 | DONE — F16 KV (+1.3%), Q8_0 NSG (neutral). 91.0 tok/s. |
 | Phase 4 revision 2 | Claude | 2026-04-13 | Gap re-attributed: barrier stalls (4.67ms, 44% of GPU time). Dispatch reorder is the lever. |
-| Status | **Accepted** | Phase 4e in progress | Next: debug V-proj reorder correctness failure, then broader dispatch reordering |
+| Phase 4 revision 3 | Claude | 2026-04-13 | V-proj imperative reorder FALSIFIED (2 clean attempts → all-pad). Root cause: Metal concurrent encoder doesn't guarantee imperative reorder safety even with disjoint buffers. Need graph-then-encode (Option A) or dual command buffer (Option B). Re-measured: hf2q 90.1 tok/s, llama.cpp 103.5 tok/s, gap=13.4 tok/s. |
+| Phase 4e partial | Claude | 2026-04-13 | Router/MLP interleaving: 120 barriers eliminated (606→486), 90.1→93.6 tok/s (+3.9%). Sourdough gate PASS (3095≥3094). New `router_norm_out` buffer avoids WAW on `norm_out`. |
+| Status | **Accepted** | Phase 4e in progress | Gap: 9.9 tok/s to llama.cpp (93.6 vs 103.5). Next: dual command buffer pipelining + additional MoE/MLP interleaving. |
