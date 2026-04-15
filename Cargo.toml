@@ -16,7 +16,7 @@ metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "de
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # ADR-006 Phase 5: mlx-native GPU compute backend (per-op cutover from candle).
 # Opt-in during migration; will become the sole backend post-migration.
-mlx-native-backend = ["dep:mlx-native"]
+mlx-native-backend = ["dep:mlx-native", "metal"]
 
 [dependencies]
 safetensors = "0.7"
