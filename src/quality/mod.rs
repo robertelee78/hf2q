@@ -1,7 +1,8 @@
 //! Quality measurement module.
 //!
-//! Phase 1: Weight-level cosine similarity (no inference needed).
-//! Phase 2: KL divergence, perplexity, and activation cosine similarity via Candle forward passes.
+//! Computes weight-level cosine similarity between original and quantized tensors.
+//! KL divergence and perplexity require an inference forward pass and are populated
+//! only when an external runner provides logit data.
 
 pub mod cosine_sim;
 pub mod kl_divergence;
@@ -11,7 +12,7 @@ pub mod regression;
 use std::path::Path;
 
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::ir::{DType, ModelMetadata, QuantizedModel, TensorMap, TensorRef};
 use crate::progress::ProgressReporter;
@@ -21,9 +22,6 @@ use crate::progress::ProgressReporter;
 pub enum QualityError {
     #[error("GPU error during quality measurement: {0}")]
     Gpu(#[from] anyhow::Error),
-
-    #[error("Candle tensor error: {0}")]
-    Candle(#[from] candle_core::Error),
 
     #[error("Tokenizer not available: {reason}")]
     TokenizerUnavailable { reason: String },
@@ -132,111 +130,62 @@ pub fn check_thresholds(report: &QualityReport, thresholds: &QualityThresholds) 
     violations
 }
 
-/// Measure quality by comparing original and quantized models via GPU forward passes.
+/// Measure quality by comparing original and quantized tensor maps.
 ///
-/// 1. Load tokenizer and encode calibration text
-/// 2. Load original model weights into Candle and run forward pass
-/// 3. Load quantized model weights (dequantized back to float) and run forward pass
-/// 4. Compute KL divergence, perplexity delta, activation cosine similarity
+/// Computes weight-level cosine similarity by comparing matching weight tensors
+/// between the original and quantized (dequantized) tensor maps.
+///
+/// KL divergence and perplexity are not computed (they require an inference
+/// forward pass which is handled by the mlx-native serve path).
 pub fn measure_quality(
     original_tensors: &TensorMap,
     quantized_tensors: &TensorMap,
-    metadata: &ModelMetadata,
-    model_dir: &Path,
+    _metadata: &ModelMetadata,
+    _model_dir: &Path,
     progress: &ProgressReporter,
 ) -> Result<QualityReport, QualityError> {
-    use crate::gpu;
-    use crate::gpu::forward::TransformerForward;
-    use crate::gpu::tokenizer as gpu_tok;
+    let pb = progress.bar(2, "Quality measurement");
 
-    let pb = progress.bar(5, "Quality measurement");
-
-    // Step 1: Load tokenizer and encode calibration text
-    let tokenizer = match gpu_tok::load_tokenizer(model_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(QualityError::TokenizerUnavailable {
-                reason: format!("{}", e),
-            });
-        }
-    };
-
-    let cal_text = gpu_tok::default_calibration_text();
-    let token_ids = gpu_tok::encode_calibration_text(&tokenizer, cal_text)?;
-
-    // Limit token count to avoid OOM on large models
-    let max_tokens = 128;
-    let token_ids: Vec<u32> = if token_ids.len() > max_tokens {
-        token_ids[..max_tokens].to_vec()
-    } else {
-        token_ids
-    };
-
-    if token_ids.len() < 2 {
-        return Err(QualityError::Gpu(anyhow::anyhow!(
-            "Calibration text too short: need at least 2 tokens, got {}",
-            token_ids.len()
-        )));
-    }
-
-    info!(tokens = token_ids.len(), "Encoded calibration text");
-    pb.inc(1);
-
-    // Step 2: Select device and load original model
-    let (device, gpu_device) = gpu::select_device()?;
-    info!(device = %gpu_device, "Using device for quality measurement");
-
-    let original_model = TransformerForward::load(original_tensors, metadata, &device)?;
-    pb.inc(1);
-
-    // Step 3: Run original forward pass with activation capture
-    debug!("Running original model forward pass");
-    let original_output = original_model.forward_with_activations(&token_ids)?;
-    pb.inc(1);
-
-    // Step 4: Load quantized model and run forward pass
-    debug!("Running quantized model forward pass");
-    let quantized_model = TransformerForward::load(quantized_tensors, metadata, &device)?;
-    let quantized_output = quantized_model.forward_with_activations(&token_ids)?;
-    pb.inc(1);
-
-    // Step 5: Compute quality metrics
     let mut report = QualityReport::empty();
 
-    // 5a: KL divergence from logits
-    let orig_logits_f32 = logits_to_f32(&original_output.logits)?;
-    let quant_logits_f32 = logits_to_f32(&quantized_output.logits)?;
+    // Compute weight-level cosine similarity between original and quantized tensors
+    pb.set_message("Computing weight cosine similarity");
 
-    match compute_kl_from_logits(&orig_logits_f32, &quant_logits_f32) {
-        Ok(kl_result) => {
-            report.kl_divergence = Some(kl_result.overall);
-            report.per_layer_kl = Some(kl_result.per_layer);
+    let mut orig_vecs: Vec<Vec<f32>> = Vec::new();
+    let mut quant_vecs: Vec<Vec<f32>> = Vec::new();
+
+    // Collect matching weight tensor pairs, sorted by name for deterministic ordering
+    let mut weight_names: Vec<&String> = original_tensors
+        .tensors
+        .keys()
+        .filter(|name| {
+            original_tensors.tensors[*name].is_weight()
+                && quantized_tensors.tensors.contains_key(*name)
+        })
+        .collect();
+    weight_names.sort();
+
+    for name in &weight_names {
+        let orig_tensor = &original_tensors.tensors[*name];
+        let quant_tensor = &quantized_tensors.tensors[*name];
+
+        let orig_f32 = tensor_ref_to_f32(orig_tensor);
+        let quant_f32 = tensor_ref_to_f32(quant_tensor);
+
+        if orig_f32.is_empty() || quant_f32.is_empty() {
+            continue;
         }
-        Err(e) => {
-            warn!("KL divergence computation failed: {}", e);
-        }
+
+        // Use the shorter length (they should match, but be safe)
+        let len = orig_f32.len().min(quant_f32.len());
+        orig_vecs.push(orig_f32[..len].to_vec());
+        quant_vecs.push(quant_f32[..len].to_vec());
     }
 
-    // 5b: Perplexity delta
-    // Use tokens[1..] as targets (next-token prediction) and logits[0..n-1] as predictions
-    let targets: Vec<u32> = token_ids[1..].to_vec();
-    match compute_perplexity_delta(&orig_logits_f32, &quant_logits_f32, &targets) {
-        Ok(ppl_result) => {
-            report.perplexity_pre = Some(ppl_result.pre_quant);
-            report.perplexity_post = Some(ppl_result.post_quant);
-            report.perplexity_delta = Some(ppl_result.delta);
-        }
-        Err(e) => {
-            warn!("Perplexity computation failed: {}", e);
-        }
-    }
+    pb.inc(1);
 
-    // 5c: Activation cosine similarity (per-layer hidden states)
-    if let (Some(ref orig_hs), Some(ref quant_hs)) = (
-        original_output.hidden_states,
-        quantized_output.hidden_states,
-    ) {
-        match compute_activation_cosine_sim(orig_hs, quant_hs) {
+    if !orig_vecs.is_empty() {
+        match cosine_sim::per_layer_cosine_similarity(&orig_vecs, &quant_vecs) {
             Ok(cos_result) => {
                 report.per_layer_cosine_sim = Some(cos_result.per_layer.clone());
                 report.cosine_sim_average = Some(cos_result.average);
@@ -247,12 +196,41 @@ pub fn measure_quality(
                 warn!("Cosine similarity computation failed: {}", e);
             }
         }
+    } else {
+        warn!("No matching weight tensors found for cosine similarity");
     }
+
+    info!(
+        weight_pairs = orig_vecs.len(),
+        "Weight-level quality measurement complete"
+    );
 
     pb.inc(1);
     pb.finish_with_message("Quality measurement complete");
 
     Ok(report)
+}
+
+/// Convert a TensorRef to f32 values for quality comparison.
+fn tensor_ref_to_f32(tensor: &TensorRef) -> Vec<f32> {
+    match tensor.dtype {
+        DType::F32 => tensor
+            .data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        DType::F16 => tensor
+            .data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect(),
+        DType::BF16 => tensor
+            .data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Dequantize a QuantizedModel back into a TensorMap for forward pass comparison.
@@ -389,95 +367,6 @@ fn unpack_quantized(data: &[u8], num_elements: usize, bits: u8) -> Vec<i8> {
         }
         _ => data.iter().take(num_elements).map(|&v| v as i8).collect(),
     }
-}
-
-/// Convert a Candle logits tensor [seq_len, vocab_size] to Vec<Vec<f32>>.
-fn logits_to_f32(
-    logits: &candle_core::Tensor,
-) -> Result<Vec<Vec<f32>>, QualityError> {
-    let dims = logits.dims();
-    if dims.len() != 2 {
-        return Err(QualityError::Gpu(anyhow::anyhow!(
-            "Expected 2D logits tensor, got {}D",
-            dims.len()
-        )));
-    }
-
-    let seq_len = dims[0];
-    let vocab_size = dims[1];
-
-    let flat: Vec<f32> = logits
-        .to_dtype(candle_core::DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-
-    let mut result = Vec::with_capacity(seq_len);
-    for i in 0..seq_len {
-        let start = i * vocab_size;
-        let end = start + vocab_size;
-        result.push(flat[start..end].to_vec());
-    }
-
-    Ok(result)
-}
-
-/// Compute KL divergence from logit sequences, treating each position as a separate
-/// comparison.
-fn compute_kl_from_logits(
-    original: &[Vec<f32>],
-    quantized: &[Vec<f32>],
-) -> Result<kl_divergence::KlDivergenceResult, kl_divergence::KlDivergenceError> {
-    kl_divergence::per_layer_kl_divergence(original, quantized)
-}
-
-/// Compute perplexity delta using logit sequences and target token IDs.
-fn compute_perplexity_delta(
-    original: &[Vec<f32>],
-    quantized: &[Vec<f32>],
-    targets: &[u32],
-) -> Result<perplexity::PerplexityResult, perplexity::PerplexityError> {
-    // Use logits[0..n-1] to predict targets[0..n-1] (next-token prediction)
-    let n = targets.len().min(original.len() - 1).min(quantized.len() - 1);
-    if n == 0 {
-        return Err(perplexity::PerplexityError::EmptySequence);
-    }
-    let orig_logits = &original[..n];
-    let quant_logits = &quantized[..n];
-    let tgt = &targets[..n];
-    perplexity::perplexity_delta(orig_logits, quant_logits, tgt)
-}
-
-/// Compute activation cosine similarity from per-layer hidden state tensors.
-fn compute_activation_cosine_sim(
-    original_hs: &[candle_core::Tensor],
-    quantized_hs: &[candle_core::Tensor],
-) -> Result<cosine_sim::CosineSimilarityResult, cosine_sim::CosineSimilarityError> {
-    let num_layers = original_hs.len().min(quantized_hs.len());
-    let mut orig_vecs = Vec::with_capacity(num_layers);
-    let mut quant_vecs = Vec::with_capacity(num_layers);
-
-    for i in 0..num_layers {
-        let orig_flat: Vec<f32> = match original_hs[i]
-            .to_dtype(candle_core::DType::F32)
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-        {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let quant_flat: Vec<f32> = match quantized_hs[i]
-            .to_dtype(candle_core::DType::F32)
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_vec1::<f32>())
-        {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        orig_vecs.push(orig_flat);
-        quant_vecs.push(quant_flat);
-    }
-
-    cosine_sim::per_layer_cosine_similarity(&orig_vecs, &quant_vecs)
 }
 
 /// Print a terminal summary of quality metrics.
@@ -714,5 +603,26 @@ mod tests {
         let t = result.tensors.get("test.weight").unwrap();
         assert_eq!(t.dtype, DType::F16);
         assert_eq!(t.data, f16_data);
+    }
+
+    #[test]
+    fn test_tensor_ref_to_f32() {
+        let f16_data: Vec<u8> = [1.0f32, -2.0, 3.5]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let tensor = TensorRef {
+            name: "test".to_string(),
+            shape: vec![3],
+            dtype: DType::F16,
+            data: f16_data,
+        };
+
+        let vals = tensor_ref_to_f32(&tensor);
+        assert_eq!(vals.len(), 3);
+        assert!((vals[0] - 1.0).abs() < 0.01);
+        assert!((vals[1] + 2.0).abs() < 0.01);
+        assert!((vals[2] - 3.5).abs() < 0.01);
     }
 }

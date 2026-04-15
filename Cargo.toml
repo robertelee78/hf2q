@@ -11,12 +11,6 @@ repository = "https://github.com/robertelee78/hf2q"
 default = []
 # Enable RuVector self-learning
 ruvector = ["dep:ruvector-core"]
-# GPU acceleration backends
-metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-# ADR-006 Phase 5: mlx-native GPU compute backend (per-op cutover from candle).
-# Opt-in during migration; will become the sole backend post-migration.
-mlx-native-backend = ["dep:mlx-native", "metal"]
 
 [dependencies]
 safetensors = "0.7"
@@ -48,16 +42,8 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 
-# GPU compute (Candle)
-candle-core = "0.10"
-candle-nn = "0.10"
-# Direct access to candle's Metal quantized kernels for the 1bNEW.1 fused
-# MoE dispatch (ports llama.cpp `kernel_mul_mv_id_*`). Only pulled in when
-# the `metal` feature is enabled so that non-Metal builds stay lean.
-candle-metal-kernels = { version = "0.10", optional = true }
-objc2-metal = { version = "0.3", optional = true }
-# ADR-006 Phase 5: mlx-native GPU compute backend.
-mlx-native = { path = "/opt/mlx-native", optional = true }
+# ADR-008: mlx-native is the sole inference/compute backend.
+mlx-native = { path = "/opt/mlx-native" }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # Async runtime + HTTP server (for `serve` subcommand)
@@ -99,35 +85,5 @@ harness = false
 name = "shard_read_bench"
 harness = false
 
-# ADR-005 1bNEW.20.FIX — vendored candle-nn with SDPA Metal offset fix.
-# Upstream candle-nn 0.10.2 (crates.io + HEAD) passes `layout.start_offset()`
-# (an element count) where Metal's `setBuffer:offset:atIndex:` expects bytes,
-# at all three SDPA dispatch paths (vector / vector_2pass / full). The bug is
-# latent whenever SDPA inputs have `start_offset == 0`, which is every other
-# candle consumer. hf2q's 1bNEW.20 in-place KV cache path hands SDPA a narrow
-# view with non-zero start_offset once `current_len > sliding_window`, which
-# exposes the bug as a coherence flip at exactly token ~1024 on Gemma-4.
-# Vendor patch applies the same `* dtype.size_in_bytes()` pattern the rest of
-# candle-nn already uses for its Metal ops. See /opt/hf2q/vendor/candle-nn/
-# src/ops.rs header for the full bug analysis. Drop this override once the
-# upstream fix lands in a candle release.
-[patch.crates-io]
-candle-nn = { path = "vendor/candle-nn" }
-
-# ADR-005 Phase 1b 1bNEW.21 vendor patch (2026-04-11): bump
-# DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER from 50 to 100 in
-# candle-metal-kernels/src/metal/commands.rs. Empirical sweep on Apple
-# M5 Max showed +0.9 tok/s reproducible across 3 independent trials
-# (85.0 → 85.9 median on the canonical Gemma 4 26B MoE DWQ bench). The
-# upstream 50 value has no empirical rationale in candle's commit
-# history — it is a historical carryover from pre-refactor single-
-# buffer code (candle commits 0cf516d1 Sept-2025 and db08cc0a Nov-2025).
-# Chesterton's fence cleared: neither `commands_rotation_threshold`
-# nor `commands_concurrent_acquisition` in candle's own tests depends
-# on the default being 50 (both override via env var). See
-# /opt/hf2q/vendor/candle-metal-kernels/src/metal/commands.rs header
-# comment and docs/spike-post-1bNEW20-results.md for the full sweep.
-# Drop this override once an upstream candle release re-validates the
-# default at 100 or higher.
-candle-metal-kernels = { path = "vendor/candle-metal-kernels" }
+# ADR-008: vendored candle patches removed (candle no longer used for inference).
 

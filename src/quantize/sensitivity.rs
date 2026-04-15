@@ -4,7 +4,6 @@
 //! Higher sensitivity = more information loss under quantization = needs more bits.
 
 use anyhow::Result;
-use candle_core::{DType, Tensor, D};
 use tracing::debug;
 
 /// Per-layer sensitivity statistics.
@@ -21,20 +20,19 @@ pub struct LayerSensitivity {
     pub score: f64,
 }
 
-/// Compute per-layer sensitivity scores from activation tensors.
+/// Compute per-layer sensitivity scores from activation f32 slices.
 ///
-/// Each activation tensor has shape [seq_len, hidden_size].
+/// Each activation slice is the flattened hidden-state values for one layer.
 /// Sensitivity is computed as:
 ///   score = sqrt(variance) * log2(1 + max_magnitude)
 ///
 /// Higher score means the layer is more sensitive to quantization error.
-pub fn compute_layer_sensitivity(activations: &[Tensor]) -> Result<Vec<LayerSensitivity>> {
+#[allow(dead_code)]
+pub fn compute_layer_sensitivity(activations: &[Vec<f32>]) -> Result<Vec<LayerSensitivity>> {
     let mut sensitivities = Vec::with_capacity(activations.len());
 
     for (i, act) in activations.iter().enumerate() {
-        // Flatten to f64 for numerical stability
-        let flat = act.flatten_all()?.to_dtype(DType::F64)?;
-        let n = flat.elem_count() as f64;
+        let n = act.len() as f64;
 
         if n < 1.0 {
             sensitivities.push(LayerSensitivity {
@@ -47,19 +45,24 @@ pub fn compute_layer_sensitivity(activations: &[Tensor]) -> Result<Vec<LayerSens
         }
 
         // Compute variance: var = E[x^2] - E[x]^2
-        let mean = flat
-            .sum_all()?
-            .to_scalar::<f64>()?
-            / n;
-        let sq = flat.sqr()?;
-        let mean_sq = sq.sum_all()?.to_scalar::<f64>()? / n;
-        let variance = (mean_sq - mean * mean).max(0.0);
+        let mut sum = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
+        let mut max_abs = 0.0_f64;
 
-        // Compute max absolute magnitude
-        let abs_vals = flat.abs()?;
-        let max_magnitude = abs_vals
-            .max(D::Minus1)?
-            .to_scalar::<f64>()?;
+        for &v in act {
+            let v = v as f64;
+            sum += v;
+            sum_sq += v * v;
+            let abs_v = v.abs();
+            if abs_v > max_abs {
+                max_abs = abs_v;
+            }
+        }
+
+        let mean = sum / n;
+        let mean_sq = sum_sq / n;
+        let variance = (mean_sq - mean * mean).max(0.0);
+        let max_magnitude = max_abs;
 
         // Combined score
         let score = variance.sqrt() * (1.0 + max_magnitude).log2();
@@ -91,6 +94,7 @@ pub fn compute_layer_sensitivity(activations: &[Tensor]) -> Result<Vec<LayerSens
 /// Layers with higher sensitivity get more bits. The allocation is:
 ///   normalized = (score - min_score) / (max_score - min_score)
 ///   bits = round(base_bits + normalized * (sensitive_bits - base_bits))
+#[allow(dead_code)]
 pub fn allocate_bits_by_sensitivity(
     sensitivity: &[LayerSensitivity],
     base_bits: u8,
@@ -133,27 +137,14 @@ pub fn allocate_bits_by_sensitivity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
 
     #[test]
     fn test_compute_layer_sensitivity_basic() {
-        let device = Device::Cpu;
-
         // Layer with low variance, small magnitude
-        let low = Tensor::from_vec(
-            vec![0.1f32, 0.2, 0.1, 0.2, 0.1, 0.2],
-            (2, 3),
-            &device,
-        )
-        .unwrap();
+        let low = vec![0.1f32, 0.2, 0.1, 0.2, 0.1, 0.2];
 
         // Layer with high variance, large magnitude
-        let high = Tensor::from_vec(
-            vec![-5.0f32, 10.0, -3.0, 8.0, -7.0, 12.0],
-            (2, 3),
-            &device,
-        )
-        .unwrap();
+        let high = vec![-5.0f32, 10.0, -3.0, 8.0, -7.0, 12.0];
 
         let activations = vec![low, high];
         let result = compute_layer_sensitivity(&activations).unwrap();
@@ -173,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_compute_layer_sensitivity_empty() {
-        let activations: Vec<Tensor> = vec![];
+        let activations: Vec<Vec<f32>> = vec![];
         let result = compute_layer_sensitivity(&activations).unwrap();
         assert!(result.is_empty());
     }

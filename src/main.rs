@@ -8,15 +8,21 @@
 //!   2 = quality threshold exceeded
 //!   3 = input/validation error
 
+#[allow(dead_code)]
 mod backends;
 mod cli;
 mod doctor;
 #[allow(dead_code)]
 mod gpu;
+#[allow(dead_code)]
 mod input;
+#[allow(dead_code)]
 mod intelligence;
+#[allow(dead_code)]
 mod ir;
+#[allow(dead_code)]
 mod preflight;
+#[allow(dead_code)]
 mod progress;
 #[allow(dead_code)]
 mod quality;
@@ -53,6 +59,7 @@ enum AppError {
     Conversion(anyhow::Error),
     #[allow(dead_code)]
     QualityExceeded(anyhow::Error),
+    #[allow(dead_code)]
     Interrupted,
 }
 
@@ -1029,8 +1036,6 @@ fn print_dry_run_plan(
 }
 
 /// Try to detect the quantization method from an output directory path.
-///
-/// Looks for known method names in the directory name (e.g., "model-gguf-q4" -> "q4").
 fn detect_quant_method_from_path(path: &std::path::Path) -> String {
     let name = path
         .file_name()

@@ -3,39 +3,19 @@
 //! Provides [`GpuContext`] — a thin wrapper that holds the [`GraphExecutor`]
 //! and [`KernelRegistry`] for the mlx-native backend.
 //!
-//! # ADR-006 Phase 5: per-op cutover
+//! # ADR-008: candle divorce
 //!
-//! During migration, the forward pass can use either candle or mlx-native as
-//! the GPU compute backend.  The `--backend candle|mlx-native` CLI flag
-//! selects the backend at runtime.
-//!
-//! # Bridge: candle weights -> MlxBuffer (load-time copy)
-//!
-//! candle and mlx-native use different Rust bindings for Metal buffers
-//! (`candle-metal-kernels::Buffer` vs `metal::Buffer` from the `metal` crate).
-//! These types wrap the same Objective-C MTLBuffer protocol but are
-//! incompatible at the Rust type level.
-//!
-//! Instead of zero-copy buffer sharing, the bridge copies weight bytes at
-//! model load time.  For quantized weights (`QTensor`), this uses
-//! `QTensor::data()`.  For dense weights (`Tensor`), this uses
-//! `Tensor::to_vec1`.  Both are one-time costs at model load.
-//!
-//! At inference time, the MlxBuffer weights are used directly by mlx-native's
-//! kernels — no per-token copies.
+//! All candle bridge functions have been removed.  Weights are loaded
+//! directly from GGUF via `mlx_native::gguf::GgufFile` into `MlxBuffer`s.
+//! The `QuantWeightInfo` struct now uses `mlx_native::GgmlType` directly.
 
-#[cfg(feature = "mlx-native-backend")]
-use mlx_native::{GraphExecutor, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
 
 /// GPU context for the mlx-native backend.
 ///
 /// Owns the graph executor (which in turn owns the Metal device and command
 /// queue) and the pre-warmed kernel registry.  Created once at model load;
-/// lives on `Gemma4Model` alongside (or eventually replacing) the candle
-/// `Device`.
-///
-/// Access the underlying `MlxDevice` via `self.executor.device()`.
-#[cfg(feature = "mlx-native-backend")]
+/// lives for the duration of inference.
 pub struct GpuContext {
     /// Batched dispatch executor — one `CommandEncoder` per forward pass.
     /// Also owns the `MlxDevice`.
@@ -48,7 +28,6 @@ pub struct GpuContext {
 unsafe impl Send for GpuContext {}
 unsafe impl Sync for GpuContext {}
 
-#[cfg(feature = "mlx-native-backend")]
 impl GpuContext {
     /// Initialize the mlx-native GPU context.
     ///
@@ -92,163 +71,21 @@ impl GpuContext {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge: candle dense Tensor -> MlxBuffer (load-time copy)
+// Quantized weight metadata
 // ---------------------------------------------------------------------------
 
-/// Copy a candle `Tensor`'s data into a fresh `MlxBuffer`.
-///
-/// This is a load-time copy, not zero-copy.  Both candle and mlx-native use
-/// `StorageModeShared` Metal buffers, but they use different Rust `metal`
-/// bindings (`candle-metal-kernels::Buffer` vs `metal::Buffer`) that are
-/// type-incompatible.
-///
-/// For F32 tensors (norm weights, layer scalars, etc.), this copies through
-/// the CPU.  The cost is negligible for the small tensors involved.
-#[cfg(feature = "mlx-native-backend")]
-pub fn candle_tensor_to_mlx_buffer(
-    tensor: &candle_core::Tensor,
-    mlx_device: &MlxDevice,
-) -> anyhow::Result<MlxBuffer> {
-    // Force contiguous + F32 for a clean byte layout.
-    let t = tensor.to_dtype(candle_core::DType::F32)?.contiguous()?;
-    let data: Vec<f32> = t.to_vec1()
-        .or_else(|_| {
-            // Multi-dimensional: flatten first.
-            t.flatten_all()?.to_vec1()
-        })
-        .map_err(|e| anyhow::anyhow!("candle_tensor_to_mlx_buffer: to_vec1 failed: {e}"))?;
-
-    let byte_len = data.len() * std::mem::size_of::<f32>();
-    let shape: Vec<usize> = tensor.dims().to_vec();
-
-    let mut mlx_buf = mlx_device.alloc_buffer(
-        byte_len,
-        mlx_native::DType::F32,
-        shape,
-    ).map_err(|e| anyhow::anyhow!("MlxBuffer alloc failed: {e}"))?;
-
-    // Write f32 data into the Metal buffer.
-    let dst: &mut [f32] = mlx_buf.as_mut_slice()
-        .map_err(|e| anyhow::anyhow!("MlxBuffer::as_mut_slice failed: {e}"))?;
-    dst.copy_from_slice(&data);
-
-    Ok(mlx_buf)
-}
-
-// ---------------------------------------------------------------------------
-// Bridge: candle QTensor -> MlxBuffer (load-time copy)
-// ---------------------------------------------------------------------------
-
-/// Load a candle `QTensor`'s raw quantized bytes into a fresh `MlxBuffer`.
-///
-/// The returned buffer contains the raw GGML block data that
-/// `quantized_matmul_ggml` consumes directly.
-///
-/// This is NOT zero-copy — it reads the bytes via `QTensor::data()` and
-/// writes them into a new mlx-native Metal allocation.  Acceptable because
-/// it only happens once at model load time.
-#[cfg(feature = "mlx-native-backend")]
-pub fn load_qtensor_to_mlx_buffer(
-    qtensor: &candle_core::quantized::QTensor,
-    mlx_device: &MlxDevice,
-) -> anyhow::Result<(MlxBuffer, QuantWeightInfo)> {
-    let raw_bytes = qtensor.data()
-        .map_err(|e| anyhow::anyhow!("QTensor::data() failed: {e}"))?;
-    let byte_len = raw_bytes.len();
-    let ggml_dtype = qtensor.dtype();
-    let shape = qtensor.shape();
-
-    // Allocate an MlxBuffer and copy the raw GGML block bytes into it.
-    let mut mlx_buf = mlx_device.alloc_buffer(
-        byte_len,
-        mlx_native::DType::U8,
-        vec![byte_len],
-    ).map_err(|e| anyhow::anyhow!("MlxBuffer alloc failed: {e}"))?;
-
-    // Write the raw bytes into the Metal buffer (CPU-accessible on unified memory).
-    let dst: &mut [u8] = mlx_buf.as_mut_slice()
-        .map_err(|e| anyhow::anyhow!("MlxBuffer::as_mut_slice failed: {e}"))?;
-    dst.copy_from_slice(&raw_bytes);
-
-    let info = QuantWeightInfo {
-        ggml_dtype,
-        rows: shape.dims()[0],
-        cols: if shape.dims().len() > 1 { shape.dims()[1] } else { 1 },
-    };
-
-    Ok((mlx_buf, info))
-}
-
-/// Load a candle `QMatMul`'s quantized weights into a fresh `MlxBuffer`.
-#[cfg(feature = "mlx-native-backend")]
-pub fn load_qmatmul_to_mlx_buffer(
-    qmatmul: &candle_core::quantized::QMatMul,
-    mlx_device: &MlxDevice,
-) -> anyhow::Result<(MlxBuffer, QuantWeightInfo)> {
-    use candle_core::quantized::QMatMul;
-
-    match qmatmul {
-        QMatMul::QTensor(qt) => load_qtensor_to_mlx_buffer(qt, mlx_device),
-        QMatMul::Tensor(_) | QMatMul::TensorF16(_) => {
-            anyhow::bail!(
-                "load_qmatmul_to_mlx_buffer: expected QTensor variant, got dequantized Tensor"
-            )
-        }
-    }
-}
-
-/// Information about a quantized weight loaded from candle.
-#[cfg(feature = "mlx-native-backend")]
+/// Information about a quantized weight loaded from GGUF.
 #[derive(Debug, Clone, Copy)]
 pub struct QuantWeightInfo {
     /// GGML quantization type (Q4_0, Q6_K, Q8_0, etc.).
-    pub ggml_dtype: candle_core::quantized::GgmlDType,
+    pub ggml_dtype: mlx_native::GgmlType,
     /// Number of output rows (N dimension of the weight matrix).
     pub rows: usize,
     /// Number of input columns (K dimension of the weight matrix).
     pub cols: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Type mapping
-// ---------------------------------------------------------------------------
-
-/// Map a candle `DType` to an mlx-native `DType`.
 #[cfg(test)]
-#[cfg(feature = "mlx-native-backend")]
-pub fn candle_dtype_to_mlx(dt: candle_core::DType) -> mlx_native::DType {
-    match dt {
-        candle_core::DType::F32 => mlx_native::DType::F32,
-        candle_core::DType::F16 => mlx_native::DType::F16,
-        candle_core::DType::BF16 => mlx_native::DType::BF16,
-        candle_core::DType::U8 => mlx_native::DType::U8,
-        candle_core::DType::U32 => mlx_native::DType::U32,
-        // Non-exhaustive fallback for types without a direct mapping.
-        _ => mlx_native::DType::F32,
-    }
-}
-
-/// Map a candle `GgmlDType` to an mlx-native `GgmlType`.
-///
-/// Only the types actually used in the model are mapped.
-#[cfg(feature = "mlx-native-backend")]
-pub fn candle_ggml_to_mlx(
-    dt: candle_core::quantized::GgmlDType,
-) -> anyhow::Result<mlx_native::GgmlType> {
-    use candle_core::quantized::GgmlDType;
-    match dt {
-        GgmlDType::Q4_0 => Ok(mlx_native::GgmlType::Q4_0),
-        GgmlDType::Q8_0 => Ok(mlx_native::GgmlType::Q8_0),
-        GgmlDType::Q6K => Ok(mlx_native::GgmlType::Q6_K),
-        other => anyhow::bail!(
-            "candle_ggml_to_mlx: unsupported GGML type {:?}",
-            other
-        ),
-    }
-}
-
-#[cfg(test)]
-#[cfg(feature = "mlx-native-backend")]
 mod tests {
     use super::*;
 
@@ -257,29 +94,5 @@ mod tests {
         let ctx = GpuContext::new().expect("GpuContext::new should succeed on Apple Silicon");
         assert!(!ctx.gpu_name().is_empty());
         println!("GpuContext GPU: {}", ctx.gpu_name());
-    }
-
-    #[test]
-    fn test_dtype_mapping() {
-        assert_eq!(
-            candle_dtype_to_mlx(candle_core::DType::F32),
-            mlx_native::DType::F32
-        );
-        assert_eq!(
-            candle_dtype_to_mlx(candle_core::DType::F16),
-            mlx_native::DType::F16
-        );
-        assert_eq!(
-            candle_dtype_to_mlx(candle_core::DType::BF16),
-            mlx_native::DType::BF16
-        );
-    }
-
-    #[test]
-    fn test_ggml_type_mapping() {
-        use candle_core::quantized::GgmlDType;
-        assert!(candle_ggml_to_mlx(GgmlDType::Q4_0).is_ok());
-        assert!(candle_ggml_to_mlx(GgmlDType::Q8_0).is_ok());
-        assert!(candle_ggml_to_mlx(GgmlDType::Q6K).is_ok());
     }
 }

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::ir::{ModelMetadata, QuantizedModel, TensorMap, TensorRef};
 use crate::progress::ProgressReporter;
@@ -144,105 +144,20 @@ fn weight_only_importance(values: &[f32]) -> f64 {
     sum / values.len() as f64
 }
 
-/// Try to run a GPU forward pass and collect per-tensor activation magnitudes.
+/// Attempt to collect per-tensor activation magnitudes.
 ///
-/// Returns None if GPU / tokenizer / forward pass is unavailable.
+/// ADR-008: the candle-based GPU forward pass has been removed.  Activation
+/// capture now requires the mlx-native inference path which is not wired into
+/// the quantization pipeline yet.  Returns None so callers fall back to
+/// weight-magnitude-only importance scoring.
 fn attempt_activation_capture(
-    tensor_map: &TensorMap,
-    metadata: &ModelMetadata,
-    model_dir: &Path,
-    calibration_tokens: usize,
+    _tensor_map: &TensorMap,
+    _metadata: &ModelMetadata,
+    _model_dir: &Path,
+    _calibration_tokens: usize,
 ) -> Option<HashMap<String, Vec<f64>>> {
-    use crate::gpu;
-
-    // Load tokenizer
-    let tokenizer = match gpu::tokenizer::load_tokenizer(model_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Apex: tokenizer unavailable, falling back to weight-only importance: {}", e);
-            return None;
-        }
-    };
-
-    let text = gpu::tokenizer::default_calibration_text();
-    let mut token_ids = match gpu::tokenizer::encode_calibration_text(&tokenizer, text) {
-        Ok(ids) => ids,
-        Err(e) => {
-            warn!("Apex: tokenization failed, weight-only fallback: {}", e);
-            return None;
-        }
-    };
-
-    // Truncate to calibration_tokens
-    token_ids.truncate(calibration_tokens);
-    if token_ids.is_empty() {
-        warn!("Apex: no calibration tokens produced");
-        return None;
-    }
-
-    // Select GPU device
-    let (device, gpu_dev) = match gpu::select_device() {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("Apex: GPU device unavailable, weight-only fallback: {}", e);
-            return None;
-        }
-    };
-    info!("Apex: using {} for activation capture", gpu_dev);
-
-    // Load transformer
-    let transformer = match gpu::forward::TransformerForward::load(tensor_map, metadata, &device) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Apex: transformer load failed, weight-only fallback: {}", e);
-            return None;
-        }
-    };
-
-    // Forward pass with activation capture
-    let output = match transformer.forward_with_activations(&token_ids) {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("Apex: forward pass failed, weight-only fallback: {}", e);
-            return None;
-        }
-    };
-
-    // Compute per-layer activation magnitudes from hidden states
-    let hidden_states = output.hidden_states?;
-    let mut act_map: HashMap<String, Vec<f64>> = HashMap::new();
-
-    for (layer_idx, hs) in hidden_states.iter().enumerate() {
-        // hs shape: [seq_len, hidden_size]
-        // Compute mean absolute value per hidden dimension across sequence
-        let mean_abs = match hs.abs().and_then(|a| a.mean(0)) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let magnitudes: Vec<f64> = match mean_abs.to_vec1::<f32>() {
-            Ok(v) => v.iter().map(|x| *x as f64).collect(),
-            Err(_) => match mean_abs.to_dtype(candle_core::DType::F32).and_then(|t| t.to_vec1::<f32>()) {
-                Ok(v) => v.iter().map(|x| *x as f64).collect(),
-                Err(_) => continue,
-            },
-        };
-
-        // Assign to all weight tensors in this layer
-        let layer_prefix = format!(".layers.{}.", layer_idx);
-        for name in tensor_map.tensors.keys() {
-            if name.contains(&layer_prefix) && tensor_map.tensors[name].is_weight() {
-                act_map.insert(name.clone(), magnitudes.clone());
-            }
-        }
-    }
-
-    if act_map.is_empty() {
-        None
-    } else {
-        info!("Apex: captured activations for {} tensors", act_map.len());
-        Some(act_map)
-    }
+    info!("Apex: using weight-magnitude-only importance (activation capture requires mlx-native serve path)");
+    None
 }
 
 /// Select optimal GGML K-quant type per tensor based on importance scores.

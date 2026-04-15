@@ -1,13 +1,14 @@
 //! mlx-native forward pass for Gemma 4 inference.
 //!
-//! ADR-006 Phase 5: routes the entire `Gemma4Model::forward` through
-//! mlx-native's `GraphExecutor`, encoding all ops into a single Metal
-//! command buffer with one `commit_and_wait` per token.
+//! ADR-008: routes the entire forward pass through mlx-native's
+//! `GraphExecutor`, encoding all ops into a single Metal command buffer
+//! with one `commit_and_wait` per token.
 //!
 //! # Architecture
 //!
-//! At model load time, all weights are copied from candle's Metal buffers
-//! into mlx-native `MlxBuffer` instances via `gpu.rs` bridge functions.
+//! At model load time, weights are loaded directly from a GGUF file into
+//! mlx-native `MlxBuffer` instances via `load_from_gguf()`.  No candle
+//! involvement.
 //! At inference time, the forward pass uses mlx-native's `GraphSession`
 //! to encode all ops (qmatmul, RmsNorm, RoPE, SDPA, etc.) into batched
 //! command buffers to minimize GPU sync points.
@@ -39,7 +40,7 @@ use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
 
 use super::config::{Gemma4Config, LayerType};
-use super::gpu::{self, GpuContext, QuantWeightInfo};
+use super::gpu::{GpuContext, QuantWeightInfo};
 
 // ---------------------------------------------------------------------------
 // Profiling support (HF2Q_MLX_PROFILE=1)
@@ -269,12 +270,11 @@ impl MlxQWeight {
     ///
     /// `m` is the number of input tokens (1 for decode).
     pub fn matmul_params(&self, m: u32) -> Result<GgmlQuantizedMatmulParams> {
-        let ggml_type = gpu::candle_ggml_to_mlx(self.info.ggml_dtype)?;
         Ok(GgmlQuantizedMatmulParams {
             m,
             n: self.info.rows as u32,
             k: self.info.cols as u32,
-            ggml_type,
+            ggml_type: self.info.ggml_dtype,
         })
     }
 }
@@ -313,9 +313,9 @@ pub struct MlxMoeWeights {
     pub per_expert_scale: MlxBuffer,
     /// GGML quant type for gate_up experts (stored separately so we can
     /// drop the individual expert Vec after stacking).
-    pub gate_up_ggml_dtype: candle_core::quantized::GgmlDType,
+    pub gate_up_ggml_dtype: mlx_native::GgmlType,
     /// GGML quant type for down experts.
-    pub down_ggml_dtype: candle_core::quantized::GgmlDType,
+    pub down_ggml_dtype: mlx_native::GgmlType,
     /// Number of experts to select per token.
     pub top_k: usize,
     /// MoE intermediate size per expert.
@@ -486,34 +486,30 @@ pub struct MlxModelWeights {
 }
 
 impl MlxModelWeights {
-    /// Load all model weights from the candle-based Gemma4Model into
-    /// mlx-native MlxBuffers.
+    /// Load all model weights directly from a GGUF file into mlx-native
+    /// MlxBuffers.
     ///
-    /// This is called once at model load time.  Each weight is copied from
-    /// candle's Metal buffer into a fresh mlx-native Metal allocation.
-    /// The copy cost is one-time and does not affect inference throughput.
-    pub fn load_from_candle(
-        model: &super::gemma4::Gemma4Model,
+    /// ADR-008 Phase 2: replaces `load_from_candle()` — weights go
+    /// GGUF → MlxBuffer with zero candle involvement.
+    pub fn load_from_gguf(
+        gguf: &mlx_native::gguf::GgufFile,
         cfg: &Gemma4Config,
-        mlx_device: &MlxDevice,
+        gpu: &mut GpuContext,
     ) -> Result<Self> {
-        eprintln!("  Loading mlx-native weights from candle model...");
+        let mlx_device = gpu.device();
+        eprintln!("  Loading mlx-native weights directly from GGUF...");
 
-        // Embedding weight (F32)
+        // --- Embedding weight (F32) ---
         eprintln!("  Loading embed_weight...");
-        let embed_weight = gpu::candle_tensor_to_mlx_buffer(
-            model.embed_weight(),
-            mlx_device,
-        )?;
+        let embed_weight = gguf.load_tensor_f32("token_embd.weight", mlx_device)
+            .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
 
+        // --- Final norm (F32) ---
         eprintln!("  Loading final_norm...");
-        // Final norm weight (F32)
-        let final_norm = gpu::candle_tensor_to_mlx_buffer(
-            model.final_norm_weight(),
-            mlx_device,
-        )?;
+        let final_norm = gguf.load_tensor_f32("output_norm.weight", mlx_device)
+            .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
 
-        // lm_head is tied to embed_weight. Create an F16 copy for GPU dense_gemm.
+        // --- lm_head F16 copy (tied to embed_weight) ---
         eprintln!("  Creating F16 embed weight for GPU lm_head...");
         let lm_head_f16 = {
             let embed_f32: &[f32] = embed_weight.as_slice()
@@ -524,7 +520,7 @@ impl MlxModelWeights {
                 f16_bytes, mlx_native::DType::F16,
                 vec![cfg.vocab_size, cfg.hidden_size],
             ).map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
-            // Convert F32 → F16 on CPU at load time (one-time cost).
+            // Convert F32 -> F16 on CPU at load time (one-time cost).
             let dst_bytes: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
                     f16_buf.contents_ptr() as *mut u8,
@@ -543,31 +539,33 @@ impl MlxModelWeights {
             cfg.vocab_size * cfg.hidden_size,
             (cfg.vocab_size * cfg.hidden_size * 2) as f64 / 1e6);
 
-        // Per-layer config
-        let num_layers = model.num_layers();
+        // --- Per-layer weights ---
+        let num_layers = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers);
         let mut kv_caches = Vec::with_capacity(num_layers);
         let mut head_dims = Vec::with_capacity(num_layers);
         let mut num_kv_heads_vec = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
-            eprintln!("  mlx layer {}/{}: attn+mlp weights...", i + 1, num_layers);
-            let refs = model.layer_weights(i);
-            eprintln!("  mlx layer {}/{}: moe weights...", i + 1, num_layers);
-            let moe_refs = model.moe_weights(i);
+            eprintln!("  GGUF layer {}/{}: loading weights...", i + 1, num_layers);
 
-            // Attention QMatMul weights
-            let q_proj = load_qweight(refs.q_proj, mlx_device, "q_proj")?;
-            let k_proj = load_qweight(refs.k_proj, mlx_device, "k_proj")?;
-            let v_proj = match refs.v_proj {
-                Some(qm) => Some(load_qweight(qm, mlx_device, "v_proj")?),
-                None => None,
+            // -- Attention quantized weights --
+            let q_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_q.weight"), mlx_device)?;
+            let k_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_k.weight"), mlx_device)?;
+            let v_proj = if cfg.is_full_attention(i) && cfg.attention_k_eq_v {
+                None
+            } else {
+                Some(load_gguf_qweight(gguf, &format!("blk.{i}.attn_v.weight"), mlx_device)?)
             };
-            let o_proj = load_qweight(refs.o_proj, mlx_device, "o_proj")?;
+            let o_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_output.weight"), mlx_device)?;
 
-            // Attention norm weights (F32)
-            let q_norm_weight = gpu::candle_tensor_to_mlx_buffer(refs.q_norm, mlx_device)?;
-            let k_norm_weight = gpu::candle_tensor_to_mlx_buffer(refs.k_norm, mlx_device)?;
+            // -- Attention head norms (F32) --
+            let q_norm_weight = gguf.load_tensor_f32(
+                &format!("blk.{i}.attn_q_norm.weight"), mlx_device,
+            ).map_err(|e| anyhow::anyhow!("layer {i} q_norm: {e}"))?;
+            let k_norm_weight = gguf.load_tensor_f32(
+                &format!("blk.{i}.attn_k_norm.weight"), mlx_device,
+            ).map_err(|e| anyhow::anyhow!("layer {i} k_norm: {e}"))?;
 
             let attn = MlxAttentionWeights {
                 q_proj,
@@ -578,10 +576,10 @@ impl MlxModelWeights {
                 k_norm_weight,
             };
 
-            // Dense MLP QMatMul weights
-            let gate_proj = load_qweight(refs.gate_proj, mlx_device, "gate_proj")?;
-            let up_proj = load_qweight(refs.up_proj, mlx_device, "up_proj")?;
-            let down_proj = load_qweight(refs.down_proj, mlx_device, "down_proj")?;
+            // -- Dense MLP (quantized) --
+            let gate_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
+            let up_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_up.weight"), mlx_device)?;
+            let down_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
 
             let mlp = MlxMlpWeights {
                 gate_proj,
@@ -589,96 +587,43 @@ impl MlxModelWeights {
                 down_proj,
             };
 
-            // MoE weights: load per-expert quantized weights
-            let mut expert_gate_up = Vec::with_capacity(cfg.num_experts);
-            let mut expert_down = Vec::with_capacity(cfg.num_experts);
-            for e in 0..cfg.num_experts {
-                if e % 32 == 0 {
-                    eprint!("\r  Loading mlx-native layer {}/{} experts {}/{}...",
-                        i + 1, num_layers, e, cfg.num_experts);
-                }
-                let gu = load_qweight(
-                    &moe_refs.expert_gate_up[e],
-                    mlx_device,
-                    &format!("layer{i}_expert{e}_gate_up"),
-                )?;
-                let dn = load_qweight(
-                    &moe_refs.expert_down[e],
-                    mlx_device,
-                    &format!("layer{i}_expert{e}_down"),
-                )?;
-                expert_gate_up.push(gu);
-                expert_down.push(dn);
+            // -- MoE expert weights (3D tensors, already stacked in GGUF) --
+            let gu_name = format!("blk.{i}.ffn_gate_up_exps.weight");
+            let gu_info = gguf.tensor_info(&gu_name)
+                .ok_or_else(|| anyhow::anyhow!("missing {gu_name}"))?;
+            let stacked_gate_up_buf = gguf.load_tensor(&gu_name, mlx_device)
+                .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
+            let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
+            let gate_up_ggml_dtype = gu_info.ggml_type;
+
+            let dn_name = format!("blk.{i}.ffn_down_exps.weight");
+            let dn_info = gguf.tensor_info(&dn_name)
+                .ok_or_else(|| anyhow::anyhow!("missing {dn_name}"))?;
+            let stacked_down_buf = gguf.load_tensor(&dn_name, mlx_device)
+                .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
+            let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
+            let down_ggml_dtype = dn_info.ggml_type;
+
+            if (i + 1) % 5 == 0 || i == 0 {
+                eprintln!("  GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
+                    i + 1, num_layers,
+                    stacked_gate_up_buf.byte_len() as f64 / 1e6,
+                    stacked_down_buf.byte_len() as f64 / 1e6);
             }
-            let router_proj = load_qweight(
-                moe_refs.router_proj,
-                mlx_device,
-                &format!("layer{i}_router_proj"),
+
+            // -- Router and scales (F32) --
+            let router_proj = load_gguf_qweight(
+                gguf, &format!("blk.{i}.ffn_gate_inp.weight"), mlx_device,
             )?;
-            let router_scale = gpu::candle_tensor_to_mlx_buffer(
-                moe_refs.router_scale, mlx_device,
-            )?;
-            let per_expert_scale = gpu::candle_tensor_to_mlx_buffer(
-                moe_refs.per_expert_scale, mlx_device,
-            )?;
+            let router_scale = gguf.load_tensor_f32(
+                &format!("blk.{i}.ffn_gate_inp.scale"), mlx_device,
+            ).map_err(|e| anyhow::anyhow!("layer {i} router_scale: {e}"))?;
+            let per_expert_scale = gguf.load_tensor_f32(
+                &format!("blk.{i}.ffn_down_exps.scale"), mlx_device,
+            ).map_err(|e| anyhow::anyhow!("layer {i} per_expert_scale: {e}"))?;
 
-            // Capture GGML dtypes before potentially dropping expert vecs.
-            let gate_up_ggml_dtype = expert_gate_up[0].info.ggml_dtype;
-            let down_ggml_dtype = expert_down[0].info.ggml_dtype;
-
-            // Build stacked expert weight buffers for fused _id dispatch.
-            // Each expert's buffer is concatenated: [expert0, expert1, ..., expertN-1].
-            let (stacked_gate_up, gate_up_expert_stride) = {
-                let per_expert = expert_gate_up[0].buffer.byte_len();
-                let total = per_expert * cfg.num_experts;
-                match mlx_device.alloc_buffer(total, mlx_native::DType::U32, vec![total / 4]) {
-                    Ok(mut stacked) => {
-                        let dst: &mut [u8] = stacked.as_mut_slice()
-                            .map_err(|e| anyhow::anyhow!("stacked gate_up: {e}"))?;
-                        for (e, qw) in expert_gate_up.iter().enumerate() {
-                            let src: &[u8] = qw.buffer.as_slice()
-                                .map_err(|e| anyhow::anyhow!("expert gate_up read: {e}"))?;
-                            dst[e * per_expert..(e + 1) * per_expert].copy_from_slice(src);
-                        }
-                        (Some(stacked), per_expert as u64)
-                    }
-                    Err(e) => {
-                        eprintln!("  Warning: could not allocate stacked gate_up buffer: {e}");
-                        (None, 0u64)
-                    }
-                }
-            };
-            let (stacked_down, down_expert_stride) = {
-                let per_expert = expert_down[0].buffer.byte_len();
-                let total = per_expert * cfg.num_experts;
-                match mlx_device.alloc_buffer(total, mlx_native::DType::U32, vec![total / 4]) {
-                    Ok(mut stacked) => {
-                        let dst: &mut [u8] = stacked.as_mut_slice()
-                            .map_err(|e| anyhow::anyhow!("stacked down: {e}"))?;
-                        for (e, qw) in expert_down.iter().enumerate() {
-                            let src: &[u8] = qw.buffer.as_slice()
-                                .map_err(|e| anyhow::anyhow!("expert down read: {e}"))?;
-                            dst[e * per_expert..(e + 1) * per_expert].copy_from_slice(src);
-                        }
-                        (Some(stacked), per_expert as u64)
-                    }
-                    Err(e) => {
-                        eprintln!("  Warning: could not allocate stacked down buffer: {e}");
-                        (None, 0u64)
-                    }
-                }
-            };
-
-            // Drop individual expert buffers after stacking to save ~12.9 GB.
-            // The _id kernel dispatches via stacked buffers only; individual
-            // buffers are dead weight once stacking completes.
-            drop(expert_gate_up);
-            drop(expert_down);
-
-            // Pre-compute router combined weight for GPU router input prep:
-            //   router_combined_weight[i] = router_scale[i] * (hidden_size ^ -0.5)
-            // This allows a single GPU rms_norm dispatch to replace the 3-step
-            // CPU sequence (unit_norm + scale + mul).
+            // Pre-compute router combined weight:
+            //   router_combined_weight[j] = router_scale[j] * (hidden_size ^ -0.5)
             let router_combined_weight = {
                 let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
                 let rs: &[f32] = router_scale.as_slice()
@@ -697,10 +642,10 @@ impl MlxModelWeights {
             };
 
             let moe = MlxMoeWeights {
-                stacked_gate_up,
-                stacked_down,
-                gate_up_expert_stride,
-                down_expert_stride,
+                stacked_gate_up: Some(stacked_gate_up_buf),
+                stacked_down: Some(stacked_down_buf),
+                gate_up_expert_stride: gate_up_expert_stride as u64,
+                down_expert_stride: down_expert_stride as u64,
                 router_proj,
                 per_expert_scale,
                 gate_up_ggml_dtype,
@@ -710,59 +655,52 @@ impl MlxModelWeights {
                 router_combined_weight,
             };
 
-            // Norm weights (F32)
+            // -- Norm weights (all F32) --
             let norms = MlxLayerNorms {
-                input_layernorm: gpu::candle_tensor_to_mlx_buffer(
-                    refs.input_layernorm, mlx_device,
-                )?,
-                post_attention_layernorm: gpu::candle_tensor_to_mlx_buffer(
-                    refs.post_attention_layernorm, mlx_device,
-                )?,
-                pre_feedforward_layernorm: gpu::candle_tensor_to_mlx_buffer(
-                    refs.pre_feedforward_layernorm, mlx_device,
-                )?,
-                post_feedforward_layernorm: gpu::candle_tensor_to_mlx_buffer(
-                    refs.post_feedforward_layernorm, mlx_device,
-                )?,
-                pre_feedforward_layernorm_2: gpu::candle_tensor_to_mlx_buffer(
-                    refs.pre_feedforward_layernorm_2, mlx_device,
-                )?,
-                post_feedforward_layernorm_1: gpu::candle_tensor_to_mlx_buffer(
-                    refs.post_feedforward_layernorm_1, mlx_device,
-                )?,
-                post_feedforward_layernorm_2: gpu::candle_tensor_to_mlx_buffer(
-                    refs.post_feedforward_layernorm_2, mlx_device,
-                )?,
+                input_layernorm: gguf.load_tensor_f32(
+                    &format!("blk.{i}.attn_norm.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} attn_norm: {e}"))?,
+                post_attention_layernorm: gguf.load_tensor_f32(
+                    &format!("blk.{i}.post_attention_norm.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} post_attn_norm: {e}"))?,
+                pre_feedforward_layernorm: gguf.load_tensor_f32(
+                    &format!("blk.{i}.ffn_norm.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} ffn_norm: {e}"))?,
+                post_feedforward_layernorm: gguf.load_tensor_f32(
+                    &format!("blk.{i}.post_ffw_norm.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm: {e}"))?,
+                pre_feedforward_layernorm_2: gguf.load_tensor_f32(
+                    &format!("blk.{i}.pre_ffw_norm_2.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} pre_ffw_norm_2: {e}"))?,
+                post_feedforward_layernorm_1: gguf.load_tensor_f32(
+                    &format!("blk.{i}.post_ffw_norm_1.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm_1: {e}"))?,
+                post_feedforward_layernorm_2: gguf.load_tensor_f32(
+                    &format!("blk.{i}.post_ffw_norm_2.weight"), mlx_device,
+                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm_2: {e}"))?,
             };
 
-            // Layer scalar (F32)
-            let layer_scalar = gpu::candle_tensor_to_mlx_buffer(
-                refs.layer_scalar, mlx_device,
-            )?;
+            // -- Layer scalar (F32) --
+            let layer_scalar = gguf.load_tensor_f32(
+                &format!("blk.{i}.layer_output_scale.weight"), mlx_device,
+            ).map_err(|e| anyhow::anyhow!("layer {i} layer_scalar: {e}"))?;
 
-            // Per-layer config
+            // -- Per-layer config --
             let hd = cfg.head_dim_for_layer(i);
             let nkv = cfg.num_kv_heads_for_layer(i);
             let is_full = cfg.is_full_attention(i);
             head_dims.push(hd);
             num_kv_heads_vec.push(nkv);
 
-            // KV cache: sliding layers use sliding_window capacity,
-            // global layers cap at a practical limit to avoid OOM.
-            // ADR-007 Phase 2.1: Full 262K context enabled by TurboQuant compression.
-            // At 4-bit nibble packing, 262K global KV cache is ~1.37 GB (vs 5.3 GB F16).
-            // Sliding layers: capacity = sliding_window (1024).
-            // Global layers:  capacity = max_position_embeddings (262144).
+            // -- KV cache allocation (identical to the old load_from_candle) --
             let capacity = if is_full {
                 cfg.max_position_embeddings
             } else {
                 cfg.sliding_window
             };
-            // KV cache: TurboQuant 4-bit nibble-packed indices + F32 norms (ADR-007 Phase 1.2).
-            // packed: [num_kv_heads, capacity, head_dim/2] U8 — 2 indices per byte
-            // norms:  [num_kv_heads, capacity] F32 — per-position L2 norm scalar
-            let packed_bytes = nkv * capacity * (hd / 2); // head_dim/2 bytes per position
-            let norms_bytes = nkv * capacity * 4; // 1 F32 per position per KV head
+            // TurboQuant 4-bit nibble-packed indices + F32 norms (ADR-007 Phase 1.2).
+            let packed_bytes = nkv * capacity * (hd / 2);
+            let norms_bytes = nkv * capacity * 4;
 
             let k_packed = mlx_device.alloc_buffer(
                 packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
@@ -797,35 +735,21 @@ impl MlxModelWeights {
             });
         }
         eprintln!(
-            "\r  Loaded {}/{} mlx-native layer weights (including MoE).    ",
+            "\r  Loaded {}/{} mlx-native layer weights from GGUF (including MoE).    ",
             num_layers, num_layers
         );
 
-        // Allocate activation buffers
+        // -- Allocate activation buffers --
         let mut activations = alloc_activation_buffers(mlx_device, cfg)?;
 
-        // Populate freq_factors GPU buffer from model weights.
-        {
-            let ff_host = model.rope_freqs_host();
-            if !ff_host.is_empty() {
-                let n = ff_host.len();
-                let mut buf = mlx_device.alloc_buffer(
-                    n * std::mem::size_of::<f32>(),
-                    mlx_native::DType::F32,
-                    vec![n],
-                ).map_err(|e| anyhow::anyhow!("rope_freq_factors_gpu alloc: {e}"))?;
-                let dst: &mut [f32] = buf.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("rope_freq_factors_gpu write: {e}"))?;
-                dst[..n].copy_from_slice(ff_host);
-                activations.rope_freq_factors_gpu = buf;
-            }
+        // -- RoPE freq_factors from GGUF --
+        if let Some(_info) = gguf.tensor_info("rope_freqs.weight") {
+            let ff_buf = gguf.load_tensor_f32("rope_freqs.weight", mlx_device)
+                .map_err(|e| anyhow::anyhow!("rope_freqs: {e}"))?;
+            activations.rope_freq_factors_gpu = ff_buf;
         }
 
-        // Centroid tables removed — dequant is now inline in the Metal SDPA kernel
-        // using a register-resident 16-element codebook (CODEBOOK_4BIT).
-        // Saves 16KB-32KB GPU allocation per table and eliminates all scattered
-        // memory access during SDPA (~19,200 random table lookups per call → 0).
-
+        // -- Build result --
         let mut result = Ok(Self {
             embed_weight,
             layers,
@@ -835,7 +759,7 @@ impl MlxModelWeights {
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
             rms_norm_eps: cfg.rms_norm_eps as f32,
-            final_logit_softcapping: model.softcapping().map(|v| v as f32),
+            final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
             kv_caches,
             activations,
             layer_types: cfg.layer_types.clone(),
@@ -849,8 +773,7 @@ impl MlxModelWeights {
         });
 
         // Pre-initialize constant param buffers so we never write them
-        // inside the hot forward_decode path.  Writing to a shared Metal
-        // buffer mid-session can force CPU-GPU synchronization.
+        // inside the hot forward_decode path.
         if let Ok(ref mut w) = result {
             // Softcap params: [cap, n_elements_as_f32_bits]
             if let Some(cap) = w.final_logit_softcapping {
@@ -1350,10 +1273,8 @@ impl MlxModelWeights {
                     && self.layers[layer_idx].moe.stacked_down.is_some();
 
                 if use_fused_id {
-                    let _ggml_type_gu = gpu::candle_ggml_to_mlx(
-                        self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
-                    let _ggml_type_dn = gpu::candle_ggml_to_mlx(
-                        self.layers[layer_idx].moe.down_ggml_dtype)?;
+                    let _ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
+                    let _ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
 
                     // -- B11: dense down + gate_up_id [2 concurrent] --
                     // dense_down reads mlp_fused (from B10), gate_up_id reads moe_norm_out
@@ -1366,8 +1287,7 @@ impl MlxModelWeights {
                         &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
                     total_dispatches += 1;
 
-                    let ggml_type_gu = gpu::candle_ggml_to_mlx(
-                        self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
+                    let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                     s.barrier_between(
                         &[&self.activations.moe_norm_out, &self.activations.moe_expert_ids,
                           self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
@@ -1408,8 +1328,7 @@ impl MlxModelWeights {
                     // -- B13: down_id + post-FF norm1 [2 concurrent] --
                     // down_id reads moe_swiglu_id_out (from B12). post-FF norm1 reads
                     // mlp_down (from B11). Disjoint writes.
-                    let ggml_type_dn = gpu::candle_ggml_to_mlx(
-                        self.layers[layer_idx].moe.down_ggml_dtype)?;
+                    let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
                     s.barrier_between(
                         &[&self.activations.moe_swiglu_id_out, &self.activations.moe_expert_ids,
                           self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
@@ -2063,10 +1982,8 @@ impl MlxModelWeights {
                     anyhow::bail!("Kernel profile requires fused _id path (stacked weights). Layer {layer_idx} missing.");
                 }
 
-                let ggml_type_gu = gpu::candle_ggml_to_mlx(
-                    self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
-                let ggml_type_dn = gpu::candle_ggml_to_mlx(
-                    self.layers[layer_idx].moe.down_ggml_dtype)?;
+                let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
+                let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
 
                 // gate_up _id
                 let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
@@ -2432,15 +2349,38 @@ impl MlxModelWeights {
 
 }
 
-/// Helper: load a candle QMatMul into an MlxQWeight.
-fn load_qweight(
-    qmatmul: &candle_core::quantized::QMatMul,
-    mlx_device: &MlxDevice,
+/// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
+///
+/// The tensor name is looked up in the GGUF file, its raw GGML block data
+/// is copied into a new MlxBuffer, and the `QuantWeightInfo` is derived
+/// from the tensor's metadata (shape and GGML type).
+fn load_gguf_qweight(
+    gguf: &mlx_native::gguf::GgufFile,
     name: &str,
+    device: &MlxDevice,
 ) -> Result<MlxQWeight> {
-    let (buffer, info) = gpu::load_qmatmul_to_mlx_buffer(qmatmul, mlx_device)
-        .map_err(|e| anyhow::anyhow!("Failed to load {} into MlxBuffer: {}", name, e))?;
-    Ok(MlxQWeight { buffer, info })
+    let full_name = if name.ends_with(".weight") {
+        name.to_string()
+    } else {
+        format!("{name}.weight")
+    };
+    let info = gguf.tensor_info(&full_name)
+        .ok_or_else(|| anyhow::anyhow!("tensor '{}' not found in GGUF", full_name))?;
+    let buffer = gguf.load_tensor(&full_name, device)
+        .map_err(|e| anyhow::anyhow!("load {}: {e}", full_name))?;
+
+    // Shape: [rows, cols] for 2D weight matrices.
+    let rows = info.shape.first().copied().unwrap_or(1);
+    let cols = if info.shape.len() > 1 { info.shape[1] } else { 1 };
+
+    Ok(MlxQWeight {
+        buffer,
+        info: QuantWeightInfo {
+            ggml_dtype: info.ggml_type,
+            rows,
+            cols,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------

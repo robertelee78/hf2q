@@ -31,6 +31,7 @@ pub enum DwqError {
     GpuError { reason: String },
 
     #[error("Tokenizer error: {reason}")]
+    #[allow(dead_code)]
     TokenizerError { reason: String },
 }
 

@@ -213,233 +213,8 @@ pub struct GenerateArgs {
     #[arg(long, conflicts_with = "chat_template")]
     pub chat_template_file: Option<PathBuf>,
 
-    /// MoE expert dispatch mode. `fused` (default, post-ADR-005 1bNEW.1
-    /// Phase D) routes every layer through the fused
-    /// `kernel_mul_mv_id_*` path, eliminating all 60 routing syncs per
-    /// token and delivering +54.8% decode speedup on the canonical
-    /// benchmark. `loop` preserves the Phase-1 baseline per-expert
-    /// `QMatMul::forward` loop for bisect-safety and fallback.
-    #[arg(long, value_enum, default_value = "fused")]
-    pub moe_kernel: MoeKernelMode,
-
-    /// RmsNorm dispatch mode. `fused` (default, post-ADR-005 1bNEW.4
-    /// Phase C) routes every RmsNorm call site (input/output norms,
-    /// q/k/v norms, router norm, final norm) through a runtime-compiled
-    /// Metal kernel that ports llama.cpp's `kernel_rms_norm_fuse_impl<F>`
-    /// at F=1/F=2/F=3 — replacing the 11-op manual candle chain with a
-    /// single dispatch per site, and folding the post-FFW NORM→ADD
-    /// residual add into the same dispatch via F=3. Phase C bench:
-    /// 37.06 → 44.51 tok/s median (+20.1%), `norm_dispatches_per_token`
-    /// 3521 → 331 (−90.6%), coherent output preserved. `loop`
-    /// preserves the Phase-1 11-op candle chain for bisect-safety.
-    #[arg(long, value_enum, default_value = "fused")]
-    pub rms_norm_kernel: RmsNormKernelMode,
-
-    /// RoPE dispatch mode. `fused` (default, post-ADR-005 1bNEW.6
-    /// Phase C) routes Q and K rotations through a runtime-compiled
-    /// Metal kernel that ports llama.cpp's `kernel_rope_neox`
-    /// (split-half / Gemma 4 variant) and `kernel_rope_norm` (GPT-J
-    /// interleaved variant) — replacing the 9-op `rope_apply` chain
-    /// + the partial-rotary narrow/cat dance with a single stride-
-    /// aware dispatch per Q and per K per layer. The stride-aware
-    /// kernel incidentally eliminates the `.contiguous()` copies on
-    /// the Q/K narrowed views (old ADR item 1bNEW.8 win — dissolved
-    /// into 1bNEW.6 per ADR-005:322-326). Phase C bench:
-    /// 44.55 → 48.80 tok/s median (+9.5%), `dispatches_per_token`
-    /// 2432 → 2192 (−9.9%), coherent output preserved, 827-token
-    /// adversarial recall preserved. `loop` preserves the Phase-1
-    /// `rope_apply` chain for bisect-safety.
-    #[arg(long, value_enum, default_value = "fused")]
-    pub rope_kernel: RopeKernelMode,
-
-    /// lm_head dispatch mode. `fused` (default, post-ADR-005 1bNEW.17
-    /// Phase C) replaces the dense F32 matmul at the final vocab
-    /// projection site with a native F16 gemm dispatched through
-    /// candle's existing `call_mlx_gemm` path against a 1.48 GB F16
-    /// copy of `token_embd.weight` — halving the per-token weight-
-    /// memory traffic at the lm_head site from 2.95 GB F32 to 1.48 GB
-    /// F16 and eliminating the single biggest remaining Walk-faithful
-    /// cost in Phase 1b per the post-Walk re-spike
-    /// (`docs/spike-post-walk-results.md`, ~7.14 ms/token measured
-    /// forced-sync wall-clock at `gemma4.rs:1879`). Ports llama.cpp
-    /// `build_lm_head` at `/opt/llama.cpp/src/models/gemma4-iswa.cpp:248`,
-    /// which calls `ggml_mul_mat` on the quantized `model.output`
-    /// tensor (tied to `token_embd.weight` per
-    /// `llama-model.cpp:4973-5610` when `output.weight` is absent,
-    /// which is the case for every Gemma 4 GGUF including DWQ).
-    /// `loop` preserves the Phase-1 dense F32 matmul for bisect-
-    /// safety; the 2.95 GB F32 copy is held alongside the 1.48 GB
-    /// F16 copy in `Fused` mode to keep the fallback path hot. Phase
-    /// C (this commit) flips the default from `loop` to `fused`
-    /// after the 5-run canonical bench gate validated median 58.49
-    /// tok/s / p95 58.57 at variance 0.2 under `fused`, +9.78 tok/s
-    /// (+20.1%) vs 1bNEW.6 Phase C baseline, with byte-identical
-    /// gen128 output to `loop` mode and 827-token `Melthorn-by-the-Sea`
-    /// needle recall preserved.
-    #[arg(long, value_enum, default_value = "fused")]
-    pub lm_head_kernel: LmHeadKernelMode,
-
-    /// KV cache append mode. `in-place` (default, post-ADR-005 1bNEW.20
-    /// Phase B) is the Walk-KERNEL-PORT of llama.cpp's
-    /// `llama_kv_cache::cpy_k` / `cpy_v` pattern at
-    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285` — direct
-    /// in-place `copy2d` into the pre-allocated cache buffer via
-    /// candle's `Tensor::slice_set` primitive (`tensor_cat.rs:246`),
-    /// returning a stride-aware narrowed view that the SDPA vector
-    /// kernel reads correctly without a `.contiguous()` bounce (the
-    /// vector kernel explicitly consumes `k_stride[1]` and `v_stride[1]`
-    /// per `candle-metal-kernels/src/kernels/sdpa.rs:278-279`).
-    /// Eliminates the contiguous copy of the entire
-    /// `[1, kv_heads, visible_len, hd]` active region on every decode
-    /// step. Phase B bench: 58.5 → 85.6 tok/s median (+27.1 tok/s,
-    /// +46.3%), top-10 byte-identical, gen128 output byte-identical,
-    /// 827-token `Melthorn-by-the-Sea` adversarial recall preserved.
-    /// `slice-scatter` preserves the pre-1bNEW.20 path (two
-    /// `Tensor::slice_scatter` calls + `narrow` + `contiguous` on the
-    /// active region — 6 candle ops per layer per token) for
-    /// bisect-safety; the `.contiguous()` at the end is load-bearing
-    /// under that mode (see `gemma4.rs::KvCache::append_slice_scatter`
-    /// doc and ADR-005 line 229 for the a0952e2 stride-gotcha history).
-    #[arg(long, value_enum, default_value = "in-place")]
-    pub kv_cache_kernel: KvCacheKernelMode,
-
-    /// GPU compute backend for the forward pass.
-    ///
-    /// `candle` (default): existing candle-based forward pass with per-op
-    /// kernel dispatches through candle's Metal command pool.
-    ///
-    /// `mlx-native`: ADR-006 Phase 5 — routes the entire forward pass
-    /// through mlx-native's `GraphExecutor`, encoding all ops into a
-    /// single Metal command buffer with one `commit_and_wait` per token.
-    /// Requires `--features mlx-native-backend` at build time. Target:
-    /// >=102 tok/s with coherence preserved.
-    #[arg(long, value_enum, default_value = "candle")]
-    pub backend: InferenceBackend,
-}
-
-/// GPU compute backend for inference.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InferenceBackend {
-    /// Existing candle-based forward pass (default).
-    Candle,
-    /// ADR-006 Phase 5: mlx-native single-encoder forward pass.
-    MlxNative,
-}
-
-impl std::fmt::Display for InferenceBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Candle => write!(f, "candle"),
-            Self::MlxNative => write!(f, "mlx-native"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoeKernelMode {
-    /// Phase-1 baseline — per-expert `QMatMul::forward` loop (slow, correct).
-    Loop,
-    /// ADR-005 1bNEW.1 — fused `kernel_mul_mv_id_*` dispatch.
-    Fused,
-}
-
-impl std::fmt::Display for MoeKernelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Loop => write!(f, "loop"),
-            Self::Fused => write!(f, "fused"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RmsNormKernelMode {
-    /// Phase-1 baseline — 11-op manual candle chain inside
-    /// `gemma4.rs::RmsNorm::forward` (and 9-op chain in `rms_norm_unit`).
-    Loop,
-    /// ADR-005 1bNEW.4 — runtime-compiled
-    /// `kernel_rms_norm_fuse_impl<F>` dispatch at F=1 (unit),
-    /// F=2 (weighted), and F=3 (weighted + post-norm residual add).
-    Fused,
-}
-
-impl std::fmt::Display for RmsNormKernelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Loop => write!(f, "loop"),
-            Self::Fused => write!(f, "fused"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RopeKernelMode {
-    /// Phase-1 baseline — 9-op manual `rope_apply` chain inside
-    /// `gemma4.rs::RotaryEmbedding::apply` (plus the partial-rotary
-    /// narrow/cat dance at `:360-373`).
-    Loop,
-    /// ADR-005 1bNEW.6 — runtime-compiled `kernel_rope_neox<float>`
-    /// (split-half, Gemma 4 variant) and `kernel_rope_norm<float>`
-    /// (GPT-J interleaved variant) dispatched via
-    /// `rope_kernel::rope_fused`.
-    Fused,
-}
-
-impl std::fmt::Display for RopeKernelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Loop => write!(f, "loop"),
-            Self::Fused => write!(f, "fused"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LmHeadKernelMode {
-    /// Phase-1 baseline — dense F32 matmul against the 2.95 GB
-    /// dequantized `token_embd.weight` copy at
-    /// `src/serve/gemma4.rs:1879`.
-    Loop,
-    /// ADR-005 1bNEW.17 — native F16 `call_mlx_gemm` dispatch
-    /// against a parallel 1.48 GB F16 copy of `token_embd.weight`,
-    /// via `src/serve/lm_head_kernel::lm_head_forward_fused`.
-    Fused,
-}
-
-impl std::fmt::Display for LmHeadKernelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Loop => write!(f, "loop"),
-            Self::Fused => write!(f, "fused"),
-        }
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KvCacheKernelMode {
-    /// Phase-1 baseline — two `Tensor::slice_scatter` writes into the
-    /// pre-allocated cache followed by `narrow` + `contiguous` on the
-    /// active region. `slice_scatter` on dim=2 internally uses a
-    /// transpose trick that produces a non-standard stride layout,
-    /// forcing a full contiguous copy of `[1, kv_heads, visible_len, hd]`
-    /// on every decode step — see the comment at `KvCache::append` in
-    /// `src/serve/gemma4.rs` for the a0952e2 regression history.
-    SliceScatter,
-    /// ADR-005 1bNEW.20 — in-place `Tensor::slice_set` write into the
-    /// pre-allocated cache at `current_len`, returning a stride-aware
-    /// narrowed view without a `.contiguous()` bounce. Ports llama.cpp
-    /// `llama_kv_cache::cpy_k` / `cpy_v` at
-    /// `/opt/llama.cpp/src/llama-kv-cache.cpp:1196-1285`.
-    InPlace,
-}
-
-impl std::fmt::Display for KvCacheKernelMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SliceScatter => write!(f, "slice-scatter"),
-            Self::InPlace => write!(f, "in-place"),
-        }
-    }
+    // ADR-008: candle-era kernel mode flags removed.
+    // The mlx-native backend handles all dispatch internally.
 }
 
 #[derive(clap::Args, Debug)]
@@ -532,6 +307,7 @@ pub enum GroupSize {
     G128,
 }
 
+#[allow(dead_code)]
 impl GroupSize {
     pub fn as_usize(self) -> usize {
         match self {
@@ -583,9 +359,11 @@ pub struct ConvertConfig {
     pub unsupported_layers: Option<UnsupportedLayerPolicy>,
 }
 
+#[allow(dead_code)]
 /// Default group size for quantization.
 pub const DEFAULT_GROUP_SIZE: usize = 64;
 
+#[allow(dead_code)]
 /// Parse a sensitive layers specification like "13-24" or "1,5,13-24" into ranges.
 pub fn parse_sensitive_layers(spec: &str) -> anyhow::Result<Vec<std::ops::RangeInclusive<usize>>> {
     let mut ranges = Vec::new();
@@ -623,6 +401,7 @@ pub fn parse_sensitive_layers(spec: &str) -> anyhow::Result<Vec<std::ops::RangeI
     Ok(ranges)
 }
 
+#[allow(dead_code)]
 /// Build a ConvertConfig from parsed CLI ConvertArgs.
 pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfig> {
     let input_dir = match (&args.input, &args.repo) {
