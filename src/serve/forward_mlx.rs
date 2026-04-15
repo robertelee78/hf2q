@@ -1289,7 +1289,22 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // -- SDPA (flash_attn_vec_tq — TurboQuant compressed, NWG=1, no reduce) --
+                // -- Pre-rotate Q via standalone FWHT (TurboQuant) --
+                // The SDPA kernel expects Q in the Hadamard-rotated domain.
+                // This standalone dispatch replaces the in-kernel FWHT that
+                // was causing 16+ threadgroup barriers inside the SDPA hot loop.
+                s.barrier_between(
+                    &[&self.activations.attn_q_normed],
+                    &[&self.activations.attn_q_normed], // in-place FWHT
+                );
+                mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q_normed,
+                    nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("FWHT Q pre-rotate L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
+
+                // -- SDPA (flash_attn_vec_tq — pre-rotated Q, no in-kernel FWHT) --
                 {
                     let centroid_table = if is_sliding {
                         &self.centroid_table_sliding
@@ -1326,7 +1341,20 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
-                total_dispatches += 1; // TQ: 1 dispatch (NWG=1, no reduce)
+                total_dispatches += 1;
+
+                // -- Inverse FWHT on SDPA output (rotate back to original domain) --
+                // FWHT is self-inverse: H^{-1} = H for the normalized form.
+                s.barrier_between(
+                    &[&self.activations.sdpa_out],
+                    &[&self.activations.sdpa_out], // in-place FWHT
+                );
+                mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.sdpa_out,
+                    nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("FWHT output inv-rotate L{layer_idx}: {e}"))?;
+                total_dispatches += 1;
 
                 // -- O-proj --
                 s.barrier_between(
@@ -2015,13 +2043,23 @@ impl MlxModelWeights {
             }
 
             // ============================================================
-            // GROUP 4: SDPA TQ (1 dispatch, NWG=1, no reduce)
+            // GROUP 4: FWHT Q pre-rotate + SDPA TQ + FWHT output inv-rotate
             // ============================================================
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
+                let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
+
+                // Pre-rotate Q
+                mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.attn_q_normed,
+                    nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("FWHT Q L{layer_idx}: {e}"))?;
+
+                s.barrier(); // FWHT wrote attn_q_normed, SDPA reads it
 
                 {
                     let centroid_table = if is_sliding {
@@ -2054,8 +2092,16 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
 
+                // Inverse-rotate output
+                s.barrier(); // SDPA wrote sdpa_out, FWHT reads it
+                mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    s.encoder_mut(), reg, metal_dev,
+                    &self.activations.sdpa_out,
+                    nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("FWHT out L{layer_idx}: {e}"))?;
+
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
-                    .map_err(|e| anyhow::anyhow!("flash_attn_vec_tq finish L{layer_idx}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("sdpa+fwht finish L{layer_idx}: {e}"))?;
                 kp.sdpa_us[layer_idx] = gpu_ns as f64 / 1000.0;
             }
 
@@ -2793,7 +2839,15 @@ impl MlxModelWeights {
                 s1_dispatches += 1;
             }
 
-            // -- SDPA TQ (1 dispatch, NWG=1, no reduce) --
+            // -- Pre-rotate Q via standalone FWHT --
+            mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.attn_q,
+                nh as u32, hd as u32,
+            ).map_err(|e| anyhow::anyhow!("FWHT Q: {e}"))?;
+            s1_dispatches += 1;
+
+            // -- SDPA TQ (pre-rotated Q, no in-kernel FWHT) --
             {
                 let centroid_table = if is_sliding {
                     &self.centroid_table_sliding
@@ -2824,7 +2878,15 @@ impl MlxModelWeights {
                     &p,
                 ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq: {e}"))?;
             }
-            s1_dispatches += 1; // TQ: 1 dispatch (NWG=1, no reduce)
+            s1_dispatches += 1;
+
+            // -- Inverse-rotate SDPA output --
+            mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.activations.sdpa_out,
+                nh as u32, hd as u32,
+            ).map_err(|e| anyhow::anyhow!("FWHT out: {e}"))?;
+            s1_dispatches += 1;
 
             // O-proj: sdpa_out → attn_out
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
