@@ -1440,6 +1440,21 @@ impl MlxModelWeights {
                 }
             }
 
+            // --- Body/Head timing split (HF2Q_SPLIT_TIMING=1) ---
+            // Inserts a commit_and_wait between layers and head to measure each
+            // GPU section separately. Adds ~50μs sync overhead — measurement only.
+            let body_dispatches = total_dispatches;
+            let split_timing = std::env::var("HF2Q_SPLIT_TIMING").map_or(false, |v| v == "1");
+            if split_timing {
+                let body_barriers = s.barrier_count();
+                let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
+                    .map_err(|e| anyhow::anyhow!("body finish: {e}"))?;
+                eprintln!("  [SPLIT] BODY: encode={:.2}ms gpu={:.2}ms dispatches={} barriers={}",
+                    enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, body_dispatches, body_barriers);
+                // Start a new session for the head
+                s = exec.begin().map_err(|e| anyhow::anyhow!("head session: {e}"))?;
+            }
+
             // --- 3. Final norm + lm_head + softcap + argmax (all GPU) ---
 
             // GPU final RMS norm: hidden → norm_out
@@ -1513,6 +1528,7 @@ impl MlxModelWeights {
             total_dispatches += 1;
 
             // === ONE finish() for the entire forward pass ===
+            let head_dispatches = total_dispatches - body_dispatches;
             let barrier_count = s.barrier_count();
             let is_recording = s.is_recording();
             if is_recording {
@@ -1526,11 +1542,17 @@ impl MlxModelWeights {
                         fusions, reordered, b0, b1);
                 }
             } else {
+                let head_barriers = barrier_count; // snapshot before finish consumes s
                 let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
                     .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
                 if std::env::var("HF2Q_MLX_TIMING").is_ok() {
-                    eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
-                        enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
+                    if split_timing {
+                        eprintln!("  [SPLIT] HEAD: encode={:.2}ms gpu={:.2}ms dispatches={} barriers={}",
+                            enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, head_dispatches, head_barriers);
+                    } else {
+                        eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
+                            enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
+                    }
                 }
             }
         }
