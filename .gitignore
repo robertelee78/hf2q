@@ -27,3 +27,12 @@ examples/
 # tests/fixtures/metrics_baseline.txt — this repo-root file is the live
 # per-run report and must not be committed.
 /metrics.txt
+
+# Data artifacts — local databases and lock files
+*.rvf
+*.rvf.lock
+ruvector.db
+
+# Local profiling data and scratch docs
+docs/coherence-test.txt
+docs/phase0-candle-perkernel-raw.json
