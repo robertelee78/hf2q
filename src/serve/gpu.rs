@@ -43,9 +43,11 @@ impl GpuContext {
         let gpu_name = device.name();
         let executor = GraphExecutor::new(device);
         let mut registry = KernelRegistry::new();
-        // Register TurboQuant KV cache kernels (ADR-007 Phase 1.2).
+        // Register all inference kernels.
         mlx_native::ops::hadamard_quantize_kv::register(&mut registry);
         mlx_native::ops::flash_attn_vec_tq::register(&mut registry);
+        // F16 SDPA reduce kernels — reused by TQ SDPA with NWG>1.
+        mlx_native::ops::flash_attn_vec::register(&mut registry);
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
         Ok(Self { executor, registry })
     }

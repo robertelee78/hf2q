@@ -397,6 +397,8 @@ pub struct MlxActivationBuffers {
     /// Scratch buffer for SDPA output `[1, num_heads, 1, head_dim]` F32.
     /// Sized for largest head config (16 heads * 512 head_dim for global).
     pub sdpa_out: MlxBuffer,
+    /// Temporary buffer for SDPA NWG>1 partial results (reduce kernel input).
+    pub sdpa_tmp: MlxBuffer,
     /// RMS norm params buffer `[eps, dim]` as F32.
     pub norm_params: MlxBuffer,
     /// Position buffer `[pos]` as U32 — single element for decode.
@@ -1113,10 +1115,11 @@ impl MlxModelWeights {
                         &self.kv_caches[layer_idx].v_packed,
                         &self.kv_caches[layer_idx].v_norms,
                         &self.activations.sdpa_out,
+                        &self.activations.sdpa_tmp,
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
-                total_dispatches += 1;
+                total_dispatches += 2; // main + reduce
 
                 // -- O-proj --
                 s.barrier_between(
@@ -1829,6 +1832,7 @@ impl MlxModelWeights {
                         &self.kv_caches[layer_idx].v_packed,
                         &self.kv_caches[layer_idx].v_norms,
                         &self.activations.sdpa_out,
+                        &self.activations.sdpa_tmp,
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
@@ -2499,6 +2503,13 @@ fn alloc_activation_buffers(
         mlp_fused: alloc_f32(interm.max(moe_interm), "mlp_fused")?,
         mlp_down: alloc_f32(hs, "mlp_down")?,
         sdpa_out: alloc_f32(num_heads * max_hd, "sdpa_out")?,
+        sdpa_tmp: {
+            let tmp_bytes = mlx_native::ops::flash_attn_vec_tq::tmp_buffer_bytes(
+                num_heads as u32, max_hd as u32);
+            device.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
+                vec![tmp_bytes / 4])
+                .map_err(|e| anyhow::anyhow!("sdpa_tmp alloc: {e}"))?
+        },
         norm_params,
         position: alloc_u32(1, "position")?,
         softcap_params,
