@@ -31,9 +31,8 @@ use anyhow::Result;
 use mlx_native::{
     GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
 };
-use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
-use mlx_native::ops::sdpa::SdpaParams;
-use mlx_native::ops::sdpa_sliding::SdpaSlidingParams;
+use mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams;
+use mlx_native::turboquant::CODEBOOK_4BIT;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
@@ -360,13 +359,20 @@ pub struct MlxDecoderLayerWeights {
     pub layer_scalar: MlxBuffer,
 }
 
-/// Per-layer KV cache buffers for the mlx-native path.
+/// Per-layer KV cache buffers for the mlx-native path (TurboQuant compressed).
+///
+/// ADR-007 Phase 1.2: KV cache is stored as 4-bit nibble-packed indices
+/// with per-position F32 norms, replacing F16 dense buffers.  This halves
+/// KV memory bandwidth during SDPA and enables 262K context.
 pub struct MlxKvCache {
-    /// K cache `[num_kv_heads * head_dim, capacity]` F32 — row = kv_heads*head_dim,
-    /// column = position. Stored as flat `[capacity * row_size]` F32.
-    pub k: MlxBuffer,
-    /// V cache, same layout as K.
-    pub v: MlxBuffer,
+    /// K packed indices `[num_kv_heads, capacity, head_dim/2]` U8 (nibble-packed).
+    pub k_packed: MlxBuffer,
+    /// K per-position norms `[num_kv_heads, capacity]` F32.
+    pub k_norms: MlxBuffer,
+    /// V packed indices `[num_kv_heads, capacity, head_dim/2]` U8 (nibble-packed).
+    pub v_packed: MlxBuffer,
+    /// V per-position norms `[num_kv_heads, capacity]` F32.
+    pub v_norms: MlxBuffer,
     /// Number of KV heads for this layer.
     pub num_kv_heads: usize,
     /// Head dimension for this layer.
@@ -526,6 +532,11 @@ pub struct MlxModelWeights {
     pub moe_intermediate_size: usize,
     /// k_eq_v flag.
     pub k_eq_v: bool,
+    /// Pre-rotated centroid table for sliding layers (head_dim=256): `[16, 256]` F32.
+    /// ADR-007 Phase 1.2: `table[idx * head_dim + c] = CODEBOOK_4BIT[idx] / sqrt(head_dim)`.
+    pub centroid_table_sliding: MlxBuffer,
+    /// Pre-rotated centroid table for global layers (head_dim=512): `[16, 512]` F32.
+    pub centroid_table_global: MlxBuffer,
     /// Global-layer RoPE frequency factors from `rope_freqs.weight`.
     /// Shape `[global_head_dim/2]`.  Each value divides the per-pair
     /// frequency: `1.0` means normal rotation, `1e+30` → identity.
@@ -818,20 +829,30 @@ impl MlxModelWeights {
             } else {
                 cfg.sliding_window
             };
-            // KV cache shape: [num_kv_heads, capacity, head_dim] — head-major
-            // Phase 4a: F16 KV cache halves memory bandwidth for SDPA reads.
-            // Reference: llama.cpp stores KV cache in F16 for bandwidth-bound decode.
-            let cache_elements = nkv * capacity * hd;
-            let cache_bytes = cache_elements * 2; // F16 = 2 bytes per element
-            let k_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F16, vec![nkv, capacity, hd],
-            ).map_err(|e| anyhow::anyhow!("KV cache K alloc failed: {e}"))?;
-            let v_cache = mlx_device.alloc_buffer(
-                cache_bytes, mlx_native::DType::F16, vec![nkv, capacity, hd],
-            ).map_err(|e| anyhow::anyhow!("KV cache V alloc failed: {e}"))?;
+            // KV cache: TurboQuant 4-bit nibble-packed indices + F32 norms (ADR-007 Phase 1.2).
+            // packed: [num_kv_heads, capacity, head_dim/2] U8 — 2 indices per byte
+            // norms:  [num_kv_heads, capacity] F32 — per-position L2 norm scalar
+            let packed_bytes = nkv * capacity * (hd / 2); // head_dim/2 bytes per position
+            let norms_bytes = nkv * capacity * 4; // 1 F32 per position per KV head
+
+            let k_packed = mlx_device.alloc_buffer(
+                packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
+            ).map_err(|e| anyhow::anyhow!("KV cache K packed alloc: {e}"))?;
+            let k_norms = mlx_device.alloc_buffer(
+                norms_bytes, mlx_native::DType::F32, vec![nkv, capacity],
+            ).map_err(|e| anyhow::anyhow!("KV cache K norms alloc: {e}"))?;
+            let v_packed = mlx_device.alloc_buffer(
+                packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
+            ).map_err(|e| anyhow::anyhow!("KV cache V packed alloc: {e}"))?;
+            let v_norms = mlx_device.alloc_buffer(
+                norms_bytes, mlx_native::DType::F32, vec![nkv, capacity],
+            ).map_err(|e| anyhow::anyhow!("KV cache V norms alloc: {e}"))?;
+
             kv_caches.push(MlxKvCache {
-                k: k_cache,
-                v: v_cache,
+                k_packed,
+                k_norms,
+                v_packed,
+                v_norms,
                 num_kv_heads: nkv,
                 head_dim: hd,
                 capacity,
@@ -877,6 +898,48 @@ impl MlxModelWeights {
         let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
             .map_err(|e| anyhow::anyhow!("lm_head dummy: {e}"))?;
 
+        // Pre-rotated centroid tables for TurboQuant KV cache (ADR-007 Phase 1.2).
+        // table[idx * head_dim + c] = CODEBOOK_4BIT[idx] / sqrt(head_dim)
+        let centroid_table_sliding = {
+            let hd = cfg.head_dim_for_layer(0); // sliding head_dim (typically 256)
+            let inv_scale = 1.0 / (hd as f32).sqrt();
+            let mut data = vec![0.0f32; 16 * hd];
+            for idx in 0..16 {
+                for c in 0..hd {
+                    data[idx * hd + c] = CODEBOOK_4BIT[idx] * inv_scale;
+                }
+            }
+            let mut buf = mlx_device.alloc_buffer(
+                data.len() * 4, mlx_native::DType::F32, vec![16, hd],
+            ).map_err(|e| anyhow::anyhow!("centroid table sliding alloc: {e}"))?;
+            let slice: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("centroid table sliding write: {e}"))?;
+            slice.copy_from_slice(&data);
+            buf
+        };
+
+        let centroid_table_global = {
+            // Find the first global layer's head_dim (typically 512)
+            let global_idx = cfg.layer_types.iter()
+                .position(|t| matches!(t, LayerType::Full))
+                .unwrap_or(0);
+            let hd = cfg.head_dim_for_layer(global_idx);
+            let inv_scale = 1.0 / (hd as f32).sqrt();
+            let mut data = vec![0.0f32; 16 * hd];
+            for idx in 0..16 {
+                for c in 0..hd {
+                    data[idx * hd + c] = CODEBOOK_4BIT[idx] * inv_scale;
+                }
+            }
+            let mut buf = mlx_device.alloc_buffer(
+                data.len() * 4, mlx_native::DType::F32, vec![16, hd],
+            ).map_err(|e| anyhow::anyhow!("centroid table global alloc: {e}"))?;
+            let slice: &mut [f32] = buf.as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("centroid table global write: {e}"))?;
+            slice.copy_from_slice(&data);
+            buf
+        };
+
         let mut result = Ok(Self {
             embed_weight,
             layers,
@@ -900,6 +963,8 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             moe_intermediate_size: cfg.moe_intermediate_size,
             k_eq_v: cfg.attention_k_eq_v,
+            centroid_table_sliding,
+            centroid_table_global,
             rope_freq_factors: model.rope_freqs_host().to_vec(),
         });
 
@@ -1189,7 +1254,7 @@ impl MlxModelWeights {
                     &self.activations.moe_expert_out
                 };
 
-                // -- GPU KV cache update (CONCURRENT: K and V copies are independent) --
+                // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
                 {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
@@ -1198,35 +1263,46 @@ impl MlxModelWeights {
                     };
                     s.barrier_between(
                         &[&self.activations.attn_k_normed],
-                        &[&self.kv_caches[layer_idx].k],
+                        &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms],
                     );
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.attn_k_normed,
-                        &self.kv_caches[layer_idx].k,
+                        &self.kv_caches[layer_idx].k_packed,
+                        &self.kv_caches[layer_idx].k_norms,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                    ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
+                        kv_is_sliding,
+                    ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
                     s.barrier_between(
                         &[v_src],
-                        &[&self.kv_caches[layer_idx].v],
+                        &[&self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                     );
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                         s.encoder_mut(), reg, metal_dev,
                         v_src,
-                        &self.kv_caches[layer_idx].v,
+                        &self.kv_caches[layer_idx].v_packed,
+                        &self.kv_caches[layer_idx].v_norms,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                    ).map_err(|e| anyhow::anyhow!("kv V L{layer_idx}: {e}"))?;
+                        kv_is_sliding,
+                    ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
                 }
 
-                // -- SDPA (flash_attn_vec) --
-                s.barrier_between(
-                    &[&self.activations.attn_q_normed, &self.kv_caches[layer_idx].k, &self.kv_caches[layer_idx].v],
-                    &[&self.activations.sdpa_out, &self.activations.flash_attn_tmp],
-                );
+                // -- SDPA (flash_attn_vec_tq — TurboQuant compressed, NWG=1, no reduce) --
                 {
-                    let p = FlashAttnVecParams {
+                    let centroid_table = if is_sliding {
+                        &self.centroid_table_sliding
+                    } else {
+                        &self.centroid_table_global
+                    };
+                    s.barrier_between(
+                        &[&self.activations.attn_q_normed,
+                          &self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
+                          &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
+                        &[&self.activations.sdpa_out],
+                    );
+                    let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
                         head_dim: hd as u32,
@@ -1237,13 +1313,20 @@ impl MlxModelWeights {
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
                     };
-                    s.flash_attn_vec(reg, dev,
-                        &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
-                        &self.activations.flash_attn_tmp, &p,
-                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec L{layer_idx}: {e}"))?;
+                    mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q_normed,
+                        &self.kv_caches[layer_idx].k_packed,
+                        &self.kv_caches[layer_idx].k_norms,
+                        centroid_table,
+                        &self.kv_caches[layer_idx].v_packed,
+                        &self.kv_caches[layer_idx].v_norms,
+                        centroid_table,
+                        &self.activations.sdpa_out,
+                        &p,
+                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
-                total_dispatches += 2;
+                total_dispatches += 1; // TQ: 1 dispatch (NWG=1, no reduce)
 
                 // -- O-proj --
                 s.barrier_between(
@@ -1893,7 +1976,7 @@ impl MlxModelWeights {
             let v_src = if v_is_k { &self.activations.attn_v } else { &self.activations.moe_expert_out };
 
             // ============================================================
-            // GROUP 3: KV cache copy (2 dispatches)
+            // GROUP 3: KV cache Hadamard-quantize (2 dispatches, ADR-007)
             // ============================================================
             {
                 let (exec, reg) = gpu.split();
@@ -1907,16 +1990,22 @@ impl MlxModelWeights {
                 } else {
                     kv_write_pos as u32
                 };
-                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                     s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k_normed, &self.kv_caches[layer_idx].k,
+                    &self.activations.attn_k_normed,
+                    &self.kv_caches[layer_idx].k_packed,
+                    &self.kv_caches[layer_idx].k_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                ).map_err(|e| anyhow::anyhow!("kv K L{layer_idx}: {e}"))?;
-                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                    kv_is_sliding,
+                ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                     s.encoder_mut(), reg, metal_dev,
-                    v_src, &self.kv_caches[layer_idx].v,
+                    v_src,
+                    &self.kv_caches[layer_idx].v_packed,
+                    &self.kv_caches[layer_idx].v_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                ).map_err(|e| anyhow::anyhow!("kv V L{layer_idx}: {e}"))?;
+                    kv_is_sliding,
+                ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
                     .map_err(|e| anyhow::anyhow!("kv finish L{layer_idx}: {e}"))?;
@@ -1924,18 +2013,21 @@ impl MlxModelWeights {
             }
 
             // ============================================================
-            // GROUP 4: SDPA (1 dispatch)
+            // GROUP 4: SDPA TQ (1 dispatch, NWG=1, no reduce)
             // ============================================================
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
-                let metal_dev = dev.metal_device();
-                let _ = metal_dev; // suppress unused warning for sliding path
                 let t0 = Instant::now();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
                 {
-                    let p = FlashAttnVecParams {
+                    let centroid_table = if is_sliding {
+                        &self.centroid_table_sliding
+                    } else {
+                        &self.centroid_table_global
+                    };
+                    let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
                         head_dim: hd as u32,
@@ -1946,15 +2038,22 @@ impl MlxModelWeights {
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
                     };
-                    s.flash_attn_vec(reg, dev,
-                        &self.activations.attn_q_normed, &self.kv_caches[layer_idx].k,
-                        &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
-                        &self.activations.flash_attn_tmp, &p,
-                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec L{layer_idx}: {e}"))?;
+                    mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q_normed,
+                        &self.kv_caches[layer_idx].k_packed,
+                        &self.kv_caches[layer_idx].k_norms,
+                        centroid_table,
+                        &self.kv_caches[layer_idx].v_packed,
+                        &self.kv_caches[layer_idx].v_norms,
+                        centroid_table,
+                        &self.activations.sdpa_out,
+                        &p,
+                    ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
                 }
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
-                    .map_err(|e| anyhow::anyhow!("flash_attn_vec finish L{layer_idx}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("flash_attn_vec_tq finish L{layer_idx}: {e}"))?;
                 kp.sdpa_us[layer_idx] = gpu_ns as f64 / 1000.0;
             }
 
@@ -2661,10 +2760,7 @@ impl MlxModelWeights {
             )?;
             s1_dispatches += 1;
 
-            // -- GPU KV cache update (batched — 2 dispatches for all heads) --
-            // Cache layout: [num_kv_heads, capacity, head_dim] (head-major).
-            // K/V source layout: [num_kv_heads * head_dim] (flat, 1 token).
-            // Single dispatch per K and V copies all heads at once.
+            // -- GPU KV cache Hadamard-quantize (2 dispatches, ADR-007) --
             {
                 let cache_pos_val = if kv_is_sliding {
                     (kv_write_pos % kv_capacity) as u32
@@ -2672,28 +2768,37 @@ impl MlxModelWeights {
                     kv_write_pos as u32
                 };
 
-                // K cache copy (all heads, 1 dispatch)
-                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                // K Hadamard-quantize (all heads, 1 dispatch)
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.attn_k,
-                    &self.kv_caches[layer_idx].k,
+                    &self.kv_caches[layer_idx].k_packed,
+                    &self.kv_caches[layer_idx].k_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                ).map_err(|e| anyhow::anyhow!("kv_cache_copy_batch K: {e}"))?;
+                    kv_is_sliding,
+                ).map_err(|e| anyhow::anyhow!("hadamard_quantize K: {e}"))?;
                 s1_dispatches += 1;
 
-                // V cache copy (all heads, 1 dispatch)
-                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                // V Hadamard-quantize (all heads, 1 dispatch)
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                     s.encoder_mut(), reg, metal_dev,
                     v_src,
-                    &self.kv_caches[layer_idx].v,
+                    &self.kv_caches[layer_idx].v_packed,
+                    &self.kv_caches[layer_idx].v_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                ).map_err(|e| anyhow::anyhow!("kv_cache_copy_batch V: {e}"))?;
+                    kv_is_sliding,
+                ).map_err(|e| anyhow::anyhow!("hadamard_quantize V: {e}"))?;
                 s1_dispatches += 1;
             }
 
-            // -- SDPA (flash_attn_vec, was start of old S2) --
+            // -- SDPA TQ (1 dispatch, NWG=1, no reduce) --
             {
-                let p = FlashAttnVecParams {
+                let centroid_table = if is_sliding {
+                    &self.centroid_table_sliding
+                } else {
+                    &self.centroid_table_global
+                };
+                let p = FlashAttnVecTqParams {
                     num_heads: nh as u32,
                     num_kv_heads: nkv as u32,
                     head_dim: hd as u32,
@@ -2704,13 +2809,20 @@ impl MlxModelWeights {
                     sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                     softcap: 0.0,
                 };
-                s.flash_attn_vec(reg, dev,
-                    &self.activations.attn_q, &self.kv_caches[layer_idx].k,
-                    &self.kv_caches[layer_idx].v, &self.activations.sdpa_out,
-                    &self.activations.flash_attn_tmp, &p,
-                ).map_err(|e| anyhow::anyhow!("flash_attn_vec: {e}"))?;
+                mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
+                    s.encoder_mut(), reg, dev,
+                    &self.activations.attn_q,
+                    &self.kv_caches[layer_idx].k_packed,
+                    &self.kv_caches[layer_idx].k_norms,
+                    centroid_table,
+                    &self.kv_caches[layer_idx].v_packed,
+                    &self.kv_caches[layer_idx].v_norms,
+                    centroid_table,
+                    &self.activations.sdpa_out,
+                    &p,
+                ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq: {e}"))?;
             }
-            s1_dispatches += 2; // flash_attn_vec main + reduce
+            s1_dispatches += 1; // TQ: 1 dispatch (NWG=1, no reduce)
 
             // O-proj: sdpa_out → attn_out
             dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,

@@ -68,7 +68,10 @@ impl GpuContext {
         let gpu_name = device.name();
         let metal_device_ptr: *const mlx_native::metal::DeviceRef = device.metal_device();
         let executor = GraphExecutor::new(device);
-        let registry = KernelRegistry::new();
+        let mut registry = KernelRegistry::new();
+        // Register TurboQuant KV cache kernels (ADR-007 Phase 1.2).
+        mlx_native::ops::hadamard_quantize_kv::register(&mut registry);
+        mlx_native::ops::flash_attn_vec_tq::register(&mut registry);
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
         Ok(Self { executor, registry, metal_device_ptr })
     }
