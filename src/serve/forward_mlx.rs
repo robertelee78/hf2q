@@ -1041,9 +1041,8 @@ impl MlxModelWeights {
                 };
 
                 // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
-                // K and V quantize read different inputs (attn_k_normed vs v_src) and write
-                // different cache buffers — they can run concurrently after ONE barrier.
-                {
+                // HF2Q_SKIP_TQ_ENCODE=1: skip for timing bisection (output garbage).
+                if !std::env::var("HF2Q_SKIP_TQ_ENCODE").map_or(false, |v| v == "1") {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
                     } else {
@@ -1075,9 +1074,21 @@ impl MlxModelWeights {
                 }
 
                 // -- SDPA (flash_attn_vec_tq — FWHT fused, inline scalar dequant) --
-                // The kernel handles Q rotation and output inverse-rotation internally.
-                // No standalone FWHT dispatches needed.
-                {
+                // HF2Q_SKIP_TQ_SDPA=1: skip for timing bisection (output garbage).
+                if !std::env::var("HF2Q_SKIP_TQ_SDPA").map_or(false, |v| v == "1") {
+                    // Pre-rotate Q via standalone FWHT (1× per head, not 32× per workgroup).
+                    s.barrier_between(
+                        &[&self.activations.attn_q_normed],
+                        &[&self.activations.attn_q_normed],
+                    );
+                    mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_q_normed,
+                        nh as u32, hd as u32,
+                    ).map_err(|e| anyhow::anyhow!("FWHT Q pre-rotate L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    // TQ SDPA (pre-rotated Q → rotated-domain output)
                     s.barrier_between(
                         &[&self.activations.attn_q_normed,
                           &self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
@@ -1106,8 +1117,20 @@ impl MlxModelWeights {
                         &self.activations.sdpa_tmp,
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
+
+                    // Inverse-rotate SDPA output (1× per head).
+                    s.barrier_between(
+                        &[&self.activations.sdpa_out],
+                        &[&self.activations.sdpa_out],
+                    );
+                    mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.sdpa_out,
+                        nh as u32, hd as u32,
+                    ).map_err(|e| anyhow::anyhow!("FWHT inv-rotate L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                    total_dispatches += 2; // main + reduce
                 }
-                total_dispatches += 2; // main + reduce
 
                 // -- O-proj --
                 s.barrier_between(

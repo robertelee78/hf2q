@@ -48,6 +48,10 @@ impl GpuContext {
         mlx_native::ops::flash_attn_vec_tq::register(&mut registry);
         // F16 SDPA reduce kernels — reused by TQ SDPA with NWG>1.
         mlx_native::ops::flash_attn_vec::register(&mut registry);
+        // Standalone FWHT for TQ SDPA pre/post rotation.
+        let fwht_src = mlx_native::ops::fwht_standalone::FWHT_STANDALONE_SHADER_SOURCE;
+        registry.register_source("fwht_standalone_f32_d256", fwht_src);
+        registry.register_source("fwht_standalone_f32_d512", fwht_src);
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
         Ok(Self { executor, registry })
     }
