@@ -1572,24 +1572,23 @@ impl MlxModelWeights {
                     p.s1_dispatches[layer_idx] = total_dispatches;
                 }
 
-                // Dual command buffer split: commit buf0 after N layers, start buf1.
-                // GPU starts executing buf0 immediately while CPU encodes buf1.
-                // Metal FIFO queue ordering guarantees buf1 executes after buf0.
+                // Dual command buffer: commit buf0 after N layers, start buf1.
+                // GPU begins executing buf0 immediately. CPU continues encoding
+                // buf1 on the main thread — the overlap is implicit because Metal
+                // command buffer execution is asynchronous.
+                //
+                // Tested: buf0 wait_until_completed BEFORE buf1 encode REGRESSES
+                // performance by 5.6 tok/s (93.2 vs 98.8) because it serializes
+                // the pipeline. The async overlap is the correct approach.
                 if dual_buffer_split == Some(layer_idx + 1) {
                     let b0_barriers = s.barrier_count();
-                    let b0_encoder = s.commit(); // commit buf0 → GPU starts executing
-                    // Create fresh session for buf1
+                    let _b0_encoder = s.commit(); // commit buf0 → GPU starts async
                     s = exec.begin().map_err(|e| anyhow::anyhow!("dual-buffer begin: {e}"))?;
-                    // Seed tracker: hidden was written by the last layer in buf0
                     s.track_dispatch(&[], &[&self.activations.hidden]);
                     if std::env::var("HF2Q_MLX_TIMING").is_ok() {
                         eprintln!("  [DUAL_BUFFER] split at layer {} — buf0: {} dispatches, {} barriers",
                             layer_idx + 1, total_dispatches, b0_barriers);
                     }
-                    // Store buf0 encoder so we can verify it completed (Metal FIFO
-                    // guarantees buf1's wait_until_completed implies buf0 is done,
-                    // but keeping the reference is defensive).
-                    drop(b0_encoder);
                 }
             }
 
