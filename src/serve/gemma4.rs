@@ -1890,29 +1890,11 @@ impl Gemma4Model {
         &self.norm.weight
     }
 
-    /// Borrow the lm_head F16 weight tensor (for the fused lm_head path).
-    #[cfg(feature = "mlx-native-backend")]
-    pub(crate) fn lm_head_f16(&self) -> Option<&Tensor> {
-        self.lm_head_f16_weight.as_ref()
-    }
-
-    /// Borrow the lm_head F32 weight tensor.
-    #[cfg(feature = "mlx-native-backend")]
-    pub(crate) fn lm_head_weight(&self) -> &Tensor {
-        &self.lm_head_weight
-    }
-
     /// Global-layer RoPE frequency factors (`rope_freqs.weight`).
     /// Shape `[global_head_dim/2]` — `1.0` for active pairs, `1e+30` for masked.
     #[cfg(feature = "mlx-native-backend")]
     pub(crate) fn rope_freqs_host(&self) -> &[f32] {
         &self.rope_freqs_host
-    }
-
-    /// Model hidden size.
-    #[cfg(feature = "mlx-native-backend")]
-    pub(crate) fn hidden_size_val(&self) -> usize {
-        self.hidden_size
     }
 
     /// Final logit softcapping value.

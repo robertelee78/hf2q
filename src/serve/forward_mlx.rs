@@ -50,11 +50,6 @@ fn profiling_enabled() -> bool {
     std::env::var("HF2Q_MLX_PROFILE").map_or(false, |v| v == "1")
 }
 
-/// Check if per-kernel-type profiling is enabled (HF2Q_MLX_KERNEL_PROFILE=1).
-fn kernel_profile_enabled() -> bool {
-    std::env::var("HF2Q_MLX_KERNEL_PROFILE").map_or(false, |v| v == "1")
-}
-
 /// Accumulated per-kernel-type timing for one token.
 #[derive(Default, Clone)]
 pub struct KernelTypeProfile {
@@ -303,12 +298,6 @@ pub struct MlxMlpWeights {
 
 /// Per-expert MoE weights for one layer (quantized, GGML block format).
 pub struct MlxMoeWeights {
-    /// Per-expert gate_up projection: Vec of MlxQWeight, one per expert.
-    /// Each expert's gate_up is `[2*moe_intermediate_size, hidden_size]`.
-    pub expert_gate_up: Vec<MlxQWeight>,
-    /// Per-expert down projection: Vec of MlxQWeight, one per expert.
-    /// Each expert's down is `[hidden_size, moe_intermediate_size]`.
-    pub expert_down: Vec<MlxQWeight>,
     /// Stacked gate_up weights: all experts concatenated into `[n_experts, N, packed_K]`.
     /// Used for the fused `quantized_matmul_id_ggml` dispatch.
     pub stacked_gate_up: Option<MlxBuffer>,
@@ -320,8 +309,6 @@ pub struct MlxMoeWeights {
     pub down_expert_stride: u64,
     /// Router projection weight (quantized).
     pub router_proj: MlxQWeight,
-    /// Router learned scale `[hidden_size]` F32.
-    pub router_scale: MlxBuffer,
     /// Per-expert scale `[num_experts]` F32.
     pub per_expert_scale: MlxBuffer,
     /// GGML quant type for gate_up experts (stored separately so we can
@@ -374,10 +361,6 @@ pub struct MlxKvCache {
     pub v_packed: MlxBuffer,
     /// V per-position norms `[num_kv_heads, capacity]` F32.
     pub v_norms: MlxBuffer,
-    /// Number of KV heads for this layer.
-    pub num_kv_heads: usize,
-    /// Head dimension for this layer.
-    pub head_dim: usize,
     /// Cache capacity (max_seq_len for global, sliding_window for sliding).
     pub capacity: usize,
     /// Whether this is a sliding window cache.
@@ -409,21 +392,13 @@ pub struct MlxActivationBuffers {
     pub mlp_up: MlxBuffer,
     /// Scratch buffer for MLP fused output `[1, intermediate_size]` F32.
     pub mlp_fused: MlxBuffer,
-    /// Second fused buffer for MoE expert batching.
-    pub mlp_fused_1: MlxBuffer,
     /// Scratch buffer for MLP down output `[1, hidden_size]` F32.
     pub mlp_down: MlxBuffer,
     /// Scratch buffer for SDPA output `[1, num_heads, 1, head_dim]` F32.
     /// Sized for largest head config (16 heads * 512 head_dim for global).
     pub sdpa_out: MlxBuffer,
-    /// Temporary buffer for flash_attn_vec workgroup partial results.
-    /// Sized for max(sliding, global) head config.
-    pub flash_attn_tmp: MlxBuffer,
     /// RMS norm params buffer `[eps, dim]` as F32.
     pub norm_params: MlxBuffer,
-    /// RoPE params buffer `[theta, head_dim, 0, 0]` as F32.
-    pub rope_params_sliding: MlxBuffer,
-    pub rope_params_global: MlxBuffer,
     /// Position buffer `[pos]` as U32 — single element for decode.
     pub position: MlxBuffer,
     /// Softcap params buffer (used if softcapping is configured).
@@ -436,26 +411,12 @@ pub struct MlxActivationBuffers {
     pub argmax_params: MlxBuffer,
     /// Logits output buffer `[1, vocab_size]` F32.
     pub logits: MlxBuffer,
-    /// Embedding scale buffer — single F32 with sqrt(hidden_size).
-    pub embed_scale: MlxBuffer,
     /// MoE scratch: router logits `[1, num_experts]` F32.
     pub moe_router_logits: MlxBuffer,
-    /// MoE scratch: softmax probs `[1, num_experts]` F32.
-    pub moe_probs: MlxBuffer,
-    /// MoE scratch: sorted indices `[1, num_experts]` U32.
-    pub moe_sorted_indices: MlxBuffer,
-    /// MoE scratch: expert gate_up output `[1, 2*moe_intermediate]` F32.
-    pub moe_gate_up_out: MlxBuffer,
-    /// MoE scratch: second expert gate_up output for batched dispatch.
-    pub moe_gate_up_out_1: MlxBuffer,
     /// MoE scratch: expert down output `[1, hidden_size]` F32.
     pub moe_expert_out: MlxBuffer,
-    /// MoE scratch: second expert down output for batched dispatch.
-    pub moe_expert_out_1: MlxBuffer,
     /// MoE scratch: accumulated output `[1, hidden_size]` F32.
     pub moe_accum: MlxBuffer,
-    /// MoE scratch: softmax params for router.
-    pub moe_softmax_params: MlxBuffer,
     /// MoE scratch: norm output for router `[1, hidden_size]` F32.
     pub moe_norm_out: MlxBuffer,
     /// Router norm output `[1, hidden_size]` F32 — separate from `norm_out` to
@@ -478,10 +439,6 @@ pub struct MlxActivationBuffers {
     pub norm_params_sliding_hd: MlxBuffer,
     /// Per-head norm params for global layers: `[eps, global_head_dim]` F32.
     pub norm_params_global_hd: MlxBuffer,
-    /// NeoX RoPE params for sliding layers: `[theta, head_dim, rope_dim, 0]` F32.
-    pub rope_params_sliding_neox: MlxBuffer,
-    /// NeoX RoPE params for global layers: `[theta, head_dim, rope_dim, 0]` F32.
-    pub rope_params_global_neox: MlxBuffer,
     /// GPU buffer holding global-layer freq_factors `[global_head_dim/2]` F32.
     pub rope_freq_factors_gpu: MlxBuffer,
     /// Dedicated V projection output buffer `[max_kv_heads * max_hd]` F32.
@@ -491,8 +448,6 @@ pub struct MlxActivationBuffers {
     pub attn_q_normed: MlxBuffer,
     /// Scratch buffer for K after per-head norm `[max_kv_heads * max_hd]` F32.
     pub attn_k_normed: MlxBuffer,
-    /// MoE softmax params for GPU dispatch: `[num_experts, 0]` F32.
-    pub moe_softmax_params_gpu: MlxBuffer,
     /// MoE scratch: pre-scaled routing weights for weighted_sum kernel `[top_k]` F32.
     pub moe_routing_weights_gpu: MlxBuffer,
 }
@@ -503,7 +458,6 @@ pub struct MlxModelWeights {
     pub layers: Vec<MlxDecoderLayerWeights>,
     pub final_norm: MlxBuffer,
     pub lm_head_f16: Option<MlxBuffer>,
-    pub lm_head_f32: MlxBuffer,
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub num_attention_heads: usize,
@@ -529,16 +483,6 @@ pub struct MlxModelWeights {
     pub num_experts: usize,
     /// Intermediate size for dense MLP.
     pub intermediate_size: usize,
-    /// Intermediate size for MoE experts.
-    pub moe_intermediate_size: usize,
-    /// k_eq_v flag.
-    pub k_eq_v: bool,
-    // Centroid tables removed — dequant is now inline in the Metal kernel
-    // using a register-resident 16-element codebook. No GPU buffer needed.
-    /// Global-layer RoPE frequency factors from `rope_freqs.weight`.
-    /// Shape `[global_head_dim/2]`.  Each value divides the per-pair
-    /// frequency: `1.0` means normal rotation, `1e+30` → identity.
-    pub rope_freq_factors: Vec<f32>,
 }
 
 impl MlxModelWeights {
@@ -576,7 +520,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
             let n_elements = embed_f32.len();
             let f16_bytes = n_elements * 2; // f16 = 2 bytes per element
-            let mut f16_buf = mlx_device.alloc_buffer(
+            let f16_buf = mlx_device.alloc_buffer(
                 f16_bytes, mlx_native::DType::F16,
                 vec![cfg.vocab_size, cfg.hidden_size],
             ).map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
@@ -728,18 +672,8 @@ impl MlxModelWeights {
             // Drop individual expert buffers after stacking to save ~12.9 GB.
             // The _id kernel dispatches via stacked buffers only; individual
             // buffers are dead weight once stacking completes.
-            let expert_gate_up_live = if stacked_gate_up.is_some() {
-                drop(expert_gate_up);
-                Vec::new()
-            } else {
-                expert_gate_up  // fallback path uses individual buffers
-            };
-            let expert_down_live = if stacked_down.is_some() {
-                drop(expert_down);
-                Vec::new()
-            } else {
-                expert_down
-            };
+            drop(expert_gate_up);
+            drop(expert_down);
 
             // Pre-compute router combined weight for GPU router input prep:
             //   router_combined_weight[i] = router_scale[i] * (hidden_size ^ -0.5)
@@ -763,14 +697,11 @@ impl MlxModelWeights {
             };
 
             let moe = MlxMoeWeights {
-                expert_gate_up: expert_gate_up_live,
-                expert_down: expert_down_live,
                 stacked_gate_up,
                 stacked_down,
                 gate_up_expert_stride,
                 down_expert_stride,
                 router_proj,
-                router_scale,
                 per_expert_scale,
                 gate_up_ggml_dtype,
                 down_ggml_dtype,
@@ -851,8 +782,6 @@ impl MlxModelWeights {
                 k_norms,
                 v_packed,
                 v_norms,
-                num_kv_heads: nkv,
-                head_dim: hd,
                 capacity,
                 is_sliding: !is_full,
                 write_pos: 0,
@@ -892,10 +821,6 @@ impl MlxModelWeights {
             }
         }
 
-        // Dummy 1-element buffer for lm_head_f32 field — kept for compatibility.
-        let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
-            .map_err(|e| anyhow::anyhow!("lm_head dummy: {e}"))?;
-
         // Centroid tables removed — dequant is now inline in the Metal SDPA kernel
         // using a register-resident 16-element codebook (CODEBOOK_4BIT).
         // Saves 16KB-32KB GPU allocation per table and eliminates all scattered
@@ -906,7 +831,6 @@ impl MlxModelWeights {
             layers,
             final_norm,
             lm_head_f16: Some(lm_head_f16),
-            lm_head_f32: lm_head_f32_dummy,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
@@ -922,9 +846,6 @@ impl MlxModelWeights {
             rope_theta_global: cfg.rope_theta_global as f32,
             num_experts: cfg.num_experts,
             intermediate_size: cfg.intermediate_size,
-            moe_intermediate_size: cfg.moe_intermediate_size,
-            k_eq_v: cfg.attention_k_eq_v,
-            rope_freq_factors: model.rope_freqs_host().to_vec(),
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -947,14 +868,6 @@ impl MlxModelWeights {
         }
 
         result
-    }
-
-    /// Clear all KV caches (for new generation).
-    pub fn clear_kv_caches(&mut self) {
-        for kv in &mut self.kv_caches {
-            kv.write_pos = 0;
-            kv.seq_len = 0;
-        }
     }
 
     /// Run one decode step through mlx-native's GraphExecutor.
@@ -1437,9 +1350,9 @@ impl MlxModelWeights {
                     && self.layers[layer_idx].moe.stacked_down.is_some();
 
                 if use_fused_id {
-                    let ggml_type_gu = gpu::candle_ggml_to_mlx(
+                    let _ggml_type_gu = gpu::candle_ggml_to_mlx(
                         self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
-                    let ggml_type_dn = gpu::candle_ggml_to_mlx(
+                    let _ggml_type_dn = gpu::candle_ggml_to_mlx(
                         self.layers[layer_idx].moe.down_ggml_dtype)?;
 
                     // -- B11: dense down + gate_up_id [2 concurrent] --
@@ -1555,7 +1468,7 @@ impl MlxModelWeights {
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.moe_accum, hs,
                     ).map_err(|e| anyhow::anyhow!("zero_buffer L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    let _ = &total_dispatches; // keep counter consistent; bail! follows
 
                     // Note: fallback path still needs CPU to read expert_ids.
                     // For now, this path is unused (all layers have stacked weights).
@@ -2517,1086 +2430,6 @@ impl MlxModelWeights {
         eprintln!("      {} sessions/token vs 1 in production mode.", 8 * num_layers + 2);
     }
 
-    /// Run one decoder layer with session-collapsed GPU dispatch.
-    ///
-    /// Session structure (2 sessions per layer — S1+S2 merged):
-    ///   Session 1: QKV matmuls → GPU per-head norms → GPU RoPE (neox f32
-    ///              with freq_factors) → GPU V norm → GPU KV cache copy
-    ///              → SDPA → O-proj → GPU-norm(post-attn) → GPU-add(residual)
-    ///              → GPU-norm(pre-FF) → gate → up → GPU-GELU → GPU-mul → down
-    ///              → GPU-norm(post-FF-1) → GPU-norm(pre-FF-2)
-    ///              → GPU-norm(router) → router_proj
-    ///   CPU: softmax + top-k on router logits (128 elements, microseconds)
-    ///   Session 2 (was S4): zero(accum) + expert _id dispatches + accumulate
-    ///   CPU: post-FF-norm2, combine, layer scalar
-    fn forward_decode_layer(
-        &mut self,
-        layer_idx: usize,
-        seq_pos: usize,
-        gpu: &mut GpuContext,
-        profile: &mut Option<TokenProfile>,
-    ) -> Result<()> {
-        let hs = self.hidden_size;
-        let hd = self.head_dims[layer_idx];
-        let nkv = self.num_kv_heads[layer_idx];
-        let nh = self.num_attention_heads;
-        let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
-        let eps = self.rms_norm_eps;
-
-        // -- a. Pre-attention norm (CPU — 2816 elements, microseconds) --
-        cpu_rms_norm_weighted(
-            &self.activations.hidden,
-            &self.layers[layer_idx].norms.input_layernorm,
-            &mut self.activations.norm_out,
-            hs, eps,
-        )?;
-
-        // -- b. Update position buffer for this token --
-        {
-            let pos_dst: &mut [u32] = self.activations.position.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("position write: {e}"))?;
-            pos_dst[0] = seq_pos as u32;
-        }
-
-        // -- c. KV cache bookkeeping (compute positions before GPU session) --
-        let kv_is_sliding = self.kv_caches[layer_idx].is_sliding;
-        let kv_write_pos = self.kv_caches[layer_idx].write_pos;
-        let kv_capacity = self.kv_caches[layer_idx].capacity;
-        self.kv_caches[layer_idx].write_pos += 1;
-        self.kv_caches[layer_idx].seq_len = self.kv_caches[layer_idx].seq_len.saturating_add(1)
-            .min(kv_capacity);
-        let kv_seq_len = self.kv_caches[layer_idx].seq_len;
-
-        // =====================================================================
-        // MERGED SESSION 1: QKV + head norms + RoPE + KV cache + SDPA + MLP
-        //                    + router prep + router_proj
-        //
-        // Phase 5d: S1+S2 merged into a single GPU session. All ops from
-        // QKV projections through router proj execute in one command buffer.
-        // Only one commit_and_wait per layer (down from 2 in Phase 5c).
-        //
-        // Head norms:    GPU rms_norm per-head on Q, K
-        // V norm:        GPU rms_norm_no_scale per-head (unit norm) on V
-        // RoPE:          GPU rope_neox_f32 with freq_factors support
-        // KV cache:      GPU kv_cache_copy_f32 per-head (strided cache layout)
-        // =====================================================================
-        let s1_start = Instant::now();
-        let mut s1_dispatches = 0usize;
-        {
-            let (exec, reg) = gpu.split();
-            let dev = exec.device();
-            let metal_dev = dev.metal_device();
-            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S1 begin: {e}"))?;
-
-            // -- QKV projections --
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
-            s1_dispatches += 1;
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
-            s1_dispatches += 1;
-            let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
-            if !v_is_k {
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                    &mut self.activations.attn_v, 1)?;
-                s1_dispatches += 1;
-            }
-
-            // -- GPU per-head RMS norm on Q: attn_q → attn_q_normed --
-            // Uses perhead helper to bypass element_count validation (buffer
-            // is allocated for max head_dim but actual dim may be smaller).
-            let hd_norm_params = if is_sliding {
-                &self.activations.norm_params_sliding_hd
-            } else {
-                &self.activations.norm_params_global_hd
-            };
-            dispatch_rms_norm_perhead(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.attn_q,
-                &self.layers[layer_idx].attn.q_norm_weight,
-                &self.activations.attn_q_normed,
-                hd_norm_params,
-                nh as u32, hd as u32,
-            )?;
-            s1_dispatches += 1;
-
-            // -- GPU per-head RMS norm on K: attn_k → attn_k_normed --
-            dispatch_rms_norm_perhead(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.attn_k,
-                &self.layers[layer_idx].attn.k_norm_weight,
-                &self.activations.attn_k_normed,
-                hd_norm_params,
-                nkv as u32, hd as u32,
-            )?;
-            s1_dispatches += 1;
-
-            // -- GPU V: copy from K if k_eq_v, then per-head unit norm --
-            if v_is_k {
-                // With k_eq_v: V_proj == K_proj, so attn_k holds the raw
-                // matmul output. K was normed into attn_k_normed (not in-place),
-                // so attn_k still has the raw values. Dispatch unit norm on
-                // attn_k → attn_v.
-                dispatch_rms_norm_unit_perhead(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k,
-                    &self.activations.attn_v,
-                    hd_norm_params,
-                    nkv as u32, hd as u32,
-                )?;
-                s1_dispatches += 1;
-            } else {
-                // V was projected into attn_v; apply unit norm per head.
-                // Output to moe_expert_out (scratch) since we can't do in-place.
-                dispatch_rms_norm_unit_perhead(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_v,
-                    &self.activations.moe_expert_out,
-                    hd_norm_params,
-                    nkv as u32, hd as u32,
-                )?;
-                s1_dispatches += 1;
-            }
-
-            // The V source for KV cache: attn_v if k_eq_v (unit norm wrote there),
-            // moe_expert_out if not k_eq_v (unit norm wrote there).
-            let v_src = if v_is_k {
-                &self.activations.attn_v
-            } else {
-                &self.activations.moe_expert_out
-            };
-
-            // -- GPU RoPE (neox f32 with freq_factors) on Q and K --
-            let rope_params = if is_sliding {
-                &self.activations.rope_params_sliding_neox
-            } else {
-                &self.activations.rope_params_global_neox
-            };
-            let ff_gpu = if is_sliding {
-                None
-            } else {
-                Some(&self.activations.rope_freq_factors_gpu)
-            };
-
-            // RoPE on Q: attn_q_normed → attn_q (reuse for in-session output)
-            dispatch_rope_neox_f32_unchecked(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.attn_q_normed,
-                &self.activations.attn_q,
-                rope_params,
-                &self.activations.position,
-                ff_gpu,
-                1, // seq_len = 1 for decode
-                nh as u32,
-                hd as u32,
-                hd as u32, // rope_dim = head_dim (full rotation)
-            )?;
-            s1_dispatches += 1;
-
-            // RoPE on K: attn_k_normed → attn_k (reuse for in-session output)
-            dispatch_rope_neox_f32_unchecked(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.attn_k_normed,
-                &self.activations.attn_k,
-                rope_params,
-                &self.activations.position,
-                ff_gpu,
-                1, // seq_len = 1 for decode
-                nkv as u32,
-                hd as u32,
-                hd as u32, // rope_dim = head_dim (full rotation)
-            )?;
-            s1_dispatches += 1;
-
-            // -- GPU KV cache Hadamard-quantize (2 dispatches, ADR-007) --
-            {
-                let cache_pos_val = if kv_is_sliding {
-                    (kv_write_pos % kv_capacity) as u32
-                } else {
-                    kv_write_pos as u32
-                };
-
-                // K Hadamard-quantize (all heads, 1 dispatch)
-                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k,
-                    &self.kv_caches[layer_idx].k_packed,
-                    &self.kv_caches[layer_idx].k_norms,
-                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                    kv_is_sliding,
-                ).map_err(|e| anyhow::anyhow!("hadamard_quantize K: {e}"))?;
-                s1_dispatches += 1;
-
-                // V Hadamard-quantize (all heads, 1 dispatch)
-                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                    s.encoder_mut(), reg, metal_dev,
-                    v_src,
-                    &self.kv_caches[layer_idx].v_packed,
-                    &self.kv_caches[layer_idx].v_norms,
-                    nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                    kv_is_sliding,
-                ).map_err(|e| anyhow::anyhow!("hadamard_quantize V: {e}"))?;
-                s1_dispatches += 1;
-            }
-
-            // -- SDPA TQ (FWHT fused — Q rotation + output inv-rotation in-kernel) --
-            {
-                let p = FlashAttnVecTqParams {
-                    num_heads: nh as u32,
-                    num_kv_heads: nkv as u32,
-                    head_dim: hd as u32,
-                    kv_seq_len: kv_seq_len as u32,
-                    kv_capacity: kv_capacity as u32,
-                    scale: 1.0,
-                    mask_type: if is_sliding { 2 } else { 1 },
-                    sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
-                    softcap: 0.0,
-                };
-                mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
-                    s.encoder_mut(), reg, dev,
-                    &self.activations.attn_q,
-                    &self.kv_caches[layer_idx].k_packed,
-                    &self.kv_caches[layer_idx].k_norms,
-                    &self.kv_caches[layer_idx].v_packed,
-                    &self.kv_caches[layer_idx].v_norms,
-                    &self.activations.sdpa_out,
-                    &p,
-                ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq: {e}"))?;
-            }
-            s1_dispatches += 1;
-
-            // O-proj: sdpa_out → attn_out
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
-            s1_dispatches += 1; // O-proj
-
-            // GPU post-attention norm: attn_out → norm_out
-            s.rms_norm(
-                reg, metal_dev,
-                &self.activations.attn_out,
-                &self.layers[layer_idx].norms.post_attention_layernorm,
-                &self.activations.norm_out,
-                &self.activations.norm_params,
-                1, hs as u32,
-            ).map_err(|e| anyhow::anyhow!("GPU post-attn norm: {e}"))?;
-            s1_dispatches += 1; // rms_norm
-
-            // GPU residual add: hidden + norm_out → residual
-            s.elementwise_add(
-                reg, metal_dev,
-                &self.activations.hidden, &self.activations.norm_out,
-                &self.activations.residual, hs, mlx_native::DType::F32,
-            ).map_err(|e| anyhow::anyhow!("GPU residual add: {e}"))?;
-            s1_dispatches += 1; // add
-
-            // GPU pre-feedforward norm: residual → norm_out
-            s.rms_norm(
-                reg, metal_dev,
-                &self.activations.residual,
-                &self.layers[layer_idx].norms.pre_feedforward_layernorm,
-                &self.activations.norm_out,
-                &self.activations.norm_params,
-                1, hs as u32,
-            ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm: {e}"))?;
-            s1_dispatches += 1; // rms_norm
-
-            // Dense MLP: gate and up projections (norm_out → mlp_gate, mlp_up)
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
-            s1_dispatches += 1; // gate
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
-            s1_dispatches += 1; // up
-
-            // Fused SwiGLU: GELU(mlp_gate) * mlp_up → mlp_fused (1 dispatch)
-            {
-                use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
-                let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
-                let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
-                encode_with_args(
-                    s.encoder_mut(), pipeline,
-                    &[
-                        (0, KernelArg::Buffer(&self.activations.mlp_gate)),
-                        (1, KernelArg::Buffer(&self.activations.mlp_up)),
-                        (2, KernelArg::Buffer(&self.activations.mlp_fused)),
-                        (3, KernelArg::Bytes(&n_elements_bytes)),
-                    ],
-                    mlx_native::MTLSize::new(self.intermediate_size as u64, 1, 1),
-                    mlx_native::MTLSize::new(
-                        std::cmp::min(256, self.intermediate_size as u64), 1, 1),
-                );
-            }
-            s1_dispatches += 1; // fused gelu*mul
-
-            // down_proj: mlp_fused → mlp_down
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
-            s1_dispatches += 1; // down
-
-            // ---- Merged S3 ops (router prep + router proj) ----
-            // GPU post-feedforward norm 1: mlp_down → attn_out (reuse as scratch)
-            s.rms_norm(
-                reg, metal_dev,
-                &self.activations.mlp_down,
-                &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
-                &self.activations.attn_out,  // output to attn_out (scratch)
-                &self.activations.norm_params,
-                1, hs as u32,
-            ).map_err(|e| anyhow::anyhow!("GPU post-FF norm 1: {e}"))?;
-            s1_dispatches += 1; // post-FF norm 1
-
-            // GPU pre-feedforward norm 2: residual → moe_norm_out (MoE expert input)
-            s.rms_norm(
-                reg, metal_dev,
-                &self.activations.residual,
-                &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-                &self.activations.moe_norm_out,
-                &self.activations.norm_params,
-                1, hs as u32,
-            ).map_err(|e| anyhow::anyhow!("GPU pre-FF norm 2: {e}"))?;
-            s1_dispatches += 1; // pre-FF norm 2
-
-            // GPU router input prep: unit_norm(residual) * router_combined_weight → norm_out
-            s.rms_norm(
-                reg, metal_dev,
-                &self.activations.residual,
-                &self.layers[layer_idx].moe.router_combined_weight,
-                &self.activations.norm_out,
-                &self.activations.norm_params,
-                1, hs as u32,
-            ).map_err(|e| anyhow::anyhow!("GPU router input prep: {e}"))?;
-            s1_dispatches += 1; // router norm
-
-            // Router projection: norm_out → moe_router_logits
-            dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                &self.layers[layer_idx].moe.router_proj,
-                &mut self.activations.moe_router_logits, 1)?;
-            s1_dispatches += 1; // router proj
-
-            s.finish().map_err(|e| anyhow::anyhow!("S1 finish: {e}"))?;
-        }
-        let s1_elapsed = s1_start.elapsed();
-        if let Some(ref mut p) = profile {
-            // S1 now contains everything that was S1+CPU1+S2 (merged session).
-            // Report S1 timing for the merged session, zero out S2/CPU1.
-            p.layer_s1_us[layer_idx] = s1_elapsed.as_secs_f64() * 1e6;
-            p.s1_dispatches[layer_idx] = s1_dispatches;
-            p.layer_cpu1_us[layer_idx] = 0.0; // CPU1 eliminated (GPU norms+RoPE+KV)
-            p.layer_s2_us[layer_idx] = 0.0;   // S2 merged into S1
-            p.s2_dispatches[layer_idx] = 0;
-        }
-
-        // -- CPU: softmax + top-k on router logits --
-        // Post-FF norm 1 result is now in attn_out (GPU wrote it in S1).
-        // MoE norm input is now in moe_norm_out (GPU wrote it in S1).
-        // Router logits are now in moe_router_logits (GPU wrote it in S1).
-        let cpu2_start = Instant::now();
-
-        // -- MoE path (session 2 — the only remaining session break per layer) --
-        let (s4_us, s4_disp) =
-            self.forward_decode_moe_no_router(layer_idx, gpu)?;
-
-        // -- Combine MLP + MoE, final norm, residual, layer scalar (CPU) --
-        // Normed mlp_down is now in attn_out (GPU wrote post-FF norm 1 there in S1).
-        {
-            let mlp: &[f32] = self.activations.attn_out.as_slice().map_err(|e| anyhow::anyhow!("m: {e}"))?;
-            let moe: &[f32] = self.activations.moe_accum.as_slice().map_err(|e| anyhow::anyhow!("mo: {e}"))?;
-            let combined: &mut [f32] = self.activations.mlp_down.as_mut_slice().map_err(|e| anyhow::anyhow!("c: {e}"))?;
-            for i in 0..hs { combined[i] = mlp[i] + moe[i]; }
-        }
-        cpu_rms_norm_weighted(
-            &self.activations.mlp_down, &self.layers[layer_idx].norms.post_feedforward_layernorm,
-            &mut self.activations.norm_out, hs, eps,
-        )?;
-        cpu_add(&self.activations.residual, &self.activations.norm_out, &mut self.activations.hidden, hs)?;
-        // Layer scalar
-        {
-            let scalar: &[f32] = self.layers[layer_idx].layer_scalar.as_slice()
-                .map_err(|e| anyhow::anyhow!("ls: {e}"))?;
-            let hidden: &mut [f32] = self.activations.hidden.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("h: {e}"))?;
-            if scalar.len() == 1 {
-                let s = scalar[0];
-                for v in hidden[..hs].iter_mut() { *v *= s; }
-            } else {
-                for i in 0..hs { hidden[i] *= scalar[i]; }
-            }
-        }
-        let cpu2_and_4_elapsed = cpu2_start.elapsed();
-        if let Some(ref mut p) = profile {
-            // S1+S2 merged, S3 merged previously. Only S4 (MoE experts) remains.
-            let total_cpu2_4 = cpu2_and_4_elapsed.as_secs_f64() * 1e6;
-            let cpu4_us = total_cpu2_4 - s4_us;
-            p.layer_cpu2_us[layer_idx] = cpu4_us.max(0.0);
-            p.layer_s3_us[layer_idx] = 0.0;  // S3 merged into S1
-            p.layer_cpu3_us[layer_idx] = 0.0;
-            p.layer_s4_us[layer_idx] = s4_us;
-            p.layer_cpu4_us[layer_idx] = cpu4_us.max(0.0);
-            p.s3_dispatches[layer_idx] = 0;
-            p.s4_dispatches[layer_idx] = s4_disp;
-        }
-
-        Ok(())
-    }
-
-    /// MoE forward pass for one layer.
-    ///
-    /// Session structure (2 sessions):
-    ///   Session 3: router_proj
-    ///   CPU: softmax + top-k (128 elements, microseconds)
-    ///   Session 4: zero_buffer(accum) + for each expert:
-    ///     qmatmul(gate_up) → moe_swiglu_fused → qmatmul(down) → moe_accumulate
-    ///   CPU: post-FF-norm2
-    ///
-    /// Optimization: all expert ops (gate_up, SwiGLU, down, accumulate) are
-    /// encoded into a SINGLE GPU session.  Within one command buffer, Metal
-    /// executes compute dispatches in order, so buffer reuse between experts
-    /// is safe — each dispatch completes before the next reads the same buffer.
-    /// This eliminates 2*top_k = 16 sessions per layer.
-    /// Returns (s3_us, cpu3_us, s4_us, s3_dispatches, s4_dispatches).
-    fn forward_decode_moe(
-        &mut self,
-        layer_idx: usize,
-        gpu: &mut GpuContext,
-    ) -> Result<(f64, f64, f64, usize, usize)> {
-        let hs = self.hidden_size;
-        let top_k = self.layers[layer_idx].moe.top_k;
-        let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
-
-        // Pre-feedforward norm 2 on residual for MoE input (CPU).
-        // Note: residual was written by GPU in session 2 and is readable
-        // after S2 finish().
-        cpu_rms_norm_weighted(
-            &self.activations.residual,
-            &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-            &mut self.activations.moe_norm_out,
-            hs, self.rms_norm_eps,
-        )?;
-
-        // =====================================================================
-        // SESSION 3: Router projection
-        // =====================================================================
-        // CPU: prepare router input (unit norm + scale on residual)
-        let s3_start = Instant::now();
-        let (top_k_indices, top_k_weights) = {
-            let residual: &[f32] = self.activations.residual.as_slice()
-                .map_err(|e| anyhow::anyhow!("router residual: {e}"))?;
-            let mut router_input = vec![0.0f32; hs];
-            router_input.copy_from_slice(&residual[..hs]);
-            rms_norm_unit_cpu(&mut router_input, self.rms_norm_eps);
-
-            let scale_factor = (hs as f32).powf(-0.5);
-            let router_scale: &[f32] = self.layers[layer_idx].moe.router_scale.as_slice()
-                .map_err(|e| anyhow::anyhow!("router scale: {e}"))?;
-            for i in 0..hs {
-                router_input[i] *= router_scale[i] * scale_factor;
-            }
-
-            // Write scaled router input into norm_out
-            {
-                let dst: &mut [f32] = self.activations.norm_out.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("ri: {e}"))?;
-                dst[..hs].copy_from_slice(&router_input);
-            }
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S3 begin: {e}"))?;
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].moe.router_proj,
-                    &mut self.activations.moe_router_logits, 1)?;
-                s.finish().map_err(|e| anyhow::anyhow!("S3 finish: {e}"))?;
-            }
-
-            // CPU: softmax + top-k on router logits (128 elements, microseconds)
-            let logits: &[f32] = self.activations.moe_router_logits.as_slice()
-                .map_err(|e| anyhow::anyhow!("router logits read: {e}"))?;
-            let num_experts = self.num_experts;
-
-            let max_val = logits[..num_experts].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if max_val.is_nan() || max_val.is_infinite() {
-                anyhow::bail!(
-                    "Router logits corrupted at layer {layer_idx}: max_val={max_val}"
-                );
-            }
-            let mut probs = vec![0.0f32; num_experts];
-            let mut sum = 0.0f32;
-            for i in 0..num_experts {
-                probs[i] = (logits[i] - max_val).exp();
-                sum += probs[i];
-            }
-            for p in probs.iter_mut() {
-                *p /= sum;
-            }
-
-            let mut indices: Vec<usize> = (0..num_experts).collect();
-            indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
-            let top_indices: Vec<u32> = indices[..top_k].iter().map(|&i| i as u32).collect();
-            let top_probs: Vec<f32> = indices[..top_k].iter().map(|&i| probs[i]).collect();
-
-            let top_sum: f32 = top_probs.iter().sum();
-            let top_weights: Vec<f32> = top_probs.iter().map(|p| p / top_sum).collect();
-
-            (top_indices, top_weights)
-        };
-        // S3 includes the GPU session + CPU softmax/topk
-        let s3_total_elapsed = s3_start.elapsed().as_secs_f64() * 1e6;
-        // We can't separate S3 GPU from CPU3 perfectly here, but S3 GPU is
-        // just 1 qmatmul (128 outputs, ~10us), so attribute most to GPU.
-        // For now, we'll report the whole block as S3 (GPU-dominated).
-        let s3_us = s3_total_elapsed;
-        let cpu3_us = 0.0; // Included in s3_us for simplicity
-
-        let per_expert_scale: Vec<f32> = {
-            let s: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
-                .map_err(|e| anyhow::anyhow!("per_expert_scale: {e}"))?;
-            s.to_vec()
-        };
-
-        // =====================================================================
-        // SESSION 4: All expert dispatches in ONE session.
-        // =====================================================================
-        // If stacked weight buffers are available, use the fused _id kernel
-        // path (2 qmatmul dispatches instead of 2*top_k). Otherwise fall
-        // back to the per-expert loop.
-
-        // Zero the accumulator on CPU (fast for 2816 elements)
-        {
-            let accum: &mut [f32] = self.activations.moe_accum.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("moe accum zero: {e}"))?;
-            accum[..hs].fill(0.0);
-        }
-
-        let s4_start = Instant::now();
-        let mut s4_dispatches = 0usize;
-
-        let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
-            && self.layers[layer_idx].moe.stacked_down.is_some();
-
-        if use_fused_id {
-            // --- Fused _id path: 2 qmatmul_id dispatches ---
-
-            // Write expert ids to GPU buffer
-            {
-                let ids_dst: &mut [u32] = self.activations.moe_expert_ids.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("moe_expert_ids write: {e}"))?;
-                for k_idx in 0..top_k {
-                    ids_dst[k_idx] = top_k_indices[k_idx];
-                }
-            }
-
-            let ggml_type_gu = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
-            let ggml_type_dn = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.down_ggml_dtype)?;
-
-            // Write pre-scaled routing weights to GPU buffer for weighted_sum
-            {
-                let w_dst: &mut [f32] = self.activations.moe_routing_weights_gpu.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("moe_routing_weights write: {e}"))?;
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    w_dst[k_idx] = top_k_weights[k_idx] * per_expert_scale[eid];
-                }
-            }
-
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let metal_dev = dev.metal_device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
-
-                // 1) gate_up _id: input=[1,K] ids=[top_k] -> output=[top_k, 2*moe_int]
-                let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
-                    n_tokens: 1,
-                    top_k: top_k as u32,
-                    n: (2 * moe_int) as u32,
-                    k: hs as u32,
-                    n_experts: self.num_experts as u32,
-                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                    ggml_type: ggml_type_gu,
-                };
-                s.quantized_matmul_id_ggml(
-                    reg, dev,
-                    &self.activations.moe_norm_out,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                    &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_gate_up_id_out,
-                    &gu_params,
-                ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
-                s4_dispatches += 1;
-
-                // 2) Batched SwiGLU for all expert slots (1 dispatch).
-                mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_gate_up_id_out,
-                    &self.activations.moe_swiglu_id_out,
-                    moe_int, top_k,
-                ).map_err(|e| anyhow::anyhow!("moe swiglu batch: {e}"))?;
-                s4_dispatches += 1;
-
-                // 3) down _id: input=[top_k, moe_int] ids=[top_k] -> output=[top_k, hs]
-                let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
-                    n_tokens: top_k as u32,
-                    top_k: 1,
-                    n: hs as u32,
-                    k: moe_int as u32,
-                    n_experts: self.num_experts as u32,
-                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                    ggml_type: ggml_type_dn,
-                };
-                s.quantized_matmul_id_ggml(
-                    reg, dev,
-                    &self.activations.moe_swiglu_id_out,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                    &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_down_id_out,
-                    &dn_params,
-                ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
-                s4_dispatches += 1;
-
-                // 4) Weighted sum of all expert outputs (1 dispatch, replaces zero+accumulate).
-                mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_down_id_out,
-                    &self.activations.moe_routing_weights_gpu,
-                    &self.activations.moe_accum,
-                    hs, top_k,
-                ).map_err(|e| anyhow::anyhow!("moe weighted_sum: {e}"))?;
-                s4_dispatches += 1;
-
-                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
-            }
-        } else {
-            // --- Fallback: per-expert loop (original path) ---
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let metal_dev = dev.metal_device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
-
-                // Zero the accumulator on GPU
-                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_accum, hs,
-                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
-                s4_dispatches += 1;
-
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
-
-                    if w.abs() < 1e-10 {
-                        continue;
-                    }
-
-                    // gate_up matmul
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
-                        &self.layers[layer_idx].moe.expert_gate_up[eid],
-                        &mut self.activations.moe_gate_up_out, 1)?;
-                    s4_dispatches += 1;
-
-                    // GPU SwiGLU
-                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_out,
-                        &self.activations.mlp_fused,
-                        moe_int,
-                    ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
-                    s4_dispatches += 1;
-
-                    // down matmul
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                        &self.layers[layer_idx].moe.expert_down[eid],
-                        &mut self.activations.moe_expert_out, 1)?;
-                    s4_dispatches += 1;
-
-                    // GPU weighted accumulate
-                    mlx_native::ops::moe_dispatch::moe_accumulate_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_accum,
-                        &self.activations.moe_expert_out,
-                        w, hs,
-                    ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
-                    s4_dispatches += 1;
-                }
-
-                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
-            }
-        }
-        let s4_us = s4_start.elapsed().as_secs_f64() * 1e6;
-
-        // Post-feedforward norm 2 on MoE output (CPU)
-        cpu_rms_norm_weighted(
-            &self.activations.moe_accum,
-            &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
-            &mut self.activations.moe_norm_out,
-            hs, self.rms_norm_eps,
-        )?;
-        {
-            let src: &[f32] = self.activations.moe_norm_out.as_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            let dst: &mut [f32] = self.activations.moe_accum.as_mut_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            dst[..hs].copy_from_slice(&src[..hs]);
-        }
-
-        Ok((s3_us, cpu3_us, s4_us, 1usize, s4_dispatches))
-    }
-
-    /// MoE forward pass WITHOUT router projection (S3 merged into S2).
-    ///
-    /// Preconditions (set by S2):
-    /// - `moe_router_logits` contains router logits (from GPU router proj in S2)
-    /// - `moe_norm_out` contains pre-FF-norm-2 of residual (from GPU norm in S2)
-    ///
-    /// Session structure (1 session):
-    ///   CPU: softmax + top-k on router logits
-    ///   Session 4: zero_buffer(accum) + expert _id dispatches + accumulate
-    ///   CPU: post-FF-norm2
-    ///
-    /// Returns (s4_us, s4_dispatches).
-    fn forward_decode_moe_no_router(
-        &mut self,
-        layer_idx: usize,
-        gpu: &mut GpuContext,
-    ) -> Result<(f64, usize)> {
-        let hs = self.hidden_size;
-        let top_k = self.layers[layer_idx].moe.top_k;
-        let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
-
-        // CPU: softmax + top-k on router logits (already in moe_router_logits from S2)
-        let logits: &[f32] = self.activations.moe_router_logits.as_slice()
-            .map_err(|e| anyhow::anyhow!("router logits read: {e}"))?;
-        let num_experts = self.num_experts;
-
-        let max_val = logits[..num_experts].iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        if max_val.is_nan() || max_val.is_infinite() {
-            anyhow::bail!(
-                "Router logits corrupted at layer {layer_idx}: max_val={max_val}"
-            );
-        }
-        let mut probs = vec![0.0f32; num_experts];
-        let mut sum = 0.0f32;
-        for i in 0..num_experts {
-            probs[i] = (logits[i] - max_val).exp();
-            sum += probs[i];
-        }
-        for p in probs.iter_mut() {
-            *p /= sum;
-        }
-
-        let mut indices: Vec<usize> = (0..num_experts).collect();
-        indices.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
-        let top_k_indices: Vec<u32> = indices[..top_k].iter().map(|&i| i as u32).collect();
-        let top_probs: Vec<f32> = indices[..top_k].iter().map(|&i| probs[i]).collect();
-
-        let top_sum: f32 = top_probs.iter().sum();
-        let top_k_weights: Vec<f32> = top_probs.iter().map(|p| p / top_sum).collect();
-
-        let per_expert_scale: Vec<f32> = {
-            let s: &[f32] = self.layers[layer_idx].moe.per_expert_scale.as_slice()
-                .map_err(|e| anyhow::anyhow!("per_expert_scale: {e}"))?;
-            s.to_vec()
-        };
-
-        // Zero the accumulator on CPU (fast for 2816 elements)
-        {
-            let accum: &mut [f32] = self.activations.moe_accum.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("moe accum zero: {e}"))?;
-            accum[..hs].fill(0.0);
-        }
-
-        // =====================================================================
-        // SESSION 4: All expert dispatches in ONE session.
-        // =====================================================================
-        let s4_start = Instant::now();
-        let mut s4_dispatches = 0usize;
-
-        let use_fused_id = self.layers[layer_idx].moe.stacked_gate_up.is_some()
-            && self.layers[layer_idx].moe.stacked_down.is_some();
-
-        if use_fused_id {
-            // Write expert ids to GPU buffer
-            {
-                let ids_dst: &mut [u32] = self.activations.moe_expert_ids.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("moe_expert_ids write: {e}"))?;
-                for k_idx in 0..top_k {
-                    ids_dst[k_idx] = top_k_indices[k_idx];
-                }
-            }
-
-            let ggml_type_gu = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.gate_up_ggml_dtype)?;
-            let ggml_type_dn = gpu::candle_ggml_to_mlx(
-                self.layers[layer_idx].moe.down_ggml_dtype)?;
-
-            // Write pre-scaled routing weights to GPU buffer for weighted_sum
-            {
-                let w_dst: &mut [f32] = self.activations.moe_routing_weights_gpu.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("moe_routing_weights write: {e}"))?;
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    w_dst[k_idx] = top_k_weights[k_idx] * per_expert_scale[eid];
-                }
-            }
-
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let metal_dev = dev.metal_device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
-
-                // 1) gate_up _id
-                let gu_params = mlx_native::GgmlQuantizedMatmulIdParams {
-                    n_tokens: 1,
-                    top_k: top_k as u32,
-                    n: (2 * moe_int) as u32,
-                    k: hs as u32,
-                    n_experts: self.num_experts as u32,
-                    expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                    ggml_type: ggml_type_gu,
-                };
-                s.quantized_matmul_id_ggml(
-                    reg, dev,
-                    &self.activations.moe_norm_out,
-                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                    &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_gate_up_id_out,
-                    &gu_params,
-                ).map_err(|e| anyhow::anyhow!("gate_up _id: {e}"))?;
-                s4_dispatches += 1;
-
-                // 2) Batched SwiGLU (1 dispatch)
-                mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_gate_up_id_out,
-                    &self.activations.moe_swiglu_id_out,
-                    moe_int, top_k,
-                ).map_err(|e| anyhow::anyhow!("moe swiglu batch: {e}"))?;
-                s4_dispatches += 1;
-
-                // 3) down _id
-                let dn_params = mlx_native::GgmlQuantizedMatmulIdParams {
-                    n_tokens: top_k as u32,
-                    top_k: 1,
-                    n: hs as u32,
-                    k: moe_int as u32,
-                    n_experts: self.num_experts as u32,
-                    expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                    ggml_type: ggml_type_dn,
-                };
-                s.quantized_matmul_id_ggml(
-                    reg, dev,
-                    &self.activations.moe_swiglu_id_out,
-                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                    &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_down_id_out,
-                    &dn_params,
-                ).map_err(|e| anyhow::anyhow!("down _id: {e}"))?;
-                s4_dispatches += 1;
-
-                // 4) Weighted sum (1 dispatch, replaces zero+accumulate)
-                mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_down_id_out,
-                    &self.activations.moe_routing_weights_gpu,
-                    &self.activations.moe_accum,
-                    hs, top_k,
-                ).map_err(|e| anyhow::anyhow!("moe weighted_sum: {e}"))?;
-                s4_dispatches += 1;
-
-                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
-            }
-        } else {
-            // --- Fallback: per-expert loop (no _id kernels) ---
-            // Note: fallback path still uses per-expert loop (not batched)
-            // since the individual expert weight buffers are separate.
-            {
-                let (exec, reg) = gpu.split();
-                let dev = exec.device();
-                let metal_dev = dev.metal_device();
-                let mut s = exec.begin().map_err(|e| anyhow::anyhow!("S4-moe begin: {e}"))?;
-
-                mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_accum, hs,
-                ).map_err(|e| anyhow::anyhow!("moe zero_buffer: {e}"))?;
-                s4_dispatches += 1;
-
-                for k_idx in 0..top_k {
-                    let eid = top_k_indices[k_idx] as usize;
-                    let w = top_k_weights[k_idx] * per_expert_scale[eid];
-
-                    if w.abs() < 1e-10 {
-                        continue;
-                    }
-
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.moe_norm_out,
-                        &self.layers[layer_idx].moe.expert_gate_up[eid],
-                        &mut self.activations.moe_gate_up_out, 1)?;
-                    s4_dispatches += 1;
-
-                    mlx_native::ops::moe_dispatch::moe_swiglu_fused_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_out,
-                        &self.activations.mlp_fused,
-                        moe_int,
-                    ).map_err(|e| anyhow::anyhow!("moe swiglu: {e}"))?;
-                    s4_dispatches += 1;
-
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                        &self.layers[layer_idx].moe.expert_down[eid],
-                        &mut self.activations.moe_expert_out, 1)?;
-                    s4_dispatches += 1;
-
-                    mlx_native::ops::moe_dispatch::moe_accumulate_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_accum,
-                        &self.activations.moe_expert_out,
-                        w, hs,
-                    ).map_err(|e| anyhow::anyhow!("moe accumulate: {e}"))?;
-                    s4_dispatches += 1;
-                }
-
-                s.finish().map_err(|e| anyhow::anyhow!("S4-moe finish: {e}"))?;
-            }
-        }
-        let s4_us = s4_start.elapsed().as_secs_f64() * 1e6;
-
-        // Post-feedforward norm 2 on MoE output (CPU)
-        cpu_rms_norm_weighted(
-            &self.activations.moe_accum,
-            &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
-            &mut self.activations.moe_norm_out,
-            hs, self.rms_norm_eps,
-        )?;
-        {
-            let src: &[f32] = self.activations.moe_norm_out.as_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            let dst: &mut [f32] = self.activations.moe_accum.as_mut_slice().map_err(|e| anyhow::anyhow!("cp: {e}"))?;
-            dst[..hs].copy_from_slice(&src[..hs]);
-        }
-
-        Ok((s4_us, s4_dispatches))
-    }
-
-    /// Final norm + GPU lm_head (dense GEMM F16) + softcap + argmax.
-    ///
-    /// Uses one GPU session for: cast(F32→F16) + dense_gemm_f16 + cast(F16→F32).
-    /// Falls back to CPU lm_head if no F16 weight is available.
-    fn forward_decode_head(
-        &mut self,
-        gpu: &mut GpuContext,
-        profile: &mut Option<TokenProfile>,
-    ) -> Result<u32> {
-        let hs = self.hidden_size;
-        let vocab_size = self.vocab_size;
-
-        // Final RMS norm (CPU — 2816 elements, microseconds)
-        cpu_rms_norm_weighted(
-            &self.activations.hidden, &self.final_norm,
-            &mut self.activations.norm_out, hs, self.rms_norm_eps,
-        )?;
-
-        // LM head: GPU dense GEMM (F16) or CPU fallback
-        let head_gpu_start = Instant::now();
-        let mut head_dispatches = 0usize;
-        if let Some(ref lm_head_f16) = self.lm_head_f16 {
-            let (exec, reg) = gpu.split();
-            let dev = exec.device();
-            let metal_dev = dev.metal_device();
-            let mut s = exec.begin().map_err(|e| anyhow::anyhow!("lm_head begin: {e}"))?;
-
-            mlx_native::ops::elementwise::cast(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.norm_out,
-                &self.activations.hidden_f16,
-                hs,
-                CastDirection::F32ToF16,
-            ).map_err(|e| anyhow::anyhow!("cast F32->F16: {e}"))?;
-            head_dispatches += 1;
-
-            let gemm_params = DenseGemmF16Params {
-                m: 1,
-                n: vocab_size as u32,
-                k: hs as u32,
-            };
-            mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.hidden_f16,
-                lm_head_f16,
-                &self.activations.logits_f16,
-                &gemm_params,
-            ).map_err(|e| anyhow::anyhow!("dense_gemm_f16: {e}"))?;
-            head_dispatches += 1;
-
-            mlx_native::ops::elementwise::cast(
-                s.encoder_mut(), reg, metal_dev,
-                &self.activations.logits_f16,
-                &self.activations.logits,
-                vocab_size,
-                CastDirection::F16ToF32,
-            ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
-            head_dispatches += 1;
-
-            s.finish().map_err(|e| anyhow::anyhow!("lm_head finish: {e}"))?;
-        } else {
-            self.lm_head_cpu()?;
-        }
-        let head_gpu_us = head_gpu_start.elapsed().as_secs_f64() * 1e6;
-
-        // Softcapping + Argmax (CPU)
-        let head_cpu_start = Instant::now();
-        if let Some(cap) = self.final_logit_softcapping {
-            let logits: &mut [f32] = self.activations.logits.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("softcap logits: {e}"))?;
-            for v in logits[..vocab_size].iter_mut() {
-                *v = cap * (*v / cap).tanh();
-            }
-        }
-
-        let logits: &[f32] = self.activations.logits.as_slice()
-            .map_err(|e| anyhow::anyhow!("argmax logits: {e}"))?;
-        let mut best_idx = 0u32;
-        let mut best_val = f32::NEG_INFINITY;
-        for i in 0..vocab_size {
-            if logits[i] > best_val {
-                best_val = logits[i];
-                best_idx = i as u32;
-            }
-        }
-        let head_cpu_us = head_cpu_start.elapsed().as_secs_f64() * 1e6;
-
-        if let Some(ref mut p) = profile {
-            p.head_session_us = head_gpu_us;
-            p.head_cpu_us = head_cpu_us;
-            p.head_dispatches = head_dispatches;
-        }
-
-        Ok(best_idx)
-    }
-
-    /// CPU lm_head matmul: logits = hidden @ embed_weight.T
-    fn lm_head_cpu(&mut self) -> Result<()> {
-        let hidden_size = self.hidden_size;
-        let vocab_size = self.vocab_size;
-        let hidden: &[f32] = self.activations.norm_out.as_slice()
-            .map_err(|e| anyhow::anyhow!("lm_head hidden: {e}"))?;
-        let weight: &[f32] = self.embed_weight.as_slice()
-            .map_err(|e| anyhow::anyhow!("lm_head weight: {e}"))?;
-        let logits: &mut [f32] = self.activations.logits.as_mut_slice()
-            .map_err(|e| anyhow::anyhow!("lm_head logits: {e}"))?;
-
-        // logits[v] = sum_k(hidden[k] * weight[v * hidden_size + k])
-        for v in 0..vocab_size {
-            let mut sum = 0.0f32;
-            let row = &weight[v * hidden_size..(v + 1) * hidden_size];
-            for k in 0..hidden_size {
-                sum += hidden[k] * row[k];
-            }
-            logits[v] = sum;
-        }
-        Ok(())
-    }
 }
 
 /// Helper: load a candle QMatMul into an MlxQWeight.
@@ -3613,41 +2446,6 @@ fn load_qweight(
 // ---------------------------------------------------------------------------
 // Forward pass dispatch helpers
 // ---------------------------------------------------------------------------
-
-/// Dispatch per-head RMS norm (f32) without element count validation.
-///
-/// The standard `dispatch_rms_norm` validates that input.element_count() ==
-/// rows * dim, which fails when using over-sized buffers (e.g. Q buffer
-/// allocated for max head_dim but used with smaller sliding head_dim).
-///
-/// This helper dispatches the kernel directly, processing only the first
-/// `rows * dim` elements.  Safe because: (1) the buffer is at least as
-/// large as rows*dim, and (2) the kernel reads/writes exactly rows*dim
-/// elements controlled by its grid size (one threadgroup per row).
-fn dispatch_rms_norm_perhead(
-    encoder: &mut mlx_native::CommandEncoder,
-    registry: &mut mlx_native::KernelRegistry,
-    device: &mlx_native::metal::DeviceRef,
-    input: &MlxBuffer,
-    weight: &MlxBuffer,
-    output: &MlxBuffer,
-    params_buf: &MlxBuffer,
-    rows: u32,
-    dim: u32,
-) -> Result<()> {
-    let pipeline = registry.get_pipeline("rms_norm_f32", device)
-        .map_err(|e| anyhow::anyhow!("rms_norm_f32 pipeline: {e}"))?;
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
-    encoder.encode_threadgroups_with_shared(
-        pipeline,
-        &[(0, input), (1, weight), (2, output), (3, params_buf)],
-        &[(0, shared_mem_bytes)],
-        mlx_native::MTLSize::new(rows as u64, 1, 1),
-        mlx_native::MTLSize::new(tg_size, 1, 1),
-    );
-    Ok(())
-}
 
 /// Dispatch per-head RMS norm without learned scale (unit norm, f32).
 ///
@@ -3677,61 +2475,6 @@ fn dispatch_rms_norm_unit_perhead(
     Ok(())
 }
 
-/// Dispatch NeoX RoPE f32 with freq_factors, bypassing element count validation.
-///
-/// Same as `dispatch_rope_neox_f32` but tolerates over-sized buffers.
-/// Safe because the kernel grid is sized to (rope_dim/2, seq_len*n_heads)
-/// and only accesses the first seq_len*n_heads*head_dim elements.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_rope_neox_f32_unchecked(
-    encoder: &mut mlx_native::CommandEncoder,
-    registry: &mut mlx_native::KernelRegistry,
-    device: &mlx_native::metal::DeviceRef,
-    input: &MlxBuffer,
-    output: &MlxBuffer,
-    params_buf: &MlxBuffer,
-    positions_buf: &MlxBuffer,
-    freq_factors: Option<&MlxBuffer>,
-    seq_len: u32,
-    n_heads: u32,
-    head_dim: u32,
-    rope_dim: u32,
-) -> Result<()> {
-    use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
-
-    let pipeline = registry.get_pipeline("rope_neox_f32", device)
-        .map_err(|e| anyhow::anyhow!("rope_neox_f32 pipeline: {e}"))?;
-    let half_rope = rope_dim / 2;
-    let n_rows = (seq_len as usize) * (n_heads as usize);
-
-    let has_ff: u32 = if freq_factors.is_some() { 1 } else { 0 };
-    // Pack [n_heads, has_freq_factors] as 2 x u32 = 8 bytes
-    let mut param_bytes = [0u8; 8];
-    param_bytes[0..4].copy_from_slice(&n_heads.to_ne_bytes());
-    param_bytes[4..8].copy_from_slice(&has_ff.to_ne_bytes());
-
-    let ff_buf = freq_factors.unwrap_or(input);
-
-    let tg_x = std::cmp::min(64, half_rope as u64);
-    let tg_y = std::cmp::min(4, n_rows as u64);
-
-    encode_with_args(
-        encoder,
-        pipeline,
-        &[
-            (0, KernelArg::Buffer(input)),
-            (1, KernelArg::Buffer(output)),
-            (2, KernelArg::Buffer(params_buf)),
-            (3, KernelArg::Buffer(positions_buf)),
-            (4, KernelArg::Bytes(&param_bytes)),
-            (5, KernelArg::Buffer(ff_buf)),
-        ],
-        mlx_native::MTLSize::new(half_rope as u64, n_rows as u64, 1),
-        mlx_native::MTLSize::new(tg_x, tg_y, 1),
-    );
-    Ok(())
-}
-
 /// Run one quantized matmul through the GraphSession.
 ///
 /// Dispatches `output = input @ weight.T` where weight is in GGML block format.
@@ -3739,7 +2482,6 @@ fn dispatch_rope_neox_f32_unchecked(
 ///
 /// Takes `registry` and `device` separately to avoid borrow conflicts on
 /// `GpuContext` (registry is `&mut`, device is `&`).
-#[allow(dead_code)]
 pub fn dispatch_qmatmul(
     session: &mut GraphSession<'_>,
     registry: &mut mlx_native::KernelRegistry,
@@ -3799,37 +2541,6 @@ fn alloc_activation_buffers(
         p[1] = hs as f32;
     }
 
-    // RoPE params: [theta, head_dim, 0, 0] as f32
-    let mut rope_params_sliding = alloc_f32(4, "rope_params_sliding")?;
-    {
-        let p: &mut [f32] = rope_params_sliding.as_mut_slice()
-            .map_err(|e| anyhow::anyhow!("rope_params_sliding init: {e}"))?;
-        p[0] = cfg.rope_theta_sliding as f32;
-        p[1] = cfg.head_dim as f32;
-        p[2] = 0.0;
-        p[3] = 0.0;
-    }
-    let mut rope_params_global = alloc_f32(4, "rope_params_global")?;
-    {
-        let p: &mut [f32] = rope_params_global.as_mut_slice()
-            .map_err(|e| anyhow::anyhow!("rope_params_global init: {e}"))?;
-        p[0] = cfg.rope_theta_global as f32;
-        p[1] = cfg.global_head_dim as f32;
-        p[2] = 0.0;
-        p[3] = 0.0;
-    }
-
-    // Embedding scale
-    let mut embed_scale = alloc_f32(1, "embed_scale")?;
-    {
-        let p: &mut [f32] = embed_scale.as_mut_slice()
-            .map_err(|e| anyhow::anyhow!("embed_scale init: {e}"))?;
-        p[0] = (hs as f32).sqrt();
-    }
-
-    // Softmax params for MoE router: [num_experts] placeholder
-    let moe_softmax_params = alloc_f32(2, "moe_softmax_params")?;
-
     // Softcap params
     let softcap_params = alloc_f32(2, "softcap_params")?;
 
@@ -3846,36 +2557,18 @@ fn alloc_activation_buffers(
         mlp_gate: alloc_f32(interm, "mlp_gate")?,
         mlp_up: alloc_f32(interm, "mlp_up")?,
         mlp_fused: alloc_f32(interm.max(moe_interm), "mlp_fused")?,
-        mlp_fused_1: alloc_f32(moe_interm, "mlp_fused_1")?,
         mlp_down: alloc_f32(hs, "mlp_down")?,
         sdpa_out: alloc_f32(num_heads * max_hd, "sdpa_out")?,
-        flash_attn_tmp: {
-            // Sized for the largest head config (global: 16 heads * dk512).
-            let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
-                num_heads as u32, max_hd as u32,
-            );
-            let tmp_elems = tmp_bytes / std::mem::size_of::<f32>();
-            alloc_f32(tmp_elems, "flash_attn_tmp")?
-        },
         norm_params,
-        rope_params_sliding,
-        rope_params_global,
         position: alloc_u32(1, "position")?,
         softcap_params,
         argmax_index: alloc_u32(1, "argmax_index")?,
         argmax_value: alloc_f32(1, "argmax_value")?,
         argmax_params,
         logits: alloc_f32(vocab, "logits")?,
-        embed_scale,
         moe_router_logits: alloc_f32(num_experts, "moe_router_logits")?,
-        moe_probs: alloc_f32(num_experts, "moe_probs")?,
-        moe_sorted_indices: alloc_u32(num_experts, "moe_sorted_indices")?,
-        moe_gate_up_out: alloc_f32(2 * moe_interm, "moe_gate_up_out")?,
-        moe_gate_up_out_1: alloc_f32(2 * moe_interm, "moe_gate_up_out_1")?,
         moe_expert_out: alloc_f32(hs.max(max_kv_heads * max_hd), "moe_expert_out")?,
-        moe_expert_out_1: alloc_f32(hs, "moe_expert_out_1")?,
         moe_accum: alloc_f32(hs, "moe_accum")?,
-        moe_softmax_params,
         moe_norm_out: alloc_f32(hs, "moe_norm_out")?,
         router_norm_out: alloc_f32(hs, "router_norm_out")?,
         // Fused _id dispatch buffers (sized for top_k = cfg.top_k_experts)
@@ -3906,145 +2599,12 @@ fn alloc_activation_buffers(
             p[1] = global_hd as f32;
             buf
         },
-        rope_params_sliding_neox: {
-            let sliding_hd = cfg.head_dim;
-            let mut buf = alloc_f32(4, "rope_params_sliding_neox")?;
-            let p: &mut [f32] = buf.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("rope_params_sliding_neox init: {e}"))?;
-            p[0] = cfg.rope_theta_sliding as f32;
-            p[1] = sliding_hd as f32;
-            p[2] = sliding_hd as f32; // rope_dim = head_dim (full rotation)
-            p[3] = 0.0;
-            buf
-        },
-        rope_params_global_neox: {
-            let global_hd = cfg.global_head_dim;
-            let mut buf = alloc_f32(4, "rope_params_global_neox")?;
-            let p: &mut [f32] = buf.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("rope_params_global_neox init: {e}"))?;
-            p[0] = cfg.rope_theta_global as f32;
-            p[1] = global_hd as f32;
-            p[2] = global_hd as f32; // rope_dim = head_dim (full rotation)
-            p[3] = 0.0;
-            buf
-        },
         rope_freq_factors_gpu: alloc_f32(1, "rope_freq_factors_gpu_placeholder")?,
         attn_v: alloc_f32(max_kv_heads * max_hd, "attn_v")?,
         attn_q_normed: alloc_f32(num_heads * max_hd, "attn_q_normed")?,
         attn_k_normed: alloc_f32(max_kv_heads * max_hd, "attn_k_normed")?,
-        moe_softmax_params_gpu: {
-            let mut buf = alloc_f32(2, "moe_softmax_params_gpu")?;
-            let p: &mut [f32] = buf.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("moe_softmax_params_gpu init: {e}"))?;
-            p[0] = num_experts as f32; // cols
-            p[1] = 0.0;
-            buf
-        },
         moe_routing_weights_gpu: alloc_f32(cfg.top_k_experts, "moe_routing_weights_gpu")?,
     })
-}
-
-// ---------------------------------------------------------------------------
-// CPU helper functions for single-token decode ops
-// ---------------------------------------------------------------------------
-
-/// RMS norm with learned weight on MlxBuffers. Reads input + weight, writes output.
-fn cpu_rms_norm_weighted(
-    input: &MlxBuffer,
-    weight: &MlxBuffer,
-    output: &mut MlxBuffer,
-    dim: usize,
-    eps: f32,
-) -> Result<()> {
-    let inp: &[f32] = input.as_slice()
-        .map_err(|e| anyhow::anyhow!("cpu_rms_norm input: {e}"))?;
-    let w: &[f32] = weight.as_slice()
-        .map_err(|e| anyhow::anyhow!("cpu_rms_norm weight: {e}"))?;
-    let out: &mut [f32] = output.as_mut_slice()
-        .map_err(|e| anyhow::anyhow!("cpu_rms_norm output: {e}"))?;
-    let mut sum_sq = 0.0f32;
-    for i in 0..dim { sum_sq += inp[i] * inp[i]; }
-    let rms = (sum_sq / dim as f32 + eps).sqrt().recip();
-    for i in 0..dim { out[i] = inp[i] * rms * w[i]; }
-    Ok(())
-}
-
-/// Elementwise add on MlxBuffers: output = a + b.
-fn cpu_add(a: &MlxBuffer, b: &MlxBuffer, output: &mut MlxBuffer, n: usize) -> Result<()> {
-    let av: &[f32] = a.as_slice().map_err(|e| anyhow::anyhow!("cpu_add a: {e}"))?;
-    let bv: &[f32] = b.as_slice().map_err(|e| anyhow::anyhow!("cpu_add b: {e}"))?;
-    let ov: &mut [f32] = output.as_mut_slice().map_err(|e| anyhow::anyhow!("cpu_add o: {e}"))?;
-    for i in 0..n { ov[i] = av[i] + bv[i]; }
-    Ok(())
-}
-
-/// In-place RMS norm with learned weight: x = x * rsqrt(mean(x^2) + eps) * w
-fn rms_norm_cpu(x: &mut [f32], w: &[f32], eps: f32) {
-    let n = x.len();
-    let mut sum_sq = 0.0f32;
-    for &v in x.iter() {
-        sum_sq += v * v;
-    }
-    let rms = (sum_sq / n as f32 + eps).sqrt().recip();
-    for i in 0..n {
-        x[i] = x[i] * rms * w[i];
-    }
-}
-
-/// In-place unit RMS norm (no learned weight): x = x * rsqrt(mean(x^2) + eps)
-fn rms_norm_unit_cpu(x: &mut [f32], eps: f32) {
-    let n = x.len();
-    let mut sum_sq = 0.0f32;
-    for &v in x.iter() {
-        sum_sq += v * v;
-    }
-    let rms = (sum_sq / n as f32 + eps).sqrt().recip();
-    for v in x.iter_mut() {
-        *v *= rms;
-    }
-}
-
-/// Apply Neox-convention RoPE in-place for a single position.
-/// data layout: [num_heads, head_dim] contiguous.
-/// Neox pairs (d[i], d[i + half_dim]) for i in 0..half_dim.
-///
-/// `freq_factors`: optional per-pair frequency divisor `[half_dim]`.
-/// For global layers, pair indices with `freq_factors[i] == 1e+30` produce
-/// `theta ≈ 0 → cos=1, sin=0 → identity rotation`.  For sliding layers,
-/// pass `None` (equivalent to all-ones).
-fn apply_rope_neox_cpu(
-    data: &mut [f32],
-    num_heads: usize,
-    head_dim: usize,
-    pos: usize,
-    theta: f32,
-    freq_factors: Option<&[f32]>,
-) {
-    let half_dim = head_dim / 2;
-    for h in 0..num_heads {
-        let base = h * head_dim;
-        for i in 0..half_dim {
-            let base_freq = (pos as f32) / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let freq = match freq_factors {
-                Some(ff) => base_freq / ff[i],
-                None => base_freq,
-            };
-            let cos_val = freq.cos();
-            let sin_val = freq.sin();
-            let x0 = data[base + i];
-            let x1 = data[base + i + half_dim];
-            data[base + i] = x0 * cos_val - x1 * sin_val;
-            data[base + i + half_dim] = x1 * cos_val + x0 * sin_val;
-        }
-    }
-}
-
-/// GELU activation with PyTorch tanh approximation.
-/// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-fn gelu_tanh(x: f32) -> f32 {
-    let sqrt_2_over_pi = 0.7978845608028654f32;
-    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-    0.5 * x * (1.0 + inner.tanh())
 }
 
 // ---------------------------------------------------------------------------

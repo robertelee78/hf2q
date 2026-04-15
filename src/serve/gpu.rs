@@ -42,10 +42,6 @@ pub struct GpuContext {
     pub executor: GraphExecutor,
     /// Pre-compiled shader pipeline cache.
     pub registry: KernelRegistry,
-    /// Raw pointer to the Metal device, cached to avoid borrow conflicts.
-    /// SAFETY: the metal device lives as long as the executor (which owns it).
-    /// This pointer is never dereferenced after the executor is dropped.
-    metal_device_ptr: *const mlx_native::metal::DeviceRef,
 }
 
 // SAFETY: The metal::DeviceRef is Send+Sync (MTLDevice is thread-safe).
@@ -66,22 +62,13 @@ impl GpuContext {
     pub fn new() -> mlx_native::Result<Self> {
         let device = MlxDevice::new()?;
         let gpu_name = device.name();
-        let metal_device_ptr: *const mlx_native::metal::DeviceRef = device.metal_device();
         let executor = GraphExecutor::new(device);
         let mut registry = KernelRegistry::new();
         // Register TurboQuant KV cache kernels (ADR-007 Phase 1.2).
         mlx_native::ops::hadamard_quantize_kv::register(&mut registry);
         mlx_native::ops::flash_attn_vec_tq::register(&mut registry);
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
-        Ok(Self { executor, registry, metal_device_ptr })
-    }
-
-    /// Get a reference to the metal device without borrowing executor.
-    ///
-    /// SAFETY: the returned reference is valid for the lifetime of this GpuContext.
-    #[inline]
-    pub fn metal_device_ref(&self) -> &mlx_native::metal::DeviceRef {
-        unsafe { &*self.metal_device_ptr }
+        Ok(Self { executor, registry })
     }
 
     /// Borrow the underlying `MlxDevice`.
@@ -144,47 +131,6 @@ pub fn candle_tensor_to_mlx_buffer(
     let dst: &mut [f32] = mlx_buf.as_mut_slice()
         .map_err(|e| anyhow::anyhow!("MlxBuffer::as_mut_slice failed: {e}"))?;
     dst.copy_from_slice(&data);
-
-    Ok(mlx_buf)
-}
-
-/// Copy a candle F16 `Tensor`'s data into a fresh `MlxBuffer` with F16 dtype.
-#[cfg(feature = "mlx-native-backend")]
-pub fn candle_tensor_f16_to_mlx_buffer(
-    tensor: &candle_core::Tensor,
-    mlx_device: &MlxDevice,
-) -> anyhow::Result<MlxBuffer> {
-    let t = tensor.to_dtype(candle_core::DType::F16)?.contiguous()?;
-    // Read raw bytes through flatten -> to_vec1 as u16 (f16 bits)
-    let flat = t.flatten_all()?;
-    let (storage, layout) = flat.storage_and_layout();
-    let byte_len = flat.elem_count() * 2; // f16 = 2 bytes
-
-    let shape: Vec<usize> = tensor.dims().to_vec();
-
-    let mut mlx_buf = mlx_device.alloc_buffer(
-        byte_len,
-        mlx_native::DType::F16,
-        shape,
-    ).map_err(|e| anyhow::anyhow!("MlxBuffer alloc failed: {e}"))?;
-
-    // Use the raw contents pointer for a direct memcpy.
-    // On Metal with StorageModeShared, contents() gives CPU-accessible memory.
-    match &*storage {
-        candle_core::Storage::Metal(ms) => {
-            let src_ptr = ms.buffer().contents() as *const u8;
-            let src_offset = layout.start_offset() * 2; // f16 = 2 bytes
-            let dst_ptr = mlx_buf.contents_ptr() as *mut u8;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_ptr.add(src_offset),
-                    dst_ptr,
-                    byte_len,
-                );
-            }
-        }
-        _ => anyhow::bail!("candle_tensor_f16_to_mlx_buffer: expected Metal storage"),
-    }
 
     Ok(mlx_buf)
 }
@@ -268,6 +214,7 @@ pub struct QuantWeightInfo {
 // ---------------------------------------------------------------------------
 
 /// Map a candle `DType` to an mlx-native `DType`.
+#[cfg(test)]
 #[cfg(feature = "mlx-native-backend")]
 pub fn candle_dtype_to_mlx(dt: candle_core::DType) -> mlx_native::DType {
     match dt {
