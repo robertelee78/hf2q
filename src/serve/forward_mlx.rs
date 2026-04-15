@@ -1660,9 +1660,11 @@ impl MlxModelWeights {
                 // buf1 on the main thread — the overlap is implicit because Metal
                 // command buffer execution is asynchronous.
                 //
-                // Tested: buf0 wait_until_completed BEFORE buf1 encode REGRESSES
-                // performance by 5.6 tok/s (93.2 vs 98.8) because it serializes
-                // the pipeline. The async overlap is the correct approach.
+                // Tested and falsified:
+                // - Sequential wait BEFORE encode: -5.6 tok/s (serialized pipeline)
+                // - Threaded wait DURING encode:   -43 tok/s (thread spawn + Metal
+                //   cross-thread synchronization overhead on command queue)
+                // The async overlap without any wait is the correct approach.
                 if dual_buffer_split == Some(layer_idx + 1) {
                     let b0_barriers = s.barrier_count();
                     let _b0_encoder = s.commit(); // commit buf0 → GPU starts async
