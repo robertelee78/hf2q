@@ -820,12 +820,12 @@ impl MlxModelWeights {
 
             // KV cache: sliding layers use sliding_window capacity,
             // global layers cap at a practical limit to avoid OOM.
-            // 262144 × 5 global layers × 2(K+V) × 2 heads × 512 dim × 4 bytes = 10.7 GB
-            // which OOMs a 64 GB machine. Cap at 8192 for now; expand if
-            // longer-context generation is needed.
-            let max_global_kv = 8192;
+            // ADR-007 Phase 2.1: Full 262K context enabled by TurboQuant compression.
+            // At 4-bit nibble packing, 262K global KV cache is ~1.37 GB (vs 5.3 GB F16).
+            // Sliding layers: capacity = sliding_window (1024).
+            // Global layers:  capacity = max_position_embeddings (262144).
             let capacity = if is_full {
-                cfg.max_position_embeddings.min(max_global_kv)
+                cfg.max_position_embeddings
             } else {
                 cfg.sliding_window
             };
