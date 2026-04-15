@@ -32,7 +32,8 @@ use mlx_native::{
     GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
 };
 use mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams;
-use mlx_native::turboquant::CODEBOOK_4BIT;
+// CODEBOOK_4BIT is now embedded directly in the Metal shader as a constant array.
+// No Rust-side centroid table construction needed.
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
@@ -532,11 +533,8 @@ pub struct MlxModelWeights {
     pub moe_intermediate_size: usize,
     /// k_eq_v flag.
     pub k_eq_v: bool,
-    /// Pre-rotated centroid table for sliding layers (head_dim=256): `[16, 256]` F32.
-    /// ADR-007 Phase 1.2: `table[idx * head_dim + c] = CODEBOOK_4BIT[idx] / sqrt(head_dim)`.
-    pub centroid_table_sliding: MlxBuffer,
-    /// Pre-rotated centroid table for global layers (head_dim=512): `[16, 512]` F32.
-    pub centroid_table_global: MlxBuffer,
+    // Centroid tables removed — dequant is now inline in the Metal kernel
+    // using a register-resident 16-element codebook. No GPU buffer needed.
     /// Global-layer RoPE frequency factors from `rope_freqs.weight`.
     /// Shape `[global_head_dim/2]`.  Each value divides the per-pair
     /// frequency: `1.0` means normal rotation, `1e+30` → identity.
@@ -898,47 +896,10 @@ impl MlxModelWeights {
         let lm_head_f32_dummy = mlx_device.alloc_buffer(4, mlx_native::DType::F32, vec![1])
             .map_err(|e| anyhow::anyhow!("lm_head dummy: {e}"))?;
 
-        // Pre-rotated centroid tables for TurboQuant KV cache (ADR-007 Phase 1.2).
-        // table[idx * head_dim + c] = CODEBOOK_4BIT[idx] / sqrt(head_dim)
-        let centroid_table_sliding = {
-            let hd = cfg.head_dim_for_layer(0); // sliding head_dim (typically 256)
-            let inv_scale = 1.0 / (hd as f32).sqrt();
-            let mut data = vec![0.0f32; 16 * hd];
-            for idx in 0..16 {
-                for c in 0..hd {
-                    data[idx * hd + c] = CODEBOOK_4BIT[idx] * inv_scale;
-                }
-            }
-            let mut buf = mlx_device.alloc_buffer(
-                data.len() * 4, mlx_native::DType::F32, vec![16, hd],
-            ).map_err(|e| anyhow::anyhow!("centroid table sliding alloc: {e}"))?;
-            let slice: &mut [f32] = buf.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("centroid table sliding write: {e}"))?;
-            slice.copy_from_slice(&data);
-            buf
-        };
-
-        let centroid_table_global = {
-            // Find the first global layer's head_dim (typically 512)
-            let global_idx = cfg.layer_types.iter()
-                .position(|t| matches!(t, LayerType::Full))
-                .unwrap_or(0);
-            let hd = cfg.head_dim_for_layer(global_idx);
-            let inv_scale = 1.0 / (hd as f32).sqrt();
-            let mut data = vec![0.0f32; 16 * hd];
-            for idx in 0..16 {
-                for c in 0..hd {
-                    data[idx * hd + c] = CODEBOOK_4BIT[idx] * inv_scale;
-                }
-            }
-            let mut buf = mlx_device.alloc_buffer(
-                data.len() * 4, mlx_native::DType::F32, vec![16, hd],
-            ).map_err(|e| anyhow::anyhow!("centroid table global alloc: {e}"))?;
-            let slice: &mut [f32] = buf.as_mut_slice()
-                .map_err(|e| anyhow::anyhow!("centroid table global write: {e}"))?;
-            slice.copy_from_slice(&data);
-            buf
-        };
+        // Centroid tables removed — dequant is now inline in the Metal SDPA kernel
+        // using a register-resident 16-element codebook (CODEBOOK_4BIT).
+        // Saves 16KB-32KB GPU allocation per table and eliminates all scattered
+        // memory access during SDPA (~19,200 random table lookups per call → 0).
 
         let mut result = Ok(Self {
             embed_weight,
@@ -963,8 +924,6 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             moe_intermediate_size: cfg.moe_intermediate_size,
             k_eq_v: cfg.attention_k_eq_v,
-            centroid_table_sliding,
-            centroid_table_global,
             rope_freq_factors: model.rope_freqs_host().to_vec(),
         });
 
@@ -1304,13 +1263,8 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("FWHT Q pre-rotate L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- SDPA (flash_attn_vec_tq — pre-rotated Q, no in-kernel FWHT) --
+                // -- SDPA (flash_attn_vec_tq — pre-rotated Q, inline scalar dequant) --
                 {
-                    let centroid_table = if is_sliding {
-                        &self.centroid_table_sliding
-                    } else {
-                        &self.centroid_table_global
-                    };
                     s.barrier_between(
                         &[&self.activations.attn_q_normed,
                           &self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
@@ -1333,10 +1287,8 @@ impl MlxModelWeights {
                         &self.activations.attn_q_normed,
                         &self.kv_caches[layer_idx].k_packed,
                         &self.kv_caches[layer_idx].k_norms,
-                        centroid_table,
                         &self.kv_caches[layer_idx].v_packed,
                         &self.kv_caches[layer_idx].v_norms,
-                        centroid_table,
                         &self.activations.sdpa_out,
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
@@ -2062,11 +2014,6 @@ impl MlxModelWeights {
                 s.barrier(); // FWHT wrote attn_q_normed, SDPA reads it
 
                 {
-                    let centroid_table = if is_sliding {
-                        &self.centroid_table_sliding
-                    } else {
-                        &self.centroid_table_global
-                    };
                     let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -2083,10 +2030,8 @@ impl MlxModelWeights {
                         &self.activations.attn_q_normed,
                         &self.kv_caches[layer_idx].k_packed,
                         &self.kv_caches[layer_idx].k_norms,
-                        centroid_table,
                         &self.kv_caches[layer_idx].v_packed,
                         &self.kv_caches[layer_idx].v_norms,
-                        centroid_table,
                         &self.activations.sdpa_out,
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
@@ -2847,13 +2792,8 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("FWHT Q: {e}"))?;
             s1_dispatches += 1;
 
-            // -- SDPA TQ (pre-rotated Q, no in-kernel FWHT) --
+            // -- SDPA TQ (pre-rotated Q, inline scalar dequant) --
             {
-                let centroid_table = if is_sliding {
-                    &self.centroid_table_sliding
-                } else {
-                    &self.centroid_table_global
-                };
                 let p = FlashAttnVecTqParams {
                     num_heads: nh as u32,
                     num_kv_heads: nkv as u32,
@@ -2870,10 +2810,8 @@ impl MlxModelWeights {
                     &self.activations.attn_q,
                     &self.kv_caches[layer_idx].k_packed,
                     &self.kv_caches[layer_idx].k_norms,
-                    centroid_table,
                     &self.kv_caches[layer_idx].v_packed,
                     &self.kv_caches[layer_idx].v_norms,
-                    centroid_table,
                     &self.activations.sdpa_out,
                     &p,
                 ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq: {e}"))?;
