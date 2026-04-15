@@ -938,26 +938,20 @@ impl MlxModelWeights {
                 total_dispatches += 1;
 
                 // -- QKV projections (CONCURRENT: all read norm_out, write separate buffers) --
+                // ONE barrier after norm (which wrote norm_out), then all 3 projections
+                // dispatch without barriers between them — they share reads and have disjoint writes.
                 s.barrier_between(
-                    &[&self.activations.norm_out, &self.layers[layer_idx].attn.q_proj.buffer],
-                    &[&self.activations.attn_q],
+                    &[&self.activations.norm_out],
+                    &[&self.activations.attn_q, &self.activations.attn_k, &self.activations.attn_v],
                 );
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
                 total_dispatches += 1;
-                s.barrier_between(
-                    &[&self.activations.norm_out, &self.layers[layer_idx].attn.k_proj.buffer],
-                    &[&self.activations.attn_k],
-                );
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
                 total_dispatches += 1;
                 let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
                 if !v_is_k {
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &self.layers[layer_idx].attn.v_proj.as_ref().unwrap().buffer],
-                        &[&self.activations.attn_v],
-                    );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
                         &mut self.activations.attn_v, 1)?;
@@ -977,10 +971,11 @@ impl MlxModelWeights {
                 };
                 let half_rope = (hd / 2) as u32;
 
-                // Fused Q: attn_q → attn_q_normed
+                // Fused Q + K norm+RoPE (CONCURRENT: read attn_q/attn_k from QKV proj,
+                // write to disjoint attn_q_normed/attn_k_normed). ONE barrier for both.
                 s.barrier_between(
-                    &[&self.activations.attn_q],
-                    &[&self.activations.attn_q_normed],
+                    &[&self.activations.attn_q, &self.activations.attn_k],
+                    &[&self.activations.attn_q_normed, &self.activations.attn_k_normed],
                 );
                 mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
                     s.encoder_mut(), reg, metal_dev,
@@ -993,12 +988,6 @@ impl MlxModelWeights {
                     eps, theta,
                 ).map_err(|e| anyhow::anyhow!("fused Q norm+RoPE L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
-
-                // Fused K: attn_k → attn_k_normed
-                s.barrier_between(
-                    &[&self.activations.attn_k],
-                    &[&self.activations.attn_k_normed],
-                );
                 mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.attn_k,
@@ -1052,6 +1041,8 @@ impl MlxModelWeights {
                 };
 
                 // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
+                // K and V quantize read different inputs (attn_k_normed vs v_src) and write
+                // different cache buffers — they can run concurrently after ONE barrier.
                 {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
@@ -1059,8 +1050,9 @@ impl MlxModelWeights {
                         kv_write_pos as u32
                     };
                     s.barrier_between(
-                        &[&self.activations.attn_k_normed],
-                        &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms],
+                        &[&self.activations.attn_k_normed, v_src],
+                        &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
+                          &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                     );
                     mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                         s.encoder_mut(), reg, metal_dev,
@@ -1071,10 +1063,6 @@ impl MlxModelWeights {
                         kv_is_sliding,
                     ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
-                    s.barrier_between(
-                        &[v_src],
-                        &[&self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
-                    );
                     mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                         s.encoder_mut(), reg, metal_dev,
                         v_src,
@@ -1159,11 +1147,13 @@ impl MlxModelWeights {
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
 
-                // -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 concurrent] --
-                // All three read `residual`, write to disjoint buffers.
+                // -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 CONCURRENT] --
+                // All three read `residual` (written by post-attn norm+add), write disjoint buffers.
+                // ONE barrier, then all three dispatch without barriers between them.
                 s.barrier_between(
                     &[&self.activations.residual],
-                    &[&self.activations.norm_out],
+                    &[&self.activations.norm_out, &self.activations.moe_norm_out,
+                      &self.activations.router_norm_out],
                 );
                 s.rms_norm(
                     reg, metal_dev,
@@ -1175,10 +1165,6 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                s.barrier_between(
-                    &[&self.activations.residual],
-                    &[&self.activations.moe_norm_out],
-                );
                 s.rms_norm(
                     reg, metal_dev,
                     &self.activations.residual,
@@ -1189,10 +1175,6 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                s.barrier_between(
-                    &[&self.activations.residual],
-                    &[&self.activations.router_norm_out],
-                );
                 s.rms_norm(
                     reg, metal_dev,
                     &self.activations.residual,
@@ -1203,37 +1185,34 @@ impl MlxModelWeights {
                 ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
                 total_dispatches += 1;
 
-                // -- B9: dense gate + dense up + router logits [3 concurrent] --
-                // gate/up read norm_out; router logits reads router_norm_out. All disjoint writes.
+                // -- B9: dense gate + dense up + router logits [3 CONCURRENT] --
+                // gate/up read norm_out (from B8 norm1); router reads router_norm_out (from B8 router norm).
+                // All write disjoint buffers. ONE barrier after B8, then 3 dispatches without barriers.
                 s.barrier_between(
-                    &[&self.activations.norm_out, &self.layers[layer_idx].mlp.gate_proj.buffer],
-                    &[&self.activations.mlp_gate],
+                    &[&self.activations.norm_out, &self.activations.router_norm_out],
+                    &[&self.activations.mlp_gate, &self.activations.mlp_up,
+                      &self.activations.moe_router_logits],
                 );
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
                 total_dispatches += 1;
-
-                s.barrier_between(
-                    &[&self.activations.norm_out, &self.layers[layer_idx].mlp.up_proj.buffer],
-                    &[&self.activations.mlp_up],
-                );
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
                 total_dispatches += 1;
-
-                s.barrier_between(
-                    &[&self.activations.router_norm_out, &self.layers[layer_idx].moe.router_proj.buffer],
-                    &[&self.activations.moe_router_logits],
-                );
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
                     &self.layers[layer_idx].moe.router_proj,
                     &mut self.activations.moe_router_logits, 1)?;
                 total_dispatches += 1;
 
-                // -- B10: fused_gelu_mul + fused_moe_routing [2 concurrent] --
+                // -- B10: fused_gelu_mul + fused_moe_routing [2 CONCURRENT] --
+                // gelu_mul reads mlp_gate+mlp_up (from B9 gate/up), writes mlp_fused.
+                // moe_routing reads moe_router_logits (from B9 router), writes expert_ids+weights.
+                // Disjoint reads and writes — ONE barrier after B9, then both dispatch.
                 s.barrier_between(
-                    &[&self.activations.mlp_gate, &self.activations.mlp_up],
-                    &[&self.activations.mlp_fused],
+                    &[&self.activations.mlp_gate, &self.activations.mlp_up,
+                      &self.activations.moe_router_logits],
+                    &[&self.activations.mlp_fused,
+                      &self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
                 );
                 {
                     use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
@@ -1253,11 +1232,6 @@ impl MlxModelWeights {
                     );
                 }
                 total_dispatches += 1;
-
-                s.barrier_between(
-                    &[&self.activations.moe_router_logits],
-                    &[&self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
-                );
                 mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.moe_router_logits,
