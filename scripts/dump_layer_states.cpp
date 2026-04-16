@@ -249,11 +249,32 @@ int main(int argc, char ** argv) {
             return 0;
         }
     } else {
-        fprintf(stderr, "Prefilling %d tokens in one batch...\n", n_tokens);
+        // ADR-010 batched dump: activate for the single batched decode so
+        // the eval callback captures cache_k_l*, cache_v_l*, Qcur_pos,
+        // Kcur_pos, kqv_out for the whole prompt in one shot. Post-extract
+        // row 34 / L7 in the Python analysis. HF2Q_BATCHED_DUMP_POS is
+        // informational only — it just flags that batched dumping is on.
+        const bool batched_dump = (getenv("HF2Q_BATCHED_DUMP_POS") != nullptr);
+        if (batched_dump) {
+            int pos_flag = atoi(getenv("HF2Q_BATCHED_DUMP_POS"));
+            fprintf(stderr, "Batched prefill with dump (target pos %d).\n", pos_flag);
+            g_dump.active = true;
+            g_dump.current_pos = pos_flag;
+        } else {
+            fprintf(stderr, "Prefilling %d tokens in one batch...\n", n_tokens);
+        }
         llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "Prefill failed\n");
             return 1;
+        }
+        g_dump.active = false;
+        if (batched_dump) {
+            fprintf(stderr, "Batched dump complete.\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
         }
     }
 

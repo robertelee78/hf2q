@@ -182,6 +182,23 @@ impl MlxModelWeights {
         // -------------------------------------------------------------------
         // Per-layer forward pass
         // -------------------------------------------------------------------
+        // ADR-010 batched sub-stage dump anchor. HF2Q_BATCHED_DUMP="layer,tok"
+        // (e.g. "7,34"). When set and the target layer finishes its batched
+        // forward pass, dump Q_normed row, K/V_normed row, dense K/V cache
+        // slice [nkv, tok+1, hd], and sdpa_out row at the target token.
+        let batched_dump: Option<(usize, usize)> = std::env::var("HF2Q_BATCHED_DUMP")
+            .ok()
+            .and_then(|v| {
+                let parts: Vec<&str> = v.split(',').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+                } else {
+                    None
+                }
+            });
+        let batched_dump_dir = std::env::var("HF2Q_DUMP_DIR")
+            .unwrap_or_else(|_| "/tmp".into());
+
         for layer_idx in 0..num_layers {
             let hd = self.head_dims[layer_idx];
             let nkv = self.num_kv_heads[layer_idx];
@@ -660,6 +677,66 @@ impl MlxModelWeights {
                 // Update KV cache metadata for subsequent decode
                 self.kv_caches[layer_idx].write_pos = seq_len;
                 self.kv_caches[layer_idx].seq_len = seq_len.min(self.kv_caches[layer_idx].capacity);
+            }
+
+            // ADR-010 batched sub-stage dump at (layer_idx, target_tok)
+            if let Some((dump_layer, target_tok)) = batched_dump {
+                if dump_layer == layer_idx && target_tok < seq_len && !use_f16_kv {
+                    // Row slices from [seq_len, *, hd] row-major buffers
+                    let q_full: &[f32] = pf_q_normed.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_q_normed: {e}"))?;
+                    let k_full: &[f32] = pf_k_normed.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_k_normed: {e}"))?;
+                    let v_full: &[f32] = pf_v_normed.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_v_normed: {e}"))?;
+                    let sdpa_full: &[f32] = pf_sdpa_out.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_sdpa_out: {e}"))?;
+
+                    let q_off = target_tok * nh * hd;
+                    let k_off = target_tok * nkv * hd;
+                    let v_off = target_tok * nkv * hd;
+                    let s_off = target_tok * nh * hd;
+
+                    let q_row = &q_full[q_off..q_off + nh * hd];
+                    let k_row = &k_full[k_off..k_off + nkv * hd];
+                    let v_row = &v_full[v_off..v_off + nkv * hd];
+                    let sdpa_row = &sdpa_full[s_off..s_off + nh * hd];
+
+                    // Cache slice positions 0..=target_tok in [nkv, tok+1, hd] logical layout
+                    let cap = dense_kvs_vec[layer_idx].capacity;
+                    let n_valid = target_tok + 1;
+                    let k_cache: &[f32] = dense_kvs_vec[layer_idx].k.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump dense K L{layer_idx}: {e}"))?;
+                    let v_cache: &[f32] = dense_kvs_vec[layer_idx].v.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump dense V L{layer_idx}: {e}"))?;
+                    let mut k_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
+                    let mut v_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
+                    for h in 0..nkv {
+                        for p in 0..n_valid {
+                            let off = h * cap * hd + p * hd;
+                            k_valid.extend_from_slice(&k_cache[off..off + hd]);
+                            v_valid.extend_from_slice(&v_cache[off..off + hd]);
+                        }
+                    }
+
+                    let write_slice = |name: &str, data: &[f32], tag_shape: &str| -> anyhow::Result<()> {
+                        let path = format!(
+                            "{batched_dump_dir}/hf2q_batched_{name}_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                        let bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+                        };
+                        std::fs::write(&path, bytes)
+                            .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                        eprintln!("[BATCHED DUMP] {} {} f32 -> {}", name, tag_shape, path);
+                        Ok(())
+                    };
+                    write_slice("q_normed_row", q_row, &format!("[{nh},{hd}]"))?;
+                    write_slice("k_normed_row", k_row, &format!("[{nkv},{hd}]"))?;
+                    write_slice("v_normed_row", v_row, &format!("[{nkv},{hd}]"))?;
+                    write_slice("sdpa_out_row", sdpa_row, &format!("[{nh},{hd}]"))?;
+                    write_slice("k_cache_upto", &k_valid, &format!("[{nkv},{n_valid},{hd}]"))?;
+                    write_slice("v_cache_upto", &v_valid, &format!("[{nkv},{n_valid},{hd}]"))?;
+                }
             }
         }
 
