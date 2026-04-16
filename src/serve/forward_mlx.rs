@@ -554,45 +554,44 @@ impl MlxModelWeights {
         // speedup. Smaller models have negligible head time, so F16 is kept
         // for maximum numerical fidelity on the oracle path.
         //
-        // Env override (set to "1" to force on, "0" to force off):
-        //   HF2Q_LMHEAD_Q8=1    always use Q8
-        //   HF2Q_LMHEAD_Q8=0    always use F16
-        //   (unset)             auto-detect by size
+        // Env override:
+        //   HF2Q_LMHEAD_Q8=1    use Q8 (opt-in; keeps F16 available if
+        //                       HF2Q_LMHEAD_COMPARE=1 so the diagnostic
+        //                       can A/B logits at each step)
+        //   HF2Q_LMHEAD_Q8=0    use F16 (default until Q8 pad-lift is understood)
+        //   (unset)             F16 default — see ADR note: Q8 was observed
+        //                       to lift <pad> into top-1 on long decodes on
+        //                       Gemma-4 26B; root cause not yet explained.
+        //                       Keep Q8 gated until that's resolved.
         //
-        // When Q8 is active we don't also allocate F16 (saves ~1.47 GB).
+        // When Q8 is active and HF2Q_LMHEAD_COMPARE=1, both buffers stay
+        // resident so the decode path can compute both logits and report
+        // rank/margin changes (the diagnostic cost is an extra lm_head
+        // matmul per token).
         let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
         let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
-        let use_q8 = match q8_env.as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => {
-                // Auto-detect: Q8 pays off when F16 weight > 256 MB.
-                let threshold_bytes: usize = 256 * 1024 * 1024;
-                lm_head_f16_bytes > threshold_bytes && cfg.hidden_size % 32 == 0
-            }
-        };
+        let compare_mode = std::env::var("HF2Q_LMHEAD_COMPARE").map_or(false, |v| v == "1");
+        let use_q8 = matches!(q8_env.as_deref(), Some("1"));
 
-        let lm_head_f16: Option<MlxBuffer>;
-        let lm_head_q8: Option<MlxQWeight>;
-        if use_q8 {
-            if cfg.hidden_size % 32 != 0 {
-                anyhow::bail!(
-                    "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
-                    cfg.hidden_size);
-            }
-            let source = if q8_env.as_deref() == Some("1") {
-                "forced"
-            } else {
-                "auto"
-            };
-            eprintln!("  Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB > 256 MB threshold)...",
-                source, lm_head_f16_bytes as f64 / 1e6);
+        // Decide which buffers to allocate. Compare mode always keeps F16
+        // (needed as the oracle for A/B), and Q8 if requested.
+        let need_q8 = use_q8;
+        let need_f16 = !use_q8 || compare_mode;
+        if use_q8 && cfg.hidden_size % 32 != 0 {
+            anyhow::bail!(
+                "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
+                cfg.hidden_size);
+        }
+
+        let lm_head_q8: Option<MlxQWeight> = if need_q8 {
+            eprintln!("  Quantizing lm_head to Q8_0 (HF2Q_LMHEAD_Q8=1, F16 size {:.1} MB)...",
+                lm_head_f16_bytes as f64 / 1e6);
             let embed_f32: &[f32] = embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
             let rows = cfg.vocab_size;
             let cols = cfg.hidden_size;
             let blocks_per_row = cols / 32;
-            let block_bytes: usize = 34; // 2 (f16 scale) + 32 (int8 quants)
+            let block_bytes: usize = 34;
             let total_bytes = rows * blocks_per_row * block_bytes;
             let q_buf = mlx_device.alloc_buffer(
                 total_bytes, mlx_native::DType::U8,
@@ -610,7 +609,6 @@ impl MlxModelWeights {
                     ..(r + 1) * blocks_per_row * block_bytes];
                 for b in 0..blocks_per_row {
                     let block_src = &row_src[b * 32..(b + 1) * 32];
-                    // Q8_0: find amax, scale = amax/127, quants = round(x / scale)
                     let amax = block_src.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                     let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
                     let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -624,31 +622,29 @@ impl MlxModelWeights {
                     }
                 }
             }
-            eprintln!("  Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16).",
+            eprintln!("  Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}.",
                 total_bytes as f64 / 1e6,
-                lm_head_f16_bytes as f64 / total_bytes as f64);
-            lm_head_f16 = None;
-            lm_head_q8 = Some(MlxQWeight {
+                lm_head_f16_bytes as f64 / total_bytes as f64,
+                if compare_mode { " [COMPARE MODE — F16 also resident]" } else { "" });
+            Some(MlxQWeight {
                 buffer: q_buf,
                 info: QuantWeightInfo {
                     ggml_dtype: mlx_native::GgmlType::Q8_0,
                     rows,
                     cols,
                 },
-            });
+            })
         } else {
-            let source = if q8_env.as_deref() == Some("0") {
-                "forced"
+            None
+        };
+
+        let lm_head_f16: Option<MlxBuffer> = if need_f16 {
+            let reason = if use_q8 && compare_mode {
+                "COMPARE MODE oracle".to_string()
+            } else if q8_env.as_deref() == Some("0") {
+                "HF2Q_LMHEAD_Q8=0".to_string()
             } else {
-                "auto"
-            };
-            let reason = if q8_env.as_deref() == Some("0") {
-                format!("{} — HF2Q_LMHEAD_Q8=0", source)
-            } else if cfg.hidden_size % 32 != 0 {
-                format!("{} — hidden_size {} not divisible by 32", source, cfg.hidden_size)
-            } else {
-                format!("{} — F16 size {:.1} MB ≤ 256 MB threshold", source,
-                    lm_head_f16_bytes as f64 / 1e6)
+                "default (Q8 opt-in via HF2Q_LMHEAD_Q8=1)".to_string()
             };
             eprintln!("  Creating F16 embed weight for GPU lm_head ({})...", reason);
             let embed_f32: &[f32] = embed_weight.as_slice()
@@ -672,9 +668,10 @@ impl MlxModelWeights {
             }
             eprintln!("  F16 embed weight created ({} elements, {:.1} MB).",
                 n_elements, lm_head_f16_bytes as f64 / 1e6);
-            lm_head_f16 = Some(f16_buf);
-            lm_head_q8 = None;
-        }
+            Some(f16_buf)
+        } else {
+            None
+        };
 
         // --- Per-layer weights ---
         let num_layers = cfg.num_hidden_layers;
@@ -2083,6 +2080,28 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
             idx[0]
         };
+
+        // Diagnostic: when <pad> (id 0) wins the argmax, dump top-10 logits so
+        // we can see whether pad is winning by a large margin (kernel bug) or
+        // by sub-kernel-precision margin (numerical noise on a tight tiebreak).
+        // This is NOT masking — the token is still returned to the caller.
+        if token_id == 0 {
+            let logits: &[f32] = self.activations.logits.as_slice()
+                .map_err(|e| anyhow::anyhow!("pad diag logits read: {e}"))?;
+            let vocab = logits.len().min(vocab_size);
+            let mut indexed: Vec<(usize, f32)> = logits[..vocab]
+                .iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("\n[PAD-DIAG] <pad> won argmax at seq_pos={}. Top 10 logits:", seq_pos);
+            for (tok_id, logit) in indexed.iter().take(10) {
+                eprintln!("  tok={tok_id:>6} logit={logit:>10.6}");
+            }
+            let pad_rank = indexed.iter().position(|&(i, _)| i == 0).unwrap_or(999);
+            let pad_logit = logits[0];
+            let rank1_logit = indexed[0].1;
+            eprintln!("  <pad> rank={} logit={:.6}  vs top-1 logit={:.6}  gap={:.6e}",
+                pad_rank, pad_logit, rank1_logit, (rank1_logit - pad_logit).abs());
+        }
 
         if let Some(ref mut p) = profile {
             // Single session — report all time in S1, zero everything else

@@ -265,12 +265,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     use std::io::Write;
 
     eprintln!("Running mlx-native forward pass...");
-    // Stop on <eos> (1), <turn|> (106), or <pad> (0). Once <pad> ever gets
-    // sampled mid-decode (rare, driven by nondeterminism accumulating over
-    // long sequences), the model tends to repeat <pad> indefinitely because
-    // training saw <pad><pad>... sequences. Treating it as EOS prevents the
-    // runaway loop.
-    let eos_token_ids: Vec<u32> = vec![0, 1, 106];
+    let eos_token_ids: Vec<u32> = vec![1, 106];
 
     // Profiling support
     let mut profiler = forward_mlx::ProfileAccumulator::new(2);
@@ -468,12 +463,7 @@ fn cmd_parity_check(
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
     // Prefill + decode
-    // Stop on <eos> (1), <turn|> (106), or <pad> (0). Once <pad> ever gets
-    // sampled mid-decode (rare, driven by nondeterminism accumulating over
-    // long sequences), the model tends to repeat <pad> indefinitely because
-    // training saw <pad><pad>... sequences. Treating it as EOS prevents the
-    // runaway loop.
-    let eos_token_ids: Vec<u32> = vec![0, 1, 106];
+    let eos_token_ids: Vec<u32> = vec![1, 106];
     let first_token = mlx_w.forward_prefill(&prompt_tokens, tokens, &mut ctx)?;
     let mut all_tokens = prompt_tokens.to_vec();
     let mut next_token = first_token;
@@ -601,12 +591,7 @@ fn cmd_parity_capture(
             .map_err(|e| anyhow::anyhow!("Tokenize: {e}"))?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-        // Stop on <eos> (1), <turn|> (106), or <pad> (0). Once <pad> ever gets
-    // sampled mid-decode (rare, driven by nondeterminism accumulating over
-    // long sequences), the model tends to repeat <pad> indefinitely because
-    // training saw <pad><pad>... sequences. Treating it as EOS prevents the
-    // runaway loop.
-    let eos_token_ids: Vec<u32> = vec![0, 1, 106];
+        let eos_token_ids: Vec<u32> = vec![1, 106];
         let first_token = mlx_w_fresh.forward_prefill(&prompt_tokens, tokens, &mut ctx)?;
         let mut all_tokens = prompt_tokens.to_vec();
         let mut next_token = first_token;
