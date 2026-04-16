@@ -553,34 +553,35 @@ impl MlxModelWeights {
 
         // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
         //
-        // The lm_head matmul is a single F32×{F16|Q8} mat-vec over
-        // [vocab × hidden_size] weights, memory-bandwidth-bound at batch=1.
-        // Q8_0 halves the weight traffic vs F16 and recovers ~12% decode
-        // throughput at Gemma-4-26B scale (1.47 GB F16 → 784 MB Q8).
+        // lm_head is memory-bandwidth-bound at batch=1; Q8_0 halves the
+        // weight traffic vs F16 and recovers ~12% decode throughput on
+        // Gemma-4-26B (1.47 GB F16 → 784 MB Q8). Raw Q8 occasionally flips
+        // a near-tiebreak (pad-emit mode, see ADR-010) — the rerank path
+        // (HF2Q_LMHEAD_RERANK; default on when Q8 is active) recovers the
+        // exact F16 trajectory by reranking top candidates on CPU using
+        // the F32 embed_weight already resident for the embedding gather.
         //
-        // Heuristic: enable Q8_0 when F16 weight would exceed 256 MB — the
-        // point where the memory-bandwidth savings produce measurable
-        // speedup. Smaller models have negligible head time, so F16 is kept
-        // for maximum numerical fidelity on the oracle path.
+        // Heuristic: enable Q8_0 when F16 weight would exceed 256 MB and
+        // hidden_size % 32 == 0. Smaller models skip Q8 because the head
+        // time is already negligible.
         //
-        // Env override:
-        //   HF2Q_LMHEAD_Q8=1    use Q8 (opt-in; keeps F16 available if
-        //                       HF2Q_LMHEAD_COMPARE=1 so the diagnostic
-        //                       can A/B logits at each step)
-        //   HF2Q_LMHEAD_Q8=0    use F16 (default until Q8 pad-lift is understood)
-        //   (unset)             F16 default — see ADR note: Q8 was observed
-        //                       to lift <pad> into top-1 on long decodes on
-        //                       Gemma-4 26B; root cause not yet explained.
-        //                       Keep Q8 gated until that's resolved.
-        //
-        // When Q8 is active and HF2Q_LMHEAD_COMPARE=1, both buffers stay
-        // resident so the decode path can compute both logits and report
-        // rank/margin changes (the diagnostic cost is an extra lm_head
-        // matmul per token).
+        // Env overrides:
+        //   HF2Q_LMHEAD_Q8=1   force Q8 (errors if hidden_size % 32 != 0)
+        //   HF2Q_LMHEAD_Q8=0   force F16 (escape hatch)
+        //   HF2Q_LMHEAD_RERANK=0   disable rerank (raw Q8 argmax, unsafe)
+        //   (unset)            auto-detect by size
         let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
         let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
         let compare_mode = std::env::var("HF2Q_LMHEAD_COMPARE").map_or(false, |v| v == "1");
-        let use_q8 = matches!(q8_env.as_deref(), Some("1"));
+        let use_q8 = match q8_env.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                // Auto: Q8 when F16 weight would exceed 256 MB and the
+                // shape is Q8-compatible.
+                lm_head_f16_bytes > 256 * 1024 * 1024 && cfg.hidden_size % 32 == 0
+            }
+        };
 
         // Decide which buffers to allocate. Compare mode always keeps F16
         // (needed as the oracle for A/B), and Q8 if requested.
@@ -593,8 +594,12 @@ impl MlxModelWeights {
         }
 
         let lm_head_q8: Option<MlxQWeight> = if need_q8 {
-            eprintln!("  Quantizing lm_head to Q8_0 (HF2Q_LMHEAD_Q8=1, F16 size {:.1} MB)...",
-                lm_head_f16_bytes as f64 / 1e6);
+            let source = match q8_env.as_deref() {
+                Some("1") => "forced",
+                _ => "auto",
+            };
+            eprintln!("  Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)...",
+                source, lm_head_f16_bytes as f64 / 1e6);
             let embed_f32: &[f32] = embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
             let rows = cfg.vocab_size;
@@ -651,9 +656,12 @@ impl MlxModelWeights {
             let reason = if use_q8 && compare_mode {
                 "COMPARE MODE oracle".to_string()
             } else if q8_env.as_deref() == Some("0") {
-                "HF2Q_LMHEAD_Q8=0".to_string()
+                "forced — HF2Q_LMHEAD_Q8=0".to_string()
+            } else if cfg.hidden_size % 32 != 0 {
+                format!("auto — hidden_size {} not divisible by 32", cfg.hidden_size)
             } else {
-                "default (Q8 opt-in via HF2Q_LMHEAD_Q8=1)".to_string()
+                format!("auto — F16 size {:.1} MB ≤ 256 MB threshold",
+                    lm_head_f16_bytes as f64 / 1e6)
             };
             eprintln!("  Creating F16 embed weight for GPU lm_head ({})...", reason);
             let embed_f32: &[f32] = embed_weight.as_slice()

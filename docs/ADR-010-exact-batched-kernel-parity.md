@@ -123,11 +123,38 @@ Not strictly a parity concern, but completed alongside the nondeterminism / drif
 - Memory at a 20k decode budget: 7.4 GB → ~2.75 GB dense KV (−4.6 GB, −62%).
 - All gates pass unchanged; 1353-token coherence test produces identical clean-EOS output at 91.5 tok/s.
 
+## lm_head Q8 + Rerank (2026-04-16, related speed work)
+
+lm_head quantization + exact rerank became the default speed path after
+this ADR's router-matmul line was closed. Summary:
+
+- **Default (auto):** Q8_0 lm_head + CPU threshold-scan rerank when the
+  F16 weight exceeds 256 MB and `hidden_size % 32 == 0`.
+- **Escape hatches:** `HF2Q_LMHEAD_Q8=0` forces F16; `HF2Q_LMHEAD_RERANK=0`
+  disables rerank (leaves raw Q8 argmax, unsafe — occasional pad-emit).
+- **Rerank mechanism:** after the Q8 matmul writes full-vocab logits, a
+  single CPU pass collects tokens with logit ≥ (Q8 top-1) − 0.5 plus
+  specials (0/1/2/105/106), then recomputes exact F32 logits from the
+  F32 `embed_weight` dotted with the pre-lm_head hidden. Argmax over
+  the reranked set.
+- **Result:** sliding_wrap is byte-identical to the F16 reference
+  (2354/2354) and speed is 101.8 tok/s on Gemma-4 26B (98% of the
+  llama.cpp 104 tok/s reference). The pad-emit failure mode is
+  explained (Q8 noise envelope ~5e-3 crossing near-tie thresholds)
+  and eliminated by the rerank set.
+- **GPU top-K — tested and rejected** for the current vocab/shape.
+  A single-threadgroup top-K (committed at mlx-native `27070c1`) costs
+  ~5 ms/token for vocab=262144 K=64 because the phase-2 extraction
+  serializes onto one thread. The CPU threshold scan at ~40 μs/token
+  dominates it. The GPU kernel stays in the tree as dormant
+  infrastructure for a future parallel-phase-2 redesign.
+
 ## Status Log
 
 - 2026-04-16: Proposed. ADR-009 Phase 3A closed. This work begins when product priorities next permit returning to parity.
 - 2026-04-16: Ring-buffer dense KV for sliding layers landed as a prerequisite memory win for long-context work. Nondeterminism and long-decode drift characterized and folded into this ADR's scope.
 - 2026-04-16: Layer-by-layer and sub-stage bisection landed (commits `012b011`, `7e0cdbb`, `ba1b98e`, `2058f76`). Seam localized to L6 MoE router top-K threshold.
+- 2026-04-16: lm_head Q8_0 + CPU threshold-scan rerank landed as the new default (speed-safety balance matched). GPU top-K kernel tested and kept dormant — CPU scan wins for vocab=262144. See "lm_head Q8 + Rerank" section above.
 - 2026-04-16: **Router matmul exactness (option 2) INVALIDATED by F64 reconciliation.** Python F64 reference matmul reconstruction at (L6, pos 34) shows:
   - hf2q's router matmul already matches Python F64 to rel_rms 1.25e-7 (kernel is F64-precise given its inputs).
   - llama's router matmul matches Python F64 to rel_rms 1.30e-4 (slightly less precise than hf2q's, per its own inputs).
