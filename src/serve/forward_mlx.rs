@@ -1106,6 +1106,41 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // ADR-009 Phase 3A: dump Q,K,V before SDPA for the detail layer
+                if dump_layers && dump_detail_layer == Some(layer_idx) {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("dump QKV finish L{layer_idx}: {e}"))?;
+                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+                        .unwrap_or_else(|_| "/tmp".into());
+
+                    // Q: [nh * hd] after head norm + RoPE
+                    let q_data: &[f32] = self.activations.attn_q_normed.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump Q L{layer_idx}: {e}"))?;
+                    let q_elems = nh * hd;
+                    let path = format!("{dump_dir}/hf2q_q_normed_layer{layer_idx:02}_pos{seq_pos}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(q_data.as_ptr() as *const u8, q_elems * 4)
+                    };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] q_normed layer {layer_idx:02} ({q_elems} f32) -> {path}");
+
+                    // K: [nkv * hd] after head norm + RoPE
+                    let k_data: &[f32] = self.activations.attn_k_normed.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump K L{layer_idx}: {e}"))?;
+                    let k_elems = nkv * hd;
+                    let path = format!("{dump_dir}/hf2q_k_normed_layer{layer_idx:02}_pos{seq_pos}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_elems * 4)
+                    };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] k_normed layer {layer_idx:02} ({k_elems} f32) -> {path}");
+
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
+                }
+
                 // -- SDPA: dense or TQ-packed (ADR-009 Track 3) --
                 // When dense_kvs is available (set by forward_prefill), use
                 // flash_attn_vec with F32 K,V for reference-parity attention.
