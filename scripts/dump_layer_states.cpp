@@ -78,7 +78,9 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // Only dump cache tensors when the active flag is set AND for layer 24
     // (to keep artifacts manageable — cache is big)
-    if ((is_cache_k || is_cache_v) && layer != 24) return true;
+    // Dump cache for all layers when HF2Q_DUMP_ALL_CACHE=1, else only layer 24.
+    static const bool dump_all_cache = (getenv("HF2Q_DUMP_ALL_CACHE") != nullptr);
+    if ((is_cache_k || is_cache_v) && !dump_all_cache && layer != 24) return true;
 
     // Get tensor data
     int64_t n_elements = ggml_nelements(t);

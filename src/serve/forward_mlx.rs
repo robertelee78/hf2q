@@ -1196,8 +1196,11 @@ impl MlxModelWeights {
                         total_dispatches += nkv * 2;
                     }
 
-                    // ADR-009 Phase 3A: dump full cached K/V for the detail layer
-                    if dump_layers && dump_detail_layer == Some(layer_idx) {
+                    // ADR-009 Phase 3A: dump full cached K/V for the detail layer,
+                    // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
+                    let dump_all_cache = std::env::var("HF2Q_DUMP_ALL_CACHE")
+                        .map_or(false, |v| v == "1");
+                    if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
                         let dump_dir = std::env::var("HF2Q_DUMP_DIR")
