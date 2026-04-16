@@ -48,6 +48,7 @@ MIN_DECODE_TPS=""          # empty = don't enforce; set to a number to enforce
 PROMPT=""
 PROMPT_FILE=""
 GGUF_PATH=""
+SHOW_OUTPUT=0
 OUT="/tmp/long_decode_out.txt"
 LOG="/tmp/long_decode.log"
 
@@ -60,6 +61,7 @@ Options:
   --min-decode-tps N  Enforce decode tok/s floor (default: off)
   --prompt "..."      Override the long-decode prompt
   --prompt-file PATH  Read prompt from a file
+  --show              Print the generated text to stdout after the gate
 
 Exit codes:
   0  gate passed
@@ -85,6 +87,8 @@ while [[ $# -gt 0 ]]; do
     --prompt-file)
       [[ $# -ge 2 ]] || err "--prompt-file requires an argument"
       PROMPT_FILE="$2"; shift 2 ;;
+    --show)
+      SHOW_OUTPUT=1; shift ;;
     -*) usage >&2; err "unknown flag: $1" ;;
     *)  [[ -z "$GGUF_PATH" ]] || err "unexpected positional arg: $1"
         GGUF_PATH="$1"; shift ;;
@@ -163,4 +167,13 @@ fi
 
 echo
 echo "=== long_decode PASS ==="
+
+if [[ "$SHOW_OUTPUT" -eq 1 ]]; then
+  echo
+  echo "--- generated output ($OUT_BYTES bytes) ---"
+  cat "$OUT"
+  # Trailing newline if hf2q didn't emit one (prevents PS1 clobber).
+  [[ -n "$(tail -c1 "$OUT" 2>/dev/null)" ]] && echo
+fi
+
 exit 0
