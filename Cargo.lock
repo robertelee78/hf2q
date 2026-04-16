@@ -1377,6 +1377,7 @@ dependencies = [
  "mlx-native",
  "predicates",
  "rayon",
+ "regex",
  "ruvector-core",
  "safetensors",
  "serde",
