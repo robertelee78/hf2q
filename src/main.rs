@@ -11,10 +11,6 @@
 #[allow(dead_code)]
 mod backends;
 mod cli;
-// `debug::InvestigationEnv::{activate, any_ack_required_active}` and the
-// `unsafe_experiments_acked` field are wired for S-4 (startup warning +
-// unsafe-ack gate) but not yet consumed; allow dead_code until S-4 lands.
-#[allow(dead_code)]
 mod debug;
 mod doctor;
 #[allow(dead_code)]
@@ -98,6 +94,12 @@ fn main() -> ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Emit one-shot warning / ack-gate summary for any investigation-only
+    // env vars that are set. No-op when the environment is clean. Runs
+    // before Cli::parse so the warning appears even when clap exits
+    // early on --help or --version.
+    debug::INVESTIGATION_ENV.activate();
 
     let cli = Cli::parse();
 

@@ -5,24 +5,28 @@
 //! reads fields off the cached struct instead of calling `std::env::var`
 //! directly — so the decode loop does zero env lookups after init.
 //!
-//! This module intentionally does not perform the S-4 startup warning or
-//! the `HF2Q_UNSAFE_EXPERIMENTS=1` acknowledgment gate yet; those land as
-//! a separate story and will fill in [`InvestigationEnv::activate`].
+//! # Unsafe-ack gate
 //!
-//! **Not in scope here:**
+//! Toggles classified as *known to risk correctness or runtime
+//! reliability* are ack-required: they only take effect when the user
+//! also sets `HF2Q_UNSAFE_EXPERIMENTS=1`. If an ack-required toggle is
+//! set without the ack, the public field reads `false` (i.e. the toggle
+//! is disabled) and [`InvestigationEnv::activate`] prints a REFUSED
+//! line so the user notices. This preserves prod-binary debuggability
+//! while preventing accidental bug reports.
+//!
+//! # Not in scope here
+//!
 //! - `HF2Q_LMHEAD_Q8` is a category-2 operator knob (user-facing,
-//!   documented in `docs/operator-env-vars.md`) and is read at load time
-//!   inside the lm_head init path. It does not belong in this struct.
+//!   documented in `docs/operator-env-vars.md`) and is read at load
+//!   time inside the lm_head init path. It does not belong in this
+//!   struct.
 //!
-//! Classification rule (see shipping contract): a toggle requires the
-//! unsafe-ack only when it is **known to risk correctness or runtime
-//! reliability**, not merely experimental or inert.
+//! # Parse semantics
 //!
-//! Parse semantics are preserved *exactly* from the original inline
-//! reads — `is_ok()` vs `map_or(false, |v| v == "1")` are distinct
-//! signals in the existing code (`is_ok()` means "set to anything,
-//! including empty"; `== "1"` means strictly the literal "1"), and each
-//! field below documents which shape the call sites expect.
+//! Each field's doc comment notes the original inline parse shape —
+//! `is_ok()` vs `map_or(false, |v| v == "1")` are distinct signals in
+//! the existing code and are preserved exactly.
 //!
 //! When adding a new investigation env var, wire it here and register
 //! its classification in `docs/shipping-contract.md`.
@@ -37,14 +41,18 @@ use std::sync::LazyLock;
 pub static INVESTIGATION_ENV: LazyLock<InvestigationEnv> =
     LazyLock::new(InvestigationEnv::from_env);
 
-/// Parsed snapshot of every investigation-only env var at the point of
-/// first access. Each field's doc comment notes its category and its
-/// exact original parse semantics.
+/// Parsed-and-gated snapshot of every investigation-only env var. Each
+/// ack-required field holds the *effective* value (already gated by
+/// `HF2Q_UNSAFE_EXPERIMENTS=1`); [`activate`] is what actually surfaces
+/// the refusal to the operator.
 #[derive(Debug, Clone)]
 pub struct InvestigationEnv {
     // ========================================================================
     // Category 4 — ack-required (known to risk correctness or reliability).
-    // S-4 will refuse to activate these unless HF2Q_UNSAFE_EXPERIMENTS=1.
+    // These fields hold the EFFECTIVE value: `true` only when the env var
+    // was set AND `HF2Q_UNSAFE_EXPERIMENTS=1` was also set. If the user
+    // set an ack-required toggle without the ack, the field is `false`
+    // and `activate()` prints a REFUSED line.
     // ========================================================================
     /// `HF2Q_F16_KV=1` — allocate dense KV cache as F16. Known-worse
     /// output vs the F32 default; documented in ADR-009.
@@ -67,7 +75,7 @@ pub struct InvestigationEnv {
     pub skip_tq_sdpa: bool,
 
     // ========================================================================
-    // Category 4 — warn-only (ineffective but safe).
+    // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
     /// `HF2Q_GRAPH_OPT=1` — use `begin_recorded` + `finish_optimized`.
     /// Shows no measured win on the default path (reorder aborts on
@@ -158,38 +166,71 @@ pub struct InvestigationEnv {
 
     // ========================================================================
     // Category 3 — benchmarking-only; ack-required.
-    // Documented as an operator knob but unsafe to flip casually.
+    // EFFECTIVE value (post-gate).
     // ========================================================================
     /// `HF2Q_LMHEAD_RERANK=0` — disable the exact-F32 rerank of top
     /// Q8 candidates. Reintroduces the rare near-tiebreak flip.
-    /// `true` iff the env var is literally `"0"` (matching the original
-    /// `matches!(var, Ok("0"))` check).
+    /// Effective: `true` only when the env var is literally `"0"` AND
+    /// `HF2Q_UNSAFE_EXPERIMENTS=1` is set.
     pub lmhead_rerank_disabled: bool,
 
     // ========================================================================
-    // Unsafe-ack gate input (read, not itself a category-4 toggle).
-    // Consumed by S-4 to decide whether ack-required toggles activate.
+    // Ack gate state (consumed by `activate` to print startup summary).
     // ========================================================================
     /// `HF2Q_UNSAFE_EXPERIMENTS=1` — explicit acknowledgment that the
     /// user is intentionally flipping an ack-required investigation
     /// toggle.
     /// Original parse: `map_or(false, |v| v == "1")`.
+    ///
+    /// Exposed for introspection (tests, future diagnostics); the gate
+    /// itself is applied inside [`from_env`] so hot-path readers don't
+    /// need to recheck the ack.
+    #[allow(dead_code)]
     pub unsafe_experiments_acked: bool,
+
+    /// Raw (pre-gate) intents for ack-required toggles. Private; used
+    /// only by [`activate`] to print REFUSED lines when the user set a
+    /// toggle but omitted the ack.
+    raw: RawAckIntent,
+}
+
+/// What the user *asked* for on the ack-required toggles, before the
+/// `HF2Q_UNSAFE_EXPERIMENTS=1` gate is applied.
+#[derive(Debug, Clone, Default)]
+struct RawAckIntent {
+    f16_kv: bool,
+    batched_prefill: bool,
+    skip_tq_encode: bool,
+    skip_tq_sdpa: bool,
+    lmhead_rerank_disabled: bool,
 }
 
 impl InvestigationEnv {
     /// Parse every investigation env var from the current process
-    /// environment. Called exactly once via [`INVESTIGATION_ENV`]'s
-    /// `LazyLock`.
+    /// environment and apply the ack gate to ack-required toggles.
+    /// Called exactly once via [`INVESTIGATION_ENV`]'s `LazyLock`.
     pub fn from_env() -> Self {
-        Self {
-            // Ack-required.
+        let raw = RawAckIntent {
             f16_kv: env_eq_one("HF2Q_F16_KV"),
             batched_prefill: env_eq_one("HF2Q_BATCHED_PREFILL"),
             skip_tq_encode: env_eq_one("HF2Q_SKIP_TQ_ENCODE"),
             skip_tq_sdpa: env_eq_one("HF2Q_SKIP_TQ_SDPA"),
+            lmhead_rerank_disabled: matches!(
+                env::var("HF2Q_LMHEAD_RERANK").as_deref(),
+                Ok("0")
+            ),
+        };
+        let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
-            // Warn-only.
+        Self {
+            // Ack-required — effective value is raw AND ack.
+            f16_kv: raw.f16_kv && ack,
+            batched_prefill: raw.batched_prefill && ack,
+            skip_tq_encode: raw.skip_tq_encode && ack,
+            skip_tq_sdpa: raw.skip_tq_sdpa && ack,
+            lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
+
+            // Warn-only — no gate.
             graph_opt: env_eq_one("HF2Q_GRAPH_OPT"),
             lmhead_compare: env_eq_one("HF2Q_LMHEAD_COMPARE"),
 
@@ -215,14 +256,8 @@ impl InvestigationEnv {
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
 
-            // Ack-required benchmarking.
-            lmhead_rerank_disabled: matches!(
-                env::var("HF2Q_LMHEAD_RERANK").as_deref(),
-                Ok("0")
-            ),
-
-            // Ack itself.
-            unsafe_experiments_acked: env_eq_one("HF2Q_UNSAFE_EXPERIMENTS"),
+            unsafe_experiments_acked: ack,
+            raw,
         }
     }
 
@@ -243,28 +278,196 @@ impl InvestigationEnv {
         }
     }
 
-    /// Whether any ack-required toggle is currently active. Used by S-4
-    /// to decide when to enforce the `HF2Q_UNSAFE_EXPERIMENTS=1` gate.
-    pub fn any_ack_required_active(&self) -> bool {
-        self.f16_kv
-            || self.batched_prefill
-            || self.skip_tq_encode
-            || self.skip_tq_sdpa
-            || self.lmhead_rerank_disabled
-    }
-
-    /// Startup hook for the S-4 warning + ack gate. Currently a no-op;
-    /// S-4 will fill this in to:
-    ///   1. print one warning block listing every active investigation
-    ///      toggle, marking ack-required ones;
-    ///   2. abort (or refuse to activate) any ack-required toggle when
-    ///      `HF2Q_UNSAFE_EXPERIMENTS=1` is not set.
+    /// Print one-shot startup summary of active investigation toggles
+    /// and any ack-required refusals. No output when nothing is set —
+    /// safe to call unconditionally at process startup.
     ///
-    /// Kept as an explicit method — rather than baking it into
-    /// `from_env` — so the call site (startup, pre-decode) is visible
-    /// in `serve/mod.rs` rather than implicit at first field access.
+    /// Sections (only emitted when non-empty):
+    ///
+    /// - **UNSAFE (ack-required, activated):** ack-required toggles
+    ///   that both the user asked for AND `HF2Q_UNSAFE_EXPERIMENTS=1`
+    ///   was set. These are genuinely live for this run.
+    /// - **REFUSED (ack-required, `HF2Q_UNSAFE_EXPERIMENTS=1` missing):**
+    ///   ack-required toggles the user asked for but the ack was
+    ///   absent; the toggles are disabled.
+    /// - **ACTIVE (investigation, safe):** warn-only category-4 toggles
+    ///   — they take effect but carry known caveats.
+    /// - **DIAGNOSTICS:** read-only / timing toggles — listed for
+    ///   visibility, no behavioral implication.
     pub fn activate(&self) {
-        // Intentionally empty. S-4 fills in.
+        // Active ack-required (user set toggle AND ack was present).
+        let mut active_unsafe: Vec<(&str, &str)> = Vec::new();
+        if self.f16_kv {
+            active_unsafe.push((
+                "HF2Q_F16_KV=1",
+                "known-worse KV cache representation (ADR-009)",
+            ));
+        }
+        if self.batched_prefill {
+            active_unsafe.push((
+                "HF2Q_BATCHED_PREFILL=1",
+                "experimental; errors when seq_len > sliding_window",
+            ));
+        }
+        if self.skip_tq_encode {
+            active_unsafe.push((
+                "HF2Q_SKIP_TQ_ENCODE=1",
+                "timing bisection; PRODUCES GARBAGE OUTPUT",
+            ));
+        }
+        if self.skip_tq_sdpa {
+            active_unsafe.push((
+                "HF2Q_SKIP_TQ_SDPA=1",
+                "timing bisection; PRODUCES GARBAGE OUTPUT",
+            ));
+        }
+        if self.lmhead_rerank_disabled {
+            active_unsafe.push((
+                "HF2Q_LMHEAD_RERANK=0",
+                "raw Q8 argmax; rare near-tiebreak flips",
+            ));
+        }
+
+        // Refused (user set ack-required toggle but HF2Q_UNSAFE_EXPERIMENTS=1 missing).
+        let mut refused: Vec<(&str, &str)> = Vec::new();
+        if self.raw.f16_kv && !self.f16_kv {
+            refused.push((
+                "HF2Q_F16_KV=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.batched_prefill && !self.batched_prefill {
+            refused.push((
+                "HF2Q_BATCHED_PREFILL=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.skip_tq_encode && !self.skip_tq_encode {
+            refused.push((
+                "HF2Q_SKIP_TQ_ENCODE=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.skip_tq_sdpa && !self.skip_tq_sdpa {
+            refused.push((
+                "HF2Q_SKIP_TQ_SDPA=1",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.lmhead_rerank_disabled && !self.lmhead_rerank_disabled {
+            refused.push((
+                "HF2Q_LMHEAD_RERANK=0",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+
+        // Active warn-only (safe but noteworthy).
+        let mut active_safe: Vec<(&str, &str)> = Vec::new();
+        if self.graph_opt {
+            active_safe.push((
+                "HF2Q_GRAPH_OPT=1",
+                "no measured win; reorder aborts on unannotated dispatches",
+            ));
+        }
+        if self.lmhead_compare {
+            active_safe.push((
+                "HF2Q_LMHEAD_COMPARE=1",
+                "inert today (not wired into live decode)",
+            ));
+        }
+
+        // Read-only / timing diagnostics.
+        let mut diagnostics: Vec<String> = Vec::new();
+        if let Some((l, t)) = self.prefill_dump {
+            diagnostics.push(format!("HF2Q_PREFILL_DUMP={l},{t}"));
+        }
+        if let Some((l, t)) = self.batched_dump {
+            diagnostics.push(format!("HF2Q_BATCHED_DUMP={l},{t}"));
+        }
+        if let Some(t) = self.batched_layer_scan {
+            diagnostics.push(format!("HF2Q_BATCHED_LAYER_SCAN={t}"));
+        }
+        if let Some(p) = self.dump_layers {
+            diagnostics.push(format!("HF2Q_DUMP_LAYERS={p}"));
+        }
+        if let Some(p) = self.dump_boundary {
+            diagnostics.push(format!("HF2Q_DUMP_BOUNDARY={p}"));
+        }
+        if let Some(l) = self.dump_layer_detail {
+            diagnostics.push(format!("HF2Q_DUMP_LAYER_DETAIL={l}"));
+        }
+        if let Some(l) = self.dump_norm_weight {
+            diagnostics.push(format!("HF2Q_DUMP_NORM_WEIGHT={l}"));
+        }
+        if self.dump_all_cache {
+            diagnostics.push("HF2Q_DUMP_ALL_CACHE=1".into());
+        }
+        if self.dump_rendered_prompt.is_some() {
+            diagnostics.push("HF2Q_DUMP_RENDERED_PROMPT=<path>".into());
+        }
+        if self.dump_prompt_tokens {
+            diagnostics.push("HF2Q_DUMP_PROMPT_TOKENS".into());
+        }
+        if self.mlx_timing {
+            diagnostics.push("HF2Q_MLX_TIMING".into());
+        }
+        if self.split_timing {
+            diagnostics.push("HF2Q_SPLIT_TIMING=1".into());
+        }
+        if self.mlx_kernel_profile {
+            diagnostics.push("HF2Q_MLX_KERNEL_PROFILE=1".into());
+        }
+        if self.mlx_profile {
+            diagnostics.push("HF2Q_MLX_PROFILE=1".into());
+        }
+
+        let nothing_to_report = active_unsafe.is_empty()
+            && refused.is_empty()
+            && active_safe.is_empty()
+            && diagnostics.is_empty();
+        if nothing_to_report {
+            return;
+        }
+
+        eprintln!();
+        eprintln!("hf2q: investigation-only environment variables detected");
+        eprintln!("      (not part of the shipping contract — see docs/shipping-contract.md)");
+
+        if !active_unsafe.is_empty() {
+            eprintln!();
+            eprintln!("  UNSAFE (ack-required, activated):");
+            for (name, note) in &active_unsafe {
+                eprintln!("    {name:<30}  {note}");
+            }
+        }
+
+        if !refused.is_empty() {
+            eprintln!();
+            eprintln!("  REFUSED (ack-required, HF2Q_UNSAFE_EXPERIMENTS=1 not set):");
+            for (name, note) in &refused {
+                eprintln!("    {name:<30}  {note}");
+            }
+            eprintln!();
+            eprintln!("  The REFUSED toggles above are DISABLED for this run.");
+        }
+
+        if !active_safe.is_empty() {
+            eprintln!();
+            eprintln!("  ACTIVE (investigation, safe):");
+            for (name, note) in &active_safe {
+                eprintln!("    {name:<30}  {note}");
+            }
+        }
+
+        if !diagnostics.is_empty() {
+            eprintln!();
+            eprintln!("  DIAGNOSTICS (read-only / timing):");
+            for name in &diagnostics {
+                eprintln!("    {name}");
+            }
+        }
+
+        eprintln!();
     }
 }
 
