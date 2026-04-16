@@ -987,14 +987,19 @@ impl MlxModelWeights {
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
                 total_dispatches += 1;
+                // Per-dispatch range annotation for the reorder pass. The
+                // single barrier_between above only annotates the first
+                // dispatch; concurrent K and V need their own ranges.
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_k]);
                 total_dispatches += 1;
                 let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
                 if !v_is_k {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
                         &mut self.activations.attn_v, 1)?;
+                    s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_v]);
                     total_dispatches += 1;
                 }
 
