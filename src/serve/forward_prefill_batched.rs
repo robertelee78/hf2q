@@ -38,6 +38,7 @@ impl MlxModelWeights {
     pub fn forward_prefill_batched(
         &mut self,
         prompt_tokens: &[u32],
+        max_decode_tokens: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
@@ -67,7 +68,9 @@ impl MlxModelWeights {
         // -------------------------------------------------------------------
         // Per-layer dense KV buffers [n_kv_heads, capacity, head_dim]
         // -------------------------------------------------------------------
-        let dense_capacity = seq_len + 1024;
+        // Dense flash_attn_vec requires a linear cache; capacity covers
+        // prompt + full decode budget. Ring-buffer for sliding is deferred (ADR-010).
+        let dense_capacity = seq_len + max_decode_tokens;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let nkv = self.num_kv_heads[layer_idx];

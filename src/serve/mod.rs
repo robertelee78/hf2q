@@ -280,9 +280,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // parity is validated.
     let use_batched = std::env::var("HF2Q_BATCHED_PREFILL").map_or(false, |v| v == "1");
     let last_token = if use_batched {
-        mlx_w.forward_prefill_batched(&prompt_tokens, &mut ctx)?
+        mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, &mut ctx)?
     } else {
-        mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?
+        mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?
     };
 
     // Decode
@@ -464,7 +464,7 @@ fn cmd_parity_check(
 
     // Prefill + decode
     let eos_token_ids: Vec<u32> = vec![1, 106];
-    let first_token = mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?;
+    let first_token = mlx_w.forward_prefill(&prompt_tokens, tokens, &mut ctx)?;
     let mut all_tokens = prompt_tokens.to_vec();
     let mut next_token = first_token;
     all_tokens.push(next_token);
@@ -592,7 +592,7 @@ fn cmd_parity_capture(
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
         let eos_token_ids: Vec<u32> = vec![1, 106];
-        let first_token = mlx_w_fresh.forward_prefill(&prompt_tokens, &mut ctx)?;
+        let first_token = mlx_w_fresh.forward_prefill(&prompt_tokens, tokens, &mut ctx)?;
         let mut all_tokens = prompt_tokens.to_vec();
         let mut next_token = first_token;
         all_tokens.push(next_token);

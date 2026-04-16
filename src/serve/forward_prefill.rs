@@ -56,6 +56,7 @@ impl MlxModelWeights {
     pub fn forward_prefill(
         &mut self,
         prompt_tokens: &[u32],
+        max_decode_tokens: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
@@ -78,8 +79,10 @@ impl MlxModelWeights {
         //   [n_kv_heads, capacity, head_dim]
         // This layout matches flash_attn_vec's K,V input format.
         //
-        // Capacity = seq_len + 1024 to allow decode to continue using
-        // dense attention for up to 1024 additional tokens.
+        // Capacity = seq_len + max_decode_tokens. dense flash_attn_vec
+        // requires a linear (non-ring-buffer) cache, so capacity must
+        // cover the full generation budget. A ring-buffer path for
+        // sliding layers is deferred (ADR-010).
         // ===================================================================
         // ADR-009 Phase 3A finding: matching llama.cpp's F16 KV cache
         // REGRESSED our parity (sourdough 3656→3095, sliding_wrap 752→627).
@@ -92,7 +95,7 @@ impl MlxModelWeights {
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
         eprintln!("Prefill: KV cache dtype = {:?}", kv_dtype);
 
-        let dense_capacity = seq_len + 1024;
+        let dense_capacity = seq_len + max_decode_tokens;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let nkv = self.num_kv_heads[layer_idx];
