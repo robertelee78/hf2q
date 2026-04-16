@@ -531,15 +531,15 @@ impl MlxModelWeights {
         gpu: &mut GpuContext,
     ) -> Result<Self> {
         let mlx_device = gpu.device();
-        eprintln!("  Loading mlx-native weights directly from GGUF...");
+        tracing::debug!("Loading mlx-native weights directly from GGUF...");
 
         // --- Embedding weight (F32) ---
-        eprintln!("  Loading embed_weight...");
+        tracing::debug!("Loading embed_weight");
         let embed_weight = gguf.load_tensor_f32("token_embd.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
 
         // --- Final norm (F32) ---
-        eprintln!("  Loading final_norm...");
+        tracing::debug!("Loading final_norm");
         let final_norm = gguf.load_tensor_f32("output_norm.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
 
@@ -594,7 +594,7 @@ impl MlxModelWeights {
                 Some("1") => "forced",
                 _ => "auto",
             };
-            eprintln!("  Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)...",
+            tracing::info!("Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB)",
                 source, lm_head_f16_bytes as f64 / 1e6);
             let embed_f32: &[f32] = embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
@@ -632,7 +632,7 @@ impl MlxModelWeights {
                     }
                 }
             }
-            eprintln!("  Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}.",
+            tracing::info!("Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16){}",
                 total_bytes as f64 / 1e6,
                 lm_head_f16_bytes as f64 / total_bytes as f64,
                 if compare_mode { " [COMPARE MODE — F16 also resident]" } else { "" });
@@ -694,7 +694,7 @@ impl MlxModelWeights {
         let mut num_kv_heads_vec = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
-            eprintln!("  GGUF layer {}/{}: loading weights...", i + 1, num_layers);
+            tracing::debug!("GGUF layer {}/{}: loading weights", i + 1, num_layers);
 
             // -- Attention quantized weights --
             let q_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_q.weight"), mlx_device)?;
@@ -752,7 +752,7 @@ impl MlxModelWeights {
             let down_ggml_dtype = dn_info.ggml_type;
 
             if (i + 1) % 5 == 0 || i == 0 {
-                eprintln!("  GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
+                tracing::debug!("GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
                     i + 1, num_layers,
                     stacked_gate_up_buf.byte_len() as f64 / 1e6,
                     stacked_down_buf.byte_len() as f64 / 1e6);
@@ -881,8 +881,8 @@ impl MlxModelWeights {
                 layer_scalar,
             });
         }
-        eprintln!(
-            "\r  Loaded {}/{} mlx-native layer weights from GGUF (including MoE).    ",
+        tracing::info!(
+            "Loaded {}/{} mlx-native layer weights from GGUF (including MoE)",
             num_layers, num_layers
         );
 
