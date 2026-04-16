@@ -355,27 +355,22 @@ impl MlxModelWeights {
                             dense_capacity as u32, tok_i as u32,
                         ).map_err(|e| anyhow::anyhow!("prefill F16 V copy L{layer_idx} T{tok_i}: {e}"))?;
                     } else {
-                        for h in 0..nkv {
-                            // F32 K: copy head h from attn_k_normed
-                            mlx_native::ops::copy::dispatch_copy_f32(
-                                s.encoder_mut(), reg, metal_dev,
-                                &self.activations.attn_k_normed,
-                                &dense_kvs_vec[layer_idx].k,
-                                h * hd,
-                                h * dense_capacity * hd + tok_i * hd,
-                                hd,
-                            ).map_err(|e| anyhow::anyhow!("prefill K copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
-
-                            // F32 V: copy head h from v_src
-                            mlx_native::ops::copy::dispatch_copy_f32(
-                                s.encoder_mut(), reg, metal_dev,
-                                v_src,
-                                &dense_kvs_vec[layer_idx].v,
-                                h * hd,
-                                h * dense_capacity * hd + tok_i * hd,
-                                hd,
-                            ).map_err(|e| anyhow::anyhow!("prefill V copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
-                        }
+                        // F32 batched: one dispatch per K, one per V (all heads).
+                        // Matches the F16 path above; eliminates the per-head loop.
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &dense_kvs_vec[layer_idx].k,
+                            nkv as u32, hd as u32,
+                            dense_capacity as u32, tok_i as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill F32 K batch copy L{layer_idx} T{tok_i}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &dense_kvs_vec[layer_idx].v,
+                            nkv as u32, hd as u32,
+                            dense_capacity as u32, tok_i as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill F32 V batch copy L{layer_idx} T{tok_i}: {e}"))?;
                     }
 
                     // Also TQ-encode into packed cache (for subsequent decode)

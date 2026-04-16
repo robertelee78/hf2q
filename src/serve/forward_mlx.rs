@@ -1175,25 +1175,24 @@ impl MlxModelWeights {
                         ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
                         total_dispatches += 2;
                     } else {
-                        for h in 0..nkv {
-                            mlx_native::ops::copy::dispatch_copy_f32(
-                                s.encoder_mut(), reg, metal_dev,
-                                &self.activations.attn_k_normed,
-                                &dense_kvs[layer_idx].k,
-                                h * hd,
-                                h * dense_cap * hd + seq_pos * hd,
-                                hd,
-                            ).map_err(|e| anyhow::anyhow!("decode dense K copy h{h} L{layer_idx}: {e}"))?;
-                            mlx_native::ops::copy::dispatch_copy_f32(
-                                s.encoder_mut(), reg, metal_dev,
-                                v_src,
-                                &dense_kvs[layer_idx].v,
-                                h * hd,
-                                h * dense_cap * hd + seq_pos * hd,
-                                hd,
-                            ).map_err(|e| anyhow::anyhow!("decode dense V copy h{h} L{layer_idx}: {e}"))?;
-                        }
-                        total_dispatches += nkv * 2;
+                        // F32 batched: one dispatch per K, one per V (all heads at once).
+                        // Replaces the old `for h in 0..nkv { 2 dispatches }` loop,
+                        // matching the F16 path above.
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &dense_kvs[layer_idx].k,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, seq_pos as u32,
+                        ).map_err(|e| anyhow::anyhow!("decode F32 K batch copy L{layer_idx}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &dense_kvs[layer_idx].v,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, seq_pos as u32,
+                        ).map_err(|e| anyhow::anyhow!("decode F32 V batch copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 2;
                     }
 
                     // ADR-009 Phase 3A: dump full cached K/V for the detail layer,
