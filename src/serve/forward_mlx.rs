@@ -412,15 +412,6 @@ pub struct MlxActivationBuffers {
     pub argmax_value: MlxBuffer,
     /// Argmax params buffer.
     pub argmax_params: MlxBuffer,
-    /// Top-K rerank output buffers — reserved for a future GPU top-K path.
-    /// The current Q8+rerank uses a CPU threshold scan (delta around the Q8
-    /// top-1) which is faster than the prototyped single-threadgroup top-K.
-    #[allow(dead_code)]
-    pub top_k_indices: MlxBuffer,
-    #[allow(dead_code)]
-    pub top_k_values: MlxBuffer,
-    #[allow(dead_code)]
-    pub top_k_params: MlxBuffer,
     /// Logits output buffer `[1, vocab_size]` F32.
     pub logits: MlxBuffer,
     /// MoE scratch: router logits `[1, num_experts]` F32.
@@ -946,13 +937,6 @@ impl MlxModelWeights {
                 let p: &mut [u32] = w.activations.argmax_params.as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
-            }
-            // Top-K params: [vocab_size, K]. K=64 is the rerank default.
-            {
-                let p: &mut [u32] = w.activations.top_k_params.as_mut_slice()
-                    .map_err(|e| anyhow::anyhow!("top_k_params init: {e}"))?;
-                p[0] = w.vocab_size as u32;
-                p[1] = 64;
             }
         }
 
@@ -1809,7 +1793,6 @@ impl MlxModelWeights {
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.moe_accum, hs,
                     ).map_err(|e| anyhow::anyhow!("zero_buffer L{layer_idx}: {e}"))?;
-                    let _ = &total_dispatches; // keep counter consistent; bail! follows
 
                     // Note: fallback path still needs CPU to read expert_ids.
                     // For now, this path is unused (all layers have stacked weights).
@@ -2163,7 +2146,6 @@ impl MlxModelWeights {
             }
             candidates.sort_unstable();
             candidates.dedup();
-            let _ = (64usize,);  // K anchor for readers: rerank set size typically < 64
 
             // Exact F32 rerank via hidden · embed_row. Softcap is monotonic
             // so skipping it doesn't change argmax order. F64 accumulator
@@ -2292,7 +2274,6 @@ impl MlxModelWeights {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let metal_dev = dev.metal_device();
-            let t0 = Instant::now();
             let mut s = exec.begin().map_err(|e| anyhow::anyhow!("embed begin: {e}"))?;
             mlx_native::ops::elementwise::embedding_gather_scale_f32(
                 s.encoder_mut(), reg, metal_dev,
@@ -2300,7 +2281,8 @@ impl MlxModelWeights {
                 input_token, hs, (hs as f32).sqrt(),
             ).map_err(|e| anyhow::anyhow!("embedding: {e}"))?;
             s.finish().map_err(|e| anyhow::anyhow!("embed finish: {e}"))?;
-            let _ = t0.elapsed(); // embedding is trivial, don't report
+            // Embedding time intentionally not reported: trivial cost relative
+            // to the per-layer kernel sessions profiled below.
         }
 
         // --- Per-layer kernel-type sessions ---
@@ -2709,7 +2691,6 @@ impl MlxModelWeights {
             {
                 let (exec, reg) = gpu.split();
                 let dev = exec.device();
-                let _ = dev; // suppress unused
                 let metal_dev = dev.metal_device();
                 let t0 = Instant::now();
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("norms_end begin L{layer_idx}: {e}"))?;
@@ -3170,9 +3151,6 @@ fn alloc_activation_buffers(
         argmax_index: alloc_u32(1, "argmax_index")?,
         argmax_value: alloc_f32(1, "argmax_value")?,
         argmax_params,
-        top_k_indices: alloc_u32(128, "top_k_indices")?,
-        top_k_values: alloc_f32(128, "top_k_values")?,
-        top_k_params: alloc_u32(2, "top_k_params")?,
         logits: alloc_f32(vocab, "logits")?,
         moe_router_logits: alloc_f32(num_experts, "moe_router_logits")?,
         moe_expert_out: alloc_f32(hs.max(max_kv_heads * max_hd), "moe_expert_out")?,

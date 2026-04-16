@@ -69,8 +69,6 @@ impl MlxModelWeights {
         let vocab_size = self.vocab_size;
         let eps = self.rms_norm_eps;
 
-        let f32_sz = std::mem::size_of::<f32>();
-
         let (exec, reg) = gpu.split();
         let dev = exec.device();
         let metal_dev = dev.metal_device();
@@ -119,7 +117,6 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
             dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
         }
-        let _ = f32_sz; // kept for clarity; unused after dtype switch
 
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
         let max_nh = self.num_attention_heads;
