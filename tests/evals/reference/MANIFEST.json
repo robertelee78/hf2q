@@ -1,0 +1,46 @@
+{
+  "description": "Locked reference outputs for ADR-009 parity validation",
+  "generated": "2026-04-16",
+  "llama_cpp_commit": "b3d758750a268bf93f084ccfa3060fb9a203192a",
+  "hf2q_commit": "96b8249",
+  "model": "gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf",
+  "model_sha256": "ae19574dab588e0a742a8cfa1282ccf358ed8a58c5a3483f2bf596020a4f8e6f",
+  "settings": {
+    "temperature": 0,
+    "seed_llama": 42,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0
+  },
+  "prompts": {
+    "sourdough": {
+      "file": "prompts/sourdough.txt",
+      "max_tokens": 1000,
+      "llama_output": "sourdough_llama.txt",
+      "llama_bytes": 3658,
+      "hf2q_output": "sourdough_hf2q.txt",
+      "hf2q_bytes": 3656,
+      "common_prefix_bytes": 3656,
+      "parity_gate": "common_prefix >= 3094"
+    },
+    "short_hello": {
+      "file": "prompts/short_hello.txt",
+      "max_tokens": 50,
+      "llama_output": "short_hello_llama.txt",
+      "llama_bytes": 46,
+      "hf2q_output": "short_hello_hf2q.txt",
+      "hf2q_bytes": 36,
+      "common_prefix_bytes": 29,
+      "note": "Divergence is EOS marker only — content identical"
+    },
+    "sliding_wrap": {
+      "file": "prompts/sliding_wrap.txt",
+      "max_tokens": 500,
+      "llama_output": "sliding_wrap_llama.txt",
+      "llama_bytes": 2327,
+      "hf2q_output": "sliding_wrap_hf2q.txt",
+      "hf2q_bytes": 2354,
+      "common_prefix_bytes": 752,
+      "note": "Lower parity than sourdough — longer prompt exercises different divergence patterns"
+    }
+  }
+}

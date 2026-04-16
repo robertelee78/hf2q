@@ -1,0 +1,69 @@
+Making sourdough bread is a blend of science (fermentation) and art (shaping and intuition). This guide covers everything from managing your starter to the final bake.
+
+---
+
+### Phase 1: The Tools & Ingredients
+
+**Essential Equipment:**
+*   **Dutch Oven:** Crucial for creating steam, which ensures a crispy crust.
+*   **Digital Scale:** Sourdough is about ratios; measuring by volume (cups) is imprecise.
+*   **Mixing Bowl & Spatula:** For dough.
+*   **Proofing Basket (Banneton) or a bowl lined with a tea towel:** For the final rise.
+*   **Lame (or a very sharp razor blade):** For scoring the dough.
+*   **Bench Scraper:** For handling sticky dough.
+
+**Core Ingredients:**
+*   **Active Sourdough Starter:** Bubbling, fed, and doubled in size.
+*   **Flour:** High-quality bread flour (or a mix of bread and whole wheat).
+*   **Water:** Filtered is best (chlorine can inhibit yeast).
+*   **Salt:** Fine sea salt (avoid iodized table salt).
+
+---
+
+### Phase 2: The Timeline (The 24-Hour Workflow)
+
+Sourdough cannot be rushed. A typical schedule looks like this:
+*   **Day 1 (Morning):** Feed the starter.
+*   **Day 1 (Afternoon):** Mix dough.
+*   **Day 1 (Evening):** Bulk Fermentation (first rise).
+*   たDay 2 (Morning): Shape and final proof.
+*   Day 2 (Bake): The oven.
+
+---
+
+### Phase 3: Step-by-Step Instructions
+
+#### 1. The Autolyse (Optional but recommended)
+Mix your flour and water until no dry clumps remain. Let it sit for 30–60 minutes. This hydrates the flour and begins gluten development.
+
+#### 2. Adding Starter and Salt
+Add your active starter and salt to the autolyse dough. Mix thoroughly. This is the "incorporation" phase.
+
+#### 3. Bulk Fermentation (The First Rise)
+This is the most critical stage. You aren't just waiting; you are building structure.
+*   **Stretch and Folds:** Instead of kneading, perform "stretches and folds" every 30 minutes for the first 2 hours. Wet your hands, grab the side of the dough, pull it up, and fold it over itself. Repeat for all four sides.
+*   **The Goal:** The dough should transform from a shaggy mess into a smooth, elastic ball that holds its shape.
+*   **The End Point:** You are looking for a 50–100% increase in volume. It should look bubbly and "jiggly."
+
+#### 4. Shaping (Pre-shape and Final Shape)
+*   **Pre-shape:** Gently turn the dough onto a floured surface. Shape it into a loose ball. Let it rest for 20 minutes (this is called "bench rest").
+*   **Final Shape:** This creates tension. Use your hands to pull the dough toward you on a clean surface, tightening the "skin" of the dough. Place it upside down into a floured banneton.
+
+#### 5. The Cold Proof
+Place your shaped dough in the fridge (uncovered or covered) for 8–24 hours. This cold fermentation develops that signature "sour" flavor and makes the dough easier to score.
+
+#### 6. Scoring and Baking
+*   **Preheat:** Heat your Dutch oven in the oven to 450°F (230°C).
+*   **Score:** Turn the cold dough onto parchment paper. Use a lame to make one deep, decisive cut. This controls where the bread expands.
+*   **The Bake:**
+    *   **Phase 1 (Lid ON):** Bake for 20–25 minutes. The steam trapped in the pot creates the "oven spring" (the rise).
+    *   **Phase 2 (Lid OFF):** Remove the lid, reduce heat to 400°F, and bake for another 20 minutes until the crust is deep golden brown.
+
+---
+
+### Phase 4: Troubleshooting Common Issues
+
+| Problem | Likely Cause | Solution |
+| :--- | :--- | :--- |
+| **Flat/Dense Bread** | Weak starter or under-proofing. | Ensure starter is very active; extend fermentation time. |
+| **Dense/Gummy Center** | Underbaked or cut too early. | Ensure internal temp reaches 205°F
