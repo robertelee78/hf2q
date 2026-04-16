@@ -43,7 +43,11 @@ anyhow = "1"
 thiserror = "2"
 
 # ADR-008: mlx-native is the sole inference/compute backend.
-mlx-native = { path = "/opt/mlx-native" }
+# Published at https://crates.io/crates/mlx-native. For local mlx-native
+# development, override via a (gitignored) .cargo/config.toml:
+#   [patch.crates-io]
+#   mlx-native = { path = "/opt/mlx-native" }
+mlx-native = "0.1.3"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # Async runtime + HTTP server (for `serve` subcommand)
