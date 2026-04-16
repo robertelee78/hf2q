@@ -1,7 +1,7 @@
 # ADR-009: Reference Parity and Coherence Recovery for Owned Inference
 
-**Status:** Accepted (Phases 1+2 complete — coherence restored, parity harnesses operational)  
-**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phases 1+2 accepted)  
+**Status:** Accepted (canonical coherence path restored; sliding-wrap parity remains open)  
+**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phase 1 canonical path accepted)  
 **Decision Makers:** Robert, Claude  
 **Related ADRs:** ADR-008 (candle divorce), ADR-007 (TurboQuant KV cache), ADR-006 (mlx-native GPU backend), ADR-005 (inference server)
 
@@ -1152,12 +1152,45 @@ The implementation effort should maintain a simple table like this in status upd
 | Attention logits parity | dense flash_attn_vec | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | **done** (dense path) |
 | `sdpa_out` parity | dense flash_attn_vec | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | **done** (dense path) |
 | Sourdough prefix | **3656** | llama.cpp parity (3658) | hf2q | **done** (2 bytes from exact parity) |
-| Greedy-token parity suite | 3656/3658 byte match | match llama.cpp on locked corpus | hf2q | **done** |
-| Parity harnesses (fixture-backed) | `hf2q parity check/capture` CLI + `parity_check.sh` | automated CLI + CI | hf2q | **done** |
+| Greedy-token parity (sourdough) | 3656/3658 byte match | match llama.cpp on locked corpus | hf2q | **done** |
+| Greedy-token parity (sliding_wrap) | 752/2327 byte match | match llama.cpp | hf2q | **open** (see O-1) |
+| Parity harnesses (text-level) | `hf2q parity check/capture` CLI + `parity_check.sh` | automated CLI + CI | hf2q | **done** |
+| Parity harnesses (tensor fixtures) | not populated | no-model fixture checks | hf2q | **open** (see O-2) |
 | Prefill tok/s | 62.8 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
 | Decode tok/s | 105.4 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
 
 This table is deliberately simple. It prevents the project from drifting back into vague statements like “attention seems better now.”
+
+### Open Issues (2026-04-16)
+
+#### O-1: Sliding-wrap parity (752/2327 bytes)
+
+The `sliding_wrap` eval prompt (82 prompt tokens, 500 decode tokens) achieves only 752 bytes common prefix with llama.cpp (32.3%). The sliding window never wraps in this test (total 582 tokens < 1024 capacity), so the `ring_start` chronology fix does not exercise.
+
+The divergence at byte 752 (~188 decode tokens) is a semantic split at a plausible decision boundary (“a mill (processor)” vs “a central processing unit (the mill)”). Both continuations are factually correct. Additional prompt-length experiments show:
+
+| Prompt tokens | Common prefix | Parity % |
+|---|---|---|
+| 17 | 1305/1305 | 100% |
+| 22 (sourdough) | 3656/3658 | 99.95% |
+| 32 | 1332/1332 | 100% |
+| 41 | 1221/1475 | 82.8% |
+| 82 (sliding_wrap) | 752/2327 | 32.3% |
+
+Divergence onset correlates with total sequence length and appears to be gradual numeric drift from accumulated precision differences in ported kernels (quantized matmul, flash attention, fused norms, F16 lm_head). It is NOT caused by:
+- A broken norm/RoPE contract (both paths use the same `fused_head_norm_rope_f32` kernel)
+- TQ encoding (skipping TQ encode doesn't change the result)
+- Sliding-window wrap (window never wraps in this test)
+
+**Status:** Open correctness investigation, not optimization backlog.
+
+**Next steps:** Boundary tensor dumps at the divergence point to identify which kernel accumulates the most drift relative to llama.cpp.
+
+#### O-2: Tensor fixtures not yet populated
+
+`tests/evals/fixtures/` remains empty. Text-level byte-prefix parity checks are in place and operational, but the ADR's original Phase 2 vision of tensor-level boundary fixtures (saved Q, K, V, attention logits, sdpa_out) for no-model CI is not yet implemented.
+
+**Status:** Accepted gap. Text-level parity (3656/3658 on sourdough) provides strong correctness evidence. Tensor fixtures are follow-up work.
 
 ---
 
