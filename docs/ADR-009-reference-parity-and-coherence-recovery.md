@@ -1211,7 +1211,21 @@ Kernel diff of `flash_attn_vec.metal` vs llama.cpp's `kernel_flash_attn_ext_vec`
 - Dense GEMM lm_head (F16 weights with F32 I/O — precision of mixed-precision path)
 - Mask application details (fma vs separate mul+add)
 
-**Next steps:** Phase 3A (see below).
+**Boundary dump findings (seq_pos=239, the actual divergence decision):**
+
+```
+hf2q top-1: tok 6082 (" central")  logit = 17.694
+hf2q top-2: tok  623 (' "')        logit = 17.668
+                                    gap   =  0.026
+```
+
+llama.cpp picks tok 623, hf2q picks tok 6082. This IS a flat-distribution tie-break — the argmax flips on a 0.026 logit gap. The upstream hidden state has accumulated just enough numerical drift through 239 forward passes to shift the top-2 ranking by 0.026.
+
+**Falsified candidates so far:**
+- Q4_0 accumulator layout (source-level change, no effect on divergence point)
+- lm_head as primary seam (the 0.026 gap means the hidden state is nearly correct — the drift is small but accumulated)
+
+**Next step:** Per-layer hidden state bisection at seq_pos=239 to find which layers accumulate the most drift. This requires comparing per-layer outputs against llama.cpp's per-layer outputs at the same position.
 
 #### O-2: Tensor fixtures not yet populated
 
