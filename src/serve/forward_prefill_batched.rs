@@ -206,6 +206,36 @@ impl MlxModelWeights {
             let top_k = self.layers[layer_idx].moe.top_k;
             let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
 
+            // ADR-010 early dump: capture layer INPUT (= previous layer's output)
+            // before any modification. pf_hidden at end of layer holds the NEXT
+            // layer's input, so we must grab it here, at start of target layer.
+            // Two modes:
+            //   HF2Q_BATCHED_DUMP="layer,tok" — dump only for that target layer
+            //   HF2Q_BATCHED_LAYER_SCAN="tok" — dump pf_hidden row `tok` for
+            //     EVERY layer (per-layer l_out scan for cross-layer drift bisection)
+            let layer_scan_tok: Option<usize> = std::env::var("HF2Q_BATCHED_LAYER_SCAN")
+                .ok().and_then(|v| v.parse::<usize>().ok());
+            let should_dump_input = match (batched_dump, layer_scan_tok) {
+                (Some((dump_layer, tok)), _) if dump_layer == layer_idx => Some(tok),
+                (_, Some(tok)) => Some(tok),
+                _ => None,
+            };
+            if let Some(target_tok) = should_dump_input {
+                if target_tok < seq_len && !use_f16_kv {
+                    let h: &[f32] = pf_hidden.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_hidden L{layer_idx}: {e}"))?;
+                    let off = target_tok * hs;
+                    let row = &h[off..off + hs];
+                    let path = format!(
+                        "{batched_dump_dir}/hf2q_batched_pre_layer_hidden_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[BATCHED DUMP] pre_layer_hidden_row L{layer_idx:02} [{}] f32 -> {path}", hs);
+                }
+            }
+
             let ff_gpu = if is_sliding { None }
                 else { Some(&self.activations.rope_freq_factors_gpu) };
             let theta = if is_sliding { self.rope_theta_sliding }
@@ -239,6 +269,28 @@ impl MlxModelWeights {
                     &self.activations.norm_params,
                     seq_len as u32, hs as u32,
                 ).map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))?;
+
+                // ADR-010 sub-stage dump: pf_norm_out is reused in session B
+                // for the pre-feedforward norm, so the end-of-layer dump hook
+                // reads the WRONG tensor. Snapshot it HERE, right after the
+                // pre-attention RMS norm is written.
+                if let Some((dump_layer, target_tok)) = batched_dump {
+                    if dump_layer == layer_idx && target_tok < seq_len && !use_f16_kv {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump norm finish L{layer_idx}: {e}"))?;
+                        let nrm: &[f32] = pf_norm_out.as_slice()
+                            .map_err(|e| anyhow::anyhow!("dump pf_norm_out early L{layer_idx}: {e}"))?;
+                        let off = target_tok * hs;
+                        let row = &nrm[off..off + hs];
+                        let path = format!(
+                            "{batched_dump_dir}/hf2q_batched_post_input_norm_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                        let bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
+                        std::fs::write(&path, bytes)
+                            .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                        eprintln!("[BATCHED DUMP] post_input_norm_row (inline) [{hs}] f32 -> {path}");
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump norm restart L{layer_idx}: {e}"))?;
+                    }
+                }
 
                 // 2. QKV projections (m = seq_len) — concurrent
                 s.barrier_between(
@@ -683,6 +735,14 @@ impl MlxModelWeights {
             if let Some((dump_layer, target_tok)) = batched_dump {
                 if dump_layer == layer_idx && target_tok < seq_len && !use_f16_kv {
                     // Row slices from [seq_len, *, hd] row-major buffers
+                    // pf_norm_out is dumped inline after the pre-attn RMS norm
+                    // (see session A); the buffer gets overwritten in session B.
+                    let qpre_full: &[f32] = pf_q.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_q: {e}"))?;
+                    let kpre_full: &[f32] = pf_k.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_k: {e}"))?;
+                    let vpre_full: &[f32] = pf_v.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_v: {e}"))?;
                     let q_full: &[f32] = pf_q_normed.as_slice()
                         .map_err(|e| anyhow::anyhow!("dump pf_q_normed: {e}"))?;
                     let k_full: &[f32] = pf_k_normed.as_slice()
@@ -697,6 +757,9 @@ impl MlxModelWeights {
                     let v_off = target_tok * nkv * hd;
                     let s_off = target_tok * nh * hd;
 
+                    let qpre_row = &qpre_full[q_off..q_off + nh * hd];
+                    let kpre_row = &kpre_full[k_off..k_off + nkv * hd];
+                    let vpre_row = &vpre_full[v_off..v_off + nkv * hd];
                     let q_row = &q_full[q_off..q_off + nh * hd];
                     let k_row = &k_full[k_off..k_off + nkv * hd];
                     let v_row = &v_full[v_off..v_off + nkv * hd];
@@ -730,6 +793,9 @@ impl MlxModelWeights {
                         eprintln!("[BATCHED DUMP] {} {} f32 -> {}", name, tag_shape, path);
                         Ok(())
                     };
+                    write_slice("q_pre_normed_row", qpre_row, &format!("[{nh},{hd}]"))?;
+                    write_slice("k_pre_normed_row", kpre_row, &format!("[{nkv},{hd}]"))?;
+                    write_slice("v_pre_normed_row", vpre_row, &format!("[{nkv},{hd}]"))?;
                     write_slice("q_normed_row", q_row, &format!("[{nh},{hd}]"))?;
                     write_slice("k_normed_row", k_row, &format!("[{nkv},{hd}]"))?;
                     write_slice("v_normed_row", v_row, &format!("[{nkv},{hd}]"))?;

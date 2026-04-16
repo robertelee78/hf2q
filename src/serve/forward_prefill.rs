@@ -131,6 +131,26 @@ impl MlxModelWeights {
 
         eprintln!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
 
+        // ADR-010 one-shot norm weight dump: read self.layers[L].norms.input_layernorm
+        // as the hf2q kernel sees it, compare against the raw GGUF tensor.
+        // Gated on HF2Q_DUMP_NORM_WEIGHT="layer" (e.g. "7"). Writes to HF2Q_DUMP_DIR.
+        if let Ok(v) = std::env::var("HF2Q_DUMP_NORM_WEIGHT") {
+            if let Ok(target_l) = v.parse::<usize>() {
+                if target_l < num_layers {
+                    let w: &[f32] = self.layers[target_l].norms.input_layernorm.as_slice()
+                        .map_err(|e| anyhow::anyhow!("norm weight read L{target_l}: {e}"))?;
+                    let dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+                    let path = format!("{dir}/hf2q_input_layernorm_weight_layer{target_l:02}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] input_layernorm weight L{target_l} [{}] f32 -> {}",
+                              w.len(), path);
+                }
+            }
+        }
+
         // ADR-009 Phase 3A: prefill boundary dumps at (target_layer, target_tok).
         // Controlled by HF2Q_PREFILL_DUMP="layer,tok" e.g. "7,34".
         let prefill_dump: Option<(usize, usize)> = std::env::var("HF2Q_PREFILL_DUMP")

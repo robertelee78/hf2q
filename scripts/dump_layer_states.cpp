@@ -50,10 +50,24 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     bool is_kqv = (!is_kqv_out && strncmp(name, "kqv", 3) == 0 && (name[3] == '-' || name[3] == '\0'));
     bool is_qcur_pos = (strncmp(name, "Qcur_pos", 8) == 0);
     bool is_kcur_pos = (strncmp(name, "Kcur_pos", 8) == 0);
+    // ADR-010 pre-attention bisection tensors
+    bool is_attn_norm = (strncmp(name, "attn_norm", 9) == 0
+                         && (name[9] == '-' || name[9] == '\0'));
+    bool is_qcur_normed = (strncmp(name, "Qcur_normed", 11) == 0);
+    bool is_kcur_normed = (strncmp(name, "Kcur_normed", 11) == 0);
+    bool is_vcur_normed = (strncmp(name, "Vcur_normed", 11) == 0);
+    bool is_qcur = (!is_qcur_pos && !is_qcur_normed
+                    && strncmp(name, "Qcur", 4) == 0 && (name[4] == '-' || name[4] == '\0'));
+    bool is_kcur = (!is_kcur_pos && !is_kcur_normed
+                    && strncmp(name, "Kcur", 4) == 0 && (name[4] == '-' || name[4] == '\0'));
+    bool is_vcur = (!is_vcur_normed
+                    && strncmp(name, "Vcur", 4) == 0 && (name[4] == '-' || name[4] == '\0'));
     bool is_cache_k = (strncmp(name, "cache_k_l", 9) == 0);
     bool is_cache_v = (strncmp(name, "cache_v_l", 9) == 0);
     if (!is_l_out && !is_attn_out && !is_kqv_out && !is_kqv
         && !is_qcur_pos && !is_kcur_pos
+        && !is_attn_norm && !is_qcur_normed && !is_kcur_normed && !is_vcur_normed
+        && !is_qcur && !is_kcur && !is_vcur
         && !is_cache_k && !is_cache_v) return true;
 
     // Extract layer number from name: "l_out-0", "attn_out-0", etc.
@@ -72,6 +86,13 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         : is_kqv ? "kqv"
         : is_qcur_pos ? "q_normed"
         : is_kcur_pos ? "k_normed"
+        : is_attn_norm ? "attn_norm_out"
+        : is_qcur_normed ? "qcur_normed"
+        : is_kcur_normed ? "kcur_normed"
+        : is_vcur_normed ? "vcur_normed"
+        : is_qcur ? "qcur"
+        : is_kcur ? "kcur"
+        : is_vcur ? "vcur"
         : is_cache_k ? "cache_k"
         : is_cache_v ? "cache_v"
         : "unknown";
