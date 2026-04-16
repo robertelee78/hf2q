@@ -1202,14 +1202,32 @@ The candle reference at `/opt/candle` was checked: candle has F32 safetensors Ge
 
 **Assessment:** This divergence is a bug until explained or eliminated. "Accumulated numeric drift" is a description of the symptom, not an acceptable end state. Every persistent long-horizon token divergence from the pinned llama.cpp oracle must be traced to a specific kernel-level cause and fixed.
 
-**Root cause investigation (in progress):**
+**Bisection summary (proven):**
 
-Kernel diff of `flash_attn_vec.metal` vs llama.cpp's `kernel_flash_attn_ext_vec` shows the F32 path uses NE=1 in both implementations, and the Q*K^T loop, softmax, and V accumulation are structurally identical. The difference must be in one of:
-- Subtleties in the flash attention kernel (padding, tail handling, shared memory layout)
-- Quantized matmul kernels (reduction order, block processing)
-- RMS norm / fused norm kernels (reduction precision, epsilon handling)
-- Dense GEMM lm_head (F16 weights with F32 I/O — precision of mixed-precision path)
-- Mask application details (fma vs separate mul+add)
+Per-layer and sub-layer hidden state comparison at seq_pos=239:
+- flash_attn_vec(d=256, nkv=8) is the first dominant amplification point (20.48x vs 4.69x for d=512)
+- QKV projection, head norm, RoPE are NOT the primary seam (0.82-1.13x, neutral)
+- O-proj compresses error back (0.30x)
+- MLP/MoE path is negligible (1.06x)
+- lm_head is downstream of an already-divergent hidden state
+
+**What is NOT yet proven:**
+
+- That the d=256 amplification is inherent to the math vs a kernel bug
+- That the cached K/V entries themselves are the root source (vs the weighted-sum path)
+- That llama.cpp would show the same drift under the same perturbation
+
+**Lead hypothesis (to falsify, not assume):**
+
+flash_attn_vec(d=256, nkv=8) is the first place where small upstream/cache-state differences are amplified enough to matter. It remains open whether the dominant cause is:
+- drift already present in cached K/V (recurrent state accumulation), or
+- the numerical behavior of the attention weighted sum itself
+
+**Next two checks:**
+
+1. **Early-token check** — compare owned vs llama.cpp Q/K/V and sdpa_out when cache depth is tiny (e.g. decode step 1). If the seam exists there, long-horizon accumulation is not required to reproduce it.
+
+2. **Cache-content check** — compare cached K/V at early, mid, and late positions. If cached K/V already drift materially, attention may be amplifying recurrent state drift. If cached K/V stay tight but sdpa_out diverges, the weighted-sum kernel is the stronger suspect.
 
 **Boundary dump findings (seq_pos=239, the actual divergence decision):**
 
