@@ -1,7 +1,7 @@
 # ADR-009: Reference Parity and Coherence Recovery for Owned Inference
 
-**Status:** Accepted (Phase 1 complete — coherence restored)  
-**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phase 1 accepted)  
+**Status:** Accepted (Phases 1+2 complete — coherence restored, parity harnesses operational)  
+**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phases 1+2 accepted)  
 **Decision Makers:** Robert, Claude  
 **Related ADRs:** ADR-008 (candle divorce), ADR-007 (TurboQuant KV cache), ADR-006 (mlx-native GPU backend), ADR-005 (inference server)
 
@@ -1153,7 +1153,7 @@ The implementation effort should maintain a simple table like this in status upd
 | `sdpa_out` parity | dense flash_attn_vec | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | **done** (dense path) |
 | Sourdough prefix | **3656** | llama.cpp parity (3658) | hf2q | **done** (2 bytes from exact parity) |
 | Greedy-token parity suite | 3656/3658 byte match | match llama.cpp on locked corpus | hf2q | **done** |
-| Parity harnesses (fixture-backed) | sourdough gate passing | automated CLI + CI | hf2q | Phase 2 |
+| Parity harnesses (fixture-backed) | `hf2q parity check/capture` CLI + `parity_check.sh` | automated CLI + CI | hf2q | **done** |
 | Prefill tok/s | 62.8 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
 | Decode tok/s | 105.4 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
 
