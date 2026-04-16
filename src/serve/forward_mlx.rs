@@ -862,6 +862,8 @@ impl MlxModelWeights {
         // Temporary diagnostic — to be merged into parity capture workflow.
         let dump_pos: Option<usize> = std::env::var("HF2Q_DUMP_BOUNDARY")
             .ok().and_then(|v| v.parse::<usize>().ok());
+        let dump_layers: bool = std::env::var("HF2Q_DUMP_LAYERS")
+            .ok().and_then(|v| v.parse::<usize>().ok()) == Some(seq_pos);
 
         // --- Pre-session CPU work ---
         // Write position buffer (same for all layers)
@@ -1534,6 +1536,31 @@ impl MlxModelWeights {
                 if let Some(ref mut p) = profile {
                     // All layer ops in single session — attribute everything to S1
                     p.s1_dispatches[layer_idx] = total_dispatches;
+                }
+
+                // ADR-009 Phase 3A: per-layer hidden state dump.
+                // Commits the session mid-forward to read hidden state, then re-starts.
+                // Only active when HF2Q_DUMP_LAYERS=<seq_pos> matches.
+                if dump_layers {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("dump layer finish L{layer_idx}: {e}"))?;
+                    let hidden_data: &[f32] = self.activations.hidden.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump hidden L{layer_idx}: {e}"))?;
+                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+                        .unwrap_or_else(|_| "/tmp".into());
+                    let path = format!("{dump_dir}/hf2q_l_out_layer{layer_idx:02}_pos{seq_pos}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            hidden_data.as_ptr() as *const u8,
+                            hs * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] l_out layer {layer_idx:02} ({hs} f32) -> {path}");
+                    // Re-start session for remaining layers
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("dump layer re-begin L{layer_idx}: {e}"))?;
                 }
 
                 // Dual command buffer: commit buf0 after N layers, start buf1.
