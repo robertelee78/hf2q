@@ -7,6 +7,7 @@ pub mod forward_mlx;
 pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
+pub mod header;
 #[allow(dead_code)]
 pub mod sampler_pure;
 
@@ -233,11 +234,42 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     tracing::debug!("Model name (GGUF general.name or file stem): {}", model_name);
 
     tracing::info!("Loading model weights from GGUF into mlx-native buffers");
-    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
+    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // Suppress progress line when tracing events at info+ are enabled
+    // (verbosity >= 1) — the tracing debug/info stream already gives
+    // per-layer visibility, and mixing \r overwrites with log lines is
+    // garbled. Equivalent to "show progress only at default verbosity".
+    let verbosity = if tracing::enabled!(tracing::Level::INFO) { 1 } else { 0 };
+    let mut load_progress = header::LoadProgress::new(
+        stderr_is_tty,
+        verbosity,
+        cfg.num_hidden_layers,
+    );
+    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(
+        &gguf, &cfg, &mut ctx, &mut load_progress,
+    )?;
     let n_layers = mlx_w.layers.len();
     let load_elapsed = load_start.elapsed();
     tracing::info!("mlx-native weights loaded ({} layers) in {:.1}s",
         n_layers, load_elapsed.as_secs_f64());
+
+    // Default-mode header lines 1 and 2 — product output on stdout,
+    // dimmed on TTY. Line 3 (prefill stats) renders after prefill completes.
+    let total_gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(0.0);
+    let header_top = header::HeaderInfoTop {
+        chip: header::short_chip_label(&backend_chip),
+        backend: "mlx-native",
+        model: model_name.clone(),
+        load_s: load_elapsed.as_secs_f64(),
+        n_layers,
+        total_gb,
+    };
+    let mut stdout = std::io::stdout();
+    header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
+        .context("print header top")?;
 
     // Load tokenizer
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -299,11 +331,28 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // path (matches llama.cpp default). Per-token remains default until
     // parity is validated.
     let use_batched = INVESTIGATION_ENV.batched_prefill;
+    let prefill_start = std::time::Instant::now();
     let last_token = if use_batched {
         mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, &mut ctx)?
     } else {
         mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?
     };
+    let prefill_elapsed = prefill_start.elapsed();
+
+    // Default-mode header line 3 — prefill stats + blank line framing
+    // the generation stream. Stdout, dimmed on TTY.
+    let prefill_n = prompt_tokens.len();
+    let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+    let prefill_tok_s = if prefill_elapsed.as_secs_f64() > 0.0 {
+        prefill_n as f64 / prefill_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    header::print_header_prefill(
+        &mut stdout,
+        &header::HeaderInfoPrefill { prefill_n, prefill_ms, prefill_tok_s },
+        stdout_is_tty,
+    ).context("print header prefill")?;
 
     // Decode
     let mut all_tokens = prompt_tokens.to_vec();
@@ -455,7 +504,11 @@ fn cmd_parity_check(
         .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
-    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
+    // cmd_parity has its own output contract — no progress line.
+    let mut parity_progress = header::LoadProgress::new(false, 1, 0);
+    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(
+        &gguf, &cfg, &mut ctx, &mut parity_progress,
+    )?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -588,8 +641,12 @@ fn cmd_parity_capture(
         eprintln!("Capturing: {} ({} tokens)", pname, tokens);
 
         // Need to reload model for each prompt since KV cache state persists
-        // Re-create model weights (reset KV caches)
-        let mut mlx_w_fresh = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
+        // Re-create model weights (reset KV caches).
+        // cmd_parity has its own output contract — no progress line.
+        let mut parity_progress = header::LoadProgress::new(false, 1, 0);
+        let mut mlx_w_fresh = forward_mlx::MlxModelWeights::load_from_gguf(
+            &gguf, &cfg, &mut ctx, &mut parity_progress,
+        )?;
 
         let rendered = render_chat_template(&gguf, &cli::GenerateArgs {
             model: model_path.to_path_buf(),

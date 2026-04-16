@@ -523,12 +523,17 @@ impl MlxModelWeights {
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
     ///
+    /// `progress` drives the default-mode in-place `\r`-overwrite progress
+    /// line on stderr; it is a no-op when stderr isn't a TTY or verbosity > 0
+    /// (tracing debug events then cover per-layer detail).
+    ///
     /// ADR-008 Phase 2: replaces `load_from_candle()` — weights go
     /// GGUF → MlxBuffer with zero candle involvement.
     pub fn load_from_gguf(
         gguf: &mlx_native::gguf::GgufFile,
         cfg: &Gemma4Config,
         gpu: &mut GpuContext,
+        progress: &mut crate::serve::header::LoadProgress,
     ) -> Result<Self> {
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
@@ -880,7 +885,9 @@ impl MlxModelWeights {
                 norms,
                 layer_scalar,
             });
+            progress.on_layer(i + 1);
         }
+        progress.finish();
         tracing::info!(
             "Loaded {}/{} mlx-native layer weights from GGUF (including MoE)",
             num_layers, num_layers
