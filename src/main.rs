@@ -87,30 +87,33 @@ impl std::fmt::Display for AppError {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     // Emit one-shot warning / ack-gate summary for any investigation-only
-    // env vars that are set. No-op when the environment is clean. Runs
-    // before Cli::parse so the warning appears even when clap exits
-    // early on --help or --version.
+    // env vars that are set. Uses direct eprintln! (not tracing), so it
+    // runs correctly before the subscriber is installed. Placed before
+    // Cli::parse so the warning appears even when clap exits early on
+    // --help or --version.
     debug::INVESTIGATION_ENV.activate();
 
     let cli = Cli::parse();
 
-    if cli.verbose > 0 {
-        let level = match cli.verbose {
-            1 => "info",
-            2 => "debug",
-            _ => "trace",
-        };
-        tracing::debug!("Verbosity level: {}", level);
-    }
+    // Verbosity-aware tracing subscriber. -v raises hf2q to info,
+    // -vv to debug, -vvv+ to trace. At verbosity 0, RUST_LOG wins; if
+    // unset, defaults to hf2q=warn (silent on the generate boot path).
+    // Stderr writer: logs never touch stdout, keeping the generation
+    // stream unpolluted.
+    use tracing_subscriber::EnvFilter;
+    let filter = match cli.verbose {
+        0 => EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
+        1 => EnvFilter::new("hf2q=info,mlx_native=info"),
+        2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
+        _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
 
     match run(cli) {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
