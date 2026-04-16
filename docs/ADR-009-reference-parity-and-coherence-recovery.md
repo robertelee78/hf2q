@@ -1459,6 +1459,27 @@ At the first divergent batched-prefill boundary, does the mismatch appear in:
 
 One layer, one head, one boundary. Stop guessing.
 
+### Apples-to-apples cache diff (2026-04-16)
+
+Compared hf2q-batched-prefill cache vs llama-batched-prefill cache layer-by-layer at seq_pos=239:
+
+- Layers 0-6: rel_rms 2-3e-4 (tight — within expected FP noise)
+- Layer 7+: rel_rms grows to 1e-3, then 1e-2 in later layers
+- Layer 17+: rel_rms 1e-2 to 2e-2
+
+Per-position at (L7, pos 34):
+- hf2q per-token vs llama batched: 4.37e-2
+- hf2q batched vs llama batched: **4.37e-2** (nearly identical to per-token)
+- hf2q per-token vs hf2q batched: **8.5e-5** (two hf2q paths agree tightly)
+
+**Definitive narrowing:**
+
+Both hf2q prefill paths produce K at (L7, pos 34) that differs from llama batched by 4.37%. The two hf2q paths agree with each other. **The gap is NOT prefill mode**; it is how we compute batched attention vs how llama computes it. Same model weights, same prompt tokens, same (functionally) FA math. Different numerics.
+
+The layer-7 spike pattern we previously tracked is present in BOTH hf2q prefill modes — so it is rooted in the attention kernel math, not in the per-token vs batched dispatch pattern.
+
+**Ready for single-boundary kernel diff:** dump QK logits, softmax weights, and V aggregation for one head at L7, pos 34 from both our batched `sdpa` and llama's `flash_attn_ext`, and bisect which stage first diverges.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
