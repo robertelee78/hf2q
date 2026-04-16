@@ -1,0 +1,60 @@
+//! Helpers for ADR-009/010 investigation-mode dumps.
+//!
+//! The decode/prefill hot paths historically grew ~20-line `if
+//! dump_layers { s.finish(); let data = buf.as_slice()?; let dump_dir
+//! = ...; let path = format!(...); let bytes = unsafe { slice_from_raw
+//! }; fs::write; eprintln; s = exec.begin() }` blocks — one per
+//! diagnostic buffer. The fs::write + slice-from-raw-ptr part is
+//! mechanical and identical across sites; this module centralizes it.
+//!
+//! The *session dance* (finish → dump → re-begin) stays inline in the
+//! call sites because it needs `s` and `exec` which are awkward to
+//! pass through, and because batching multiple dumps between one
+//! finish/begin pair is an important perf optimization that the
+//! caller controls.
+//!
+//! Files are written to [`INVESTIGATION_ENV.dump_dir`]
+//! (`HF2Q_DUMP_DIR`, default `/tmp`).
+
+use anyhow::Result;
+use mlx_native::MlxBuffer;
+
+use super::INVESTIGATION_ENV;
+
+/// Write `n_elems` F32 values from `buf` to
+/// `<dump_dir>/hf2q_<name>[_layer<NN>]_pos<seq_pos>.bin` and emit one
+/// `[DUMP]` line on stderr. `layer_idx = None` produces the
+/// layer-less form used for pre-lm_head / post-lm_head dumps.
+///
+/// Invariant: `buf` must be a host-readable F32 buffer containing at
+/// least `n_elems` elements. The caller is responsible for finishing
+/// the GPU session before calling so the buffer contents are valid.
+pub fn dump_f32(
+    buf: &MlxBuffer,
+    n_elems: usize,
+    name: &str,
+    layer_idx: Option<usize>,
+    seq_pos: usize,
+) -> Result<()> {
+    let data: &[f32] = buf
+        .as_slice()
+        .map_err(|e| anyhow::anyhow!("dump {name} read: {e}"))?;
+    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+    let path = match layer_idx {
+        Some(l) => format!("{dump_dir}/hf2q_{name}_layer{l:02}_pos{seq_pos}.bin"),
+        None => format!("{dump_dir}/hf2q_{name}_pos{seq_pos}.bin"),
+    };
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const u8,
+            n_elems * std::mem::size_of::<f32>(),
+        )
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    match layer_idx {
+        Some(l) => eprintln!("[DUMP] {name} layer {l:02} ({n_elems} f32) -> {path}"),
+        None => eprintln!("[DUMP] {name} ({n_elems} f32) -> {path}"),
+    }
+    Ok(())
+}

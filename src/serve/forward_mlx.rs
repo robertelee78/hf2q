@@ -39,7 +39,7 @@ use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
 
-use crate::debug::INVESTIGATION_ENV;
+use crate::debug::{dumps, INVESTIGATION_ENV};
 use super::config::{Gemma4Config, LayerType};
 use super::gpu::{GpuContext, QuantWeightInfo};
 
@@ -1236,32 +1236,10 @@ impl MlxModelWeights {
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump QKV finish L{layer_idx}: {e}"))?;
-                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
-
-                    // Q: [nh * hd] after head norm + RoPE
-                    let q_data: &[f32] = self.activations.attn_q_normed.as_slice()
-                        .map_err(|e| anyhow::anyhow!("dump Q L{layer_idx}: {e}"))?;
-                    let q_elems = nh * hd;
-                    let path = format!("{dump_dir}/hf2q_q_normed_layer{layer_idx:02}_pos{seq_pos}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(q_data.as_ptr() as *const u8, q_elems * 4)
-                    };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] q_normed layer {layer_idx:02} ({q_elems} f32) -> {path}");
-
-                    // K: [nkv * hd] after head norm + RoPE
-                    let k_data: &[f32] = self.activations.attn_k_normed.as_slice()
-                        .map_err(|e| anyhow::anyhow!("dump K L{layer_idx}: {e}"))?;
-                    let k_elems = nkv * hd;
-                    let path = format!("{dump_dir}/hf2q_k_normed_layer{layer_idx:02}_pos{seq_pos}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_elems * 4)
-                    };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] k_normed layer {layer_idx:02} ({k_elems} f32) -> {path}");
-
+                    dumps::dump_f32(&self.activations.attn_q_normed, nh * hd,
+                        "q_normed", Some(layer_idx), seq_pos)?;
+                    dumps::dump_f32(&self.activations.attn_k_normed, nkv * hd,
+                        "k_normed", Some(layer_idx), seq_pos)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
@@ -1498,20 +1476,9 @@ impl MlxModelWeights {
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out finish L{layer_idx}: {e}"))?;
-                    let sdpa_data: &[f32] = self.activations.sdpa_out.as_slice()
-                        .map_err(|e| anyhow::anyhow!("dump sdpa_out L{layer_idx}: {e}"))?;
-                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
-                    let sdpa_elems = nh * hd; // [nh, 1, hd] flattened
-                    let path = format!("{dump_dir}/hf2q_sdpa_out_layer{layer_idx:02}_pos{seq_pos}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            sdpa_data.as_ptr() as *const u8,
-                            sdpa_elems * std::mem::size_of::<f32>(),
-                        )
-                    };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] sdpa_out layer {layer_idx:02} ({sdpa_elems} f32) -> {path}");
+                    // [nh, 1, hd] flattened.
+                    dumps::dump_f32(&self.activations.sdpa_out, nh * hd,
+                        "sdpa_out", Some(layer_idx), seq_pos)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out re-begin L{layer_idx}: {e}"))?;
                 }
@@ -1543,20 +1510,9 @@ impl MlxModelWeights {
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;
-                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
-                    // Dump post-attention residual
-                    let res_data: &[f32] = self.activations.residual.as_slice()
-                        .map_err(|e| anyhow::anyhow!("dump residual L{layer_idx}: {e}"))?;
-                    let path = format!("{dump_dir}/hf2q_attn_out_layer{layer_idx:02}_pos{seq_pos}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            res_data.as_ptr() as *const u8,
-                            hs * std::mem::size_of::<f32>(),
-                        )
-                    };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] attn_out layer {layer_idx:02} ({hs} f32) -> {path}");
+                    // Post-attention residual (= attn_out after norm+add).
+                    dumps::dump_f32(&self.activations.residual, hs,
+                        "attn_out", Some(layer_idx), seq_pos)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump post-attn re-begin L{layer_idx}: {e}"))?;
                 }
@@ -1852,19 +1808,8 @@ impl MlxModelWeights {
                 if dump_layers {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump layer finish L{layer_idx}: {e}"))?;
-                    let hidden_data: &[f32] = self.activations.hidden.as_slice()
-                        .map_err(|e| anyhow::anyhow!("dump hidden L{layer_idx}: {e}"))?;
-                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
-                    let path = format!("{dump_dir}/hf2q_l_out_layer{layer_idx:02}_pos{seq_pos}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            hidden_data.as_ptr() as *const u8,
-                            hs * std::mem::size_of::<f32>(),
-                        )
-                    };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] l_out layer {layer_idx:02} ({hs} f32) -> {path}");
+                    dumps::dump_f32(&self.activations.hidden, hs,
+                        "l_out", Some(layer_idx), seq_pos)?;
                     // Re-start session for remaining layers
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump layer re-begin L{layer_idx}: {e}"))?;
@@ -1926,25 +1871,12 @@ impl MlxModelWeights {
 
             // --- ADR-009 Phase 3A: boundary dump at specific token position ---
             if dump_pos == Some(seq_pos) {
-                // Finish session to read GPU buffers
+                // Finish session to read GPU buffers.
                 s.finish().map_err(|e| anyhow::anyhow!("dump boundary finish: {e}"))?;
-
-                // Dump pre-lm_head (norm_out = final_norm applied to hidden)
-                let norm_out_data: &[f32] = self.activations.norm_out.as_slice()
-                    .map_err(|e| anyhow::anyhow!("dump norm_out: {e}"))?;
-                let dump_dir = &INVESTIGATION_ENV.dump_dir;
-                let path = format!("{dump_dir}/hf2q_pre_lmhead_pos{seq_pos}.bin");
-                let bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        norm_out_data.as_ptr() as *const u8,
-                        hs * std::mem::size_of::<f32>(),
-                    )
-                };
-                std::fs::write(&path, bytes)
-                    .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                eprintln!("[DUMP] pre-lm_head ({hs} f32) -> {path}");
-
-                // Re-begin session for lm_head + argmax
+                // Pre-lm_head = final_norm applied to hidden.
+                dumps::dump_f32(&self.activations.norm_out, hs,
+                    "pre_lmhead", None, seq_pos)?;
+                // Re-begin session for lm_head + argmax.
                 s = exec.begin().map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
             }
 
@@ -2052,21 +1984,11 @@ impl MlxModelWeights {
 
         // --- ADR-009 Phase 3A: dump post-lm_head logits at boundary position ---
         if dump_pos == Some(seq_pos) {
+            dumps::dump_f32(&self.activations.logits, vocab_size,
+                "logits", None, seq_pos)?;
+            // Also dump top-10 logits for quick inspection.
             let logits_data: &[f32] = self.activations.logits.as_slice()
-                .map_err(|e| anyhow::anyhow!("dump logits: {e}"))?;
-            let dump_dir = &INVESTIGATION_ENV.dump_dir;
-            let path = format!("{dump_dir}/hf2q_logits_pos{seq_pos}.bin");
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    logits_data.as_ptr() as *const u8,
-                    vocab_size * std::mem::size_of::<f32>(),
-                )
-            };
-            std::fs::write(&path, bytes)
-                .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-            eprintln!("[DUMP] logits ({vocab_size} f32) -> {path}");
-
-            // Also dump top-10 logits for quick inspection
+                .map_err(|e| anyhow::anyhow!("dump top-10 read: {e}"))?;
             let mut indexed: Vec<(usize, f32)> = logits_data[..vocab_size]
                 .iter().enumerate().map(|(i, &v)| (i, v)).collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());

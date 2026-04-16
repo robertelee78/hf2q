@@ -7,6 +7,7 @@
 //! convention (and will be loud at startup once S-4 lands the warning +
 //! unsafe-ack gate).
 
+pub mod dumps;
 pub mod investigation_env;
 
 pub use investigation_env::INVESTIGATION_ENV;
