@@ -1371,6 +1371,69 @@ On short prompts, hf2q matches llama batched better than llama per-token. The di
 2. **Fallback path:** If batched prefill is too large a surface, document that hf2q targets llama.cpp per-token prefill (and generate per-token reference as the new oracle) with the current 67% sliding_wrap parity as the starting baseline.
 3. Resume kernel-level investigation only if, after matching prefill mode, significant remaining drift persists.
 
+### Batched prefill implementation scope (2026-04-16)
+
+Audit of mlx-native kernels for batched prefill support:
+
+| Op | Batched capability | Work needed |
+|---|---|---|
+| Embedding gather | Single-token only | Loop per token or new kernel |
+| RMS norm | Supports `rows > 1` | None |
+| Quantized matmul (Q4_0/Q6_K/Q8_0) | Supports `m > 1` | None |
+| Fused head_norm + RoPE | Single-position grid | Extend dispatch to `n_heads * seq_len` (kernel already handles seq_idx) |
+| Dense SDPA (tiled kernel) | Supports `seq_len > 1` with causal mask | None |
+| KV cache copy (F32→F16) | Single-position | Multi-position variant or loop |
+| Fused norm + add | Supports `rows > 1` | None |
+| MoE routing + expert dispatch | Per-token inherently | Keep as per-token loop within batched prefill |
+
+**Implementation risk assessment:**
+
+Most kernels already support batched input. The significant structural work is:
+1. Allocating `[seq_len, *]` activation buffers for the batched pipeline
+2. Correctly applying the CAUSAL mask in SDPA (not just single-query decode mask)
+3. Correctly reading back the LAST-ROW logits for the first decode token
+4. Handling the sliding-window mask semantics when `seq_len > sliding_window` (not applicable at 82 tokens, but important to think about)
+
+**Estimated effort:** 400-600 lines of new code in a sibling function (`forward_prefill_batched`), gated by env var. Leave current `forward_prefill` (per-token) as default for Walk-phase safety.
+
+**Decision:** Proceed with implementation as a new method alongside the existing one. If the result measurably improves sliding_wrap parity (e.g. > 1800 bytes), promote to default. Otherwise, document the per-token path as the supported oracle.
+
+### Batched prefill MVP result — gap is NOT solely prefill mode (2026-04-16)
+
+Implemented `forward_prefill_batched` with batched ops throughout: embedding, QKV, head_norm+RoPE, single dense SDPA, O-proj, MLP, MoE (routing + gate_up + swiglu_seq + down + weighted_sum_seq), end-of-layer. Added six new batched mlx-native kernels. Commit `458c8fa` (hf2q) + `cec146a` (mlx-native). Gated by `HF2Q_BATCHED_PREFILL=1`.
+
+**A/B results:**
+
+sliding_wrap (82-token prompt, 500-token decode):
+
+|  | llama batched | llama per-token |
+|---|---:|---:|
+| hf2q per-token | 752 | 1569 |
+| hf2q batched | **752** | 870 |
+
+- hf2q batched did NOT improve parity with llama batched (still 752)
+- hf2q batched REGRESSED parity with llama per-token (1569 → 870)
+- hf2q batched vs hf2q per-token: 870 bytes common (self-diverges)
+
+sourdough (22-token prompt, 1000-token decode):
+
+- hf2q batched == hf2q per-token (byte-identical output on short prompts)
+- Both match llama batched at 3656 bytes
+
+**Interpretation:**
+
+The sliding_wrap gap is NOT solely a prefill-mode mismatch. Even with true batched prefill (matching llama's default kernel dispatch):
+1. hf2q batched still only matches llama batched at 752 bytes — same as per-token
+2. hf2q batched self-diverges from hf2q per-token at 870 bytes, meaning our batched path produces a different trajectory
+
+Hypotheses for what remains:
+- Batched SDPA kernel (tiled) vs decode-path flash_attn_vec numerics differ
+- MoE routing softmax/argsort reduction order differs between our batched kernel and llama.cpp's ggml_soft_max + ggml_argsort_top_k
+- Batched norm/projection reduction order different from per-token
+- Something else we haven't isolated
+
+**Next step:** The per-token path is still the most reliable baseline. Keep batched prefill opt-in. Don't promote to default. Resume kernel-level diffing, focusing specifically on the batched SDPA (`sdpa` kernel) vs llama's batched `flash_attn_ext` — these are different kernels processing the same inputs, and the sliding_wrap divergence trajectory is concentrated there.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
