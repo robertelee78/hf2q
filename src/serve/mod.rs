@@ -358,6 +358,257 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run the `parity` subcommand (ADR-009 Phase 2).
+///
+/// `parity check` — compare hf2q output against locked reference fixtures.
+/// `parity capture` — generate fresh reference outputs from hf2q.
+pub fn cmd_parity(args: cli::ParityArgs) -> Result<()> {
+    use cli::ParityCommand;
+
+    match args.command {
+        ParityCommand::Check { model, prompt, min_prefix, max_tokens } => {
+            cmd_parity_check(&model, &prompt, min_prefix, max_tokens)
+        }
+        ParityCommand::Capture { model, output, prompt, max_tokens } => {
+            cmd_parity_capture(&model, &output, &prompt, max_tokens)
+        }
+    }
+}
+
+/// Parity check: run hf2q on a prompt and compare against locked reference.
+fn cmd_parity_check(
+    model_path: &Path,
+    prompt_name: &str,
+    min_prefix: Option<usize>,
+    max_tokens: Option<usize>,
+) -> Result<()> {
+    let evals_dir = Path::new("tests/evals");
+    let ref_dir = evals_dir.join("reference");
+
+    // Load prompt
+    let prompt_file = evals_dir.join("prompts").join(format!("{prompt_name}.txt"));
+    anyhow::ensure!(prompt_file.exists(), "Prompt file not found: {}", prompt_file.display());
+    let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
+
+    // Load locked reference (llama.cpp output)
+    let ref_file = ref_dir.join(format!("{prompt_name}_llama.txt"));
+    anyhow::ensure!(ref_file.exists(), "Reference file not found: {}", ref_file.display());
+    let ref_bytes = std::fs::read(&ref_file)?;
+
+    // Determine settings
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ref_dir.join("MANIFEST.json"))?
+    )?;
+    let prompt_meta = &manifest["prompts"][prompt_name];
+    let tokens = max_tokens.unwrap_or_else(||
+        prompt_meta["max_tokens"].as_u64().unwrap_or(1000) as usize
+    );
+    let threshold = min_prefix.unwrap_or_else(||
+        // Parse from gate field like "common_prefix >= 3094"
+        prompt_meta["parity_gate"].as_str()
+            .and_then(|s| s.split(">=").nth(1))
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    );
+
+    // Run hf2q
+    eprintln!("=== Parity Check: {} ===", prompt_name);
+    eprintln!("Model:     {}", model_path.display());
+    eprintln!("Prompt:    {} ({} chars)", prompt_name, prompt_text.len());
+    eprintln!("Tokens:    {}", tokens);
+    eprintln!("Threshold: {} bytes", threshold);
+    eprintln!();
+
+    let tokenizer_path = find_tokenizer(model_path, None)?;
+    let config_path = find_config(model_path, None)?;
+    let cfg = config::Gemma4Config::from_config_json(&config_path)?;
+    let mut ctx = gpu::GpuContext::new()
+        .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let gguf = mlx_native::gguf::GgufFile::open(model_path)
+        .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+    let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
+
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
+    tokenizer.with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+
+    let rendered = render_chat_template(&gguf, &cli::GenerateArgs {
+        model: model_path.to_path_buf(),
+        prompt: Some(prompt_text.clone()),
+        prompt_file: None,
+        tokenizer: None,
+        config: None,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        max_tokens: tokens,
+        chat_template: None,
+        chat_template_file: None,
+        benchmark: false,
+    }, &prompt_text)?;
+
+    let encoding = tokenizer.encode(rendered.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("Tokenize: {e}"))?;
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    // Prefill + decode
+    let eos_token_ids: Vec<u32> = vec![1, 106];
+    let first_token = mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?;
+    let mut all_tokens = prompt_tokens.to_vec();
+    let mut next_token = first_token;
+    all_tokens.push(next_token);
+
+    for _ in 1..tokens {
+        if eos_token_ids.contains(&next_token) {
+            break;
+        }
+        let pos = all_tokens.len() - 1;
+        let mut p = None;
+        next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+        all_tokens.push(next_token);
+    }
+
+    // Decode generated tokens to text
+    let gen_tokens = &all_tokens[prompt_tokens.len()..];
+    let hf2q_text = tokenizer.decode(gen_tokens, false).unwrap_or_default();
+    let hf2q_bytes = hf2q_text.as_bytes();
+
+    // Compare
+    let n = ref_bytes.len().min(hf2q_bytes.len());
+    let mut common = 0;
+    while common < n && ref_bytes[common] == hf2q_bytes[common] {
+        common += 1;
+    }
+
+    eprintln!();
+    println!("Reference: {} bytes (llama.cpp)", ref_bytes.len());
+    println!("hf2q:      {} bytes", hf2q_bytes.len());
+    println!("Common:    {} bytes", common);
+    println!("Threshold: {} bytes", threshold);
+
+    if common >= threshold {
+        println!("PASS: {} >= {}", common, threshold);
+        if common > threshold {
+            println!("      ({} bytes above threshold)", common - threshold);
+        }
+    } else {
+        println!("FAIL: {} < {}", common, threshold);
+        // Show divergence context
+        if common < n {
+            let ctx_start = common;
+            let ctx_end = (common + 80).min(n);
+            let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
+            let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
+            println!();
+            println!("Divergence at byte {}:", common);
+            println!("  llama: {:?}", ref_snip);
+            println!("  hf2q:  {:?}", hf2q_snip);
+        }
+        anyhow::bail!("Parity check failed: {} < {}", common, threshold);
+    }
+
+    Ok(())
+}
+
+/// Parity capture: generate fresh hf2q output and save to reference dir.
+fn cmd_parity_capture(
+    model_path: &Path,
+    output_dir: &Path,
+    prompt_name: &str,
+    max_tokens: Option<usize>,
+) -> Result<()> {
+    let evals_dir = Path::new("tests/evals");
+
+    let prompts: Vec<String> = if prompt_name == "all" {
+        vec!["sourdough".into(), "short_hello".into(), "sliding_wrap".into()]
+    } else {
+        vec![prompt_name.to_string()]
+    };
+
+    // Load model once
+    let tokenizer_path = find_tokenizer(model_path, None)?;
+    let config_path = find_config(model_path, None)?;
+    let cfg = config::Gemma4Config::from_config_json(&config_path)?;
+    let mut ctx = gpu::GpuContext::new()
+        .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
+    let gguf = mlx_native::gguf::GgufFile::open(model_path)
+        .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+    // Model loaded once here; individual prompts re-create weights below to reset KV state
+    let _gguf_preload = &gguf; // keep gguf alive
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
+    tokenizer.with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+
+    std::fs::create_dir_all(output_dir)?;
+
+    for pname in &prompts {
+        let prompt_file = evals_dir.join("prompts").join(format!("{pname}.txt"));
+        anyhow::ensure!(prompt_file.exists(), "Prompt not found: {}", prompt_file.display());
+        let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
+
+        let tokens = max_tokens.unwrap_or(match pname.as_str() {
+            "sourdough" => 1000,
+            "short_hello" => 50,
+            "sliding_wrap" => 500,
+            _ => 200,
+        });
+
+        eprintln!("Capturing: {} ({} tokens)", pname, tokens);
+
+        // Need to reload model for each prompt since KV cache state persists
+        // Re-create model weights (reset KV caches)
+        let mut mlx_w_fresh = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
+
+        let rendered = render_chat_template(&gguf, &cli::GenerateArgs {
+            model: model_path.to_path_buf(),
+            prompt: Some(prompt_text.clone()),
+            prompt_file: None,
+            tokenizer: None,
+            config: None,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            max_tokens: tokens,
+            chat_template: None,
+            chat_template_file: None,
+            benchmark: false,
+        }, &prompt_text)?;
+
+        let encoding = tokenizer.encode(rendered.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("Tokenize: {e}"))?;
+        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+        let eos_token_ids: Vec<u32> = vec![1, 106];
+        let first_token = mlx_w_fresh.forward_prefill(&prompt_tokens, &mut ctx)?;
+        let mut all_tokens = prompt_tokens.to_vec();
+        let mut next_token = first_token;
+        all_tokens.push(next_token);
+
+        for _ in 1..tokens {
+            if eos_token_ids.contains(&next_token) {
+                break;
+            }
+            let pos = all_tokens.len() - 1;
+            let mut p = None;
+            next_token = mlx_w_fresh.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+            all_tokens.push(next_token);
+        }
+
+        let gen_tokens = &all_tokens[prompt_tokens.len()..];
+        let text = tokenizer.decode(gen_tokens, false).unwrap_or_default();
+
+        let out_path = output_dir.join(format!("{pname}_hf2q.txt"));
+        std::fs::write(&out_path, &text)?;
+        eprintln!("  Wrote {} bytes to {}", text.len(), out_path.display());
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::render_jinja_template;

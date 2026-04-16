@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# parity_check.sh — ADR-009 Phase 2: quick parity validation suite.
+# parity_check.sh — ADR-009 Phase 2: parity validation suite.
 #
-# Runs the sourdough coherence gate and a short deterministic sanity check.
-# Used for routine validation during development and CI.
+# Runs hf2q parity checks against locked llama.cpp reference outputs.
+# Uses the `hf2q parity check` CLI for structured comparison.
 #
 # Usage:
 #   scripts/parity_check.sh <gguf_path>
@@ -11,7 +11,6 @@
 #   0  all checks passed
 #   1  usage / env error
 #   2  parity check failed
-#   3  tool invocation failure
 
 set -euo pipefail
 
@@ -38,32 +37,42 @@ echo "hf2q: $HF2Q_BIN"
 echo "git:  $GIT_HEAD"
 echo
 
-# --- Check 1: Short deterministic sanity ---
-echo "--- Check 1: Short deterministic output ---"
-SHORT_OUT=$("$HF2Q_BIN" generate --model "$GGUF_PATH" \
-    --prompt "What is 2+2?" --max-tokens 10 --temperature 0 2>/dev/null)
-if echo "$SHORT_OUT" | grep -qi "4"; then
-    echo "PASS: short prompt produces coherent output containing '4'"
-    echo "  Output: $SHORT_OUT"
+# --- Check 1: Short deterministic — exact byte comparison ---
+echo "--- Check 1: short_hello (exact byte comparison) ---"
+if $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt short_hello --min-prefix 29 2>/dev/null; then
+    echo "  PASS"
     ((PASS++))
 else
-    echo "FAIL: short prompt output does not contain '4'"
-    echo "  Output: $SHORT_OUT"
+    echo "  FAIL"
     ((FAIL++))
 fi
 echo
 
 # --- Check 2: Sourdough coherence gate ---
-echo "--- Check 2: Sourdough coherence gate (min-prefix 3094) ---"
-if scripts/sourdough_gate.sh "$GGUF_PATH" --min-prefix 3094; then
+echo "--- Check 2: sourdough (min-prefix 3094) ---"
+if $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt sourdough --min-prefix 3094 2>/dev/null; then
+    echo "  PASS"
     ((PASS++))
 else
+    echo "  FAIL"
+    ((FAIL++))
+fi
+echo
+
+# --- Check 3: Sliding wrap prompt ---
+echo "--- Check 3: sliding_wrap (min-prefix 700) ---"
+if $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt sliding_wrap --min-prefix 700 2>/dev/null; then
+    echo "  PASS"
+    ((PASS++))
+else
+    echo "  FAIL"
     ((FAIL++))
 fi
 echo
 
 # --- Summary ---
-echo "=== Parity Summary: $PASS passed, $FAIL failed ==="
+TOTAL=$((PASS + FAIL))
+echo "=== Parity Summary: $PASS/$TOTAL passed ==="
 if [[ $FAIL -gt 0 ]]; then
     exit 2
 fi

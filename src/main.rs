@@ -133,6 +133,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             eprintln!("Serve mode not yet implemented. Use `generate` for now.");
             Ok(())
         }
+        Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
     }
 }
 

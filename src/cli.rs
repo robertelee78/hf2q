@@ -42,6 +42,9 @@ pub enum Command {
 
     /// Serve a GGUF model via OpenAI-compatible HTTP API
     Serve(ServeArgs),
+
+    /// ADR-009 parity validation against locked references
+    Parity(ParityArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -242,6 +245,53 @@ pub struct ServeArgs {
     /// Maximum sequence length
     #[arg(long, default_value = "4096")]
     pub max_seq_len: usize,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ParityCommand {
+    /// Check hf2q output against locked reference fixtures
+    Check {
+        /// Path to GGUF model file
+        #[arg(long)]
+        model: PathBuf,
+
+        /// Eval prompt name (sourdough, short_hello, sliding_wrap)
+        #[arg(long, default_value = "sourdough")]
+        prompt: String,
+
+        /// Minimum common byte prefix required to pass
+        #[arg(long)]
+        min_prefix: Option<usize>,
+
+        /// Maximum tokens to generate
+        #[arg(long)]
+        max_tokens: Option<usize>,
+    },
+
+    /// Capture fresh reference outputs (requires model)
+    Capture {
+        /// Path to GGUF model file
+        #[arg(long)]
+        model: PathBuf,
+
+        /// Output directory for captured references
+        #[arg(long, default_value = "tests/evals/reference")]
+        output: PathBuf,
+
+        /// Eval prompt name (sourdough, short_hello, sliding_wrap, all)
+        #[arg(long, default_value = "all")]
+        prompt: String,
+
+        /// Maximum tokens to generate
+        #[arg(long)]
+        max_tokens: Option<usize>,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ParityArgs {
+    #[command(subcommand)]
+    pub command: ParityCommand,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
