@@ -1434,6 +1434,31 @@ Hypotheses for what remains:
 
 **Next step:** The per-token path is still the most reliable baseline. Keep batched prefill opt-in. Don't promote to default. Resume kernel-level diffing, focusing specifically on the batched SDPA (`sdpa` kernel) vs llama's batched `flash_attn_ext` — these are different kernels processing the same inputs, and the sliding_wrap divergence trajectory is concentrated there.
 
+### Checkpoint summary (2026-04-16)
+
+**Defensible takeaways:**
+- Prefill mode matters, but is not the dominant cause of the sliding_wrap gap
+- The 752-byte ceiling vs llama batched survives both hf2q prefill modes (per-token and batched)
+- The next suspect must be a kernel/math mismatch that survives oracle control
+
+**Status of both hf2q paths:**
+- `forward_prefill` (per-token): default. Uses `flash_attn_vec` (decode-path kernel) per prompt token.
+- `forward_prefill_batched` (opt-in via `HF2Q_BATCHED_PREFILL=1`): uses the tiled `sdpa` kernel over the full prompt.
+- Decode: unchanged — uses `flash_attn_vec` with dense F32 K,V accumulated by prefill.
+
+Both are kept gated. Batched is NOT promoted to default.
+
+**Next investigation:**
+
+The cleanest remaining branch is a single-boundary diff of our tiled `sdpa` (used in batched prefill) vs llama.cpp's `flash_attn_ext` (their batched prefill attention kernel). These are different kernels with different numerical properties processing the same inputs. Narrow the question:
+
+At the first divergent batched-prefill boundary, does the mismatch appear in:
+- QK logits (score formation)
+- Softmax weights (score normalization)
+- V aggregation (weighted sum)
+
+One layer, one head, one boundary. Stop guessing.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
