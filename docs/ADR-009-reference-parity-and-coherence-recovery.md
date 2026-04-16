@@ -1286,6 +1286,34 @@ The seam is in our flash_attn_vec kernel itself (or in its upstream inputs), NOT
 - Online softmax intermediate precision
 - Reduce kernel numerical ordering
 
+### Correction: amplification baseline was wrong (2026-04-16)
+
+Earlier conclusion "flash_attn_vec amplifies Q/K error 20.48x" used the wrong baseline. The ratio was `sdpa_out rel_rms / max(Q_current, K_current) rel_rms`, but Q_current and K_current are only the LATEST token's projections, not the actual attention inputs.
+
+The actual attention inputs at seq_pos=239 are the full cached K,V (240 positions) plus Q_current. Correct baseline:
+
+- Cached K mean rel_rms per position: **5.0e-3**
+- Cached K overall rel_rms: **1.4e-2**
+- sdpa_out rel_rms: **1.4e-2**
+- **Cache → sdpa_out amplification: ~2.8x** (not 20x)
+
+A 2.8x amplification is within the expected range for an attention-weighted sum over inputs with scattered per-position drift.
+
+**Revised interpretation:** The flash_attn_vec kernel appears to be faithfully computing `softmax(Q·K^T)·V` on inputs that are already divergent. The real root of the sliding_wrap divergence is the **cached K,V state carrying cumulative per-position drift** from earlier layer outputs feeding back into the recurrent KV write path.
+
+This does NOT exonerate flash_attn_vec — the 2.8x amplification on noisy inputs still compounds over 30 layers of generation. But it shifts the weight of evidence: the primary drift source may be UPSTREAM of the cache write (the layer computations that produce K,V per token), not the attention weighted-sum itself.
+
+**Launch contract diff findings:**
+
+- Both kernels use nsg=1, nwg=32 at ne11=240 (nsg loop condition `2*nwg*nsg*ncpsg < ne11` is false with nsg=1)
+- Grid `(1, 16, 32)`, threadgroup `(32, 1, 1)` — same
+- Q at binding 1, K at 2, V at 3 — same
+- **Difference:** llama.cpp passes explicit mask buffer at binding 4; we compute mask inline. For causal decode this should be numerically equivalent (both produce ~0 weight for out-of-range positions via `exp(-MAXHALF - M) ≈ 0`).
+- **Difference:** llama.cpp has a `pad` buffer for partial KV chunks at the tail. We rely on inline masking of out-of-range positions. Since garbage K,V values get masked with `-MAXHALF` and `exp(very_negative) ≈ 0`, this should be numerically harmless.
+- **Not initialized:** our dense_kvs buffer memory is not zero-initialized — positions beyond kv_seq_len contain whatever was in memory. However, the mask ensures those positions don't contribute to the softmax output.
+
+The launch contract is functionally equivalent for the F32 path. No evident bug in the kernel invocation that would explain a 2.8x amplification as wrong.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
