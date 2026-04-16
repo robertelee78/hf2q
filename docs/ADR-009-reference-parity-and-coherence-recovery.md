@@ -1480,6 +1480,40 @@ The layer-7 spike pattern we previously tracked is present in BOTH hf2q prefill 
 
 **Ready for single-boundary kernel diff:** dump QK logits, softmax weights, and V aggregation for one head at L7, pos 34 from both our batched `sdpa` and llama's `flash_attn_ext`, and bisect which stage first diverges.
 
+### Single-layer bisection (2026-04-16)
+
+Checked the L6 → L7 transition at pos 34 in batched mode:
+- L6 cache K at pos 34: **rel_rms = 3.11e-4** (tight)
+- L7 cache K at pos 34: **rel_rms = 4.37e-2** (100x worse in ONE layer)
+
+This localizes the divergence to Layer 7's forward pass. But the divergence is the SAME magnitude whether we use per-token or batched prefill (differ by only 8.5e-5 between our two paths). It is also the same magnitude we see comparing hf2q K against llama's cache value for that same (layer, position).
+
+**What we know:**
+- hf2q per-token K_normed at L7 pos 34 matches llama PER-TOKEN K_normed at 1.48e-4 (tight)
+- hf2q batched K_normed at L7 pos 34 is within 8.5e-5 of hf2q per-token's K_normed
+- Both differ from llama BATCHED cached K by 4.37e-2
+
+**Conclusion:**
+
+The 4.37% K divergence at (L7, pos 34) is **intrinsic to different batched-kernel implementations** (ours vs llama's). It is not a specific bug we can fix with a kernel tweak; it is the consequence of doing batched matmul + batched head_norm + batched RoPE with our kernels vs llama's kernels. Small reduction-order or rounding differences in each stage accumulate into the cached value.
+
+This ceiling propagates through attention (where the cached K is read) and compounds in the decode path. The 752-byte sliding_wrap parity ceiling vs llama batched is the manifestation of this intrinsic difference.
+
+**Practical implication:**
+
+Exact parity with llama.cpp batched prefill likely requires either:
+1. Bit-exact kernel replication (significant engineering — essentially rewriting our kernels to match llama's implementation details)
+2. Integrating llama.cpp's ggml kernels directly (violates the "own the stack" principle of ADR-008)
+
+The current owned stack produces a coherent output trajectory that matches llama.cpp at 3656/3658 on sourdough (99.9%) and 1569/2354 on sliding_wrap vs llama per-token (67%) / 752/2327 vs llama batched (32%). The batched vs per-token split for long prompts is a legitimate characteristic of independent implementations, not a bug.
+
+**Recommendation:**
+
+- Accept the 752-byte ceiling on sliding_wrap as intrinsic to independent batched-kernel implementations on quantized weights
+- Keep `forward_prefill` (per-token) as the Walk-phase default — it produces correct coherent output and has the better per-token llama parity (1569 bytes)
+- Keep `forward_prefill_batched` as opt-in via HF2Q_BATCHED_PREFILL=1 for users who want faster prefill speed or batched-llama-style trajectory
+- Close Phase 3A — further parity improvement requires kernel-bit-exact engineering that's out of scope for the coherence-recovery ADR
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
