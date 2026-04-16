@@ -50,14 +50,21 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     bool is_kqv = (!is_kqv_out && strncmp(name, "kqv", 3) == 0 && (name[3] == '-' || name[3] == '\0'));
     bool is_qcur_pos = (strncmp(name, "Qcur_pos", 8) == 0);
     bool is_kcur_pos = (strncmp(name, "Kcur_pos", 8) == 0);
+    bool is_cache_k = (strncmp(name, "cache_k_l", 9) == 0);
+    bool is_cache_v = (strncmp(name, "cache_v_l", 9) == 0);
     if (!is_l_out && !is_attn_out && !is_kqv_out && !is_kqv
-        && !is_qcur_pos && !is_kcur_pos) return true;
+        && !is_qcur_pos && !is_kcur_pos
+        && !is_cache_k && !is_cache_v) return true;
 
     // Extract layer number from name: "l_out-0", "attn_out-0", etc.
     int layer = -1;
-    const char * dash = strrchr(name, '-');
-    if (dash) {
-        layer = atoi(dash + 1);
+    if (is_cache_k || is_cache_v) {
+        // name is "cache_k_l24" — extract after "_l"
+        const char * l_marker = strstr(name, "_l");
+        if (l_marker) layer = atoi(l_marker + 2);
+    } else {
+        const char * dash = strrchr(name, '-');
+        if (dash) layer = atoi(dash + 1);
     }
     const char * prefix = is_l_out ? "l_out"
         : is_attn_out ? "attn_out"
@@ -65,15 +72,56 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         : is_kqv ? "kqv"
         : is_qcur_pos ? "q_normed"
         : is_kcur_pos ? "k_normed"
+        : is_cache_k ? "cache_k"
+        : is_cache_v ? "cache_v"
         : "unknown";
+
+    // Only dump cache tensors when the active flag is set AND for layer 24
+    // (to keep artifacts manageable — cache is big)
+    if ((is_cache_k || is_cache_v) && layer != 24) return true;
 
     // Get tensor data
     int64_t n_elements = ggml_nelements(t);
-    size_t n_bytes = n_elements * sizeof(float);
+    size_t elem_bytes = ggml_type_size(t->type);
+    size_t n_bytes = n_elements * elem_bytes;
 
-    // Read tensor data to CPU
+    // Read tensor data to CPU (raw bytes, then convert to F32 if needed)
+    std::vector<char> raw_data(n_bytes);
+    ggml_backend_tensor_get(t, raw_data.data(), 0, n_bytes);
+
+    // Convert to F32 for uniform comparison
     std::vector<float> data(n_elements);
-    ggml_backend_tensor_get(t, data.data(), 0, n_bytes);
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(data.data(), raw_data.data(), n_bytes);
+    } else if (t->type == GGML_TYPE_F16) {
+        const uint16_t * src = (const uint16_t *)raw_data.data();
+        for (int64_t i = 0; i < n_elements; i++) {
+            // F16 -> F32 conversion (IEEE 754 half precision)
+            uint16_t h = src[i];
+            uint32_t sign = (h & 0x8000) << 16;
+            uint32_t exp  = (h & 0x7C00) >> 10;
+            uint32_t frac = (h & 0x03FF);
+            uint32_t f32_bits;
+            if (exp == 0) {
+                if (frac == 0) f32_bits = sign;
+                else {
+                    // subnormal: normalize
+                    while (!(frac & 0x0400)) { frac <<= 1; exp--; }
+                    exp++;
+                    frac &= 0x03FF;
+                    f32_bits = sign | ((exp + 112) << 23) | (frac << 13);
+                }
+            } else if (exp == 0x1F) {
+                f32_bits = sign | 0x7F800000 | (frac << 13);
+            } else {
+                f32_bits = sign | ((exp + 112) << 23) | (frac << 13);
+            }
+            memcpy(&data[i], &f32_bits, 4);
+        }
+    } else {
+        fprintf(stderr, "[DUMP] skipping %s: unsupported dtype %d\n", name, (int)t->type);
+        return true;
+    }
 
     // Write to file
     char path[512];
@@ -83,7 +131,11 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (f) {
         fwrite(data.data(), sizeof(float), n_elements, f);
         fclose(f);
-        fprintf(stderr, "[DUMP] %s: %lld f32 -> %s\n", name, (long long)n_elements, path);
+        fprintf(stderr, "[DUMP] %s: %lld f32 (src %s) shape=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] -> %s\n",
+            name, (long long)n_elements, ggml_type_name(t->type),
+            (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+            (size_t)t->nb[0], (size_t)t->nb[1], (size_t)t->nb[2], (size_t)t->nb[3],
+            path);
     }
 
     return true;

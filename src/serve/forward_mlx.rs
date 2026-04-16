@@ -1176,6 +1176,49 @@ impl MlxModelWeights {
                     }
                     total_dispatches += nkv * 2;
 
+                    // ADR-009 Phase 3A: dump full cached K/V for the detail layer
+                    if dump_layers && dump_detail_layer == Some(layer_idx) {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
+                        let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+                            .unwrap_or_else(|_| "/tmp".into());
+                        let cache_elems = nkv * dense_cap * hd;
+                        // Only dump the valid portion [nkv, kv_seq_len, hd]
+                        let k_data: &[f32] = dense_kvs[layer_idx].k.as_slice()
+                            .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
+                        let v_data: &[f32] = dense_kvs[layer_idx].v.as_slice()
+                            .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
+                        // Pack [nkv, kv_seq_len, hd] into a tight buffer
+                        let valid_len = kv_seq_len;
+                        let mut k_valid = vec![0.0f32; nkv * valid_len * hd];
+                        let mut v_valid = vec![0.0f32; nkv * valid_len * hd];
+                        for h in 0..nkv {
+                            for p in 0..valid_len {
+                                let src = h * dense_cap * hd + p * hd;
+                                let dst = h * valid_len * hd + p * hd;
+                                k_valid[dst..dst+hd].copy_from_slice(&k_data[src..src+hd]);
+                                v_valid[dst..dst+hd].copy_from_slice(&v_data[src..src+hd]);
+                            }
+                        }
+                        let k_path = format!("{dump_dir}/hf2q_cache_k_layer{layer_idx:02}_pos{seq_pos}.bin");
+                        let v_path = format!("{dump_dir}/hf2q_cache_v_layer{layer_idx:02}_pos{seq_pos}.bin");
+                        let k_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(k_valid.as_ptr() as *const u8, k_valid.len() * 4)
+                        };
+                        let v_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(v_valid.as_ptr() as *const u8, v_valid.len() * 4)
+                        };
+                        std::fs::write(&k_path, k_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {k_path}: {e}"))?;
+                        std::fs::write(&v_path, v_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {v_path}: {e}"))?;
+                        eprintln!("[DUMP] cache K layer {layer_idx:02} [{nkv},{valid_len},{hd}] -> {k_path}");
+                        eprintln!("[DUMP] cache V layer {layer_idx:02} [{nkv},{valid_len},{hd}] -> {v_path}");
+                        let _ = cache_elems;
+                        s = exec.begin()
+                            .map_err(|e| anyhow::anyhow!("dump cache re-begin L{layer_idx}: {e}"))?;
+                    }
+
                     // Dense flash_attn_vec
                     let dense_sdpa_tmp = self.dense_sdpa_tmp.as_ref().unwrap();
                     s.barrier_between(
