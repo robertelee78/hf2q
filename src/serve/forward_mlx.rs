@@ -1095,6 +1095,15 @@ impl MlxModelWeights {
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                         &[&self.activations.sdpa_out],
                     );
+                    // ADR-009 Track 2: ring_start for correct sliding-window
+                    // chronology after wrap. Before wrap, ring_start = 0
+                    // (physical == logical). After wrap, ring_start = write_pos
+                    // % capacity (physical slot of the oldest cached entry).
+                    let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
+                        (kv_write_pos % kv_capacity) as u32
+                    } else {
+                        0
+                    };
                     let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -1105,6 +1114,7 @@ impl MlxModelWeights {
                         mask_type: if is_sliding { 2 } else { 1 },
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
+                        ring_start,
                     };
                     mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
                         s.encoder_mut(), reg, dev,
@@ -1834,6 +1844,15 @@ impl MlxModelWeights {
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
                 {
+                    // ADR-009 Track 2: ring_start for correct sliding-window
+                    // chronology after wrap. Before wrap, ring_start = 0
+                    // (physical == logical). After wrap, ring_start = write_pos
+                    // % capacity (physical slot of the oldest cached entry).
+                    let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
+                        (kv_write_pos % kv_capacity) as u32
+                    } else {
+                        0
+                    };
                     let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -1844,6 +1863,7 @@ impl MlxModelWeights {
                         mask_type: if is_sliding { 2 } else { 1 },
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
+                        ring_start,
                     };
                     mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
                         s.encoder_mut(), reg, dev,
