@@ -213,12 +213,42 @@ int main(int argc, char ** argv) {
     tokens.resize(n_tokens);
     fprintf(stderr, "Tokens: %d\n", n_tokens);
 
-    // Prefill
-    fprintf(stderr, "Prefilling %d tokens...\n", n_tokens);
-    llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "Prefill failed\n");
-        return 1;
+    // Prefill — optionally per-token if HF2Q_PREFILL_DUMP_POS is set
+    const char * prefill_pos_env = getenv("HF2Q_PREFILL_DUMP_POS");
+    int prefill_dump_pos = prefill_pos_env ? atoi(prefill_pos_env) : -1;
+
+    if (prefill_dump_pos >= 0) {
+        fprintf(stderr, "Prefilling %d tokens one-by-one (dump at pos=%d)...\n",
+                n_tokens, prefill_dump_pos);
+        for (int i = 0; i < n_tokens; i++) {
+            if (i == prefill_dump_pos) {
+                g_dump.active = true;
+                g_dump.current_pos = i;
+                fprintf(stderr, "Activating dump at prefill pos %d\n", i);
+            } else {
+                g_dump.active = false;
+            }
+            llama_token t = tokens[i];
+            llama_batch b = llama_batch_get_one(&t, 1);
+            if (llama_decode(ctx, b) != 0) {
+                fprintf(stderr, "Prefill decode failed at pos %d\n", i);
+                return 1;
+            }
+        }
+        g_dump.active = false;
+        // Skip decode loop if we're only dumping prefill
+        fprintf(stderr, "Prefill dump complete.\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    } else {
+        fprintf(stderr, "Prefilling %d tokens in one batch...\n", n_tokens);
+        llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "Prefill failed\n");
+            return 1;
+        }
     }
 
     // Decode loop

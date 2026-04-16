@@ -14,7 +14,7 @@
 //! - After all tokens: extract last-row logits, argmax → first decode token
 
 use anyhow::Result;
-// MlxBuffer used indirectly via DenseKvBuffers
+use mlx_native::MlxBuffer;
 use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use std::time::Instant;
@@ -22,6 +22,28 @@ use std::time::Instant;
 use super::forward_mlx::{MlxModelWeights, DenseKvBuffers, dispatch_qmatmul, dispatch_rms_norm_unit_perhead};
 use super::config::LayerType;
 use super::gpu::GpuContext;
+
+/// Helper: dump an F32 MlxBuffer's first `n_elems` to a file at dump_dir.
+fn write_dump_f32(
+    dump_dir: &str,
+    name: &str,
+    layer: usize,
+    tok: usize,
+    buf: &MlxBuffer,
+    n_elems: usize,
+) -> Result<()> {
+    let data: &[f32] = buf.as_slice()
+        .map_err(|e| anyhow::anyhow!("dump {name} L{layer} T{tok}: {e}"))?;
+    let path = format!("{dump_dir}/hf2q_prefill_{name}_layer{layer:02}_tok{tok:03}.bin");
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8,
+            n_elems * std::mem::size_of::<f32>())
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    eprintln!("[PREFILL DUMP] {} L{} T{} ({} f32) -> {}", name, layer, tok, n_elems, path);
+    Ok(())
+}
 
 impl MlxModelWeights {
     /// True batched prefill with dense attention (ADR-009 Track 1).
@@ -95,6 +117,20 @@ impl MlxModelWeights {
 
         eprintln!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
 
+        // ADR-009 Phase 3A: prefill boundary dumps at (target_layer, target_tok).
+        // Controlled by HF2Q_PREFILL_DUMP="layer,tok" e.g. "7,34".
+        let prefill_dump: Option<(usize, usize)> = std::env::var("HF2Q_PREFILL_DUMP")
+            .ok()
+            .and_then(|v| {
+                let parts: Vec<&str> = v.split(',').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+                } else {
+                    None
+                }
+            });
+        let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+
         // ===================================================================
         // Process each prompt token through all layers
         // ===================================================================
@@ -149,6 +185,18 @@ impl MlxModelWeights {
                     let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
                     let (kv_is_sliding, kv_write_pos, kv_capacity, _kv_seq_len) = kv_info[layer_idx];
 
+                    // Active dump flag for this iteration
+                    let dump_here = prefill_dump == Some((layer_idx, tok_i));
+                    // Dump at layer-start: hidden = L(layer_idx-1) l_out (or embed for L0)
+                    if dump_here {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("prefill dump L{layer_idx} T{tok_i} start finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "pre_layer_hidden", layer_idx, tok_i,
+                                        &self.activations.hidden, hs)?;
+                        s = exec.begin()
+                            .map_err(|e| anyhow::anyhow!("prefill dump restart: {e}"))?;
+                    }
+
                     // -- Pre-attention norm --
                     s.barrier_between(
                         &[&self.activations.hidden, &self.layers[layer_idx].norms.input_layernorm],
@@ -162,6 +210,13 @@ impl MlxModelWeights {
                         &self.activations.norm_params,
                         1, hs as u32,
                     ).map_err(|e| anyhow::anyhow!("prefill norm L{layer_idx} T{tok_i}: {e}"))?;
+
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "post_input_norm", layer_idx, tok_i,
+                                        &self.activations.norm_out, hs)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
 
                     // -- QKV projections (concurrent) --
                     s.barrier_between(
@@ -216,6 +271,19 @@ impl MlxModelWeights {
                         nkv as u32, hd as u32, half_rope,
                         eps, theta,
                     ).map_err(|e| anyhow::anyhow!("prefill K norm+RoPE L{layer_idx} T{tok_i}: {e}"))?;
+
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "q_pre_normed", layer_idx, tok_i,
+                                        &self.activations.attn_q, nh * hd)?;
+                        write_dump_f32(&dump_dir, "k_pre_normed", layer_idx, tok_i,
+                                        &self.activations.attn_k, nkv * hd)?;
+                        write_dump_f32(&dump_dir, "q_normed", layer_idx, tok_i,
+                                        &self.activations.attn_q_normed, nh * hd)?;
+                        write_dump_f32(&dump_dir, "k_normed", layer_idx, tok_i,
+                                        &self.activations.attn_k_normed, nkv * hd)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
 
                     // -- V norm --
                     let hd_norm_params = if is_sliding {
@@ -379,6 +447,13 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("prefill dense SDPA L{layer_idx} T{tok_i}: {e}"))?;
 
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "sdpa_out", layer_idx, tok_i,
+                                        &self.activations.sdpa_out, nh * hd)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
+
                     // -- O-proj (same as decode) --
                     s.barrier_between(
                         &[&self.activations.sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
@@ -386,6 +461,13 @@ impl MlxModelWeights {
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
                         &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "attn_out_pre_resid", layer_idx, tok_i,
+                                        &self.activations.attn_out, hs)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
 
                     // -- Fused post-attention norm + residual add --
                     s.barrier_between(
@@ -400,6 +482,13 @@ impl MlxModelWeights {
                         &self.activations.residual,
                         hs as u32, 1, eps,
                     ).map_err(|e| anyhow::anyhow!("prefill post-attn L{layer_idx} T{tok_i}: {e}"))?;
+
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "residual", layer_idx, tok_i,
+                                        &self.activations.residual, hs)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
 
                     // ============================================================
                     // Dense MLP + MoE (identical to forward_decode)
@@ -608,6 +697,13 @@ impl MlxModelWeights {
                         1, hs as u32, eps,
                         scalar_is_vector,
                     ).map_err(|e| anyhow::anyhow!("prefill end-layer L{layer_idx} T{tok_i}: {e}"))?;
+
+                    if dump_here {
+                        s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
+                        write_dump_f32(&dump_dir, "l_out", layer_idx, tok_i,
+                                        &self.activations.hidden, hs)?;
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
+                    }
                 }
 
                 // --- 3. Final norm + lm_head + softcap + argmax ---
