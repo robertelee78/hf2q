@@ -411,6 +411,15 @@ pub struct MlxActivationBuffers {
     pub argmax_value: MlxBuffer,
     /// Argmax params buffer.
     pub argmax_params: MlxBuffer,
+    /// Top-K rerank output buffers — reserved for a future GPU top-K path.
+    /// The current Q8+rerank uses a CPU threshold scan (delta around the Q8
+    /// top-1) which is faster than the prototyped single-threadgroup top-K.
+    #[allow(dead_code)]
+    pub top_k_indices: MlxBuffer,
+    #[allow(dead_code)]
+    pub top_k_values: MlxBuffer,
+    #[allow(dead_code)]
+    pub top_k_params: MlxBuffer,
     /// Logits output buffer `[1, vocab_size]` F32.
     pub logits: MlxBuffer,
     /// MoE scratch: router logits `[1, num_experts]` F32.
@@ -924,6 +933,13 @@ impl MlxModelWeights {
                 let p: &mut [u32] = w.activations.argmax_params.as_mut_slice()
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
+            }
+            // Top-K params: [vocab_size, K]. K=64 is the rerank default.
+            {
+                let p: &mut [u32] = w.activations.top_k_params.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("top_k_params init: {e}"))?;
+                p[0] = w.vocab_size as u32;
+                p[1] = 64;
             }
         }
 
@@ -2017,6 +2033,7 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("GPU argmax: {e}"))?;
             total_dispatches += 1;
 
+
             // === ONE finish() for the entire forward pass ===
             let head_dispatches = total_dispatches - body_dispatches;
             let barrier_count = s.barrier_count();
@@ -2101,6 +2118,28 @@ impl MlxModelWeights {
         let rerank_active = self.lm_head_q8.is_some()
             && !matches!(std::env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0"));
         let token_id: u32 = if rerank_active {
+            // CPU candidate selection via threshold scan over the full Q8
+            // logits. GPU top-K was explored but a single-threadgroup
+            // top-K on vocab=262144 serializes phase 2 onto one thread
+            // and costs ~5 ms/token — worse than the ~40 μs CPU scan.
+            //
+            // Algorithm: read the Q8 top-1 value (from the GPU argmax
+            // output), then collect all tokens with logit ≥ top1 - delta,
+            // plus specials. Delta is chosen larger than the observed
+            // Q8 noise envelope (~5e-3) so the true winner is always in
+            // the set.
+            let top1_q8_val: f32 = {
+                let v: &[f32] = self.activations.argmax_value.as_slice()
+                    .map_err(|e| anyhow::anyhow!("argmax_value read: {e}"))?;
+                v[0]
+            };
+            // Headroom for Q8 noise. Empirical Q8 noise envelope is ~5e-3
+            // per logit, so delta=0.5 is a comfortable ~100× margin. The
+            // candidate set remains small (~10–100 tokens typically) because
+            // real top-K distributions fall off quickly below the winner.
+            let delta: f32 = 0.5;
+            let threshold = top1_q8_val - delta;
+
             let logits: &[f32] = self.activations.logits.as_slice()
                 .map_err(|e| anyhow::anyhow!("rerank logits read: {e}"))?;
             let hidden: &[f32] = self.activations.norm_out.as_slice()
@@ -2108,25 +2147,9 @@ impl MlxModelWeights {
             let embed_f32: &[f32] = self.embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("rerank embed read: {e}"))?;
 
-            let top1_q8 = logits[gpu_top1 as usize];
-            let delta: f32 = 0.01;
-            let top_k: usize = 64;
-
-            let mut candidates: Vec<u32> = Vec::with_capacity(top_k + 16);
-            {
-                // Top-K via partial sort.
-                let mut indexed: Vec<(u32, f32)> = logits[..vocab_size]
-                    .iter().enumerate().map(|(i, &v)| (i as u32, v)).collect();
-                let k = top_k.min(indexed.len());
-                indexed.select_nth_unstable_by(k - 1, |a, b|
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                for &(tok, _) in &indexed[..k] {
-                    candidates.push(tok);
-                }
-            }
-            // Within-delta of top-1.
+            let mut candidates: Vec<u32> = Vec::with_capacity(64);
             for (i, &v) in logits[..vocab_size].iter().enumerate() {
-                if (top1_q8 - v).abs() <= delta {
+                if v >= threshold {
                     candidates.push(i as u32);
                 }
             }
@@ -2138,18 +2161,17 @@ impl MlxModelWeights {
             }
             candidates.sort_unstable();
             candidates.dedup();
+            let _ = (64usize,);  // K anchor for readers: rerank set size typically < 64
 
-            // Exact F32 rerank using the pre-lm_head hidden (norm_out) dotted
-            // against embed_weight row for each candidate. Softcap is monotonic
-            // and applied to all candidates equally, so skipping it doesn't
-            // change argmax order.
+            // Exact F32 rerank via hidden · embed_row. Softcap is monotonic
+            // so skipping it doesn't change argmax order. F64 accumulator
+            // for precision; the set is tiny so cost is negligible.
             let mut best_tok: u32 = gpu_top1;
             let mut best_logit: f32 = f32::NEG_INFINITY;
             for &tok in &candidates {
                 let row_off = (tok as usize) * hs;
                 if row_off + hs > embed_f32.len() { continue; }
                 let row = &embed_f32[row_off..row_off + hs];
-                // F64 accumulator — the candidate set is tiny so cost is negligible.
                 let mut acc: f64 = 0.0;
                 for i in 0..hs {
                     acc += (hidden[i] as f64) * (row[i] as f64);
@@ -3146,6 +3168,9 @@ fn alloc_activation_buffers(
         argmax_index: alloc_u32(1, "argmax_index")?,
         argmax_value: alloc_f32(1, "argmax_value")?,
         argmax_params,
+        top_k_indices: alloc_u32(128, "top_k_indices")?,
+        top_k_values: alloc_f32(128, "top_k_values")?,
+        top_k_params: alloc_u32(2, "top_k_params")?,
         logits: alloc_f32(vocab, "logits")?,
         moe_router_logits: alloc_f32(num_experts, "moe_router_logits")?,
         moe_expert_out: alloc_f32(hs.max(max_kv_heads * max_hd), "moe_expert_out")?,
