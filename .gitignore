@@ -34,7 +34,6 @@ examples/
 ruvector.db
 
 # Local profiling data and scratch docs
-docs/coherence-test.txt
 docs/phase0-candle-perkernel-raw.json
 scripts/dump_layer_states
 
