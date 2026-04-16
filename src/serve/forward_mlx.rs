@@ -858,6 +858,11 @@ impl MlxModelWeights {
             p.s4_dispatches = vec![0; num_layers];
         }
 
+        // ADR-009 Phase 3A: boundary dump at specific token position.
+        // Temporary diagnostic — to be merged into parity capture workflow.
+        let dump_pos: Option<usize> = std::env::var("HF2Q_DUMP_BOUNDARY")
+            .ok().and_then(|v| v.parse::<usize>().ok());
+
         // --- Pre-session CPU work ---
         // Write position buffer (same for all layers)
         {
@@ -1585,6 +1590,30 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
             total_dispatches += 1;
 
+            // --- ADR-009 Phase 3A: boundary dump at specific token position ---
+            if dump_pos == Some(seq_pos) {
+                // Finish session to read GPU buffers
+                s.finish().map_err(|e| anyhow::anyhow!("dump boundary finish: {e}"))?;
+
+                // Dump pre-lm_head (norm_out = final_norm applied to hidden)
+                let norm_out_data: &[f32] = self.activations.norm_out.as_slice()
+                    .map_err(|e| anyhow::anyhow!("dump norm_out: {e}"))?;
+                let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+                let path = format!("{dump_dir}/hf2q_pre_lmhead_pos{seq_pos}.bin");
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        norm_out_data.as_ptr() as *const u8,
+                        hs * std::mem::size_of::<f32>(),
+                    )
+                };
+                std::fs::write(&path, bytes)
+                    .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                eprintln!("[DUMP] pre-lm_head ({hs} f32) -> {path}");
+
+                // Re-begin session for lm_head + argmax
+                s = exec.begin().map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
+            }
+
             // GPU lm_head: mixed-precision mat-vec (F32 input × F16 weights → F32 output)
             // Single dispatch replaces the old 3-dispatch path (cast + gemm + cast).
             if let Some(ref lm_head_f16) = self.lm_head_f16 {
@@ -1670,6 +1699,32 @@ impl MlxModelWeights {
             }
         }
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
+
+        // --- ADR-009 Phase 3A: dump post-lm_head logits at boundary position ---
+        if dump_pos == Some(seq_pos) {
+            let logits_data: &[f32] = self.activations.logits.as_slice()
+                .map_err(|e| anyhow::anyhow!("dump logits: {e}"))?;
+            let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+            let path = format!("{dump_dir}/hf2q_logits_pos{seq_pos}.bin");
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    logits_data.as_ptr() as *const u8,
+                    vocab_size * std::mem::size_of::<f32>(),
+                )
+            };
+            std::fs::write(&path, bytes)
+                .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+            eprintln!("[DUMP] logits ({vocab_size} f32) -> {path}");
+
+            // Also dump top-10 logits for quick inspection
+            let mut indexed: Vec<(usize, f32)> = logits_data[..vocab_size]
+                .iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            eprintln!("[DUMP] top-10 logits at pos {seq_pos}:");
+            for (tok_id, logit) in indexed.iter().take(10) {
+                eprintln!("  tok={tok_id:>6} logit={logit:.6}");
+            }
+        }
 
         // Read the argmax result (8 bytes: 1 u32 index + 1 f32 value)
         let token_id: u32 = {
