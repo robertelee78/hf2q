@@ -217,9 +217,13 @@ int main(int argc, char ** argv) {
     const char * prefill_pos_env = getenv("HF2Q_PREFILL_DUMP_POS");
     int prefill_dump_pos = prefill_pos_env ? atoi(prefill_pos_env) : -1;
 
-    if (prefill_dump_pos >= 0) {
-        fprintf(stderr, "Prefilling %d tokens one-by-one (dump at pos=%d)...\n",
-                n_tokens, prefill_dump_pos);
+    // HF2Q_PER_TOKEN_PREFILL=1 forces per-token prefill (for oracle re-anchoring).
+    const bool per_token_prefill = (getenv("HF2Q_PER_TOKEN_PREFILL") != nullptr);
+
+    if (prefill_dump_pos >= 0 || per_token_prefill) {
+        fprintf(stderr, "Prefilling %d tokens one-by-one%s...\n",
+                n_tokens,
+                prefill_dump_pos >= 0 ? " (with dump)" : "");
         for (int i = 0; i < n_tokens; i++) {
             if (i == prefill_dump_pos) {
                 g_dump.active = true;
@@ -236,12 +240,14 @@ int main(int argc, char ** argv) {
             }
         }
         g_dump.active = false;
-        // Skip decode loop if we're only dumping prefill
-        fprintf(stderr, "Prefill dump complete.\n");
-        llama_free(ctx);
-        llama_model_free(model);
-        llama_backend_free();
-        return 0;
+        if (prefill_dump_pos >= 0 && !per_token_prefill) {
+            // Prefill-dump-only mode: exit after prefill
+            fprintf(stderr, "Prefill dump complete.\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
     } else {
         fprintf(stderr, "Prefilling %d tokens in one batch...\n", n_tokens);
         llama_batch batch = llama_batch_get_one(tokens.data(), n_tokens);
@@ -252,9 +258,16 @@ int main(int argc, char ** argv) {
     }
 
     // Decode loop
+    // HF2Q_PREDICT=<N> sets how many decode tokens to generate (default = target_decode_token+5)
+    const char * predict_env = getenv("HF2Q_PREDICT");
+    int n_predict = predict_env ? atoi(predict_env) : (target_decode_token + 5);
+    // HF2Q_OUTPUT_FILE=<path> writes decoded text to that path
+    const char * output_file = getenv("HF2Q_OUTPUT_FILE");
+    FILE * output_fp = output_file ? fopen(output_file, "w") : nullptr;
+
     int n_decoded = 0;
     llama_token prev_token = -1;
-    for (int i = 0; i < target_decode_token + 5; i++) {
+    for (int i = 0; i < n_predict; i++) {
         // Sample greedy
         auto * logits = llama_get_logits_ith(ctx, -1);
         llama_token best = 0;
@@ -264,6 +277,22 @@ int main(int argc, char ** argv) {
             if (logits[v] > best_logit) {
                 best_logit = logits[v];
                 best = v;
+            }
+        }
+
+        // EOS check
+        if (llama_vocab_is_eog(vocab, best)) {
+            fprintf(stderr, "EOS reached at step %d\n", i);
+            break;
+        }
+
+        // Emit piece
+        if (output_fp) {
+            char piece[128];
+            int len = llama_token_to_piece(vocab, best, piece, sizeof(piece), 0, false);
+            if (len > 0) {
+                fwrite(piece, 1, len, output_fp);
+                fflush(output_fp);
             }
         }
 
@@ -317,6 +346,8 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "Decoded %d tokens\n", n_decoded);
+
+    if (output_fp) fclose(output_fp);
 
     llama_free(ctx);
     llama_model_free(model);
