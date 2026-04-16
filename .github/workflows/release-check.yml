@@ -1,0 +1,107 @@
+name: release-check
+
+# Manual invocation of scripts/release-check.sh — the shipping-contract
+# merge gate (short_hello / sourdough / sliding_wrap parity + decode
+# perf sanity). Requires:
+#
+#   - the Gemma-4 26B DWQ GGUF (~16GB), available on the runner
+#   - llama-completion on PATH (or at /opt/llama.cpp/build/bin/llama-completion)
+#   - tests/evals/reference/*.txt locked-reference fixtures in the tree
+#
+# None of those are available on github-hosted runners, so this
+# workflow only makes sense with a self-hosted macOS runner that has
+# the model pre-populated. If you haven't provisioned one, this
+# workflow will never succeed — it's here so the gate procedure is
+# declarative + reviewable instead of tribal knowledge, and so
+# triggering it is a single UI click once the runner exists.
+#
+# To provision:
+#   1. Set up a self-hosted runner on an Apple Silicon Mac with the
+#      GGUF at a stable absolute path (e.g.
+#      /models/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf) and
+#      llama-completion installed.
+#   2. Add the runner label `hf2q-gates` (configured below).
+#   3. Set the GGUF path as a repo variable `GGUF_PATH`, or pass it
+#      via the `gguf_path` workflow_dispatch input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gguf_path:
+        description: "Absolute path to the Gemma-4 26B DWQ GGUF on the runner. Leave blank to use the GGUF_PATH repo variable."
+        type: string
+        required: false
+        default: ""
+      min_decode_tps:
+        description: "Decode tok/s floor for the perf-sanity gate (default: 95)."
+        type: string
+        required: false
+        default: "95"
+      max_tokens:
+        description: "Max tokens for the perf sanity run (default: 1000)."
+        type: string
+        required: false
+        default: "1000"
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-check:
+    name: parity + perf gates
+    runs-on: [self-hosted, macos, hf2q-gates]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve GGUF path
+        id: gguf
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${{ inputs.gguf_path }}"
+          if [[ -z "$p" ]]; then
+            p="${{ vars.GGUF_PATH }}"
+          fi
+          if [[ -z "$p" ]]; then
+            echo "error: no GGUF path supplied (pass workflow input gguf_path or set repo variable GGUF_PATH)" >&2
+            exit 1
+          fi
+          if [[ ! -f "$p" ]]; then
+            echo "error: GGUF not found at $p" >&2
+            exit 1
+          fi
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain (1.81.0)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-cargo-${{ runner.os }}-
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: scripts/release-check.sh
+        env:
+          GGUF_PATH: ${{ steps.gguf.outputs.path }}
+        run: |
+          scripts/release-check.sh \
+            "$GGUF_PATH" \
+            --min-decode-tps "${{ inputs.min_decode_tps }}" \
+            --max-tokens "${{ inputs.max_tokens }}"

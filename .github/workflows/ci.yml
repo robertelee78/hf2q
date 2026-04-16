@@ -1,0 +1,107 @@
+name: CI
+
+# Per-PR and per-push-to-main build + test gate.
+#
+# Runs on macOS because hf2q's inference path depends on mlx-native,
+# which is Metal-only (Apple Silicon). The release-check.sh parity +
+# perf gate is wired in a separate workflow (release-check.yml) that
+# needs a self-hosted runner with the Gemma-4 26B DWQ GGUF.
+#
+# Lint strictness policy:
+#   * cargo check + build --release + test — BLOCKING; the tree must
+#     compile and pass tests on every push.
+#   * cargo clippy + fmt --check — INFORMATIONAL (continue-on-error);
+#     surfaces lint findings in the job log but does not block merges.
+#     The baseline currently carries pre-existing clippy findings; once
+#     those are cleaned up the policy can flip to blocking.
+#   * activate() warning-matrix smoke — BLOCKING; confirms the
+#     HF2Q_UNSAFE_EXPERIMENTS ack gate (docs/shipping-contract.md)
+#     still refuses/activates/warns correctly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build + test (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.81.0, as pinned in Cargo.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # --- Informational lint pass (does not fail the job) ---
+      - name: cargo fmt --check (informational)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (informational)
+        continue-on-error: true
+        run: cargo clippy --all-targets --all-features -- -W clippy::all
+
+      # --- Blocking compile + test ---
+      - name: cargo check
+        run: cargo check --all-targets --all-features
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test --all-targets --all-features
+
+      # --- Blocking: activate() matrix matches the shipping contract ---
+      - name: activate() matrix smoke (clean / REFUSED / UNSAFE)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "--- clean env should produce no investigation output ---"
+          ./target/release/hf2q --help > /dev/null 2>/tmp/stderr_clean.log
+          if [[ -s /tmp/stderr_clean.log ]]; then
+            echo "FAIL: clean-env run produced stderr:" >&2
+            cat /tmp/stderr_clean.log >&2
+            exit 1
+          fi
+          echo "  OK"
+
+          echo "--- HF2Q_F16_KV=1 without ack must REFUSE ---"
+          HF2Q_F16_KV=1 ./target/release/hf2q --help \
+              > /dev/null 2>/tmp/stderr_refused.log
+          grep -q "REFUSED" /tmp/stderr_refused.log
+          grep -q "HF2Q_F16_KV=1" /tmp/stderr_refused.log
+          echo "  OK"
+
+          echo "--- HF2Q_F16_KV=1 + HF2Q_UNSAFE_EXPERIMENTS=1 must ACTIVATE ---"
+          HF2Q_F16_KV=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
+              ./target/release/hf2q --help \
+              > /dev/null 2>/tmp/stderr_unsafe.log
+          grep -q "UNSAFE (ack-required, activated)" /tmp/stderr_unsafe.log
+          ! grep -q "REFUSED" /tmp/stderr_unsafe.log
+          echo "  OK"
