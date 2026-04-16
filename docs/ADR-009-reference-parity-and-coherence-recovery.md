@@ -1334,6 +1334,43 @@ Shift from "find the kernel bug" to "find the earliest cache drift origin":
 3. Trace that hidden state backward through the layer stack to find which sub-kernel first introduces drift
 4. Only then decide whether the root cause is attention, residual, norm, quantized matmul, or the MLP/MoE path
 
+### Oracle re-anchor — prefill-mode is a major factor (2026-04-16)
+
+Built a minimal per-token llama runner (`HF2Q_PER_TOKEN_PREFILL=1` in `scripts/dump_layer_states`) and ran three-way comparisons:
+
+**sliding_wrap (82-token prompt, 500-token decode):**
+
+| Pair | Common prefix |
+|---|---:|
+| hf2q per-token vs llama BATCHED | 752 bytes |
+| hf2q per-token vs llama PER-TOKEN | **1569 bytes** |
+| llama PER-TOKEN vs llama BATCHED | 752 bytes |
+
+On long prompts, hf2q matches llama per-token 2x better than llama batched. The 752-byte "gap" was dominated by prefill-mode mismatch, not hf2q drift.
+
+**sourdough (22-token prompt, 1000-token decode):**
+
+| Pair | Common prefix |
+|---|---:|
+| hf2q per-token vs llama BATCHED | **3656 bytes** |
+| hf2q per-token vs llama PER-TOKEN | 3095 bytes |
+| llama PER-TOKEN vs llama BATCHED | 3095 bytes |
+
+On short prompts, hf2q matches llama batched better than llama per-token. The direction reverses.
+
+**Implications:**
+- Per-token vs batched prefill produces materially different trajectories in llama.cpp itself (not an hf2q bug)
+- Neither mode is uniquely "correct"; both produce valid outputs
+- The production llama.cpp default is batched prefill; that is therefore the natural parity target
+- Matching llama.cpp's BATCHED trajectory requires implementing true batched prefill in hf2q (not per-token with dense F32 SDPA as we do today)
+- The existing (L7, pos 34) "earliest cache drift" finding is INVALID as evidence of an hf2q bug — it was comparing hf2q per-token K against llama BATCHED cache, which are legitimately different
+
+**Revised Phase 3A plan (again):**
+
+1. **Primary path:** Implement true batched prefill in hf2q (multi-query SDPA over the prompt in one kernel call). This is the natural oracle-matching path and is also faster than token-by-token prefill.
+2. **Fallback path:** If batched prefill is too large a surface, document that hf2q targets llama.cpp per-token prefill (and generate per-token reference as the new oracle) with the current 67% sliding_wrap parity as the starting baseline.
+3. Resume kernel-level investigation only if, after matching prefill mode, significant remaining drift persists.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
