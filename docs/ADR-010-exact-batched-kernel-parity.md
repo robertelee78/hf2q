@@ -39,29 +39,56 @@ Phase 3A's `forward_prefill_batched` (gated behind `HF2Q_BATCHED_PREFILL=1`) did
 
 Pursue exact batched-kernel parity as a separate, narrowly scoped investigation outside ADR-009. This ADR defines the scope and acceptance criteria.
 
+### Localization (2026-04-16 session — what the data showed)
+
+Per-layer and per-stage bisection at (sliding_wrap, pos 34) in batched mode narrowed the seam much further than ADR-009's "attention path" hypothesis:
+
+1. **Per-layer l_out scan** (hf2q batched vs llama batched):
+   - Layers 0–5 all tight at rel_rms 1.3e-4 to 2.1e-4
+   - Layer 6 output: rel_rms 2.91e-2 — **a 200× jump in a single layer**
+   - Layers 7+ continue to accumulate to 1.7e-1 by the final layer
+
+2. **L6 sub-stage bisection** — attention is entirely clean:
+   - Input (L5 l_out): 1.34e-4
+   - Pre-attn norm output: 3.13e-4
+   - Q/K/V post-QKV matmul: 2.2–3.4e-4
+   - Q/K post head-norm + RoPE: 2.2–2.4e-4
+   - SDPA output (kqv_out): 5.47e-4
+   - Post-attn residual vs llama `attn_out`: 1.66e-4
+   - Router logits: **1.58e-4** (still tight)
+   - MLP+MoE combined: **5.45e-2** (jump)
+   - L6 l_out: 2.91e-2
+
+3. **Root cause — MoE top-K threshold sensitivity**:
+   - Router logits agree between hf2q and llama to ~1e-4 (the matmul noise floor).
+   - But at L6 pos 34 the 7th and 8th ranked logits differ by only **0.0001**, below the matmul noise floor.
+   - hf2q picks expert 95 at rank 7; llama picks expert 61. Seven of eight top-K picks match; one swap is enough.
+   - That one expert swap drives the 5.5% divergence in the MoE weighted sum; post-FF norm and layer_scalar carry it to 2.9% at L6's l_out, which then propagates.
+
+### Defensible framing
+
+Current evidence shows the remaining long-sequence batched parity gap is driven by **router matmul numerical differences crossing MoE top-K thresholds** at a small number of early tokens — not by attention kernels and not by an "intrinsic" implementation gap. Exact batched parity therefore requires **tighter router-logit agreement than the current owned router matmul provides**. hf2q's top-K selection already breaks true ties deterministically (lower expert_id on strict tie), and llama's is implementation-defined (`std::sort` unstable), so a stable-tiebreak change in hf2q is not the fix — the logits themselves need to agree more tightly than the current ~1e-4 floor allows under 0.0001 expert-gap conditions.
+
 ### In scope
 
-1. **Boundary dumps at batched-kernel sub-stages**
-   - After QK GEMM, before softmax (raw attention logits, all rows)
-   - After softmax, before V aggregation (attention weights)
-   - After V aggregation (sdpa_out per head, per row)
-   - For layers 0–8 of the sliding attention stack at prompt positions covering the full prefill window.
+1. **Router matmul exactness (FIRST concrete implementation target).**
+   - Port ggml's router projection reduction order into a dedicated `router_matmul` kernel in mlx-native, used only at the `ffn_gate_inp` call site.
+   - Small surface: input `[hs=2816]` × weight `[num_experts=128, hs]` → logits `[num_experts]` per token. The weight is already quantized — the alignment is about reduction/accumulation order over the K dimension, not the full qmatmul framework.
+   - Replicate llama's `build_lora_mm(ffn_gate_inp, tmp)` behavior precisely, including the preceding `ggml_mul(ctx0, tmp, ffn_gate_inp_s)` scaling.
+   - Gate behind `HF2Q_ROUTER_EXACT=1` initially so we can A/B measure.
+   - Decisive checks only: (a) L6 pos 34 router logits ≤ 1e-5 rel_rms, (b) L6 pos 34 expert IDs match exactly, (c) sliding_wrap vs llama batched common-prefix moves materially, (d) no regression on sourdough or sliding_wrap vs per-token llama reference.
 
-2. **Reduction-order alignment**
-   - Compare hf2q's tiled `sdpa` reduction order with ggml's flash-attention-ext tile loop structure.
-   - Identify any divergence in accumulator zeroing, tile boundary FMA order, or row-max / row-sum stability.
+2. **Per-layer scan to confirm no other seams.**
+   - With router exact, re-run the per-layer l_out scan on sliding_wrap. If L6 jump is gone but another layer shows a new jump, bisect there.
 
-3. **Accumulator/precision alignment**
-   - Verify both stacks use identical accumulator precision (F32) at every reduction.
-   - Check for unintended F16 intermediate in the hf2q path.
-
-4. **Kernel-level reference replication**
-   - If sub-stage dumps localize the gap to a single kernel (e.g., batched QK GEMM), consider porting that specific kernel to mirror llama's implementation. This is a targeted bit-exact replication, not a full framework rewrite.
+3. **Sub-stage boundary instrumentation (already landed).**
+   - The `HF2Q_BATCHED_DUMP="layer,tok"` and `HF2Q_BATCHED_LAYER_SCAN="tok"` env vars in `forward_prefill_batched.rs` plus the extended `dump_layer_states` tool cover all sub-stages we need. Kept as the standing diagnostic for this ADR.
 
 ### Explicitly out of scope (for now)
 
-- **Direct ggml integration.** Violates ADR-008 ("we own the stack"). Only reconsider if the parity cost/benefit dramatically favors it after sub-stage evidence is collected.
-- **Rewriting hf2q's general GPU framework.** This ADR is about matching a specific numerical trajectory, not about reshaping the compute architecture.
+- **Flash-attention-vec bit-exact replication.** Evidence shows attention is not the seam in batched mode — SDPA output is within 5.5e-4 of llama's. Deferred unless a future layer-scan reveals an attention-specific jump after the router fix.
+- **Direct ggml integration of whole framework.** Violates ADR-008. Only reconsider if router-matmul alignment doesn't close the gap and layer-scan reveals distributed sub-1e-4 noise accumulation.
+- **Rewriting hf2q's general GPU framework.** This ADR is about matching a specific numerical trajectory, not reshaping compute architecture.
 
 ## Acceptance Criteria
 
@@ -100,3 +127,15 @@ Not strictly a parity concern, but completed alongside the nondeterminism / drif
 
 - 2026-04-16: Proposed. ADR-009 Phase 3A closed. This work begins when product priorities next permit returning to parity.
 - 2026-04-16: Ring-buffer dense KV for sliding layers landed as a prerequisite memory win for long-context work. Nondeterminism and long-decode drift characterized and folded into this ADR's scope.
+- 2026-04-16: Layer-by-layer and sub-stage bisection landed (commits `012b011`, `7e0cdbb`, `ba1b98e`, `2058f76`). Seam localized to L6 MoE router top-K threshold.
+- 2026-04-16: **Router matmul exactness (option 2) INVALIDATED by F64 reconciliation.** Python F64 reference matmul reconstruction at (L6, pos 34) shows:
+  - hf2q's router matmul already matches Python F64 to rel_rms 1.25e-7 (kernel is F64-precise given its inputs).
+  - llama's router matmul matches Python F64 to rel_rms 1.30e-4 (slightly less precise than hf2q's, per its own inputs).
+  - Even with pure F64 matmul, hf2q's expert selection still picks e95 over e61 because its **input** (`pf_residual`) differs from llama's `attn_out` by 1.66e-4 — and that input drift is below the 0.0001 true logit gap between experts 61 and 95.
+  - Top-K truly cannot be stabilized by matmul precision alone on this token. The router is the messenger, not the source.
+
+**Reframe:** the precision floor is the end-to-end attention+norm+residual chain, which delivers L6's MLP/MoE input with ~1.6e-4 drift under batched F32. That is below the MoE's 1e-4 top-K logit gap for this token, so the gate flips. Closing this would require either:
+  1. Pervasive kernel alignment across the whole pre-MoE chain at the ~1e-5 level (a substantially wider engineering effort than a single targeted kernel).
+  2. Structural mitigation at the MoE gate itself (e.g., tie-aware routing, logit smoothing) — not what Gemma4 specifies.
+
+For practical purposes, the sliding_wrap 752-byte batched-vs-batched ceiling reflects a **genuine sensitivity of MoE top-K to sub-kernel-precision input noise**, not a single kernel mismatch. Unless a future effort pursues (1), this ADR should be closed as "localized, understood, not pursuing" rather than "next concrete implementation target".
