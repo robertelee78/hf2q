@@ -1613,6 +1613,8 @@ impl MlxModelWeights {
         Ok(token_id)
     }
 
+    // forward_prefill() is defined in forward_prefill.rs (ADR-009 Track 1).
+
     /// Per-kernel-type profiling forward pass.
     ///
     /// Breaks the single session into one session PER KERNEL TYPE PER LAYER,
@@ -2414,7 +2416,7 @@ fn load_gguf_qweight(
 ///
 /// Same as `dispatch_rms_norm_perhead` but uses `rms_norm_no_scale_f32`
 /// (no weight buffer — just unit normalization).
-fn dispatch_rms_norm_unit_perhead(
+pub fn dispatch_rms_norm_unit_perhead(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut mlx_native::KernelRegistry,
     device: &mlx_native::metal::DeviceRef,

@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod forward_mlx;
+pub mod forward_prefill;
 pub mod gpu;
 #[allow(dead_code)]
 pub mod sampler_pure;
@@ -270,21 +271,10 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let kernel_profile_mode = std::env::var("HF2Q_MLX_KERNEL_PROFILE")
         .map_or(false, |v| v == "1");
 
-    // Prefill: process prompt tokens one at a time through mlx-native.
-    eprintln!("Prefilling {} tokens (mlx-native, per-token)...", prompt_tokens.len());
-    let prefill_start = std::time::Instant::now();
-    let mut last_token = 0u32;
-    for (i, &tok) in prompt_tokens.iter().enumerate() {
-        let mut p = None; // don't profile prefill
-        last_token = mlx_w.forward_decode(tok, i, &mut ctx, &mut p)?;
-    }
-    let prefill_elapsed = prefill_start.elapsed();
-    eprintln!(
-        "Prefill complete in {:.1} ms ({} tokens, {:.1} tok/s).",
-        prefill_elapsed.as_secs_f64() * 1000.0,
-        prompt_tokens.len(),
-        prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64(),
-    );
+    // Prefill: true batched prefill with dense SDPA (ADR-009 Track 1).
+    // Uses dense F32 attention instead of TQ-packed attention during prompt
+    // ingestion to eliminate compounding quantization noise.
+    let last_token = mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?;
 
     // Decode
     let mut all_tokens = prompt_tokens.to_vec();
