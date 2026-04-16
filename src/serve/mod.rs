@@ -5,6 +5,7 @@
 pub mod config;
 pub mod forward_mlx;
 pub mod forward_prefill;
+pub mod forward_prefill_batched;
 pub mod gpu;
 #[allow(dead_code)]
 pub mod sampler_pure;
@@ -274,7 +275,15 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // Prefill: true batched prefill with dense SDPA (ADR-009 Track 1).
     // Uses dense F32 attention instead of TQ-packed attention during prompt
     // ingestion to eliminate compounding quantization noise.
-    let last_token = mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?;
+    // ADR-009 Phase 3A: HF2Q_BATCHED_PREFILL=1 uses the new batched prefill
+    // path (matches llama.cpp default). Per-token remains default until
+    // parity is validated.
+    let use_batched = std::env::var("HF2Q_BATCHED_PREFILL").map_or(false, |v| v == "1");
+    let last_token = if use_batched {
+        mlx_w.forward_prefill_batched(&prompt_tokens, &mut ctx)?
+    } else {
+        mlx_w.forward_prefill(&prompt_tokens, &mut ctx)?
+    };
 
     // Decode
     let mut all_tokens = prompt_tokens.to_vec();
