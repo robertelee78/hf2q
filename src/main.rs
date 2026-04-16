@@ -100,7 +100,9 @@ fn main() -> ExitCode {
     // -vv to debug, -vvv+ to trace. At verbosity 0, RUST_LOG wins; if
     // unset, defaults to hf2q=warn (silent on the generate boot path).
     // Stderr writer: logs never touch stdout, keeping the generation
-    // stream unpolluted.
+    // stream unpolluted. ANSI colors only when stderr is a TTY, so
+    // piped/redirected logs are plain text (AC-4).
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
     let filter = match cli.verbose {
         0 => EnvFilter::try_from_default_env()
@@ -109,9 +111,11 @@ fn main() -> ExitCode {
         2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
         _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
     };
+    let stderr_is_tty = std::io::stderr().is_terminal();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(stderr_is_tty)
         .without_time()
         .init();
 

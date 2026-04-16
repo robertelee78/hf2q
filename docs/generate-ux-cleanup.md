@@ -57,10 +57,14 @@ Doing the UX cleanup with a `Verbosity` enum first and migrating to `tracing` la
 
 Every existing print site on the `generate` boot/run path, with its reason for existing. **No site is deleted outright — each gets reclassified.**
 
-### 2.1 `src/serve/mod.rs` — `cmd_generate`
+### 2.1 `src/serve/mod.rs` — `cmd_generate` + chat-template resolution
 
 | Line | Current | Purpose | Target |
 |------|---------|---------|--------|
+| 132  | `tracing::info!("Chat template: using CLI --chat-template override")` | Chat template source decision | `info!` — no change |
+| 138  | `tracing::info!("Chat template: loading from --chat-template-file {}", ...)` | Same | `info!` — no change |
+| 146  | `tracing::info!("Chat template: using GGUF metadata tokenizer.chat_template ({} chars)", ...)` | Same | `info!` — no change |
+| 154  | `tracing::warn!("Chat template: no GGUF metadata ... falling back ...")` | Chat template fallback warning | `warn!` — no change |
 | 192  | `tracing::info!("Model: {}", ...)` | Path echo for debugging mis-resolution | `info!` — no change |
 | 193  | `tracing::info!("Tokenizer: {}", ...)` | Same | `info!` — no change |
 | 194  | `tracing::info!("Config: {}", ...)` | Same | `info!` — no change |
@@ -74,6 +78,12 @@ Every existing print site on the `generate` boot/run path, with its reason for e
 | 249  | `tracing::info!("Prompt: {} tokens", ...)` | Tokenization sanity check | `info!` — no change |
 | 268  | `eprintln!("Running mlx-native forward pass...")` | Step marker pre-prefill | `info!` |
 | 339  | `eprintln!("\n\n--- mlx-native: ... tok/s ---")` | Post-generation footer with decode speed | **Trailer: stays as stderr product output** (dim on TTY) |
+
+### 2.1b `src/serve/gpu.rs`
+
+| Line | Current | Purpose | Target |
+|------|---------|---------|--------|
+| 55   | `tracing::info!("mlx-native GpuContext initialized on {}", gpu_name)` | GPU context init ack | `info!` — no change |
 
 ### 2.2 `src/serve/forward_mlx.rs` — weight loading
 
