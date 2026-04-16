@@ -943,6 +943,10 @@ impl MlxModelWeights {
             };
 
             // --- 2. Transformer layers ---
+            // Phase 3A: sub-layer detail dump (which specific layer to break down)
+            let dump_detail_layer: Option<usize> = std::env::var("HF2Q_DUMP_LAYER_DETAIL")
+                .ok().and_then(|v| v.parse::<usize>().ok());
+
             for layer_idx in 0..num_layers {
                 let hd = self.head_dims[layer_idx];
                 let nkv = self.num_kv_heads[layer_idx];
@@ -1229,6 +1233,29 @@ impl MlxModelWeights {
                     total_dispatches += 2; // main + reduce
                 }
 
+                // ADR-009 Phase 3A: dump sdpa_out before O-proj
+                if dump_layers && dump_detail_layer == Some(layer_idx) {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("dump sdpa_out finish L{layer_idx}: {e}"))?;
+                    let sdpa_data: &[f32] = self.activations.sdpa_out.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump sdpa_out L{layer_idx}: {e}"))?;
+                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+                        .unwrap_or_else(|_| "/tmp".into());
+                    let sdpa_elems = nh * hd; // [nh, 1, hd] flattened
+                    let path = format!("{dump_dir}/hf2q_sdpa_out_layer{layer_idx:02}_pos{seq_pos}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            sdpa_data.as_ptr() as *const u8,
+                            sdpa_elems * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] sdpa_out layer {layer_idx:02} ({sdpa_elems} f32) -> {path}");
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("dump sdpa_out re-begin L{layer_idx}: {e}"))?;
+                }
+
                 // -- O-proj --
                 s.barrier_between(
                     &[&self.activations.sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
@@ -1252,9 +1279,7 @@ impl MlxModelWeights {
                     hs as u32, 1, eps,
                 ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
 
-                // ADR-009 Phase 3A: sub-layer dump at attention boundary.
-                let dump_detail_layer: Option<usize> = std::env::var("HF2Q_DUMP_LAYER_DETAIL")
-                    .ok().and_then(|v| v.parse::<usize>().ok());
+                // (dump_detail_layer already declared above for sdpa_out dump)
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;

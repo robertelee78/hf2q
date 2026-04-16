@@ -42,10 +42,13 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     const char * name = ggml_get_name(t);
     if (!name) return true;
 
-    // We want "l_out" and "attn_out" tensors
+    // We want "l_out", "attn_out", and "kqv_out" tensors
+    // kqv_out is the raw SDPA output before O-proj in llama.cpp
     bool is_l_out = (strncmp(name, "l_out", 5) == 0);
     bool is_attn_out = (strncmp(name, "attn_out", 8) == 0);
-    if (!is_l_out && !is_attn_out) return true;
+    bool is_kqv_out = (strncmp(name, "kqv_out", 7) == 0);
+    bool is_kqv = (!is_kqv_out && strncmp(name, "kqv", 3) == 0 && (name[3] == '-' || name[3] == '\0'));
+    if (!is_l_out && !is_attn_out && !is_kqv_out && !is_kqv) return true;
 
     // Extract layer number from name: "l_out-0", "attn_out-0", etc.
     int layer = -1;
@@ -53,7 +56,7 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (dash) {
         layer = atoi(dash + 1);
     }
-    const char * prefix = is_l_out ? "l_out" : "attn_out";
+    const char * prefix = is_l_out ? "l_out" : (is_attn_out ? "attn_out" : (is_kqv_out ? "kqv_out" : "kqv"));
 
     // Get tensor data
     int64_t n_elements = ggml_nelements(t);
