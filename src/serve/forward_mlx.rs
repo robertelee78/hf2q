@@ -1264,11 +1264,22 @@ impl MlxModelWeights {
                           &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
                         &[&self.activations.sdpa_out],
                     );
+                    // Dense cache is linear (all positions filled), so kv_seq_len
+                    // must be the true position count (seq_pos + 1), NOT the
+                    // TQ-cache kv_seq_len which is clamped to capacity=sliding_window.
+                    // Using the clamped value would make flash_attn_vec's causal
+                    // bound (causal_max_k = kv_seq_len) stop at position 1023 even
+                    // when the current query is at seq_pos > 1023, causing the mask
+                    // to attend to the OLDEST 1024 positions instead of the current
+                    // sliding window. The sliding_window field still limits the
+                    // mask's window_start; the linear kv_seq_len just tells the
+                    // kernel where the current query actually is.
+                    let dense_kv_seq_len = (seq_pos + 1) as u32;
                     let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
                         head_dim: hd as u32,
-                        kv_seq_len: kv_seq_len as u32,
+                        kv_seq_len: dense_kv_seq_len,
                         kv_capacity: dense_cap as u32,
                         scale: 1.0,
                         mask_type: if is_sliding { 2 } else { 1 },
