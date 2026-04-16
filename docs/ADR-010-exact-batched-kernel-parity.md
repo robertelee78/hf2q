@@ -83,8 +83,20 @@ Pursue exact batched-kernel parity as a separate, narrowly scoped investigation 
 
 ## Deferred Work Also Tracked Separately
 
-- **Greedy nondeterminism at T=0** (observed in both 3fb8988 and 8a02725). Low rate (~2–3% of sourdough runs) but not deterministic. Roots likely in GPU argmax tie-breaks or reduction ordering. Not in scope for this ADR — should get its own issue.
+- **Greedy nondeterminism at T=0.** Historically observed at ~2–3% on 3fb8988 and 8a02725 but *not reproducing in current sessions*: 40/40 runs at common=3656 on 7dba9f9. Earlier outliers may have been transient (thermal / memory pressure). Argmax kernel is deterministic (strict `>` tree reduction). If repro returns, suspect matmul reduction order in lm_head mixed-precision matvec. Deferred pending reliable repro.
+
+- **Long-decode single-token drift vs llama on non-gate prompts.** On the `Comlprehensive instructions for making sourdough bread.` prompt (different typo placement than the gate's `Complrehensive`), hf2q and llama diverge at the first tight logit tie-break (~decode token 570): hf2q picks `kneading`, llama picks `intense kneading`. On the same prompt, a later tie-break at decode ~675 produces a `####DP 4.` glyph artifact where a Markdown header-and-space pair tokenizes as `[####, DP,  4]` instead of `[####,  4]`. Neither gate prompt hits these tiebreaks within 3656 / 2354 bytes, so the gates pass byte-identical. This is a concrete instance of the exact-batched-kernel-parity gap this ADR is chartered to address — fixing it requires either (a) sub-stage boundary dumps + kernel reduction-order alignment, or (b) increased accumulator precision in the matmul / flash_attn_vec reductions. Not a separate issue; folded into this ADR's sub-stage investigation scope.
+
+## Memory Optimization Landed (2026-04-16)
+
+Not strictly a parity concern, but completed alongside the nondeterminism / drift investigation because it shares the dense-KV code path. Commit `7dba9f9`:
+
+- Sliding layers now use a ring-buffer dense KV cache (capacity = `sliding_window = 1024`, writes wrap at `seq_pos % capacity`). Global layers stay linear.
+- Dense `flash_attn_vec` uses `mask_type = 1` (causal) in ring mode; the ring itself applies the sliding constraint. Correctness rests on attention being permutation-invariant over cached K,V (RoPE is baked in pre-cache).
+- Memory at a 20k decode budget: 7.4 GB → ~2.75 GB dense KV (−4.6 GB, −62%).
+- All gates pass unchanged; 1353-token coherence test produces identical clean-EOS output at 91.5 tok/s.
 
 ## Status Log
 
 - 2026-04-16: Proposed. ADR-009 Phase 3A closed. This work begins when product priorities next permit returning to parity.
+- 2026-04-16: Ring-buffer dense KV for sliding layers landed as a prerequisite memory win for long-context work. Nondeterminism and long-decode drift characterized and folded into this ADR's scope.
