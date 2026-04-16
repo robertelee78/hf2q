@@ -59,18 +59,30 @@ impl MlxModelWeights {
         // Capacity = seq_len + 1024 to allow decode to continue using
         // dense attention for up to 1024 additional tokens.
         // ===================================================================
+        // ADR-009 Phase 3A finding: matching llama.cpp's F16 KV cache
+        // REGRESSED our parity (sourdough 3656→3095, sliding_wrap 752→627).
+        // llama.cpp itself is insensitive to KV dtype (its F16 and F32 outputs
+        // are byte-identical). Our F16 path has a separate bug worse than F32.
+        // F32 remains the default; F16 is opt-in via HF2Q_F16_KV=1 for the
+        // follow-up investigation into the F16-specific regression.
+        let use_f16_kv = std::env::var("HF2Q_F16_KV").map_or(false, |v| v == "1");
+        let kv_dtype = if use_f16_kv { mlx_native::DType::F16 } else { mlx_native::DType::F32 };
+        let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
+        eprintln!("Prefill: KV cache dtype = {:?}", kv_dtype);
+
         let dense_capacity = seq_len + 1024;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let nkv = self.num_kv_heads[layer_idx];
             let hd = self.head_dims[layer_idx];
             let n = nkv * dense_capacity * hd;
-            let k = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, dense_capacity, hd])
+            let k = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, dense_capacity, hd])
                 .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-            let v = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, dense_capacity, hd])
+            let v = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, dense_capacity, hd])
                 .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
             dense_kvs_vec.push(DenseKvBuffers { k, v });
         }
+        let _ = f32_sz; // kept for clarity; unused after dtype switch
 
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
         let max_nh = self.num_attention_heads;
@@ -256,26 +268,46 @@ impl MlxModelWeights {
                         &[&self.activations.attn_k_normed, v_src],
                         &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
                     );
-                    for h in 0..nkv {
-                        // K: copy head h from attn_k_normed
-                        mlx_native::ops::copy::dispatch_copy_f32(
+                    if use_f16_kv {
+                        // F16 KV: use the kv_cache_copy_batch_f32_to_f16 kernel to
+                        // cast and write one token's K,V into all heads at once.
+                        // Layout: cache is [n_heads, capacity, head_dim] F16 (matches).
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
                             &self.activations.attn_k_normed,
                             &dense_kvs_vec[layer_idx].k,
-                            h * hd,                              // src: head h in [nkv, hd]
-                            h * dense_capacity * hd + tok_i * hd, // dst: [h, tok_i, :] in [nkv, capacity, hd]
-                            hd,
-                        ).map_err(|e| anyhow::anyhow!("prefill K copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
-
-                        // V: copy head h from v_src
-                        mlx_native::ops::copy::dispatch_copy_f32(
+                            nkv as u32, hd as u32,
+                            dense_capacity as u32, tok_i as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill F16 K copy L{layer_idx} T{tok_i}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
                             &dense_kvs_vec[layer_idx].v,
-                            h * hd,
-                            h * dense_capacity * hd + tok_i * hd,
-                            hd,
-                        ).map_err(|e| anyhow::anyhow!("prefill V copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
+                            nkv as u32, hd as u32,
+                            dense_capacity as u32, tok_i as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill F16 V copy L{layer_idx} T{tok_i}: {e}"))?;
+                    } else {
+                        for h in 0..nkv {
+                            // F32 K: copy head h from attn_k_normed
+                            mlx_native::ops::copy::dispatch_copy_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed,
+                                &dense_kvs_vec[layer_idx].k,
+                                h * hd,
+                                h * dense_capacity * hd + tok_i * hd,
+                                hd,
+                            ).map_err(|e| anyhow::anyhow!("prefill K copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
+
+                            // F32 V: copy head h from v_src
+                            mlx_native::ops::copy::dispatch_copy_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                v_src,
+                                &dense_kvs_vec[layer_idx].v,
+                                h * hd,
+                                h * dense_capacity * hd + tok_i * hd,
+                                hd,
+                            ).map_err(|e| anyhow::anyhow!("prefill V copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
+                        }
                     }
 
                     // Also TQ-encode into packed cache (for subsequent decode)

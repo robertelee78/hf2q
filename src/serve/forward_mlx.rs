@@ -1149,32 +1149,52 @@ impl MlxModelWeights {
 
                 if use_dense_sdpa {
                     // -- Dense decode SDPA (ADR-009 Track 3) --
-                    // Copy this position's K,V into dense KV buffers
+                    // Copy this position's K,V into dense KV buffers.
+                    // Uses F16 cast kernel when dense_kvs are F16, else F32 copy.
                     let dense_kvs = self.dense_kvs.as_ref().unwrap();
                     let dense_cap = self.dense_kv_capacity;
+                    let kv_is_f16 = dense_kvs[layer_idx].k.dtype() == mlx_native::DType::F16;
                     s.barrier_between(
                         &[&self.activations.attn_k_normed, v_src],
                         &[&dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
                     );
-                    for h in 0..nkv {
-                        mlx_native::ops::copy::dispatch_copy_f32(
+                    if kv_is_f16 {
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
                             &self.activations.attn_k_normed,
                             &dense_kvs[layer_idx].k,
-                            h * hd,
-                            h * dense_cap * hd + seq_pos * hd,
-                            hd,
-                        ).map_err(|e| anyhow::anyhow!("decode dense K copy h{h} L{layer_idx}: {e}"))?;
-                        mlx_native::ops::copy::dispatch_copy_f32(
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, seq_pos as u32,
+                        ).map_err(|e| anyhow::anyhow!("decode F16 K copy L{layer_idx}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
                             &dense_kvs[layer_idx].v,
-                            h * hd,
-                            h * dense_cap * hd + seq_pos * hd,
-                            hd,
-                        ).map_err(|e| anyhow::anyhow!("decode dense V copy h{h} L{layer_idx}: {e}"))?;
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, seq_pos as u32,
+                        ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 2;
+                    } else {
+                        for h in 0..nkv {
+                            mlx_native::ops::copy::dispatch_copy_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed,
+                                &dense_kvs[layer_idx].k,
+                                h * hd,
+                                h * dense_cap * hd + seq_pos * hd,
+                                hd,
+                            ).map_err(|e| anyhow::anyhow!("decode dense K copy h{h} L{layer_idx}: {e}"))?;
+                            mlx_native::ops::copy::dispatch_copy_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                v_src,
+                                &dense_kvs[layer_idx].v,
+                                h * hd,
+                                h * dense_cap * hd + seq_pos * hd,
+                                hd,
+                            ).map_err(|e| anyhow::anyhow!("decode dense V copy h{h} L{layer_idx}: {e}"))?;
+                        }
+                        total_dispatches += nkv * 2;
                     }
-                    total_dispatches += nkv * 2;
 
                     // ADR-009 Phase 3A: dump full cached K/V for the detail layer
                     if dump_layers && dump_detail_layer == Some(layer_idx) {
@@ -1182,22 +1202,38 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
                         let dump_dir = std::env::var("HF2Q_DUMP_DIR")
                             .unwrap_or_else(|_| "/tmp".into());
-                        let cache_elems = nkv * dense_cap * hd;
-                        // Only dump the valid portion [nkv, kv_seq_len, hd]
-                        let k_data: &[f32] = dense_kvs[layer_idx].k.as_slice()
-                            .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
-                        let v_data: &[f32] = dense_kvs[layer_idx].v.as_slice()
-                            .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
-                        // Pack [nkv, kv_seq_len, hd] into a tight buffer
+                        // Pack [nkv, kv_seq_len, hd] into a tight F32 buffer for comparison
                         let valid_len = kv_seq_len;
                         let mut k_valid = vec![0.0f32; nkv * valid_len * hd];
                         let mut v_valid = vec![0.0f32; nkv * valid_len * hd];
-                        for h in 0..nkv {
-                            for p in 0..valid_len {
-                                let src = h * dense_cap * hd + p * hd;
-                                let dst = h * valid_len * hd + p * hd;
-                                k_valid[dst..dst+hd].copy_from_slice(&k_data[src..src+hd]);
-                                v_valid[dst..dst+hd].copy_from_slice(&v_data[src..src+hd]);
+                        if kv_is_f16 {
+                            // Read F16 bits and convert to F32
+                            let k_raw: &[u16] = dense_kvs[layer_idx].k.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
+                            let v_raw: &[u16] = dense_kvs[layer_idx].v.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
+                            for h in 0..nkv {
+                                for p in 0..valid_len {
+                                    let src = h * dense_cap * hd + p * hd;
+                                    let dst = h * valid_len * hd + p * hd;
+                                    for i in 0..hd {
+                                        k_valid[dst+i] = half::f16::from_bits(k_raw[src+i]).to_f32();
+                                        v_valid[dst+i] = half::f16::from_bits(v_raw[src+i]).to_f32();
+                                    }
+                                }
+                            }
+                        } else {
+                            let k_data: &[f32] = dense_kvs[layer_idx].k.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
+                            let v_data: &[f32] = dense_kvs[layer_idx].v.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
+                            for h in 0..nkv {
+                                for p in 0..valid_len {
+                                    let src = h * dense_cap * hd + p * hd;
+                                    let dst = h * valid_len * hd + p * hd;
+                                    k_valid[dst..dst+hd].copy_from_slice(&k_data[src..src+hd]);
+                                    v_valid[dst..dst+hd].copy_from_slice(&v_data[src..src+hd]);
+                                }
                             }
                         }
                         let k_path = format!("{dump_dir}/hf2q_cache_k_layer{layer_idx:02}_pos{seq_pos}.bin");
@@ -1212,9 +1248,9 @@ impl MlxModelWeights {
                             .map_err(|e| anyhow::anyhow!("write {k_path}: {e}"))?;
                         std::fs::write(&v_path, v_bytes)
                             .map_err(|e| anyhow::anyhow!("write {v_path}: {e}"))?;
-                        eprintln!("[DUMP] cache K layer {layer_idx:02} [{nkv},{valid_len},{hd}] -> {k_path}");
-                        eprintln!("[DUMP] cache V layer {layer_idx:02} [{nkv},{valid_len},{hd}] -> {v_path}");
-                        let _ = cache_elems;
+                        let dtype_str = if kv_is_f16 { "F16→F32" } else { "F32" };
+                        eprintln!("[DUMP] cache K layer {layer_idx:02} [{nkv},{valid_len},{hd}] {dtype_str} -> {k_path}");
+                        eprintln!("[DUMP] cache V layer {layer_idx:02} [{nkv},{valid_len},{hd}] {dtype_str} -> {v_path}");
                         s = exec.begin()
                             .map_err(|e| anyhow::anyhow!("dump cache re-begin L{layer_idx}: {e}"))?;
                     }

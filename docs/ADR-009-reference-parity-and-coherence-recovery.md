@@ -1254,6 +1254,38 @@ Cached K/V entries DO drift. The drift enters within prefill and feeds back thro
 
 **Multi-backend KV preserved:** The F16 dense path is additive for the Walk-phase parity goal. The TurboQuant packed KV cache (ADR-007) and F32 dense KV are kept and selectable — F16 is the parity target against llama.cpp, TurboQuant is the memory-efficient production target. The long-horizon goal is to make TurboQuant match the F16-reference trajectory closely enough that the packed path is safe to re-enable as default.
 
+### F16 KV experiment result — pivot FALSIFIED (2026-04-16)
+
+Implemented F16 dense KV cache + `kv_cache_copy_batch_f32_to_f16` cast kernel, routing flash_attn_vec through the `flash_attn_vec_f16kv_dk256` variant.
+
+**A/B results:**
+
+| Test | F32 KV (baseline) | F16 KV | Delta |
+|------|------:|------:|------:|
+| sourdough | 3656/3658 | 3095/3658 | **−561 bytes** |
+| sliding_wrap | 752/2327 | 627/2316 | **−125 bytes** |
+| L24 cache_k rel_rms vs llama | 1.4e-2 | 2.7e-1 | 19x worse |
+| L24 sdpa_out rel_rms vs llama | 1.4e-2 | 6.4e-1 | 45x worse |
+
+**Critical control test:** Ran llama.cpp with `-ctk f32 -ctv f32` (force F32 KV cache):
+- llama.cpp F16 KV vs llama.cpp F32 KV: **2327/2327 bytes — identical**
+
+**Interpretation:**
+
+llama.cpp's output is insensitive to KV cache dtype — its F32 KV and F16 KV paths produce byte-identical output. This falsifies the F16-KV-matching hypothesis as the controlling parity issue: matching llama.cpp's KV dtype does not close the gap, and in fact reveals a separate bug in our F16 flash_attn_vec path that makes it worse than the F32 path.
+
+**Restored state:** F32 KV remains the default. F16 KV is opt-in via `HF2Q_F16_KV=1` for follow-up investigation into the F16-specific regression.
+
+**Updated lead hypothesis:**
+
+The seam is in our flash_attn_vec kernel itself (or in its upstream inputs), NOT in the KV cache representation. The 20.48x amplification at d=256 persists because of something in the F32 kernel path specifically. The F16 kernel path has its own additional regression. Both need investigation, but F32 is the better baseline.
+
+**Next:** Return to per-kernel source diff of `flash_attn_vec` vs llama.cpp's `kernel_flash_attn_ext_vec` for the F32 path. The FOR_UNROLL A/B was inconclusive; the next most likely suspects are:
+- Shared memory layout / Q cast-to-half pattern
+- Mask value type (F32 vs F16 in shared memory)
+- Online softmax intermediate precision
+- Reduce kernel numerical ordering
+
 **Boundary dump findings (seq_pos=239, the actual divergence decision):**
 
 ```
