@@ -1,0 +1,1210 @@
+# ADR-009: Reference Parity and Coherence Recovery for Owned Inference
+
+**Status:** Proposed  
+**Date:** 2026-04-15  
+**Decision Makers:** Robert, Claude  
+**Related ADRs:** ADR-008 (candle divorce), ADR-007 (TurboQuant KV cache), ADR-006 (mlx-native GPU backend), ADR-005 (inference server)
+
+---
+
+## Engineering Mantra (load-bearing — read before every session)
+
+Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim.
+
+> **DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it.**
+
+**Operational reading for this ADR:**
+
+- **No shortcuts** — this ADR is not a license to tweak thresholds or lower the coherence bar. It exists to restore correct owned semantics.
+- **Measure 3x, cut once** — no phase is considered complete because a final output looks plausible. Every phase has tensor-contract gates and an end-to-end coherence gate.
+- **Chesterton's fence** — candle and llama.cpp are not being reintroduced as dependencies. They are being used as semantic reference implementations so that the owned stack can absorb the right behavior.
+- **No fallback** — the end state is a coherent and fast owned stack in `hf2q + mlx-native`, not a permanent dual-backend system.
+- **Never make assumptions** — every statement in the repair plan must be tied either to direct code audit, a tensor-boundary comparison, or an end-to-end measured gate.
+- **No stub code** — temporary harnesses are acceptable; permanent placeholder code paths are not. If a contract is required for parity, it must be fully implemented.
+- **Pure excellence** — this ADR is intentionally stricter than a normal bugfix note. It is the execution contract for repairing inference semantics in the owned stack.
+
+---
+
+## PRD Framing
+
+This ADR also serves as a PRD for the coherence-recovery work.
+
+- **Why** — the current owned stack is not preserving the reference model trajectory, and we now know the problem is structural rather than a small local bug.
+- **What** — implement the missing owned semantics for prefill, active KV views, sliding chronology, and attention parity.
+- **Evaluation** — accept work only when tensor-boundary parity and end-to-end coherence gates pass, then recover speed without regressing those gates.
+
+---
+
+## Scope
+
+**Validation scope:** Gemma4. This is the active failing production path and has the strongest reference material (llama.cpp semantic oracle + candle dense Rust reference).
+
+**Implementation scope:** The core owned contracts — batched prefill, decode, KV chronology/view, parity harness plumbing, eval corpus format — must be designed as architecture-generic reusable infrastructure, not hard-coded to Gemma4.
+
+**Model-specific semantics** — attention scale, RoPE variants, GQA/MQA layout, sliding/global layer patterns, special masks, router semantics — belong in per-family adapters/specs, not in one supposedly universal contract.
+
+Future model families (Qwen3, GPT-OSS, etc.) should get their own parity validation suites on top of the same generic engine contracts. This ADR does not define those suites.
+
+---
+
+## Engineer Quick-Start
+
+Read this section first. The rest of the document provides evidence and justification.
+
+### What to build (in order)
+
+1. **Step 0 — Freeze references and eval corpus** (blocker for everything else)
+   - Pin llama.cpp and candle commits in `docs/reference-lock.md`
+   - Create locked eval corpus at `tests/evals/`
+   - Generate and store reference fixtures
+
+2. **Track 1 — True batched prefill** (start immediately)
+   - `forward_prefill` in `hf2q` with `q_len > 1`
+   - Use **dense owned attention** for prefill (not packed-TQ)
+   - One last-row logits result seeds decode
+
+3. **Track 2 — Sliding active-window chronology** (start immediately, parallel with Track 1)
+   - Explicit logical chronology in `mlx-native` before and after wrap
+   - Host and kernel agree on active token order
+
+4. **Track 3 — Attention reconciliation** (gated on Tracks 1 + 2)
+   - May begin exploratory work on non-wrap / decode-only cases early
+   - Final acceptance requires Tracks 1 and 2 complete
+   - Compare active K/V, attention logits, `sdpa_out` against pinned references
+
+5. **Parity harnesses** (build during Tracks 1-3, harden after)
+   - Fixture-backed CLI for routine validation
+   - Live model-backed capture for fixture generation
+
+6. **Speed recovery** (only after correctness gates pass)
+
+### Acceptance target
+
+**llama.cpp coherence parity** — deterministic greedy-token match on the locked eval corpus. Not "materially improved," not "close enough."
+
+### Key dependency rule
+
+Tracks 1 and 2 are parallel. Track 3 is downstream of both. Do not claim attention parity while prefill or chronology remain broken.
+
+---
+
+## Why (Problems)
+
+### P-1: The owned stack is not coherent against the references
+
+The current owned inference stack is fast enough to be interesting, but it is not preserving the reference model trajectory. The canonical coherence gate demonstrates the failure:
+
+- old good candle path: passes sourdough at `3095` common-prefix bytes
+- current `HEAD` owned path: fails at `69` common-prefix bytes
+
+That failure is large enough that it cannot be written off as acceptable quantization noise or sampler variance.
+
+### P-2: The current repo is not even running the same prefill contract as the references
+
+The current owned path still ingests prompt tokens as repeated decode-style single-token steps. The reference-good paths do batched prefill.
+
+This means the repo is diverging from the reference behavior before later decode semantics can even be evaluated fairly.
+
+### P-3: The first real tensor divergence is already inside attention
+
+Paired boundary work showed:
+
+- `q_pre_fwht` is close
+- `sdpa_out` is the first materially divergent tensor
+
+That eliminates a large amount of speculation about later ops being the first cause.
+
+### P-4: The current sliding cache/view contract is structurally insufficient after wrap
+
+Packed storage is not the problem by itself. The problem is that, after a sliding layer wraps, the current host/kernel contract cannot reconstruct the same chronological active view as the dense references.
+
+### P-5: The repo needs an owned fix, not a dependency retreat
+
+The intent of this codebase remains:
+
+- own GGUF and weight conversion logic
+- own quantization logic
+- own inference stack
+- use candle and llama.cpp only as references, not runtime dependencies
+
+So the work must improve `hf2q + mlx-native`, not reintroduce a permanent foreign backend.
+
+---
+
+## Why This ADR Exists
+
+This ADR exists to answer two questions precisely:
+
+1. **Where is the owned implementation semantically incorrect relative to the references?**
+2. **What must be changed in `hf2q` and `mlx-native` to restore coherence without giving up speed ownership?**
+
+The references are:
+
+- **llama.cpp** — primary semantic oracle for GGUF-backed Gemma4 inference behavior
+- **candle** — dense Rust implementation reference, especially useful for tracing model-space KV and attention semantics
+
+The owned implementation target is:
+
+- **`hf2q`**
+- **`mlx-native`**
+
+The goal is not to “switch back to candle.” The goal is to port the missing semantics and capabilities from the references into the owned stack.
+
+---
+
+## What (Proposed Solution)
+
+### Product Requirements
+
+The owned stack must satisfy all of the following:
+
+1. **Reference-parity requirement**
+   - The owned stack must materially preserve the dense reference trajectory better than it does today.
+
+2. **Owned-runtime requirement**
+   - The runtime path must remain owned by `hf2q + mlx-native`.
+
+3. **No lowered-bar requirement**
+   - The current coherence failure must be fixed, not normalized.
+
+4. **No hidden semantic drift requirement**
+   - Boundary-level parity harnesses must exist so future optimizations cannot silently break correctness again.
+
+5. **Performance recovery requirement**
+   - Correctness restoration is not the final state; the owned stack must return to speed work after parity is restored.
+
+### Proposed Solution Summary
+
+**Restore coherence by aligning the owned stack with the dense reference contracts at prefill, active KV view, and attention output, while preserving packed storage and then recovering performance only after parity gates pass.**
+
+This breaks down into three primary decisions:
+
+1. **Implement a real batched prefill path in `hf2q`.**
+   - Prompt ingestion must no longer be emulated as repeated single-token decode calls.
+
+2. **Treat packed-TQ attention as an implementation detail, not the public semantic boundary.**
+   - The owned stack must expose dense-equivalent behavior at the boundaries that matter:
+     - active KV view
+     - attention logits
+     - `sdpa_out`
+
+3. **Fix sliding-window chronology after wrap.**
+   - Packed storage is acceptable.
+   - The current active-window/view contract is not.
+   - Sliding layers need offset-aware chronology or explicit compaction before attention.
+
+**Primary oracle choice:** for Gemma4, use **llama.cpp** as the top-level semantic oracle for attention scale and masking behavior. Use candle as the dense Rust implementation reference where that helps explain or validate the same contract.
+
+### Non-Goals
+
+This ADR does **not** propose:
+
+- reintroducing candle as a permanent runtime backend
+- lowering the sourdough threshold to accommodate the current bug
+- preserving decode-style prompt ingestion for convenience
+- treating internal self-consistency as sufficient evidence of correctness
+- doing performance-first optimization before the semantic contracts are repaired
+
+---
+
+## Evidence Chain
+
+### E-1: The owned stack is not coherent today
+
+The current owned path fails the sourdough gate at `69` bytes.
+
+That failure is not “close enough” and must not be re-baselined away until the owned stack matches the reference trajectory materially better.
+
+### E-2: The good old run was candle-backed, not old mlx-native-backed
+
+The historically good run came from the old candle path.
+
+When the old bisect tree was rebuilt with the actual mlx-native backend enabled, old mlx-native did **not** reproduce the good candle coherence. A short comparison against llama.cpp showed only `28` bytes of common prefix.
+
+So the correct reference split is:
+
+- **old candle**: coherent
+- **old mlx-native**: not coherent
+- **current mlx-native**: not coherent
+
+This matters because it eliminates the earlier false story that “an older mlx-native TQ path was good and the current mlx-native path regressed later.”
+
+### E-3: Old mlx-native attention and current mlx-native attention are effectively the same
+
+Paired boundary dumps on the same prompt/token/layer showed:
+
+- `0_q_pre_fwht`: old mlx-native vs current == identical
+- `1_sdpa_out`: old mlx-native vs current == identical to numerical noise
+
+So the current bug is not primarily “a new regression introduced only after the earliest mlx-native attention port.” The owned mlx-native attention contract has been off relative to the dense references from the start.
+
+### E-4: The first real semantic split from the dense references is the attention path
+
+Paired dumps against the old candle reference showed:
+
+- `q_pre_fwht`: nearly identical
+- `sdpa_out`: first materially bad boundary
+
+That eliminates:
+
+- weight loading as the primary first failure
+- O-proj as the first failure
+- residual/norm/MLP/MoE/lm_head as the first failure
+
+Those later stages may amplify the error, but they do not create it first.
+
+### E-5: Model construction is mostly aligned
+
+The audit of:
+
+- GGUF dimension reversal
+- GGML type mapping
+- ordinary 2D quantized weight loading
+- stacked MoE expert tensor loading
+
+did not reveal a first-order semantic mismatch large enough to explain the coherence collapse.
+
+This does **not** mean model construction is mathematically perfect in every respect. It means it is not the primary explanation for the first bad boundary.
+
+### E-6: Post-attention and head logic are mostly aligned
+
+The audits of:
+
+- O-proj / quantized matmul usage
+- residual add / RMS norm ordering
+- MoE routing and combine path
+- final norm / lm_head / softcap
+
+did not identify the first divergence there. The first materially wrong tensor appears earlier.
+
+### E-7: Current `hf2q` has no true prefill path
+
+The current repo only has a decode-oriented entrypoint and handles prompt ingestion by looping token-by-token through decode semantics.
+
+That is not equivalent to the good/reference prefill contract.
+
+Reference behavior:
+
+- old candle path: prompt batched as `[1, seq_len]`, one logical prefill call
+- llama.cpp: prefill constructed as a batched graph problem over `n_tokens`
+
+Current owned behavior:
+
+- prompt tokens are fed through repeated `forward_decode`-style calls
+
+This is an independent correctness problem even before deeper attention semantics are considered.
+
+### E-8: Packed storage is acceptable, but sliding active-window semantics break after wrap
+
+The current packed cache stores:
+
+- packed nibble K/V
+- norms
+- `write_pos`
+- `seq_len`
+
+That is enough for storage, but not enough to recover the correct **chronological active window** once a sliding layer wraps.
+
+Before wrap:
+
+- global layers: acceptable
+- sliding layers: acceptable enough
+
+After wrap:
+
+- the current host/kernel contract lacks the information needed to reconstruct the same chronological active view as the dense references
+- mask logic and KV read logic no longer share a common explicit logical position map
+
+This is a structural correctness problem, not a mere tuning issue.
+
+### E-9: The owned packed-TQ attention path is the primary semantic mismatch
+
+Dense reference path:
+
+- live float K/V view in model space
+- dense attention in model space
+- model-space `sdpa_out`
+
+Owned packed-TQ path:
+
+- packed nibble+norm K/V storage exposed directly to attention
+- rotated-domain attention staging
+- caller-side inverse FWHT to reconstruct model-space output
+
+That path may be internally self-consistent. It is not yet demonstrated to be dense-equivalent at the boundaries that matter.
+
+---
+
+## Mismatch Matrix
+
+### Cleared or mostly cleared
+
+- GGUF parsing and metadata interpretation
+- ordinary 2D quantized weight loading
+- MoE stacked expert tensor loading
+- post-attention layer stack as first-cause location
+- head stack as first-cause location
+- old mlx-native vs current mlx-native attention differences
+
+### Not cleared
+
+1. **Prefill contract**
+2. **Prefill→decode KV handoff** (dense prefill writing KV consumed by packed-TQ decode)
+3. **Active KV view contract**
+4. **Sliding-window chronology after wrap**
+5. **Packed-TQ attention equivalence to dense reference attention**
+
+---
+
+## Current vs Target Architecture
+
+### Current owned runtime shape
+
+Today the owned runtime effectively behaves like this:
+
+```text
+prompt tokens
+  -> repeated single-token decode-style ingestion
+  -> packed K/V append into mlx-native cache
+  -> packed/rotated TQ attention
+  -> inverse FWHT after SDPA
+  -> later layer stack
+  -> final logits / token choice
+```
+
+This has two important consequences:
+
+1. prompt ingestion is not semantically the same as reference batched prefill
+2. attention is validated only against its own internal packed contract, not yet against dense-reference boundaries
+
+### Target owned runtime shape
+
+The repaired owned runtime must behave like this:
+
+```text
+prompt tokens
+  -> true batched prefill
+  -> ordered logical KV population
+  -> dense-equivalent active KV view semantics
+  -> dense-equivalent attention behavior at validated boundaries
+  -> later layer stack
+  -> last-row prefill logits
+  -> one sample to seed decode
+  -> decode loop (q_len == 1)
+```
+
+The implementation may still use packed storage, FWHT, and TQ kernels internally. But those become implementation details rather than the externally accepted semantic contract.
+
+---
+
+## Reference Ownership by Subsystem
+
+This section defines which reference is authoritative for which part of the repair. Engineers should not mix oracles casually.
+
+### GGUF / tensor metadata / storage interpretation
+
+Primary references:
+
+- llama.cpp
+- candle
+
+Current status:
+
+- mostly aligned already
+
+Use this reference set for:
+
+- tensor shape interpretation
+- GGML type interpretation
+- tensor ordering
+- stacked expert tensor semantics
+
+### Prefill contract
+
+Primary reference:
+
+- llama.cpp
+
+Secondary implementation reference:
+
+- old candle path
+
+Reason:
+
+- llama.cpp is the best semantic oracle for production Gemma4 behavior
+- candle is still valuable as a readable dense Rust implementation of batched prefill semantics
+
+### Dense KV view semantics
+
+Primary references:
+
+- llama.cpp
+- candle
+
+Reason:
+
+- both expose dense logical active views
+- both make chronology explicit enough to reason about active tokens
+
+### Attention scale and mask behavior for Gemma4
+
+Primary reference:
+
+- llama.cpp
+
+Reason:
+
+- Gemma4 scale in llama.cpp is `1.0`
+- old candle has a manual sliding path using `1 / sqrt(head_dim)` in one implementation path, which should not become the canonical oracle for the owned Gemma4 stack
+
+### Attention implementation semantics
+
+Primary semantic oracle:
+
+- llama.cpp
+
+Secondary dense implementation reference:
+
+- candle
+
+Use these to validate:
+
+- active `k/v`
+- logits before softmax
+- `sdpa_out`
+
+### Post-attention stack and head
+
+Current status:
+
+- mostly cleared as first-cause locations
+
+Use references only as confirmation if later regressions appear; they are not the primary focus of Phase 1.
+
+---
+
+## Code Map for the Engineer
+
+This section exists so an engineer can begin implementing without having to rediscover where the relevant contracts live.
+
+### `hf2q` current owned path
+
+- prompt ingestion / generation orchestration:
+  - `src/serve/mod.rs`
+- owned forward path:
+  - `src/serve/forward_mlx.rs`
+- packed KV cache host contract:
+  - `src/serve/forward_mlx.rs`
+
+### `mlx-native` current owned path
+
+- packed TQ SDPA kernel:
+  - `src/shaders/flash_attn_vec_tq.metal`
+- FWHT-related kernels / ops:
+  - `src/ops/...`
+  - `src/shaders/...`
+- quantized matmul and related ops:
+  - `src/ops/quantized_matmul_ggml.rs`
+
+### Reference: old candle path
+
+- old good serving/generation orchestration:
+  - `/tmp/hf2q-bisect/src/serve/mod.rs`
+- dense Gemma4 forward / attention path:
+  - `/tmp/hf2q-bisect/src/serve/gemma4.rs`
+
+### Reference: llama.cpp
+
+- model and attention scale behavior:
+  - `/opt/llama.cpp/src/llama-model.cpp`
+  - `/opt/llama.cpp/src/models/gemma4-iswa.cpp`
+- KV view and mask behavior:
+  - `/opt/llama.cpp/src/llama-kv-cache.cpp`
+- graph-level attention construction:
+  - `/opt/llama.cpp/src/llama-graph.cpp`
+
+---
+
+## Architectural Consequences
+
+### Consequence C-1: Prefill and decode must be separate contracts
+
+The repo cannot keep using a single-token decode function as its prompt-ingestion mechanism and still claim parity with the references.
+
+Required split:
+
+- **prefill**
+  - `q_len > 1`
+  - one logical prompt pass
+  - full causal/SWA masking over the prompt
+  - one last-row logits output used to seed decode
+
+- **decode**
+  - `q_len == 1`
+  - incremental append
+  - one next-token distribution
+
+### Consequence C-2: Packed K/V cannot remain the public semantic boundary
+
+Packed K/V is an implementation/storage format. That is fine.
+
+But reference parity is defined against:
+
+- active dense K/V view
+- dense attention logits
+- dense-equivalent `sdpa_out`
+
+So the owned stack must either:
+
+- prove the packed/rotated path is equivalent enough at those boundaries, or
+- change the implementation until it is
+
+### Consequence C-3: Sliding chronology must be explicit after wrap
+
+The current “infer chronology from `kv_seq_len` and physical slot ordering” contract is only valid before wrap.
+
+After wrap, the owned stack must choose one of two real solutions:
+
+1. **Offset-aware active-window contract**
+   - pass `visible_start`, `cache_base`, or equivalent logical position metadata into the attention path
+
+2. **Explicit compaction / re-linearization**
+   - compact the active window into chronological order before SDPA
+
+Either is acceptable. The current implicit contract is not.
+
+### Consequence C-4: The coherence gate remains load-bearing
+
+This ADR explicitly rejects the idea of lowering the coherence bar just because the current implementation is internally consistent.
+
+Internal consistency is not enough.
+
+The owned stack must preserve the reference trajectory materially better than it does today.
+
+---
+
+## What Specifically Must Change
+
+### `hf2q`
+
+- add a real batched prefill entrypoint
+- split prefill and decode contracts explicitly
+- select last-row logits after prefill and sample exactly once to seed decode
+- expose parity dump/harness points at:
+  - prefill output
+  - active KV view
+  - attention logits
+  - `sdpa_out`
+- carry any host-side active-window metadata required by the repaired sliding contract
+
+### `mlx-native`
+
+- support a correct sliding active-window contract after wrap
+- make mask logic and KV reads use the same logical chronology
+- hide packed/rotated implementation details behind dense-equivalent externally validated behavior
+- keep Gemma4 attention scale aligned with the chosen oracle (`1.0` from llama.cpp)
+
+---
+
+## Implementation Strategy
+
+This section is intentionally concrete. An engineer should be able to take this section and start work in order.
+
+### Step 0: Freeze the references, eval corpus, and gates
+
+Before changing semantics:
+
+- pin the exact reference commits and record them in `docs/reference-lock.md`:
+  - llama.cpp commit hash (primary semantic oracle)
+  - candle commit hash (secondary dense Rust reference)
+  - any old hf2q comparison commit (historical artifact, non-authoritative)
+  - model file path and checksum
+  - exact deterministic decode settings (greedy / temperature 0 / token horizon / stop conditions)
+- reference repos live at `/opt/llama.cpp` and `/opt/candle` — these are research/validation oracles only, never runtime dependencies
+- stop relying on `/tmp/hf2q-bisect/` as a durable reference; recreate from pinned commits when needed
+- keep the current coherence gate unchanged
+- keep tensor-boundary dump tooling available until parity is restored
+
+Create the locked eval corpus at `tests/evals/`:
+
+- `tests/evals/README.md` — corpus description and usage
+- `tests/evals/prompts/` — prompt text files
+- `tests/evals/reference/` — pinned reference outputs (token ids, text, boundary tensor fixtures)
+- `tests/evals/fixtures/` — saved tensor fixtures for routine parity checks
+
+Minimum corpus contents:
+
+1. **Sourdough** — main coherence gate
+2. **Short deterministic sanity prompts** — fast parity checks during active development
+3. **Boundary-diagnostic prompts** — fixed prompt/token/layer targets for prefill, active KV, attention logits, and `sdpa_out` checks
+4. **Wrapped sliding-window case** — specifically exercises the chronology-after-wrap bug class
+
+Deliverables:
+
+- `docs/reference-lock.md` with pinned commits, model, and settings
+- `tests/evals/` populated with the minimum corpus
+- reference fixture generation commands documented and runnable
+- stable paths / commands for reference runs
+
+### Step 1: Build the real prefill path
+
+Implement in `hf2q`:
+
+- a distinct prefill entrypoint
+- batched prompt ingestion (`q_len > 1`)
+- one last-row logits result
+- **use dense owned attention for prefill** — do not route through the packed-TQ/FWHT kernel
+  - the existing TQ SDPA kernel is decode-shaped (`q_len == 1`)
+  - forcing prefill through the same mismatchy path is the wrong dependency order
+  - TQ-optimized prefill is deferred to Phase 3 (speed recovery), after parity gates pass
+
+Do **not** intertwine this with attention redesign at first. The first job is to make prompt orchestration correct.
+
+Deliverables:
+
+- `forward_prefill` or equivalent with dense owned attention
+- generation path uses prefill once, then decode
+- parity harness can dump prefill last-row logits
+
+### Step 2: Make active KV chronology explicit
+
+Implement the sliding-window contract repair before trying to “tune” SDPA numerics.
+
+Choose one path:
+
+1. offset-aware active-window metadata
+2. explicit compaction into chronological order
+
+This decision should be made based on simplicity of correctness first, not presumed speed. Speed work comes later.
+
+Deliverables:
+
+- explicit logical chronology before and after wrap
+- host and kernel agree on active token order
+
+### Step 3: Reconcile active KV views against the dense references
+
+Once chronology is explicit:
+
+- dump or reconstruct owned active `k/v`
+- compare against reference active `k/v`
+
+Do not move to “the SDPA kernel is fixed” until active KV parity is understood.
+
+Deliverables:
+
+- `k_ref` vs `k_owned` comparison
+- `v_ref` vs `v_owned` comparison
+- tolerance and interpretation documented
+
+### Step 4: Reconcile attention logits and `sdpa_out`
+
+Only after prefill and active KV are correct enough:
+
+- compare attention logits
+- compare `sdpa_out`
+
+This is where packed/rotated attention must either prove dense-equivalence or be changed until it does.
+
+Deliverables:
+
+- logits parity report
+- `sdpa_out` parity report
+- updated sourdough result
+
+### Step 5: Re-run end-to-end coherence
+
+After the first bad boundary is materially repaired:
+
+- re-run sourdough
+- locate first divergence if it still fails
+- decide whether later-stage investigation is needed
+
+Deliverables:
+
+- new coherence report
+- divergence context if still failing
+
+### Step 6: Recover speed safely
+
+Only after semantic parity is back on track:
+
+- optimize prefill
+- optimize sliding active-window handling
+- optimize packed attention path
+
+Deliverables:
+
+- tok/s improvements with no parity regression
+
+---
+
+## Repair Plan
+
+### Phase 1: Correctness Restoration
+
+#### Track Dependency Structure
+
+Tracks 1, 2, and 3 are not fully sequential, but they are not independent either.
+
+- **Track 1 (Prefill)** — can start immediately
+- **Track 2 (Sliding chronology)** — can start immediately, in parallel with Track 1
+- **Track 3 (Attention reconciliation)** — may begin exploratory work on non-wrap / decode-only cases early, but **final acceptance depends on Tracks 1 and 2 being complete**
+
+Why: if prefill is still wrong, prompt-state comparisons are contaminated. If sliding chronology is still wrong, post-wrap attention comparisons are contaminated. Deep attention reconciliation before those two are in place risks measuring the wrong thing.
+
+#### Track 1 — True batched prefill
+
+Owner: primarily `hf2q`, with supporting `mlx-native` work where needed
+
+Required changes:
+
+- add a real prefill entrypoint
+- stop looping over `forward_decode` for prompt ingestion
+- compute prompt attention with `q_len > 1`
+- **use dense owned attention for prefill** (not packed-TQ/FWHT); TQ prefill is Phase 3
+- produce one final-row logits result after prefill
+- seed decode from that one result
+
+Success gate:
+
+- prompt ingestion no longer loops through decode semantics
+- a prefill-only run emits one final-row logits result
+- first-token generation after prefill is driven by that result
+
+#### Prefill→Decode Handoff Validation
+
+Because Phase 1 prefill uses dense attention while decode continues through packed-TQ attention, the **first decode token after prefill** is a distinct parity boundary where the two paths meet. KV state written during dense prefill must be correctly consumable by the decode-path kernel.
+
+Required validation:
+
+- after batched prefill, run exactly the first decode token
+- compare against the pinned reference for:
+  - active KV state presented to decode
+  - first decode-token attention logits
+  - first decode-token `sdpa_out`
+  - first decode-token final logits / chosen token
+
+Success gate:
+
+- the first decode token after prefill matches the reference
+- if tensor thresholds pass but the first decode token diverges, the handoff contract is still wrong
+
+#### Track 2 — Sliding active-window chronology
+
+Owner: primarily `mlx-native`, with host-side coordination in `hf2q`
+
+Required changes:
+
+- carry explicit logical active-window metadata for sliding layers
+- ensure mask generation and KV reads share the same logical chronology
+- support either offset-aware reads or explicit compaction before SDPA
+
+Success gate:
+
+- active-window chronology is reconstructible before and after wrap
+- the owned sliding active view matches the reference active view
+
+#### Track 3 — Attention semantic reconciliation
+
+Owner: `mlx-native`, with harnessing and orchestration in `hf2q`
+
+Required changes:
+
+- compare active `k/v` against dense references
+- compare attention logits against dense references
+- compare `sdpa_out` against dense references
+- keep Gemma4 scale pinned to the llama.cpp oracle (`1.0`)
+
+Success gate:
+
+- tensor deltas at the first bad boundary shrink materially
+- `sdpa_out` is no longer the first obvious divergence point
+- sourdough common prefix improves materially from the current `69` bytes
+
+### Phase 2: Parity Harness Hardening
+
+**Note:** Parity harnesses are built *during* Phase 1 — engineers need them to verify their own work at every step. Phase 2 is about hardening those harnesses into durable, automated, fixture-backed validation infrastructure.
+
+Owner: `hf2q`
+
+Required harnesses:
+
+1. **Prefill parity harness**
+   - prompt batch
+   - last-row logits
+
+2. **Prefill→Decode handoff harness**
+   - first decode token after prefill
+   - active KV state at the handoff boundary
+   - first decode-token logits and chosen token
+
+3. **Active KV parity harness**
+   - dense reference `k`
+   - dense reference `v`
+   - owned reconstructed active `k`
+   - owned reconstructed active `v`
+
+4. **Attention parity harness**
+   - compare logits before softmax
+   - compare `sdpa_out`
+
+5. **End-to-end coherence harness**
+   - sourdough prefix
+   - exact divergence location/context
+
+#### Harness Execution Model
+
+Harnesses must be CLI/script-driven, not ad hoc manual dump-and-diff:
+
+- **Routine validation (CI and day-to-day):**
+  - fixture-backed — compare owned outputs against saved reference tensor fixtures
+  - no full model load required
+  - invoked via CLI subcommands (`hf2q parity capture ...` / `hf2q parity check ...`) or repo scripts
+  - fixture format: structured JSON or binary tensors with metadata headers
+
+- **Fixture generation and refresh:**
+  - live model-backed runs against pinned references
+  - deliberate workflow, not the default
+  - used to generate or refresh the `tests/evals/fixtures/` corpus
+
+- **CI model:**
+  - normal CI: fixture-based parity checks, no giant model required
+  - optional full-parity CI or local gated runs: model-backed capture/check on dedicated machines
+
+Success gate:
+
+- these harnesses become the required checkpoints before performance work proceeds
+- harnesses are automatable, reproducible, and cheap enough to run consistently
+
+### Phase 3: Speed Recovery
+
+Owner: both repos
+
+This phase is explicitly downstream of correctness restoration.
+
+Performance work resumes only after the correctness gates above pass.
+
+Likely work areas:
+
+- batched prefill efficiency (including evaluating TQ-optimized prefill to replace dense prefill)
+- graph/dispatch structure
+- packed attention kernel efficiency
+- active-window handling cost after chronology fix
+
+Success gate:
+
+- no regression in tensor-parity harnesses
+- no regression in sourdough prefix
+- measurable prefill/decode tok/s improvement
+
+---
+
+## Risks and Failure Modes
+
+### R-1: Mixing reference oracles incorrectly
+
+If engineers freely mix:
+
+- candle’s local implementation details
+- llama.cpp Gemma4 semantics
+- current owned assumptions
+
+the result will be another internally consistent but semantically muddled stack.
+
+Mitigation:
+
+- use the subsystem ownership table above
+- document which oracle governs each changed contract
+
+### R-2: Optimizing before chronology is fixed
+
+If sliding chronology after wrap remains implicit, any amount of kernel tuning can preserve the wrong answer faster.
+
+Mitigation:
+
+- chronology fix must precede performance work
+
+### R-3: Declaring victory from internal consistency
+
+A CPU replay of the current packed path can prove the current packed path matches itself. That is useful but insufficient.
+
+Mitigation:
+
+- accept fixes only when dense-reference boundaries move into parity
+
+### R-4: Letting temporary harnesses rot or disappear too early
+
+If dump and parity harnesses are removed before parity is stable, future performance work will re-open the same class of bug blindly.
+
+Mitigation:
+
+- keep the parity harnesses as permanent validation assets until the stack is demonstrably stable
+
+---
+
+## Engineer Checklist
+
+An engineer implementing this ADR should be able to answer “yes” to all of the following before claiming success:
+
+### Prefill
+
+- Is there a true prefill path distinct from decode?
+- Does prompt ingestion avoid looping through decode semantics?
+- Does prefill return one last-row logits result?
+
+### Sliding active window
+
+- Can the logical active window be explained before wrap?
+- Can it still be explained after wrap?
+- Do host and kernel use the same chronology?
+
+### Attention parity
+
+- Can owned active `k/v` be compared directly against the references?
+- Are attention logits closer to the references than before?
+- Is `sdpa_out` no longer the first obviously wrong tensor?
+
+### End-to-end behavior
+
+- Did sourdough improve materially from 69 bytes?
+- If it still fails, is the new first divergence known and localized?
+
+### Speed
+
+- Were performance changes made only after the above answers were yes?
+- Do parity and coherence still hold after optimization?
+
+---
+
+## Repo Ownership Split
+
+### `hf2q` owns
+
+- top-level prefill orchestration
+- decode vs prefill API split
+- last-row logits selection after prefill
+- parity harnesses and dump tooling
+- coherence gate integration
+
+### `mlx-native` owns
+
+- active-window chronology contract for sliding attention
+- packed attention implementation details
+- dense-equivalent attention behavior at the externally validated boundaries
+- performance recovery inside the kernels / command structure once parity is restored
+
+---
+
+## Evaluation / Acceptance Criteria
+
+This section is the PRD acceptance layer. Work is not accepted because code landed. It is accepted only if the following gates are met.
+
+### Gate G-1: Prefill parity
+
+Measure:
+
+- existence and use of real prefill path
+- one-shot prompt ingestion
+- last-row logits behavior
+
+Failure means:
+
+- repo is still not running the same class of prefill as the references
+
+### Gate G-1.5: Prefill→Decode Handoff parity
+
+Measure:
+
+- first decode token after batched prefill
+- active KV state presented to decode at the handoff boundary
+- first decode-token attention logits, `sdpa_out`, final logits, chosen token
+
+Acceptance:
+
+- first decode token matches the pinned reference
+- if tensor thresholds pass but the token diverges, the handoff contract is still wrong
+
+Failure means:
+
+- KV state written during dense prefill is not correctly consumable by the decode-path kernel
+
+### Gate G-2: Active KV parity
+
+Measure:
+
+- `k_ref` vs `k_owned`
+- `v_ref` vs `v_owned`
+
+Thresholds use a two-class system:
+
+**Class A (exact-structure boundaries):** exact match required
+
+- active-window chronology metadata
+- visible token order
+- mask shape / valid-range semantics
+
+**Class B (reconstructed dense-state boundaries):** extremely tight tolerance
+
+- reconstructed active `k`: rel_rms ≤ 1e-5, max_abs ≤ 1e-4
+- reconstructed active `v`: rel_rms ≤ 1e-5, max_abs ≤ 1e-4
+
+If Class B fails, the contract is still wrong.
+
+Reporting:
+
+- RMS, relative error
+- first offending position/head if materially wrong
+
+Failure means:
+
+- owned cache/view contract is still semantically wrong regardless of downstream attention math
+
+### Gate G-3: Attention parity
+
+Measure:
+
+- logits before softmax
+- `sdpa_out`
+
+**Class C thresholds (reduction-heavy floating boundaries):** tiny numeric drift allowed, semantic drift not allowed
+
+- attention logits: rel_rms ≤ 1e-4, max_abs ≤ 1e-3
+- `sdpa_out`: rel_rms ≤ 1e-4, max_abs ≤ 1e-3
+- plus **top-1 token agreement** on the fixed deterministic eval prompts at that stage's consuming boundary
+
+Reporting:
+
+- RMS, relative error
+- per-layer comparison for the first several early layers
+
+**Override rule:** if a boundary meets the numeric threshold but still causes token divergence, the threshold is too loose for that boundary and must be tightened. The end-to-end gate (G-4) wins.
+
+Failure means:
+
+- owned attention semantics are still not matching the dense reference
+
+### Gate G-4: End-to-end coherence
+
+**Target: llama.cpp coherence parity.** Not "materially improved," not "close enough."
+
+Measure:
+
+- sourdough byte prefix
+- greedy-token parity on the locked eval corpus against llama.cpp
+- first divergence token / context
+
+Acceptance:
+
+- sourdough gate passes at llama.cpp-equivalent prefix
+- deterministic greedy decoding matches llama.cpp on the locked prompt suite for the required token horizon
+- no known first-divergence boundary remains unexplained on the canonical diagnostics
+
+Reporting:
+
+- exact byte prefix
+- token index
+- human-readable divergence excerpt
+
+Failure means:
+
+- the stack may be internally cleaner but is still not preserving the reference trajectory
+
+### Gate G-5: Speed
+
+Measure:
+
+- prefill tok/s
+- decode tok/s
+- dispatch counts where relevant
+
+Failure means:
+
+- correctness was restored but the implementation still needs optimization
+
+### ADR-Level Acceptance Criteria
+
+This ADR should move from **Proposed** to **Accepted** only when all of the following are true:
+
+1. A true batched prefill path exists and is used in normal generation.
+2. The prefill→decode KV handoff is validated (first decode token matches reference).
+3. Sliding active-window chronology is correct before and after wrap.
+4. Active KV and attention parity harnesses exist and pass at the defined thresholds (Class A exact, Class B rel_rms ≤ 1e-5, Class C rel_rms ≤ 1e-4).
+5. The sourdough coherence gate passes at llama.cpp-equivalent parity — deterministic greedy decoding matches llama.cpp on the locked eval corpus.
+6. The runtime architecture remains owned by `hf2q + mlx-native`.
+7. Performance work can proceed on top of these repaired semantics without removing the new validation gates.
+8. The locked eval corpus and reference fixtures are version-controlled at `tests/evals/`.
+
+---
+
+## Suggested Progress Dashboard
+
+The implementation effort should maintain a simple table like this in status updates:
+
+| Area | Current | Target | Owner | Status |
+|---|---:|---:|---|---|
+| Reference lock + eval corpus | missing | pinned commits + `tests/evals/` | hf2q | open |
+| Batched prefill (dense attention) | no | yes | hf2q | open |
+| Prefill→decode handoff | unvalidated | first decode token matches reference | hf2q | open |
+| Sliding chronology after wrap | wrong | correct | hf2q + mlx-native | open |
+| Active `k` parity | unknown / bad | rel_rms ≤ 1e-5 | hf2q + mlx-native | open |
+| Active `v` parity | unknown / bad | rel_rms ≤ 1e-5 | hf2q + mlx-native | open |
+| Attention logits parity | bad | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | open |
+| `sdpa_out` parity | bad | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | open |
+| Sourdough prefix | 69 | llama.cpp parity | hf2q | open |
+| Greedy-token parity suite | missing | match llama.cpp on locked corpus | hf2q | open |
+| Parity harnesses (fixture-backed) | missing | automated CLI + CI | hf2q | open |
+| Prefill tok/s | baseline | improved after correctness | hf2q + mlx-native | later |
+| Decode tok/s | baseline | improved after correctness | hf2q + mlx-native | later |
+
+This table is deliberately simple. It prevents the project from drifting back into vague statements like “attention seems better now.”
+
+---
+
+## Rejected Alternatives
+
+### A-1: Re-baseline the coherence gate for TQ
+
+Rejected because the research does not show an unavoidable intrinsic TQ limit. It shows the owned implementation does not yet match the reference semantics.
+
+### A-2: Keep using decode-style prompt ingestion
+
+Rejected because it is not parity with the good/reference prefill contract.
+
+### A-3: Accept the current sliding ring contract and tune around it
+
+Rejected because the problem after wrap is structural chronology loss, not merely performance tuning.
+
+### A-4: Reintroduce candle as a permanent fallback backend
+
+Rejected because it violates the ownership goal and creates long-term maintenance debt.
+
+---
+
+## Immediate Plan of Record
+
+1. Implement a real batched prefill path.
+2. Define and implement the sliding active-window chronology contract.
+3. Build the parity harnesses for active KV, attention logits, and `sdpa_out`.
+4. Reconcile packed-TQ attention against the dense references until the first bad boundary is materially repaired.
+5. Re-run the coherence gate.
+6. Only then resume aggressive speed optimization.
+
+---
+
+## Appendix: Compact Executive Summary
+
+The coherence failure is not best explained by GGUF loading, O-proj, MoE, lm_head, or a recent downstream-only candle-divorce bug. The audit narrowed it to two primary correctness problems and one structural cache problem:
+
+1. **No true prefill path**
+2. **Packed-TQ attention not yet dense-equivalent at the validated boundaries**
+3. **Sliding active-window chronology breaks after wrap**
+
+The fix is therefore:
+
+- restore the reference prefill contract using dense owned attention (TQ prefill deferred to Phase 3)
+- validate the prefill→decode KV handoff as its own parity boundary
+- repair sliding active-window chronology before and after wrap
+- make the owned attention path match dense-reference behavior where it matters
+- validate against llama.cpp coherence parity on a locked eval corpus
+- then recover speed on top of that correct foundation
