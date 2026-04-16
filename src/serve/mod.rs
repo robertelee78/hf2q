@@ -405,8 +405,9 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     }
     let decode_elapsed = decode_start.elapsed();
     let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
+    let (td, tr) = if stderr_is_tty { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
     eprintln!(
-        "\n\n--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---",
+        "\n\n{td}--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
         generated, decode_elapsed.as_secs_f64(), tok_per_sec,
     );
 
