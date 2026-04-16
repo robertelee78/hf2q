@@ -202,22 +202,42 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         cfg.num_experts, cfg.top_k_experts,
     );
 
-    // Initialize mlx-native GPU context
-    eprintln!("Initializing mlx-native GPU context...");
+    // Initialize mlx-native GPU context. Timing starts here; ends once
+    // weights are resident. The elapsed duration feeds Step 5's header
+    // line 2 ("loaded in Xs").
+    let load_start = std::time::Instant::now();
+    tracing::info!("Initializing mlx-native GPU context");
     let mut ctx = gpu::GpuContext::new()
         .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
-    eprintln!("mlx-native backend: {}", ctx.gpu_name());
+    let backend_chip = ctx.gpu_name().to_string();
+    tracing::info!("mlx-native backend: {}", backend_chip);
 
     // Load weights directly from GGUF (ADR-008: no candle)
-    eprintln!("Loading GGUF model...");
+    tracing::info!("Loading GGUF model");
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
-    eprintln!("GGUF loaded: {} tensors, {} metadata keys",
+    tracing::debug!("GGUF loaded: {} tensors, {} metadata keys",
         gguf.tensor_count(), gguf.metadata_count());
 
-    eprintln!("Loading model weights from GGUF into mlx-native buffers...");
+    // Extract human-readable model name from GGUF metadata, with fallback
+    // to the file stem. Consumed by the header printer in Step 5.
+    let model_name = gguf
+        .metadata_string("general.name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+    tracing::debug!("Model name (GGUF general.name or file stem): {}", model_name);
+
+    tracing::info!("Loading model weights from GGUF into mlx-native buffers");
     let mut mlx_w = forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx)?;
-    eprintln!("mlx-native weights loaded ({} layers).", mlx_w.layers.len());
+    let n_layers = mlx_w.layers.len();
+    let load_elapsed = load_start.elapsed();
+    tracing::info!("mlx-native weights loaded ({} layers) in {:.1}s",
+        n_layers, load_elapsed.as_secs_f64());
 
     // Load tokenizer
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -265,7 +285,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // --- mlx-native forward pass ---
     use std::io::Write;
 
-    eprintln!("Running mlx-native forward pass...");
+    tracing::info!("Running mlx-native forward pass");
     let eos_token_ids: Vec<u32> = vec![1, 106];
 
     // Profiling support
