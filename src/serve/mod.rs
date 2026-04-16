@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::cli;
+use crate::debug::INVESTIGATION_ENV;
 use config::Gemma4Config;
 
 /// Resolve the tokenizer path: explicit flag, or look next to GGUF / in parent dirs.
@@ -231,8 +232,8 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
 
     // ADR-005 1bNEW.0c: dump rendered prompt and exit if requested
-    if let Ok(dump_path) = std::env::var("HF2Q_DUMP_RENDERED_PROMPT") {
-        std::fs::write(&dump_path, prompt_text.as_bytes())
+    if let Some(dump_path) = INVESTIGATION_ENV.dump_rendered_prompt.as_deref() {
+        std::fs::write(dump_path, prompt_text.as_bytes())
             .with_context(|| format!("HF2Q_DUMP_RENDERED_PROMPT: failed to write {dump_path}"))?;
         eprintln!(
             "HF2Q_DUMP_RENDERED_PROMPT: wrote {} bytes to {}",
@@ -246,7 +247,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
     tracing::info!("Prompt: {} tokens", prompt_tokens.len());
-    if std::env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok() {
+    if INVESTIGATION_ENV.dump_prompt_tokens {
         eprintln!("HF2Q_DUMP_PROMPT_TOKENS: first10={:?} last10={:?} total={}",
             &prompt_tokens[..prompt_tokens.len().min(10)],
             &prompt_tokens[prompt_tokens.len().saturating_sub(10)..],
@@ -269,8 +270,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Profiling support
     let mut profiler = forward_mlx::ProfileAccumulator::new(2);
-    let kernel_profile_mode = std::env::var("HF2Q_MLX_KERNEL_PROFILE")
-        .map_or(false, |v| v == "1");
+    let kernel_profile_mode = INVESTIGATION_ENV.mlx_kernel_profile;
 
     // Prefill: true batched prefill with dense SDPA (ADR-009 Track 1).
     // Uses dense F32 attention instead of TQ-packed attention during prompt
@@ -278,7 +278,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // ADR-009 Phase 3A: HF2Q_BATCHED_PREFILL=1 uses the new batched prefill
     // path (matches llama.cpp default). Per-token remains default until
     // parity is validated.
-    let use_batched = std::env::var("HF2Q_BATCHED_PREFILL").map_or(false, |v| v == "1");
+    let use_batched = INVESTIGATION_ENV.batched_prefill;
     let last_token = if use_batched {
         mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, &mut ctx)?
     } else {

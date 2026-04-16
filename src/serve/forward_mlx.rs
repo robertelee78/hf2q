@@ -39,6 +39,7 @@ use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
 
+use crate::debug::INVESTIGATION_ENV;
 use super::config::{Gemma4Config, LayerType};
 use super::gpu::{GpuContext, QuantWeightInfo};
 
@@ -48,7 +49,7 @@ use super::gpu::{GpuContext, QuantWeightInfo};
 
 /// Check if profiling is enabled via environment variable.
 fn profiling_enabled() -> bool {
-    std::env::var("HF2Q_MLX_PROFILE").map_or(false, |v| v == "1")
+    INVESTIGATION_ENV.mlx_profile
 }
 
 /// Accumulated per-kernel-type timing for one token.
@@ -571,8 +572,12 @@ impl MlxModelWeights {
         //   HF2Q_LMHEAD_RERANK=0   disable rerank (raw Q8 argmax, unsafe)
         //   (unset)            auto-detect by size
         let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
+        // HF2Q_LMHEAD_Q8 is a category-2 operator knob — documented in
+        // docs/operator-env-vars.md and docs/shipping-contract.md. It is
+        // intentionally read directly here (not via InvestigationEnv) because
+        // it is part of the supported user-facing product surface.
         let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
-        let compare_mode = std::env::var("HF2Q_LMHEAD_COMPARE").map_or(false, |v| v == "1");
+        let compare_mode = INVESTIGATION_ENV.lmhead_compare;
         let use_q8 = match q8_env.as_deref() {
             Some("1") => true,
             Some("0") => false,
@@ -997,10 +1002,8 @@ impl MlxModelWeights {
 
         // ADR-009 Phase 3A: boundary dump at specific token position.
         // Temporary diagnostic — to be merged into parity capture workflow.
-        let dump_pos: Option<usize> = std::env::var("HF2Q_DUMP_BOUNDARY")
-            .ok().and_then(|v| v.parse::<usize>().ok());
-        let dump_layers: bool = std::env::var("HF2Q_DUMP_LAYERS")
-            .ok().and_then(|v| v.parse::<usize>().ok()) == Some(seq_pos);
+        let dump_pos: Option<usize> = INVESTIGATION_ENV.dump_boundary;
+        let dump_layers: bool = INVESTIGATION_ENV.dump_layers == Some(seq_pos);
 
         // --- Pre-session CPU work ---
         // Write position buffer (same for all layers)
@@ -1036,7 +1039,7 @@ impl MlxModelWeights {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let metal_dev = dev.metal_device();
-            let use_graph_opt = std::env::var("HF2Q_GRAPH_OPT").map_or(false, |v| v == "1");
+            let use_graph_opt = INVESTIGATION_ENV.graph_opt;
             let mut s = if use_graph_opt {
                 exec.begin_recorded().map_err(|e| anyhow::anyhow!("recorded session begin: {e}"))?
             } else {
@@ -1074,15 +1077,12 @@ impl MlxModelWeights {
             // (94.3→98.7) with zero correctness impact (sourdough gate PASS).
             //
             // Override: HF2Q_DUAL_BUFFER=N (split after layer N, 0=disabled).
-            let dual_buffer_split: Option<usize> = match std::env::var("HF2Q_DUAL_BUFFER") {
-                Ok(v) => v.parse::<usize>().ok().filter(|&n| n > 0 && n < num_layers),
-                Err(_) => Some(3), // default: split after layer 3
-            };
+            let dual_buffer_split: Option<usize> =
+                INVESTIGATION_ENV.dual_buffer_split(num_layers);
 
             // --- 2. Transformer layers ---
             // Phase 3A: sub-layer detail dump (which specific layer to break down)
-            let dump_detail_layer: Option<usize> = std::env::var("HF2Q_DUMP_LAYER_DETAIL")
-                .ok().and_then(|v| v.parse::<usize>().ok());
+            let dump_detail_layer: Option<usize> = INVESTIGATION_ENV.dump_layer_detail;
 
             for layer_idx in 0..num_layers {
                 let hd = self.head_dims[layer_idx];
@@ -1217,7 +1217,7 @@ impl MlxModelWeights {
 
                 // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
                 // HF2Q_SKIP_TQ_ENCODE=1: skip for timing bisection (output garbage).
-                if !std::env::var("HF2Q_SKIP_TQ_ENCODE").map_or(false, |v| v == "1") {
+                if !INVESTIGATION_ENV.skip_tq_encode {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
                     } else {
@@ -1252,8 +1252,7 @@ impl MlxModelWeights {
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump QKV finish L{layer_idx}: {e}"))?;
-                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
-                        .unwrap_or_else(|_| "/tmp".into());
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
 
                     // Q: [nh * hd] after head norm + RoPE
                     let q_data: &[f32] = self.activations.attn_q_normed.as_slice()
@@ -1344,13 +1343,11 @@ impl MlxModelWeights {
 
                     // ADR-009 Phase 3A: dump full cached K/V for the detail layer,
                     // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
-                    let dump_all_cache = std::env::var("HF2Q_DUMP_ALL_CACHE")
-                        .map_or(false, |v| v == "1");
+                    let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
                     if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
-                        let dump_dir = std::env::var("HF2Q_DUMP_DIR")
-                            .unwrap_or_else(|_| "/tmp".into());
+                        let dump_dir = &INVESTIGATION_ENV.dump_dir;
                         // Pack [nkv, kv_seq_len, hd] into a tight F32 buffer for comparison
                         let valid_len = kv_seq_len;
                         let mut k_valid = vec![0.0f32; nkv * valid_len * hd];
@@ -1449,7 +1446,7 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("dense flash_attn_vec L{layer_idx}: {e}"))?;
                     total_dispatches += 2; // main + reduce
-                } else if !std::env::var("HF2Q_SKIP_TQ_SDPA").map_or(false, |v| v == "1") {
+                } else if !INVESTIGATION_ENV.skip_tq_sdpa {
                     // -- TQ-packed SDPA (original path) --
                     // Pre-rotate Q via standalone FWHT (1× per head).
                     s.barrier_between(
@@ -1519,8 +1516,7 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out finish L{layer_idx}: {e}"))?;
                     let sdpa_data: &[f32] = self.activations.sdpa_out.as_slice()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out L{layer_idx}: {e}"))?;
-                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
-                        .unwrap_or_else(|_| "/tmp".into());
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
                     let sdpa_elems = nh * hd; // [nh, 1, hd] flattened
                     let path = format!("{dump_dir}/hf2q_sdpa_out_layer{layer_idx:02}_pos{seq_pos}.bin");
                     let bytes: &[u8] = unsafe {
@@ -1563,8 +1559,7 @@ impl MlxModelWeights {
                 if dump_layers && dump_detail_layer == Some(layer_idx) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;
-                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
-                        .unwrap_or_else(|_| "/tmp".into());
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
                     // Dump post-attention residual
                     let res_data: &[f32] = self.activations.residual.as_slice()
                         .map_err(|e| anyhow::anyhow!("dump residual L{layer_idx}: {e}"))?;
@@ -1876,8 +1871,7 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump layer finish L{layer_idx}: {e}"))?;
                     let hidden_data: &[f32] = self.activations.hidden.as_slice()
                         .map_err(|e| anyhow::anyhow!("dump hidden L{layer_idx}: {e}"))?;
-                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
-                        .unwrap_or_else(|_| "/tmp".into());
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
                     let path = format!("{dump_dir}/hf2q_l_out_layer{layer_idx:02}_pos{seq_pos}.bin");
                     let bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(
@@ -1908,7 +1902,7 @@ impl MlxModelWeights {
                     let _b0_encoder = s.commit(); // commit buf0 → GPU starts async
                     s = exec.begin().map_err(|e| anyhow::anyhow!("dual-buffer begin: {e}"))?;
                     s.track_dispatch(&[], &[&self.activations.hidden]);
-                    if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                    if INVESTIGATION_ENV.mlx_timing {
                         eprintln!("  [DUAL_BUFFER] split at layer {} — buf0: {} dispatches, {} barriers",
                             layer_idx + 1, total_dispatches, b0_barriers);
                     }
@@ -1919,7 +1913,7 @@ impl MlxModelWeights {
             // Inserts a commit_and_wait between layers and head to measure each
             // GPU section separately. Adds ~50μs sync overhead — measurement only.
             let body_dispatches = total_dispatches;
-            let split_timing = std::env::var("HF2Q_SPLIT_TIMING").map_or(false, |v| v == "1");
+            let split_timing = INVESTIGATION_ENV.split_timing;
             if split_timing {
                 let body_barriers = s.barrier_count();
                 let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
@@ -1955,7 +1949,7 @@ impl MlxModelWeights {
                 // Dump pre-lm_head (norm_out = final_norm applied to hidden)
                 let norm_out_data: &[f32] = self.activations.norm_out.as_slice()
                     .map_err(|e| anyhow::anyhow!("dump norm_out: {e}"))?;
-                let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+                let dump_dir = &INVESTIGATION_ENV.dump_dir;
                 let path = format!("{dump_dir}/hf2q_pre_lmhead_pos{seq_pos}.bin");
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
@@ -2050,7 +2044,7 @@ impl MlxModelWeights {
                 let (enc_ns, gpu_ns, fusions, reordered, b0, b1) =
                     s.finish_optimized_with_timing(reg, metal_dev, session_start)
                         .map_err(|e| anyhow::anyhow!("optimized session finish: {e}"))?;
-                if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                if INVESTIGATION_ENV.mlx_timing {
                     eprintln!("  [TIMING] encode={:.2}ms gpu_wait={:.2}ms dispatches={} barriers={}",
                         enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
                     eprintln!("  [GRAPH_OPT] fusions={} reordered={} barriers={}+{}",
@@ -2060,7 +2054,7 @@ impl MlxModelWeights {
                 let head_barriers = barrier_count; // snapshot before finish consumes s
                 let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
                     .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
-                if std::env::var("HF2Q_MLX_TIMING").is_ok() {
+                if INVESTIGATION_ENV.mlx_timing {
                     if split_timing {
                         eprintln!("  [SPLIT] HEAD: encode={:.2}ms gpu={:.2}ms dispatches={} barriers={}",
                             enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, head_dispatches, head_barriers);
@@ -2077,7 +2071,7 @@ impl MlxModelWeights {
         if dump_pos == Some(seq_pos) {
             let logits_data: &[f32] = self.activations.logits.as_slice()
                 .map_err(|e| anyhow::anyhow!("dump logits: {e}"))?;
-            let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+            let dump_dir = &INVESTIGATION_ENV.dump_dir;
             let path = format!("{dump_dir}/hf2q_logits_pos{seq_pos}.bin");
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
@@ -2124,7 +2118,7 @@ impl MlxModelWeights {
         // Rerank is skipped when lm_head is already F16 (no coarse noise to
         // correct) or when HF2Q_LMHEAD_RERANK=0.
         let rerank_active = self.lm_head_q8.is_some()
-            && !matches!(std::env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0"));
+            && !INVESTIGATION_ENV.lmhead_rerank_disabled;
         let token_id: u32 = if rerank_active {
             // CPU candidate selection via threshold scan over the full Q8
             // logits. GPU top-K was explored but a single-threadgroup

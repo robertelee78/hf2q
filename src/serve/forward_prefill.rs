@@ -19,6 +19,7 @@ use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use std::time::Instant;
 
+use crate::debug::INVESTIGATION_ENV;
 use super::forward_mlx::{MlxModelWeights, DenseKvBuffers, dispatch_qmatmul, dispatch_rms_norm_unit_perhead};
 use super::config::LayerType;
 use super::gpu::GpuContext;
@@ -90,7 +91,7 @@ impl MlxModelWeights {
         // are byte-identical). Our F16 path has a separate bug worse than F32.
         // F32 remains the default; F16 is opt-in via HF2Q_F16_KV=1 for the
         // follow-up investigation into the F16-specific regression.
-        let use_f16_kv = std::env::var("HF2Q_F16_KV").map_or(false, |v| v == "1");
+        let use_f16_kv = INVESTIGATION_ENV.f16_kv;
         let kv_dtype = if use_f16_kv { mlx_native::DType::F16 } else { mlx_native::DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
         eprintln!("Prefill: KV cache dtype = {:?}", kv_dtype);
@@ -134,36 +135,25 @@ impl MlxModelWeights {
         // ADR-010 one-shot norm weight dump: read self.layers[L].norms.input_layernorm
         // as the hf2q kernel sees it, compare against the raw GGUF tensor.
         // Gated on HF2Q_DUMP_NORM_WEIGHT="layer" (e.g. "7"). Writes to HF2Q_DUMP_DIR.
-        if let Ok(v) = std::env::var("HF2Q_DUMP_NORM_WEIGHT") {
-            if let Ok(target_l) = v.parse::<usize>() {
-                if target_l < num_layers {
-                    let w: &[f32] = self.layers[target_l].norms.input_layernorm.as_slice()
-                        .map_err(|e| anyhow::anyhow!("norm weight read L{target_l}: {e}"))?;
-                    let dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
-                    let path = format!("{dir}/hf2q_input_layernorm_weight_layer{target_l:02}.bin");
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
-                    std::fs::write(&path, bytes)
-                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-                    eprintln!("[DUMP] input_layernorm weight L{target_l} [{}] f32 -> {}",
-                              w.len(), path);
-                }
+        if let Some(target_l) = INVESTIGATION_ENV.dump_norm_weight {
+            if target_l < num_layers {
+                let w: &[f32] = self.layers[target_l].norms.input_layernorm.as_slice()
+                    .map_err(|e| anyhow::anyhow!("norm weight read L{target_l}: {e}"))?;
+                let dir = &INVESTIGATION_ENV.dump_dir;
+                let path = format!("{dir}/hf2q_input_layernorm_weight_layer{target_l:02}.bin");
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
+                std::fs::write(&path, bytes)
+                    .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                eprintln!("[DUMP] input_layernorm weight L{target_l} [{}] f32 -> {}",
+                          w.len(), path);
             }
         }
 
         // ADR-009 Phase 3A: prefill boundary dumps at (target_layer, target_tok).
         // Controlled by HF2Q_PREFILL_DUMP="layer,tok" e.g. "7,34".
-        let prefill_dump: Option<(usize, usize)> = std::env::var("HF2Q_PREFILL_DUMP")
-            .ok()
-            .and_then(|v| {
-                let parts: Vec<&str> = v.split(',').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
-                } else {
-                    None
-                }
-            });
-        let dump_dir = std::env::var("HF2Q_DUMP_DIR").unwrap_or_else(|_| "/tmp".into());
+        let prefill_dump: Option<(usize, usize)> = INVESTIGATION_ENV.prefill_dump;
+        let dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
 
         // ===================================================================
         // Process each prompt token through all layers
@@ -411,7 +401,7 @@ impl MlxModelWeights {
                     }
 
                     // Also TQ-encode into packed cache (for subsequent decode)
-                    if !std::env::var("HF2Q_SKIP_TQ_ENCODE").map_or(false, |v| v == "1") {
+                    if !INVESTIGATION_ENV.skip_tq_encode {
                         let cache_pos_val = if kv_is_sliding {
                             (kv_write_pos % kv_capacity) as u32
                         } else {

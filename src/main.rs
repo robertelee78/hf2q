@@ -11,6 +11,11 @@
 #[allow(dead_code)]
 mod backends;
 mod cli;
+// `debug::InvestigationEnv::{activate, any_ack_required_active}` and the
+// `unsafe_experiments_acked` field are wired for S-4 (startup warning +
+// unsafe-ack gate) but not yet consumed; allow dead_code until S-4 lands.
+#[allow(dead_code)]
+mod debug;
 mod doctor;
 #[allow(dead_code)]
 mod gpu;

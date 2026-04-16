@@ -25,6 +25,7 @@ use mlx_native::{DType, MlxBuffer};
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use std::time::Instant;
 
+use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
 use super::forward_mlx::{
     DenseKvBuffers, MlxModelWeights, dispatch_qmatmul, dispatch_rms_norm_unit_perhead,
@@ -60,7 +61,7 @@ impl MlxModelWeights {
         let dev = exec.device();
         let metal_dev = dev.metal_device();
 
-        let use_f16_kv = std::env::var("HF2Q_F16_KV").map_or(false, |v| v == "1");
+        let use_f16_kv = INVESTIGATION_ENV.f16_kv;
         let kv_dtype = if use_f16_kv { DType::F16 } else { DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
         eprintln!("Batched prefill: KV={:?}, seq_len={}", kv_dtype, seq_len);
@@ -186,18 +187,8 @@ impl MlxModelWeights {
         // (e.g. "7,34"). When set and the target layer finishes its batched
         // forward pass, dump Q_normed row, K/V_normed row, dense K/V cache
         // slice [nkv, tok+1, hd], and sdpa_out row at the target token.
-        let batched_dump: Option<(usize, usize)> = std::env::var("HF2Q_BATCHED_DUMP")
-            .ok()
-            .and_then(|v| {
-                let parts: Vec<&str> = v.split(',').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
-                } else {
-                    None
-                }
-            });
-        let batched_dump_dir = std::env::var("HF2Q_DUMP_DIR")
-            .unwrap_or_else(|_| "/tmp".into());
+        let batched_dump: Option<(usize, usize)> = INVESTIGATION_ENV.batched_dump;
+        let batched_dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
 
         for layer_idx in 0..num_layers {
             let hd = self.head_dims[layer_idx];
@@ -213,8 +204,7 @@ impl MlxModelWeights {
             //   HF2Q_BATCHED_DUMP="layer,tok" — dump only for that target layer
             //   HF2Q_BATCHED_LAYER_SCAN="tok" — dump pf_hidden row `tok` for
             //     EVERY layer (per-layer l_out scan for cross-layer drift bisection)
-            let layer_scan_tok: Option<usize> = std::env::var("HF2Q_BATCHED_LAYER_SCAN")
-                .ok().and_then(|v| v.parse::<usize>().ok());
+            let layer_scan_tok: Option<usize> = INVESTIGATION_ENV.batched_layer_scan;
             let should_dump_input = match (batched_dump, layer_scan_tok) {
                 (Some((dump_layer, tok)), _) if dump_layer == layer_idx => Some(tok),
                 (_, Some(tok)) => Some(tok),
