@@ -485,6 +485,25 @@ pub struct MlxModelWeights {
     pub num_experts: usize,
     /// Intermediate size for dense MLP.
     pub intermediate_size: usize,
+    /// Dense F32 KV buffers per layer for decode (ADR-009 Track 3).
+    ///
+    /// When set (by `forward_prefill`), `forward_decode` uses dense SDPA
+    /// instead of TQ-packed SDPA. Each layer has K and V in head-major
+    /// layout `[nkv_heads, capacity, head_dim]`.
+    ///
+    /// `dense_kv_capacity` is the stride (number of positions allocated)
+    /// in the dense buffers.
+    pub dense_kvs: Option<Vec<DenseKvBuffers>>,
+    /// Capacity (number of positions) in the dense KV buffers.
+    pub dense_kv_capacity: usize,
+    /// Tmp buffer for flash_attn_vec when using dense decode.
+    pub dense_sdpa_tmp: Option<MlxBuffer>,
+}
+
+/// Per-layer dense F32 KV buffers for dense attention path (ADR-009).
+pub struct DenseKvBuffers {
+    pub k: MlxBuffer,
+    pub v: MlxBuffer,
 }
 
 impl MlxModelWeights {
@@ -772,6 +791,9 @@ impl MlxModelWeights {
             rope_theta_global: cfg.rope_theta_global as f32,
             num_experts: cfg.num_experts,
             intermediate_size: cfg.intermediate_size,
+            dense_kvs: None,
+            dense_kv_capacity: 0,
+            dense_sdpa_tmp: None,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1073,10 +1095,72 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // -- SDPA (flash_attn_vec_tq — FWHT fused, inline scalar dequant) --
-                // HF2Q_SKIP_TQ_SDPA=1: skip for timing bisection (output garbage).
-                if !std::env::var("HF2Q_SKIP_TQ_SDPA").map_or(false, |v| v == "1") {
-                    // Pre-rotate Q via standalone FWHT (1× per head, not 32× per workgroup).
+                // -- SDPA: dense or TQ-packed (ADR-009 Track 3) --
+                // When dense_kvs is available (set by forward_prefill), use
+                // flash_attn_vec with F32 K,V for reference-parity attention.
+                // Otherwise fall back to the original TQ SDPA path.
+                let use_dense_sdpa = self.dense_kvs.is_some();
+
+                if use_dense_sdpa {
+                    // -- Dense decode SDPA (ADR-009 Track 3) --
+                    // Copy this position's K,V into dense KV buffers
+                    let dense_kvs = self.dense_kvs.as_ref().unwrap();
+                    let dense_cap = self.dense_kv_capacity;
+                    s.barrier_between(
+                        &[&self.activations.attn_k_normed, v_src],
+                        &[&dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                    );
+                    for h in 0..nkv {
+                        mlx_native::ops::copy::dispatch_copy_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &dense_kvs[layer_idx].k,
+                            h * hd,
+                            h * dense_cap * hd + seq_pos * hd,
+                            hd,
+                        ).map_err(|e| anyhow::anyhow!("decode dense K copy h{h} L{layer_idx}: {e}"))?;
+                        mlx_native::ops::copy::dispatch_copy_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &dense_kvs[layer_idx].v,
+                            h * hd,
+                            h * dense_cap * hd + seq_pos * hd,
+                            hd,
+                        ).map_err(|e| anyhow::anyhow!("decode dense V copy h{h} L{layer_idx}: {e}"))?;
+                    }
+                    total_dispatches += nkv * 2;
+
+                    // Dense flash_attn_vec
+                    let dense_sdpa_tmp = self.dense_sdpa_tmp.as_ref().unwrap();
+                    s.barrier_between(
+                        &[&self.activations.attn_q_normed,
+                          &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                        &[&self.activations.sdpa_out],
+                    );
+                    let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
+                        num_heads: nh as u32,
+                        num_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        kv_seq_len: kv_seq_len as u32,
+                        kv_capacity: dense_cap as u32,
+                        scale: 1.0,
+                        mask_type: if is_sliding { 2 } else { 1 },
+                        sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                        softcap: 0.0,
+                    };
+                    mlx_native::ops::flash_attn_vec::flash_attn_vec(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q_normed,
+                        &dense_kvs[layer_idx].k,
+                        &dense_kvs[layer_idx].v,
+                        &self.activations.sdpa_out,
+                        dense_sdpa_tmp,
+                        &p,
+                    ).map_err(|e| anyhow::anyhow!("dense flash_attn_vec L{layer_idx}: {e}"))?;
+                    total_dispatches += 2; // main + reduce
+                } else if !std::env::var("HF2Q_SKIP_TQ_SDPA").map_or(false, |v| v == "1") {
+                    // -- TQ-packed SDPA (original path) --
+                    // Pre-rotate Q via standalone FWHT (1× per head).
                     s.barrier_between(
                         &[&self.activations.attn_q_normed],
                         &[&self.activations.attn_q_normed],
@@ -1095,10 +1179,6 @@ impl MlxModelWeights {
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                         &[&self.activations.sdpa_out],
                     );
-                    // ADR-009 Track 2: ring_start for correct sliding-window
-                    // chronology after wrap. Before wrap, ring_start = 0
-                    // (physical == logical). After wrap, ring_start = write_pos
-                    // % capacity (physical slot of the oldest cached entry).
                     let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
                         (kv_write_pos % kv_capacity) as u32
                     } else {

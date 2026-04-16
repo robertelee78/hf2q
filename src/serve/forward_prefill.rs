@@ -14,12 +14,12 @@
 //! - After all tokens: extract last-row logits, argmax → first decode token
 
 use anyhow::Result;
-use mlx_native::MlxBuffer;
+// MlxBuffer used indirectly via DenseKvBuffers
 use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use std::time::Instant;
 
-use super::forward_mlx::{MlxModelWeights, dispatch_qmatmul, dispatch_rms_norm_unit_perhead};
+use super::forward_mlx::{MlxModelWeights, DenseKvBuffers, dispatch_qmatmul, dispatch_rms_norm_unit_perhead};
 use super::config::LayerType;
 use super::gpu::GpuContext;
 
@@ -53,23 +53,23 @@ impl MlxModelWeights {
 
         // ===================================================================
         // Allocate per-layer dense K,V buffers in head-major layout:
-        //   [n_kv_heads, seq_len, head_dim]
+        //   [n_kv_heads, capacity, head_dim]
         // This layout matches flash_attn_vec's K,V input format.
+        //
+        // Capacity = seq_len + 1024 to allow decode to continue using
+        // dense attention for up to 1024 additional tokens.
         // ===================================================================
-        struct DenseKv {
-            k: MlxBuffer,
-            v: MlxBuffer,
-        }
-        let mut dense_kvs: Vec<DenseKv> = Vec::with_capacity(num_layers);
+        let dense_capacity = seq_len + 1024;
+        let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let nkv = self.num_kv_heads[layer_idx];
             let hd = self.head_dims[layer_idx];
-            let n = nkv * seq_len * hd;
-            let k = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, seq_len, hd])
+            let n = nkv * dense_capacity * hd;
+            let k = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, dense_capacity, hd])
                 .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-            let v = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, seq_len, hd])
+            let v = dev.alloc_buffer(n * f32_sz, mlx_native::DType::F32, vec![nkv, dense_capacity, hd])
                 .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
-            dense_kvs.push(DenseKv { k, v });
+            dense_kvs_vec.push(DenseKvBuffers { k, v });
         }
 
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
@@ -254,16 +254,16 @@ impl MlxModelWeights {
                     // ====================================================
                     s.barrier_between(
                         &[&self.activations.attn_k_normed, v_src],
-                        &[&dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                        &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
                     );
                     for h in 0..nkv {
                         // K: copy head h from attn_k_normed
                         mlx_native::ops::copy::dispatch_copy_f32(
                             s.encoder_mut(), reg, metal_dev,
                             &self.activations.attn_k_normed,
-                            &dense_kvs[layer_idx].k,
+                            &dense_kvs_vec[layer_idx].k,
                             h * hd,                              // src: head h in [nkv, hd]
-                            h * seq_len * hd + tok_i * hd,      // dst: [h, tok_i, :] in [nkv, seq_len, hd]
+                            h * dense_capacity * hd + tok_i * hd, // dst: [h, tok_i, :] in [nkv, capacity, hd]
                             hd,
                         ).map_err(|e| anyhow::anyhow!("prefill K copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
 
@@ -271,9 +271,9 @@ impl MlxModelWeights {
                         mlx_native::ops::copy::dispatch_copy_f32(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
-                            &dense_kvs[layer_idx].v,
+                            &dense_kvs_vec[layer_idx].v,
                             h * hd,
-                            h * seq_len * hd + tok_i * hd,
+                            h * dense_capacity * hd + tok_i * hd,
                             hd,
                         ).map_err(|e| anyhow::anyhow!("prefill V copy h{h} L{layer_idx} T{tok_i}: {e}"))?;
                     }
@@ -323,7 +323,7 @@ impl MlxModelWeights {
                     let dense_kv_seq_len = (tok_i + 1) as u32; // positions 0..=tok_i
                     s.barrier_between(
                         &[&self.activations.attn_q_normed,
-                          &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                          &dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
                         &[&self.activations.sdpa_out],
                     );
                     let p = FlashAttnVecParams {
@@ -331,7 +331,7 @@ impl MlxModelWeights {
                         num_kv_heads: nkv as u32,
                         head_dim: hd as u32,
                         kv_seq_len: dense_kv_seq_len,
-                        kv_capacity: seq_len as u32, // stride = full seq_len allocation
+                        kv_capacity: dense_capacity as u32, // stride = full allocation
                         scale: 1.0, // Gemma4: scale = 1.0 (llama.cpp oracle)
                         mask_type: if is_sliding { 2 } else { 1 },
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
@@ -340,8 +340,8 @@ impl MlxModelWeights {
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(
                         s.encoder_mut(), reg, dev,
                         &self.activations.attn_q_normed,
-                        &dense_kvs[layer_idx].k,
-                        &dense_kvs[layer_idx].v,
+                        &dense_kvs_vec[layer_idx].k,
+                        &dense_kvs_vec[layer_idx].v,
                         &self.activations.sdpa_out,
                         &sdpa_tmp,
                         &p,
@@ -652,6 +652,12 @@ impl MlxModelWeights {
             seq_len as f64 / prefill_elapsed.as_secs_f64(),
             last_token,
         );
+
+        // Store dense KV buffers on self so forward_decode can use them
+        // for dense attention during the decode phase (ADR-009 Track 3).
+        self.dense_kvs = Some(dense_kvs_vec);
+        self.dense_kv_capacity = dense_capacity;
+        self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         Ok(last_token)
     }
