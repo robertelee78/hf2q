@@ -1547,6 +1547,18 @@ A follow-up ADR should scope exact batched-llama parity narrowly:
 
 The current owned stack produces coherent output that matches llama.cpp at byte-level parity on the canonical coherence gate (sourdough) and tracks both prefill modes of the oracle in a characteristic pattern on longer sequences. The coherence-recovery bar of ADR-009 is met. Further parity improvement is a separate engineering question and is explicitly deferred.
 
+**Regression set (default per-token path, HEAD = 8a02725):**
+
+| Gate | Result |
+|---|---|
+| sourdough (1000 decode) | 20/20 runs at common=3656, median=3656, no regression vs baseline 3fb8988 (also 20/20 at 3656) |
+| sliding_wrap (500 decode) | hf2q=2354, llama=2327, common=752 — matches locked reference exactly |
+| short smoke ("Hello, what is 2+2?") | "The answer to 2 + 2 is **4**." — correct, coherent |
+
+**Known caveat (separately tracked):**
+
+Both baseline (3fb8988) and HEAD (8a02725) exhibit low-rate greedy nondeterminism at T=0 on the sourdough prompt (~2–3% of runs diverge earlier than 3656 bytes or continue past EOS). In paired 20-run samples, both branches produced identical common-prefix distributions (100% at 3656). Deterministic hardening of argmax / GPU-reduction tie-breaks is deferred to a follow-up issue and is not a Phase 3A blocker.
+
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
 Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
