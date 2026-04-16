@@ -1229,6 +1229,31 @@ flash_attn_vec(d=256, nkv=8) is the first place where small upstream/cache-state
 
 2. **Cache-content check** — compare cached K/V at early, mid, and late positions. If cached K/V already drift materially, attention may be amplifying recurrent state drift. If cached K/V stay tight but sdpa_out diverges, the weighted-sum kernel is the stronger suspect.
 
+### Cache-content check result — Phase 3A pivot (2026-04-16)
+
+Cache content comparison at layer 24, seq_pos=239 revealed a structural representation mismatch:
+
+- **llama.cpp uses F16 KV cache** (default `cache_type_k/v = GGML_TYPE_F16`)
+- **hf2q uses F32 KV cache** (dense_kvs buffers)
+- Different kernel dispatch: llama uses `kernel_flash_attn_ext_vec_f16_dk256`, hf2q uses `kernel_flash_attn_vec_dk256` (F32)
+
+Cache content findings (after correct stride interpretation, F16→F32 conversion):
+- Position 0 (first prefill token): rel_rms = 2.5e-4 (tight — confirms layout decoded correctly)
+- Position 34+ (still within prefill): rel_rms up to 8e-2 (scattered drift)
+- Overall first 240 positions: rel_rms = 1.4e-2
+
+Cached K/V entries DO drift. The drift enters within prefill and feeds back through the recurrent KV state.
+
+**Pivot decision:** Phase 3A pivots from kernel-only investigation to KV representation parity. For exact llama.cpp parity (the Walk-phase "sameness" goal), hf2q must match the F16 KV cache contract — otherwise we are comparing attention inputs that fundamentally differ regardless of kernel correctness.
+
+**Next work:**
+1. Add owned F16 dense KV path matching llama.cpp's sliding/global cache dtype
+2. Route flash_attn_vec through the F16 variant (`flash_attn_vec_f16kv_dk256`)
+3. Re-measure: cache-content parity, layer 24 sdpa_out amplification, sliding_wrap bytes, sourdough bytes
+4. Only resume kernel-level micro-diffing if parity is still off after F16 KV match
+
+**Multi-backend KV preserved:** The F16 dense path is additive for the Walk-phase parity goal. The TurboQuant packed KV cache (ADR-007) and F32 dense KV are kept and selectable — F16 is the parity target against llama.cpp, TurboQuant is the memory-efficient production target. The long-horizon goal is to make TurboQuant match the F16-reference trajectory closely enough that the packed path is safe to re-enable as default.
+
 **Boundary dump findings (seq_pos=239, the actual divergence decision):**
 
 ```
