@@ -2,16 +2,21 @@
 //! (docs/generate-ux-cleanup.md).
 //!
 //! Tests drive the real `hf2q generate` binary against a GGUF model, so
-//! they require a model. Tests skip gracefully (printing a note and
-//! returning `Ok(())`) when `HF2Q_TEST_MODEL` is not set — this keeps CI
-//! green on machines that don't carry the 16 GB model artifact while
-//! letting developers run the full suite locally with:
+//! each integration test loads ~16 GB of weights. They are marked
+//! `#[ignore]` by default so default `cargo test --release` stays fast
+//! and parallel-safe. Run them explicitly with `--test-threads=1` to
+//! avoid concurrent-load OOMs:
 //!
 //!     HF2Q_TEST_MODEL=models/gemma-4-26B-.../gemma-4-....gguf \
-//!         cargo test --release --test serve_ux
+//!         cargo test --release --test serve_ux -- --ignored --test-threads=1
 //!
-//! Each test uses --temperature 0 for deterministic token output. Timing
-//! values drift run-to-run and are normalized via `normalize_for_compare`.
+//! Tests still skip gracefully (printing a note) when `HF2Q_TEST_MODEL`
+//! is not set, so passing `--ignored` on a machine without the model is
+//! harmless. Timing values drift run-to-run and are normalized via
+//! `normalize` before comparison.
+//!
+//! Unit tests (unit::*) run on every `cargo test` — they gate the
+//! normalization helpers themselves.
 
 use assert_cmd::Command;
 use std::path::PathBuf;
@@ -69,6 +74,7 @@ fn normalize(line: &str) -> String {
 }
 
 #[test]
+#[ignore = "loads 16GB model — run with --ignored --test-threads=1 plus HF2Q_TEST_MODEL set"]
 fn default_stdout_has_three_header_lines_and_generation() {
     let Some(model) = test_model() else {
         eprintln!("skipping: set {MODEL_ENV} to run");
@@ -146,6 +152,7 @@ fn default_stdout_has_three_header_lines_and_generation() {
 }
 
 #[test]
+#[ignore = "loads 16GB model — run with --ignored --test-threads=1 plus HF2Q_TEST_MODEL set"]
 fn default_stderr_is_only_dim_or_plain_trailer() {
     let Some(model) = test_model() else {
         eprintln!("skipping: set {MODEL_ENV} to run");
@@ -188,6 +195,7 @@ fn default_stderr_is_only_dim_or_plain_trailer() {
 }
 
 #[test]
+#[ignore = "loads 16GB model — run with --ignored --test-threads=1 plus HF2Q_TEST_MODEL set"]
 fn vv_boot_log_matches_fixture() {
     let Some(model) = test_model() else {
         eprintln!("skipping: set {MODEL_ENV} to run");
