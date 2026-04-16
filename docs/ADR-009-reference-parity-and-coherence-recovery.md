@@ -1286,6 +1286,12 @@ The seam is in our flash_attn_vec kernel itself (or in its upstream inputs), NOT
 - Online softmax intermediate precision
 - Reduce kernel numerical ordering
 
+### Reference: TurboQuant paper (arXiv 2504.19874)
+
+Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." This is the paper our ADR-007 TurboQuant KV cache is based on. Key claim: "absolute quality neutrality with 3.5 bits per channel" for KV cache quantization.
+
+Relevant to the longer-horizon goal of making TurboQuant match the F32/F16 reference trajectory closely enough to re-enable as default. The paper's two-stage approach (MSE-optimal quantizer + 1-bit Quantized JL transform on residuals) claims to produce an unbiased inner product estimator. If our TurboQuant implementation does not preserve this unbiasedness at the flash_attn_vec boundary, that is a concrete target for the Run-phase TQ parity work (not this current Walk-phase investigation).
+
 **Boundary dump findings (seq_pos=239, the actual divergence decision):**
 
 ```
