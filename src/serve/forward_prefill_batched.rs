@@ -67,22 +67,28 @@ impl MlxModelWeights {
 
         // -------------------------------------------------------------------
         // Per-layer dense KV buffers [n_kv_heads, capacity, head_dim]
+        // Sliding layers use ring buffer (capacity = sliding_window) and
+        // dense flash_attn_vec uses mask_type=1 (causal); the ring itself
+        // applies the sliding-window constraint. Attention is permutation-
+        // invariant over cached K,V (RoPE is baked in pre-cache), so ring
+        // slot order doesn't affect correctness.
         // -------------------------------------------------------------------
-        // Dense flash_attn_vec requires a linear cache; capacity covers
-        // prompt + full decode budget. Ring-buffer for sliding is deferred (ADR-010).
-        let dense_capacity = seq_len + max_decode_tokens;
+        let linear_capacity = seq_len + max_decode_tokens;
+        let sw = self.sliding_window;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let nkv = self.num_kv_heads[layer_idx];
             let hd = self.head_dims[layer_idx];
-            let n = nkv * dense_capacity * hd;
+            let layer_is_ring = self.layer_types[layer_idx] == LayerType::Sliding;
+            let capacity = if layer_is_ring { sw } else { linear_capacity };
+            let n = nkv * capacity * hd;
             let k = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype,
-                                      vec![nkv, dense_capacity, hd])
+                                      vec![nkv, capacity, hd])
                 .map_err(|e| anyhow::anyhow!("batched dense K L{layer_idx}: {e}"))?;
             let v = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype,
-                                      vec![nkv, dense_capacity, hd])
+                                      vec![nkv, capacity, hd])
                 .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
-            dense_kvs_vec.push(DenseKvBuffers { k, v });
+            dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
         }
         let max_nh = nh;
         let max_hd = self.head_dims.iter().copied().max().unwrap_or(512);
@@ -602,6 +608,17 @@ impl MlxModelWeights {
             {
                 let mut s = exec.begin()
                     .map_err(|e| anyhow::anyhow!("batched cache write L{layer_idx}: {e}"))?;
+                // Ring mode needs wrap support in the seq kernel — not
+                // implemented yet. Guard: batched prefill requires seq_len
+                // <= per-layer capacity.
+                let layer_cap = dense_kvs_vec[layer_idx].capacity;
+                if seq_len > layer_cap {
+                    anyhow::bail!(
+                        "batched prefill L{}: seq_len={} exceeds dense cap={} (sliding layer). \
+                         Ring-wrap in the seq kernel is a follow-up; use HF2Q_BATCHED_PREFILL=0 \
+                         (default) for now.",
+                        layer_idx, seq_len, layer_cap);
+                }
                 s.barrier_between(
                     &[&pf_k_normed, &pf_v_normed],
                     &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
@@ -612,14 +629,14 @@ impl MlxModelWeights {
                         &pf_k_normed,
                         &dense_kvs_vec[layer_idx].k,
                         nkv as u32, hd as u32,
-                        dense_capacity as u32, 0, seq_len as u32,
+                        layer_cap as u32, 0, seq_len as u32,
                     ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
                         s.encoder_mut(), reg, metal_dev,
                         &pf_v_normed,
                         &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
-                        dense_capacity as u32, 0, seq_len as u32,
+                        layer_cap as u32, 0, seq_len as u32,
                     ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
                 } else {
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
@@ -627,14 +644,14 @@ impl MlxModelWeights {
                         &pf_k_normed,
                         &dense_kvs_vec[layer_idx].k,
                         nkv as u32, hd as u32,
-                        dense_capacity as u32, 0, seq_len as u32,
+                        layer_cap as u32, 0, seq_len as u32,
                     ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
                         s.encoder_mut(), reg, metal_dev,
                         &pf_v_normed,
                         &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
-                        dense_capacity as u32, 0, seq_len as u32,
+                        layer_cap as u32, 0, seq_len as u32,
                     ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
                 }
                 s.finish()
@@ -746,7 +763,6 @@ impl MlxModelWeights {
 
         // Store dense KV buffers so forward_decode can use them
         self.dense_kvs = Some(dense_kvs_vec);
-        self.dense_kv_capacity = dense_capacity;
         self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         Ok(first_token)

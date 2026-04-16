@@ -491,11 +491,13 @@ pub struct MlxModelWeights {
     /// instead of TQ-packed SDPA. Each layer has K and V in head-major
     /// layout `[nkv_heads, capacity, head_dim]`.
     ///
-    /// `dense_kv_capacity` is the stride (number of positions allocated)
-    /// in the dense buffers.
+    /// Per-layer capacity: sliding layers use ring-buffer mode sized to
+    /// `sliding_window` (writes wrap at `seq_pos % sliding_window`);
+    /// global layers use a linear buffer sized to `seq_len + max_tokens`.
+    /// Attention is permutation-invariant over cached K,V (RoPE is baked
+    /// in before caching), so the ring's slot order doesn't matter for
+    /// correctness — the kernel just attends to all populated slots.
     pub dense_kvs: Option<Vec<DenseKvBuffers>>,
-    /// Capacity (number of positions) in the dense KV buffers.
-    pub dense_kv_capacity: usize,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
 }
@@ -504,6 +506,12 @@ pub struct MlxModelWeights {
 pub struct DenseKvBuffers {
     pub k: MlxBuffer,
     pub v: MlxBuffer,
+    /// Capacity (positions) in this layer's cache. Sliding layers use
+    /// ring-buffer mode: capacity == sliding_window, writes wrap.
+    /// Global layers use linear mode: capacity >= seq_len + max_tokens.
+    pub capacity: usize,
+    /// True if this is a sliding layer (ring-buffer semantics).
+    pub is_sliding: bool,
 }
 
 impl MlxModelWeights {
@@ -792,7 +800,6 @@ impl MlxModelWeights {
             num_experts: cfg.num_experts,
             intermediate_size: cfg.intermediate_size,
             dense_kvs: None,
-            dense_kv_capacity: 0,
             dense_sdpa_tmp: None,
         });
 
@@ -1152,7 +1159,14 @@ impl MlxModelWeights {
                     // Copy this position's K,V into dense KV buffers.
                     // Uses F16 cast kernel when dense_kvs are F16, else F32 copy.
                     let dense_kvs = self.dense_kvs.as_ref().unwrap();
-                    let dense_cap = self.dense_kv_capacity;
+                    let dense_cap = dense_kvs[layer_idx].capacity;
+                    let layer_is_ring = dense_kvs[layer_idx].is_sliding;
+                    // Ring-buffer write for sliding layers; linear for global.
+                    let write_slot = if layer_is_ring {
+                        (seq_pos % dense_cap) as u32
+                    } else {
+                        seq_pos as u32
+                    };
                     let kv_is_f16 = dense_kvs[layer_idx].k.dtype() == mlx_native::DType::F16;
                     s.barrier_between(
                         &[&self.activations.attn_k_normed, v_src],
@@ -1164,33 +1178,31 @@ impl MlxModelWeights {
                             &self.activations.attn_k_normed,
                             &dense_kvs[layer_idx].k,
                             nkv as u32, hd as u32,
-                            dense_cap as u32, seq_pos as u32,
+                            dense_cap as u32, write_slot,
                         ).map_err(|e| anyhow::anyhow!("decode F16 K copy L{layer_idx}: {e}"))?;
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
                             &dense_kvs[layer_idx].v,
                             nkv as u32, hd as u32,
-                            dense_cap as u32, seq_pos as u32,
+                            dense_cap as u32, write_slot,
                         ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
                         total_dispatches += 2;
                     } else {
                         // F32 batched: one dispatch per K, one per V (all heads at once).
-                        // Replaces the old `for h in 0..nkv { 2 dispatches }` loop,
-                        // matching the F16 path above.
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
                             s.encoder_mut(), reg, metal_dev,
                             &self.activations.attn_k_normed,
                             &dense_kvs[layer_idx].k,
                             nkv as u32, hd as u32,
-                            dense_cap as u32, seq_pos as u32,
+                            dense_cap as u32, write_slot,
                         ).map_err(|e| anyhow::anyhow!("decode F32 K batch copy L{layer_idx}: {e}"))?;
                         mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
                             s.encoder_mut(), reg, metal_dev,
                             v_src,
                             &dense_kvs[layer_idx].v,
                             nkv as u32, hd as u32,
-                            dense_cap as u32, seq_pos as u32,
+                            dense_cap as u32, write_slot,
                         ).map_err(|e| anyhow::anyhow!("decode F32 V batch copy L{layer_idx}: {e}"))?;
                         total_dispatches += 2;
                     }
@@ -1264,17 +1276,23 @@ impl MlxModelWeights {
                           &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
                         &[&self.activations.sdpa_out],
                     );
-                    // Dense cache is linear (all positions filled), so kv_seq_len
-                    // must be the true position count (seq_pos + 1), NOT the
-                    // TQ-cache kv_seq_len which is clamped to capacity=sliding_window.
-                    // Using the clamped value would make flash_attn_vec's causal
-                    // bound (causal_max_k = kv_seq_len) stop at position 1023 even
-                    // when the current query is at seq_pos > 1023, causing the mask
-                    // to attend to the OLDEST 1024 positions instead of the current
-                    // sliding window. The sliding_window field still limits the
-                    // mask's window_start; the linear kv_seq_len just tells the
-                    // kernel where the current query actually is.
-                    let dense_kv_seq_len = (seq_pos + 1) as u32;
+                    // kv_seq_len for the dense cache:
+                    //   - Sliding (ring): min(seq_pos+1, capacity). The ring holds
+                    //     at most `capacity=sliding_window` entries — the causal
+                    //     mask then attends to exactly the populated slots.
+                    //     Attention is permutation-invariant over cached K,V
+                    //     (RoPE is baked in pre-cache), so slot order doesn't
+                    //     matter for correctness.
+                    //   - Global (linear): seq_pos + 1.
+                    // In ring mode we use mask_type=1 (causal) since the ring
+                    // itself applies the sliding-window constraint — the
+                    // kernel's sliding-window mask would incorrectly mask slots
+                    // whose logical positions don't equal their slot index.
+                    let dense_kv_seq_len = if layer_is_ring {
+                        ((seq_pos + 1).min(dense_cap)) as u32
+                    } else {
+                        (seq_pos + 1) as u32
+                    };
                     let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -1282,8 +1300,8 @@ impl MlxModelWeights {
                         kv_seq_len: dense_kv_seq_len,
                         kv_capacity: dense_cap as u32,
                         scale: 1.0,
-                        mask_type: if is_sliding { 2 } else { 1 },
-                        sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                        mask_type: 1, // causal; ring applies the sliding window for us
+                        sliding_window: 0,
                         softcap: 0.0,
                     };
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(
