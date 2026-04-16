@@ -1251,6 +1251,31 @@ impl MlxModelWeights {
                     &self.activations.residual,
                     hs as u32, 1, eps,
                 ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
+
+                // ADR-009 Phase 3A: sub-layer dump at attention boundary.
+                let dump_detail_layer: Option<usize> = std::env::var("HF2Q_DUMP_LAYER_DETAIL")
+                    .ok().and_then(|v| v.parse::<usize>().ok());
+                if dump_layers && dump_detail_layer == Some(layer_idx) {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;
+                    let dump_dir = std::env::var("HF2Q_DUMP_DIR")
+                        .unwrap_or_else(|_| "/tmp".into());
+                    // Dump post-attention residual
+                    let res_data: &[f32] = self.activations.residual.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump residual L{layer_idx}: {e}"))?;
+                    let path = format!("{dump_dir}/hf2q_attn_out_layer{layer_idx:02}_pos{seq_pos}.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            res_data.as_ptr() as *const u8,
+                            hs * std::mem::size_of::<f32>(),
+                        )
+                    };
+                    std::fs::write(&path, bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                    eprintln!("[DUMP] attn_out layer {layer_idx:02} ({hs} f32) -> {path}");
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("dump post-attn re-begin L{layer_idx}: {e}"))?;
+                }
                 total_dispatches += 1;
 
                 // ============================================================

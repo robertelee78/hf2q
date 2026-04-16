@@ -42,16 +42,18 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     const char * name = ggml_get_name(t);
     if (!name) return true;
 
-    // We want "l_out" tensors — these are end-of-layer hidden states
-    if (strncmp(name, "l_out", 5) != 0) return true;
+    // We want "l_out" and "attn_out" tensors
+    bool is_l_out = (strncmp(name, "l_out", 5) == 0);
+    bool is_attn_out = (strncmp(name, "attn_out", 8) == 0);
+    if (!is_l_out && !is_attn_out) return true;
 
-    // Extract layer number from the name metadata
-    // llama.cpp stores the layer index in the tensor's extra field or via cb naming
-    // The name will be "l_out-0", "l_out-1", etc.
+    // Extract layer number from name: "l_out-0", "attn_out-0", etc.
     int layer = -1;
-    if (strlen(name) > 6 && name[5] == '-') {
-        layer = atoi(name + 6);
+    const char * dash = strrchr(name, '-');
+    if (dash) {
+        layer = atoi(dash + 1);
     }
+    const char * prefix = is_l_out ? "l_out" : "attn_out";
 
     // Get tensor data
     int64_t n_elements = ggml_nelements(t);
@@ -63,8 +65,8 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // Write to file
     char path[512];
-    snprintf(path, sizeof(path), "%s/llama_l_out_layer%02d_pos%d.bin",
-        g_dump.out_dir.c_str(), layer, g_dump.current_pos);
+    snprintf(path, sizeof(path), "%s/llama_%s_layer%02d_pos%d.bin",
+        g_dump.out_dir.c_str(), prefix, layer, g_dump.current_pos);
     FILE * f = fopen(path, "wb");
     if (f) {
         fwrite(data.data(), sizeof(float), n_elements, f);
