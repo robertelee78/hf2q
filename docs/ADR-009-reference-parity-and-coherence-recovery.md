@@ -1299,9 +1299,20 @@ The actual attention inputs at seq_pos=239 are the full cached K,V (240 position
 
 A 2.8x amplification is within the expected range for an attention-weighted sum over inputs with scattered per-position drift.
 
-**Revised interpretation:** The flash_attn_vec kernel appears to be faithfully computing `softmax(Q·K^T)·V` on inputs that are already divergent. The real root of the sliding_wrap divergence is the **cached K,V state carrying cumulative per-position drift** from earlier layer outputs feeding back into the recurrent KV write path.
+**What is still true:**
+- sdpa_out is the first place the divergence becomes large enough to dominate output behavior
+- Layer 24 sliding attention is the first major amplification point observable in the per-layer bisection
 
-This does NOT exonerate flash_attn_vec — the 2.8x amplification on noisy inputs still compounds over 30 layers of generation. But it shifts the weight of evidence: the primary drift source may be UPSTREAM of the cache write (the layer computations that produce K,V per token), not the attention weighted-sum itself.
+**What changes:**
+- The "20.48x kernel amplification" claim was overstated; the baseline was wrong
+- flash_attn_vec is NOT definitively the root cause; it's the first major AMPLIFIER
+
+**Updated framing:**
+
+- **Proven:** cached K/V state is already materially divergent before the weighted sum (rel_rms ~5e-3 per position by seq_pos=239); layer-24 sliding attention amplifies that existing drift by ~2.8x to become behaviorally decisive
+- **Not yet proven:** whether the earliest source of that cache drift is inside prior attention kernels, earlier residual paths, or another recurrent operation
+
+**Next step:** Find the earliest position/layer where cached K/V first becomes materially wrong (e.g. rel_rms > 1e-3). Trace back to the hidden state feeding that cache write. Only then decide whether flash_attn_vec is root cause or just first major amplifier.
 
 **Launch contract diff findings:**
 
@@ -1313,6 +1324,15 @@ This does NOT exonerate flash_attn_vec — the 2.8x amplification on noisy input
 - **Not initialized:** our dense_kvs buffer memory is not zero-initialized — positions beyond kv_seq_len contain whatever was in memory. However, the mask ensures those positions don't contribute to the softmax output.
 
 The launch contract is functionally equivalent for the F32 path. No evident bug in the kernel invocation that would explain a 2.8x amplification as wrong.
+
+**Revised Phase 3A plan:**
+
+Shift from "find the kernel bug" to "find the earliest cache drift origin":
+
+1. Measure cached K/V rel_rms across positions and layers, looking for the earliest position where rel_rms first exceeds a small threshold (e.g. 1e-4 or 1e-3)
+2. At that position, inspect the hidden state that fed the K,V projection
+3. Trace that hidden state backward through the layer stack to find which sub-kernel first introduces drift
+4. Only then decide whether the root cause is attention, residual, norm, quantized matmul, or the MLP/MoE path
 
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
