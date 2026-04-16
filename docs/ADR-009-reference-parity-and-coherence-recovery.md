@@ -1493,26 +1493,59 @@ This localizes the divergence to Layer 7's forward pass. But the divergence is t
 - hf2q batched K_normed at L7 pos 34 is within 8.5e-5 of hf2q per-token's K_normed
 - Both differ from llama BATCHED cached K by 4.37e-2
 
-**Conclusion:**
+**What the evidence supports:**
 
-The 4.37% K divergence at (L7, pos 34) is **intrinsic to different batched-kernel implementations** (ours vs llama's). It is not a specific bug we can fix with a kernel tweak; it is the consequence of doing batched matmul + batched head_norm + batched RoPE with our kernels vs llama's kernels. Small reduction-order or rounding differences in each stage accumulate into the cached value.
+- sourdough is effectively at parity with llama.cpp (3656/3658 bytes)
+- sliding_wrap retains a large gap against llama batched (752/2327)
+- The gap is not explained by prefill mode alone (both hf2q paths hit the same 752-byte ceiling vs batched llama)
+- The L6→L7 jump in batched comparison is real (3.11e-4 → 4.37e-2)
+- hf2q's per-token path tracks llama's per-token path tightly at that boundary (1.48e-4)
 
-This ceiling propagates through attention (where the cached K is read) and compounds in the decode path. The 752-byte sliding_wrap parity ceiling vs llama batched is the manifestation of this intrinsic difference.
+**What the evidence does NOT prove:**
 
-**Practical implication:**
+- That the 752-byte ceiling is an intrinsic unavoidable limit
+- That closing the gap is impossible without bit-exact kernel replication
 
-Exact parity with llama.cpp batched prefill likely requires either:
-1. Bit-exact kernel replication (significant engineering — essentially rewriting our kernels to match llama's implementation details)
-2. Integrating llama.cpp's ggml kernels directly (violates the "own the stack" principle of ADR-008)
+These are plausible interpretations but stronger than the data supports.
 
-The current owned stack produces a coherent output trajectory that matches llama.cpp at 3656/3658 on sourdough (99.9%) and 1569/2354 on sliding_wrap vs llama per-token (67%) / 752/2327 vs llama batched (32%). The batched vs per-token split for long prompts is a legitimate characteristic of independent implementations, not a bug.
+**Defensible closing statement:**
 
-**Recommendation:**
+Current evidence indicates the remaining sliding_wrap gap is dominated by early batched-kernel numerical differences between hf2q and llama.cpp, not by prefill mode or KV dtype. Closing that gap would likely require either:
+- Much deeper batched-kernel alignment and boundary-level replication, or
+- Direct reuse of ggml-equivalent kernel execution
 
-- Accept the 752-byte ceiling on sliding_wrap as intrinsic to independent batched-kernel implementations on quantized weights
-- Keep `forward_prefill` (per-token) as the Walk-phase default — it produces correct coherent output and has the better per-token llama parity (1569 bytes)
-- Keep `forward_prefill_batched` as opt-in via HF2Q_BATCHED_PREFILL=1 for users who want faster prefill speed or batched-llama-style trajectory
-- Close Phase 3A — further parity improvement requires kernel-bit-exact engineering that's out of scope for the coherence-recovery ADR
+Neither falls within the coherence-recovery scope of this ADR.
+
+---
+
+## Phase 3A Closeout (2026-04-16)
+
+**Status:** Phase 3A complete for coherence-recovery goals. Exact long-sequence batched parity against llama.cpp remains unresolved and is **deferred** to a future ADR.
+
+**Shipping state:**
+
+- `forward_prefill` (per-token dense F32 SDPA) — **default path**
+- `forward_prefill_batched` (true batched prefill via tiled `sdpa`) — **experimental, opt-in** via `HF2Q_BATCHED_PREFILL=1`
+- Decode unchanged: `flash_attn_vec` with dense F32 K,V accumulated by prefill
+
+**Parity measurements (final, default per-token path):**
+
+| Prompt | vs llama BATCHED | vs llama PER-TOKEN |
+|---|---:|---:|
+| sourdough (22 prompt, 1000 decode) | **3656/3658 (99.9%)** | 3095/3656 (84.6%) |
+| short_hello (22 prompt, 50 decode) | 29/36 (content match, EOS differs) | — |
+| sliding_wrap (82 prompt, 500 decode) | 752/2327 (32.3%) | **1569/2354 (66.7%)** |
+
+**Deferred work (out of Phase 3A scope):**
+
+A follow-up ADR should scope exact batched-llama parity narrowly:
+1. Batched-kernel boundary dumps at QK logits / softmax weights / V aggregation stage
+2. ggml-equivalent batched kernel alignment (reduction order, FMA pattern, accumulator layout)
+3. Optionally: direct ggml integration if the parity cost/benefit justifies violating ADR-008
+
+**Acceptance for Phase 3A:**
+
+The current owned stack produces coherent output that matches llama.cpp at byte-level parity on the canonical coherence gate (sourdough) and tracks both prefill modes of the oracle in a characteristic pattern on longer sequences. The coherence-recovery bar of ADR-009 is met. Further parity improvement is a separate engineering question and is explicitly deferred.
 
 ### Reference: TurboQuant paper (arXiv 2504.19874)
 
