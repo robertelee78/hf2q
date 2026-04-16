@@ -1,9 +1,11 @@
 # ADR-010: Exact Batched-Kernel Parity with llama.cpp
 
-**Status:** Proposed
+**Status:** Parity line **Deferred**. Speed line **Shipping** via lm_head Q8+rerank as the new default strategy (see "lm_head Q8 + Rerank" section below).
 **Date:** 2026-04-16
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend), ADR-007 (TurboQuant KV cache), ADR-008 (candle divorce), ADR-009 (reference parity and coherence recovery)
+
+> **TL;DR (2026-04-16 landing):** Default hf2q decode now matches the F16 coherence trajectory on the locked prompts while running at ~98% of llama.cpp throughput via Q8 lm_head + CPU threshold-scan exact rerank. Exact batched-kernel parity against llama.cpp's MoE path remains an open numerical sensitivity issue (sliding_wrap ~752/2327 bytes vs llama batched); the investigation is paused, not closed, and a GPU top-K kernel is committed-but-dormant pending a future parallel-phase-2 redesign.
 
 ---
 
