@@ -1,7 +1,7 @@
 # ADR-009: Reference Parity and Coherence Recovery for Owned Inference
 
-**Status:** Accepted (canonical coherence path restored; sliding-wrap parity remains open)  
-**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phase 1 canonical path accepted)  
+**Status:** Phase 1 accepted (semantic parity); Phase 3A open (exact numerical parity)  
+**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phase 1 accepted, Phase 3A opened)  
 **Decision Makers:** Robert, Claude  
 **Related ADRs:** ADR-008 (candle divorce), ADR-007 (TurboQuant KV cache), ADR-006 (mlx-native GPU backend), ADR-005 (inference server)
 
@@ -1200,15 +1200,65 @@ Ruled out:
 
 The candle reference at `/opt/candle` was checked: candle has F32 safetensors Gemma4 but no quantized GGUF path, so it cannot serve as a same-quantization reference baseline. The old candle-backed hf2q path (removed in ADR-008) achieved 3095 bytes on sourdough (22-token prompt) vs our 3656 — showing our dense path is more accurate, not less.
 
-**Assessment:** This is accumulated numeric drift from an independent implementation operating on quantized weights — the same class of divergence that occurs between any two ML framework implementations when logit distributions are near-flat. The 22-token sourdough prompt (3656/3658 = 99.95% parity) demonstrates the owned stack is semantically correct. Longer sequences accumulate more drift, which is expected and not pathological.
+**Assessment:** This divergence is a bug until explained or eliminated. "Accumulated numeric drift" is a description of the symptom, not an acceptable end state. Every persistent long-horizon token divergence from the pinned llama.cpp oracle must be traced to a specific kernel-level cause and fixed.
 
-**Next steps:** If tighter long-prompt parity is needed, instrument the per-layer logit deltas at the divergence point to identify which specific kernel accumulates the most drift.
+**Root cause investigation (in progress):**
+
+Kernel diff of `flash_attn_vec.metal` vs llama.cpp's `kernel_flash_attn_ext_vec` shows the F32 path uses NE=1 in both implementations, and the Q*K^T loop, softmax, and V accumulation are structurally identical. The difference must be in one of:
+- Subtleties in the flash attention kernel (padding, tail handling, shared memory layout)
+- Quantized matmul kernels (reduction order, block processing)
+- RMS norm / fused norm kernels (reduction precision, epsilon handling)
+- Dense GEMM lm_head (F16 weights with F32 I/O — precision of mixed-precision path)
+- Mask application details (fma vs separate mul+add)
+
+**Next steps:** Phase 3A (see below).
 
 #### O-2: Tensor fixtures not yet populated
 
 `tests/evals/fixtures/` remains empty. Text-level byte-prefix parity checks are in place and operational, but the ADR's original Phase 2 vision of tensor-level boundary fixtures (saved Q, K, V, attention logits, sdpa_out) for no-model CI is not yet implemented.
 
 **Status:** Accepted gap. Text-level parity (3656/3658 on sourdough) provides strong correctness evidence. Tensor fixtures are follow-up work.
+
+---
+
+## Phase 3A: Exact llama.cpp Numerical Parity
+
+### Goal
+
+Deterministic greedy-token parity with the pinned llama.cpp oracle on the locked long-sequence corpus. Not "close enough" — matching the oracle trajectory.
+
+### Acceptance target
+
+- All eval corpus prompts (sourdough, short_hello, sliding_wrap) produce byte-identical output to llama.cpp for the required token horizon
+- No unexplained token divergence at any prompt length
+- New long-prompt tests added as needed to validate
+
+### Execution order
+
+1. **Flash-attn parity** — match llama.cpp's `kernel_flash_attn_ext_vec` exactly
+   - Layout: NE/NL/NSG/NWG, reduction tree, shared memory
+   - Precision: fma vs mul+add, softcap/tanh, mask application order
+   - Padding/tail: how partial chunks at KV end are handled
+   - A/B: measure sliding_wrap before/after each change
+
+2. **Norm/kernel parity** — only if flash-attn doesn't close the gap
+   - RMS norm: reduction order, epsilon, weight application
+   - Fused head norm+RoPE: compare intermediate values
+   - Post-attention fused norms
+
+3. **Matmul parity** — quantized and dense
+   - Q4_0, Q6_K, Q8_0 matmul kernels vs llama.cpp originals
+   - Dense F16 lm_head GEMM vs llama.cpp's path
+
+4. **Remaining tails**
+   - Softcap (if used)
+   - Logits postprocessing
+   - Sampling / argmax seam
+   - Prefill → decode handoff precision
+
+### Key principle
+
+Every divergent token is a bug report against a specific kernel. The investigation proceeds by bisection: isolate the layer and position where the first logit delta exceeds the argmax-flip threshold, then trace that delta to a specific kernel dispatch.
 
 ---
 
