@@ -892,8 +892,20 @@ impl MlxModelWeights {
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("batched final norm: {e}"))?;
 
-            // lm_head (F16 weights × F32 I/O)
-            if let Some(ref lm_head_f16) = self.lm_head_f16 {
+            // lm_head: whichever weight was loaded (Q8 for large vocab×hs, F16 otherwise).
+            if let Some(ref q8) = self.lm_head_q8 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q8.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s, reg, dev,
+                    &self.activations.norm_out,
+                    q8,
+                    &mut self.activations.logits,
+                    1,
+                ).map_err(|e| anyhow::anyhow!("batched lm_head Q8: {e}"))?;
+            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
                 s.barrier_between(
                     &[&self.activations.norm_out, lm_head_f16],
                     &[&self.activations.logits],
@@ -906,7 +918,7 @@ impl MlxModelWeights {
                     &DenseGemmF16Params { m: 1, n: vocab_size as u32, k: hs as u32 },
                 ).map_err(|e| anyhow::anyhow!("batched lm_head: {e}"))?;
             } else {
-                anyhow::bail!("batched prefill requires GPU lm_head (F16 weight)");
+                anyhow::bail!("batched prefill requires GPU lm_head (F16 or Q8 weight)");
             }
 
             if let Some(cap) = self.final_logit_softcapping {

@@ -542,51 +542,55 @@ impl MlxModelWeights {
         let final_norm = gguf.load_tensor_f32("output_norm.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
 
-        // --- lm_head F16 copy (tied to embed_weight) ---
-        eprintln!("  Creating F16 embed weight for GPU lm_head...");
-        let lm_head_f16 = {
-            let embed_f32: &[f32] = embed_weight.as_slice()
-                .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
-            let n_elements = embed_f32.len();
-            let f16_bytes = n_elements * 2; // f16 = 2 bytes per element
-            let f16_buf = mlx_device.alloc_buffer(
-                f16_bytes, mlx_native::DType::F16,
-                vec![cfg.vocab_size, cfg.hidden_size],
-            ).map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
-            // Convert F32 -> F16 on CPU at load time (one-time cost).
-            let dst_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    f16_buf.contents_ptr() as *mut u8,
-                    f16_bytes,
-                )
-            };
-            for i in 0..n_elements {
-                let f16_val = half::f16::from_f32(embed_f32[i]);
-                let bits = f16_val.to_bits();
-                dst_bytes[i * 2] = (bits & 0xFF) as u8;
-                dst_bytes[i * 2 + 1] = (bits >> 8) as u8;
+        // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
+        //
+        // The lm_head matmul is a single F32×{F16|Q8} mat-vec over
+        // [vocab × hidden_size] weights, memory-bandwidth-bound at batch=1.
+        // Q8_0 halves the weight traffic vs F16 and recovers ~12% decode
+        // throughput at Gemma-4-26B scale (1.47 GB F16 → 784 MB Q8).
+        //
+        // Heuristic: enable Q8_0 when F16 weight would exceed 256 MB — the
+        // point where the memory-bandwidth savings produce measurable
+        // speedup. Smaller models have negligible head time, so F16 is kept
+        // for maximum numerical fidelity on the oracle path.
+        //
+        // Env override (set to "1" to force on, "0" to force off):
+        //   HF2Q_LMHEAD_Q8=1    always use Q8
+        //   HF2Q_LMHEAD_Q8=0    always use F16
+        //   (unset)             auto-detect by size
+        //
+        // When Q8 is active we don't also allocate F16 (saves ~1.47 GB).
+        let lm_head_f16_bytes = cfg.vocab_size * cfg.hidden_size * 2;
+        let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
+        let use_q8 = match q8_env.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                // Auto-detect: Q8 pays off when F16 weight > 256 MB.
+                let threshold_bytes: usize = 256 * 1024 * 1024;
+                lm_head_f16_bytes > threshold_bytes && cfg.hidden_size % 32 == 0
             }
-            f16_buf
         };
-        eprintln!("  F16 embed weight created ({} elements, {:.1} MB).",
-            cfg.vocab_size * cfg.hidden_size,
-            (cfg.vocab_size * cfg.hidden_size * 2) as f64 / 1e6);
 
-        // --- Optional Q8_0 lm_head (HF2Q_LMHEAD_Q8=1) ---
-        // Halves memory traffic vs F16 lm_head (~1.47 GB → ~784 MB for
-        // vocab=262144, hs=2816). Gated experiment; F16 remains the default
-        // oracle path.
-        let lm_head_q8: Option<MlxQWeight> = if std::env::var("HF2Q_LMHEAD_Q8")
-            .map_or(false, |v| v == "1")
-        {
-            eprintln!("  Quantizing lm_head to Q8_0 (HF2Q_LMHEAD_Q8=1)...");
+        let lm_head_f16: Option<MlxBuffer>;
+        let lm_head_q8: Option<MlxQWeight>;
+        if use_q8 {
+            if cfg.hidden_size % 32 != 0 {
+                anyhow::bail!(
+                    "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
+                    cfg.hidden_size);
+            }
+            let source = if q8_env.as_deref() == Some("1") {
+                "forced"
+            } else {
+                "auto"
+            };
+            eprintln!("  Quantizing lm_head to Q8_0 ({} — F16 size {:.1} MB > 256 MB threshold)...",
+                source, lm_head_f16_bytes as f64 / 1e6);
             let embed_f32: &[f32] = embed_weight.as_slice()
                 .map_err(|e| anyhow::anyhow!("embed as_slice for q8 quantize: {e}"))?;
             let rows = cfg.vocab_size;
             let cols = cfg.hidden_size;
-            if cols % 32 != 0 {
-                anyhow::bail!("HF2Q_LMHEAD_Q8 requires hidden_size % 32 == 0 (got {cols})");
-            }
             let blocks_per_row = cols / 32;
             let block_bytes: usize = 34; // 2 (f16 scale) + 32 (int8 quants)
             let total_bytes = rows * blocks_per_row * block_bytes;
@@ -611,30 +615,66 @@ impl MlxModelWeights {
                     let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
                     let inv_d = if d != 0.0 { 1.0 / d } else { 0.0 };
                     let block_off = b * block_bytes;
-                    // F16 scale
                     let d_bits = half::f16::from_f32(d).to_bits();
                     row_dst[block_off] = (d_bits & 0xFF) as u8;
                     row_dst[block_off + 1] = (d_bits >> 8) as u8;
-                    // Int8 quants
                     for (i, &v) in block_src.iter().enumerate() {
                         let q = (v * inv_d).round().clamp(-127.0, 127.0) as i8;
                         row_dst[block_off + 2 + i] = q as u8;
                     }
                 }
             }
-            eprintln!("  Q8_0 lm_head created ({} rows × {} blocks, {:.1} MB).",
-                rows, blocks_per_row, total_bytes as f64 / 1e6);
-            Some(MlxQWeight {
+            eprintln!("  Q8_0 lm_head created ({:.1} MB, {:.2}× smaller than F16).",
+                total_bytes as f64 / 1e6,
+                lm_head_f16_bytes as f64 / total_bytes as f64);
+            lm_head_f16 = None;
+            lm_head_q8 = Some(MlxQWeight {
                 buffer: q_buf,
                 info: QuantWeightInfo {
                     ggml_dtype: mlx_native::GgmlType::Q8_0,
                     rows,
                     cols,
                 },
-            })
+            });
         } else {
-            None
-        };
+            let source = if q8_env.as_deref() == Some("0") {
+                "forced"
+            } else {
+                "auto"
+            };
+            let reason = if q8_env.as_deref() == Some("0") {
+                format!("{} — HF2Q_LMHEAD_Q8=0", source)
+            } else if cfg.hidden_size % 32 != 0 {
+                format!("{} — hidden_size {} not divisible by 32", source, cfg.hidden_size)
+            } else {
+                format!("{} — F16 size {:.1} MB ≤ 256 MB threshold", source,
+                    lm_head_f16_bytes as f64 / 1e6)
+            };
+            eprintln!("  Creating F16 embed weight for GPU lm_head ({})...", reason);
+            let embed_f32: &[f32] = embed_weight.as_slice()
+                .map_err(|e| anyhow::anyhow!("embed as_slice for f16 copy: {e}"))?;
+            let n_elements = embed_f32.len();
+            let f16_buf = mlx_device.alloc_buffer(
+                lm_head_f16_bytes, mlx_native::DType::F16,
+                vec![cfg.vocab_size, cfg.hidden_size],
+            ).map_err(|e| anyhow::anyhow!("lm_head_f16 alloc: {e}"))?;
+            let dst_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    f16_buf.contents_ptr() as *mut u8,
+                    lm_head_f16_bytes,
+                )
+            };
+            for i in 0..n_elements {
+                let f16_val = half::f16::from_f32(embed_f32[i]);
+                let bits = f16_val.to_bits();
+                dst_bytes[i * 2] = (bits & 0xFF) as u8;
+                dst_bytes[i * 2 + 1] = (bits >> 8) as u8;
+            }
+            eprintln!("  F16 embed weight created ({} elements, {:.1} MB).",
+                n_elements, lm_head_f16_bytes as f64 / 1e6);
+            lm_head_f16 = Some(f16_buf);
+            lm_head_q8 = None;
+        }
 
         // --- Per-layer weights ---
         let num_layers = cfg.num_hidden_layers;
@@ -851,7 +891,7 @@ impl MlxModelWeights {
             embed_weight,
             layers,
             final_norm,
-            lm_head_f16: Some(lm_head_f16),
+            lm_head_f16,
             lm_head_q8,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
@@ -1910,12 +1950,9 @@ impl MlxModelWeights {
                 s = exec.begin().map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
             }
 
-            // GPU lm_head: Q8_0 path when HF2Q_LMHEAD_Q8=1 was set at load time
-            // and is still set now; otherwise F16 matvec (default oracle).
-            let use_q8_lmhead = self.lm_head_q8.is_some()
-                && std::env::var("HF2Q_LMHEAD_Q8").map_or(false, |v| v == "1");
-            if use_q8_lmhead {
-                let q8 = self.lm_head_q8.as_ref().unwrap();
+            // GPU lm_head: whichever weight buffer was chosen at load time
+            // (Q8_0 auto-enabled for large vocab × hidden models, F16 otherwise).
+            if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
                     &[&self.activations.norm_out, &q8.buffer],
                     &[&self.activations.logits],
