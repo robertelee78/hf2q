@@ -92,7 +92,7 @@ impl MlxModelWeights {
         let use_f16_kv = INVESTIGATION_ENV.f16_kv;
         let kv_dtype = if use_f16_kv { mlx_native::DType::F16 } else { mlx_native::DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
-        eprintln!("Prefill: KV cache dtype = {:?}", kv_dtype);
+        tracing::debug!("Prefill: KV cache dtype = {:?}", kv_dtype);
 
         // Per-layer capacity:
         //   - Sliding (ring): sliding_window. Writes wrap at seq_pos % capacity.
@@ -127,7 +127,7 @@ impl MlxModelWeights {
             vec![tmp_bytes / 4])
             .map_err(|e| anyhow::anyhow!("prefill sdpa_tmp: {e}"))?;
 
-        eprintln!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
+        tracing::debug!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
 
         // ADR-010 one-shot norm weight dump: read self.layers[L].norms.input_layernorm
         // as the hf2q kernel sees it, compare against the raw GGUF tensor.
@@ -844,7 +844,7 @@ impl MlxModelWeights {
         }
 
         let prefill_elapsed = prefill_start.elapsed();
-        eprintln!(
+        tracing::debug!(
             "Prefill complete (dense SDPA): {} tokens in {:.1} ms ({:.1} tok/s), first decode token = {}",
             seq_len,
             prefill_elapsed.as_secs_f64() * 1000.0,
