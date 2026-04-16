@@ -802,6 +802,57 @@ impl MlxModelWeights {
                     write_slice("sdpa_out_row", sdpa_row, &format!("[{nh},{hd}]"))?;
                     write_slice("k_cache_upto", &k_valid, &format!("[{nkv},{n_valid},{hd}]"))?;
                     write_slice("v_cache_upto", &v_valid, &format!("[{nkv},{n_valid},{hd}]"))?;
+
+                    // ADR-010 L6 post-attention bisection: dump the rest of
+                    // the post-SDPA pipeline for this token. All target
+                    // buffers are distinct per-role and not reused within
+                    // a layer, so end-of-layer reads are safe.
+                    let attn_out_full: &[f32] = pf_attn_out.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_attn_out: {e}"))?;
+                    let residual_full: &[f32] = pf_residual.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_residual: {e}"))?;
+                    let rlogits_full: &[f32] = pf_router_logits.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_router_logits: {e}"))?;
+                    let rweights_full: &[f32] = pf_routing_weights.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_routing_weights: {e}"))?;
+                    let eids_full: &[u32] = pf_expert_ids.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_expert_ids: {e}"))?;
+                    let mlp_down_full: &[f32] = pf_mlp_down.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_mlp_down: {e}"))?;
+                    let moe_accum_full: &[f32] = pf_moe_accum.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_moe_accum: {e}"))?;
+                    let hidden_full: &[f32] = pf_hidden.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dump pf_hidden end: {e}"))?;
+
+                    let hs_off = target_tok * hs;
+                    let exp_off = target_tok * top_k;
+                    let rl_off = target_tok * num_experts;
+
+                    write_slice("attn_out_row",
+                        &attn_out_full[hs_off..hs_off + hs], &format!("[{hs}]"))?;
+                    write_slice("residual_row",
+                        &residual_full[hs_off..hs_off + hs], &format!("[{hs}]"))?;
+                    write_slice("router_logits_row",
+                        &rlogits_full[rl_off..rl_off + num_experts], &format!("[{num_experts}]"))?;
+                    write_slice("routing_weights_row",
+                        &rweights_full[exp_off..exp_off + top_k], &format!("[{top_k}]"))?;
+                    write_slice("mlp_down_row",
+                        &mlp_down_full[hs_off..hs_off + hs], &format!("[{hs}]"))?;
+                    write_slice("moe_accum_row",
+                        &moe_accum_full[hs_off..hs_off + hs], &format!("[{hs}]"))?;
+                    write_slice("l_out_row",
+                        &hidden_full[hs_off..hs_off + hs], &format!("[{hs}]"))?;
+
+                    // u32 expert IDs — separate byte format
+                    let eid_slice = &eids_full[exp_off..exp_off + top_k];
+                    let path_eid = format!(
+                        "{batched_dump_dir}/hf2q_batched_expert_ids_row_layer{layer_idx:02}_tok{target_tok:03}.bin");
+                    let eid_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(eid_slice.as_ptr() as *const u8,
+                                                    eid_slice.len() * 4) };
+                    std::fs::write(&path_eid, eid_bytes)
+                        .map_err(|e| anyhow::anyhow!("write {path_eid}: {e}"))?;
+                    eprintln!("[BATCHED DUMP] expert_ids_row [{top_k}] u32 -> {path_eid}");
                 }
             }
         }

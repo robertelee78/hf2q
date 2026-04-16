@@ -64,10 +64,27 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                     && strncmp(name, "Vcur", 4) == 0 && (name[4] == '-' || name[4] == '\0'));
     bool is_cache_k = (strncmp(name, "cache_k_l", 9) == 0);
     bool is_cache_v = (strncmp(name, "cache_v_l", 9) == 0);
+    // ADR-010 L6 post-attention bisection: FFN / MoE tensor names from
+    // gemma4-iswa.cpp cb() calls.
+    bool is_ffn_norm_1     = (strncmp(name, "ffn_norm_1-", 11) == 0);
+    bool is_ffn_norm_2     = (strncmp(name, "ffn_norm_2-", 11) == 0);
+    bool is_ffn_mlp        = (strncmp(name, "ffn_mlp-", 8) == 0);
+    bool is_ffn_moe_logits = (strncmp(name, "ffn_moe_logits-", 15) == 0);
+    bool is_ffn_moe_combined = (strncmp(name, "ffn_moe_combined-", 17) == 0);
+    bool is_ffn_moe        = (!is_ffn_moe_logits && !is_ffn_moe_combined
+                              && strncmp(name, "ffn_moe-", 8) == 0);
+    bool is_ffn_norm       = (!is_ffn_norm_1 && !is_ffn_norm_2
+                              && strncmp(name, "ffn_norm-", 9) == 0);
+    bool is_ffn_out        = (strncmp(name, "ffn_out-", 8) == 0);
+    bool is_ffn_post_norm  = (strncmp(name, "ffn_post_norm-", 14) == 0);
+    bool is_out_scaled     = (strncmp(name, "out_scaled-", 11) == 0);
     if (!is_l_out && !is_attn_out && !is_kqv_out && !is_kqv
         && !is_qcur_pos && !is_kcur_pos
         && !is_attn_norm && !is_qcur_normed && !is_kcur_normed && !is_vcur_normed
         && !is_qcur && !is_kcur && !is_vcur
+        && !is_ffn_norm_1 && !is_ffn_norm_2 && !is_ffn_mlp
+        && !is_ffn_moe_logits && !is_ffn_moe_combined && !is_ffn_moe
+        && !is_ffn_norm && !is_ffn_out && !is_ffn_post_norm && !is_out_scaled
         && !is_cache_k && !is_cache_v) return true;
 
     // Extract layer number from name: "l_out-0", "attn_out-0", etc.
@@ -93,6 +110,16 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         : is_qcur ? "qcur"
         : is_kcur ? "kcur"
         : is_vcur ? "vcur"
+        : is_ffn_norm_1 ? "ffn_norm_1"
+        : is_ffn_norm_2 ? "ffn_norm_2"
+        : is_ffn_mlp ? "ffn_mlp"
+        : is_ffn_moe_logits ? "ffn_moe_logits"
+        : is_ffn_moe_combined ? "ffn_moe_combined"
+        : is_ffn_moe ? "ffn_moe"
+        : is_ffn_norm ? "ffn_norm"
+        : is_ffn_out ? "ffn_out"
+        : is_ffn_post_norm ? "ffn_post_norm"
+        : is_out_scaled ? "out_scaled"
         : is_cache_k ? "cache_k"
         : is_cache_v ? "cache_v"
         : "unknown";
