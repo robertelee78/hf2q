@@ -2074,17 +2074,100 @@ impl MlxModelWeights {
             }
         }
 
-        // Read the argmax result (8 bytes: 1 u32 index + 1 f32 value)
-        let token_id: u32 = {
+        // Read the Q8 GPU argmax result (8 bytes: 1 u32 index + 1 f32 value).
+        let gpu_top1: u32 = {
             let idx: &[u32] = self.activations.argmax_index.as_slice()
                 .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
             idx[0]
         };
 
-        // Diagnostic: when <pad> (id 0) wins the argmax, dump top-10 logits so
-        // we can see whether pad is winning by a large margin (kernel bug) or
-        // by sub-kernel-precision margin (numerical noise on a tight tiebreak).
-        // This is NOT masking — the token is still returned to the caller.
+        // Q8 coarse → F32 exact rerank.
+        //
+        // Data shows Q8_0 lm_head adds ~2.5–5e-3 logit noise. Any token within
+        // that envelope of top-1 has non-trivial chance of flipping. The pad
+        // case is the most visible symptom; the mechanism is symmetric.
+        //
+        // Fix: keep Q8 for coarse scoring, but for the small set of tokens
+        // plausibly eligible to win, recompute exact F32 logits from the F32
+        // `embed_weight` (already resident) and take argmax on those.
+        //
+        // Candidate set (O(~100) tokens):
+        //   - top-K Q8 tokens (K=64)
+        //   - all tokens within delta=0.01 of Q8 top-1
+        //   - special tokens: 0 <pad>, 1 <eos>, 2 <bos>, 105 <|turn>, 106 <turn|>
+        //
+        // Rerank is skipped when lm_head is already F16 (no coarse noise to
+        // correct) or when HF2Q_LMHEAD_RERANK=0.
+        let rerank_active = self.lm_head_q8.is_some()
+            && !matches!(std::env::var("HF2Q_LMHEAD_RERANK").as_deref(), Ok("0"));
+        let token_id: u32 = if rerank_active {
+            let logits: &[f32] = self.activations.logits.as_slice()
+                .map_err(|e| anyhow::anyhow!("rerank logits read: {e}"))?;
+            let hidden: &[f32] = self.activations.norm_out.as_slice()
+                .map_err(|e| anyhow::anyhow!("rerank norm_out read: {e}"))?;
+            let embed_f32: &[f32] = self.embed_weight.as_slice()
+                .map_err(|e| anyhow::anyhow!("rerank embed read: {e}"))?;
+
+            let top1_q8 = logits[gpu_top1 as usize];
+            let delta: f32 = 0.01;
+            let top_k: usize = 64;
+
+            let mut candidates: Vec<u32> = Vec::with_capacity(top_k + 16);
+            {
+                // Top-K via partial sort.
+                let mut indexed: Vec<(u32, f32)> = logits[..vocab_size]
+                    .iter().enumerate().map(|(i, &v)| (i as u32, v)).collect();
+                let k = top_k.min(indexed.len());
+                indexed.select_nth_unstable_by(k - 1, |a, b|
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                for &(tok, _) in &indexed[..k] {
+                    candidates.push(tok);
+                }
+            }
+            // Within-delta of top-1.
+            for (i, &v) in logits[..vocab_size].iter().enumerate() {
+                if (top1_q8 - v).abs() <= delta {
+                    candidates.push(i as u32);
+                }
+            }
+            // Specials always included.
+            for sp in [0u32, 1, 2, 105, 106] {
+                if (sp as usize) < vocab_size {
+                    candidates.push(sp);
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+
+            // Exact F32 rerank using the pre-lm_head hidden (norm_out) dotted
+            // against embed_weight row for each candidate. Softcap is monotonic
+            // and applied to all candidates equally, so skipping it doesn't
+            // change argmax order.
+            let mut best_tok: u32 = gpu_top1;
+            let mut best_logit: f32 = f32::NEG_INFINITY;
+            for &tok in &candidates {
+                let row_off = (tok as usize) * hs;
+                if row_off + hs > embed_f32.len() { continue; }
+                let row = &embed_f32[row_off..row_off + hs];
+                // F64 accumulator — the candidate set is tiny so cost is negligible.
+                let mut acc: f64 = 0.0;
+                for i in 0..hs {
+                    acc += (hidden[i] as f64) * (row[i] as f64);
+                }
+                let l = acc as f32;
+                if l > best_logit {
+                    best_logit = l;
+                    best_tok = tok;
+                }
+            }
+            best_tok
+        } else {
+            gpu_top1
+        };
+
+        // Diagnostic: when <pad> (id 0) still wins AFTER rerank (or when
+        // rerank is off and <pad> wins raw), dump top-10 Q8 logits so we
+        // see whether pad is near-tie or a genuine model preference.
         if token_id == 0 {
             let logits: &[f32] = self.activations.logits.as_slice()
                 .map_err(|e| anyhow::anyhow!("pad diag logits read: {e}"))?;
@@ -2092,7 +2175,8 @@ impl MlxModelWeights {
             let mut indexed: Vec<(usize, f32)> = logits[..vocab]
                 .iter().enumerate().map(|(i, &v)| (i, v)).collect();
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            eprintln!("\n[PAD-DIAG] <pad> won argmax at seq_pos={}. Top 10 logits:", seq_pos);
+            eprintln!("\n[PAD-DIAG] <pad> won at seq_pos={} (rerank={}). Top 10 Q8 logits:",
+                seq_pos, if rerank_active { "on" } else { "off" });
             for (tok_id, logit) in indexed.iter().take(10) {
                 eprintln!("  tok={tok_id:>6} logit={logit:>10.6}");
             }
