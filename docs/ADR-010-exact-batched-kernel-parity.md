@@ -138,4 +138,4 @@ Not strictly a parity concern, but completed alongside the nondeterminism / drif
   1. Pervasive kernel alignment across the whole pre-MoE chain at the ~1e-5 level (a substantially wider engineering effort than a single targeted kernel).
   2. Structural mitigation at the MoE gate itself (e.g., tie-aware routing, logit smoothing) — not what Gemma4 specifies.
 
-For practical purposes, the sliding_wrap 752-byte batched-vs-batched ceiling reflects a **genuine sensitivity of MoE top-K to sub-kernel-precision input noise**, not a single kernel mismatch. Unless a future effort pursues (1), this ADR should be closed as "localized, understood, not pursuing" rather than "next concrete implementation target".
+For this project phase the sliding_wrap 752-byte batched-vs-batched ceiling is **localized, understood, and out of scope**: exact batched parity would require broader pre-MoE chain alignment than the current product goal justifies. That is a scope decision for this phase, not a universal claim — a future effort with different priorities could take up (1) or (2) and close more of the gap.
