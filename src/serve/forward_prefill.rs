@@ -470,6 +470,39 @@ impl MlxModelWeights {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
                         write_dump_f32(&dump_dir, "sdpa_out", layer_idx, tok_i,
                                         &self.activations.sdpa_out, nh * hd)?;
+                        // ADR-010 sub-stage dump: full dense K,V cache up to
+                        // (and including) the target token, packed as
+                        // [nkv, tok_i+1, hd] for comparison with llama's
+                        // cache_k_l*/cache_v_l* at pos tok_i. Only F32 path.
+                        if !use_f16_kv {
+                            let cap = dense_kvs_vec[layer_idx].capacity;
+                            let n_valid = tok_i + 1;
+                            let k_full: &[f32] = dense_kvs_vec[layer_idx].k.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump K cache L{layer_idx}: {e}"))?;
+                            let v_full: &[f32] = dense_kvs_vec[layer_idx].v.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump V cache L{layer_idx}: {e}"))?;
+                            let mut k_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
+                            let mut v_valid = Vec::<f32>::with_capacity(nkv * n_valid * hd);
+                            for h in 0..nkv {
+                                for p in 0..n_valid {
+                                    let off = h * cap * hd + p * hd;
+                                    k_valid.extend_from_slice(&k_full[off..off+hd]);
+                                    v_valid.extend_from_slice(&v_full[off..off+hd]);
+                                }
+                            }
+                            for (name, buf) in [("k_cache_upto", &k_valid), ("v_cache_upto", &v_valid)] {
+                                let path = format!(
+                                    "{dump_dir}/hf2q_prefill_{name}_layer{layer_idx:02}_tok{tok_i:03}.bin");
+                                let bytes: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        buf.as_ptr() as *const u8, buf.len() * 4) };
+                                std::fs::write(&path, bytes)
+                                    .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+                                eprintln!(
+                                    "[PREFILL DUMP] {} [{},{},{}] f32 -> {}",
+                                    name, nkv, n_valid, hd, path);
+                            }
+                        }
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
 
