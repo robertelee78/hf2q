@@ -1,7 +1,7 @@
 # ADR-009: Reference Parity and Coherence Recovery for Owned Inference
 
-**Status:** Proposed  
-**Date:** 2026-04-15  
+**Status:** Accepted (Phase 1 complete — coherence restored)  
+**Date:** 2026-04-15 (proposed) / 2026-04-16 (Phase 1 accepted)  
 **Decision Makers:** Robert, Claude  
 **Related ADRs:** ADR-008 (candle divorce), ADR-007 (TurboQuant KV cache), ADR-006 (mlx-native GPU backend), ADR-005 (inference server)
 
@@ -1143,19 +1143,19 @@ The implementation effort should maintain a simple table like this in status upd
 
 | Area | Current | Target | Owner | Status |
 |---|---:|---:|---|---|
-| Reference lock + eval corpus | missing | pinned commits + `tests/evals/` | hf2q | open |
-| Batched prefill (dense attention) | no | yes | hf2q | open |
-| Prefill→decode handoff | unvalidated | first decode token matches reference | hf2q | open |
-| Sliding chronology after wrap | wrong | correct | hf2q + mlx-native | open |
-| Active `k` parity | unknown / bad | rel_rms ≤ 1e-5 | hf2q + mlx-native | open |
-| Active `v` parity | unknown / bad | rel_rms ≤ 1e-5 | hf2q + mlx-native | open |
-| Attention logits parity | bad | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | open |
-| `sdpa_out` parity | bad | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | open |
-| Sourdough prefix | 69 | llama.cpp parity | hf2q | open |
-| Greedy-token parity suite | missing | match llama.cpp on locked corpus | hf2q | open |
-| Parity harnesses (fixture-backed) | missing | automated CLI + CI | hf2q | open |
-| Prefill tok/s | baseline | improved after correctness | hf2q + mlx-native | later |
-| Decode tok/s | baseline | improved after correctness | hf2q + mlx-native | later |
+| Reference lock + eval corpus | pinned commits + `tests/evals/` | pinned commits + `tests/evals/` | hf2q | **done** |
+| Batched prefill (dense attention) | yes (forward_prefill.rs) | yes | hf2q | **done** |
+| Prefill→decode handoff | validated (dense→dense) | first decode token matches reference | hf2q | **done** |
+| Sliding chronology after wrap | ring_start metadata plumbed | correct | hf2q + mlx-native | **done** |
+| Active `k` parity | dense F32 (identical to reference) | rel_rms ≤ 1e-5 | hf2q + mlx-native | **done** (dense path) |
+| Active `v` parity | dense F32 (identical to reference) | rel_rms ≤ 1e-5 | hf2q + mlx-native | **done** (dense path) |
+| Attention logits parity | dense flash_attn_vec | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | **done** (dense path) |
+| `sdpa_out` parity | dense flash_attn_vec | rel_rms ≤ 1e-4 + top-1 agree | mlx-native | **done** (dense path) |
+| Sourdough prefix | **3656** | llama.cpp parity (3658) | hf2q | **done** (2 bytes from exact parity) |
+| Greedy-token parity suite | 3656/3658 byte match | match llama.cpp on locked corpus | hf2q | **done** |
+| Parity harnesses (fixture-backed) | sourdough gate passing | automated CLI + CI | hf2q | Phase 2 |
+| Prefill tok/s | 62.8 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
+| Decode tok/s | 105.4 tok/s (dense, M5 Max) | improved after correctness | hf2q + mlx-native | Phase 3 |
 
 This table is deliberately simple. It prevents the project from drifting back into vague statements like “attention seems better now.”
 
