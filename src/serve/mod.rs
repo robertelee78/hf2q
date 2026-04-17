@@ -434,6 +434,26 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         println!("Decode tok/s: {:.1}", tok_per_sec);
     }
 
+    // ADR-005 Gate G: mlx-native dispatch + sync counter emission.
+    // Gated by HF2Q_DUMP_COUNTERS=1. Emits totals, per-prompt-token, and
+    // per-decode-token rates on stderr so release-check.sh can threshold
+    // them. The counters are atomic globals in mlx-native (not per-
+    // invocation); for fresh numbers, run hf2q in a fresh process.
+    if std::env::var("HF2Q_DUMP_COUNTERS").ok().as_deref() == Some("1") {
+        let dispatches = mlx_native::dispatch_count();
+        let syncs = mlx_native::sync_count();
+        let prompt_n = prompt_tokens.len() as u64;
+        let decode_n = generated as u64;
+        let dispatches_per_prompt_tok = if prompt_n > 0 { dispatches as f64 / prompt_n as f64 } else { 0.0 };
+        let syncs_per_decode_tok = if decode_n > 0 { syncs as f64 / decode_n as f64 } else { 0.0 };
+        eprintln!(
+            "[MLX_COUNTERS] dispatches={} syncs={} prompt_tokens={} decode_tokens={} \
+             dispatches_per_prompt_tok={:.2} syncs_per_decode_tok={:.2}",
+            dispatches, syncs, prompt_n, decode_n,
+            dispatches_per_prompt_tok, syncs_per_decode_tok,
+        );
+    }
+
     Ok(())
 }
 

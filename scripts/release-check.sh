@@ -9,13 +9,16 @@
 #   2. perf sanity (Gate B) — median-of-3 decode tok/s on sourdough ≥ floor.
 #   3. prefill perf (Gate A) — batched prefill tok/s on a ≥2048-token prompt
 #      ≥ floor. Requires prefill_2048.txt fixture (skipped if absent).
+#   4. mlx-native counter thresholds (Gate G) — dispatches/decode_tok and
+#      total syncs within thresholds; uses HF2Q_DUMP_COUNTERS=1 hook.
 #
-# Gates not yet wired here: D (frozen hf2q self-baseline), G (mlx-native
-# dispatch counter thresholds). Both are follow-ups; see ADR-005 Closeout
-# Amendment for scope.
+# Gates not yet wired here: D (frozen hf2q self-baseline). Needs a
+# committed token-id fixture; follow-up.
 #
 # Parity suite wraps `hf2q parity check` via scripts/parity_check.sh.
 # Perf gates parse tok/s from stderr of `hf2q generate`.
+# Counter gate parses `[MLX_COUNTERS] ...` stderr from a 128-decode-token
+# run with HF2Q_DUMP_COUNTERS=1.
 #
 # Usage:
 #   scripts/release-check.sh <gguf_path>
@@ -93,7 +96,7 @@ echo "perf max-tokens: $MAX_TOKENS"
 echo
 
 # --- Gate 1: parity suite (Gates C/E + F) ---
-echo "--- Gate 1/3: parity suite ---"
+echo "--- Gate 1/4: parity suite ---"
 if ! "$SCRIPT_DIR/parity_check.sh" "$GGUF_PATH"; then
   echo "FAIL: parity gate tripped. See output above." >&2
   exit 2
@@ -107,7 +110,7 @@ fi
 # median" — resilient to a single thermal dip, still tight enough to flag
 # real regressions.
 echo
-echo "--- Gate 2/3: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
+echo "--- Gate 2/4: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
 PERF_SAMPLES=()
 for run in 1 2 3; do
   if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PERF_PROMPT" \
@@ -161,7 +164,7 @@ PREFILL_2048_PROMPT="tests/evals/prompts/prefill_2048.txt"
 MIN_PREFILL_TPS="130"
 if [[ -f "$PREFILL_2048_PROMPT" ]]; then
   echo
-  echo "--- Gate 3/3: prefill perf on ≥2048-token prompt (batched) ---"
+  echo "--- Gate 3/4: prefill perf on ≥2048-token prompt (batched) ---"
   PREFILL_LOG="/tmp/release_check_prefill.log"
   if ! HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1 \
       "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt-file "$PREFILL_2048_PROMPT" \
@@ -191,6 +194,66 @@ if [[ -f "$PREFILL_2048_PROMPT" ]]; then
 else
   echo
   echo "(Gate 3 skipped: $PREFILL_2048_PROMPT not found)" >&2
+fi
+
+
+# --- Gate 4: mlx-native dispatch/sync counter thresholds (Gate G) ---
+# ADR-005 Closeout Amendment Gate G: mlx-native dispatch counter
+# thresholds, analog to the candle-era `moe_to_vec2_count`,
+# `sampler_sync_count`, `norm_dispatches_per_token` targets. mlx-native
+# exposes global atomics dispatch_count() and sync_count(); hf2q emits
+# them via HF2Q_DUMP_COUNTERS=1 at end of a generate run.
+#
+# Observed baseline on M5 Max, sourdough prompt, 128 decode tokens:
+#   dispatches=138570, syncs=22, decode_tokens=128
+#   → ~1082 dispatches/decode_tok, ~0.17 syncs/decode_tok (windowed drain)
+#
+# Thresholds chosen to catch 20%+ regressions without flaking:
+#   dispatches/decode_tok <= 1300 (20% headroom above steady-state)
+#   total syncs <= 60 (tolerates prefill per-token syncs at 22 + headroom)
+echo
+echo "--- Gate 4/4: mlx-native counter thresholds (Gate G) ---"
+COUNTER_LOG="/tmp/release_check_counters.log"
+COUNTER_PROMPT="Complrehensive instructions for making sourdough bread."
+if ! HF2Q_DUMP_COUNTERS=1 "$HF2Q_BIN" generate \
+    --model "$GGUF_PATH" --prompt "$COUNTER_PROMPT" \
+    --max-tokens 128 --temperature 0 \
+    >/dev/null 2>"$COUNTER_LOG"; then
+  echo "counter-gate run crashed; see $COUNTER_LOG" >&2
+  exit 3
+fi
+COUNTER_LINE="$(grep '^\[MLX_COUNTERS\]' "$COUNTER_LOG" | tail -1)"
+if [[ -z "$COUNTER_LINE" ]]; then
+  echo "FAIL: no [MLX_COUNTERS] line found — HF2Q_DUMP_COUNTERS plumbing broken." >&2
+  exit 2
+fi
+# Use leading-space anchors to disambiguate `dispatches=N` from
+# `dispatches_per_prompt_tok=X.Y` and `syncs=N` from
+# `syncs_per_decode_tok=X.Y`. decode_tokens= is unambiguous.
+DISPATCHES="$(echo "$COUNTER_LINE" | grep -oE ' dispatches=[0-9]+' | grep -oE '[0-9]+')"
+SYNCS="$(echo "$COUNTER_LINE" | grep -oE ' syncs=[0-9]+' | grep -oE '[0-9]+')"
+DECODE_N="$(echo "$COUNTER_LINE" | grep -oE 'decode_tokens=[0-9]+' | grep -oE '[0-9]+')"
+if [[ -z "$DISPATCHES" || -z "$SYNCS" || -z "$DECODE_N" || "$DECODE_N" = "0" ]]; then
+  echo "FAIL: could not parse counter line: $COUNTER_LINE" >&2
+  exit 2
+fi
+DISPATCHES_PER_TOK="$(awk -v d="$DISPATCHES" -v n="$DECODE_N" 'BEGIN { printf "%.1f", d/n }')"
+MAX_DISPATCHES_PER_TOK="1300"
+MAX_SYNCS="60"
+echo "  dispatches=$DISPATCHES  syncs=$SYNCS  decode_tok=$DECODE_N"
+echo "  dispatches/decode_tok=$DISPATCHES_PER_TOK (max: $MAX_DISPATCHES_PER_TOK)"
+echo "  total syncs: $SYNCS (max: $MAX_SYNCS)"
+FAIL_COUNTERS=0
+if (( $(awk -v a="$DISPATCHES_PER_TOK" -v b="$MAX_DISPATCHES_PER_TOK" 'BEGIN { print (a+0 > b+0) ? 1 : 0 }') )); then
+  echo "FAIL: dispatches/decode_tok=$DISPATCHES_PER_TOK exceeds max=$MAX_DISPATCHES_PER_TOK" >&2
+  FAIL_COUNTERS=1
+fi
+if (( SYNCS > MAX_SYNCS )); then
+  echo "FAIL: total syncs=$SYNCS exceeds max=$MAX_SYNCS" >&2
+  FAIL_COUNTERS=1
+fi
+if (( FAIL_COUNTERS > 0 )); then
+  exit 2
 fi
 
 echo
