@@ -14,6 +14,17 @@ use thiserror::Error;
 use crate::ir::{FormatWarning, OutputManifest, QuantizedModel, ModelMetadata, TensorMap};
 use crate::progress::ProgressReporter;
 
+/// Quantization knobs for backends that implement their own quantization
+/// algorithm (see [`OutputBackend::quantize_and_write`]).
+///
+/// `bits` is the default bit-width; `bit_overrides` is an optional
+/// per-tensor override map (e.g. keep embeddings at f16, lm_head at q6).
+pub struct QuantizeConfig<'a> {
+    pub bits: u8,
+    pub group_size: usize,
+    pub bit_overrides: Option<&'a HashMap<String, u8>>,
+}
+
 /// Errors from output backend operations.
 #[derive(Error, Debug)]
 pub enum BackendError {
@@ -65,14 +76,12 @@ pub trait OutputBackend: Send + Sync {
         &self,
         tensor_map: &TensorMap,
         metadata: &ModelMetadata,
-        bits: u8,
-        group_size: usize,
-        bit_overrides: Option<&HashMap<String, u8>>,
+        config: &QuantizeConfig<'_>,
         input_dir: &Path,
         output_dir: &Path,
         progress: &ProgressReporter,
     ) -> Result<OutputManifest, BackendError> {
-        let _ = (tensor_map, metadata, bits, group_size, bit_overrides, input_dir, output_dir, progress);
+        let _ = (tensor_map, metadata, config, input_dir, output_dir, progress);
         Err(BackendError::UnsupportedFormat {
             format: format!("{} does not support native quantization", self.name()),
         })

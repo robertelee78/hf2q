@@ -622,13 +622,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             config.bits.unwrap_or(quantizer_default_bits(&config.quant))
         };
 
+        let quantize_config = backends::QuantizeConfig {
+            bits: native_bits,
+            group_size: config.group_size,
+            bit_overrides: bit_overrides.as_ref(),
+        };
         backend
             .quantize_and_write(
                 &tensor_map,
                 &metadata,
-                native_bits,
-                config.group_size,
-                bit_overrides.as_ref(),
+                &quantize_config,
                 &config.input_dir,
                 &config.output_dir,
                 &progress,
