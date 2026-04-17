@@ -28,7 +28,8 @@ use std::time::Instant;
 use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
 use super::forward_mlx::{
-    DenseKvBuffers, MlxModelWeights, dispatch_qmatmul, dispatch_rms_norm_unit_perhead,
+    DenseKvBuffers, MlxModelWeights, dispatch_qmatmul,
+    dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
 use super::gpu::GpuContext;
 
@@ -337,10 +338,13 @@ impl MlxModelWeights {
                     );
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &pf_k,
-                        &pf_v_normed,
-                        hd_norm_params,
-                        (seq_len * nkv) as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &pf_k,
+                            output: &pf_v_normed,
+                            params_buf: hd_norm_params,
+                            rows: (seq_len * nkv) as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                 } else {
                     s.barrier_between(
@@ -349,10 +353,13 @@ impl MlxModelWeights {
                     );
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &pf_v,
-                        &pf_v_normed,
-                        hd_norm_params,
-                        (seq_len * nkv) as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &pf_v,
+                            output: &pf_v_normed,
+                            params_buf: hd_norm_params,
+                            rows: (seq_len * nkv) as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                 }
 

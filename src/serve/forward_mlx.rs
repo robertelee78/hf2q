@@ -1177,10 +1177,13 @@ impl MlxModelWeights {
                     );
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_k,
-                        &self.activations.attn_v,
-                        hd_norm_params,
-                        nkv as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &self.activations.attn_k,
+                            output: &self.activations.attn_v,
+                            params_buf: hd_norm_params,
+                            rows: nkv as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                     total_dispatches += 1;
                 } else {
@@ -1190,10 +1193,13 @@ impl MlxModelWeights {
                     );
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_v,
-                        &self.activations.moe_expert_out,
-                        hd_norm_params,
-                        nkv as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &self.activations.attn_v,
+                            output: &self.activations.moe_expert_out,
+                            params_buf: hd_norm_params,
+                            rows: nkv as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                     total_dispatches += 1;
                 }
@@ -2312,14 +2318,24 @@ impl MlxModelWeights {
                 if v_is_k {
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_k, &self.activations.attn_v,
-                        hd_norm_params, nkv as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &self.activations.attn_k,
+                            output: &self.activations.attn_v,
+                            params_buf: hd_norm_params,
+                            rows: nkv as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                 } else {
                     dispatch_rms_norm_unit_perhead(
                         s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_v, &self.activations.moe_expert_out,
-                        hd_norm_params, nkv as u32, hd as u32,
+                        &RmsNormPerHeadArgs {
+                            input: &self.activations.attn_v,
+                            output: &self.activations.moe_expert_out,
+                            params_buf: hd_norm_params,
+                            rows: nkv as u32,
+                            dim: hd as u32,
+                        },
                     )?;
                 }
 
@@ -2964,6 +2980,27 @@ fn load_gguf_qweight(
 // Forward pass dispatch helpers
 // ---------------------------------------------------------------------------
 
+/// Buffers + shape for a single per-head RMS-norm dispatch.
+///
+/// Grouped out of `dispatch_rms_norm_unit_perhead` (was 8 positional
+/// args). The I/O buffers and the `(rows, dim)` shape describe *what*
+/// the kernel operates on; `encoder`/`registry`/`device` describe *where*
+/// it runs. Separating the two groups makes call sites scannable.
+pub struct RmsNormPerHeadArgs<'a> {
+    /// F32 `[rows, dim]` input tensor.
+    pub input: &'a MlxBuffer,
+    /// F32 `[rows, dim]` output tensor (separate buffer; kernel does not
+    /// support in-place).
+    pub output: &'a MlxBuffer,
+    /// Constant params buffer (`dim`, `eps`) — pre-populated at load time.
+    pub params_buf: &'a MlxBuffer,
+    /// Number of rows (per-layer: `num_kv_heads`, or `seq_len * num_kv_heads`
+    /// in the batched prefill path).
+    pub rows: u32,
+    /// Per-row element count (per-layer `head_dim`).
+    pub dim: u32,
+}
+
 /// Dispatch per-head RMS norm without learned scale (unit norm, f32).
 ///
 /// Same as `dispatch_rms_norm_perhead` but uses `rms_norm_no_scale_f32`
@@ -2972,21 +3009,17 @@ pub fn dispatch_rms_norm_unit_perhead(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut mlx_native::KernelRegistry,
     device: &mlx_native::metal::DeviceRef,
-    input: &MlxBuffer,
-    output: &MlxBuffer,
-    params_buf: &MlxBuffer,
-    rows: u32,
-    dim: u32,
+    args: &RmsNormPerHeadArgs<'_>,
 ) -> Result<()> {
     let pipeline = registry.get_pipeline("rms_norm_no_scale_f32", device)
         .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32 pipeline: {e}"))?;
-    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let tg_size = std::cmp::min(256, args.dim.next_power_of_two()) as u64;
     let shared_mem_bytes = tg_size * 4;
     encoder.encode_threadgroups_with_shared(
         pipeline,
-        &[(0, input), (1, output), (2, params_buf)],
+        &[(0, args.input), (1, args.output), (2, args.params_buf)],
         &[(0, shared_mem_bytes)],
-        mlx_native::MTLSize::new(rows as u64, 1, 1),
+        mlx_native::MTLSize::new(args.rows as u64, 1, 1),
         mlx_native::MTLSize::new(tg_size, 1, 1),
     );
     Ok(())

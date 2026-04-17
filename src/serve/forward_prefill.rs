@@ -20,7 +20,10 @@ use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
-use super::forward_mlx::{MlxModelWeights, DenseKvBuffers, dispatch_qmatmul, dispatch_rms_norm_unit_perhead};
+use super::forward_mlx::{
+    MlxModelWeights, DenseKvBuffers, dispatch_qmatmul,
+    dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
+};
 use super::config::LayerType;
 use super::gpu::GpuContext;
 
@@ -320,10 +323,13 @@ impl MlxModelWeights {
                         );
                         dispatch_rms_norm_unit_perhead(
                             s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_k,
-                            &self.activations.attn_v,
-                            hd_norm_params,
-                            nkv as u32, hd as u32,
+                            &RmsNormPerHeadArgs {
+                                input: &self.activations.attn_k,
+                                output: &self.activations.attn_v,
+                                params_buf: hd_norm_params,
+                                rows: nkv as u32,
+                                dim: hd as u32,
+                            },
                         )?;
                     } else {
                         s.barrier_between(
@@ -332,10 +338,13 @@ impl MlxModelWeights {
                         );
                         dispatch_rms_norm_unit_perhead(
                             s.encoder_mut(), reg, metal_dev,
-                            &self.activations.attn_v,
-                            &self.activations.moe_expert_out,
-                            hd_norm_params,
-                            nkv as u32, hd as u32,
+                            &RmsNormPerHeadArgs {
+                                input: &self.activations.attn_v,
+                                output: &self.activations.moe_expert_out,
+                                params_buf: hd_norm_params,
+                                rows: nkv as u32,
+                                dim: hd as u32,
+                            },
                         )?;
                     }
 
