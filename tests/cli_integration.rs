@@ -146,7 +146,7 @@ fn test_dry_run_prints_plan_and_exits_success() {
         }"#,
     )
     .unwrap();
-    std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+    std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()
@@ -186,7 +186,7 @@ fn test_dry_run_does_not_write_files() {
         }"#,
     )
     .unwrap();
-    std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+    std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()
@@ -231,7 +231,7 @@ fn test_dry_run_shows_quant_config() {
         }"#,
     )
     .unwrap();
-    std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+    std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()
@@ -272,7 +272,7 @@ fn test_dry_run_safetensors_format() {
         }"#,
     )
     .unwrap();
-    std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+    std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()

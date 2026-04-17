@@ -238,7 +238,7 @@ mod tests {
         let a = vec![0.1, -0.5, 0.3, 0.8, -0.2];
         let b = vec![-0.3, 0.7, -0.1, 0.4, 0.6];
         let sim = cosine_similarity(&a, &b).unwrap();
-        assert!(sim >= -1.0 && sim <= 1.0, "Cosine similarity should be in [-1, 1], got {}", sim);
+        assert!((-1.0..=1.0).contains(&sim), "Cosine similarity should be in [-1, 1], got {}", sim);
     }
 
     #[test]

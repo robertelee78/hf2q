@@ -308,7 +308,7 @@ impl RuVectorDb {
                 {
                     let ratio = r.fingerprint.total_params as f64
                         / fingerprint.total_params as f64;
-                    if ratio > 2.0 || ratio < 0.5 {
+                    if !(0.5..=2.0).contains(&ratio) {
                         return None; // Outside 2x range
                     }
                     // Proximity score: 1.0 at exact match, 0.0 at 2x boundary

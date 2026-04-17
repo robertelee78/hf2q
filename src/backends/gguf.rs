@@ -486,121 +486,65 @@ fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
     let vc = meta.raw_config.get("vision_config").cloned().unwrap_or_default();
     let tc = meta.raw_config.get("text_config").cloned().unwrap_or_default();
 
-    let mut kv: Vec<(String, MetaValue)> = Vec::new();
-
-    // Core identification — mmproj uses "clip" architecture
-    kv.push((
-        "general.architecture".into(),
-        MetaValue::String("clip".into()),
-    ));
-    kv.push((
-        "general.type".into(),
-        MetaValue::String("mmproj".into()),
-    ));
-    kv.push((
-        "general.file_type".into(),
-        MetaValue::Uint32(ggml_ftype_from_bits(model.bits)),
-    ));
-
-    // clip.has_vision_encoder = true
-    kv.push((
-        "clip.has_vision_encoder".into(),
-        MetaValue::Bool(true),
-    ));
-
     // Projector type — Gemma4 uses "gemma4v"
     let projector_type = match meta.model_type.as_str() {
         "gemma4" => "gemma4v",
         "gemma3" => "gemma3",
         _ => "mlp",
     };
-    kv.push((
-        "clip.vision.projector_type".into(),
-        MetaValue::String(projector_type.into()),
-    ));
 
-    // Vision geometry parameters from vision_config
+    // Vision geometry parameters from vision_config.
     let image_size = vc.get("image_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(224) as u32;
-    kv.push((
-        "clip.vision.image_size".into(),
-        MetaValue::Uint32(image_size),
-    ));
-
     let patch_size = vc.get("patch_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(14) as u32;
-    kv.push((
-        "clip.vision.patch_size".into(),
-        MetaValue::Uint32(patch_size),
-    ));
-
     let vision_hidden_size = vc.get("hidden_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(1024) as u32;
-    kv.push((
-        "clip.vision.embedding_length".into(),
-        MetaValue::Uint32(vision_hidden_size),
-    ));
-
     let vision_intermediate_size = vc.get("intermediate_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(4096) as u32;
-    kv.push((
-        "clip.vision.feed_forward_length".into(),
-        MetaValue::Uint32(vision_intermediate_size),
-    ));
-
     let vision_block_count = vc.get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .unwrap_or(24) as u32;
-    kv.push((
-        "clip.vision.block_count".into(),
-        MetaValue::Uint32(vision_block_count),
-    ));
-
     let vision_head_count = vc.get("num_attention_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(16) as u32;
-    kv.push((
-        "clip.vision.attention.head_count".into(),
-        MetaValue::Uint32(vision_head_count),
-    ));
-
-    // Layer norm epsilon
     let layer_norm_eps = vc.get("layer_norm_eps")
         .or_else(|| vc.get("rms_norm_eps"))
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-6) as f32;
-    kv.push((
-        "clip.vision.attention.layer_norm_epsilon".into(),
-        MetaValue::Float32(layer_norm_eps),
-    ));
 
-    // Projection dimension = text model hidden size (the target dim for the projection)
+    // Projection dimension = text model hidden size (the target dim for the projection).
     let text_hidden_size = tc.get("hidden_size")
         .and_then(|v| v.as_u64())
         .or_else(|| meta.raw_config.get("hidden_size").and_then(|v| v.as_u64()))
-        .unwrap_or(meta.hidden_size as u64) as u32;
-    kv.push((
-        "clip.vision.projection_dim".into(),
-        MetaValue::Uint32(text_hidden_size),
-    ));
+        .unwrap_or(meta.hidden_size) as u32;
 
-    // Image mean/std — Gemma4 uses standardization via tensors (std_bias/std_scale),
-    // but llama.cpp still expects these metadata fields. Use [0.5, 0.5, 0.5] as the
-    // default for Gemma4 (ImageNet-style normalization when no preprocessor_config).
-    kv.push((
-        "clip.vision.image_mean".into(),
-        MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
-    ));
-    kv.push((
-        "clip.vision.image_std".into(),
-        MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5]),
-    ));
-
-    kv
+    vec![
+        // Core identification — mmproj uses "clip" architecture.
+        ("general.architecture".into(), MetaValue::String("clip".into())),
+        ("general.type".into(), MetaValue::String("mmproj".into())),
+        ("general.file_type".into(), MetaValue::Uint32(ggml_ftype_from_bits(model.bits))),
+        ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
+        ("clip.vision.projector_type".into(), MetaValue::String(projector_type.into())),
+        // Vision geometry.
+        ("clip.vision.image_size".into(), MetaValue::Uint32(image_size)),
+        ("clip.vision.patch_size".into(), MetaValue::Uint32(patch_size)),
+        ("clip.vision.embedding_length".into(), MetaValue::Uint32(vision_hidden_size)),
+        ("clip.vision.feed_forward_length".into(), MetaValue::Uint32(vision_intermediate_size)),
+        ("clip.vision.block_count".into(), MetaValue::Uint32(vision_block_count)),
+        ("clip.vision.attention.head_count".into(), MetaValue::Uint32(vision_head_count)),
+        ("clip.vision.attention.layer_norm_epsilon".into(), MetaValue::Float32(layer_norm_eps)),
+        ("clip.vision.projection_dim".into(), MetaValue::Uint32(text_hidden_size)),
+        // Image mean/std — Gemma4 uses standardization via tensors (std_bias/std_scale),
+        // but llama.cpp still expects these metadata fields. Use [0.5, 0.5, 0.5] as the
+        // default for Gemma4 (ImageNet-style normalization when no preprocessor_config).
+        ("clip.vision.image_mean".into(), MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5])),
+        ("clip.vision.image_std".into(), MetaValue::ArrayFloat32(vec![0.5, 0.5, 0.5])),
+    ]
 }
 
 /// Write a separate mmproj GGUF file containing vision encoder and multimodal
@@ -1108,6 +1052,13 @@ fn repack_q8_0(
 /// 3. Reconstruct approximate f32 values: val = signed_q * f16_scale
 /// 4. Re-quantize each 256-element super-block into Q6_K format following
 ///    the exact algorithm from llama.cpp's quantize_row_q6_K_ref.
+///
+/// The inner sub-block loops (`for ib in 0..16`, `for i in sub_start..sub_end`)
+/// are deliberate line-for-line mirrors of the C reference — rewriting them
+/// with iterator adapters (`chunks_exact(16)` + `.iter().enumerate()`) breaks
+/// the visual parallel that makes diff-against-upstream tractable. Chesterton's
+/// fence: keep the shape, silence the lint.
+#[allow(clippy::needless_range_loop)]
 fn repack_q6_k(
     qt: &crate::ir::QuantizedTensor,
     scales_bytes: &[u8],
@@ -1766,32 +1717,19 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
     let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
     let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
 
-    // Build metadata KV pairs
-    let mut kv: Vec<(String, MetaValue)> = Vec::new();
-
-    // Required: tokenizer model name
-    kv.push((
-        "tokenizer.ggml.model".into(),
-        MetaValue::String(tokenizer_model_name.clone()),
-    ));
-
-    // Token strings
-    kv.push((
-        "tokenizer.ggml.tokens".into(),
-        MetaValue::ArrayString(tokens),
-    ));
-
-    // Scores
-    kv.push((
-        "tokenizer.ggml.scores".into(),
-        MetaValue::ArrayFloat32(scores),
-    ));
-
-    // Token types
-    kv.push((
-        "tokenizer.ggml.token_type".into(),
-        MetaValue::ArrayInt32(token_types),
-    ));
+    // Build metadata KV pairs. The four always-present entries go in via the
+    // vec![] literal; conditional ones (merges, special token ids, chat template)
+    // are appended below.
+    let mut kv: Vec<(String, MetaValue)> = vec![
+        // Required: tokenizer model name.
+        ("tokenizer.ggml.model".into(), MetaValue::String(tokenizer_model_name.clone())),
+        // Token strings.
+        ("tokenizer.ggml.tokens".into(), MetaValue::ArrayString(tokens)),
+        // Scores.
+        ("tokenizer.ggml.scores".into(), MetaValue::ArrayFloat32(scores)),
+        // Token types.
+        ("tokenizer.ggml.token_type".into(), MetaValue::ArrayInt32(token_types)),
+    ];
 
     // Merges
     if !merges.is_empty() {
@@ -2817,7 +2755,7 @@ mod tests {
         // Dequantize Q4_0 block and check approximate values
         // Nibble packing: byte[i] = q_lo[i] | (q_hi[i] << 4)
         // where q_lo = first 16 elements, q_hi = second 16 elements
-        let mut dequantized = vec![0.0f32; 32];
+        let mut dequantized = [0.0f32; 32];
         for i in 0..16 {
             let byte = repacked[2 + i];
             let q_lo = (byte & 0x0F) as i32 - 8;

@@ -85,7 +85,7 @@ fn test_preflight_validates_input_exists() {
 fn test_preflight_validates_config_json_exists() {
     let tmp = tempfile::tempdir().unwrap();
     // Directory exists but has no config.json
-    fs::write(tmp.path().join("model.safetensors"), &[0u8; 16]).unwrap();
+    fs::write(tmp.path().join("model.safetensors"), [0u8; 16]).unwrap();
 
     Command::cargo_bin("hf2q")
         .unwrap()

@@ -594,7 +594,7 @@ mod tests {
     fn test_validate_input_dir_valid() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.json"), "{}").unwrap();
-        std::fs::write(tmp.path().join("model.safetensors"), &[0u8; 16]).unwrap();
+        std::fs::write(tmp.path().join("model.safetensors"), [0u8; 16]).unwrap();
         assert!(validate_input_dir(tmp.path()).is_ok());
     }
 
@@ -629,7 +629,7 @@ mod tests {
         let input_dir = tmp.path().join("input");
         std::fs::create_dir_all(&input_dir).unwrap();
         std::fs::write(input_dir.join("config.json"), "{}").unwrap();
-        std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+        std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
         let output_dir = tmp.path().join("output_nonexistent");
 
@@ -667,7 +667,7 @@ mod tests {
         let input_dir = tmp.path().join("input");
         std::fs::create_dir_all(&input_dir).unwrap();
         std::fs::write(input_dir.join("config.json"), "{}").unwrap();
-        std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+        std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
         let output_dir = tmp.path().join("output_nonexistent");
 
@@ -709,7 +709,7 @@ mod tests {
         let input_dir = tmp.path().join("input");
         std::fs::create_dir_all(&input_dir).unwrap();
         std::fs::write(input_dir.join("config.json"), "{}").unwrap();
-        std::fs::write(input_dir.join("model.safetensors"), &[0u8; 16]).unwrap();
+        std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
         let output_dir = tmp.path().join("output_nonexistent");
 

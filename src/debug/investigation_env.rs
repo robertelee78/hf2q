@@ -477,7 +477,7 @@ impl InvestigationEnv {
 
 /// Mirrors `std::env::var(name).map_or(false, |v| v == "1")`.
 fn env_eq_one(name: &str) -> bool {
-    env::var(name).map_or(false, |v| v == "1")
+    env::var(name).is_ok_and(|v| v == "1")
 }
 
 /// Mirrors `std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())`.

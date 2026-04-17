@@ -2168,15 +2168,17 @@ impl MlxModelWeights {
         let num_layers = self.layers.len();
         let vocab_size = self.vocab_size;
 
-        let mut kp = KernelTypeProfile::default();
-        kp.qkv_matmuls_us = vec![0.0; num_layers];
-        kp.head_norms_rope_us = vec![0.0; num_layers];
-        kp.kv_cache_copy_us = vec![0.0; num_layers];
-        kp.sdpa_us = vec![0.0; num_layers];
-        kp.o_proj_us = vec![0.0; num_layers];
-        kp.mlp_matmuls_us = vec![0.0; num_layers];
-        kp.moe_us = vec![0.0; num_layers];
-        kp.norms_adds_us = vec![0.0; num_layers];
+        let mut kp = KernelTypeProfile {
+            qkv_matmuls_us: vec![0.0; num_layers],
+            head_norms_rope_us: vec![0.0; num_layers],
+            kv_cache_copy_us: vec![0.0; num_layers],
+            sdpa_us: vec![0.0; num_layers],
+            o_proj_us: vec![0.0; num_layers],
+            mlp_matmuls_us: vec![0.0; num_layers],
+            moe_us: vec![0.0; num_layers],
+            norms_adds_us: vec![0.0; num_layers],
+            ..Default::default()
+        };
 
         // Write position buffer
         {

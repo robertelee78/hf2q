@@ -151,7 +151,9 @@ impl MlxModelWeights {
         {
             let p: &mut [u32] = pf_positions.as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("positions write: {e}"))?;
-            for i in 0..seq_len { p[i] = i as u32; }
+            for (i, slot) in p[..seq_len].iter_mut().enumerate() {
+                *slot = i as u32;
+            }
         }
         let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;
         {

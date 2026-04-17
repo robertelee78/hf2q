@@ -154,7 +154,7 @@ impl SafetensorsBackend {
 
         // Add metadata
         let meta_value = serde_json::to_value(metadata)
-            .map_err(|e| BackendError::Serialization(e))?;
+            .map_err(BackendError::Serialization)?;
         header.insert("__metadata__".to_string(), meta_value);
 
         // Calculate data offsets
@@ -182,7 +182,7 @@ impl SafetensorsBackend {
         }
 
         let header_json =
-            serde_json::to_string(&header).map_err(|e| BackendError::Serialization(e))?;
+            serde_json::to_string(&header).map_err(BackendError::Serialization)?;
 
         // Pad header to 8-byte alignment
         let header_bytes = header_json.as_bytes();
@@ -280,9 +280,16 @@ impl OutputBackend for SafetensorsBackend {
         let mut output_files = Vec::new();
 
         if total_data_size > SHARD_SIZE_BYTES {
-            // Multi-shard output
-            let mut shards: Vec<Vec<(String, &str, Vec<usize>, &[u8])>> = Vec::new();
-            let mut current_shard: Vec<(String, &str, Vec<usize>, &[u8])> = Vec::new();
+            // Multi-shard output.
+            //
+            // Each shard is a Vec of `(tensor_name, dtype_str, shape, raw_bytes)`
+            // tuples, and `shards` is a Vec of those — aliased below for
+            // readability and to satisfy `clippy::type_complexity`.
+            type ShardEntry<'a> = (String, &'a str, Vec<usize>, &'a [u8]);
+            type Shard<'a> = Vec<ShardEntry<'a>>;
+
+            let mut shards: Vec<Shard> = Vec::new();
+            let mut current_shard: Shard = Vec::new();
             let mut current_size: u64 = 0;
 
             for entry in &entries {
@@ -339,7 +346,7 @@ impl OutputBackend for SafetensorsBackend {
                 "weight_map": weight_map,
             });
             let index_json = serde_json::to_string_pretty(&index)
-                .map_err(|e| BackendError::Serialization(e))?;
+                .map_err(BackendError::Serialization)?;
             let index_path = output_dir.join("model.safetensors.index.json");
             fs::write(&index_path, &index_json)?;
 
@@ -367,7 +374,7 @@ impl OutputBackend for SafetensorsBackend {
         // Write quantization_config.json sidecar
         let quant_config = Self::build_quant_config(model);
         let config_json = serde_json::to_string_pretty(&quant_config)
-            .map_err(|e| BackendError::Serialization(e))?;
+            .map_err(BackendError::Serialization)?;
         let config_path = output_dir.join("quantization_config.json");
         fs::write(&config_path, &config_json)?;
 

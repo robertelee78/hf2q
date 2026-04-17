@@ -212,7 +212,7 @@ impl MlxModelWeights {
                     if dump_here {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("prefill dump L{layer_idx} T{tok_i} start finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "pre_layer_hidden", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "pre_layer_hidden", layer_idx, tok_i,
                                         &self.activations.hidden, hs)?;
                         s = exec.begin()
                             .map_err(|e| anyhow::anyhow!("prefill dump restart: {e}"))?;
@@ -234,7 +234,7 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "post_input_norm", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "post_input_norm", layer_idx, tok_i,
                                         &self.activations.norm_out, hs)?;
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
@@ -295,13 +295,13 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "q_pre_normed", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "q_pre_normed", layer_idx, tok_i,
                                         &self.activations.attn_q, nh * hd)?;
-                        write_dump_f32(&dump_dir, "k_pre_normed", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "k_pre_normed", layer_idx, tok_i,
                                         &self.activations.attn_k, nkv * hd)?;
-                        write_dump_f32(&dump_dir, "q_normed", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "q_normed", layer_idx, tok_i,
                                         &self.activations.attn_q_normed, nh * hd)?;
-                        write_dump_f32(&dump_dir, "k_normed", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "k_normed", layer_idx, tok_i,
                                         &self.activations.attn_k_normed, nkv * hd)?;
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
@@ -475,7 +475,7 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "sdpa_out", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "sdpa_out", layer_idx, tok_i,
                                         &self.activations.sdpa_out, nh * hd)?;
                         // ADR-010 sub-stage dump: full dense K,V cache up to
                         // (and including) the target token, packed as
@@ -523,7 +523,7 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "attn_out_pre_resid", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "attn_out_pre_resid", layer_idx, tok_i,
                                         &self.activations.attn_out, hs)?;
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
@@ -544,7 +544,7 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "residual", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "residual", layer_idx, tok_i,
                                         &self.activations.residual, hs)?;
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
@@ -759,7 +759,7 @@ impl MlxModelWeights {
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
-                        write_dump_f32(&dump_dir, "l_out", layer_idx, tok_i,
+                        write_dump_f32(dump_dir, "l_out", layer_idx, tok_i,
                                         &self.activations.hidden, hs)?;
                         s = exec.begin().map_err(|e| anyhow::anyhow!("dump restart: {e}"))?;
                     }
