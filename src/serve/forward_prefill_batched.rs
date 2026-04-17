@@ -394,43 +394,54 @@ impl MlxModelWeights {
                 //      position only attends to keys within `sliding_window`
                 //      positions of itself. Matches llama.cpp's flash_attn_ext
                 //      sliding mask behaviour on Gemma4 SWA layers.
-                // SDPA over the prompt.
                 //
-                // For sliding layers, strictly correct behaviour when
-                // seq_len > sliding_window requires masking out keys
-                // farther than `sliding_window` positions from each query.
-                // mlx-native ships `sdpa_sliding` with exactly that mask,
-                // but empirical testing (`docs/spike-gate-a-prefill.md`,
-                // Task #7 work 2026-04-16) showed it emits a zero/pad
-                // output at seq_len=576 while plain `sdpa` emits a real
-                // token — so the sliding kernel has a bug at prefill
-                // shapes that must be fixed before we can route sliding
-                // layers through it. Until then, we still use plain
-                // `sdpa` (causal-only), which is correct only when
-                // seq_len <= sliding_window (every position already
-                // within-window for every layer). The seq_len > layer_cap
-                // guard below retains the bail for sliding layers on
-                // that basis.
-                let sdpa_params = mlx_native::ops::sdpa::SdpaParams {
-                    n_heads: nh as u32,
-                    n_kv_heads: nkv as u32,
-                    head_dim: hd as u32,
-                    seq_len: seq_len as u32,
-                    kv_seq_len: seq_len as u32,
-                    scale: 1.0,
-                    kv_capacity: seq_len as u32,
-                };
+                // History note: sdpa_sliding appeared broken at prefill shapes
+                // during initial Gate A work (2026-04-16) — emitted pad at
+                // seq_len=576. Root-caused as downstream corruption from the
+                // fused_head_norm_rope shared-memory race (mlx-native 0.3.1,
+                // see docs/spike-batched-prefill-race-rootcause.md). Once the
+                // race was fixed, sdpa_sliding works byte-identically to the
+                // per-token path; verified 2026-04-17 on 2455-token prompt.
                 s.barrier_between(
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
                     &[&pf_sdpa_out_perm],
                 );
-                s.sdpa(
-                    reg, dev,
-                    &pf_q_perm, &pf_k_perm, &pf_v_perm,
-                    &pf_sdpa_out_perm,
-                    &sdpa_params,
-                    1,
-                ).map_err(|e| anyhow::anyhow!("batched dense SDPA L{layer_idx}: {e}"))?;
+                if is_sliding {
+                    let sliding_params = mlx_native::ops::sdpa_sliding::SdpaSlidingParams {
+                        n_heads: nh as u32,
+                        n_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        seq_len: seq_len as u32,
+                        kv_seq_len: seq_len as u32,
+                        window_size: self.sliding_window as u32,
+                        scale: 1.0,
+                        kv_capacity: seq_len as u32,
+                    };
+                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
+                        s.encoder_mut(), reg, dev,
+                        &pf_q_perm, &pf_k_perm, &pf_v_perm,
+                        &pf_sdpa_out_perm,
+                        &sliding_params,
+                        1,
+                    ).map_err(|e| anyhow::anyhow!("batched sliding SDPA L{layer_idx}: {e}"))?;
+                } else {
+                    let sdpa_params = mlx_native::ops::sdpa::SdpaParams {
+                        n_heads: nh as u32,
+                        n_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        seq_len: seq_len as u32,
+                        kv_seq_len: seq_len as u32,
+                        scale: 1.0,
+                        kv_capacity: seq_len as u32,
+                    };
+                    s.sdpa(
+                        reg, dev,
+                        &pf_q_perm, &pf_k_perm, &pf_v_perm,
+                        &pf_sdpa_out_perm,
+                        &sdpa_params,
+                        1,
+                    ).map_err(|e| anyhow::anyhow!("batched dense SDPA L{layer_idx}: {e}"))?;
+                }
 
                 // 7. Permute sdpa_out [n_heads, seq_len, hd] → [seq_len, n_heads, hd]
                 s.barrier_between(
@@ -704,24 +715,18 @@ impl MlxModelWeights {
                 // Global layers have capacity = seq_len + max_decode_tokens
                 // so n_copy == seq_len and src_tok_offset == 0 (linear).
                 let layer_cap = dense_kvs_vec[layer_idx].capacity;
-                // Guard: sliding layers cannot honour prompts past their
-                // window until `sdpa_sliding` is verified for prefill
-                // shapes (see SDPA comment above). Global layers must
-                // never exceed their allocated capacity regardless.
-                if seq_len > layer_cap {
-                    if dense_kvs_vec[layer_idx].is_sliding {
-                        anyhow::bail!(
-                            "batched prefill L{}: seq_len={} exceeds sliding dense cap={} — \
-                             sdpa_sliding is a Gate A prerequisite; until it is verified \
-                             at prefill shapes, batched prefill errs here. Use \
-                             HF2Q_BATCHED_PREFILL=0 (default).",
-                            layer_idx, seq_len, layer_cap);
-                    } else {
-                        anyhow::bail!(
-                            "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
-                             increase linear_capacity allocation",
-                            layer_idx, seq_len, layer_cap);
-                    }
+                // Guard: global (non-sliding) layers must never exceed
+                // their allocated capacity — that's a sizing bug.
+                // Sliding layers ring-wrap correctly via src_tok_offset
+                // below (kv_cache_copy_seq handles modular slot); the
+                // sliding-window attention above runs on fresh K/V, not
+                // the cache, so the ring-wrap doesn't affect correctness
+                // of this forward pass.
+                if !dense_kvs_vec[layer_idx].is_sliding && seq_len > layer_cap {
+                    anyhow::bail!(
+                        "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
+                         increase linear_capacity allocation",
+                        layer_idx, seq_len, layer_cap);
                 }
                 let n_copy = seq_len.min(layer_cap);
                 let src_tok_offset = (seq_len - n_copy) as u32;
