@@ -465,8 +465,8 @@ pub fn cmd_parity(args: cli::ParityArgs) -> Result<()> {
     use cli::ParityCommand;
 
     match args.command {
-        ParityCommand::Check { model, prompt, min_prefix, max_tokens } => {
-            cmd_parity_check(&model, &prompt, min_prefix, max_tokens)
+        ParityCommand::Check { model, prompt, min_prefix, max_tokens, self_baseline } => {
+            cmd_parity_check(&model, &prompt, min_prefix, max_tokens, self_baseline)
         }
         ParityCommand::Capture { model, output, prompt, max_tokens } => {
             cmd_parity_capture(&model, &output, &prompt, max_tokens)
@@ -480,6 +480,7 @@ fn cmd_parity_check(
     prompt_name: &str,
     min_prefix: Option<usize>,
     max_tokens: Option<usize>,
+    self_baseline: bool,
 ) -> Result<()> {
     let evals_dir = Path::new("tests/evals");
     let ref_dir = evals_dir.join("reference");
@@ -489,8 +490,12 @@ fn cmd_parity_check(
     anyhow::ensure!(prompt_file.exists(), "Prompt file not found: {}", prompt_file.display());
     let prompt_text = std::fs::read_to_string(&prompt_file)?.trim().to_string();
 
-    // Load locked reference (llama.cpp output)
-    let ref_file = ref_dir.join(format!("{prompt_name}_llama.txt"));
+    // Load reference. Default: llama.cpp-anchored parity (*_llama.txt).
+    // Gate D (--self-baseline): hf2q frozen self-baseline (*_hf2q.txt),
+    // bisect-safe when math deliberately changes and llama.cpp drift is
+    // expected.
+    let ref_suffix = if self_baseline { "_hf2q" } else { "_llama" };
+    let ref_file = ref_dir.join(format!("{prompt_name}{ref_suffix}.txt"));
     anyhow::ensure!(ref_file.exists(), "Reference file not found: {}", ref_file.display());
     let ref_bytes = std::fs::read(&ref_file)?;
 
@@ -586,30 +591,52 @@ fn cmd_parity_check(
     }
 
     eprintln!();
-    println!("Reference: {} bytes (llama.cpp)", ref_bytes.len());
+    let ref_label = if self_baseline { "frozen hf2q" } else { "llama.cpp" };
+    println!("Reference: {} bytes ({})", ref_bytes.len(), ref_label);
     println!("hf2q:      {} bytes", hf2q_bytes.len());
     println!("Common:    {} bytes", common);
-    println!("Threshold: {} bytes", threshold);
-
-    if common >= threshold {
-        println!("PASS: {} >= {}", common, threshold);
-        if common > threshold {
-            println!("      ({} bytes above threshold)", common - threshold);
+    if self_baseline {
+        // Gate D contract: byte-identical. Length must match AND every
+        // byte in the common-prefix comparison was equal.
+        let identical = hf2q_bytes.len() == ref_bytes.len() && common == ref_bytes.len();
+        if identical {
+            println!("PASS: byte-identical to frozen hf2q baseline ({} bytes)", common);
+        } else {
+            println!("FAIL: not byte-identical to frozen hf2q baseline");
+            if common < n {
+                let ctx_start = common;
+                let ctx_end = (common + 80).min(n);
+                let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
+                let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
+                println!();
+                println!("Divergence at byte {}:", common);
+                println!("  frozen: {:?}", ref_snip);
+                println!("  hf2q:   {:?}", hf2q_snip);
+            }
+            anyhow::bail!("Self-baseline check failed: hf2q differs from frozen baseline");
         }
     } else {
-        println!("FAIL: {} < {}", common, threshold);
-        // Show divergence context
-        if common < n {
-            let ctx_start = common;
-            let ctx_end = (common + 80).min(n);
-            let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
-            let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
-            println!();
-            println!("Divergence at byte {}:", common);
-            println!("  llama: {:?}", ref_snip);
-            println!("  hf2q:  {:?}", hf2q_snip);
+        println!("Threshold: {} bytes", threshold);
+        if common >= threshold {
+            println!("PASS: {} >= {}", common, threshold);
+            if common > threshold {
+                println!("      ({} bytes above threshold)", common - threshold);
+            }
+        } else {
+            println!("FAIL: {} < {}", common, threshold);
+            // Show divergence context
+            if common < n {
+                let ctx_start = common;
+                let ctx_end = (common + 80).min(n);
+                let ref_snip = String::from_utf8_lossy(&ref_bytes[ctx_start..ctx_end]);
+                let hf2q_snip = String::from_utf8_lossy(&hf2q_bytes[ctx_start..ctx_end.min(hf2q_bytes.len())]);
+                println!();
+                println!("Divergence at byte {}:", common);
+                println!("  llama: {:?}", ref_snip);
+                println!("  hf2q:  {:?}", hf2q_snip);
+            }
+            anyhow::bail!("Parity check failed: {} < {}", common, threshold);
         }
-        anyhow::bail!("Parity check failed: {} < {}", common, threshold);
     }
 
     Ok(())

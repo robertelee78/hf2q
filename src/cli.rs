@@ -266,6 +266,15 @@ pub enum ParityCommand {
         /// Maximum tokens to generate
         #[arg(long)]
         max_tokens: Option<usize>,
+
+        /// Compare against the frozen hf2q self-baseline (*_hf2q.txt)
+        /// instead of the llama.cpp reference (*_llama.txt). Encodes
+        /// ADR-005 Closeout Amendment Gate D (hf2q-self bisect-safety
+        /// when math deliberately changes and temporary llama.cpp drift
+        /// is expected). Pass requires byte-identical match (not a
+        /// min-prefix floor).
+        #[arg(long)]
+        self_baseline: bool,
     },
 
     /// Capture fresh reference outputs (requires model)

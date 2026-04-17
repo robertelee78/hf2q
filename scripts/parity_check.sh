@@ -50,17 +50,21 @@ FAIL=0
 
 # Runs `hf2q parity check` N times for one prompt; every run must pass.
 # Encodes Gate F (N≥3 determinism): a single flaky run fails the gate.
+# When EXTRA_ARGS is non-empty they're forwarded to `hf2q parity check`
+# (used to plumb --self-baseline for Gate D).
 run_parity_n_times() {
   local prompt="$1"
   local min_prefix="$2"
   local label="$3"
+  local extra_args="${4:-}"
 
   echo "--- $label (prompt=$prompt, min-prefix=$min_prefix, n_runs=$N_RUNS) ---"
   local run_pass=0
   local run_fail=0
   for run in $(seq 1 "$N_RUNS"); do
+    # shellcheck disable=SC2086
     if $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt "$prompt" \
-        --min-prefix "$min_prefix" 2>/dev/null >/dev/null; then
+        --min-prefix "$min_prefix" $extra_args 2>/dev/null >/dev/null; then
       run_pass=$((run_pass + 1))
     else
       run_fail=$((run_fail + 1))
@@ -77,22 +81,30 @@ run_parity_n_times() {
   echo
 }
 
-echo "=== ADR-005 Parity Suite (Gates C/E + F via N=$N_RUNS rerun) ==="
+echo "=== ADR-005 Parity Suite (Gates C/D/E + F via N=$N_RUNS rerun) ==="
 echo "GGUF: $GGUF_PATH"
 echo "hf2q: $HF2Q_BIN"
 echo "git:  $GIT_HEAD"
 echo
 
+# --- Gates C/E/F: live llama.cpp-anchored parity ---
 # Short deterministic — exact byte comparison
-run_parity_n_times "short_hello"  29   "Check 1: short_hello (exact)"
+run_parity_n_times "short_hello"  29   "Check 1: short_hello (exact vs llama.cpp)"
 # Sourdough coherence gate — mid-length
-run_parity_n_times "sourdough"    3094 "Check 2: sourdough (exact-parity prompt)"
+run_parity_n_times "sourdough"    3094 "Check 2: sourdough (exact-parity vs llama.cpp)"
 # Sliding wrap — long, ADR-010 Deferred exact parity (floor only)
-run_parity_n_times "sliding_wrap" 700  "Check 3: sliding_wrap (ADR-010-deferred, floor)"
+run_parity_n_times "sliding_wrap" 700  "Check 3: sliding_wrap (ADR-010-deferred floor)"
+
+# --- Gate D: frozen hf2q self-baseline (byte-identical required) ---
+# min-prefix is unused under --self-baseline (hf2q passes 0 safely as
+# a placeholder; the kernel check is byte-equality, not prefix).
+run_parity_n_times "short_hello"  0    "Check 4: short_hello (Gate D self-baseline)"   "--self-baseline"
+run_parity_n_times "sourdough"    0    "Check 5: sourdough (Gate D self-baseline)"     "--self-baseline"
+run_parity_n_times "sliding_wrap" 0    "Check 6: sliding_wrap (Gate D self-baseline)"  "--self-baseline"
 
 # --- Summary ---
 TOTAL=$((PASS + FAIL))
-echo "=== Parity Summary: $PASS/$TOTAL prompts fully deterministic ==="
+echo "=== Parity Summary: $PASS/$TOTAL checks passed ==="
 if [[ $FAIL -gt 0 ]]; then
     exit 2
 fi
