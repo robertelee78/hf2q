@@ -47,7 +47,7 @@ thiserror = "2"
 # development, override via a (gitignored) .cargo/config.toml:
 #   [patch.crates-io]
 #   mlx-native = { path = "/opt/mlx-native" }
-mlx-native = "0.1.3"
+mlx-native = "0.3"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # Async runtime + HTTP server (for `serve` subcommand)

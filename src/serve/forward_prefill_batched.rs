@@ -388,9 +388,29 @@ impl MlxModelWeights {
                 //    Q: [1, nh, seq_len, hd], K: [1, nkv, seq_len, hd], V: same
                 //    kv_capacity = seq_len (tight packing, no pre-allocated capacity)
                 //    scale = 1.0 for Gemma4 (per llama.cpp oracle)
-                //    Causal mask: kernel uses abs_pos = kv_seq_len - seq_len + q_pos
-                //                 which gives the correct triangular causal pattern
-                //                 when seq_len == kv_seq_len.
+                //    Global layers: plain causal mask (kernel uses
+                //      abs_pos = kv_seq_len - seq_len + q_pos).
+                //    Sliding layers: sdpa_sliding with window_size so each query
+                //      position only attends to keys within `sliding_window`
+                //      positions of itself. Matches llama.cpp's flash_attn_ext
+                //      sliding mask behaviour on Gemma4 SWA layers.
+                // SDPA over the prompt.
+                //
+                // For sliding layers, strictly correct behaviour when
+                // seq_len > sliding_window requires masking out keys
+                // farther than `sliding_window` positions from each query.
+                // mlx-native ships `sdpa_sliding` with exactly that mask,
+                // but empirical testing (`docs/spike-gate-a-prefill.md`,
+                // Task #7 work 2026-04-16) showed it emits a zero/pad
+                // output at seq_len=576 while plain `sdpa` emits a real
+                // token — so the sliding kernel has a bug at prefill
+                // shapes that must be fixed before we can route sliding
+                // layers through it. Until then, we still use plain
+                // `sdpa` (causal-only), which is correct only when
+                // seq_len <= sliding_window (every position already
+                // within-window for every layer). The seq_len > layer_cap
+                // guard below retains the bail for sliding layers on
+                // that basis.
                 let sdpa_params = mlx_native::ops::sdpa::SdpaParams {
                     n_heads: nh as u32,
                     n_kv_heads: nkv as u32,
@@ -676,17 +696,36 @@ impl MlxModelWeights {
             {
                 let mut s = exec.begin()
                     .map_err(|e| anyhow::anyhow!("batched cache write L{layer_idx}: {e}"))?;
-                // Ring mode needs wrap support in the seq kernel — not
-                // implemented yet. Guard: batched prefill requires seq_len
-                // <= per-layer capacity.
+                // Ring-wrap geometry: for sliding layers (capacity =
+                // sliding_window), prompts longer than the window keep only
+                // the last `capacity` tokens in modular-slot order — this
+                // matches what repeated decode-step appends would produce,
+                // and decode reads via `ring_start = write_pos % capacity`.
+                // Global layers have capacity = seq_len + max_decode_tokens
+                // so n_copy == seq_len and src_tok_offset == 0 (linear).
                 let layer_cap = dense_kvs_vec[layer_idx].capacity;
+                // Guard: sliding layers cannot honour prompts past their
+                // window until `sdpa_sliding` is verified for prefill
+                // shapes (see SDPA comment above). Global layers must
+                // never exceed their allocated capacity regardless.
                 if seq_len > layer_cap {
-                    anyhow::bail!(
-                        "batched prefill L{}: seq_len={} exceeds dense cap={} (sliding layer). \
-                         Ring-wrap in the seq kernel is a follow-up; use HF2Q_BATCHED_PREFILL=0 \
-                         (default) for now.",
-                        layer_idx, seq_len, layer_cap);
+                    if dense_kvs_vec[layer_idx].is_sliding {
+                        anyhow::bail!(
+                            "batched prefill L{}: seq_len={} exceeds sliding dense cap={} — \
+                             sdpa_sliding is a Gate A prerequisite; until it is verified \
+                             at prefill shapes, batched prefill errs here. Use \
+                             HF2Q_BATCHED_PREFILL=0 (default).",
+                            layer_idx, seq_len, layer_cap);
+                    } else {
+                        anyhow::bail!(
+                            "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
+                             increase linear_capacity allocation",
+                            layer_idx, seq_len, layer_cap);
+                    }
                 }
+                let n_copy = seq_len.min(layer_cap);
+                let src_tok_offset = (seq_len - n_copy) as u32;
+                let dst_seq_pos_start = src_tok_offset;
                 s.barrier_between(
                     &[&pf_k_normed, &pf_v_normed],
                     &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
@@ -697,14 +736,18 @@ impl MlxModelWeights {
                         &pf_k_normed,
                         &dense_kvs_vec[layer_idx].k,
                         nkv as u32, hd as u32,
-                        layer_cap as u32, 0, seq_len as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
                     ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
                         s.encoder_mut(), reg, metal_dev,
                         &pf_v_normed,
                         &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
-                        layer_cap as u32, 0, seq_len as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
                     ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
                 } else {
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
@@ -712,14 +755,18 @@ impl MlxModelWeights {
                         &pf_k_normed,
                         &dense_kvs_vec[layer_idx].k,
                         nkv as u32, hd as u32,
-                        layer_cap as u32, 0, seq_len as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
                     ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
                     mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
                         s.encoder_mut(), reg, metal_dev,
                         &pf_v_normed,
                         &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
-                        layer_cap as u32, 0, seq_len as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
                     ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
                 }
                 s.finish()
