@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# release-check.sh — Hardening v1 reproducible gate runner.
+# release-check.sh — ADR-005 Closeout Amendment reproducible gate runner.
 #
-# Runs the merge-gating checks defined in docs/shipping-contract.md in
-# sequence and exits non-zero on first fail:
+# Runs the merge-gating checks defined in the ADR and in docs/shipping-
+# contract.md in sequence, exiting non-zero on first fail:
 #
-#   1. parity suite   — short_hello, sourdough (>=3094), sliding_wrap (>=700)
-#   2. perf sanity    — decode tok/s on the sourdough prompt >= floor
+#   1. parity suite (Gates C/E + F) — short_hello / sourdough / sliding_wrap
+#      each run 3× at T=0; every run must pass its min-prefix threshold.
+#   2. perf sanity (Gate B) — median-of-3 decode tok/s on sourdough ≥ floor.
+#   3. prefill perf (Gate A) — batched prefill tok/s on a ≥2048-token prompt
+#      ≥ floor. Requires prefill_2048.txt fixture (skipped if absent).
 #
-# The parity suite wraps `hf2q parity check` via scripts/parity_check.sh.
-# The perf sanity runs hf2q on the canonical sourdough prompt and parses
-# tok/s from stderr, matching the "X.X tok/s" shape already emitted by
-# the decode loop.
+# Gates not yet wired here: D (frozen hf2q self-baseline), G (mlx-native
+# dispatch counter thresholds). Both are follow-ups; see ADR-005 Closeout
+# Amendment for scope.
+#
+# Parity suite wraps `hf2q parity check` via scripts/parity_check.sh.
+# Perf gates parse tok/s from stderr of `hf2q generate`.
 #
 # Usage:
 #   scripts/release-check.sh <gguf_path>
@@ -87,8 +92,8 @@ echo "min decode tps:  $MIN_DECODE_TPS"
 echo "perf max-tokens: $MAX_TOKENS"
 echo
 
-# --- Gate 1: parity suite (short_hello + sourdough + sliding_wrap) ---
-echo "--- Gate 1/2: parity suite ---"
+# --- Gate 1: parity suite (Gates C/E + F) ---
+echo "--- Gate 1/3: parity suite ---"
 if ! "$SCRIPT_DIR/parity_check.sh" "$GGUF_PATH"; then
   echo "FAIL: parity gate tripped. See output above." >&2
   exit 2
@@ -102,7 +107,7 @@ fi
 # median" — resilient to a single thermal dip, still tight enough to flag
 # real regressions.
 echo
-echo "--- Gate 2/2: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
+echo "--- Gate 2/3: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
 PERF_SAMPLES=()
 for run in 1 2 3; do
   if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PERF_PROMPT" \
@@ -133,6 +138,57 @@ if [[ "$PASS_PERF" != "1" ]]; then
   echo "      Bisect recent changes to the forward pass, KV cache, SDPA, MoE," >&2
   echo "      or lm_head before landing." >&2
   exit 2
+fi
+
+
+# --- Gate 3: prefill tok/s on a ≥2048-token prompt (batched path) ---
+# ADR-005 Closeout Amendment Gate A: prefill tok/s parity vs llama.cpp on
+# a ≥2048-token prompt. llama.cpp is the reference at ~3260 tok/s on M5 Max.
+# hf2q batched prefill (post mlx-native 0.3.1 race fix + sdpa_sliding
+# re-enable) sits at ~152-155 tok/s on the same prompt. True peer-parity
+# is Run-scope (needs a flash-attn-style tiled kernel, not a one-liner).
+# For now, floor at 150 tok/s catches genuine regressions in batched-
+# prefill throughput without pretending the peer gap is closed.
+PREFILL_2048_PROMPT="tests/evals/prompts/prefill_2048.txt"
+# Floor at 140 tok/s: cold-start batched prefill hits 152-155 tok/s on
+# M5 Max, but Gate 3 runs AFTER Gate 2's ~30s of sustained decode load,
+# so thermal throttling can pull it into the 145-150 range on the third
+# gate. 140 gives ~5-10 tok/s headroom below hot steady-state — tight
+# enough to flag real regressions (pre-fix batched prefill was broken
+# at seq_len>1024, not slow; a real regression would drop far below 140).
+MIN_PREFILL_TPS="140"
+if [[ -f "$PREFILL_2048_PROMPT" ]]; then
+  echo
+  echo "--- Gate 3/3: prefill perf on ≥2048-token prompt (batched) ---"
+  PREFILL_LOG="/tmp/release_check_prefill.log"
+  if ! HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1 \
+      "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt-file "$PREFILL_2048_PROMPT" \
+        --max-tokens 1 --temperature 0 \
+        >/dev/null 2>"$PREFILL_LOG"; then
+    echo "prefill sanity run crashed; see $PREFILL_LOG" >&2
+    exit 3
+  fi
+  # hf2q emits the prefill summary to stdout but also logs a stderr line
+  # "Batched prefill complete: N tokens in X.X ms (Y.Y tok/s)" at the end
+  # of the batched prefill session. We parse the stderr line to avoid
+  # needing stdout capture (which would mix decoded text with timing).
+  PREFILL_TPS="$(grep -oE 'Batched prefill complete: [0-9]+ tokens in [0-9.]+ ms \(([0-9.]+) tok/s\)' "$PREFILL_LOG" \
+      | tail -1 | grep -oE '\([0-9.]+ tok/s\)' | grep -oE '[0-9.]+' | head -1)"
+  if [[ -z "$PREFILL_TPS" ]]; then
+    echo "FAIL: no prefill tok/s line found in $PREFILL_LOG — format may have changed." >&2
+    exit 2
+  fi
+  PASS_PREFILL="$(awk -v t="$PREFILL_TPS" -v m="$MIN_PREFILL_TPS" 'BEGIN { print (t+0 >= m+0) ? "1" : "0" }')"
+  echo "prefill: $PREFILL_TPS tok/s on 2455-token prompt (floor: $MIN_PREFILL_TPS)"
+  if [[ "$PASS_PREFILL" != "1" ]]; then
+    echo "FAIL: batched prefill $PREFILL_TPS tok/s is below floor $MIN_PREFILL_TPS." >&2
+    echo "      Bisect recent changes to fused_head_norm_rope, sdpa_sliding," >&2
+    echo "      or the batched prefill session structure." >&2
+    exit 2
+  fi
+else
+  echo
+  echo "(Gate 3 skipped: $PREFILL_2048_PROMPT not found)" >&2
 fi
 
 echo
