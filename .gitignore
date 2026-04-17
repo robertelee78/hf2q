@@ -39,3 +39,4 @@ scripts/dump_layer_states
 
 # dump_layer_states binary (built separately via g++)
 scripts/dump_layer_states
+.cargo/

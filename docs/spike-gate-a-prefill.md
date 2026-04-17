@@ -99,3 +99,54 @@ If A1 or A3, Gate A stays `[ ]` until ring-wrap lands.
 1. Pick A1 / A2 / A3 above.
 2. If A1 or A3: open a task for ring-wrap in the batched prefill seq kernel. Expected to slot into the existing mlx-native ring-buffer KV cache pattern (`src/serve/forward_mlx.rs`).
 3. Update ADR-005 Closeout Amendment Gate A row to reflect the picked option.
+
+## Addendum — 2026-04-16 PM (post-A1 lock, Task #7 execution)
+
+User picked A1: ring-wrap lands as an explicit Phase 1b prerequisite. Implementation started. Two findings:
+
+### Finding 1 — Ring-wrap KV writes landed (correct)
+
+`mlx-native` commit `3b09de7` (pushed to github origin main, NOT yet published to crates.io) adds modular-slot writes to `kv_cache_copy_seq_f32` / `kv_cache_copy_seq_f32_to_f16` plus a new `src_tok_offset` parameter so the host can deduplicate the overwritten prefix. Two new unit tests pass at ε=1e-4:
+
+- `test_kv_cache_copy_seq_f32_sliding_ring_wrap`: 8 tokens, capacity=4 → surviving tokens 4/5/6/7 land at slots 0/1/2/3 in modular order.
+- `test_kv_cache_copy_seq_f32_no_wrap`: 3 tokens, capacity=8 → linear writes, untouched slots retain sentinel.
+
+Initial naive implementation (mod without `src_tok_offset`) was **incorrect** — when n_tokens > capacity, multiple threads wrote to the same slot and Metal did not serialise them, producing nondeterministic survivors. The `src_tok_offset` param fixes this by dispatching exactly one write per surviving slot.
+
+### Finding 2 — Blocker: `sdpa_sliding` broken at prefill shapes
+
+The kv-write side is ready. The attention side is not: `mlx-native`'s `sdpa_sliding` kernel — the correct attention path for sliding layers at `seq_len > sliding_window` — emits `pad` (token 0) at prefill shapes.
+
+Reproducer (hf2q, HEAD this session, `.cargo/config.toml` patching mlx-native to the local 0.2.0+`3b09de7`):
+
+| Path | seq_len | First decode token | Verdict |
+|---|---|---|---|
+| Per-token prefill (baseline) | 576 | `2021` ("To") | reference |
+| Batched prefill, plain `sdpa` all layers | 576 | `2021` ("To") | matches baseline |
+| Batched prefill, `sdpa_sliding` on sliding layers | 576 | `0` ("pad") | **broken** |
+
+At seq_len=576 < sliding_window=1024, `sdpa_sliding` with `window_size=1024` should behave identically to plain `sdpa` (every position is within-window). It doesn't. Plain sdpa emits the correct token; sdpa_sliding emits pad.
+
+The kernel is orphaned in mlx-native — nothing else in hf2q uses it, so this bug has never been exercised. It's a Gate A hard blocker: without a working sliding-attention kernel, batched prefill at `seq_len > sliding_window` cannot produce correct output.
+
+### Durable state after this session
+
+- **mlx-native `3b09de7`** (pushed, not published): ring-wrap KV writes + two passing unit tests. Durable infra. When `sdpa_sliding` is fixed the ring-wrap side is already in place.
+- **hf2q**: no commits. Local working tree has `forward_prefill_batched.rs` + `Cargo.toml` changes that pass the new 11-arg signature and narrow the guard to sliding-only (global layers can still exceed allocation safely). These don't commit cleanly until mlx-native publishes 0.2.1+ including the ring-wrap kernel.
+- **New finding**: at `seq_len ≤ sliding_window` (≤1024), batched prefill with plain sdpa runs **2.85× faster** than per-token (283 vs 99 tok/s at 576 tokens) and is **byte-identical** in output. Useful for medium-prompt workloads independent of Gate A closure.
+
+### Updated Gate A dependency chain
+
+Gate A closure requires, in order:
+
+1. **Task #8 (new)** — debug + fix `sdpa_sliding` in mlx-native at prefill shapes. Read kernel, compare math vs mlx-lm/llama.cpp references, write unit tests at prefill shapes, fix, publish.
+2. **Task #7 (in-progress, blocked by #8)** — once sdpa_sliding is fixed, re-enable sliding-layer routing in `forward_prefill_batched.rs`, drop the sliding-layer bail, rebench.
+3. Post-ring-wrap prefill tok/s measurement (this spike doc gets a Finding 3).
+4. Gate A concrete floor set in `scripts/release-check.sh`.
+
+### Open question for the user
+
+Two paths forward:
+
+- **Path X — Publish `mlx-native` 0.2.1 now** (with the ring-wrap + src_tok_offset kernel change). That lets hf2q commit its source change + Cargo.toml bump immediately and lands the batched-prefill 2.85× win for ≤1024-token prompts as a shipping feature, decoupled from the Gate A closure schedule. Requires `cargo publish` to crates.io.
+- **Path Y — Hold the publish, debug sdpa_sliding first**. Everything sits in working-tree / github-only until Gate A can close in one landing. Conservative — no half-landed feature — but the 2.85× ≤1024-token batched-prefill win stays unshipped in the meantime.
