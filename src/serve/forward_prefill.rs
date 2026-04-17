@@ -105,10 +105,10 @@ impl MlxModelWeights {
         let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-        for layer_idx in 0..num_layers {
-            let nkv = self.num_kv_heads[layer_idx];
-            let hd = self.head_dims[layer_idx];
-            let layer_is_ring = self.layer_types[layer_idx] == LayerType::Sliding;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nkv = layer.num_kv_heads;
+            let hd = layer.head_dim;
+            let layer_is_ring = layer.layer_type == LayerType::Sliding;
             let capacity = if layer_is_ring { sw } else { linear_capacity };
             let n = nkv * capacity * hd;
             let k = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
@@ -120,7 +120,7 @@ impl MlxModelWeights {
 
         // Tmp buffer for flash_attn_vec (sized for largest layer config)
         let max_nh = self.num_attention_heads;
-        let max_hd = self.head_dims.iter().copied().max().unwrap_or(512);
+        let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
         let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
             max_nh as u32, max_hd as u32);
         let sdpa_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
@@ -200,10 +200,11 @@ impl MlxModelWeights {
 
                 // --- 2. Transformer layers ---
                 for layer_idx in 0..num_layers {
-                    let hd = self.head_dims[layer_idx];
-                    let nkv = self.num_kv_heads[layer_idx];
+                    let layer = &self.layers[layer_idx];
+                    let hd = layer.head_dim;
+                    let nkv = layer.num_kv_heads;
                     let nh = self.num_attention_heads;
-                    let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
+                    let is_sliding = layer.layer_type == LayerType::Sliding;
                     let (kv_is_sliding, kv_write_pos, kv_capacity, _kv_seq_len) = kv_info[layer_idx];
 
                     // Active dump flag for this iteration

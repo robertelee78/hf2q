@@ -77,10 +77,10 @@ impl MlxModelWeights {
         let linear_capacity = seq_len + max_decode_tokens;
         let sw = self.sliding_window;
         let mut dense_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-        for layer_idx in 0..num_layers {
-            let nkv = self.num_kv_heads[layer_idx];
-            let hd = self.head_dims[layer_idx];
-            let layer_is_ring = self.layer_types[layer_idx] == LayerType::Sliding;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nkv = layer.num_kv_heads;
+            let hd = layer.head_dim;
+            let layer_is_ring = layer.layer_type == LayerType::Sliding;
             let capacity = if layer_is_ring { sw } else { linear_capacity };
             let n = nkv * capacity * hd;
             let k = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype,
@@ -92,7 +92,7 @@ impl MlxModelWeights {
             dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
         }
         let max_nh = nh;
-        let max_hd = self.head_dims.iter().copied().max().unwrap_or(512);
+        let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
         let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
             max_nh as u32, max_hd as u32);
         let sdpa_tmp = dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
@@ -110,7 +110,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
         };
 
-        let max_nkv = self.num_kv_heads.iter().copied().max().unwrap_or(8);
+        let max_nkv = self.layers.iter().map(|l| l.num_kv_heads).max().unwrap_or(8);
         let pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
         let pf_residual = alloc_f32(seq_len * hs, "pf_residual")?;
         let pf_norm_out = alloc_f32(seq_len * hs, "pf_norm_out")?;
@@ -192,12 +192,12 @@ impl MlxModelWeights {
         let batched_dump: Option<(usize, usize)> = INVESTIGATION_ENV.batched_dump;
         let batched_dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
 
-        for layer_idx in 0..num_layers {
-            let hd = self.head_dims[layer_idx];
-            let nkv = self.num_kv_heads[layer_idx];
-            let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
-            let top_k = self.layers[layer_idx].moe.top_k;
-            let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let hd = layer.head_dim;
+            let nkv = layer.num_kv_heads;
+            let is_sliding = layer.layer_type == LayerType::Sliding;
+            let top_k = layer.moe.top_k;
+            let moe_int = layer.moe.moe_intermediate_size;
 
             // ADR-010 early dump: capture layer INPUT (= previous layer's output)
             // before any modification. pf_hidden at end of layer holds the NEXT

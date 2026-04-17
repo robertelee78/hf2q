@@ -339,13 +339,20 @@ pub struct MlxLayerNorms {
     pub post_feedforward_layernorm_2: MlxBuffer,
 }
 
-/// All mlx-native weights for one decoder layer.
+/// All mlx-native weights for one decoder layer, plus per-layer config
+/// that used to live as parallel Vecs on `MlxModelWeights`.
 pub struct MlxDecoderLayerWeights {
     pub attn: MlxAttentionWeights,
     pub mlp: MlxMlpWeights,
     pub moe: MlxMoeWeights,
     pub norms: MlxLayerNorms,
     pub layer_scalar: MlxBuffer,
+    /// Head dim for this layer (Gemma-4: 256 for sliding, 512 for global).
+    pub head_dim: usize,
+    /// KV heads for this layer (Gemma-4: 8 for sliding, 2 for global).
+    pub num_kv_heads: usize,
+    /// Sliding vs Full attention — drives SDPA dispatch and KV cache layout.
+    pub layer_type: LayerType,
 }
 
 /// Per-layer KV cache buffers for the mlx-native path (TurboQuant compressed).
@@ -474,14 +481,8 @@ pub struct MlxModelWeights {
     pub kv_caches: Vec<MlxKvCache>,
     /// Reusable activation buffers.
     pub activations: MlxActivationBuffers,
-    /// Layer types (Sliding vs Full) for attention dispatch.
-    pub layer_types: Vec<LayerType>,
     /// Sliding window size.
     pub sliding_window: usize,
-    /// Per-layer head_dim (256 for sliding, 512 for global).
-    pub head_dims: Vec<usize>,
-    /// Per-layer num_kv_heads (8 for sliding, 2 for global).
-    pub num_kv_heads: Vec<usize>,
     /// RoPE theta for sliding layers.
     pub rope_theta_sliding: f32,
     /// RoPE theta for global layers.
@@ -695,8 +696,6 @@ impl MlxModelWeights {
         let num_layers = cfg.num_hidden_layers;
         let mut layers = Vec::with_capacity(num_layers);
         let mut kv_caches = Vec::with_capacity(num_layers);
-        let mut head_dims = Vec::with_capacity(num_layers);
-        let mut num_kv_heads_vec = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
             tracing::debug!("GGUF layer {}/{}: loading weights", i + 1, num_layers);
@@ -841,8 +840,7 @@ impl MlxModelWeights {
             let hd = cfg.head_dim_for_layer(i);
             let nkv = cfg.num_kv_heads_for_layer(i);
             let is_full = cfg.is_full_attention(i);
-            head_dims.push(hd);
-            num_kv_heads_vec.push(nkv);
+            let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
 
             // -- KV cache allocation (identical to the old load_from_candle) --
             let capacity = if is_full {
@@ -884,6 +882,9 @@ impl MlxModelWeights {
                 moe,
                 norms,
                 layer_scalar,
+                head_dim: hd,
+                num_kv_heads: nkv,
+                layer_type,
             });
             progress.on_layer(i + 1);
         }
@@ -917,10 +918,7 @@ impl MlxModelWeights {
             final_logit_softcapping: cfg.final_logit_softcapping.map(|v| v as f32),
             kv_caches,
             activations,
-            layer_types: cfg.layer_types.clone(),
             sliding_window: cfg.sliding_window,
-            head_dims,
-            num_kv_heads: num_kv_heads_vec,
             rope_theta_sliding: cfg.rope_theta_sliding as f32,
             rope_theta_global: cfg.rope_theta_global as f32,
             num_experts: cfg.num_experts,
@@ -1076,10 +1074,10 @@ impl MlxModelWeights {
             let dump_detail_layer: Option<usize> = INVESTIGATION_ENV.dump_layer_detail;
 
             for layer_idx in 0..num_layers {
-                let hd = self.head_dims[layer_idx];
-                let nkv = self.num_kv_heads[layer_idx];
+                let hd = self.layers[layer_idx].head_dim;
+                let nkv = self.layers[layer_idx].num_kv_heads;
                 let nh = self.num_attention_heads;
-                let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
+                let is_sliding = self.layers[layer_idx].layer_type == LayerType::Sliding;
                 let eps = self.rms_norm_eps;
                 let (kv_is_sliding, kv_write_pos, kv_capacity, kv_seq_len) = kv_info[layer_idx];
 
@@ -2217,14 +2215,23 @@ impl MlxModelWeights {
         }
 
         // --- Per-layer kernel-type sessions ---
+        //
+        // clippy::needless_range_loop stays off here: the body writes into 8
+        // parallel `kp.*_us` profile vectors and indexes `kv_info`/`self.kv_caches`
+        // by layer_idx. Zipping all of them into one iterator chain would be
+        // much less readable than the index form. Migration note: the `layer`
+        // binding covers the per-layer config (head_dim, num_kv_heads, layer_type)
+        // and attn/moe/norms accesses.
+        #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
-            let hd = self.head_dims[layer_idx];
-            let nkv = self.num_kv_heads[layer_idx];
+            let layer = &self.layers[layer_idx];
+            let hd = layer.head_dim;
+            let nkv = layer.num_kv_heads;
             let nh = self.num_attention_heads;
-            let is_sliding = self.layer_types[layer_idx] == LayerType::Sliding;
+            let is_sliding = layer.layer_type == LayerType::Sliding;
             let eps = self.rms_norm_eps;
             let (kv_is_sliding, kv_write_pos, kv_capacity, kv_seq_len) = kv_info[layer_idx];
-            let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
+            let v_is_k = layer.attn.v_proj.is_none();
 
             // ============================================================
             // GROUP 1: QKV matmuls (pre-attn norm + Q + K + V projections)
