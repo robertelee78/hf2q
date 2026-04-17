@@ -10,10 +10,14 @@ name: CI
 # Lint strictness policy:
 #   * cargo check + build --release + test — BLOCKING; the tree must
 #     compile and pass tests on every push.
-#   * cargo clippy + fmt --check — INFORMATIONAL (continue-on-error);
-#     surfaces lint findings in the job log but does not block merges.
-#     The baseline currently carries pre-existing clippy findings; once
-#     those are cleaned up the policy can flip to blocking.
+#   * cargo clippy — BLOCKING (warnings-as-errors). The tree was
+#     cleaned to zero findings in the hardening-v2 clippy pass; new
+#     warnings fail CI.
+#   * cargo fmt --check — INFORMATIONAL (continue-on-error). The
+#     baseline carries ~700 rustfmt diffs from earlier style drift;
+#     running `cargo fmt --all` against the whole tree is a separate
+#     policy decision (touches wide swaths of legacy code). Kept in
+#     the log so new drift is visible.
 #   * activate() warning-matrix smoke — BLOCKING; confirms the
 #     HF2Q_UNSAFE_EXPERIMENTS ack gate (docs/shipping-contract.md)
 #     still refuses/activates/warns correctly.
@@ -57,14 +61,14 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
-      # --- Informational lint pass (does not fail the job) ---
+      # --- fmt: informational (baseline drift, see header) ---
       - name: cargo fmt --check (informational)
         continue-on-error: true
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (informational)
-        continue-on-error: true
-        run: cargo clippy --all-targets --all-features -- -W clippy::all
+      # --- clippy: BLOCKING (warnings as errors) ---
+      - name: cargo clippy (warnings-as-errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       # --- Blocking compile + test ---
       - name: cargo check
