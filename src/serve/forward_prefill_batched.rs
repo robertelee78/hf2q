@@ -57,6 +57,11 @@ impl MlxModelWeights {
 
         let f32_sz = std::mem::size_of::<f32>();
         let u32_sz = std::mem::size_of::<u32>();
+        // bf16 = 2 bytes/element (ADR-011 Phase 2 Wave 3 bf16 conversion).
+        // Intermediate sublayer activations (Q/K/V, SDPA out, MLP/MoE expert
+        // outputs) move to bf16 per the MLX-LM dtype convention; residual
+        // stream stays f32. See docs/ADR-011-phase2-bf16-conversion-map.md.
+        let bf16_sz: usize = 2;
 
         let (exec, reg) = gpu.split();
         let dev = exec.device();
@@ -104,6 +109,14 @@ impl MlxModelWeights {
         // -------------------------------------------------------------------
         let alloc_f32 = |n: usize, name: &str| -> Result<MlxBuffer> {
             dev.alloc_buffer(n * f32_sz, DType::F32, vec![n])
+                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        };
+        // bf16 allocation helper — used for intermediate sublayer activations
+        // (Q/K/V post-qmatmul casts, head-normed + RoPE'd Q/K/V, permuted
+        // Q/K/V for SDPA, SDPA output, MLP/MoE expert intermediates). The
+        // residual stream (pf_hidden, pf_residual) stays f32.
+        let alloc_bf16 = |n: usize, name: &str| -> Result<MlxBuffer> {
+            dev.alloc_buffer(n * bf16_sz, DType::BF16, vec![n])
                 .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
         };
         let alloc_u32 = |n: usize, name: &str| -> Result<MlxBuffer> {
