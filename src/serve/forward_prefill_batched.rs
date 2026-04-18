@@ -140,10 +140,28 @@ impl MlxModelWeights {
         let pf_k_normed = alloc_f32(seq_len * max_nkv * max_hd, "pf_k_normed")?;
         let pf_v_normed = alloc_f32(seq_len * max_nkv * max_hd, "pf_v_normed")?;
 
-        let pf_q_perm = alloc_f32(nh * seq_len * max_hd, "pf_q_perm")?;
-        let pf_k_perm = alloc_f32(max_nkv * seq_len * max_hd, "pf_k_perm")?;
-        let pf_v_perm = alloc_f32(max_nkv * seq_len * max_hd, "pf_v_perm")?;
-        let pf_sdpa_out_perm = alloc_f32(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+        // ADR-011 Phase 2 Wave 3 (bf16 SDPA island):
+        //
+        // Q/K/V projections (qmatmul) and head-norm+RoPE remain f32 in this
+        // stage — the MLX-LM convention calls for bf16 but the upstream f32
+        // sources (quantized_matmul_ggml kernels, the f32 norm weights
+        // loaded via `gguf.load_tensor_f32`) would require either
+        // mlx-native kernel changes or a per-layer f32→bf16 weight cast.
+        // Neither is in Wave 3's scope. Instead we introduce a *bf16 island*
+        // spanning permute→SDPA→permute: cast f32 normed Q/K/V into bf16
+        // buffers, run permute_021_bf16 + sdpa_bf16 + back-permute_021_bf16
+        // on bf16 data, then cast bf16→f32 into the f32 `pf_sdpa_out` buffer
+        // for the O-proj qmatmul (also f32-only). This matches the dtype
+        // convention for the core attention compute and is exactly the
+        // region Wave 4's `flash_attn_prefill` (bf16-only) will later wrap.
+        let pf_q_normed_bf16 = alloc_bf16(seq_len * nh * max_hd, "pf_q_normed_bf16")?;
+        let pf_k_normed_bf16 = alloc_bf16(seq_len * max_nkv * max_hd, "pf_k_normed_bf16")?;
+        let pf_v_normed_bf16 = alloc_bf16(seq_len * max_nkv * max_hd, "pf_v_normed_bf16")?;
+        let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
+        let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
+        let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
+        let pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+        let pf_sdpa_out_bf16 = alloc_bf16(seq_len * nh * max_hd, "pf_sdpa_out_bf16")?;
         let pf_sdpa_out = alloc_f32(seq_len * nh * max_hd, "pf_sdpa_out")?;
 
         let mut pf_mlp_gate = alloc_f32(seq_len * intermediate, "pf_mlp_gate")?;
@@ -376,24 +394,47 @@ impl MlxModelWeights {
                     )?;
                 }
 
-                // 5. Permute [seq_len, n_heads, hd] → [n_heads, seq_len, hd]
+                // 4b. Cast normed Q/K/V f32 → bf16 to enter the bf16 attention island.
+                //     seq_len*n_heads*hd (or n_kv_heads) contiguous elements
+                //     are written starting at offset 0 of each buffer; the
+                //     rest (padding for max_hd) is unused.
                 s.barrier_between(
                     &[&pf_q_normed, &pf_k_normed, &pf_v_normed],
+                    &[&pf_q_normed_bf16, &pf_k_normed_bf16, &pf_v_normed_bf16],
+                );
+                let q_normed_elems = (seq_len * nh * hd) as u32;
+                let kv_normed_elems = (seq_len * nkv * hd) as u32;
+                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
+                    s.encoder_mut(), reg, metal_dev,
+                    &pf_q_normed, &pf_q_normed_bf16, q_normed_elems,
+                ).map_err(|e| anyhow::anyhow!("batched Q normed f32->bf16 L{layer_idx}: {e}"))?;
+                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
+                    s.encoder_mut(), reg, metal_dev,
+                    &pf_k_normed, &pf_k_normed_bf16, kv_normed_elems,
+                ).map_err(|e| anyhow::anyhow!("batched K normed f32->bf16 L{layer_idx}: {e}"))?;
+                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
+                    s.encoder_mut(), reg, metal_dev,
+                    &pf_v_normed, &pf_v_normed_bf16, kv_normed_elems,
+                ).map_err(|e| anyhow::anyhow!("batched V normed f32->bf16 L{layer_idx}: {e}"))?;
+
+                // 5. Permute [seq_len, n_heads, hd] → [n_heads, seq_len, hd] (bf16).
+                s.barrier_between(
+                    &[&pf_q_normed_bf16, &pf_k_normed_bf16, &pf_v_normed_bf16],
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
                 );
-                mlx_native::ops::transpose::permute_021_f32(
+                mlx_native::ops::transpose::permute_021_bf16(
                     s.encoder_mut(), reg, metal_dev,
-                    &pf_q_normed, &pf_q_perm,
+                    &pf_q_normed_bf16, &pf_q_perm,
                     seq_len, nh, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute Q L{layer_idx}: {e}"))?;
-                mlx_native::ops::transpose::permute_021_f32(
+                mlx_native::ops::transpose::permute_021_bf16(
                     s.encoder_mut(), reg, metal_dev,
-                    &pf_k_normed, &pf_k_perm,
+                    &pf_k_normed_bf16, &pf_k_perm,
                     seq_len, nkv, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute K L{layer_idx}: {e}"))?;
-                mlx_native::ops::transpose::permute_021_f32(
+                mlx_native::ops::transpose::permute_021_bf16(
                     s.encoder_mut(), reg, metal_dev,
-                    &pf_v_normed, &pf_v_perm,
+                    &pf_v_normed_bf16, &pf_v_perm,
                     seq_len, nkv, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute V L{layer_idx}: {e}"))?;
 
@@ -456,16 +497,27 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("batched dense SDPA L{layer_idx}: {e}"))?;
                 }
 
-                // 7. Permute sdpa_out [n_heads, seq_len, hd] → [seq_len, n_heads, hd]
+                // 7. Permute sdpa_out [n_heads, seq_len, hd] → [seq_len, n_heads, hd] (bf16),
+                //    then cast bf16 → f32 for the f32-only O-proj qmatmul.
                 s.barrier_between(
                     &[&pf_sdpa_out_perm],
-                    &[&pf_sdpa_out],
+                    &[&pf_sdpa_out_bf16],
                 );
-                mlx_native::ops::transpose::permute_021_f32(
+                mlx_native::ops::transpose::permute_021_bf16(
                     s.encoder_mut(), reg, metal_dev,
-                    &pf_sdpa_out_perm, &pf_sdpa_out,
+                    &pf_sdpa_out_perm, &pf_sdpa_out_bf16,
                     nh, seq_len, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute SDPA L{layer_idx}: {e}"))?;
+
+                s.barrier_between(
+                    &[&pf_sdpa_out_bf16],
+                    &[&pf_sdpa_out],
+                );
+                mlx_native::ops::elementwise::dispatch_cast_bf16_to_f32_with_encoder(
+                    s.encoder_mut(), reg, metal_dev,
+                    &pf_sdpa_out_bf16, &pf_sdpa_out,
+                    (seq_len * nh * hd) as u32,
+                ).map_err(|e| anyhow::anyhow!("batched SDPA out bf16->f32 L{layer_idx}: {e}"))?;
 
                 // 8. O-proj (m = seq_len): [seq_len, nh*hd] → [seq_len, hs]
                 s.barrier_between(
