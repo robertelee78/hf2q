@@ -260,3 +260,70 @@ Both converge on the same port source and the same perf expectation — strong c
 - **Phase 1 can begin immediately.** Literal vendoring of candle's `scaled_dot_product_attention.metal:1895-2337` + `kernels/sdpa.rs:22-247` into `/opt/mlx-native/src/shaders/flash_attn_prefill.metal` + `/opt/mlx-native/src/ops/flash_attn_prefill.rs`.
 - **Estimated elapsed**: 4-9 engineering days total across all 4 phases, per the initial risk analysis (R6).
 - **Owner**: Robert + Claude, next focused session.
+
+---
+
+## Phase 1a Addendum (2026-04-17 — landed)
+
+Phase 1a is mlx-native's first production flash-attention prefill kernel. It is our kernel — authored by us, owned by us, in our repo. It implements the algorithm described in Dao et al.'s FlashAttention paper, using the same simdgroup-MMA tile structure that MLX, candle, and llama.cpp all use because that's what fits Apple GPU's MMA hardware. We studied those reference implementations as prior art before writing ours.
+
+The original Decision text above is preserved as-written; this addendum supersedes where called out.
+
+### Landed scope
+
+- `/opt/mlx-native/src/shaders/flash_attn_prefill.metal` — the kernel. Implements `attention<BQ, BK, BD, WM, WN>` with eight host-visible entry points covering D ∈ {256, 512} × I/O dtype ∈ {bf16, f16} × mask kind ∈ {additive, bool}. The kernel preamble is the authoritative description of what the file does.
+- `/opt/mlx-native/src/ops/flash_attn_prefill.rs` — host dispatcher. Exposes `dispatch_flash_attn_prefill_bf16_d256` (the Phase 1a production entry point) and registers all eight kernel names so future dispatchers can be added without touching registration. Includes the `AttnParamsGpu` ABI mirror (160 bytes), function-constant pipeline cache, and full input validation.
+- `/opt/mlx-native/tests/test_flash_attn_prefill.rs` — 23-test suite: structural layout (2), library-compilation (1), error-path validation (5), CPU-reference self-consistency (6), and bf16 GPU correctness (9: unmasked, causal, additive-mask, fully-masked NaN-guard, GQA, custom scale, determinism, unaligned-ql, unaligned-kl). All pass at `atol=5e-3, rtol=2e-2` against the kernel-equivalent CPU reference (`sdpa_reference_f32`).
+
+Phase 1a research artifacts under `/opt/hf2q/docs/`:
+
+- `ADR-011-phase1-prior-art-map.md` — annotated walk through MLX/candle's flash-attention algorithm to extract what we'd reuse.
+- `ADR-011-phase1-llamacpp-delta.md` — comparison of MLX-style vs llama.cpp-style flash-attention design choices on Apple Silicon.
+- `ADR-011-phase1-port-source-decision.md` — evidence-based comparison of MLX-style vs llama.cpp-style as the design our kernel follows, with measured llama.cpp prefill numbers on our hardware.
+- `ADR-011-phase1-tests-verification.md` — point-in-time test-landing log and blocker diagnosis.
+- `ADR-011-phase1-review-verdict.md` — independent reviewer audit of the Phase 1a stack.
+
+### Discovery 1 — f32 at D=256 is structurally unrunnable on Apple Silicon (revises §Phase 1)
+
+The original Phase 1 plan said: *"Start with f32 Q/K/V/O for cheap correctness verification; add bf16 variant after f32 lands."*
+
+This is **infeasible**. At D=256 with the BQ=32 tile geometry, the Qs threadgroup tile alone is `BQ × BD × sizeof(float) = 32 × 256 × 4 = 32 KB` — the entire `MTLDevice.maxThreadgroupMemoryLength` budget on every M-series chip (M1..M5; the 32 KB limit is constant). With KV_smem and scratch the kernel needs ~53.7 KB and Metal rejects the library at compile time. The same constraint applies at D=512.
+
+**Resolution**: f32 is excluded at both head dims. Phase 1a GPU correctness runs at **bf16 D=256** with an f32 CPU reference for tolerance-bounded cross-check. bf16/f16 halve the threadgroup footprint (~29 KB) and fit within the budget. f32 correctness is verified at the CPU reference layer only. The original §Phase 4 work item ("bf16 variant") is therefore substantially landed in Phase 1a; what remains for Phase 4 is sliding-window-attention mask handling and exposing the D=512 dispatcher.
+
+### Discovery 2 — Measured peer numbers warrant updating §Decision
+
+The Phase 1a evaluator (`ADR-011-phase1-port-source-decision.md`) measured llama.cpp's `flash_attn_ext` on M5 Max against Gemma 4 26B MoE DWQ at the canonical shapes:
+
+| seq | fa=1 tok/s | fa=0 tok/s | ADR-cited |
+|---|---|---|---|
+| 512 | **3722** | — | — |
+| 2455 | 3314 | **3456** | 3260 (stale) |
+| 4096 | 2977 | **3362** | — |
+
+Two items revise §Decision:
+
+- The ADR-cited 3260 tok/s peer figure is stale; today's measured peer is 3314 tok/s with FA on, 3456 tok/s with FA off at the same prompt length. Phase 3's success criteria (≥2400 tok/s) and ADR-005 §Gate A floors should reference today's measurement.
+- llama.cpp's `fa=0` is 4-12% **faster** than `fa=1` on this MoE prefill at long sequences, contradicting the implicit "FA always wins" framing. The `flash_attn_ext_blk` 8×64 mask pre-pass with ~59% tile skip on sliding-window layers is the single most impactful unported optimization and remains a Phase 4/5 work item.
+
+### Design choices worth calling out
+
+Two design choices in our kernel deserve explicit documentation, since they reflect deliberate divergence from what some other flash-attention implementations do on Apple Silicon:
+
+**Register-resident output accumulator.** The Otile (output accumulator) lives in registers across the K-tile sweep, not in threadgroup memory. This avoids the per-K-tile `threadgroup_barrier` cost some implementations incur for accumulator updates, at the cost of higher register pressure. The trade is right for our prefill shapes on Apple Silicon: simdgroup-level barriers are cheap, threadgroup barriers are not.
+
+**Three NaN guards using true -infinity sentinel.** We use true -infinity (not `-FLT_MAX/2` finite arithmetic) as the masked-position sentinel, which means three sentinel-arithmetic sites need NaN guards. The kernel preamble enumerates them: (1) `ExpSubOp` for `max == -inf`, (2) the rescale factor for `old_max == -inf`, and (3) `DivOp` for `sum_score == 0` (covers the fully-masked-row case at output normalization). All three are required for the kernel to produce finite output on a fully-masked input — verified by `test_gpu_bf16_d256_fully_masked_nan_guard`.
+
+### Phase 1b carry-overs
+
+The reviewer (`ADR-011-phase1-review-verdict.md`) approved Phase 1a with three caveats — all three landed in this commit, not deferred:
+
+- **S1**: Unaligned-ql GPU test (`align_Q=false` function-constant path) — landed.
+- **S2**: Unaligned-kl GPU test (`align_K=false` function-constant path) — landed.
+- **S3**: Phase 1a addendum to ADR-011 — this section.
+
+### Updated Status
+
+- **ADR-011 status: Phase 0 + Phase 1a complete.** Kernel + bf16 D=256 dispatcher + 23-test suite landed and passing on M5 Max.
+- **Phase 2 ready to begin.** hf2q integration through `forward_prefill_batched.rs:386-430`'s SDPA dispatch, gated behind `HF2Q_FLASH_ATTN_PREFILL=1` per the original §Phase 2 plan. The Phase 2 correctness gate must use the kernel-equivalent CPU reference (`sdpa_reference_f32` in the test file), not `sdpa.metal`'s exp-based output, since the two paths differ in scale placement and exp-vs-exp2 by design.
+- **Phase 3, 4, 5 unchanged from the original plan**, with Phase 4 explicitly inheriting (a) the bf16 D=512 dispatcher from already-registered kernel names, (b) sliding-window mask handling, and (c) the `flash_attn_ext_blk` tile-skip optimization as an orthogonal additive layer (~15% throughput win on SWA layers).
