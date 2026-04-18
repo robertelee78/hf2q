@@ -610,22 +610,38 @@ impl MlxModelWeights {
                         },
                     ).map_err(|e| anyhow::anyhow!("batched sliding flash_attn_prefill L{layer_idx}: {e}"))?;
                 } else {
-                    let sdpa_params = mlx_native::ops::sdpa::SdpaParams {
-                        n_heads: nh as u32,
-                        n_kv_heads: nkv as u32,
-                        head_dim: hd as u32,
-                        seq_len: seq_len as u32,
-                        kv_seq_len: seq_len as u32,
-                        scale: 1.0,
-                        kv_capacity: seq_len as u32,
-                    };
-                    s.sdpa(
-                        reg, dev,
+                    // ADR-011 Phase 2 Wave 4 Stage 3: flash_attn_prefill D=512
+                    // (NSG=8 llama.cpp-derived kernel) replaces s.sdpa for
+                    // Gemma 4's 5 global layers (head_dim=512).
+                    //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, 512],
+                    //     contiguous inner dim.
+                    //   - mask: &global_mask, rank-2 [seq_len, seq_len] bf16
+                    //     with window_size=None, causal=true (Wave 2D).
+                    //   - blk: &blk_global, (BQ=8, BK=64) tile-skip bytes —
+                    //     BK=64 matches the D=512 main kernel's ic0 loop
+                    //     step (NCPSG=64). For fully-causal masks most
+                    //     tiles are type-1 (mixed), so blk offers modest
+                    //     savings mostly at (qtile, ktile) pairs beyond
+                    //     the causal diagonal.
+                    //   - scale=1.0, do_causal=false (same contract as D=256).
+                    mlx_native::ops::flash_attn_prefill_d512::
+                        dispatch_flash_attn_prefill_bf16_d512_with_blk(
+                        s.encoder_mut(), dev, reg,
                         &pf_q_perm, &pf_k_perm, &pf_v_perm,
-                        &pf_sdpa_out_perm,
-                        &sdpa_params,
-                        1,
-                    ).map_err(|e| anyhow::anyhow!("batched dense SDPA L{layer_idx}: {e}"))?;
+                        Some(&global_mask),
+                        Some(&blk_global),
+                        &mut pf_sdpa_out_perm,
+                        &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillParams {
+                            n_heads: nh as u32,
+                            n_kv_heads: nkv as u32,
+                            head_dim: hd as u32,
+                            seq_len_q: seq_len as u32,
+                            seq_len_k: seq_len as u32,
+                            batch: 1,
+                            scale: 1.0,
+                            do_causal: false,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("batched global flash_attn_prefill L{layer_idx}: {e}"))?;
                 }
 
                 // 7. Permute sdpa_out [n_heads, seq_len, hd] → [seq_len, n_heads, hd] (bf16),
