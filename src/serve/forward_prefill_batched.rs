@@ -160,7 +160,7 @@ impl MlxModelWeights {
         let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
-        let pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+        let mut pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
         let pf_sdpa_out_bf16 = alloc_bf16(seq_len * nh * max_hd, "pf_sdpa_out_bf16")?;
         let pf_sdpa_out = alloc_f32(seq_len * nh * max_hd, "pf_sdpa_out")?;
 
@@ -574,23 +574,41 @@ impl MlxModelWeights {
                     &[&pf_sdpa_out_perm],
                 );
                 if is_sliding {
-                    let sliding_params = mlx_native::ops::sdpa_sliding::SdpaSlidingParams {
-                        n_heads: nh as u32,
-                        n_kv_heads: nkv as u32,
-                        head_dim: hd as u32,
-                        seq_len: seq_len as u32,
-                        kv_seq_len: seq_len as u32,
-                        window_size: self.sliding_window as u32,
-                        scale: 1.0,
-                        kv_capacity: seq_len as u32,
-                    };
-                    mlx_native::ops::sdpa_sliding::sdpa_sliding(
-                        s.encoder_mut(), reg, dev,
+                    // ADR-011 Phase 2 Wave 4 Stage 2: flash_attn_prefill D=256
+                    // replaces sdpa_sliding. Inputs:
+                    //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, hd=256],
+                    //     contiguous inner dim (already ensured by the
+                    //     permute_021_bf16 pre-SDPA step above).
+                    //   - mask: &sliding_mask, rank-2 [seq_len, seq_len] bf16
+                    //     built once per prefill with window_size=sliding_window
+                    //     and causal=true (Wave 2D). Post-Wave-4.1 dispatcher
+                    //     detects rank-2 and emits strides [0,0,kL] so the
+                    //     single plane broadcasts across all 16 heads.
+                    //   - blk: &blk_sliding, (BQ=32, BK=16) tile-skip bytes
+                    //     from Wave 2E classifier. Per-tile content matches
+                    //     (sliding_mask tile); main kernel skips fully-masked
+                    //     tiles entirely, saving work on rows where the
+                    //     sliding window excludes most of the prefix.
+                    //   - scale=1.0 (Gemma 4: Q is pre-scaled upstream in
+                    //     qmatmul), do_causal=false (mask carries causal).
+                    mlx_native::ops::flash_attn_prefill::
+                        dispatch_flash_attn_prefill_bf16_d256_with_blk(
+                        s.encoder_mut(), dev, reg,
                         &pf_q_perm, &pf_k_perm, &pf_v_perm,
-                        &pf_sdpa_out_perm,
-                        &sliding_params,
-                        1,
-                    ).map_err(|e| anyhow::anyhow!("batched sliding SDPA L{layer_idx}: {e}"))?;
+                        Some(&sliding_mask),
+                        Some(&blk_sliding),
+                        &mut pf_sdpa_out_perm,
+                        &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams {
+                            n_heads: nh as u32,
+                            n_kv_heads: nkv as u32,
+                            head_dim: hd as u32,
+                            seq_len_q: seq_len as u32,
+                            seq_len_k: seq_len as u32,
+                            batch: 1,
+                            scale: 1.0,
+                            do_causal: false,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("batched sliding flash_attn_prefill L{layer_idx}: {e}"))?;
                 } else {
                     let sdpa_params = mlx_native::ops::sdpa::SdpaParams {
                         n_heads: nh as u32,
