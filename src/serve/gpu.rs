@@ -52,6 +52,19 @@ impl GpuContext {
         let fwht_src = mlx_native::ops::fwht_standalone::FWHT_STANDALONE_SHADER_SOURCE;
         registry.register_source("fwht_standalone_f32_d256", fwht_src);
         registry.register_source("fwht_standalone_f32_d512", fwht_src);
+        // ADR-011 Phase 2 Wave 4 (flash_attn_prefill wire-up):
+        //   Flash-attention tiled prefill kernels replace sdpa/sdpa_sliding for
+        //   batched prefill. Three registration calls cover (1) the D=256
+        //   main kernel (bf16 Q/K/V/O, BQ=32, BK=16), (2) the D=512 NSG=8
+        //   llama.cpp-derived main kernel (bf16, NQPSG=8, NCPSG=64), (3) the
+        //   SWA / causal mask builder (Wave 2D, shape [qL, kL] broadcast
+        //   across batch + heads), and (4) the tile-skip pre-pass classifier
+        //   (Wave 2E, one byte per (qtile, ktile) from the mask). See
+        //   docs/ADR-011-phase2-wave4-wire-up-verification.md.
+        mlx_native::ops::flash_attn_prefill::register(&mut registry);
+        mlx_native::ops::flash_attn_prefill_d512::register(&mut registry);
+        mlx_native::ops::flash_attn_prefill_mask::register(&mut registry);
+        mlx_native::ops::flash_attn_prefill_blk::register(&mut registry);
         tracing::info!("mlx-native GpuContext initialized on {}", gpu_name);
         Ok(Self { executor, registry })
     }

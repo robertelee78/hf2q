@@ -215,6 +215,119 @@ impl MlxModelWeights {
         }
 
         // -------------------------------------------------------------------
+        // ADR-011 Phase 2 Wave 4 (flash_attn_prefill wire-up):
+        //   Build the two SWA/causal masks (sliding + global) and the two
+        //   tile-skip pre-pass `blk` byte buffers ONCE per prefill, before
+        //   the layer loop. Reused by 25 sliding (D=256) layers + 5 global
+        //   (D=512) layers. All four buffers live as `let` locals so Rust
+        //   ownership keeps them alive for the full layer-loop duration.
+        //
+        //   Mask layout: [seq_len, seq_len] bf16, single-plane — consumed by
+        //   flash_attn_prefill via rank-2 detection (m_strides = [0, 0, kL])
+        //   which broadcasts the plane across (batch, head). Post-Wave-4.1
+        //   mlx-native dispatcher supports this layout at h>1.
+        //
+        //   blk layout: one byte per (qtile, ktile) at the tile shape used
+        //   by each main kernel — (BQ=32, BK=16) for D=256, (BQ=8, BK=64)
+        //   for D=512 (the D=512 kernel's ic0 KV-chunk loop steps by
+        //   NCPSG=64). alloc_blk_buffer pads to 32-byte alignment per
+        //   llama.cpp's GGML_PAD convention.
+        //
+        //   Constants — scale=1.0 (Gemma 4 oracle: Q is pre-scaled upstream
+        //   in qmatmul), do_causal=false (mask carries causal — avoids
+        //   double-masking), q_abs_offset=0 (prefill fills positions
+        //   [0, seq_len) with kv_seq_len == seq_len).
+        let sliding_mask: MlxBuffer;
+        let global_mask: MlxBuffer;
+        let blk_sliding: MlxBuffer;
+        let blk_global: MlxBuffer;
+        {
+            use mlx_native::ops::flash_attn_prefill_mask::{
+                build_sdpa_mask_bf16, SdpaMaskParams,
+            };
+            use mlx_native::ops::flash_attn_prefill_blk::{
+                alloc_blk_buffer, dispatch_flash_attn_prefill_blk, BlkParams,
+            };
+
+            // Pre-allocate the two blk byte buffers (Metal alloc, no kernel
+            // dispatch). These must be constructed outside the session
+            // scope so the session's &mut borrow of the executor is confined.
+            let blk_sliding_params = BlkParams {
+                seq_len_q: seq_len as u32,
+                seq_len_k: seq_len as u32,
+                bq: 32,
+                bk: 16,
+            };
+            blk_sliding = alloc_blk_buffer(dev, &blk_sliding_params)
+                .map_err(|e| anyhow::anyhow!("alloc blk_sliding: {e}"))?;
+            let blk_global_params = BlkParams {
+                seq_len_q: seq_len as u32,
+                seq_len_k: seq_len as u32,
+                bq: 8,
+                bk: 64,
+            };
+            blk_global = alloc_blk_buffer(dev, &blk_global_params)
+                .map_err(|e| anyhow::anyhow!("alloc blk_global: {e}"))?;
+
+            // One session for the mask-build + blk-classify pre-pass. The
+            // final barrier ensures the masks + blk outputs are visible
+            // to the first layer's flash_attn_prefill dispatch.
+            let mut s = exec.begin()
+                .map_err(|e| anyhow::anyhow!("batched mask+blk session: {e}"))?;
+
+            // Sliding-window causal mask — reused across all 25 sliding layers.
+            // window_size = self.sliding_window (Gemma 4: 1024). q_abs_offset=0
+            // because prefill fills positions [0, seq_len).
+            sliding_mask = build_sdpa_mask_bf16(
+                dev, reg, s.encoder_mut(),
+                &SdpaMaskParams {
+                    seq_len_q: seq_len as u32,
+                    seq_len_k: seq_len as u32,
+                    window_size: Some(self.sliding_window as u32),
+                    causal: true,
+                    q_abs_offset: 0,
+                },
+            ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?;
+
+            // Global causal mask — reused across all 5 global layers.
+            global_mask = build_sdpa_mask_bf16(
+                dev, reg, s.encoder_mut(),
+                &SdpaMaskParams {
+                    seq_len_q: seq_len as u32,
+                    seq_len_k: seq_len as u32,
+                    window_size: None,
+                    causal: true,
+                    q_abs_offset: 0,
+                },
+            ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?;
+
+            // Tile-skip classifiers — one per mask at the respective tile
+            // shape. Reads the mask, writes `blk_*` bytes.
+            s.barrier_between(
+                &[&sliding_mask],
+                &[&blk_sliding],
+            );
+            dispatch_flash_attn_prefill_blk(
+                s.encoder_mut(), dev, reg,
+                &sliding_mask, &blk_sliding,
+                &blk_sliding_params,
+            ).map_err(|e| anyhow::anyhow!("dispatch blk_sliding: {e}"))?;
+
+            s.barrier_between(
+                &[&global_mask],
+                &[&blk_global],
+            );
+            dispatch_flash_attn_prefill_blk(
+                s.encoder_mut(), dev, reg,
+                &global_mask, &blk_global,
+                &blk_global_params,
+            ).map_err(|e| anyhow::anyhow!("dispatch blk_global: {e}"))?;
+
+            s.finish()
+                .map_err(|e| anyhow::anyhow!("batched mask+blk finish: {e}"))?;
+        }
+
+        // -------------------------------------------------------------------
         // Per-layer forward pass
         // -------------------------------------------------------------------
         // ADR-010 batched sub-stage dump anchor. HF2Q_BATCHED_DUMP="layer,tok"
