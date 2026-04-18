@@ -551,24 +551,27 @@ impl MlxModelWeights {
                     seq_len, nkv, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute V L{layer_idx}: {e}"))?;
 
-                // 6. Dense batched SDPA (tiled kernel):
+                // 6. Flash-attention tiled prefill (ADR-011 Phase 2 Wave 4):
                 //    Q: [1, nh, seq_len, hd], K: [1, nkv, seq_len, hd], V: same
-                //    kv_capacity = seq_len (tight packing, no pre-allocated capacity)
-                //    scale = 1.0 for Gemma4 (per llama.cpp oracle)
-                //    Global layers: plain causal mask (kernel uses
-                //      abs_pos = kv_seq_len - seq_len + q_pos).
-                //    Sliding layers: sdpa_sliding with window_size so each query
-                //      position only attends to keys within `sliding_window`
-                //      positions of itself. Matches llama.cpp's flash_attn_ext
-                //      sliding mask behaviour on Gemma4 SWA layers.
+                //    scale = 1.0 for Gemma 4 (per llama.cpp oracle — Q is
+                //      pre-scaled upstream in qmatmul).
+                //    Global layers (head_dim=512): flash_attn_prefill_bf16_d512
+                //      (llama.cpp-derived NSG=8 kernel). Consumes global_mask
+                //      + blk_global built once per prefill above.
+                //    Sliding layers (head_dim=256): flash_attn_prefill_bf16_d256
+                //      (candle-derived BQ=32/BK=16 kernel). Consumes sliding_mask
+                //      + blk_sliding — mask carries `q_abs - k_pos < window_size`
+                //      AND causal constraint (Wave 2D SWA mask), so in-kernel
+                //      do_causal=false avoids double-masking.
                 //
-                // History note: sdpa_sliding appeared broken at prefill shapes
-                // during initial Gate A work (2026-04-16) — emitted pad at
-                // seq_len=576. Root-caused as downstream corruption from the
-                // fused_head_norm_rope shared-memory race (mlx-native 0.3.1,
-                // see docs/spike-batched-prefill-race-rootcause.md). Once the
-                // race was fixed, sdpa_sliding works byte-identically to the
-                // per-token path; verified 2026-04-17 on 2455-token prompt.
+                // History note: Wave 3 had a narrow bf16 SDPA island using
+                // sdpa_bf16 (D=256) and sdpa (D=512) kernels; this was a
+                // stepping-stone. Wave 4 replaces both with the flash-attention
+                // tiled kernels that llama.cpp uses (flash_attn_ext_* family)
+                // — single kernel for both sliding + global, with a single
+                // mask representation. sdpa_sliding previously had a "dense
+                // cap 1024" issue at pp=2455 (docs/spike-gate-a-prefill.md
+                // §Addendum); flash_attn_prefill unblocks that sub-gate.
                 s.barrier_between(
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
                     &[&pf_sdpa_out_perm],
