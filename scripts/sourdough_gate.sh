@@ -159,20 +159,44 @@ if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
 fi
 
 # 4. Common-byte-prefix diff.
-read -r LLAMA_BYTES HF2Q_BYTES COMMON_BYTES DIVERGE_A DIVERGE_B < <(
-  python3 - "$OUT_LLAMA" "$OUT_HF2Q" <<'PY'
+# hf2q prints a 4-line header on stdout (src/serve/header.rs, commit 172488b):
+#   1: "hf2q · <chip> · <backend>"
+#   2: "<model> · loaded in <s>s · <n> layers · <gb> GB"
+#   3: "prefill: <n> tok in <ms>ms (<tok/s> tok/s)"
+#   4: blank line
+# Strip by skipping the first 4 newline-terminated lines before diffing.
+#
+# Write TSV to a temp file instead of process substitution — the python
+# heredoc contains literal ) which bash's <( ... ) parser miscounts.
+DIFF_TSV="/tmp/sourdough_gate_diff.tsv"
+python3 - "$OUT_LLAMA" "$OUT_HF2Q" "$DIFF_TSV" <<'PY'
 import sys, json
 a = open(sys.argv[1], "rb").read()
-b = open(sys.argv[2], "rb").read()
-n = min(len(a), len(b)); i = 0
-while i < n and a[i] == b[i]: i += 1
+b_raw = open(sys.argv[2], "rb").read()
+out = sys.argv[3]
+if b_raw.startswith(b"hf2q \xc2\xb7 "):
+    pos = 0
+    for _ in range(4):
+        nl = b_raw.find(b"\n", pos)
+        if nl < 0:
+            break
+        pos = nl + 1
+    b = b_raw[pos:]
+else:
+    b = b_raw
+n = min(len(a), len(b))
+i = 0
+while i < n and a[i] == b[i]:
+    i += 1
 def snip(buf, start, length=120):
     s = buf[start:start+length].decode("utf-8", errors="replace")
-    if len(buf) - start > length: s += "..."
+    if len(buf) - start > length:
+        s += "..."
     return json.dumps(s)
-print(len(a), len(b), i, snip(a, i), snip(b, i))
+with open(out, "w") as f:
+    f.write(f"{len(a)}\t{len(b)}\t{i}\t{snip(a, i)}\t{snip(b, i)}\n")
 PY
-)
+IFS=$'\t' read -r LLAMA_BYTES HF2Q_BYTES COMMON_BYTES DIVERGE_A DIVERGE_B < "$DIFF_TSV"
 
 echo
 echo "--- Comparison ---"
