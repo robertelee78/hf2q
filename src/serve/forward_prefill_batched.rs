@@ -29,7 +29,7 @@ use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
 use super::forward_mlx::{
     DenseKvBuffers, MlxModelWeights, dispatch_qmatmul,
-    dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
+    dispatch_rms_norm_unit_perhead_dual,
 };
 use super::gpu::GpuContext;
 
@@ -354,6 +354,7 @@ impl MlxModelWeights {
         let batched_dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let layer_start = std::time::Instant::now();
             let hd = layer.head_dim;
             let nkv = layer.num_kv_heads;
             let is_sliding = layer.layer_type == LayerType::Sliding;
@@ -503,56 +504,27 @@ impl MlxModelWeights {
 
                 // 4. V norm (unit RMS, no RoPE, per-head across seq_len)
                 //    Layout: [seq_len * nkv, hd] — treat all positions' heads as rows
-                if v_is_k {
-                    s.barrier_between(
-                        &[&pf_k],
-                        &[&pf_v_normed],
-                    );
-                    dispatch_rms_norm_unit_perhead(
-                        s.encoder_mut(), reg, metal_dev,
-                        &RmsNormPerHeadArgs {
-                            input: &pf_k,
-                            output: &pf_v_normed,
-                            params_buf: hd_norm_params,
-                            rows: (seq_len * nkv) as u32,
-                            dim: hd as u32,
-                        },
-                    )?;
-                } else {
-                    s.barrier_between(
-                        &[&pf_v],
-                        &[&pf_v_normed],
-                    );
-                    dispatch_rms_norm_unit_perhead(
-                        s.encoder_mut(), reg, metal_dev,
-                        &RmsNormPerHeadArgs {
-                            input: &pf_v,
-                            output: &pf_v_normed,
-                            params_buf: hd_norm_params,
-                            rows: (seq_len * nkv) as u32,
-                            dim: hd as u32,
-                        },
-                    )?;
-                }
-
-                // 4b. Cast normed V f32 → bf16 to enter the bf16 attention
-                //     island.  ADR-011 Phase 3 Wave P3b.4 — Q and K casts
-                //     were folded into the fused head-norm+RoPE dispatches
-                //     at step 3 via the `_with_bf16` variant.  V still runs
-                //     its own cast because its normalization uses
-                //     `rms_norm_unit_perhead` (the shared `rms_norm_no_scale_f32`
-                //     kernel), not `fused_head_norm_rope_f32`.
-                //     seq_len*n_kv_heads*hd contiguous elements are written
-                //     starting at offset 0; the rest (padding for max_hd) is unused.
+                //
+                // ADR-011 Phase 3 Wave P3b-tensor.3 — use the dual-output
+                // variant so the kernel co-writes both pf_v_normed (f32,
+                // for the KV cache copy below) and pf_v_normed_bf16 (for
+                // the bf16 attention island).  Eliminates the otherwise-
+                // separate f32→bf16 cast dispatch (30 dispatches /
+                // prefill).
+                let v_input = if v_is_k { &pf_k } else { &pf_v };
                 s.barrier_between(
-                    &[&pf_v_normed],
-                    &[&pf_v_normed_bf16],
+                    &[v_input],
+                    &[&pf_v_normed, &pf_v_normed_bf16],
                 );
-                let kv_normed_elems = (seq_len * nkv * hd) as u32;
-                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
+                dispatch_rms_norm_unit_perhead_dual(
                     s.encoder_mut(), reg, metal_dev,
-                    &pf_v_normed, &pf_v_normed_bf16, kv_normed_elems,
-                ).map_err(|e| anyhow::anyhow!("batched V normed f32->bf16 L{layer_idx}: {e}"))?;
+                    v_input,
+                    &pf_v_normed,
+                    &pf_v_normed_bf16,
+                    hd_norm_params,
+                    (seq_len * nkv) as u32,
+                    hd as u32,
+                )?;
 
                 // 5. Permute [seq_len, n_heads, hd] → [n_heads, seq_len, hd] (bf16).
                 s.barrier_between(
@@ -1019,6 +991,11 @@ impl MlxModelWeights {
 
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
+                if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
+                    let kind = if is_sliding { "SW" } else { "GL" };
+                    eprintln!("[LAYER_TIME] L{:02} {} {}us", layer_idx, kind,
+                        layer_start.elapsed().as_micros());
+                }
             }
 
             // ADR-011 Phase 3 Wave P3b.2 — Session C ("write K,V to dense

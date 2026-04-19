@@ -3025,6 +3025,39 @@ pub fn dispatch_rms_norm_unit_perhead(
     Ok(())
 }
 
+/// Dual-output variant: writes both f32 (for KV cache copy) AND bf16
+/// (for the bf16 attention island) — ADR-011 Phase 3 Wave P3b-tensor.3.
+///
+/// Used by batched prefill V-norm to fuse the f32→bf16 cast that was
+/// previously a separate `cast_f32_to_bf16` dispatch.  Same compute,
+/// one extra device write per element (effectively free on Apple
+/// unified memory since the f32 result is in registers).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_rms_norm_unit_perhead_dual(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut mlx_native::KernelRegistry,
+    device: &mlx_native::metal::DeviceRef,
+    input: &MlxBuffer,
+    output: &MlxBuffer,
+    output_bf16: &MlxBuffer,
+    params_buf: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+) -> Result<()> {
+    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32_dual", device)
+        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual pipeline: {e}"))?;
+    let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
+    let shared_mem_bytes = tg_size * 4;
+    encoder.encode_threadgroups_with_shared(
+        pipeline,
+        &[(0, input), (1, output), (2, params_buf), (3, output_bf16)],
+        &[(0, shared_mem_bytes)],
+        mlx_native::MTLSize::new(rows as u64, 1, 1),
+        mlx_native::MTLSize::new(tg_size, 1, 1),
+    );
+    Ok(())
+}
+
 /// Run one quantized matmul through the GraphSession.
 ///
 /// Dispatches `output = input @ weight.T` where weight is in GGML block format.
