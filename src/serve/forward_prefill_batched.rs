@@ -211,48 +211,27 @@ impl MlxModelWeights {
         }
 
         // -------------------------------------------------------------------
-        // SESSION 1: batched embedding
+        // SETUP SESSION (Wave P4.6 — merge embed + mask+blk into one session)
+        //
+        // Pre-P4.6 these ran as two separate `exec.begin()` / `s.finish()`
+        // pairs, costing an extra commit_and_wait per prefill.  The two
+        // workloads are independent (embed writes pf_hidden; mask+blk write
+        // sliding_mask, global_mask, blk_sliding, blk_global — no overlap),
+        // so they share the setup command buffer.  The blk dispatches still
+        // need barrier_between against their masks (intra-session ordering)
+        // but no inter-workload barrier is required.
         // -------------------------------------------------------------------
-        let prefill_start = Instant::now();
-        {
-            let mut s = exec.begin()
-                .map_err(|e| anyhow::anyhow!("batched embed session: {e}"))?;
-            s.track_dispatch(&[&self.embed_weight, &pf_token_ids], &[&pf_hidden]);
-            mlx_native::ops::elementwise::embedding_gather_scale_batch_f32(
-                s.encoder_mut(), reg, metal_dev,
-                &self.embed_weight,
-                &pf_token_ids,
-                &pf_hidden,
-                hs, seq_len,
-                (hs as f32).sqrt(),
-            ).map_err(|e| anyhow::anyhow!("batched embed: {e}"))?;
-            s.finish()
-                .map_err(|e| anyhow::anyhow!("batched embed finish: {e}"))?;
-        }
-
-        // -------------------------------------------------------------------
-        // ADR-011 Phase 2 Wave 4 (flash_attn_prefill wire-up):
+        //
+        // ADR-011 Phase 2 Wave 4 mask + blk pre-pass docs (preserved):
         //   Build the two SWA/causal masks (sliding + global) and the two
         //   tile-skip pre-pass `blk` byte buffers ONCE per prefill, before
         //   the layer loop. Reused by 25 sliding (D=256) layers + 5 global
-        //   (D=512) layers. All four buffers live as `let` locals so Rust
-        //   ownership keeps them alive for the full layer-loop duration.
-        //
-        //   Mask layout: [seq_len, seq_len] bf16, single-plane — consumed by
-        //   flash_attn_prefill via rank-2 detection (m_strides = [0, 0, kL])
-        //   which broadcasts the plane across (batch, head). Post-Wave-4.1
-        //   mlx-native dispatcher supports this layout at h>1.
-        //
-        //   blk layout: one byte per (qtile, ktile) at the tile shape used
-        //   by each main kernel — (BQ=32, BK=16) for D=256, (BQ=8, BK=64)
-        //   for D=512 (the D=512 kernel's ic0 KV-chunk loop steps by
-        //   NCPSG=64). alloc_blk_buffer pads to 32-byte alignment per
-        //   llama.cpp's GGML_PAD convention.
-        //
-        //   Constants — scale=1.0 (Gemma 4 oracle: Q is pre-scaled upstream
-        //   in qmatmul), do_causal=false (mask carries causal — avoids
-        //   double-masking), q_abs_offset=0 (prefill fills positions
-        //   [0, seq_len) with kv_seq_len == seq_len).
+        //   (D=512) layers.  Mask layout: [seq_len, seq_len] bf16, single-
+        //   plane.  blk layout: one byte per (qtile, ktile) at the tile
+        //   shape used by each main kernel — (BQ=32, BK=16) for D=256,
+        //   (BQ=8, BK=64) for D=512.  Constants — scale=1.0 (Q pre-scaled
+        //   upstream), do_causal=false (mask carries causal), q_abs_offset=0.
+        let prefill_start = Instant::now();
         let sliding_mask: MlxBuffer;
         let global_mask: MlxBuffer;
         let blk_sliding: MlxBuffer;
@@ -266,8 +245,7 @@ impl MlxModelWeights {
             };
 
             // Pre-allocate the two blk byte buffers (Metal alloc, no kernel
-            // dispatch). These must be constructed outside the session
-            // scope so the session's &mut borrow of the executor is confined.
+            // dispatch) outside the session so &mut borrow stays confined.
             let blk_sliding_params = BlkParams {
                 seq_len_q: seq_len as u32,
                 seq_len_k: seq_len as u32,
@@ -285,15 +263,21 @@ impl MlxModelWeights {
             blk_global = alloc_blk_buffer(dev, &blk_global_params)
                 .map_err(|e| anyhow::anyhow!("alloc blk_global: {e}"))?;
 
-            // One session for the mask-build + blk-classify pre-pass. The
-            // final barrier ensures the masks + blk outputs are visible
-            // to the first layer's flash_attn_prefill dispatch.
             let mut s = exec.begin()
-                .map_err(|e| anyhow::anyhow!("batched mask+blk session: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("batched setup session: {e}"))?;
 
-            // Sliding-window causal mask — reused across all 25 sliding layers.
-            // window_size = self.sliding_window (Gemma 4: 1024). q_abs_offset=0
-            // because prefill fills positions [0, seq_len).
+            // 1. Embedding: token_ids -> pf_hidden (no dependency on masks/blk).
+            s.track_dispatch(&[&self.embed_weight, &pf_token_ids], &[&pf_hidden]);
+            mlx_native::ops::elementwise::embedding_gather_scale_batch_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.embed_weight,
+                &pf_token_ids,
+                &pf_hidden,
+                hs, seq_len,
+                (hs as f32).sqrt(),
+            ).map_err(|e| anyhow::anyhow!("batched embed: {e}"))?;
+
+            // 2. Sliding-window causal mask — reused across all 25 sliding layers.
             sliding_mask = build_sdpa_mask_bf16(
                 dev, reg, s.encoder_mut(),
                 &SdpaMaskParams {
@@ -305,7 +289,7 @@ impl MlxModelWeights {
                 },
             ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?;
 
-            // Global causal mask — reused across all 5 global layers.
+            // 3. Global causal mask — reused across all 5 global layers.
             global_mask = build_sdpa_mask_bf16(
                 dev, reg, s.encoder_mut(),
                 &SdpaMaskParams {
@@ -317,8 +301,7 @@ impl MlxModelWeights {
                 },
             ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?;
 
-            // Tile-skip classifiers — one per mask at the respective tile
-            // shape. Reads the mask, writes `blk_*` bytes.
+            // 4. Tile-skip classifiers — read mask, write blk bytes.
             s.barrier_between(
                 &[&sliding_mask],
                 &[&blk_sliding],
@@ -340,7 +323,7 @@ impl MlxModelWeights {
             ).map_err(|e| anyhow::anyhow!("dispatch blk_global: {e}"))?;
 
             s.finish()
-                .map_err(|e| anyhow::anyhow!("batched mask+blk finish: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
         }
 
         // -------------------------------------------------------------------
