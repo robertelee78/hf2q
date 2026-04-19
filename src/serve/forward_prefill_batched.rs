@@ -181,15 +181,18 @@ impl MlxModelWeights {
 
         // ADR-011 Phase 3 Wave P3b — scratch pooling for MoE mm_id path.
         //
-        // The `quantized_matmul_id_ggml` mm_id branch (n_tokens > 8, top_k=8)
-        // needs two small u32 scratch buffers per call (htpe: per-expert
-        // count, hids: per-expert routed-token list).  Pre-P3b allocated
-        // these inside `dispatch_id_mm` on every call — 2 × 30 MoE layers =
-        // 60 allocations per prefill.  Pool once here for the whole
-        // prefill, sized for gate_up's `n_tokens = seq_len` shape (the
-        // down-proj call routes to mv_id at top_k=1 so touches nothing).
+        // The `quantized_matmul_id_ggml` mm_id branch (n_tokens > 8) needs
+        // two small u32 scratch buffers per call (htpe: per-expert count,
+        // hids: per-expert routed-token list).  Pool once here for the
+        // whole prefill.
+        //
+        // Sizing: P3b-tensor.2 routes BOTH the gate_up call (top_k=8,
+        // n_tokens=seq_len) AND the down call (top_k=1,
+        // n_tokens=seq_len*top_k_max) through mm_id.  Size for the down
+        // call's larger n_tokens.
+        let max_id_n_tokens = (seq_len * top_k_max) as u32;
         let mut pf_moe_mm_scratch = mlx_native::IdMmScratch::alloc(
-            dev, num_experts as u32, seq_len as u32,
+            dev, num_experts as u32, max_id_n_tokens,
         ).map_err(|e| anyhow::anyhow!("batched alloc IdMmScratch: {e}"))?;
 
         let mut pf_positions = alloc_u32(seq_len, "pf_positions")?;
