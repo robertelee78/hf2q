@@ -179,6 +179,19 @@ impl MlxModelWeights {
         let mut pf_moe_down = alloc_f32(seq_len * top_k_max * hs, "pf_moe_down")?;
         let pf_moe_accum = alloc_f32(seq_len * hs, "pf_moe_accum")?;
 
+        // ADR-011 Phase 3 Wave P3b — scratch pooling for MoE mm_id path.
+        //
+        // The `quantized_matmul_id_ggml` mm_id branch (n_tokens > 8, top_k=8)
+        // needs two small u32 scratch buffers per call (htpe: per-expert
+        // count, hids: per-expert routed-token list).  Pre-P3b allocated
+        // these inside `dispatch_id_mm` on every call — 2 × 30 MoE layers =
+        // 60 allocations per prefill.  Pool once here for the whole
+        // prefill, sized for gate_up's `n_tokens = seq_len` shape (the
+        // down-proj call routes to mv_id at top_k=1 so touches nothing).
+        let mut pf_moe_mm_scratch = mlx_native::IdMmScratch::alloc(
+            dev, num_experts as u32, seq_len as u32,
+        ).map_err(|e| anyhow::anyhow!("batched alloc IdMmScratch: {e}"))?;
+
         let mut pf_positions = alloc_u32(seq_len, "pf_positions")?;
         {
             let p: &mut [u32] = pf_positions.as_mut_slice()
@@ -811,12 +824,13 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
                     &[&pf_moe_gate_up],
                 );
-                s.quantized_matmul_id_ggml(
+                s.quantized_matmul_id_ggml_pooled(
                     reg, dev,
                     &pf_moe_norm_out,
                     self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                     &pf_expert_ids,
                     &mut pf_moe_gate_up,
+                    &mut pf_moe_mm_scratch,
                     &mlx_native::GgmlQuantizedMatmulIdParams {
                         n_tokens: seq_len as u32,
                         top_k: top_k as u32,
@@ -847,12 +861,13 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
                     &[&pf_moe_down],
                 );
-                s.quantized_matmul_id_ggml(
+                s.quantized_matmul_id_ggml_pooled(
                     reg, dev,
                     &pf_moe_swiglu,
                     self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                     &pf_expert_ids,
                     &mut pf_moe_down,
+                    &mut pf_moe_mm_scratch,
                     &mlx_native::GgmlQuantizedMatmulIdParams {
                         n_tokens: (seq_len * top_k) as u32,
                         top_k: 1,
