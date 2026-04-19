@@ -717,8 +717,74 @@ impl MlxModelWeights {
                     hs as u32, seq_len as u32, eps,
                 ).map_err(|e| anyhow::anyhow!("batched post-attn L{layer_idx}: {e}"))?;
 
+                // ------------------------------------------------------------
+                // ADR-011 Phase 3 Wave P3b.2 — merge KV cache copy into
+                // session A.  Pre-P3b.2 this ran as a separate "Session C"
+                // with its own `exec.begin()` / `s.finish()` pair, costing
+                // one commit_and_wait per layer (30 per prefill).  The
+                // copy's inputs (pf_k_normed, pf_v_normed) are already
+                // session-A internals; its outputs (dense_kvs_vec[layer].{k,v})
+                // are not read again within this prefill.  Run as the final
+                // dispatches of session A and the barrier-between check keeps
+                // it correctly ordered against the V-norm that produced the
+                // source buffers.
+                // ------------------------------------------------------------
+                let layer_cap = dense_kvs_vec[layer_idx].capacity;
+                if !dense_kvs_vec[layer_idx].is_sliding && seq_len > layer_cap {
+                    anyhow::bail!(
+                        "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
+                         increase linear_capacity allocation",
+                        layer_idx, seq_len, layer_cap);
+                }
+                let n_copy = seq_len.min(layer_cap);
+                let src_tok_offset = (seq_len - n_copy) as u32;
+                let dst_seq_pos_start = src_tok_offset;
+                s.barrier_between(
+                    &[&pf_k_normed, &pf_v_normed],
+                    &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
+                );
+                if use_f16_kv {
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_k_normed,
+                        &dense_kvs_vec[layer_idx].k,
+                        nkv as u32, hd as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
+                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_v_normed,
+                        &dense_kvs_vec[layer_idx].v,
+                        nkv as u32, hd as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
+                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
+                } else {
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_k_normed,
+                        &dense_kvs_vec[layer_idx].k,
+                        nkv as u32, hd as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
+                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_v_normed,
+                        &dense_kvs_vec[layer_idx].v,
+                        nkv as u32, hd as u32,
+                        layer_cap as u32,
+                        dst_seq_pos_start, n_copy as u32,
+                        src_tok_offset,
+                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
+                }
+
                 s.finish()
-                    .map_err(|e| anyhow::anyhow!("batched attn finish L{layer_idx}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("batched attn+kv finish L{layer_idx}: {e}"))?;
             }
 
             // ================================================================
@@ -941,87 +1007,15 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
             }
 
-            // ================================================================
-            // SESSION C: write K,V to dense cache at positions [0, seq_len)
-            //            Layout conversion: [seq_len, nkv, hd] → [nkv, cap, hd]
-            // ================================================================
-            {
-                let mut s = exec.begin()
-                    .map_err(|e| anyhow::anyhow!("batched cache write L{layer_idx}: {e}"))?;
-                // Ring-wrap geometry: for sliding layers (capacity =
-                // sliding_window), prompts longer than the window keep only
-                // the last `capacity` tokens in modular-slot order — this
-                // matches what repeated decode-step appends would produce,
-                // and decode reads via `ring_start = write_pos % capacity`.
-                // Global layers have capacity = seq_len + max_decode_tokens
-                // so n_copy == seq_len and src_tok_offset == 0 (linear).
-                let layer_cap = dense_kvs_vec[layer_idx].capacity;
-                // Guard: global (non-sliding) layers must never exceed
-                // their allocated capacity — that's a sizing bug.
-                // Sliding layers ring-wrap correctly via src_tok_offset
-                // below (kv_cache_copy_seq handles modular slot); the
-                // sliding-window attention above runs on fresh K/V, not
-                // the cache, so the ring-wrap doesn't affect correctness
-                // of this forward pass.
-                if !dense_kvs_vec[layer_idx].is_sliding && seq_len > layer_cap {
-                    anyhow::bail!(
-                        "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
-                         increase linear_capacity allocation",
-                        layer_idx, seq_len, layer_cap);
-                }
-                let n_copy = seq_len.min(layer_cap);
-                let src_tok_offset = (seq_len - n_copy) as u32;
-                let dst_seq_pos_start = src_tok_offset;
-                s.barrier_between(
-                    &[&pf_k_normed, &pf_v_normed],
-                    &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
-                );
-                if use_f16_kv {
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_k_normed,
-                        &dense_kvs_vec[layer_idx].k,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_v_normed,
-                        &dense_kvs_vec[layer_idx].v,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
-                } else {
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_k_normed,
-                        &dense_kvs_vec[layer_idx].k,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_v_normed,
-                        &dense_kvs_vec[layer_idx].v,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
-                }
-                s.finish()
-                    .map_err(|e| anyhow::anyhow!("batched cache finish L{layer_idx}: {e}"))?;
-
-                // Update KV cache metadata for subsequent decode
-                self.kv_caches[layer_idx].write_pos = seq_len;
-                self.kv_caches[layer_idx].seq_len = seq_len.min(self.kv_caches[layer_idx].capacity);
-            }
+            // ADR-011 Phase 3 Wave P3b.2 — Session C ("write K,V to dense
+            // cache") was merged into the tail of Session A.  Only the
+            // host-side metadata update survives here: it's pure CPU state
+            // used by subsequent decode to locate the cache, and it doesn't
+            // need to wait on the GPU copy (the copy is still in flight on
+            // its command buffer, but decode won't run until that buffer
+            // commits at the end of the prefill).
+            self.kv_caches[layer_idx].write_pos = seq_len;
+            self.kv_caches[layer_idx].seq_len = seq_len.min(self.kv_caches[layer_idx].capacity);
 
             // ADR-010 batched sub-stage dump at (layer_idx, target_tok)
             if let Some((dump_layer, target_tok)) = batched_dump {
