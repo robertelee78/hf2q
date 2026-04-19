@@ -458,33 +458,45 @@ impl MlxModelWeights {
                         &mut pf_v, seq_len as u32)?;
                 }
 
-                // 3. Batched fused head norm + RoPE on Q (with weight) and K (with weight)
+                // 3. Batched fused head norm + RoPE on Q and K.
+                //
+                // ADR-011 Phase 3 Wave P3b.4 — use the `_with_bf16` variant
+                // so the kernel co-writes the normed Q/K in both f32 AND
+                // bf16 in a single dispatch.  The f32 pf_{q,k}_normed path
+                // stays (KV cache copy + ADR-010 dump both read f32); the
+                // bf16 pf_{q,k}_normed_bf16 path eliminates the two
+                // otherwise-separate f32→bf16 cast dispatches that fed
+                // the bf16 attention island.  Total: 60 cast dispatches /
+                // prefill eliminated (2 per layer × 30 layers).
                 s.barrier_between(
                     &[&pf_q, &pf_k],
-                    &[&pf_q_normed, &pf_k_normed],
+                    &[&pf_q_normed, &pf_k_normed,
+                      &pf_q_normed_bf16, &pf_k_normed_bf16],
                 );
-                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32(
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_q,
                     &pf_q_normed,
+                    Some(&pf_q_normed_bf16),
                     Some(&self.layers[layer_idx].attn.q_norm_weight),
                     &pf_positions,
                     ff_gpu,
                     nh as u32, hd as u32, half_rope,
                     seq_len as u32,
                     eps, theta,
-                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE L{layer_idx}: {e}"))?;
-                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32(
+                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE+bf16 L{layer_idx}: {e}"))?;
+                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_k,
                     &pf_k_normed,
+                    Some(&pf_k_normed_bf16),
                     Some(&self.layers[layer_idx].attn.k_norm_weight),
                     &pf_positions,
                     ff_gpu,
                     nkv as u32, hd as u32, half_rope,
                     seq_len as u32,
                     eps, theta,
-                ).map_err(|e| anyhow::anyhow!("batched K norm+RoPE L{layer_idx}: {e}"))?;
+                ).map_err(|e| anyhow::anyhow!("batched K norm+RoPE+bf16 L{layer_idx}: {e}"))?;
 
                 // 4. V norm (unit RMS, no RoPE, per-head across seq_len)
                 //    Layout: [seq_len * nkv, hd] — treat all positions' heads as rows
@@ -520,24 +532,20 @@ impl MlxModelWeights {
                     )?;
                 }
 
-                // 4b. Cast normed Q/K/V f32 → bf16 to enter the bf16 attention island.
-                //     seq_len*n_heads*hd (or n_kv_heads) contiguous elements
-                //     are written starting at offset 0 of each buffer; the
-                //     rest (padding for max_hd) is unused.
+                // 4b. Cast normed V f32 → bf16 to enter the bf16 attention
+                //     island.  ADR-011 Phase 3 Wave P3b.4 — Q and K casts
+                //     were folded into the fused head-norm+RoPE dispatches
+                //     at step 3 via the `_with_bf16` variant.  V still runs
+                //     its own cast because its normalization uses
+                //     `rms_norm_unit_perhead` (the shared `rms_norm_no_scale_f32`
+                //     kernel), not `fused_head_norm_rope_f32`.
+                //     seq_len*n_kv_heads*hd contiguous elements are written
+                //     starting at offset 0; the rest (padding for max_hd) is unused.
                 s.barrier_between(
-                    &[&pf_q_normed, &pf_k_normed, &pf_v_normed],
-                    &[&pf_q_normed_bf16, &pf_k_normed_bf16, &pf_v_normed_bf16],
+                    &[&pf_v_normed],
+                    &[&pf_v_normed_bf16],
                 );
-                let q_normed_elems = (seq_len * nh * hd) as u32;
                 let kv_normed_elems = (seq_len * nkv * hd) as u32;
-                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_q_normed, &pf_q_normed_bf16, q_normed_elems,
-                ).map_err(|e| anyhow::anyhow!("batched Q normed f32->bf16 L{layer_idx}: {e}"))?;
-                mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_k_normed, &pf_k_normed_bf16, kv_normed_elems,
-                ).map_err(|e| anyhow::anyhow!("batched K normed f32->bf16 L{layer_idx}: {e}"))?;
                 mlx_native::ops::elementwise::dispatch_cast_f32_to_bf16_with_encoder(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_v_normed, &pf_v_normed_bf16, kv_normed_elems,
