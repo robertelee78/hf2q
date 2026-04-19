@@ -783,16 +783,19 @@ impl MlxModelWeights {
                     ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
                 }
 
-                s.finish()
-                    .map_err(|e| anyhow::anyhow!("batched attn+kv finish L{layer_idx}: {e}"))?;
-            }
+                // ADR-011 Phase 3 Wave P3b.3 — MLP + MoE continue in the
+                // same session `s` as attention + KV copy above.  Pre-P3b.3
+                // this was a separate "Session B" with its own
+                // `exec.begin()` / `s.finish()` pair — 30 CPU/GPU syncs
+                // per prefill.  The sole cross-boundary input is
+                // pf_residual (written by the post-attn fused_norm_add
+                // above, read by the three pre-FF norms below); smart
+                // barrier_between keeps it correctly ordered without
+                // needing a CPU-visible sync.
 
-            // ================================================================
-            // SESSION B: batched MLP + MoE
-            // ================================================================
-            {
-                let mut s = exec.begin()
-                    .map_err(|e| anyhow::anyhow!("batched mlp session L{layer_idx}: {e}"))?;
+                // ================================================================
+                // MLP + MoE (merged into session A — Wave P3b.3)
+                // ================================================================
 
                 // Pre-FF norm (for MLP), pre-FF norm 2 (for MoE input), router norm
                 s.barrier_between(
