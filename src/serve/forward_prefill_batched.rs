@@ -1305,12 +1305,48 @@ impl MlxModelWeights {
                     scalar_is_vector,
                 ).map_err(|e| anyhow::anyhow!("batched end-layer L{layer_idx}: {e}"))?;
 
-                s.finish()
-                    .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
-                if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
-                    let kind = if is_sliding { "SW" } else { "GL" };
-                    eprintln!("[LAYER_TIME] L{:02} {} {}us", layer_idx, kind,
-                        layer_start.elapsed().as_micros());
+                // Layer-boundary commit.  In production, we use `s.commit()`
+                // (no wait) so the GPU runs this layer while the CPU encodes
+                // the next — closes the ~2-3 ms per-layer GPU-idle burst that
+                // `commit_and_wait` imposes and that the Metal System Trace
+                // from 2026-04-20 showed as ~75 ms of 220 ms total idle in a
+                // 916 ms pp2455 prefill.
+                //
+                // Metal guarantees in-order execution of command buffers
+                // submitted to the same queue (see encoder.rs and
+                // ADR-011 P4 notes), so pf_hidden written in layer N is
+                // visible to layer N+1's first read automatically — the
+                // CPU-side `wait_until_completed` is not required for GPU
+                // correctness.  Memory residency is unchanged (activations
+                // are shared buffers, weights are permanently resident).
+                //
+                // We still fall back to `s.finish()` (commit + wait) when:
+                //   * HF2Q_BATCHED_DUMP is set — the dump path below
+                //     CPU-reads activation buffers and needs the GPU to
+                //     have finished.
+                //   * HF2Q_PROFILE_LAYERS is set — the per-layer
+                //     wall-clock print is only meaningful when we wait.
+                //   * HF2Q_SYNC_PER_LAYER is set — explicit debug knob
+                //     for bisecting cross-layer correctness issues.
+                let sync_per_layer = batched_dump.is_some()
+                    || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
+                    || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok();
+                if sync_per_layer {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
+                    if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
+                        let kind = if is_sliding { "SW" } else { "GL" };
+                        eprintln!("[LAYER_TIME] L{:02} {} {}us", layer_idx, kind,
+                            layer_start.elapsed().as_micros());
+                    }
+                } else {
+                    // Fire-and-forget commit — GPU continues executing
+                    // while CPU moves on.  The returned CommandEncoder is
+                    // dropped at end of scope; Metal's CommandBuffer is
+                    // already committed and ref-counted into the queue,
+                    // so it outlives the Rust handle until GPU completion.
+                    let _committed = s.commit();
+                    drop(_committed);
                 }
             }
 
