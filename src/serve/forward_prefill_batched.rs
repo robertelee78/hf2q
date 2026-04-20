@@ -532,8 +532,36 @@ impl MlxModelWeights {
                 s = exec.begin().map_err(|e| anyhow::anyhow!("bucket blk_gl resume: {e}"))?;
             }
 
-            s.finish()
-                .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
+            // Wave P4.18 — setup-session async commit.  Matches the
+            // layer-boundary async-commit pattern (commit 9091b8c): the
+            // setup outputs (sliding_mask, global_mask, blk_sliding,
+            // blk_global, pf_hidden, pf_positions, pf_token_ids) are
+            // written to shared buffers and read by layer 0's first
+            // dispatches.  Metal guarantees in-order execution of CBs
+            // submitted to the same queue, so those reads see the setup
+            // writes without requiring a CPU-side wait.  The ~30-45 ms
+            // of GPU idle at the setup→layer0 boundary (from the 2026-
+            // 04-20 bucket profile) collapses: layer 0's CPU-encode
+            // phase runs concurrently with the tail of setup's GPU work.
+            //
+            // Same fallback escape hatches as the layer boundary:
+            //   * HF2Q_BATCHED_DUMP set — dump path CPU-reads setup
+            //     outputs indirectly; keep sync for safety.
+            //   * HF2Q_PROFILE_BUCKETS set — per-sub-step sync above
+            //     has already flushed; a final finish is needed to
+            //     close the last sub-step's measurement.
+            //   * HF2Q_SYNC_PER_LAYER set — debug knob.
+            let sync_setup = INVESTIGATION_ENV.batched_dump.is_some()
+                || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
+                || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
+                || profile_buckets_on;
+            if sync_setup {
+                s.finish()
+                    .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
+            } else {
+                let _committed = s.commit();
+                drop(_committed);
+            }
         }
 
         // -------------------------------------------------------------------
