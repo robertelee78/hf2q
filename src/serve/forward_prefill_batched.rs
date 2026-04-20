@@ -466,17 +466,17 @@ impl MlxModelWeights {
                 // Two-pass: memcpy then scale.  copy_from_slice compiles
                 // to a full-width memcpy (NEON on arm64) that streams at
                 // ~50 GB/s; the subsequent scale loop auto-vectorizes to
-                // NEON fmul, running at ~40 GB/s.  Total ~2-3 ms for 30 MB
-                // on M5 Max vs the ~25 ms a per-element iterator-chain
-                // version would spend on dependent-load stalls.
+                // NEON fmul.  Rayon parallel was tested (Wave P4.18 drafts)
+                // and measured high-variance with no reliable speedup —
+                // the gather is cold-page-touch bound, and spreading the
+                // random reads across threads doesn't help when the
+                // bottleneck is DRAM latency for cache-miss lines.
                 for (tok_idx, &tok_id) in prompt_tokens.iter().enumerate() {
                     let src_off = (tok_id as usize) * hs;
                     let dst_off = tok_idx * hs;
                     out[dst_off..dst_off + hs]
                         .copy_from_slice(&embed_f32[src_off..src_off + hs]);
                 }
-                // Scale in-place; single contiguous pass over pf_hidden
-                // hits the CPU prefetcher cleanly.
                 for v in out[..seq_len * hs].iter_mut() {
                     *v *= scale;
                 }
