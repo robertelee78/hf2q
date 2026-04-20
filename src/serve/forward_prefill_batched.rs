@@ -1181,50 +1181,28 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (O) L{layer_idx}: {e}"))?;
                 }
 
-                // Wave P4.18 — fused post-attention norm+add + triple pre-FF
-                // norm.  Replaces the previous two-dispatch sequence
-                //   (a) fused_norm_add_f32(hidden, attn_out, post_attn_w → residual)
-                //   (b) rms_norm_f32_triple(residual → norm_a/b/c)
-                // with ONE kernel that computes (a) into residual_output,
-                // then immediately rms-norms residual_output with three
-                // weight vectors in a second shared-compute pass.  Saves:
-                //   - 1 dispatch per layer (30/prefill)
-                //   - the residual write+read round-trip at 30 MB/layer
-                //     (~1.8 GB eliminated memory traffic over prefill)
-                //
-                // KV_COPY below is INDEPENDENT of the fused norm op (no
-                // shared buffers between them), so MTLDispatchType::
-                // Concurrent already lets the two overlap on the GPU.
+                // 9. Post-attn fused norm + residual add (rows = seq_len)
+                //    residual = (pre-attn hidden) + norm(attn_out, post_attn_norm)
                 let t0_post_attn_norm_add = if profile_buckets_on {
                     Some(std::time::Instant::now())
                 } else { None };
                 s.barrier_between(
                     &[&pf_hidden, &pf_attn_out],
-                    &[&pf_residual, &pf_norm_out, &pf_moe_norm_out, &pf_router_norm_out],
+                    &[&pf_residual],
                 );
-                mlx_native::ops::rms_norm::dispatch_fused_post_attn_triple_norm_f32(
+                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_hidden,
                     &pf_attn_out,
                     &self.layers[layer_idx].norms.post_attention_layernorm,
-                    &self.layers[layer_idx].norms.pre_feedforward_layernorm,
-                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-                    &self.layers[layer_idx].moe.router_combined_weight,
                     &pf_residual,
-                    &pf_norm_out,
-                    &pf_moe_norm_out,
-                    &pf_router_norm_out,
-                    eps,
-                    seq_len as u32,
-                    hs as u32,
-                ).map_err(|e| anyhow::anyhow!("batched fused post-attn+triple norm L{layer_idx}: {e}"))?;
+                    hs as u32, seq_len as u32, eps,
+                ).map_err(|e| anyhow::anyhow!("batched post-attn L{layer_idx}: {e}"))?;
                 if let Some(t0) = t0_post_attn_norm_add {
-                    s.finish().map_err(|e| anyhow::anyhow!("bucket fused norm finish L{layer_idx}: {e}"))?;
-                    // Attribute to POST_ATTN_NORM_ADD (the upstream op it
-                    // subsumes); TRIPLE_RMS_NORM bucket will show zero.
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket post_attn_norm_add finish L{layer_idx}: {e}"))?;
                     PROFILE_B_POST_ATTN_NORM_ADD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     PROFILE_B_POST_ATTN_NORM_ADD_COUNT.fetch_add(1, Ordering::Relaxed);
-                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket fused norm resume L{layer_idx}: {e}"))?;
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket post_attn_norm_add resume L{layer_idx}: {e}"))?;
                 }
 
                 // ------------------------------------------------------------
@@ -1302,11 +1280,34 @@ impl MlxModelWeights {
                 // MLP + MoE (merged into session A — Wave P3b.3)
                 // ================================================================
 
-                // Pre-FF triple norm is now subsumed by the fused
-                // post-attn+triple norm kernel above (Wave P4.18).
-                // Retained profile bucket for backwards compat — will
-                // show 0 ms / 0 calls with the fused path.
-                let t0_triple_norm: Option<std::time::Instant> = None;
+                // Pre-FF norm (for MLP), pre-FF norm 2 (for MoE input), router norm.
+                //
+                // Wave P4.9 — fused 3-output RMS norm: all three norms read the
+                // same pf_residual input and apply different per-element
+                // weights.  Using rms_norm_f32_triple computes RMS(pf_residual)
+                // ONCE (instead of three times) and produces the three outputs
+                // in one dispatch.  Saves 2 dispatches per layer (60/prefill)
+                // and 2 reads of the [seq_len, hs] residual buffer per layer
+                // (~40 MB at pp2455 × 30 layers = 1.2 GB of read traffic).
+                let t0_triple_norm = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
+                s.barrier_between(
+                    &[&pf_residual],
+                    &[&pf_norm_out, &pf_moe_norm_out, &pf_router_norm_out],
+                );
+                mlx_native::ops::rms_norm::dispatch_rms_norm_f32_triple(
+                    s.encoder_mut(), reg, metal_dev,
+                    &pf_residual,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm,
+                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                    &self.layers[layer_idx].moe.router_combined_weight,
+                    &pf_norm_out,
+                    &pf_moe_norm_out,
+                    &pf_router_norm_out,
+                    &self.activations.norm_params,
+                    seq_len as u32, hs as u32,
+                ).map_err(|e| anyhow::anyhow!("batched pre-FF triple norm L{layer_idx}: {e}"))?;
                 if let Some(t0) = t0_triple_norm {
                     s.finish().map_err(|e| anyhow::anyhow!("bucket triple_norm finish L{layer_idx}: {e}"))?;
                     PROFILE_B_TRIPLE_NORM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
