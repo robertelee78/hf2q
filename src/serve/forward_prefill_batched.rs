@@ -70,6 +70,25 @@ impl MlxModelWeights {
         if seq_len == 0 {
             anyhow::bail!("forward_prefill_batched: empty prompt");
         }
+
+        // Metal-1 — programmatic GPU capture.  Gated on
+        // HF2Q_METAL_CAPTURE=path.gputrace.  Requires process env
+        // MTL_CAPTURE_ENABLED=1 (Metal's own capture enablement).
+        // HF2Q_METAL_CAPTURE_LAYERS="start-end" (inclusive, default
+        // "0-0") bounds the capture to a single layer so the resulting
+        // .gputrace is small enough to open in Xcode.  Start-capture is
+        // deferred to the layer loop (see the matching begin/end calls
+        // below).  We resolve paths + destination here.
+        let capture_path = std::env::var("HF2Q_METAL_CAPTURE").ok();
+        let (capture_layer_start, capture_layer_end) = std::env::var("HF2Q_METAL_CAPTURE_LAYERS")
+            .ok()
+            .and_then(|s| {
+                let mut it = s.splitn(2, '-');
+                let a = it.next()?.parse::<usize>().ok()?;
+                let b = it.next()?.parse::<usize>().ok()?;
+                Some((a, b))
+            })
+            .unwrap_or((0, 0));
         let hs = self.hidden_size;
         let num_layers = self.layers.len();
         let vocab_size = self.vocab_size;
@@ -404,7 +423,41 @@ impl MlxModelWeights {
         let batched_dump: Option<(usize, usize)> = INVESTIGATION_ENV.batched_dump;
         let batched_dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
 
+        // Metal-1: tracks whether the GPU capture was successfully
+        // started during the layer loop — needed so the teardown at the
+        // end of the function knows whether to call stop_capture.
+        let mut capture_active: bool = false;
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Metal-1 — begin/end programmatic GPU capture around the
+            // configured layer range (HF2Q_METAL_CAPTURE_LAYERS).
+            if let Some(p) = capture_path.as_ref() {
+                if layer_idx == capture_layer_start && !capture_active {
+                    use mlx_native::metal::{CaptureDescriptor, MTLCaptureDestination};
+                    let desc = CaptureDescriptor::new();
+                    desc.set_capture_device(dev.metal_device());
+                    desc.set_destination(MTLCaptureDestination::GpuTraceDocument);
+                    desc.set_output_url(std::path::Path::new(p));
+                    let mgr = mlx_native::metal::CaptureManager::shared();
+                    match mgr.start_capture(&desc) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[METAL_CAPTURE] started at layer {} (through {}), writing to {}",
+                                capture_layer_start, capture_layer_end, p
+                            );
+                            capture_active = true;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[METAL_CAPTURE] start_capture failed: {} \
+                                 (make sure MTL_CAPTURE_ENABLED=1 is set in the env)",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             let layer_start = std::time::Instant::now();
             let hd = layer.head_dim;
             let nkv = layer.num_kv_heads;
@@ -1395,6 +1448,19 @@ impl MlxModelWeights {
                     eprintln!("[BATCHED DUMP] expert_ids_row [{top_k}] u32 -> {path_eid}");
                 }
             }
+
+            // Metal-1 — stop capture once the target layer window closes
+            // (before the final-norm + lm_head, so the .gputrace is
+            // bounded to the per-layer scheduling we asked to inspect).
+            if capture_active && layer_idx == capture_layer_end {
+                mlx_native::metal::CaptureManager::shared().stop_capture();
+                eprintln!(
+                    "[METAL_CAPTURE] stopped after layer {}; .gputrace written to {}",
+                    layer_idx,
+                    capture_path.as_ref().map(|s| s.as_str()).unwrap_or("?")
+                );
+                capture_active = false;
+            }
         }
 
         // -------------------------------------------------------------------
@@ -1580,6 +1646,16 @@ impl MlxModelWeights {
         // Store dense KV buffers so forward_decode can use them
         self.dense_kvs = Some(dense_kvs_vec);
         self.dense_sdpa_tmp = Some(sdpa_tmp);
+
+        // Metal-1 — safety-net stop in case the layer-range end was
+        // beyond the actual layer count (shouldn't happen with valid
+        // envs but the capture API must always be balanced).
+        if capture_active {
+            mlx_native::metal::CaptureManager::shared().stop_capture();
+            if let Some(p) = capture_path.as_ref() {
+                eprintln!("[METAL_CAPTURE] safety-net stop; .gputrace written to {}", p);
+            }
+        }
 
         Ok(first_token)
     }
