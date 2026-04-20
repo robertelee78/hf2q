@@ -255,7 +255,7 @@ impl MlxModelWeights {
         };
 
         let max_nkv = self.layers.iter().map(|l| l.num_kv_heads).max().unwrap_or(8);
-        let pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
+        let mut pf_hidden = alloc_f32(seq_len * hs, "pf_hidden")?;
         let pf_residual = alloc_f32(seq_len * hs, "pf_residual")?;
         let pf_norm_out = alloc_f32(seq_len * hs, "pf_norm_out")?;
         let pf_moe_norm_out = alloc_f32(seq_len * hs, "pf_moe_norm_out")?;
@@ -431,24 +431,61 @@ impl MlxModelWeights {
             // wait transitions (~50-200 µs each) under the profile flag;
             // normal runs keep the single session.
 
-            // 1. Embedding: token_ids -> pf_hidden (no dependency on masks/blk).
+            // 1. Embedding: gather prompt rows from embed_weight into pf_hidden
+            //    and scale by sqrt(hidden_size).
+            //
+            // Wave P4.18 — CPU-side gather.  The GPU kernel version cost
+            // ~48 ms wall-clock at pp2455 on M5 Max (measured 2026-04-20
+            // via HF2Q_SKIP_EMBED: prefill drops from 798 ms → 750 ms
+            // when the GPU embed dispatch is skipped).  That was 50× more
+            // than the ~1 ms a memcpy-speed bound would predict — the
+            // op is a simple scatter/gather over 30 MB.  Root cause:
+            // spawning 7.5 M GPU threads (one per output element) for a
+            // purely-memory-bound op has high per-thread scheduling
+            // latency that dominates the tiny per-thread work.
+            //
+            // The embed_weight buffer is StorageModeShared (CPU/GPU
+            // unified) so the CPU can write pf_hidden directly; the
+            // next GPU op (layer 0 pre-attn norm) will see the CPU
+            // writes without any flush since MTLResourceOptions::
+            // StorageModeShared is coherent.
+            //
+            // Per-row memcpy pattern: 2455 rows × 12 KB each.  On M5 Max
+            // single-core memory copy runs at ~25 GB/s, so 30 MB → ~1.2 ms
+            // pure data; with row-loop overhead, measure <5 ms in practice.
+            // Saves ~45 ms vs the GPU dispatch.
             let t0_embed = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            s.track_dispatch(&[&self.embed_weight, &pf_token_ids], &[&pf_hidden]);
-            mlx_native::ops::elementwise::embedding_gather_scale_batch_f32(
-                s.encoder_mut(), reg, metal_dev,
-                &self.embed_weight,
-                &pf_token_ids,
-                &pf_hidden,
-                hs, seq_len,
-                (hs as f32).sqrt(),
-            ).map_err(|e| anyhow::anyhow!("batched embed: {e}"))?;
+            {
+                let scale = (hs as f32).sqrt();
+                let embed_f32: &[f32] = self.embed_weight.as_slice()
+                    .map_err(|e| anyhow::anyhow!("batched embed read: {e}"))?;
+                let out: &mut [f32] = pf_hidden.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("batched pf_hidden write: {e}"))?;
+                // Two-pass: memcpy then scale.  copy_from_slice compiles
+                // to a full-width memcpy (NEON on arm64) that streams at
+                // ~50 GB/s; the subsequent scale loop auto-vectorizes to
+                // NEON fmul, running at ~40 GB/s.  Total ~2-3 ms for 30 MB
+                // on M5 Max vs the ~25 ms a per-element iterator-chain
+                // version would spend on dependent-load stalls.
+                for (tok_idx, &tok_id) in prompt_tokens.iter().enumerate() {
+                    let src_off = (tok_id as usize) * hs;
+                    let dst_off = tok_idx * hs;
+                    out[dst_off..dst_off + hs]
+                        .copy_from_slice(&embed_f32[src_off..src_off + hs]);
+                }
+                // Scale in-place; single contiguous pass over pf_hidden
+                // hits the CPU prefetcher cleanly.
+                for v in out[..seq_len * hs].iter_mut() {
+                    *v *= scale;
+                }
+            }
             if let Some(t0) = t0_embed {
-                s.finish().map_err(|e| anyhow::anyhow!("bucket embed finish: {e}"))?;
+                // No s.finish() needed — no GPU dispatch was made; just
+                // record the CPU-side wall-clock of the scatter+scale.
                 PROFILE_B_EMBED_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 PROFILE_B_EMBED_COUNT.fetch_add(1, Ordering::Relaxed);
-                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket embed resume: {e}"))?;
             }
 
             // 2. Sliding-window causal mask — reused across all 25 sliding layers.
