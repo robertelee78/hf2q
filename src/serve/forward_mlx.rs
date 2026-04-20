@@ -3033,26 +3033,50 @@ pub fn dispatch_rms_norm_unit_perhead(
 /// one extra device write per element (effectively free on Apple
 /// unified memory since the f32 result is in registers).
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_rms_norm_unit_perhead_dual(
+/// Fused per-head V-norm + permute (Wave P4.16).
+///
+/// Same compute as `dispatch_rms_norm_unit_perhead_dual` but writes the
+/// bf16 output at the permuted [n_heads, seq_len, head_dim] layout
+/// instead of the natural [seq_len, n_heads, head_dim] layout.  Saves
+/// the post-norm `permute_021_bf16` dispatch on V (~30 dispatches/
+/// prefill on Gemma 4) and ~10 MB of intermediate-buffer traffic at
+/// pp2455.
+///
+/// The f32 output stays at natural layout — KV cache copy reads it.
+pub fn dispatch_rms_norm_unit_perhead_dual_perm(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut mlx_native::KernelRegistry,
     device: &mlx_native::metal::DeviceRef,
     input: &MlxBuffer,
     output: &MlxBuffer,
-    output_bf16: &MlxBuffer,
+    output_bf16_perm: &MlxBuffer,
     params_buf: &MlxBuffer,
-    rows: u32,
+    n_heads: u32,
+    seq_len: u32,
     dim: u32,
 ) -> Result<()> {
-    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32_dual", device)
-        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual pipeline: {e}"))?;
+    use mlx_native::ops::encode_helpers::{encode_threadgroups_with_args_and_shared, KernelArg};
+    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32_dual_perm", device)
+        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32_dual_perm pipeline: {e}"))?;
+    let rows = (n_heads as u64) * (seq_len as u64);
     let tg_size = std::cmp::min(256, dim.next_power_of_two()) as u64;
     let shared_mem_bytes = tg_size * 4;
-    encoder.encode_threadgroups_with_shared(
+    let aux_bytes: [u32; 2] = [n_heads, seq_len];
+    let aux_bytes_b: &[u8] = unsafe {
+        std::slice::from_raw_parts(aux_bytes.as_ptr() as *const u8, std::mem::size_of_val(&aux_bytes))
+    };
+    encode_threadgroups_with_args_and_shared(
+        encoder,
         pipeline,
-        &[(0, input), (1, output), (2, params_buf), (3, output_bf16)],
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(output)),
+            (2, KernelArg::Buffer(params_buf)),
+            (3, KernelArg::Buffer(output_bf16_perm)),
+            (4, KernelArg::Bytes(aux_bytes_b)),
+        ],
         &[(0, shared_mem_bytes)],
-        mlx_native::MTLSize::new(rows as u64, 1, 1),
+        mlx_native::MTLSize::new(rows, 1, 1),
         mlx_native::MTLSize::new(tg_size, 1, 1),
     );
     Ok(())

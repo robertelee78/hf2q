@@ -30,7 +30,7 @@ use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
 use super::forward_mlx::{
     DenseKvBuffers, MlxModelWeights, dispatch_qmatmul,
-    dispatch_rms_norm_unit_perhead_dual,
+    dispatch_rms_norm_unit_perhead_dual_perm,
 };
 use super::gpu::GpuContext;
 
@@ -184,7 +184,8 @@ impl MlxModelWeights {
         // The head_norm+RoPE dispatch now writes bf16 directly at permuted
         // layout into pf_q_perm and pf_k_perm, fusing the permute_021_bf16
         // pre-FA dispatch.
-        let pf_v_normed_bf16 = alloc_bf16(seq_len * max_nkv * max_hd, "pf_v_normed_bf16")?;
+        // Wave P4.16 — pf_v_normed_bf16 removed.  V's dual-norm now writes
+        // bf16 directly at permuted [nkv, seq_len, hd] layout into pf_v_perm.
         let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
@@ -546,34 +547,31 @@ impl MlxModelWeights {
                 // the bf16 attention island).  Eliminates the otherwise-
                 // separate f32→bf16 cast dispatch (30 dispatches /
                 // prefill).
+                // V norm with permuted bf16 output — Wave P4.16.
+                // The kernel co-writes pf_v_normed at natural layout
+                // (KV cache copy reads it) AND pf_v_perm at permuted
+                // [nkv, seq_len, hd] layout (FA reads it).  Removes:
+                //   - The previous separate dispatch_rms_norm_unit_
+                //     perhead_dual + permute_021_bf16(V) pair
+                //     (-30 dispatches/prefill).
+                //   - pf_v_normed_bf16 intermediate buffer
+                //     (~10 MB at pp2455 × 30 = ~300 MB of read+write
+                //     traffic eliminated).
                 let v_input = if v_is_k { &pf_k } else { &pf_v };
                 s.barrier_between(
                     &[v_input],
-                    &[&pf_v_normed, &pf_v_normed_bf16],
+                    &[&pf_v_normed, &pf_v_perm],
                 );
-                dispatch_rms_norm_unit_perhead_dual(
+                dispatch_rms_norm_unit_perhead_dual_perm(
                     s.encoder_mut(), reg, metal_dev,
                     v_input,
                     &pf_v_normed,
-                    &pf_v_normed_bf16,
+                    &pf_v_perm,
                     hd_norm_params,
-                    (seq_len * nkv) as u32,
+                    nkv as u32,
+                    seq_len as u32,
                     hd as u32,
                 )?;
-
-                // 5. Permute V only — Q and K were written directly into
-                // their permuted layout by the head_norm dispatch (P4.15).
-                // V still uses dispatch_rms_norm_unit_perhead_dual which
-                // doesn't yet have a permuted-output mode.
-                s.barrier_between(
-                    &[&pf_v_normed_bf16],
-                    &[&pf_v_perm],
-                );
-                mlx_native::ops::transpose::permute_021_bf16(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_v_normed_bf16, &pf_v_perm,
-                    seq_len, nkv, hd,
-                ).map_err(|e| anyhow::anyhow!("batched permute V L{layer_idx}: {e}"))?;
 
                 // 6. Flash-attention tiled prefill (ADR-011 Phase 2 Wave 4):
                 //    Q: [1, nh, seq_len, hd], K: [1, nkv, seq_len, hd], V: same
