@@ -49,6 +49,12 @@ static PROFILE_MOE_DN_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_DN_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MM_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_POST_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_POST_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_NORM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PERMUTE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PERMUTE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl MlxModelWeights {
     /// True batched prefill with single-shot dense SDPA over the whole prompt.
@@ -976,12 +982,24 @@ impl MlxModelWeights {
                     &[&pf_moe_gate_up],
                     &[&pf_moe_swiglu],
                 );
+                let swiglu_t0 = if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile pre-finish (swiglu) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile begin (swiglu) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 mlx_native::ops::moe_dispatch::moe_swiglu_seq_encode(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_moe_gate_up,
                     &pf_moe_swiglu,
                     moe_int, top_k, seq_len,
                 ).map_err(|e| anyhow::anyhow!("batched MoE swiglu L{layer_idx}: {e}"))?;
+                if let Some(t0) = swiglu_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile post-finish (swiglu) L{layer_idx}: {e}"))?;
+                    PROFILE_MOE_POST_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MOE_POST_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile resume (swiglu) L{layer_idx}: {e}"))?;
+                }
 
                 // MoE down experts: quantized_matmul_id_ggml with n_tokens = seq_len*top_k, top_k=1
                 let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
@@ -1039,6 +1057,12 @@ impl MlxModelWeights {
                     &[&pf_moe_down, &pf_routing_weights],
                     &[&pf_moe_accum],
                 );
+                let wsum_t0 = if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile pre-finish (wsum) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile begin (wsum) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 mlx_native::ops::moe_dispatch::moe_weighted_sum_seq_encode(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_moe_down,
@@ -1046,6 +1070,12 @@ impl MlxModelWeights {
                     &pf_moe_accum,
                     hs, top_k, seq_len,
                 ).map_err(|e| anyhow::anyhow!("batched MoE weighted_sum L{layer_idx}: {e}"))?;
+                if let Some(t0) = wsum_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile post-finish (wsum) L{layer_idx}: {e}"))?;
+                    PROFILE_MOE_POST_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MOE_POST_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile resume (wsum) L{layer_idx}: {e}"))?;
+                }
 
                 // post-FF norm 2 + combine MLP + MoE: output = mlp_down_out + norm(moe_accum)
                 s.barrier_between(
@@ -1385,6 +1415,23 @@ impl MlxModelWeights {
                 prefill_ms,
             );
         }
+        if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() {
+            let post_ns = PROFILE_MOE_POST_NS.swap(0, Ordering::Relaxed);
+            let post_n = PROFILE_MOE_POST_COUNT.swap(0, Ordering::Relaxed);
+            let total_ms = post_ns as f64 / 1_000_000.0;
+            eprintln!(
+                "[MOE_POST_PROFILE] swiglu+wsum: {} calls, {:.2} ms total ({:.3} ms/call) ({:.1}% of prefill {:.1} ms)",
+                post_n, total_ms,
+                if post_n > 0 { total_ms / post_n as f64 } else { 0.0 },
+                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                prefill_ms,
+            );
+        }
+        // Suppress dead_code warnings for as-yet-unwired profile counters
+        // (PROFILE_NORM_*, PROFILE_PERMUTE_*) — staged for upcoming
+        // sub-category profiling waves.
+        let _ = (PROFILE_NORM_NS.load(Ordering::Relaxed), PROFILE_NORM_COUNT.load(Ordering::Relaxed),
+                 PROFILE_PERMUTE_NS.load(Ordering::Relaxed), PROFILE_PERMUTE_COUNT.load(Ordering::Relaxed));
 
         // Store dense KV buffers so forward_decode can use them
         self.dense_kvs = Some(dense_kvs_vec);
