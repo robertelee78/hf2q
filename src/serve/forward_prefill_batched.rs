@@ -835,32 +835,31 @@ impl MlxModelWeights {
                 // MLP + MoE (merged into session A — Wave P3b.3)
                 // ================================================================
 
-                // Pre-FF norm (for MLP), pre-FF norm 2 (for MoE input), router norm
+                // Pre-FF norm (for MLP), pre-FF norm 2 (for MoE input), router norm.
+                //
+                // Wave P4.9 — fused 3-output RMS norm: all three norms read the
+                // same pf_residual input and apply different per-element
+                // weights.  Using rms_norm_f32_triple computes RMS(pf_residual)
+                // ONCE (instead of three times) and produces the three outputs
+                // in one dispatch.  Saves 2 dispatches per layer (60/prefill)
+                // and 2 reads of the [seq_len, hs] residual buffer per layer
+                // (~40 MB at pp2455 × 30 layers = 1.2 GB of read traffic).
                 s.barrier_between(
                     &[&pf_residual],
                     &[&pf_norm_out, &pf_moe_norm_out, &pf_router_norm_out],
                 );
-                s.rms_norm(reg, metal_dev,
+                mlx_native::ops::rms_norm::dispatch_rms_norm_f32_triple(
+                    s.encoder_mut(), reg, metal_dev,
                     &pf_residual,
                     &self.layers[layer_idx].norms.pre_feedforward_layernorm,
-                    &pf_norm_out,
-                    &self.activations.norm_params,
-                    seq_len as u32, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("batched pre-FF norm L{layer_idx}: {e}"))?;
-                s.rms_norm(reg, metal_dev,
-                    &pf_residual,
                     &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-                    &pf_moe_norm_out,
-                    &self.activations.norm_params,
-                    seq_len as u32, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("batched pre-FF norm2 L{layer_idx}: {e}"))?;
-                s.rms_norm(reg, metal_dev,
-                    &pf_residual,
                     &self.layers[layer_idx].moe.router_combined_weight,
+                    &pf_norm_out,
+                    &pf_moe_norm_out,
                     &pf_router_norm_out,
                     &self.activations.norm_params,
                     seq_len as u32, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("batched router norm L{layer_idx}: {e}"))?;
+                ).map_err(|e| anyhow::anyhow!("batched pre-FF triple norm L{layer_idx}: {e}"))?;
 
                 // Dense MLP gate / up (m = seq_len); router proj (m = seq_len)
                 s.barrier_between(
