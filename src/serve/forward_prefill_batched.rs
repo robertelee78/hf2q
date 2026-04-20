@@ -93,7 +93,26 @@ impl MlxModelWeights {
         let use_f16_kv = INVESTIGATION_ENV.f16_kv;
         let kv_dtype = if use_f16_kv { DType::F16 } else { DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
-        eprintln!("Batched prefill: KV={:?}, seq_len={}", kv_dtype, seq_len);
+
+        // Option 3 (Phase D) — HF2Q_NO_FA=1 swaps the flash-attention
+        // prefill path for a tensor-mm attention path that mirrors
+        // llama.cpp's `-fa 0` fast path:
+        //   1. cast Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
+        //   2. Q @ K^T via hf2q_dense_mm_bf16_f32_tensor -> kq f32 [nh, seq, seq]
+        //   3. scale_mask_softmax_f32 (scale is pre-applied in Q's norm
+        //      weights; passes 1.0; reuses the existing bf16 sliding /
+        //      global masks from the flash-attn path)
+        //   4. transpose_last2_bf16 on V: [nkv, seq, hd] -> [nkv, hd, seq]
+        //   5. scores @ V^T via hf2q_dense_mm_bf16_f32_tensor -> attn f32 [nh, seq, hd]
+        //   6. permute_021_f32 -> pf_sdpa_out f32 [seq, nh, hd]
+        // The FA path stays live; env flag swap lets us A/B without
+        // code churn.  The non-FA path requires ~555 MB of extra
+        // intermediate buffers at seq_len=2455; only allocate them if
+        // the flag is set so the default-path footprint is unchanged.
+        let use_no_fa = std::env::var("HF2Q_NO_FA").is_ok();
+
+        eprintln!("Batched prefill: KV={:?}, seq_len={}, path={}", kv_dtype, seq_len,
+                  if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" });
 
         // -------------------------------------------------------------------
         // Per-layer dense KV buffers [n_kv_heads, capacity, head_dim]
@@ -190,6 +209,23 @@ impl MlxModelWeights {
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
         let mut pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+
+        // HF2Q_NO_FA path buffers — only allocated when the env flag is
+        // set.  pf_kq is the dominant footprint at seq_len=2455:
+        //   nh × seq × seq × 4 = 16 × 2455² × 4 ≈ 386 MB.
+        // Q / V-transposed / attn-out are each ~40-80 MB.
+        let pf_q_perm_f32: Option<MlxBuffer> = if use_no_fa {
+            Some(alloc_f32(nh * seq_len * max_hd, "pf_q_perm_f32")?)
+        } else { None };
+        let mut pf_kq: Option<MlxBuffer> = if use_no_fa {
+            Some(alloc_f32(nh * seq_len * seq_len, "pf_kq")?)
+        } else { None };
+        let pf_v_perm_t: Option<MlxBuffer> = if use_no_fa {
+            Some(alloc_bf16(max_nkv * max_hd * seq_len, "pf_v_perm_t")?)
+        } else { None };
+        let mut pf_attn_f32: Option<MlxBuffer> = if use_no_fa {
+            Some(alloc_f32(nh * seq_len * max_hd, "pf_attn_f32")?)
+        } else { None };
         // Wave P4.10 — pf_sdpa_out_bf16 (the intermediate bf16 buffer
         // between permute and cast) is no longer needed: the fused
         // permute_021_bf16_to_f32 dispatch writes f32 directly into
@@ -594,6 +630,132 @@ impl MlxModelWeights {
                 // mask representation. sdpa_sliding previously had a "dense
                 // cap 1024" issue at pp=2455 (docs/spike-gate-a-prefill.md
                 // §Addendum); flash_attn_prefill unblocks that sub-gate.
+                if use_no_fa {
+                    // ---- HF2Q_NO_FA path: tensor-mm attention ----
+                    //
+                    // Mirrors llama.cpp's `-fa 0` fast path (which on M5
+                    // today measures 3410 vs 3217 for `-fa 1` at pp2455):
+                    //
+                    //   1. Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
+                    //   2. Q @ K^T -> kq f32  [nh, seq, seq]
+                    //   3. scale-mask-softmax -> kq in-place
+                    //   4. transpose_last2 V bf16 -> V_t bf16 [nkv, hd, seq]
+                    //   5. scores @ V_t -> attn f32 [nh, seq, hd]
+                    //   6. permute_021 attn -> pf_sdpa_out f32 [seq, nh, hd]
+                    //
+                    // Gemma 4 on this GGUF has no Q·K softcap (only the
+                    // lm_head softcap), so step 3 skips the tanh-based
+                    // logit cap that llama's graph inserts for Gemma 2/3.
+                    // The mask buffer is the same bf16 sliding / global
+                    // mask the FA path uses (reused verbatim).
+                    let pf_q_perm_f32_ref = pf_q_perm_f32.as_ref()
+                        .expect("pf_q_perm_f32 must be allocated in HF2Q_NO_FA mode");
+                    let pf_kq_ref = pf_kq.as_mut()
+                        .expect("pf_kq must be allocated in HF2Q_NO_FA mode");
+                    let pf_v_perm_t_ref = pf_v_perm_t.as_ref()
+                        .expect("pf_v_perm_t must be allocated in HF2Q_NO_FA mode");
+                    let pf_attn_f32_ref = pf_attn_f32.as_mut()
+                        .expect("pf_attn_f32 must be allocated in HF2Q_NO_FA mode");
+
+                    // Step 1: cast Q bf16 -> f32 using the trivial [1, N, 1]
+                    // permute_021 pattern (equivalent to a flat bf16->f32
+                    // cast in memory; dim_a=1 makes the permute a no-op).
+                    s.barrier_between(
+                        &[&pf_q_perm],
+                        &[pf_q_perm_f32_ref],
+                    );
+                    mlx_native::ops::transpose::permute_021_bf16_to_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_q_perm, pf_q_perm_f32_ref,
+                        1, nh * seq_len * hd, 1,
+                    ).map_err(|e| anyhow::anyhow!("Q bf16->f32 cast L{layer_idx}: {e}"))?;
+
+                    // Step 2: Q @ K^T via dense bf16×f32→f32 tensor-mm.
+                    // src0 = K [nkv, seq, hd] bf16, src1 = Q [nh, seq, hd] f32.
+                    // Output kq[h, q, k] = sum_d K[h/r2, k, d] * Q[h, q, d].
+                    // r2 = nh / nkv for GQA head broadcast.
+                    s.barrier_between(
+                        &[&pf_k_perm, pf_q_perm_f32_ref],
+                        &[pf_kq_ref],
+                    );
+                    mlx_native::ops::dense_mm_bf16::dense_matmul_bf16_f32_tensor(
+                        s.encoder_mut(), reg, dev,
+                        &pf_k_perm, pf_q_perm_f32_ref,
+                        pf_kq_ref,
+                        &mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params {
+                            m: seq_len as u32,
+                            n: seq_len as u32,
+                            k: hd as u32,
+                            src0_batch: nkv as u32,
+                            src1_batch: nh as u32,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("non-FA Q@K^T L{layer_idx}: {e}"))?;
+
+                    // Step 3: scale + mask + softmax fused.  scale = 1.0
+                    // because Q's norm-weight pre-scales by 1/sqrt(hd)
+                    // (matches FA path's scale=1.0).
+                    let mask_ref = if is_sliding { &sliding_mask } else { &global_mask };
+                    s.barrier_between(
+                        &[pf_kq_ref, mask_ref],
+                        &[pf_kq_ref],
+                    );
+                    mlx_native::ops::scale_mask_softmax::dispatch_scale_mask_softmax_f32(
+                        s.encoder_mut(), reg, dev,
+                        pf_kq_ref, pf_kq_ref, mask_ref,
+                        &mlx_native::ops::scale_mask_softmax::ScaleMaskSoftmaxParams {
+                            rows: (nh * seq_len) as u32,
+                            cols: seq_len as u32,
+                            seq_q: seq_len as u32,
+                            scale: 1.0,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("non-FA scale_mask_softmax L{layer_idx}: {e}"))?;
+
+                    // Step 4: transpose V [nkv, seq, hd] -> [nkv, hd, seq]
+                    // so the scores@V matmul contracts on seq_kv (K-dim
+                    // = inner-most dim of src0 per our kernel contract).
+                    s.barrier_between(
+                        &[&pf_v_perm],
+                        &[pf_v_perm_t_ref],
+                    );
+                    mlx_native::ops::transpose::transpose_last2_bf16(
+                        s.encoder_mut(), reg, metal_dev,
+                        &pf_v_perm, pf_v_perm_t_ref,
+                        nkv, seq_len, hd,
+                    ).map_err(|e| anyhow::anyhow!("non-FA V transpose L{layer_idx}: {e}"))?;
+
+                    // Step 5: scores @ V_t via dense bf16×f32→f32 tensor-mm.
+                    // src0 = V_t [nkv, hd, seq_kv] bf16, src1 = kq [nh, seq_q, seq_kv] f32.
+                    // Output attn[h, q, d] = sum_k V_t[h/r2, d, k] * kq[h, q, k]
+                    //                       = sum_k V[h/r2, k, d] * probs[h, q, k].
+                    s.barrier_between(
+                        &[pf_v_perm_t_ref, pf_kq_ref],
+                        &[pf_attn_f32_ref],
+                    );
+                    mlx_native::ops::dense_mm_bf16::dense_matmul_bf16_f32_tensor(
+                        s.encoder_mut(), reg, dev,
+                        pf_v_perm_t_ref, pf_kq_ref,
+                        pf_attn_f32_ref,
+                        &mlx_native::ops::dense_mm_bf16::DenseMmBf16F32Params {
+                            m: seq_len as u32,
+                            n: hd as u32,
+                            k: seq_len as u32,
+                            src0_batch: nkv as u32,
+                            src1_batch: nh as u32,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("non-FA scores@V L{layer_idx}: {e}"))?;
+
+                    // Step 6: permute attn [nh, seq, hd] f32 -> pf_sdpa_out
+                    // [seq, nh, hd] f32 to match the O-proj input layout.
+                    s.barrier_between(
+                        &[pf_attn_f32_ref],
+                        &[&pf_sdpa_out],
+                    );
+                    mlx_native::ops::transpose::permute_021_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        pf_attn_f32_ref, &pf_sdpa_out,
+                        nh, seq_len, hd,
+                    ).map_err(|e| anyhow::anyhow!("non-FA attn permute L{layer_idx}: {e}"))?;
+                } else {
                 s.barrier_between(
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
                     &[&pf_sdpa_out_perm],
@@ -728,6 +890,7 @@ impl MlxModelWeights {
                     &pf_sdpa_out_perm, &pf_sdpa_out,
                     nh, seq_len, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute+cast SDPA L{layer_idx}: {e}"))?;
+                } // end of !use_no_fa branch
 
                 // 8. O-proj (m = seq_len): [seq_len, nh*hd] → [seq_len, hs]
                 s.barrier_between(
