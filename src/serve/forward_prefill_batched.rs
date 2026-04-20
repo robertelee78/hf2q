@@ -547,11 +547,19 @@ impl MlxModelWeights {
                     &[&pf_q_normed, &pf_k_normed,
                       &pf_q_perm, &pf_k_perm],
                 );
-                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
+                // D.1 — in HF2Q_NO_FA mode, the head-norm+RoPE kernel
+                // also co-writes f32 at the permuted [nh, seq, hd]
+                // layout into pf_q_perm_f32, eliminating the separate
+                // permute_021_bf16_to_f32 cast dispatch that otherwise
+                // runs every layer to produce the src1 of the tensor-mm
+                // Q@K^T.
+                mlx_native::ops::fused_head_norm_rope::
+                    dispatch_fused_head_norm_rope_batch_f32_with_bf16_f32_perm(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_q,
                     &pf_q_normed,
-                    Some(&pf_q_perm),    // P4.15: write bf16 at permuted [head, token, i]
+                    Some(&pf_q_perm),            // P4.15 bf16 permuted
+                    pf_q_perm_f32.as_ref(),      // D.1 f32 permuted (None outside HF2Q_NO_FA)
                     Some(&self.layers[layer_idx].attn.q_norm_weight),
                     &pf_positions,
                     ff_gpu,
@@ -559,7 +567,7 @@ impl MlxModelWeights {
                     seq_len as u32,
                     eps, theta,
                     true,                // bf16_permuted
-                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE+permuted bf16 L{layer_idx}: {e}"))?;
+                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE+permuted bf16/f32 L{layer_idx}: {e}"))?;
                 mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_k,
@@ -657,18 +665,10 @@ impl MlxModelWeights {
                     let pf_attn_f32_ref = pf_attn_f32.as_mut()
                         .expect("pf_attn_f32 must be allocated in HF2Q_NO_FA mode");
 
-                    // Step 1: cast Q bf16 -> f32 using the trivial [1, N, 1]
-                    // permute_021 pattern (equivalent to a flat bf16->f32
-                    // cast in memory; dim_a=1 makes the permute a no-op).
-                    s.barrier_between(
-                        &[&pf_q_perm],
-                        &[pf_q_perm_f32_ref],
-                    );
-                    mlx_native::ops::transpose::permute_021_bf16_to_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_q_perm, pf_q_perm_f32_ref,
-                        1, nh * seq_len * hd, 1,
-                    ).map_err(|e| anyhow::anyhow!("Q bf16->f32 cast L{layer_idx}: {e}"))?;
+                    // Step 1 removed (D.1): the Q bf16→f32 cast is fused
+                    // into the head-norm+RoPE kernel via the optional
+                    // output_f32_perm buffer.  pf_q_perm_f32 is already
+                    // populated at permuted [nh, seq, hd] layout.
 
                     // Step 2: Q @ K^T via dense bf16×f32→f32 tensor-mm.
                     // src0 = K [nkv, seq, hd] bf16, src1 = Q [nh, seq, hd] f32.
