@@ -781,44 +781,30 @@ impl MlxModelWeights {
                     &[&pf_k_normed, &pf_v_normed],
                     &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
                 );
+                // Wave P4.11 — fused K + V cache copy.  Both copies share
+                // identical metadata + layout, only the source/dest buffers
+                // differ.  One dispatch instead of two saves 30 dispatches/
+                // prefill on Gemma 4.
                 if use_f16_kv {
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16_dual(
                         s.encoder_mut(), reg, metal_dev,
-                        &pf_k_normed,
-                        &dense_kvs_vec[layer_idx].k,
+                        &pf_k_normed, &pf_v_normed,
+                        &dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
                         layer_cap as u32,
                         dst_seq_pos_start, n_copy as u32,
                         src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_v_normed,
-                        &dense_kvs_vec[layer_idx].v,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
+                    ).map_err(|e| anyhow::anyhow!("batched KV cache copy (f16, dual) L{layer_idx}: {e}"))?;
                 } else {
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
+                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
                         s.encoder_mut(), reg, metal_dev,
-                        &pf_k_normed,
-                        &dense_kvs_vec[layer_idx].k,
+                        &pf_k_normed, &pf_v_normed,
+                        &dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v,
                         nkv as u32, hd as u32,
                         layer_cap as u32,
                         dst_seq_pos_start, n_copy as u32,
                         src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched K cache copy L{layer_idx}: {e}"))?;
-                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_v_normed,
-                        &dense_kvs_vec[layer_idx].v,
-                        nkv as u32, hd as u32,
-                        layer_cap as u32,
-                        dst_seq_pos_start, n_copy as u32,
-                        src_tok_offset,
-                    ).map_err(|e| anyhow::anyhow!("batched V cache copy L{layer_idx}: {e}"))?;
+                    ).map_err(|e| anyhow::anyhow!("batched KV cache copy (f32, dual) L{layer_idx}: {e}"))?;
                 }
 
                 // ADR-011 Phase 3 Wave P3b.3 — MLP + MoE continue in the
