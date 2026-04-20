@@ -180,8 +180,10 @@ impl MlxModelWeights {
         // for the O-proj qmatmul (also f32-only). This matches the dtype
         // convention for the core attention compute and is exactly the
         // region Wave 4's `flash_attn_prefill` (bf16-only) will later wrap.
-        let pf_q_normed_bf16 = alloc_bf16(seq_len * nh * max_hd, "pf_q_normed_bf16")?;
-        let pf_k_normed_bf16 = alloc_bf16(seq_len * max_nkv * max_hd, "pf_k_normed_bf16")?;
+        // Wave P4.15 — pf_q_normed_bf16 and pf_k_normed_bf16 removed.
+        // The head_norm+RoPE dispatch now writes bf16 directly at permuted
+        // layout into pf_q_perm and pf_k_perm, fusing the permute_021_bf16
+        // pre-FA dispatch.
         let pf_v_normed_bf16 = alloc_bf16(seq_len * max_nkv * max_hd, "pf_v_normed_bf16")?;
         let pf_q_perm = alloc_bf16(nh * seq_len * max_hd, "pf_q_perm")?;
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
@@ -497,35 +499,43 @@ impl MlxModelWeights {
                 // otherwise-separate f32→bf16 cast dispatches that fed
                 // the bf16 attention island.  Total: 60 cast dispatches /
                 // prefill eliminated (2 per layer × 30 layers).
+                // Wave P4.15 — head_norm+RoPE writes bf16 output DIRECTLY at
+                // permuted layout [n_heads, seq_len, head_dim] into pf_q_perm/
+                // pf_k_perm.  Eliminates the post-norm permute_021_bf16
+                // dispatch for Q and K (60 dispatches/prefill saved) and the
+                // intermediate pf_q_normed_bf16/pf_k_normed_bf16 buffers
+                // (~50 MB at pp2455 × 30 = 1.5 GB of memory traffic).
                 s.barrier_between(
                     &[&pf_q, &pf_k],
                     &[&pf_q_normed, &pf_k_normed,
-                      &pf_q_normed_bf16, &pf_k_normed_bf16],
+                      &pf_q_perm, &pf_k_perm],
                 );
                 mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_q,
                     &pf_q_normed,
-                    Some(&pf_q_normed_bf16),
+                    Some(&pf_q_perm),    // P4.15: write bf16 at permuted [head, token, i]
                     Some(&self.layers[layer_idx].attn.q_norm_weight),
                     &pf_positions,
                     ff_gpu,
                     nh as u32, hd as u32, half_rope,
                     seq_len as u32,
                     eps, theta,
-                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE+bf16 L{layer_idx}: {e}"))?;
+                    true,                // bf16_permuted
+                ).map_err(|e| anyhow::anyhow!("batched Q norm+RoPE+permuted bf16 L{layer_idx}: {e}"))?;
                 mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_batch_f32_with_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_k,
                     &pf_k_normed,
-                    Some(&pf_k_normed_bf16),
+                    Some(&pf_k_perm),    // P4.15: write bf16 at permuted [head, token, i]
                     Some(&self.layers[layer_idx].attn.k_norm_weight),
                     &pf_positions,
                     ff_gpu,
                     nkv as u32, hd as u32, half_rope,
                     seq_len as u32,
                     eps, theta,
-                ).map_err(|e| anyhow::anyhow!("batched K norm+RoPE+bf16 L{layer_idx}: {e}"))?;
+                    true,                // bf16_permuted
+                ).map_err(|e| anyhow::anyhow!("batched K norm+RoPE+permuted bf16 L{layer_idx}: {e}"))?;
 
                 // 4. V norm (unit RMS, no RoPE, per-head across seq_len)
                 //    Layout: [seq_len * nkv, hd] — treat all positions' heads as rows
@@ -551,21 +561,14 @@ impl MlxModelWeights {
                     hd as u32,
                 )?;
 
-                // 5. Permute [seq_len, n_heads, hd] → [n_heads, seq_len, hd] (bf16).
+                // 5. Permute V only — Q and K were written directly into
+                // their permuted layout by the head_norm dispatch (P4.15).
+                // V still uses dispatch_rms_norm_unit_perhead_dual which
+                // doesn't yet have a permuted-output mode.
                 s.barrier_between(
-                    &[&pf_q_normed_bf16, &pf_k_normed_bf16, &pf_v_normed_bf16],
-                    &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
+                    &[&pf_v_normed_bf16],
+                    &[&pf_v_perm],
                 );
-                mlx_native::ops::transpose::permute_021_bf16(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_q_normed_bf16, &pf_q_perm,
-                    seq_len, nh, hd,
-                ).map_err(|e| anyhow::anyhow!("batched permute Q L{layer_idx}: {e}"))?;
-                mlx_native::ops::transpose::permute_021_bf16(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_k_normed_bf16, &pf_k_perm,
-                    seq_len, nkv, hd,
-                ).map_err(|e| anyhow::anyhow!("batched permute K L{layer_idx}: {e}"))?;
                 mlx_native::ops::transpose::permute_021_bf16(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_v_normed_bf16, &pf_v_perm,
