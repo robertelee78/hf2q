@@ -23,6 +23,7 @@
 use anyhow::Result;
 use mlx_native::{DType, MlxBuffer};
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
@@ -32,6 +33,22 @@ use super::forward_mlx::{
     dispatch_rms_norm_unit_perhead_dual,
 };
 use super::gpu::GpuContext;
+
+// Wave P4.0 — env-gated per-kernel GPU-time profiling.  Enabled via
+// HF2Q_PROFILE_FA / HF2Q_PROFILE_MOE / HF2Q_PROFILE_MM to break out the
+// contribution of each kernel category.  Each adds 2 commit_and_wait per
+// dispatch to isolate its session, so prefill total throughput will
+// REGRESS substantially when on — never enable in production.
+static PROFILE_FA_SW_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FA_SW_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FA_GL_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_FA_GL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_GU_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_GU_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_DN_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MOE_DN_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MM_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl MlxModelWeights {
     /// True batched prefill with single-shot dense SDPA over the whole prompt.
@@ -434,6 +451,13 @@ impl MlxModelWeights {
                     &[&pf_norm_out],
                     &[&pf_q, &pf_k, &pf_v],
                 );
+                let profile_mm = std::env::var("HF2Q_PROFILE_MM").is_ok();
+                let qkv_t0 = if profile_mm {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (qkv) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (qkv) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                     &self.layers[layer_idx].attn.q_proj, &mut pf_q, seq_len as u32)?;
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
@@ -443,6 +467,12 @@ impl MlxModelWeights {
                     dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
                         &mut pf_v, seq_len as u32)?;
+                }
+                if let Some(t0) = qkv_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (qkv) L{layer_idx}: {e}"))?;
+                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MM_COUNT.fetch_add(if v_is_k { 2 } else { 3 }, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (qkv) L{layer_idx}: {e}"))?;
                 }
 
                 // 3. Batched fused head norm + RoPE on Q and K.
@@ -555,6 +585,22 @@ impl MlxModelWeights {
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
                     &[&pf_sdpa_out_perm],
                 );
+                // Wave P4.0 — env-gated FA isolation for per-kernel timing.
+                // When HF2Q_PROFILE_FA=1: commit-and-wait the QKV+permute
+                // work, restart with a session that holds ONLY the FA
+                // dispatch, then commit-and-wait again to capture true
+                // FA-only wall-clock GPU time.  The 2 extra syncs/layer
+                // make the overall prefill slower but isolate FA's cost
+                // from QKV mm and the post-FA permute/cast.
+                let profile_fa = std::env::var("HF2Q_PROFILE_FA").is_ok();
+                let fa_start = if profile_fa {
+                    s.finish().map_err(|e| anyhow::anyhow!("FA-profile pre-finish L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("FA-profile begin L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else {
+                    None
+                };
                 if is_sliding {
                     // ADR-011 Phase 2 Wave 4 Stage 2: flash_attn_prefill D=256
                     // replaces sdpa_sliding. Inputs:
@@ -636,6 +682,21 @@ impl MlxModelWeights {
                         },
                     ).map_err(|e| anyhow::anyhow!("batched global flash_attn_prefill L{layer_idx}: {e}"))?;
                 }
+                // Wave P4.0 — close the FA-only session and accumulate
+                // wall-clock time (commit_and_wait blocks until the GPU
+                // finishes, so the measurement bounds true GPU work).
+                if let Some(t0) = fa_start {
+                    s.finish().map_err(|e| anyhow::anyhow!("FA-profile post-finish L{layer_idx}: {e}"))?;
+                    let elapsed_ns = t0.elapsed().as_nanos() as u64;
+                    if is_sliding {
+                        PROFILE_FA_SW_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+                        PROFILE_FA_SW_COUNT.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        PROFILE_FA_GL_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+                        PROFILE_FA_GL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("FA-profile resume L{layer_idx}: {e}"))?;
+                }
 
                 // 7. Permute sdpa_out [n_heads, seq_len, hd] → [seq_len, n_heads, hd] (bf16),
                 //    then cast bf16 → f32 for the f32-only O-proj qmatmul.
@@ -664,9 +725,21 @@ impl MlxModelWeights {
                     &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                     &[&pf_attn_out],
                 );
+                let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_sdpa_out,
                     &self.layers[layer_idx].attn.o_proj,
                     &mut pf_attn_out, seq_len as u32)?;
+                if let Some(t0) = o_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (O) L{layer_idx}: {e}"))?;
+                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (O) L{layer_idx}: {e}"))?;
+                }
 
                 // 9. Post-attn fused norm + residual add (rows = seq_len)
                 //    residual = (pre-attn hidden) + norm(attn_out, post_attn_norm)
@@ -795,6 +868,12 @@ impl MlxModelWeights {
                     &[&pf_norm_out, &pf_router_norm_out],
                     &[&pf_mlp_gate, &pf_mlp_up, &pf_router_logits],
                 );
+                let gur_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (gur) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (gur) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                     &self.layers[layer_idx].mlp.gate_proj,
                     &mut pf_mlp_gate, seq_len as u32)?;
@@ -804,6 +883,12 @@ impl MlxModelWeights {
                 dispatch_qmatmul(&mut s, reg, dev, &pf_router_norm_out,
                     &self.layers[layer_idx].moe.router_proj,
                     &mut pf_router_logits, seq_len as u32)?;
+                if let Some(t0) = gur_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (gur) L{layer_idx}: {e}"))?;
+                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MM_COUNT.fetch_add(3, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (gur) L{layer_idx}: {e}"))?;
+                }
 
                 // Fused GELU(gate) * up over [seq_len, intermediate]
                 // + batched MoE routing over [seq_len, num_experts]
@@ -843,9 +928,21 @@ impl MlxModelWeights {
                     &[&pf_mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
                     &[&pf_mlp_down],
                 );
+                let dn_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (mlp_dn) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (mlp_dn) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_mlp_fused,
                     &self.layers[layer_idx].mlp.down_proj,
                     &mut pf_mlp_down, seq_len as u32)?;
+                if let Some(t0) = dn_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (mlp_dn) L{layer_idx}: {e}"))?;
+                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (mlp_dn) L{layer_idx}: {e}"))?;
+                }
 
                 // MoE gate_up experts: quantized_matmul_id_ggml with n_tokens = seq_len
                 if self.layers[layer_idx].moe.stacked_gate_up.is_none()
@@ -859,6 +956,13 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
                     &[&pf_moe_gate_up],
                 );
+                let profile_moe = std::env::var("HF2Q_PROFILE_MOE").is_ok();
+                let moe_gu_t0 = if profile_moe {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-profile pre-finish (gu) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile begin (gu) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 s.quantized_matmul_id_ggml_pooled(
                     reg, dev,
                     &pf_moe_norm_out,
@@ -876,6 +980,12 @@ impl MlxModelWeights {
                         ggml_type: ggml_type_gu,
                     },
                 ).map_err(|e| anyhow::anyhow!("batched gate_up_id L{layer_idx}: {e}"))?;
+                if let Some(t0) = moe_gu_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-profile post-finish (gu) L{layer_idx}: {e}"))?;
+                    PROFILE_MOE_GU_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MOE_GU_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile resume (gu) L{layer_idx}: {e}"))?;
+                }
 
                 // Batched SwiGLU over [seq_len, top_k, 2*moe_int] → [seq_len, top_k, moe_int]
                 s.barrier_between(
@@ -896,6 +1006,12 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
                     &[&pf_moe_down],
                 );
+                let moe_dn_t0 = if std::env::var("HF2Q_PROFILE_MOE").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-profile pre-finish (dn) L{layer_idx}: {e}"))?;
+                    let t0 = std::time::Instant::now();
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile begin (dn) L{layer_idx}: {e}"))?;
+                    Some(t0)
+                } else { None };
                 s.quantized_matmul_id_ggml_pooled(
                     reg, dev,
                     &pf_moe_swiglu,
@@ -913,6 +1029,12 @@ impl MlxModelWeights {
                         ggml_type: ggml_type_dn,
                     },
                 ).map_err(|e| anyhow::anyhow!("batched down_id L{layer_idx}: {e}"))?;
+                if let Some(t0) = moe_dn_t0 {
+                    s.finish().map_err(|e| anyhow::anyhow!("MoE-profile post-finish (dn) L{layer_idx}: {e}"))?;
+                    PROFILE_MOE_DN_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MOE_DN_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile resume (dn) L{layer_idx}: {e}"))?;
+                }
 
                 // post-FF norm 1 on mlp_down: [seq_len, hs]
                 s.barrier_between(
@@ -1226,6 +1348,59 @@ impl MlxModelWeights {
             seq_len as f64 / elapsed.as_secs_f64(),
             first_token,
         );
+
+        // Wave P4.0 — dump per-kernel-category totals when profiling is on.
+        let prefill_ms = elapsed.as_secs_f64() * 1000.0;
+        if std::env::var("HF2Q_PROFILE_FA").is_ok() {
+            let sw_ns = PROFILE_FA_SW_NS.swap(0, Ordering::Relaxed);
+            let sw_n = PROFILE_FA_SW_COUNT.swap(0, Ordering::Relaxed);
+            let gl_ns = PROFILE_FA_GL_NS.swap(0, Ordering::Relaxed);
+            let gl_n = PROFILE_FA_GL_COUNT.swap(0, Ordering::Relaxed);
+            let total_ms = (sw_ns + gl_ns) as f64 / 1_000_000.0;
+            eprintln!(
+                "[FA_PROFILE] D=256 (SW): {} calls, {:.2} ms total ({:.3} ms/call) | \
+                 D=512 (GL): {} calls, {:.2} ms total ({:.3} ms/call) | \
+                 FA total: {:.2} ms ({:.1}% of prefill {:.1} ms)",
+                sw_n, sw_ns as f64 / 1_000_000.0,
+                if sw_n > 0 { (sw_ns as f64 / sw_n as f64) / 1_000_000.0 } else { 0.0 },
+                gl_n, gl_ns as f64 / 1_000_000.0,
+                if gl_n > 0 { (gl_ns as f64 / gl_n as f64) / 1_000_000.0 } else { 0.0 },
+                total_ms,
+                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                prefill_ms,
+            );
+        }
+        if std::env::var("HF2Q_PROFILE_MOE").is_ok() {
+            let gu_ns = PROFILE_MOE_GU_NS.swap(0, Ordering::Relaxed);
+            let gu_n = PROFILE_MOE_GU_COUNT.swap(0, Ordering::Relaxed);
+            let dn_ns = PROFILE_MOE_DN_NS.swap(0, Ordering::Relaxed);
+            let dn_n = PROFILE_MOE_DN_COUNT.swap(0, Ordering::Relaxed);
+            let total_ms = (gu_ns + dn_ns) as f64 / 1_000_000.0;
+            eprintln!(
+                "[MOE_PROFILE] gate_up: {} calls, {:.2} ms total ({:.3} ms/call) | \
+                 down: {} calls, {:.2} ms total ({:.3} ms/call) | \
+                 MoE total: {:.2} ms ({:.1}% of prefill {:.1} ms)",
+                gu_n, gu_ns as f64 / 1_000_000.0,
+                if gu_n > 0 { (gu_ns as f64 / gu_n as f64) / 1_000_000.0 } else { 0.0 },
+                dn_n, dn_ns as f64 / 1_000_000.0,
+                if dn_n > 0 { (dn_ns as f64 / dn_n as f64) / 1_000_000.0 } else { 0.0 },
+                total_ms,
+                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                prefill_ms,
+            );
+        }
+        if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+            let mm_ns = PROFILE_MM_NS.swap(0, Ordering::Relaxed);
+            let mm_n = PROFILE_MM_COUNT.swap(0, Ordering::Relaxed);
+            let total_ms = mm_ns as f64 / 1_000_000.0;
+            eprintln!(
+                "[MM_PROFILE] dense qmatmul: {} calls, {:.2} ms total ({:.3} ms/call) ({:.1}% of prefill {:.1} ms)",
+                mm_n, total_ms,
+                if mm_n > 0 { total_ms / mm_n as f64 } else { 0.0 },
+                if prefill_ms > 0.0 { 100.0 * total_ms / prefill_ms } else { 0.0 },
+                prefill_ms,
+            );
+        }
 
         // Store dense KV buffers so forward_decode can use them
         self.dense_kvs = Some(dense_kvs_vec);
