@@ -154,7 +154,10 @@ impl MlxModelWeights {
         let pf_moe_norm_out = alloc_f32(seq_len * hs, "pf_moe_norm_out")?;
         let pf_router_norm_out = alloc_f32(seq_len * hs, "pf_router_norm_out")?;
         let mut pf_attn_out = alloc_f32(seq_len * hs, "pf_attn_out")?;
-        let pf_mlp_down_out = alloc_f32(seq_len * hs, "pf_mlp_down_out")?;
+        // Wave P4.14 — pf_mlp_down_out (the intermediate normed MLP-down
+        // buffer between post-FF norm 1 and the MoE wsum+add) is no longer
+        // needed: the fused fused_moe_wsum_dnorm_add_f32 dispatch absorbs
+        // both norms and the add into one pass.
 
         let mut pf_q = alloc_f32(seq_len * nh * max_hd, "pf_q")?;
         let mut pf_k = alloc_f32(seq_len * max_nkv * max_hd, "pf_k")?;
@@ -1038,46 +1041,35 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile resume (dn) L{layer_idx}: {e}"))?;
                 }
 
-                // post-FF norm 1 on mlp_down: [seq_len, hs]
+                // Wave P4.14 — fully-fused post-MoE-down combine: in one
+                // dispatch the kernel does
+                //   normed_mlp = norm(pf_mlp_down,  post_FF_layernorm_1)
+                //   weighted   = Σ_k pf_moe_down[k] * pf_routing_weights[k]
+                //   normed_w   = norm(weighted,     post_FF_layernorm_2)
+                //   pf_mlp_down (in-place) = normed_mlp + normed_w
+                // The kernel runs two parallel sum-of-squares reductions
+                // in threadgroup memory and stashes the per-row weighted
+                // sum in shmem to avoid a global write+read.  Replaces
+                // the previous two-dispatch sequence (RMS norm of
+                // pf_mlp_down → pf_mlp_down_out, then fused_moe_wsum
+                // _norm_add) — saves 1 more dispatch per layer
+                // (30/prefill) and eliminates the pf_mlp_down_out
+                // [seq_len, hs] write+read (~5 MB × 30 = 150 MB of
+                // additional memory traffic on top of P4.13's saving).
                 s.barrier_between(
-                    &[&pf_mlp_down],
-                    &[&pf_mlp_down_out],
-                );
-                s.rms_norm(reg, metal_dev,
-                    &pf_mlp_down,
-                    &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
-                    &pf_mlp_down_out,
-                    &self.activations.norm_params,
-                    seq_len as u32, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("batched post-FF norm1 L{layer_idx}: {e}"))?;
-
-                // Batched MoE weighted sum: [seq_len, top_k, hs] with weights [seq_len, top_k]
-                //   → [seq_len, hs]
-                //
-                // Wave P4.13 — fuse MoE weighted_sum + post-FF norm2+combine
-                // into a single dispatch.  The kernel computes
-                // weighted_sum across top_k expert outputs, RMS-normalises
-                // the per-row result, multiplies by post_feedforward_
-                // layernorm_2, and adds pf_mlp_down_out — all in one pass
-                // through threadgroup memory, no global write+read of the
-                // intermediate weighted-sum buffer.
-                //
-                // Removes 1 dispatch per layer (30/prefill) and eliminates
-                // the [seq_len, hs] intermediate write+read of pf_moe_accum
-                // (~5 MB at pp2455 × 30 = 150 MB of memory traffic).
-                s.barrier_between(
-                    &[&pf_moe_down, &pf_routing_weights, &pf_mlp_down_out],
+                    &[&pf_moe_down, &pf_routing_weights, &pf_mlp_down],
                     &[&pf_mlp_down],
                 );
-                mlx_native::ops::fused_norm_add::dispatch_fused_moe_wsum_norm_add_f32(
+                mlx_native::ops::fused_norm_add::dispatch_fused_moe_wsum_dnorm_add_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_moe_down,
                     &pf_routing_weights,
-                    &pf_mlp_down_out,
+                    &pf_mlp_down,
+                    &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
                     &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
                     &pf_mlp_down,
                     hs as u32, top_k as u32, seq_len as u32, eps,
-                ).map_err(|e| anyhow::anyhow!("batched fused MoE wsum+norm+add L{layer_idx}: {e}"))?;
+                ).map_err(|e| anyhow::anyhow!("batched fused MoE wsum+dnorm+add L{layer_idx}: {e}"))?;
 
                 // End-of-layer: output = (residual + norm(mlp_down, post_feedforward_layernorm)) * scalar
                 let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
