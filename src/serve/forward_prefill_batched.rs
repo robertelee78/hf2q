@@ -39,6 +39,17 @@ use super::gpu::GpuContext;
 // contribution of each kernel category.  Each adds 2 commit_and_wait per
 // dispatch to isolate its session, so prefill total throughput will
 // REGRESS substantially when on — never enable in production.
+//
+// Wave P4.17 — HF2Q_PROFILE_BUCKETS=1 is a super-flag that turns on
+// per-op wall-clock isolation for EVERY category in the prefill forward
+// pass: setup (embed, masks, blk), per-layer (pre-attn norm, QKV, head
+// norm+RoPE, FA, post-FA permute, O, post-attn norm-add, KV copy, triple
+// norm, MLP gate/up/router, gelu+routing, MLP down, MoE gate_up, MoE
+// swiglu, MoE down, MoE wsum+dnorm+add, end-of-layer norm-add-scalar),
+// and head session (copy+final_norm, lm_head, softcap, argmax).  With
+// every op isolated, the sum of buckets accounts for the total prefill
+// wall-clock (modulo CPU encode overhead), so the "unaccounted" gap to
+// llama.cpp can be attributed category by category.
 static PROFILE_FA_SW_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FA_SW_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_FA_GL_NS: AtomicU64 = AtomicU64::new(0);
@@ -47,14 +58,62 @@ static PROFILE_MOE_GU_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_GU_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_DN_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_DN_COUNT: AtomicU64 = AtomicU64::new(0);
-static PROFILE_MM_NS: AtomicU64 = AtomicU64::new(0);
-static PROFILE_MM_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_POST_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_MOE_POST_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_NORM_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_PERMUTE_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_PERMUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// MM — split into four per-site atomics (was a single PROFILE_MM_NS).
+// HF2Q_PROFILE_MM continues to work: its emission block reads the sum.
+// HF2Q_PROFILE_BUCKETS reports them individually.
+static PROFILE_QKV_MM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_QKV_MM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_O_MM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_O_MM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MLP_GUR_MM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MLP_GUR_MM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MLP_DN_MM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_MLP_DN_MM_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Wave P4.17 bucket atomics — all gated on HF2Q_PROFILE_BUCKETS=1.
+static PROFILE_B_EMBED_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_EMBED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MASK_SW_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MASK_SW_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MASK_GL_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MASK_GL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_BLK_SW_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_BLK_SW_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_BLK_GL_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_BLK_GL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_PRE_ATTN_NORM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_PRE_ATTN_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_HEAD_NORM_ROPE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_HEAD_NORM_ROPE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_POST_FA_PERMUTE_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_POST_FA_PERMUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_POST_ATTN_NORM_ADD_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_POST_ATTN_NORM_ADD_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_KV_COPY_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_KV_COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_TRIPLE_NORM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_TRIPLE_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_GELU_MUL_ROUTING_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_GELU_MUL_ROUTING_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MOE_WSUM_ADD_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_MOE_WSUM_ADD_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_END_LAYER_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_END_LAYER_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_FINAL_NORM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_FINAL_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_LM_HEAD_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_SOFTCAP_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_SOFTCAP_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_ARGMAX_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_ARGMAX_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl MlxModelWeights {
     /// True batched prefill with single-shot dense SDPA over the whole prompt.
@@ -130,8 +189,18 @@ impl MlxModelWeights {
         // the flag is set so the default-path footprint is unchanged.
         let use_no_fa = std::env::var("HF2Q_NO_FA").is_ok();
 
-        eprintln!("Batched prefill: KV={:?}, seq_len={}, path={}", kv_dtype, seq_len,
-                  if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" });
+        // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
+        // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
+        // pairs so its wall-clock is measured; the individual bucket atomics
+        // accumulate ns and counts.  Prefill throughput REGRESSES under this
+        // flag (extra finish/begin per op ≈ 50-200 µs each, × ~15 ops/layer
+        // × 30 layers ≈ 100-150 ms of pure overhead on top of normal work),
+        // so it's a profiling-only knob.
+        let profile_buckets_on = std::env::var("HF2Q_PROFILE_BUCKETS").is_ok();
+
+        eprintln!("Batched prefill: KV={:?}, seq_len={}, path={}{}", kv_dtype, seq_len,
+                  if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" },
+                  if profile_buckets_on { " [BUCKET_PROFILE]" } else { "" });
 
         // -------------------------------------------------------------------
         // Per-layer dense KV buffers [n_kv_heads, capacity, head_dim]
@@ -353,7 +422,19 @@ impl MlxModelWeights {
             let mut s = exec.begin()
                 .map_err(|e| anyhow::anyhow!("batched setup session: {e}"))?;
 
+            // Wave P4.17 — each setup sub-step gets its own bucket timing
+            // when HF2Q_PROFILE_BUCKETS=1.  The five sub-steps (embed,
+            // sliding mask, global mask, sliding blk, global blk) are
+            // independent in the default path (no barrier_between between
+            // embed and the masks; the masks and blks serialize per-pair
+            // via explicit barriers).  Splitting them adds 4 extra commit+
+            // wait transitions (~50-200 µs each) under the profile flag;
+            // normal runs keep the single session.
+
             // 1. Embedding: token_ids -> pf_hidden (no dependency on masks/blk).
+            let t0_embed = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             s.track_dispatch(&[&self.embed_weight, &pf_token_ids], &[&pf_hidden]);
             mlx_native::ops::elementwise::embedding_gather_scale_batch_f32(
                 s.encoder_mut(), reg, metal_dev,
@@ -363,8 +444,17 @@ impl MlxModelWeights {
                 hs, seq_len,
                 (hs as f32).sqrt(),
             ).map_err(|e| anyhow::anyhow!("batched embed: {e}"))?;
+            if let Some(t0) = t0_embed {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket embed finish: {e}"))?;
+                PROFILE_B_EMBED_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_EMBED_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket embed resume: {e}"))?;
+            }
 
             // 2. Sliding-window causal mask — reused across all 25 sliding layers.
+            let t0_mask_sw = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             sliding_mask = build_sdpa_mask_bf16(
                 dev, reg, s.encoder_mut(),
                 &SdpaMaskParams {
@@ -375,8 +465,17 @@ impl MlxModelWeights {
                     q_abs_offset: 0,
                 },
             ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?;
+            if let Some(t0) = t0_mask_sw {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket mask_sw finish: {e}"))?;
+                PROFILE_B_MASK_SW_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_MASK_SW_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket mask_sw resume: {e}"))?;
+            }
 
             // 3. Global causal mask — reused across all 5 global layers.
+            let t0_mask_gl = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             global_mask = build_sdpa_mask_bf16(
                 dev, reg, s.encoder_mut(),
                 &SdpaMaskParams {
@@ -387,8 +486,17 @@ impl MlxModelWeights {
                     q_abs_offset: 0,
                 },
             ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?;
+            if let Some(t0) = t0_mask_gl {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket mask_gl finish: {e}"))?;
+                PROFILE_B_MASK_GL_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_MASK_GL_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket mask_gl resume: {e}"))?;
+            }
 
             // 4. Tile-skip classifiers — read mask, write blk bytes.
+            let t0_blk_sw = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             s.barrier_between(
                 &[&sliding_mask],
                 &[&blk_sliding],
@@ -398,7 +506,16 @@ impl MlxModelWeights {
                 &sliding_mask, &blk_sliding,
                 &blk_sliding_params,
             ).map_err(|e| anyhow::anyhow!("dispatch blk_sliding: {e}"))?;
+            if let Some(t0) = t0_blk_sw {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket blk_sw finish: {e}"))?;
+                PROFILE_B_BLK_SW_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_BLK_SW_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket blk_sw resume: {e}"))?;
+            }
 
+            let t0_blk_gl = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             s.barrier_between(
                 &[&global_mask],
                 &[&blk_global],
@@ -408,6 +525,12 @@ impl MlxModelWeights {
                 &global_mask, &blk_global,
                 &blk_global_params,
             ).map_err(|e| anyhow::anyhow!("dispatch blk_global: {e}"))?;
+            if let Some(t0) = t0_blk_gl {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket blk_gl finish: {e}"))?;
+                PROFILE_B_BLK_GL_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_BLK_GL_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket blk_gl resume: {e}"))?;
+            }
 
             s.finish()
                 .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
@@ -515,6 +638,9 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("batched attn session L{layer_idx}: {e}"))?;
 
                 // 1. Pre-attention norm over [seq_len, hs]
+                let t0_pre_attn_norm = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_hidden, &self.layers[layer_idx].norms.input_layernorm],
                     &[&pf_norm_out],
@@ -527,6 +653,12 @@ impl MlxModelWeights {
                     &self.activations.norm_params,
                     seq_len as u32, hs as u32,
                 ).map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_pre_attn_norm {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket pre_attn_norm finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_PRE_ATTN_NORM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_PRE_ATTN_NORM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket pre_attn_norm resume L{layer_idx}: {e}"))?;
+                }
 
                 // ADR-010 sub-stage dump: pf_norm_out is reused in session B
                 // for the pre-feedforward norm, so the end-of-layer dump hook
@@ -555,7 +687,7 @@ impl MlxModelWeights {
                     &[&pf_norm_out],
                     &[&pf_q, &pf_k, &pf_v],
                 );
-                let profile_mm = std::env::var("HF2Q_PROFILE_MM").is_ok();
+                let profile_mm = std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on;
                 let qkv_t0 = if profile_mm {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (qkv) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
@@ -574,8 +706,8 @@ impl MlxModelWeights {
                 }
                 if let Some(t0) = qkv_t0 {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (qkv) L{layer_idx}: {e}"))?;
-                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_MM_COUNT.fetch_add(if v_is_k { 2 } else { 3 }, Ordering::Relaxed);
+                    PROFILE_QKV_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_QKV_MM_COUNT.fetch_add(if v_is_k { 2 } else { 3 }, Ordering::Relaxed);
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (qkv) L{layer_idx}: {e}"))?;
                 }
 
@@ -595,6 +727,9 @@ impl MlxModelWeights {
                 // dispatch for Q and K (60 dispatches/prefill saved) and the
                 // intermediate pf_q_normed_bf16/pf_k_normed_bf16 buffers
                 // (~50 MB at pp2455 × 30 = 1.5 GB of memory traffic).
+                let t0_head_norm_rope = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_q, &pf_k],
                     &[&pf_q_normed, &pf_k_normed,
@@ -669,6 +804,12 @@ impl MlxModelWeights {
                     seq_len as u32,
                     hd as u32,
                 )?;
+                if let Some(t0) = t0_head_norm_rope {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket head_norm_rope finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_HEAD_NORM_ROPE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_HEAD_NORM_ROPE_COUNT.fetch_add(3, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket head_norm_rope resume L{layer_idx}: {e}"))?;
+                }
 
                 // 6. Flash-attention tiled prefill (ADR-011 Phase 2 Wave 4):
                 //    Q: [1, nh, seq_len, hd], K: [1, nkv, seq_len, hd], V: same
@@ -820,7 +961,7 @@ impl MlxModelWeights {
                 // FA-only wall-clock GPU time.  The 2 extra syncs/layer
                 // make the overall prefill slower but isolate FA's cost
                 // from QKV mm and the post-FA permute/cast.
-                let profile_fa = std::env::var("HF2Q_PROFILE_FA").is_ok();
+                let profile_fa = std::env::var("HF2Q_PROFILE_FA").is_ok() || profile_buckets_on;
                 let fa_start = if profile_fa {
                     s.finish().map_err(|e| anyhow::anyhow!("FA-profile pre-finish L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
@@ -934,6 +1075,9 @@ impl MlxModelWeights {
                 //    intermediate buffer (was 2 reads + 2 writes per layer,
                 //    now 1 read + 1 write) and removes one dispatch per
                 //    layer (30/prefill).
+                let t0_post_fa_permute = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_sdpa_out_perm],
                     &[&pf_sdpa_out],
@@ -943,6 +1087,12 @@ impl MlxModelWeights {
                     &pf_sdpa_out_perm, &pf_sdpa_out,
                     nh, seq_len, hd,
                 ).map_err(|e| anyhow::anyhow!("batched permute+cast SDPA L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_post_fa_permute {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket post_fa_permute finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_POST_FA_PERMUTE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_POST_FA_PERMUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket post_fa_permute resume L{layer_idx}: {e}"))?;
+                }
                 } // end of !use_no_fa branch
 
                 // 8. O-proj (m = seq_len): [seq_len, nh*hd] → [seq_len, hs]
@@ -950,7 +1100,7 @@ impl MlxModelWeights {
                     &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                     &[&pf_attn_out],
                 );
-                let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
@@ -961,13 +1111,16 @@ impl MlxModelWeights {
                     &mut pf_attn_out, seq_len as u32)?;
                 if let Some(t0) = o_t0 {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (O) L{layer_idx}: {e}"))?;
-                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_MM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PROFILE_O_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_O_MM_COUNT.fetch_add(1, Ordering::Relaxed);
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (O) L{layer_idx}: {e}"))?;
                 }
 
                 // 9. Post-attn fused norm + residual add (rows = seq_len)
                 //    residual = (pre-attn hidden) + norm(attn_out, post_attn_norm)
+                let t0_post_attn_norm_add = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_hidden, &pf_attn_out],
                     &[&pf_residual],
@@ -980,6 +1133,12 @@ impl MlxModelWeights {
                     &pf_residual,
                     hs as u32, seq_len as u32, eps,
                 ).map_err(|e| anyhow::anyhow!("batched post-attn L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_post_attn_norm_add {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket post_attn_norm_add finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_POST_ATTN_NORM_ADD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_POST_ATTN_NORM_ADD_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket post_attn_norm_add resume L{layer_idx}: {e}"))?;
+                }
 
                 // ------------------------------------------------------------
                 // ADR-011 Phase 3 Wave P3b.2 — merge KV cache copy into
@@ -1003,6 +1162,9 @@ impl MlxModelWeights {
                 let n_copy = seq_len.min(layer_cap);
                 let src_tok_offset = (seq_len - n_copy) as u32;
                 let dst_seq_pos_start = src_tok_offset;
+                let t0_kv_copy = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_k_normed, &pf_v_normed],
                     &[&dense_kvs_vec[layer_idx].k, &dense_kvs_vec[layer_idx].v],
@@ -1032,6 +1194,12 @@ impl MlxModelWeights {
                         src_tok_offset,
                     ).map_err(|e| anyhow::anyhow!("batched KV cache copy (f32, dual) L{layer_idx}: {e}"))?;
                 }
+                if let Some(t0) = t0_kv_copy {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket kv_copy finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_KV_COPY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_KV_COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket kv_copy resume L{layer_idx}: {e}"))?;
+                }
 
                 // ADR-011 Phase 3 Wave P3b.3 — MLP + MoE continue in the
                 // same session `s` as attention + KV copy above.  Pre-P3b.3
@@ -1056,6 +1224,9 @@ impl MlxModelWeights {
                 // in one dispatch.  Saves 2 dispatches per layer (60/prefill)
                 // and 2 reads of the [seq_len, hs] residual buffer per layer
                 // (~40 MB at pp2455 × 30 layers = 1.2 GB of read traffic).
+                let t0_triple_norm = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_residual],
                     &[&pf_norm_out, &pf_moe_norm_out, &pf_router_norm_out],
@@ -1072,13 +1243,19 @@ impl MlxModelWeights {
                     &self.activations.norm_params,
                     seq_len as u32, hs as u32,
                 ).map_err(|e| anyhow::anyhow!("batched pre-FF triple norm L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_triple_norm {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket triple_norm finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_TRIPLE_NORM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_TRIPLE_NORM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket triple_norm resume L{layer_idx}: {e}"))?;
+                }
 
                 // Dense MLP gate / up (m = seq_len); router proj (m = seq_len)
                 s.barrier_between(
                     &[&pf_norm_out, &pf_router_norm_out],
                     &[&pf_mlp_gate, &pf_mlp_up, &pf_router_logits],
                 );
-                let gur_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                let gur_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (gur) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (gur) L{layer_idx}: {e}"))?;
@@ -1095,13 +1272,16 @@ impl MlxModelWeights {
                     &mut pf_router_logits, seq_len as u32)?;
                 if let Some(t0) = gur_t0 {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (gur) L{layer_idx}: {e}"))?;
-                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_MM_COUNT.fetch_add(3, Ordering::Relaxed);
+                    PROFILE_MLP_GUR_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MLP_GUR_MM_COUNT.fetch_add(3, Ordering::Relaxed);
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (gur) L{layer_idx}: {e}"))?;
                 }
 
                 // Fused GELU(gate) * up over [seq_len, intermediate]
                 // + batched MoE routing over [seq_len, num_experts]
+                let t0_gelu_mul_routing = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_mlp_gate, &pf_mlp_up, &pf_router_logits],
                     &[&pf_mlp_fused, &pf_expert_ids, &pf_routing_weights],
@@ -1132,13 +1312,19 @@ impl MlxModelWeights {
                     &self.layers[layer_idx].moe.per_expert_scale,
                     num_experts as u32, top_k as u32, seq_len as u32,
                 ).map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_gelu_mul_routing {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket gelu_mul_routing finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_GELU_MUL_ROUTING_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_GELU_MUL_ROUTING_COUNT.fetch_add(2, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket gelu_mul_routing resume L{layer_idx}: {e}"))?;
+                }
 
                 // Dense MLP down
                 s.barrier_between(
                     &[&pf_mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
                     &[&pf_mlp_down],
                 );
-                let dn_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() {
+                let dn_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (mlp_dn) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (mlp_dn) L{layer_idx}: {e}"))?;
@@ -1149,8 +1335,8 @@ impl MlxModelWeights {
                     &mut pf_mlp_down, seq_len as u32)?;
                 if let Some(t0) = dn_t0 {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (mlp_dn) L{layer_idx}: {e}"))?;
-                    PROFILE_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_MM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PROFILE_MLP_DN_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_MLP_DN_MM_COUNT.fetch_add(1, Ordering::Relaxed);
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile resume (mlp_dn) L{layer_idx}: {e}"))?;
                 }
 
@@ -1166,7 +1352,7 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
                     &[&pf_moe_gate_up],
                 );
-                let profile_moe = std::env::var("HF2Q_PROFILE_MOE").is_ok();
+                let profile_moe = std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on;
                 let moe_gu_t0 = if profile_moe {
                     s.finish().map_err(|e| anyhow::anyhow!("MoE-profile pre-finish (gu) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
@@ -1202,7 +1388,7 @@ impl MlxModelWeights {
                     &[&pf_moe_gate_up],
                     &[&pf_moe_swiglu],
                 );
-                let swiglu_t0 = if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() {
+                let swiglu_t0 = if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile pre-finish (swiglu) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile begin (swiglu) L{layer_idx}: {e}"))?;
@@ -1228,7 +1414,7 @@ impl MlxModelWeights {
                       self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
                     &[&pf_moe_down],
                 );
-                let moe_dn_t0 = if std::env::var("HF2Q_PROFILE_MOE").is_ok() {
+                let moe_dn_t0 = if std::env::var("HF2Q_PROFILE_MOE").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MoE-profile pre-finish (dn) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-profile begin (dn) L{layer_idx}: {e}"))?;
@@ -1273,6 +1459,9 @@ impl MlxModelWeights {
                 // (30/prefill) and eliminates the pf_mlp_down_out
                 // [seq_len, hs] write+read (~5 MB × 30 = 150 MB of
                 // additional memory traffic on top of P4.13's saving).
+                let t0_moe_wsum_add = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&pf_moe_down, &pf_routing_weights, &pf_mlp_down],
                     &[&pf_mlp_down],
@@ -1287,8 +1476,17 @@ impl MlxModelWeights {
                     &pf_mlp_down,
                     hs as u32, top_k as u32, seq_len as u32, eps,
                 ).map_err(|e| anyhow::anyhow!("batched fused MoE wsum+dnorm+add L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_moe_wsum_add {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket moe_wsum_add finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_MOE_WSUM_ADD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_MOE_WSUM_ADD_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket moe_wsum_add resume L{layer_idx}: {e}"))?;
+                }
 
                 // End-of-layer: output = (residual + norm(mlp_down, post_feedforward_layernorm)) * scalar
+                let t0_end_layer = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
                 s.barrier_between(
                     &[&pf_residual, &pf_mlp_down],
@@ -1304,6 +1502,12 @@ impl MlxModelWeights {
                     seq_len as u32, hs as u32, eps,
                     scalar_is_vector,
                 ).map_err(|e| anyhow::anyhow!("batched end-layer L{layer_idx}: {e}"))?;
+                if let Some(t0) = t0_end_layer {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket end_layer finish L{layer_idx}: {e}"))?;
+                    PROFILE_B_END_LAYER_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_END_LAYER_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket end_layer resume L{layer_idx}: {e}"))?;
+                }
 
                 // Layer-boundary commit.  In production, we use `s.commit()`
                 // (no wait) so the GPU runs this layer while the CPU encodes
@@ -1330,7 +1534,8 @@ impl MlxModelWeights {
                 //     for bisecting cross-layer correctness issues.
                 let sync_per_layer = batched_dump.is_some()
                     || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
-                    || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok();
+                    || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
+                    || profile_buckets_on;
                 if sync_per_layer {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
@@ -1508,6 +1713,9 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("batched head session: {e}"))?;
 
             // Copy last row of pf_hidden ([seq_len, hs]) into activations.hidden ([hs])
+            let t0_final_norm = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             s.barrier_between(
                 &[&pf_hidden],
                 &[&self.activations.hidden],
@@ -1533,8 +1741,17 @@ impl MlxModelWeights {
                 &self.activations.norm_params,
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("batched final norm: {e}"))?;
+            if let Some(t0) = t0_final_norm {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket final_norm finish: {e}"))?;
+                PROFILE_B_FINAL_NORM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_FINAL_NORM_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket final_norm resume: {e}"))?;
+            }
 
             // lm_head: whichever weight was loaded (Q8 for large vocab×hs, F16 otherwise).
+            let t0_lm_head = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
                     &[&self.activations.norm_out, &q8.buffer],
@@ -1562,8 +1779,17 @@ impl MlxModelWeights {
             } else {
                 anyhow::bail!("batched prefill requires GPU lm_head (F16 or Q8 weight)");
             }
+            if let Some(t0) = t0_lm_head {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket lm_head finish: {e}"))?;
+                PROFILE_B_LM_HEAD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_LM_HEAD_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket lm_head resume: {e}"))?;
+            }
 
             if let Some(cap) = self.final_logit_softcapping {
+                let t0_softcap = if profile_buckets_on {
+                    Some(std::time::Instant::now())
+                } else { None };
                 s.barrier_between(
                     &[&self.activations.logits],
                     &[&self.activations.logits],
@@ -1575,8 +1801,17 @@ impl MlxModelWeights {
                     &self.activations.softcap_params,
                     cap,
                 ).map_err(|e| anyhow::anyhow!("batched softcap: {e}"))?;
+                if let Some(t0) = t0_softcap {
+                    s.finish().map_err(|e| anyhow::anyhow!("bucket softcap finish: {e}"))?;
+                    PROFILE_B_SOFTCAP_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    PROFILE_B_SOFTCAP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket softcap resume: {e}"))?;
+                }
             }
 
+            let t0_argmax = if profile_buckets_on {
+                Some(std::time::Instant::now())
+            } else { None };
             s.barrier_between(
                 &[&self.activations.logits],
                 &[&self.activations.argmax_index, &self.activations.argmax_value],
@@ -1589,6 +1824,12 @@ impl MlxModelWeights {
                 &self.activations.argmax_params,
                 vocab_size as u32,
             ).map_err(|e| anyhow::anyhow!("batched argmax: {e}"))?;
+            if let Some(t0) = t0_argmax {
+                s.finish().map_err(|e| anyhow::anyhow!("bucket argmax finish: {e}"))?;
+                PROFILE_B_ARGMAX_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROFILE_B_ARGMAX_COUNT.fetch_add(1, Ordering::Relaxed);
+                s = exec.begin().map_err(|e| anyhow::anyhow!("bucket argmax resume: {e}"))?;
+            }
 
             s.finish()
                 .map_err(|e| anyhow::anyhow!("batched head finish: {e}"))?;
@@ -1650,8 +1891,20 @@ impl MlxModelWeights {
             );
         }
         if std::env::var("HF2Q_PROFILE_MM").is_ok() {
-            let mm_ns = PROFILE_MM_NS.swap(0, Ordering::Relaxed);
-            let mm_n = PROFILE_MM_COUNT.swap(0, Ordering::Relaxed);
+            // Sum across the four per-site atomics.  These are also fed by
+            // HF2Q_PROFILE_BUCKETS; if bucket profiling already swapped them,
+            // this emission will see zeros and that's fine — both flags
+            // don't cooperate, only one is meaningful per run.
+            let qkv_ns = PROFILE_QKV_MM_NS.load(Ordering::Relaxed);
+            let qkv_n  = PROFILE_QKV_MM_COUNT.load(Ordering::Relaxed);
+            let o_ns   = PROFILE_O_MM_NS.load(Ordering::Relaxed);
+            let o_n    = PROFILE_O_MM_COUNT.load(Ordering::Relaxed);
+            let gur_ns = PROFILE_MLP_GUR_MM_NS.load(Ordering::Relaxed);
+            let gur_n  = PROFILE_MLP_GUR_MM_COUNT.load(Ordering::Relaxed);
+            let dn_ns  = PROFILE_MLP_DN_MM_NS.load(Ordering::Relaxed);
+            let dn_n   = PROFILE_MLP_DN_MM_COUNT.load(Ordering::Relaxed);
+            let mm_ns = qkv_ns + o_ns + gur_ns + dn_ns;
+            let mm_n  = qkv_n + o_n + gur_n + dn_n;
             let total_ms = mm_ns as f64 / 1_000_000.0;
             eprintln!(
                 "[MM_PROFILE] dense qmatmul: {} calls, {:.2} ms total ({:.3} ms/call) ({:.1}% of prefill {:.1} ms)",
@@ -1678,6 +1931,117 @@ impl MlxModelWeights {
         // sub-category profiling waves.
         let _ = (PROFILE_NORM_NS.load(Ordering::Relaxed), PROFILE_NORM_COUNT.load(Ordering::Relaxed),
                  PROFILE_PERMUTE_NS.load(Ordering::Relaxed), PROFILE_PERMUTE_COUNT.load(Ordering::Relaxed));
+
+        // Wave P4.17 — comprehensive BUCKET_PROFILE breakdown.  Sum across
+        // every instrumented category should approximately equal the
+        // prefill wall-clock; the residual is CPU encode + commit/finish
+        // overhead that the per-op sync pattern introduces.
+        if profile_buckets_on {
+            let fetch = |ns: &AtomicU64, cnt: &AtomicU64| -> (f64, u64) {
+                let n_ns = ns.swap(0, Ordering::Relaxed);
+                let n_cnt = cnt.swap(0, Ordering::Relaxed);
+                (n_ns as f64 / 1_000_000.0, n_cnt)
+            };
+            let pct = |ms: f64| -> f64 {
+                if prefill_ms > 0.0 { 100.0 * ms / prefill_ms } else { 0.0 }
+            };
+            let per = |ms: f64, n: u64| -> f64 {
+                if n > 0 { ms / n as f64 } else { 0.0 }
+            };
+
+            // Startup sub-buckets.
+            let (embed_ms, embed_n)       = fetch(&PROFILE_B_EMBED_NS, &PROFILE_B_EMBED_COUNT);
+            let (mask_sw_ms, mask_sw_n)   = fetch(&PROFILE_B_MASK_SW_NS, &PROFILE_B_MASK_SW_COUNT);
+            let (mask_gl_ms, mask_gl_n)   = fetch(&PROFILE_B_MASK_GL_NS, &PROFILE_B_MASK_GL_COUNT);
+            let (blk_sw_ms, blk_sw_n)     = fetch(&PROFILE_B_BLK_SW_NS, &PROFILE_B_BLK_SW_COUNT);
+            let (blk_gl_ms, blk_gl_n)     = fetch(&PROFILE_B_BLK_GL_NS, &PROFILE_B_BLK_GL_COUNT);
+            let startup_ms = embed_ms + mask_sw_ms + mask_gl_ms + blk_sw_ms + blk_gl_ms;
+
+            // Per-layer sub-buckets.
+            let (pre_norm_ms, pre_norm_n) = fetch(&PROFILE_B_PRE_ATTN_NORM_NS, &PROFILE_B_PRE_ATTN_NORM_COUNT);
+            let (qkv_ms, qkv_n)           = fetch(&PROFILE_QKV_MM_NS, &PROFILE_QKV_MM_COUNT);
+            let (hnr_ms, hnr_n)           = fetch(&PROFILE_B_HEAD_NORM_ROPE_NS, &PROFILE_B_HEAD_NORM_ROPE_COUNT);
+            let (fa_sw_ms, fa_sw_n)       = fetch(&PROFILE_FA_SW_NS, &PROFILE_FA_SW_COUNT);
+            let (fa_gl_ms, fa_gl_n)       = fetch(&PROFILE_FA_GL_NS, &PROFILE_FA_GL_COUNT);
+            let (post_fa_perm_ms, post_fa_perm_n) = fetch(&PROFILE_B_POST_FA_PERMUTE_NS, &PROFILE_B_POST_FA_PERMUTE_COUNT);
+            let (o_ms, o_n)               = fetch(&PROFILE_O_MM_NS, &PROFILE_O_MM_COUNT);
+            let (post_attn_na_ms, post_attn_na_n) = fetch(&PROFILE_B_POST_ATTN_NORM_ADD_NS, &PROFILE_B_POST_ATTN_NORM_ADD_COUNT);
+            let (kv_copy_ms, kv_copy_n)   = fetch(&PROFILE_B_KV_COPY_NS, &PROFILE_B_KV_COPY_COUNT);
+            let (triple_ms, triple_n)     = fetch(&PROFILE_B_TRIPLE_NORM_NS, &PROFILE_B_TRIPLE_NORM_COUNT);
+            let (gur_ms, gur_n)           = fetch(&PROFILE_MLP_GUR_MM_NS, &PROFILE_MLP_GUR_MM_COUNT);
+            let (gelu_mul_r_ms, gelu_mul_r_n) = fetch(&PROFILE_B_GELU_MUL_ROUTING_NS, &PROFILE_B_GELU_MUL_ROUTING_COUNT);
+            let (mlp_dn_ms, mlp_dn_n)     = fetch(&PROFILE_MLP_DN_MM_NS, &PROFILE_MLP_DN_MM_COUNT);
+            let (moe_gu_ms, moe_gu_n)     = fetch(&PROFILE_MOE_GU_NS, &PROFILE_MOE_GU_COUNT);
+            let (moe_sw_ms, moe_sw_n)     = fetch(&PROFILE_MOE_POST_NS, &PROFILE_MOE_POST_COUNT);
+            let (moe_dn_ms, moe_dn_n)     = fetch(&PROFILE_MOE_DN_NS, &PROFILE_MOE_DN_COUNT);
+            let (moe_ws_ms, moe_ws_n)     = fetch(&PROFILE_B_MOE_WSUM_ADD_NS, &PROFILE_B_MOE_WSUM_ADD_COUNT);
+            let (end_layer_ms, end_layer_n) = fetch(&PROFILE_B_END_LAYER_NS, &PROFILE_B_END_LAYER_COUNT);
+
+            // Head sub-buckets.
+            let (final_norm_ms, final_norm_n) = fetch(&PROFILE_B_FINAL_NORM_NS, &PROFILE_B_FINAL_NORM_COUNT);
+            let (lm_head_ms, lm_head_n)   = fetch(&PROFILE_B_LM_HEAD_NS, &PROFILE_B_LM_HEAD_COUNT);
+            let (softcap_ms, softcap_n)   = fetch(&PROFILE_B_SOFTCAP_NS, &PROFILE_B_SOFTCAP_COUNT);
+            let (argmax_ms, argmax_n)     = fetch(&PROFILE_B_ARGMAX_NS, &PROFILE_B_ARGMAX_COUNT);
+            let head_ms = final_norm_ms + lm_head_ms + softcap_ms + argmax_ms;
+
+            let sum_ms = startup_ms
+                + pre_norm_ms + qkv_ms + hnr_ms + fa_sw_ms + fa_gl_ms
+                + post_fa_perm_ms + o_ms + post_attn_na_ms + kv_copy_ms
+                + triple_ms + gur_ms + gelu_mul_r_ms + mlp_dn_ms
+                + moe_gu_ms + moe_sw_ms + moe_dn_ms + moe_ws_ms + end_layer_ms
+                + head_ms;
+            let residual_ms = prefill_ms - sum_ms;
+
+            let sep = "------------------------------------------------------------------";
+            let row5 = |name: &str, ms: f64, n: u64| {
+                eprintln!("{:<32} {:>8.3}  {:>5.1}%  {:>5}  {:>8.3}",
+                    name, ms, pct(ms), n, per(ms, n));
+            };
+            let row3 = |name: &str, ms: f64, p: f64| {
+                eprintln!("{:<32} {:>8.2}  {:>5.1}%", name, ms, p);
+            };
+            eprintln!("[BUCKET_PROFILE] pp={} prefill={:.2} ms (tok/s={:.1}) path={}",
+                seq_len, prefill_ms, seq_len as f64 / (prefill_ms / 1000.0),
+                if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" });
+            eprintln!("{:<32} {:>8}  {:>6}  {:>5}  {:>8}", "CATEGORY", "ms", "%", "calls", "ms/call");
+            eprintln!("{sep}");
+            let startup_n = embed_n + mask_sw_n + mask_gl_n + blk_sw_n + blk_gl_n;
+            eprintln!("{:<32} {:>8.2}  {:>5.1}%  {:>5}  {:>8}",
+                "STARTUP (setup total)", startup_ms, pct(startup_ms), startup_n, "—");
+            row5("  embed",         embed_ms,   embed_n);
+            row5("  mask_sliding",  mask_sw_ms, mask_sw_n);
+            row5("  mask_global",   mask_gl_ms, mask_gl_n);
+            row5("  blk_sliding",   blk_sw_ms,  blk_sw_n);
+            row5("  blk_global",    blk_gl_ms,  blk_gl_n);
+            eprintln!("{sep}");
+            row5("PRE_ATTN_NORM",             pre_norm_ms,     pre_norm_n);
+            row5("QKV_MM",                    qkv_ms,          qkv_n);
+            row5("HEAD_NORM_ROPE (Q+K+V)",    hnr_ms,          hnr_n);
+            row5("FA_SW (D=256)",             fa_sw_ms,        fa_sw_n);
+            row5("FA_GL (D=512)",             fa_gl_ms,        fa_gl_n);
+            row5("POST_FA_PERMUTE",           post_fa_perm_ms, post_fa_perm_n);
+            row5("O_MM",                      o_ms,            o_n);
+            row5("POST_ATTN_NORM_ADD",        post_attn_na_ms, post_attn_na_n);
+            row5("KV_COPY",                   kv_copy_ms,      kv_copy_n);
+            row5("TRIPLE_RMS_NORM",           triple_ms,       triple_n);
+            row5("MLP_GUR_MM",                gur_ms,          gur_n);
+            row5("GELU_MUL + MOE_ROUTING",    gelu_mul_r_ms,   gelu_mul_r_n);
+            row5("MLP_DN_MM",                 mlp_dn_ms,       mlp_dn_n);
+            row5("MOE_GATE_UP",               moe_gu_ms,       moe_gu_n);
+            row5("MOE_SWIGLU",                moe_sw_ms,       moe_sw_n);
+            row5("MOE_DOWN",                  moe_dn_ms,       moe_dn_n);
+            row5("MOE_WSUM_DNORM_ADD",        moe_ws_ms,       moe_ws_n);
+            row5("END_LAYER_NORM_ADD_SCALAR", end_layer_ms,    end_layer_n);
+            eprintln!("{sep}");
+            row5("FINAL_NORM (copy + rms)",   final_norm_ms, final_norm_n);
+            row5("LM_HEAD",                   lm_head_ms,    lm_head_n);
+            row5("SOFTCAP",                   softcap_ms,    softcap_n);
+            row5("ARGMAX",                    argmax_ms,     argmax_n);
+            eprintln!("{sep}");
+            row3("SUM OF BUCKETS",        sum_ms,      pct(sum_ms));
+            row3("PREFILL TOTAL",         prefill_ms,  100.0);
+            row3("RESIDUAL (sync + CPU)", residual_ms, pct(residual_ms));
+        }
 
         // Store dense KV buffers so forward_decode can use them
         self.dense_kvs = Some(dense_kvs_vec);
