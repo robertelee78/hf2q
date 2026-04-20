@@ -1132,48 +1132,80 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("FA-profile resume L{layer_idx}: {e}"))?;
                 }
 
-                // 7. Fused permute + bf16→f32 cast on sdpa_out:
-                //    [n_heads, seq_len, hd] bf16 → [seq_len, n_heads, hd] f32.
-                //    Wave P4.10 — replaces the prior two-pass sequence
-                //    (permute_021_bf16 → cast_bf16_to_f32) with a single
-                //    dispatch.  Halves global-memory traffic on the
-                //    intermediate buffer (was 2 reads + 2 writes per layer,
-                //    now 1 read + 1 write) and removes one dispatch per
-                //    layer (30/prefill).
-                let t0_post_fa_permute = if profile_buckets_on {
-                    Some(std::time::Instant::now())
-                } else { None };
-                s.barrier_between(
-                    &[&pf_sdpa_out_perm],
-                    &[&pf_sdpa_out],
-                );
-                mlx_native::ops::transpose::permute_021_bf16_to_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &pf_sdpa_out_perm, &pf_sdpa_out,
-                    nh, seq_len, hd,
-                ).map_err(|e| anyhow::anyhow!("batched permute+cast SDPA L{layer_idx}: {e}"))?;
-                if let Some(t0) = t0_post_fa_permute {
-                    s.finish().map_err(|e| anyhow::anyhow!("bucket post_fa_permute finish L{layer_idx}: {e}"))?;
-                    PROFILE_B_POST_FA_PERMUTE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_B_POST_FA_PERMUTE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    s = exec.begin().map_err(|e| anyhow::anyhow!("bucket post_fa_permute resume L{layer_idx}: {e}"))?;
-                }
+                // Wave P4.19 — POST_FA_PERMUTE elimination.
+                //
+                // Pre-P4.19 we ran a dedicated `permute_021_bf16_to_f32`
+                // dispatch here that transposed `pf_sdpa_out_perm`
+                // ([n_heads, seq_len, head_dim] bf16, natively written by
+                // flash-attention) into `pf_sdpa_out`
+                // ([seq_len, n_heads*head_dim] f32) for the O-proj
+                // matmul's f32 input contract.  The dispatch cost ~11 ms
+                // in the bucket profile at pp2455 and ~30 MB of write+
+                // read traffic per layer (~900 MB across the prefill).
+                //
+                // Wave P4.19 teaches the O-proj matmul kernel to read
+                // `pf_sdpa_out_perm` DIRECTLY via a bf16-input perm021
+                // variant (`kernel_mul_mm_q{4_0,6_K}_tensor_bf16_perm021`
+                // in quantized_matmul_mm_tensor.metal).  The B-stage of
+                // the kernel maps logical (m, k) to physical
+                // (h = k/hd, t = m, f = k%hd) and converts bf16→half at
+                // staging time.
+                //
+                // Byte-exact equivalence:
+                //   old path: bf16 -> (cast dispatch) f32 -> (mm B-stage) half
+                //   new path: bf16 -> (mm B-stage) half
+                // Both produce identical half bits because bfloat->float
+                // is pure bit-expansion and the float->half RNE round
+                // drops the zero-pad low 16 bits without changing the
+                // result.  Verified against sourdough gate.
                 } // end of !use_no_fa branch
 
-                // 8. O-proj (m = seq_len): [seq_len, nh*hd] → [seq_len, hs]
-                s.barrier_between(
-                    &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
-                    &[&pf_attn_out],
-                );
+                // 8. O-proj (m = seq_len): [seq_len, nh*hd] -> [seq_len, hs]
+                //
+                // Branches on use_no_fa:
+                //   * !use_no_fa (default FA path): O-proj reads pf_sdpa_out_perm
+                //       [n_heads, seq_len, head_dim] bf16 directly via the
+                //       perm021 tensor-mm variant (Wave P4.19) — no permute
+                //       dispatch needed.
+                //   * use_no_fa (experimental tensor-mm attention path):
+                //       the NO_FA attention steps already permute the
+                //       attention output into [seq_len, n_heads, head_dim]
+                //       f32 at pf_sdpa_out, so O-proj reads pf_sdpa_out as
+                //       before via the standard f32 tensor-mm path.
                 let o_t0 = if std::env::var("HF2Q_PROFILE_MM").is_ok() || profile_buckets_on {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile pre-finish (O) L{layer_idx}: {e}"))?;
                     let t0 = std::time::Instant::now();
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else { None };
-                dispatch_qmatmul(&mut s, reg, dev, &pf_sdpa_out,
-                    &self.layers[layer_idx].attn.o_proj,
-                    &mut pf_attn_out, seq_len as u32)?;
+                if use_no_fa {
+                    s.barrier_between(
+                        &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
+                        &[&pf_attn_out],
+                    );
+                    dispatch_qmatmul(&mut s, reg, dev, &pf_sdpa_out,
+                        &self.layers[layer_idx].attn.o_proj,
+                        &mut pf_attn_out, seq_len as u32)?;
+                } else {
+                    s.barrier_between(
+                        &[&pf_sdpa_out_perm, &self.layers[layer_idx].attn.o_proj.buffer],
+                        &[&pf_attn_out],
+                    );
+                    let o_info = &self.layers[layer_idx].attn.o_proj.info;
+                    mlx_native::quantized_matmul_mm_tensor_perm021(
+                        s.encoder_mut(), reg, dev,
+                        &pf_sdpa_out_perm,
+                        &self.layers[layer_idx].attn.o_proj.buffer,
+                        &mut pf_attn_out,
+                        &mlx_native::GgmlQuantizedMatmulPerm021Params {
+                            m: seq_len as u32,
+                            n: o_info.rows as u32,
+                            k: o_info.cols as u32,
+                            head_dim: hd as u32,
+                            ggml_type: o_info.ggml_dtype,
+                        },
+                    ).map_err(|e| anyhow::anyhow!("batched O-proj perm021 L{layer_idx}: {e}"))?;
+                }
                 if let Some(t0) = o_t0 {
                     s.finish().map_err(|e| anyhow::anyhow!("MM-profile post-finish (O) L{layer_idx}: {e}"))?;
                     PROFILE_O_MM_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
