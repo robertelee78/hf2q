@@ -1053,43 +1053,31 @@ impl MlxModelWeights {
 
                 // Batched MoE weighted sum: [seq_len, top_k, hs] with weights [seq_len, top_k]
                 //   → [seq_len, hs]
+                //
+                // Wave P4.13 — fuse MoE weighted_sum + post-FF norm2+combine
+                // into a single dispatch.  The kernel computes
+                // weighted_sum across top_k expert outputs, RMS-normalises
+                // the per-row result, multiplies by post_feedforward_
+                // layernorm_2, and adds pf_mlp_down_out — all in one pass
+                // through threadgroup memory, no global write+read of the
+                // intermediate weighted-sum buffer.
+                //
+                // Removes 1 dispatch per layer (30/prefill) and eliminates
+                // the [seq_len, hs] intermediate write+read of pf_moe_accum
+                // (~5 MB at pp2455 × 30 = 150 MB of memory traffic).
                 s.barrier_between(
-                    &[&pf_moe_down, &pf_routing_weights],
-                    &[&pf_moe_accum],
+                    &[&pf_moe_down, &pf_routing_weights, &pf_mlp_down_out],
+                    &[&pf_mlp_down],
                 );
-                let wsum_t0 = if std::env::var("HF2Q_PROFILE_MOE_POST").is_ok() {
-                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile pre-finish (wsum) L{layer_idx}: {e}"))?;
-                    let t0 = std::time::Instant::now();
-                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile begin (wsum) L{layer_idx}: {e}"))?;
-                    Some(t0)
-                } else { None };
-                mlx_native::ops::moe_dispatch::moe_weighted_sum_seq_encode(
+                mlx_native::ops::fused_norm_add::dispatch_fused_moe_wsum_norm_add_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &pf_moe_down,
                     &pf_routing_weights,
-                    &pf_moe_accum,
-                    hs, top_k, seq_len,
-                ).map_err(|e| anyhow::anyhow!("batched MoE weighted_sum L{layer_idx}: {e}"))?;
-                if let Some(t0) = wsum_t0 {
-                    s.finish().map_err(|e| anyhow::anyhow!("MoE-post-profile post-finish (wsum) L{layer_idx}: {e}"))?;
-                    PROFILE_MOE_POST_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    PROFILE_MOE_POST_COUNT.fetch_add(1, Ordering::Relaxed);
-                    s = exec.begin().map_err(|e| anyhow::anyhow!("MoE-post-profile resume (wsum) L{layer_idx}: {e}"))?;
-                }
-
-                // post-FF norm 2 + combine MLP + MoE: output = mlp_down_out + norm(moe_accum)
-                s.barrier_between(
-                    &[&pf_mlp_down_out, &pf_moe_accum],
-                    &[&pf_mlp_down],
-                );
-                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                    s.encoder_mut(), reg, metal_dev,
                     &pf_mlp_down_out,
-                    &pf_moe_accum,
                     &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
                     &pf_mlp_down,
-                    hs as u32, seq_len as u32, eps,
-                ).map_err(|e| anyhow::anyhow!("batched post-FF norm2+combine L{layer_idx}: {e}"))?;
+                    hs as u32, top_k as u32, seq_len as u32, eps,
+                ).map_err(|e| anyhow::anyhow!("batched fused MoE wsum+norm+add L{layer_idx}: {e}"))?;
 
                 // End-of-layer: output = (residual + norm(mlp_down, post_feedforward_layernorm)) * scalar
                 let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
