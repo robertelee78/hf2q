@@ -1,10 +1,59 @@
 # ADR-007: TurboQuant KV Cache Compression for 262K Context
 
-**Status:** Proposed  
-**Date:** 2026-04-14  
-**Decision Makers:** Robert, Claude  
-**Related ADRs:** ADR-006 (mlx-native GPU backend — KV cache path lives here), ADR-005 (inference server — speed gates)  
+**Status:** Partially Implemented — End-to-End Correctness UNVERIFIED; dormant on default path since 2026-04-16 (ADR-009 Track 3 fallback)
+**Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite)
+**Decision Makers:** Robert, Claude
+**Related ADRs:** ADR-006 (mlx-native GPU backend — KV cache path lives here), ADR-005 (inference server — speed gates), ADR-008 (candle-divorce port — introduced ring-chronology regression), ADR-009 (Track 3 dense-SDPA "safe fallback" — the stub this ADR's mantra forbids)
 **Reference:** Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874, April 2025)
+
+---
+
+## Current Status (2026-04-21 — honest rewrite)
+
+**One sentence:** The kernels exist and pass isolated replay tests, but the full pipeline is gated off on the default path; TQ encode runs every decode token while TQ decode never fires, so we pay the cost without the benefit.
+
+### What actually exists in code
+
+| Component | Path | Status | Notes |
+|---|---|---|---|
+| `hadamard_quantize_kv_fast_d256/d512` shader | `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal` | Built, replay-test max_err < 0.001 | SIMD-shuffle FWHT, 1 simdgroup/head, zero threadgroup barriers |
+| `dispatch_hadamard_quantize_kv` (single-token) | `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs` | Built, called every decode step AND every non-batched prefill token | Always fires when `!HF2Q_SKIP_TQ_ENCODE`, even when dense path will read |
+| `dispatch_hadamard_quantize_kv_seq` (seq wrapper) | `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs` (commit `a28783e`) | Built on 2026-04-21. Not yet wired into main; needed for batched prefill population | Iterates cleared single-token kernel with buffer byte offsets — no shader changes |
+| `flash_attn_vec_tq`, `flash_attn_vec_tq_v2` | `/opt/mlx-native/src/shaders/flash_attn_vec_tq*.metal` | Built, cleared by replay test | Reads packed nibbles + per-position norm + pre-rotated centroid table |
+| TQ SDPA decode branch | `forward_mlx.rs:1258–1300` approx (post-revert line numbers vary) | **UNREACHABLE on default path** | Gated by `use_dense_sdpa = self.dense_kvs.is_some()`; `dense_kvs` is always populated |
+| Dense SDPA decode branch (Track 3 fallback) | `forward_mlx.rs:1264–1410` approx | **Active on default path** | Reads dense F32 KV the prefill stored in `self.dense_kvs` |
+| Ring-chronology fix (Codex) | `forward_mlx.rs` + `forward_prefill{_batched}.rs` — branch `cfa/cfa-20260421-111303-tq-revival/codex`, commits `e9fd6fc` + `415c9d6` | Preserved on branch; **reverted from main** 2026-04-21 (`e0f33c1`) because sourdough-byte-exact still fails at 69 bytes with the fix | Real bug: `kv_write_pos` was the pre-write slot but decode read it as `ring_start` for a full ring. Fix: `(write_pos + 1) % capacity` when the ring is full |
+
+### What does NOT exist
+
+1. **TQ as the active decode read path.** Removed on merge + reverted same session (see "Capitulation" below).
+2. **Byte-identical sourdough passing with TQ-only.** Fails at 69 bytes with Codex's fix applied; passes at 3656 bytes only when the dense fallback is active.
+3. **Any measurement at long context (pp > 8K) with TQ as read path.** ADR-007 Phase 2 gates (F-1 262K OOM, F-4 needle-in-haystack, P-2 decode speed at 262K) were never exercised because decode never read from TQ.
+4. **Realized memory savings.** Both `self.kv_caches[].k_packed` (TQ, ~750 MiB at pp65k) AND `self.dense_kvs[].k` (F32, ~6 GiB at pp65k) are allocated on the default path. We hold 6.75 GiB of KV — **worse** than dense-only.
+5. **Phase 0 validation evidence.** The Phase 0.1/0.2/0.3 gates (Hadamard-vs-random MSE, gather throughput, Hadamard overhead) do not have written measurement reports in `docs/` or `/tmp/`. Phase 0 appears to have been skipped.
+
+### The capitulation (2026-04-16 ADR-009 Track 3)
+
+Commit history `3472689..HEAD` shows: TQ was integrated end-to-end, sourdough failed at 69 bytes, the response was to introduce `dense_kvs` as a "Track 3 safe fallback" rather than root-cause the regression. This ADR's own mantra section says:
+
+> **No fallback. No stub (todo later) code.**
+
+`use_dense_sdpa = dense_kvs.is_some()` is the literal pattern the mantra forbids. Every decode currently runs the TQ encode (~0.14 ms/token) AND the dense SDPA read — cost paid, benefit unrealized.
+
+### Today's session (2026-04-21) findings
+
+Dual-mode CFA `cfa-20260421-111303-tq-revival`:
+
+- **Claude team:** concluded infeasible based on the kernel test's `nrmse < 0.15` assertion. Verdict: "4-bit cannot byte-match F16". That conclusion was **wrong framing** — the replay test `max_err < 0.001` from 5-day-old memory says the kernel round-trip is much tighter than `nrmse < 0.15` (which is the unit-test safety margin, not the realized precision on natural inputs).
+- **Codex team:** found a real off-by-one bug in TQ's `ring_start` computation — decode passed the pre-write slot as "oldest surviving" when after the write that slot holds the newest token. Fix (commit `e9fd6fc`) makes the ring chronology correct. Coherent output restored with TQ-only decode. But **sourdough still fails at 69 bytes** with the fix applied.
+- **Batched-prefill population gap:** `forward_prefill_batched.rs` only populated `dense_kvs_vec` (local) — never the TQ cache. With the dense fallback removed, batched prefill + decode produced garbage because decode read an uninitialized TQ cache. My extension (commit `415c9d6`) adds TQ encode to batched prefill via the new `dispatch_hadamard_quantize_kv_seq` wrapper.
+- **Reverted** the merge (`e0f33c1`) because sourdough-byte-exact remains at 69 bytes even with all known fixes. Main is back to the dense-fallback state; branch preserved.
+
+**Unresolved:** Is the 69-byte divergence after Codex's fix
+- (a) a remaining **bug** (a second port-time regression we haven't isolated), or
+- (b) the genuine **representation floor** of 4-bit Lloyd-Max KV quantization accumulated over 30 layers?
+
+We have not executed the layer-by-layer divergence audit that would distinguish these. That audit is the gating step described in "Path to Completion" below.
 
 ---
 
@@ -20,6 +69,8 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim.
 - **Measure 3x, cut once** — Phase 0 validates correctness (logit match) before Phase 1 touches the SDPA kernel. Phase 2 benchmarks bandwidth savings before Phase 3 lifts the context cap. No step proceeds without measurement.
 - **No fallback** — the F16 KV cache path is deleted once TurboQuant is validated. No feature flag, no dual-path. Clean stack.
 - **Never make assumptions** — the research swarm (5 agents, 2026-04-14) produced concrete FLOP counts, bandwidth estimates, and kernel architecture analysis. Every claim in this ADR has a derivation. Where a claim depends on an untested hypothesis (e.g., gather throughput in SDPA), it is flagged as Phase 0 measurement work.
+
+**2026-04-21 addendum — we have shipped a stub.** The ADR-009 Track 3 `dense_kvs` fallback is the "no fallback, no stub" violation the mantra forbids. Phase 0 was skipped (no measurement reports exist for 0.1/0.2/0.3). The 69-byte sourdough regression that drove the fallback was never root-caused; the response was to gate TQ decode off on the default path. The debt is: (1) execute Phase 0 with written evidence, (2) run a layer-by-layer divergence audit between the dense F32 path and the TQ path on identical inputs to localize the 69-byte regression to a specific op or confirm it as representation noise, (3) only then choose between "fix and remove dense_kvs" vs "ship TQ as opt-in with a TQ-specific quality gate".
 
 ---
 
@@ -200,11 +251,13 @@ Compression: **5.96×**.
 
 ## Implementation Plan
 
-### Phase 0 — Validate & Measure (Chesterton's fence + measure 3x)
+### Phase 0 — Validate & Measure (Chesterton's fence + measure 3x) — **STATUS: SKIPPED**
 
 **Goal:** Prove TurboQuant preserves coherence and measure gather throughput on M5 Max.
 
-**0.1 — CPU reference implementation**
+**As of 2026-04-21, no written measurement report for any Phase 0 subtask exists in `docs/` or `/tmp/`.** The kernels went straight to integration; this ADR's `Chesterton's fence + measure 3x` discipline was not executed. The 69-byte sourdough regression that triggered the Track 3 fallback is the direct consequence.
+
+**0.1 — CPU reference implementation — [ ] NOT DONE**
 - Implement Hadamard + Lloyd-Max quantize/dequantize in pure Rust (no GPU)
 - Validate: quantize a KV vector, dequantize, measure MSE vs paper's bounds
 - Validate: run a full forward pass with CPU-side quantize/dequantize intercepting the KV cache write/read, compare logits to F16 baseline
@@ -213,85 +266,96 @@ Compression: **5.96×**.
 - **Fixed channel split validation:** After Hadamard rotation of 1000 KV vectors, measure per-coordinate magnitude variance. Identify top-d/4 highest-magnitude coordinates per vector; measure overlap ratio across vectors. **Gate:** If overlap < 50% (outlier channels are position-dependent), revisit fixed-split assumption. Expected: overlap is low but magnitudes are near-uniform, confirming fixed split is sufficient.
 - **Gate:** Top-1 token agreement on 100-token greedy decode at 8K context. If top-1 disagrees on >2 tokens, investigate before proceeding.
 
-**0.2 — Gather throughput microbench**
+**0.2 — Gather throughput microbench — [ ] NOT DONE**
 - Write a standalone Metal kernel that reads from a nibble-packed buffer using index-based gather (simulating SDPA cache reads)
 - Measure throughput vs sequential F16 reads at capacity=8192 and capacity=262144
 - **Gate:** Gather throughput ≥ 50% of sequential F16 throughput. If below 50%, the bandwidth savings from smaller representation are negated by gather penalty — revisit the architecture (consider dequant-to-temp-buffer instead).
 
-**0.3 — Hadamard transform microbench**
+**0.3 — Hadamard transform microbench — [ ] NOT DONE**
 - Write a standalone Metal kernel for in-place FWHT at d=128, 256, 512
 - Measure latency per head and total per-token overhead across all layers
 - **Gate:** Total Hadamard overhead ≤ 200 μs/token (< 2% of decode budget).
 
-### Phase 1 — Metal Kernels
+**0.4 — NEW — Layer-by-layer divergence audit — [ ] NOT DONE, GATING**
+(Added 2026-04-21.) Dump Q, K, V, attention-weight matrix, and sdpa_out at each of the 30 layers for the SAME decode step under two configurations:
+  - config A: dense F32 KV decode (current default)
+  - config B: TQ-packed KV decode (Codex branch `cfa/cfa-20260421-111303-tq-revival/codex`)
+
+Compare per-layer tensors. The FIRST layer where A vs B diverges by more than the kernel replay-test bound (~1e-3 element-wise) is the bug site. If no layer shows super-threshold divergence and the 69-byte fail is just layer-30 logit perturbation from accumulated <1e-3 error, the divergence is representation-limited and requires a quality metric other than byte-exact-vs-F16.
+
+**Gate:** A localization to within a single layer+op OR written evidence that the aggregated error is within the Lloyd-Max theoretical distortion bound (Theorem 1 in the paper: MSE ≤ 0.009 at 4-bit for Gaussian inputs). No further integration work until this audit has a written conclusion.
+
+### Phase 1 — Metal Kernels — **STATUS: [x] kernels built, [?] correctness gates unverified on Phase-0 CPU reference (since there is no Phase-0 CPU reference), [x] integration done, [ ] integration sourdough gate FAILS**
 
 **Goal:** Replace F16 KV cache with TurboQuant on GPU.
 
-**1.1 — `hadamard_quantize_kv` kernel**
+**1.1 — `hadamard_quantize_kv` kernel — [x] BUILT**
 - Metal compute kernel: FWHT + normalize + quantize + nibble-pack
-- One threadgroup per head, d threads per threadgroup
-- Shared memory for butterfly stages
-- **Correctness gate:** Output indices match CPU reference from Phase 0.1 exactly (bitwise on indices, ε < 1e-6 on norms)
+- One threadgroup per head (fast variant uses 1 simdgroup/head, zero threadgroup barriers)
+- **Correctness gate:** Output indices match CPU reference from Phase 0.1 exactly (bitwise on indices, ε < 1e-6 on norms) — **[?] ASSERTED but not verified against a CPU reference because Phase 0.1 was skipped.** Kernel has an internal replay test (`tests/test_flash_attn_vec_tq.rs`) with `assert!(nrmse < 0.15)` — that is a unit-test safety margin, not evidence of Phase-1 correctness-gate compliance.
 
-**1.2 — Pre-rotated centroid table computation**
+**1.2 — Pre-rotated centroid table computation — [x] BUILT**
 - At model load, apply inverse Hadamard to each of the 2^b centroid vectors
 - Store as `[2^b, head_dim]` F32 Metal buffer per layer
-- **Correctness gate:** `H^(-1) · centroid` round-trips to original centroid within ε < 1e-7
+- **Correctness gate:** `H^(-1) · centroid` round-trips to original centroid within ε < 1e-7 — **[?] ASSERTED, Phase-0-less.**
 
-**1.3 — `flash_attn_vec_tq` kernel**
-- Fork `flash_attn_vec`, replace F16 cache loads with:
-  - Nibble extraction from packed buffer
-  - Gather from pre-rotated centroid table
-  - F32 dot product and value accumulation
+**1.3 — `flash_attn_vec_tq` kernel — [x] BUILT**
+- Fork `flash_attn_vec`, replace F16 cache loads with nibble-unpack + centroid gather + dot product
 - Keep the existing workgroup partitioning and reduce pattern
-- **Correctness gate:** SDPA output matches CPU reference from Phase 0.1 within ε < 1e-4
-- **Sourdough gate:** Full 100-token greedy decode matches F16 path output through ≥95 tokens
+- **Correctness gate:** SDPA output matches CPU reference from Phase 0.1 within ε < 1e-4 — **[?] Phase-0-less.** 5-day-old memory claims replay-test max_err < 0.001 on isolated kernel input; that's necessary but not sufficient for the ε < 1e-4 end-to-end gate.
+- **Sourdough gate:** Full 100-token greedy decode matches F16 path output through ≥95 tokens — **[ ] FAILS.** With Codex's ring fix applied, decode diverges at byte 69 (~token 15-20). Without the fix, at ~13 tokens.
 
-**1.4 — Integration into `forward_mlx.rs`**
-- Replace `MlxKvCache` fields: `k: MlxBuffer` (F16) → `k_packed: MlxBuffer` (u8 nibble) + `k_norms: MlxBuffer` (F32)
-- Replace `dispatch_kv_cache_copy_batch_f32_to_f16` calls with `hadamard_quantize_kv` dispatch
-- Replace `flash_attn_vec` calls with `flash_attn_vec_tq` dispatch
-- Add centroid table buffers to `MlxForwardState`
-- For 2.5-bit mode: add both 2-bit and 3-bit pre-rotated centroid tables per layer
-- **Dispatch count gate:** Total dispatches per forward pass must not increase vs pre-TurboQuant baseline at the same model configuration and context length. (Do not hardcode a specific number — it varies by model config.)
-- **Sourdough gate:** Byte-identical 16-token greedy gen at T=0 vs llama.cpp at 8K context. (At longer contexts where quantization error accumulates, this gate relaxes to top-1 agreement ≥ 95/100 tokens.)
+**1.4 — Integration into `forward_mlx.rs` — [x] CODE INTEGRATED, [ ] GATED OFF, [ ] SOURDOUGH FAILS**
+- `MlxKvCache` fields updated: `k_packed: MlxBuffer` (u8 nibble) + `k_norms: MlxBuffer` (F32) — **[x] DONE**
+- `dispatch_kv_cache_copy_batch_f32_to_f16` replaced with `hadamard_quantize_kv` dispatch — **[x] DONE for non-batched prefill and decode**
+- Batched-prefill TQ cache population — **[ ] NOT ON MAIN.** Was added on branch `cfa/.../codex` via `dispatch_hadamard_quantize_kv_seq` (commit `415c9d6`); reverted with the merge.
+- `flash_attn_vec` replaced with `flash_attn_vec_tq` on decode — **[?] CODE PRESENT AT forward_mlx.rs:~1258, BUT UNREACHABLE.** Gated by `use_dense_sdpa = self.dense_kvs.is_some()` which is always `true` because prefill unconditionally populates `self.dense_kvs`. **This is the ADR-009 Track 3 fallback — the mantra-violating stub.**
+- Centroid table buffers added to model state — **[x] DONE**
+- 2.5-bit mode — **[ ] NOT IMPLEMENTED.** Current code is uniform 4-bit. The 2.5-bit channel split remains a paper design that was never coded.
+- **Dispatch count gate:** Total dispatches per forward pass must not increase vs pre-TurboQuant baseline — **[ ] NOT MEASURED** (because Phase 0 was skipped, there is no "pre-TurboQuant baseline" bucket count to compare against).
+- **Sourdough gate:** Byte-identical 16-token greedy gen at T=0 vs llama.cpp at 8K context — **[ ] FAILS on default path with TQ-only (if dense fallback were removed). PASSES on default path only because the Track 3 dense fallback is active.** This is the correctness failure that drove the fallback; it has never been root-caused.
 
-### Phase 2 — 262K Context Unlock
+### Phase 2 — 262K Context Unlock — **STATUS: [ ] BLOCKED by Phase 1.4 sourdough failure**
 
 **Goal:** Remove the 8192 cap and validate at full context length.
 
-**2.1 — Remove the cap**
+Phase 2 cannot start until TQ decode is actually the read path (Phase 1.4 end gate). Today TQ decode is unreachable on the default path, so 262K testing has only ever exercised the dense fallback — which is the thing we wanted TQ to replace. See recent CFA `cfa-20260420-204542-longctx-stress` for today's dense-path long-ctx measurements (`project_long_prefill_parity_inverts.md`): at pp65536 the dense F32 path is 92% slower than llama's F16 path and the first-decode-token at pp65536 is 0 (potential silent corruption — undiagnosed).
+
+**2.1 — Remove the cap — [ ] NOT DONE**
 - Delete `let max_global_kv = 8192;` (grep to locate; line number may have shifted)
 - Set `capacity = cfg.max_position_embeddings` for global layers
 - Validate memory allocation succeeds on M5 Max 192 GB
 
-**2.2 — Memory budget validation**
+**2.2 — Memory budget validation — [ ] NOT DONE**
 - Measure actual RSS with 262K context KV cache allocated
 - **Gate:** Total KV cache allocation ≤ 1,400 MB (nibble packing) or ≤ 900 MB (true mixed-width packing if implemented)
 - If nibble packing exceeds 1,400 MB, implement true mixed-width packing before proceeding
 
-**2.3 — Long-context correctness**
+**Note:** measuring memory savings requires removing the dense-F32 allocation first (see Phase 1.4 stub). Today `dense_kvs` and `kv_caches.*_packed` coexist, giving **worse** total KV memory than dense alone.
+
+**2.3 — Long-context correctness — [ ] NOT DONE**
 - Needle-in-haystack test: insert a unique fact at various positions in a 100K+ token document, verify retrieval
 - **Gate:** Retrieval accuracy ≥ 95% at all insertion positions (paper reports 99.7%)
 
-**2.4 — Long-context performance**
+**2.4 — Long-context performance — [ ] NOT DONE**
 - 5-run median benchmark at 8K, 32K, 131K, 262K context lengths
 - Measure decode tok/s at each length
 - **Gate:** Decode speed at 262K ≥ 80 tok/s on M5 Max (conservative; estimate is ~105 tok/s)
 
-### Phase 3 — Optimization (only if Phase 2 gates are met)
+### Phase 3 — Optimization — **STATUS: [ ] BLOCKED by Phase 2**
 
-**3.1 — True mixed-width packing** (if not already done in Phase 2)
+**3.1 — True mixed-width packing — [ ] NOT DONE**
 - For 2.5-bit mode: pack 3-bit channels densely (8 indices → 24 bits = 3 bytes) and 2-bit channels densely (4 indices → 8 bits = 1 byte)
 - Custom extraction logic in SDPA kernel keyed on the compile-time channel split boundary
 - **Gate:** Memory reduction ≥ 35% vs nibble packing
 
-**3.2 — Configurable bit-width** (already wired in Phase 1 via `--kv-bits`)
+**3.2 — Configurable bit-width — [ ] NOT DONE**
 - Supported modes: `--kv-bits <2|2.5|3|4>`, where 2.5 activates fixed channel splitting
 - Default: 3 (best quality/memory tradeoff)
 - Lloyd-Max codebooks for all integer widths (2, 3, 4) already baked in; 2.5-bit uses both 2-bit and 3-bit codebooks
+- **Current state:** uniform 4-bit nibble-packed only; `--kv-bits` flag does not exist
 
-**3.3 — Per-layer adaptive bit-width**
+**3.3 — Per-layer adaptive bit-width — [ ] NOT DONE**
 - Sliding layers (small cache, 1024 positions): use 4-bit TurboQuant (minimal memory impact, highest quality)
 - Global layers (large cache, 262K positions): use 2-3 bit (maximum savings where it matters)
 - No F16 KV path remains for any layer type after Phase 1
@@ -299,38 +363,97 @@ Compression: **5.96×**.
 
 ---
 
-## Acceptance Criteria (End Gates)
+## Acceptance Criteria (End Gates) — 2026-04-21 STATUS
+
+Legend: [ ] not started, [~] partially done / unverified, [x] done + evidence, [✗] attempted and failed.
 
 ### Functional
 
-- [ ] **F-1:** Full 262,144-token context supported without OOM on M5 Max 192 GB
-- [ ] **F-2:** All KV cache layers use TurboQuant_mse with Hadamard rotation — no F16 KV path remains for any layer type (sliding or global)
-- [ ] **F-3:** Sourdough gate passes at 8K context: byte-identical 16-token greedy gen at T=0 vs llama.cpp. At contexts >8K, relaxed gate: top-1 token agreement ≥ 95/100 on greedy decode
-- [ ] **F-4:** Needle-in-haystack retrieval accuracy ≥ 95% at 100K+ tokens
-- [ ] **F-5:** Lloyd-Max codebooks for 2, 3, and 4-bit widths baked into binary as compile-time constants. 2.5-bit mode uses both 2-bit and 3-bit codebooks with fixed channel split
+- [ ] **F-1:** Full 262,144-token context supported without OOM on M5 Max 192 GB — never exercised with TQ as read path
+- [✗] **F-2:** All KV cache layers use TurboQuant_mse with Hadamard rotation — no F16 KV path remains for any layer type (sliding or global) — **VIOLATED.** `self.dense_kvs` (F32, not even F16) is the default decode read path via `use_dense_sdpa = dense_kvs.is_some()`
+- [✗] **F-3:** Sourdough gate passes at 8K context: byte-identical 16-token greedy gen at T=0 vs llama.cpp — **FAILS at byte 69 with TQ-only path (Codex's ring fix applied); PASSES at 3656 bytes only because the Track 3 dense-F32 fallback is active.** Relaxed gate (top-1 ≥ 95/100) has not been separately measured with TQ-only
+- [ ] **F-4:** Needle-in-haystack retrieval accuracy ≥ 95% at 100K+ tokens — never run
+- [~] **F-5:** Lloyd-Max codebooks for 2, 3, and 4-bit widths baked into binary — **only 4-bit exists.** No 2 / 3 / 2.5-bit codebooks
 
 ### Performance
 
-- [ ] **P-1:** KV cache memory at 262K context ≤ 1,400 MB (nibble) or ≤ 900 MB (true mixed-width packing)
-- [ ] **P-2:** Decode speed at 262K context ≥ 80 tok/s on M5 Max (5-run median)
-- [ ] **P-3:** Decode speed at 8K context: no regression vs current F16 path (≥ 94 tok/s, 5-run median)
-- [ ] **P-4:** Hadamard + quantize overhead ≤ 200 μs/token total across all layers
-- [ ] **P-5:** Dispatch count per forward pass: unchanged from pre-TurboQuant baseline at same model config and context length
-- [ ] **P-6:** Gather throughput in SDPA ≥ 50% of sequential F16 throughput (Phase 0 microbench)
+- [ ] **P-1:** KV cache memory at 262K context ≤ 1,400 MB — never measured. Current default allocates BOTH dense F32 AND TQ-packed — strictly worse than dense alone
+- [ ] **P-2:** Decode speed at 262K context ≥ 80 tok/s — never measured with TQ as read path
+- [~] **P-3:** Decode speed at 8K context: no regression vs current F16 path — today with TQ encode firing and dense SDPA reading, n_gen=128 ~ 106.8 tok/s (matches spec). The encode cost (~0.14 ms/token ≈ 15 tok/s at short ctx) is paid on the default path
+- [ ] **P-4:** Hadamard + quantize overhead ≤ 200 μs/token total across all layers — never isolated-measured
+- [ ] **P-5:** Dispatch count per forward pass: unchanged from pre-TurboQuant baseline — no pre-TurboQuant baseline was captured
+- [ ] **P-6:** Gather throughput in SDPA ≥ 50% of sequential F16 throughput — Phase 0.2 microbench skipped
 
 ### Quality
 
-- [ ] **Q-1:** Top-1 token agreement with F16 baseline ≥ 98/100 on greedy decode at 8K context
-- [ ] **Q-2:** LongBench average score ≥ 49.0 (paper: 49.44 at 2.5-bit, baseline: 50.06)
-- [ ] **Q-3:** No catastrophic attention flattening at any layer (validate via attention entropy monitoring in Phase 1)
+- [ ] **Q-1:** Top-1 token agreement with F16 baseline ≥ 98/100 on greedy decode at 8K context — never measured on TQ-only path
+- [ ] **Q-2:** LongBench average score ≥ 49.0 — never measured
+- [ ] **Q-3:** No catastrophic attention flattening at any layer — Phase-0.4 layer-by-layer divergence audit (added 2026-04-21) gates this
 
 ### Engineering
 
-- [ ] **E-1:** Zero new Metal dispatches per forward pass vs pre-TurboQuant baseline (modify existing kernels, don't add new ones)
-- [ ] **E-2:** No C/C++ dependencies added (pure Rust + Metal shading language, consistent with project constraints)
-- [ ] **E-3:** Centroid tables and Hadamard computation are deterministic (no runtime randomness — the Hadamard matrix is fixed, not random)
-- [ ] **E-4:** All new Metal kernels have standalone microbench tests in `mlx-native`
-- [ ] **E-5:** Each phase commits + pushes on completion (per `feedback_commit_push_cadence.md`)
+- [~] **E-1:** Zero new Metal dispatches per forward pass vs pre-TurboQuant baseline — no baseline captured; current code actually issues MORE dispatches because both dense KV copy AND TQ encode fire
+- [x] **E-2:** No C/C++ dependencies added — compliant
+- [x] **E-3:** Centroid tables and Hadamard computation are deterministic — compliant
+- [~] **E-4:** All new Metal kernels have standalone microbench tests in `mlx-native` — `tests/test_flash_attn_vec_tq.rs` + `benches/bench_sdpa_tq.rs` exist; Hadamard transform + gather throughput microbenches do NOT exist
+- [x] **E-5:** Each phase commits + pushes on completion — compliant
+
+### Mantra compliance
+
+- [✗] **No fallback, no stub.** ADR-009 Track 3 `dense_kvs` is both. It is the dominant reason the gates above are [ ]/[✗].
+- [✗] **Measure 3x, cut once.** Phase 0 skipped → 1.4 sourdough failed → fallback added instead of root-cause. Each of the three cuts was premature.
+- [~] **Chesterton's fence.** `use_dense_sdpa` introduced with a comment but without a measurement report. The fence was put up, but the audit that justifies it is owed.
+- [x] **No C/C++ deps, pure Rust + Metal.** Compliant.
+- [ ] **Dive deep before changing.** The 69-byte regression has not had a layer-by-layer divergence audit — Phase 0.4 (new) is the remedy.
+
+---
+
+## Path to Completion (2026-04-21)
+
+Mantra-grounded, ordered, each step cites the mantra principle that governs it.
+
+**C-0. Layer-by-layer divergence audit on branch `cfa/cfa-20260421-111303-tq-revival/codex`.**
+(Mantra: "Always dive deep and ensure you know the problem you're solving.")
+Dump Q, K, V, attention-weight, and sdpa_out at each of the 30 layers for decode step N under two configurations on IDENTICAL prior-layer inputs:
+  - dense F32 KV (today's default)
+  - TQ-packed KV (Codex branch)
+Find the first layer where pairs diverge by more than the kernel replay-test bound (~1e-3). If a single op is implicated (likely candidates: per-head norm, O-proj, residual add, lm_head — ADR-008 port candidates), fix that op. If divergence accumulates gracefully across all 30 layers within Lloyd-Max theoretical distortion, document that the byte-exact sourdough gate is the wrong metric for TQ and design a TQ-specific gate.
+
+**Exit state:** written report + concrete next action of "fix op X" or "representation floor confirmed, design gate Y".
+
+**C-1. Phase 0.1 — CPU reference + Hadamard-vs-random + Gaussian-vs-Beta codebook.**
+(Mantra: "Measure 3x, cut once. Never make assumptions.")
+Pure-Rust CPU reference. Hadamard MSE ≤ 1.2× random MSE gate. Gaussian codebook MSE ≤ 1.05× Beta-optimal gate. Written report.
+
+**C-2. Phase 0.2 — Gather throughput microbench.**
+(Mantra: "Measure 3x.")
+Standalone Metal kernel gather vs sequential at capacity {8192, 262144}. Gate: gather ≥ 50% sequential. Written report.
+
+**C-3. Phase 0.3 — Hadamard transform microbench.**
+(Mantra: "Measure 3x.")
+Standalone FWHT at d={128, 256, 512}. Gate: total Hadamard ≤ 200 μs/token. Written report.
+
+**C-4. Remove the Track 3 stub, based on C-0 outcome.**
+(Mantra: "No fallback. No stub (todo later) code.")
+Two branches:
+  - If C-0 found a fixable bug: apply fix. Delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
+  - If C-0 found representation-floor: introduce `--kv-mode {f16, tq4}`. When `f16`, disable TQ encode (save the 0.14 ms/token). When `tq4`, disable dense fallback. `f16` is default; `tq4` is opt-in for long-ctx memory savings. Adjust sourdough gate to run in both modes with appropriate criteria (byte-exact for `f16`; TQ-specific quality metric for `tq4`).
+
+No third option. No new "Track 4 safe fallback."
+
+**C-5. Phase 2 — 262K unlock.**
+(Mantra: "No short cuts. Done the right way.")
+Only after C-4. Remove the 8192 cap. Needle-in-haystack. Benchmark.
+
+**C-6. Phase 3 — bit-width configurability.**
+(Mantra: "Just pure excellence.")
+Land `--kv-bits {2, 2.5, 3, 4}`, per-layer adaptive, true mixed-width packing. Only after C-5.
+
+### Governing constraints (all steps)
+
+- **Plenty of time.** No schedule pressure justifies skipping Phase 0 again.
+- **Never assume.** The "4-bit representation floor" hypothesis remains UNVERIFIED; the "ring off-by-one is the only bug" hypothesis remains UNVERIFIED. C-0 ends both.
+- **Chesterton's fence.** The `use_dense_sdpa` gate was put up for a reason (69-byte regression). That reason must be localized before the fence comes down.
 
 ---
 
