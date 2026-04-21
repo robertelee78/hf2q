@@ -56,13 +56,15 @@ def get_op_shape(layer, op):
         else:  # k_normed, v_normed
             return 2048, (8, 256)
 
-THRESHOLD = 1e-3          # max_abs_diff gate
-NRMSE_KERNEL_BOUND = 0.15 # declared kernel replay-test bound
-NRMSE_DRILLDOWN    = 0.10 # 2/3 of 0.15 — triggers drilldown warning
-
-THRESHOLD = 1e-3          # max_abs_diff gate
-NRMSE_KERNEL_BOUND = 0.15 # declared kernel replay-test bound
-NRMSE_DRILLDOWN    = 0.10 # 2/3 of 0.15 — triggers drilldown warning
+# Thresholds.
+# THRESHOLD (analyst's internal breach trigger, held at 1e-3 for continuity with
+# earlier sessions). This is NOT the kernel test's declared max_abs gate.
+# MAX_AD_KERNEL_BOUND is the kernel test's own declared ceiling (test_flash_attn_vec_tq.rs:403).
+# NRMSE_KERNEL_BOUND is the kernel test's nrmse ceiling (test_flash_attn_vec_tq.rs:399).
+THRESHOLD            = 1e-3  # analyst internal breach trigger
+MAX_AD_KERNEL_BOUND  = 1.0   # kernel test: assert!(max_abs_diff < 1.0)
+NRMSE_KERNEL_BOUND   = 0.15  # kernel test: assert!(nrmse < 0.15)
+NRMSE_DRILLDOWN      = 0.10  # 2/3 of 0.15 — triggers drilldown warning
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def load_tensor(root, layer, seq_pos, op):
@@ -81,15 +83,26 @@ def load_tensor(root, layer, seq_pos, op):
 
 
 def diff_metrics(d, t):
-    """Compute diff metrics between two arrays of the same shape."""
+    """Compute diff metrics between two arrays of the same shape.
+
+    nrmse formula matches mlx-native/tests/test_flash_attn_vec_tq.rs (lines 384-388):
+        nrmse = sqrt(sum_sq_diff / sum_sq_ref)
+    (CORRECTED 2026-04-21 — prior formula used |dense|.mean() as denominator, which
+    under-measured against the kernel's own declared bound. See queen-directive
+    in cfa-20260421-C0-audit for the review trail.)
+    """
     diff      = d - t
     abs_diff  = np.abs(diff)
     max_ad    = float(abs_diff.max())
     mean_ad   = float(abs_diff.mean())
     mse       = float(np.mean(diff ** 2))
-    denom     = float(np.abs(d).mean()) + 1e-12
-    nrmse     = float(np.sqrt(mse) / denom)
-    rel_err   = 100.0 * mean_ad / denom
+    # kernel-test nrmse: sqrt(sum_sq_diff / sum_sq_ref)
+    sum_sq_diff = float((diff.astype(np.float64) * diff.astype(np.float64)).sum())
+    sum_sq_ref  = float((d.astype(np.float64) * d.astype(np.float64)).sum())
+    nrmse     = float(np.sqrt(sum_sq_diff / sum_sq_ref)) if sum_sq_ref > 0.0 else 0.0
+    # rel_err_pct kept on the old denom purely as an auxiliary human-scale metric
+    denom_legacy = float(np.abs(d).mean()) + 1e-12
+    rel_err   = 100.0 * mean_ad / denom_legacy
     dense_mag = float(np.abs(d).mean())
     tq_mag    = float(np.abs(t).mean())
     return max_ad, mean_ad, mse, nrmse, rel_err, dense_mag, tq_mag
