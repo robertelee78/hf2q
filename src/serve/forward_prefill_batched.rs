@@ -2079,6 +2079,9 @@ impl MlxModelWeights {
             let row3 = |name: &str, ms: f64, p: f64| {
                 eprintln!("{:<32} {:>8.2}  {:>5.1}%", name, ms, p);
             };
+            // [BUCKET_PROFILE] header is key=value pairs (pp, prefill, tok/s, path,
+            // time_source). Parse by key, not position — time_source= was added when
+            // HF2Q_PROFILE_GPU_TS=1 landed and distinguishes CPU vs GPU wall-clock.
             eprintln!("[BUCKET_PROFILE] pp={} prefill={:.2} ms (tok/s={:.1}) path={} time_source={}",
                 seq_len, prefill_ms, seq_len as f64 / (prefill_ms / 1000.0),
                 if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" },
