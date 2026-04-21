@@ -282,13 +282,7 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
             dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
         }
-        let max_nh = nh;
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
-        let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
-            max_nh as u32, max_hd as u32);
-        let sdpa_tmp = dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
-            .map_err(|e| anyhow::anyhow!("batched sdpa_tmp: {e}"))?;
-
         // -------------------------------------------------------------------
         // Batched activation buffers (seq_len × ...)
         // -------------------------------------------------------------------
@@ -2126,10 +2120,6 @@ impl MlxModelWeights {
             row3("PREFILL TOTAL",         prefill_ms,  100.0);
             row3("RESIDUAL (sync + CPU)", residual_ms, pct(residual_ms));
         }
-
-        // Store dense KV buffers so forward_decode can use them
-        self.dense_kvs = Some(dense_kvs_vec);
-        self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         // Metal-1 — safety-net stop in case the layer-range end was
         // beyond the actual layer count (shouldn't happen with valid
