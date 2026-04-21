@@ -862,6 +862,11 @@ impl MlxModelWeights {
             last_token,
         );
 
+        // Store dense KV buffers on self so forward_decode can use them
+        // for dense attention during the decode phase (ADR-009 Track 3).
+        self.dense_kvs = Some(dense_kvs_vec);
+        self.dense_sdpa_tmp = Some(sdpa_tmp);
+
         Ok(last_token)
     }
 }

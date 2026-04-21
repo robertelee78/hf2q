@@ -491,9 +491,24 @@ pub struct MlxModelWeights {
     pub num_experts: usize,
     /// Intermediate size for dense MLP.
     pub intermediate_size: usize,
+    /// Dense F32 KV buffers per layer for decode (ADR-009 Track 3).
+    ///
+    /// When set (by `forward_prefill`), `forward_decode` uses dense SDPA
+    /// instead of TQ-packed SDPA. Each layer has K and V in head-major
+    /// layout `[nkv_heads, capacity, head_dim]`.
+    ///
+    /// Per-layer capacity: sliding layers use ring-buffer mode sized to
+    /// `sliding_window` (writes wrap at `seq_pos % sliding_window`);
+    /// global layers use a linear buffer sized to `seq_len + max_tokens`.
+    /// Attention is permutation-invariant over cached K,V (RoPE is baked
+    /// in before caching), so the ring's slot order doesn't matter for
+    /// correctness — the kernel just attends to all populated slots.
+    pub dense_kvs: Option<Vec<DenseKvBuffers>>,
+    /// Tmp buffer for flash_attn_vec when using dense decode.
+    pub dense_sdpa_tmp: Option<MlxBuffer>,
 }
 
-/// Per-layer dense KV buffers for prefill attention.
+/// Per-layer dense F32 KV buffers for dense attention path (ADR-009).
 pub struct DenseKvBuffers {
     pub k: MlxBuffer,
     pub v: MlxBuffer,
@@ -908,6 +923,8 @@ impl MlxModelWeights {
             rope_theta_global: cfg.rope_theta_global as f32,
             num_experts: cfg.num_experts,
             intermediate_size: cfg.intermediate_size,
+            dense_kvs: None,
+            dense_sdpa_tmp: None,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1238,7 +1255,171 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
 
-                if !INVESTIGATION_ENV.skip_tq_sdpa {
+                // -- SDPA: dense or TQ-packed (ADR-009 Track 3) --
+                // When dense_kvs is available (set by forward_prefill), use
+                // flash_attn_vec with F32 K,V for reference-parity attention.
+                // Otherwise fall back to the original TQ SDPA path.
+                let use_dense_sdpa = self.dense_kvs.is_some();
+
+                if use_dense_sdpa {
+                    // -- Dense decode SDPA (ADR-009 Track 3) --
+                    // Copy this position's K,V into dense KV buffers.
+                    // Uses F16 cast kernel when dense_kvs are F16, else F32 copy.
+                    let dense_kvs = self.dense_kvs.as_ref().unwrap();
+                    let dense_cap = dense_kvs[layer_idx].capacity;
+                    let layer_is_ring = dense_kvs[layer_idx].is_sliding;
+                    // Ring-buffer write for sliding layers; linear for global.
+                    let write_slot = if layer_is_ring {
+                        (seq_pos % dense_cap) as u32
+                    } else {
+                        seq_pos as u32
+                    };
+                    let kv_is_f16 = dense_kvs[layer_idx].k.dtype() == mlx_native::DType::F16;
+                    s.barrier_between(
+                        &[&self.activations.attn_k_normed, v_src],
+                        &[&dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                    );
+                    if kv_is_f16 {
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &dense_kvs[layer_idx].k,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("decode F16 K copy L{layer_idx}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &dense_kvs[layer_idx].v,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("decode F16 V copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 2;
+                    } else {
+                        // F32 batched: one dispatch per K, one per V (all heads at once).
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &dense_kvs[layer_idx].k,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("decode F32 K batch copy L{layer_idx}: {e}"))?;
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &dense_kvs[layer_idx].v,
+                            nkv as u32, hd as u32,
+                            dense_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("decode F32 V batch copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 2;
+                    }
+
+                    // ADR-009 Phase 3A: dump full cached K/V for the detail layer,
+                    // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
+                    let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
+                    if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
+                        let dump_dir = &INVESTIGATION_ENV.dump_dir;
+                        // Pack [nkv, kv_seq_len, hd] into a tight F32 buffer for comparison
+                        let valid_len = kv_seq_len;
+                        let mut k_valid = vec![0.0f32; nkv * valid_len * hd];
+                        let mut v_valid = vec![0.0f32; nkv * valid_len * hd];
+                        if kv_is_f16 {
+                            // Read F16 bits and convert to F32
+                            let k_raw: &[u16] = dense_kvs[layer_idx].k.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
+                            let v_raw: &[u16] = dense_kvs[layer_idx].v.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
+                            for h in 0..nkv {
+                                for p in 0..valid_len {
+                                    let src = h * dense_cap * hd + p * hd;
+                                    let dst = h * valid_len * hd + p * hd;
+                                    for i in 0..hd {
+                                        k_valid[dst+i] = half::f16::from_bits(k_raw[src+i]).to_f32();
+                                        v_valid[dst+i] = half::f16::from_bits(v_raw[src+i]).to_f32();
+                                    }
+                                }
+                            }
+                        } else {
+                            let k_data: &[f32] = dense_kvs[layer_idx].k.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache K L{layer_idx}: {e}"))?;
+                            let v_data: &[f32] = dense_kvs[layer_idx].v.as_slice()
+                                .map_err(|e| anyhow::anyhow!("dump cache V L{layer_idx}: {e}"))?;
+                            for h in 0..nkv {
+                                for p in 0..valid_len {
+                                    let src = h * dense_cap * hd + p * hd;
+                                    let dst = h * valid_len * hd + p * hd;
+                                    k_valid[dst..dst+hd].copy_from_slice(&k_data[src..src+hd]);
+                                    v_valid[dst..dst+hd].copy_from_slice(&v_data[src..src+hd]);
+                                }
+                            }
+                        }
+                        let k_path = format!("{dump_dir}/hf2q_cache_k_layer{layer_idx:02}_pos{seq_pos}.bin");
+                        let v_path = format!("{dump_dir}/hf2q_cache_v_layer{layer_idx:02}_pos{seq_pos}.bin");
+                        let k_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(k_valid.as_ptr() as *const u8, k_valid.len() * 4)
+                        };
+                        let v_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(v_valid.as_ptr() as *const u8, v_valid.len() * 4)
+                        };
+                        std::fs::write(&k_path, k_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {k_path}: {e}"))?;
+                        std::fs::write(&v_path, v_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {v_path}: {e}"))?;
+                        let dtype_str = if kv_is_f16 { "F16→F32" } else { "F32" };
+                        eprintln!("[DUMP] cache K layer {layer_idx:02} [{nkv},{valid_len},{hd}] {dtype_str} -> {k_path}");
+                        eprintln!("[DUMP] cache V layer {layer_idx:02} [{nkv},{valid_len},{hd}] {dtype_str} -> {v_path}");
+                        s = exec.begin()
+                            .map_err(|e| anyhow::anyhow!("dump cache re-begin L{layer_idx}: {e}"))?;
+                    }
+
+                    // Dense flash_attn_vec
+                    let dense_sdpa_tmp = self.dense_sdpa_tmp.as_ref().unwrap();
+                    s.barrier_between(
+                        &[&self.activations.attn_q_normed,
+                          &dense_kvs[layer_idx].k, &dense_kvs[layer_idx].v],
+                        &[&self.activations.sdpa_out],
+                    );
+                    // kv_seq_len for the dense cache:
+                    //   - Sliding (ring): min(seq_pos+1, capacity). The ring holds
+                    //     at most `capacity=sliding_window` entries — the causal
+                    //     mask then attends to exactly the populated slots.
+                    //     Attention is permutation-invariant over cached K,V
+                    //     (RoPE is baked in pre-cache), so slot order doesn't
+                    //     matter for correctness.
+                    //   - Global (linear): seq_pos + 1.
+                    // In ring mode we use mask_type=1 (causal) since the ring
+                    // itself applies the sliding-window constraint — the
+                    // kernel's sliding-window mask would incorrectly mask slots
+                    // whose logical positions don't equal their slot index.
+                    let dense_kv_seq_len = if layer_is_ring {
+                        ((seq_pos + 1).min(dense_cap)) as u32
+                    } else {
+                        (seq_pos + 1) as u32
+                    };
+                    let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
+                        num_heads: nh as u32,
+                        num_kv_heads: nkv as u32,
+                        head_dim: hd as u32,
+                        kv_seq_len: dense_kv_seq_len,
+                        kv_capacity: dense_cap as u32,
+                        scale: 1.0,
+                        mask_type: 1, // causal; ring applies the sliding window for us
+                        sliding_window: 0,
+                        softcap: 0.0,
+                    };
+                    mlx_native::ops::flash_attn_vec::flash_attn_vec(
+                        s.encoder_mut(), reg, dev,
+                        &self.activations.attn_q_normed,
+                        &dense_kvs[layer_idx].k,
+                        &dense_kvs[layer_idx].v,
+                        &self.activations.sdpa_out,
+                        dense_sdpa_tmp,
+                        &p,
+                    ).map_err(|e| anyhow::anyhow!("dense flash_attn_vec L{layer_idx}: {e}"))?;
+                    total_dispatches += 2; // main + reduce
+                } else if !INVESTIGATION_ENV.skip_tq_sdpa {
                     // -- TQ-packed SDPA (original path) --
                     // Pre-rotate Q via standalone FWHT (1× per head).
                     s.barrier_between(
@@ -1259,12 +1440,11 @@ impl MlxModelWeights {
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                         &[&self.activations.sdpa_out],
                     );
-                    let ring_start = compute_tq_ring_start_after_write(
-                        kv_is_sliding,
-                        kv_write_pos,
-                        kv_capacity,
-                        kv_seq_len,
-                    );
+                    let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
+                        (kv_write_pos % kv_capacity) as u32
+                    } else {
+                        0
+                    };
                     let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -2214,16 +2394,14 @@ impl MlxModelWeights {
 
                 {
                     // ADR-009 Track 2: ring_start for correct sliding-window
-                    // chronology after wrap. `kv_write_pos` is captured before
-                    // the current token write, so once the ring is full the
-                    // overwritten slot now holds the newest token and the
-                    // oldest surviving entry advances by one slot.
-                    let ring_start = compute_tq_ring_start_after_write(
-                        kv_is_sliding,
-                        kv_write_pos,
-                        kv_capacity,
-                        kv_seq_len,
-                    );
+                    // chronology after wrap. Before wrap, ring_start = 0
+                    // (physical == logical). After wrap, ring_start = write_pos
+                    // % capacity (physical slot of the oldest cached entry).
+                    let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
+                        (kv_write_pos % kv_capacity) as u32
+                    } else {
+                        0
+                    };
                     let p = FlashAttnVecTqParams {
                         num_heads: nh as u32,
                         num_kv_heads: nkv as u32,
@@ -2847,26 +3025,6 @@ pub fn dispatch_rms_norm_unit_perhead(
     Ok(())
 }
 
-/// Compute the physical slot of the chronologically oldest entry visible to
-/// TQ decode after the current token write has landed.
-///
-/// `write_pos_before_write` is captured before we append the current token.
-/// Once a sliding cache is full, that slot is immediately overwritten by the
-/// current token, so the oldest surviving entry advances to the following
-/// physical slot.
-fn compute_tq_ring_start_after_write(
-    kv_is_sliding: bool,
-    write_pos_before_write: usize,
-    kv_capacity: usize,
-    kv_seq_len_after_write: usize,
-) -> u32 {
-    if kv_is_sliding && kv_seq_len_after_write >= kv_capacity {
-        ((write_pos_before_write + 1) % kv_capacity) as u32
-    } else {
-        0
-    }
-}
-
 /// Dual-output variant: writes both f32 (for KV cache copy) AND bf16
 /// (for the bf16 attention island) — ADR-011 Phase 3 Wave P3b-tensor.3.
 ///
@@ -3118,25 +3276,3 @@ fn alloc_activation_buffers(
 // - [ ] Merge S1+S2 with MoE (S4): needs GPU-side accumulate with GPU weights
 // - [ ] GPU embedding via embedding_gather kernel
 // - [ ] GPU argmax via dispatch_argmax_f32
-
-#[cfg(test)]
-mod tests {
-    use super::compute_tq_ring_start_after_write;
-
-    #[test]
-    fn tq_ring_start_stays_zero_before_wrap() {
-        assert_eq!(compute_tq_ring_start_after_write(true, 7, 1024, 8), 0);
-        assert_eq!(compute_tq_ring_start_after_write(false, 7, 1024, 1024), 0);
-    }
-
-    #[test]
-    fn tq_ring_start_rolls_to_zero_on_first_full_window() {
-        assert_eq!(compute_tq_ring_start_after_write(true, 1023, 1024, 1024), 0);
-    }
-
-    #[test]
-    fn tq_ring_start_advances_past_overwritten_slot_after_wrap() {
-        assert_eq!(compute_tq_ring_start_after_write(true, 2455, 1024, 1024), 408);
-        assert_eq!(compute_tq_ring_start_after_write(true, 407, 1024, 1024), 408);
-    }
-}

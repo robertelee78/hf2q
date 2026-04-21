@@ -282,7 +282,13 @@ impl MlxModelWeights {
                 .map_err(|e| anyhow::anyhow!("batched dense V L{layer_idx}: {e}"))?;
             dense_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
         }
+        let max_nh = nh;
         let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
+        let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+            max_nh as u32, max_hd as u32);
+        let sdpa_tmp = dev.alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+            .map_err(|e| anyhow::anyhow!("batched sdpa_tmp: {e}"))?;
+
         // -------------------------------------------------------------------
         // Batched activation buffers (seq_len × ...)
         // -------------------------------------------------------------------
@@ -1313,55 +1319,6 @@ impl MlxModelWeights {
                     bucket_finish!(s, exec, t0, &PROFILE_B_KV_COPY_NS, &PROFILE_B_KV_COPY_COUNT, 1, "kv_copy");
                 }
 
-                // -- TQ-encode prefill K/V into the packed cache --
-                // After the batched dense copy above, decode reads K/V from
-                // `self.kv_caches[layer].k_packed` / `v_packed` via the TQ
-                // SDPA path (ADR-007 encoded, ADR-009 ring-chronology-correct).
-                // Non-batched prefill populates these per-token in its own
-                // loop; batched prefill must do the equivalent here so the
-                // decoder has live TQ cache to read. Skip when
-                // HF2Q_SKIP_TQ_ENCODE=1 (timing bisection; output garbage).
-                if !INVESTIGATION_ENV.skip_tq_encode {
-                    // First valid cache position for this prefill. Matches the
-                    // dense-copy `dst_seq_pos_start` so both caches agree on
-                    // where token t lands. Sliding layers will wrap inside
-                    // the kernel via `write_pos % cache_capacity`.
-                    s.barrier_between(
-                        &[&pf_k_normed, &pf_v_normed],
-                        &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
-                          &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
-                    );
-                    let kv_capacity = self.kv_caches[layer_idx].capacity;
-                    let is_sliding = dense_kvs_vec[layer_idx].is_sliding;
-                    // Use the new seq wrapper that iterates the cleared
-                    // single-token kernel with buffer offsets — no shader
-                    // changes, correctness-first.
-                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_seq(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_k_normed,
-                        &self.kv_caches[layer_idx].k_packed,
-                        &self.kv_caches[layer_idx].k_norms,
-                        nkv as u32, hd as u32,
-                        kv_capacity as u32,
-                        dst_seq_pos_start,
-                        n_copy as u32,
-                        src_tok_offset,
-                        is_sliding,
-                    ).map_err(|e| anyhow::anyhow!("batched TQ K seq encode L{layer_idx}: {e}"))?;
-                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_seq(
-                        s.encoder_mut(), reg, metal_dev,
-                        &pf_v_normed,
-                        &self.kv_caches[layer_idx].v_packed,
-                        &self.kv_caches[layer_idx].v_norms,
-                        nkv as u32, hd as u32,
-                        kv_capacity as u32,
-                        dst_seq_pos_start,
-                        n_copy as u32,
-                        src_tok_offset,
-                        is_sliding,
-                    ).map_err(|e| anyhow::anyhow!("batched TQ V seq encode L{layer_idx}: {e}"))?;
-                }
-
                 // ADR-011 Phase 3 Wave P3b.3 — MLP + MoE continue in the
                 // same session `s` as attention + KV copy above.  Pre-P3b.3
                 // this was a separate "Session B" with its own
@@ -2169,6 +2126,10 @@ impl MlxModelWeights {
             row3("PREFILL TOTAL",         prefill_ms,  100.0);
             row3("RESIDUAL (sync + CPU)", residual_ms, pct(residual_ms));
         }
+
+        // Store dense KV buffers so forward_decode can use them
+        self.dense_kvs = Some(dense_kvs_vec);
+        self.dense_sdpa_tmp = Some(sdpa_tmp);
 
         // Metal-1 — safety-net stop in case the layer-range end was
         // beyond the actual layer count (shouldn't happen with valid
