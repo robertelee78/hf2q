@@ -1210,6 +1210,83 @@ impl MlxModelWeights {
                     &self.activations.moe_expert_out
                 };
 
+                // ADR-007 C-2: pre-hadamard_quantize K/V dump (independent-floor oracle inputs).
+                // Gate: dump_pre_quant && layer_idx == 0 && kv_seq_len == 23.
+                // Fires BEFORE dispatch_hadamard_quantize_kv — captures raw F32 K (attn_k_normed)
+                // and V (attn_v or moe_expert_out) at the exact moment before TQ encode.
+                // Category-4 read-only diagnostic; no HF2Q_UNSAFE_EXPERIMENTS ack required.
+                if INVESTIGATION_ENV.dump_pre_quant && layer_idx == 0 && kv_seq_len == 23 {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("pre_quant dump finish L{layer_idx}: {e}"))?;
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+                    let pre_quant_dir = format!("{dump_dir}/pre_quant");
+                    std::fs::create_dir_all(&pre_quant_dir)
+                        .map_err(|e| anyhow::anyhow!("pre_quant mkdir: {e}"))?;
+
+                    // k_pre_quant.f32.bin — K pre-quant [nkv, hd] F32 little-endian
+                    {
+                        let k_raw: &[f32] = self.activations.attn_k_normed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("pre_quant k_normed read: {e}"))?;
+                        let n_elems = nkv * hd;
+                        let k_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                k_raw.as_ptr() as *const u8,
+                                n_elems * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        let kp = format!("{pre_quant_dir}/k_pre_quant.f32.bin");
+                        std::fs::write(&kp, k_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {kp}: {e}"))?;
+                        eprintln!("[PRE_QUANT_DUMP] k_pre_quant [{nkv},{hd}] f32 -> {kp}");
+                    }
+
+                    // v_pre_quant.f32.bin — V pre-quant [nkv, hd] F32 little-endian
+                    {
+                        let v_raw: &[f32] = v_src.as_slice()
+                            .map_err(|e| anyhow::anyhow!("pre_quant v_src read: {e}"))?;
+                        let n_elems = nkv * hd;
+                        let v_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                v_raw.as_ptr() as *const u8,
+                                n_elems * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        let vp = format!("{pre_quant_dir}/v_pre_quant.f32.bin");
+                        std::fs::write(&vp, v_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {vp}: {e}"))?;
+                        eprintln!("[PRE_QUANT_DUMP] v_pre_quant [{nkv},{hd}] f32 -> {vp}");
+                    }
+
+                    // meta.json sidecar with provenance
+                    {
+                        let cache_pos_at_dump = if kv_is_sliding {
+                            (kv_write_pos % kv_capacity) as u32
+                        } else {
+                            kv_write_pos as u32
+                        };
+                        let meta = serde_json::json!({
+                            "site": "pre_hadamard_quantize_kv",
+                            "layer_idx": layer_idx,
+                            "kv_seq_len": kv_seq_len,
+                            "cache_pos_val": cache_pos_at_dump,
+                            "nkv": nkv,
+                            "hd": hd,
+                            "kv_is_sliding": kv_is_sliding,
+                            "k_pre_quant_shape": [nkv, hd],
+                            "v_pre_quant_shape": [nkv, hd],
+                        });
+                        let meta_str = serde_json::to_string_pretty(&meta)
+                            .map_err(|e| anyhow::anyhow!("pre_quant meta json: {e}"))?;
+                        let mp = format!("{pre_quant_dir}/meta.json");
+                        std::fs::write(&mp, meta_str.as_bytes())
+                            .map_err(|e| anyhow::anyhow!("write {mp}: {e}"))?;
+                        eprintln!("[PRE_QUANT_DUMP] meta -> {mp}");
+                    }
+
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("pre_quant dump re-begin: {e}"))?;
+                }
+
                 // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
                 // HF2Q_SKIP_TQ_ENCODE=1: skip for timing bisection (output garbage).
                 if !INVESTIGATION_ENV.skip_tq_encode {
