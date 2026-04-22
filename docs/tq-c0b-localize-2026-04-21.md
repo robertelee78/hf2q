@@ -10,13 +10,27 @@
 
 ## 1. Executive Summary
 
-**Verdict: E1 — H3 (prefill encode/cache) cleared. Defect lives in {H1 kernel / H2 FWHT / H4 dispatch}.**
+**Verdict: E1-partial — non-batched compact-encoded L0/L5 prefill cache cleared; sourdough regression is NOT in encode on the path that actually runs by default. Batched-prefill encode + capacity-stride runtime access + verbatim decode-call parameters remain formally untested.**
 
-The TQ-packed KV cache produced by the batched-prefill encode path — `dispatch_hadamard_quantize_kv_seq` on codex@d14f596 — dequantizes to within the kernel's own declared bounds on every one of 440 measured cells (2 layers × K+V × heads × 22 positions). Zero violations of nrmse < 0.15 or max_abs_diff < 1.0. The worst nrmse across all cells is **0.1390** (layer 0, K, head 1, position 20). The worst max_abs_diff is **0.4450** (layer 5, V, head 0, position 12).
+The TQ-packed KV cache produced by the **non-batched** prefill encode path — `dispatch_hadamard_quantize_kv` on codex@d14f596 — dequantizes to within the kernel's own declared bounds on every one of 440 measured cells (2 layers × K+V × heads × 22 positions). Zero violations of nrmse < 0.15 or max_abs_diff < 1.0. The worst nrmse across all cells is **0.1390** (layer 0, K, head 1, position 20). The worst max_abs_diff is **0.4450** (layer 5, V, head 0, position 12).
 
-This proves: the packed cache + per-position norms at end-of-prefill correctly reconstruct KV within the kernel's declared tolerance on both the sliding-attention layer (L0, hd=256) and the global-attention sanity layer (L5, hd=512).
+**The path tested IS the path the 69-byte sourdough regression runs on.** `HF2Q_BATCHED_PREFILL` requires `HF2Q_UNSAFE_EXPERIMENTS=1` to take effect (`src/debug/investigation_env.rs:246`); neither `scripts/sourdough_gate.sh` nor the default hf2q binary set either. So the regression reproduces on the non-batched path cleared here — encode is not causing the observed sourdough failure, which argues the defect locus is downstream of encode on that path (H1 / H2 / H4).
 
-This does NOT prove which of H1/H2/H4 is the defect locus. Next per ADR-007 §C-4 E1: kernel replay test with real L=0/P=1 Q/K/V inputs injected into `mlx-native/tests/test_flash_attn_vec_tq.rs`.
+**What this does NOT clear:**
+
+1. **Batched-prefill encode** (`dispatch_hadamard_quantize_kv_seq`, added 2026-04-21 in codex-branch commit `415c9d6`). The instrumentation dumps from both paths, but the default run only exercised non-batched. The batched path is newer, prime-suspect code for any future long-context run, and remains formally untested.
+2. **Capacity-strided runtime access.** The dump compacts from `[nkv, kv_capacity=1024, hd/2]` → `[nkv, kv_seq_len=22, hd/2]` at dump time (dump loop at `forward_prefill.rs:827–836`). The dequantizer walks the compact layout. Bugs that live in the `kv_capacity * hd_half` stride — e.g., the kernel reading a wrong physical index — are invisible to this test.
+3. **Verbatim decode-call parameters.** The meta JSON hardcodes `mask_type: 1` for all layers, but the actual decode kernel at `forward_mlx.rs:1279` passes `mask_type: 2` for sliding (L0 is sliding). Meta is an encode-site snapshot, not a decode-call snapshot. Semantic mismatches between encode-side parameter belief and decode-site parameter usage are invisible to this test.
+
+Next session (C-1) MUST: re-dump with raw capacity-strided buffers (no compaction), capture the actual decode-call params verbatim, and run again with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` to clear the batched path.
+
+Per ADR-007 §C-4 E1 (interpreted narrowly): kernel replay test with real L=0/P=1 Q/K/V + capacity-strided packed cache + verbatim `mask_type` injected into `mlx-native/tests/test_flash_attn_vec_tq.rs`.
+
+---
+
+### 1.1 Revision note (queen Phase 3 — 2026-04-21)
+
+This report initially self-certified E1 with language claiming the "batched-prefill encode path `dispatch_hadamard_quantize_kv_seq`" was cleared. Codex peer review (session `codex-review`, verdict `request_changes`, high-sev) caught three structural scope errors: (a) the meta JSON explicitly records `path: "nonbatched"` — batched was never dumped; (b) the dump is compacted at write-time, so the capacity-stride runtime layout is not what the dequantizer walked; (c) meta `mask_type` is a hardcoded literal, not a read-back of kernel-call parameters, and diverges from the real sliding-layer dispatch. The verdict is narrowed above from E1 to E1-partial. The 440-cell dequant math is **unchanged and verified correct** by Codex's independent Python reproduction (codex reproduced the exact worst-cells `L0/k/h1/p20 nrmse=0.138983` and `L5/v/h0/p12 max_abs=0.444982`); the revision is purely scope narrowing, not measurement revision.
 
 ---
 
@@ -42,7 +56,7 @@ Same temperature=0 seed, both sides. Prompt produces 22 KV positions after prefi
 
 ### 2.3 Dump boundaries and what was captured
 
-**TQ side (codex@d14f596):** Dump fires at end-of-prefill in `forward_prefill_batched.rs` immediately after the TQ V-seq encode dispatch (`dispatch_hadamard_quantize_kv_seq`), gated by `HF2Q_DUMP_TQ_STATE=1`. Per-layer outputs written to `/tmp/cfa-20260421-C0b-localize/dumps/tq/`:
+**TQ side (codex@d14f596):** Dump fires at end-of-prefill in BOTH `forward_prefill.rs` (non-batched path, line ~827) and `forward_prefill_batched.rs` (batched path, line ~1362). Which one fires is controlled by `HF2Q_BATCHED_PREFILL` (ack-gated by `HF2Q_UNSAFE_EXPERIMENTS=1`). **In this session, neither flag was set** — only the non-batched dump fired. Meta JSON confirms this: `"path": "nonbatched"`. Gated by `HF2Q_DUMP_TQ_STATE=1`. Per-layer outputs written to `/tmp/cfa-20260421-C0b-localize/dumps/tq/`:
 
 - `hf2q_k_packed_layer{LL}_pos22.u8.bin` — u8 nibble-packed K, shape `[nkv, 22, hd/2]`
 - `hf2q_v_packed_layer{LL}_pos22.u8.bin` — u8 nibble-packed V, shape `[nkv, 22, hd/2]`
@@ -79,15 +93,15 @@ nrmse = sqrt( sum(diff²) / max(sum(ref²), 1e-30) )
 
 Applied per `(head, position)` over the `[hd]`-length slice. This is the same formula used in the C-0 audit after Codex correction (see `docs/tq-c0-audit-2026-04-21.md §2.7`).
 
-### 2.6 Self-test gate: 0.06 → 0.12 adjustment
+### 2.6 Self-test gate: 0.06 → 0.12 adjustment (Gaussian N(0,1) heuristic, not a universal floor)
 
-The queen's spec cited 0.06 as the gate for the dequantizer self-test. Worker 2 flagged this and adjusted to **0.12**. Rationale:
+The queen's spec cited 0.06 as the gate for the dequantizer self-test. Worker 2 adjusted to **0.12** against the Gaussian N(0,1) reference distribution. Rationale:
 
-The `nrmse < 0.15` bound in `test_flash_attn_vec_tq.rs` is the safety margin for SDPA *output* (post attention averaging across many K/V vectors), not per-vector round-trip error. The mathematical floor for 4-bit Lloyd-Max encode+decode on random N(0,1) vectors under this specific nrmse formula is approximately **0.097** — confirmed by running the self-test with the Rust `nibble_quantize`/`nibble_dequantize` reference in `mlx-native/tests/test_flash_attn_vec_tq.rs`. Measured self-test values: hd=256 → 0.097148, hd=512 → 0.097281.
+The `nrmse < 0.15` bound in `test_flash_attn_vec_tq.rs` is the safety margin for SDPA *output* (post attention averaging across many K/V vectors), not per-vector round-trip error. On 1000 draws from **N(0,1)** — the only distribution tested — a correct 4-bit Lloyd-Max encode+decode with matching Rust `nibble_quantize`/`nibble_dequantize` reference achieved nrmse = 0.0973 ± small. Measured self-test values: hd=256 → 0.097148, hd=512 → 0.097281.
 
-A gate of 0.06 would unconditionally reject a correct 4-bit implementation. A gate of 0.12 catches all implementation bugs (wrong nibble order, wrong codebook, wrong FWHT normalization, rsqrt double-application) while passing the genuine quantization noise floor.
+**Calibration scope:** 0.097 is a **Gaussian N(0,1) heuristic**, NOT a universal floor. A correct implementation on codebook-aligned inputs (i.e., inputs whose values happen to land near codebook centroids) can produce nrmse well below 0.06. The 0.12 gate is therefore a distribution-conditional catch: it catches implementation bugs — wrong nibble order, wrong codebook, wrong FWHT normalization, rsqrt double-application — against a sampled Gaussian, but it does not prove a specific numeric floor holds for every input distribution. A more robust self-test for C-1 would include explicit bad-mutant controls (intentional off-by-one nibble order, transposed codebook, skipped FWHT, double-rsqrt) and assert the gate flags each of them.
 
-**Flag for Codex review:** This gate adjustment is Worker 2's independent judgment. Codex should verify: (a) the 0.097 floor is confirmed by the Rust reference, and (b) 0.12 is a sufficient margin above 0.097 to catch bugs while not being so tight as to fail correct implementations on edge-case input distributions.
+The 0.06 gate in the original spec was not defensible without the distribution qualifier; the 0.12 gate is defensible on N(0,1) and should be re-derived per-input-distribution for future sessions. Codex review confirmed the dequantizer math and codebook values byte-identical to Rust reference; the self-test gate language above is the revised, accurate version.
 
 ### 2.7 Scope
 
@@ -145,33 +159,39 @@ Source: `python3 /opt/hf2q/scripts/tq-c0b-dequant.py --self-test`.
 
 ## 4. Verdict and Logic Chain
 
-**E1.** The packed cache is not the defect locus.
+**E1-partial.** The non-batched-compact-encoded prefill cache is not the defect locus on the path the sourdough regression runs on. Batched encode, capacity-stride runtime access, and decode-call-parameter semantics remain formally untested.
 
 Logic chain:
 
 1. **Given:** Paired F32 dumps at identical prompt + seed (sourdough, T=0), same kv_seq_len=22 tokens on both sides. Dense side: main@a258e92. TQ side: codex@d14f596.
-2. **Given:** Python dequantizer validated by round-trip self-test — nrmse 0.0973 on 1000 N(0,1) vectors at hd=256 and hd=512, both within 4-bit Lloyd-Max mathematical floor and below the 0.12 gate.
-3. **And:** Dequantized TQ cache vs dense F32 cache — **max nrmse across all 440 cells is 0.1390** (< kernel bound 0.15).
-4. **And:** **Max_abs_diff across all 440 cells is 0.4450** (< kernel bound 1.0).
-5. **Therefore:** The packed cache produced by `dispatch_hadamard_quantize_kv_seq` (batched prefill encode on codex@d14f596) plus per-position norms reconstruct KV within the kernel's own declared tolerance at both sliding (L0, hd=256) and global (L5, hd=512) layers.
-6. **Therefore: H3 (prefill encode/cache) is NOT the defect locus.**
+2. **Given:** Meta JSON records `path: "nonbatched"` (field hardcoded in `forward_prefill.rs` dump block). `HF2Q_BATCHED_PREFILL` is ack-gated in `investigation_env.rs:246`; neither the sourdough gate nor the default hf2q binary set it. **The path dumped is the path the 69-byte regression runs on.**
+3. **Given:** Python dequantizer validated by Gaussian N(0,1) round-trip self-test — nrmse 0.0973 on 1000 vectors at hd=256 and hd=512, below the 0.12 distribution-conditional gate; codebook values byte-identical to `turboquant.rs:27–32`; independently reproduced end-to-end by Codex.
+4. **And:** Dequantized TQ cache vs dense F32 cache — **max nrmse across all 440 cells is 0.1390** (< kernel bound 0.15).
+5. **And:** **Max_abs_diff across all 440 cells is 0.4450** (< kernel bound 1.0).
+6. **Therefore (what IS proved):** On the non-batched prefill encode path, with inputs compacted to `[nkv, kv_seq_len, hd/2]` at dump time, the stored nibbles + norms reconstruct KV within kernel tolerance at both sliding (L0, hd=256) and global (L5, hd=512) layers. Encode math on this path is correct for the compacted artifact the dequantizer walks.
+7. **Inference (stronger than pure negation):** Because the sourdough regression reproduces on this exact path (non-batched, default flags), and encode on this path is correct, the sourdough defect cannot live in non-batched encode. It lives downstream — H1 (kernel math), H2 (FWHT pipeline), or H4 (caller dispatch).
 
 What this verdict does NOT claim:
 
-- Does NOT claim the kernel is correct. H1 (`flash_attn_vec_tq` Metal shader math), H2 (FWHT pipeline wrapping the kernel call in `forward_mlx.rs`), and H4 (caller-side dispatch — strides, norm binding, ring/mask params) are all still live hypotheses.
-- Does NOT rank H1/H2/H4 against each other beyond the secondary V/K asymmetry signal.
-- Does NOT cover layers 1–4 or 6–29. C-0b is a localization experiment scoped to L0 (primary) + L5 (sanity).
-- Does NOT cover decode-step positions beyond prefill. The dump is taken at end-of-prefill; decode-written slots are not in scope.
+- Does NOT clear **batched-prefill encode** (`dispatch_hadamard_quantize_kv_seq`). The batched path is untested. The new-encode bug class cannot be ruled out for any future run that sets `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1`.
+- Does NOT clear **capacity-strided runtime access.** The dump compacts at `forward_prefill.rs:827–836`. A stride bug in the kernel (reading physical index `h * kv_capacity * hd_half + p * hd_half` where runtime semantics expected a different formula) is invisible to this test.
+- Does NOT clear **decode-call parameter semantics.** Meta records `mask_type: 1` hardcoded; the actual decode kernel at `forward_mlx.rs:1279` passes `mask_type: 2` for sliding. Mask-type mismatches between encode-side belief and decode-site usage are invisible here.
+- Does NOT claim the kernel is correct. H1 (`flash_attn_vec_tq` Metal shader math), H2 (FWHT pipeline wrapping the kernel call in `forward_mlx.rs`), H4 (caller-side dispatch — strides, norm binding, ring/mask params) all remain live.
+- Does NOT rank H1/H2/H4 against each other beyond the secondary V/K magnitude asymmetry (Codex noted that ratio tracks the V-norms-vs-K-norms scale gap 8–16×, so the 8–14× V/K max_abs asymmetry is mostly scale-driven, not a V-path-specific signal; use this as a weak prior only).
+- Does NOT cover layers 1–4 or 6–29. C-0b is localization scoped to L0 + L5.
+- Does NOT cover decode-step positions beyond prefill.
 
 ---
 
-## 5. Next Session per ADR-007 §C-4 E1 Branch
+## 5. Next Session per ADR-007 §C-4 E1-partial Branch
 
 ADR-007 §C-4 E1 states: "If packed cache dequantizes to a value close to dense KV (within `nrmse<0.15`) and the kernel receives byte-close inputs, defect lives in H1 (kernel), H2 (FWHT), or H4 (dispatch). Next: kernel replay test with REAL decode inputs from the L=0/P=1 dumps (injected into `mlx-native/tests/test_flash_attn_vec_tq.rs`)."
 
-### 5.1 C-1 session 1, first task
+C-0b's E1-partial means that the replay path is viable for the **non-batched-compact-encoded** slice, but three coverage gaps must be closed before any "encode fully cleared" claim lands.
 
-Extract the L=0/P=1 decode-step Q/K/V from the C-0 dumps at:
+### 5.1 C-1 session 1, required coverage
+
+**Task A — kernel replay (the core E1-branch next step).** Extract the L=0/P=1 decode-step Q/K/V from the C-0 dumps at:
 
 ```
 /tmp/cfa-20260421-C0-audit/dumps/{tq,dense}/layer00/pos01/...
@@ -188,6 +208,18 @@ Also extract the L=0 packed cache from the C-0b dumps at:
 
 Construct a self-contained kernel replay test that invokes `flash_attn_vec_tq` (from mlx-native@a28783e) with these exact inputs and compares `sdpa_out` to the dense `sdpa_out` from C-0.
 
+**Critical:** the kernel reads `[nkv, kv_capacity=1024, hd/2]` at runtime. The C-0b dumps are compacted to `[nkv, 22, hd/2]`. Before the replay, **zero-pad** each packed buffer to kv_capacity along the position axis OR re-instrument and re-dump with raw capacity-strided buffers (see Task B). Without this, the replay test will not reproduce the runtime access pattern even if Task A answers the H1 question on the compacted-layout slice.
+
+**Task B — re-dump with raw capacity buffers + verbatim decode-call params.** Extend the HF2Q_DUMP_TQ_STATE instrumentation so:
+
+- `k_packed` / `v_packed` are dumped at full `[nkv, kv_capacity, hd/2]` (no compaction at dump time). The kernel access pattern is then directly comparable.
+- `k_norms` / `v_norms` at full `[nkv, kv_capacity]`.
+- Meta JSON records the **verbatim decode-call** `mask_type`, `sliding_window`, `ring_start`, `scale`, `softcap`, `kv_seq_len`, `kv_capacity` as they appear in `FlashAttnVecTqParams` at the point of kernel invocation (`forward_mlx.rs:1272–1283`). Snapshot the struct at invocation, not at encode.
+
+**Task C — re-run with batched prefill.** Run the dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` so `dispatch_hadamard_quantize_kv_seq` fires and its output lands in the dump. Diff the batched-path packed cache against the non-batched-path packed cache. Equivalence at the byte level = batched encode validated against non-batched baseline. Divergence = H3-batched is a live bug even though H3-non-batched cleared here.
+
+Tasks A+B+C together deliver a globally-cleared E1 or identify which of H3-batched, H4 (kernel stride), or H4 (decode-call-param mismatch, e.g., mask_type) is the defect locus.
+
 ### 5.2 Decision tree for the replay test
 
 **If the replay reproduces the C-0 divergence (max_abs_diff > 1.0 on `sdpa_out`):**
@@ -199,9 +231,9 @@ Construct a self-contained kernel replay test that invokes `flash_attn_vec_tq` (
 **If the replay reproduces divergence BUT the divergence disappears when FWHT is disabled on Q or on `sdpa_out`:**
 → **H2 confirmed.** The defect is in the FWHT pipeline wrapping the kernel call (forward-rotate Q, inverse-rotate `sdpa_out`) in `forward_mlx.rs`. Next: bisect forward-rotate Q vs inverse-rotate `sdpa_out` as independent suspects.
 
-### 5.3 Secondary signal to watch
+### 5.3 Secondary signal (weak, scale-driven)
 
-V max_abs_diff is 8–15× larger than K in C-0b (Table 3.3), with both passing the bound. If H4 is confirmed, this asymmetry is consistent with a V-path-specific parameter bug — e.g., wrong V stride, wrong V-norms buffer binding, or V-loop `inv_sqrt_dk` applied differently. Worth checking the V-path dispatch arguments first in the H4 investigation.
+V max_abs_diff is 8–15× larger than K in C-0b (Table 3.3), with both passing the bound. **Codex flagged this asymmetry is mostly explained by V norms being 8–16× larger than K norms in this model (scale-driven), NOT a V-path-specific signal.** Keep this as a weak prior only. The C-1 H4 investigation should first check V vs K dispatch arguments for apples-to-apples (same stride formula, same binding, same inv_sqrt_dk), but the V/K max_abs ratio by itself does not elevate the V-path as a prime suspect over the K-path.
 
 ---
 
@@ -238,11 +270,15 @@ User decides; do NOT push either way without explicit approval.
 
 ## 7. Process Learning
 
-The self-test gate came into this session from the queen's spec at 0.06, copied from the kernel unit test's `nrmse < 0.15` assertion scaled down by an unstated factor. Worker 2 flagged independently that 0.06 is below the mathematical floor for correct 4-bit Lloyd-Max under this nrmse formula on random N(0,1) vectors (~0.097, confirmed by Rust `nibble_quantize`/`nibble_dequantize` reference). Worker 2 adjusted to 0.12.
+Two separate process notes from C-0b, in rough order of severity:
 
-This mirrors the C-0 session's nrmse-formula drift: in C-0, Codex caught a formula error that Claude's own 9/9 self-certification missed. In C-0b, the formula drift was caught in-worker before the run, not after. This is the intended behavior for the review-only CFA mode.
+**(Primary) Codex caught scope overclaim that self-certification missed.** The initial draft of this report claimed the "batched-prefill encode path `dispatch_hadamard_quantize_kv_seq`" was cleared. The meta JSON records `path: "nonbatched"`. The verdict language did not match the dumped artifact. Worker 3's acceptance-criteria self-check (9/9 in `agents-reporter-result`) passed against structural checks, not against cross-artifact scope semantics. Codex's independent ground-truth reading caught three structural errors: (a) non-batched vs batched label, (b) compact vs capacity-strided dump layout, (c) meta `mask_type: 1` vs runtime kernel `mask_type: 2`. None of these were detectable by re-running the dequant script; all required reading the instrumentation source code against the dump. This is the C-0 pattern repeating in a different axis — self-certification is not a substitute for independent review of artifact semantics against production-path semantics.
 
-**Flag for Codex:** Verify that the gate adjustment from 0.06 to 0.12 is legitimate (the 0.097 floor is derived from the correct implementation, not from a buggy one), and that the spec's original 0.06 was indeed a copy-error rather than a deliberate tighter-than-floor requirement.
+Concrete prescription for future TQ localization sessions: the self-test acceptance criteria must include an **artifact-semantics cross-check** — the meta JSON fields must be grepped against the actual kernel-call site (not just the dump site) before a verdict is self-certified.
+
+**(Secondary) Self-test gate calibration.** The queen's spec cited 0.06 without a distribution qualifier. Worker 2 measured N(0,1) round-trip at ~0.097 with correct Rust `nibble_quantize`/`nibble_dequantize` reference and adjusted to 0.12. Codex confirmed the math and codebook values. However, the 0.097 figure is specifically a Gaussian heuristic — codebook-aligned inputs can round-trip to ≤0.06. The right fix is not a number but a method: future sessions should include bad-mutant controls (off-by-one nibble order, double-rsqrt, skipped FWHT) that demonstrate the gate catches each failure mode.
+
+The C-0 session had a similar drift pattern (Codex caught an nrmse-formula error that self-certification missed). C-0b caught the math drift in-worker before the run but missed the scope drift. Both axes — math and scope — need an independent pre-merge check; Codex serves this role.
 
 ---
 
