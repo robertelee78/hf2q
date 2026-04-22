@@ -148,6 +148,16 @@ pub struct InvestigationEnv {
     /// at the call site, which is the caller's responsibility).
     pub dump_tq_state: bool,
 
+    /// `HF2Q_DUMP_PRE_QUANT=1` — dump pre-hadamard-quantize K/V tensors
+    /// to `{dump_dir}/pre_quant/` when layer_idx=0 and kv_seq_len=23.
+    /// Fires BEFORE `dispatch_hadamard_quantize_kv` (line ~1226 in
+    /// forward_mlx.rs), capturing the raw F32 K (attn_k_normed) and V
+    /// (attn_v or moe_expert_out) before TQ encode. These pre-quant dumps
+    /// serve as the independent-floor oracle inputs for ADR-007 C-2 multi-step
+    /// audit. Category-4 read-only diagnostic; no `HF2Q_UNSAFE_EXPERIMENTS`
+    /// ack required.
+    pub dump_pre_quant: bool,
+
     /// `HF2Q_DUMP_LAYERS_LIST=0,5` — comma-separated layer indices to
     /// include in the TQ state dump. Empty list (default) means ALL layers
     /// when `dump_tq_state` is set. Parsed as `Vec<usize>`.
@@ -266,6 +276,7 @@ impl InvestigationEnv {
             dump_norm_weight: env_usize("HF2Q_DUMP_NORM_WEIGHT"),
             dump_all_cache: env_eq_one("HF2Q_DUMP_ALL_CACHE"),
             dump_tq_state: env_eq_one("HF2Q_DUMP_TQ_STATE"),
+            dump_pre_quant: env_eq_one("HF2Q_DUMP_PRE_QUANT"),
             dump_tq_layers_list: env_usize_list("HF2Q_DUMP_LAYERS_LIST"),
             dump_rendered_prompt: env::var("HF2Q_DUMP_RENDERED_PROMPT").ok(),
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),
@@ -430,6 +441,9 @@ impl InvestigationEnv {
                     .collect::<Vec<_>>().join(",")
             };
             diagnostics.push(format!("HF2Q_DUMP_TQ_STATE=1 (layers: {layers_str})"));
+        }
+        if self.dump_pre_quant {
+            diagnostics.push("HF2Q_DUMP_PRE_QUANT=1 (pre-quant K/V dump before TQ encode)".into());
         }
         if self.dump_rendered_prompt.is_some() {
             diagnostics.push("HF2Q_DUMP_RENDERED_PROMPT=<path>".into());
