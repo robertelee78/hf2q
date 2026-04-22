@@ -1,7 +1,7 @@
 # ADR-007: TurboQuant KV Cache Compression for 262K Context
 
-**Status:** Partially Implemented — End-to-End Correctness UNVERIFIED; dormant on default path since 2026-04-16 (ADR-009 Track 3 fallback)
-**Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite)
+**Status:** Partially Implemented — End-to-End Correctness UNVERIFIED; dormant on default path since 2026-04-16 (ADR-009 Track 3 fallback). Phase 0.4 C-0 divergence audit **COMPLETED 2026-04-21** — divergence confirmed beyond the kernel's own declared bounds on all 30 layers; causal locus unpinned within a 4-hypothesis matrix (kernel / FWHT / prefill-encode / dispatch); C-0b localization experiment is the new gating step.
+**Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite); 2026-04-21 (C-0 audit completion + Codex-reviewed revision)
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend — KV cache path lives here), ADR-005 (inference server — speed gates), ADR-008 (candle-divorce port — introduced ring-chronology regression), ADR-009 (Track 3 dense-SDPA "safe fallback" — the stub this ADR's mantra forbids)
 **Reference:** Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874, April 2025)
@@ -10,7 +10,7 @@
 
 ## Current Status (2026-04-21 — honest rewrite)
 
-**One sentence:** The kernels exist and pass isolated replay tests, but the full pipeline is gated off on the default path; TQ encode runs every decode token while TQ decode never fires, so we pay the cost without the benefit.
+**One sentence:** The kernels exist and pass isolated replay tests, but the full pipeline is gated off on the default path; TQ encode runs every decode token while TQ decode never fires, so we pay the cost without the benefit. The C-0 paired-dump audit (2026-04-21) confirmed that when the TQ decode path is forced active, its `sdpa_out` exceeds the kernel's own declared bounds on every one of the 30 layers — a genuine defect, not measurement artifact — but the causal locus within {kernel, FWHT, encode/prefill, dispatch} is not yet pinned.
 
 ### What actually exists in code
 
@@ -49,11 +49,23 @@ Dual-mode CFA `cfa-20260421-111303-tq-revival`:
 - **Batched-prefill population gap:** `forward_prefill_batched.rs` only populated `dense_kvs_vec` (local) — never the TQ cache. With the dense fallback removed, batched prefill + decode produced garbage because decode read an uninitialized TQ cache. My extension (commit `415c9d6`) adds TQ encode to batched prefill via the new `dispatch_hadamard_quantize_kv_seq` wrapper.
 - **Reverted** the merge (`e0f33c1`) because sourdough-byte-exact remains at 69 bytes even with all known fixes. Main is back to the dense-fallback state; branch preserved.
 
-**Unresolved:** Is the 69-byte divergence after Codex's fix
-- (a) a remaining **bug** (a second port-time regression we haven't isolated), or
-- (b) the genuine **representation floor** of 4-bit Lloyd-Max KV quantization accumulated over 30 layers?
+**Resolved (2026-04-21 — later same day, CFA session `cfa-20260421-C0-audit`):** C-0 layer-by-layer paired-dump audit executed. Report: `docs/tq-c0-audit-2026-04-21.md` (initial draft commit `789b667`, Codex-reviewed revision commit `bd8ab27`). Scaffolding: commit `742f892` extends `HF2Q_DUMP_ALL_CACHE` to the Phase 3A attn Q/K/V + sdpa_out dump sites for full-coverage single-run audits.
 
-We have not executed the layer-by-layer divergence audit that would distinguish these. That audit is the gating step described in "Path to Completion" below.
+The binary (a)-bug-or-(b)-floor question did NOT resolve cleanly — it resolved into a narrower trinary:
+
+1. **The divergence is real and beyond representation.** 196 of 210 `sdpa_out` cells on the TQ path violate the kernel's own declared `max_abs_diff < 1.0`; every one of 30 layers has at least one decode position where `sdpa_out` violates `nrmse < 0.15` (per-layer max nrmse range 0.673–1.281, using the kernel test's own L2-reference formula `sqrt(sum_sq_diff / sum_sq_ref)`). Hypothesis (b) "within representation noise" is falsified.
+
+2. **The defect is NOT yet pinned to the SDPA kernel.** At decode position 1 / layer 0 specifically, current-step Q, K, V are byte-identical (SHA-256 equal) between dense and TQ paths and `sdpa_out` still diverges — but decode pos 1 attends over a 22-token prefilled prompt cache, which on the TQ path is TQ-encoded-then-decoded and was NOT dumped in C-0. That reopens all four localization hypotheses:
+   (H1) **TQ SDPA kernel math** (`flash_attn_vec_tq` in mlx-native@`a28783e`)
+   (H2) **FWHT pipeline** (forward-rotate Q / inverse-rotate sdpa_out around the kernel call)
+   (H3) **Prefill encode/cache** (Lloyd-Max 4-bit encode on prompt tokens, `hadamard_quantize_kv` for decode writes, `dispatch_hadamard_quantize_kv_seq` for batched prefill)
+   (H4) **Dispatch / buffer binding** (strides, norm binding, centroid-table lookup, ring/mask parameter handoff)
+
+3. **Methodology correction from within the session (important).** The initial draft report (`789b667`) claimed `L=0/P=1 sdpa_out = 0.844` was 844× the kernel's threshold and attributed the defect to the kernel. The dual-mode Codex reviewer (review-only CFA mode) caught three high-severity methodology errors: (i) the diff script's `nrmse` formula differed from the kernel's own test formula `sqrt(sum_sq_diff / sum_sq_ref)`, (ii) the kernel test's actual `max_abs_diff` threshold is `1.0`, not `1e-3`, and (iii) byte-identical *current-step* Q/K/V at pos 1 does NOT prove SDPA inputs are identical because decode pos 1 attends over prefill-cached tokens never dumped. The revision commit `bd8ab27` corrects the math and narrows the verdict.
+
+**Process learning — Codex review is load-bearing for binary-verdict deliverables.** Claude self-certified 9/9 acceptance criteria with three high-sev errors intact. Without the Codex second-opinion step this session would have sent C-1 directly into kernel-shader bisection, skipping prefill-state dumping, and wasted the next session. For any future CFA session producing a binary-verdict audit deliverable, review-only mode with a Codex reviewer should be treated as non-optional, not optional.
+
+**Gating next step:** C-0b Localization (see Path to Completion). The C-4 Track-3-stub-removal decision tree originally conditioned on the (a)/(b) binary is now conditioned on C-0b's E1/E2/E3 localization outcome instead.
 
 ---
 
@@ -276,14 +288,18 @@ Compression: **5.96×**.
 - Measure latency per head and total per-token overhead across all layers
 - **Gate:** Total Hadamard overhead ≤ 200 μs/token (< 2% of decode budget).
 
-**0.4 — NEW — Layer-by-layer divergence audit — [ ] NOT DONE, GATING**
-(Added 2026-04-21.) Dump Q, K, V, attention-weight matrix, and sdpa_out at each of the 30 layers for the SAME decode step under two configurations:
-  - config A: dense F32 KV decode (current default)
-  - config B: TQ-packed KV decode (Codex branch `cfa/cfa-20260421-111303-tq-revival/codex`)
+**0.4 — Layer-by-layer divergence audit — [x] COMPLETED 2026-04-21 (revised verdict in commit `bd8ab27`)**
+(Added 2026-04-21.) Paired F32 dumps of Q (pre-FWHT), K, V (pre-TQ-encode), and sdpa_out (post-inverse-FWHT on TQ side, apples-to-apples) at each of 30 layers × 7 decode positions {1, 5, 10, 15, 20, 25, 30} × 2 configurations:
+  - config A: dense F32 KV decode (`main@dcfb773`)
+  - config B: TQ-packed KV decode (`cfa/cfa-20260421-111303-tq-revival/codex@415c9d6`, Codex ring-chronology fix applied)
 
-Compare per-layer tensors. The FIRST layer where A vs B diverges by more than the kernel replay-test bound (~1e-3 element-wise) is the bug site. If no layer shows super-threshold divergence and the 69-byte fail is just layer-30 logit perturbation from accumulated <1e-3 error, the divergence is representation-limited and requires a quality metric other than byte-exact-vs-F16.
+Sourdough prompt baseline held during the audit: dense PASS 3656 bytes, TQ FAIL at 69 bytes — matches the regression under investigation. Identical greedy decode on both sides. Same seed. 840 paired F32 tensor comparisons (30 × 7 × 4 ops).
 
-**Gate:** A localization to within a single layer+op OR written evidence that the aggregated error is within the Lloyd-Max theoretical distortion bound (Theorem 1 in the paper: MSE ≤ 0.009 at 4-bit for Gaussian inputs). No further integration work until this audit has a written conclusion.
+**Outcome (revised):** every one of 30 layers has at least one decode position where `sdpa_out` violates the kernel's own `nrmse < 0.15` (L2-reference formula `sqrt(sum_sq_diff / sum_sq_ref)`), per-layer max nrmse range 0.673–1.281. 196 of 210 `sdpa_out` cells violate `max_abs_diff < 1.0`. The divergence is real and exceeds the kernel's declared tolerance on every layer. What is NOT proven: that the defect lives in the TQ SDPA kernel itself vs FWHT, encode/prefill, or dispatch. That distinction is the C-0b localization experiment.
+
+**Artifacts:** `docs/tq-c0-audit-2026-04-21.md` (report), `docs/tq-c0-audit-2026-04-21-raw.csv` (840-row diff table), `docs/tq-c0-audit-2026-04-21-summary.md` (analyst summary), `docs/tq-c0-audit-2026-04-21-perhead.md` (per-head drilldown at L=0/P=1), `scripts/tq-c0-diff.py` (diff tool). Scaffolding commit `742f892` extends `HF2Q_DUMP_ALL_CACHE` to the Phase 3A attn Q/K/V + sdpa_out dump sites.
+
+**Gate:** [x] Written conclusion published. Gate released. Proceed to C-0b for locus pinning — the binary (a)/(b) question the gate originally anticipated was replaced by a trinary finding, so C-4's branching is now conditional on C-0b's E1/E2/E3 outcome rather than directly on C-0.
 
 ### Phase 1 — Metal Kernels — **STATUS: [x] kernels built, [?] correctness gates unverified on Phase-0 CPU reference (since there is no Phase-0 CPU reference), [x] integration done, [ ] integration sourdough gate FAILS**
 
@@ -388,7 +404,7 @@ Legend: [ ] not started, [~] partially done / unverified, [x] done + evidence, [
 
 - [ ] **Q-1:** Top-1 token agreement with F16 baseline ≥ 98/100 on greedy decode at 8K context — never measured on TQ-only path
 - [ ] **Q-2:** LongBench average score ≥ 49.0 — never measured
-- [ ] **Q-3:** No catastrophic attention flattening at any layer — Phase-0.4 layer-by-layer divergence audit (added 2026-04-21) gates this
+- [~] **Q-3:** No catastrophic attention flattening at any layer — Phase-0.4 audit [x] COMPLETED 2026-04-21 (`docs/tq-c0-audit-2026-04-21.md`). Finding: TQ `sdpa_out` violates kernel's own declared bounds on all 30 layers (per-layer max nrmse 0.673–1.281 vs kernel bound 0.15). "Flattening" per se (e.g., attention-entropy collapse) has NOT been separately measured; remains open pending C-0b localization
 
 ### Engineering
 
@@ -412,14 +428,24 @@ Legend: [ ] not started, [~] partially done / unverified, [x] done + evidence, [
 
 Mantra-grounded, ordered, each step cites the mantra principle that governs it.
 
-**C-0. Layer-by-layer divergence audit on branch `cfa/cfa-20260421-111303-tq-revival/codex`.**
+**C-0. Layer-by-layer divergence audit on branch `cfa/cfa-20260421-111303-tq-revival/codex`. [x] COMPLETED 2026-04-21.**
 (Mantra: "Always dive deep and ensure you know the problem you're solving.")
-Dump Q, K, V, attention-weight, and sdpa_out at each of the 30 layers for decode step N under two configurations on IDENTICAL prior-layer inputs:
-  - dense F32 KV (today's default)
-  - TQ-packed KV (Codex branch)
-Find the first layer where pairs diverge by more than the kernel replay-test bound (~1e-3). If a single op is implicated (likely candidates: per-head norm, O-proj, residual add, lm_head — ADR-008 port candidates), fix that op. If divergence accumulates gracefully across all 30 layers within Lloyd-Max theoretical distortion, document that the byte-exact sourdough gate is the wrong metric for TQ and design a TQ-specific gate.
+Executed as CFA session `cfa-20260421-C0-audit` (review-only mode: 3 Claude workers + Codex read-only reviewer + Opus queen). Paired F32 dumps per the spec. Written report at `docs/tq-c0-audit-2026-04-21.md`.
 
-**Exit state:** written report + concrete next action of "fix op X" or "representation floor confirmed, design gate Y".
+**Actual outcome:** the (a)-bug-or-(b)-floor binary the audit was designed to resolve instead produced a trinary: the divergence is quantitatively real and exceeds the kernel's own declared bounds on every one of the 30 layers (hypothesis (b) falsified), BUT the causal locus is not yet pinned — byte-identical *current-step* Q/K/V at L=0/P=1 do not prove identical SDPA inputs because decode pos 1 attends over a 22-token prefilled prompt cache that was never dumped. Four-hypothesis localization matrix now governs: (H1) TQ SDPA kernel, (H2) FWHT pipeline, (H3) prefill encode/cache, (H4) dispatch / buffer binding.
+
+**Process learning:** Codex orthogonal review caught three high-severity methodology errors (nrmse formula, threshold value, load-bearing byte-identity scope logic) that Claude's own 9/9 self-certification missed. For any future CFA session producing a binary-verdict audit deliverable, review-only mode with a Codex reviewer should be treated as non-optional.
+
+**C-0b. Localization experiment — prefill-cache state dump vs dense. [ ] NEXT SESSION.**
+(Mantra: "Measure 3x, cut once. Never make assumptions.")
+C-0 proved divergence beyond representation but did NOT split {H1 kernel, H2 FWHT, H3 encode/prefill, H4 dispatch}. The cheapest most-diagnostic next measurement: dump the actual TQ-consumed prefill-cache state at decode pos 1, layer 0 — packed K/V bytes, per-position norms, ring/mask parameters, centroid-table contents (or dequantized-cache equivalents). Diff against the dense prefill cache. Scaffolding is in place: `HF2Q_DUMP_ALL_CACHE=1` now enables full-layer coverage at the attn Q/K/V, sdpa_out, and dense-cache dump sites (commit `742f892` on main).
+
+**Exit state — one of three concrete next actions:**
+  - **E1:** If packed cache dequantizes to a value close to dense KV (within `nrmse<0.15`) and the kernel receives byte-close inputs, defect lives in H1 (kernel), H2 (FWHT), or H4 (dispatch). Next: kernel replay test with REAL decode inputs from the L=0/P=1 dumps (injected into `mlx-native/tests/test_flash_attn_vec_tq.rs`).
+  - **E2:** If packed cache dequantizes to a value that diverges from dense KV by more than the kernel's own `nrmse<0.15`, defect lives in H3 (prefill encode). Next: bisect `hadamard_quantize_kv` (single-token) vs `dispatch_hadamard_quantize_kv_seq` (batched prefill) on controlled inputs.
+  - **E3:** If both E1 and E2 test positive (both paths contribute), defect is compound. Fix the larger-magnitude contributor first, re-run C-0 paired dumps, then branch again through E1/E2 on the residual.
+
+**Only** after C-0b closes does C-4 become actionable. C-4's branches (below) are now keyed on E1/E2/E3 outcomes rather than the original (a)/(b) binary.
 
 **C-1. Phase 0.1 — CPU reference + Hadamard-vs-random + Gaussian-vs-Beta codebook.**
 (Mantra: "Measure 3x, cut once. Never make assumptions.")
@@ -433,13 +459,17 @@ Standalone Metal kernel gather vs sequential at capacity {8192, 262144}. Gate: g
 (Mantra: "Measure 3x.")
 Standalone FWHT at d={128, 256, 512}. Gate: total Hadamard ≤ 200 μs/token. Written report.
 
-**C-4. Remove the Track 3 stub, based on C-0 outcome.**
+**C-4. Remove the Track 3 stub, based on C-0b outcome (updated 2026-04-21).**
 (Mantra: "No fallback. No stub (todo later) code.")
-Two branches:
-  - If C-0 found a fixable bug: apply fix. Delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
-  - If C-0 found representation-floor: introduce `--kv-mode {f16, tq4}`. When `f16`, disable TQ encode (save the 0.14 ms/token). When `tq4`, disable dense fallback. `f16` is default; `tq4` is opt-in for long-ctx memory savings. Adjust sourdough gate to run in both modes with appropriate criteria (byte-exact for `f16`; TQ-specific quality metric for `tq4`).
+The original C-4 binary (a) fixable-bug / (b) representation-floor was replaced by C-0's trinary finding and C-0b's upcoming E1/E2/E3 split. Revised branches:
 
-No third option. No new "Track 4 safe fallback."
+  - **C-0b outcome E1 (H1 kernel / H2 FWHT / H4 dispatch bug confirmed):** localize to specific op via kernel-replay test with real decode inputs (L=0/P=1 dumps); apply fix. Then delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, and the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
+
+  - **C-0b outcome E2 (H3 prefill-encode bug confirmed):** fix encode — bisect `hadamard_quantize_kv` single-token vs `dispatch_hadamard_quantize_kv_seq` batched paths, align them, land a regression test at the encode boundary. Then same stub-removal as E1.
+
+  - **C-0b outcome E3 (compound defect):** fix the larger-magnitude contributor first, re-run C-0 paired dumps; residual delta is either a second locus (branch again through E1/E2) or a surviving-representation-floor (then and only then: introduce `--kv-mode {f16, tq4}` with `f16` default disabling TQ encode entirely to avoid the 0.14 ms/token waste, `tq4` opt-in for long-context memory savings, byte-exact sourdough in `f16` mode and a TQ-specific quality metric in `tq4`).
+
+No third option. No new "Track 4 safe fallback." Track 3 ships no further until one of E1/E2/E3 fires.
 
 **C-5. Phase 2 — 262K unlock.**
 (Mantra: "No short cuts. Done the right way.")
