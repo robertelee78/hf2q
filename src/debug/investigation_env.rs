@@ -131,7 +131,10 @@ pub struct InvestigationEnv {
     /// `input_layernorm.weight` at this layer.
     pub dump_norm_weight: Option<usize>,
 
-    /// `HF2Q_DUMP_ALL_CACHE=1` — when dumping, include all cached K,V.
+    /// `HF2Q_DUMP_ALL_CACHE=1` — at Phase 3A dump sites (attn Q/K/V, sdpa_out,
+    /// dense cached K/V), fire for all 30 layers instead of the single
+    /// detail layer, and include the full cached K/V history rather than
+    /// the current write slot. Enables single-run full-coverage audits.
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub dump_all_cache: bool,
 

@@ -1243,14 +1243,18 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
-                // ADR-009 Phase 3A: dump Q,K,V before SDPA for the detail layer
-                if dump_layers && dump_detail_layer == Some(layer_idx) {
+                // ADR-009 Phase 3A: dump Q,K,V before SDPA for the detail layer,
+                // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
+                let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
+                if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump QKV finish L{layer_idx}: {e}"))?;
                     dumps::dump_f32(&self.activations.attn_q_normed, nh * hd,
                         "q_normed", Some(layer_idx), seq_pos)?;
                     dumps::dump_f32(&self.activations.attn_k_normed, nkv * hd,
                         "k_normed", Some(layer_idx), seq_pos)?;
+                    dumps::dump_f32(v_src, nkv * hd,
+                        "v_normed", Some(layer_idx), seq_pos)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
@@ -1483,8 +1487,9 @@ impl MlxModelWeights {
                     total_dispatches += 2; // main + reduce
                 }
 
-                // ADR-009 Phase 3A: dump sdpa_out before O-proj
-                if dump_layers && dump_detail_layer == Some(layer_idx) {
+                // ADR-009 Phase 3A: dump sdpa_out before O-proj for the detail layer,
+                // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
+                if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out finish L{layer_idx}: {e}"))?;
                     // [nh, 1, hd] flattened.
