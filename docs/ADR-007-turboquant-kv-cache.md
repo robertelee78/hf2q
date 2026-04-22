@@ -1,7 +1,7 @@
 # ADR-007: TurboQuant KV Cache Compression for 262K Context
 
-**Status:** Partially Implemented — End-to-End Correctness UNVERIFIED; dormant on default path since 2026-04-16 (ADR-009 Track 3 fallback). Phase 0.4 C-0 divergence audit **COMPLETED 2026-04-21** — divergence confirmed beyond kernel bounds on all 30 layers. C-0b localization **COMPLETED 2026-04-21** — verdict E1-partial: non-batched compact-encoded L0/L5 prefill cache cleared; **sourdough regression reproduces on the non-batched path this session cleared**, so H3 is effectively cleared on the actually-exercised failing path. Batched-prefill encode (commit `415c9d6` on codex branch, ack-gated) + full-capacity layout + verbatim decode-call parameters remain untested. C-4 E1 branch (kernel replay test with real L=0/P=1 inputs) is the new gating step.
-**Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite); 2026-04-21 (C-0 audit completion + Codex-reviewed revision); 2026-04-21 (C-0b localization + Codex-reviewed narrowing)
+**Status:** Partially Implemented — End-to-End Correctness UNVERIFIED; dormant on default path since 2026-04-16 (ADR-009 Track 3 fallback). Phase 0.4 C-0 divergence audit **COMPLETED 2026-04-21** — divergence confirmed beyond kernel bounds on all 30 layers. C-0b localization **COMPLETED 2026-04-21** — verdict E1-partial: non-batched encode cleared on the failing default path. C-1 kernel replay **ATTEMPTED 2026-04-22 → VERIFICATION_BLOCKED** — two independent harness defects (22-row capture point vs production's 23-row SDPA; missing `memory_barrier()` between FWHT/kernel/iFWHT dispatches on Metal's concurrent encoder). No H1/H2/H4 attribution possible from the four runs. Harness scaffolding + partial metrics retained; **C-1-unlock is the new gating step** (5 concrete fixes: add barriers, add 23-row dump site, rebuild manifest, replace degenerate Variation C with dense control, persist raw output bins).
+**Date:** 2026-04-14 (original); revised 2026-04-21 (honest current-state rewrite); 2026-04-21 (C-0 audit completion + Codex-reviewed revision); 2026-04-21 (C-0b localization + Codex-reviewed narrowing); 2026-04-22 (C-1 VERIFICATION_BLOCKED + 2 harness defects identified)
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend — KV cache path lives here), ADR-005 (inference server — speed gates), ADR-008 (candle-divorce port — introduced ring-chronology regression), ADR-009 (Track 3 dense-SDPA "safe fallback" — the stub this ADR's mantra forbids)
 **Reference:** Zandieh, Daliri, Hadian, Mirrokni — "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate" (arXiv:2504.19874, April 2025)
@@ -65,7 +65,7 @@ The binary (a)-bug-or-(b)-floor question did NOT resolve cleanly — it resolved
 
 **Process learning — Codex review is load-bearing for binary-verdict deliverables.** Claude self-certified 9/9 acceptance criteria with three high-sev errors intact. Without the Codex second-opinion step this session would have sent C-1 directly into kernel-shader bisection, skipping prefill-state dumping, and wasted the next session. For any future CFA session producing a binary-verdict audit deliverable, review-only mode with a Codex reviewer should be treated as non-optional, not optional.
 
-**Gating next step (updated 2026-04-21, evening):** C-0b Localization **COMPLETED**. See the new "C-0b outcome" subsection directly below + Phase 0.4b in "Implementation Plan" below. Verdict E1-partial. The C-4 Track-3-stub-removal decision tree originally conditioned on the (a)/(b) binary is now on its **C-4 E1 branch** — next session's kernel replay test with real L=0/P=1 decode inputs must split {H1 kernel / H2 FWHT / H4 dispatch}. Caveat: batched-prefill encode path remains formally untested; the sourdough default does NOT exercise it, so H3 is effectively cleared on the failing default path — but if the user re-enables batched prefill in a future session, H3 on that path must be independently verified.
+**Gating next step (updated 2026-04-22, dawn):** C-1 kernel replay **ATTEMPTED → VERIFICATION_BLOCKED**. See the new "C-1 outcome" subsection below. The C-4 Track-3-stub-removal decision tree is now on **C-1-unlock** — a short session that fixes the two harness defects identified in C-1, re-runs the 4 variations against corrected 23-row inputs, and produces the H1/H2/H4 verdict the session was designed for. Until C-1-unlock closes, no H1/H2/H4 claim is defensible and C-4's branch selection cannot be made.
 
 ### C-0b outcome (2026-04-21, evening — CFA session `cfa-20260421-C0b-localize`)
 
@@ -92,6 +92,39 @@ Paired F32 dumps of end-of-prefill TQ-packed KV cache (codex worktree with new `
 - `docs/tq-c0b-localize-2026-04-21-summary.md` — analyst summary
 - `scripts/tq-c0b-dequant.py` — Python dequantizer mirroring the kernel
 - Instrumentation `b43d14c` on main: `HF2Q_DUMP_TQ_STATE=1` + `HF2Q_DUMP_LAYERS_LIST` + `dump_u8`/`dump_meta_json` helpers + dump site in non-batched prefill (the batched-path dump site from the codex-branch commit was dropped because batched prefill on main doesn't populate TQ cache — that's gated on codex commit `415c9d6` which is not on main).
+
+### C-1 outcome (2026-04-22, dawn — CFA session `cfa-20260422-C1-kernel-replay`)
+
+Kernel replay test attempted per the C-4 E1 branch. Harness committed at `mlx-native@9a4ca61` as `examples/tq_kernel_replay.rs` — loads L=0/P=1 Q + packed K/V + norms from a manifest, runs 4 variations (A full / B FWHT-disabled / C dense-reencoded / A_canary norms=1e9), computes nrmse + max_abs_diff vs an in-harness CPU reference. Report at commit `6ca03c2` (initial) + `6cf6b85` (Codex-reviewed revision) on main.
+
+**Verdict: VERIFICATION_BLOCKED.** Two independent harness defects prevent attribution:
+
+1. **Capture-point defect (caught by Worker 3 analyst)**: the C-0b dump captured end-of-prefill state (`kv_seq_len=22`, 22 packed rows), but production SDPA at decode step 1 runs with `kv_seq_len=23` — the decode-token K/V is written into packed slot 22 by `hadamard_quantize_kv` (`src/serve/forward_mlx.rs:1226-1243`) BEFORE the SDPA dispatch at `:1464`, and seq_len is incremented at `:1007-1015` before any per-layer work. The replay is missing the 23rd row that the kernel actually attends over at its heaviest weights.
+2. **Synchronization defect (caught by Codex review)**: the harness dispatches `FWHT(Q) → flash_attn_vec_tq → iFWHT(sdpa_out)` on Metal's concurrent-dispatch command encoder (`mlx-native/src/encoder.rs:404-453`) with **zero `memory_barrier()` calls**. Production inserts three `barrier_between` calls at this boundary (`src/serve/forward_mlx.rs:1429-1431, 1441-1446, 1477-1480`). Without barriers the concurrent encoder can execute FWHT and kernel dispatches out-of-order or overlapping, making the caller-side FWHT effectively a no-op. This almost certainly explains the A=B bit-identity that Worker 2 initially read as "kernel applies FWHT internally, H2 ruled out" — that reading is withdrawn.
+
+**Partial findings (retained but confounded):**
+- A = B = A_canary to 16 decimal places at 22 rows. As noted above, "bit-identical" cannot be asserted (raw output bins weren't persisted, only aggregate JSON). The equality is consistent with the FWHT-dispatch being a no-op due to Defect #2, not with kernel-internal FWHT.
+- C ≈ A at 22 rows. Variation C is degenerate in retrospect: dequant-then-requant reproduces the same packed bytes within small norm drift, so C mostly retests A rather than isolating a new locus. A real dense control would run `flash_attn_vec` (dense F32 kernel) on the same 22-row dequantized K/V.
+- Canary (A_canary = A) does NOT validate mask semantics as the report initially claimed. The kernel's main loop at `mlx-native/src/shaders/flash_attn_vec_tq.metal:262-266, 299, 358` breaks at `ic >= kv_seq_len`; positions 22..1023 are never dereferenced regardless of mask. The canary confirms loop bounds, not mask correctness. H4 mask-leak is therefore NOT ruled out.
+- Worker 4's "C-0 reframing" claim (dense-23 vs TQ-22 apples-to-oranges at C-0's L=0/P=1 cell) was a **new methodology error** that Codex caught. Production always uses post-write `kv_seq_len` before SDPA, so C-0's comparisons were row-count-matched at all positions. C-0's "within-bound at L=0/P=1" finding remains as-stated, and C-0's "all 30 layers violate bound" finding at pos 5+ is unaffected. The reframing was retracted in revision `6cf6b85`.
+
+**Methodology pattern across 3 sessions on the same problem (queen's Phase-3 observation):**
+
+| Session | Errors | Caught by |
+|---|---|---|
+| C-0 | 3 high-sev (nrmse formula, 1e-3 threshold, byte-identity scope) | Codex |
+| C-0b | 3 high-sev (nonbatched scope, compact layout, Gaussian-heuristic framing) | Codex |
+| C-1 | 1 first-order state-field (22/23) | in-worker analyst |
+| C-1 | 3 higher-order (dispatch barriers, C-0 reframing wrongness, canary misinterpretation) + 3 med-sev overclaims | Codex |
+
+Internal workers are learning to catch state-field mismatches but not dispatch/synchronization correctness or claim-discipline. Protocol refinement: add a dispatch-fidelity verification phase pre-measurement + a claim-discipline phase post-measurement for future TQ sessions.
+
+**Key pattern-level insight carried forward**: bit-identical results across variations that should mathematically differ are a synchronization-noop fingerprint, not a rule-out signal. First hypothesis should be "the variation toggle is a no-op at the dispatch level," not "the toggled operation doesn't matter." Stored as brain memory `992ab3f1`.
+
+**Artifacts (on main at `6ca03c2` + `6cf6b85`; on mlx-native at `9a4ca61`):**
+- `docs/tq-c1-kernel-replay-2026-04-22.md` — full report (revised to acknowledge both defects + retract the C-0 reframing)
+- `/tmp/cfa-20260422-C1-kernel-replay/` — manifest, inputs, 4 metrics JSONs (retained for C-1-unlock re-use)
+- `mlx-native/examples/tq_kernel_replay.rs` — harness scaffolding (needs barrier fix + Variation C replacement)
 
 ---
 
@@ -491,14 +524,18 @@ Standalone FWHT at d={128, 256, 512}. Gate: total Hadamard ≤ 200 μs/token. Wr
 (Mantra: "No fallback. No stub (todo later) code.")
 The original C-4 binary (a) fixable-bug / (b) representation-floor was replaced by C-0's trinary finding and C-0b's upcoming E1/E2/E3 split. Revised branches:
 
-  - **C-0b outcome E1 (H1 kernel / H2 FWHT / H4 dispatch bug confirmed) — CURRENT BRANCH as of 2026-04-21 evening:** localize to specific op via kernel-replay test with real decode inputs (L=0/P=1 dumps from C-0 + L=0 packed cache from C-0b).
-    - **Prerequisite 1**: the C-0b dumps were compacted `[nkv, kv_seq_len=22, hd/2]`; the kernel reads `[nkv, kv_capacity=1024, hd/2]`. Either zero-pad the compact dumps to kv_capacity stride before the replay OR re-dump raw full-capacity (extend `HF2Q_DUMP_TQ_STATE` handler to emit the full buffer).
-    - **Prerequisite 2**: the C-0b meta JSON has `mask_type=1` hardcoded but the decode TQ dispatch passes `mask_type=2` for sliding. Capture the verbatim decode-call parameters directly (`mask_type`, `sliding_window`, `ring_start`, `kv_seq_len`, `kv_capacity`, `scale`, `softcap`).
-    - **Replay-test decision tree**:
-      - Reproduces C-0's 0.844 max_abs_diff on identical inputs → **H1 confirmed**, bisect `flash_attn_vec_tq.metal` softmax / accumulation / online-max sections.
-      - Clean output within 0.15 nrmse on identical inputs → **H4 confirmed**, compare caller-side argument marshalling in `ops/flash_attn_vec_tq.rs` against the kernel's expected layout; check V-stride particularly (V max_abs_diff was 10× K in C-0b, consistent with V-path-specific layout bug).
-      - Divergence disappears when FWHT is disabled on Q or sdpa_out → **H2 confirmed**, bisect forward-rotate Q and inverse-rotate sdpa_out.
-    - **Optional H3 closure on the batched path** (not blocking C-4 since the default regression runs nonbatched): re-dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` on the codex branch (which has the batched-TQ-populate fix at `415c9d6`) and run the same C-0b diff.
+  - **C-0b outcome E1 (H1 kernel / H2 FWHT / H4 dispatch bug confirmed)** — was the current branch 2026-04-21 evening; attempted as C-1 kernel replay 2026-04-22 dawn; **VERIFICATION_BLOCKED**. See "C-1 outcome" subsection above. The harness at `mlx-native/examples/tq_kernel_replay.rs` (commit `9a4ca61`) is complete scaffolding but has two defects that prevent verdict attribution.
+    - **C-1-unlock (current gating step, 2026-04-22):** short session that fixes both harness defects and re-runs. Concrete steps:
+      1. In `mlx-native/examples/tq_kernel_replay.rs`, insert `encoder.memory_barrier()` (or mirror production's `s.barrier_between()` — see `src/serve/forward_mlx.rs:1429-1431, 1441-1446, 1477-1480` for the exact pattern) between the forward-FWHT dispatch and the kernel, and between the kernel and the inverse-FWHT dispatch.
+      2. Add a new TQ state dump site in `src/serve/forward_mlx.rs` between `hadamard_quantize_kv` (`:1226-1243`) and the TQ SDPA dispatch (`:1464`). This captures the 23-row packed cache state (22 prefill + 1 decode-token-just-written) that the kernel actually sees.
+      3. Rebuild `/tmp/cfa-20260422-C1-kernel-replay/manifest.json` at `kv_seq_len=23`, pointing to the new post-quant pre-SDPA dumps. Redesign the canary to mutate rows IN-RANGE (0..22) rather than out-of-range (22..1023) to test row-specific sensitivity.
+      4. Replace Variation C (dequant→requant, degenerate) with a real dense control: run `flash_attn_vec` (the dense F32 kernel in `mlx-native/src/ops/flash_attn_vec.rs`) on the same 23-row dequantized K/V, or compare the packed-path GPU output against a dense-GPU output built from the same replay inputs.
+      5. Persist raw `.bin` outputs for A / B / C / canary runs before computing aggregate metrics. Required for byte-level comparison and for avoiding overclaims like "bit-identical."
+    - **After C-1-unlock produces a clean verdict**:
+      - **H1 confirmed**: bisect `flash_attn_vec_tq.metal` softmax / accumulation / online-max. C-0's per-head signal at L=0/P=1 (heads 12/13 extreme-spike dimensions) is a starting point.
+      - **H2 confirmed**: bisect the forward-rotate Q / inverse-rotate sdpa_out dispatches in `mlx-native/src/ops/fwht_standalone.rs`.
+      - **H4 confirmed**: compare caller-side arg marshalling in `mlx-native/src/ops/flash_attn_vec_tq.rs` against the kernel's expected layout. Check V-stride particularly — V max_abs_diff in C-0b was 10× K (both within bound, but possibly a V-path-specific layout bug that C-1-unlock will surface).
+    - **Optional H3 closure on the batched path** (not blocking C-4 since default exercise is non-batched): re-dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` on the codex branch (commit `415c9d6`) and run the C-0b diff.
     - After H1/H2/H4 is pinned and fixed: delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, and the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
 
   - **C-0b outcome E2 (H3 prefill-encode bug confirmed):** fix encode — bisect `hadamard_quantize_kv` single-token vs `dispatch_hadamard_quantize_kv_seq` batched paths, align them, land a regression test at the encode boundary. Then same stub-removal as E1.
