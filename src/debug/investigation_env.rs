@@ -138,6 +138,21 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub dump_all_cache: bool,
 
+    // ========================================================================
+    // Category 4 — C-0b localization: TQ packed-cache state dump.
+    // ========================================================================
+    /// `HF2Q_DUMP_TQ_STATE=1` — at end-of-prefill (after the final TQ-seq
+    /// encode dispatch) dump k_packed + k_norms + v_packed + v_norms + a
+    /// meta JSON sidecar for each layer in `dump_tq_layers_list`. Safe;
+    /// purely read-only of live GPU buffers (requires a finish/begin pair
+    /// at the call site, which is the caller's responsibility).
+    pub dump_tq_state: bool,
+
+    /// `HF2Q_DUMP_LAYERS_LIST=0,5` — comma-separated layer indices to
+    /// include in the TQ state dump. Empty list (default) means ALL layers
+    /// when `dump_tq_state` is set. Parsed as `Vec<usize>`.
+    pub dump_tq_layers_list: Vec<usize>,
+
     /// `HF2Q_DUMP_RENDERED_PROMPT=<path>` — write rendered chat-template
     /// prompt to `<path>` and exit. Raw string; `None` if unset.
     pub dump_rendered_prompt: Option<String>,
@@ -250,6 +265,8 @@ impl InvestigationEnv {
             dump_layer_detail: env_usize("HF2Q_DUMP_LAYER_DETAIL"),
             dump_norm_weight: env_usize("HF2Q_DUMP_NORM_WEIGHT"),
             dump_all_cache: env_eq_one("HF2Q_DUMP_ALL_CACHE"),
+            dump_tq_state: env_eq_one("HF2Q_DUMP_TQ_STATE"),
+            dump_tq_layers_list: env_usize_list("HF2Q_DUMP_LAYERS_LIST"),
             dump_rendered_prompt: env::var("HF2Q_DUMP_RENDERED_PROMPT").ok(),
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),
 
@@ -405,6 +422,15 @@ impl InvestigationEnv {
         if self.dump_all_cache {
             diagnostics.push("HF2Q_DUMP_ALL_CACHE=1".into());
         }
+        if self.dump_tq_state {
+            let layers_str = if self.dump_tq_layers_list.is_empty() {
+                "all".to_string()
+            } else {
+                self.dump_tq_layers_list.iter().map(|l| l.to_string())
+                    .collect::<Vec<_>>().join(",")
+            };
+            diagnostics.push(format!("HF2Q_DUMP_TQ_STATE=1 (layers: {layers_str})"));
+        }
         if self.dump_rendered_prompt.is_some() {
             diagnostics.push("HF2Q_DUMP_RENDERED_PROMPT=<path>".into());
         }
@@ -486,6 +512,15 @@ fn env_eq_one(name: &str) -> bool {
 /// Mirrors `std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())`.
 fn env_usize(name: &str) -> Option<usize> {
     env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
+}
+
+/// Parses `HF2Q_DUMP_LAYERS_LIST=0,5` as a `Vec<usize>`.
+/// Returns an empty Vec if the env var is unset or empty.
+fn env_usize_list(name: &str) -> Vec<usize> {
+    env::var(name).ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Mirrors the inline `HF2Q_*_DUMP="L,T"` parsers: exactly one comma,

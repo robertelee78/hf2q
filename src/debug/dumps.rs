@@ -16,10 +16,52 @@
 //! Files are written to [`INVESTIGATION_ENV.dump_dir`]
 //! (`HF2Q_DUMP_DIR`, default `/tmp`).
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use mlx_native::MlxBuffer;
 
 use super::INVESTIGATION_ENV;
+
+/// Write `n_bytes` raw U8 values from `buf` to
+/// `<dump_dir>/hf2q_<name>_layer<LL>_pos<seq_pos>.u8.bin` and emit one
+/// `[DUMP]` line on stderr. Used for TQ packed K/V cache (nibble-packed
+/// u8 arrays). The caller is responsible for finishing the GPU session
+/// before calling so the buffer contents are valid.
+pub fn dump_u8(
+    buf: &MlxBuffer,
+    n_bytes: usize,
+    name: &str,
+    layer_idx: usize,
+    seq_pos: usize,
+) -> Result<()> {
+    let data: &[u8] = buf
+        .as_slice()
+        .map_err(|e| anyhow::anyhow!("dump_u8 {name} read: {e}"))?;
+    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+    let path = format!("{dump_dir}/hf2q_{name}_layer{layer_idx:02}_pos{seq_pos}.u8.bin");
+    std::fs::write(&path, &data[..n_bytes])
+        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    eprintln!("[DUMP] {name} layer {layer_idx:02} ({n_bytes} u8) -> {path}");
+    Ok(())
+}
+
+/// Write a meta JSON sidecar to
+/// `<dump_dir>/hf2q_<name>_layer<LL>_pos<seq_pos>.json`.
+/// `json_str` should be a pretty-printed JSON string (use `serde_json::to_string_pretty`).
+pub fn dump_meta_json(
+    json_str: &str,
+    name: &str,
+    layer_idx: usize,
+    seq_pos: usize,
+) -> Result<()> {
+    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+    let path = format!("{dump_dir}/hf2q_{name}_layer{layer_idx:02}_pos{seq_pos}.json");
+    std::fs::write(&path, json_str.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    eprintln!("[DUMP] {name} layer {layer_idx:02} -> {path}");
+    Ok(())
+}
 
 /// Write `n_elems` F32 values from `buf` to
 /// `<dump_dir>/hf2q_<name>[_layer<NN>]_pos<seq_pos>.bin` and emit one

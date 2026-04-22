@@ -775,6 +775,99 @@ impl MlxModelWeights {
                     }
                 }
 
+                // C-0b: HF2Q_DUMP_TQ_STATE — dump packed KV cache at end-of-prefill
+                // (last token only) for ADR-007 layer-0 localization audit.
+                if INVESTIGATION_ENV.dump_tq_state && tok_i + 1 == seq_len {
+                    let dump_layers_list = &INVESTIGATION_ENV.dump_tq_layers_list;
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("tq_dump nonbatched finish T{tok_i}: {e}"))?;
+                    for li in 0..num_layers {
+                        if !dump_layers_list.is_empty() && !dump_layers_list.contains(&li) {
+                            continue;
+                        }
+                        let layer = &self.layers[li];
+                        let hd = layer.head_dim;
+                        let nkv = layer.num_kv_heads;
+                        let (kv_is_sliding, _kv_write_pos, kv_capacity, kv_seq_len) = kv_info[li];
+                        let hd_half = hd / 2;
+                        let k_raw: &[u8] = self.kv_caches[li].k_packed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("tq_dump nb k_packed L{li}: {e}"))?;
+                        let v_raw: &[u8] = self.kv_caches[li].v_packed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("tq_dump nb v_packed L{li}: {e}"))?;
+                        let k_norms_raw: &[f32] = self.kv_caches[li].k_norms.as_slice()
+                            .map_err(|e| anyhow::anyhow!("tq_dump nb k_norms L{li}: {e}"))?;
+                        let v_norms_raw: &[f32] = self.kv_caches[li].v_norms.as_slice()
+                            .map_err(|e| anyhow::anyhow!("tq_dump nb v_norms L{li}: {e}"))?;
+                        let mut k_tight = vec![0u8; nkv * kv_seq_len * hd_half];
+                        let mut v_tight = vec![0u8; nkv * kv_seq_len * hd_half];
+                        let mut kn_tight = vec![0.0f32; nkv * kv_seq_len];
+                        let mut vn_tight = vec![0.0f32; nkv * kv_seq_len];
+                        for h in 0..nkv {
+                            for p in 0..kv_seq_len {
+                                let src_packed = h * kv_capacity * hd_half + p * hd_half;
+                                let dst_packed = h * kv_seq_len * hd_half + p * hd_half;
+                                k_tight[dst_packed..dst_packed + hd_half]
+                                    .copy_from_slice(&k_raw[src_packed..src_packed + hd_half]);
+                                v_tight[dst_packed..dst_packed + hd_half]
+                                    .copy_from_slice(&v_raw[src_packed..src_packed + hd_half]);
+                                let src_norm = h * kv_capacity + p;
+                                let dst_norm = h * kv_seq_len + p;
+                                kn_tight[dst_norm] = k_norms_raw[src_norm];
+                                vn_tight[dst_norm] = v_norms_raw[src_norm];
+                            }
+                        }
+                        let dir = &INVESTIGATION_ENV.dump_dir;
+                        std::fs::create_dir_all(dir.as_str())
+                            .map_err(|e| anyhow::anyhow!("tq_dump nb mkdir {dir}: {e}"))?;
+                        let kp = format!("{dir}/hf2q_k_packed_layer{li:02}_pos{kv_seq_len}.u8.bin");
+                        let vp = format!("{dir}/hf2q_v_packed_layer{li:02}_pos{kv_seq_len}.u8.bin");
+                        std::fs::write(&kp, &k_tight)
+                            .map_err(|e| anyhow::anyhow!("write {kp}: {e}"))?;
+                        std::fs::write(&vp, &v_tight)
+                            .map_err(|e| anyhow::anyhow!("write {vp}: {e}"))?;
+                        eprintln!("[TQ_DUMP] k_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {kp}");
+                        eprintln!("[TQ_DUMP] v_packed L{li:02} [{nkv},{kv_seq_len},{hd_half}] u8 -> {vp}");
+                        let kn = format!("{dir}/hf2q_k_norms_layer{li:02}_pos{kv_seq_len}.f32.bin");
+                        let vn = format!("{dir}/hf2q_v_norms_layer{li:02}_pos{kv_seq_len}.f32.bin");
+                        let kn_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                kn_tight.as_ptr() as *const u8, kn_tight.len() * 4)
+                        };
+                        let vn_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                vn_tight.as_ptr() as *const u8, vn_tight.len() * 4)
+                        };
+                        std::fs::write(&kn, kn_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {kn}: {e}"))?;
+                        std::fs::write(&vn, vn_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {vn}: {e}"))?;
+                        eprintln!("[TQ_DUMP] k_norms L{li:02} [{nkv},{kv_seq_len}] f32 -> {kn}");
+                        eprintln!("[TQ_DUMP] v_norms L{li:02} [{nkv},{kv_seq_len}] f32 -> {vn}");
+                        let layer_type_str = if kv_is_sliding { "sliding" } else { "global" };
+                        let kv_write_pos_final = self.kv_caches[li].write_pos;
+                        let meta = serde_json::json!({
+                            "nkv": nkv, "nh": max_nh, "hd": hd,
+                            "kv_seq_len": kv_seq_len,
+                            "kv_capacity": kv_capacity,
+                            "kv_write_pos": kv_write_pos_final,
+                            "kv_is_sliding": kv_is_sliding,
+                            "ring_start": 0,
+                            "sliding_window": sw,
+                            "mask_type": 1,
+                            "layer_type": layer_type_str,
+                            "path": "nonbatched"
+                        });
+                        let meta_str = serde_json::to_string_pretty(&meta)
+                            .map_err(|e| anyhow::anyhow!("meta json nb L{li}: {e}"))?;
+                        let mp = format!("{dir}/hf2q_tq_meta_layer{li:02}_pos{kv_seq_len}.json");
+                        std::fs::write(&mp, meta_str.as_bytes())
+                            .map_err(|e| anyhow::anyhow!("write {mp}: {e}"))?;
+                        eprintln!("[TQ_DUMP] meta L{li:02} -> {mp}");
+                    }
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("tq_dump nonbatched re-begin: {e}"))?;
+                }
+
                 // --- 3. Final norm + lm_head + softcap + argmax ---
                 s.barrier_between(
                     &[&self.activations.hidden, &self.final_norm],
