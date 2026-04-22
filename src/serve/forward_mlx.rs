@@ -1243,6 +1243,135 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // C-1-unlock: post-hadamard_quantize pre-SDPA dump (decode step 1, layer 0).
+                // Gate: dump_tq_state && layer_idx == 0 && kv_seq_len == 23 (one decode token
+                // has been written into slot 22 of the TQ ring buffer).
+                // Dumps full-capacity packed K/V + norms + Q (pre-FWHT) to post_quant subdir.
+                if INVESTIGATION_ENV.dump_tq_state && layer_idx == 0 && kv_seq_len == 23 {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("post_quant dump finish L{layer_idx}: {e}"))?;
+                    let hd_half = hd / 2;
+                    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+                    let post_quant_dir = format!("{dump_dir}/post_quant");
+                    std::fs::create_dir_all(&post_quant_dir)
+                        .map_err(|e| anyhow::anyhow!("post_quant mkdir: {e}"))?;
+
+                    // k_packed_post_quant.u8.bin — full [nkv, kv_capacity, hd/2] u8
+                    {
+                        let k_raw: &[u8] = self.kv_caches[layer_idx].k_packed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("post_quant k_packed read: {e}"))?;
+                        let n_bytes = nkv * kv_capacity * hd_half;
+                        let kp = format!("{post_quant_dir}/k_packed_post_quant.u8.bin");
+                        std::fs::write(&kp, &k_raw[..n_bytes])
+                            .map_err(|e| anyhow::anyhow!("write {kp}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] k_packed [{nkv},{kv_capacity},{hd_half}] u8 -> {kp}");
+                    }
+
+                    // v_packed_post_quant.u8.bin — full [nkv, kv_capacity, hd/2] u8
+                    {
+                        let v_raw: &[u8] = self.kv_caches[layer_idx].v_packed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("post_quant v_packed read: {e}"))?;
+                        let n_bytes = nkv * kv_capacity * hd_half;
+                        let vp = format!("{post_quant_dir}/v_packed_post_quant.u8.bin");
+                        std::fs::write(&vp, &v_raw[..n_bytes])
+                            .map_err(|e| anyhow::anyhow!("write {vp}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] v_packed [{nkv},{kv_capacity},{hd_half}] u8 -> {vp}");
+                    }
+
+                    // k_norms_post_quant.f32.bin — full [nkv, kv_capacity] f32
+                    {
+                        let kn_raw: &[f32] = self.kv_caches[layer_idx].k_norms.as_slice()
+                            .map_err(|e| anyhow::anyhow!("post_quant k_norms read: {e}"))?;
+                        let n_elems = nkv * kv_capacity;
+                        let kn_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                kn_raw.as_ptr() as *const u8,
+                                n_elems * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        let kn = format!("{post_quant_dir}/k_norms_post_quant.f32.bin");
+                        std::fs::write(&kn, kn_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {kn}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] k_norms [{nkv},{kv_capacity}] f32 -> {kn}");
+                    }
+
+                    // v_norms_post_quant.f32.bin — full [nkv, kv_capacity] f32
+                    {
+                        let vn_raw: &[f32] = self.kv_caches[layer_idx].v_norms.as_slice()
+                            .map_err(|e| anyhow::anyhow!("post_quant v_norms read: {e}"))?;
+                        let n_elems = nkv * kv_capacity;
+                        let vn_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                vn_raw.as_ptr() as *const u8,
+                                n_elems * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        let vn = format!("{post_quant_dir}/v_norms_post_quant.f32.bin");
+                        std::fs::write(&vn, vn_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {vn}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] v_norms [{nkv},{kv_capacity}] f32 -> {vn}");
+                    }
+
+                    // q_natural.f32.bin — Q pre-FWHT, shape [nh, hd] f32
+                    {
+                        let q_raw: &[f32] = self.activations.attn_q_normed.as_slice()
+                            .map_err(|e| anyhow::anyhow!("post_quant q_normed read: {e}"))?;
+                        let n_elems = nh * hd;
+                        let q_bytes: &[u8] = unsafe {
+                            std::slice::from_raw_parts(
+                                q_raw.as_ptr() as *const u8,
+                                n_elems * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        let qp = format!("{post_quant_dir}/q_natural.f32.bin");
+                        std::fs::write(&qp, q_bytes)
+                            .map_err(|e| anyhow::anyhow!("write {qp}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] q_natural [{nh},{hd}] f32 -> {qp}");
+                    }
+
+                    // meta_post_quant.json — production call-site params + provenance
+                    {
+                        let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
+                            (kv_write_pos % kv_capacity) as u32
+                        } else {
+                            0u32
+                        };
+                        let commit_sha = option_env!("GIT_COMMIT_SHA")
+                            .unwrap_or("03bea75071a8b0fd43a47f1101a832e23317e429");
+                        let meta = serde_json::json!({
+                            "site": "post_hadamard_quantize_pre_sdpa",
+                            "layer_idx": layer_idx,
+                            "seq_pos": seq_pos,
+                            "kv_seq_len": kv_seq_len,
+                            "kv_capacity": kv_capacity,
+                            "kv_write_pos": kv_write_pos,
+                            "nkv": nkv,
+                            "nh": nh,
+                            "hd": hd,
+                            "hd_half": hd_half,
+                            "kv_is_sliding": kv_is_sliding,
+                            "mask_type": if is_sliding { 2u32 } else { 1u32 },
+                            "sliding_window": if is_sliding { self.sliding_window as u32 } else { 0u32 },
+                            "ring_start": ring_start,
+                            "k_packed_shape": [nkv, kv_capacity, hd_half],
+                            "v_packed_shape": [nkv, kv_capacity, hd_half],
+                            "k_norms_shape": [nkv, kv_capacity],
+                            "v_norms_shape": [nkv, kv_capacity],
+                            "q_natural_shape": [nh, hd],
+                            "commit_sha": commit_sha,
+                        });
+                        let meta_str = serde_json::to_string_pretty(&meta)
+                            .map_err(|e| anyhow::anyhow!("post_quant meta json: {e}"))?;
+                        let mp = format!("{post_quant_dir}/meta_post_quant.json");
+                        std::fs::write(&mp, meta_str.as_bytes())
+                            .map_err(|e| anyhow::anyhow!("write {mp}: {e}"))?;
+                        eprintln!("[POST_QUANT_DUMP] meta -> {mp}");
+                    }
+
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("post_quant dump re-begin: {e}"))?;
+                }
+
                 // ADR-009 Phase 3A: dump Q,K,V before SDPA for the detail layer,
                 // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
                 let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
