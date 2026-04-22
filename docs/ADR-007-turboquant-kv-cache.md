@@ -8,9 +8,9 @@
 
 ---
 
-## Current Status (2026-04-21 — honest rewrite)
+## Current Status (2026-04-22 — C-2 complete, spec-level defect confirmed)
 
-**One sentence:** The kernels exist and pass isolated replay tests, but the full pipeline is gated off on the default path; TQ encode runs every decode token while TQ decode never fires, so we pay the cost without the benefit. The C-0 paired-dump audit (2026-04-21) confirmed that when the TQ decode path is forced active, its `sdpa_out` exceeds the kernel's own declared bounds on every one of the 30 layers — a genuine defect, not measurement artifact — but the causal locus within {kernel, FWHT, encode/prefill, dispatch} is not yet pinned.
+**One sentence:** The kernels exist, pass isolated replay tests, AND (as of C-2, 2026-04-22) the causal locus of the sourdough regression is pinned: the independent-floor oracle landed in `examples/tq_kernel_replay.rs` shows a 3-order-of-magnitude nrmse gap between the GPU-TQ output and a dense `flash_attn_vec` reference on pre-quant F32 K/V at every tested position (50, 500, 1050, 2048) including ring-wrap — ruling out {kernel math H1, FWHT pipeline H2, dispatch/ring_start H4} and placing the defect inside the TQ specification itself (CODEBOOK_4BIT Lloyd-Max values, FWHT normalization convention, or the encode/decode sqrt(hd) pairing). C-3 will bisect.
 
 ### What actually exists in code
 
@@ -483,7 +483,7 @@ Legend: [ ] not started, [~] partially done / unverified, [x] done + evidence, [
 
 ---
 
-## Path to Completion (2026-04-21)
+## Path to Completion (2026-04-22)
 
 Mantra-grounded, ordered, each step cites the mantra principle that governs it.
 
@@ -533,19 +533,22 @@ The original C-4 binary (a) fixable-bug / (b) representation-floor was replaced 
       5. Persist raw `.bin` outputs for A / B / C / canary runs before computing aggregate metrics. Required for byte-level comparison and for avoiding overclaims like "bit-identical."
     - **C-1-unlock actual outcome**: kernel math, FWHT, and dispatch are all CLEAN at the single captured state. No H1/H2/H4 surfaced at L=0/P=1. BUT this proves only "kernel implements its own CPU spec," not end-to-end correctness — the harness's CPU oracle uses the same `nibble_dequantize` as the kernel, so a spec-level dequant bug would be invisible. The 30-layer bound violations from C-0 (at pos 5+ not pos 1) are therefore consistent with: (i) cumulative quant-noise drift through the ring, (ii) a dequant spec bug canceled out of the single-step oracle, (iii) a ring-wrap bug not exercised at kv_seq_len=23, (iv) a nonzero-`ring_start` bug. C-2 multi-step audit below is the next experiment to split these.
 
-    - **C-2 multi-step audit (current gating step, 2026-04-22 late).** 3 prioritized caveat-closers from C-1-unlock's cross-reviews:
+    - **C-2 multi-step audit. [x] COMPLETED 2026-04-22 (CFA session `cfa-20260422-C2-multistep`, dual mode downgraded to review-only after Codex sandbox walls on Metal + cross-repo writes).** Verdict `dequant_spec_bug_confirmed`. See `### C-2 outcome (2026-04-22)` subsection below for the 4-position × 2-oracle matrix, canary mechanism proof, and evidence paths. Merge SHAs: mlx-native `5f07801`, hf2q `665054a`. Original 3 prioritized caveat-closers from C-1-unlock's cross-reviews (all delivered):
       1. **Independent-floor oracle** (load-bearing for detecting spec-level dequant bugs): add `HF2Q_DUMP_PRE_QUANT=1` dump site in `forward_mlx.rs` at the pre-`hadamard_quantize_kv` boundary (just before line 1226 on main). Extend the harness to load pre-quant F32 K/V and run a dense `flash_attn_vec` reference against it. The harness now compares GPU-TQ-output against TWO oracles: the dequant-identical CPU ref (already there), AND the independent-floor dense-from-unquant ref (new). If GPU matches dequant ref but diverges from independent-floor ref, that's a spec-level dequant bug and the locus is `nibble_dequantize` / its Metal analogue.
       2. **Canary symmetry fix**: propagate the in-range canary mutation into the CPU oracle's `k_norms_ref` array (or add `canary_ref: bool` path). Both teams had the same symmetric defect; fix both branches.
       3. **Multi-step / ring-wrap / nonzero-`ring_start` variations**: replay at decode pos 50 (mid-range), 500 (deep into sliding), 1050 (first ring-wrap, `kv_seq_len >= kv_capacity`), 2048 (second wrap). Extend `cpu_sdpa` to honor `mask_type`, `sliding_window`, `ring_start`, `softcap` (currently special-cased for the kv_seq_len=23 manifest). This is where H1 gets actually tested against the cumulative sourdough regression.
       4. (secondary) Port Codex's `ManifestShaGate` hard-exit to Claude harness.
 
-    - **After C-2 produces a clean verdict** (requires both the dequant-oracle AND multi-step dimensions to pass):
-      - **H1 confirmed**: bisect `flash_attn_vec_tq.metal` softmax / accumulation / online-max. C-0's per-head signal at L=0/P=1 (heads 12/13 extreme-spike dimensions) is a starting point.
-      - **H2 confirmed**: bisect the forward-rotate Q / inverse-rotate sdpa_out dispatches in `mlx-native/src/ops/fwht_standalone.rs`.
-      - **H4 confirmed**: compare caller-side arg marshalling in `mlx-native/src/ops/flash_attn_vec_tq.rs` against the kernel's expected layout. Check V-stride particularly — V max_abs_diff in C-0b was 10× K (both within bound, but possibly a V-path-specific layout bug that C-2 will surface in multi-step runs).
-      - **Spec-level dequant bug confirmed** (new outcome enabled by the independent-floor oracle): bisect `nibble_dequantize` Rust (`turboquant.rs:27-32` codebook, `:94-97` FWHT normalization) and the Metal analogue at `flash_attn_vec_tq.metal:98-103`.
-    - **Optional H3 closure on the batched path** (not blocking C-4 since default exercise is non-batched): re-dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` on the codex branch (commit `415c9d6`) and run the C-0b diff.
-    - After H1/H2/H4 is pinned and fixed: delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, and the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
+    - **C-2 outcome (2026-04-22): `dequant_spec_bug_confirmed`.** The independent-floor oracle (dense `flash_attn_vec` on pre-quant F32, landed at `examples/tq_kernel_replay.rs`) produced 3-order-of-magnitude nrmse at every tested position including ring-wrap. Same pattern across ring_start={0,1,27} rules out H4 (dispatch/ring). Dequant-oracle agreement at all positions rules out H1 (kernel core math). The dequant pipeline is self-consistent with the kernel but divergent from ground truth — the defect is in the TQ spec itself, not the code that implements it. Full record in `### C-2 outcome (2026-04-22)` subsection below.
+
+    - **C-3 bisect (current gating step, 2026-04-22 late).** Three targets, ordered by cost:
+      1. **Round-trip identity test (cheapest).** Encode a known F32 K/V → decode immediately via `nibble_dequantize` → compare to original. Expected near-zero. If NOT near-zero, the bug is in the codebook values or the FWHT normalization. If it IS near-zero but full pipeline (encode → decode → SDPA) still diverges 0.32–0.55 nrmse vs ground truth, the bug is in how the representation interacts with attention (not in the K/V vector round-trip).
+      2. **`CODEBOOK_4BIT` values vs the TurboQuant paper's Lloyd-Max Gaussian table.** Inline Lloyd-Max centroids at `mlx-native/src/ops/turboquant.rs:27-32` and the Metal mirror in `flash_attn_vec_tq.metal:98-103`. Cross-reference against the paper's 4-bit Gaussian centroids. Any numerical drift from the paper's values is the locus.
+      3. **FWHT normalization convention.** Verify (a) encode `scale = sqrt(hd)` at `turboquant.rs:94-97` and decode `inv_scale = 1/sqrt(hd)` in the kernel are literal reciprocals (not, say, reciprocal up to a `1/d` factor); (b) both sides use the same H·H=I-vs-H·H=d·I orthogonality convention; (c) the `rsqrt(head_dim)` factor in `flash_attn_vec_tq.metal` matches what `hadamard_quantize_kv.metal` wrote.
+      C-2 MED-severity followups (not blocking C-3): re-run multistep at real Gemma-4 sliding-layer shape (16/8/256 vs the 8/4/256 Claude used), swap the custom SplitMix64 for `rand::rngs::StdRng::seed_from_u64(0xC25EED)` to restore cross-team bit-identical comparability, fix or explicitly relabel the singlestep `--oracle independent-floor` partial-independence at `tq_kernel_replay.rs:1014` (history rows backfilled from dequant, only newest row from pre-quant), port Codex's `ManifestShaGate` hard-exit to the Claude harness.
+
+    - **Optional H3 closure on the batched path** (not blocking stub removal since default exercise is non-batched): re-dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` on the codex branch (commit `415c9d6`) and run the C-0b diff.
+    - After C-3 fix lands and sourdough clears: delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, and the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
 
 ### C-2 outcome (2026-04-22)
 
