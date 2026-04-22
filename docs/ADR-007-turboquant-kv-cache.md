@@ -547,6 +547,40 @@ The original C-4 binary (a) fixable-bug / (b) representation-floor was replaced 
     - **Optional H3 closure on the batched path** (not blocking C-4 since default exercise is non-batched): re-dump with `HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1` on the codex branch (commit `415c9d6`) and run the C-0b diff.
     - After H1/H2/H4 is pinned and fixed: delete `dense_kvs` / `dense_sdpa_tmp` fields, the `use_dense_sdpa` gate, the dense SDPA decode branch, and the `self.dense_kvs = Some(...)` assignments in both prefills. Keep `dispatch_hadamard_quantize_kv_seq` wiring in batched prefill. Sourdough passes byte-exact at 3094+.
 
+### C-2 outcome (2026-04-22)
+
+CFA session `cfa-20260422-C2-multistep`. Claude branch commits: hf2q `a6ca566` (P1a), mlx `6035cca` (P3a), `460f66e` (P1b), `7895164` (P2), `eda59ef` (P3b), hf2q `[P4-sha]` (P4). Codex team parallel.
+
+**Singlestep regression gate:** dequant_oracle_nrmse = 5.138e-5 (target 5.1e-5 ±1e-6). PASS.
+
+**4-position × 2-oracle result matrix** (seed 0xC25EED, mask_type=2 sliding_window=1024 softcap=0, kv_capacity=1024, num_heads=8/4 head_dim=256):
+
+| pos | kvl_logical | ring_start | dequant_oracle_nrmse | independent_floor_nrmse | verdict |
+|-----|-------------|------------|---------------------|------------------------|--------|
+| 50 | 51 | 0 | 6.85e-4 | 4.55e-1 | dequant_spec_bug_confirmed |
+| 500 | 501 | 0 | 1.12e-3 | 5.50e-1 | dequant_spec_bug_confirmed |
+| 1050 | 1024 | 27 | 8.92e-4 | 4.91e-1 | dequant_spec_bug_confirmed |
+| 2048 | 1024 | 1 | 5.71e-4 | 3.23e-1 | dequant_spec_bug_confirmed |
+
+**C-2 verdict: `dequant_spec_bug_confirmed`**
+
+Pattern across all 4 positions: dequant_oracle_nrmse is low (5e-4 to 1e-3) but independent_floor_nrmse is very high (0.32–0.55). The TQ kernel output closely matches the CPU oracle built from `nibble_dequantize` at every position including ring-wrap (pos 1050, ring_start=27) and deep ring (pos 2048, ring_start=1). But the GPU-TQ output diverges dramatically from the dense `flash_attn_vec` oracle operating on the same pre-quant F32 K/V.
+
+This is the `dequant_spec_bug_confirmed` branch: the kernel implements `nibble_dequantize` faithfully, but `nibble_dequantize` itself (FWHT+codebook lookup) is quantizing to a representation whose SDPA output doesn't match what the pre-quant F32 input would have produced. The locus is in the `nibble_dequantize` formula, the CODEBOOK_4BIT values, or the FWHT normalization convention used during encode — one or more of these causes the round-trip (encode → decode → SDPA) to deviate from the identity (pre-quant → SDPA) by 0.32–0.55 NRMSE at practical context lengths.
+
+This eliminates H1 (kernel math), H2 (FWHT pipeline), and H4 (dispatch/ring_start bug) as primary causes: the kernel is self-consistent, ring-wrap handling is correct (ring_start=27 and ring_start=1 show same pattern as ring_start=0), and the pattern holds at all positions. The defect is in the quantization spec itself.
+
+**Canary-symmetry findings:** C-1-unlock's asymmetric canary (one-sided mutation: GPU sees 2x norm, CPU oracle does not) produced 0.111 nrmse. Symmetric fix (P2): mutating k_norms_compact at pos=10 BEFORE rebuilding k_dequant brings nrmse to 7.88e-5 (≤ 1e-4). Asymmetric mode (`HF2Q_REPLAY_CANARY_ASYMMETRIC=1`) reproduces 0.111. Both paths verified.
+
+**Anomalies:** The `dequant_spec_bug_confirmed` nrmse values grow slightly with kvl_logical (pos 50: 6.85e-4 vs pos 500: 1.12e-3), suggesting cumulative quantization noise compounds as cache length grows, but the primary signal is the large independent-floor divergence present at even the smallest tested position (pos=50, kvl=51).
+
+**Next step (C-3):** Bisect `nibble_dequantize` / `CODEBOOK_4BIT` / FWHT normalization. Specifically: (a) compare `CODEBOOK_4BIT` values against the paper's Lloyd-Max Gaussian table for 4-bit; (b) verify FWHT normalization convention (normalized H·H=I vs unnormalized H·H=d·I) is consistent between encode and decode; (c) check whether the `inv_scale = 1/sqrt(hd)` in `nibble_dequantize` matches the encode-side `scale = sqrt(hd)` in `nibble_quantize`.
+
+**Evidence files:**
+- `/tmp/cfa-20260422-C2-multistep/claude-multi.md` — Markdown table
+- `/tmp/cfa-20260422-C2-multistep/claude-multi.json` — raw JSON
+- `/tmp/cfa-20260422-C2-multistep/claude-single.json` — singlestep regression gate
+
   - **C-0b outcome E2 (H3 prefill-encode bug confirmed):** fix encode — bisect `hadamard_quantize_kv` single-token vs `dispatch_hadamard_quantize_kv_seq` batched paths, align them, land a regression test at the encode boundary. Then same stub-removal as E1.
 
   - **C-0b outcome E3 (compound defect):** fix the larger-magnitude contributor first, re-run C-0 paired dumps; residual delta is either a second locus (branch again through E1/E2) or a surviving-representation-floor (then and only then: introduce `--kv-mode {f16, tq4}` with `f16` default disabling TQ encode entirely to avoid the 0.14 ms/token waste, `tq4` opt-in for long-context memory savings, byte-exact sourdough in `f16` mode and a TQ-specific quality metric in `tq4`).
