@@ -549,7 +549,7 @@ The original C-4 binary (a) fixable-bug / (b) representation-floor was replaced 
 
 ### C-2 outcome (2026-04-22)
 
-CFA session `cfa-20260422-C2-multistep`. Claude branch commits: hf2q `a6ca566` (P1a), mlx `6035cca` (P3a), `460f66e` (P1b), `7895164` (P2), `eda59ef` (P3b), hf2q `[P4-sha]` (P4). Codex team parallel.
+CFA session `cfa-20260422-C2-multistep`. Claude branch commits: hf2q `a6ca566` (P1a), mlx `6035cca` (P3a), `460f66e` (P1b), `7895164` (P2), `eda59ef` (P3b), hf2q `a0a4a87` (P4). Codex team parallel.
 
 **Singlestep regression gate:** dequant_oracle_nrmse = 5.138e-5 (target 5.1e-5 ±1e-6). PASS.
 
