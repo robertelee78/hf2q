@@ -21,9 +21,10 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::mtp::{load_mtp_weights_if_present, MtpWeights};
-use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 
 use mlx_native::gguf::GgufFile;
+use mlx_native::MlxDevice;
 
 // ================================================================
 // Layer weight enums
@@ -149,22 +150,45 @@ impl Qwen35Model {
 
     /// Load a complete model from a GGUF file.
     ///
-    /// **Current state (ADR-013 P11 scaffold):** parses the config and
-    /// MTP scaffold from the GGUF but does NOT yet load the dense tensor
-    /// content — that requires the full GGUF → f32 dequant pipeline
-    /// (ADR-013 P11 + P5-tail), which lands in a follow-up iter.
+    /// Acquires a Metal GPU device for dequantization, loads the three
+    /// global tensors (`token_embd`, `output`, `output_norm`), then
+    /// iterates over all layers loading weights via
+    /// [`weight_loader::load_layer`].  Layer weights are dequantized
+    /// to f32 on the Metal GPU and downloaded back to CPU `Vec<f32>`,
+    /// matching the layout expected by [`Qwen35Model::forward_gpu`].
     ///
-    /// For now the returned model carries `cfg` + `mtp` populated with
-    /// real values from the GGUF, and `layers` / `token_embd` /
-    /// `output_*` populated with zeros of the correct shape. Callers
-    /// wanting actual inference must complete the weight load themselves
-    /// (bridge path until P11 finalizes).
+    /// # Memory note
+    ///
+    /// A fully dequantized 35B MoE apex GGUF consumes roughly 85–90 GB
+    /// of CPU RAM.  Ensure the host has sufficient unified memory
+    /// (≥ 128 GB for M-series) before calling this function.
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
         let cfg = Self::load_config_only(gguf)?;
         let mtp = load_mtp_weights_if_present(gguf, cfg.num_hidden_layers)?;
-        let mut model = Self::empty_from_cfg(cfg);
-        model.mtp = mtp;
-        Ok(model)
+
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+
+        let (token_embd, output_weight, output_norm) =
+            weight_loader::load_global_tensors(gguf, &cfg, &device)
+                .context("load_global_tensors")?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(
+                weight_loader::load_layer(gguf, &cfg, i, &device)
+                    .with_context(|| format!("load_layer {i}"))?,
+            );
+        }
+
+        Ok(Self {
+            cfg,
+            layers,
+            token_embd,
+            output_weight,
+            output_norm,
+            mtp,
+        })
     }
 
     /// Report the active FFN variant (Dense or Moe) determined by config.
@@ -276,12 +300,6 @@ fn empty_ffn_for(cfg: &Qwen35Config) -> Qwen35FfnWeights {
     }
 }
 
-// Suppress the unused-import warning when tests aren't compiled; `anyhow` is
-// only used for the Result alias in the `Result` return type above.
-#[allow(dead_code)]
-fn _touch_anyhow() -> anyhow::Error {
-    anyhow!("")
-}
 
 // ================================================================
 // Tests
