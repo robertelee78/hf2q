@@ -9,6 +9,8 @@
 //!   3 = input/validation error
 
 #[allow(dead_code)]
+mod arch;
+#[allow(dead_code)]
 mod backends;
 mod cli;
 mod debug;
@@ -169,6 +171,43 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
         Command::Serve(args) => serve::cmd_serve(args).map_err(AppError::Conversion),
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
+        Command::Smoke(args) => cmd_smoke(args),
+    }
+}
+
+/// Handle the `smoke` subcommand — ADR-012 Decision 16.
+///
+/// Dispatches via `ArchRegistry::get(arch)` — unknown arches (including
+/// gemma4, ministral, deepseekv3, bogus) return a uniform structured
+/// error. Preflight failures map to the documented exit codes 2-6.
+fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
+    let smoke_args = arch::smoke::SmokeArgs {
+        arch: args.arch,
+        quant: arch::smoke::normalize_quant_label(&args.quant),
+        with_vision: args.with_vision,
+        skip_convert: args.skip_convert,
+        dry_run: args.dry_run,
+        fixtures_root: args.fixtures_root,
+    };
+    let env = arch::smoke::RealSmokeEnv {
+        convert_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let outcome = arch::smoke::dispatch(&smoke_args, &env);
+    let code = outcome.exit_code();
+    let rendered = arch::smoke::render_outcome(&outcome);
+    if matches!(outcome, arch::smoke::SmokeOutcome::Pass { .. }
+                        | arch::smoke::SmokeOutcome::Skipped { .. })
+    {
+        println!("{}", rendered);
+        Ok(())
+    } else {
+        // Preflight / unknown-arch — non-zero exit with the documented code.
+        eprintln!("{}", rendered);
+        if code == arch::conformance::EXIT_UNKNOWN_ARCH {
+            Err(AppError::Input(anyhow::anyhow!("{}", rendered)))
+        } else {
+            Err(AppError::Conversion(anyhow::anyhow!("{}", rendered)))
+        }
     }
 }
 

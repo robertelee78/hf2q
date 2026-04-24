@@ -86,6 +86,36 @@ pub enum Command {
 
     /// ADR-009 parity validation against locked references
     Parity(ParityArgs),
+
+    /// ADR-012 Decision 16 — end-gate smoke test for a registered arch
+    Smoke(SmokeArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SmokeArgs {
+    /// Arch key as registered in `src/arch/` (qwen35, qwen35moe)
+    #[arg(long)]
+    pub arch: String,
+
+    /// Quant method to smoke-test
+    #[arg(long, default_value = "q4_0")]
+    pub quant: String,
+
+    /// Also exercise the --emit-vision-tower path (dense variants with vision_config)
+    #[arg(long, default_value_t = false)]
+    pub with_vision: bool,
+
+    /// Skip the convert step and reuse an existing GGUF on disk
+    #[arg(long, default_value_t = false)]
+    pub skip_convert: bool,
+
+    /// Run preflight + dispatch, skip convert/inference, emit transcript path
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Fixtures root (defaults to `tests/fixtures/`)
+    #[arg(long)]
+    pub fixtures_root: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
