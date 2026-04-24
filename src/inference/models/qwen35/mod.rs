@@ -30,6 +30,7 @@ pub mod delta_net;
 pub mod dense;
 pub mod ffn;
 pub mod forward_cpu;
+pub mod forward_gpu;
 pub mod full_attn;
 pub mod gpu_delta_net;
 pub mod gpu_ffn;

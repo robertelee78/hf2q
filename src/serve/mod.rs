@@ -184,9 +184,25 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
 /// Run the `generate` subcommand.
 ///
 /// ADR-008: single backend path — loads directly from GGUF into mlx-native.
+/// ADR-013 P11: routes `qwen35` / `qwen35moe` GGUF architectures to the
+/// dedicated Qwen3.5 forward path (`cmd_generate_qwen35`) before attempting
+/// the Gemma4 path, so the two model families share the same CLI surface.
 pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let model_path = &args.model;
     anyhow::ensure!(model_path.exists(), "Model not found: {}", model_path.display());
+
+    // --- Architecture detection (fast: metadata-only GGUF open) ---
+    {
+        let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
+        if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
+            use crate::inference::models::qwen35::{ARCH_QWEN35, ARCH_QWEN35MOE};
+            if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
+                tracing::info!("Detected architecture '{}' → routing to Qwen3.5 path", arch);
+                return cmd_generate_qwen35(args, gguf_peek);
+            }
+        }
+    }
 
     let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
     let config_path = find_config(model_path, args.config.as_deref())?;
@@ -454,6 +470,149 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             dispatches_per_prompt_tok, syncs_per_decode_tok,
         );
     }
+
+    Ok(())
+}
+
+// ================================================================
+// Qwen3.5 generate path (ADR-013 P11)
+// ================================================================
+
+/// Generate subcommand dispatch for `qwen35` / `qwen35moe` GGUF architectures.
+///
+/// Loads the model via [`Qwen35Model::load_from_gguf`], builds a
+/// [`HybridKvCache`], and runs `forward_gpu` token-by-token.  For P11 the
+/// forward pass is a full-prefill-in-one-shot (no incremental decode KV
+/// integration — P13 adds that).  The function still accepts `--n-predict`
+/// tokens but currently generates only the first token deterministically
+/// (argmax at temp 0.0) and returns, so that `hf2q generate` is fully
+/// callable end-to-end without NaN or panic.
+///
+/// # Acceptance criteria (P11)
+///
+/// - Runs without panic / NaN.
+/// - Produces logits of shape `[vocab_size]` for the last token.
+/// - Argmax at temp=0.0 produces a deterministic token.
+fn cmd_generate_qwen35(
+    args: cli::GenerateArgs,
+    gguf: mlx_native::gguf::GgufFile,
+) -> Result<()> {
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+    use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
+    use crate::inference::models::qwen35::model::Qwen35Model;
+    use mlx_native::MlxDevice;
+
+    let model_path = &args.model;
+    let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
+
+    tracing::info!("Qwen3.5 path: {}", model_path.display());
+    tracing::info!("Tokenizer:    {}", tokenizer_path.display());
+
+    // Load the Qwen3.5 model config + zero-weighted struct.
+    // (P11: weight dequant load is complete via load_from_gguf scaffolding;
+    //  actual GGUF → f32 tensor read lands in P5-tail. For P11 the test GGUF
+    //  is always a synthetic file with F32 weights from the parity test suite,
+    //  or the caller supplies a real GGUF whose tensors load_from_gguf can open.)
+    let load_start = std::time::Instant::now();
+    tracing::info!("Loading Qwen3.5 model from GGUF");
+    let model = Qwen35Model::load_from_gguf(&gguf)
+        .context("Qwen35Model::load_from_gguf")?;
+    let load_elapsed = load_start.elapsed();
+    tracing::info!(
+        "Qwen3.5 model loaded ({} layers, variant={:?}) in {:.2}s",
+        model.layers.len(),
+        model.cfg.variant,
+        load_elapsed.as_secs_f64()
+    );
+
+    // Load tokenizer.
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer load failed: {e}"))?;
+    tokenizer
+        .with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+
+    // Resolve + render prompt.
+    let prompt_text_raw = resolve_prompt(&args)?;
+    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+
+    // Tokenize.
+    let encoding = tokenizer
+        .encode(prompt_text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    tracing::info!("Qwen3.5: {} prompt tokens", prompt_tokens.len());
+
+    // Build KV cache.
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
+    let max_seq = (prompt_tokens.len() + args.max_tokens + 64)
+        .max(128)
+        .min(model.cfg.max_position_embeddings as usize);
+    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+        .context("HybridKvCache::new")?;
+
+    // Build positions: text-convention flat [4 * seq_len] i32.
+    let seq_len = prompt_tokens.len();
+    let mut positions_flat = vec![0i32; 4 * seq_len];
+    for axis in 0..4 {
+        for t in 0..seq_len {
+            positions_flat[axis * seq_len + t] = t as i32;
+        }
+    }
+
+    // Run GPU forward pass.
+    tracing::info!("Running Qwen3.5 GPU forward pass (seq_len={})", seq_len);
+    let fwd_start = std::time::Instant::now();
+    let logits = model
+        .forward_gpu(&prompt_tokens, &positions_flat, &mut kv_cache)
+        .context("Qwen35Model::forward_gpu")?;
+    let fwd_elapsed = fwd_start.elapsed();
+
+    // Logits have shape [seq_len, vocab_size] row-major.
+    let vocab_size = model.cfg.vocab_size;
+    anyhow::ensure!(
+        logits.len() == seq_len * vocab_size as usize,
+        "forward_gpu returned logits.len()={} != seq_len({}) * vocab({}) = {}",
+        logits.len(),
+        seq_len,
+        vocab_size,
+        seq_len * vocab_size as usize,
+    );
+    tracing::info!(
+        "forward_gpu: {:.2}s, logits shape [{}, {}]",
+        fwd_elapsed.as_secs_f64(),
+        seq_len,
+        vocab_size
+    );
+
+    // Check for NaN/Inf in last-token logits.
+    let last_logits = &logits[logits.len() - vocab_size as usize..];
+    let n_nan = last_logits.iter().filter(|v| v.is_nan()).count();
+    let n_inf = last_logits.iter().filter(|v| v.is_infinite()).count();
+    if n_nan > 0 || n_inf > 0 {
+        tracing::warn!(
+            "Qwen3.5 forward_gpu: last-token logits contain {} NaN + {} Inf values",
+            n_nan,
+            n_inf
+        );
+    }
+
+    // Sample first token (argmax at temp=0.0).
+    let next_token = greedy_argmax_last_token(last_logits, vocab_size);
+    tracing::info!("Qwen3.5 first decoded token: {}", next_token);
+
+    // Decode and print.
+    use std::io::Write;
+    let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
+    print!("{}", token_str);
+    std::io::stdout().flush()?;
+
+    // P11: single-token output (no incremental decode loop; P13 adds that).
+    eprintln!(
+        "\n\n[Qwen3.5 P11] prefill {seq_len} tokens in {:.2}s, first token = {next_token} ({token_str:?})",
+        fwd_elapsed.as_secs_f64()
+    );
 
     Ok(())
 }
