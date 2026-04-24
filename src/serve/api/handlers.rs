@@ -88,6 +88,10 @@ pub async fn chat_completions(
     let engine = state.engine.as_ref().expect("engine gate above ensures Some");
 
     // --- Generate (non-streaming) ---
+    // Snapshot mlx-native process-global GPU counters pre-generation so we
+    // can report the per-request delta in x_hf2q_timing.
+    let pre_dispatches = mlx_native::dispatch_count();
+    let pre_syncs = mlx_native::sync_count();
     let gen_started = std::time::Instant::now();
     let result = match engine.generate(prompt_tokens, params).await {
         Ok(r) => r,
@@ -126,6 +130,8 @@ pub async fn chat_completions(
         0.0
     };
     let ttft_ms = prefill_time_secs * 1000.0;
+    let post_dispatches = mlx_native::dispatch_count();
+    let post_syncs = mlx_native::sync_count();
     let timing = super::schema::TimingInfo {
         prefill_time_secs,
         decode_time_secs,
@@ -133,8 +139,8 @@ pub async fn chat_completions(
         time_to_first_token_ms: ttft_ms,
         prefill_tokens_per_sec,
         decode_tokens_per_sec,
-        gpu_sync_count: 0,
-        gpu_dispatch_count: 0,
+        gpu_sync_count: post_syncs.saturating_sub(pre_syncs),
+        gpu_dispatch_count: post_dispatches.saturating_sub(pre_dispatches),
     };
 
     // Per-token reasoning count comes straight from the engine (it runs the
@@ -172,7 +178,55 @@ pub async fn chat_completions(
         },
         x_hf2q_timing: Some(timing),
     };
-    (StatusCode::OK, Json(resp)).into_response()
+    let mut response = (StatusCode::OK, Json(resp)).into_response();
+    apply_transparency_headers(&state, &req, &mut response, None, None);
+    response
+}
+
+/// Apply Decision #23 transparency headers on a chat-completion response.
+///
+///   - `X-HF2Q-Overflow-Policy` — the policy the server applied for THIS
+///     request (request's override if present, else the server default).
+///   - `X-HF2Q-Summarized-Messages` — count of messages that were replaced
+///     by a synthetic summary (Decision #23 summarize path; when the
+///     summarization path is wired in a later iter, handlers set this to
+///     the count).
+///   - `X-HF2Q-Summary-Tokens` — token count of the synthetic summary.
+///
+/// Present on EVERY chat-completion response so clients don't have to
+/// re-derive the applied policy from config.
+fn apply_transparency_headers(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    resp: &mut Response,
+    summarized_messages: Option<usize>,
+    summary_tokens: Option<usize>,
+) {
+    use axum::http::{header::HeaderName, HeaderValue};
+    use super::schema::OverflowPolicy;
+    let policy = req
+        .hf2q_overflow_policy
+        .unwrap_or(state.config.default_overflow_policy);
+    let policy_str: &'static str = match policy {
+        OverflowPolicy::Reject => "reject",
+        OverflowPolicy::TruncateLeft => "truncate_left",
+        OverflowPolicy::Summarize => "summarize",
+    };
+    let headers = resp.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-hf2q-overflow-policy"),
+        HeaderValue::from_static(policy_str),
+    );
+    if let Some(n) = summarized_messages {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            headers.insert(HeaderName::from_static("x-hf2q-summarized-messages"), v);
+        }
+    }
+    if let Some(n) = summary_tokens {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            headers.insert(HeaderName::from_static("x-hf2q-summary-tokens"), v);
+        }
+    }
 }
 
 /// Everything the non-streaming + streaming paths both need to start the
@@ -353,8 +407,11 @@ async fn chat_completions_stream(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = chrono_seconds();
-    let sse = generation_events_to_sse(events_rx, request_id, req.model, created, opts);
-    sse.into_response()
+    let sse =
+        generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
+    let mut response = sse.into_response();
+    apply_transparency_headers(&state, &req, &mut response, None, None);
+    response
 }
 
 /// Pre-compile the request's `response_format` to a GBNF grammar and parse
