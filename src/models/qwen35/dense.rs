@@ -237,6 +237,13 @@ fn map_norm_suffix(suffix: &str, blk: &str) -> Option<String> {
 /// - `qwen35.ssm.time_step_rank`                 — llama-arch.cpp:271 / llama-model.cpp:2814 (mandatory)
 /// - `qwen35.ssm.group_count`                    — llama-arch.cpp:272 / llama-model.cpp:2815 (mandatory)
 /// - `qwen35.nextn_predict_layers`               — llama-arch.cpp:194 (optional, default 0)
+#[deprecated(
+    since = "0.1.0",
+    note = "kv emission happens in src/backends/gguf.rs::emit_qwen35_metadata; \
+            validation happens in Qwen35ConvertContext::from_metadata — this \
+            validator is redundant and no active caller remains."
+)]
+#[allow(dead_code)]
 pub fn emit_metadata_dense(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError> {
     // Validate dense-specific required field
     if ctx.intermediate_size.is_none() {
@@ -483,6 +490,7 @@ mod tests {
     }
 
     /// emit_metadata_dense returns Ok when context is valid (P4 implementation).
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_dense_returns_ok_when_valid() {
         let ctx = dense_ctx();
@@ -493,6 +501,7 @@ mod tests {
     }
 
     /// emit_metadata_dense returns error when intermediate_size is absent.
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_dense_errors_when_missing_ff_size() {
         let mut ctx = dense_ctx();

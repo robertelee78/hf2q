@@ -672,6 +672,13 @@ pub fn merge_moe_experts_in_place(
 /// - `qwen35moe.expert_used_count`                  — llama-arch.cpp:183 (LLM_KV_EXPERT_USED_COUNT)
 /// - `qwen35moe.expert_feed_forward_length`         — llama-arch.cpp:175 / llama-model.cpp:2835 (optional)
 /// - `qwen35moe.expert_shared_feed_forward_length`  — llama-arch.cpp:176 / llama-model.cpp:2836 (optional)
+#[deprecated(
+    since = "0.1.0",
+    note = "kv emission happens in src/backends/gguf.rs::emit_qwen35_metadata; \
+            validation happens in Qwen35ConvertContext::from_metadata + \
+            validate_required_qwen35moe_fields — this validator is redundant."
+)]
+#[allow(dead_code)]
 pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError> {
     // Validate MoE-specific required fields
     if ctx.num_experts.is_none() {
@@ -1078,6 +1085,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns Ok when context is valid (P4 implementation).
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_returns_ok_when_valid() {
         let ctx = moe_ctx();
@@ -1088,6 +1096,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns error when num_experts is absent.
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_errors_when_missing_num_experts() {
         let mut ctx = moe_ctx();
@@ -1101,6 +1110,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns error when moe_intermediate_size is absent.
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_errors_when_missing_moe_ff_size() {
         let mut ctx = moe_ctx();
