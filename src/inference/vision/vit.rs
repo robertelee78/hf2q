@@ -783,6 +783,190 @@ pub fn qkv_projection_forward(
     Ok((q, k, v))
 }
 
+/// In-place scalar multiply: `x *= c` across every element. Used by
+/// Gemma 4V's post-blocks pipeline (`ggml_scale(cur, sqrtf(n_embd))`).
+pub fn scale_in_place(x: &mut [f32], c: f32) {
+    for v in x.iter_mut() {
+        *v *= c;
+    }
+}
+
+/// 2×2 spatial average-pool on a `[N_patches, hidden]` row-major tensor
+/// laid out as an `N_side × N_side` patch grid. Returns
+/// `[(N_side/2)², hidden]` where each output row is the mean of 4
+/// adjacent input rows.
+///
+/// For Gemma 4V: `[196, 1152]` (14×14 patches) → `[49, 1152]` (7×7
+/// patches). Matches llama.cpp's `ggml_pool_2d(..., AVG, 2, 2, 2, 2)`.
+///
+/// Output memory layout is row-major over the new 7×7 grid:
+/// `out[y*7 + x]` = mean of input patches `(2y, 2x)`, `(2y, 2x+1)`,
+/// `(2y+1, 2x)`, `(2y+1, 2x+1)`.
+///
+/// # Errors
+///
+/// - `input.len() != n_patches * hidden`
+/// - `n_side * n_side != n_patches`
+/// - `n_side % 2 != 0`
+pub fn avg_pool_2x2_spatial(
+    input: &[f32],
+    n_side: usize,
+    hidden: usize,
+) -> Result<Vec<f32>> {
+    let n_patches = n_side * n_side;
+    if input.len() != n_patches * hidden {
+        return Err(anyhow!(
+            "avg_pool_2x2_spatial: input len {} != n_patches*hidden = {}*{} = {}",
+            input.len(),
+            n_patches,
+            hidden,
+            n_patches * hidden
+        ));
+    }
+    if n_side == 0 || n_side % 2 != 0 {
+        return Err(anyhow!(
+            "avg_pool_2x2_spatial: n_side {} must be positive and even",
+            n_side
+        ));
+    }
+
+    let out_side = n_side / 2;
+    let out_patches = out_side * out_side;
+    let mut out = vec![0f32; out_patches * hidden];
+    let inv4 = 0.25f32;
+    for oy in 0..out_side {
+        for ox in 0..out_side {
+            let iy0 = oy * 2;
+            let ix0 = ox * 2;
+            let out_off = (oy * out_side + ox) * hidden;
+            for d in 0..hidden {
+                let a = input[(iy0 * n_side + ix0) * hidden + d];
+                let b = input[(iy0 * n_side + (ix0 + 1)) * hidden + d];
+                let c = input[((iy0 + 1) * n_side + ix0) * hidden + d];
+                let d4 = input[((iy0 + 1) * n_side + (ix0 + 1)) * hidden + d];
+                out[out_off + d] = (a + b + c + d4) * inv4;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Execute one ViT transformer block end-to-end on a `[batch, hidden]`
+/// residual-stream tensor. Composes the 11-stage pipeline:
+///
+/// ```text
+/// cur = rms_norm(x, ln1)
+/// (q, k, v) = qkv_projection(cur)
+/// per_head_rms_norm(q, attn_q_norm)
+/// per_head_rms_norm(k, attn_k_norm)
+/// attn = scaled_dot_product_attention(q, k, v)     # TODO scale=1.0 for Gemma4V
+/// attn = linear(attn, attn_output)
+/// x = residual_add(x, attn)
+/// cur = rms_norm(x, ln2)
+/// gate = silu(linear(cur, ffn_gate))
+/// up   = linear(cur, ffn_up)
+/// cur  = gate * up
+/// cur  = linear(cur, ffn_down)
+/// cur  = rms_norm(cur, post_ffw_norm)
+/// x    = residual_add(x, cur)
+/// ```
+///
+/// `hidden_states` is consumed and the returned `Vec<f32>` replaces it
+/// for the next block's input. Matches llama.cpp `build_vit` Gemma 4V
+/// path structure; known block-parity TODOs (Gemma 4V `scale=1.0`,
+/// V-RMSNorm, 2D RoPE) are unchanged from iter 40.
+pub fn apply_vit_block_forward(
+    hidden_states: Vec<f32>,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+    block_idx: usize,
+) -> Result<Vec<f32>> {
+    let hidden = cfg.hidden_size as usize;
+    let num_heads = cfg.num_attention_heads as usize;
+    let head_dim = hidden / num_heads;
+    let intermediate = cfg.intermediate_size as usize;
+    let eps = cfg.layer_norm_eps;
+    if hidden_states.len() % hidden != 0 {
+        return Err(anyhow!(
+            "apply_vit_block_forward: input len {} not divisible by hidden {}",
+            hidden_states.len(),
+            hidden
+        ));
+    }
+    let batch = hidden_states.len() / hidden;
+
+    // Helper: extract a block-local tensor as &[f32].
+    let slice = |suffix: &str| -> Result<&[f32]> {
+        let buf = weights.block_tensor(block_idx, suffix)?;
+        buf.as_slice::<f32>()
+            .map_err(|e| anyhow!("block {}: {} as_slice: {e}", block_idx, suffix))
+    };
+
+    // --- Attention half ---
+    let mut residual = hidden_states;
+    let mut cur = residual.clone();
+    rms_norm_forward(&mut cur, slice("ln1.weight")?, hidden, eps)?;
+
+    let (mut q, mut k, v) = qkv_projection_forward(
+        &cur,
+        slice("attn_q.weight")?,
+        slice("attn_k.weight")?,
+        slice("attn_v.weight")?,
+        batch,
+        hidden,
+    )?;
+    per_head_rms_norm_forward(
+        &mut q,
+        slice("attn_q_norm.weight")?,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
+    per_head_rms_norm_forward(
+        &mut k,
+        slice("attn_k_norm.weight")?,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
+
+    let attn = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)?;
+    let attn_projected = linear_forward(
+        &attn,
+        slice("attn_output.weight")?,
+        None,
+        batch,
+        hidden,
+        hidden,
+    )?;
+    residual_add(&mut residual, &attn_projected)?;
+
+    // --- FFN half ---
+    let mut cur = residual.clone();
+    rms_norm_forward(&mut cur, slice("ln2.weight")?, hidden, eps)?;
+
+    let mut gate =
+        linear_forward(&cur, slice("ffn_gate.weight")?, None, batch, hidden, intermediate)?;
+    let up = linear_forward(&cur, slice("ffn_up.weight")?, None, batch, hidden, intermediate)?;
+    silu_in_place(&mut gate);
+    elementwise_mul_in_place(&mut gate, &up)?;
+
+    let mut down = linear_forward(
+        &gate,
+        slice("ffn_down.weight")?,
+        None,
+        batch,
+        intermediate,
+        hidden,
+    )?;
+    rms_norm_forward(&mut down, slice("post_ffw_norm.weight")?, hidden, eps)?;
+    residual_add(&mut residual, &down)?;
+
+    Ok(residual)
+}
+
 /// Drive `patch_embed_forward` from a `LoadedMmprojWeights` + parsed
 /// `MmprojConfig`, reading the `v.patch_embd.weight` buffer directly
 /// off the GPU. This is the hook iter 34+ will call from the handler's
@@ -1198,6 +1382,166 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // scale_in_place + avg_pool_2x2_spatial + apply_vit_block_forward (iter 41)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scale_in_place_multiplies_every_element() {
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        scale_in_place(&mut x, 2.5);
+        assert_eq!(x, vec![2.5, 5.0, 7.5, 10.0]);
+    }
+
+    #[test]
+    fn scale_in_place_by_one_is_identity() {
+        let mut x = vec![0.1f32, -2.3, 7.7];
+        let snap = x.clone();
+        scale_in_place(&mut x, 1.0);
+        assert_eq!(x, snap);
+    }
+
+    #[test]
+    fn scale_in_place_by_zero_zeros_everything() {
+        let mut x = vec![1.0f32, 2.0, 3.0];
+        scale_in_place(&mut x, 0.0);
+        assert_eq!(x, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn avg_pool_2x2_averages_each_2x2_block() {
+        // 4×4 grid × 2 hidden dims → 2×2 output.
+        // Each output should be the mean of 4 input values per dim.
+        // Layout: input[y*4 + x] has hidden=2 values.
+        // Values: input[y*4+x][0] = y*4+x, input[...][1] = (y*4+x)*10.
+        let n_side = 4;
+        let hidden = 2;
+        let mut input = vec![0f32; n_side * n_side * hidden];
+        for y in 0..n_side {
+            for x in 0..n_side {
+                let patch = y * n_side + x;
+                input[patch * hidden + 0] = patch as f32;
+                input[patch * hidden + 1] = (patch as f32) * 10.0;
+            }
+        }
+        let out = avg_pool_2x2_spatial(&input, n_side, hidden).unwrap();
+        // Expected out[0,0] = avg(patches 0,1,4,5) = avg(0,1,4,5) = 2.5
+        // Expected out[0,1] = avg(patches 2,3,6,7) = avg(2,3,6,7) = 4.5
+        // Expected out[1,0] = avg(patches 8,9,12,13) = 10.5
+        // Expected out[1,1] = avg(patches 10,11,14,15) = 12.5
+        assert_eq!(out.len(), 2 * 2 * hidden);
+        assert!((out[0 * hidden + 0] - 2.5).abs() < 1e-6);
+        assert!((out[0 * hidden + 1] - 25.0).abs() < 1e-6);
+        assert!((out[1 * hidden + 0] - 4.5).abs() < 1e-6);
+        assert!((out[1 * hidden + 1] - 45.0).abs() < 1e-6);
+        assert!((out[2 * hidden + 0] - 10.5).abs() < 1e-6);
+        assert!((out[2 * hidden + 1] - 105.0).abs() < 1e-6);
+        assert!((out[3 * hidden + 0] - 12.5).abs() < 1e-6);
+        assert!((out[3 * hidden + 1] - 125.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn avg_pool_gemma4_shape_14x14_to_7x7() {
+        // Production Gemma 4 shape: 196 patches (14×14) × 1152 hidden
+        // → 49 patches (7×7) × 1152 hidden.
+        let n_side = 14;
+        let hidden = 1152;
+        let input = vec![1.0f32; n_side * n_side * hidden];
+        let out = avg_pool_2x2_spatial(&input, n_side, hidden).unwrap();
+        assert_eq!(out.len(), 7 * 7 * hidden);
+        // Uniform input → uniform output at the same value.
+        for v in &out {
+            assert!((*v - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn avg_pool_rejects_non_even_n_side() {
+        let err = avg_pool_2x2_spatial(&[0f32; 27], 3, 3).unwrap_err();
+        assert!(format!("{err}").contains("positive and even"));
+    }
+
+    #[test]
+    fn avg_pool_rejects_mismatched_input_len() {
+        let err = avg_pool_2x2_spatial(&[0f32; 15], 4, 2).unwrap_err();
+        assert!(format!("{err}").contains("input len"));
+    }
+
+    #[test]
+    fn apply_vit_block_forward_real_gemma4_block0_matches_inline_chain() {
+        // Wraps iter 40's inline block-0 chain into one function call.
+        // Asserts output shape + that the new API produces the same
+        // block-out distribution as the iter 40 explicit pipeline.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let patch_embed =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+
+        // NEW API: single call replaces iter 40's inline 11-stage chain.
+        let block_out =
+            apply_vit_block_forward(patch_embed, &weights, &cfg, 0).expect("block_forward");
+
+        assert_eq!(block_out.len(), num_patches * hidden);
+        for v in &block_out {
+            assert!(v.is_finite(), "non-finite: {v}");
+        }
+        // Cross-patch differentiation (no stride bug inside the wrapper).
+        let p0 = &block_out[0..hidden];
+        let p_last = &block_out[(num_patches - 1) * hidden..num_patches * hidden];
+        let l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2 > 1e-3, "wrapper produced stride-bugged output");
+    }
+
+    #[test]
+    fn apply_vit_block_forward_rejects_mismatched_hidden() {
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Wrong-shape hidden state: len not divisible by hidden.
+        let bad = vec![0f32; 196 * 1152 + 1];
+        let err = apply_vit_block_forward(bad, &weights, &cfg, 0).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
     }
 
     // -----------------------------------------------------------------------
