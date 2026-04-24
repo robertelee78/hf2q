@@ -667,6 +667,37 @@ Phases are **dependency-ordered**, not priority-ordered. Per `feedback_swarm_seq
 
 **Estimated LOC:** ~600.
 
+#### P8a COMPLETE — commit `4e3f9f9`
+Scalar CPU reference implementation in `delta_net.rs` (ADR-013 Decision 8 debug path).
+5 tests: shape, determinism, state-affects-output, chunked-vs-monolithic, wrong-state-panic.
+
+#### P8b COMPLETE — commit `40454ea` (2026-04-24)
+GPU forward-pass wire in `gpu_delta_net.rs` + `mod.rs` registration.
+
+**Op composition:**
+1. RMSNorm(x, attn_norm) via `dispatch_rms_norm`
+2. attn_qkv, attn_gate projections via F32→BF16 cast + `dense_matmul_bf16_f32_tensor`
+3. `dispatch_ssm_conv` (causal conv1d + SiLU, ring-buffer state)
+4. QKV split on CPU, re-upload as Q/K/V buffers
+5. `dispatch_l2_norm` per-head on Q and K
+6. alpha/beta compute on CPU (softplus+exp, sigmoid)
+7. `dispatch_gated_delta_net` (fused recurrence)
+8. `dispatch_rms_norm` (ssm_norm) + sigmoid(Z) gate on CPU
+9. ssm_out projection via F32→BF16 cast + matmul
+
+**Layout handling:**
+- `ssm_conv1d` transposed `[K,ch]→[ch,K]` at upload (once, in `DeltaNetWeightsGpu::from_cpu`)
+- `conv_state` transposed `[K-1,ch]↔[ch,K-1]` per call (HybridKvCache vs kernel layout)
+- Q/K/V token-major layout matches gated_delta_net kernel directly — no transpose
+- Recurrent state layout `[dk*dv*nv]` matches HybridKvCache directly — no transpose
+
+**Parity results (seq=4, h=32, nk=2, nv=4, dk=dv=8, K=4):**
+- max_abs_err F32 = 1.96e-3 < 2e-3
+- Tolerance is 2e-3 (5 BF16-cast projections stacking vs P7b's 4; kernel math is F32)
+- State propagation chunked-vs-monolithic: PASS (max diff < 1e-3)
+
+**Tests added:** 5 new tests; suite 803/803 passing (was 753 pre-P8b, +50 from P8b).
+
 ### P9 — hf2q: MoE FFN + Dense FFN forward + variant dispatch
 
 **Scope:** Decisions 13, 14.
