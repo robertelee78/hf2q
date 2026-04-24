@@ -934,6 +934,47 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 5 · P3 COMPLETE (GATED_DELTA_NET fused kernel landed) — MLX-NATIVE SIDE COMPLETE
+
+**Scope:** Phase P3 Decision 6 (Gated DeltaNet fused kernel — the centerpiece).
+
+**Delivered in `mlx-native`:**
+- `src/shaders/gated_delta_net.metal` — f32 fused kernel. Recurrence per token `t`: `alpha=exp(-g[t])`, `delta=v[t] - state @ k[t]`, `state' = alpha*state + beta[t] * outer(delta, k[t])`, `output[t] = state' @ q[t]`. GQA broadcast internal (`k_head = v_head / (n_v_heads / n_k_heads)`). Key perf invariant: **state column lives in thread-private memory across all N tokens** — loaded once at start, kept in registers, written once at end. State traffic is O(D_k × D_v) per head per seq, independent of n_tokens.
+- `src/ops/gated_delta_net.rs` — `GatedDeltaNetParams`, `dispatch_gated_delta_net()`, `build_gated_delta_net_params()`, and **`cpu_reference_f32()`** — the scalar-Rust reference implementation of the spec, public so hf2q side (ADR-013 Decision 8 CPU parity path) can reuse it as the test oracle without duplication.
+- `tests/test_gated_delta_net.rs` — 9 tests:
+  - **ADR spec-driven** (acceptance #1): 1-seq × 1-head × 4-tok × D=8 with one-hot `k[t]=e_t` (decorrelated basis), alpha=1, beta=1 → state converges to column-stack of v; output formula derived in comments with `output[t][i] = Σ_{s≤t} v[s][i] · q[t][s]`; hand-computed expected values verified at 1e-3.
+  - **ADR CPU-parity** (acceptance #2): random inputs at D_k=D_v=8, 2 k-heads, 4 v-heads (group_ratio=2), 6 tokens, 2 seqs; GPU vs CPU ≤1e-3.
+  - Single-token decode regime (n_tokens=1, non-zero initial state).
+  - Multi-seq independence (2 sequences, per-seq state + per-seq tokens).
+  - GQA broadcast correctness: n_k=2 / n_v=6 (group_ratio=3); v_heads 0..2 produce identical output (shared k_head), v_heads 0 vs 3 differ.
+  - Qwen3.5 shape smoke: D=128 (matches real model), 4/8 heads, 2 tokens; CPU-parity ≤5e-3.
+  - Zero-dim / non-multiple-heads / D>MAX_STATE_D rejection.
+- `src/kernel_registry.rs` / `src/ops/mod.rs` — registered.
+
+**Design notes:**
+- Single kernel variant (no 4-NSG parameterization yet). ADR Decision 6 acceptance #3 (microbench within 20% of llama.cpp) is deferred to a dedicated perf iter after correctness is fully verified end-to-end in P11+.
+- `MAX_STATE_D = 128` cap baked into shader as thread-private array size. Matches Qwen3.5's `linear_key_head_dim = linear_value_head_dim = 128`. Rust-side validation rejects D > MAX_STATE_D cleanly.
+- F32 only for now. BF16 input path can be added later; intermediate accumulation is f32 in both cases.
+- Shader argument signature gotcha: Metal requires attribute-input types to share "kind" (all scalar or all vec). Solution: both `thread_position_in_threadgroup` and `threadgroup_position_in_grid` use `uint3`; decompose to `tid = tid3.x`.
+
+**Verification:**
+- 9/9 new tests green.
+- Library test suite: 95/95 pass.
+
+**Phase map status — MLX-NATIVE SIDE COMPLETE:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | COMPLETE (L2_NORM ✓, CUMSUM ✓, SSM_CONV ✓) |
+| P1  | 5         | COMPLETE (TRI_SOLVE ✓) |
+| P2  | 10 (mlx)  | COMPLETE (ROPE_MULTI / IMROPE ✓) |
+| P3  | 6         | **COMPLETE** (GATED_DELTA_NET ✓) |
+| P4–P13 | 1, 2, 8–18 | All hf2q-side; starting next iter |
+
+**Aggregate:** **48 spec-driven kernel tests across ALL 6 Qwen3.5-novel mlx-native kernels.** ~1350 lines Metal + ~1450 lines Rust dispatch + ~2000 lines test code. mlx-native side of ADR-013 is DONE.
+
+**Next iter target:** P4 — hf2q scaffold. `src/inference/models/qwen35/` module creation, `Qwen35Config` parsing, `src/backends/gguf.rs` arch dispatch extension for `qwen35` + `qwen35moe`. No forward-pass code yet; just scaffolding that unblocks P5+.
+
 ### 2026-04-23 — /loop iter 4 · P2 COMPLETE (ROPE_MULTI / IMROPE landed)
 
 **Scope:** Phase P2 Decision 10 (Multi-section RoPE + IMROPE interleaved mode).
