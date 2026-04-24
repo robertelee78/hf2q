@@ -48,9 +48,9 @@ const QWEN35_DENSE_CONFIG: &str = r#"{
     "max_position_embeddings": 131072,
     "dtype": "float16",
     "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
-    "linear_value_head_dim": 128,
+    "linear_key_head_dim": 16,
+    "linear_num_key_heads": 4,
+    "linear_value_head_dim": 16,
     "linear_num_value_heads": 8
 }"#;
 
@@ -130,12 +130,13 @@ fn setup_qwen35_dense(dir: &Path) {
             push_zero(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h], "F16");
             push_zero(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h], "F16");
         } else {
-            let qkv = (4 + 1 + 8) * 16;
-            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h], "F16");
-            push_zero(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128], "F16");
-            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h], "F16");
-            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h], "F16");
-            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h], "F16");
+            // Spec-correct shapes (nk=4, nv=8, head_k/v_dim=16 from config).
+            let qkv_rows = 4 * 16 * 2 + 8 * 16; // = 256
+            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h], "F16");
+            push_zero(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16], "F16");
+            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![8, h], "F16");
+            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![8, h], "F16");
+            push_zero(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![8 * 16, h], "F16");
             // linear_attn.norm MUST NOT get +1 (convert_hf_to_gguf.py:4794 exclusion).
             push_zero(&mut tensors, &format!("{p}.linear_attn.norm.weight"), vec![128], "F32");
         }

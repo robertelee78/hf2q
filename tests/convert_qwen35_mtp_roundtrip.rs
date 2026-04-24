@@ -58,6 +58,10 @@ const QWEN35_DENSE_MTP_CONFIG: &str = r#"{
     "vocab_size": 128,
     "head_dim": 16,
     "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
     "full_attention_interval": 4,
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,
@@ -83,6 +87,10 @@ const QWEN35MOE_MTP_CONFIG: &str = r#"{
     "vocab_size": 128,
     "head_dim": 16,
     "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
     "full_attention_interval": 4,
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,
@@ -156,15 +164,21 @@ fn build_qwen35_dense_mtp_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
             let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_size, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * head_dim]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![num_heads, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![num_heads, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * head_dim, hidden]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![num_heads]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![num_heads]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![4, 1, lin_v_heads * head_dim]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * head_dim]);
+            // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
+            let nk = 4usize;
+            let hk = head_dim;
+            let hv = head_dim;
+            let qkv_rows = nk * hk * 2 + lin_v_heads * hv;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * hv]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * hv, hidden]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![lin_v_heads]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![lin_v_heads]);
+            let conv_channels = 2 * nk * hk + lin_v_heads * hv;
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![conv_channels, 1, 4]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * hv]);
         }
         // Dense FFN
         push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.gate_proj.weight"), vec![inter, hidden]);
@@ -216,15 +230,21 @@ fn build_qwen35moe_mtp_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
             let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_size, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * head_dim]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![num_heads, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![num_heads, hidden]);
-            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * head_dim, hidden]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![num_heads]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![num_heads]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![4, 1, lin_v_heads * head_dim]);
-            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * head_dim]);
+            // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
+            let nk = 4usize;
+            let hk = head_dim;
+            let hv = head_dim;
+            let qkv_rows = nk * hk * 2 + lin_v_heads * hv;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * hv]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * hv, hidden]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![lin_v_heads]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![lin_v_heads]);
+            let conv_channels = 2 * nk * hk + lin_v_heads * hv;
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![conv_channels, 1, 4]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * hv]);
         }
         // MoE router.
         push_f32_zeros(&mut tensors, &format!("{prefix}.mlp.gate.weight"), vec![num_experts, hidden]);

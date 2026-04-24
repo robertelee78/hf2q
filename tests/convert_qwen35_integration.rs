@@ -171,61 +171,79 @@ fn build_qwen35_dense_safetensors() -> Vec<u8> {
         } else {
             // Linear attention block
             let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
+            // Correct Qwen3.5 linear-attn tensor shapes (spec:
+            // convert_hf_to_gguf.py Qwen3Next/Qwen3_5 + llama-model.cpp).
+            // 2026-04-24 fixture fix — pre-fix shapes (A_log [num_heads],
+            // in_proj_a [num_heads, hidden] etc.) silently passed through
+            // because the convert pipeline never invoked the V-head
+            // reorder. Now that main.rs Phase 1.7 fires the transform,
+            // the fixtures must use shapes derivable from
+            // linear_num_{key,value}_heads + linear_{key,value}_head_dim.
+            //
+            // nk = linear_num_key_heads = 4; nv = linear_num_value_heads = 8
+            // head_k_dim = 16; head_v_dim = 16
+            let nk = 4usize;
+            let nv = 8usize;
+            let head_k_dim = 16usize;
+            let head_v_dim = 16usize;
+            // in_proj_qkv shape [Q_total + K_total + V_total, hidden]
+            //   Q_total = nk * head_k_dim
+            //   K_total = nk * head_k_dim
+            //   V_total = nv * head_v_dim
+            let qkv_rows = nk * head_k_dim + nk * head_k_dim + nv * head_v_dim;
             tensors.push((
                 format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                vec![qkv_size, hidden],
+                vec![qkv_rows, hidden],
                 "F16",
-                vec![6u8; qkv_size * hidden * f16],
+                vec![6u8; qkv_rows * hidden * f16],
             ));
             tensors.push((
                 format!("{prefix}.linear_attn.out_proj.weight"),
-                vec![hidden, lin_v_heads * head_dim],
+                vec![hidden, nv * head_v_dim],
                 "F16",
-                vec![7u8; hidden * lin_v_heads * head_dim * f16],
+                vec![7u8; hidden * nv * head_v_dim * f16],
             ));
+            // in_proj_a / in_proj_b — [nv, hidden] per spec.
             tensors.push((
                 format!("{prefix}.linear_attn.in_proj_a.weight"),
-                vec![num_heads, hidden],
+                vec![nv, hidden],
                 "F16",
-                vec![0u8; num_heads * hidden * f16],
+                vec![0u8; nv * hidden * f16],
             ));
             tensors.push((
                 format!("{prefix}.linear_attn.in_proj_b.weight"),
-                vec![num_heads, hidden],
+                vec![nv, hidden],
                 "F16",
-                vec![0u8; num_heads * hidden * f16],
+                vec![0u8; nv * hidden * f16],
             ));
             tensors.push((
                 format!("{prefix}.linear_attn.in_proj_z.weight"),
-                vec![lin_v_heads * head_dim, hidden],
+                vec![nv * head_v_dim, hidden],
                 "F16",
-                vec![0u8; lin_v_heads * head_dim * hidden * f16],
+                vec![0u8; nv * head_v_dim * hidden * f16],
             ));
-            // A_log and dt_proj (SSM tensors)
+            // A_log / dt_bias — 1-D [nv] per spec.
             tensors.push((
                 format!("{prefix}.linear_attn.A_log"),
-                vec![num_heads],
+                vec![nv],
                 "F32",
-                vec![0u8; num_heads * 4],
-            ));
-            tensors.push((
-                format!("{prefix}.linear_attn.dt_proj.weight"),
-                vec![num_heads, hidden],
-                "F16",
-                vec![0u8; num_heads * hidden * f16],
+                vec![0u8; nv * 4],
             ));
             tensors.push((
                 format!("{prefix}.linear_attn.dt_bias"),
-                vec![num_heads],
+                vec![nv],
                 "F32",
-                vec![0u8; num_heads * 4],
+                vec![0u8; nv * 4],
             ));
-            // conv1d
+            // conv1d.weight — [total_channels, 1, conv_kernel_dim] per spec,
+            // where total_channels = 2*nk*head_k_dim + nv*head_v_dim.
+            let conv_channels = 2 * nk * head_k_dim + nv * head_v_dim;
+            let conv_kernel_dim = 4usize;
             tensors.push((
                 format!("{prefix}.linear_attn.conv1d.weight"),
-                vec![num_heads, 1, hidden / num_heads],
+                vec![conv_channels, 1, conv_kernel_dim],
                 "F16",
-                vec![0u8; num_heads * (hidden / num_heads) * f16],
+                vec![0u8; conv_channels * conv_kernel_dim * f16],
             ));
             // norm weight
             tensors.push((

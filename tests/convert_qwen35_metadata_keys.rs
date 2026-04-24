@@ -48,9 +48,9 @@ const QWEN35_DENSE_CONFIG: &str = r#"{
     "max_position_embeddings": 131072,
     "dtype": "float16",
     "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
-    "linear_value_head_dim": 128,
+    "linear_key_head_dim": 16,
+    "linear_num_key_heads": 4,
+    "linear_value_head_dim": 16,
     "linear_num_value_heads": 8
 }"#;
 
@@ -85,9 +85,9 @@ const QWEN35_MOE_CONFIG: &str = r#"{
     "max_position_embeddings": 131072,
     "dtype": "float16",
     "linear_conv_kernel_dim": 4,
-    "linear_key_head_dim": 128,
-    "linear_num_key_heads": 16,
-    "linear_value_head_dim": 128,
+    "linear_key_head_dim": 16,
+    "linear_num_key_heads": 4,
+    "linear_value_head_dim": 16,
     "linear_num_value_heads": 8
 }"#;
 
@@ -148,12 +148,13 @@ fn setup_dense(dir: &Path) {
             push_f16(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h]);
             push_f16(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
         } else {
-            let qkv = (4 + 1 + 8) * 16;
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h]);
+            // Spec-correct: nk=4, nv=8, head_k/v_dim=16 (matches config).
+            let qkv_rows = 4 * 16 * 2 + 8 * 16; // = 256
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![8 * 16, h]);
         }
         push_f16(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), vec![inter, h]);
         push_f16(&mut tensors, &format!("{p}.mlp.up_proj.weight"), vec![inter, h]);
@@ -188,12 +189,13 @@ fn setup_moe(dir: &Path) {
             push_f16(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h]);
             push_f16(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
         } else {
-            let qkv = (4 + 1 + 8) * 16;
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h]);
+            // Spec-correct: nk=4, nv=8, head_k/v_dim=16 (matches config).
+            let qkv_rows = 4 * 16 * 2 + 8 * 16; // = 256
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![8 * 16, h]);
         }
         push_f16(&mut tensors, &format!("{p}.mlp.gate.weight"), vec![4, h]);
         for e in 0..4 {
@@ -356,9 +358,9 @@ fn qwen35_dense_with_legacy_rope_scaling_still_emits_all_rope_keys() {
         "max_position_embeddings": 131072,
         "dtype": "float16",
         "linear_conv_kernel_dim": 4,
-        "linear_key_head_dim": 128,
-        "linear_num_key_heads": 16,
-        "linear_value_head_dim": 128,
+        "linear_key_head_dim": 16,
+        "linear_num_key_heads": 4,
+        "linear_value_head_dim": 16,
         "linear_num_value_heads": 8
     }"#;
 
@@ -397,12 +399,13 @@ fn qwen35_dense_with_legacy_rope_scaling_still_emits_all_rope_keys() {
             push_f16(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h]);
             push_f16(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
         } else {
-            let qkv = (4 + 1 + 8) * 16;
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h]);
-            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h]);
+            // Spec-correct: nk=4, nv=8, head_k/v_dim=16 (matches config).
+            let qkv_rows = 4 * 16 * 2 + 8 * 16; // = 256
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![8, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![8 * 16, h]);
         }
         push_f16(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), vec![inter, h]);
         push_f16(&mut tensors, &format!("{p}.mlp.up_proj.weight"), vec![inter, h]);

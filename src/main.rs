@@ -471,20 +471,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("qwen35 RMS norm +1 bias application failed")
         .map_err(AppError::Conversion)?;
 
-    // Phase 1.7 (PENDING wire-up — see ADR-012 R2 gap note below).
+    // Phase 1.7: ADR-012 P2/P3 Decision 5 + R2 — linear-attention transforms.
+    // A_log negation, conv1d squeeze, in_proj_qkvz split into qkv + z,
+    // and the 6-case V-head grouped→tiled reorder per py:5367-5424.
     //
-    // `models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map`
-    // is available and tested but NOT yet invoked here — turning it on
-    // exposes pre-existing incorrect tensor shapes in the synthetic
-    // fixtures under `tests/convert_qwen35*_integration.rs` (A_log
-    // shape [num_heads] where spec requires [num_value_heads], etc.).
-    // The wire-up lands in a dedicated follow-up commit that also
-    // fixes those fixtures and adds positive-value regression tests
-    // for the V-head reorder invariants. Until then, this line is
-    // intentionally left as a comment to document the gap.
+    // 4th silent wire-up gap caught by the 2026-04-24 audit. ADR-012 R2
+    // was the named "plausible-looking nonsense" failure mode — pre-fix
+    // every Qwen3.5 GGUF we produced shipped HF-grouped V-head layout
+    // instead of ggml-tiled. Enabled here after the fixture shapes in
+    // tests/convert_qwen35{,moe}_integration.rs were corrected to match
+    // real Qwen3.5 spec ([linear_num_value_heads, hidden] for A_log /
+    // in_proj_a etc., not [num_heads, hidden]).
     //
-    // Spec source: convert_hf_to_gguf.py:5367-5424 +
-    // Qwen3NextModel.modify_tensors pre-processing (py:4786-4830).
+    // Spec sources: convert_hf_to_gguf.py:5367-5424 (6-case dispatcher)
+    // + Qwen3NextModel.modify_tensors:4786-4830 (A_log negation, dt_bias
+    // rename, conv1d squeeze). No-op for non-Qwen3.5 arches.
+    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
+        &mut tensor_map,
+        &metadata,
+    )
+    .context("qwen35 linear-attention transforms failed")
+    .map_err(AppError::Conversion)?;
 
     check_interrupted()?;
 

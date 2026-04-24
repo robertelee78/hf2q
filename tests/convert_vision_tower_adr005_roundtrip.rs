@@ -29,6 +29,10 @@ const TINY_VIT_CONFIG: &str = r#"{
     "vocab_size": 128,
     "head_dim": 16,
     "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
     "full_attention_interval": 2,
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,
@@ -107,11 +111,12 @@ fn build_tiny_vit_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
         } else {
             let qkv = (4 + 1 + 8) * 16;
-            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h]);
-            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128]);
-            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h]);
-            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h]);
-            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h]);
+            let qkv_rows = 4 * 16 * 2 + 8 * 16;
+            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
+            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);
+            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![8, h]);
+            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![8, h]);
+            push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![8 * 16, h]);
         }
         push_f16_zeros(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), vec![inter, h]);
         push_f16_zeros(&mut tensors, &format!("{p}.mlp.up_proj.weight"), vec![inter, h]);
