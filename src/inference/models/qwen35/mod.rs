@@ -32,6 +32,7 @@ pub mod full_attn;
 pub mod kernels;
 pub mod kv_cache;
 pub mod moe;
+pub mod mtp;
 
 /// `general.architecture` value for the dense variant.
 pub const ARCH_QWEN35: &str = "qwen35";

@@ -934,6 +934,48 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 13 · P10 COMPLETE (MTP load-only scaffold)
+
+**Scope:** Phase P10 Decision 15 — load-only scaffolding for Multi-Token Prediction tensors. Production forward ignores MTP; execution (speculative decoding) is a follow-up ADR.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/mtp.rs` (new file, ~320 LOC):
+  - `MtpWeights` struct — flexible bag-of-tensors keyed by suffix. Captures names + shapes (not data — tensor loading lands when MTP execution ships). Structure accommodates either full-attn or linear-attn MTP blocks without a loader change.
+  - `MtpWeights::has_tensor_suffix()` / `len()` / `is_empty()` helpers.
+  - **`load_mtp_weights_if_present(gguf, num_hidden_layers) -> Result<Option<MtpWeights>>`**. Scans for `blk.{num_hidden_layers}.nextn.*` tensors and returns `None` cleanly when absent.
+
+**Tests (4 unit + 1 real-apex integration, all green):**
+- `mtp_absent_returns_none` — ADR acceptance #1: no MTP tensors → `Ok(None)`.
+- `mtp_present_returns_populated_struct` — ADR acceptance #2: synthetic MTP-bearing GGUF → `Ok(Some)` with `layer_index = 40`, captured tensor suffixes, non-MTP tensors excluded.
+- `mtp_wrong_layer_index_returns_none` — layer index mismatch → None (defensive).
+- `mtp_captures_tensor_shape` — captures tensor shapes correctly (pinned GGUF dim-order convention: innermost-first on wire, reversed in `TensorInfo.shape`).
+- `mtp_on_real_apex_returns_none` (`#[ignore]`d) — **real 25 GB apex GGUF returns None** (MTP stripped per the 2026-04-23 dump). Confirmed running.
+
+**Verification:**
+- 4/4 new MTP unit tests green.
+- 1/1 real-apex integration test green.
+- 512/512 hf2q test suite green (+4 from iter 12's 508, 0 regressions).
+
+**Design notes:**
+- The `MtpWeights` struct is intentionally flexible — the exact tensor set for an MTP block depends on whether it's a full-attn or linear-attn block. The apex file doesn't have MTP so the reference is ambiguous. The suffix-keyed map lets P13+ speculative-decoding loaders inspect what's present without a signature change.
+- GGUF dim-order convention discovered mid-test: GGUF stores innermost-first on wire but `TensorInfo.shape` presents outer-first. Documented in the test comment so future readers don't hit the same reversal surprise.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | PARTIAL — CPU ✓; GPU pending |
+| P8     | 8          | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P10    | 15         | **COMPLETE** |
+| P11    | 16         | Pending (end-to-end forward wire-up) |
+| P12    | 17         | Pending (ActivationCapture for ADR-012) |
+| P13    | 17, 18     | Pending (sourdough + bench) |
+
+**Next iter target:** P7b (full-attention GPU builder) — the simplest of the three GPU builders since mlx-native has all the primitives (rms_norm, dense_gemm, rope_multi, flash_attn_prefill_d512). Build against the P7a CPU-ref oracle with a ≤1e-3 parity test.
+
 ### 2026-04-24 — /loop iter 12 · P8 PARTIAL (DeltaNet layer scalar CPU reference)
 
 **Scope:** Phase P8 Decision 8 — scalar CPU reference for the full Gated DeltaNet linear-attention layer. Orchestrates all the DeltaNet primitives (pre-norm, QKV+Z projection, conv1d, α/β gating, L2 norm, GATED_DELTA_NET recurrence, output norm, output projection).
