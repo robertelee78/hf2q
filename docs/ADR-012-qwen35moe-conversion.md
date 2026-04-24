@@ -1,6 +1,6 @@
 # ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
 
-**Status:** In progress (2026-04-24) — P0 shipped, P1–P7 pending
+**Status:** ✅ **COMPLETE** (2026-04-24) — all 15 decisions across P0–P7 shipped
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
 
@@ -15,7 +15,38 @@
 | P4 — GGUF metadata + tensor naming (1, 7, 8, 11) | ✅ shipped 2026-04-24 | `4ffd035` | Arch dispatch in `src/backends/gguf.rs` (`arch_gguf_name()` from `architectures[0]` — **not** `model_type`). `emit_metadata_dense/moe` validators + `emit_qwen35_metadata()` KV emission. **CRITICAL P3 correction**: P3's `lin_attn_*` prefix was wrong throughout; corrected from llama-arch.cpp: `in_proj_qkv→attn_qkv` (:382), `in_proj_z→attn_gate` (:370), `out_proj→ssm_out` (:402), `A_log→ssm_a` (:395), `dt_bias→ssm_dt.bias` (:397). **`post_attention_layernorm → post_attention_norm`** verdict (llama-arch.cpp:367, not `ffn_norm`). MTP: `model.mtp.layers.0.* → blk.{n_layer}.nextn.*` (llama-arch.cpp:447-450). 3 files, 832 insertions, 90 deletions. 717 tests pass; zero new clippy. |
 | P5 — Expert merge (9, MoE only) | ✅ shipped 2026-04-24 | `6175bb7` | `merge_expert_tensors` body + layer-streaming orchestration via `merge_moe_experts_in_place`. Dim order verified from `llama-model.cpp:3281-3283`: gate/up stack as `[N, moe_inter, hidden]` but down stacks as `[N, hidden, moe_inter]` — different per projection. Memory strategy: layer-streaming, peak add ~3.7 GB above baseline (256 × 2 × 512 × 7168 × 2B for BF16) — well within 64 GB budget. Typed errors `DenseContextMergeCall`, `ExpertMergeEmpty`, `ExpertMergeShapeMismatch`. 7 new tests, 721 total green. Dense arch-gate verified (Dense context invoking merge → `DenseContextMergeCall`). Shared experts confirmed emit as `_shexp` singletons (not merged). 2 files, 463 insertions, 39 deletions. |
 | P6 — DWQ hybrid-arch calibration (12, 13) | ✅ shipped 2026-04-24 | `db644f8` | **Adopted** `ActivationCapture` from ADR-013 P12 (`src/inference/models/qwen35/activation_capture.rs`) — no redefinition. Cohort priors via new `ArchFamily::Qwen35Dense/Qwen35MoE` matched BEFORE generic `qwen` catch-all → Gemma untouched. Both qwen35: SSM state (A_log/dt_*/conv1d) → 8-bit always. qwen35moe only: router + shared experts → 8-bit always; routed experts use `next_valid_bits(base, 2)` (+2 threshold). **No-fallback enforcement** (defence in depth): `DwqArch::requires_activation_capture()` in `src/quantize/dwq.rs` + `main.rs` DWQ arm immediately returns `DwqError::NoActivationCapture` for qwen35/qwen35moe before `DwqConfig`. Non-qwen35 weight-space path unchanged. Gemma snapshot regression verified byte-identical. 18 new tests, 790 total green. 3 files, 623 insertions, 18 deletions. |
-| P7 — Integration + HF download + docs (14, 15) | ✅ shipped 2026-04-24 | pending commit | `tests/convert_qwen35_integration.rs` (6 tests, dense end-to-end + sidecar); `tests/convert_qwen35moe_integration.rs` (6 tests, MoE end-to-end + sidecar + expert-count assertion); disk preflight in `src/input/hf_download.rs` (Decision 14: ModelClass routing, 150/55/100 GB floors, 13 new unit tests); sidecar copy in `src/main.rs` (Decision 15: Phase 4.7, byte-identical, silent-skip on missing); `docs/converting-qwen35.md` (canonical commands for MoE + dense + smoke test); `docs/converting-a-model.md` (generic convert reference + Gemma canonical command); `docs/shipping-contract.md` updated with qwen35/qwen35moe acceptance section. |
+| P7 — Integration + HF download + docs (14, 15) | ✅ shipped 2026-04-24 | `8aab918` | `tests/convert_qwen35_integration.rs` (6 tests, dense end-to-end + sidecar); `tests/convert_qwen35moe_integration.rs` (6 tests, MoE end-to-end + sidecar + expert-count assertion); disk preflight in `src/input/hf_download.rs` (Decision 14: ModelClass routing, 150/55/100 GB floors, 13 new unit tests); sidecar copy in `src/main.rs` (Decision 15: Phase 4.7, byte-identical, silent-skip on missing); `docs/converting-qwen35.md` (canonical commands for MoE + dense + smoke test); `docs/converting-a-model.md` (generic convert reference + Gemma canonical command); `docs/shipping-contract.md` updated with qwen35/qwen35moe acceptance section. 8 files, 1952 insertions. 814 tests pass, 0 fail. |
+
+## Closure summary (2026-04-24)
+
+| Metric | Value |
+|---|---|
+| Decisions shipped | 15 of 15 |
+| Phases shipped | P0–P7 (8 of 8) |
+| Commits on main | `4a2b1e6` · `c7b1296` · `1a849e1` · `73a96e4` · `4ffd035` · `6175bb7` · `db644f8` · `8aab918` |
+| Total tests at close | 814 passed · 0 failed · 10 ignored (3 require on-disk model; 7 pre-existing) |
+| New tests across P0→P7 | ≈ 126 |
+| Total LOC inserted | ~8,600 across 8 feature commits (excluding ADR status updates) |
+| Clippy status | zero new warnings in any ADR-012-touched file |
+| Sovereignty check | pure Rust; no candle-* added; no llama.cpp runtime artifact referenced; llama.cpp and convert_hf_to_gguf.py consulted as read-only spec sources only |
+
+**Deferred to follow-up work (documented in-code + in docs):**
+
+1. **Real-model smoke test** — `llama-cli --model out.gguf -p "Hello" -n 8` on a converted qwen35/qwen35moe model. Manual only (150 GB disk + HF token + ~25 min). Protocol in `docs/converting-qwen35.md`.
+2. **DWQ activation calibration for qwen35/qwen35moe** — guarded by `DwqError::NoActivationCapture` until ADR-013's `ActivationCapture` impl is production-ready. Mock wired for unit tests; no weight-space fallback per Decision 13.
+3. **MTP head inference** — ADR-013 territory. This ADR emits MTP tensors losslessly per Decision 11; inference consumption is separate.
+4. **Vision tower (Qwen3.6-27B multimodal)** — follow-up ADR per non-goal 3.
+
+**Key engineering insights (stored in `patterns` namespace):**
+
+- `reorder_v_heads` is NOT self-inverse for nk≠nv → explicit `reorder_v_heads_inverse` helper (P2 caught via round-trip test).
+- P3's `lin_attn_*` prefix was wrong throughout → P4 corrected against `llama-arch.cpp` with line citations per key.
+- `post_attention_layernorm → post_attention_norm` (llama-arch.cpp:367), NOT `ffn_norm`.
+- `config.model_type` (`qwen3_5_moe_text`) is NOT the GGUF arch string; use `config.architectures[0]`.
+- MoE expert dim-order asymmetry: gate/up stack `[N, moe_inter, hidden]`; down stacks `[N, hidden, moe_inter]`.
+- RMS norm +1 verdict: YES for Qwen3.5 per `convert_hf_to_gguf.py:4794-4795`; exclusion: `linear_attn.norm.weight`.
+- `ActivationCapture` was already landed by ADR-013 P12 (`src/inference/models/qwen35/activation_capture.rs`); adopted, not redefined.
+- ArchFamily dispatch order is load-bearing: `qwen3_5` match must come BEFORE generic `qwen` to preserve Gemma regression.
 
 **Related memories:** `project_qwen36_architecture.md`, `project_model_class_split.md`, `project_pure_rust_crate_factory.md`, `project_mlx_native_is_the_strategic_destination.md`, `feedback_hf2q_sovereignty.md`, `feedback_llama_cpp_over_candle.md`, `feedback_no_broken_windows.md`, `feedback_correct_outcomes.md`
 
