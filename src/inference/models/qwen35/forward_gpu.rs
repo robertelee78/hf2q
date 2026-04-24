@@ -716,7 +716,7 @@ mod tests {
                         .into_iter()
                         .map(|v| -v.abs() - 0.5)
                         .collect();
-                    attn.ssm_norm = vec![1.0f32; z_ch];
+                    attn.ssm_norm = vec![1.0f32; dv]; // [D_v] only, broadcast across heads
                     attn.ssm_out = mk_rand(&mut seed, h * z_ch, 0.02);
                     match ffn {
                         Qwen35FfnWeights::Dense(w) => {

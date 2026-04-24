@@ -295,7 +295,8 @@ fn empty_delta_net_weights(cfg: &Qwen35Config) -> DeltaNetLayerWeights {
         ssm_dt_bias: vec![0.0f32; nv],
         ssm_beta: vec![0.0f32; nv * h],
         ssm_a: vec![0.0f32; nv],
-        ssm_norm: vec![1.0f32; z_channels],
+        // ssm_norm shape is [D_v], broadcast across n_v_heads per token.
+        ssm_norm: vec![1.0f32; dv],
         ssm_out: vec![0.0f32; h * z_channels],
     }
 }

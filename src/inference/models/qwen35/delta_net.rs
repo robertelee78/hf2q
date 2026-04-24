@@ -247,7 +247,9 @@ pub fn delta_net_layer_cpu_ref(
     assert_eq!(weights.ssm_dt_bias.len(), nv);
     assert_eq!(weights.ssm_beta.len(), nv * h);
     assert_eq!(weights.ssm_a.len(), nv);
-    assert_eq!(weights.ssm_norm.len(), z_channels);
+    // ssm_norm has shape [D_v] (per-head dim only), broadcast across n_v_heads.
+    // This matches the apex GGUF's blk.{i}.ssm_norm.weight shape = [D_v].
+    assert_eq!(weights.ssm_norm.len(), dv);
     assert_eq!(weights.ssm_out.len(), h * z_channels);
     assert_eq!(state_in.len(), dk * dv * nv);
     assert_eq!(conv_state.len(), km1 * qkv_channels);
@@ -378,15 +380,33 @@ pub fn delta_net_layer_cpu_ref(
         }
     }
 
-    // 9. Output RMSNorm per-token over z_channels, then gate by sigmoid(Z).
-    //    ssm_norm is shared across the entire z_channels vector (one weight
-    //    per value), applied as RMSNorm.
+    // 9. Output RMSNorm per-head then SiLU-gate by z.
+    //    ssm_norm has shape [D_v] and is BROADCAST across all n_v_heads per token.
+    //    For each token and each value head, RMSNorm is applied independently over
+    //    the D_v elements of that head using the same ssm_norm weights.
+    //    Gate uses SiLU (x * sigmoid(x)) matching llama.cpp's build_norm_gated:
+    //      ggml_silu(ctx0, gate) — SiLU, not plain sigmoid.
+    //    See llama.cpp qwen35moe.cpp::build_layer_attn_linear.
+    assert_eq!(
+        weights.ssm_norm.len(),
+        dv,
+        "ssm_norm shape mismatch: expected [D_v={}] got {}",
+        dv,
+        weights.ssm_norm.len()
+    );
     let mut gated = vec![0.0f32; seq * z_channels];
     for t in 0..seq {
-        let row = &attn_out[t * z_channels..(t + 1) * z_channels];
-        let normed = rms_norm_row(row, &weights.ssm_norm, shape.rms_norm_eps);
-        for i in 0..z_channels {
-            gated[t * z_channels + i] = normed[i] * sigmoid(z[t * z_channels + i]);
+        for vh in 0..nv {
+            let head_off = t * z_channels + vh * dv;
+            let head_row = &attn_out[head_off..head_off + dv];
+            let normed = rms_norm_row(head_row, &weights.ssm_norm, shape.rms_norm_eps);
+            for d in 0..dv {
+                let z_val = z[head_off + d];
+                // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                // Matches llama.cpp build_norm_gated: ggml_silu(ctx0, gate)
+                let z_silu = z_val / (1.0 + (-z_val).exp());
+                gated[head_off + d] = normed[d] * z_silu;
+            }
         }
     }
 
@@ -479,8 +499,9 @@ mod tests {
             ssm_dt_bias: mk_rand(&mut seed, nv, 0.05),
             ssm_beta: mk_rand(&mut seed, nv * h, 0.1),
             ssm_a: mk_rand(&mut seed, nv, 0.1),
+            // ssm_norm shape is [D_v] (broadcast across heads), not [z_channels].
             ssm_norm: {
-                let mut v = vec![1.0f32; z_channels];
+                let mut v = vec![1.0f32; dv];
                 for (i, x) in v.iter_mut().enumerate() {
                     *x += 0.01 * (i as f32);
                 }

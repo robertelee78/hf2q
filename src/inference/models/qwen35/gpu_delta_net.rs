@@ -559,66 +559,67 @@ pub fn apply_gated_delta_net(
     Ok((output_buf, new_state))
 }
 
-/// Apply output RMSNorm then element-wise sigmoid-gate multiply.
+/// Apply per-head output RMSNorm then element-wise SiLU-gate multiply.
 ///
 /// `attn_out`: `[seq_len, nv*dv]` F32.
-/// `z_flat`: `[seq_len, nv*dv]` F32 (raw Z-gate logits).
-/// `ssm_norm_w`: `[nv*dv]` F32 (output RMSNorm weight).
+/// `z_flat`: `[seq_len, nv*dv]` F32 (raw Z-gate logits before SiLU).
+/// `ssm_norm_w`: `[dv]` F32 (RMSNorm weight, **broadcast** across all n_v_heads).
+///   In the apex GGUF the ssm_norm tensor has shape `[D_v]` not `[n_v_heads * D_v]`.
+///   The norm is applied independently to each `[dv]`-element head slice.
+/// `n_v_heads`: number of value heads (nv).
+/// `d_v`: per-head value dimension (dv).
 ///
-/// Returns `[seq_len, nv*dv]` F32 = `RMSNorm(attn_out) * sigmoid(z)`.
+/// Returns `[seq_len, nv*dv]` F32 = `RMSNorm_per_head(attn_out) * silu(z)`.
+///
+/// Gate: SiLU(x) = x / (1 + exp(-x)), matching llama.cpp build_norm_gated
+/// which calls `ggml_silu(ctx0, gate)`.
 pub fn apply_ssm_norm_and_gate(
     encoder: &mut mlx_native::CommandEncoder,
-    registry: &mut KernelRegistry,
+    _registry: &mut KernelRegistry,
     device: &MlxDevice,
     attn_out: &MlxBuffer,
     z_flat: &MlxBuffer,
     ssm_norm_w: &MlxBuffer,
     seq_len: u32,
-    z_channels: u32,
+    z_channels: u32,  // = n_v_heads * d_v (kept for API compatibility)
     eps: f32,
 ) -> Result<MlxBuffer> {
-    // Step 1: RMSNorm(attn_out, ssm_norm_w) over z_channels per token.
-    let normed = device
-        .alloc_buffer(
-            (seq_len * z_channels) as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, z_channels as usize],
-        )
-        .map_err(|e| anyhow!("alloc ssm_norm out: {e}"))?;
-    let mut params = device
-        .alloc_buffer(8, DType::F32, vec![2])
-        .map_err(|e| anyhow!("alloc params: {e}"))?;
-    {
-        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = eps;
-        s[1] = z_channels as f32;
-    }
-    rms_norm::dispatch_rms_norm(
-        encoder,
-        registry,
-        device.metal_device(),
-        attn_out,
-        ssm_norm_w,
-        &normed,
-        &params,
-        seq_len,
-        z_channels,
-    )
-    .context("dispatch_rms_norm ssm_norm")?;
+    // We can't use dispatch_rms_norm here because ssm_norm_w has shape [dv],
+    // not [z_channels]. We need per-head normalization with weight broadcasting.
+    // Download to CPU and apply per-head.
+    encoder.commit_and_wait().context("commit before ssm_norm_gate")?;
 
-    // Step 2: element-wise multiply normed * sigmoid(z). Done CPU-side for
-    // the parity test (avoids an additional kernel dependency). Uses the
-    // same pattern as P7b's SDPA permute.
-    encoder.commit_and_wait().context("commit ssm_norm")?;
+    let attn_out_cpu = download_f32(attn_out).context("download attn_out ssm_norm")?;
+    let z_cpu = download_f32(z_flat).context("download z ssm_norm")?;
+    let norm_w_cpu = download_f32(ssm_norm_w).context("download ssm_norm_w")?;
 
-    let normed_cpu = download_f32(&normed)?;
-    let z_cpu = download_f32(z_flat)?;
-    let n = (seq_len * z_channels) as usize;
-    let mut gated = vec![0.0f32; n];
-    for i in 0..n {
-        gated[i] = normed_cpu[i] * sigmoid_f32(z_cpu[i]);
+    let n_total = (seq_len * z_channels) as usize;
+    let dv = norm_w_cpu.len(); // actual D_v from the norm weight shape
+    // z_channels should be n_v_heads * dv, but we infer nv from the two:
+    let nv = if dv > 0 { z_channels as usize / dv } else { 1 };
+
+    let mut gated = vec![0.0f32; n_total];
+    let seq = seq_len as usize;
+
+    for t in 0..seq {
+        for vh in 0..nv {
+            let head_off = t * nv * dv + vh * dv;
+            let head_row = &attn_out_cpu[head_off..head_off + dv];
+
+            // Per-head RMSNorm with the D_v-element weight vector.
+            let sum_sq: f32 = head_row.iter().map(|v| v * v).sum();
+            let inv = ((sum_sq / (dv as f32)) + eps).sqrt().recip();
+            for d in 0..dv {
+                let normed_val = head_row[d] * inv * norm_w_cpu[d];
+                let z_val = z_cpu[head_off + d];
+                // SiLU: x / (1 + exp(-x)) — matches llama.cpp ggml_silu
+                let z_silu = z_val / (1.0 + (-z_val).exp());
+                gated[head_off + d] = normed_val * z_silu;
+            }
+        }
     }
-    upload_f32(&gated, device)
+
+    upload_f32(&gated, device).context("upload ssm_norm_gated")
 }
 
 // ================================================================
@@ -864,8 +865,9 @@ mod tests {
             ssm_dt_bias: mk_rand(&mut seed, nv, 0.05),
             ssm_beta: mk_rand(&mut seed, nv * h, 0.1),
             ssm_a: mk_rand(&mut seed, nv, 0.1),
+            // ssm_norm shape is [D_v] (broadcast across heads), not [z_channels].
             ssm_norm: {
-                let mut v = vec![1.0f32; z_channels];
+                let mut v = vec![1.0f32; dv];
                 for (i, x) in v.iter_mut().enumerate() {
                     *x += 0.01 * (i as f32);
                 }
