@@ -201,23 +201,30 @@ fn residual_add_gpu(
 // ================================================================
 
 impl Qwen35Model {
-    /// End-to-end GPU forward pass (prefill regime, stateless cache).
+    /// End-to-end GPU forward pass (prefill or single-token decode, stateful).
     ///
     /// # Arguments
     ///
-    /// - `tokens`: input token IDs, length = seq_len.
-    /// - `positions`: per-token axis positions.  For text-only Qwen3.5,
-    ///   replicate the token index across all 4 axes.  Layout is the flat
-    ///   `[4 * seq_len]` i32 buffer expected by the IMROPE kernel:
-    ///   `positions[axis * seq_len + t]` = axis-a coordinate for token t.
-    /// - `_kv_cache`: hybrid KV cache (currently unused for P11 prefill;
-    ///   the slot mapping is exercised but state writes are deferred to P13).
+    /// - `tokens`: input token IDs, length = seq_len.  For decode this is
+    ///   `[1]`; for prefill it is the full prompt token vector.
+    /// - `positions_flat`: per-token axis positions in flat `[4 * seq_len]`
+    ///   i32 layout expected by the IMROPE kernel:
+    ///   `positions_flat[axis * seq_len + t]` = axis-a coordinate for token t.
+    ///   For text-only Qwen3.5, replicate the absolute position index across
+    ///   all 4 axes.
+    /// - `kv_cache`: hybrid KV cache carrying DeltaNet SSM state (conv +
+    ///   recurrent) per linear-attention layer.  State is **read before** and
+    ///   **written back after** each `build_delta_net_layer` call so that
+    ///   decode steps correctly propagate SSM context.  Full-attention layers
+    ///   do not yet use the cache K/V slots (KV-append for full-attn is a
+    ///   follow-up once the full-attn SDPA kernel gains an incremental path).
     ///
     /// # Returns
     ///
-    /// `[seq_len * vocab_size]` logits, row-major.
+    /// `[seq_len * vocab_size]` logits, row-major.  For decode the caller
+    /// takes the last (and only) row.
     ///
-    /// # Panics / Errors
+    /// # Errors
     ///
     /// Returns an error if tokens is empty, if positions length doesn't match
     /// `4 * seq_len`, or if any GPU op fails.
@@ -225,7 +232,7 @@ impl Qwen35Model {
         &self,
         tokens: &[u32],
         positions_flat: &[i32], // [4 * seq_len] axis-major
-        _kv_cache: &mut HybridKvCache,
+        kv_cache: &mut HybridKvCache,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -312,16 +319,37 @@ impl Qwen35Model {
                     let rec_size = (cfg.linear_key_head_dim
                         * cfg.linear_value_head_dim
                         * cfg.linear_num_value_heads) as usize;
-                    let conv_state_zero = vec![0.0f32; km1 * qkv_channels];
-                    let rec_state_zero = vec![0.0f32; rec_size];
 
-                    let (out, _new_conv, _new_rec) = build_delta_net_layer(
+                    // --- Read SSM state from kv_cache (slot indexed by linear-attn rank) ---
+                    let (old_conv_state, old_rec_state, linear_slot_idx) =
+                        match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                            Some(super::kv_cache::LayerSlot::Linear(rank)) => {
+                                let slot = &kv_cache.linear_attn[rank as usize];
+                                let conv = slot.conv_state.as_slice::<f32>()
+                                    .map_err(|e| anyhow!("conv_state as_slice: {e}"))?
+                                    .to_vec();
+                                let rec = slot.recurrent.as_slice::<f32>()
+                                    .map_err(|e| anyhow!("recurrent as_slice: {e}"))?
+                                    .to_vec();
+                                (conv, rec, rank as usize)
+                            }
+                            _ => {
+                                // Fallback: fresh zero state (should not happen when kv_cache
+                                // is correctly sized for this model).
+                                tracing::warn!(
+                                    "forward_gpu: no linear-attn slot for layer {layer_idx}, using zero state"
+                                );
+                                (vec![0.0f32; km1 * qkv_channels], vec![0.0f32; rec_size], usize::MAX)
+                            }
+                        };
+
+                    let (out, new_conv_state, new_rec_state) = build_delta_net_layer(
                         &device,
                         &mut registry,
                         &hidden,
                         attn,
-                        &conv_state_zero,
-                        &rec_state_zero,
+                        &old_conv_state,
+                        &old_rec_state,
                         seq_len,
                         shape.hidden_size,
                         shape.n_k_heads,
@@ -332,6 +360,26 @@ impl Qwen35Model {
                         shape.rms_norm_eps,
                     )
                     .with_context(|| format!("delta_net layer {layer_idx}"))?;
+
+                    // --- Write back updated state into kv_cache slot ---
+                    if linear_slot_idx != usize::MAX {
+                        let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                        // conv_state: kv_cache stores [K-1, channels] CPU layout (same as
+                        // what build_delta_net_layer returns for new_conv_state).
+                        {
+                            let dst = slot.conv_state.as_mut_slice::<f32>()
+                                .map_err(|e| anyhow!("conv_state as_mut_slice: {e}"))?;
+                            dst.copy_from_slice(&new_conv_state);
+                        }
+                        // recurrent: kv_cache and kernel both use [d_k * d_v * n_v_heads]
+                        // flat layout for n_seqs=1.
+                        {
+                            let dst = slot.recurrent.as_mut_slice::<f32>()
+                                .map_err(|e| anyhow!("recurrent as_mut_slice: {e}"))?;
+                            dst.copy_from_slice(&new_rec_state);
+                        }
+                    }
+
                     out
                 }
             };

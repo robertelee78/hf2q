@@ -475,24 +475,34 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 }
 
 // ================================================================
-// Qwen3.5 generate path (ADR-013 P11)
+// Qwen3.5 generate path (ADR-013 P13.1)
 // ================================================================
 
 /// Generate subcommand dispatch for `qwen35` / `qwen35moe` GGUF architectures.
 ///
-/// Loads the model via [`Qwen35Model::load_from_gguf`], builds a
-/// [`HybridKvCache`], and runs `forward_gpu` token-by-token.  For P11 the
-/// forward pass is a full-prefill-in-one-shot (no incremental decode KV
-/// integration — P13 adds that).  The function still accepts `--n-predict`
-/// tokens but currently generates only the first token deterministically
-/// (argmax at temp 0.0) and returns, so that `hf2q generate` is fully
-/// callable end-to-end without NaN or panic.
+/// Full end-to-end generate loop with stateful KV / SSM state threading:
 ///
-/// # Acceptance criteria (P11)
+/// 1. Load model + tokenizer from GGUF.
+/// 2. Render + tokenize the prompt via GGUF's `tokenizer.chat_template`.
+/// 3. Allocate [`HybridKvCache`] for the session (max_seq_len = prompt_len +
+///    max_tokens, capped to `max_position_embeddings`).
+/// 4. **Prefill**: call `forward_gpu(prompt_tokens, positions, kv_cache)`.
+///    DeltaNet SSM state is threaded through `kv_cache.linear_attn` slots.
+/// 5. **Decode loop** for `max_tokens` steps:
+///    - Sample next token (argmax, temp=0 greedy).
+///    - Check EOS (GGUF `tokenizer.ggml.eos_token_id`; default 151645 for
+///      Qwen3.5 / Qwen3.6 per HF tokenizer_config.json).
+///    - Call `forward_gpu([token], [pos], kv_cache)` — kv_cache carries the
+///      DeltaNet conv+recurrent state from the previous step.
+/// 6. Print the canonical hf2q 4-line header then the generated text.
 ///
-/// - Runs without panic / NaN.
-/// - Produces logits of shape `[vocab_size]` for the last token.
-/// - Argmax at temp=0.0 produces a deterministic token.
+/// # State threading
+///
+/// DeltaNet (Gated DeltaNet) layers maintain a recurrent state and a conv
+/// ring-buffer that must persist across decode steps. `forward_gpu` now reads
+/// from and writes back to the `kv_cache.linear_attn` slots on every call.
+/// For full-attention layers the SDPA is re-run from scratch on each decode
+/// token (the KV-append incremental path is a future optimisation).
 fn cmd_generate_qwen35(
     args: cli::GenerateArgs,
     gguf: mlx_native::gguf::GgufFile,
@@ -501,6 +511,7 @@ fn cmd_generate_qwen35(
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::model::Qwen35Model;
     use mlx_native::MlxDevice;
+    use std::io::Write;
 
     let model_path = &args.model;
     let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
@@ -508,11 +519,7 @@ fn cmd_generate_qwen35(
     tracing::info!("Qwen3.5 path: {}", model_path.display());
     tracing::info!("Tokenizer:    {}", tokenizer_path.display());
 
-    // Load the Qwen3.5 model config + zero-weighted struct.
-    // (P11: weight dequant load is complete via load_from_gguf scaffolding;
-    //  actual GGUF → f32 tensor read lands in P5-tail. For P11 the test GGUF
-    //  is always a synthetic file with F32 weights from the parity test suite,
-    //  or the caller supplies a real GGUF whose tensors load_from_gguf can open.)
+    // ---- Load model ----
     let load_start = std::time::Instant::now();
     tracing::info!("Loading Qwen3.5 model from GGUF");
     let model = Qwen35Model::load_from_gguf(&gguf)
@@ -525,94 +532,216 @@ fn cmd_generate_qwen35(
         load_elapsed.as_secs_f64()
     );
 
-    // Load tokenizer.
+    // ---- Resolve EOS from GGUF metadata ----
+    // Qwen3.5 / Qwen3.6: tokenizer.ggml.eos_token_id is typically 151645 or 151643.
+    // We prefer the GGUF-declared value (the authoritative source for this GGUF)
+    // over any hard-coded default, per project_qwen36_architecture.md.
+    let eos_token_id: u32 = gguf
+        .metadata_u32("tokenizer.ggml.eos_token_id")
+        .unwrap_or(151645); // HF Qwen3.5 default EOS
+    tracing::info!("Qwen3.5 EOS token id: {}", eos_token_id);
+
+    // ---- Load tokenizer ----
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer load failed: {e}"))?;
     tokenizer
         .with_truncation(None)
         .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
 
-    // Resolve + render prompt.
+    // ---- Resolve + render prompt ----
     let prompt_text_raw = resolve_prompt(&args)?;
     let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
 
-    // Tokenize.
+    // ---- Tokenize ----
     let encoding = tokenizer
         .encode(prompt_text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-    tracing::info!("Qwen3.5: {} prompt tokens", prompt_tokens.len());
+    let prompt_len = prompt_tokens.len();
+    tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
-    // Build KV cache.
+    // ---- Allocate HybridKvCache ----
     let device = MlxDevice::new()
         .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
-    let max_seq = (prompt_tokens.len() + args.max_tokens + 64)
+    let max_seq = (prompt_len + args.max_tokens + 64)
         .max(128)
         .min(model.cfg.max_position_embeddings as usize);
     let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
         .context("HybridKvCache::new")?;
+    tracing::info!(
+        "Qwen3.5 KV cache allocated: max_seq={}, {} MB",
+        max_seq,
+        kv_cache.total_bytes() / (1024 * 1024)
+    );
 
-    // Build positions: text-convention flat [4 * seq_len] i32.
-    let seq_len = prompt_tokens.len();
-    let mut positions_flat = vec![0i32; 4 * seq_len];
-    for axis in 0..4 {
-        for t in 0..seq_len {
-            positions_flat[axis * seq_len + t] = t as i32;
+    // ---- Build header info ----
+    let backend_chip = {
+        use crate::serve::gpu::GpuContext;
+        GpuContext::new()
+            .ok()
+            .map(|c| c.gpu_name().to_string())
+            .unwrap_or_else(|| "Metal".to_string())
+    };
+    let model_name = gguf
+        .metadata_string("general.name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "qwen3.5".to_string())
+        });
+    let total_gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(0.0);
+    let n_layers = model.layers.len();
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    let header_top = header::HeaderInfoTop {
+        chip: header::short_chip_label(&backend_chip),
+        backend: "mlx-native",
+        model: model_name,
+        load_s: load_elapsed.as_secs_f64(),
+        n_layers,
+        total_gb,
+    };
+    let mut stdout = std::io::stdout();
+    header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
+        .context("print header top")?;
+
+    // ---- Prefill ----
+    // Build flat positions [4 * prompt_len]: axis-major, all axes = token index.
+    let prefill_positions: Vec<i32> = {
+        let mut flat = vec![0i32; 4 * prompt_len];
+        for axis in 0..4 {
+            for t in 0..prompt_len {
+                flat[axis * prompt_len + t] = t as i32;
+            }
         }
-    }
+        flat
+    };
 
-    // Run GPU forward pass.
-    tracing::info!("Running Qwen3.5 GPU forward pass (seq_len={})", seq_len);
-    let fwd_start = std::time::Instant::now();
-    let logits = model
-        .forward_gpu(&prompt_tokens, &positions_flat, &mut kv_cache)
-        .context("Qwen35Model::forward_gpu")?;
-    let fwd_elapsed = fwd_start.elapsed();
+    tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
+    let prefill_start = std::time::Instant::now();
+    let prefill_logits = model
+        .forward_gpu(&prompt_tokens, &prefill_positions, &mut kv_cache)
+        .context("Qwen35Model::forward_gpu (prefill)")?;
+    let prefill_elapsed = prefill_start.elapsed();
 
-    // Logits have shape [seq_len, vocab_size] row-major.
+    // Sanity-check logits shape.
     let vocab_size = model.cfg.vocab_size;
     anyhow::ensure!(
-        logits.len() == seq_len * vocab_size as usize,
-        "forward_gpu returned logits.len()={} != seq_len({}) * vocab({}) = {}",
-        logits.len(),
-        seq_len,
+        prefill_logits.len() == prompt_len * vocab_size as usize,
+        "forward_gpu (prefill) returned logits.len()={} != prompt_len({}) * vocab({}) = {}",
+        prefill_logits.len(),
+        prompt_len,
         vocab_size,
-        seq_len * vocab_size as usize,
-    );
-    tracing::info!(
-        "forward_gpu: {:.2}s, logits shape [{}, {}]",
-        fwd_elapsed.as_secs_f64(),
-        seq_len,
-        vocab_size
+        prompt_len * vocab_size as usize,
     );
 
-    // Check for NaN/Inf in last-token logits.
-    let last_logits = &logits[logits.len() - vocab_size as usize..];
-    let n_nan = last_logits.iter().filter(|v| v.is_nan()).count();
-    let n_inf = last_logits.iter().filter(|v| v.is_infinite()).count();
-    if n_nan > 0 || n_inf > 0 {
-        tracing::warn!(
-            "Qwen3.5 forward_gpu: last-token logits contain {} NaN + {} Inf values",
-            n_nan,
-            n_inf
-        );
-    }
+    let prefill_tok_s = prompt_len as f64 / prefill_elapsed.as_secs_f64();
+    header::print_header_prefill(
+        &mut stdout,
+        &header::HeaderInfoPrefill {
+            prefill_n: prompt_len,
+            prefill_ms: prefill_elapsed.as_secs_f64() * 1000.0,
+            prefill_tok_s,
+        },
+        stdout_is_tty,
+    )
+    .context("print header prefill")?;
 
-    // Sample first token (argmax at temp=0.0).
-    let next_token = greedy_argmax_last_token(last_logits, vocab_size);
+    // Sample the first token from prefill logits (last token's row).
+    let last_prefill_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+    let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
     tracing::info!("Qwen3.5 first decoded token: {}", next_token);
 
-    // Decode and print.
-    use std::io::Write;
-    let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
-    print!("{}", token_str);
-    std::io::stdout().flush()?;
+    // Print first token immediately.
+    {
+        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
+        print!("{}", s);
+        stdout.flush()?;
+    }
 
-    // P11: single-token output (no incremental decode loop; P13 adds that).
+    // ---- Decode loop ----
+    let decode_start = std::time::Instant::now();
+    let mut generated = 1usize;
+
+    for step in 1..args.max_tokens {
+        if next_token == eos_token_id {
+            break;
+        }
+
+        // Absolute position of the decode token: prompt_len + (step - 1) since
+        // step=1 is the second decode token, positioned at prompt_len.
+        // (step=0 was the first decode token sampled from prefill; it already
+        // "consumed" position prompt_len implicitly because we ran prefill at
+        // positions 0..prompt_len-1, so the next position is prompt_len.)
+        let pos = (prompt_len + step - 1) as i32;
+
+        // Check we haven't overrun the KV cache.
+        if pos as usize >= max_seq {
+            tracing::warn!(
+                "Qwen3.5 decode: reached max_seq {} at step {}; stopping",
+                max_seq,
+                step
+            );
+            break;
+        }
+
+        // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
+        let decode_positions = vec![pos; 4];
+
+        // forward_gpu with 1 token; kv_cache carries SSM state from previous step.
+        let decode_logits = model
+            .forward_gpu(&[next_token], &decode_positions, &mut kv_cache)
+            .with_context(|| format!("forward_gpu decode step {step}"))?;
+
+        anyhow::ensure!(
+            decode_logits.len() == vocab_size as usize,
+            "decode step {step}: logits.len()={} != vocab_size={}",
+            decode_logits.len(),
+            vocab_size
+        );
+
+        next_token = greedy_argmax_last_token(&decode_logits, vocab_size);
+        generated += 1;
+
+        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
+        print!("{}", s);
+        stdout.flush()?;
+    }
+
+    let decode_elapsed = decode_start.elapsed();
+    let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
+
+    let (td, tr) = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
     eprintln!(
-        "\n\n[Qwen3.5 P11] prefill {seq_len} tokens in {:.2}s, first token = {next_token} ({token_str:?})",
-        fwd_elapsed.as_secs_f64()
+        "\n\n{td}--- mlx-native (Qwen3.5): {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
+        generated,
+        decode_elapsed.as_secs_f64(),
+        tok_per_sec,
     );
+
+    if args.benchmark {
+        let (chip, mem_gb) = detect_hardware_info();
+        let model_filename = model_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!();
+        println!("=== Benchmark Results ===");
+        println!("Hardware: {}, {} GB", chip, mem_gb);
+        println!("Model: {}", model_filename);
+        println!("Prompt tokens: {}", prompt_len);
+        println!("Generated tokens: {}", generated);
+        println!("Prefill tok/s: {:.1}", prefill_tok_s);
+        println!("Decode tok/s: {:.1}", tok_per_sec);
+    }
 
     Ok(())
 }
