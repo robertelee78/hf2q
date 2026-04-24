@@ -1113,6 +1113,69 @@ pub fn transform_in_proj_qkvz(
 /// For BF16 tensors: decode, add 1.0, re-encode.
 /// For F16 tensors: decode, add 1.0, re-encode.
 /// Other dtypes (norm weights should always be a float type): return typed error.
+/// Apply `apply_rms_norm_plus_one` to every qualifying norm tensor in
+/// a pre-quantization `TensorMap`. Arch-gated: no-op for non-Qwen3.5
+/// arches (Gemma4, LLaMA, etc. do not use the `gamma + 1` convention).
+///
+/// Qualifying: tensor name ends with `norm.weight` AND does NOT end
+/// with `linear_attn.norm.weight` — matches convert_hf_to_gguf.py:4794-4795
+/// exactly.
+///
+/// # Silent wire-up gap (2026-04-24)
+///
+/// P3 shipped `apply_rms_norm_plus_one` in commit `73a96e4` but never
+/// wired it into the convert pipeline. Before this function, the
+/// per-tensor transform only ran inside its own unit tests; real
+/// qwen35/qwen35moe convert output shipped RMS norm weights WITHOUT
+/// the +1 bias. llama.cpp's forward pass assumes `gamma + 1` baked
+/// in at convert time (`build_norm` at `llama-graph.cpp:1028-1055`
+/// does plain multiply, no +1), so the missing bias produces ~1.0x
+/// norm multiplier shift through every layer — compounding silent
+/// logit skew.
+///
+/// This walker is the fix. Called from `src/main.rs` Phase 1.5
+/// alongside the MoE expert merge.
+pub fn apply_rms_norm_plus_one_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    // Arch gate — Qwen3.5 family only. convert_hf_to_gguf.py:4794 is
+    // scoped to Qwen3NextModel which Qwen3_5TextModel + Qwen3_5MoeTextModel
+    // both inherit from (py:5259, 5427-5434).
+    let arch_str = metadata.architecture.as_str();
+    let model_type = metadata.model_type.as_str();
+    let is_qwen35 = arch_str == "Qwen3_5ForCausalLM"
+        || arch_str == "Qwen3_5ForConditionalGeneration"
+        || arch_str == "Qwen3_5MoeForCausalLM"
+        || arch_str == "Qwen3_5MoeForConditionalGeneration"
+        || model_type == "qwen3_5"
+        || model_type == "qwen3_5_moe_text";
+    if !is_qwen35 {
+        return Ok(());
+    }
+
+    // Collect the names first (cannot mutate the map while iterating).
+    let qualifying: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.ends_with("norm.weight")
+                && !n.ends_with("linear_attn.norm.weight")
+        })
+        .cloned()
+        .collect();
+
+    for name in qualifying {
+        let Some(tensor) = tensor_map.tensors.remove(&name) else {
+            continue;
+        };
+        let transformed = apply_rms_norm_plus_one(tensor)?;
+        tensor_map.tensors.insert(transformed.name.clone(), transformed);
+    }
+
+    Ok(())
+}
+
 pub fn apply_rms_norm_plus_one(
     mut tensor: TensorRef,
 ) -> Result<TensorRef, ConvertError> {

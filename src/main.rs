@@ -460,6 +460,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("qwen35moe expert merge failed")
         .map_err(AppError::Conversion)?;
 
+    // Phase 1.6: ADR-012 P3 Decision 6 — RMS norm +1 bias (Qwen3.5 family
+    // `gamma + 1` convention, py:4794-4795). Baked into the stored weights
+    // at convert time. Silent wire-up gap caught by spec-source audit
+    // 2026-04-24 — P3 shipped the per-tensor transform but never called
+    // it; before this fix, converted Qwen3.5 GGUFs shipped RMS norm
+    // weights WITHOUT the +1 bias, producing silent logit skew at
+    // inference. No-op for non-Qwen3.5 arches (Gemma4, LLaMA).
+    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(&mut tensor_map, &metadata)
+        .context("qwen35 RMS norm +1 bias application failed")
+        .map_err(AppError::Conversion)?;
+
     check_interrupted()?;
 
     let input_size = tensor_map.total_size_bytes() as u64;
