@@ -1216,6 +1216,33 @@ Phase 2 closes when 2a + 2b + 2c all pass.
 - [ ] mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp
 - [ ] OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly
 
+#### Phase 2 Execution Log
+
+Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs, no fallbacks, dive deep, measure 3x cut once, Chesterton's fence.
+
+- **2026-04-23 loop iter 1 — Phase 2a foundation, schema layer restored + extended.**
+  - **Engine-agnostic review (Task #1 DONE).** Reviewed `fe54bc2~1:src/serve/{schema.rs,sse.rs,router.rs}` for engine-agnosticism:
+    - `schema.rs` (1215 LOC) — engine-agnostic: only imports `axum::http::StatusCode`, `axum::response::{IntoResponse, Response}`, `serde::{Deserialize, Serialize}`, and `serde_json`. No inference-engine dependency. **Restorable wholesale.**
+    - `sse.rs` (681 LOC) — mostly engine-agnostic: imports `super::schema` (OK) and `super::tool_parser::{...}` (NOT restored per Decision #6) and `crate::inference::engine::GenerationStats` (candle-era type; rewire to current stats struct on restore). **Restore with ~30 LOC of rewiring, strip `tool_parser` imports (grammar-constrained decoding obviates post-hoc parsing).**
+    - `router.rs` (28 LOC) — trivially engine-agnostic. Will be regenerated to match rebuilt handlers shape in the iter that lands handlers.
+    - `tool_parser.rs` (867 LOC) — **NOT restored** per Decision #6 (grammar-constrained decoding obviates per-model post-hoc parsing).
+    - `middleware.rs`, `mod.rs`, `handlers.rs`, `embeddings.rs` — **rebuild from scratch** (candle-era inference integration).
+  - **Spec layer schema restored + Tier 2/3/4 extension (Task #2 DONE for schema.rs; remainder of spec layer remains).** New file `src/serve/api/schema.rs` (1156 LOC, 46 unit tests, all passing). Restored the engine-agnostic types from `fe54bc2~1:src/serve/schema.rs` and extended in-place for the 27 Phase 2 decisions:
+    - **Tier 1 additions:** `max_completion_tokens` (OpenAI's newer `max_tokens` replacement), `response_format` with three variants (`text` / `json_object` / `json_schema` — the third holds a `JsonSchemaSpec {name, description, schema, strict}`). These ride the grammar-constrained sampler (Decision #6).
+    - **Tier 2 additions:** `seed`, `stream_options.include_usage`.
+    - **Tier 3 additions:** `top_k`, `repetition_penalty`, `min_p` (llama.cpp / ollama extension surface).
+    - **Tier 4 additions:** `logprobs` (bool), `top_logprobs` (u32), `logit_bias` (HashMap<String, f32>), `parallel_tool_calls`. New response types `ChoiceLogprobs`, `TokenLogprob`, `TopLogprobEntry`.
+    - **Reasoning split (Decision #21):** `reasoning_content: Option<String>` field on both `ChatMessage` (for history echo-back and non-streaming responses) and `ChunkDelta` (for streaming splits). New `CompletionTokensDetails` with `reasoning_tokens`.
+    - **Overflow policy (Decision #23):** new `OverflowPolicy` enum (`reject` / `truncate_left` / `summarize`, default = `summarize`); per-request `hf2q_overflow_policy` extension field on `ChatCompletionRequest`.
+    - **Error schema (Decision #24):** `ApiError` retains OpenAI `{error: {message, type, param, code}}` shape; constructors extended with `model_not_loaded` (Decision #26), `not_ready` (Decision #16), `unauthorized` (Decision #8), `grammar_error` (Decision #6). Queue-full moved from 503 to **429 + Retry-After**; `not_ready` keeps 503 + Retry-After.
+    - **`/v1/models` (Decision #26):** `ModelObject` extended with `quant_type`, `backend`, `loaded` fields.
+    - **`/health` / `/readyz` (Decision #12):** new `HealthResponse {status, model, backend, context_length, uptime_seconds}` and `ReadyzResponse {ready, detail}`.
+    - **Embeddings (Decision #4):** `EmbeddingRequest` gains `dimensions`, `user` (both accepted, `dimensions` is advisory).
+    - **System fingerprint:** `ChatCompletionResponse` and `ChatCompletionChunk` gain optional `system_fingerprint` (planned format `hf2q-<short-git-sha>-<mlx-native>`).
+  - **Verification:** `cargo test --bin hf2q serve::api::schema` — 46/46 pass. Full suite: 321/321 pass. Zero warnings. Commit + push in same iter.
+  - **Files under the `src/serve/api/` submodule (`mod.rs` + `schema.rs`) are gated with `#![allow(dead_code)]` until handlers land in iter 2+. No existing code paths changed; build is fully backwards-compatible.**
+  - **Next (iter 2):** restore `sse.rs` with `tool_parser` stripped + rewired to a future stats type; skeleton `handlers.rs`, `router.rs`, `state.rs`, `middleware.rs`. Grammar stack (GBNF parser + JSON-schema→GBNF + sampler) port begins in a parallel swarm.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)

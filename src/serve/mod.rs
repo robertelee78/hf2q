@@ -2,6 +2,7 @@
 //!
 //! ADR-008: single backend (mlx-native).  All candle code has been removed.
 
+pub mod api;
 pub mod config;
 pub mod forward_mlx;
 pub mod forward_prefill;
