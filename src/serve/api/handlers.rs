@@ -406,11 +406,91 @@ async fn chat_completions_stream(
     response
 }
 
+/// Pure-compute core of `apply_overflow_policy`. Parameterized by an
+/// abstract `tokenize` callback so it can be unit-tested without a live
+/// Engine + tokenizer + chat template.
+///
+/// Returns `Ok((possibly-shrunk messages, tokens, length))` on success.
+/// On any failure the caller receives a `TruncateOutcome` describing the
+/// failure kind; the HTTP-level `apply_overflow_policy` maps it to the
+/// right 4xx/5xx response envelope.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TruncateOutcome<E> {
+    /// Prompt fits within `ctx_len`; no mutation was needed.
+    Fits(Vec<super::schema::ChatMessage>, usize),
+    /// Shrunk successfully via left-truncation.
+    Truncated(Vec<super::schema::ChatMessage>, usize, usize),
+    /// Could not shrink further (only system + last-user remained and the
+    /// prompt still overflowed).
+    CannotShrink { ctx_len: usize, actual: usize },
+    /// Caller-tokenizer returned an error.
+    TokenizeErr(E),
+}
+
+/// Left-truncate iteratively. Drops the oldest non-system message that
+/// isn't the triggering last-user turn, re-tokenizes via `tokenize`, and
+/// stops when the prompt fits or when nothing more can be dropped.
+pub(crate) fn truncate_left<F, E>(
+    messages: &[super::schema::ChatMessage],
+    ctx_len: usize,
+    mut tokenize: F,
+) -> TruncateOutcome<E>
+where
+    F: FnMut(&[super::schema::ChatMessage]) -> Result<usize, E>,
+{
+    // Initial size check.
+    let initial_n = match tokenize(messages) {
+        Ok(n) => n,
+        Err(e) => return TruncateOutcome::TokenizeErr(e),
+    };
+    if initial_n < ctx_len {
+        return TruncateOutcome::Fits(messages.to_vec(), initial_n);
+    }
+
+    let mut msgs = messages.to_vec();
+    let mut iterations = 0usize;
+    loop {
+        // Identify the last-user index on EACH iteration since msgs mutates.
+        let last_user_idx = msgs.iter().rposition(|m| m.role == "user");
+        // Find the first non-system-and-not-last-user index.
+        let drop_idx = msgs
+            .iter()
+            .position(|m| m.role != "system")
+            .filter(|idx| Some(*idx) != last_user_idx);
+        let Some(drop_idx) = drop_idx else {
+            // Only system + last user remain.
+            let final_n = tokenize(&msgs).unwrap_or(usize::MAX);
+            return TruncateOutcome::CannotShrink {
+                ctx_len,
+                actual: final_n,
+            };
+        };
+        if Some(drop_idx) == last_user_idx {
+            // Defensive: the filter above already excludes this, but leave
+            // the guard for future refactor safety.
+            return TruncateOutcome::CannotShrink {
+                ctx_len,
+                actual: initial_n,
+            };
+        }
+        msgs.remove(drop_idx);
+        let n = match tokenize(&msgs) {
+            Ok(n) => n,
+            Err(e) => return TruncateOutcome::TokenizeErr(e),
+        };
+        iterations += 1;
+        if n < ctx_len {
+            return TruncateOutcome::Truncated(msgs, n, iterations);
+        }
+    }
+}
+
 /// Apply Decision #23 context-overflow policy. Renders the chat template,
 /// tokenizes, and checks against `engine.context_length()`:
 ///
 ///   - `Reject`        → 400 context_length_exceeded if `prompt ≥ ctx_len`.
-///   - `TruncateLeft`  → drop oldest non-system messages until prompt fits.
+///   - `TruncateLeft`  → drop oldest non-system messages until prompt fits
+///                       (via the pure-compute `truncate_left` helper).
 ///   - `Summarize`     → 501 not-implemented in this iter (needs internal
 ///                       engine recursion; lands with forward_decode
 ///                       refactor).
@@ -425,31 +505,32 @@ fn apply_overflow_policy(
     use super::schema::OverflowPolicy;
 
     // Helper: render + tokenize a message slice. Returns tokens + length.
-    let render_and_tokenize = |msgs: &[super::schema::ChatMessage]| -> Result<(Vec<u32>, usize), Response> {
-        let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "chat template render failed");
-                return Err(ApiError::invalid_request(
-                    format!("chat template render failed: {e}"),
-                    Some("messages".into()),
-                )
-                .into_response());
-            }
+    let render_and_tokenize =
+        |msgs: &[super::schema::ChatMessage]| -> Result<(Vec<u32>, usize), Response> {
+            let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "chat template render failed");
+                    return Err(ApiError::invalid_request(
+                        format!("chat template render failed: {e}"),
+                        Some("messages".into()),
+                    )
+                    .into_response());
+                }
+            };
+            let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tokenization failed");
+                    return Err(ApiError::internal_error().into_response());
+                }
+            };
+            let tokens: Vec<u32> = encoding.get_ids().to_vec();
+            let n = tokens.len();
+            Ok((tokens, n))
         };
-        let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "tokenization failed");
-                return Err(ApiError::internal_error().into_response());
-            }
-        };
-        let tokens: Vec<u32> = encoding.get_ids().to_vec();
-        let n = tokens.len();
-        Ok((tokens, n))
-    };
 
-    let (mut tokens, mut n) = render_and_tokenize(messages)?;
+    let (tokens, n) = render_and_tokenize(messages)?;
     let ctx_len = match engine.context_length() {
         Some(c) => c,
         None => return Ok((tokens, n)), // no advertised ctx → trust the caller
@@ -464,39 +545,20 @@ fn apply_overflow_policy(
             Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
         }
         OverflowPolicy::TruncateLeft => {
-            // Repeatedly drop the oldest NON-system message until the
-            // prompt fits. If we run out of non-system messages and still
-            // don't fit, fall through to a hard context_length_exceeded
-            // (keeping system + last user turn).
-            let mut msgs = messages.to_vec();
-            // Identify the last-user index so we never drop it — without
-            // the triggering user turn there's nothing to generate against.
-            let last_user_idx = msgs.iter().rposition(|m| m.role == "user");
-            loop {
-                // Find the first non-system index (keep system at 0).
-                let drop_idx = msgs
-                    .iter()
-                    .position(|m| m.role != "system")
-                    .filter(|idx| Some(*idx) != last_user_idx);
-                let Some(drop_idx) = drop_idx else {
-                    // Only system + last user remain; can't shrink further.
-                    return Err(
-                        ApiError::context_length_exceeded(ctx_len, n).into_response()
-                    );
-                };
-                // If the next candidate to drop IS the last user, skip it.
-                if Some(drop_idx) == last_user_idx {
-                    return Err(
-                        ApiError::context_length_exceeded(ctx_len, n).into_response()
-                    );
-                }
-                msgs.remove(drop_idx);
-                let (t, nn) = render_and_tokenize(&msgs)?;
-                tokens = t;
-                n = nn;
-                if n < ctx_len {
-                    return Ok((tokens, n));
-                }
+            // Use the pure-compute truncate_left helper. We need a
+            // length-only tokenizer here (the helper doesn't care about
+            // the token bytes), then re-run once on the final shrunk
+            // messages to get the token Vec for the generator.
+            let outcome = truncate_left(messages, ctx_len, |msgs| {
+                render_and_tokenize(msgs).map(|(_, n)| n).map_err(|r| r)
+            });
+            match outcome {
+                TruncateOutcome::Fits(_, _) => Ok((tokens, n)),
+                TruncateOutcome::Truncated(shrunk, _, _) => render_and_tokenize(&shrunk),
+                TruncateOutcome::CannotShrink { ctx_len, actual } => Err(
+                    ApiError::context_length_exceeded(ctx_len, actual).into_response(),
+                ),
+                TruncateOutcome::TokenizeErr(resp) => Err(resp),
             }
         }
         OverflowPolicy::Summarize => {
@@ -519,6 +581,152 @@ fn apply_overflow_policy(
             *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
             Err(resp)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the pure-compute truncate helper
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+    use super::super::schema::{ChatMessage, MessageContent};
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Fake tokenizer: N tokens per message. Chosen so tests can reason
+    /// about token counts precisely without needing a real tokenizer.
+    fn toks_per_msg(msgs: &[ChatMessage], per_msg: usize) -> Result<usize, ()> {
+        Ok(msgs.len() * per_msg)
+    }
+
+    #[test]
+    fn truncate_left_fits_returns_initial_count() {
+        let msgs = vec![msg("system", "s"), msg("user", "u")];
+        let out = truncate_left::<_, ()>(&msgs, 100, |m| toks_per_msg(m, 10));
+        match out {
+            TruncateOutcome::Fits(m, n) => {
+                assert_eq!(m.len(), 2);
+                assert_eq!(n, 20);
+            }
+            other => panic!("expected Fits, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn truncate_left_drops_oldest_nonsystem_until_fits() {
+        // 10 tokens/msg. 5 messages = 50 tokens. ctx_len=25 → must drop
+        // down to 2 messages. But system+last_user are both pinned, so
+        // the only droppables are the 3 middle. Dropping 3 → 2 msgs = 20
+        // tokens < 25. Final: 2 messages retained.
+        let msgs = vec![
+            msg("system", "s"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "final"),
+        ];
+        let out = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
+        match out {
+            TruncateOutcome::Truncated(retained, n, iters) => {
+                assert_eq!(retained.len(), 2);
+                assert_eq!(retained[0].role, "system");
+                assert_eq!(retained[1].role, "user");
+                // Last user should be the ORIGINAL last-user (the "final" msg).
+                assert_eq!(retained[1].content.as_ref().map(|c| c.text()).unwrap(), "final");
+                assert_eq!(n, 20);
+                assert_eq!(iters, 4); // dropped u1, a1, u2, a2
+            }
+            other => panic!("expected Truncated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn truncate_left_cannot_shrink_when_system_plus_last_user_overflow() {
+        // ctx_len=15 but system+last_user = 20 tokens. Cannot shrink further.
+        let msgs = vec![msg("system", "s"), msg("user", "u")];
+        let out = truncate_left::<_, ()>(&msgs, 15, |m| toks_per_msg(m, 10));
+        assert!(
+            matches!(out, TruncateOutcome::CannotShrink { .. }),
+            "got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn truncate_left_no_system_keeps_last_user_only() {
+        // No system message. messages: user, assistant, user(final).
+        // 30 tokens total, ctx=15 → drop user and assistant → 1 msg = 10
+        // tokens < 15. Retained: just the last user.
+        let msgs = vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "final"),
+        ];
+        let out = truncate_left::<_, ()>(&msgs, 15, |m| toks_per_msg(m, 10));
+        match out {
+            TruncateOutcome::Truncated(retained, n, _) => {
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].role, "user");
+                assert_eq!(retained[0].content.as_ref().map(|c| c.text()).unwrap(), "final");
+                assert_eq!(n, 10);
+            }
+            other => panic!("expected Truncated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn truncate_left_multiple_system_messages_all_preserved() {
+        // Two system messages + several history turns. Both systems must
+        // survive truncation.
+        let msgs = vec![
+            msg("system", "s1"),
+            msg("system", "s2"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "final"),
+        ];
+        let out = truncate_left::<_, ()>(&msgs, 35, |m| toks_per_msg(m, 10));
+        match out {
+            TruncateOutcome::Truncated(retained, _, _) => {
+                assert!(retained.iter().filter(|m| m.role == "system").count() == 2);
+                assert_eq!(retained.last().unwrap().role, "user");
+            }
+            other => panic!("expected Truncated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn truncate_left_propagates_tokenizer_error() {
+        let msgs = vec![msg("user", "u")];
+        let out = truncate_left::<_, &'static str>(&msgs, 100, |_| Err("fake tokenize error"));
+        assert_eq!(out, TruncateOutcome::TokenizeErr("fake tokenize error"));
+    }
+
+    #[test]
+    fn truncate_left_is_deterministic() {
+        // Same input → same output. Regression-guard against accidental
+        // randomness via HashMap iteration or similar.
+        let msgs = vec![
+            msg("system", "s"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "final"),
+        ];
+        let a = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
+        let b = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
+        assert_eq!(format!("{:?}", a), format!("{:?}", b));
     }
 }
 
