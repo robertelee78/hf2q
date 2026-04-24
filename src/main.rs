@@ -14,6 +14,8 @@ mod cli;
 mod debug;
 mod doctor;
 #[allow(dead_code)]
+mod models;
+#[allow(dead_code)]
 mod gpu;
 #[allow(dead_code)]
 mod inference;
