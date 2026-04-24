@@ -265,6 +265,17 @@ fn prepare_chat_generation(
         .into_response());
     }
 
+    // --- Multimodal validation (Phase 2c — Decision #1) ---
+    // Scan message content parts for image_url entries. Each URL is
+    // parsed at request time so bad URLs surface as 400 before the
+    // generation is queued. If any images ARE supplied and pass parse,
+    // return 501: the ViT forward pass that consumes them lands in a
+    // later iter (live-model validation required). Per mantra: honest
+    // 501 rather than silently stripping images.
+    if let Err(resp) = validate_multimodal_content(&req.messages) {
+        return Err(resp);
+    }
+
     // Pre-compile the response_format grammar (Decision #6). Fails fast on
     // malformed JSON-Schema so the client sees a grammar_error before any
     // generation starts — not after N tokens of model output. Note: the
@@ -728,6 +739,61 @@ mod truncate_tests {
         let b = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
         assert_eq!(format!("{:?}", a), format!("{:?}", b));
     }
+}
+
+/// Scan message content parts for `image_url` entries. Validates each URL
+/// via `crate::inference::vision::parse_image_url` (catches malformed URLs
+/// at request time) and returns:
+///
+///   - `Ok(())` when no images are present → normal text-only flow.
+///   - `Err(400 invalid_request)` when any URL is malformed — with the
+///     specific parse error in the message.
+///   - `Err(501 not_implemented)` when images parse cleanly but the ViT
+///     forward-pass path that would inject them isn't wired yet.
+///
+/// Per mantra ("no stubs"): we REFUSE to silently strip images from a
+/// request that supplied them. The 501 surfaces the feature gap plainly
+/// so clients know to either omit images or wait for the ViT iter.
+fn validate_multimodal_content(
+    messages: &[super::schema::ChatMessage],
+) -> std::result::Result<(), Response> {
+    use super::schema::{ContentPart, MessageContent};
+    let mut has_images = false;
+    for (mi, msg) in messages.iter().enumerate() {
+        if let Some(MessageContent::Parts(parts)) = msg.content.as_ref() {
+            for (pi, p) in parts.iter().enumerate() {
+                if let ContentPart::ImageUrl { image_url } = p {
+                    // Fail fast on malformed URLs (even though we'd 501 below
+                    // for forward-pass-pending, a bad URL is a client bug).
+                    if let Err(e) = crate::inference::vision::parse_image_url(&image_url.url) {
+                        return Err(ApiError::invalid_request(
+                            format!(
+                                "messages[{}].content[{}].image_url parse failed: {}",
+                                mi, pi, e
+                            ),
+                            Some(format!("messages[{}].content[{}]", mi, pi)),
+                        )
+                        .into_response());
+                    }
+                    has_images = true;
+                }
+            }
+        }
+    }
+    if has_images {
+        let err = ApiError::invalid_request(
+            "multimodal vision (image_url content parts) is not yet implemented \
+             in this build. The image URLs parsed correctly; the ViT forward \
+             pass that consumes them lands in a later hf2q iter (ADR-005 \
+             Phase 2c, Task #15). Send a text-only message to exercise the \
+             chat path.",
+            Some("messages".into()),
+        );
+        let mut resp = err.into_response();
+        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+        return Err(resp);
+    }
+    Ok(())
 }
 
 /// Pre-compile the request's `response_format` to a GBNF grammar and parse

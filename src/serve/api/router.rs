@@ -480,6 +480,40 @@ mod tests {
         assert_eq!(v["error"]["code"], "model_not_loaded");
     }
 
+    // --- Multimodal validation (Phase 2c, iter 23) ---
+
+    #[tokio::test]
+    async fn chat_completions_without_engine_multimodal_gate_is_secondary() {
+        // Without an engine loaded, the engine gate runs FIRST — so a
+        // multimodal request without --model returns model_not_loaded
+        // (same as text-only). Documents the ordering: multimodal
+        // validation happens after engine-gate.
+        let app = build_router(state_default());
+        let body = r#"{
+            "model":"nope",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"what is this"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0K"}}
+            ]}]
+        }"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).unwrap();
+        // Engine-gate runs first; test doesn't depend on which gate hits.
+        assert!(
+            v["error"]["code"] == "model_not_loaded",
+            "engine-gate should win: got {:?}",
+            v
+        );
+    }
+
     #[tokio::test]
     async fn chat_completions_stream_without_engine_returns_model_not_loaded() {
         // Even with stream:true, the engine gate runs first — no engine →
