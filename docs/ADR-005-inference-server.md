@@ -1,6 +1,6 @@
 # ADR-005: Inference Server — OpenAI-Compatible API for hf2q
 
-**Status:** Phase 1b Walk **closeout in progress** as of 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. Phases 2–5 **In Progress**. See the Phase 1b Closeout section and the Phase 1b Closeout Amendment immediately below it in Acceptance Criteria for gate-by-gate status.
+**Status:** Phase 1b Walk **closeout in progress** as of 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. **Phase 2 scope refined 2026-04-23 (party-mode session `adr_005_phase_2`)**: vision absorbed into Phase 2 as sub-phase **2c**; downstream phases renumbered (old Phase 3 → 2c, old Phase 4 → Phase 3, old Phase 5 → Phase 4); 27 design decisions recorded; continuous-batching carved out to a future ADR (see "Concurrent-deployment scaling (deferred)" section). Phase 2 (2a + 2b + 2c), Phase 3, Phase 4 **In Progress**. See the Phase 1b Closeout section and the Phase 1b Closeout Amendment immediately below it in Acceptance Criteria for gate-by-gate status.
 **Date:** 2026-04-09 (original), 2026-04-10 (Walk replan), 2026-04-16 (Phase 1b closeout)
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native destination), ADR-007 (TurboQuant KV), ADR-008 (candle divorce), ADR-009 (parity recovery), ADR-010 (exact batched parity + Q8 rerank shipping strategy)
@@ -112,20 +112,22 @@ Candle's `gemma4/vision.rs` provides the ViT encoder. The mmproj GGUF contains t
 5. MoE text decoder forward pass
 
 ### API Layer: Restore Spec Layer, Rebuild Inference Integration
-The prior OpenAI API implementation (deleted in commit fe54bc2) had 5,868 lines of production code. It was deleted during the pivot from MLX to candle/Metal. The spec-compliance layers (schema, SSE protocol, tool parsing) are engine-agnostic and should be restored. Anything that touched the inference path must be rewritten for candle + GGUF.
+The prior OpenAI API implementation (deleted in commit fe54bc2) had 5,868 lines of production code. It was deleted during the pivot from MLX to candle/Metal. The spec-compliance layers (schema, SSE protocol) are engine-agnostic and should be restored. Anything that touched the inference path must be rewritten for **mlx-native** (candle was removed under ADR-008).
 
 **Restore from git history** (engine-agnostic spec compliance):
 - `schema.rs` (1,215 lines) — OpenAI request/response types
 - `sse.rs` (681 lines) — Server-Sent Events streaming
-- `tool_parser.rs` (867 lines) — tool call extraction
 - `router.rs` — axum routes
+
+**NOT restored — `tool_parser.rs` (867 lines, 2026-04-23 refinement):** the prior file was per-model post-hoc text parsing to extract tool calls from potentially-malformed model output. Under Decision #6 (grammar-constrained decoding), tool-call JSON is well-formed **by construction** — the grammar masks invalid tokens at decode time. Post-hoc parsing is obviated. The replacement is **per-model tool-call registration** (boundary markers + chat-template tool-injection hook + optional preamble, ~15–30 LOC per supported model) co-located with chat-template entries and reasoning-token boundary markers (Decision #21). That's registration, not parsing.
 
 **Note on middleware (2026-04-10):** the prior ADR text referenced a `middleware.rs` file; `git show fe54bc2 --stat` does not list `middleware.rs`. CORS and other middleware configuration previously lived inline inside `router.rs` / `mod.rs`. Treat middleware as **rebuild-from-scratch**, not restore.
 
-**Rebuild from scratch** (was wired to MLX, needs candle):
-- `handlers.rs` — new inference integration with candle QMatMul engine
-- `mod.rs` — AppState with continuous batching scheduler, model loading
-- Middleware (CORS, request logging) — re-create at the `router.rs`/`mod.rs` boundary; no file to restore
+**Rebuild from scratch (wired to mlx-native, not candle):**
+- `handlers.rs` — new inference integration on the mlx-native forward path
+- `mod.rs` — AppState with serialized FIFO admission queue, model loading, warmup
+- Middleware (CORS, request logging, auth, rate-limit) — re-create at the `router.rs`/`mod.rs` boundary; no file to restore
+- Grammar machinery — port GBNF parser, JSON-schema→GBNF converter, grammar sampler from llama.cpp (`common/grammar-parser.cpp`, `common/json-schema-to-grammar.cpp`, `src/llama-grammar.cpp`)
 
 Deep review of the deleted code is required before restoring to confirm each file is truly engine-agnostic.
 
@@ -827,25 +829,76 @@ Each question is a measurement task. Spike duration is bounded; results go into 
 - *Mitigation:* Unit tests at ε=1e-5 vs manual BEFORE any benchmark run. Two-pass reduction or Welford if needed. Layer A is exact token match — silent numerical drift shows up as a fixture diff.
 - *Escape hatch:* Per-site bisect — replace one norm site at a time, Layer A per site. If a specific site regresses, leave it on the manual path.
 
-### Phase 2: HTTP Server (2026-04-10 clarifications)
-- Restore spec-layer code (schema, SSE, tool parsing, router) from git history after deep review. **Middleware is not restorable** — `git show fe54bc2 --stat` does not list `middleware.rs`; CORS/logging middleware lived inline in `router.rs`/`mod.rs` and must be re-created rather than restored.
-- Rebuild handlers and AppState from scratch for candle inference.
-- **Continuous batching scheduler (vLLM port).** The vLLM scheduler lives in `vllm/core/scheduler.py` class `Scheduler` (specific `file:line` to be pinned once Phase 2 begins; treat as a port, not an original design). Walk discipline applies: we port their continuous-batching state machine, not invent one.
-- **Concurrency target (2026-04-10):** serve concurrent requests at ≥60% of single-stream tok/s at N=4 concurrent, ≥40% at N=8, with throughput still scaling between N=8 and N=16 before saturating. These numbers are provisional and will be revalidated once Phase 1b End gate (107 tok/s single-stream) is met.
-- `hf2q serve --model X.gguf --port 8080`.
+### Phase 2: HTTP Server — OpenAI-Compatible REST API with Vision + Embeddings (refined 2026-04-23)
 
-### Phase 3: Vision (2026-04-10 clarifications)
-- Image preprocessing pipeline (image crate).
+**Scope:** OpenAI-compatible `/v1/chat/completions` (text + vision), `/v1/embeddings` (chat-model pool + BERT dedicated), `/v1/models`, `/health`, `/readyz`, `/metrics`. Serialized FIFO queue; parallel batching explicitly NOT in scope (see "Concurrent-deployment scaling (deferred)" carve-out at the end of this section). Deployment targets: **localhost dev + LAN Open WebUI + local agents**; public-internet is NOT a supported scenario (reverse-proxy assumption for exposure).
+
+**Bar:** parity or superior to ollama and llama.cpp server.
+
+Phase 2 splits into sub-phases **2a + 2b + 2c**; closes when all three pass. Scope refined via party-mode session on 2026-04-23 producing 27 numbered design decisions (see Resolved Questions entry "Phase 2 scope refinement (2026-04-23)").
+
+#### Phase 2a — HTTP server + chat-model pooled embeddings
+
+- Restore spec-layer code (`schema.rs`, `sse.rs`, `router.rs`) from git `fe54bc2` after engine-agnostic review. `tool_parser.rs` (867 LOC) is **NOT** restored — grammar-constrained decoding obviates per-model post-hoc parsers (Decision #6).
+- Rebuild `handlers.rs` and AppState on the **mlx-native forward path** (candle removed under ADR-008; staleness correction from prior ADR text).
+- **Serialized FIFO admission queue** with configurable hard cap; 429 + `Retry-After` on overflow; silent wait + SSE keepalive comment every 15s.
+- **Prompt caching:** single-slot LCP-based prefix cache; KV-representation-agnostic (works against TQ KV per ADR-007 default or dense).
+- **Chat-model pooled embeddings:** last-hidden-state pool + L2-normalize; matches `llama.cpp --embedding` byte-for-byte on identical GGUF.
+- **Grammar-constrained tool calling:** port GBNF parser, JSON-schema→GBNF converter, and grammar sampler from llama.cpp (`common/grammar-parser.cpp`, `common/json-schema-to-grammar.cpp`, `src/llama-grammar.cpp`). `response_format: {type: "json_object"}` and `{type: "json_schema", ...}` ride the same grammar infrastructure at no extra cost.
+- **Per-model tool-call registration:** boundary markers + chat-template tool-injection hook + optional preamble (~15–30 LOC per model), co-located with chat template + reasoning-token markers. This is registration, NOT post-hoc parsing.
+- **Reasoning tokens:** OpenAI-o1-style split — `message.reasoning_content` vs `message.content`; streaming splits `delta.reasoning_content` from `delta.content`. Per-model boundary markers registered alongside chat template (same file as tool-call markers).
+- **Context overflow — summarize by default:** when prompt would exceed 80% of context budget, run summarization forward pass with the currently-loaded model on the oldest non-system messages; replace in-place with a synthetic `system` message `"[Summary of prior conversation]: <summary>"` positioned immediately after the original system prompt. Configurable via `--overflow-policy={reject,truncate_left,summarize}` server flag + `hf2q_overflow_policy` per-request extension. Transparency headers (`X-HF2Q-Overflow-Policy`, `X-HF2Q-Summarized-Messages`, `X-HF2Q-Summary-Tokens`) and an SSE comment frame during summarization (`: summarizing prior conversation...`).
+- **OpenAI surface — Tiers 1+2+3+4:**
+  - Tier 1 (core): `model`, `messages`, `stream`, `max_tokens`/`max_completion_tokens`, `temperature`, `stop`, `tools`, `tool_choice`, `response_format`
+  - Tier 2 (important): `top_p`, `seed`, `frequency_penalty`, `presence_penalty`, `stream_options.include_usage`
+  - Tier 3 (llama.cpp/ollama extensions): `top_k`, `repetition_penalty`, `min_p`
+  - Tier 4 (agent power-user): `logprobs`, `top_logprobs`, `logit_bias`, `parallel_tool_calls`
+  - **Explicit skip:** `function_call`, `functions` (legacy pre-tools), `n`, `suffix`, `service_tier`, `user`, `/v1/completions` (legacy pre-chat endpoint)
+- **Operational defaults:**
+  - Bind `127.0.0.1` (flag `--host 0.0.0.0` to expose); optional `Authorization: Bearer` auth (configured → required, unconfigured → no-auth passthrough)
+  - CORS restrictive default (origin allowlist), configurable
+  - Rate limits + request timeouts configurable
+  - TLS out of scope (reverse-proxy assumption)
+  - `/metrics` Prometheus text format; `/health` JSON liveness with model info; `/readyz` k8s-style readiness (503 during warmup → 200 when ready)
+  - Eager model load at server start, **fail-fast on bad weights**; warmup required before `/readyz` flips 200; API endpoints return 503 + `Retry-After` during warmup
+  - SIGTERM drains in-flight + queue then exits; SIGKILL exits immediately
+  - SSE client drop cancels active generation, frees queue slot, counted as cancellation in metrics
+- **Error response schema:** OpenAI-compliant `{error: {message, type, param, code}}`. Request IDs: accept client-supplied `X-Request-Id` header, echo in response; generate UUIDv4 if absent.
+- **Logging:** human-readable colored stderr at `INFO` level by default; `--log-format=json` flag for structured ingestion (Loki/Datadog); `--log-level={debug,info,warn,error}`.
+- `hf2q serve --model X.gguf --port 8080 [--host 0.0.0.0] [--auth-token TOKEN] [--overflow-policy summarize] [--embedding-model Y.gguf]`.
+
+#### Phase 2b — Dedicated BERT-family embedding models
+
+- New model class `src/models/bert.rs` — encoder-only, bidirectional attention, no KV cache, pooling per `gguf.pooling_type` metadata (`NONE` / `MEAN` / `CLS` / `LAST` / `RANK`).
+- GGUF loader path for BERT tensor names.
+- **Day-one supported models:** `nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, `bge-small-en-v1.5`.
+- Served through the same `/v1/embeddings` handler; `--embedding-model <X.gguf>` flag selects the dedicated model at server start.
+- Unsupported embedding-model format → clear error naming the day-one supported list.
+- **Strategic role:** Phase 2b is the first multi-architecture port — de-risks Phase 4 (Qwen3, Mistral, etc.) by validating the model-class abstraction under a genuinely different forward pass (encoder-only, no causal mask, no KV cache).
+
+#### Phase 2c — Vision (ViT + mmproj + multimodal embedding injection)
+
+Absorbed from the previous Phase 3 per the 2026-04-23 scope refinement. Vision is on the critical path for competing with ollama / llama.cpp (both ship vision); delivering the HTTP server without vision would ship an incomplete product.
+
+- Image preprocessing pipeline (`image` crate).
 - hf2q produces mmproj GGUF from safetensors (vision tower quantization).
   - **mmproj quant format:** F16 (de facto standard for vision towers). We do not Q4/Q6 the vision tower unless a later measurement shows a specific model tolerates it.
 - Also accepts user-provided mmproj files.
 - Load mmproj GGUF for vision tower.
-- ViT forward pass + multimodal embedding injection.
-- **Reference implementation to port the multimodal embedder projection from:** candle-transformers `gemma4/vision.rs` (preferred — already pure Rust and candle-native). If a specific op is missing, fall back to porting from HuggingFace `modeling_gemma4.py`. Pick one and commit in the item that lands Phase 3.
+- ViT forward pass + multimodal embedding injection into the text decoder.
+- **Reference implementation to port the multimodal embedder projection from:** candle-transformers `gemma4/vision.rs` migrated to mlx-native (preferred). If a specific op is missing, fall back to porting from HuggingFace `modeling_gemma4.py`. Pick one and commit in the item that lands Phase 2c.
 - **Accuracy gate:** hf2q vision output matches mlx-lm's Gemma 4 vision output on a canonical set of 5 standard prompts × 5 images (token-match for the first 50 generated tokens at T=0). Fixtures committed alongside `crawl_baseline.tokens`.
-- `--image` flag for CLI, base64 for API.
+- `--image` flag for CLI; base64 `image_url` content parts per OpenAI format in `/v1/chat/completions`.
 
-### Phase 4: Auto Pipeline (2026-04-10 clarifications)
+#### Concurrent-deployment scaling (deferred, future ADR)
+
+**Explicitly NOT in Phase 2 scope:** continuous batching (vLLM-style scheduler + admission-during-decode), paged KV cache, inflight batching with per-slot KV separation, N-concurrent-stream throughput targets. These require a KV-representation-aware scheduler and a different concurrency model than the serialized FIFO queue (Decision #2) that Phase 2 commits to.
+
+**Rationale for deferral:** hf2q's positioning comparators are **ollama and llama.cpp**, not vLLM. Ollama serializes requests (`OLLAMA_NUM_PARALLEL` adds parallelism via multiple llama.cpp slots but is not true continuous batching) and llama.cpp's `-cb` inflight batching is opt-in and uncommonly configured. The serialized FIFO queue meets the primary deployment targets (localhost dev + LAN Open WebUI + local agents) at parity or better than these peers.
+
+**Reopen trigger:** a concrete deployment scenario with ≥8 concurrent users served by a single hf2q instance, reported by a real user or demanded by a target customer. At that point, a separate ADR opens covering scheduler design (likely porting vLLM's `Scheduler` from `vllm/core/scheduler.py`), paged-KV or inflight-batched KV layout (likely porting llama.cpp's `llama_kv_cache` multi-seq semantics from `src/llama-kv-cache.cpp`), and measuring against the Phase 2 baseline.
+
+### Phase 3: Auto Pipeline (2026-04-10 clarifications; renumbered from Phase 4 on 2026-04-23)
 - `hf2q serve --model google/gemma-4-27b-it` → download + quantize + serve.
 - **Hardware detection → static quant selection rule** (decision table, provisional thresholds; refined by measurement before Phase 4 ships):
 
@@ -861,7 +914,7 @@ Each question is a measurement task. Spike duration is bounded; results go into 
 - **Cache policy:** `~/.cache/hf2q/` keyed by `{model-id}/{quant-type}/{sha256}`. Re-download on HuggingFace safetensors sha256 mismatch OR on explicit `hf2q cache clear`. Otherwise offline mode uses the cached quantized GGUF indefinitely.
 - **Integrity check:** compare sha256 of downloaded safetensors shards against the HuggingFace-published hashes from the model card's `safetensors` metadata; refuse to quantize on mismatch.
 
-### Phase 5: Multi-Model + Architectures (2026-04-10 clarifications)
+### Phase 4: Multi-Model + Architectures (2026-04-10 clarifications; renumbered from Phase 5 on 2026-04-23)
 - Hot-swap model loading (ollama-style).
 - **Hot-swap algorithm:** LRU pool of loaded models, memory-bounded, ollama-compatible semantics. Reference for the pool management pattern: ollama `llm/memory.go` and `llm/server.go`. The pool supports up to **N = 3** cached loaded models; eviction is LRU, bounded by a memory ceiling of **80% of system unified memory** (configurable).
 - Qwen3, Mistral model support — prefer candle-transformers when they meet our performance bar; own implementations only when needed.
@@ -1131,27 +1184,46 @@ The base rate of "static evidence (`llama.cpp does X, candle doesn't`) → measu
 
 **Microbench harness update:** Agent C1 extended `vendor/candle-metal-kernels/examples/metal_benchmarks.rs` from 490 → 1007 lines, adding the `Q6kMicrobench` subcommand and 6 supporting functions. Now contains both the NSG sweep AND Q6_K NR0 microbench infrastructure as permanent test assets for future hardware re-runs. Also annotated `docs/spike-1bNEW29-research-notes.md:190` with a falsification backpointer so future investigators don't re-derive the same hypothesis from the static evidence.
 
-### Phase 2: HTTP Server
-- [ ] OpenAI Python/JS SDK clients connect and work (chat completions, streaming, tool calling, embeddings)
-- [ ] Open WebUI connects and provides full multi-turn chat experience (streaming, vision, tool use)
-- [ ] Continuous batching handles concurrent requests without serializing to one-at-a-time
-- [ ] Concurrency target met: ≥60% single-stream tok/s at N=4, ≥40% at N=8, throughput still scaling through N=16
-- [ ] **Primary embeddings path:** `POST /v1/embeddings` returns pooled output from the loaded chat model (no `--embedding-model` required) — verified against a committed set of reference embeddings for 5 canonical inputs
-- [ ] `--embedding-model` flag loads a separate model for `/v1/embeddings` — verified against the secondary path
+### Phase 2: HTTP Server (refined 2026-04-23)
 
-### Phase 3: Vision
+Phase 2 closes when 2a + 2b + 2c all pass.
+
+#### Phase 2a AC — HTTP server + chat-model pooled embeddings
+- [ ] OpenAI Python/JS SDK clients connect and work: `chat.completions` streaming + non-streaming, tool calling, `response_format` (`json_object` + `json_schema`), reasoning-content split, chat-model pooled embeddings
+- [ ] Open WebUI on separate host: multi-turn chat works (streaming, tool use, reasoning-panel display). Image input required at 2c, not 2a.
+- [ ] Serialized FIFO queue: concurrent HTTP clients accepted; queue depth visible in `/metrics`; 429 + `Retry-After` at configurable cap
+- [ ] Prompt cache: same-prefix second request ≥5× faster TTFT than first; cached-path output byte-identical to uncached-path on the same full prompt
+- [ ] Grammar-constrained tool calls: 100% valid JSON across BFCL / ToolBench sanity suite on both Gemma 4 and Qwen 3.6
+- [ ] Per-model tool-call registration cleanly extends to any new model class added under `models/` without modifying core server code
+- [ ] `/v1/embeddings` pooled chat-model output matches `llama.cpp --embedding` byte-identical on identical GGUF for 5 canonical inputs
+- [ ] Context overflow triggers summarize at 80% of budget: fidelity test passes on 10 conversations with known facts carried across summary; overflow-turn TTFT documented (not hidden); `X-HF2Q-*` transparency headers + SSE comment frame emitted
+- [ ] Overflow-policy override works: `--overflow-policy=reject` returns 400; `--overflow-policy=truncate_left` drops oldest message pairs silently; per-request `hf2q_overflow_policy` extension overrides server default
+- [ ] Lifecycle: fail-fast on bad weights at startup; `/readyz` 503→200 on warmup complete; SIGTERM drains in-flight + queue; SSE client drop cancels generation within M tokens and frees slot
+- [ ] `/v1/models` lists all cached models under `~/.cache/hf2q/` with extension fields (`quant_type`, `context_length`, `backend`, `loaded`); unloaded model in request → 400 `model_not_loaded` (Phase 4 replaces this with auto-swap)
+- [ ] `/health` (JSON liveness with model info), `/readyz` (k8s-style readiness), `/metrics` (Prometheus text format)
+- [ ] Bind `127.0.0.1` default, `--host` flag flips to `0.0.0.0`, optional Bearer auth, restrictive CORS with configurable origin allowlist, configurable rate limits + timeouts
+
+#### Phase 2b AC — Dedicated BERT-family embedding models
+- [ ] `nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, `bge-small-en-v1.5` each load and serve through `/v1/embeddings`
+- [ ] Per-model output matches `llama.cpp --embedding` byte-for-byte on identical GGUF
+- [ ] MTEB 5-task sanity suite recovers published scores within ±1 pt per supported model
+- [ ] Unsupported embedding-model format → clear error naming the day-one supported list
+
+#### Phase 2c AC — Vision (absorbed from old Phase 3, 2026-04-23)
 - [ ] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output
+- [ ] Open WebUI with image uploads: full multi-turn vision chat works end-to-end
 - [ ] Vision accuracy gate: hf2q matches mlx-lm's Gemma 4 vision output on 5 prompts × 5 images (token-match, first 50 tokens, T=0)
 - [ ] mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp
+- [ ] OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly
 
-### Phase 4: Auto Pipeline
+### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
 - [ ] Hardware detection selects quant per the static table; unit tests cover every threshold boundary
 - [ ] Safetensors sha256 integrity check refuses to quantize on mismatch
 - [ ] `hf2q cache clear` invalidates the cache entry for a model
 
-### Phase 5: Multi-Model + Architectures
+### Phase 4: Multi-Model + Architectures (renumbered from Phase 5 on 2026-04-23)
 - [ ] Hot-swap between two cached GGUFs in under 10 seconds, measured on M5 Max
 - [ ] Cached pool holds up to 3 loaded models with LRU eviction bounded by 80% of system unified memory (configurable)
 - [ ] Qwen3 / Mistral decode speed matches llama.cpp on the same hardware within ±5% (same Walk bar as Gemma 4)
@@ -1208,3 +1280,61 @@ The base rate of "static evidence (`llama.cpp does X, candle doesn't`) → measu
 - **GPU compute backend choice (Proposed 2026-04-11 PM):** see [ADR-006](ADR-006-mlx-native-gpu-backend.md) — migrate hf2q's GPU compute backend from candle (Hugging Face's general-purpose Rust ML framework, not owned by Robert) to mlx-native (Robert's pure-Rust Metal compute library, currently 29-commit WIP). Strategic destination commitment is independent of Phase 0 diagnosis outcome; tactical plan section gates on Phase 0. Status: Proposed → Accepted after Phase 0 confirms the plan. Six-phase migration plan inline in ADR-006: (0) Diagnosis via per-kernel timing measurement, (1) this ADR + cross-references, (2) mlx-native maturation PRD modeled on coreml-native v0.2.0, (3) Borrow Phase porting useful work from candle with attribution, (4) Build Phase porting framework patterns from llama.cpp's ggml-metal, (5) Per-op gradual integration into hf2q with sourdough gate validation, (6) Final measurement and Walk closure at ≥102 tok/s. See `project_mlx_native_is_the_strategic_destination.md` user memory for the ownership rationale that's load-bearing for this ADR.
 
 - **End gate re-baselining: 107 → 102 tok/s (resolved 2026-04-11 PM, cfa swarm `swarm-1775949388026-7eii34`):** The original ADR End gate at lines 162/874/887/1029 was "≥107 tok/s decode on M5 Max Gemma 4 26B MoE Q4_K_M", citing llama.cpp as the reference peer. **Agent #2's fresh 5-run llama.cpp re-measurement** on the same M5 Max, same DWQ Gemma 4 26B GGUF, same canonical bench prompt, same `llama-completion` flag set per ADR-005:998 lands at **102.01 tok/s median** (range 101.88–102.20 across 5 cold-mmap runs, cold run 1 excluded). The historical 107 figure does not reproduce on this hardware on this date. Possible explanations for the original 107 (none verified): different llama.cpp build, different thermal state at measurement time, different hardware config, or aspirational rather than measured value. **User decision (2026-04-11 PM):** "what we can measure now is ground truth" — accept the live re-measurement as the authoritative peer reference, do NOT spend cycles on a source-of-107 archaeology investigation. End gate updated from `≥107` → `≥102` at lines 162/874/887/1029. **Walk-discipline justification:** Walk = match peer; if peer's measured speed today on this exact setup is 102, then the End gate cannot honestly require >102 — that would be Run, not Walk. **Reversibility condition:** if a llama.cpp build/configuration that hits ≥107 on this exact hardware is later identified, re-open the gate with the new measurement as the peer reference. **Effect on remaining gap framing:** decode 84.9 tok/s → 102 tok/s = ~17 tok/s remaining, not the 21.6 tok/s framed against the historical 107. **Coherence baseline (orthogonal to the speed re-baseline):** Agent #2 also confirmed **byte-identical 16-token greedy generation** between hf2q and llama.cpp at T=0 on the canonical prompt — strictly stronger than the prior top-1-token-match Walk-correctness End gate, which is now redundantly met. Full numbers in `docs/spike-1bNEW29-llamacpp-timings.md` and `docs/spike-1bNEW29-pre-microbench-results.md`.
+
+- **Phase 2 scope refinement (resolved 2026-04-23, party-mode session `adr_005_phase_2`):** Before executing Phase 2, ran a refinement Q&A producing **27 numbered design decisions** that narrow scope in some directions (continuous batching carved out) and widen it in others (vision absorbed, grammar-constrained tool calling, summarization-based context-overflow policy, BERT-family embedding models). Under the comparator "parity or superior to ollama/llama.cpp" and deployment targets "localhost dev + LAN Open WebUI + local agents + local agent frameworks":
+
+  **Architecture & concurrency:**
+  1. Continuous batching pulled from ADR-005 — deferred to a future ADR; reopen trigger = real deployment scenario with ≥8 concurrent users on a single instance.
+  2. Concurrency model = serialized FIFO queue; hard cap + 429 + `Retry-After` on overflow; silent wait + SSE keepalive comment every 15s.
+  3. Vision IN Phase 2 as sub-phase 2c (was: Phase 3); downstream phases renumber: old Phase 4 → Phase 3, old Phase 5 → Phase 4.
+  4. Embeddings via Option C — chat-model pool (Phase 2a) + BERT-family dedicated models (Phase 2b, day-one list: `nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, `bge-small-en-v1.5`).
+  5. Phase 2 splits into 2a + 2b + 2c; closes when all three pass.
+
+  **Tool calling & reasoning:**
+  6. Tool calling = grammar-constrained decoding (model-agnostic JSON validity by construction) + per-model tool-call **registration** (~15–30 LOC per model: boundary markers + template hook + optional preamble). `tool_parser.rs` (867 LOC) NOT restored — post-hoc parsing obviated. Port GBNF + JSON-schema→GBNF + grammar sampler from llama.cpp. `response_format: {type: "json_object"}` and `{type: "json_schema", ...}` ride same grammar infrastructure.
+  21. Reasoning tokens = OpenAI-o1-style split — `message.reasoning_content` + `message.content`; streaming delta splits accordingly. Per-model boundary markers co-located with chat-template and tool-call markers.
+
+  **Operational surface:**
+  7. Bind `127.0.0.1` default; `--host` flag for `0.0.0.0`.
+  8. Auth = optional `Authorization: Bearer`; configured → required.
+  9. CORS = restrictive default (origin allowlist), configurable.
+  10. Rate limits + timeouts = configurable.
+  11. Metrics = Prometheus text format on `/metrics`.
+  12. Health = `/health` (JSON liveness + model info) + `/readyz` (k8s-style readiness, 503 during warmup → 200 when ready).
+  13. TLS out of scope; reverse-proxy assumption.
+  14. Deployment targets explicit: localhost dev + LAN Open WebUI + local agents; public-internet NOT supported.
+
+  **Lifecycle:**
+  15. Model load = eager at startup, fail-fast on bad weights.
+  16. Warmup required before `/readyz` returns 200; API endpoints return 503 + `Retry-After` during warmup.
+  17. Graceful shutdown: SIGTERM drains in-flight + queue then exits; SIGKILL exits immediately.
+  18. SSE client drop cancels active generation, frees queue slot, counted as cancellation in metrics.
+
+  **Queue & overflow:**
+  19. Queue = hard cap (configurable), 429 + `Retry-After` on overflow.
+  20. Queue feedback = silent + SSE keepalive comment every 15s (prevents proxy/client idle timeouts; optional position/eta in comment payload).
+  23. **Context overflow = summarize by default** — when prompt reaches 80% of context budget, run summarization forward pass on oldest non-system messages using currently-loaded model; replace in-place with synthetic `system` message `"[Summary of prior conversation]: <summary>"` right after the original system prompt. Configurable via `--overflow-policy={reject,truncate_left,summarize}` server flag + `hf2q_overflow_policy` per-request extension. Transparency via `X-HF2Q-*` headers + SSE comment frame during summarization. **Superior-to-peer feature** (ollama silently truncates; llama.cpp context-shifts at KV level; neither summarizes).
+
+  **API surface:**
+  22. OpenAI surface = Tiers 1+2+3+4 (core + important + llama.cpp/ollama extensions `top_k`/`repetition_penalty`/`min_p` + power-user `logprobs`/`top_logprobs`/`logit_bias`/`parallel_tool_calls`). Explicit skip: `function_call`, `functions` (legacy pre-tools), `n`, `suffix`, `service_tier`, `user`, `/v1/completions` (legacy pre-chat).
+  26. `/v1/models` = all cached models under `~/.cache/hf2q/` with extension fields `{quant_type, context_length, backend, loaded}`; forward-compatible with Phase 4 hot-swap (Phase 2 returns 400 `model_not_loaded` for unloaded models; Phase 4 replaces with auto-swap without a contract change).
+  27. `/v1/completions` legacy endpoint = skip; only `/v1/chat/completions` and `/v1/embeddings`.
+
+  **Performance:**
+  24. Prompt caching = single-slot LCP-based prefix cache in Phase 2a; KV-representation-agnostic (works against TQ KV per ADR-007 default or dense). Required for "feels fast" UX in multi-turn chat and agent loops.
+  25. Bar = parity or superior to ollama/llama.cpp on every measurable axis (single-stream tok/s, TTFT with cache hit, tool-call reliability, OpenAI surface completeness, reasoning-token UX, embedding quality, memory footprint via TQ).
+
+  **Error/logging defaults (OpenAI-convention-following):**
+  - Error response schema: `{error: {message, type, param, code}}`
+  - Request IDs: accept client `X-Request-Id`, echo + generate UUIDv4 if absent
+  - `usage` field in final SSE chunk (when `stream_options.include_usage`) or response body
+  - Stop-sequence stripping from returned text (OpenAI convention)
+  - Rate-limit headers on 429: `Retry-After`, `X-RateLimit-*`
+  - Logging: human-readable colored stderr at INFO by default; `--log-format=json` for structured; `--log-level={debug,info,warn,error}`
+
+  **Pre-conditions / parallel dependencies:**
+  - ADR-007 TQ KV default (parallel session): TQ must support position-based truncation for prompt cache invalidation on LCP mismatch. Flag back to TQ session if codebook state interacts with truncation.
+  - Phase 1b closeout Gates A–G pass before Phase 2a begins (per 2026-04-16 amendment).
+  - Qwen 3.6 integration in parallel session: Phase 2's model-agnostic design (grammar constraints + per-model registration + Jinja chat templates + boundary-marker registration) absorbs Qwen 3.6 without Phase 2 scope change.
+
+  Full session transcript in the `adr_005_phase_2` party-mode conversation; this ADR's body + AC sections reflect the decisions.
