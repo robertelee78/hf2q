@@ -1786,8 +1786,9 @@ impl MlxModelWeights {
 
                     // meta_post_quant.json — production call-site params + provenance
                     {
+                        // iter-25 Subtask B fix: use corrected ring_start formula (oldest slot).
                         let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                            (kv_write_pos % kv_capacity) as u32
+                            ((kv_write_pos + 1) % kv_capacity) as u32
                         } else {
                             0u32
                         };
@@ -2305,8 +2306,11 @@ impl MlxModelWeights {
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                         &[&self.activations.sdpa_out],
                     );
+                    // iter-25 Subtask B fix: ring_start must be the physical slot of the OLDEST
+                    // entry (not newest). kv_write_pos is pre-increment (the slot just written
+                    // this step). After wrap: oldest = (kv_write_pos + 1) % capacity.
                     let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                        (kv_write_pos % kv_capacity) as u32
+                        ((kv_write_pos + 1) % kv_capacity) as u32
                     } else {
                         0
                     };
@@ -3348,12 +3352,14 @@ impl MlxModelWeights {
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
                 {
-                    // ADR-009 Track 2: ring_start for correct sliding-window
-                    // chronology after wrap. Before wrap, ring_start = 0
-                    // (physical == logical). After wrap, ring_start = write_pos
-                    // % capacity (physical slot of the oldest cached entry).
+                    // ADR-009 Track 2 + iter-25 Subtask B fix: ring_start must be the
+                    // physical slot of the OLDEST entry (not newest).
+                    // kv_write_pos is pre-increment (the slot just written this step).
+                    // After wrap: oldest = (kv_write_pos + 1) % capacity.
+                    // The kernel formula: logical_idx = (k_pos - ring_start + cap) % cap
+                    // maps ring_start → logical 0 (oldest). Matches HB dispatch.
                     let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                        (kv_write_pos % kv_capacity) as u32
+                        ((kv_write_pos + 1) % kv_capacity) as u32
                     } else {
                         0
                     };

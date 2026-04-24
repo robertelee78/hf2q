@@ -1,0 +1,80 @@
+{
+  "elapsed_s": 52.730537667,
+  "gate_c_measurements": {
+    "6bit": {
+      "ppl_tq": 1.110996683523334,
+      "raw_delta": 0.007279286048863452,
+      "raw_pass": true
+    },
+    "8bit": {
+      "ppl_tq": 1.1166396153679774,
+      "raw_delta": 0.012395420456815888,
+      "raw_pass": false
+    },
+    "dense_nll_count": 999,
+    "dense_ppl": 1.1029678649317913
+  },
+  "gate_c_per_position_analysis": {
+    "6bit": {
+      "n_positions": 999,
+      "outlier_count": 22,
+      "outlier_fraction_of_delta": 0.14759478136505128
+    },
+    "8bit": {
+      "mean_pos_delta": 0.012319226226226216,
+      "median_pos_delta": 4.000000000000001e-6,
+      "n_positions": 999,
+      "outlier_count": 18,
+      "outlier_fraction_of_delta": 0.09163133807279732,
+      "outlier_threshold_nll": 0.8976617567798872,
+      "p5_pos_delta": -0.542627,
+      "p95_pos_delta": 0.5566869999999999,
+      "sigma_pos_delta": 0.2951141768512204,
+      "top5_outlier_deltas": [
+        -1.135648,
+        -1.1263189999999998,
+        1.11785,
+        -1.115026,
+        1.103447
+      ],
+      "top5_outlier_positions": [
+        671,
+        182,
+        875,
+        974,
+        705
+      ]
+    }
+  },
+  "gate_c_robust_aggregates": {
+    "8bit": {
+      "median_delta": 4.000008000072653e-6,
+      "noise_verdict": "systematic",
+      "robust_pass": false,
+      "trimmed_mean_delta": 0.013841382115456968,
+      "windsorized_delta": 0.013173609976398621
+    }
+  },
+  "gate_thresholds": {
+    "gate_c_delta": 0.01,
+    "outlier_sigma": 3.0,
+    "trim_frac": 0.05
+  },
+  "iter": 25,
+  "ring_start_convention_check": {
+    "4bit_dispatch_formula": "not_found",
+    "affects_current_gates": false,
+    "findings": [
+      "Both 4-bit and HB dispatches use the same ring_start formula.",
+      "NOT affecting current Gate C: 1000-token run does not exceed sliding_window=1024.",
+      "DOES affect long-context (>1024 tokens) correctness — must fix before shipping."
+    ],
+    "hb_dispatch_formula": "not_found",
+    "kernel_ring_start_semantic": "oldest_entry",
+    "mismatch_detected": false,
+    "status": "CONSISTENT"
+  },
+  "schema_version": "iter25-v1",
+  "verdict": "REJECT_INVESTIGATE",
+  "verdict_rationale": "8-bit Gate C raw=1.2395% AND robust aggregates fail (trimmed=1.3841%, windsorized=1.3174%). Systematic quality regression at 8-bit. Investigate: softmax precision, accumulator dtype, NLL measurement methodology. Consider iter-26 with position-level analysis."
+}
