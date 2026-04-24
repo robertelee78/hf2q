@@ -49,11 +49,13 @@ PROMPT_FILE="tests/sourdough_qwen35_prompt.txt"
 OUT_HF2Q="/tmp/sourdough_qwen35_hf2q.txt"; LOG_HF2Q="/tmp/sourdough_qwen35_hf2q.log"
 OUT_LLAMA="/tmp/sourdough_qwen35_llama.txt"; LOG_LLAMA="/tmp/sourdough_qwen35_llama.log"
 
-# Floor starts conservatively at 128 bytes (~30 decoded tokens with the
-# Qwen3.5 tokenizer). P13 measures the empirical floor on first pass and
-# the floor gets raised to match — same methodology as ADR-005's
-# 1bNEW.20.FIX floor-calibration.
-MIN_COMMON_PREFIX=128
+# Floor calibrated from ADR-013 P13 first successful pass (git HEAD 5737f89,
+# 2026-04-24): llama 310 bytes, hf2q 304 bytes, common prefix 180 bytes.
+# Raised from the initial 128-byte bootstrap floor to 160 — leaves ~20 bytes
+# safety margin below the measured prefix so future commits catch real
+# regressions (drift > current level) without false-alarming on noise.
+# Same methodology as ADR-005's 1bNEW.20.FIX floor calibration.
+MIN_COMMON_PREFIX=160
 MAX_TOKENS=80
 
 usage() {
