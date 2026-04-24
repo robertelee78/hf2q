@@ -18,7 +18,7 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim.
 - **No fallback.** When a Qwen3.5-MoE-specific code path is required (V-head reorder, A_log negation, MROPE section emission, SSM tensor naming, linear-attention layer type), implement it fully in the first cut. No `unimplemented!()`, no "we'll handle shared experts in a follow-up." Either the phase ships conversion-capable code or the phase hasn't shipped.
 - **Chesterton's fence.** The hardcoded `base_bits: 4, sensitive_bits: 6` at `src/main.rs:447-448` exists because DWQ-4-6 is the single validated sensitivity profile for Gemma-4. Before parameterizing, read `src/quantize/dwq.rs` and `src/intelligence/auto_quant.rs` to understand *which* layers DWQ-4-6 chose to promote, and *why* — then widen the preset surface without silently changing gemma's behavior.
 - **Dive deep.** The authoritative references for every decision in this ADR are `/opt/llama.cpp/convert_hf_to_gguf.py` (Qwen2MoeModel → Qwen3NextModel → _LinearAttentionVReorderBase → Qwen3_5MoeTextModel chain) and `/opt/llama.cpp/src/llama-arch.{h,cpp}` (LLM_ARCH_QWEN35MOE metadata key table). Every TODO in this ADR cites a specific file:line range. Read them.
-- **No Python at runtime.** Sovereignty directive (`feedback_hf2q_sovereignty.md`). llama.cpp's Python is a study reference, not a build-time or runtime dependency. Test fixtures produced by `convert_hf_to_gguf.py` are allowed as test oracles (binary data held in-tree); Python in the critical path is not.
+- **Absolute sovereignty (`feedback_hf2q_sovereignty.md`, tightened 2026-04-23).** Pure Rust; hf2q and mlx-native are the only repos in our deliverables. No code, Cargo crates, utils, binaries, or derivative artifacts from `/opt/candle` or `/opt/llama.cpp` enter our deliverables — candle is a Rust crate we don't own, same rule as llama.cpp's Python. This applies at build time, test time, and CI time. Reading their source to derive the mathematical specification is fine; using their output to prove our correctness or as a library is not. No new file in this ADR introduces a `candle-*` dependency; ADR-008 is the in-flight cleanup of pre-existing usage. Fixtures and test oracles are produced by our own code on deterministic inputs, with expected outputs derived from the underlying spec (e.g., ggml broadcast semantics produce an unambiguous V-reorder mapping computable from first principles) or hand-authored.
 
 ---
 
@@ -108,7 +108,7 @@ Every porting decision in this ADR has an upstream reference. These file:line ci
 
 ### Existing local reference: the `apex.gguf` on disk
 
-`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf` (25 GB, `general.file_type=17` i.e. IQ2_XS) was produced by an external invocation of `convert_hf_to_gguf.py` + `llama-quantize`. It contains 733 tensors and 43 metadata keys. For Phase P7 integration testing, diffing its **non-weight** metadata against hf2q's output is the primary correctness signal.
+`/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf` (25 GB, `general.file_type=17` i.e. IQ2_XS) was produced outside hf2q by an external invocation of `convert_hf_to_gguf.py` + `llama-quantize`. It exists on Robert's disk as a convenience reference. **It is NOT a test oracle, NOT a checked-in fixture, and NOT a CI dependency** per the sovereignty directive. If an engineer wants to look at it during development to understand what keys/tensors a reference implementation emits, that's fine — like reading llama.cpp source code. What's not fine is writing an assertion that compares hf2q's output against it.
 
 ---
 
@@ -203,9 +203,9 @@ Gemma logic stays where it is; no refactor of Gemma in this ADR.
 Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)`.
 
 **Acceptance criteria.**
-- Unit test per case: construct a tensor with known marker values at each V-head position, apply the transform, assert the output has markers at the expected tiled positions.
-- Round-trip test: apply the reorder, apply its inverse (derivable from same params), assert byte-identical to input. This protects against bugs where the reorder is partially correct (permutation subset applied twice).
-- Oracle test: if a llama.cpp-produced BF16 `.linear_attn.*` tensor fixture is checked in, hf2q's output must match it byte-for-byte after the reorder.
+- Unit test per case: construct a tensor with known marker values at each V-head position, apply the transform, assert the output has markers at the expected tiled positions. Expected positions are derived analytically from ggml broadcast semantics and hand-authored as a constant in the test file (commented with the derivation), not copied from any external tool's output.
+- Round-trip test: apply the reorder, apply its inverse (derivable from the same params), assert byte-identical to input. This protects against bugs where the reorder is partially correct (permutation subset applied twice).
+- Specification-driven test: for a small reference case (e.g., num_k_heads=2, num_v_per_k=2, head_dim=4), hand-author the complete expected permutation map in the test, with a code comment deriving it from ggml broadcast semantics (the rule: ggml binary ops expect `[K0, K1, ..., K0, K1, ...]` tiled order; HF stores `[G0_v0..v{r-1}, G1_v0..v{r-1}, ...]` grouped). The test is the specification.
 
 ### 6. Qwen-specific tensor transforms (non-V-reorder)
 
@@ -269,8 +269,9 @@ Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_
 - `tokenizer.ggml.model`, `tokens`, `merges`, `scores`, `token_type`, `bos_token_id`, `eos_token_id`, `pad_token_id`, `chat_template`, `pre` — per ADR-004 decision 5.
 
 **Acceptance criteria.**
-- An "oracle diff" test loads both the hf2q-produced GGUF and the pre-existing `apex.gguf`, extracts all metadata keys from each, and asserts every `qwen35moe.*` key present in apex.gguf is also present in hf2q's output with either (a) the same value for invariants (arch, vocab, rope_theta, head_count, …) or (b) a documented diff (e.g. `general.file_type` legitimately differs because apex is IQ2_XS and hf2q output is DWQ-mixed-4-6).
-- Missing any `qwen35moe.*` key that apex.gguf has → integration test fails loudly with the missing key name in the assertion message.
+- The authoritative list of required `qwen35moe.*` keys is derived by reading `/opt/llama.cpp/src/llama-arch.{h,cpp}` (`LLM_KV_*` enum + KV_NAMES table) and `/opt/llama.cpp/src/models/qwen35moe.cpp` (which keys the loader actually reads), and hand-transcribed into a constant list in `src/models/qwen35moe.rs` with a code comment citing the source file:line. No binary produced by llama.cpp is consulted as an automated check.
+- Unit test: `emit_metadata()` called on a known `Qwen35MoeConvertContext` produces a GGUF metadata section containing every key in the hand-transcribed list with the expected value.
+- Regression: whenever the list is updated (because llama.cpp added a new key in a new release and Robert wants to support it), the PR description cites the llama.cpp file:line where the new key was added.
 
 ### 8. Tensor naming for hybrid layers
 
@@ -582,11 +583,13 @@ Located alongside implementations in `src/models/qwen35moe.rs`. Each tensor tran
 ### Integration tests
 
 - `tests/convert_qwen35moe_integration.rs`: synthetic tiny-model end-to-end. 2 linear + 1 full-attn layers, 4 experts, hidden_size=64, head_dim=16. Weights are deterministic from a fixed seed.
-- Output GGUF is read back by hf2q's own GGUF reader and asserted byte-identical (where possible) or structurally-identical (metadata keys, tensor names, tensor shapes) against a checked-in reference fixture produced by `convert_hf_to_gguf.py --outtype bf16` on the same synthetic weights. Reference fixture is held in-tree under `tests/fixtures/qwen35moe_tiny_reference.gguf`. Production of the fixture is a one-time offline step documented in `tests/fixtures/README.md`; Python is **not** invoked at test time.
+- Output GGUF is read back by hf2q's own GGUF reader and asserted against a **self-contained expected-structure spec** (a constant in the test file that enumerates the expected metadata keys, tensor names, tensor shapes, and for the smallest tensors the expected byte content). The spec is derived by reading llama.cpp source to understand what the loader requires, then hand-authored — not produced by running `convert_hf_to_gguf.py`.
+- No binary reference GGUF is ever checked in. No `.gitignore`d "regenerate via Python on first run" pattern. The test's source of truth lives in the test file.
 
-### Oracle tests
+### Specification-driven tests
 
-- For select tensor transforms (V-reorder, A_log negation), fixtures of known-correct output from llama.cpp's Python script are checked into `tests/fixtures/` and used as bit-exact oracles.
+- For select tensor transforms (V-reorder, A_log negation, conv1d squeeze, in_proj_qkvz), the expected output on small hand-sized inputs is hand-authored in the test file with a code comment deriving it from the mathematical specification (ggml broadcast semantics, `-exp(x)`, shape squeeze, head-grouped reorder).
+- The specification-driven test IS the spec — if the spec is wrong, the test is wrong; both change together in the same commit with a citation to the llama.cpp source that motivated the change.
 
 ### Real-model smoke test
 
@@ -616,7 +619,7 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 
 **Likelihood:** Medium — this is the named silent-failure mode in `project_qwen36_architecture.md` gotcha #1.
 **Impact:** GGUF loads, inference produces plausible-looking nonsense. No automated test catches it without inference.
-**Mitigation:** Oracle tests (Decision 5 acceptance) against llama.cpp-produced BF16 tensor fixtures. The inference session's sourdough-gate analogue for Qwen will catch this downstream. Do not ship to Robert's end-user workflow without either the oracle passing or the inference gate green.
+**Mitigation:** Specification-driven tests (Decision 5 acceptance) with hand-authored expected permutation maps derived from ggml broadcast semantics — the same source of truth llama.cpp's implementation is derived from, independently applied. The inference session's sourdough-gate analogue for Qwen will catch this downstream. Do not ship to Robert's end-user workflow without either the spec-driven tests passing or the inference gate green. Deliberately no reliance on llama.cpp binary output as an oracle — that would couple our correctness proof to a repo we don't own.
 
 ### R3: DWQ calibration can't run because inference session isn't ready
 
