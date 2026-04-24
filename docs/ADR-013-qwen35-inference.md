@@ -934,6 +934,77 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 6 · P4 COMPLETE (hf2q scaffold + Qwen35Config parser)
+
+**Scope:** Phase P4 Decisions 1 & 2 — hf2q-side module scaffolding and `Qwen35Config` parser.
+
+**Delivered in `hf2q`:**
+- `src/inference/mod.rs` — registers `pub mod models;`.
+- `src/inference/models/mod.rs` — registers `pub mod qwen35;`.
+- `src/inference/models/qwen35/mod.rs` — the **main module** (398 lines). Contains:
+  - `Qwen35Variant::{Dense, Moe}` with `from_arch()` / `key_prefix()`.
+  - `Qwen35LayerKind::{LinearAttention, FullAttention}` — distinct from Gemma-4's `LayerType`.
+  - `Qwen35Config` with all 25 fields from ADR Decision 2 (variant, hidden_size, heads, head_dim, linear_*, full_attention_interval, layer_types, partial_rotary_factor, rope_theta, rotary_dim, mrope_section, mrope_interleaved, rms_norm_eps, max_position_embeddings, vocab_size, attn_output_gate, mtp_num_hidden_layers, intermediate_size, moe).
+  - `Qwen35MoeConfig` (moe_intermediate_size, num_experts, num_experts_per_tok, shared_expert_intermediate_size).
+  - `Qwen35Config::from_gguf(&GgufFile) -> Result<Self>` — **grounded in the apex GGUF dump (2026-04-23)**. Exact key-to-field mapping documented in rustdoc. Required keys validated with clear errors; optional keys (`mtp.num_hidden_layers`, `attention.output_gate`) fall back to canonical defaults.
+  - `default_layer_types(n_layers, interval)` — derives the full/linear stack when the GGUF doesn't emit an explicit `layer_types` array (apex convention). For interval=4: layers 3, 7, 11, ... are FullAttention.
+- `src/inference/models/qwen35/{dense,moe,kernels,kv_cache}.rs` — stub sub-modules with rustdoc roadmap pointing to future phases.
+
+**Supporting changes:**
+- `src/main.rs` — added `mod inference;` to the top-level module list.
+- `src/preflight.rs` — added `"linear_attention"` to `SUPPORTED_LAYER_TYPES` (ADR-012 Decision 3 coordination).
+
+**GGUF metadata key mapping (authoritative, grounded in apex file):**
+
+| Field | GGUF key | Type | Example (apex, qwen35moe) |
+|---|---|---|---|
+| `num_hidden_layers` | `{prefix}.block_count` | u32 | 40 |
+| `hidden_size` | `{prefix}.embedding_length` | u32 | 2048 |
+| `num_attention_heads` | `{prefix}.attention.head_count` | u32 | 16 |
+| `num_key_value_heads` | `{prefix}.attention.head_count_kv` | u32 | 2 |
+| `head_dim` | `{prefix}.attention.key_length` = `.value_length` | u32 | 256 |
+| `rotary_dim` | `{prefix}.rope.dimension_count` | u32 | 64 |
+| `mrope_section` | `{prefix}.rope.dimension_sections` | i32[4] | [11, 11, 10, 0] |
+| `rope_theta` | `{prefix}.rope.freq_base` | f32 | 1e7 |
+| `rms_norm_eps` | `{prefix}.attention.layer_norm_rms_epsilon` | f32 | ~1e-6 |
+| `full_attention_interval` | `{prefix}.full_attention_interval` | u32 | 4 |
+| `linear_key_head_dim` / `_value_head_dim` | `{prefix}.ssm.state_size` | u32 | 128 |
+| `linear_num_key_heads` | `{prefix}.ssm.group_count` | u32 | 16 |
+| `linear_num_value_heads` | `{prefix}.ssm.inner_size / state_size` (derived) | u32 | 32 |
+| `linear_conv_kernel_dim` | `{prefix}.ssm.conv_kernel` | u32 | 4 |
+| `num_experts` | `{prefix}.expert_count` | u32 | 256 |
+| `num_experts_per_tok` | `{prefix}.expert_used_count` | u32 | 8 |
+| `moe_intermediate_size` | `{prefix}.expert_feed_forward_length` | u32 | 512 |
+| `shared_expert_intermediate_size` | `{prefix}.expert_shared_feed_forward_length` | u32 | 512 |
+| `max_position_embeddings` | `{prefix}.context_length` | u32 | (from file) |
+
+**Tests (5 unit + 1 integration):**
+- `variant_from_arch`: `qwen35` / `qwen35moe` recognized, others rejected.
+- `layer_types_interval_4`: 40-layer MoE produces correct pattern; exhaustive check on first 8 layers.
+- `layer_types_dense_27b_64layer`: 64/4 = 16 full-attn layers.
+- `layer_types_interval_zero_all_linear`: degenerate case guarded.
+- `key_prefix_roundtrip`: enum → prefix constants match.
+- `parses_real_apex_gguf` (**#[ignore]**d): parses the actual 25 GB apex GGUF, verifies all fields match the known values (num_hidden_layers=40, head_dim=256, mrope_section=[11,11,10,0], num_experts=256, etc.). Gracefully skips when mlx-native loader rejects Q5_K tensors — **that loader gap lands in P5 (Decision 12 adds Q5_K + I16 support)**.
+
+**Verification:**
+- 5/5 new unit tests green.
+- Full hf2q suite: 407/407 pass (0 regressions).
+- Clean `cargo build --release` on both hf2q and mlx-native.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | COMPLETE |
+| P1  | 5         | COMPLETE |
+| P2  | 10 (mlx)  | COMPLETE |
+| P3  | 6         | COMPLETE |
+| P4  | 1, 2      | **COMPLETE** |
+| P5  | 12        | Next iter — weight loading + I16 + **Q5_K** dequant (apex GGUF unblocker) |
+| P6–P13 | 8–18  | Pending |
+
+**Next iter target:** P5 — `src/backends/gguf.rs` I16 + Q5_K dequant (the latter is out-of-scope for ADR-013 proper but is a required prerequisite for the apex GGUF; fixing it now per no-broken-windows). Plus Qwen3.5 tensor-name table enumeration from the apex dump (733 tensors).
+
 ### 2026-04-23 — /loop iter 5 · P3 COMPLETE (GATED_DELTA_NET fused kernel landed) — MLX-NATIVE SIDE COMPLETE
 
 **Scope:** Phase P3 Decision 6 (Gated DeltaNet fused kernel — the centerpiece).

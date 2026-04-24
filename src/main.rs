@@ -16,6 +16,8 @@ mod doctor;
 #[allow(dead_code)]
 mod gpu;
 #[allow(dead_code)]
+mod inference;
+#[allow(dead_code)]
 mod input;
 #[allow(dead_code)]
 mod intelligence;

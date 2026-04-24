@@ -1,5 +1,7 @@
-# Model files — do not commit to git
-models/
+# Top-level model files — do not commit to git.
+# NOTE: leading slash so this only matches the top-level `models/` directory
+# (which holds GGUFs), not `src/inference/models/` (the module tree).
+/models/
 
 # Build artifacts
 /target

@@ -254,6 +254,8 @@ const SUPPORTED_LAYER_TYPES: &[&str] = &[
     "attention",
     "full_attention",
     "sliding_attention",
+    // Qwen3.5 / Qwen3.5-MoE Gated DeltaNet layer kind (ADR-013 / ADR-012 Decision 3).
+    "linear_attention",
     "moe_attention",
     "linear",
     "mlp",
