@@ -29,6 +29,9 @@
 //!   a parser concern. Belongs with the sampler iter.
 
 pub mod parser;
+pub mod sampler;
 
 #[allow(unused_imports)]
 pub use parser::{parse, Grammar, GretElement, GretType, ParseError};
+#[allow(unused_imports)]
+pub use sampler::{GrammarRuntime, PartialUtf8, Pos, Stack, Stacks};

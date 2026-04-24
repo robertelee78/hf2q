@@ -1313,6 +1313,26 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 402/402 pass (+26 from iter 4's 376). Zero clippy errors. Commit + push.
   - **Next (iter 6):** port `common/json-schema-to-grammar.cpp` (→ `src/serve/api/grammar/json_schema.rs`) — JSON Schema → GBNF translator that `response_format: {json_schema: ...}` requests go through. Then iter 7 = port `src/llama-grammar.cpp` runtime sampler (advance_stack, apply, accept) + wire into engine decode loop. Then iter 8 = per-model tool-call registration (Task #6) on top of the grammar sampler. Prompt cache (Task #7) and real-model live-smoke wait for OOM pressure to clear.
 
+- **2026-04-23 loop iter 6 — GBNF runtime sampler ported; JSON grammar acceptance verified.** Swapped iter 6/7 order: landed the **runtime sampler** (Task #5 continues) rather than the JSON-schema→GBNF translator, because the sampler is the critical path to making any grammar functional at decode time — once the sampler is in place, even a hand-written GBNF (or a future json_schema-derived one) is usable.
+  - **`src/serve/api/grammar/sampler.rs` (~410 LOC + 23 tests):** pure-Rust port of the runtime sampler functions from `/opt/llama.cpp/src/llama-grammar.cpp` (lines 737–1050). No axum / mlx-native dependencies — runs entirely on CPU, no model load required.
+    - **`Pos { rule_id, elem_idx }`** replaces llama.cpp's `const llama_grammar_element *` raw pointers. Rust-safe, clone-friendly, stable across ownership transfers. `Stack = Vec<Pos>`, `Stacks = Vec<Stack>`.
+    - **`PartialUtf8 { value, n_remain: i8 }`** tracks multi-byte UTF-8 sequences that straddle token boundaries. Negative `n_remain` = invalid state (mirrors llama.cpp's `-1` sentinel).
+    - **`match_char(grammar, pos, chr)`** and **`match_partial_char(...)`** mirror `llama_grammar_match_char` / `..._partial_char` byte-for-byte: positive vs negative class, `CharAny`, `CharRngUpper`, `CharAlt` chains.
+    - **`advance_stack`** expands `RuleRef` elements (with alternation traversal), unwraps `End`/`Alt` off the stack top, dedupes via a `HashSet` frontier — matches llama.cpp's BFS/dedupe logic.
+    - **`accept_char`** = feed one code point to all current stacks → new stack set. Dead-ends are discarded.
+    - **`GrammarRuntime::new(grammar, start_rule_id)`** seeds the initial stacks (iterating the start rule's alternatives). **`accept_char(chr) → bool`** feeds one code point; **`accept_bytes(bytes) → bool`** feeds UTF-8 bytes (partial sequences carried across calls via `self.partial_utf8`); **`is_accepted()`** returns true when any stack is empty (root fully matched); **`is_dead()`** = no stacks remain.
+  - **23 sampler tests cover:**
+    - Exact literal match + rejection of wrong literal
+    - Char classes: range (positive / negative), multi-alt, any-char `.`
+    - Alternation + rule references + nested rule chains
+    - Repetitions: `*` zero-occurrences, `*` many, `+` requires-at-least-one, `?` both-paths, `{n}` exact count (rejects over), `{n,m}` range (accepts within, rejects over)
+    - UTF-8: whole-code-point via `accept_bytes` (Greek alpha), incremental partial UTF-8 across calls (first byte 0xCE buffered, second byte 0xB1 completes)
+    - **`json.gbnf` fixture tests** (the grammar OpenAI `response_format: json_object` rides): `value` rule accepts all 11 canonical JSON samples (null/true/false/scalars/arrays/nested objects); `root` rule (== object) correctly rejects bare scalars and accepts only objects; grammar rejects malformed JSON (truncated, missing-value, unterminated string); grammar rejects trailing garbage after a complete object.
+  - **Bug caught + fixed during test iteration:** initial `accept_bytes` treated `partial_utf8.n_remain == 0` as "just-completed partial" even on fresh calls, feeding `char 0` to the sampler and killing valid grammars. Restructured to only run the "complete partial" branch when `self.partial_utf8.n_remain > 0` at entry.
+  - **Wire-compatibility verified:** the sampler consumes the exact `Grammar` produced by iter 5's parser. `json.gbnf` parses to N rules → runtime seeds initial stacks from `root` or `value` → `accept_bytes` drives the stack set to acceptance on every well-formed sample. This is the end-to-end parity gate for the grammar stack.
+  - **Full suite:** 430/430 pass, 1 ignored (+28 from iter 5's 402). Zero clippy errors. Commit + push.
+  - **Next (iter 7):** wire `GrammarRuntime` into `engine::generate_once` / `generate_stream_once` — when the chat-completion request has `response_format: {json_object}` or `{json_schema}`, construct a `GrammarRuntime` over the hf2q-hardcoded json.gbnf (for json_object) or the synthesized grammar (for json_schema, iter 8). At each decode step, before argmax, compute the set of valid next-character code points via `advance_stack + match_char` and mask out tokens whose bytes would dead-end the grammar. Then iter 8 = port `json-schema-to-grammar.cpp`; iter 9 = per-model tool-call registration (Task #6) on top of grammar.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)

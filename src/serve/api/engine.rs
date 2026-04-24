@@ -605,7 +605,9 @@ fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<Strin
             GgmlType::Q4_0 => "Q4_0",
             GgmlType::Q8_0 => "Q8_0",
             GgmlType::Q4_K => "Q4_K",
+            GgmlType::Q5_K => "Q5_K",
             GgmlType::Q6_K => "Q6_K",
+            GgmlType::I16 => "I16",
         };
         *histogram.entry(label).or_insert(0) += 1;
     }
