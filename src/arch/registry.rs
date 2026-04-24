@@ -265,4 +265,97 @@ mod tests {
         assert!(s.contains("qwen35"));
         assert!(s.contains("qwen35moe"));
     }
+
+    /// Field-invariant sweep — every registered arch entry must satisfy
+    /// load-bearing non-empty / non-zero invariants. Decision 20 §future-
+    /// arch onboarding: a new entry with e.g. empty `hf_repos` or zero
+    /// `disk_floor_gb` would silently break smoke preflight. This test
+    /// is the gate — adding Ministral / DeepSeek-V3 with a nonsensical
+    /// field fails CI before any runtime manifest.
+    #[test]
+    fn every_registered_entry_passes_field_invariants() {
+        for entry in ArchRegistry::global().iter() {
+            // Identity.
+            assert!(!entry.arch.is_empty(), "arch string must be non-empty");
+            assert!(
+                !entry.hf_architectures.is_empty(),
+                "{}: hf_architectures must list at least one HF arch",
+                entry.arch
+            );
+            for hf in entry.hf_architectures {
+                assert!(
+                    !hf.is_empty(),
+                    "{}: hf_architectures must not contain empty strings",
+                    entry.arch
+                );
+            }
+
+            // Preflight-load-bearing.
+            assert!(
+                entry.disk_floor_gb > 0,
+                "{}: disk_floor_gb must be > 0 (else preflight exit 3 never fires)",
+                entry.arch
+            );
+            assert!(
+                !entry.hf_repos.is_empty(),
+                "{}: hf_repos must list at least one resolvable repo",
+                entry.arch
+            );
+            for repo in entry.hf_repos {
+                assert!(
+                    repo.contains('/'),
+                    "{}: hf_repo {:?} must be `owner/name` form",
+                    entry.arch,
+                    repo
+                );
+            }
+
+            // Smoke-load-bearing.
+            assert!(
+                !entry.smoke_prompts.is_empty(),
+                "{}: smoke_prompts must have at least one prompt (llama-cli needs -p)",
+                entry.arch
+            );
+            for prompt in entry.smoke_prompts {
+                assert!(
+                    !prompt.trim().is_empty(),
+                    "{}: smoke_prompts must not contain whitespace-only prompts",
+                    entry.arch
+                );
+            }
+
+            // Tensor catalog non-empty — otherwise expected_tensor_count
+            // returns 0 and the transcript assertion becomes vacuous.
+            assert!(
+                !entry.tensor_catalog.entries.is_empty(),
+                "{}: tensor_catalog must have at least one entry",
+                entry.arch
+            );
+
+            // Quality thresholds — ratios > 1.0 (DWQ must be at least
+            // tie-or-worse with F16; a ratio of 1.0 means bit-identical)
+            // and KL > 0 (0 would accept any divergence).
+            assert!(
+                entry.quality_thresholds.ppl_ratio_dwq46 >= 1.0,
+                "{}: ppl_ratio_dwq46 must be >= 1.0",
+                entry.arch
+            );
+            assert!(
+                entry.quality_thresholds.ppl_ratio_dwq48 >= 1.0,
+                "{}: ppl_ratio_dwq48 must be >= 1.0",
+                entry.arch
+            );
+            assert!(
+                entry.quality_thresholds.ppl_ratio_dwq48
+                    <= entry.quality_thresholds.ppl_ratio_dwq46,
+                "{}: dwq48 threshold must be tighter than dwq46 (8-bit keeps more fidelity)",
+                entry.arch
+            );
+            assert!(
+                entry.quality_thresholds.max_median_kl > 0.0,
+                "{}: max_median_kl must be > 0",
+                entry.arch
+            );
+        }
+    }
 }
