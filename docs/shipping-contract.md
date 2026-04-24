@@ -106,12 +106,47 @@ document (for categories 2–3).
 
 ---
 
+---
+
+## Qwen3.5 / Qwen3.6 conversion acceptance (ADR-012)
+
+`qwen35` (dense 27B) and `qwen35moe` (MoE 35B) are shipped as **convert-only**
+model classes as of ADR-012. Inference coherence is delegated to ADR-013.
+
+### Acceptance gates for a converted GGUF
+
+| Gate | Criterion |
+|---|---|
+| Structural validity | File begins with magic `GGUF`, version 3, tensor_count > 0, kv_count > 0 |
+| Metadata completeness | Every key in the ADR-012 Decision 7 catalog is present |
+| Tensor naming | Every tensor name matches the ADR-012 Decision 8 naming spec |
+| llama.cpp load | `llama-cli --model out.gguf -p "Hello" -n 8` exits 0 |
+| Sidecar set | `tokenizer.json`, `tokenizer_config.json`, `config.json`, `generation_config.json`, `special_tokens_map.json` (and `chat_template.jinja` when present) are byte-identical copies alongside the GGUF |
+
+### Out-of-scope for ADR-012
+
+- Inference coherence (sourdough gate, sliding-window parity) — ADR-013.
+- DWQ activation-based quantization for qwen35/qwen35moe — requires
+  `ActivationCapture` from ADR-013 inference session; ADR-012 P6 wires the
+  guard that returns a clear error if activation capture is not available.
+- Vision tower for Qwen3.5-27B multimodal — follow-up ADR.
+- MTP head inference — ADR-013.
+
+### CI integration tests
+
+`tests/convert_qwen35_integration.rs` and
+`tests/convert_qwen35moe_integration.rs` run the full convert pipeline on
+synthetic tiny models (4 layers, hidden=64, 4 experts) to validate structural
+correctness and sidecar behavior without downloading real model weights.
+
+---
+
 ## Known out-of-scope
 
 These are deliberately not part of any category:
 
-- Models other than Gemma-4 26B DWQ. Other Gemma variants and
-  Llama/Qwen have not been exercised against the gates.
+- Inference coherence for models other than Gemma-4 26B DWQ. Qwen3.5
+  inference coherence is ADR-013.
 - Byte-identical batched-prefill parity with llama.cpp at the ~752-byte
   `sliding_wrap` level (see `docs/ADR-010-exact-batched-kernel-parity.md`;
   deferred).
@@ -127,4 +162,7 @@ These are deliberately not part of any category:
   F32-KV and per-token prefill are the defaults.
 - `docs/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
   parity is deferred.
+- `docs/ADR-012-qwen35moe-conversion.md` — qwen35/qwen35moe convert spec.
+- `docs/converting-qwen35.md` — canonical convert commands for Qwen3.5/3.6.
+- `docs/converting-a-model.md` — generic convert reference including Gemma.
 - `scripts/release-check.sh` — the reproducible gate runner.

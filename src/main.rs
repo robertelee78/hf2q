@@ -737,6 +737,11 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .map_err(AppError::Conversion)?
     };
 
+    // Phase 4.7: Copy sidecar files into output directory (Decision 15).
+    // manifest.output_dir is the canonical parent directory that contains
+    // the written .gguf or safetensors files.
+    copy_sidecars(&config.input_dir, std::path::Path::new(&manifest.output_dir));
+
     // Phase 5.1: Regression detection against previous baseline
     let quality_gate_result = if quality_report.has_metrics() {
         let thresholds = quality::QualityThresholds::default();
@@ -1125,6 +1130,54 @@ fn print_dry_run_plan(
     eprintln!();
     eprintln!("{}", style("No files were written (dry run).").dim());
     eprintln!();
+}
+
+/// Sidecar files to copy from the HF source directory into the output
+/// directory alongside the produced `.gguf` (Decision 15).
+///
+/// Files are copied byte-identically. If a file is missing from the
+/// source directory it is silently skipped — not all models ship all
+/// sidecars.
+const SIDECAR_FILES: &[&str] = &[
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+];
+
+/// Copy sidecar files from `src_dir` to `dst_dir` (Decision 15).
+///
+/// - Byte-identical content; no transformation.
+/// - Missing source files are silently skipped.
+/// - The destination directory must already exist.
+/// - Errors on individual copies are logged as warnings but do not fail
+///   the overall convert operation.
+fn copy_sidecars(src_dir: &std::path::Path, dst_dir: &std::path::Path) {
+    for filename in SIDECAR_FILES {
+        let src = src_dir.join(filename);
+        if !src.exists() {
+            // Silent skip — not an error.
+            continue;
+        }
+        let dst = dst_dir.join(filename);
+        match std::fs::copy(&src, &dst) {
+            Ok(bytes) => {
+                tracing::info!(
+                    file = %filename,
+                    bytes = bytes,
+                    "Sidecar file copied"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to copy sidecar '{}' to output: {}",
+                    filename, e
+                );
+            }
+        }
+    }
 }
 
 /// Try to detect the quantization method from an output directory path.

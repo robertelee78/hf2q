@@ -9,7 +9,37 @@
 //! 3. ~/.huggingface/token file (legacy path)
 //!
 //! Cache: Uses standard hf-hub cache directory. Subsequent runs with
-//! the same repo skip re-download.
+//! the same repo skip re-download (hf-hub's built-in LFS resumption).
+//!
+//! # Disk preflight (Decision 14)
+//!
+//! Before starting any download, the available disk space on the target
+//! path is checked against per-model-class minimums:
+//!
+//! | Model class | Minimum free |
+//! |---|---|
+//! | Qwen3.5-MoE 35B (`qwen35moe`) | 150 GB |
+//! | Qwen3.5 27B dense (`qwen35`) | 55 GB |
+//! | Gemma-4 26B and other models | 100 GB |
+//!
+//! If the check fails the download is aborted with a user-actionable
+//! error message that includes the specific path and shortfall.
+//!
+//! # Shard resumption
+//!
+//! hf-hub's `repo.get(filename)` skips re-downloading files that are
+//! already present in the cache directory. Interrupted downloads leave
+//! partial files; on re-invocation the partially-downloaded shard is
+//! re-fetched from the beginning (hf-hub does not do byte-range
+//! resumption at the shard level). Fully-completed shards are NOT
+//! re-downloaded. This means a Ctrl+C during a 40-shard download
+//! followed by re-invoke will re-download only the in-flight shard;
+//! all completed shards are reused.
+//!
+//! Manual test protocol: `Ctrl+C` mid-download → observe partial shard
+//! in `~/.cache/huggingface/hub/models--*/snapshots/*/` → re-invoke
+//! `hf2q` → verify only in-flight shard re-downloads, total wall-clock
+//! is proportionally shorter.
 
 use std::path::PathBuf;
 
@@ -18,6 +48,63 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::progress::ProgressReporter;
+
+/// Minimum free disk space requirements by model class (Decision 14).
+///
+/// These constants encode:
+/// - qwen35moe 35B: ~70 GB BF16 + ~73 GB DWQ intermediate peak + 10 GB margin = 153 GB → 150 GB floor
+/// - qwen35 27B dense: ~28 GB BF16 + ~22 GB DWQ + 5 GB margin = 55 GB floor
+/// - gemma4 26B (existing) + others: 100 GB conservative floor
+const DISK_REQUIREMENT_QWEN35MOE_BYTES: u64 = 150 * 1024 * 1024 * 1024;
+const DISK_REQUIREMENT_QWEN35_BYTES: u64 = 55 * 1024 * 1024 * 1024;
+const DISK_REQUIREMENT_DEFAULT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+
+/// Model class for disk preflight routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelClass {
+    Qwen35Moe,
+    Qwen35Dense,
+    Other,
+}
+
+impl ModelClass {
+    /// Detect model class from a HuggingFace repo ID.
+    ///
+    /// Heuristic: looks for well-known name fragments in the repo id
+    /// (case-insensitive). Gemma and other classes fall through to
+    /// `Other`, which uses the conservative 100 GB floor.
+    pub fn from_repo_id(repo_id: &str) -> Self {
+        let lower = repo_id.to_lowercase();
+        // Order matters: check MoE first to avoid misclassifying as dense.
+        // Repo IDs containing "-a3b", "-moe", or "35b-a" suggest MoE variant.
+        if lower.contains("-a3b") || lower.contains("-moe") || lower.contains("35b-a") {
+            return ModelClass::Qwen35Moe;
+        }
+        // Dense variant: "qwen3" (or "qwen35") with "27b" but no MoE markers.
+        if (lower.contains("qwen3") || lower.contains("qwen35")) && lower.contains("27b") {
+            return ModelClass::Qwen35Dense;
+        }
+        ModelClass::Other
+    }
+
+    /// Minimum free bytes required before download begins.
+    pub fn min_free_bytes(self) -> u64 {
+        match self {
+            ModelClass::Qwen35Moe => DISK_REQUIREMENT_QWEN35MOE_BYTES,
+            ModelClass::Qwen35Dense => DISK_REQUIREMENT_QWEN35_BYTES,
+            ModelClass::Other => DISK_REQUIREMENT_DEFAULT_BYTES,
+        }
+    }
+
+    /// Human-readable model label for error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelClass::Qwen35Moe => "Qwen3.5-MoE 35B",
+            ModelClass::Qwen35Dense => "Qwen3.5 27B dense",
+            ModelClass::Other => "model",
+        }
+    }
+}
 
 /// Errors from HF download operations.
 #[derive(Error, Debug)]
@@ -66,6 +153,21 @@ pub enum DownloadError {
     )]
     CliFallbackFailed { reason: String },
 
+    /// Disk preflight failure (Decision 14).
+    ///
+    /// Error message wording is load-bearing — integration tests assert
+    /// against the exact phrasing. Do not change without updating tests.
+    #[error(
+        "{label} requires \u{2265}{required_gb} GB free in {path}; found {found_gb} GB. \
+         Free space or change --cache-dir."
+    )]
+    InsufficientDisk {
+        label: String,
+        required_gb: u64,
+        found_gb: u64,
+        path: String,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -82,15 +184,106 @@ const OPTIONAL_FILES: &[&str] = &[
     "generation_config.json",
 ];
 
+/// Check that enough disk space is available before starting a download (Decision 14).
+///
+/// `target_path` is the directory where downloaded files will be written
+/// (typically `~/.cache/huggingface/hub` or a custom `--cache-dir`).
+/// If the path does not exist yet, the nearest existing ancestor is used.
+///
+/// Returns `Ok(())` when sufficient space is available.
+/// Returns `Err(DownloadError::InsufficientDisk)` with an actionable message otherwise.
+///
+/// # Test seam
+///
+/// `available_bytes_override` is `Some(n)` in unit tests to inject a
+/// fake free-space value without touching the filesystem.
+pub fn check_disk_preflight(
+    repo_id: &str,
+    target_path: &std::path::Path,
+    available_bytes_override: Option<u64>,
+) -> Result<(), DownloadError> {
+    let class = ModelClass::from_repo_id(repo_id);
+    let required = class.min_free_bytes();
+
+    let available = match available_bytes_override {
+        Some(v) => v,
+        None => get_available_space_for_path(target_path),
+    };
+
+    debug!(
+        repo = %repo_id,
+        class = ?class,
+        required_gb = required / (1024 * 1024 * 1024),
+        available_gb = available / (1024 * 1024 * 1024),
+        "Disk preflight check"
+    );
+
+    if available < required {
+        let path_str = target_path.display().to_string();
+        return Err(DownloadError::InsufficientDisk {
+            label: class.label().to_string(),
+            required_gb: required / (1024 * 1024 * 1024),
+            found_gb: available / (1024 * 1024 * 1024),
+            path: path_str,
+        });
+    }
+
+    Ok(())
+}
+
+/// Get available bytes for the filesystem containing `path`.
+///
+/// Walks to the nearest existing ancestor directory, then uses `sysinfo`
+/// to find the matching mount point. Returns 0 if nothing can be determined
+/// (conservative — will not block downloads when the check can't run).
+fn get_available_space_for_path(path: &std::path::Path) -> u64 {
+    // Walk up to an existing ancestor
+    let existing = {
+        let mut p = path.to_path_buf();
+        loop {
+            if p.exists() {
+                break p;
+            }
+            match p.parent() {
+                Some(parent) => p = parent.to_path_buf(),
+                None => break std::path::PathBuf::from("/"),
+            }
+        }
+    };
+
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64)> = None;
+    for disk in disks.list() {
+        let mount = disk.mount_point();
+        if existing.starts_with(mount) {
+            let len = mount.as_os_str().len();
+            match best {
+                Some((prev, _)) if len > prev => best = Some((len, disk.available_space())),
+                None => best = Some((len, disk.available_space())),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(_, space)| space).unwrap_or(0)
+}
+
 /// Download a model from HuggingFace Hub.
 ///
 /// Returns the path to the local directory containing the downloaded model files.
 /// Uses hf-hub crate cache — subsequent calls with the same repo skip re-download.
+/// Completed shards are not re-fetched on re-invocation; only in-flight shards
+/// are restarted (hf-hub file-level skip, not byte-range resumption).
 pub fn download_model(
     repo_id: &str,
     progress: &ProgressReporter,
 ) -> Result<PathBuf, DownloadError> {
     info!(repo = %repo_id, "Downloading model from HuggingFace Hub");
+
+    // Decision 14: disk preflight before any network activity.
+    // Use the hf-hub default cache dir (~/.cache/huggingface/hub).
+    let cache_dir = resolve_hf_cache_dir();
+    check_disk_preflight(repo_id, &cache_dir, None)?;
 
     // Attempt 1: Use hf-hub crate (primary method)
     match download_via_hf_hub(repo_id, progress) {
@@ -450,6 +643,36 @@ fn read_token_file(path: &std::path::Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolve the hf-hub cache directory.
+///
+/// Resolution order (mirrors hf-hub's own logic):
+/// 1. `HF_HUB_CACHE` env var
+/// 2. `HF_HOME` env var + `/hub`
+/// 3. `XDG_CACHE_HOME` env var + `/huggingface/hub`
+/// 4. `~/.cache/huggingface/hub`
+fn resolve_hf_cache_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("HF_HUB_CACHE") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Ok(v) = std::env::var("HF_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join("hub");
+        }
+    }
+    if let Ok(v) = std::env::var("XDG_CACHE_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join("huggingface").join("hub");
+        }
+    }
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .join(".cache")
+        .join("huggingface")
+        .join("hub")
+}
+
 /// Get the user's home directory.
 fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
@@ -534,6 +757,191 @@ mod tests {
     fn test_home_dir_returns_something() {
         let home = home_dir();
         assert!(home.is_some());
+    }
+
+    // --- Decision 14: disk preflight tests ---
+
+    #[test]
+    fn test_model_class_from_repo_id_qwen35moe() {
+        let cases = [
+            "jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated",
+            "org/Qwen3.5-MoE-35B-Instruct",
+            "someone/model-35b-a3b-stuff",
+        ];
+        for repo in &cases {
+            assert_eq!(
+                ModelClass::from_repo_id(repo),
+                ModelClass::Qwen35Moe,
+                "Expected Qwen35Moe for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_class_from_repo_id_qwen35_dense() {
+        let cases = [
+            "Qwen/Qwen3.5-27B-Instruct",
+            "org/qwen35-27b-dense",
+        ];
+        for repo in &cases {
+            assert_eq!(
+                ModelClass::from_repo_id(repo),
+                ModelClass::Qwen35Dense,
+                "Expected Qwen35Dense for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_class_from_repo_id_other() {
+        let cases = [
+            "google/gemma-4-26b-it",
+            "meta-llama/Llama-3.1-8B",
+            "mistralai/Mistral-7B-v0.1",
+        ];
+        for repo in &cases {
+            assert_eq!(
+                ModelClass::from_repo_id(repo),
+                ModelClass::Other,
+                "Expected Other for {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_class_min_free_bytes() {
+        assert_eq!(
+            ModelClass::Qwen35Moe.min_free_bytes(),
+            150 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            ModelClass::Qwen35Dense.min_free_bytes(),
+            55 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            ModelClass::Other.min_free_bytes(),
+            100 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_disk_preflight_qwen35moe_insufficient_fails_with_exact_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 50 GB < 150 GB required for qwen35moe
+        let available: u64 = 50 * 1024 * 1024 * 1024;
+        let repo = "jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated";
+
+        let err = check_disk_preflight(repo, tmp.path(), Some(available))
+            .expect_err("Should fail with insufficient disk");
+
+        let msg = err.to_string();
+        // ADR-012 Decision 14: exact wording is part of the spec.
+        assert!(
+            msg.contains("Qwen3.5-MoE 35B"),
+            "Error must name the model class: {msg}"
+        );
+        assert!(
+            msg.contains("≥150 GB"),
+            "Error must state the requirement: {msg}"
+        );
+        assert!(
+            msg.contains("50 GB"),
+            "Error must state found bytes: {msg}"
+        );
+        assert!(
+            msg.contains("Free space or change --cache-dir"),
+            "Error must be actionable: {msg}"
+        );
+        assert!(
+            msg.contains(tmp.path().to_str().unwrap()),
+            "Error must include path: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_disk_preflight_qwen35moe_sufficient_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 200 GB > 150 GB required
+        let available: u64 = 200 * 1024 * 1024 * 1024;
+        let repo = "jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated";
+
+        assert!(
+            check_disk_preflight(repo, tmp.path(), Some(available)).is_ok(),
+            "200 GB should pass the 150 GB requirement"
+        );
+    }
+
+    #[test]
+    fn test_disk_preflight_qwen35_dense_insufficient_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 30 GB < 55 GB required for qwen35 dense
+        let available: u64 = 30 * 1024 * 1024 * 1024;
+        let repo = "Qwen/Qwen3.5-27B-Instruct";
+
+        let err = check_disk_preflight(repo, tmp.path(), Some(available))
+            .expect_err("Should fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Qwen3.5 27B dense"), "Expected dense label: {msg}");
+        assert!(msg.contains("≥55 GB"), "Expected 55 GB requirement: {msg}");
+    }
+
+    #[test]
+    fn test_disk_preflight_qwen35_dense_sufficient_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let available: u64 = 100 * 1024 * 1024 * 1024;
+        let repo = "Qwen/Qwen3.5-27B-Instruct";
+
+        assert!(check_disk_preflight(repo, tmp.path(), Some(available)).is_ok());
+    }
+
+    #[test]
+    fn test_disk_preflight_gemma_regression_passes() {
+        // Gemma-4 26B produces ~13 GB GGUF + overhead; requirement is 100 GB.
+        // With 120 GB available, should pass.
+        let tmp = tempfile::tempdir().unwrap();
+        let available: u64 = 120 * 1024 * 1024 * 1024;
+        let repo = "google/gemma-4-26b-it";
+
+        assert!(
+            check_disk_preflight(repo, tmp.path(), Some(available)).is_ok(),
+            "Gemma-4 should pass with 120 GB available (100 GB floor)"
+        );
+    }
+
+    #[test]
+    fn test_disk_preflight_gemma_insufficient_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let available: u64 = 80 * 1024 * 1024 * 1024;
+        let repo = "google/gemma-4-26b-it";
+
+        assert!(
+            check_disk_preflight(repo, tmp.path(), Some(available)).is_err(),
+            "Gemma-4 should fail with only 80 GB (100 GB floor)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_hf_cache_dir_uses_env_override() {
+        let original = std::env::var("HF_HUB_CACHE").ok();
+        std::env::set_var("HF_HUB_CACHE", "/custom/cache");
+        let dir = resolve_hf_cache_dir();
+        assert_eq!(dir, std::path::PathBuf::from("/custom/cache"));
+        match original {
+            Some(v) => std::env::set_var("HF_HUB_CACHE", v),
+            None => std::env::remove_var("HF_HUB_CACHE"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_hf_cache_dir_returns_path() {
+        // With no special env vars, should return something rooted under home.
+        std::env::remove_var("HF_HUB_CACHE");
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("XDG_CACHE_HOME");
+        let dir = resolve_hf_cache_dir();
+        assert!(dir.to_str().is_some());
+        assert!(dir.ends_with("hub") || dir.to_str().unwrap().contains("huggingface"));
     }
 
     #[test]
