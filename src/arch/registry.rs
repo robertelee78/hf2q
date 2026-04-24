@@ -266,6 +266,90 @@ mod tests {
         assert!(s.contains("qwen35moe"));
     }
 
+    /// Per-catalog-entry invariant sweep — every TensorCatalogEntry in
+    /// every registered arch must satisfy: non-empty name_template,
+    /// non-empty citation (ADR-012 mantra: "REQUIRED for every catalog
+    /// entry"), `{L}` placeholder present iff scope is per-layer,
+    /// `{X}` placeholder present iff scope is `MoeExpertsPerLayer`,
+    /// and name_template uniqueness within a catalog.
+    ///
+    /// A missing `{L}` on a per-layer entry would silently cause
+    /// `expand_names` to emit N copies of the SAME name — the expected
+    /// count path would still work (count is right) but the names
+    /// collide, defeating the MTP round-trip integrity gate (P11).
+    #[test]
+    fn every_catalog_entry_passes_template_invariants() {
+        use super::super::catalog::LayerScope;
+        for entry in ArchRegistry::global().iter() {
+            let mut seen_names = std::collections::HashSet::new();
+            for cat_entry in entry.tensor_catalog.entries {
+                assert!(
+                    !cat_entry.name_template.is_empty(),
+                    "{}: catalog entry has empty name_template",
+                    entry.arch
+                );
+                assert!(
+                    !cat_entry.citation.is_empty(),
+                    "{}: catalog entry {:?} has empty citation — ADR-012 mantra violation",
+                    entry.arch,
+                    cat_entry.name_template
+                );
+                let has_l = cat_entry.name_template.contains("{L}");
+                let has_x = cat_entry.name_template.contains("{X}");
+                match cat_entry.scope {
+                    LayerScope::Global => {
+                        assert!(
+                            !has_l && !has_x,
+                            "{}: Global-scope entry {:?} must not contain {{L}}/{{X}}",
+                            entry.arch,
+                            cat_entry.name_template
+                        );
+                    }
+                    LayerScope::AllLayers
+                    | LayerScope::FullAttentionLayersOnly
+                    | LayerScope::LinearAttentionLayersOnly
+                    | LayerScope::MtpLayers
+                    | LayerScope::MoeSharedExpertPerLayer
+                    | LayerScope::MoeRouterPerLayer => {
+                        assert!(
+                            has_l,
+                            "{}: per-layer entry {:?} MUST contain {{L}} \
+                             (else expand_names emits N duplicates)",
+                            entry.arch,
+                            cat_entry.name_template
+                        );
+                        assert!(
+                            !has_x,
+                            "{}: non-expert entry {:?} must not contain {{X}}",
+                            entry.arch,
+                            cat_entry.name_template
+                        );
+                    }
+                    LayerScope::MoeExpertsPerLayer => {
+                        assert!(
+                            has_l,
+                            "{}: MoeExpertsPerLayer {:?} MUST contain {{L}}",
+                            entry.arch,
+                            cat_entry.name_template
+                        );
+                        assert!(
+                            has_x,
+                            "{}: MoeExpertsPerLayer {:?} MUST contain {{X}}",
+                            entry.arch,
+                            cat_entry.name_template
+                        );
+                    }
+                }
+                assert!(
+                    seen_names.insert(cat_entry.name_template),
+                    "{}: duplicate name_template {:?} in catalog",
+                    entry.arch,
+                    cat_entry.name_template
+                );
+            }
+        }
+    }
+
     /// Field-invariant sweep — every registered arch entry must satisfy
     /// load-bearing non-empty / non-zero invariants. Decision 20 §future-
     /// arch onboarding: a new entry with e.g. empty `hf_repos` or zero
