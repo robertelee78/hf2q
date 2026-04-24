@@ -26,10 +26,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use super::engine::{self, SamplingParams};
+use super::grammar;
 use super::schema::{
     ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
-    ReadyzResponse, UsageStats,
+    ReadyzResponse, ResponseFormat, UsageStats,
 };
 use super::state::AppState;
 
@@ -59,13 +60,20 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
+    use std::sync::atomic::Ordering;
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
     // Shared prelude: engine gate, model-id match, chat-template render,
     // tokenize, sampling-params build. Returns either a prepared context or
     // an error response to return directly.
     let prepared = match prepare_chat_generation(&state, &req) {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(resp) => {
+            state.metrics.requests_rejected_total.fetch_add(1, Ordering::Relaxed);
+            return resp;
+        }
     };
+    state.metrics.chat_completions_started.fetch_add(1, Ordering::Relaxed);
 
     // --- Dispatch streaming vs non-streaming ---
     if req.stream.unwrap_or(false) {
@@ -87,6 +95,7 @@ pub async fn chat_completions(
             let msg = format!("{e}");
             // Distinguish queue_full (→ 429) from other engine errors (→ 500).
             if msg.contains("queue_full") {
+                state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
                 return ApiError::queue_full().into_response();
             }
             tracing::error!(error = %msg, "chat_completion generation failed");
@@ -94,6 +103,9 @@ pub async fn chat_completions(
         }
     };
     let total_time = gen_started.elapsed();
+    state.metrics.chat_completions_completed.fetch_add(1, Ordering::Relaxed);
+    state.metrics.prompt_tokens_total.fetch_add(result.prompt_tokens as u64, Ordering::Relaxed);
+    state.metrics.decode_tokens_total.fetch_add(result.completion_tokens as u64, Ordering::Relaxed);
 
     // --- Wrap in OpenAI response envelope ---
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -202,6 +214,19 @@ fn prepare_chat_generation(
         )
         .into_response());
     }
+
+    // Pre-compile the response_format grammar (Decision #6). Fails fast on
+    // malformed JSON-Schema so the client sees a grammar_error before any
+    // generation starts — not after N tokens of model output. Note: the
+    // grammar is compiled but not yet wired into the decode-time sampler
+    // (that refactor needs a live model to validate byte-identical output);
+    // the pre-compile catches the most common class of bad requests.
+    if let Some(rf) = req.response_format.as_ref() {
+        if let Err(resp) = validate_response_format(rf) {
+            return Err(resp);
+        }
+    }
+
     let rendered =
         match engine::render_chat_prompt(engine.chat_template(), &req.messages) {
             Ok(s) => s,
@@ -302,12 +327,152 @@ async fn chat_completions_stream(
     sse.into_response()
 }
 
+/// Pre-compile the request's `response_format` to a GBNF grammar and parse
+/// it. Returns `Err(Response)` with the OpenAI-shaped 400 `grammar_error`
+/// envelope on failure. On success, the grammar is discarded (iter 9 scope)
+/// — a future iter plumbs the compiled `Grammar` into the engine so it
+/// actually constrains decoding. Pre-compile alone is still valuable:
+/// malformed schemas are rejected in <1ms instead of producing garbage
+/// after N tokens.
+fn validate_response_format(rf: &ResponseFormat) -> std::result::Result<(), Response> {
+    let gbnf = match rf {
+        ResponseFormat::Text => return Ok(()),
+        ResponseFormat::JsonObject => {
+            // Unconstrained JSON. Hardcoded grammar — no schema to compile.
+            // We still parse it to make sure the primitive rule set is wired.
+            static JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+string ::=
+  "\"" (
+    [^"\\\x7F\x00-\x1F] |
+    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+  )* "\"" ws
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+ws ::= | " " | "\n" [ \t]{0,20}
+"#;
+            JSON_OBJECT_GRAMMAR.to_string()
+        }
+        ResponseFormat::JsonSchema { json_schema } => {
+            // Compile json_schema → GBNF via iter-8's translator.
+            match grammar::json_schema::schema_to_gbnf(&json_schema.schema) {
+                Ok(g) => g,
+                Err(e) => {
+                    return Err(ApiError::grammar_error(format!(
+                        "json_schema → GBNF failed: {}",
+                        e
+                    ))
+                    .into_response())
+                }
+            }
+        }
+    };
+    // Sanity-parse: compile the GBNF. Catches bugs in the translator or in
+    // the hardcoded json_object grammar before they hit the sampler.
+    if let Err(e) = grammar::parser::parse(&gbnf) {
+        return Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e))
+            .into_response());
+    }
+    Ok(())
+}
+
 /// Current Unix epoch seconds (used for response `created` field).
 fn chrono_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// GET /metrics  (Prometheus text exposition format, Decision #11)
+// ---------------------------------------------------------------------------
+
+/// Handler for `GET /metrics`. Emits Prometheus text-exposition format
+/// (version 0.0.4) directly — no Prometheus client library dependency; the
+/// output is plain-text key/value with `# HELP` and `# TYPE` annotations.
+///
+/// Counters / gauges surfaced:
+///   - `hf2q_uptime_seconds`          (gauge)
+///   - `hf2q_ready`                   (gauge — 0/1)
+///   - `hf2q_model_loaded`            (gauge — 0/1)
+///   - `hf2q_requests_total`          (counter)
+///   - `hf2q_requests_rejected_total` (counter)
+///   - `hf2q_chat_completions_started`   (counter)
+///   - `hf2q_chat_completions_completed` (counter)
+///   - `hf2q_chat_completions_queue_full`(counter)
+///   - `hf2q_sse_cancellations`       (counter)
+///   - `hf2q_decode_tokens_total`     (counter)
+///   - `hf2q_prompt_tokens_total`     (counter)
+pub async fn metrics(State(state): State<AppState>) -> Response {
+    use std::sync::atomic::Ordering;
+    let m = &state.metrics;
+    let ready = if state.is_ready_for_gen() { 1 } else { 0 };
+    let model_loaded = if state.engine.is_some() { 1 } else { 0 };
+    let body = format!(
+        "\
+# HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
+# TYPE hf2q_uptime_seconds gauge\n\
+hf2q_uptime_seconds {uptime}\n\
+# HELP hf2q_ready 1 if generation endpoints are ready, 0 during warmup.\n\
+# TYPE hf2q_ready gauge\n\
+hf2q_ready {ready}\n\
+# HELP hf2q_model_loaded 1 if a model is loaded, 0 if HTTP-only backbone.\n\
+# TYPE hf2q_model_loaded gauge\n\
+hf2q_model_loaded {model}\n\
+# HELP hf2q_requests_total Total HTTP requests reaching a handler (post-auth).\n\
+# TYPE hf2q_requests_total counter\n\
+hf2q_requests_total {req_total}\n\
+# HELP hf2q_requests_rejected_total HTTP requests rejected at handler (auth/malformed).\n\
+# TYPE hf2q_requests_rejected_total counter\n\
+hf2q_requests_rejected_total {req_rej}\n\
+# HELP hf2q_chat_completions_started Chat completion generations started.\n\
+# TYPE hf2q_chat_completions_started counter\n\
+hf2q_chat_completions_started {chat_start}\n\
+# HELP hf2q_chat_completions_completed Chat completion generations completed successfully.\n\
+# TYPE hf2q_chat_completions_completed counter\n\
+hf2q_chat_completions_completed {chat_done}\n\
+# HELP hf2q_chat_completions_queue_full Chat completions rejected with 429 queue_full.\n\
+# TYPE hf2q_chat_completions_queue_full counter\n\
+hf2q_chat_completions_queue_full {chat_429}\n\
+# HELP hf2q_sse_cancellations SSE streams cancelled by client drop mid-generation.\n\
+# TYPE hf2q_sse_cancellations counter\n\
+hf2q_sse_cancellations {sse_cancel}\n\
+# HELP hf2q_decode_tokens_total Tokens decoded across all completions.\n\
+# TYPE hf2q_decode_tokens_total counter\n\
+hf2q_decode_tokens_total {decode_tok}\n\
+# HELP hf2q_prompt_tokens_total Prompt tokens ingested across all completions.\n\
+# TYPE hf2q_prompt_tokens_total counter\n\
+hf2q_prompt_tokens_total {prompt_tok}\n\
+",
+        uptime = state.uptime_seconds(),
+        ready = ready,
+        model = model_loaded,
+        req_total = m.requests_total.load(Ordering::Relaxed),
+        req_rej = m.requests_rejected_total.load(Ordering::Relaxed),
+        chat_start = m.chat_completions_started.load(Ordering::Relaxed),
+        chat_done = m.chat_completions_completed.load(Ordering::Relaxed),
+        chat_429 = m.chat_completions_queue_full.load(Ordering::Relaxed),
+        sse_cancel = m.sse_cancellations.load(Ordering::Relaxed),
+        decode_tok = m.decode_tokens_total.load(Ordering::Relaxed),
+        prompt_tok = m.prompt_tokens_total.load(Ordering::Relaxed),
+    );
+    // Prometheus exposition format: text/plain with a versioned content-type.
+    let mut resp = (StatusCode::OK, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +484,10 @@ fn chrono_seconds() -> i64 {
 /// is wired into `AppState`), backend name, context length, and process
 /// uptime in seconds.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (model, context_length) = match state.engine.as_ref() {
         Some(e) => (Some(e.model_id().to_string()), e.context_length()),
         None => (None, None),
@@ -341,6 +510,10 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// server is still warming up, 200 once ready. The readiness signal is an
 /// `AtomicBool` flipped by the warmup task (future iter).
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if state.is_ready_for_gen() {
         (
             StatusCode::OK,
@@ -376,6 +549,10 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 /// modest amount of allocation; keeping it off the async executor keeps the
 /// request hot path responsive.
 pub async fn list_models(State(state): State<AppState>) -> Response {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cache_dir = state.config.cache_dir.clone();
     let mut models =
         match tokio::task::spawn_blocking(move || scan_cache_dir(cache_dir.as_deref())).await {

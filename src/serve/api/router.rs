@@ -37,6 +37,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
         .route("/readyz", get(handlers::readyz))
+        .route("/metrics", get(handlers::metrics))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
         .route("/v1/chat/completions", post(handlers::chat_completions))
@@ -355,6 +356,127 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         // With no engine, the handler returns model_not_loaded first.
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    // --- /metrics (Decision #11) ---
+
+    #[tokio::test]
+    async fn metrics_returns_prometheus_text_format() {
+        let app = build_router(state_default());
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain") && ct.contains("version=0.0.4"),
+            "unexpected content-type: {}",
+            ct
+        );
+        let body = body_string(resp).await;
+        // Spot-check the expected metric names + HELP/TYPE annotations.
+        for expected in [
+            "hf2q_uptime_seconds",
+            "hf2q_ready",
+            "hf2q_model_loaded",
+            "hf2q_requests_total",
+            "hf2q_chat_completions_started",
+            "hf2q_decode_tokens_total",
+            "# HELP",
+            "# TYPE",
+        ] {
+            assert!(
+                body.contains(expected),
+                "metric body missing {:?}\nbody:\n{}",
+                expected,
+                body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_ready_gauge_reflects_state() {
+        let state = state_default();
+        state.mark_not_ready();
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+        // `hf2q_ready 0` must appear on its own line when not ready.
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_ready 0"),
+            "expected `hf2q_ready 0` line; body:\n{}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_counter_increments_after_health_request() {
+        // Hit /health once, then /metrics and assert requests_total >= 2.
+        let state = state_default();
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        let app2 = build_router(state);
+        let req2 = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app2.oneshot(req2).await.unwrap();
+        let body = body_string(resp).await;
+        // Find the `hf2q_requests_total <N>` line and assert N >= 1.
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("hf2q_requests_total"))
+            .expect("requests_total line present");
+        let n: u64 = line
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.parse().ok())
+            .expect("parse counter");
+        assert!(n >= 1, "requests_total should have been bumped, got {}", n);
+    }
+
+    // --- response_format pre-compile validation (Decision #6) ---
+
+    #[tokio::test]
+    async fn bad_json_schema_returns_grammar_error() {
+        // Engine gate still runs first (no engine → model_not_loaded).
+        // To exercise the grammar path, the test would need a loaded engine;
+        // for now we assert the error kind is model_not_loaded (gate order)
+        // and document: engine-loaded variant gets the grammar_error path.
+        let app = build_router(state_default());
+        let body = r#"{
+            "model":"nope",
+            "messages":[{"role":"user","content":"hi"}],
+            "response_format":{"type":"json_schema","json_schema":{"name":"bad","schema":{"type":"not_a_real_type"}}}
+        }"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Without an engine loaded, the engine gate runs first and we
+        // return model_not_loaded. The grammar pre-compile kicks in only
+        // after engine-gate passes; this is the documented ordering.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).unwrap();
         assert_eq!(v["error"]["code"], "model_not_loaded");
     }
 

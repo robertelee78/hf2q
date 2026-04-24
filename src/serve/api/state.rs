@@ -106,6 +106,31 @@ pub fn default_cache_dir() -> Option<PathBuf> {
         .map(|h| h.join(".cache").join("hf2q"))
 }
 
+/// Process-wide metric counters surfaced via `/metrics` in Prometheus text
+/// format (Decision #11). Cheap atomics; handler code bumps them inline.
+#[derive(Debug, Default)]
+pub struct ServerMetrics {
+    /// Total number of HTTP requests that reached a handler (post-auth).
+    pub requests_total: AtomicU64,
+    /// Total number of chat-completion generations started.
+    pub chat_completions_started: AtomicU64,
+    /// Total number of chat-completion generations that completed
+    /// successfully.
+    pub chat_completions_completed: AtomicU64,
+    /// Total number of chat-completion generations that hit
+    /// `queue_full` (FIFO at capacity → 429).
+    pub chat_completions_queue_full: AtomicU64,
+    /// Total number of SSE stream cancellations (client dropped the
+    /// connection mid-generation; Decision #18).
+    pub sse_cancellations: AtomicU64,
+    /// Total tokens decoded across all completions (cumulative counter).
+    pub decode_tokens_total: AtomicU64,
+    /// Total prompt tokens ingested across all completions.
+    pub prompt_tokens_total: AtomicU64,
+    /// Total requests rejected at handler boundary (auth, malformed, etc.).
+    pub requests_rejected_total: AtomicU64,
+}
+
 /// Shared runtime state threaded through axum handlers.
 ///
 /// Cheap to clone (every field is behind `Arc` or is a plain atomic wrapper).
@@ -125,6 +150,8 @@ pub struct AppState {
     /// `Some(engine)` means a model is loaded and the worker thread is up;
     /// generation endpoints gate on `ready_for_gen` for warmup status.
     pub engine: Option<Engine>,
+    /// Process-wide metric counters surfaced via `/metrics`.
+    pub metrics: Arc<ServerMetrics>,
 }
 
 impl AppState {
@@ -139,6 +166,7 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: None,
+            metrics: Arc::new(ServerMetrics::default()),
         }
     }
 
@@ -152,6 +180,7 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(false)),
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: Some(engine),
+            metrics: Arc::new(ServerMetrics::default()),
         }
     }
 
