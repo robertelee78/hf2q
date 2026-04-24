@@ -221,6 +221,68 @@ pub fn rms_norm_forward(
     Ok(())
 }
 
+/// Apply RMSNorm per-head to a `[batch, num_heads, head_dim]` tensor
+/// (equivalently `[batch, hidden]` with `hidden = num_heads × head_dim`).
+///
+/// Gemma 4's SigLIP vision tower applies RMSNorm on each head's 72-dim
+/// Q and K slices after QKV projection, before the scaled-dot-product.
+/// The gain vector is shared across heads — a single `[head_dim]`
+/// tensor (`attn_q_norm.weight [72]` / `attn_k_norm.weight [72]`) is
+/// broadcast across all `batch × num_heads` slices.
+///
+/// Implementation: since `[batch, num_heads, head_dim]` in row-major is
+/// byte-identical to `[batch × num_heads, head_dim]`, this is just
+/// `rms_norm_forward` with `hidden = head_dim`. The wrapper exists to
+/// validate shape + document the semantic.
+///
+/// V is NOT normalized — only Q and K. Call twice with the respective
+/// gain vectors.
+///
+/// `input` is overwritten in-place. Shape `[batch, num_heads, head_dim]`.
+/// `gamma` is `[head_dim]`.
+///
+/// # Errors
+///
+/// - `input.len() != batch * num_heads * head_dim`
+/// - `gamma.len() != head_dim`
+/// - any dim is 0
+pub fn per_head_rms_norm_forward(
+    input: &mut [f32],
+    gamma: &[f32],
+    batch: usize,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "per_head_rms_norm_forward: batch ({}), num_heads ({}), head_dim ({}) must all be > 0",
+            batch, num_heads, head_dim
+        ));
+    }
+    let expected_input_len = batch * num_heads * head_dim;
+    if input.len() != expected_input_len {
+        return Err(anyhow!(
+            "per_head_rms_norm_forward: input len {} != batch*num_heads*head_dim = {}*{}*{} = {}",
+            input.len(),
+            batch,
+            num_heads,
+            head_dim,
+            expected_input_len
+        ));
+    }
+    if gamma.len() != head_dim {
+        return Err(anyhow!(
+            "per_head_rms_norm_forward: gamma len {} != head_dim {}",
+            gamma.len(),
+            head_dim
+        ));
+    }
+    // Row-major byte-identity means we can dispatch to the 2D rms_norm
+    // with hidden=head_dim; each row is exactly one (batch, head) slice.
+    rms_norm_forward(input, gamma, head_dim, eps)
+}
+
 /// Numerically-stable softmax over the last dimension of a `[..., hidden]`
 /// tensor. Subtracts the per-row max before `exp` so that even rows with
 /// large positive entries don't overflow f32 (max finite exp input ≈ 88.7).
@@ -970,6 +1032,199 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // per_head_rms_norm_forward (iter 36 — Gemma 4 Q/K per-head norm)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn per_head_rms_norm_with_unit_gain_normalizes_each_head_slice_independently() {
+        // batch=2, num_heads=3, head_dim=4. Per-(b, h) RMS-normalized,
+        // each row ends at mean(x²)≈1 independent of the others.
+        let batch = 2;
+        let num_heads = 3;
+        let head_dim = 4;
+        // Different magnitude per head so we can see independence.
+        let mut input = vec![0f32; batch * num_heads * head_dim];
+        for b in 0..batch {
+            for h in 0..num_heads {
+                for d in 0..head_dim {
+                    input[b * (num_heads * head_dim) + h * head_dim + d] =
+                        ((h + 1) * 100) as f32 + (d as f32);
+                }
+            }
+        }
+        let gamma = vec![1.0f32; head_dim];
+        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6)
+            .unwrap();
+        // Every head slice should have mean(x²) ≈ 1 since γ=1.
+        for b in 0..batch {
+            for h in 0..num_heads {
+                let off = b * (num_heads * head_dim) + h * head_dim;
+                let slice = &input[off..off + head_dim];
+                let ms: f32 = slice.iter().map(|v| v * v).sum::<f32>() / (head_dim as f32);
+                assert!(
+                    (ms - 1.0).abs() < 1e-3,
+                    "head ({},{}): ms = {}",
+                    b, h, ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_head_rms_norm_broadcasts_same_gamma_across_heads() {
+        // All heads same constant input. Per-head RMSNorm → each
+        // slice independently normalized → output = γ (uniform input
+        // with RMSNorm produces [1,1,...] which γ scales).
+        let batch = 1;
+        let num_heads = 3;
+        let head_dim = 4;
+        let mut input = vec![5.0f32; batch * num_heads * head_dim];
+        let gamma = vec![0.5f32, 1.0, 2.0, 4.0];
+        per_head_rms_norm_forward(&mut input, &gamma, batch, num_heads, head_dim, 1e-6)
+            .unwrap();
+        for h in 0..num_heads {
+            let off = h * head_dim;
+            for (i, g) in gamma.iter().enumerate() {
+                assert!(
+                    (input[off + i] - g).abs() < 1e-4,
+                    "head {}: got {}, want {}",
+                    h,
+                    input[off + i],
+                    g
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_head_rms_norm_rejects_zero_dims() {
+        let err =
+            per_head_rms_norm_forward(&mut [], &[], 0, 1, 1, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
+    }
+
+    #[test]
+    fn per_head_rms_norm_rejects_mismatched_input_len() {
+        let mut input = vec![0f32; 5];
+        let gamma = vec![1f32; 2];
+        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
+            .unwrap_err();
+        assert!(format!("{err}").contains("input len"));
+    }
+
+    #[test]
+    fn per_head_rms_norm_rejects_wrong_gamma_len() {
+        let mut input = vec![0f32; 8];
+        let gamma = vec![1f32; 3]; // should be 2 (head_dim)
+        let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
+            .unwrap_err();
+        assert!(format!("{err}").contains("gamma len"));
+    }
+
+    #[test]
+    fn per_head_rms_norm_end_to_end_real_gemma4_chain() {
+        // The deepest real-data chain test to date. Runs:
+        //   preprocess gradient → patch_embed → rms_norm(ln1) →
+        //   qkv_projection → per-head RMSNorm on Q and K.
+        // Asserts every stage yields finite, non-trivial output.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Gemma 4 vision tower: 16 heads × 72 head_dim = 1152.
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        assert_eq!(num_heads, 16);
+        assert_eq!(head_dim, 72);
+
+        // Stage 1: synthetic 224×224 preprocessed gradient image →
+        // [196, 1152] patch embeddings.
+        let img = cfg.image_size as usize;
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let mut hidden_states =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        let num_patches = 196usize;
+        assert_eq!(hidden_states.len(), num_patches * hidden);
+
+        // Stage 2: ln1 RMSNorm.
+        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        let ln1_gamma: &[f32] = ln1.as_slice::<f32>().expect("ln1 as_slice");
+        rms_norm_forward(&mut hidden_states, ln1_gamma, hidden, 1e-6).expect("rms ln1");
+
+        // Stage 3: QKV projection.
+        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("attn_q");
+        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("attn_k");
+        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("attn_v");
+        let q_w: &[f32] = q_buf.as_slice::<f32>().expect("q slice");
+        let k_w: &[f32] = k_buf.as_slice::<f32>().expect("k slice");
+        let v_w: &[f32] = v_buf.as_slice::<f32>().expect("v slice");
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            q_w,
+            k_w,
+            v_w,
+            num_patches,
+            hidden,
+        )
+        .expect("qkv");
+
+        // Stage 4: per-head RMSNorm on Q and K (Gemma 4 quirk).
+        let q_norm = weights
+            .block_tensor(0, "attn_q_norm.weight")
+            .expect("attn_q_norm");
+        let k_norm = weights
+            .block_tensor(0, "attn_k_norm.weight")
+            .expect("attn_k_norm");
+        let q_norm_gamma: &[f32] = q_norm.as_slice::<f32>().expect("q_norm slice");
+        let k_norm_gamma: &[f32] = k_norm.as_slice::<f32>().expect("k_norm slice");
+        assert_eq!(q_norm_gamma.len(), head_dim);
+        assert_eq!(k_norm_gamma.len(), head_dim);
+
+        per_head_rms_norm_forward(&mut q, q_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
+            .expect("per-head Q");
+        per_head_rms_norm_forward(&mut k, k_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
+            .expect("per-head K");
+
+        // V stays un-normalized — sanity-check it's still finite from
+        // stage 3 but deliberately NOT shaped by per-head norm.
+        for t in [&q, &k, &v] {
+            for val in t.iter() {
+                assert!(val.is_finite(), "non-finite: {val}");
+            }
+        }
+        // After per-head RMSNorm, every Q and K head slice has mean(x²)
+        // scaled by γ². Catches silent-no-op (if the norm didn't fire,
+        // Q would still have the post-projection distribution which has
+        // far wider spread than post-norm).
+        let q_slice0 = &q[0..head_dim];
+        let q_ms: f32 = q_slice0.iter().map(|v| v * v).sum::<f32>() / (head_dim as f32);
+        // γ values for pretrained Gemma 4 are O(1), so mean(x²) should
+        // be in O(1) range after normalization.
+        assert!(
+            q_ms > 0.01 && q_ms < 100.0,
+            "Q head-0 mean(x²) outside expected range: {q_ms}"
+        );
     }
 
     // -----------------------------------------------------------------------
