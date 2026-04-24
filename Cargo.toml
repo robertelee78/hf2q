@@ -69,7 +69,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # iter-20 audit binary: pattern matching for tok/s parsing
 regex = "1"
@@ -88,6 +88,10 @@ regex = "1"
 [[bin]]
 name = "iter23_audit"
 path = "src/bin/iter23_audit.rs"
+
+[[bin]]
+name = "iter24_audit"
+path = "src/bin/iter24_audit.rs"
 
 [[bench]]
 name = "quantize_bench"
