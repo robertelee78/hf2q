@@ -934,6 +934,58 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 19 · P11 non-layer CPU references (embed + output head)
+
+**Scope:** Scope pivot — full weight data load would require ~80 GB of f32 memory (apex dequantized), not viable until Qwen35LayerWeights is refactored to hold MlxBuffers of quantized bytes. Instead, landed the remaining non-layer CPU reference pieces: token embedding lookup and LM-head output projection. Combined with the per-layer refs from iters 10-12, the full-stack CPU forward pass is now representable.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/io_heads.rs` (new file, ~270 LOC):
+  - **`embed_tokens(tokens, table, vocab, hidden) -> Vec<f32>`** — standard embedding table lookup returning `[seq_len, hidden_size]`.
+  - **`apply_output_head(hidden, norm_w, lm_head_w, hidden, vocab, eps) -> Vec<f32>`** — final RMSNorm + LM-head projection returning `[seq_len, vocab_size]` logits.
+  - **`greedy_argmax_last_token(logits, vocab) -> u32`** — convenience sampling helper for `temperature=0` inference loops.
+
+**Tests (7 new, all green):**
+- `embed_tokens_basic` — 4-token lookup verified row-by-row against hand-computed table rows.
+- `embed_tokens_panics_on_out_of_range` — guard on invalid token IDs.
+- `embed_tokens_empty_input` — degenerate seq_len=0.
+- `output_head_identity_weight_returns_normalized_hidden` — with identity `output_weight` + unit norm weight, logits equal the RMSNorm'd hidden state. Hand-computed token-1 case (`[2,2,2,2]` → normalized = `[1,1,1,1]`) pinned.
+- `output_head_deterministic` — bit-for-bit across re-runs.
+- `greedy_argmax_picks_highest_last_token` — samples LAST token only (ignoring earlier rows).
+- `greedy_argmax_handles_single_token` — seq_len=1 path.
+
+**Verification:**
+- 7/7 new io_heads tests green.
+- 594/594 hf2q test suite green (+8 from iter 18's 586, 0 regressions).
+
+**CPU reference forward pipeline status:**
+
+| Stage | Reference | Location |
+|---|---|---|
+| Token embedding | `embed_tokens()` | `io_heads.rs` (this iter) |
+| Full-attention layer | `gated_full_attention_cpu_ref()` | `full_attn.rs` (iter 10) |
+| DeltaNet layer | `delta_net_layer_cpu_ref()` | `delta_net.rs` (iter 12) |
+| Dense SwiGLU FFN | `dense_swiglu_cpu_ref()` | `ffn.rs` (iter 11) |
+| MoE FFN | `moe_ffn_cpu_ref()` | `ffn.rs` (iter 11) |
+| Output head + lm_head | `apply_output_head()` | `io_heads.rs` (this iter) |
+| Greedy sampler | `greedy_argmax_last_token()` | `io_heads.rs` (this iter) |
+
+**Every piece of a Qwen3.5 forward pass now has a pure-Rust scalar CPU reference.** The integrated forward pass just assembles them — that's the next iter target.
+
+**Phase map status (unchanged at the phase level; refinement within P11):**
+
+| Phase | Status |
+|---|---|
+| P0-P6 | COMPLETE |
+| P7     | PARTIAL — CPU ref + 5 of 7 GPU ops |
+| P8     | PARTIAL — CPU ref only |
+| P9     | PARTIAL — CPU refs only |
+| P10    | COMPLETE |
+| P11    | **Type scaffold ✓; all CPU components ✓**; integrated forward + GPU wiring remaining |
+| P12    | COMPLETE |
+| P13    | Pending |
+
+**Next iter target:** Assemble the integrated CPU-reference forward pass: a function that takes `Qwen35Model` + tokens, dispatches per-layer to the correct CPU ref, and returns logits. Tested against a tiny synthetic model constructed via `empty_from_cfg` with hand-filled weights. This is the P11 CPU-side completion — the GPU-side wiring comes after.
+
 ### 2026-04-24 — /loop iter 18 · P11 scaffold (Qwen35Model top-level type)
 
 **Scope:** Strategic pivot — rather than land the SDPA GPU wire (which requires bf16 handling + detailed buffer layouts), landed the top-level `Qwen35Model` struct that pulls every preceding phase together. This is the concrete target P11 (end-to-end wire-up) needs.
