@@ -99,6 +99,20 @@ pub enum PreflightError {
          Use a different --output path, or remove the existing directory first."
     )]
     OutputDirExists { path: String },
+
+    /// ADR-012 Decision 3: hybrid arch requires at least one full-attention layer.
+    #[error(
+        "Hybrid architecture sanity check failed: config contains linear_attention layers \
+         but no full_attention layer.\n\
+         \n\
+         A hybrid linear/full-attention architecture requires at least one full_attention \
+         layer to anchor the KV state. A model with 100% linear_attention layers is \
+         not a valid hybrid configuration.\n\
+         \n\
+         Check the 'layer_types' array in config.json and ensure at least one entry \
+         is 'full_attention'."
+    )]
+    LinearAttentionWithoutFullAttention,
 }
 
 /// Result of a successful preflight validation.
@@ -138,7 +152,11 @@ pub fn validate(
     // Check 1: Input directory exists and has required files
     validate_input_dir(&config.input_dir)?;
 
-    // Check 2: Validate layer types are supported for chosen quantizer
+    // Check 2a: ADR-012 Decision 3 — hybrid architecture sanity check.
+    // If any layer is linear_attention, at least one must be full_attention.
+    validate_linear_attention_hybrid(metadata)?;
+
+    // Check 2b: Validate layer types are supported for chosen quantizer
     let unsupported = find_unsupported_layers(metadata, &config.quant);
     if !unsupported.is_empty() {
         match config.unsupported_layers {
@@ -243,6 +261,32 @@ fn validate_input_dir(input_dir: &Path) -> Result<(), PreflightError> {
         return Err(PreflightError::NoSafetensorsFiles {
             path: input_dir.display().to_string(),
         });
+    }
+
+    Ok(())
+}
+
+/// ADR-012 Decision 3: validate that a hybrid linear+full-attention config has
+/// at least one full_attention layer.
+///
+/// A model with *only* linear_attention layers is not a valid hybrid; KV state
+/// anchoring requires at least one full_attention layer.
+/// Models without any linear_attention layers (Gemma4, LLaMA, etc.) pass trivially.
+fn validate_linear_attention_hybrid(metadata: &ModelMetadata) -> Result<(), PreflightError> {
+    let has_linear = metadata
+        .layer_types
+        .iter()
+        .any(|t| t == "linear_attention");
+
+    if has_linear {
+        let has_full = metadata
+            .layer_types
+            .iter()
+            .any(|t| t == "full_attention");
+
+        if !has_full {
+            return Err(PreflightError::LinearAttentionWithoutFullAttention);
+        }
     }
 
     Ok(())
@@ -471,6 +515,25 @@ mod tests {
             top_k_experts: None,
             intermediate_size: Some(512),
             raw_config: serde_json::Value::Null,
+            // ADR-012 P1 fields: None for test models (Chesterton's fence)
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
         }
     }
 
@@ -744,5 +807,89 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("unsupported-layers=passthrough"));
+    }
+
+    // --- ADR-012 Decision 3: linear_attention hybrid sanity checks ---
+
+    /// `linear_attention` is now a recognised layer type — pure-linear_attention
+    /// models (no full_attention) must fail with a clear hybrid-arch error.
+    #[test]
+    fn preflight_all_linear_attention_fails() {
+        // Synthetic config: 100% linear_attention — invalid hybrid (no full_attention anchor).
+        let metadata = make_test_metadata(
+            4,
+            vec!["linear_attention".to_string(); 4],
+        );
+
+        let err = validate_linear_attention_hybrid(&metadata)
+            .expect_err("100% linear_attention must fail hybrid check");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("full_attention"),
+            "error must mention full_attention requirement, got: {msg}"
+        );
+    }
+
+    /// A valid hybrid (linear_attention + full_attention) passes the sanity check.
+    #[test]
+    fn preflight_hybrid_linear_full_passes() {
+        let metadata = make_test_metadata(
+            8,
+            vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+        );
+
+        assert!(
+            validate_linear_attention_hybrid(&metadata).is_ok(),
+            "valid hybrid (linear+full) must pass"
+        );
+    }
+
+    /// Models with no linear_attention (Gemma4, LLaMA) pass trivially.
+    #[test]
+    fn preflight_non_hybrid_passes() {
+        let metadata = make_test_metadata(
+            4,
+            vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+        );
+
+        assert!(
+            validate_linear_attention_hybrid(&metadata).is_ok(),
+            "non-hybrid model must pass hybrid check trivially"
+        );
+    }
+
+    /// `linear_attention` is in SUPPORTED_LAYER_TYPES — it must not be flagged as unsupported.
+    #[test]
+    fn preflight_linear_attention_is_supported_layer_type() {
+        let metadata = make_test_metadata(
+            4,
+            vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+        );
+
+        let unsupported = find_unsupported_layers(&metadata, &QuantMethod::Q4);
+        assert!(
+            unsupported.is_empty(),
+            "linear_attention must be in SUPPORTED_LAYER_TYPES (not flagged as unsupported)"
+        );
     }
 }

@@ -274,6 +274,30 @@ impl Default for TensorMap {
     }
 }
 
+/// RoPE (Rotary Position Embedding) parameters for hybrid architectures.
+///
+/// Qwen3.5-family models embed these as a nested `rope_parameters` object in config.json.
+/// All fields are optional to preserve Chesterton's fence for existing architectures.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RopeParameters {
+    /// Whether interleaved MROPE is used (Qwen3.5 uses true).
+    #[serde(default)]
+    pub mrope_interleaved: bool,
+    /// MROPE section sizes: [temporal, height, width] split of the head_dim/2 positions.
+    /// For Qwen3.5-MoE apex: [11, 11, 10].
+    #[serde(default)]
+    pub mrope_section: Vec<u32>,
+    /// Base frequency for RoPE. For Qwen3.5-MoE: 10_000_000.
+    #[serde(default)]
+    pub rope_theta: f64,
+    /// RoPE variant string (e.g. "default", "linear", "dynamic").
+    #[serde(default)]
+    pub rope_type: String,
+    /// Fraction of head_dim rotated. Qwen3.5 partial-rotary: 0.25.
+    #[serde(default)]
+    pub partial_rotary_factor: f32,
+}
+
 /// Metadata extracted from a HuggingFace model's config.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -287,7 +311,9 @@ pub struct ModelMetadata {
     pub hidden_size: u64,
     /// Number of transformer layers
     pub num_layers: u32,
-    /// Layer types (e.g., ["sliding_attention", "full_attention"])
+    /// Layer types (e.g., ["sliding_attention", "full_attention"]).
+    /// For Qwen3.5-MoE: 40-element vec alternating linear_attention/full_attention.
+    /// Populated by `resolved_layer_types()` logic in the parser.
     pub layer_types: Vec<String>,
     /// Number of attention heads
     pub num_attention_heads: u32,
@@ -307,6 +333,67 @@ pub struct ModelMetadata {
     pub intermediate_size: Option<u64>,
     /// All raw config values for passthrough to output
     pub raw_config: serde_json::Value,
+
+    // --- ADR-012 Decision 2: Qwen3.5-family extended fields ---
+
+    /// Explicit per-layer attention type enumeration (preferred over full_attention_interval).
+    /// None when the config omits it (e.g. Gemma4 — Chesterton's fence: no behavior change).
+    pub explicit_layer_types: Option<Vec<String>>,
+
+    /// Computed layer-type interval: every N-th layer is full_attention, rest are linear_attention.
+    /// Used as fallback when `explicit_layer_types` is absent.
+    pub full_attention_interval: Option<u32>,
+
+    /// Whether the attention output has a gating projection (Qwen3.5 DeltaNet).
+    pub attn_output_gate: Option<bool>,
+
+    /// Per-attention-head dimension. Explicitly parsed — NEVER derived from hidden_size/num_heads.
+    /// Qwen3.5-MoE apex: 256. May differ from hidden_size/num_attention_heads.
+    pub head_dim: Option<u32>,
+
+    /// Fraction of head_dim that is rotated (top-level field, may duplicate rope_parameters).
+    pub partial_rotary_factor: Option<f32>,
+
+    /// Nested RoPE configuration object (Qwen3.5-family).
+    pub rope_parameters: Option<RopeParameters>,
+
+    // Linear-attention (Gated DeltaNet) kernel dimensions:
+
+    /// Convolution kernel width for the linear-attention SSM state.
+    pub linear_conv_kernel_dim: Option<u32>,
+    /// Head dimension for linear-attention key projections.
+    pub linear_key_head_dim: Option<u32>,
+    /// Number of key heads in linear-attention layers.
+    pub linear_num_key_heads: Option<u32>,
+    /// Head dimension for linear-attention value projections.
+    pub linear_value_head_dim: Option<u32>,
+    /// Number of value heads in linear-attention layers.
+    pub linear_num_value_heads: Option<u32>,
+
+    /// dtype used for SSM state in Mamba/DeltaNet kernels.
+    /// Validated as one of: "float32", "bfloat16", "float16".
+    pub mamba_ssm_dtype: Option<String>,
+
+    // MoE sizing (Qwen3.5-MoE):
+
+    /// Size of each expert's FFN intermediate layer.
+    pub moe_intermediate_size: Option<u32>,
+    /// Intermediate size of the always-active shared expert (Qwen3.5-MoE).
+    pub shared_expert_intermediate_size: Option<u32>,
+
+    // Multi-Token Prediction (MTP) fields:
+
+    /// Number of hidden layers in the MTP draft head.
+    pub mtp_num_hidden_layers: Option<u32>,
+    /// Whether the MTP head uses its own embedding table.
+    pub mtp_use_dedicated_embeddings: Option<bool>,
+
+    // Router fields:
+
+    /// Whether to output router logits in the forward pass (training-time flag).
+    pub output_router_logits: Option<bool>,
+    /// Auxiliary load-balancing loss coefficient.
+    pub router_aux_loss_coef: Option<f32>,
 }
 
 impl ModelMetadata {
@@ -321,6 +408,41 @@ impl ModelMetadata {
     /// Whether this is a Mixture of Experts model.
     pub fn is_moe(&self) -> bool {
         self.num_experts.is_some() && self.num_experts.unwrap_or(0) > 1
+    }
+
+    /// Resolved layer type list for hybrid architectures (ADR-012 Decision 2).
+    ///
+    /// Preference order:
+    /// 1. `explicit_layer_types` — when the config contains an explicit `layer_types` array.
+    /// 2. Derive from `full_attention_interval` — every N-th layer (0-indexed) is
+    ///    `"full_attention"`, all others are `"linear_attention"`.
+    /// 3. Fall back to `layer_types` as populated at parse time (Gemma / llama / etc.).
+    ///
+    /// Callers in P2+ should use this rather than `layer_types` directly when they
+    /// need to know whether a specific layer is linear or full attention.
+    pub fn resolved_layer_types(&self) -> Vec<String> {
+        // Prefer explicit enumeration
+        if let Some(explicit) = &self.explicit_layer_types {
+            return explicit.clone();
+        }
+        // Derive from interval
+        if let Some(interval) = self.full_attention_interval {
+            let n = self.num_layers as usize;
+            if n > 0 && interval > 0 {
+                return (0..n)
+                    .map(|i| {
+                        // interval-th layer (1-indexed): layers at positions interval-1, 2*interval-1, …
+                        if (i + 1) % interval as usize == 0 {
+                            "full_attention".to_string()
+                        } else {
+                            "linear_attention".to_string()
+                        }
+                    })
+                    .collect();
+            }
+        }
+        // Fall back to whatever the parser set in layer_types
+        self.layer_types.clone()
     }
 }
 
@@ -574,6 +696,25 @@ mod tests {
             top_k_experts: Some(8),
             intermediate_size: Some(512),
             raw_config: serde_json::Value::Null,
+            // ADR-012 P1 fields: None for non-qwen35 models (Chesterton's fence)
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
         };
         assert!(meta.is_moe());
     }
