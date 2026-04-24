@@ -1458,6 +1458,19 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 531/531 pass (+11 from iter 15's 520; other session fixed the qwen35::mtp failure that was hanging from iter 14). `scripts/smoke_api.sh` 26/26 still green.
   - **Next (iter 17):** `/v1/embeddings` POST handler — engine-gate for embedding path, request parsing (iter-1 EmbeddingRequest types already in `schema.rs`), 501 response envelope with a structured error envelope naming the missing forward-pass hook. Or: port BERT tokenizer (WordPiece) wrapper that reads from GGUF tokenizer metadata. Both testable without a live forward pass.
 
+- **2026-04-24 loop iter 17 — Extract `truncate_left` pure-compute helper + 7 unit tests.** Refactor of `apply_overflow_policy` for testability. The Engine-coupled iteration logic is extracted into a `truncate_left<F, E>` generic helper that takes a caller-supplied tokenizer closure; unit tests use a 10-tokens-per-message stub. 7 tests exercise Fits/Truncated/CannotShrink/TokenizeErr paths, multi-system-message preservation, no-system-messages case, and determinism. 543/543 suite pass. Commit + push.
+
+- **2026-04-24 loop iter 18 — Grammar-mask helper (decode-time ready).** Pure-CPU function that masks invalid tokens against a `GrammarRuntime`. This is the CPU-side half of `response_format: {json_object,json_schema}` decode-time enforcement (Decision #6). Drops directly into `forward_decode` when that refactor becomes safe.
+  - **`src/serve/api/grammar/mask.rs` (~180 LOC + 10 tests):**
+    - `mask_invalid_tokens(grammar, token_bytes, logits) -> masked_count`. Clones the grammar per candidate token, feeds token bytes through the sampler; if the clone dies, sets `logits[i] = f32::NEG_INFINITY`.
+    - Skips empty-string tokens (special/EOS markers) and already-masked (non-finite) logits — idempotent across calls.
+    - `surviving_token_ids(grammar, token_bytes, logits)` — test helper that returns the live token-id list without mutating logits.
+  - **Design:** caller pre-decodes the vocab into a `Vec<Vec<u8>>` once at engine load (`tokenizer.decode(&[id], false)` for each id). Runtime is `O(vocab × avg_token_bytes × avg_stack_depth)` per decode step; ~1-5ms/token for vocab=262k and shallow JSON grammar on modern CPU. Acceptable for correctness-first first cut.
+  - **10 unit tests cover:** literal-mismatch rejection, char-class range, UTF-8 multi-byte token (Greek alpha), empty-string skip, already-masked skip, idempotence (2-pass → 0 newly masked), partial-decode narrowing (simulates decode-step progression: after 'a' is sampled, only 'b' survives for `"ab"` grammar), `json.gbnf` fixture test (`{` survives root=object but `}[\"a1` all die), surviving-ids helper, out-of-bounds defence.
+  - **Not wired yet:** integration into `forward_decode` requires exposing logits from GPU to CPU per decode step — that refactor needs live-model parity validation (OOM-blocked). The mask function is ready to drop in when the refactor lands.
+  - **Full suite:** 556/556 pass (+13 from iter 17's 543). `scripts/smoke_api.sh` 26/26 green. Zero clippy errors. Commit + push.
+  - **Next (iter 19):** either (a) BERT WordPiece tokenizer loader from GGUF metadata (pure compute, needed for pooled embeddings integration when forward_embed hook lands); (b) PromptCache data structure + LCP algorithm as a standalone module (pure compute, deferred integration until KV-replay can be live-validated); (c) start a real mid-unit-test integration test — spin up the server with a fixture GGUF (small BERT for /v1/embeddings or a tiny synthetic chat path) to exercise the success path end-to-end.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
