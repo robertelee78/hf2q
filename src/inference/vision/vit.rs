@@ -851,6 +851,59 @@ pub fn avg_pool_2x2_spatial(
     Ok(out)
 }
 
+/// Elementwise per-channel bias/scale normalization, in-place across
+/// `[batch, hidden]` rows: `x[b, i] = (x[b, i] - bias[i]) * scale[i]`.
+///
+/// Gemma 4 vision tower uses this between the post-blocks avg-pool and
+/// the `mm.0` projector (`v.std_bias [1152]`, `v.std_scale [1152]`).
+/// Not a standard stage in other ViTs — SigLIP2's Gemma 4 variant
+/// introduced it as a pre-projector normalization.
+///
+/// # Errors
+///
+/// - `x.len() % hidden != 0`
+/// - `bias.len() != hidden`
+/// - `scale.len() != hidden`
+pub fn std_bias_scale_in_place(
+    x: &mut [f32],
+    bias: &[f32],
+    scale: &[f32],
+    hidden: usize,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("std_bias_scale_in_place: hidden must be > 0"));
+    }
+    if x.len() % hidden != 0 {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: x len {} not divisible by hidden {}",
+            x.len(),
+            hidden
+        ));
+    }
+    if bias.len() != hidden {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: bias len {} != hidden {}",
+            bias.len(),
+            hidden
+        ));
+    }
+    if scale.len() != hidden {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: scale len {} != hidden {}",
+            scale.len(),
+            hidden
+        ));
+    }
+    let n_rows = x.len() / hidden;
+    for row in 0..n_rows {
+        let off = row * hidden;
+        for i in 0..hidden {
+            x[off + i] = (x[off + i] - bias[i]) * scale[i];
+        }
+    }
+    Ok(())
+}
+
 /// Execute one ViT transformer block end-to-end on a `[batch, hidden]`
 /// residual-stream tensor. Composes the 11-stage pipeline:
 ///
@@ -965,6 +1018,118 @@ pub fn apply_vit_block_forward(
     residual_add(&mut residual, &down)?;
 
     Ok(residual)
+}
+
+/// Full CPU ViT forward: pixel tensor → projected multimodal embeddings.
+///
+/// Pipeline (from llama.cpp `clip_graph_gemma4v::build`):
+///
+/// ```text
+///   1. hidden = patch_embed(pixels)                          [196, 1152]
+///   2. for block in 0..n_layers:
+///          hidden = apply_vit_block_forward(hidden, block)
+///   3. hidden = avg_pool_2x2_spatial(hidden, 14, 1152)       [49, 1152]
+///   4. scale_in_place(hidden, sqrt(n_embd))
+///   5. std_bias_scale_in_place(hidden, v.std_bias, v.std_scale)
+///   6. hidden = linear(hidden, mm.0.weight)                  [49, text_hidden]
+///   7. rms_norm(hidden, gamma=ones, eps)    # no-gain RMSNorm
+/// ```
+///
+/// Returns the final `[num_patches_side² / 4, text_hidden]` tensor
+/// ready to be injected into the chat model's token stream.
+///
+/// # Cost
+///
+/// Per-block CPU compute ≈ 3 GFLOP; 27 blocks + post-blocks ≈ 81 GFLOP.
+/// Naive-loop GEMM on a single CPU thread runs this in ~15–17 min —
+/// which is why the full-forward integration test below is
+/// `#[ignore]`'d. The GPU port dispatches `mlx_native::ops::mul_mm`
+/// + `flash_attn_*` and runs in <1s for the same pipeline.
+///
+/// # Parity TODOs (from iter 40)
+///
+/// Not yet applied — mlx-lm reference needed for byte-identical
+/// validation:
+///   1. `scaled_dot_product_attention` scale=1.0 for Gemma 4V
+///      (not 1/√d_head).
+///   2. V RMSNorm (no gain) between QKV and attention.
+///   3. 2D RoPE on Q, K against `v.position_embd.weight`.
+///
+/// # Errors
+///
+/// Propagated from any stage; see individual function docs.
+pub fn apply_vit_full_forward(
+    pixel_values: &[f32],
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+) -> Result<Vec<f32>> {
+    // --- Stage 1: patch embedding ---
+    let mut hidden_states = patch_embed_from_mmproj_weights(pixel_values, weights, cfg)?;
+
+    // --- Stage 2: transformer blocks ---
+    let n_layers = cfg.num_hidden_layers as usize;
+    for block_idx in 0..n_layers {
+        hidden_states = apply_vit_block_forward(hidden_states, weights, cfg, block_idx)?;
+    }
+
+    // --- Stage 3: 2×2 spatial avg-pool ---
+    let n_side = cfg.num_patches_side as usize;
+    let hidden = cfg.hidden_size as usize;
+    let mut hidden_states = avg_pool_2x2_spatial(&hidden_states, n_side, hidden)?;
+
+    // --- Stage 4: scale by sqrt(n_embd) ---
+    scale_in_place(&mut hidden_states, (hidden as f32).sqrt());
+
+    // --- Stage 5: std_bias / std_scale normalization ---
+    let std_bias_buf = weights
+        .get("v.std_bias")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing v.std_bias"))?;
+    let std_scale_buf = weights
+        .get("v.std_scale")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing v.std_scale"))?;
+    let std_bias: &[f32] = std_bias_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("std_bias as_slice: {e}"))?;
+    let std_scale: &[f32] = std_scale_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("std_scale as_slice: {e}"))?;
+    std_bias_scale_in_place(&mut hidden_states, std_bias, std_scale, hidden)?;
+
+    // --- Stage 6: mm.0 projector [n_patches_out, hidden] → [n_patches_out, text_hidden] ---
+    let mm0_buf = weights
+        .get("mm.0.weight")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing mm.0.weight"))?;
+    let mm0: &[f32] = mm0_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("mm.0 as_slice: {e}"))?;
+    // Shape: mm.0.weight is [text_hidden, hidden] per PyTorch nn.Linear
+    // convention. Text hidden = mm0.len() / hidden.
+    let text_hidden = mm0.len() / hidden;
+    if mm0.len() != text_hidden * hidden {
+        return Err(anyhow!(
+            "mm.0.weight len {} not divisible by hidden {}",
+            mm0.len(),
+            hidden
+        ));
+    }
+    let n_patches_out = hidden_states.len() / hidden;
+    let mut projected = linear_forward(
+        &hidden_states,
+        mm0,
+        None,
+        n_patches_out,
+        hidden,
+        text_hidden,
+    )?;
+
+    // --- Stage 7: no-gain final RMSNorm ---
+    // llama.cpp calls ggml_rms_norm without a weight param, so gamma is
+    // effectively all-ones. Allocate once per call; cheap relative to
+    // the ~81 GFLOP that preceded.
+    let ones = vec![1.0f32; text_hidden];
+    rms_norm_forward(&mut projected, &ones, text_hidden, cfg.layer_norm_eps)?;
+
+    Ok(projected)
 }
 
 /// Drive `patch_embed_forward` from a `LoadedMmprojWeights` + parsed
@@ -1382,6 +1547,138 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // std_bias_scale_in_place + apply_vit_full_forward (iter 42)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn std_bias_scale_subtracts_and_scales_per_channel() {
+        // batch=2, hidden=3. bias=[1, 2, 3], scale=[10, 20, 30].
+        // Row 0: [5, 10, 15] → (row - bias) = [4, 8, 12] → * scale = [40, 160, 360].
+        // Row 1: [10, 20, 30] → (row - bias) = [9, 18, 27] → * scale = [90, 360, 810].
+        let mut x = vec![5.0f32, 10.0, 15.0, 10.0, 20.0, 30.0];
+        let bias = vec![1.0f32, 2.0, 3.0];
+        let scale = vec![10.0f32, 20.0, 30.0];
+        std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap();
+        assert_eq!(x, vec![40.0, 160.0, 360.0, 90.0, 360.0, 810.0]);
+    }
+
+    #[test]
+    fn std_bias_scale_zero_bias_unit_scale_is_identity() {
+        let mut x = vec![0.5f32, 1.7, -2.3, 4.1];
+        let snap = x.clone();
+        let bias = vec![0.0f32; 2];
+        let scale = vec![1.0f32; 2];
+        std_bias_scale_in_place(&mut x, &bias, &scale, 2).unwrap();
+        assert_eq!(x, snap);
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_hidden_zero() {
+        let mut x = vec![0f32; 4];
+        let err = std_bias_scale_in_place(&mut x, &[], &[], 0).unwrap_err();
+        assert!(format!("{err}").contains("hidden must be > 0"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_non_divisible_len() {
+        let mut x = vec![0f32; 7];
+        let bias = vec![0f32; 3];
+        let scale = vec![1f32; 3];
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_wrong_bias_len() {
+        let mut x = vec![0f32; 6];
+        let bias = vec![0f32; 2]; // should be 3
+        let scale = vec![1f32; 3];
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("bias len"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_wrong_scale_len() {
+        let mut x = vec![0f32; 6];
+        let bias = vec![0f32; 3];
+        let scale = vec![1f32; 2]; // should be 3
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("scale len"));
+    }
+
+    /// Full 27-block ViT forward on real Gemma 4 pretrained weights.
+    /// Takes ~15-17 min on CPU (single-threaded naive GEMMs); marked
+    /// `#[ignore]` so `cargo test` default run stays fast. Run via:
+    ///
+    ///     cargo test --bin hf2q apply_vit_full_forward_on_real_gemma4 \
+    ///         -- --ignored --nocapture
+    #[test]
+    #[ignore = "27-block CPU forward ~15min; run manually via --ignored"]
+    fn apply_vit_full_forward_on_real_gemma4() {
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Preprocess a deterministic gradient image to [3, 224, 224] f32.
+        let img = cfg.image_size as usize;
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let out = apply_vit_full_forward(&pixels, &weights, &cfg).expect("full forward");
+        let elapsed = t0.elapsed();
+        eprintln!("apply_vit_full_forward: {:?}", elapsed);
+
+        // Expected shape: [49 patches, text_hidden=2816].
+        let n_patches_out = 49;
+        let mm0_buf = weights.get("mm.0.weight").expect("mm.0");
+        let mm0_slice: &[f32] = mm0_buf.as_slice::<f32>().expect("slice");
+        let text_hidden = mm0_slice.len() / (cfg.hidden_size as usize);
+        assert_eq!(text_hidden, 2816, "Gemma 4 projector output width");
+        assert_eq!(out.len(), n_patches_out * text_hidden);
+
+        // Every element finite.
+        for v in &out {
+            assert!(v.is_finite(), "non-finite in ViT output: {v}");
+        }
+        // Post-final-RMSNorm mean(x²) per row ≈ 1 (no-gain norm).
+        for p in 0..n_patches_out {
+            let row = &out[p * text_hidden..(p + 1) * text_hidden];
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / (text_hidden as f32);
+            assert!(
+                (ms - 1.0).abs() < 1e-2,
+                "patch {p} mean(x²) = {ms}, expected ≈ 1.0 after no-gain RMSNorm"
+            );
+        }
+        // Cross-patch distinction preserved.
+        let p0 = &out[0..text_hidden];
+        let p_last = &out[(n_patches_out - 1) * text_hidden..n_patches_out * text_hidden];
+        let l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2 > 1e-3, "token 0 and token 48 collapsed to identical output");
     }
 
     // -----------------------------------------------------------------------

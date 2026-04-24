@@ -1705,6 +1705,24 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Mantra check:** the wrapper consolidates iter 40's chain without changing its semantics — same invariants, same numerical output path. Next iters can call it in a loop across blocks 0..27 without re-stitching the 11 stages inline each time.
   - **Cadence note:** real-data block tests now take ~38s each. 27 sequential blocks ≈ 17 minutes of CPU compute per full forward run — too slow for `cargo test` default behavior. Iter 42's full-forward test gets `#[ignore]`'d so it's opt-in via `cargo test -- --ignored`. GPU port (iter 44+) will bring this to sub-second.
   - **Next (iter 42):** `apply_vit_full_forward(pixel_values, weights, cfg) -> Vec<f32>`. Stages: `patch_embed_from_mmproj_weights` → loop 0..27 × `apply_vit_block_forward` → `avg_pool_2x2_spatial(14, 1152)` → `scale_in_place(by √1152)` → std_bias/scale (new primitive; `(x - std_bias) * std_scale` elementwise on the full `[49, 1152]` tensor) → `linear(x, mm.0.weight, None, 49, 1152, 2816)` → `rms_norm_forward` final post-projection norm. Output: `[49, 2816]`. One `#[ignore]`'d real-data test to run the full ~17-min forward on demand; all shorter synthetic tests stay default. Iter 43 then wires the full forward into the chat handler's multimodal path, replacing the 501.
+
+- **2026-04-24 loop iter 42 — `std_bias_scale_in_place` + `apply_vit_full_forward` = complete CPU ViT pipeline.**
+  - **`std_bias_scale_in_place(x, bias, scale, hidden)`:** elementwise per-channel normalization `x[b, i] = (x[b, i] - bias[i]) * scale[i]`. Gemma 4–specific pre-projector stage reading `v.std_bias [1152]` / `v.std_scale [1152]` from the mmproj.
+  - **`apply_vit_full_forward(pixel_values, weights, cfg) -> Vec<f32>`:** complete pixel-to-projected-multimodal-embedding pipeline matching llama.cpp `clip_graph_gemma4v::build`:
+    1. `patch_embed_from_mmproj_weights` → `[196, 1152]`
+    2. `for block in 0..27: apply_vit_block_forward` → `[196, 1152]`
+    3. `avg_pool_2x2_spatial(14, 1152)` → `[49, 1152]` (Gemma4VisionPooler)
+    4. `scale_in_place(√n_embd = √1152 ≈ 33.94)`
+    5. `std_bias_scale_in_place(v.std_bias, v.std_scale)`
+    6. `linear(mm.0.weight)` → `[49, text_hidden=2816]`
+    7. `rms_norm_forward(ones, eps)` — final no-gain RMSNorm (llama.cpp `ggml_rms_norm` with no weight param)
+  - **Tests (7 new, 1 of which is `#[ignore]`'d):**
+    - 6 default-running synthetic tests for `std_bias_scale_in_place`: per-channel reference values, zero-bias-unit-scale identity, 4 shape-validation rejections.
+    - **`apply_vit_full_forward_on_real_gemma4`** (`#[ignore]`'d): runs the ~15-17 min full CPU forward on real Gemma 4 pretrained weights. Asserts output shape `[49, 2816]`, every element finite, each output row's mean(x²) ≈ 1 (no-gain final RMSNorm contract), cross-patch L2 > 1e-3 (no stride bug). Invoke via `cargo test --bin hf2q apply_vit_full_forward_on_real_gemma4 -- --ignored --nocapture`.
+  - **Verification:** `cargo test --bin hf2q std_bias_scale` — 6/6 pass. Full suite `cargo test --bin hf2q` — 890/890 pass (+6 from iter 41's 884), 8 ignored (+1 new).
+  - **Cost reality check:** ~81 GFLOP per forward run. On M5 Max's naive single-threaded `linear_forward` that's ~15-17 min. GPU port via `mlx_native::ops::mul_mm` + `flash_attn_*` lands in iter 44+ and brings this sub-second. The CPU path is the correctness reference.
+  - **Mantra check:** full CPU ViT pipeline end-to-end — NOT a stub. Missing for byte-identical parity: the three iter-40 TODOs (Gemma4V `kq_scale=1.0`, V-RMSNorm, 2D RoPE). Those produce a known numerical gap vs mlx-lm until corrected; structural graph is complete and every tensor shape is verified.
+  - **Next (iter 43):** handler wiring. `state.mmproj.weights` is already on AppState. Extend `process_multimodal_content` to also compute `apply_vit_full_forward` per `PreprocessedImage` when mmproj is configured. Wire the resulting `[49, 2816]` output tensor(s) into the chat prompt's token stream as embedding injection points (prefix the model's input tokens with the ViT-projected embeddings, replacing the `<image>` marker). Handler's 501 finally becomes 200 with a real multimodal response. Cost caveat: CPU forward at ~15 min per image is too slow for production — handler gates on `HF2Q_CPU_VIT=1` env var, defaulting to the 501 until the GPU port lands. That way we can demonstrate the full OpenAI multimodal path end-to-end when explicitly requested, but don't regress latency for non-multimodal requests.
   - **`src/serve/api/grammar/mask.rs` (~180 LOC + 10 tests):**
     - `mask_invalid_tokens(grammar, token_bytes, logits) -> masked_count`. Clones the grammar per candidate token, feeds token bytes through the sampler; if the clone dies, sets `logits[i] = f32::NEG_INFINITY`.
     - Skips empty-string tokens (special/EOS markers) and already-masked (non-finite) logits — idempotent across calls.
