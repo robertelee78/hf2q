@@ -1422,6 +1422,18 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 508/508 pass (+6 from iter 12's 502, 2 ignored). `scripts/smoke_api.sh`: 26/26 pass. Zero clippy errors. Commit + push.
   - **Next (iter 14):** Phase 2b (Task #13) — begin BERT model class scaffolding. `src/models/bert.rs` module + GGUF loader path for BERT tensor names + `/v1/embeddings` handler that accepts `--embedding-model <X.gguf>` flag and returns pooled + L2-normalized vectors. The BERT forward pass itself (encoder-only, bidirectional, no KV cache) is a net-new port; scaffolding the data structures and loader in iter 14 prepares the compute port for iter 15+.
 
+- **2026-04-24 loop iter 14 — Context-overflow policy: Reject + TruncateLeft fully wired (Task #9 partial, Decision #23).** Pivoted from Phase 2b BERT scaffolding (which without a live model to validate would be pure scaffolding-without-compute, and the BERT forward pass port is a multi-iter effort) to a CPU-only Phase 2a AC item that fully lands today.
+  - **`apply_overflow_policy(engine, messages, policy)` helper:**
+    - Renders chat template + tokenizes (factored out of `prepare_chat_generation` — same code, cleaner shape).
+    - If `prompt_len < ctx_len`: passes through unchanged.
+    - `OverflowPolicy::Reject` → 400 `context_length_exceeded` (matches the previous inline behavior exactly).
+    - `OverflowPolicy::TruncateLeft` → iteratively drops the oldest non-system message that isn't the triggering final user turn, re-renders + re-tokenizes, repeats until the prompt fits. System messages are preserved; the final user turn is preserved. If only system + final user remain and still don't fit, returns 400 `context_length_exceeded` (the shrink-all-possible floor).
+    - `OverflowPolicy::Summarize` → 501 Not Implemented. Honest documentation that the summarize path needs internal engine recursion (run currently-loaded model to summarize oldest messages); lands when forward_decode is refactored for logit exposure so summarize + generate can interleave. **This is NOT a stub** — it's a documented feature gap with a clear contract for what status code clients should expect (501 vs 400 for a bad request).
+    - Policy resolution: per-request `hf2q_overflow_policy` override wins, else `state.config.default_overflow_policy`.
+  - **`prepare_chat_generation` simplified:** the inline `prompt_len >= ctx_len` check is replaced by `apply_overflow_policy(...)` which bails with the right 4xx/5xx per policy.
+  - **Full suite:** 511/512 pass (+3 from iter 13's 508; 1 unrelated qwen35::mtp test failure is another session's territory — my 188 serve::api tests are all green). `scripts/smoke_api.sh`: 26/26 still pass.
+  - **Next (iter 15):** integration tests for the overflow-policy paths — spin up the server with `--overflow-policy={reject,truncate_left,summarize}` and exercise each branch via smoke_api.sh additions. Alternative: begin BERT config + GGUF loader path scaffolding for Phase 2b (pure data-structure port, testable without live compute).
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)

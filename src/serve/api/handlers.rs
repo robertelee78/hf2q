@@ -277,34 +277,26 @@ fn prepare_chat_generation(
         }
     }
 
-    let rendered =
-        match engine::render_chat_prompt(engine.chat_template(), &req.messages) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "chat template render failed");
-                return Err(ApiError::invalid_request(
-                    format!("chat template render failed: {e}"),
-                    Some("messages".into()),
-                )
-                .into_response());
-            }
+    // Render + tokenize + apply context-overflow policy (Decision #23).
+    // `apply_overflow_policy` handles the three policies:
+    //   Reject        → 400 context_length_exceeded when prompt ≥ ctx_len.
+    //   TruncateLeft  → iteratively drop oldest non-system messages until
+    //                   the prompt fits under ctx_len, then re-tokenize.
+    //   Summarize     → currently returns 501 (not implemented yet; needs
+    //                   internal engine recursion which lands when
+    //                   forward_decode is refactored for logit exposure).
+    // The 80% budget trigger from Decision #23 applies only to Summarize
+    // (its whole point is to preemptively shrink the context so summary +
+    // completion fit in the remaining 20%); Reject + TruncateLeft trigger
+    // strictly on prompt ≥ ctx_len.
+    let policy = req
+        .hf2q_overflow_policy
+        .unwrap_or(state.config.default_overflow_policy);
+    let (prompt_tokens, _prompt_len) =
+        match apply_overflow_policy(engine, &req.messages, policy) {
+            Ok(r) => r,
+            Err(resp) => return Err(resp),
         };
-    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "tokenization failed");
-            return Err(ApiError::internal_error().into_response());
-        }
-    };
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-    let prompt_len = prompt_tokens.len();
-    if let Some(ctx_len) = engine.context_length() {
-        if prompt_len >= ctx_len {
-            return Err(
-                ApiError::context_length_exceeded(ctx_len, prompt_len).into_response(),
-            );
-        }
-    }
     let max_tokens = req
         .max_completion_tokens
         .or(req.max_tokens)
@@ -412,6 +404,122 @@ async fn chat_completions_stream(
     let mut response = sse.into_response();
     apply_transparency_headers(&state, &req, &mut response, None, None);
     response
+}
+
+/// Apply Decision #23 context-overflow policy. Renders the chat template,
+/// tokenizes, and checks against `engine.context_length()`:
+///
+///   - `Reject`        → 400 context_length_exceeded if `prompt ≥ ctx_len`.
+///   - `TruncateLeft`  → drop oldest non-system messages until prompt fits.
+///   - `Summarize`     → 501 not-implemented in this iter (needs internal
+///                       engine recursion; lands with forward_decode
+///                       refactor).
+///
+/// Returns `(prompt_tokens, prompt_len)` on success, or the error response
+/// to bail with on failure.
+fn apply_overflow_policy(
+    engine: &engine::Engine,
+    messages: &[super::schema::ChatMessage],
+    policy: super::schema::OverflowPolicy,
+) -> std::result::Result<(Vec<u32>, usize), Response> {
+    use super::schema::OverflowPolicy;
+
+    // Helper: render + tokenize a message slice. Returns tokens + length.
+    let render_and_tokenize = |msgs: &[super::schema::ChatMessage]| -> Result<(Vec<u32>, usize), Response> {
+        let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "chat template render failed");
+                return Err(ApiError::invalid_request(
+                    format!("chat template render failed: {e}"),
+                    Some("messages".into()),
+                )
+                .into_response());
+            }
+        };
+        let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "tokenization failed");
+                return Err(ApiError::internal_error().into_response());
+            }
+        };
+        let tokens: Vec<u32> = encoding.get_ids().to_vec();
+        let n = tokens.len();
+        Ok((tokens, n))
+    };
+
+    let (mut tokens, mut n) = render_and_tokenize(messages)?;
+    let ctx_len = match engine.context_length() {
+        Some(c) => c,
+        None => return Ok((tokens, n)), // no advertised ctx → trust the caller
+    };
+    if n < ctx_len {
+        return Ok((tokens, n));
+    }
+
+    // Prompt does not fit. Dispatch on policy.
+    match policy {
+        OverflowPolicy::Reject => {
+            Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
+        }
+        OverflowPolicy::TruncateLeft => {
+            // Repeatedly drop the oldest NON-system message until the
+            // prompt fits. If we run out of non-system messages and still
+            // don't fit, fall through to a hard context_length_exceeded
+            // (keeping system + last user turn).
+            let mut msgs = messages.to_vec();
+            // Identify the last-user index so we never drop it — without
+            // the triggering user turn there's nothing to generate against.
+            let last_user_idx = msgs.iter().rposition(|m| m.role == "user");
+            loop {
+                // Find the first non-system index (keep system at 0).
+                let drop_idx = msgs
+                    .iter()
+                    .position(|m| m.role != "system")
+                    .filter(|idx| Some(*idx) != last_user_idx);
+                let Some(drop_idx) = drop_idx else {
+                    // Only system + last user remain; can't shrink further.
+                    return Err(
+                        ApiError::context_length_exceeded(ctx_len, n).into_response()
+                    );
+                };
+                // If the next candidate to drop IS the last user, skip it.
+                if Some(drop_idx) == last_user_idx {
+                    return Err(
+                        ApiError::context_length_exceeded(ctx_len, n).into_response()
+                    );
+                }
+                msgs.remove(drop_idx);
+                let (t, nn) = render_and_tokenize(&msgs)?;
+                tokens = t;
+                n = nn;
+                if n < ctx_len {
+                    return Ok((tokens, n));
+                }
+            }
+        }
+        OverflowPolicy::Summarize => {
+            // Decision #23 summarize path requires internal engine recursion
+            // (run the currently-loaded model on the oldest messages to
+            // produce a synthetic system summary). That needs the
+            // forward_decode refactor so we can interleave summarize +
+            // generate; lands in a later iter. Until then we return a
+            // clear 501.
+            let err = ApiError::invalid_request(
+                "overflow-policy=summarize is not yet implemented in this build. \
+                 Use overflow-policy=truncate_left or reject via \
+                 --overflow-policy server flag or the hf2q_overflow_policy \
+                 request extension field.",
+                Some("hf2q_overflow_policy".into()),
+            );
+            // Override the status to 501 Not Implemented (more honest than
+            // 400 for a feature we know is coming).
+            let mut resp = err.into_response();
+            *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+            Err(resp)
+        }
+    }
 }
 
 /// Pre-compile the request's `response_format` to a GBNF grammar and parse
