@@ -37,6 +37,30 @@
 
 use anyhow::{anyhow, Result};
 
+/// Elementwise in-place residual add: `a += b`. Shape-validated thin
+/// wrapper — the reason it exists as a named function (rather than an
+/// inline `for` loop) is that the transformer block has multiple
+/// residual additions (post-attn, post-FFN) and every one of them is a
+/// good place to accidentally skip-or-duplicate. Naming the operation
+/// makes the block-construction code self-documenting.
+///
+/// # Errors
+///
+/// - `a.len() != b.len()`
+pub fn residual_add(a: &mut [f32], b: &[f32]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(anyhow!(
+            "residual_add: a len {} != b len {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        *ai += *bi;
+    }
+    Ok(())
+}
+
 /// Add a learned position-embedding tensor in-place to a patch-embedding
 /// tensor. Both are `[N_patches, hidden]` row-major.
 ///
@@ -1129,6 +1153,200 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // residual_add + full attention-half block 0 (iter 38)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn residual_add_is_elementwise() {
+        let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![10.0f32, 20.0, 30.0, 40.0];
+        residual_add(&mut a, &b).unwrap();
+        assert_eq!(a, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn residual_add_with_zero_is_identity() {
+        let mut a = vec![0.5f32, -1.2, 3.7];
+        let snap = a.clone();
+        let b = vec![0.0f32; 3];
+        residual_add(&mut a, &b).unwrap();
+        assert_eq!(a, snap);
+    }
+
+    #[test]
+    fn residual_add_rejects_shape_mismatch() {
+        let mut a = vec![0f32; 4];
+        let b = vec![0f32; 3];
+        let err = residual_add(&mut a, &b).unwrap_err();
+        assert!(format!("{err}").contains("len"));
+    }
+
+    #[test]
+    fn residual_add_is_commutative_against_add_in_place_loop() {
+        // Sanity check vs a hand-rolled loop — catches any silent
+        // sign-flip or off-by-one in the iterator.
+        let a: Vec<f32> = (0..10).map(|i| i as f32 * 0.3).collect();
+        let b: Vec<f32> = (0..10).map(|i| i as f32 * 0.7).collect();
+        let mut via_fn = a.clone();
+        residual_add(&mut via_fn, &b).unwrap();
+        let mut via_loop = a.clone();
+        for (x, y) in via_loop.iter_mut().zip(b.iter()) {
+            *x += *y;
+        }
+        assert_eq!(via_fn, via_loop);
+    }
+
+    #[test]
+    fn attention_half_block_end_to_end_real_gemma4() {
+        // Completes the attention half of ViT block 0 on real Gemma 4
+        // weights: chain from iter 37 extended with attn_output
+        // projection, residual add (pre-attn → post-attn), and ln2
+        // RMSNorm. This is the exact input that the FFN half (iter 39+)
+        // will consume.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        // Stage 1: preprocess + patch_embed → residual_stream.
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let residual_stream =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+
+        // Stage 2: copy → ln1 → QKV → per-head norm → attention.
+        let mut hidden_states = residual_stream.clone();
+        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        rms_norm_forward(
+            &mut hidden_states,
+            ln1.as_slice::<f32>().expect("ln1 slice"),
+            hidden,
+            1e-6,
+        )
+        .expect("rms ln1");
+
+        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("q");
+        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("k");
+        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("v");
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            q_buf.as_slice::<f32>().expect("q slice"),
+            k_buf.as_slice::<f32>().expect("k slice"),
+            v_buf.as_slice::<f32>().expect("v slice"),
+            num_patches,
+            hidden,
+        )
+        .expect("qkv");
+
+        let q_norm = weights
+            .block_tensor(0, "attn_q_norm.weight")
+            .expect("attn_q_norm");
+        let k_norm = weights
+            .block_tensor(0, "attn_k_norm.weight")
+            .expect("attn_k_norm");
+        per_head_rms_norm_forward(
+            &mut q,
+            q_norm.as_slice::<f32>().expect("q_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head Q");
+        per_head_rms_norm_forward(
+            &mut k,
+            k_norm.as_slice::<f32>().expect("k_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head K");
+
+        let attn = scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim)
+            .expect("attention");
+
+        // Stage 3 (NEW): attn_output projection.
+        let attn_output = weights
+            .block_tensor(0, "attn_output.weight")
+            .expect("attn_output");
+        let attn_output_w: &[f32] =
+            attn_output.as_slice::<f32>().expect("attn_output slice");
+        assert_eq!(attn_output_w.len(), hidden * hidden);
+        let attn_projected =
+            linear_forward(&attn, attn_output_w, None, num_patches, hidden, hidden)
+                .expect("attn_output proj");
+
+        // Stage 4 (NEW): residual add → post-attention hidden states.
+        let mut post_attn = residual_stream.clone();
+        residual_add(&mut post_attn, &attn_projected).expect("residual");
+
+        // Stage 5 (NEW): ln2 RMSNorm.
+        let mut pre_ffn = post_attn.clone();
+        let ln2 = weights.block_tensor(0, "ln2.weight").expect("ln2");
+        rms_norm_forward(
+            &mut pre_ffn,
+            ln2.as_slice::<f32>().expect("ln2 slice"),
+            hidden,
+            1e-6,
+        )
+        .expect("rms ln2");
+
+        // Sanity: every stage's output is finite, shape-correct, and
+        // differs from the bare patch_embed (stages have changed the
+        // signal, not silently no-oped).
+        for t in [&attn_projected, &post_attn, &pre_ffn] {
+            assert_eq!(t.len(), num_patches * hidden);
+            for v in t.iter() {
+                assert!(v.is_finite(), "non-finite: {v}");
+            }
+        }
+        // post_attn = residual + attn_projected, so it should differ
+        // from the raw residual unless attention produced all-zero
+        // output (which would itself be a real problem).
+        let delta_l2: f32 = residual_stream
+            .iter()
+            .zip(post_attn.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            delta_l2 > 1e-3,
+            "post-attn residual is identical to pre-attn — attn_output all zero?"
+        );
+        // pre_ffn (post-LN) should differ from post_attn (pre-LN) — catches
+        // LN being a silent no-op.
+        let ln_delta: f32 = post_attn
+            .iter()
+            .zip(pre_ffn.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(ln_delta > 1e-3, "ln2 was a no-op");
     }
 
     // -----------------------------------------------------------------------

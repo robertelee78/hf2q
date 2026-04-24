@@ -1635,6 +1635,23 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Verification:** `cargo test --bin hf2q attention` — 7/7 pass (1 real-GPU, ~27s). Full suite `cargo test --bin hf2q` — 860/860 pass (+7 from iter 36's 853).
   - **Mantra check:** not a stub — every stage of the first half of a ViT transformer block now runs production math on production weights. End-to-end pretrained Gemma 4 signal flows from pixel tensor to post-attention hidden state.
   - **Next (iter 38):** attention output projection (`linear_forward` with `attn_output.weight [1152, 1152]`) + residual add (`input + attn_out`) + `ln2` RMSNorm. Completes the attention half of block 0. Then iter 39: SwiGLU FFN. Gemma 4's FFN: `silu(x @ gate.T) * (x @ up.T) @ down.T` with `ffn_gate.weight [4304, 1152]`, `ffn_up.weight [4304, 1152]`, `ffn_down.weight [1152, 4304]`. Need `silu(x) = x · σ(x) = x / (1 + exp(-x))` — new primitive. Then iter 40: `post_ffw_norm` + second residual = block 0 complete. Iter 41 loops 0..27 + applies projector `mm.0.weight` → full ViT forward.
+
+- **2026-04-24 loop iter 38 — `residual_add` + attention-half block 0 complete on real Gemma 4.** Only one new primitive needed — `residual_add` — the rest of the attention-half closer (output projection + ln2) reuses existing `linear_forward` and `rms_norm_forward`.
+  - **`src/inference/vision/vit.rs::residual_add(a: &mut [f32], b: &[f32])`:** elementwise in-place add with shape validation. Named (rather than inline-loop) because the block has two residual additions (post-attn, post-FFN) and naming the op makes the block-construction code self-documenting. Prevents the "accidentally skipped a residual" class of bug.
+  - **Tests (5 new, all passing):**
+    - `residual_add_is_elementwise`, `_with_zero_is_identity`, `_rejects_shape_mismatch`, `_is_commutative_against_add_in_place_loop` (4 synthetic).
+    - **`attention_half_block_end_to_end_real_gemma4`** — NEW deepest real-data chain. Runs the full first half of ViT block 0 on real Gemma 4 pretrained weights:
+      1. preprocess gradient → patch_embed
+      2. `residual_stream` = snapshot for the residual
+      3. `hidden_states` = `rms_norm(ln1, residual_stream)` → QKV → per-head norm(Q,K)
+      4. `attn` = scaled_dot_product_attention
+      5. `attn_projected` = `linear_forward(attn, attn_output.weight)` — NEW
+      6. `post_attn` = `residual_add(residual_stream, attn_projected)` — NEW
+      7. `pre_ffn` = `rms_norm(ln2, post_attn)` — NEW
+      Asserts: every stage output finite + shape-correct; `post_attn` differs from `residual_stream` by L2 > 1e-3 (catches silent-zero attn_output); `pre_ffn` differs from `post_attn` (catches silent-no-op ln2). ~18s on M5 Max (400MB mmproj load dominates; the new 3 stages add ~450 MFLOP).
+  - **Verification:** `cargo test --bin hf2q residual_add` — 4/4 pass. `cargo test --bin hf2q attention_half_block` — 1/1 pass (~18s real GPU). Full suite `cargo test --bin hf2q` — 865/865 pass (+5 from iter 37's 860).
+  - **Mantra check:** The first half of a ViT transformer block now runs as a verified production pipeline on production pretrained weights. `pre_ffn` is the exact tensor the FFN half (iter 39+) will consume — no shape drift possible between halves.
+  - **Next (iter 39):** SwiGLU FFN first part. Need `silu(x) = x · σ(x) = x / (1 + exp(-x))` as a new in-place primitive. Then the gated-activation: `gate_out = silu(x @ ffn_gate.weight.T)`, `up_out = x @ ffn_up.weight.T`, `activated = gate_out * up_out` (elementwise). Shape: `[196, 1152]` → `[196, 4304]` → `[196, 4304]`. Iter 40 finishes FFN with the down projection `[196, 4304] → [196, 1152]` + residual + post_ffw_norm = block 0 done.
   - **`src/serve/api/grammar/mask.rs` (~180 LOC + 10 tests):**
     - `mask_invalid_tokens(grammar, token_bytes, logits) -> masked_count`. Clones the grammar per candidate token, feeds token bytes through the sampler; if the clone dies, sets `logits[i] = f32::NEG_INFINITY`.
     - Skips empty-string tokens (special/EOS markers) and already-masked (non-finite) logits — idempotent across calls.
