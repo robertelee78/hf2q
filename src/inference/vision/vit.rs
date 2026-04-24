@@ -588,6 +588,103 @@ pub fn linear_forward(
     Ok(out)
 }
 
+/// Scaled-dot-product attention over `[batch, num_heads, head_dim]`
+/// Q/K/V, returning `[batch, num_heads, head_dim]`.
+///
+/// ```text
+/// scale = 1 / sqrt(head_dim)
+/// for each head h:
+///     scores[i, j] = <Q[i, h, :], K[j, h, :]> * scale        [batch × batch]
+///     scores[i, :] = softmax(scores[i, :])                    # over j (last dim)
+///     out[i, h, :] = Σ_j scores[i, j] * V[j, h, :]           [head_dim]
+/// ```
+///
+/// **No mask.** ViT attention is bidirectional (unlike decoder-style
+/// causal LMs). When a masked variant lands for a different model
+/// family, it gets its own function — don't retrofit an `Option<&[bool]>`
+/// parameter into this one and pay the branch tax.
+///
+/// # Complexity
+///
+/// `O(batch² × num_heads × head_dim)` — for Gemma 4 block 0 at
+/// `[196, 16, 72]`: 196² × 16 × 72 ≈ 44 MFLOP for the two matmuls
+/// combined, plus a negligible softmax pass. CPU runs it in ~30ms
+/// unoptimized. GPU port dispatches `mlx_native::ops::flash_attn_*`.
+///
+/// # Errors
+///
+/// - Any of `q`/`k`/`v` length != `batch * num_heads * head_dim`
+/// - Any dim is 0
+pub fn scaled_dot_product_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "scaled_dot_product_attention: batch ({}), num_heads ({}), head_dim ({}) must all be > 0",
+            batch, num_heads, head_dim
+        ));
+    }
+    let expected = batch * num_heads * head_dim;
+    for (name, t) in [("q", q), ("k", k), ("v", v)] {
+        if t.len() != expected {
+            return Err(anyhow!(
+                "scaled_dot_product_attention: {} len {} != batch*num_heads*head_dim = {}*{}*{} = {}",
+                name,
+                t.len(),
+                batch,
+                num_heads,
+                head_dim,
+                expected
+            ));
+        }
+    }
+
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let stride_batch = num_heads * head_dim;
+    let stride_head = head_dim;
+
+    let mut out = vec![0f32; expected];
+    // One [batch × batch] score matrix reused across heads.
+    let mut scores = vec![0f32; batch * batch];
+
+    for h in 0..num_heads {
+        // --- scores[i, j] = <Q[i, h, :], K[j, h, :]> * scale ---
+        for i in 0..batch {
+            let q_off = i * stride_batch + h * stride_head;
+            for j in 0..batch {
+                let k_off = j * stride_batch + h * stride_head;
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += q[q_off + d] * k[k_off + d];
+                }
+                scores[i * batch + j] = acc * scale;
+            }
+        }
+        // --- softmax along j ---
+        softmax_last_dim(&mut scores, batch)
+            .map_err(|e| anyhow!("scaled_dot_product_attention softmax: {e}"))?;
+        // --- out[i, h, :] = Σ_j scores[i, j] * V[j, h, :] ---
+        for i in 0..batch {
+            let out_off = i * stride_batch + h * stride_head;
+            let sc_off = i * batch;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for j in 0..batch {
+                    let v_elem = v[j * stride_batch + h * stride_head + d];
+                    acc += scores[sc_off + j] * v_elem;
+                }
+                out[out_off + d] = acc;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Apply the three Q/K/V projections from a ViT attention block. Returns
 /// `(q, k, v)` each of shape `[batch, hidden]` (for Gemma 4 at
 /// `hidden=1152`; head reshape is a separate downstream op).
@@ -1032,6 +1129,264 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // scaled_dot_product_attention (iter 37)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attention_uniform_qk_averages_v_across_tokens() {
+        // Q and K all equal → every softmax is uniform 1/batch → output
+        // row = mean of V rows per head.
+        let batch = 3;
+        let num_heads = 2;
+        let head_dim = 4;
+        let n = batch * num_heads * head_dim;
+        let q = vec![1f32; n];
+        let k = vec![1f32; n];
+        // V per head: head 0 rows = [1,2,3,4]×3, head 1 rows = [10,20,30,40]×3.
+        // Actually give distinct rows so averaging is non-trivial:
+        // token 0: head 0 = [1,2,3,4], head 1 = [10,20,30,40]
+        // token 1: head 0 = [5,6,7,8], head 1 = [50,60,70,80]
+        // token 2: head 0 = [9,10,11,12], head 1 = [90,100,110,120]
+        let mut v = vec![0f32; n];
+        for b in 0..batch {
+            for h in 0..num_heads {
+                for d in 0..head_dim {
+                    v[b * num_heads * head_dim + h * head_dim + d] = if h == 0 {
+                        (b * 4 + d + 1) as f32
+                    } else {
+                        ((b * 4 + d + 1) * 10) as f32
+                    };
+                }
+            }
+        }
+        let out = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim).unwrap();
+        // Mean of head-0 rows across 3 tokens:
+        //   d=0: (1+5+9)/3 = 5
+        //   d=1: (2+6+10)/3 = 6
+        //   d=2: (3+7+11)/3 = 7
+        //   d=3: (4+8+12)/3 = 8
+        // Mean of head-1 rows: 10× those, so [50, 60, 70, 80].
+        let expected_h0 = [5.0f32, 6.0, 7.0, 8.0];
+        let expected_h1 = [50.0f32, 60.0, 70.0, 80.0];
+        for b in 0..batch {
+            for d in 0..head_dim {
+                let got_h0 = out[b * num_heads * head_dim + 0 * head_dim + d];
+                let got_h1 = out[b * num_heads * head_dim + 1 * head_dim + d];
+                assert!(
+                    (got_h0 - expected_h0[d]).abs() < 1e-4,
+                    "h0 b{b} d{d}: {got_h0} vs {}",
+                    expected_h0[d]
+                );
+                assert!(
+                    (got_h1 - expected_h1[d]).abs() < 1e-4,
+                    "h1 b{b} d{d}: {got_h1} vs {}",
+                    expected_h1[d]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_single_key_dominant_selects_its_value() {
+        // Make token 1's K overwhelmingly similar to every Q, rest
+        // orthogonal. Softmax picks token 1 → output row ≈ V[1].
+        let batch = 3;
+        let num_heads = 1;
+        let head_dim = 4;
+        let n = batch * num_heads * head_dim;
+        // Q all = [1, 0, 0, 0] (points at dim 0)
+        let mut q = vec![0f32; n];
+        for b in 0..batch {
+            q[b * head_dim] = 1.0;
+        }
+        // K: token 0 = [100,0,0,0] (huge along dim 0), others orthogonal.
+        // That inverts the usual delta test — the point is ONE key
+        // dominates softmax and we should read V[that-key].
+        let mut k = vec![0f32; n];
+        k[0 * head_dim] = 100.0; // token 0's key points huge along dim 0
+        // Token 1: orthogonal
+        k[1 * head_dim + 1] = 100.0;
+        // Token 2: orthogonal
+        k[2 * head_dim + 2] = 100.0;
+        // V: each token has a unique signature
+        let v = vec![
+            7.0, 7.0, 7.0, 7.0, // token 0
+            1.0, 2.0, 3.0, 4.0, // token 1
+            99.0, 99.0, 99.0, 99.0, // token 2
+        ];
+        let out = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim).unwrap();
+        // Every query [1, 0, 0, 0] dots with K[0] = 100 (high score),
+        // K[1] = 0, K[2] = 0. Softmax overwhelmingly picks token 0 → V[0] = [7,7,7,7].
+        for b in 0..batch {
+            for d in 0..head_dim {
+                let got = out[b * head_dim + d];
+                assert!(
+                    (got - 7.0).abs() < 0.1,
+                    "b{b} d{d}: {got} (expected ≈7.0)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_scale_factor_applied_to_logits() {
+        // Large head_dim + moderate Q/K magnitudes → without scaling,
+        // logits overflow exp. Check that the scale keeps outputs finite.
+        let batch = 4;
+        let num_heads = 1;
+        let head_dim = 1024; // large; uses 1/sqrt(1024) = 0.03125
+        let n = batch * num_heads * head_dim;
+        let q = vec![3.0f32; n];
+        let k = vec![3.0f32; n];
+        let v = vec![1.0f32; n];
+        let out = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim).unwrap();
+        for val in &out {
+            assert!(val.is_finite(), "non-finite: {val}");
+        }
+        // Uniform Q/K → uniform softmax → output == mean(V) = 1.0.
+        for val in &out {
+            assert!((*val - 1.0).abs() < 1e-3, "got {val}");
+        }
+    }
+
+    #[test]
+    fn attention_rejects_zero_dims() {
+        let err = scaled_dot_product_attention(&[], &[], &[], 0, 1, 1).unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
+    }
+
+    #[test]
+    fn attention_rejects_mismatched_q_len() {
+        let batch = 2;
+        let num_heads = 2;
+        let head_dim = 2;
+        let n = batch * num_heads * head_dim;
+        let q = vec![0f32; n - 1];
+        let k = vec![0f32; n];
+        let v = vec![0f32; n];
+        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)
+            .unwrap_err();
+        assert!(format!("{err}").contains("q len"));
+    }
+
+    #[test]
+    fn attention_rejects_mismatched_k_len() {
+        let batch = 2;
+        let num_heads = 2;
+        let head_dim = 2;
+        let n = batch * num_heads * head_dim;
+        let q = vec![0f32; n];
+        let k = vec![0f32; n + 1];
+        let v = vec![0f32; n];
+        let err = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)
+            .unwrap_err();
+        assert!(format!("{err}").contains("k len"));
+    }
+
+    #[test]
+    fn attention_end_to_end_real_gemma4_full_self_attention() {
+        // Extends iter 36's chain test by running the full self-attention
+        // through scaled-dot-product. Drives:
+        //   preprocess → patch_embed → rms_norm(ln1) → qkv_projection →
+        //   per_head_rms_norm(Q, K) → scaled_dot_product_attention
+        // All against real Gemma 4 pretrained block-0 weights.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let mut hidden_states =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        let ln1_g: &[f32] = ln1.as_slice::<f32>().expect("ln1 slice");
+        rms_norm_forward(&mut hidden_states, ln1_g, hidden, 1e-6).expect("rms ln1");
+
+        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("q");
+        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("k");
+        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("v");
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            q_buf.as_slice::<f32>().expect("q slice"),
+            k_buf.as_slice::<f32>().expect("k slice"),
+            v_buf.as_slice::<f32>().expect("v slice"),
+            num_patches,
+            hidden,
+        )
+        .expect("qkv");
+
+        let q_norm = weights
+            .block_tensor(0, "attn_q_norm.weight")
+            .expect("attn_q_norm");
+        let k_norm = weights
+            .block_tensor(0, "attn_k_norm.weight")
+            .expect("attn_k_norm");
+        per_head_rms_norm_forward(
+            &mut q,
+            q_norm.as_slice::<f32>().expect("q_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head Q");
+        per_head_rms_norm_forward(
+            &mut k,
+            k_norm.as_slice::<f32>().expect("k_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head K");
+
+        // THE NEW STAGE: scaled-dot-product attention.
+        let attn_out = scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim)
+            .expect("attention");
+        assert_eq!(attn_out.len(), num_patches * hidden);
+        for val in &attn_out {
+            assert!(val.is_finite(), "non-finite attention output: {val}");
+        }
+        // Distribution sanity: different query positions should produce
+        // different attention outputs (bidirectional but each query is
+        // unique because the input gradient was per-pixel).
+        let token_0 = &attn_out[0..hidden];
+        let token_last = &attn_out[(num_patches - 1) * hidden..num_patches * hidden];
+        let l2_diff: f32 = token_0
+            .iter()
+            .zip(token_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            l2_diff > 1e-3,
+            "token 0 and token 195 attention outputs identical — stride bug?"
+        );
     }
 
     // -----------------------------------------------------------------------
