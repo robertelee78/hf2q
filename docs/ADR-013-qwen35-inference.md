@@ -934,6 +934,41 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 17 · P7b continued (sigmoid-mul kernel + gate-mul parity)
+
+**Scope:** Landed the sigmoid-mul Metal kernel in mlx-native and wired it into hf2q's full-attention pipeline. Output-gate application now GPU-verified.
+
+**Delivered in `mlx-native`:**
+- `src/shaders/sigmoid_mul.metal` — f32 + bf16 kernels. `out[i] = x[i] * sigmoid(gate[i])` with numerically stable `1/(1+exp(-g))`.
+- `src/ops/sigmoid_mul.rs` — `dispatch_sigmoid_mul()` with full shape/dtype validation.
+- `tests/test_sigmoid_mul.rs` — 4 tests: CPU parity over 100 elements (diff < 1e-6), saturation bounds (gate=+inf → x, gate=-inf → 0, gate=0 → x*0.5), zero-n rejection, dtype-mismatch rejection.
+- Registered in `kernel_registry.rs`.
+
+**Delivered in `hf2q/gpu_full_attn.rs`:**
+- **`apply_sigmoid_gate_multiply()`** — wraps `dispatch_sigmoid_mul`, allocates output + params, returns the gated result ready for the wo projection step.
+- **`sigmoid_gate_multiply_matches_cpu_ref`** parity test: 256-element Qwen3.5-shaped input (matches seq=4 × n_head=4 × head_dim=16), matches CPU recomputation of `attn_out[i] * sigmoid(gate[i])` at <1e-6 per element.
+
+**Verification:**
+- 4/4 new mlx-native sigmoid_mul tests green.
+- 9/9 gpu_full_attn tests green (+1 from iter 16's 8, 0 regressions).
+- 557/557 hf2q test suite green.
+- 95/95 mlx-native lib tests green.
+
+**P7b pipeline status (8 steps, 5 done — only SDPA remaining):**
+
+| Step | Op | Status |
+|---|---|---|
+| 1 | Pre-attention RMSNorm on x | ✅ iter 15 |
+| 2 | Q/K/V/gate projections (pure matmul) | ⏸ Delegated to mlx-native matmul kernels |
+| 3 | Per-head Q RMSNorm | ✅ iter 16 |
+| 4 | Per-head K RMSNorm | ✅ iter 16 |
+| 5 | IMROPE | ✅ iter 16 |
+| 6 | SDPA (GQA + causal mask) | ⏳ next iter |
+| 7 | Sigmoid(gate) × attn_out | ✅ **iter 17 (this)** |
+| 8 | wo projection + residual (pure matmul) | ⏸ Delegated |
+
+**Next iter:** SDPA via `flash_attn_prefill_*` (bf16-only, so test against CPU ref with a looser 1e-2 tolerance to account for the f32→bf16 round-trip). Once landed, compose `build_gated_attn_layer()` with full-layer parity test vs `gated_full_attention_cpu_ref`.
+
 ### 2026-04-24 — /loop iter 16 · P7b continued (per-head RMSNorm + IMROPE GPU parity)
 
 **Scope:** Continue P7b pipeline. Two more GPU dispatches verified against the P7a CPU reference.

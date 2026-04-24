@@ -34,6 +34,7 @@ use mlx_native::ops::rms_norm;
 use mlx_native::ops::rope_multi::{
     build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
 };
+use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::full_attn::FullAttnLayerWeights;
@@ -223,6 +224,48 @@ pub fn apply_imrope(
         params,
     )
     .context("dispatch_rope_multi")?;
+
+    Ok(out)
+}
+
+/// Apply sigmoid-gated elementwise multiply: `out[i] = attn_out[i] * sigmoid(gate[i])`.
+///
+/// Qwen3.5 full-attention's output-gate application (ADR-013 Decision 9).
+/// Sigmoid (not swish) is the authoritative activation — cited by HF
+/// `modeling_qwen3_5.py:689` and vLLM `qwen3_next.py:312-314`.
+pub fn apply_sigmoid_gate_multiply(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    attn_out: &MlxBuffer,
+    gate: &MlxBuffer,
+    n_elements: u32,
+) -> Result<MlxBuffer> {
+    let out = device
+        .alloc_buffer(
+            n_elements as usize * 4,
+            DType::F32,
+            vec![n_elements as usize],
+        )
+        .map_err(|e| anyhow!("alloc sigmoid-mul out: {e}"))?;
+    let mut params = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc params: {e}"))?;
+    params
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("mut_slice: {e}"))?[0] = n_elements;
+
+    dispatch_sigmoid_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        attn_out,
+        gate,
+        &out,
+        &params,
+        n_elements,
+    )
+    .context("dispatch_sigmoid_mul")?;
 
     Ok(out)
 }
@@ -690,6 +733,58 @@ mod tests {
                 d_err < 1e-5,
                 "imrope mismatch at {}: gpu={}, cpu={}, diff={}",
                 i, g, e, d_err
+            );
+        }
+    }
+
+    /// **Parity test**: sigmoid-gated multiply on GPU matches CPU.
+    /// Mirror of the output-gate step of the CPU reference.
+    #[test]
+    fn sigmoid_gate_multiply_matches_cpu_ref() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        // Realistic Qwen3.5 shape: seq * n_head * head_dim = 4 * 4 * 16 = 256.
+        let n = 256usize;
+        let mut seed = 0xBEEF_u32;
+        let attn_out: Vec<f32> = (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.3
+            })
+            .collect();
+        let gate: Vec<f32> = (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 2.0 - 1.0
+            })
+            .collect();
+
+        // CPU reference.
+        let expected: Vec<f32> = attn_out
+            .iter()
+            .zip(gate.iter())
+            .map(|(&a, &g)| a * (1.0 / (1.0 + (-g).exp())))
+            .collect();
+
+        // GPU path.
+        let attn_buf = upload_f32(&attn_out, &device).expect("attn");
+        let gate_buf = upload_f32(&gate, &device).expect("gate");
+
+        let mut enc = device.command_encoder().expect("enc");
+        let out = apply_sigmoid_gate_multiply(
+            &mut enc, &mut registry, &device, &attn_buf, &gate_buf, n as u32,
+        )
+        .expect("apply");
+        enc.commit_and_wait().expect("commit");
+
+        let got = download_f32(&out).expect("download");
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            let d = (g - e).abs();
+            assert!(
+                d < 1e-6,
+                "sigmoid_mul mismatch at {}: gpu={}, cpu={}, diff={}",
+                i, g, e, d
             );
         }
     }
