@@ -323,7 +323,11 @@ fn test_convert_help_lists_all_four_dwq_variants() {
 
 #[test]
 fn test_bits_with_dwq_variant_errors_with_exact_message() {
-    // --bits combined with any DWQ variant must produce the exact documented error.
+    // --bits combined with any DWQ variant must produce the exact
+    // documented error. Decision 10c AC — all four dwq-mixed-N-M
+    // variants must trip it; narrowing the check to only one variant
+    // (e.g. `quant == "dwq-mixed-4-6"` instead of `dwq_bit_pair()
+    // .is_some()`) would silently accept `--bits` on the other three.
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
 
@@ -343,24 +347,26 @@ fn test_bits_with_dwq_variant_errors_with_exact_message() {
     .unwrap();
     std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
-    Command::cargo_bin("hf2q")
-        .unwrap()
-        .args([
-            "convert",
-            "--input",
-            input_dir.to_str().unwrap(),
-            "--format",
-            "gguf",
-            "--quant",
-            "dwq-mixed-4-6",
-            "--bits",
-            "5",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants",
-        ));
+    for variant in ["dwq-mixed-2-8", "dwq-mixed-4-6", "dwq-mixed-4-8", "dwq-mixed-6-8"] {
+        Command::cargo_bin("hf2q")
+            .unwrap()
+            .args([
+                "convert",
+                "--input",
+                input_dir.to_str().unwrap(),
+                "--format",
+                "gguf",
+                "--quant",
+                variant,
+                "--bits",
+                "5",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants",
+            ));
+    }
 }
 
 #[test]
