@@ -323,6 +323,128 @@ fn qwen35moe_emits_all_decision_7_shared_keys_and_moe_specific() {
     assert_eq!(arch, "qwen35moe");
 }
 
+/// Legacy `rope_scaling` form proof. Some HF configs ship rope as
+/// `rope_scaling: {mrope_section, type}` with `rope_theta` on the
+/// parent config (older Qwen / Llama convention), not `rope_parameters`.
+/// The parser's 2026-04-24 schema-flexibility fix accepts both forms;
+/// this test asserts the legacy form still yields all Decision 7
+/// rope keys in the emitted GGUF — proving the fix at the end-to-end
+/// convert layer, not just in unit tests.
+#[test]
+fn qwen35_dense_with_legacy_rope_scaling_still_emits_all_rope_keys() {
+    const LEGACY_CONFIG: &str = r#"{
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "intermediate_size": 128,
+        "vocab_size": 128,
+        "head_dim": 16,
+        "linear_num_value_heads": 8,
+        "full_attention_interval": 2,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000.0,
+        "rope_scaling": {
+            "mrope_section": [3, 3, 2],
+            "type": "mrope"
+        },
+        "mtp_num_hidden_layers": 0,
+        "attn_output_gate": true,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": 131072,
+        "dtype": "float16",
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_value_head_dim": 128,
+        "linear_num_value_heads": 8
+    }"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("legacy-in");
+    let output = tmp.path().join("legacy.gguf");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("config.json"), LEGACY_CONFIG).unwrap();
+    fs::write(input.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
+    fs::write(
+        input.join("tokenizer_config.json"),
+        r#"{"model_max_length":131072}"#,
+    )
+    .unwrap();
+
+    // Reuse the dense-model safetensors builder by setting up a dense
+    // dir next to it.
+    let h = 64usize;
+    let inter = 128usize;
+    let mut tensors: Vec<(String, Vec<usize>, &str, Vec<u8>)> = Vec::new();
+    push_f16(&mut tensors, "model.embed_tokens.weight", vec![128, h]);
+    push_f16(&mut tensors, "lm_head.weight", vec![128, h]);
+    push_f16(&mut tensors, "model.norm.weight", vec![h]);
+    for layer in 0..2 {
+        let p = format!("model.layers.{layer}");
+        push_f16(&mut tensors, &format!("{p}.input_layernorm.weight"), vec![h]);
+        push_f16(
+            &mut tensors,
+            &format!("{p}.post_attention_layernorm.weight"),
+            vec![h],
+        );
+        if layer == 1 {
+            push_f16(&mut tensors, &format!("{p}.self_attn.q_proj.weight"), vec![h, h]);
+            push_f16(&mut tensors, &format!("{p}.self_attn.k_proj.weight"), vec![16, h]);
+            push_f16(&mut tensors, &format!("{p}.self_attn.v_proj.weight"), vec![16, h]);
+            push_f16(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h]);
+            push_f16(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
+        } else {
+            let qkv = (4 + 1 + 8) * 16;
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 128]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_a.weight"), vec![4, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_b.weight"), vec![4, h]);
+            push_f16(&mut tensors, &format!("{p}.linear_attn.in_proj_z.weight"), vec![128, h]);
+        }
+        push_f16(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), vec![inter, h]);
+        push_f16(&mut tensors, &format!("{p}.mlp.up_proj.weight"), vec![inter, h]);
+        push_f16(&mut tensors, &format!("{p}.mlp.down_proj.weight"), vec![h, inter]);
+    }
+    fs::write(
+        input.join("model.safetensors"),
+        build_safetensors_bytes(tensors),
+    )
+    .unwrap();
+
+    convert(&input, &output);
+    let gguf = GgufFile::open(&output).expect("open legacy-form GGUF");
+    // These are the keys that would have been missing before the
+    // parser fix landed — proves the fix at the GGUF layer.
+    for key in &[
+        "qwen35.rope.freq_base",
+        "qwen35.rope.dimension_count",
+        "qwen35.rope.dimension_sections",
+    ] {
+        assert!(
+            gguf.metadata(key).is_some(),
+            "legacy rope_scaling config MUST still emit {:?} per parser schema fix",
+            key
+        );
+    }
+    // Positive value check — rope_theta from parent config should flow
+    // through, not default to zero.
+    use mlx_native::gguf::MetadataValue;
+    let theta = gguf.metadata("qwen35.rope.freq_base").expect("present");
+    match theta {
+        MetadataValue::Float32(v) => {
+            assert!(
+                (*v - 10_000_000.0).abs() < 1.0,
+                "rope_theta from parent config must flow through; got {}",
+                v
+            );
+        }
+        other => panic!("expected Float32, got {:?}", other),
+    }
+}
+
 /// Decision 7 explicit call-out: `{arch}.rope.dimension_sections` is
 /// MANDATORY — llama-model.cpp:2808 reads it and rejects the file
 /// without it. Having a separate named test anchors this so a future
