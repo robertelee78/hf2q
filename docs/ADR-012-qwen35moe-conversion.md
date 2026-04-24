@@ -17,7 +17,7 @@ Source: `~/Documents/mantra.txt` (Robert, undated). Quoted verbatim.
 
 - **No fallback.** When a Qwen3.5-MoE-specific code path is required (V-head reorder, A_log negation, MROPE section emission, SSM tensor naming, linear-attention layer type), implement it fully in the first cut. No `unimplemented!()`, no "we'll handle shared experts in a follow-up." Either the phase ships conversion-capable code or the phase hasn't shipped.
 - **Chesterton's fence.** The hardcoded `base_bits: 4, sensitive_bits: 6` at `src/main.rs:447-448` exists because DWQ-4-6 is the single validated sensitivity profile for Gemma-4. Before parameterizing, read `src/quantize/dwq.rs` and `src/intelligence/auto_quant.rs` to understand *which* layers DWQ-4-6 chose to promote, and *why* — then widen the preset surface without silently changing gemma's behavior.
-- **Dive deep.** The authoritative references for every decision in this ADR are `/opt/llama.cpp/convert_hf_to_gguf.py` (Qwen2MoeModel → Qwen3NextModel → _LinearAttentionVReorderBase → Qwen3_5MoeTextModel chain) and `/opt/llama.cpp/src/llama-arch.{h,cpp}` (LLM_ARCH_QWEN35MOE metadata key table). Every TODO in this ADR cites a specific file:line range. Read them.
+- **Dive deep.** The authoritative references for every decision in this ADR are `/opt/llama.cpp/convert_hf_to_gguf.py` (Qwen2MoeModel → Qwen3NextModel → _LinearAttentionVReorderBase → {Qwen3_5TextModel, Qwen3_5MoeTextModel} chain) and `/opt/llama.cpp/src/llama-arch.{h,cpp}` (LLM_ARCH_QWEN35 + LLM_ARCH_QWEN35MOE metadata key tables). Every TODO in this ADR cites a specific file:line range. Read them.
 - **Absolute sovereignty (`feedback_hf2q_sovereignty.md`, tightened 2026-04-23).** Pure Rust; hf2q and mlx-native are the only repos in our deliverables. No code, Cargo crates, utils, binaries, or derivative artifacts from `/opt/candle` or `/opt/llama.cpp` enter our deliverables — candle is a Rust crate we don't own, same rule as llama.cpp's Python. This applies at build time, test time, and CI time. Reading their source to derive the mathematical specification is fine; using their output to prove our correctness or as a library is not. No new file in this ADR introduces a `candle-*` dependency; ADR-008 is the in-flight cleanup of pre-existing usage. Fixtures and test oracles are produced by our own code on deterministic inputs, with expected outputs derived from the underlying spec (e.g., ggml broadcast semantics produce an unambiguous V-reorder mapping computable from first principles) or hand-authored.
 
 ---
@@ -110,7 +110,7 @@ This is the application of `feedback_hf2q_sovereignty.md` to the specific questi
 
 Each of these is explicitly *not* in this ADR's scope. They are named so that the ADR's acceptance criteria can be measured against a bounded surface.
 
-1. **Inference / forward-pass graph construction.** The inference session owns the Rust port of `Qwen3_5MoeTextModel` forward for execution, including GATED_DELTA_NET / SSM_CONV / TRI_SOLVE / L2_NORM / CumSum Metal kernels in `/opt/mlx-native`. This ADR consumes the inference engine only as a callable activation-capture backend for DWQ calibration (Phase P5). The inference port's ADR is separate.
+1. **Inference / forward-pass graph construction.** The inference session owns the Rust port of `Qwen3_5TextModel` and `Qwen3_5MoeTextModel` forward for execution, including GATED_DELTA_NET / SSM_CONV / TRI_SOLVE / L2_NORM / CumSum Metal kernels in `/opt/mlx-native`. This ADR consumes the inference engine only as a callable activation-capture backend for DWQ calibration (Phase P6). The inference port's ADR is separate.
 2. **Tokenizer runtime changes.** The Qwen3.5 tokenizer (248K vocab) is embedded in the output GGUF via the existing tokenizer-embedding pipeline. If the existing `_set_vocab_qwen` equivalent in hf2q is sufficient for the new vocab, no work. If not, a follow-up ADR.
 3. **Multimodal / vision tower.** The local MoE target (`qwen3.6-35b-a3b-abliterix-ega-abliterated`) config drops `vision_config`. Qwen3.6-27B dense *does* ship with a vision tower (27-layer ViT, patch_size=16), but this ADR covers only its text side. The `mmproj-qwen36-F16.gguf` file already in the MoE model directory is a pre-existing artifact from an external converter; hf2q does not produce mmproj files in this ADR. Vision-tower conversion for either variant is a follow-up ADR.
 4. **MTP head execution.** Conversion **emits** MTP tensors losslessly for both variants (see Decision 11). Whether the inference engine uses them for speculative decoding is the inference session's choice. This ADR does not implement speculative decoding infrastructure.
@@ -128,15 +128,17 @@ Every porting decision in this ADR has an upstream reference. These file:line ci
 1. `/opt/llama.cpp/convert_hf_to_gguf.py:4553` — `class Qwen2MoeModel(TextModel)`. Base for MoE tensor naming, expert merge, router handling.
 2. `/opt/llama.cpp/convert_hf_to_gguf.py:4770` — `class Qwen3NextModel(Qwen2MoeModel)`. Adds linear-attention conversion: A_log negation, dt_bias rename, conv1d squeeze, in_proj_qkvz reordering.
 3. `/opt/llama.cpp/convert_hf_to_gguf.py:5259` — `class _LinearAttentionVReorderBase(Qwen3NextModel)`. The grouped-to-tiled V-head reorder. Six cases (in_proj_qkv, in_proj_z, in_proj_a/b, A_log / dt_bias / dt_proj, conv1d, out_proj). Implementation at `:5375-5424`.
-4. `/opt/llama.cpp/convert_hf_to_gguf.py:5433` — `class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase)`. Terminal class; `model_arch = gguf.MODEL_ARCH.QWEN35MOE`.
+4. `/opt/llama.cpp/convert_hf_to_gguf.py:5428` — `class Qwen3_5TextModel(_LinearAttentionVReorderBase)`. Terminal class for dense variant; `model_arch = gguf.MODEL_ARCH.QWEN35`.
+5. `/opt/llama.cpp/convert_hf_to_gguf.py:5433` — `class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase)`. Terminal class for MoE variant; `model_arch = gguf.MODEL_ARCH.QWEN35MOE`.
 
 ### C++ loader & metadata keys
 
-5. `/opt/llama.cpp/src/llama-arch.cpp:43` — `{ LLM_ARCH_QWEN35MOE, "qwen35moe" }`. The arch string hf2q must emit as `general.architecture`.
-6. `/opt/llama.cpp/src/llama-arch.cpp:860` — `case LLM_ARCH_QWEN35MOE:` in `llm_arch_is_hybrid` (or equivalent predicate). Confirms upstream treats qwen35moe as a hybrid state-space/attention architecture.
-7. `/opt/llama.cpp/src/llama-arch.h` + `llama-arch.cpp` — `LLM_KV_*` enum and the `LLM_KV_NAMES[]` table (starts around `:180`). Every key the loader reads must be emitted by hf2q. This is the authoritative list; do not derive from blog posts or the GGUF file's observed keys alone.
-8. `/opt/llama.cpp/src/models/qwen35moe.cpp` — graph builder (~17 KB). Tells us which tensors the loader expects to find by name for each layer class. Conversion must produce all of them.
-9. `/opt/llama.cpp/src/models/delta-net-base.cpp` — linear-attention compute (~16 KB). Informs which SSM-family tensors are load-bearing and which are optional.
+6. `/opt/llama.cpp/src/llama-arch.cpp:42-43` — `{ LLM_ARCH_QWEN35, "qwen35" }` and `{ LLM_ARCH_QWEN35MOE, "qwen35moe" }`. The arch strings hf2q must emit as `general.architecture` per variant.
+7. `/opt/llama.cpp/src/llama-arch.cpp:860` — `case LLM_ARCH_QWEN35MOE:` (and the adjacent `LLM_ARCH_QWEN35` case in the same switch) in `llm_arch_is_hybrid` (or equivalent predicate). Confirms upstream treats both as hybrid state-space/attention architectures.
+8. `/opt/llama.cpp/src/llama-arch.h` + `llama-arch.cpp` — `LLM_KV_*` enum and the `LLM_KV_NAMES[]` table (starts around `:180`). Every key the loader reads must be emitted by hf2q. This is the authoritative list; do not derive from blog posts or the GGUF file's observed keys alone.
+9. `/opt/llama.cpp/src/models/qwen35.cpp` — dense variant graph builder (~15 KB). Tells us which tensors the dense loader expects to find by name.
+10. `/opt/llama.cpp/src/models/qwen35moe.cpp` — MoE variant graph builder (~17 KB). Tells us which tensors the MoE loader expects to find by name.
+11. `/opt/llama.cpp/src/models/delta-net-base.cpp` — linear-attention compute (~16 KB; shared by both variants). Informs which SSM-family tensors are load-bearing and which are optional.
 
 ### Existing local reference: the `apex.gguf` on disk
 
@@ -266,7 +268,7 @@ Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_
 
 **Problem.** Multiple conversion-time tensor transforms Qwen3.5 requires that Gemma doesn't.
 
-**Decision.** Implement each transform in `src/models/qwen35moe.rs`:
+**Decision.** Implement each transform in `src/models/qwen35/mod.rs` (shared by dense and MoE variants, since linear-attention tensors are structurally identical across both):
 
 | Transform | Trigger | Action |
 |---|---|---|
@@ -280,7 +282,7 @@ Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_
 - One unit test per transform with hand-constructed fixtures.
 - A_log transform test asserts `|output + exp(input)| < 1e-6` for random inputs.
 - Conv1d squeeze test asserts shape change and byte-identical data.
-- An audit note in `src/models/qwen35moe.rs` documents whether Qwen3.5 RMS norm adds +1 (with citation to the specific llama.cpp line consulted).
+- An audit note in `src/models/qwen35/mod.rs` documents whether Qwen3.5 RMS norm adds +1 (with citation to the specific llama.cpp line consulted). Audit applies to both variants since norm handling is shared.
 
 ### 7. GGUF metadata emission for `qwen35.*` and `qwen35moe.*`
 
@@ -324,7 +326,7 @@ Use the same helper logic: `reorder_v_heads(tensor, dim, num_k_heads, num_v_per_
 - `tokenizer.ggml.model`, `tokens`, `merges`, `scores`, `token_type`, `bos_token_id`, `eos_token_id`, `pad_token_id`, `chat_template`, `pre` — per ADR-004 decision 5.
 
 **Acceptance criteria.**
-- The authoritative list of required `qwen35moe.*` keys is derived by reading `/opt/llama.cpp/src/llama-arch.{h,cpp}` (`LLM_KV_*` enum + KV_NAMES table) and `/opt/llama.cpp/src/models/qwen35moe.cpp` (which keys the loader actually reads), and hand-transcribed into a constant list in `src/models/qwen35moe.rs` with a code comment citing the source file:line. No binary produced by llama.cpp is consulted as an automated check.
+- The authoritative lists of required `qwen35.*` and `qwen35moe.*` keys are derived by reading `/opt/llama.cpp/src/llama-arch.{h,cpp}` (`LLM_KV_*` enum + KV_NAMES table) and `/opt/llama.cpp/src/models/{qwen35.cpp, qwen35moe.cpp}` (which keys each loader actually reads), and hand-transcribed into constant lists in `src/models/qwen35/dense.rs` and `src/models/qwen35/moe.rs` respectively — with shared keys factored into `src/models/qwen35/mod.rs`. Each entry carries a code comment citing the source file:line. No binary produced by llama.cpp is consulted as an automated check.
 - Unit test: `emit_metadata()` called on a known `Qwen35MoeConvertContext` produces a GGUF metadata section containing every key in the hand-transcribed list with the expected value.
 - Regression: whenever the list is updated (because llama.cpp added a new key in a new release and Robert wants to support it), the PR description cites the llama.cpp file:line where the new key was added.
 
@@ -544,19 +546,20 @@ Phases are **dependency-ordered**, not priority-ordered. Each phase has a single
 
 **Estimated LOC:** ~300
 
-### P2 — Scaffold `src/models/qwen35moe.rs` and V-head reorder
+### P2 — Scaffold `src/models/qwen35/` module and V-head reorder
 
 **Scope:** Decisions 4 and 5.
 
 **Deliverables:**
-- New file `src/models/qwen35moe.rs` with public API per Decision 4
-- V-head reorder implementation with 6 case handlers
-- Unit tests per Decision 5's acceptance criteria (per-case + round-trip + oracle)
-- Fixtures: small hand-constructed tensors exhibiting the grouped-vs-tiled ordering
+- New module `src/models/qwen35/` with `mod.rs`, `dense.rs`, `moe.rs` per Decision 4's public API
+- V-head reorder implementation in `mod.rs` (shared by both variants) with 6 case handlers
+- Unit tests per Decision 5's acceptance criteria (per-case + round-trip + spec-driven)
+- Test fixtures authored in Rust from deterministic small inputs; expected outputs hand-authored in test files with code comments deriving them from ggml broadcast semantics
 
 **Acceptance:**
 - Decision 4 & 5 criteria met
 - Module builds, tests pass
+- No fixtures produced by external tools (sovereignty directive)
 
 **Estimated LOC:** ~500
 
@@ -652,7 +655,7 @@ Phases are **dependency-ordered**, not priority-ordered. Each phase has a single
 
 ### Unit tests (per-transform)
 
-Located alongside implementations in `src/models/qwen35moe.rs`. Each tensor transform in Decisions 5, 6, and 9 has a test with hand-constructed tiny inputs and known outputs.
+Located alongside implementations in `src/models/qwen35/` (shared transforms in `mod.rs`, dense-specific in `dense.rs`, MoE-specific in `moe.rs`). Each tensor transform in Decisions 5, 6, and 9 has a test with hand-constructed tiny inputs and known outputs, with expected values derived from the mathematical specification in a code comment.
 
 ### Regression tests (Chesterton's fence)
 
@@ -688,11 +691,11 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 
 ## Risks and mitigations
 
-### R1: llama.cpp changes its `qwen35moe.*` key naming
+### R1: llama.cpp changes its `qwen35.*` / `qwen35moe.*` key naming
 
-**Likelihood:** Medium — `qwen35moe` is new; names may churn.
+**Likelihood:** Medium — both arches are new; names may churn.
 **Impact:** hf2q output stops loading in newer llama.cpp.
-**Mitigation:** Pin the reference commit in `tests/fixtures/` to the version used to generate fixtures. CI test alerts on divergence. Doc `docs/converting-qwen35moe.md` lists the minimum llama.cpp version that loads hf2q's output. When upstream breaks, treat it as a new ADR addendum, not a CVE.
+**Mitigation:** Doc `docs/converting-qwen35.md` lists the minimum llama.cpp version that loads hf2q's output. When upstream changes key names, that's an ADR addendum (hand-update the transcribed constant list in `src/models/qwen35/{mod,dense,moe}.rs` with new citations) — not a CVE. Spec-driven tests verify what hf2q emits against the hand-transcribed catalog; if upstream diverges, the catalog (not the fixtures) is what needs updating.
 
 ### R2: V-head reorder has a subtle bug that loads but produces garbage
 
