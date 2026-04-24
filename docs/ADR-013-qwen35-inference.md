@@ -934,6 +934,57 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 11 · P9 PARTIAL (FFN scalar CPU references — dense + MoE)
+
+**Scope:** Phase P9 Decisions 13 + 14 — pure-Rust scalar CPU references for both dense SwiGLU and MoE FFN variants. Mirrors the iter-10 pattern: CPU reference ships first as the authoritative spec; GPU builders come in a follow-up iter.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/ffn.rs` (new file, ~520 LOC):
+  - `DenseFfnWeights` + `DenseFfnShape` + **`dense_swiglu_cpu_ref(x, weights, shape) -> Vec<f32>`** — standard SwiGLU `down @ (silu(gate @ x) * (up @ x))`.
+  - `MoeFfnWeights` + `MoeFfnShape` + **`moe_ffn_cpu_ref(x, weights, shape) -> Vec<f32>`** — top-k expert routing with **sigmoid-gated shared expert** (ADR-013 Decision 13 distinguishing feature).
+  - Internal helpers: `silu`, `sigmoid`, `matmul_a_by_bt` (self-contained — no dependency on full_attn's implementation).
+
+**MoE spec detail (per-token):**
+1. Router logits: `router @ x` → `[num_experts]`.
+2. Softmax (numerically stable) → probs.
+3. Top-k selection by probability (argsort + slice).
+4. Renormalize top-k weights to sum to 1.
+5. For each selected expert: compute SwiGLU output, weighted-sum into `moe_out`.
+6. Shared-expert **sigmoid-gated** (not always-on): `shared_gate_val = sigmoid(shared_gate_logit_w @ x)`. Multiply shared SwiGLU output by `shared_gate_val` before adding to `moe_out`.
+
+**Tests (7 new, all green):**
+- **Dense:**
+  - `dense_swiglu_zero_weights_zero_output` — sanity guard.
+  - `dense_swiglu_matches_independent_recompute` — ADR Decision 14 acceptance: synthetic weights produce expected output verified by an in-test hand rollout of the exact same math (not against itself; independent path).
+  - `dense_swiglu_deterministic` — bit-for-bit determinism across re-runs.
+- **MoE:**
+  - `moe_4experts_routing_selects_top_k` — ADR Decision 13 acceptance: synthetic 4-expert, top-2 routing produces finite output.
+  - **`moe_shared_expert_gate_controls_contribution`** — ADR Decision 13 "gate=0 → no shared contribution; gate=1 → full shared contribution". Uses sigmoid saturation (logit = ±1000) to drive the gate to 0/1 and verifies linearity: `out(gate=mid) ≈ 0.5 * (out(gate=off) + out(gate=on))` to 1e-3. This is the defining test for the sigmoid-gated-shared-expert property.
+  - `moe_topk_all_experts_eq_softmax_weighted_sum` — when top-k = num_experts, renormalization is a no-op, so output equals a plain softmax-weighted expert sum. Verified against independent recomputation.
+  - `moe_deterministic`.
+
+**Verification:**
+- 7/7 new FFN tests green.
+- 502/502 hf2q test suite green (+7 from iter 10's 495, zero regressions).
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | PARTIAL — CPU reference ✓; GPU builder pending |
+| P8     | 8          | Pending — DeltaNet layer CPU reference + GPU builder |
+| P9     | 13, 14     | **PARTIAL** — CPU references ✓ (dense + MoE); GPU builders pending |
+| P10-P13| 15-18      | Pending |
+
+**Design notes:**
+- MoE routing uses a simple argsort-based top-k in the scalar reference. The GPU path will use mlx-native's existing `moe_gate` + `moe_dispatch` kernels per ADR Decision 13.
+- Matmul convention (`matmul_a_by_bt`) identical to full_attn.rs — GGUF-native `[out_dim, in_dim]` row-major. Chosen for consistency across layers rather than introducing divergent conventions.
+- Shared expert is **sigmoid-gated**, not always-on. This differs from some MoE designs where the shared expert always contributes; Qwen3.5's design uses a learned per-token gate. Test `moe_shared_expert_gate_controls_contribution` pins this invariant.
+
+**Next iter target:** P8 DeltaNet layer scalar CPU reference — orchestrates input RMSNorm → QKV+Z projection → conv1d (via ssm_conv spec) → α/β gating → L2 norm on Q/K → GATED_DELTA_NET recurrence (re-using `mlx_native::ops::gated_delta_net::cpu_reference_f32`) → output RMSNorm → output projection. ~300 LOC + tests.
+
 ### 2026-04-23 — /loop iter 10 · P7 PARTIAL (full-attention scalar CPU reference)
 
 **Scope:** Phase P7 Decision 9 — pure-Rust scalar CPU reference for the gated full-attention forward pass. The GPU builder using mlx-native ops lands next iter (explicit scope split — the CPU reference IS the authoritative correctness oracle, so it must come first).
