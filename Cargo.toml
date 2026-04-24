@@ -74,6 +74,12 @@ ctrlc = { version = "3.4", features = ["termination"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Phase 2c vision preprocessing (ADR-005 iter 22+). Keep features minimal
+# — PNG + JPEG cover OpenAI's `image_url` data-URI cases and the fixture
+# shapes we use in tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+
 # Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
 # common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
 minijinja = "2"
