@@ -38,6 +38,7 @@ pub mod kv_cache;
 pub mod model;
 pub mod moe;
 pub mod mtp;
+pub mod weight_loader;
 
 /// `general.architecture` value for the dense variant.
 pub const ARCH_QWEN35: &str = "qwen35";

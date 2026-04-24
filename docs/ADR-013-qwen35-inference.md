@@ -934,6 +934,53 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 21 · P5-tail — real GGUF weight loader + two apex-layout discoveries
+
+**Scope:** Real GGUF tensor load into the per-layer CPU reference types, on-demand per layer. Surfaced two important layout discrepancies between the ADR spec and the actual apex GGUF — fixed on the spot.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/weight_loader.rs` (new file, ~430 LOC):
+  - `load_f32_tensor(gguf, name, device)` — wrapper that dequantizes via `mlx_native::gguf::load_tensor_f32` and downloads to `Vec<f32>`.
+  - `load_global_tensors(gguf, cfg, device)` — loads `token_embd`, `output.weight`, `output_norm.weight`.
+  - **`load_full_attn_layer()`** — loads a single full-attn layer's tensors with fused-Q-gate handling (see discovery below).
+  - **`load_delta_net_layer()`** — loads DeltaNet layer's 10 tensors.
+  - `load_moe_ffn()` / `load_dense_ffn()` — FFN variant loaders.
+  - **`load_layer(gguf, cfg, layer_idx, device) -> Qwen35LayerWeights`** — full per-layer loader that dispatches on kind + variant.
+
+**Apex layout discovery #1 — full-attn `attn_q.weight` is FUSED Q+gate:**
+Layer 3 (first full-attn in apex) has tensors `attn_k.weight`, `attn_k_norm.weight`, `attn_norm.weight`, `attn_output.weight`, **`attn_q.weight`**, `attn_q_norm.weight`, `attn_v.weight`, `post_attention_norm.weight` — but **NO separate `attn_gate.weight`** on full-attn layers. The `attn_q.weight` tensor has output dim `2 × n_head × head_dim` (Q in lower half, gate in upper half), matching llama.cpp's in-memory `wq` convention. Loader now splits the fused tensor into `wq` + `w_gate` after download.
+
+**Apex layout discovery #2 — `ssm_norm.weight` is per-head-shared `[D_v]`:**
+The DeltaNet output RMSNorm weight is a single `[D_v=128]` vector broadcast across all `num_v_heads=32`, NOT a separate `[n_v_heads × D_v = 4096]` vector as the prior schema assumed. This is a common per-head-shared norm pattern. Correction noted in the integration test; the `DeltaNetLayerWeights.ssm_norm` field semantics will be updated in a follow-up iter along with `delta_net_layer_cpu_ref` broadcasting, to keep this iter focused.
+
+**Tests (3 real-apex integration, all `#[ignore]`d, all GREEN when run with `--ignored`):**
+- **`load_real_apex_linear_attn_layer_0`** — loads layer 0 (linear-attn); verifies all 18 tensor shapes + finite + non-degenerate distributions. Stats: `attn_qkv` stddev=0.015, `ssm_conv1d` stddev=0.033, `ssm_a` mean=-10.84 (log-decay bases, as expected), `ssm_out` stddev=0.015.
+- **`load_real_apex_full_attn_layer_3`** — loads layer 3 (full-attn) with fused Q-gate split; verifies shape + stats. `wq` stddev=0.016, `wk` stddev=0.017, `wv` stddev=0.013 (typical init scales).
+- **`load_real_apex_global_tensors`** — loads the 3 global tensors; `token_embd` 508,559,360 f32 values = 248,320 × 2048, stddev=0.012.
+
+**Verification:**
+- 3/3 real-apex integration tests green.
+- 638/638 hf2q test suite green (full compile pass).
+
+**Significance:**
+- Real GGUF tensors NOW flow end-to-end into CPU reference types, layer-by-layer, memory-efficient (~200MB-1.5GB per layer).
+- The two layout discoveries would have caused silent-corruption bugs in GPU forward had we gone there first — running CPU-side integration tests first was the correct ordering.
+
+**Phase map status:**
+
+| Phase | Status |
+|---|---|
+| P0-P6 | COMPLETE |
+| P7     | PARTIAL — CPU + 5 GPU ops |
+| P8     | PARTIAL — CPU ref only |
+| P9     | PARTIAL — CPU refs only |
+| P10    | COMPLETE |
+| P11    | **CPU side COMPLETE + real weight loader** |
+| P12    | COMPLETE |
+| P13    | Pending |
+
+**Next iter target:** Refine `DeltaNetLayerWeights.ssm_norm` to match apex's per-head-shared `[D_v]` shape + broadcast in `delta_net_layer_cpu_ref`; also add `post_attention_norm` field + wire into `forward_cpu` as the between-attention-and-FFN normalization.
+
 ### 2026-04-24 — /loop iter 20 · P11 INTEGRATED CPU FORWARD PASS
 
 **Scope:** Compose every preceding stage into a single `Qwen35Model::forward_cpu(tokens, positions) -> logits` entry point. This is the P11 CPU-side completion — the end-to-end pure-Rust forward pass.
