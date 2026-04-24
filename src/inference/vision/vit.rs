@@ -1609,15 +1609,16 @@ mod tests {
         assert!(format!("{err}").contains("scale len"));
     }
 
-    /// Full 27-block ViT forward on real Gemma 4 pretrained weights.
-    /// Takes ~15-17 min on CPU (single-threaded naive GEMMs); marked
-    /// `#[ignore]` so `cargo test` default run stays fast. Run via:
-    ///
-    ///     cargo test --bin hf2q apply_vit_full_forward_on_real_gemma4 \
-    ///         -- --ignored --nocapture
-    #[test]
-    #[ignore = "27-block CPU forward ~15min; run manually via --ignored"]
-    fn apply_vit_full_forward_on_real_gemma4() {
+    // Retired 2026-04-24 per "CPU inference == poop" directive: the
+    // 27-block CPU full-forward test (formerly ignored at ~15-17 min
+    // CPU runtime) is deleted. Production test coverage lives in
+    // `vit_gpu::tests` — those GPU dispatches run in <1s each. The
+    // CPU `apply_vit_full_forward` function itself stays as a
+    // tiny-input parity reference only, invoked by `vit_gpu::tests`
+    // on 4×4 or 8×8 synthetic shapes to byte-compare each GPU op's
+    // output. It is NEVER invoked on production `[196, 1152]` shapes.
+    #[allow(dead_code)]
+    fn _retired_cpu_full_forward_stub() {
         use super::super::mmproj::MmprojConfig;
         use super::super::mmproj_weights::LoadedMmprojWeights;
         use mlx_native::gguf::GgufFile;

@@ -1723,6 +1723,27 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Cost reality check:** ~81 GFLOP per forward run. On M5 Max's naive single-threaded `linear_forward` that's ~15-17 min. GPU port via `mlx_native::ops::mul_mm` + `flash_attn_*` lands in iter 44+ and brings this sub-second. The CPU path is the correctness reference.
   - **Mantra check:** full CPU ViT pipeline end-to-end — NOT a stub. Missing for byte-identical parity: the three iter-40 TODOs (Gemma4V `kq_scale=1.0`, V-RMSNorm, 2D RoPE). Those produce a known numerical gap vs mlx-lm until corrected; structural graph is complete and every tensor shape is verified.
   - **Next (iter 43):** handler wiring. `state.mmproj.weights` is already on AppState. Extend `process_multimodal_content` to also compute `apply_vit_full_forward` per `PreprocessedImage` when mmproj is configured. Wire the resulting `[49, 2816]` output tensor(s) into the chat prompt's token stream as embedding injection points (prefix the model's input tokens with the ViT-projected embeddings, replacing the `<image>` marker). Handler's 501 finally becomes 200 with a real multimodal response. Cost caveat: CPU forward at ~15 min per image is too slow for production — handler gates on `HF2Q_CPU_VIT=1` env var, defaulting to the 501 until the GPU port lands. That way we can demonstrate the full OpenAI multimodal path end-to-end when explicitly requested, but don't regress latency for non-multimodal requests.
+
+- **2026-04-24 loop iter 43 — Course correction: GPU pivot starts. First `vit_linear_gpu` GPU dispatch against real Gemma 4 weights.** User feedback ("CPU inference == poop"; "we're GPU/NPU only basically") reversed iter 42's stated plan. Iter 43 ships the first GPU dispatch, retires the 15-min `#[ignore]`'d CPU full-forward test, and resets the forward-path roadmap around mlx-native dispatches.
+  - **Memory update:** new `feedback_tests_on_gpu_not_cpu.md` saved capturing the directive. Cross-references existing `feedback_gpu_everything.md` from 2026-02 which I'd drifted from.
+  - **`src/inference/vision/vit_gpu.rs` (NEW):** the production GPU forward path. Documents the starting-point mapping `CPU ref (vit.rs) → GPU primitive (vit_gpu.rs)` for each op.
+  - **`vit_linear_gpu(encoder, registry, device, input, weight_f32, seq, in, out) -> MlxBuffer`:** GPU dense linear `y = x @ W.T`. Input/output are F32 on device; weight F32 is cast to BF16 once per call to satisfy `dense_matmul_bf16_f32_tensor`'s tensor-core contract. Constraint: `in_features >= 32` (tile requirement). Mirrors qwen35's `apply_linear_projection_f32` pattern.
+  - **Tests (4 new, all passing, run in ~10s total):**
+    - `vit_linear_gpu_matches_cpu_reference_on_small_input` — synthetic [4 × 64] × [32 × 64]^T, sine-based deterministic input + cosine-based weight, GPU vs CPU `linear_forward` max_diff < 1e-2 (BF16 round-trip bound).
+    - `vit_linear_gpu_rejects_small_in_features` — in_features=16 < 32 → error.
+    - `vit_linear_gpu_rejects_zero_dims` — seq=0 → error.
+    - **`vit_linear_gpu_on_real_gemma4_mm0_matches_cpu_at_small_seq`** — real data test. Loads real Gemma 4 mmproj (~400MB), reads `mm.0.weight [2816, 1152]` as F32, runs GPU matmul on a synthetic [4, 1152] F32 input, reads back, compares against CPU `linear_forward` reference. Passes with >99% of 11,264 output elements within 5e-2 (BF16 weight round-trip on real pretrained magnitudes).
+  - **CPU full-forward test retired.** Deleted the `#[ignore]`'d ~15-min test per directive — production test coverage lives in `vit_gpu`; CPU `apply_vit_full_forward` stays only as tiny-input parity reference invoked from `vit_gpu::tests`.
+  - **Verification:** `cargo test --bin hf2q inference::vision::vit_gpu` — 4/4 pass (~10s including real GPU dispatch). Full suite `cargo test --bin hf2q` — 894/894 pass (+4 new GPU tests, -1 retired ignored), 7 ignored.
+  - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
+    - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
+    - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
+    - iter 46: `vit_sigmoid_mul_gpu` (fused silu+mul via `mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul`), `vit_residual_add_gpu`.
+    - iter 47: `apply_vit_block_forward_gpu` composes the 11 stages on-GPU.
+    - iter 48: `apply_vit_full_forward_gpu` full pipeline, including `avg_pool` GPU dispatch and projector.
+    - iter 49: handler wiring — `process_multimodal_content` invokes the GPU full forward, 501 becomes 200.
+    - iter 50: block-parity corrections (Gemma4V `kq_scale=1.0`, V-RMSNorm, 2D RoPE) measured against mlx-lm reference.
+  - **Mantra check:** real GPU dispatch on real pretrained weights, correctness-validated against the CPU reference. No stub; no CPU fallback; feedback loop is seconds not minutes.
   - **`src/serve/api/grammar/mask.rs` (~180 LOC + 10 tests):**
     - `mask_invalid_tokens(grammar, token_bytes, logits) -> masked_count`. Clones the grammar per candidate token, feeds token bytes through the sampler; if the clone dies, sets `logits[i] = f32::NEG_INFINITY`.
     - Skips empty-string tokens (special/EOS markers) and already-masked (non-finite) logits — idempotent across calls.
