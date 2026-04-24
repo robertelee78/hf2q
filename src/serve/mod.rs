@@ -701,6 +701,26 @@ fn cmd_generate_qwen35(
     )
     .context("print header prefill")?;
 
+    // HF2Q_DUMP_LOGITS=1: write the last-token logit vector to /tmp/hf2q_logits_t0.bin
+    // and exit immediately. Used for first-token logit comparison vs llama.cpp.
+    if std::env::var("HF2Q_DUMP_LOGITS").as_deref() == Ok("1") {
+        let last_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                last_logits.as_ptr() as *const u8,
+                last_logits.len() * 4,
+            )
+        };
+        std::fs::write("/tmp/hf2q_logits_t0.bin", bytes)
+            .context("HF2Q_DUMP_LOGITS: write /tmp/hf2q_logits_t0.bin")?;
+        // Top-3 to stderr for quick sanity check.
+        let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("HF2Q_DUMP_LOGITS: wrote {} f32 values to /tmp/hf2q_logits_t0.bin", last_logits.len());
+        eprintln!("  top-3: {:?}", &indexed[..3.min(indexed.len())]);
+        return Ok(());
+    }
+
     // Sample the first token from prefill logits (last token's row).
     let last_prefill_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
     let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
