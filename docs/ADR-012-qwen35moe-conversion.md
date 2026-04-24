@@ -26,11 +26,14 @@
 
 | Metric | Value |
 |---|---|
-| Decisions shipped | 17 of 20 (P0–P7 + scaffolding P8 + P11 complete; DWQ-bound P9, vision-path P10 remain) |
-| Phases shipped | P0–P7 complete · P8 scaffolding + preflight + dispatch + Decision 20 complete (Q4_0 convert+llama-cli runner still pending) · P11 fully shipped with ADR-013 P14 cross-link |
-| Commits on main | `4a2b1e6` · `c7b1296` · `1a849e1` · `73a96e4` · `4ffd035` · `6175bb7` · `db644f8` · `8aab918` · `ebec4a1` (P8 scaffold) · _pending_ (P11 + ADR-013 P14) |
-| Total tests | 906 unit + 12 integration tests (smoke_conformance × 9 + convert_qwen35_mtp_roundtrip × 3) = 918 green · 7 ignored |
-| New tests across P0→P11 current state | ≈ 184 (P0→P7 ~126 + P8 scaffold 46 + smoke_conformance 9 + MTP round-trip 3) |
+| Decisions shipped | 19 of 20 (P0–P8 scaffold + P10 module + P11 + P9 foundation complete; P9 real-model shipment hard-blocked on ADR-013 P12) |
+| Phases shipped | P0–P7 complete · P8 scaffolding + preflight + dispatch + Decision 20 + docs/arch-onboarding.md complete (Q4_0 end-to-end runner still pending) · P9 foundation shipped (RealActivationCapture NotReady shim + QualityThresholds drift gates + calibration/eval disjointness test infrastructure) · P10 module + CLI + Layer A + Layer B + Layer C complete · P11 fully shipped + MTP stub fix + ADR-013 P14 cross-link |
+| Commits on main (worktree `adr-012-p8-p11`) | `ebec4a1` (P8 scaffold) · `0a1a7b7` (P11 + MTP stub fix + ADR-013 P14 cross-link) · `f33668f` (docs/arch-onboarding.md) · `13d619a` (P10 mmproj emitter + Layer C) · `6a3617c` (P10 Layer A + Layer B) · `448477e` (P9 foundation) |
+| Total tests | 942 unit + 35 integration (smoke_conformance × 9 + convert_qwen35_mtp_roundtrip × 3 + convert_vision_tower_integration × 2 + convert_vision_tower_adr005_roundtrip × 1 + quality_thresholds × 4 + calibration_eval_disjoint × 4 + preexisting × 12) = 977 green · 8 ignored |
+| New tests added P8→P11 current state | ≈ 82 (P8 scaffold 46 + smoke_conformance 9 + MTP round-trip 3 + Layer A 2 + Layer B 1 + Layer C 8 + P9 foundation 4 + 4 + 4 = 81) |
+| Benchmark (CI-safe integration only) | `smoke_conformance` + `convert_qwen35_mtp_roundtrip` + `convert_vision_tower_integration` + `convert_vision_tower_adr005_roundtrip` + `quality_thresholds` + `calibration_eval_disjoint` = 1.39 s total wall |
+| Benchmark (full `cargo test` wall) | 32.3 s (was ~30 s pre-P8; +46 arch unit tests + 23 new integration tests for +2.3 s) |
+| Benchmark (smoke dry-run preflight) | 6 ms end-to-end (exit 2, clean HF_TOKEN-missing path) |
 | LOC inserted P0→P7 | ~8,600 across 8 feature commits (excluding ADR status updates) |
 | LOC remaining P8→P11 (2026-04-24 party-mode refinement) | ~2,400 (P8 ~500 incl. arch-registry · P9 ~700 incl. PPL/KL infra · P10 ~1,000 three-layer defense · P11 ~200) |
 | Clippy status | zero new warnings in any ADR-012-touched file |
