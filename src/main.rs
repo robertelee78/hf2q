@@ -98,28 +98,48 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    // Verbosity-aware tracing subscriber. -v raises hf2q to info,
-    // -vv to debug, -vvv+ to trace. At verbosity 0, RUST_LOG wins; if
-    // unset, defaults to hf2q=warn (silent on the generate boot path).
+    // Logging subscriber init. Priority:
+    //   1. --log-level (explicit) overrides everything.
+    //   2. -v/-vv/-vvv bumps verbosity.
+    //   3. RUST_LOG env var.
+    //   4. Default: hf2q=warn (silent on the generate boot path).
+    // Log format (text/json) comes from --log-format (Decision #11).
     // Stderr writer: logs never touch stdout, keeping the generation
-    // stream unpolluted. ANSI colors only when stderr is a TTY, so
-    // piped/redirected logs are plain text (AC-4).
+    // stream unpolluted. ANSI colors only when stderr is a TTY for
+    // text format; JSON format is always ANSI-free.
     use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
-    let filter = match cli.verbose {
-        0 => EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
-        1 => EnvFilter::new("hf2q=info,mlx_native=info"),
-        2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
-        _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
+    let filter = if let Some(lvl) = cli.log_level {
+        EnvFilter::new(format!("hf2q={lvl},mlx_native={lvl}", lvl = lvl.as_str()))
+    } else {
+        match cli.verbose {
+            0 => EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("hf2q=warn")),
+            1 => EnvFilter::new("hf2q=info,mlx_native=info"),
+            2 => EnvFilter::new("hf2q=debug,mlx_native=debug"),
+            _ => EnvFilter::new("hf2q=trace,mlx_native=trace"),
+        }
     };
     let stderr_is_tty = std::io::stderr().is_terminal();
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(stderr_is_tty)
-        .without_time()
-        .init();
+    match cli.log_format {
+        cli::LogFormat::Text => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_ansi(stderr_is_tty)
+                .without_time()
+                .init();
+        }
+        cli::LogFormat::Json => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_current_span(false)
+                .with_span_list(false)
+                .init();
+        }
+    }
 
     match run(cli) {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),

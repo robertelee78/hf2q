@@ -137,14 +137,10 @@ pub async fn chat_completions(
         gpu_dispatch_count: 0,
     };
 
-    // Approximate reasoning-token count from the character count of the
-    // reasoning_text. We don't have a per-token classifier on the
-    // non-streaming path, so `len()/4` is a rough proxy (avg token length
-    // for English) until a proper per-token reasoning counter is plumbed.
-    let reasoning_tokens = result
-        .reasoning_text
-        .as_ref()
-        .map(|s| s.chars().count().max(1) / 4);
+    // Per-token reasoning count comes straight from the engine (it runs the
+    // same ReasoningSplitter the streaming path uses). Fall back to None
+    // when the model has no reasoning markers registered.
+    let reasoning_tokens = result.reasoning_tokens;
     let resp = ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",

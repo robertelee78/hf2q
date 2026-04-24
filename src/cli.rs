@@ -16,8 +16,49 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
+    /// Log output format. `text` (default) emits human-readable colored
+    /// output on stderr; `json` emits one JSON object per line (structured
+    /// ingest for Loki / Datadog / etc.). ADR-005 Decision #11.
+    #[arg(long, value_enum, global = true, default_value = "text")]
+    pub log_format: LogFormat,
+
+    /// Explicit log level override. When unset, verbosity (`-v`) controls
+    /// the level. When set, this wins and `-v` is ignored. ADR-005
+    /// Decision #11.
+    #[arg(long, value_enum, global = true)]
+    pub log_level: Option<LogLevel>,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Log output format (Decision #11).
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable colored stderr (ANSI only when stderr is a TTY).
+    Text,
+    /// One JSON object per log event (structured ingest).
+    Json,
+}
+
+/// Log level override (Decision #11). When `None`, `-v` flag controls it.
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

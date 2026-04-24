@@ -94,6 +94,10 @@ pub struct GenerationResult {
     pub prompt_tokens: usize,
     /// Completion token count (tokens emitted by the decoder).
     pub completion_tokens: usize,
+    /// Number of completion tokens that were emitted inside a reasoning
+    /// span (Decision #21). `None` when no reasoning markers registered /
+    /// no reasoning span opened. Counted per-token in the decode loop.
+    pub reasoning_tokens: Option<usize>,
     /// Reason generation halted: `"stop"` | `"length"`.
     pub finish_reason: &'static str,
     /// Prefill wall-clock.
@@ -558,19 +562,32 @@ fn generate_once(
         .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx)?;
     let prefill_duration = prefill_start.elapsed();
 
+    // --- Reasoning splitter + counter (Decision #21) ---
+    // Feed each decoded fragment through a local ReasoningSplitter; count
+    // tokens whose post-feed state is `in_reasoning`. Mirrors the streaming
+    // path's accounting exactly so stream + non-stream usage agree.
+    let mut splitter = registration
+        .filter(|r| r.has_reasoning())
+        .and_then(super::registry::ReasoningSplitter::from_registration);
+    let reasoning_enabled = splitter.is_some();
+    let mut reasoning_token_count: usize = 0;
+
     // --- Decode loop ---
     let decode_start = Instant::now();
     let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
     generated_tokens.push(next_token);
 
-    // Decode with ad-hoc text accumulation for stop-string matching. The
-    // tokenizer's incremental `.decode` on a growing slice each step is the
-    // same shape cmd_generate uses; for serve we additionally scan the
-    // accumulated text for any stop string.
-    let mut decoded_text = loaded
+    let first_fragment = loaded
         .tokenizer
         .decode(&[next_token], false)
         .unwrap_or_default();
+    let mut decoded_text = first_fragment.clone();
+    if let Some(sp) = splitter.as_mut() {
+        let _ = sp.feed(&first_fragment);
+        if sp.in_reasoning() {
+            reasoning_token_count += 1;
+        }
+    }
 
     let mut finish_reason: &'static str = "length";
     let mut profiler = ProfileAccumulator::new(0);
@@ -595,8 +612,16 @@ fn generate_once(
             }
 
             generated_tokens.push(next_token);
-            if let Ok(fragment) = loaded.tokenizer.decode(&[next_token], false) {
-                decoded_text.push_str(&fragment);
+            let fragment = loaded
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_text.push_str(&fragment);
+            if let Some(sp) = splitter.as_mut() {
+                let _ = sp.feed(&fragment);
+                if sp.in_reasoning() {
+                    reasoning_token_count += 1;
+                }
             }
             if hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
@@ -627,6 +652,11 @@ fn generate_once(
         reasoning_text,
         prompt_tokens: prompt_len,
         completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_enabled && reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
         finish_reason,
         prefill_duration,
         decode_duration,

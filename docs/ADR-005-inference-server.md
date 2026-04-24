@@ -1389,6 +1389,19 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 488/488 pass (+16 from iter 8's 472, 2 ignored). Zero clippy errors. Live smoke confirms endpoint. Commit + push.
   - **Next (iter 10):** candidates: (a) `ServeArgs` additions (`--log-format=json`, `--log-level`) to satisfy Decision #11 logging; (b) OpenAI `logit_bias` wiring into sampling_params (Tier 4); (c) `response_format` decode-time wiring once live-model validation becomes possible; (d) begin pooled chat-model embeddings (Task #8, needs hidden-state forward pass). Prompt cache + real-model live smoke still OOM-blocked.
 
+- **2026-04-23 loop iter 10 — Logging ergonomics (Decision #11) + accurate per-token reasoning counter.** Two Phase 2a AC items land:
+  - **Logging flags (Decision #11):**
+    - `--log-format={text,json}` — global Cli flag (applies to every subcommand). Default `text` (human-readable colored stderr; ANSI only on TTY). `json` emits one JSON object per event via `tracing_subscriber::fmt().json()`.
+    - `--log-level={debug,info,warn,error}` — global Cli flag; when set, wins over `-v`/`-vv`/`-vvv`. When unset, verbosity flag controls the level. `RUST_LOG` env var is still honored at verbosity 0 when both are unset.
+    - Added `json` feature to `tracing-subscriber` in `Cargo.toml` (pulls in `tracing-serde`).
+    - **Live smoke:** `./target/debug/hf2q --log-format json --log-level info serve --port 38087` emits structured logs like `{"timestamp":"...","level":"INFO","fields":{"message":"hf2q HTTP server listening","addr":"127.0.0.1:38087"},"target":"hf2q::serve"}`. JSON body from `/health` remains unchanged.
+  - **Accurate `reasoning_tokens` in non-streaming path:**
+    - Replaced the chars/4 approximation in `chat_completions` handler with the engine-computed per-token count.
+    - `GenerationResult` gains `reasoning_tokens: Option<usize>`. `generate_once` now runs a local `ReasoningSplitter` through the decode loop and increments the counter when `splitter.in_reasoning()` is true after feeding the token fragment. Mirrors the streaming path's accounting exactly — stream + non-stream `usage.completion_tokens_details.reasoning_tokens` now agree byte-for-byte for the same prompt.
+    - Handler reads the count directly; no more lossy character-level heuristic.
+  - **Full suite:** 495/495 pass (+7 from iter 9's 488, 2 ignored). Zero clippy errors. Commit + push.
+  - **Next (iter 11):** candidates: (a) extend `SamplingParams` with `frequency_penalty`, `presence_penalty`, `min_p`, `seed`, `logit_bias` so the full Tier 2/3/4 request surface plumbs through to the worker thread (even when the sampler doesn't yet honor every field — pure plumbing prep for iter-12+ decode-time sampler wiring); (b) `/v1/embeddings` handler scaffolding using the same gate ordering as chat; (c) start a concrete scenario-test integration suite in `tests/` that spins up the server + asserts OpenAI SDK-shaped interactions end-to-end (without a live model). Prompt cache + forward_decode refactor still OOM-blocked.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
