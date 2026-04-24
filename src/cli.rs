@@ -183,6 +183,12 @@ pub struct ConvertArgs {
     /// How to handle unsupported layer types
     #[arg(long, value_enum)]
     pub unsupported_layers: Option<UnsupportedLayerPolicy>,
+
+    /// ADR-012 P10 (Decision 18) — emit mmproj-<slug>-F16.gguf alongside
+    /// the text GGUF when the HF repo has a vision_config. Silently skipped
+    /// when no vision_config is present (Gemma4, Qwen3.6-35B-A3B MoE).
+    #[arg(long, default_value_t = false)]
+    pub emit_vision_tower: bool,
 }
 
 #[derive(clap::Args, Debug)]

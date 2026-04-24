@@ -7,3 +7,6 @@
 //! ADR-013: inference-side models live in src/inference/models/ — do NOT mix.
 
 pub mod qwen35;
+
+/// ADR-012 P10: pure-Rust mmproj vision-tower emitter.
+pub mod vit;

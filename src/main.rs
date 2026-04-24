@@ -781,6 +781,31 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // the written .gguf or safetensors files.
     copy_sidecars(&config.input_dir, std::path::Path::new(&manifest.output_dir));
 
+    // Phase 4.8: ADR-012 P10 / Decision 18 — emit pure-Rust mmproj when
+    // --emit-vision-tower is set AND the HF config has a vision_config.
+    // Silent skip for Gemma4 (no vision_config) and Qwen3.6-35B-A3B MoE
+    // (publisher dropped vision_config). Only Qwen3.6-27B dense emits.
+    if args.emit_vision_tower {
+        let output_parent = std::path::Path::new(&manifest.output_dir);
+        match models::vit::convert_vision_tower(&config.input_dir, output_parent) {
+            Ok(Some(path)) => {
+                tracing::info!(
+                    "ADR-012 P10: mmproj emitted at {}",
+                    path.display()
+                );
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "--emit-vision-tower requested but {} has no vision_config — skipping",
+                    config.input_dir.display()
+                );
+            }
+            Err(e) => {
+                warn!("vision-tower emission failed: {}", e);
+            }
+        }
+    }
+
     // Phase 5.1: Regression detection against previous baseline
     let quality_gate_result = if quality_report.has_metrics() {
         let thresholds = quality::QualityThresholds::default();
