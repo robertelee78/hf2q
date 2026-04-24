@@ -934,6 +934,40 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 16 · P7b continued (per-head RMSNorm + IMROPE GPU parity)
+
+**Scope:** Continue P7b pipeline. Two more GPU dispatches verified against the P7a CPU reference.
+
+**Delivered in `hf2q/gpu_full_attn.rs`:**
+- **`apply_q_or_k_per_head_rms_norm()`** — dispatches mlx-native rms_norm with `rows = seq*n_heads`, `dim = head_dim`, reusing the same per-row kernel that serves pre-attention normalization. Weight buffer is `[head_dim]` shared across all heads and tokens (matches HF / llama.cpp convention).
+- **`apply_imrope()`** — wraps `mlx_native::ops::rope_multi::dispatch_rope_multi` with Qwen3.5's IMROPE mode, sections `[s0, s1, s2, s3]`, partial rotary via `rope_dim < head_dim`. Allocates output + builds the three param buffers.
+
+**Tests added (3 new, all green):**
+- **`q_per_head_rms_norm_matches_cpu_ref`** — GPU output matches in-test CPU recomputation of the exact per-head RMSNorm formula from full_attn.rs at ≤1e-5 per element.
+- **`k_per_head_rms_norm_matches_cpu_ref`** — mirror for K using `attn_k_norm` weight and `n_kv` heads (GQA-aware).
+- **`imrope_matches_cpu_ref`** — full IMROPE dispatch with `sections=[2,2,0,0]`, text-convention positions; CPU recomputation re-derives the `sector % 3` axis picker, per-pair frequency, NeoX pair rotation exactly. Match ≤1e-5.
+
+**Verification:**
+- 8/8 gpu_full_attn tests green (+3 from iter 15's 5, 0 regressions).
+- 546/546 hf2q test suite green.
+
+**Progress on P7b pipeline (8 ops → 4 done, 4 remaining):**
+
+| Step | Op | Status |
+|---|---|---|
+| 1 | Pre-attention RMSNorm on x | ✅ iter 15 |
+| 2 | Q / K / V / gate projections | ⏸ Pure matmul — no Qwen-specific logic; delegated to mlx-native's existing `quantized_matmul_ggml` (Q5_K tested in mlx-native@8777d38) or `dense_gemm` for F32 synthetic paths |
+| 3 | Per-head Q RMSNorm | ✅ iter 16 (this) |
+| 4 | Per-head K RMSNorm | ✅ iter 16 (this) |
+| 5 | IMROPE on Q and K | ✅ iter 16 (this) |
+| 6 | SDPA (GQA + causal mask) | ⏳ next iter — mlx-native's `flash_attn_prefill_d512` handles head_dim=256 |
+| 7 | Sigmoid(gate) * attn_out | ⏳ next iter — elementwise |
+| 8 | wo projection + residual | ⏸ Pure matmul |
+
+**Phase map unchanged** (P7 still PARTIAL; ops 6+7 are the remaining Qwen-specific pieces).
+
+**Next iter target:** SDPA (flash_attn_prefill_d512 with causal mask + GQA repeat) + sigmoid-gate application. These two complete every Qwen3.5-specific full-attention op with CPU parity; composing `build_gated_attn_layer()` and the full-layer parity test vs `gated_full_attention_cpu_ref` follows immediately after.
+
 ### 2026-04-24 — /loop iter 15 · P7b-prep (GPU-CPU bridge + RMSNorm parity)
 
 **Scope:** Phase P7b (GPU builder for full-attention) broken into two sub-iters; this iter lands the foundation — weight upload infrastructure + first dispatch verified end-to-end.

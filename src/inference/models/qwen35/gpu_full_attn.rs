@@ -31,6 +31,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::rms_norm;
+use mlx_native::ops::rope_multi::{
+    build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
+};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::full_attn::FullAttnLayerWeights;
@@ -94,6 +97,134 @@ pub fn download_f32(buf: &MlxBuffer) -> Result<Vec<f32>> {
     }
     let slice: &[f32] = buf.as_slice().map_err(|e| anyhow!("as_slice: {e}"))?;
     Ok(slice.to_vec())
+}
+
+/// Apply per-head RMSNorm to a Q or K buffer.
+///
+/// # Layout contract
+///
+/// Input buffer shape is `[seq_len * n_heads, head_dim]` f32 (row-major
+/// with `head_dim` innermost). The per-head RMSNorm treats each row as an
+/// independent vector and applies `x / sqrt(mean(x^2) + eps) * weight`
+/// element-wise, where `weight` is shape `[head_dim]` shared across all
+/// heads and tokens (matches llama.cpp / HF's Qwen3.5 convention).
+///
+/// # Why this dispatches rms_norm with rows = seq*n_heads
+///
+/// The full-attention op order has RMSNorm applied POST-reshape, meaning
+/// each Q head of each token gets normalized independently over the
+/// `head_dim` axis. Since mlx-native's `dispatch_rms_norm` is already a
+/// per-row operation with an element-wise weight, we can reuse it directly
+/// by flattening (seq, head) into a single row axis.
+///
+/// # Parity contract
+///
+/// Output matches the CPU reference's step 3 (Q) or 4 (K) — per-head
+/// RMSNorm over `head_dim` — to ≤1e-5 per element.
+pub fn apply_q_or_k_per_head_rms_norm(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    let rows = seq_len * n_heads;
+    let dim = head_dim;
+    let out = device
+        .alloc_buffer(
+            (rows * dim) as usize * 4,
+            DType::F32,
+            vec![rows as usize, dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc out: {e}"))?;
+    let mut params = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc params: {e}"))?;
+    {
+        let s = params
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("mut_slice: {e}"))?;
+        s[0] = eps;
+        s[1] = dim as f32;
+    }
+    rms_norm::dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        norm_weight,
+        &out,
+        &params,
+        rows,
+        dim,
+    )
+    .context("dispatch_rms_norm per-head")?;
+    Ok(out)
+}
+
+/// Apply IMROPE to a Q or K buffer on the GPU.
+///
+/// `input` shape: `[seq_len * n_heads, head_dim]` (flat row-major).
+/// `positions`: int32 array of length `4 * seq_len` — per-axis positions
+/// (see mlx-native `rope_multi` spec; text-only Qwen3.5 replicates the
+/// same token index across all 4 axes).
+///
+/// Returns a new buffer with the same shape holding the rotated Q/K.
+pub fn apply_imrope(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    positions: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+) -> Result<MlxBuffer> {
+    let params = RopeMultiParams {
+        head_dim,
+        rope_dim: rotary_dim,
+        n_heads,
+        seq_len,
+        freq_base,
+        mode: RopeMultiMode::Imrope,
+        sections: mrope_section,
+    };
+    let out = device
+        .alloc_buffer(
+            (seq_len * n_heads * head_dim) as usize * 4,
+            DType::F32,
+            vec![
+                seq_len as usize,
+                n_heads as usize,
+                head_dim as usize,
+            ],
+        )
+        .map_err(|e| anyhow!("alloc imrope out: {e}"))?;
+    let (params_buf, rope_params, sections_buf) =
+        build_rope_multi_buffers(device, params).map_err(|e| anyhow!("rope bufs: {e}"))?;
+
+    dispatch_rope_multi(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &out,
+        positions,
+        &params_buf,
+        &rope_params,
+        &sections_buf,
+        params,
+    )
+    .context("dispatch_rope_multi")?;
+
+    Ok(out)
 }
 
 /// Apply pre-attention RMSNorm to a residual-stream input buffer.
@@ -331,6 +462,236 @@ mod tests {
         let buf = upload_f32(&data, &device).expect("upload");
         assert_eq!(buf.dtype(), DType::F32);
         assert_eq!(buf.element_count(), 3);
+    }
+
+    /// **Parity test**: per-head Q RMSNorm on GPU matches the scalar CPU
+    /// reference. Input is a synthetic Q buffer shaped
+    /// `[seq_len, n_head, head_dim]` (flattened row-major as
+    /// `[seq_len * n_head, head_dim]`). CPU-side recomputes
+    /// `x / sqrt(mean(x^2) + eps) * attn_q_norm` per row.
+    #[test]
+    fn q_per_head_rms_norm_matches_cpu_ref() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, weights_cpu, seq_len) = small_shape_and_weights();
+        let nh = shape.n_head as usize;
+        let d = shape.head_dim as usize;
+
+        // Synthetic pre-projection Q values.
+        let mut seed = 0xDEAD_u32;
+        let q_cpu: Vec<f32> = (0..(seq_len as usize * nh * d))
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+
+        // CPU reference.
+        let mut expected = vec![0.0f32; q_cpu.len()];
+        for t in 0..seq_len as usize {
+            for h in 0..nh {
+                let off = (t * nh + h) * d;
+                let row = &q_cpu[off..off + d];
+                let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+                let inv = ((sum_sq / (d as f32)) + shape.rms_norm_eps).sqrt().recip();
+                for j in 0..d {
+                    expected[off + j] = row[j] * inv * weights_cpu.attn_q_norm[j];
+                }
+            }
+        }
+
+        // GPU path.
+        let gpu = FullAttnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
+        let q_gpu = upload_f32(&q_cpu, &device).expect("upload q");
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        let out = apply_q_or_k_per_head_rms_norm(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_gpu,
+            &gpu.attn_q_norm,
+            seq_len,
+            shape.n_head,
+            shape.head_dim,
+            shape.rms_norm_eps,
+        )
+        .expect("apply q per-head norm");
+        encoder.commit_and_wait().expect("commit");
+
+        let got = download_f32(&out).expect("download");
+        assert_eq!(got.len(), expected.len());
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            let d = (g - e).abs();
+            assert!(
+                d < 1e-5,
+                "q per-head norm mismatch at {}: gpu={}, cpu={}, diff={}",
+                i, g, e, d
+            );
+        }
+    }
+
+    /// Mirror parity test for K per-head RMSNorm (n_kv heads instead of n_head).
+    #[test]
+    fn k_per_head_rms_norm_matches_cpu_ref() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, weights_cpu, seq_len) = small_shape_and_weights();
+        let nkv = shape.n_kv as usize;
+        let d = shape.head_dim as usize;
+
+        let mut seed = 0xFEED_u32;
+        let k_cpu: Vec<f32> = (0..(seq_len as usize * nkv * d))
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+
+        let mut expected = vec![0.0f32; k_cpu.len()];
+        for t in 0..seq_len as usize {
+            for h in 0..nkv {
+                let off = (t * nkv + h) * d;
+                let row = &k_cpu[off..off + d];
+                let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+                let inv = ((sum_sq / (d as f32)) + shape.rms_norm_eps).sqrt().recip();
+                for j in 0..d {
+                    expected[off + j] = row[j] * inv * weights_cpu.attn_k_norm[j];
+                }
+            }
+        }
+
+        let gpu = FullAttnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
+        let k_gpu = upload_f32(&k_cpu, &device).expect("upload k");
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        let out = apply_q_or_k_per_head_rms_norm(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &k_gpu,
+            &gpu.attn_k_norm,
+            seq_len,
+            shape.n_kv,
+            shape.head_dim,
+            shape.rms_norm_eps,
+        )
+        .expect("apply k per-head norm");
+        encoder.commit_and_wait().expect("commit");
+
+        let got = download_f32(&out).expect("download");
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            let d = (g - e).abs();
+            assert!(
+                d < 1e-5,
+                "k per-head norm mismatch at {}: gpu={}, cpu={}, diff={}",
+                i, g, e, d
+            );
+        }
+    }
+
+    /// **Parity test**: IMROPE on GPU matches the scalar CPU reference.
+    /// Input is a synthetic Q buffer shaped `[seq_len, n_head, head_dim]`
+    /// already per-head-normalized; positions are text-convention
+    /// `[t, t, t, t]` per token. Expected output is `imrope_inplace()` from
+    /// the CPU reference (re-implemented inline here to keep the test
+    /// self-contained).
+    #[test]
+    fn imrope_matches_cpu_ref() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, _weights_cpu, seq_len) = small_shape_and_weights();
+        let nh = shape.n_head as usize;
+        let d = shape.head_dim as usize;
+        let rotary_dim = shape.rotary_dim as usize;
+        let half_rope = rotary_dim / 2;
+        let half_dim = d / 2;
+        let sect_dims = shape.mrope_section.iter().sum::<u32>().max(1);
+
+        // Synthetic Q after per-head norm.
+        let n_elem = seq_len as usize * nh * d;
+        let mut seed = 0xBEEF_u32;
+        let q_cpu: Vec<f32> = (0..n_elem)
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+
+        // Text-only positions: all 4 axes equal token index.
+        let positions: Vec<i32> = (0..seq_len as i32)
+            .cycle()
+            .take(4 * seq_len as usize)
+            .collect();
+
+        // CPU reference (same formula as full_attn::imrope_inplace).
+        let pick_axis = |sector: u32| -> usize {
+            if sector % 3 == 0 && sector < 3 * shape.mrope_section[0] {
+                0
+            } else if sector % 3 == 1 && sector < 3 * shape.mrope_section[1] {
+                1
+            } else if sector % 3 == 2 && sector < 3 * shape.mrope_section[2] {
+                2
+            } else {
+                3
+            }
+        };
+        let mut expected = q_cpu.clone();
+        for t in 0..seq_len as usize {
+            for h in 0..nh {
+                let base = (t * nh + h) * d;
+                for pair in 0..half_rope {
+                    let sector = (pair as u32) % sect_dims;
+                    let axis = pick_axis(sector);
+                    let pos = positions[axis * seq_len as usize + t] as f32;
+                    let dim_ratio = 2.0 * pair as f32 / rotary_dim as f32;
+                    let freq = 1.0 / shape.rope_theta.powf(dim_ratio);
+                    let angle = pos * freq;
+                    let (ca, sa) = (angle.cos(), angle.sin());
+                    let x0 = q_cpu[base + pair];
+                    let x1 = q_cpu[base + pair + half_dim];
+                    expected[base + pair] = x0 * ca - x1 * sa;
+                    expected[base + pair + half_dim] = x0 * sa + x1 * ca;
+                }
+            }
+        }
+
+        // GPU path.
+        let q_gpu = upload_f32(&q_cpu, &device).expect("upload");
+        let mut pos_buf = device
+            .alloc_buffer(positions.len() * 4, DType::I32, vec![positions.len()])
+            .expect("alloc positions");
+        pos_buf
+            .as_mut_slice::<i32>()
+            .expect("mut")
+            .copy_from_slice(&positions);
+
+        let mut encoder = device.command_encoder().expect("enc");
+        let out = apply_imrope(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &q_gpu,
+            &pos_buf,
+            seq_len,
+            shape.n_head,
+            shape.head_dim,
+            shape.rotary_dim,
+            shape.rope_theta,
+            shape.mrope_section,
+        )
+        .expect("apply imrope");
+        encoder.commit_and_wait().expect("commit");
+
+        let got = download_f32(&out).expect("download");
+        for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            let d_err = (g - e).abs();
+            assert!(
+                d_err < 1e-5,
+                "imrope mismatch at {}: gpu={}, cpu={}, diff={}",
+                i, g, e, d_err
+            );
+        }
     }
 
     /// download_f32 rejects non-F32 buffers with a clear error.
