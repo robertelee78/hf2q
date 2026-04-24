@@ -382,6 +382,106 @@ pub fn merge_expert_tensors(
     })
 }
 
+/// Merge all per-expert tensors in a **pre-quantization** `TensorMap`
+/// for the `qwen35moe` arch.
+///
+/// # Why pre-quantization
+///
+/// `merge_moe_experts_in_place` (below) was originally written against
+/// `QuantizedModel` but runs post-quantization — by then each
+/// per-expert tensor's byte count reflects its quantized form (Q4_0:
+/// 0.5 bytes/elem) not its declared F16 dtype, which tripped the
+/// expected-bytes check in `merge_expert_tensors`.
+///
+/// This variant runs BEFORE quantization — the TensorMap still holds
+/// the original F16/BF16 bytes, so `shape.numel() * element_size()`
+/// matches `data.len()` and the merge's shape-check passes.
+///
+/// # Ordering
+///
+/// Callers run this immediately after `input::read_model` and before
+/// the quantizer dispatch. Gemma and other non-MoE arches hit the
+/// early-return guard and incur no cost.
+pub fn merge_moe_experts_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    let arch_str = metadata.architecture.as_str();
+    if arch_str != "Qwen3_5MoeForCausalLM"
+        && arch_str != "Qwen3_5MoeForConditionalGeneration"
+        && metadata.model_type != "qwen3_5_moe_text"
+    {
+        return Ok(());
+    }
+    let num_experts = match metadata.num_experts {
+        Some(n) => n as usize,
+        None => return Ok(()),
+    };
+
+    let mut moe_layers: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
+    for name in tensor_map.tensors.keys() {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot].parse::<usize>() {
+                    if rest[dot + 1..].starts_with("mlp.experts.") {
+                        moe_layers.insert(layer_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    for proj in &["gate_proj", "up_proj", "down_proj"] {
+        let expert_proj = match *proj {
+            "gate_proj" => ExpertProj::Gate,
+            "up_proj" => ExpertProj::Up,
+            "down_proj" => ExpertProj::Down,
+            _ => unreachable!(),
+        };
+        for &layer_idx in &moe_layers {
+            let mut collected: Vec<TensorRef> = Vec::with_capacity(num_experts);
+            let mut keys: Vec<String> = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let hf = format!(
+                    "model.layers.{}.mlp.experts.{}.{}.weight",
+                    layer_idx, e, proj
+                );
+                let Some(t) = tensor_map.tensors.get(&hf) else {
+                    break;
+                };
+                collected.push(TensorRef {
+                    name: hf.clone(),
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                    data: t.data.clone(),
+                });
+                keys.push(hf);
+            }
+            if collected.len() != num_experts {
+                continue;
+            }
+            let merged =
+                merge_expert_tensors(&collected, expert_proj, super::Qwen35Arch::Moe)?;
+            // Remove per-expert; insert merged with canonical HF name.
+            for k in &keys {
+                tensor_map.tensors.remove(k);
+            }
+            let merged_ref = TensorRef {
+                name: format!(
+                    "model.layers.{}.mlp.experts.{}.weight",
+                    layer_idx, proj
+                ),
+                shape: merged.shape,
+                dtype: merged.dtype,
+                data: merged.data,
+            };
+            tensor_map.tensors.insert(merged_ref.name.clone(), merged_ref);
+        }
+    }
+    Ok(())
+}
+
 /// Merge all per-expert tensors in a `QuantizedModel` for the `qwen35moe` arch.
 ///
 /// # Layer-streaming orchestration (ADR-012 Decision 9)

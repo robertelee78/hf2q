@@ -439,6 +439,26 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
+    // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
+    //
+    // Must run BEFORE quantization: `merge_moe_experts_in_tensor_map`
+    // consumes pre-quantization F16/BF16 bytes where shape × dtype.size
+    // matches data.len(). Running post-quant on Q4_0 bytes trips the
+    // expected-bytes check in `merge_expert_tensors`.
+    //
+    // Without this call, qwen35moe GGUFs emit N_experts × 3 × N_layers
+    // separate per-expert tensors instead of 3 × N_layers merged ones,
+    // and llama.cpp's loader rejects the file (silent P4→P5 wire-up
+    // gap caught by ADR-012 P11 round-trip test).
+    //
+    // No-op for dense arches (guarded by the arch string check inside
+    // the function itself).
+    models::qwen35::moe::merge_moe_experts_in_tensor_map(&mut tensor_map, &metadata)
+        .context("qwen35moe expert merge failed")
+        .map_err(AppError::Conversion)?;
+
+    check_interrupted()?;
+
     let input_size = tensor_map.total_size_bytes() as u64;
 
     tracing::info!(

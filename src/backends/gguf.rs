@@ -1482,10 +1482,40 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm" (llama-arch.cpp:367).
         // There is NO separate ffn_norm tensor — the post-attn norm gates the FFN.
         // ADR-012 Decision 8: post_attention_layernorm verdict.
-        "qwen35" | "qwen35moe" => {
+        "qwen35" => {
             map.extend_from_slice(&[
-                // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
                 ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+            ]);
+        }
+        // ADR-012 Decision 11 + P5: qwen35moe adds the MoE-specific surface:
+        // router (mlp.gate), per-expert merged stacks (mlp.experts.* post-merge
+        // named mlp.experts.{proj}.weight by merge_moe_experts_in_place), and
+        // shared-expert + shared-expert-gate. Each entry cites the
+        // llama-arch.cpp / src/models/qwen35/moe.rs line that pinned it.
+        // Previously this branch only mapped post_attention_layernorm,
+        // silently passing MoE tensors through as `blk.N.mlp.*.weight`
+        // (wrong GGUF names; llama.cpp loader would reject the file).
+        // P11 round-trip gate caught it — fix lands here.
+        "qwen35moe" => {
+            map.extend_from_slice(&[
+                // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM
+                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+                // llama-arch.cpp:393 LLM_TENSOR_FFN_GATE_INP → "blk.%d.ffn_gate_inp"
+                // src/models/qwen35/moe.rs:83 — MoE router.
+                ("mlp.gate.weight", "ffn_gate_inp.weight"),
+                // llama-arch.cpp:394 LLM_TENSOR_FFN_GATE_INP_SHEXP → "blk.%d.ffn_gate_inp_shexp"
+                // src/models/qwen35/moe.rs:90 — shared-expert scalar gate.
+                ("mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight"),
+                // Shared-expert per-projection tensors (src/models/qwen35/moe.rs:138-140).
+                ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
+                ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
+                ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
+                // Merged expert tensors — post-merge names produced by
+                // merge_moe_experts_in_place at src/models/qwen35/moe.rs:494-497.
+                // Shape [N_experts, out_features, in_features].
+                ("mlp.experts.gate_proj.weight", "ffn_gate_exps.weight"),
+                ("mlp.experts.up_proj.weight", "ffn_up_exps.weight"),
+                ("mlp.experts.down_proj.weight", "ffn_down_exps.weight"),
             ]);
         }
         // LLaMA-like default: covers llama, mistral, qwen2, qwen3, phi, etc.

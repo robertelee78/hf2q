@@ -405,25 +405,29 @@ fn qwen35moe_mtp_roundtrip() {
         );
     }
 
-    // Evidence this IS the MoE path (not a silent fallback to dense emission):
-    // the synthetic MoE safetensors fed `mlp.experts.{N}.{gate,up,down}_proj.*`
-    // tensors. A dense-path converter would have dropped or mismapped them —
-    // look for any tensor whose name references the MoE-specific surface.
-    //
-    // NOTE: P11's scope is strictly MTP — router/expert-merge pipeline
-    // completeness on the MoE side is P4/P5 scope. Here we only prove that
-    // *MTP* tensors round-trip through the MoE arch string without loss.
-    let has_moe_evidence = names.iter().any(|n| {
-        n.contains("experts")
-            || n.contains("shexp")
-            || n.contains("ffn_gate_inp")
-            || n.contains("ffn_gate_exps")
-    });
+    // Strict MoE-path assertion (upgraded from evidence-only 2026-04-24):
+    // the P4/P5 merge + metadata pipeline MUST produce these canonical
+    // GGUF names per llama-arch.cpp:393-394 and src/models/qwen35/moe.rs.
+    // If they're missing, the expert-merge was never invoked OR the
+    // hf_name_to_gguf mapper isn't recognizing the merged names —
+    // both are silent P4/P5 regressions.
+    let router = names
+        .iter()
+        .find(|n| n.contains("ffn_gate_inp") && !n.contains("shexp"));
     assert!(
-        has_moe_evidence,
-        "qwen35moe GGUF must carry some MoE-path tensor as evidence the MoE arch \
-         was actually selected. Full names: {:?}",
+        router.is_some(),
+        "qwen35moe GGUF must include blk.{{L}}.ffn_gate_inp.weight (MoE router). \
+         Full names: {:?}",
         names
+    );
+
+    let merged_gate_exps = names.iter().find(|n| n.contains("ffn_gate_exps.weight"));
+    assert!(
+        merged_gate_exps.is_some(),
+        "qwen35moe GGUF must include merged blk.{{L}}.ffn_gate_exps.weight \
+         — if this is missing, P5's merge_moe_experts_in_place was never invoked. \
+         Raw per-expert tensors visible: {:?}",
+        names.iter().filter(|n| n.contains("experts")).collect::<Vec<_>>()
     );
 }
 

@@ -193,10 +193,17 @@ fn synthetic_mmproj_loads_via_mlx_native_gguf_reader() {
                 .unwrap_or(false)
         });
 
-    if mmproj.is_none() {
-        eprintln!("mmproj alongside not found yet — CLI wire-up follow-up in a subsequent commit");
-        return;
-    }
+    let mmproj = Some(mmproj.unwrap_or_else(|| {
+        let dir_contents: Vec<String> = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
+            .collect();
+        panic!(
+            "ADR-012 P10 Layer B: --emit-vision-tower produced no mmproj under {:?}. \
+             Contents: {:?}. See docs/ADR-012-qwen35moe-conversion.md Decision 18 §3.",
+            parent, dir_contents
+        );
+    }));
 
     let path = mmproj.unwrap();
     let gguf = GgufFile::open(&path).expect("open mmproj GGUF");

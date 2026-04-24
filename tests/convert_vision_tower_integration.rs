@@ -246,17 +246,25 @@ fn layer_a_synthetic_vit_roundtrip_structural() {
         });
     let _ = crate_output;
 
+    // ADR-012 P10 end-to-end assertion: --emit-vision-tower MUST produce
+    // the mmproj file alongside the text GGUF. Verified locally 2026-04-24:
+    // `/tmp/vit-e2e/` convert writes `mmproj-<slug>-F16.gguf` + text.gguf.
+    // If this assertion fails, the Phase 4.8 wire-up in src/main.rs is
+    // broken — see docs/ADR-012-qwen35moe-conversion.md Decision 18 §3.
+    let mmproj = mmproj.unwrap_or_else(|| {
+        let dir_contents: Vec<String> = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
+            .collect();
+        panic!(
+            "ADR-012 P10: --emit-vision-tower failed to emit mmproj-*.gguf under {:?}. \
+             Contents: {:?}. Check src/main.rs Phase 4.8 wire-up.",
+            parent, dir_contents
+        );
+    });
+    let mmproj = Some(mmproj);
     if mmproj.is_none() {
-        // P10-foundation wiring may not yet land mmproj alongside; fall
-        // back to a direct library call to `convert_vision_tower`. This
-        // keeps the structural test live while the CLI wiring matures.
-        eprintln!("mmproj alongside not found — running convert_vision_tower directly");
-        // We can't easily import the crate-private API from an integration
-        // test (binary crate). Skip the structural branch here; the direct
-        // library tests in src/models/vit/mod.rs already cover silent-skip
-        // and no-mmproj paths. When mmproj alongside lands in a follow-up,
-        // this branch flips to an assertion.
-        return;
+        unreachable!("mmproj None path removed above");
     }
 
     let mmproj_path = mmproj.unwrap();
