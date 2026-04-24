@@ -1352,6 +1352,28 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 454/454 pass (+24 from iter 6's 430, 1 ignored). Zero clippy errors. Commit + push.
   - **Next (iter 8):** continue grammar stack — either port `json-schema-to-grammar.cpp` (synthesizes GBNF from user-supplied JSON schema) OR refactor `forward_decode` to return logits and wire `GrammarRuntime` into the decode-time sampler. The latter is higher-impact (makes grammar-constrained decoding actually happen) but needs a live model to validate; the former is pure compute and testable today. Prompt cache (Task #7) + real-model live-smoke wait for OOM pressure clearance.
 
+- **2026-04-23 loop iter 8 — JSON Schema → GBNF translator (Task #5 continues).** `response_format: {type: "json_schema", json_schema: {schema: {...}}}` compiles to a sampler-ready grammar end-to-end.
+  - **`src/serve/api/grammar/json_schema.rs` (~550 LOC + 18 tests):** minimal-viable subset of llama.cpp's `common/json-schema-to-grammar.cpp`. Chose minimum-useful rather than whole-spec-port because the full 1189 LOC covers features hf2q doesn't need today ($ref, $defs, pattern→regex→grammar, anyOf/oneOf/allOf, min/maxItems, etc.) and porting them speculatively would violate the mantra's "no speculative features". Per-feature gate: those land when a real user needs them.
+    - **Ported subset:** primitive types (string, number, integer, boolean, null), bare `{}` (any value), object with properties + required, array with items, enum (string/number/bool/null values), type as single string or array (union), nested object + array combinations.
+    - **Deliberately deferred:** `$ref` / `$defs`, `pattern`, min/max bounds, anyOf / oneOf / allOf, `additionalProperties`, tuple-form arrays.
+    - **`format_literal`** ports llama.cpp's escaping (`\r \n " \ ` → GBNF-safe literal text).
+    - **Primitive rule library** (`boolean`, `integer`, `number`, `string`, `null`, `value`, `object`, `array`, `char`, `integral-part`, `decimal-part`) emitted wire-compatibly with llama.cpp's `PRIMITIVE_RULES`.
+    - **`SPACE_RULE`** = `| " " | "\n"{1,2} [ \t]{0,20}` — identical to llama.cpp, so trailing-whitespace acceptance matches byte-for-byte.
+    - **`schema_to_gbnf(value) -> Result<String, SchemaError>`** returns the full GBNF text with `root` as the start rule.
+    - **Object emission strategy:** properties emitted in alphabetical order; required first, optional as `(",", space, entry)?` wrappers. Strict (stricter than llama.cpp's full combinatorial-alternation, looser than no-optional). A later iter adds combinatorial alternation when a user's strict-OpenAI-schemas need it.
+  - **18 unit tests cover** end-to-end: each test compiles a schema to GBNF, parses with iter-5's parser, seeds a `GrammarRuntime` with iter-6's sampler, and asserts accept/reject on JSON samples. This is a **full-stack grammar parity gate** — schema → GBNF → parser → sampler all agree on acceptance.
+    - Primitives accept canonical forms + reject malformed
+    - Enum (string + non-string values)
+    - Empty schema = accept any JSON value
+    - Object with 1+ required props; with optional props (both paths)
+    - Array of typed items + array of any
+    - Union types (string | null)
+    - Nested object+array (classic tool-call shape: `{name: string, arguments: object}`)
+    - Unsupported type rejected at compile time
+    - Unknown keys silently ignored (documented behavior until iter 9+ adds strict mode)
+  - **Full suite:** 472/472 pass (+18 from iter 7's 454, 2 ignored). Zero clippy errors. Commit + push.
+  - **Next (iter 9):** with the full grammar stack landed (parser + sampler + JSON-schema translator), the next big step is decode-time integration — refactoring `forward_decode` to expose logits, masking invalid tokens via `GrammarRuntime`, and hooking `response_format` from requests into `engine::generate_*` so grammar-constrained decoding actually runs. That refactor is higher-risk + needs a live model to validate (OOM-blocked). Alternative: iter 9 = ADR-007 prompt-cache (Task #7) metadata-only plumbing (cached_tokens populated from LCP against a per-engine prior-prompt snapshot) — partial value before KV replay needs parity validation. Or iter 9 = pooled chat-model embeddings (Task #8) — requires hidden-state forward-pass hook, also OOM-blocked. Real-model live-smoke for all three waits for OOM pressure clearance.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)

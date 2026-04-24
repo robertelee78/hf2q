@@ -30,6 +30,7 @@
 
 pub mod parser;
 pub mod sampler;
+pub mod json_schema;
 
 #[allow(unused_imports)]
 pub use parser::{parse, Grammar, GretElement, GretType, ParseError};
