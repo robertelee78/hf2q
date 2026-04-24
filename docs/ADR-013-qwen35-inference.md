@@ -934,6 +934,64 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 10 · P7 PARTIAL (full-attention scalar CPU reference)
+
+**Scope:** Phase P7 Decision 9 — pure-Rust scalar CPU reference for the gated full-attention forward pass. The GPU builder using mlx-native ops lands next iter (explicit scope split — the CPU reference IS the authoritative correctness oracle, so it must come first).
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/full_attn.rs` (new file, ~630 LOC):
+  - `FullAttnLayerWeights` struct: `attn_norm`, `wq`, `wk`, `wv`, `w_gate`, `attn_q_norm`, `attn_k_norm`, `wo` as flat f32 Vecs with explicit documented shapes.
+  - `FullAttnShape` — shape params (hidden_size, n_head, n_kv, head_dim, rotary_dim, rope_theta, mrope_section, rms_norm_eps) derived via `FullAttnShape::from_config(cfg)`.
+  - **`gated_full_attention_cpu_ref()`** — the authoritative scalar reference. Implements ADR-013 Decision 9 op order verbatim:
+    1. Pre-attention RMSNorm.
+    2. Q / K / V / gate projections (Q and gate are SEPARATE tensors per apex GGUF layout, not fused).
+    3. Per-head RMSNorm on Q and K.
+    4. IMROPE on Q and K with sections [s0, s1, s2, s3] and `sector % 3` cycling.
+    5. GQA-aware SDPA with 1/√head_dim scale and causal mask (numerically stable softmax, f32 accumulation).
+    6. Elementwise multiply by `sigmoid(gate)` (not swish — per HF transformers citation in ADR).
+    7. Output projection via `wo`.
+    8. Returns residual CONTRIBUTION (caller adds to input).
+  - Internal helpers: `rms_norm_row()`, `matmul_a_by_bt()` (rhs stored as `[out_dim, in_dim]` matching GGUF convention), `sigmoid()`, `imrope_inplace()`.
+
+**Tests (7 new, all green):**
+- **`acceptance_1seq_4tok_deterministic`** — ADR Decision 9 acceptance criterion exact shape (n_head=4, n_kv=2, head_dim=16, 4 tokens). Verifies bit-for-bit determinism across re-runs and non-trivial (non-zero) output.
+- **`causal_mask_future_inputs_dont_leak`** — perturbing input at token 3 must NOT change outputs at tokens 0-2 (causal violation smoke); must change token 3 output.
+- `gate_zero_gives_half_output` — with `w_gate = 0` the pre-sigmoid gate is 0 so output = attn_out × sigmoid(0) = attn_out × 0.5. Comparison against `w_gate = 10` (sigmoid → ~1) should show the correct 2× ratio.
+- `gqa_ratio_4_2_runs_without_panic` — 4 Q-heads / 2 KV-heads smoke.
+- `rope_makes_output_position_dependent` — seq_len=2 case comparing position [0,1] vs [0,100]; Q·K inner products at token 1 must differ because RoPE rotated Q differently.
+- `shape_from_config` — `FullAttnShape::from_config` reads all 8 relevant Qwen35Config fields.
+- `single_token_seq` — degenerate seq_len=1 path executes cleanly.
+
+**Fixed broken window:** `src/serve/api/engine.rs:629` was missing a `reasoning_tokens` field in a `GenerationResult` struct literal (pre-existing, blocking test compile). Added `reasoning_tokens: None` with a comment explaining the non-streaming path doesn't surface it yet.
+
+**Verification:**
+- 7/7 full_attn tests green.
+- 495/495 hf2q test suite green (+0 regressions from iter 9).
+
+**Design notes:**
+- GGUF emits `attn_q.weight` and `attn_gate.weight` as SEPARATE tensors, distinct from llama.cpp's in-memory `wq` which fuses them. Our scalar reference matches the GGUF layout (separate wq + w_gate) because that's how the loader will present them. The math is equivalent either way; the GPU path can choose either fused or separate dispatch based on perf.
+- `matmul_a_by_bt()` intentionally computes `out = lhs @ rhs_t` (with rhs transposed), matching the GGUF weight convention where the output dim is the first ("contiguous") axis. This means `wq[hq * head_dim + i][j] = weight connecting input-j to output-(hq * head_dim + i)`.
+- IMROPE is a 1:1 copy of the spec from mlx-native's rope_multi kernel (ported to scalar Rust for reference).
+
+**GPU builder scope (next iter):**
+- `build_gated_attn_layer(encoder, registry, device, weights, kv_cache, cfg, input, positions) -> output` encoding:
+  - `dispatch_rms_norm` for pre-attention + per-head Q/K norms.
+  - `dispatch_dense_gemm` (or quantized matmul for prod path) for Q/K/V/gate projections.
+  - `dispatch_rope_multi` in IMROPE mode.
+  - `dispatch_flash_attn_prefill_d512` (head_dim=256 fits the d512 variant).
+  - `dispatch_elementwise_mul` for sigmoid-gate application.
+  - `dispatch_dense_gemm` for output projection.
+- GPU-vs-CPU parity test with ≤1e-3 tolerance per ADR acceptance.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | **PARTIAL** — CPU reference ✓; GPU builder pending next iter |
+| P8-P13 | 8,13-18    | Pending |
+
 ### 2026-04-23 — /loop iter 9 · P6 COMPLETE (hybrid KV cache landed)
 
 **Scope:** Phase P6 Decision 11 — hybrid KV cache (full-attention KV slots + linear-attention SSM state slots).
