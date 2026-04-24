@@ -22,7 +22,8 @@ use std::time::Instant;
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
 use crate::inference::models::bert::BertConfig;
-use crate::inference::vision::mmproj::MmprojConfig;
+use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
+use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
@@ -228,15 +229,20 @@ impl EmbeddingModel {
 }
 
 /// Loaded mmproj (multimodal projector) descriptor. Captures the GGUF
-/// path + the parsed `MmprojConfig` header + a stable `model_id` (file
-/// stem). Weights are NOT loaded here — the ViT forward-pass iter
-/// (ADR-005 Phase 2c Task #15) will memory-map the tensors on demand.
+/// path, the parsed `MmprojConfig` header, the detected `ArchProfile`
+/// (iter 31), the loaded-on-GPU weights wrapped in `Arc` for cheap
+/// clone, and a stable `model_id` (file stem).
 ///
-/// Cheap to clone (PathBuf + small struct + String).
+/// Weights are loaded eagerly at server startup so the first
+/// multimodal request doesn't pay the ~10s mmap/dequant cost. The
+/// `Arc` makes `LoadedMmproj` cheap to clone across handler calls
+/// while keeping the GPU buffers singly-owned behind the Arc.
 #[derive(Debug, Clone)]
 pub struct LoadedMmproj {
     pub gguf_path: PathBuf,
     pub config: MmprojConfig,
+    pub arch: ArchProfile,
+    pub weights: Arc<LoadedMmprojWeights>,
     pub model_id: String,
 }
 
@@ -432,9 +438,12 @@ mod tests {
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
         };
+        let device = mlx_native::MlxDevice::new().expect("create device");
         let m = LoadedMmproj {
             gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
             config: cfg.clone(),
+            arch: ArchProfile::Gemma4Siglip,
+            weights: Arc::new(LoadedMmprojWeights::empty(device)),
             model_id: "synthetic-mmproj".into(),
         };
         let state = AppState::new(ServerConfig::default()).with_mmproj(m);
@@ -442,6 +451,7 @@ mod tests {
         assert_eq!(attached.model_id, "synthetic-mmproj");
         assert_eq!(attached.gguf_path.file_name().unwrap(), "synthetic-mmproj.gguf");
         assert_eq!(attached.config, cfg);
+        assert_eq!(attached.arch, ArchProfile::Gemma4Siglip);
         assert!(attached.config.projector.is_supported());
     }
 }

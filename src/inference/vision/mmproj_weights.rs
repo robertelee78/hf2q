@@ -118,6 +118,17 @@ impl LoadedMmprojWeights {
         self.tensors.get(name)
     }
 
+    /// Build an empty `LoadedMmprojWeights` with no tensors. Useful for
+    /// tests that need an `AppState.mmproj` shape but don't need to
+    /// drive a forward pass. The shortcut accessors all return `Err`
+    /// (as the real accessors would on a broken-producer file).
+    pub fn empty(device: MlxDevice) -> Self {
+        Self {
+            tensors: HashMap::new(),
+            _device: device,
+        }
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
@@ -319,5 +330,23 @@ mod tests {
             _device: MlxDevice::new().expect("device"),
         };
         assert!(weights.get("v.patch_embd.weight").is_none());
+    }
+
+    #[test]
+    fn empty_constructor_produces_zero_tensor_weights() {
+        // `empty(device)` is the pub constructor for test/scaffolding
+        // call sites that need a LoadedMmprojWeights shape without a
+        // real 400MB load. Should len == 0, is_empty == true, and
+        // every shortcut accessor should return Err.
+        let device = MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::empty(device);
+        assert_eq!(weights.len(), 0);
+        assert!(weights.is_empty());
+        assert!(weights.patch_embd_weight().is_err());
+        assert!(weights.position_embd_weight().is_err());
+        assert!(weights.post_ln_weight().is_err());
+        assert!(weights.mm_0_weight().is_err());
+        assert!(weights.mm_2_weight().is_err());
+        assert!(weights.block_tensor(0, "attn_q.weight").is_err());
     }
 }

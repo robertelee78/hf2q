@@ -609,12 +609,33 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
         let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
-        // Walk the GGUF's tensor list against the expected set per
-        // MmprojConfig (iter 30). Fails fast on an incomplete producer
-        // rather than hitting NotFound mid-forward-pass.
+        // Walk the GGUF's tensor list against the arch-agnostic
+        // required set (iter 30 + iter 31). Fails fast on an incomplete
+        // producer rather than hitting NotFound mid-forward-pass.
         let actual_names: Vec<&str> = gguf.tensor_names();
         crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
+        // Detect the arch profile so forward-pass dispatch knows
+        // which per-block-norm shape to expect (Gemma 4 SigLIP vs
+        // classic CLIP vs Unknown).
+        let arch = crate::inference::vision::mmproj::detect_arch_profile(&actual_names);
+        if !arch.is_supported() {
+            anyhow::bail!(
+                "mmproj arch profile is Unknown — neither Gemma 4 \
+                 SigLIP markers (ln1/ln2/post_ffw_norm) nor CLIP marker \
+                 (attn_norm) found in block 0. hf2q's ViT forward pass \
+                 cannot dispatch on this file."
+            );
+        }
+        // Load every tensor onto the Metal device. For Gemma 4 this is
+        // ~400MB / 356 tensors / ~10s cold-cache on M5 Max.
+        let device = mlx_native::MlxDevice::new()
+            .map_err(|e| anyhow::anyhow!("create MlxDevice for mmproj load: {e}"))?;
+        let mmp_weights =
+            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
+                &gguf, &mmp_config, device,
+            )
+            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?;
         let model_id = mmp_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -626,12 +647,15 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             hidden = mmp_config.hidden_size,
             layers = mmp_config.num_hidden_layers,
             projector = mmp_config.projector.as_str(),
-            tensors = actual_names.len(),
-            "Validated mmproj GGUF header + tensor set"
+            arch = arch.as_str(),
+            tensors_loaded = mmp_weights.len(),
+            "Loaded mmproj GGUF header + tensor set + weights"
         );
         Some(api::state::LoadedMmproj {
             gguf_path: mmp_path.clone(),
             config: mmp_config,
+            arch,
+            weights: std::sync::Arc::new(mmp_weights),
             model_id,
         })
     } else {

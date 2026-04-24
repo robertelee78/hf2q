@@ -1518,10 +1518,13 @@ mod multimodal_tests {
         format!("data:image/png;base64,{b64}")
     }
 
-    /// Build a synthetic `LoadedMmproj` matching the Gemma-4 vision tower
-    /// shape (896×896, patch 14, MLP projector). `target_size` is shrunk
-    /// to 8 in tests to keep preprocess cheap.
+    /// Build a synthetic `LoadedMmproj` matching a shrunken 8×8 Gemma-4
+    /// vision tower for cheap preprocess in tests. `target_size` is 8
+    /// so the 4×4 synthetic PNGs resize cheaply. Uses the empty
+    /// `LoadedMmprojWeights` — multimodal tests here only exercise
+    /// preprocessing + config routing, not forward-pass weight math.
     fn synthetic_mmproj() -> LoadedMmproj {
+        use std::sync::Arc;
         let cfg = MmprojConfig {
             image_size: 8,
             patch_size: 1,
@@ -1535,9 +1538,13 @@ mod multimodal_tests {
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
         };
+        let device = mlx_native::MlxDevice::new().expect("create device");
+        let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device);
         LoadedMmproj {
             gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
             config: cfg,
+            arch: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            weights: Arc::new(weights),
             model_id: "synthetic-mmproj".into(),
         }
     }
