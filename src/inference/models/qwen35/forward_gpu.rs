@@ -395,53 +395,53 @@ impl Qwen35Model {
                 .with_context(|| format!("residual attn layer {layer_idx}"))?;
 
             // --- Post-attention RMSNorm ---
-            // Applied between the attention residual and the FFN input.
-            // Stored as `blk.{i}.post_attention_norm.weight` in the apex GGUF.
-            // llama.cpp applies this at qwen35moe.cpp:56; without it hidden states
-            // blow up across 40 layers → uniform logits → constant `!` output.
-            {
+            // The normed value is the FFN *input* only.  The FFN output is added
+            // back to `ffn_residual` (the pre-norm value), matching llama.cpp:
+            //   ffn_residual = cur;                // after attn residual, BEFORE norm
+            //   attn_post_norm = build_norm(cur);  // norm for FFN input only
+            //   cur = build_layer_ffn(attn_post_norm);
+            //   cur = ggml_add(cur, ffn_residual); // FFN residual is pre-norm
+            let ffn_residual = hidden.clone();  // save pre-norm for later residual
+            let ffn_input = {
                 let post_norm_w = match layer_gpu {
                     LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                     LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
                 };
-                let normed = {
-                    let out = device
-                        .alloc_buffer(
-                            (seq_len * h) as usize * 4,
-                            DType::F32,
-                            vec![seq_len as usize, h as usize],
-                        )
-                        .map_err(|e| anyhow!("alloc post_attn_norm output layer {layer_idx}: {e}"))?;
-                    let mut params = device
-                        .alloc_buffer(8, DType::F32, vec![2])
-                        .map_err(|e| anyhow!("alloc post_attn_norm params: {e}"))?;
-                    {
-                        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-                        s[0] = eps;
-                        s[1] = h as f32;
-                    }
-                    let mut enc = device.command_encoder()
-                        .with_context(|| format!("enc post_attn_norm layer {layer_idx}"))?;
-                    rms_norm::dispatch_rms_norm(
-                        &mut enc,
-                        &mut registry,
-                        device.metal_device(),
-                        &hidden,
-                        post_norm_w,
-                        &out,
-                        &params,
-                        seq_len,
-                        h,
+                let out = device
+                    .alloc_buffer(
+                        (seq_len * h) as usize * 4,
+                        DType::F32,
+                        vec![seq_len as usize, h as usize],
                     )
-                    .with_context(|| format!("dispatch_rms_norm post_attn layer {layer_idx}"))?;
-                    enc.commit_and_wait()
-                        .with_context(|| format!("commit post_attn_norm layer {layer_idx}"))?;
-                    out
-                };
-                hidden = normed;
-            }
+                    .map_err(|e| anyhow!("alloc post_attn_norm output layer {layer_idx}: {e}"))?;
+                let mut params = device
+                    .alloc_buffer(8, DType::F32, vec![2])
+                    .map_err(|e| anyhow!("alloc post_attn_norm params: {e}"))?;
+                {
+                    let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+                    s[0] = eps;
+                    s[1] = h as f32;
+                }
+                let mut enc = device.command_encoder()
+                    .with_context(|| format!("enc post_attn_norm layer {layer_idx}"))?;
+                rms_norm::dispatch_rms_norm(
+                    &mut enc,
+                    &mut registry,
+                    device.metal_device(),
+                    &hidden,
+                    post_norm_w,
+                    &out,
+                    &params,
+                    seq_len,
+                    h,
+                )
+                .with_context(|| format!("dispatch_rms_norm post_attn layer {layer_idx}"))?;
+                enc.commit_and_wait()
+                    .with_context(|| format!("commit post_attn_norm layer {layer_idx}"))?;
+                out
+            };
 
-            // --- FFN ---
+            // --- FFN (takes normed ffn_input, not the pre-norm residual) ---
             let ffn_weights_gpu = match layer_gpu {
                 LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
                 LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
@@ -455,7 +455,7 @@ impl Qwen35Model {
                         hidden_size: h,
                         intermediate_size: m,
                     };
-                    build_dense_ffn_layer_gpu(&device, &mut registry, &hidden, w, shape)
+                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape)
                         .with_context(|| format!("dense_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
@@ -476,7 +476,7 @@ impl Qwen35Model {
                             "layer {layer_idx} config says F32-MoE but weights are different variant"
                         )),
                     };
-                    build_moe_ffn_layer_gpu(&device, &mut registry, &hidden, w_gpu, w_cpu, shape)
+                    build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
                         .with_context(|| format!("moe_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::MoeQ(w_gpu) => {
@@ -490,13 +490,14 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &hidden, w_gpu, shape)
+                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape)
                         .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
                 }
             };
 
-            // --- Residual after FFN ---
-            hidden = residual_add_gpu(&hidden, &ffn_out, &device)
+            // --- Residual after FFN: add to pre-norm ffn_residual, not normed ---
+            // Matches llama.cpp: `cur = ggml_add(cur, ffn_residual)`.
+            hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device)
                 .with_context(|| format!("residual ffn layer {layer_idx}"))?;
         }
 
