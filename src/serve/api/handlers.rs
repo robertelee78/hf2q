@@ -125,6 +125,14 @@ pub async fn chat_completions(
         gpu_dispatch_count: 0,
     };
 
+    // Approximate reasoning-token count from the character count of the
+    // reasoning_text. We don't have a per-token classifier on the
+    // non-streaming path, so `len()/4` is a rough proxy (avg token length
+    // for English) until a proper per-token reasoning counter is plumbed.
+    let reasoning_tokens = result
+        .reasoning_text
+        .as_ref()
+        .map(|s| s.chars().count().max(1) / 4);
     let resp = ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",
@@ -136,7 +144,7 @@ pub async fn chat_completions(
             message: ChatMessage {
                 role: "assistant".into(),
                 content: Some(MessageContent::Text(result.text)),
-                reasoning_content: None,
+                reasoning_content: result.reasoning_text,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -151,7 +159,8 @@ pub async fn chat_completions(
             // Prompt caching (Decision #24) lands with Task #7 — no cached
             // tokens reported until then.
             prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
-            completion_tokens_details: None,
+            completion_tokens_details: reasoning_tokens
+                .map(|reasoning_tokens| super::schema::CompletionTokensDetails { reasoning_tokens }),
         },
         x_hf2q_timing: Some(timing),
     };

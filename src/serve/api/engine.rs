@@ -82,8 +82,14 @@ impl Default for SamplingParams {
 /// Result of a non-streaming chat generation.
 #[derive(Debug, Clone)]
 pub struct GenerationResult {
-    /// Decoded text (full assistant response, not including the prompt).
+    /// Decoded text that goes into `message.content` — post reasoning-marker
+    /// split (Decision #21). If the model has no reasoning markers
+    /// registered, this is the full raw decoded text.
     pub text: String,
+    /// Decoded text that goes into `message.reasoning_content`. `None` when
+    /// the model's registration has no reasoning markers or when no
+    /// reasoning span was emitted.
+    pub reasoning_text: Option<String>,
     /// Prompt token count (after chat-template rendering + tokenization).
     pub prompt_tokens: usize,
     /// Completion token count (tokens emitted by the decoder).
@@ -121,6 +127,9 @@ struct EngineInner {
     /// Chat-template string (GGUF metadata or fallback). Rendered per request
     /// using `minijinja`.
     chat_template: Arc<String>,
+    /// Per-model registration — reasoning-boundary + tool-call markers
+    /// (Decision #21). `None` when no family matches this model's id.
+    registration: Option<super::registry::ModelRegistration>,
 }
 
 /// The request protocol the worker thread drains.
@@ -315,10 +324,26 @@ impl Engine {
         let eos_token_ids = loaded.eos_token_ids.clone();
         let tokenizer = Arc::new(loaded.tokenizer.clone());
         let chat_template = Arc::new(loaded.chat_template.clone());
+        let registration = super::registry::find_for(&model_id);
+        if let Some(ref r) = registration {
+            tracing::info!(
+                family = r.family,
+                reasoning = r.has_reasoning(),
+                tools = r.has_tools(),
+                "hf2q-engine: matched model registration"
+            );
+        } else {
+            tracing::info!(
+                model_id = %model_id,
+                "hf2q-engine: no matching model registration (text emitted as plain content)"
+            );
+        }
 
+        // Move registration into the worker closure in addition to the handle.
+        let worker_registration = registration.clone();
         std::thread::Builder::new()
             .name("hf2q-engine".into())
-            .spawn(move || worker_run(loaded, rx))
+            .spawn(move || worker_run(loaded, rx, worker_registration))
             .expect("spawn hf2q-engine thread");
 
         Engine {
@@ -330,6 +355,7 @@ impl Engine {
                 eos_token_ids,
                 tokenizer,
                 chat_template,
+                registration,
             }),
         }
     }
@@ -351,6 +377,9 @@ impl Engine {
     }
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.inner.eos_token_ids
+    }
+    pub fn registration(&self) -> Option<&super::registry::ModelRegistration> {
+        self.inner.registration.as_ref()
     }
 
     /// Run a single-prompt warmup pass. Blocks until the worker finishes it.
@@ -428,8 +457,14 @@ impl Engine {
 }
 
 /// Worker-thread entry point. Owns the `LoadedModel` and drains requests
-/// serially.
-fn worker_run(mut loaded: LoadedModel, mut rx: mpsc::Receiver<Request>) {
+/// serially. `registration` (if `Some`) drives reasoning-content split
+/// (Decision #21) — decode text passes through a `ReasoningSplitter` on
+/// the way out.
+fn worker_run(
+    mut loaded: LoadedModel,
+    mut rx: mpsc::Receiver<Request>,
+    registration: Option<super::registry::ModelRegistration>,
+) {
     tracing::info!(
         model = %loaded.model_id,
         "hf2q-engine worker thread started"
@@ -446,7 +481,7 @@ fn worker_run(mut loaded: LoadedModel, mut rx: mpsc::Receiver<Request>) {
                 params,
                 reply,
             } => {
-                let result = generate_once(&mut loaded, &prompt_tokens, &params);
+                let result = generate_once(&mut loaded, &prompt_tokens, &params, registration.as_ref());
                 let _ = reply.send(result);
             }
             Request::GenerateStream {
@@ -458,7 +493,7 @@ fn worker_run(mut loaded: LoadedModel, mut rx: mpsc::Receiver<Request>) {
                 // via `events`. Errors stay inside the function — the
                 // terminal event is always one of Done/Error, unless the
                 // receiver was dropped (client disconnect → early exit).
-                generate_stream_once(&mut loaded, &prompt_tokens, &params, &events);
+                generate_stream_once(&mut loaded, &prompt_tokens, &params, &events, registration.as_ref());
             }
             Request::Shutdown => {
                 tracing::info!("hf2q-engine worker received Shutdown; exiting");
@@ -507,6 +542,7 @@ fn generate_once(
     loaded: &mut LoadedModel,
     prompt_tokens: &[u32],
     params: &SamplingParams,
+    registration: Option<&super::registry::ModelRegistration>,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
         !prompt_tokens.is_empty(),
@@ -577,8 +613,18 @@ fn generate_once(
     // When finish_reason == "stop" but the EOS was seen, make sure the EOS
     // token text isn't present in the returned content.
     let _ = params; // params.temperature etc. are greedy defaults in this iter
+
+    // Apply reasoning split (Decision #21) if this model has boundary
+    // markers registered. If not, the full decoded text goes into
+    // `content` and `reasoning_text` is `None`.
+    let (content, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        _ => (decoded_text, None),
+    };
+
     Ok(GenerationResult {
-        text: decoded_text,
+        text: content,
+        reasoning_text,
         prompt_tokens: prompt_len,
         completion_tokens: generated_tokens.len(),
         finish_reason,
@@ -627,6 +673,7 @@ fn generate_stream_once(
     prompt_tokens: &[u32],
     params: &SamplingParams,
     events: &mpsc::Sender<super::sse::GenerationEvent>,
+    registration: Option<&super::registry::ModelRegistration>,
 ) {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
@@ -649,6 +696,44 @@ fn generate_stream_once(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
+    // Reasoning splitter — classifies each decoded fragment into the
+    // content / reasoning_content slot. `None` when the model has no
+    // registered reasoning markers; all fragments then route to `Content`.
+    let mut splitter = registration
+        .and_then(|r| super::registry::ReasoningSplitter::from_registration(r));
+
+    // Local helper to emit a fragment through the splitter (if any) into
+    // the correct DeltaKind slot. Returns the bytes emitted (for stop-string
+    // bookkeeping). Note: the splitter holds back a tail that's drained at
+    // generation end.
+    let emit_fragment = |splitter: &mut Option<super::registry::ReasoningSplitter>,
+                         events: &mpsc::Sender<GenerationEvent>,
+                         fragment: &str| -> Result<(), ()> {
+        if fragment.is_empty() {
+            return Ok(());
+        }
+        if let Some(sp) = splitter.as_mut() {
+            for (slot, text) in sp.feed(fragment) {
+                let kind = match slot {
+                    super::registry::SplitSlot::Content => DeltaKind::Content,
+                    super::registry::SplitSlot::Reasoning => DeltaKind::Reasoning,
+                };
+                if events.blocking_send(GenerationEvent::Delta { kind, text }).is_err() {
+                    return Err(());
+                }
+            }
+        } else if events
+            .blocking_send(GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: fragment.to_string(),
+            })
+            .is_err()
+        {
+            return Err(());
+        }
+        Ok(())
+    };
+
     // --- Prefill ---
     let prefill_start = Instant::now();
     let next_token_result =
@@ -668,6 +753,7 @@ fn generate_stream_once(
     let decode_start = Instant::now();
     let mut completion_tokens = 0usize;
     let mut accumulated_text = String::new();
+    let mut reasoning_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
     let mut profiler = ProfileAccumulator::new(0);
 
@@ -679,12 +765,15 @@ fn generate_stream_once(
     let mut is_eos_first = loaded.eos_token_ids.contains(&next_token);
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
-        send!(GenerationEvent::Delta {
-            kind: DeltaKind::Content,
-            text: first_text,
-        });
+        if emit_fragment(&mut splitter, events, &first_text).is_err() {
+            tracing::info!("SSE stream dropped by client; aborting decode");
+            return;
+        }
     }
     completion_tokens += 1;
+    if splitter.as_ref().map(|s| s.in_reasoning()).unwrap_or(false) {
+        reasoning_token_count += 1;
+    }
     if is_eos_first {
         finish_reason = "stop";
     } else if hit_stop_string(&accumulated_text, &params.stop_strings) {
@@ -719,21 +808,36 @@ fn generate_stream_once(
                 .decode(&[next_token], false)
                 .unwrap_or_default();
             accumulated_text.push_str(&fragment);
-            send!(GenerationEvent::Delta {
-                kind: DeltaKind::Content,
-                text: fragment,
-            });
+            if emit_fragment(&mut splitter, events, &fragment).is_err() {
+                tracing::info!("SSE stream dropped by client; aborting decode");
+                return;
+            }
+            if splitter.as_ref().map(|s| s.in_reasoning()).unwrap_or(false) {
+                reasoning_token_count += 1;
+            }
             if hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
-                // NOTE: we cannot "unsend" the last delta that included the
-                // stop string. OpenAI's convention is to strip the stop from
-                // the non-streaming response's `content` field; the streaming
-                // path already delivered the fragment containing it.
-                // Acceptable — matches llama.cpp server behavior.
                 break;
             }
         }
     }
+
+    // Drain any leftover tail the splitter was holding back.
+    if let Some(sp) = splitter.as_mut() {
+        if let Some((slot, tail)) = sp.finish() {
+            let kind = match slot {
+                super::registry::SplitSlot::Content => DeltaKind::Content,
+                super::registry::SplitSlot::Reasoning => DeltaKind::Reasoning,
+            };
+            if !tail.is_empty() {
+                if events.blocking_send(GenerationEvent::Delta { kind, text: tail }).is_err() {
+                    tracing::info!("SSE stream dropped by client; aborting decode");
+                    return;
+                }
+            }
+        }
+    }
+
     let decode_duration = decode_start.elapsed();
 
     let stats = StreamStats {
@@ -756,7 +860,11 @@ fn generate_stream_once(
         gpu_sync_count: None,
         gpu_dispatch_count: None,
         cached_prompt_tokens: None,
-        reasoning_tokens: None,
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
     };
 
     send!(GenerationEvent::Done {

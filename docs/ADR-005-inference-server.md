@@ -1333,6 +1333,25 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 430/430 pass, 1 ignored (+28 from iter 5's 402). Zero clippy errors. Commit + push.
   - **Next (iter 7):** wire `GrammarRuntime` into `engine::generate_once` / `generate_stream_once` — when the chat-completion request has `response_format: {json_object}` or `{json_schema}`, construct a `GrammarRuntime` over the hf2q-hardcoded json.gbnf (for json_object) or the synthesized grammar (for json_schema, iter 8). At each decode step, before argmax, compute the set of valid next-character code points via `advance_stack + match_char` and mask out tokens whose bytes would dead-end the grammar. Then iter 8 = port `json-schema-to-grammar.cpp`; iter 9 = per-model tool-call registration (Task #6) on top of grammar.
 
+- **2026-04-23 loop iter 7 — Task #6 lands: per-model registration + reasoning-content split (Decision #21).** Pivoted from grammar-into-decode-loop wiring (needs live model for the forward_decode refactor validation, blocked by OOM pressure) to Task #6 which is CPU-only, fully testable, and a Phase 2a AC requirement on its own.
+  - **`src/serve/api/registry.rs` (~310 LOC + 16 tests):**
+    - `ModelRegistration { family, id_substrings, reasoning_open/close, tool_open/close, tool_preamble }` — ~15 LOC per model per ADR-005 target. Case-insensitive substring match against `model_id` via `matches(...)`.
+    - **Day-1 built-ins:**
+      - `GEMMA4` — reasoning `<|think|>` / `</think|>`, tool `<tool_call>` / `</tool_call>`. Matches `gemma-4`/`gemma4` ids.
+      - `QWEN35` — reasoning `<think>` / `</think>` (distinct from Gemma's piped variant), tool `<tool_call>` / `</tool_call>`. Matches qwen3.5 / qwen3.6 / qwen35 / qwen36 ids.
+    - Process-global `OnceLock<RwLock<Vec<ModelRegistration>>>` registry seeded with built-ins; `register(...)` appends at runtime; `find_for(model_id) -> Option<ModelRegistration>` lookup.
+    - **`ReasoningSplitter`** — sliding-tail-buffer state machine that classifies decoded fragments into `SplitSlot::{Content, Reasoning}`. Tail buffer sized to `max(open.len, close.len)` so markers that span fragment boundaries are still detected. Markers are **swallowed** (not emitted in either slot — OpenAI-o1 convention). UTF-8 char-boundary-safe slicing via `snap_down_char_boundary`.
+    - **`split_full_output(reg, text) -> (content, Option<reasoning>)`** — convenience wrapper for the non-streaming handler path.
+  - **Engine wiring (`src/serve/api/engine.rs`):**
+    - `Engine` now stores `registration: Option<ModelRegistration>` auto-resolved from the model id at spawn time. `worker_run` carries it into both `generate_once` and `generate_stream_once` so every decoded fragment passes through the appropriate classifier.
+    - `GenerationResult.text` now holds the **content** slot; new `GenerationResult.reasoning_text: Option<String>` holds the reasoning slot. `generate_once` applies `split_full_output` post-decode.
+    - `generate_stream_once` holds a `ReasoningSplitter` locally and routes each token fragment through it; `DeltaKind::Content` vs `DeltaKind::Reasoning` is derived per-fragment. Tail drain on generation end so held-back bytes aren't lost. `reasoning_token_count` increments when the splitter's `in_reasoning()` is true after emitting, surfaced on the final `Done` as `stats.reasoning_tokens`.
+  - **Handler (`src/serve/api/handlers.rs`):**
+    - `chat_completions` non-streaming path populates `message.reasoning_content` from `result.reasoning_text` (was always `None`). `usage.completion_tokens_details.reasoning_tokens` is a length-based approximation (chars/4) until proper per-token classification is plumbed.
+  - **16 registry tests + bug caught during test iteration:** initial `ReasoningSplitter::feed` scanned from `leading_len` (prepended tail offset), which missed markers that spanned the fragment boundary — the very case the tail buffer was supposed to handle. Fixed by scanning + emitting from offset 0 (tail was held back, not previously emitted). All 16 tests green.
+  - **Full suite:** 454/454 pass (+24 from iter 6's 430, 1 ignored). Zero clippy errors. Commit + push.
+  - **Next (iter 8):** continue grammar stack — either port `json-schema-to-grammar.cpp` (synthesizes GBNF from user-supplied JSON schema) OR refactor `forward_decode` to return logits and wire `GrammarRuntime` into the decode-time sampler. The latter is higher-impact (makes grammar-constrained decoding actually happen) but needs a live model to validate; the former is pure compute and testable today. Prompt cache (Task #7) + real-model live-smoke wait for OOM pressure clearance.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
