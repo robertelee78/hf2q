@@ -166,11 +166,17 @@ impl MlxModelWeights {
             }
         }
 
-        // iter-21 Track B: allocate leg_hb_encoded byte-packed cache + leg_f_kvs shadow.
-        // HF2Q_TQ_CODEBOOK_BITS=5|6 → allocate per-layer byte-packed HB buffers.
+        // iter-21 Track B + 2026-04-24 post-close default correction.
+        // HF2Q_TQ_CODEBOOK_BITS=5|6|8 (or unset) → allocate per-layer byte-packed HB buffers.
         // Also allocates leg_f_kvs (F32 shadow) if not already allocated by Leg F above.
+        // MUST stay in lockstep with forward_mlx.rs::tq_codebook_bits and cb_bits gates.
+        //   unset (DEFAULT) = 8-bit native HB SDPA
+        //   "4"             = legacy 4-bit (no HB buffers)
+        //   "5" | "6" | "8" = corresponding HB bits
         let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-            Ok("5") => 5, Ok("6") => 6, Ok("8") => 8, _ => 0,
+            Ok("4") => 0,
+            Ok("5") => 5, Ok("6") => 6, Ok("8") => 8,
+            _ => 8,  // DEFAULT: 8-bit
         };
         if tq_codebook_bits_prefill >= 5 {
             eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",

@@ -117,7 +117,10 @@ echo
 #    token-level input. See crawl_verify.sh:96-183 for the long Chesterton
 #    fence on why we strip the leading literal <bos>.
 echo "--- Rendering chat template via hf2q ---"
-if ! HF2Q_DUMP_RENDERED_PROMPT="$RENDERED_PROMPT" \
+# ADR-007 post-close 2026-04-24: byte-exact gate requires DENSE decode.
+# TQ is the default decode path post-correction; force dense explicitly here
+# so the gate keeps asserting "hf2q dense == llama.cpp" byte-identity.
+if ! HF2Q_DUMP_RENDERED_PROMPT="$RENDERED_PROMPT" HF2Q_USE_DENSE=1 \
       "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
         --max-tokens 1 --temperature 0 \
         >/dev/null 2>"$LOG_HF2Q"; then
@@ -152,7 +155,11 @@ fi
 # 3. Run hf2q on the raw user prompt (it applies the chat template
 #    internally and produces byte-identical input tokens to step 1).
 echo "--- Running hf2q (T=0 greedy, $MAX_TOKENS tokens) ---"
-if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
+# ADR-007 post-close 2026-04-24: HF2Q_USE_DENSE=1 forces dense decode for the
+# byte-exact comparison vs llama.cpp. TQ is the production default but cannot
+# produce byte-identical output by design (quantization is lossy, passes
+# semantic gates not byte-exact gates).
+if ! HF2Q_USE_DENSE=1 "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$USER_PROMPT" \
       --max-tokens "$MAX_TOKENS" --temperature 0 \
       >"$OUT_HF2Q" 2>"$LOG_HF2Q"; then
   echo "hf2q failed. See $LOG_HF2Q" >&2; exit 3

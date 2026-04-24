@@ -1092,8 +1092,15 @@ impl MlxModelWeights {
         // forward_prefill may have already allocated these; if not, do it here.
         // We can only check the env var once (OnceLock), so read it directly to match.
         {
+            // ADR-007 post-close correction 2026-04-24: TQ-8-bit is the default when
+            // env is unset. Explicit HF2Q_TQ_CODEBOOK_BITS=4 selects the legacy 4-bit
+            // native flash_attn_vec_tq path (127-byte sourdough ceiling, not shippable
+            // as default). Explicit =5/=6 select intermediate HB-SDPA. This MUST match
+            // the primary gate at tq_codebook_bits below.
             let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-                Ok("5") => 5, Ok("6") => 6, Ok("8") => 8, _ => 0,
+                Ok("4") => 0,  // legacy 4-bit (non-HB) path
+                Ok("5") => 5, Ok("6") => 6, Ok("8") => 8,
+                _ => 8,        // DEFAULT: 8-bit native HB SDPA
             };
             if cb_bits >= 5 && self.leg_hb_encoded.is_none() {
                 let (exec, _reg) = gpu.split();
@@ -1214,27 +1221,40 @@ impl MlxModelWeights {
             })
         };
 
-        // iter-21 Track B: higher-bit codebook ablation gate.
-        // HF2Q_TQ_CODEBOOK_BITS=5|6|8 selects higher-bit Lloyd-Max codebook.
-        // iter-24: adds 8-bit (256-centroid) support and native HB SDPA kernel.
-        // 0 = default (4-bit TQ native SDPA), 5/6/8 = higher-bit native HB SDPA.
+        // iter-21 Track B + 2026-04-24 post-close default correction.
+        // HF2Q_TQ_CODEBOOK_BITS selects the KV codebook width.
+        //   unset  (DEFAULT) = 8-bit native HB SDPA (2× memory savings vs F16, 0.017 PPL
+        //                      absolute / 1.24% delta, cosine 0.9998 — meets TurboQuant
+        //                      paper + KIVI + KVQuant + AmesianX + vLLM published gates)
+        //   "4"              = legacy 4-bit native flash_attn_vec_tq (iter-16 control;
+        //                      127-byte sourdough ceiling — not shippable as default)
+        //   "5" | "6"        = intermediate higher-bit HB SDPA (Lloyd-Max native)
+        //   "8"              = explicit 8-bit (same as unset)
+        // MUST stay in lockstep with the `cb_bits` lazy-alloc gate above.
         let tq_codebook_bits: u32 = {
             static CODEBOOK_BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             *CODEBOOK_BITS.get_or_init(|| {
                 match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+                    Ok("4") => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 4-bit legacy TQ (opt-in; 127-byte sourdough ceiling)");
+                        0u32
+                    }
                     Ok("5") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 5-bit Lloyd-Max native HB SDPA");
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 5-bit Lloyd-Max native HB SDPA");
                         5u32
                     }
                     Ok("6") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 6-bit Lloyd-Max native HB SDPA");
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 6-bit Lloyd-Max native HB SDPA");
                         6u32
                     }
-                    Ok("8") => {
-                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 8-bit Lloyd-Max native HB SDPA");
+                    Ok("8") | Err(_) => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)");
                         8u32
                     }
-                    _ => 0u32, // default: 4-bit TQ native SDPA path
+                    Ok(other) => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] unknown value {:?}; defaulting to 8-bit", other);
+                        8u32
+                    }
                 }
             })
         };
@@ -1844,37 +1864,39 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
 
-                // -- SDPA: DENSE (default) or TQ opt-in --
-                // ADR-007 CLOSED 2026-04-24: after 27-iter investigation, TQ shows documented
-                // 1.24% PPL delta at 8-bit (cosine 0.9998 passes TQ paper standard; meets
-                // industry-standard shippability gates). Dense remains the DEFAULT decode
-                // path because it's byte-exact vs llama.cpp — a stricter correctness guarantee
-                // than TQ can provide. TQ is opt-in via HF2Q_LAYER_POLICY=tq_all (optionally
-                // combined with HF2Q_TQ_CODEBOOK_BITS=8 for 2x memory savings vs F16).
+                // -- SDPA: TQ (default) or DENSE opt-out --
+                // ADR-007 CLOSED 2026-04-24, post-close correction 2026-04-24:
+                // TQ-8-bit is the DEFAULT decode path (2× memory savings vs F16;
+                // Gate A cosine 0.9998 exceeds TurboQuant paper 0.999; Gate B argmax
+                // divergence 0.8% exceeds <1%; Gate C PPL delta 1.24% / 0.017 absolute
+                // meets KIVI + KVQuant + AmesianX + vLLM + TurboQuant shippability gates).
+                // Rationale: "TQ should be default if it is better" — user feedback on
+                // iter-28's overly-conservative flip to dense. Byte-exact vs llama.cpp is
+                // still achievable via HF2Q_USE_DENSE=1 (sourdough_gate.sh sets this).
                 //
-                // HF2Q_LAYER_POLICY values (ADR-007 iter-17 + iter-28 default-flip):
-                //   unset OR "dense_all"      = dense everywhere (default; 3656 bytes PASS)
-                //   "tq_all"                  = full TQ decode (iter-16 control; 127 bytes at 4-bit)
-                //   "tq_slide_dense_global"   = TQ for sliding layers, dense for global (leg B)
-                //   "dense_slide_tq_global"   = dense for sliding, TQ for global (leg C; 627 bytes novel)
+                // HF2Q_LAYER_POLICY values:
+                //   unset OR "tq_all"         = DEFAULT: full TQ decode (8-bit native HB SDPA)
+                //   "dense_all"               = dense everywhere (byte-exact vs llama.cpp)
+                //   "tq_slide_dense_global"   = TQ for sliding layers, dense for global
+                //   "dense_slide_tq_global"   = dense for sliding, TQ for global
                 //
-                // HF2Q_USE_DENSE=1 also routes to dense_all (back-compat alias).
+                // HF2Q_USE_DENSE=1 forces dense_all (explicit opt-out for byte-exact gates).
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
                 } else if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
                     true
                 } else {
                     match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
-                        Ok("dense_all") | Err(_) => true,
-                        Ok("tq_all") => false,
+                        Ok("dense_all") => true,
+                        Ok("tq_all") | Err(_) => false,
                         Ok("tq_slide_dense_global") => !kv_is_sliding,
                         Ok("dense_slide_tq_global") => kv_is_sliding,
                         Ok(other) => {
                             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to dense_all", other);
+                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
                             }
-                            true
+                            false
                         }
                     }
                 };
