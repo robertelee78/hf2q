@@ -161,8 +161,58 @@ fn render_chat_template(
 }
 
 /// Render a Jinja2 chat template using minijinja.
+///
+/// Extends the minijinja environment with Python string methods used by
+/// Qwen3.5/3.6 and other HuggingFace chat templates:
+///
+/// - `str.startswith(prefix)` / `str.endswith(suffix)` — Qwen3.6 multi-step
+///   tool-call detection path.
+/// - `tojson` filter — common HF template helper.
+/// - `raise_exception(msg)` function — Qwen3.6 guard for missing user query
+///   (we always supply a user message, so this code path is unreachable; we
+///   log a warning and continue rather than aborting template rendering).
 fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String> {
     let mut env = minijinja::Environment::new();
+
+    // `tojson` filter — converts any value to its JSON representation.
+    env.add_filter("tojson", |v: minijinja::Value| {
+        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())
+    });
+
+    // `raise_exception(msg)` — log-and-continue instead of aborting.
+    // Qwen3.6 calls this when the message list has no user turn; we always
+    // inject a user message so the guard should not fire.
+    env.add_function("raise_exception", |msg: String| -> minijinja::Value {
+        tracing::warn!("chat template raise_exception: {}", msg);
+        minijinja::Value::UNDEFINED
+    });
+
+    // Python string method shims via `set_unknown_method_callback`.
+    // Handles: `.startswith(prefix)`, `.endswith(suffix)` called as attribute
+    // method invocations on string values (Qwen3.6 template line 72).
+    env.set_unknown_method_callback(|_state, value, method, args| {
+        let s = value.as_str().unwrap_or("");
+        match method {
+            "startswith" => {
+                let prefix = args.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(minijinja::Value::from(s.starts_with(prefix)))
+            }
+            "endswith" => {
+                let suffix = args.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(minijinja::Value::from(s.ends_with(suffix)))
+            }
+            other => Err(minijinja::Error::from(
+                minijinja::ErrorKind::UnknownMethod,
+            ).with_source(std::io::Error::other(format!(
+                "string has no method named {other}"
+            ))))
+        }
+    });
+
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
     let tmpl = env

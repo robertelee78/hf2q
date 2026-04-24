@@ -100,11 +100,49 @@ else
   err "llama-cli not found on PATH or at /opt/llama.cpp/build/bin/llama-cli"
 fi
 
-# Validate arch: file MUST be qwen35 or qwen35moe. Run a lightweight probe
-# via hf2q to read the GGUF metadata without loading weights — the `info`
-# subcommand surfaces general.architecture and fails fast on unsupported
-# arches, before we waste time on a full generate pass.
-ARCH="$("$HF2Q_BIN" info "$GGUF_PATH" 2>/dev/null | awk '/^arch:/ {print $2; exit}' || true)"
+# Validate arch: file MUST be qwen35 or qwen35moe. Read general.architecture
+# directly from GGUF metadata via a minimal Python3 parser — avoids the need
+# for a dedicated hf2q info-gguf subcommand while remaining zero-dependency.
+ARCH="$(python3 - "$GGUF_PATH" <<'PYEOF'
+import struct, sys
+path = sys.argv[1]
+with open(path, 'rb') as f:
+    magic = f.read(4)
+    if magic != b'GGUF':
+        sys.exit(0)
+    f.read(4)  # version
+    f.read(16) # n_tensors, n_kv
+    # scan KV pairs until we hit general.architecture
+    while True:
+        hdr = f.read(8)
+        if len(hdr) < 8:
+            break
+        key_len = struct.unpack('<Q', hdr)[0]
+        if key_len > 4096:
+            break
+        key = f.read(key_len).decode('utf-8', errors='replace')
+        vt = struct.unpack('<I', f.read(4))[0]
+        if vt == 8:  # STRING
+            slen = struct.unpack('<Q', f.read(8))[0]
+            val = f.read(slen).decode('utf-8', errors='replace')
+            if key == 'general.architecture':
+                print(val)
+                sys.exit(0)
+        elif vt == 9:  # ARRAY
+            at, alen = struct.unpack('<IQ', f.read(12))
+            esz = {0:1,1:1,2:2,3:4,4:4,5:8,6:8,7:4,10:8,11:8,12:4}.get(at, 0)
+            if esz:
+                f.read(alen * esz)
+            else:
+                break
+        else:
+            esz = {0:1,1:1,2:2,3:4,4:4,5:8,6:8,7:4,10:8,11:8,12:4}.get(vt, 0)
+            if esz:
+                f.read(esz)
+            else:
+                break
+PYEOF
+)"
 if [[ "$ARCH" != "qwen35" && "$ARCH" != "qwen35moe" ]]; then
   err "GGUF arch is '$ARCH', expected 'qwen35' or 'qwen35moe' — wrong gate for this file."
 fi
@@ -139,9 +177,11 @@ if ! "$LLAMA_BIN" --model "$GGUF_PATH" --prompt "$PROMPT_CONTENT" \
 fi
 
 # 2. Run hf2q.
+# Note: --seed is not in hf2q's generate CLI (at temp=0 greedy, seed is
+# irrelevant — argmax is deterministic). Removed to match actual CLI surface.
 echo "--- Running hf2q generate (T=0 greedy, $MAX_TOKENS tokens) ---"
 if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PROMPT_CONTENT" \
-      --max-tokens "$MAX_TOKENS" --temperature 0 --seed 42 \
+      --max-tokens "$MAX_TOKENS" --temperature 0 \
       >"$OUT_HF2Q" 2>"$LOG_HF2Q"; then
   echo "hf2q failed. See $LOG_HF2Q" >&2; exit 3
 fi

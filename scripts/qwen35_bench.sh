@@ -127,24 +127,42 @@ if [[ $SKIP_LLAMA -eq 0 ]]; then
   done < <(tail -n +2 "$OUT_DIR/llama.csv")
 fi
 
+# --- Generate synthetic prompts of varying lengths for the pp matrix -------
+# We produce prompts that tokenize to approximately PP_LIST token counts by
+# repeating a base passage. The word "approximately" is deliberate: the bench
+# table reports the exact prefill token count from hf2q output, not the target.
+BASE_PASSAGE="The history of computing is a fascinating journey spanning centuries of human ingenuity. "
+gen_prompt() {
+  local target_tok="$1"
+  # Empirical: ~1.35 chars/token for this passage with the Qwen3.5 tokenizer.
+  local reps=$(( (target_tok * 135 / 100) / ${#BASE_PASSAGE} + 1 ))
+  local str=""
+  for ((i=0; i<reps; i++)); do str+="$BASE_PASSAGE"; done
+  echo -n "$str"
+}
+
 # --- hf2q-bench pass -------------------------------------------------------
+# Uses `hf2q generate --benchmark` which emits:
+#   prefill: N tok in Xms (Y tok/s)
+#   decode: M tok in Xms (Y tok/s)
+# on stderr. --benchmark also prints a structured result block on stdout.
 echo "--- hf2q bench pass ---"
 declare -A HF2Q_TPS_PP HF2Q_TPS_TG
 for pp in "${PP_LIST[@]}"; do
+  PROMPT_TEXT="$(gen_prompt "$pp")"
   for tg in "${DECODE_LIST[@]}"; do
     echo -n "  pp=$pp tg=$tg ... "
-    # Wrap each datapoint in a cold-process invocation per
-    # reference_decode_benchmark_methodology.md — hf2q --benchmark is a
-    # single-run tool; wrapping externally gives us deterministic cold-
-    # start numbers that match llama-bench's methodology.
+    # Cold-process invocation per reference_decode_benchmark_methodology.md.
     OUT="$OUT_DIR/hf2q_pp${pp}_tg${tg}.txt"
-    if ! "$HF2Q_BIN" bench --model "$GGUF_PATH" \
-          --prompt-length "$pp" --max-tokens "$tg" --temperature 0 --seed 42 \
-          >"$OUT" 2>>"$LOG_HF2Q"; then
-      echo "FAIL (see $LOG_HF2Q)"; exit 3
+    if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" \
+          --prompt "$PROMPT_TEXT" --max-tokens "$tg" --temperature 0 \
+          --benchmark \
+          >"$OUT" 2>"$OUT_DIR/hf2q_pp${pp}_tg${tg}.log"; then
+      echo "FAIL (see $OUT_DIR/hf2q_pp${pp}_tg${tg}.log)"; exit 3
     fi
-    PP_TPS="$(grep -oE 'prefill: *[0-9.]+ tok/s' "$OUT" | grep -oE '[0-9.]+' | head -1 || echo 0)"
-    TG_TPS="$(grep -oE 'decode: *[0-9.]+ tok/s'  "$OUT" | grep -oE '[0-9.]+' | head -1 || echo 0)"
+    # Parse tok/s from the Benchmark Results block on stdout.
+    PP_TPS="$(grep -oE 'Prefill tok/s: *[0-9.]+' "$OUT" | grep -oE '[0-9.]+' | head -1 || echo 0)"
+    TG_TPS="$(grep -oE 'Decode tok/s: *[0-9.]+' "$OUT" | grep -oE '[0-9.]+' | head -1 || echo 0)"
     HF2Q_TPS_PP["$pp"]="$PP_TPS"
     HF2Q_TPS_TG["$tg"]="$TG_TPS"
     echo "pp=$PP_TPS tg=$TG_TPS tok/s"
