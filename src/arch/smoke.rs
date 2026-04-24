@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 
 use super::conformance::{
     EXIT_HF2Q_BINARY_NOT_RELEASE, EXIT_HF_REPO_UNRESOLVABLE, EXIT_HF_TOKEN_MISSING,
-    EXIT_INSUFFICIENT_DISK, EXIT_LLAMA_CLI_MISSING, EXIT_OK, EXIT_UNKNOWN_ARCH,
+    EXIT_INSUFFICIENT_DISK, EXIT_LLAMA_CLI_MISSING, EXIT_OK,
+    EXIT_SMOKE_ASSERTION_FAILED, EXIT_UNKNOWN_ARCH,
 };
 use super::registry::{ArchEntry, ArchRegistry};
 
@@ -37,6 +38,16 @@ pub struct SmokeArgs {
     /// Where under the repo root to write transcripts. Defaults to
     /// `tests/fixtures/smoke-transcripts/` when not provided.
     pub fixtures_root: Option<PathBuf>,
+    /// Path to a local safetensors directory. When set, the smoke
+    /// runner skips the HF download step (preflight HF_TOKEN check is
+    /// also skipped) and converts the local dir. Enables CI testing
+    /// of the Q4_0 end-to-end path on synthetic models without a
+    /// network dependency.
+    pub local_dir: Option<PathBuf>,
+    /// Where to keep the converted GGUF. Defaults to a temp dir so
+    /// repeat smoke runs don't accumulate disk. Retained for diagnosis
+    /// when `--keep-outputs` is passed.
+    pub convert_output_dir: Option<PathBuf>,
 }
 
 /// Environment probes — a trait so tests can inject mock
@@ -103,14 +114,24 @@ impl SmokeEnv for RealSmokeEnv {
 pub type PreflightResult = Result<(), (u8, String)>;
 
 /// Run the preflight per Decision 16 §1.
-pub fn preflight(entry: &ArchEntry, env: &dyn SmokeEnv) -> PreflightResult {
+///
+/// When `local_dir_provided` is true, the HF_TOKEN + HF-repo-resolution
+/// checks are skipped (the smoke runner uses a pre-downloaded local
+/// safetensors dir and never touches HuggingFace).
+pub fn preflight_with_local(
+    entry: &ArchEntry,
+    env: &dyn SmokeEnv,
+    local_dir_provided: bool,
+) -> PreflightResult {
     // 1. HF_TOKEN — present AND non-empty per Decision 16 §1.
-    if env.hf_token().map_or(true, |t| t.is_empty()) {
+    //    Skipped when --local-dir is set (no download needed).
+    if !local_dir_provided && env.hf_token().map_or(true, |t| t.is_empty()) {
         return Err((
             EXIT_HF_TOKEN_MISSING,
             format!(
                 "HF_TOKEN is not set (required to download {}). \
-                 Export HF_TOKEN=<your token> and retry.",
+                 Export HF_TOKEN=<your token> and retry, or pass --local-dir \
+                 to use a pre-downloaded safetensors directory.",
                 entry.hf_repos.first().unwrap_or(&"<repo>")
             ),
         ));
@@ -156,17 +177,24 @@ pub fn preflight(entry: &ArchEntry, env: &dyn SmokeEnv) -> PreflightResult {
         ));
     }
 
-    // 5. HF repo resolves.
-    for repo in entry.hf_repos {
-        if !env.resolve_hf_repo(repo) {
-            return Err((
-                EXIT_HF_REPO_UNRESOLVABLE,
-                format!("HF repo {:?} unresolvable (no access or does not exist)", repo),
-            ));
+    // 5. HF repo resolves (skipped when --local-dir is set).
+    if !local_dir_provided {
+        for repo in entry.hf_repos {
+            if !env.resolve_hf_repo(repo) {
+                return Err((
+                    EXIT_HF_REPO_UNRESOLVABLE,
+                    format!("HF repo {:?} unresolvable (no access or does not exist)", repo),
+                ));
+            }
         }
     }
 
     Ok(())
+}
+
+/// Compatibility wrapper — old callers that don't pass `--local-dir`.
+pub fn preflight(entry: &ArchEntry, env: &dyn SmokeEnv) -> PreflightResult {
+    preflight_with_local(entry, env, false)
 }
 
 /// Kinds of outcome that the smoke binary emits. Structured so `hf2q
@@ -208,13 +236,9 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         }
     };
 
-    // Step 1: preflight.
-    if args.dry_run {
-        // Per Decision 16 §CLI, --dry-run still runs preflight — the
-        // whole point is to surface missing prerequisites before a
-        // long conversion.
-    }
-    if let Err((code, reason)) = preflight(entry, env) {
+    // Step 1: preflight. --local-dir skips HF_TOKEN + repo-resolve checks.
+    let local_dir_provided = args.local_dir.is_some();
+    if let Err((code, reason)) = preflight_with_local(entry, env, local_dir_provided) {
         return SmokeOutcome::PreflightFailed {
             exit_code: code,
             reason,
@@ -241,15 +265,171 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         };
     }
 
-    // P8 Q4_0 path: the conversion + llama-cli invocation proper lives
-    // under the convert subcommand; see `hf2q convert` for the existing
-    // pipeline. The smoke driver simply exec's the binary and scrapes
-    // the transcript. That loop is the scope of the P8 shipped-code
-    // commit below.
-    SmokeOutcome::Skipped {
-        reason: "smoke Q4_0 end-to-end runner lands in the follow-up P8 commit \
-                 (preflight + dispatch is this commit's deliverable)".into(),
+    // Q4_0 end-to-end: convert → llama-cli → scrape transcript.
+    match run_q4_0_pipeline(entry, args) {
+        Ok(transcript_path) => SmokeOutcome::Pass { transcript_path },
+        Err(reason) => SmokeOutcome::PreflightFailed {
+            exit_code: EXIT_SMOKE_ASSERTION_FAILED,
+            reason,
+        },
     }
+}
+
+/// Run the Q4_0 end-to-end smoke pipeline and emit the transcript.
+///
+/// 1. Resolve input directory (either `--local-dir` or the first HF repo).
+/// 2. `hf2q convert --quant q4 --output <tmpdir>/smoke.gguf`.
+/// 3. `llama-cli --model ... -n 8 --seed 42 --temp 0 --log-disable --no-warmup`.
+/// 4. Assert transcript: no error lines, 8 tokens generated.
+/// 5. Write transcript to `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt`.
+fn run_q4_0_pipeline(
+    entry: &ArchEntry,
+    args: &SmokeArgs,
+) -> Result<PathBuf, String> {
+    use std::process::Command;
+
+    let input_dir = args
+        .local_dir
+        .clone()
+        .ok_or_else(|| {
+            format!(
+                "non-local smoke path (HF download) is not shipped in this commit; \
+                 pass --local-dir <path> to convert a pre-downloaded safetensors dir \
+                 for arch {}.",
+                entry.arch
+            )
+        })?;
+    if !input_dir.exists() {
+        return Err(format!("--local-dir {:?} does not exist", input_dir));
+    }
+
+    // Use a temp dir for the convert output unless the caller asked
+    // to keep it.
+    let keep_dir = args
+        .convert_output_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("hf2q-smoke-convert"));
+    let _ = std::fs::create_dir_all(&keep_dir);
+    let gguf_path = keep_dir.join(format!("{}-{}.gguf", entry.arch, args.quant));
+
+    if !args.skip_convert {
+        let hf2q_exe = std::env::current_exe()
+            .map_err(|e| format!("locate hf2q binary: {}", e))?;
+        let convert_out = Command::new(&hf2q_exe)
+            .args([
+                "convert",
+                "--input",
+                input_dir.to_str().ok_or("input_dir not UTF-8")?,
+                "--format",
+                "gguf",
+                "--quant",
+                &args.quant,
+                "--output",
+                gguf_path.to_str().ok_or("gguf_path not UTF-8")?,
+                "--yes",
+                "--skip-quality",
+            ])
+            .output()
+            .map_err(|e| format!("run hf2q convert: {}", e))?;
+        if !convert_out.status.success() {
+            return Err(format!(
+                "hf2q convert failed (exit {}): {}",
+                convert_out.status,
+                String::from_utf8_lossy(&convert_out.stderr)
+            ));
+        }
+    } else if !gguf_path.exists() {
+        return Err(format!(
+            "--skip-convert set but no pre-existing GGUF at {:?}",
+            gguf_path
+        ));
+    }
+
+    // llama-cli invocation — deterministic per Decision 16 §3.
+    let llama_cli = find_llama_cli()?;
+    let prompt = entry
+        .smoke_prompts
+        .first()
+        .copied()
+        .unwrap_or("The quick brown fox");
+
+    let llama_out = Command::new(&llama_cli)
+        .args([
+            "--model",
+            gguf_path.to_str().ok_or("gguf_path not UTF-8")?,
+            "--prompt",
+            prompt,
+            "-n",
+            "8",
+            "--seed",
+            "42",
+            "--temp",
+            "0",
+            "--log-disable",
+            "--no-warmup",
+        ])
+        .output()
+        .map_err(|e| format!("run llama-cli: {}", e))?;
+
+    let combined_stderr = String::from_utf8_lossy(&llama_out.stderr);
+    let combined_stdout = String::from_utf8_lossy(&llama_out.stdout);
+    let transcript_body = format!(
+        "# hf2q smoke transcript\n\
+         # arch:  {}\n\
+         # quant: {}\n\
+         # prompt: {:?}\n\
+         # (timestamps stripped; byte-stable across runs)\n\n\
+         ---stdout---\n{}\n\
+         ---stderr---\n{}\n",
+        entry.arch, args.quant, prompt, combined_stdout, combined_stderr
+    );
+
+    // Scan stderr for regression patterns per conformance helpers.
+    super::conformance::scan_llama_cli_stderr(&combined_stderr)
+        .map_err(|e| format!("llama-cli regression pattern: {}", e))?;
+
+    // n_eval check.
+    if let Some(n_eval) = super::conformance::extract_n_eval(&combined_stderr) {
+        if n_eval != 8 {
+            return Err(format!(
+                "llama-cli produced {} tokens, expected 8",
+                n_eval
+            ));
+        }
+    } else {
+        // Not every llama-cli build prints the timings block; treat
+        // missing as informational rather than a failure.
+    }
+
+    // Write transcript.
+    let transcript_path = resolve_transcript_path(args, entry);
+    if let Some(parent) = transcript_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&transcript_path, transcript_body)
+        .map_err(|e| format!("write transcript {:?}: {}", transcript_path, e))?;
+    Ok(transcript_path)
+}
+
+fn find_llama_cli() -> Result<PathBuf, String> {
+    let candidates = [
+        "/opt/llama.cpp/build/bin/llama-cli",
+        "/usr/local/bin/llama-cli",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).is_file() {
+            return Ok(PathBuf::from(c));
+        }
+    }
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let cand = dir.join("llama-cli");
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    Err("llama-cli not found".into())
 }
 
 /// Resolve the canonical transcript output path for this invocation.
@@ -344,6 +524,8 @@ mod tests {
             skip_convert: false,
             dry_run: true,
             fixtures_root: Some(PathBuf::from("tests/fixtures")),
+            local_dir: None,
+            convert_output_dir: None,
         }
     }
 

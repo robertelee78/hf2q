@@ -116,6 +116,17 @@ pub struct SmokeArgs {
     /// Fixtures root (defaults to `tests/fixtures/`)
     #[arg(long)]
     pub fixtures_root: Option<PathBuf>,
+
+    /// Use a local safetensors directory instead of downloading from HF.
+    /// When set, preflight skips HF_TOKEN + repo-resolution checks.
+    /// Enables CI testing of the Q4_0 end-to-end path on synthetic models.
+    #[arg(long)]
+    pub local_dir: Option<PathBuf>,
+
+    /// Keep converted GGUF(s) in this directory. Defaults to a temp dir
+    /// so repeat smoke runs don't accumulate disk.
+    #[arg(long)]
+    pub convert_output_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]

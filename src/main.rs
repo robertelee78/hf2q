@@ -188,6 +188,8 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
         skip_convert: args.skip_convert,
         dry_run: args.dry_run,
         fixtures_root: args.fixtures_root,
+        local_dir: args.local_dir,
+        convert_output_dir: args.convert_output_dir,
     };
     let env = arch::smoke::RealSmokeEnv {
         convert_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

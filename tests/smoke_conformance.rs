@@ -175,3 +175,69 @@ fn smoke_hf_token_empty_string_rejected_same_as_missing() {
         .expect("exec hf2q");
     assert!(!out.status.success(), "empty HF_TOKEN must be rejected");
 }
+
+#[test]
+fn smoke_local_dir_skips_hf_token_preflight() {
+    // --local-dir bypasses the HF_TOKEN + repo-resolve preflight checks
+    // per `preflight_with_local(..., local_dir_provided=true)`. With a
+    // (non-existent) --local-dir still provided, preflight should NOT
+    // return EXIT_HF_TOKEN_MISSING (code 2). Failure now happens later
+    // — release-build check, local-dir existence, etc.
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("nonexistent");
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "qwen35",
+            "--dry-run",
+            "--local-dir",
+            fake.to_str().unwrap(),
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{}{}", stderr, stdout);
+    // No HF_TOKEN-named failure (that'd be the regression).
+    assert!(
+        !combined.contains("HF_TOKEN is not set"),
+        "--local-dir must bypass HF_TOKEN preflight, got: {}",
+        combined
+    );
+}
+
+#[test]
+fn smoke_help_documents_local_dir_flag() {
+    hf2q()
+        .args(["smoke", "--help"])
+        .env_remove("HF_TOKEN")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--local-dir"));
+}
+
+#[test]
+fn smoke_unknown_arch_still_rejected_with_local_dir() {
+    // Sanity: --local-dir does not weaken the arch-registry dispatch.
+    // An unregistered arch is STILL rejected with the uniform error,
+    // regardless of whether --local-dir is provided.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "bogus",
+            "--dry-run",
+            "--local-dir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("unknown arch"));
+    assert!(stderr.contains("qwen35"));
+}
