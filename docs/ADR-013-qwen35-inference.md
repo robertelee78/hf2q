@@ -934,6 +934,52 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 14 · P12 COMPLETE (ActivationCapture trait + mock)
+
+**Scope:** Phase P12 Decision 16 — the `ActivationCapture` trait that ADR-012's DWQ calibration pass (P6) consumes. Lands BEFORE ADR-012 starts wiring so they can build against a trait object and inject a mock today.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/activation_capture.rs` (new file, ~300 LOC):
+  - **`LayerActivations`** struct: per-layer residual-stream inputs + outputs as flat f32 row-major `[seq_len, hidden_size]` vectors, plus shape metadata. Includes `validate()` that checks internal shape consistency + `element_count()` for memory accounting.
+  - **`ActivationCapture`** trait — the cross-ADR contract:
+    ```rust
+    pub trait ActivationCapture {
+        fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations>;
+    }
+    ```
+  - **`MockActivationCapture`** — deterministic synthetic implementation. Activation at `layer_inputs[l][t, j]` is a closed-form function of `tokens[t]`, `l`, and `j` so ADR-012 tests can pin expected values in round-trip.
+
+**Tests (10, all green):**
+- Shape validation: matching shapes accepted, wrong layer count rejected, wrong element count rejected.
+- `element_count` formula correctness.
+- Mock correctness: produces correct shapes, deterministic across instances, differs between layers (formula increments by 0.01/layer), differs between tokens, rejects empty input.
+- **`trait_object_usable_for_cross_adr_consumption`** — cross-ADR pattern demonstration: a function taking `&mut dyn ActivationCapture` can consume either the mock OR a real model (when it lands), proving the interface is sufficient for ADR-012's use case.
+
+**Verification:**
+- 10/10 new ActivationCapture tests green.
+- 531/531 hf2q test suite green (+10 from iter 13's 512, +9 mystery? — 512 to 531 is +19 including 9 from the parallel ADR-005 session that concurrently landed; this crate's tests in isolation pass cleanly, which is what matters).
+
+**Design notes:**
+- Trait takes `&mut self` so implementations can safely reset internal state (KV cache, layer scratch buffers) between calls.
+- `LayerActivations` intentionally does NOT capture intermediate activations (Q/K/V/attn_out). Most quantizers need only residual-stream inputs; adding intermediates would bloat memory and the interface for no current consumer. Future extension is additive.
+- Real impl on `Qwen35Model` ships in a future iter after P11 (end-to-end forward is wired up).
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | PARTIAL — CPU ✓; GPU pending |
+| P8     | 8          | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P10    | 15         | COMPLETE |
+| P11    | 16         | Pending (end-to-end forward wire-up — largest remaining piece) |
+| P12    | 17         | **COMPLETE** (trait + mock; real impl deferred until P11 lands) |
+| P13    | 17, 18     | Pending (sourdough + bench) |
+
+**Next iter target:** Back to GPU-builder territory. P7b (full-attention GPU builder) is the simplest of the three; landing it builds momentum and the parity-vs-CPU-ref pattern that P8b/P9b will follow.
+
 ### 2026-04-24 — /loop iter 13 · P10 COMPLETE (MTP load-only scaffold)
 
 **Scope:** Phase P10 Decision 15 — load-only scaffolding for Multi-Token Prediction tensors. Production forward ignores MTP; execution (speculative decoding) is a follow-up ADR.
