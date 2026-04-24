@@ -934,6 +934,64 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 18 · P11 scaffold (Qwen35Model top-level type)
+
+**Scope:** Strategic pivot — rather than land the SDPA GPU wire (which requires bf16 handling + detailed buffer layouts), landed the top-level `Qwen35Model` struct that pulls every preceding phase together. This is the concrete target P11 (end-to-end wire-up) needs.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/model.rs` (new file, ~440 LOC):
+  - **`Qwen35FfnWeights`** enum — Dense(DenseFfnWeights) | Moe(MoeFfnWeights). Exactly one variant per model, determined by `cfg.variant`.
+  - **`Qwen35LayerWeights`** enum — FullAttn { attn, ffn } | LinearAttn { attn, ffn }. Kind determined per-layer by `cfg.layer_types`. Methods: `kind()`, `ffn()`.
+  - **`Qwen35Model`** struct — top-level model container:
+    ```rust
+    pub struct Qwen35Model {
+        pub cfg: Qwen35Config,
+        pub layers: Vec<Qwen35LayerWeights>,     // len = num_hidden_layers
+        pub token_embd: Vec<f32>,                // [vocab, hidden]
+        pub output_weight: Vec<f32>,             // [hidden, vocab]
+        pub output_norm: Vec<f32>,               // [hidden]
+        pub mtp: Option<MtpWeights>,
+    }
+    ```
+  - `Qwen35Model::load_config_only(gguf)` — cheap config parse (no weight alloc).
+  - `Qwen35Model::empty_from_cfg(cfg)` — constructs a zero-weighted model of the prescribed shape. Useful for test harnesses + placeholder weight-loading targets.
+  - **`Qwen35Model::load_from_gguf(gguf)`** — parses config + MTP scaffold from GGUF and allocates zero-weighted model body of the correct shape. Weight data load lands in follow-up iter (requires GGUF → Vec<f32> dequant path per-layer, which is straightforward composition of the already-tested `load_tensor_f32` from mlx-native).
+  - Metadata helpers: `num_linear_attn_layers()`, `num_full_attn_layers()`, `layer_kind(idx)`, `ffn_variant()`.
+
+**Tests (8 unit + 1 real-apex integration, all green):**
+- `empty_moe_40layer_has_correct_slot_counts` — 40-layer MoE → 10 full-attn + 30 linear-attn slots.
+- `empty_dense_12layer_uses_swiglu_ffn` / `empty_moe_12layer_uses_moe_ffn` — FFN variant matches config.
+- `layer_kind_matches_config` — per-layer kind lookup matches cfg.layer_types across all 40 layers.
+- `layer_kind_out_of_bounds_is_none` — bounds check.
+- `full_attn_layer_has_q_and_kv_weights` — tests layer 3 (first full-attn) has correctly-sized Q/K/V buffers.
+- `linear_attn_layer_has_ssm_weights` — tests layer 0 has SSM tensors (ssm_a, ssm_conv1d, etc.) of correct sizes.
+- `ffn_variant_reported_via_config`.
+- **`load_from_real_apex_has_correct_shape`** (`#[ignore]`d): **real 25 GB apex GGUF loads as a fully-shaped Qwen35Model** — cfg.variant=Moe, 40 layers with correct 10/30 split, MTP absent. Confirmed running.
+
+**Pre-existing broken window fixed:** `src/inference/models/bert/tokenizer.rs:172` had `tokenizers::AHashMap::default()` which doesn't compile (not re-exported from crate root in tokenizers 0.22). Replaced with direct `ahash::AHashMap::default()` import. This was blocking all hf2q tests from compiling.
+
+**Verification:**
+- 8/8 new Qwen35Model tests + 1 real-apex integration green.
+- 586/586 hf2q test suite green.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | PARTIAL — CPU ref ✓; GPU 5 of 7 ops verified (+1 sigmoid_mul kernel landed); SDPA + full-layer composition pending |
+| P8     | 8          | PARTIAL — CPU ref ✓; GPU pending |
+| P9     | 13, 14     | PARTIAL — CPU refs ✓; GPU pending |
+| P10    | 15         | COMPLETE |
+| P11    | 16         | **SCAFFOLD DONE** — Qwen35Model type + empty/load_from_gguf up to shape level. Real weight data load + forward() impl pending |
+| P12    | 17         | COMPLETE |
+| P13    | 17, 18     | Pending (sourdough + bench) |
+
+**Major milestone:** The top-level type is live and loads the real apex file. Every remaining GPU-side piece (P7 SDPA, P8b, P9b) + the per-tensor weight data load now have a clear integration target.
+
+**Next iter target:** Weight data load — replace the zero-filled buffers in `empty_from_cfg` with `mlx_native::load_tensor_f32` calls against the GGUF's actual tensors. This exercises the P5 dequant path end-to-end on all ~733 apex tensors.
+
 ### 2026-04-24 — /loop iter 17 · P7b continued (sigmoid-mul kernel + gate-mul parity)
 
 **Scope:** Landed the sigmoid-mul Metal kernel in mlx-native and wired it into hf2q's full-attention pipeline. Output-gate application now GPU-verified.

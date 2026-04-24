@@ -33,6 +33,7 @@ pub mod full_attn;
 pub mod gpu_full_attn;
 pub mod kernels;
 pub mod kv_cache;
+pub mod model;
 pub mod moe;
 pub mod mtp;
 
