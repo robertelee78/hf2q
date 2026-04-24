@@ -609,6 +609,12 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
         let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
+        // Walk the GGUF's tensor list against the expected set per
+        // MmprojConfig (iter 30). Fails fast on an incomplete producer
+        // rather than hitting NotFound mid-forward-pass.
+        let actual_names: Vec<&str> = gguf.tensor_names();
+        crate::inference::vision::mmproj::validate_tensor_set(&mmp_config, &actual_names)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF tensor-set validation: {e}"))?;
         let model_id = mmp_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -620,7 +626,8 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             hidden = mmp_config.hidden_size,
             layers = mmp_config.num_hidden_layers,
             projector = mmp_config.projector.as_str(),
-            "Validated mmproj GGUF header"
+            tensors = actual_names.len(),
+            "Validated mmproj GGUF header + tensor set"
         );
         Some(api::state::LoadedMmproj {
             gguf_path: mmp_path.clone(),
