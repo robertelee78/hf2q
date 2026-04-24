@@ -934,6 +934,58 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 9 · P6 COMPLETE (hybrid KV cache landed)
+
+**Scope:** Phase P6 Decision 11 — hybrid KV cache (full-attention KV slots + linear-attention SSM state slots).
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/kv_cache.rs` — full implementation (~300 LOC + ~200 LOC tests):
+  - `HybridKvCache` struct holding `Vec<FullAttnKvSlot>` + `Vec<LinearAttnStateSlot>` plus `max_seq_len`, `n_seqs`, and a precomputed `per_layer_slot` lookup.
+  - `FullAttnKvSlot` with `k`, `v` buffers shaped `[head_dim, n_kv_heads, max_seq_len, n_seqs]` and per-seq `current_len: Vec<u32>` write cursor.
+  - `LinearAttnStateSlot` with `conv_state: [K-1, conv_channels, n_seqs]` and `recurrent: [D_k, D_v, num_v_heads, n_seqs]` — recurrent layout matches mlx-native's gated_delta_net kernel exactly (d_k innermost for per-thread contig reads).
+  - `LayerSlot` enum + `slot_index_for_layer()` O(1) lookup from model layer index.
+  - `conv_channels_for(cfg)` public helper: `2 * n_k * D_k + n_v * D_v` (8192 MoE, 10240 dense).
+  - `reset()` zeros recurrent/conv state and resets cursors (does not zero K/V — overwritten on next tokens).
+  - `total_bytes()` for memory accounting.
+  - Re-exports `cpu_reference_f32` from mlx-native as `gated_delta_net_cpu_ref` — avoids duplicating the DeltaNet scalar reference.
+
+**Tests (12 new):**
+- **ADR acceptance criterion #1**: `moe_40layer_slot_counts` — 10 full-attn + 30 linear-attn slots for 40-layer MoE with interval=4.
+- `dense_64layer_slot_counts` — 16 full-attn + 48 linear-attn for 64-layer dense.
+- `conv_channels_moe_8192` / `conv_channels_dense_10240` — formula correctness.
+- `layer_slot_lookup_matches_layer_types` — per-layer slot resolution across the full 40-layer stack.
+- `slot_lookup_out_of_range_none` — bounds check.
+- `full_attn_slot_shape_and_dtype` — element count + f32 dtype verified.
+- `linear_attn_slot_shape_matches_kernel_layout` — matches gated_delta_net kernel's expected shape.
+- `reset_zeros_state_and_resets_cursors` — reset clears both state and cursors.
+- `rejects_zero_seqs` / `rejects_zero_max_seq_len` — guard rails.
+- `total_bytes_matches_expected_footprint` — hand-computed expected footprint matches.
+- `re_exported_cpu_ref_callable` — re-export works end-to-end.
+
+**Verification:**
+- 12/12 kv_cache tests green.
+- 484/484 hf2q tests pass (+0 regressions from iter 8).
+
+**Design notes:**
+- Memory footprint at Qwen3.5-MoE max context (262144) is substantial: ~1 GB per full-attn layer × 10 layers ≈ 10 GB KV cache. Callers must pick `max_seq_len` appropriately (ADR Risk R8). For production serving, 8192–32768 is the typical sweet spot.
+- Per-seq `current_len: Vec<u32>` supports future batched inference where different seqs have different progress; single-seq (n_seqs=1) uses a length-1 vec.
+- Recurrent state layout documented in-file as `[D_k, D_v, num_v_heads, n_seqs]` — matches exactly what `mlx_native::ops::gated_delta_net::dispatch_gated_delta_net` reads/writes, so P7/P8 forward wire-up can hand the buffer directly to the kernel without reshape.
+
+**Acceptance criterion #2 (cache update from token 0 to 100)** is deferred to P7/P8 — the cache buffers are ready, but actual update correctness requires the forward-pass layer builders (`build_delta_net_layer`, `build_gated_attn_layer`) to be wired up.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4    | 1, 2       | COMPLETE |
+| P5    | 12         | COMPLETE |
+| P6    | 11         | **COMPLETE** |
+| P7    | 9          | Next iter — gated full-attention forward builder |
+| P8-P13| 8,13-18    | Pending |
+
+**Next iter target:** P7 `build_gated_attn_layer` — pure Rust graph builder for Qwen3.5 full-attention: RMSNorm → Q/K/V projection → QK RMSNorm → IMROPE → SDPA → output-gate sigmoid multiply → wo projection → residual. Uses mlx-native's existing flash_attn_prefill (head_dim=256 fits d512 variant) plus the new rope_multi kernel. ~450 LOC per ADR estimate.
+
 ### 2026-04-23 — /loop iter 8 · P5 COMPLETE (Q5_K + I16 f32 dequant landed)
 
 **Scope:** Phase P5 Decision 12(b) remainder — Q5_K and I16 dequantization to f32.
