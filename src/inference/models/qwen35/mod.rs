@@ -31,6 +31,7 @@ pub mod dense;
 pub mod ffn;
 pub mod forward_cpu;
 pub mod full_attn;
+pub mod gpu_delta_net;
 pub mod gpu_full_attn;
 pub mod io_heads;
 pub mod kernels;
