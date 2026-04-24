@@ -471,6 +471,21 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("qwen35 RMS norm +1 bias application failed")
         .map_err(AppError::Conversion)?;
 
+    // Phase 1.7 (PENDING wire-up — see ADR-012 R2 gap note below).
+    //
+    // `models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map`
+    // is available and tested but NOT yet invoked here — turning it on
+    // exposes pre-existing incorrect tensor shapes in the synthetic
+    // fixtures under `tests/convert_qwen35*_integration.rs` (A_log
+    // shape [num_heads] where spec requires [num_value_heads], etc.).
+    // The wire-up lands in a dedicated follow-up commit that also
+    // fixes those fixtures and adds positive-value regression tests
+    // for the V-head reorder invariants. Until then, this line is
+    // intentionally left as a comment to document the gap.
+    //
+    // Spec source: convert_hf_to_gguf.py:5367-5424 +
+    // Qwen3NextModel.modify_tensors pre-processing (py:4786-4830).
+
     check_interrupted()?;
 
     let input_size = tensor_map.total_size_bytes() as u64;

@@ -206,7 +206,11 @@ fn parse_config_value(config: &Value, config_path: &Path) -> Result<ModelMetadat
 ///
 /// ADR-012 Decision 2: "missing required-for-qwen35moe fields … returns an error
 /// with a clear message identifying the missing field — not silent zero-filling."
-pub fn validate_required_qwen35moe_fields(
+/// Shared qwen35-family field validator (both dense and MoE).
+///
+/// Checks every hparam the linear-attention transforms need. The MoE
+/// variant calls this PLUS `validate_required_qwen35moe_extra_fields`.
+fn validate_required_qwen35_common_fields(
     metadata: &ModelMetadata,
 ) -> Result<(), ConfigParseError> {
     macro_rules! require {
@@ -220,7 +224,6 @@ pub fn validate_required_qwen35moe_fields(
     }
 
     require!(metadata.rope_parameters, "rope_parameters");
-    // rope_parameters is present; verify mrope_section is non-empty
     if let Some(ref rp) = metadata.rope_parameters {
         if rp.mrope_section.is_empty() {
             return Err(ConfigParseError::MissingField {
@@ -237,12 +240,41 @@ pub fn validate_required_qwen35moe_fields(
     require!(metadata.linear_value_head_dim, "linear_value_head_dim");
     require!(metadata.linear_num_value_heads, "linear_num_value_heads");
     require!(metadata.mamba_ssm_dtype, "mamba_ssm_dtype");
+    require!(metadata.mtp_num_hidden_layers, "mtp_num_hidden_layers");
+
+    Ok(())
+}
+
+/// Dense-variant field validator — subset of MoE requirements.
+///
+/// Dense Qwen3.5 does not use `moe_intermediate_size` or
+/// `shared_expert_intermediate_size`. Calling the MoE validator on a
+/// dense model produces a false-positive "missing field" error.
+pub fn validate_required_qwen35_fields(
+    metadata: &ModelMetadata,
+) -> Result<(), ConfigParseError> {
+    validate_required_qwen35_common_fields(metadata)
+}
+
+pub fn validate_required_qwen35moe_fields(
+    metadata: &ModelMetadata,
+) -> Result<(), ConfigParseError> {
+    validate_required_qwen35_common_fields(metadata)?;
+
+    macro_rules! require {
+        ($field:expr, $name:literal) => {
+            if $field.is_none() {
+                return Err(ConfigParseError::MissingField {
+                    field: $name.to_string(),
+                });
+            }
+        };
+    }
     require!(metadata.moe_intermediate_size, "moe_intermediate_size");
     require!(
         metadata.shared_expert_intermediate_size,
         "shared_expert_intermediate_size"
     );
-    require!(metadata.mtp_num_hidden_layers, "mtp_num_hidden_layers");
 
     Ok(())
 }

@@ -71,7 +71,9 @@
 pub mod dense;
 pub mod moe;
 
-use crate::input::config_parser::{validate_required_qwen35moe_fields, ConfigParseError};
+use crate::input::config_parser::{
+    validate_required_qwen35_fields, validate_required_qwen35moe_fields, ConfigParseError,
+};
 use crate::ir::{DType, ModelMetadata, TensorRef};
 use thiserror::Error;
 
@@ -203,11 +205,15 @@ impl Qwen35ConvertContext {
     ///
     /// The `arch` variant is inferred from `metadata.is_moe()`.
     pub fn from_metadata(metadata: &ModelMetadata) -> Result<Self, ConvertError> {
-        validate_required_qwen35moe_fields(metadata)?;
-
+        // Arch-specific validators: dense doesn't need moe_intermediate_size
+        // or shared_expert_intermediate_size. Calling the MoE validator on a
+        // dense model produced false-positive "missing field" errors pre-
+        // 2026-04-24.
         let arch = if metadata.is_moe() {
+            validate_required_qwen35moe_fields(metadata)?;
             Qwen35Arch::Moe
         } else {
+            validate_required_qwen35_fields(metadata)?;
             Qwen35Arch::Dense
         };
 
@@ -1135,6 +1141,104 @@ pub fn transform_in_proj_qkvz(
 ///
 /// This walker is the fix. Called from `src/main.rs` Phase 1.5
 /// alongside the MoE expert merge.
+/// Apply the full Qwen3.5 linear-attention transform suite to every
+/// qualifying tensor in a pre-quantization `TensorMap`.
+///
+/// Matches `convert_hf_to_gguf.py` `_LinearAttentionVReorderBase.modify_tensors`
+/// (py:5367-5424) + `Qwen3NextModel.modify_tensors` preprocessing
+/// (py:4786-4830): A_log negation, conv1d squeeze, in_proj_qkvz split,
+/// then the 6-case V-head reorder for the remaining linear-attn tensors.
+///
+/// # Silent wire-up gap (2026-04-24)
+///
+/// P2/P3 shipped `transform_linear_attn_tensor` + `transform_in_proj_qkvz`
+/// in commits `1a849e1` + `73a96e4` but neither was ever called from the
+/// convert pipeline. Result: every Qwen3.5 GGUF produced before this
+/// fix shipped HF-grouped V-head layout (not the ggml-tiled layout the
+/// loader expects) — THE named silent-corruption R2 failure mode ADR-012
+/// called out, producing "plausible-looking nonsense" at inference.
+///
+/// This walker is the wire-up. Called from `src/main.rs` Phase 1.7
+/// alongside the MoE merge + RMS norm +1 bias.
+///
+/// # Arch gate
+///
+/// No-op for non-Qwen3.5 arches. Linear-attention transforms are specific
+/// to the Qwen3.5 family's Gated DeltaNet; Gemma4 and LLaMA have no
+/// linear_attn tensors.
+///
+/// # Short-circuit when num_k_heads == num_v_heads
+///
+/// Per py:5379, the V-head reorder only fires when
+/// `num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads`.
+/// `transform_linear_attn_tensor` short-circuits itself when
+/// `ctx.linear_num_v_per_k == 1` — we rely on that short-circuit rather
+/// than duplicating the check here.
+pub fn apply_qwen35_linear_attn_transforms_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    let arch_str = metadata.architecture.as_str();
+    let model_type = metadata.model_type.as_str();
+    let is_qwen35 = arch_str == "Qwen3_5ForCausalLM"
+        || arch_str == "Qwen3_5ForConditionalGeneration"
+        || arch_str == "Qwen3_5MoeForCausalLM"
+        || arch_str == "Qwen3_5MoeForConditionalGeneration"
+        || model_type == "qwen3_5"
+        || model_type == "qwen3_5_moe_text";
+    if !is_qwen35 {
+        return Ok(());
+    }
+
+    let ctx = Qwen35ConvertContext::from_metadata(metadata)?;
+
+    // Step 1: handle in_proj_qkvz tensors first (split into qkv + z),
+    // then transform the split qkv through case 1 (V-head reorder).
+    // The qkvz form is used by Qwen3Next/3.5 fused projections.
+    let qkvz_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| n.contains("in_proj_qkvz.weight"))
+        .cloned()
+        .collect();
+
+    for key in qkvz_keys {
+        let Some(qkvz_tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let (qkv_tensor, z_tensor) = transform_in_proj_qkvz(qkvz_tensor, &ctx)?;
+        // Apply V-head reorder to the qkv tensor (case 1).
+        let qkv_reordered = transform_linear_attn_tensor(qkv_tensor, &ctx)?;
+        // z_tensor follows the same V-head reorder path as in_proj_z (case 2).
+        let z_reordered = transform_linear_attn_tensor(z_tensor, &ctx)?;
+        tensor_map.tensors.insert(qkv_reordered.name.clone(), qkv_reordered);
+        tensor_map.tensors.insert(z_reordered.name.clone(), z_reordered);
+    }
+
+    // Step 2: walk all linear-attn tensors that didn't come from qkvz
+    // split (independent in_proj_qkv, in_proj_z, in_proj_a/b, A_log,
+    // dt_bias, dt_proj, conv1d, out_proj). transform_linear_attn_tensor
+    // dispatches to the right case or no-ops.
+    let linear_attn_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| n.contains("linear_attn."))
+        .cloned()
+        .collect();
+
+    for key in linear_attn_keys {
+        let Some(tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let transformed = transform_linear_attn_tensor(tensor, &ctx)?;
+        tensor_map
+            .tensors
+            .insert(transformed.name.clone(), transformed);
+    }
+
+    Ok(())
+}
+
 pub fn apply_rms_norm_plus_one_in_tensor_map(
     tensor_map: &mut crate::ir::TensorMap,
     metadata: &crate::ir::ModelMetadata,
