@@ -934,6 +934,41 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 3 · P1 COMPLETE (TRI_SOLVE landed)
+
+**Scope:** Phase P1 Decision 5 (lower-triangular unit-diagonal solve).
+
+**Delivered in `mlx-native`:**
+- `src/shaders/tri_solve.metal` — 2 kernels (f32 + bf16). Forward-substitution kernel `X = L \ B` with L implicitly unit-diagonal; one thread per (col, batch), serial walk over rows, f32 accumulation. Multi-column RHS + batched over a leading dim.
+- `src/ops/tri_solve.rs` — `TriSolveParams { n, m, batch }` + `dispatch_tri_solve()`. Validates shape + dtype + overflow; rejects any zero dim.
+- `tests/test_tri_solve.rs` — 7 tests:
+  - **ADR spec-driven 3×3** with hand-computed golden in file comments (L[1,0]=2, L[2,0]=0.5, L[2,1]=-1; B=[10,4,0]; X=[10,-16,-21]; verified via L·X=B in comments).
+  - **ADR acceptance 4×4 random + 4×8 RHS**: measured `|L·X - B|_∞ < 1e-4` (passes).
+  - Batched 4×4 × 3 RHS × 5 batches (cross-batch independence verified).
+  - Identity (strict-lower=0 → X=B pass-through).
+  - BF16 4×4 × 4 RHS with tolerance 1e-2.
+  - Zero-N rejection.
+  - Element-count mismatch rejection.
+- `src/kernel_registry.rs` / `src/ops/mod.rs` — registered both kernels.
+
+**Verification:**
+- 7/7 TRI_SOLVE tests green.
+- Library test suite: 95/95 pass (no regression).
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | COMPLETE |
+| P1  | 5         | **COMPLETE** |
+| P2  | 10 (mlx)  | Next iter — ROPE_MULTI (IMROPE mode) |
+| P3  | 6         | Pending |
+| P4–P13 | 1, 2, 8–18 | Pending |
+
+**Aggregate so far:** 31 spec-driven kernel tests, ~900 lines Rust dispatch + ~900 lines Metal, 4 of 6 novel Qwen3.5 mlx-native kernels landed.
+
+**Next iter target:** P2 ROPE_MULTI with IMROPE mode (sections [11,11,10,0], `sector % 3`-cycling theta selection, NeoX-style pair indexing).
+
 ### 2026-04-23 — /loop iter 2 · P0 COMPLETE (SSM_CONV landed)
 
 **Scope:** Phase P0 Decision 7 (SSM depthwise causal 1D conv + SiLU).
