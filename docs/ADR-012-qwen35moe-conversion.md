@@ -1128,6 +1128,7 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 **Likelihood:** Medium — both arches are new; names may churn.
 **Impact:** hf2q output stops loading in newer llama.cpp.
 **Mitigation:** Doc `docs/converting-qwen35.md` lists the minimum llama.cpp version that loads hf2q's output. When upstream changes key names, that's an ADR addendum (hand-update the transcribed constant list in `src/models/qwen35/{mod,dense,moe}.rs` with new citations) — not a CVE. Spec-driven tests verify what hf2q emits against the hand-transcribed catalog; if upstream diverges, the catalog (not the fixtures) is what needs updating.
+**Automation (2026-04-24):** `tests/upstream_citation_drift.rs` walks every citation in `src/arch/entries/{qwen35,qwen35moe}.rs` and verifies the named `LLM_TENSOR_*` / `LLM_KV_*` constant resolves in the current `/opt/llama.cpp/src/llama-arch.cpp` source (±2-line tolerance for minor upstream shuffles). Fires with an actionable assertion message naming the offending citation. Silent-skips when `/opt/llama.cpp` is absent so CI portability is preserved.
 
 ### R2: V-head reorder has a subtle bug that loads but produces garbage
 
@@ -1181,7 +1182,7 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 
 **Likelihood:** Medium — mmproj is younger than the core GGUF format and its tensor/metadata catalog is still evolving upstream.
 **Impact:** hf2q's P10 output stops loading in newer `llama-mtmd-cli`. The externally-produced reference mmproj currently on disk may be targeting an older format.
-**Mitigation:** Same rule as R1 (loader key churn). `docs/converting-qwen35.md` records the minimum `llama-mtmd-cli` version that loads our P10 output. The hand-transcribed tensor-name catalog in `src/models/vit/convert.rs` carries file:line citations pinned to a specific `/opt/llama.cpp` commit — when upstream drifts, we re-transcribe and re-cite, and the regression test catches anything structural. No fixture comparison against the existing external mmproj (sovereignty).
+**Mitigation:** Same rule as R1 (loader key churn). `docs/converting-qwen35.md` records the minimum `llama-mtmd-cli` version that loads our P10 output. The hand-transcribed tensor-name catalog in `src/models/vit/convert.rs` carries file:line citations pinned to a specific `/opt/llama.cpp` commit — when upstream drifts, we re-transcribe and re-cite, and the regression test catches anything structural. No fixture comparison against the existing external mmproj (sovereignty). **Automation:** `tests/upstream_citation_drift.rs` fires on drift in the qwen35 catalog; the mmproj catalog in `src/models/vit/convert.rs` uses a different citation format (source-line annotations rather than named constants) and is covered by the spec-driven Layer C layout tests (fc1↔fc2, linear_1↔linear_2).
 
 ### R11: P9 wall clock + disk budget on the 35B MoE exceeds M5 Max capacity
 
