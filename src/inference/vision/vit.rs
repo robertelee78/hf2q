@@ -37,6 +37,113 @@
 
 use anyhow::{anyhow, Result};
 
+/// Add a learned position-embedding tensor in-place to a patch-embedding
+/// tensor. Both are `[N_patches, hidden]` row-major.
+///
+/// This is the trivial elementwise-add stage between `patch_embed_forward`
+/// and the first transformer block.
+///
+/// # Errors
+///
+/// - shape mismatch between `patch_embeds` and `pos_embeds`.
+pub fn position_embed_add(patch_embeds: &mut [f32], pos_embeds: &[f32]) -> Result<()> {
+    if patch_embeds.len() != pos_embeds.len() {
+        return Err(anyhow!(
+            "position_embed_add: patch len {} != pos len {}",
+            patch_embeds.len(),
+            pos_embeds.len()
+        ));
+    }
+    for (p, pe) in patch_embeds.iter_mut().zip(pos_embeds.iter()) {
+        *p += *pe;
+    }
+    Ok(())
+}
+
+/// Forward-pass LayerNorm over the last dimension of a
+/// `[..., hidden]`-shaped tensor.
+///
+/// For each `hidden`-element slice `x`:
+///
+/// ```text
+/// μ    = mean(x)
+/// σ²   = mean((x - μ)²)            # population variance (not sample)
+/// y_i  = (x_i - μ) / sqrt(σ² + ε)
+/// y_i  = y_i * γ_i + β_i           # affine scale/shift
+/// ```
+///
+/// Matches PyTorch / HF `nn.LayerNorm` byte-for-byte when
+/// `elementwise_affine=True`.
+///
+/// `input` is overwritten with the output. `gamma` and `beta` are each
+/// `[hidden]`; pass both even when one is conceptually absent — zero bias
+/// is `vec![0.0; hidden]`, unit gain is `vec![1.0; hidden]`.
+///
+/// # Errors
+///
+/// - `input.len() % hidden != 0`
+/// - `gamma.len() != hidden`
+/// - `beta.len() != hidden`
+/// - `hidden == 0`
+pub fn layer_norm_forward(
+    input: &mut [f32],
+    gamma: &[f32],
+    beta: &[f32],
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("layer_norm_forward: hidden must be > 0"));
+    }
+    if input.len() % hidden != 0 {
+        return Err(anyhow!(
+            "layer_norm_forward: input len {} not divisible by hidden {}",
+            input.len(),
+            hidden
+        ));
+    }
+    if gamma.len() != hidden {
+        return Err(anyhow!(
+            "layer_norm_forward: gamma len {} != hidden {}",
+            gamma.len(),
+            hidden
+        ));
+    }
+    if beta.len() != hidden {
+        return Err(anyhow!(
+            "layer_norm_forward: beta len {} != hidden {}",
+            beta.len(),
+            hidden
+        ));
+    }
+
+    let n_rows = input.len() / hidden;
+    let inv_hidden = 1.0f32 / (hidden as f32);
+    for row in 0..n_rows {
+        let off = row * hidden;
+        let slice = &mut input[off..off + hidden];
+        // Pass 1: mean.
+        let mut sum = 0.0f32;
+        for &v in slice.iter() {
+            sum += v;
+        }
+        let mean = sum * inv_hidden;
+        // Pass 2: population variance.
+        let mut var_sum = 0.0f32;
+        for &v in slice.iter() {
+            let d = v - mean;
+            var_sum += d * d;
+        }
+        let variance = var_sum * inv_hidden;
+        let inv_std = 1.0f32 / (variance + eps).sqrt();
+        // Pass 3: normalize + affine.
+        for (i, v) in slice.iter_mut().enumerate() {
+            *v = (*v - mean) * inv_std * gamma[i] + beta[i];
+        }
+    }
+    Ok(())
+}
+
 /// Apply the patch-embedding Conv2d to a CHW pixel tensor.
 ///
 /// Mathematically equivalent to:
@@ -387,6 +494,172 @@ mod tests {
         let err = patch_embed_forward(&pixels, &weight, None, 4, 0, 1).unwrap_err();
         assert!(format!("{err}").contains("patch_size"));
     }
+
+    // -----------------------------------------------------------------------
+    // position_embed_add
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn position_embed_add_is_elementwise() {
+        let mut patch = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let pos = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        position_embed_add(&mut patch, &pos).unwrap();
+        let expected = [1.1f32, 2.2, 3.3, 4.4, 5.5, 6.6];
+        for (got, want) in patch.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn position_embed_add_rejects_shape_mismatch() {
+        let mut patch = vec![0.0f32; 10];
+        let pos = vec![0.0f32; 11];
+        let err = position_embed_add(&mut patch, &pos).unwrap_err();
+        assert!(format!("{err}").contains("!= pos len"));
+    }
+
+    #[test]
+    fn position_embed_add_zero_pos_is_identity() {
+        let mut patch = vec![0.5f32, -0.3, 1.7, -2.1];
+        let snapshot = patch.clone();
+        let pos = vec![0.0f32; 4];
+        position_embed_add(&mut patch, &pos).unwrap();
+        assert_eq!(patch, snapshot);
+    }
+
+    // -----------------------------------------------------------------------
+    // layer_norm_forward
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn layer_norm_constant_row_goes_to_zero_then_beta() {
+        // Constant row has var=0 and mean=the constant; (x-mean)=0 so
+        // normalized = 0; output = 0 * gamma + beta = beta.
+        let mut x = vec![7.0f32; 4];
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.1f32, 0.2, 0.3, 0.4];
+        layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-6).unwrap();
+        for (got, want) in x.iter().zip(beta.iter()) {
+            assert!((*got - *want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn layer_norm_pytorch_reference_values() {
+        // x = [1, 2, 3, 4], mean=2.5, var = mean([1.5², 0.5², 0.5², 1.5²])
+        //                             = mean([2.25, 0.25, 0.25, 2.25]) = 1.25
+        // inv_std = 1/sqrt(1.25 + 1e-5) ≈ 0.8944270...
+        // normalized = [-1.3416, -0.4472, 0.4472, 1.3416]
+        // With γ=1, β=0 these are the outputs.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.0f32; 4];
+        layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-5).unwrap();
+        let expected = [-1.3416408f32, -0.4472136, 0.4472136, 1.3416408];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-3, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn layer_norm_applies_affine_scale_and_shift() {
+        // After normalize, multiply by γ=[2,2,2,2] then add β=[10,20,30,40].
+        // Normalized [1,2,3,4] = [-1.3416, -0.4472, 0.4472, 1.3416].
+        // * 2      = [-2.683, -0.894, 0.894, 2.683]
+        // + β      = [7.317, 19.106, 30.894, 42.683]
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma = vec![2.0f32; 4];
+        let beta = vec![10.0f32, 20.0, 30.0, 40.0];
+        layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-5).unwrap();
+        let expected = [7.3167f32, 19.1056, 30.8944, 42.6833];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-2, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn layer_norm_normalizes_multiple_rows_independently() {
+        // Two rows, completely different scales. Each row should
+        // independently normalize to zero-mean-unit-variance.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.0f32; 4];
+        layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-5).unwrap();
+        // Both rows should yield the exact same normalized shape because
+        // the second is a 100× scaling of the first (mean and variance
+        // scale together).
+        for i in 0..4 {
+            assert!(
+                (x[i] - x[4 + i]).abs() < 1e-3,
+                "row 0 element {} = {} != row 1 = {}",
+                i,
+                x[i],
+                x[4 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn layer_norm_mean_after_is_approximately_zero() {
+        let mut x = vec![0.5f32, 1.7, -2.3, 4.1, -0.8, 3.2];
+        let gamma = vec![1.0f32; 6];
+        let beta = vec![0.0f32; 6];
+        layer_norm_forward(&mut x, &gamma, &beta, 6, 1e-5).unwrap();
+        let mean: f32 = x.iter().sum::<f32>() / 6.0;
+        assert!(mean.abs() < 1e-5, "post-LN mean = {mean}");
+    }
+
+    #[test]
+    fn layer_norm_rejects_hidden_zero() {
+        let mut x = vec![1.0f32; 4];
+        let err = layer_norm_forward(&mut x, &[], &[], 0, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("hidden must be > 0"));
+    }
+
+    #[test]
+    fn layer_norm_rejects_non_divisible_input_len() {
+        let mut x = vec![1.0f32; 7];
+        let gamma = vec![1.0f32; 3];
+        let beta = vec![0.0f32; 3];
+        let err = layer_norm_forward(&mut x, &gamma, &beta, 3, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    #[test]
+    fn layer_norm_rejects_wrong_gamma_len() {
+        let mut x = vec![1.0f32; 4];
+        let gamma = vec![1.0f32; 3];
+        let beta = vec![0.0f32; 4];
+        let err = layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("gamma len"));
+    }
+
+    #[test]
+    fn layer_norm_rejects_wrong_beta_len() {
+        let mut x = vec![1.0f32; 4];
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.0f32; 3];
+        let err = layer_norm_forward(&mut x, &gamma, &beta, 4, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("beta len"));
+    }
+
+    #[test]
+    fn layer_norm_does_not_divide_by_zero_when_variance_is_zero() {
+        // All-ones row → variance = 0. With eps > 0 this normalizes
+        // cleanly; without eps it would divide by zero and NaN.
+        let mut x = vec![5.0f32; 8];
+        let gamma = vec![1.0f32; 8];
+        let beta = vec![0.0f32; 8];
+        layer_norm_forward(&mut x, &gamma, &beta, 8, 1e-5).unwrap();
+        for v in &x {
+            assert!(v.is_finite(), "got non-finite {}", v);
+            assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_embed_forward production-shape smoke
+    // -----------------------------------------------------------------------
 
     #[test]
     fn gemma4_shape_does_not_panic() {
