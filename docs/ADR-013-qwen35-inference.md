@@ -934,6 +934,54 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 8 · P5 COMPLETE (Q5_K + I16 f32 dequant landed)
+
+**Scope:** Phase P5 Decision 12(b) remainder — Q5_K and I16 dequantization to f32.
+
+**Delivered in `mlx-native`:**
+- `src/gguf/mod.rs::dequantize_q5_k` — full Q5_K super-block dequantization. Per-block layout: d(fp16) + dmin(fp16) + 12-byte packed scales + 32-byte qh + 128-byte qs. 4 pairs of sub-blocks per block; `u1`/`u2` high-bit selector masks shift by 2 each pair. Shares `get_scale_min_k4()` with Q4_K. Output formula: `d*sc*q - dmin*m` where `q = low_nibble + (qh_bit ? 16 : 0)`. Spec derived from `ggml/src/ggml-quants.c::dequantize_row_q5_K`; no code copied.
+- `src/gguf/mod.rs::dequantize_i16` — simple `i16 -> f32` cast (no per-tensor scale; apex convention). Handles odd-length buffers with explicit error.
+- Removed the "not yet implemented" error stubs in `dequantize_to_f32` — Q5_K and I16 now have real dequant.
+
+**Tests (10 new):**
+- **`tests/test_q5_k_dequant.rs`** (new file, 8 tests):
+  - 5 hand-computed Q5_K edge cases verifying exact values from the spec (all-zeros, zero-quant non-zero-scale, first value with high bit, second sub-block uses u2 + high nibble, third pair uses shifted u1, non-zero min dmin).
+  - **Round-trip through real `load_tensor_f32`**: synthesizes a minimal GGUF file in a tempdir with one Q5_K tensor, opens it via `GgufFile::open`, calls `load_tensor_f32`, compares against a pure-Rust spec-re-derivation of the same dequant formula → matches to 1e-5.
+  - **I16 round-trip through `load_tensor_f32`** with a synthesized 5-element GGUF: verifies `[0, 1, -1, 32767, -32768] → i16 as f32` exact.
+- **`dequantizes_real_apex_q5k_tensor` (#[ignore]d)** in `hf2q`:
+  - Loads the actual 25 GB apex GGUF.
+  - Dequantizes `blk.0.attn_gate.weight` (shape [2048, 4096] = 8,388,608 f32 values, 32,768 Q5_K super-blocks).
+  - Verifies no NaN / no Inf, stddev ≈ 0.017 (sensible range for neural net weights), non-degenerate distribution.
+  - Runs in <100ms.
+
+**Verification:**
+- 8/8 new Q5_K + I16 unit tests green.
+- 1/1 new real-apex Q5_K integration test green (stats: `count=8388608, mean=-0.000026, stddev=0.016849`).
+- 95/95 mlx-native library tests still pass.
+- 454/454 hf2q tests still pass (+ 2 `#[ignore]`d for real-GGUF integrations).
+- Pre-existing 3 `test_q4_0_id_vs_norid*` failures in mlx-native are unchanged (tracked since iter 1; unrelated to ADR-013).
+
+**Findings from apex type scan (2026-04-23, 733 tensors):**
+- F32 (type 0): 301 tensors — norms, router projections, small scalars.
+- Q8_0 (type 8): 2 tensors — `token_embd.weight`, `output.weight` (embeddings).
+- Q5_K (type 13): 370 tensors — most weight matrices (attn/FFN projections).
+- Q6_K (type 14): 60 tensors — `attn_qkv.weight`, `ffn_down_*.weight`.
+- **No I16** in apex (despite ADR anticipating I16 on embeddings — apex uses Q8_0). I16 dequant is still implemented per-spec in case future GGUFs emit it, but no current tensor exercises it in production.
+
+**P5 complete — apex GGUF now fully readable and dequantizable end-to-end.**
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4    | 1, 2       | COMPLETE |
+| P5    | 12         | **COMPLETE** (type recognition + tensor-name tables + Q5_K/I16 dequant) |
+| P6    | 11         | Next iter — hybrid KV cache (`HybridKvCache`, full-attn slots + linear-attn SSM state) |
+| P7-P13| 8–18       | Pending |
+
+**Next iter target:** P6 hybrid KV cache — `src/inference/models/qwen35/kv_cache.rs` populated with `HybridKvCache`, `FullAttnKvSlot`, `LinearAttnStateSlot`; allocation routine; update hooks. Pure Rust; ~300 LOC.
+
 ### 2026-04-23 — /loop iter 7 · P5 PARTIAL (Q5_K+I16 type recognition + tensor-name tables)
 
 **Scope:** Phase P5 Decision 12 — two of three sub-deliverables (type recognition + tensor-name enumeration). Full dequant kernels deferred to iter 8+.

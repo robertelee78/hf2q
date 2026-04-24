@@ -558,4 +558,78 @@ mod tests {
         // MTP stripped from apex; must be 0.
         assert_eq!(cfg.mtp_num_hidden_layers, 0);
     }
+
+    /// End-to-end Q5_K dequant against the real apex GGUF. Picks
+    /// `blk.0.attn_gate.weight` (a Q5_K tensor of shape [2048, 4096] =
+    /// 8,388,608 values = 32,768 Q5_K blocks) and verifies:
+    /// - load_tensor_f32 returns the expected count.
+    /// - All values are finite (no NaN / Inf from broken super-block arithmetic).
+    /// - The value distribution is non-degenerate (std > 0).
+    ///
+    /// `#[ignore]`d because it opens the 25 GB file and dequantizes ~32K
+    /// super-blocks; runs in ~100ms but we don't want every `cargo test`
+    /// invocation touching disk. Run via `--ignored`.
+    #[test]
+    #[ignore]
+    fn dequantizes_real_apex_q5k_tensor() {
+        let path = std::path::PathBuf::from(
+            "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
+             qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: apex GGUF not at expected path");
+            return;
+        }
+        let device = match mlx_native::MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let gguf = GgufFile::open(&path).expect("open apex gguf");
+        let buf = gguf
+            .load_tensor_f32("blk.0.attn_gate.weight", &device)
+            .expect("load Q5_K tensor");
+
+        let got: &[f32] = buf.as_slice().expect("slice");
+        assert_eq!(got.len(), 2048 * 4096, "element count");
+
+        // All finite.
+        let mut n_nan = 0usize;
+        let mut n_inf = 0usize;
+        let mut sum = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
+        for v in got {
+            if v.is_nan() {
+                n_nan += 1;
+            } else if !v.is_finite() {
+                n_inf += 1;
+            } else {
+                sum += *v as f64;
+                sum_sq += (*v as f64) * (*v as f64);
+            }
+        }
+        assert_eq!(n_nan, 0, "Q5_K dequant produced NaN values");
+        assert_eq!(n_inf, 0, "Q5_K dequant produced Inf values");
+
+        let n = got.len() as f64;
+        let mean = sum / n;
+        let variance = (sum_sq / n) - mean * mean;
+        let stddev = variance.max(0.0).sqrt();
+        assert!(
+            stddev > 1e-6,
+            "Q5_K dequant produced degenerate (all-equal) tensor; stddev = {}",
+            stddev
+        );
+        // Typical attention-gate weights have small magnitudes; sanity bound.
+        assert!(stddev < 10.0, "Q5_K dequant stddev absurdly large: {}", stddev);
+
+        eprintln!(
+            "blk.0.attn_gate.weight (Q5_K → f32): count={}, mean={:.6}, stddev={:.6}",
+            got.len(),
+            mean,
+            stddev
+        );
+    }
 }
