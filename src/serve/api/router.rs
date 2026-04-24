@@ -73,8 +73,10 @@ mod tests {
     }
 
     fn state_with_auth(token: &str) -> AppState {
-        let mut cfg = ServerConfig::default();
-        cfg.auth_token = Some(token.to_string());
+        let cfg = ServerConfig {
+            auth_token: Some(token.to_string()),
+            ..Default::default()
+        };
         AppState::new(cfg)
     }
 
@@ -143,8 +145,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_returns_empty_list_when_cache_unset() {
-        let mut cfg = ServerConfig::default();
-        cfg.cache_dir = None;
+        let cfg = ServerConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
         let state = AppState::new(cfg);
         let app = build_router(state);
         let req = Request::builder()
@@ -161,8 +165,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_model_returns_404_when_absent() {
-        let mut cfg = ServerConfig::default();
-        cfg.cache_dir = None;
+        let cfg = ServerConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
         let state = AppState::new(cfg);
         let app = build_router(state);
         let req = Request::builder()

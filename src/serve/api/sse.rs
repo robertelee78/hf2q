@@ -516,9 +516,11 @@ mod tests {
     #[tokio::test]
     async fn include_usage_true_yields_usage_in_final_chunk() {
         let (tx, rx) = mpsc::channel(8);
-        let mut stats = StreamStats::default();
-        stats.cached_prompt_tokens = Some(2);
-        stats.reasoning_tokens = Some(1);
+        let stats = StreamStats {
+            cached_prompt_tokens: Some(2),
+            reasoning_tokens: Some(1),
+            ..Default::default()
+        };
         let events = vec![
             GenerationEvent::Delta {
                 kind: DeltaKind::Content,
@@ -531,9 +533,11 @@ mod tests {
                 stats,
             },
         ];
-        let mut opts = SseStreamOptions::default();
-        opts.include_usage = true;
-        opts.system_fingerprint = Some("hf2q-test-mlx-native".into());
+        let opts = SseStreamOptions {
+            include_usage: true,
+            system_fingerprint: Some("hf2q-test-mlx-native".into()),
+            ..Default::default()
+        };
         let sse = make_sse(rx, opts);
         tokio::spawn(spawn_feeder(tx, events));
         let payloads = drain_sse(sse).await;
@@ -660,8 +664,10 @@ mod tests {
                 stats: StreamStats::default(),
             },
         ];
-        let mut opts = SseStreamOptions::default();
-        opts.logprobs = true;
+        let opts = SseStreamOptions {
+            logprobs: true,
+            ..Default::default()
+        };
         let sse = make_sse(rx, opts);
         tokio::spawn(spawn_feeder(tx, events));
         let payloads = drain_sse(sse).await;

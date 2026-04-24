@@ -1168,7 +1168,7 @@ mod tests {
     /// ADR-013 P7b acceptance criterion.
     #[test]
     fn full_layer_gpu_matches_cpu_ref() {
-        use super::super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
+        use super::super::full_attn::gated_full_attention_cpu_ref;
 
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
