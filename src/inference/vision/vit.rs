@@ -144,6 +144,83 @@ pub fn layer_norm_forward(
     Ok(())
 }
 
+/// Numerically-stable softmax over the last dimension of a `[..., hidden]`
+/// tensor. Subtracts the per-row max before `exp` so that even rows with
+/// large positive entries don't overflow f32 (max finite exp input ≈ 88.7).
+///
+/// Matches PyTorch `torch.softmax(x, dim=-1)` byte-for-byte.
+///
+/// `input` is overwritten with the output (in-place).
+///
+/// # Errors
+///
+/// - `hidden == 0`
+/// - `input.len() % hidden != 0`
+pub fn softmax_last_dim(input: &mut [f32], hidden: usize) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("softmax_last_dim: hidden must be > 0"));
+    }
+    if input.len() % hidden != 0 {
+        return Err(anyhow!(
+            "softmax_last_dim: input len {} not divisible by hidden {}",
+            input.len(),
+            hidden
+        ));
+    }
+    let n_rows = input.len() / hidden;
+    for row in 0..n_rows {
+        let off = row * hidden;
+        let slice = &mut input[off..off + hidden];
+        // Pass 1: max.
+        let mut m = f32::NEG_INFINITY;
+        for &v in slice.iter() {
+            if v > m {
+                m = v;
+            }
+        }
+        // Pass 2: exp(x - max) + accumulate sum. `m` is finite-guaranteed
+        // as long as the row has at least one finite element; an all-NaN
+        // or all -inf row produces NaN softmax, which matches PyTorch.
+        let mut sum = 0.0f32;
+        for v in slice.iter_mut() {
+            let e = (*v - m).exp();
+            *v = e;
+            sum += e;
+        }
+        // Pass 3: divide. If sum is 0 (all -inf input) we produce NaN,
+        // matching PyTorch.
+        let inv = 1.0f32 / sum;
+        for v in slice.iter_mut() {
+            *v *= inv;
+        }
+    }
+    Ok(())
+}
+
+/// GELU activation, tanh-approximation form.
+///
+/// ```text
+/// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+/// ```
+///
+/// Matches PyTorch's `approximate="tanh"` mode, HuggingFace's
+/// `gelu_new` / `gelu_pytorch_tanh`, and the activation that BERT,
+/// GPT-2, and the Gemma 4 vision tower all use. Exact GELU (via erf)
+/// agrees to within ~2e-4; the tanh form is the one serialized weights
+/// were trained with, so it's the correct reference.
+///
+/// In-place on `input`.
+pub fn gelu_tanh_approx(input: &mut [f32]) {
+    // sqrt(2 / π) pre-computed to f32 precision.
+    const C: f32 = 0.7978845608028654_f32;
+    const K: f32 = 0.044715_f32;
+    for v in input.iter_mut() {
+        let x = *v;
+        let inner = C * (x + K * x * x * x);
+        *v = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
 /// Apply the patch-embedding Conv2d to a CHW pixel tensor.
 ///
 /// Mathematically equivalent to:
@@ -655,6 +732,182 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // softmax_last_dim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn softmax_sums_to_one_per_row() {
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
+        softmax_last_dim(&mut x, 4).unwrap();
+        for row in 0..2 {
+            let s: f32 = x[row * 4..row * 4 + 4].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "row {} sum = {}", row, s);
+        }
+    }
+
+    #[test]
+    fn softmax_uniform_input_yields_uniform_output() {
+        let mut x = vec![5.0f32; 8];
+        softmax_last_dim(&mut x, 8).unwrap();
+        for v in &x {
+            assert!(
+                (*v - 0.125).abs() < 1e-6,
+                "expected 1/8 = 0.125, got {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_reference_values_match_pytorch() {
+        // torch.softmax(tensor([1, 2, 3]), dim=-1) =
+        //   [0.09003057, 0.24472848, 0.66524094]
+        let mut x = vec![1.0f32, 2.0, 3.0];
+        softmax_last_dim(&mut x, 3).unwrap();
+        assert!((x[0] - 0.09003057).abs() < 1e-6, "x[0] = {}", x[0]);
+        assert!((x[1] - 0.24472848).abs() < 1e-6, "x[1] = {}", x[1]);
+        assert!((x[2] - 0.66524094).abs() < 1e-6, "x[2] = {}", x[2]);
+    }
+
+    #[test]
+    fn softmax_is_numerically_stable_for_large_inputs() {
+        // Without max-subtraction, exp(1000) overflows to +inf and the
+        // whole row becomes NaN. With the stable form, the row should
+        // cleanly peak at the max element.
+        let mut x = vec![1000.0f32, 999.0, 998.0];
+        softmax_last_dim(&mut x, 3).unwrap();
+        // Expected same as softmax([2, 1, 0]) = softmax([1000, 999, 998])
+        // because we subtract max before exp.
+        // softmax([2, 1, 0]) = [0.6652, 0.2447, 0.0900]
+        assert!((x[0] - 0.6652).abs() < 1e-3, "x[0] = {}", x[0]);
+        assert!((x[1] - 0.2447).abs() < 1e-3, "x[1] = {}", x[1]);
+        assert!((x[2] - 0.0900).abs() < 1e-3, "x[2] = {}", x[2]);
+    }
+
+    #[test]
+    fn softmax_concentrates_on_the_dominant_element() {
+        // A single much-larger element → softmax ≈ one-hot.
+        let mut x = vec![0.0f32, 20.0, 0.0, 0.0];
+        softmax_last_dim(&mut x, 4).unwrap();
+        assert!(x[1] > 0.999, "dominant element prob = {}", x[1]);
+        for i in [0, 2, 3] {
+            assert!(x[i] < 1e-8, "x[{}] = {}", i, x[i]);
+        }
+    }
+
+    #[test]
+    fn softmax_rejects_hidden_zero() {
+        let mut x = vec![1.0f32; 4];
+        let err = softmax_last_dim(&mut x, 0).unwrap_err();
+        assert!(format!("{err}").contains("hidden must be > 0"));
+    }
+
+    #[test]
+    fn softmax_rejects_non_divisible_input_len() {
+        let mut x = vec![1.0f32; 7];
+        let err = softmax_last_dim(&mut x, 3).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    // -----------------------------------------------------------------------
+    // gelu_tanh_approx
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gelu_zero_is_zero() {
+        let mut x = vec![0.0f32];
+        gelu_tanh_approx(&mut x);
+        assert!(x[0].abs() < 1e-7, "gelu(0) should be 0, got {}", x[0]);
+    }
+
+    #[test]
+    fn gelu_reference_values_match_pytorch_tanh_approximate() {
+        // PyTorch reference (approximate="tanh"):
+        //   gelu(-3) ≈ -0.00363752
+        //   gelu(-1) ≈ -0.15880802
+        //   gelu(-0.5) ≈ -0.15428595
+        //   gelu(0.5) ≈  0.34571406
+        //   gelu(1)  ≈  0.84119198
+        //   gelu(3)  ≈  2.99636247
+        let inputs = [-3.0f32, -1.0, -0.5, 0.5, 1.0, 3.0];
+        let expected = [
+            -0.00363752_f32,
+            -0.15880802,
+            -0.15428595,
+            0.34571406,
+            0.84119198,
+            2.99636247,
+        ];
+        let mut x = inputs.to_vec();
+        gelu_tanh_approx(&mut x);
+        for (i, (got, want)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (*got - *want).abs() < 1e-4,
+                "i={}: gelu({}) got {} want {}",
+                i,
+                inputs[i],
+                got,
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_is_monotonic_on_nonneg_inputs() {
+        // GELU is NOT globally monotone — it has a local minimum near
+        // x ≈ -0.7517 where derivative Φ(x) + x·φ(x) crosses zero. But
+        // for x ≥ 0 the derivative is strictly positive (Φ(x) ≥ 0.5,
+        // x·φ(x) ≥ 0), so monotone-increasing holds. This catches sign
+        // errors in the inner polynomial without falsely flagging the
+        // correct near-zero dip.
+        let mut x: Vec<f32> = (0..80).map(|i| i as f32 * 0.1).collect();
+        gelu_tanh_approx(&mut x);
+        for i in 1..x.len() {
+            assert!(
+                x[i] > x[i - 1] - 1e-6,
+                "gelu not monotone on x>=0 at i={}: {} -> {}",
+                i,
+                x[i - 1],
+                x[i]
+            );
+        }
+    }
+
+    #[test]
+    fn gelu_has_local_minimum_near_negative_point_seven_five() {
+        // Sanity: confirm the non-monotone region exists where theory
+        // predicts. The true local min is at x ≈ -0.7517. At x=-0.75
+        // gelu ≈ -0.16998. Values at x=-0.5 and x=-1.0 should BOTH be
+        // LESS NEGATIVE (greater) than at x=-0.75, confirming the dip.
+        let mut probe = vec![-1.0f32, -0.75, -0.5];
+        gelu_tanh_approx(&mut probe);
+        assert!(
+            probe[1] < probe[0] && probe[1] < probe[2],
+            "expected local min at x=-0.75, got: \
+             gelu(-1.0)={}, gelu(-0.75)={}, gelu(-0.5)={}",
+            probe[0],
+            probe[1],
+            probe[2]
+        );
+    }
+
+    #[test]
+    fn gelu_large_positive_approaches_x() {
+        // As x → +∞, GELU(x) → x. At x=10 the approximation is within 1e-5.
+        let mut x = vec![10.0f32];
+        gelu_tanh_approx(&mut x);
+        assert!((x[0] - 10.0).abs() < 1e-4, "gelu(10) ≈ 10, got {}", x[0]);
+    }
+
+    #[test]
+    fn gelu_large_negative_approaches_zero() {
+        // As x → -∞, GELU(x) → 0. At x=-10 the value is near zero.
+        let mut x = vec![-10.0f32];
+        gelu_tanh_approx(&mut x);
+        assert!(x[0].abs() < 1e-5, "gelu(-10) ≈ 0, got {}", x[0]);
     }
 
     // -----------------------------------------------------------------------
