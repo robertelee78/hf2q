@@ -325,6 +325,71 @@ fn layer_a_synthetic_vit_roundtrip_structural() {
 // Layer A negative regression — Gemma4 (no vision_config)
 // ---------------------------------------------------------------------------
 
+/// Sovereignty check: when `--emit-vision-tower` succeeds, exactly ONE
+/// mmproj file exists under the output directory (the P10-emitted
+/// `mmproj-<slug>-F16.gguf`). The legacy backend auto-emitted
+/// `<text>-mmproj.gguf` — if both shipped, downstream loaders would
+/// non-deterministically pick one. Phase 4.8's sovereignty cleanup
+/// removes the legacy copy; this test anchors that invariant.
+#[test]
+fn layer_a_single_authoritative_mmproj_after_emit_vision_tower() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("tiny-vit-single");
+    let output = tmp.path().join("out");
+    setup_tiny_vit_model(&input);
+
+    let text_gguf_path = output.join("tiny.gguf");
+    let _ = assert_cmd::Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert",
+            "--input", input.to_str().unwrap(),
+            "--format", "gguf",
+            "--quant", "f16",
+            "--output", text_gguf_path.to_str().unwrap(),
+            "--emit-vision-tower",
+            "--yes",
+        ])
+        .assert();
+
+    let parent = text_gguf_path.parent().unwrap();
+    let gguf_files: Vec<String> = fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".gguf")
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    // Legacy "-mmproj.gguf" files (name contains "-mmproj" but NOT
+    // starting with "mmproj-") are the backend's auto-emit from
+    // src/backends/gguf.rs:455. They must be removed by Phase 4.8.
+    let legacy_mmprojs: Vec<&String> = gguf_files
+        .iter()
+        .filter(|n| n.contains("-mmproj.gguf") && !n.starts_with("mmproj-"))
+        .collect();
+    assert!(
+        legacy_mmprojs.is_empty(),
+        "expected ZERO legacy -mmproj.gguf files after --emit-vision-tower \
+         (Phase 4.8 should have removed them); got {:?}",
+        legacy_mmprojs
+    );
+
+    let p10_mmprojs: Vec<&String> = gguf_files
+        .iter()
+        .filter(|n| n.starts_with("mmproj-") && n.ends_with("-F16.gguf"))
+        .collect();
+    assert_eq!(
+        p10_mmprojs.len(),
+        1,
+        "expected exactly ONE P10-emitted mmproj-<slug>-F16.gguf; got {:?}",
+        p10_mmprojs
+    );
+}
+
 #[test]
 fn layer_a_no_vision_config_no_mmproj_emitted() {
     let tmp = tempfile::tempdir().unwrap();

@@ -807,6 +807,11 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // --emit-vision-tower is set AND the HF config has a vision_config.
     // Silent skip for Gemma4 (no vision_config) and Qwen3.6-35B-A3B MoE
     // (publisher dropped vision_config). Only Qwen3.6-27B dense emits.
+    //
+    // Sovereignty: when the P10 emitter succeeds, delete the backend's
+    // auto-emitted legacy `<text>-mmproj.gguf` so there's ONE
+    // authoritative mmproj per convert invocation — the pure-Rust P10
+    // output produced from clip.cpp/clip-model.h spec.
     if args.emit_vision_tower {
         let output_parent = std::path::Path::new(&manifest.output_dir);
         match models::vit::convert_vision_tower(&config.input_dir, output_parent) {
@@ -815,6 +820,37 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     "ADR-012 P10: mmproj emitted at {}",
                     path.display()
                 );
+                // Remove the backend's legacy auto-emitted mmproj if
+                // present. The legacy path fires whenever the model
+                // has `vision_tower.*` tensors (see src/backends/gguf.rs
+                // line 449 `has_vision` check). With P10 in play the
+                // legacy file is now redundant duplication; keeping
+                // both invites loader confusion.
+                for entry in std::fs::read_dir(output_parent)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let p = entry.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with("-mmproj.gguf")
+                            && !name.starts_with("mmproj-")
+                            && p != path
+                        {
+                            if let Err(e) = std::fs::remove_file(&p) {
+                                warn!(
+                                    "failed to remove legacy mmproj {:?}: {}",
+                                    p, e
+                                );
+                            } else {
+                                tracing::info!(
+                                    "ADR-012 P10 sovereignty: removed legacy backend mmproj {:?}",
+                                    p
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Ok(None) => {
                 tracing::info!(
