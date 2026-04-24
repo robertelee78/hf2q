@@ -191,7 +191,12 @@ const DENSE_CATALOG: TensorCatalog = TensorCatalog {
 /// The qwen35 arch entry.
 pub const ENTRY: ArchEntry = ArchEntry {
     arch: "qwen35",
-    hf_architectures: &["Qwen3_5ForCausalLM"],
+    // Both HF architecture aliases — *ForCausalLM is the text-only form,
+    // *ForConditionalGeneration ships on multimodal Qwen3.5 checkpoints.
+    // `arch_gguf_name` (src/backends/gguf.rs:2585) accepts both; the
+    // registry must too so `get_by_hf_architecture` matches what convert
+    // sees in config.json.
+    hf_architectures: &["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"],
     tensor_catalog: &DENSE_CATALOG,
     has_mtp: true,
     has_vision: true, // Qwen3.6-27B ships a vision_config; --emit-vision-tower honored when present.
@@ -237,7 +242,10 @@ mod tests {
 
     #[test]
     fn hf_architectures_routes_to_dense_entry() {
-        assert_eq!(ENTRY.hf_architectures, &["Qwen3_5ForCausalLM"]);
+        assert_eq!(
+            ENTRY.hf_architectures,
+            &["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"]
+        );
         assert_eq!(ENTRY.arch, "qwen35");
     }
 

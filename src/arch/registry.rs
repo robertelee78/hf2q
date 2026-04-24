@@ -229,6 +229,24 @@ mod tests {
         assert_eq!(e.arch, "qwen35moe");
     }
 
+    /// Both HF architecture aliases must resolve to the same ArchEntry.
+    /// `*ForConditionalGeneration` is what multimodal Qwen3.5 checkpoints
+    /// ship with; registry-side dispatch must match the four-alias
+    /// acceptance of `arch_gguf_name` (src/backends/gguf.rs:2585) so the
+    /// two call paths do not diverge when a multimodal checkpoint is
+    /// fed into either side.
+    #[test]
+    fn hf_architectures_dispatch_resolves_conditional_generation_aliases() {
+        let e = ArchRegistry::global()
+            .get_by_hf_architecture("Qwen3_5ForConditionalGeneration")
+            .expect("Qwen3_5ForConditionalGeneration → qwen35");
+        assert_eq!(e.arch, "qwen35");
+        let e = ArchRegistry::global()
+            .get_by_hf_architecture("Qwen3_5MoeForConditionalGeneration")
+            .expect("Qwen3_5MoeForConditionalGeneration → qwen35moe");
+        assert_eq!(e.arch, "qwen35moe");
+    }
+
     #[test]
     fn unknown_hf_architecture_returns_uniform_error() {
         let err = ArchRegistry::global()
