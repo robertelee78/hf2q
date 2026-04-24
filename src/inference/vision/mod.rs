@@ -38,6 +38,7 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 pub mod mmproj;
+pub mod mmproj_weights;
 pub mod preprocess;
 pub mod vit;
 

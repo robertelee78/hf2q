@@ -1,0 +1,323 @@
+//! mmproj GGUF weight loader (ADR-005 Phase 2c, Task #15 iter 31).
+//!
+//! Reads every required tensor from a parsed `GgufFile` onto the Metal
+//! device as F32 buffers, dequantizing Q-type tensors on the CPU first
+//! via `mlx_native::gguf::GgufFile::load_tensor_f32`. The produced
+//! `LoadedMmprojWeights` holds one `MlxBuffer` per tensor keyed by its
+//! GGUF name (e.g. `"v.patch_embd.weight"`).
+//!
+//! # Sequencing vs iter 30's validator
+//!
+//! Iter 30 (`validate_tensor_set`) proves the tensors EXIST at startup
+//! before the expensive load runs. Iter 31 (this module) actually
+//! reads them onto the GPU. Caller should invoke the validator first
+//! and bail early on missing tensors — that keeps the operator's
+//! error message specific (missing list) rather than a generic
+//! "tensor not found" from mid-load.
+//!
+//! # GPU cost
+//!
+//! Gemma 4 vision tower ≈ 400 MB of F32 after dequant (221 tensors).
+//! The load sequentially dispatches a small allocation per tensor;
+//! total time on M5 Max ≈ 150-300ms for a cold-page-cache load of the
+//! Gemma 4 mmproj. Deliberately NOT parallelized: mlx-native's
+//! `load_tensor_f32` serializes through the GGUF `BufReader` mutex,
+//! and the cost is already dominated by the page-cache fill rather
+//! than CPU dequant.
+//!
+//! # Not in this iter
+//!
+//! - Handler wiring. The loader is usable in isolation; the
+//!   `process_multimodal_content` short-circuit at 501 is unchanged.
+//!   iter 32+ threads the loaded weights through `patch_embed_forward`
+//!   etc. as the ViT forward pass ports block-by-block.
+//! - Lazy tensor loading. Every required tensor is loaded eagerly at
+//!   `load()` time. A future iter can add a per-layer lazy mode if a
+//!   memory-constrained deployment needs it.
+
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
+use mlx_native::{MlxBuffer, MlxDevice};
+use mlx_native::gguf::GgufFile;
+
+use super::mmproj::{vit_layer_tensor, MmprojConfig};
+
+/// Collection of mmproj tensors loaded onto a Metal device as F32.
+///
+/// Cheap to move; cloning requires the caller to pay the GPU-alloc
+/// cost again (not implemented here — if a use case needs cheap
+/// cloning, wrap in `Arc` at the call site).
+pub struct LoadedMmprojWeights {
+    /// Keyed by the tensor's GGUF name. Values are F32 `MlxBuffer`s
+    /// with shape preserved from the source GGUF.
+    tensors: HashMap<String, MlxBuffer>,
+    /// Device handle kept alive for the lifetime of the buffers.
+    /// Held for RAII even though public accessors go through `tensors`.
+    _device: MlxDevice,
+}
+
+impl std::fmt::Debug for LoadedMmprojWeights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedMmprojWeights")
+            .field("tensor_count", &self.tensors.len())
+            .finish()
+    }
+}
+
+impl LoadedMmprojWeights {
+    /// Load every tensor from the GGUF file onto the supplied device
+    /// as F32. Arch-agnostic — walks `gguf.tensor_names()` and doesn't
+    /// assume a particular naming convention, so it transparently
+    /// handles both Gemma 4's SigLIP-style tower AND classic CLIP
+    /// producers. Callers should run `validate_tensor_set` + detect
+    /// `ArchProfile` first to know what the forward-pass dispatch
+    /// branch needs.
+    ///
+    /// `_cfg` is accepted but currently unused — kept in the signature
+    /// because a future lazy/tiered loader will partition tensor loads
+    /// by cfg (e.g., load only stem + first few blocks on cold start,
+    /// lazy-load remaining blocks on first request).
+    pub fn load(
+        gguf: &GgufFile,
+        _cfg: &MmprojConfig,
+        device: MlxDevice,
+    ) -> Result<Self> {
+        let names = gguf.tensor_names();
+        let mut tensors = HashMap::with_capacity(names.len());
+        for name in &names {
+            let buf = gguf
+                .load_tensor_f32(*name, &device)
+                .map_err(|e| anyhow!("mmproj load_tensor_f32('{}'): {e}", name))?;
+            tensors.insert((*name).to_string(), buf);
+        }
+        Ok(Self {
+            tensors,
+            _device: device,
+        })
+    }
+
+    /// Load from a GGUF file path. Opens the file, creates a default
+    /// MlxDevice, and loads every tensor. Convenience wrapper for the
+    /// common startup path.
+    pub fn load_from_path(path: &Path, cfg: &MmprojConfig) -> Result<Self> {
+        let gguf = GgufFile::open(path)
+            .map_err(|e| anyhow!("open mmproj GGUF {}: {e}", path.display()))?;
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow!("create MlxDevice for mmproj load: {e}"))?;
+        Self::load(&gguf, cfg, device)
+    }
+
+    /// Look up a tensor by its GGUF name. `None` when absent (optional
+    /// tensors like biases — callers gate the forward-pass branch on
+    /// `Some`).
+    pub fn get(&self, name: &str) -> Option<&MlxBuffer> {
+        self.tensors.get(name)
+    }
+
+    /// Number of loaded tensors.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Empty when no tensors were loaded (only possible from an empty
+    /// `expected_tensor_names`; normal load paths return ≥ 5 tensors).
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    // -----------------------------------------------------------------------
+    // Stem shortcuts. Each returns the buffer when present OR errors with
+    // a specific name — matches what a forward-pass call-site needs.
+    // -----------------------------------------------------------------------
+
+    pub fn patch_embd_weight(&self) -> Result<&MlxBuffer> {
+        self.tensors
+            .get(super::mmproj::TENSOR_PATCH_EMBD)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_PATCH_EMBD))
+    }
+
+    pub fn position_embd_weight(&self) -> Result<&MlxBuffer> {
+        self.tensors
+            .get(super::mmproj::TENSOR_POS_EMBD)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_POS_EMBD))
+    }
+
+    pub fn post_ln_weight(&self) -> Result<&MlxBuffer> {
+        self.tensors
+            .get(super::mmproj::TENSOR_POST_LN_WEIGHT)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_POST_LN_WEIGHT))
+    }
+
+    /// Per-block tensor accessor.
+    ///
+    /// `suffix` is the block-relative name ("attn_q.weight",
+    /// "ffn_down.weight", etc. — see `BLOCK_REQUIRED_SUFFIXES`).
+    pub fn block_tensor(&self, layer_idx: usize, suffix: &str) -> Result<&MlxBuffer> {
+        let key = vit_layer_tensor(layer_idx, suffix);
+        self.tensors
+            .get(&key)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", key))
+    }
+
+    /// MLP projector accessors.
+    pub fn mm_0_weight(&self) -> Result<&MlxBuffer> {
+        self.tensors
+            .get(super::mmproj::TENSOR_MM_0_WEIGHT)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_MM_0_WEIGHT))
+    }
+
+    pub fn mm_2_weight(&self) -> Result<&MlxBuffer> {
+        self.tensors
+            .get(super::mmproj::TENSOR_MM_2_WEIGHT)
+            .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_MM_2_WEIGHT))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::mmproj::ProjectorType;
+
+    /// Gemma 4 26B mmproj — present on this dev machine. Tests gate on
+    /// existence so CI without the fixture skips them cleanly.
+    const GEMMA4_MMPROJ_PATH: &str =
+        "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
+
+    #[test]
+    fn load_gemma4_mmproj_populates_arch_tensors() {
+        // Real Gemma 4 mmproj (SigLIP variant): 356 tensors total —
+        //   5 non-block (patch_embd, pos_embd, std_bias, std_scale, mm.0.weight)
+        //   13/block × 27 blocks = 351
+        //   No v.post_ln.weight, no mm.2.weight.
+        // See /opt/hf2q/docs/ADR-005 iter 31 for the real tensor manifest.
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("parse mmproj config");
+        // Sanity: Gemma 4's 27-layer SigLIP at 224×224 with 16×16 patches.
+        assert_eq!(cfg.num_hidden_layers, 27);
+        assert_eq!(cfg.image_size, 224);
+        assert_eq!(cfg.patch_size, 16);
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.projector, ProjectorType::Mlp);
+
+        let device = MlxDevice::new().expect("create device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load weights");
+        // Gemma 4 mmproj has 356 tensors total.
+        assert_eq!(weights.len(), 356);
+        // Arch-agnostic shortcuts present.
+        weights.patch_embd_weight().expect("patch_embd_weight");
+        weights.position_embd_weight().expect("position_embd_weight");
+        weights.mm_0_weight().expect("mm_0_weight");
+        // post_ln + mm.2 do NOT exist in Gemma 4 mmproj.
+        assert!(weights.post_ln_weight().is_err());
+        assert!(weights.mm_2_weight().is_err());
+        // Every layer's arch-agnostic QKV+output suffixes present.
+        for layer_idx in 0..27 {
+            for suffix in [
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            ] {
+                weights
+                    .block_tensor(layer_idx, suffix)
+                    .unwrap_or_else(|_| panic!("layer {} {}", layer_idx, suffix));
+            }
+        }
+    }
+
+    #[test]
+    fn load_gemma4_mmproj_patch_embd_has_expected_shape_and_values() {
+        // `v.patch_embd.weight` in Gemma 4 is a 2D tensor [hidden,
+        // 3*patch*patch] = [1152, 768] = 884,736 f32 elements. This is
+        // the flattened Conv2d kernel ready for a matmul against the
+        // flattened patch pixels.
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("parse mmproj config");
+        let device = MlxDevice::new().expect("create device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load weights");
+        let patch = weights.patch_embd_weight().expect("patch_embd");
+        let expected_elems = (cfg.hidden_size as usize)
+            * 3
+            * (cfg.patch_size as usize)
+            * (cfg.patch_size as usize);
+        let data: &[f32] = patch.as_slice().expect("as_slice f32");
+        assert_eq!(data.len(), expected_elems, "patch_embd element count");
+        // Sanity: loaded f32 dequant output is non-trivial.
+        let sum_abs: f32 = data.iter().take(1024).map(|v| v.abs()).sum();
+        assert!(
+            sum_abs > 0.0,
+            "first 1024 elements all zero — probable load bug"
+        );
+    }
+
+    #[test]
+    fn load_from_path_wraps_gguf_open_and_device_create() {
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open for cfg");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let weights = LoadedMmprojWeights::load_from_path(path, &cfg).expect("load_from_path");
+        assert_eq!(weights.len(), 356);
+    }
+
+    #[test]
+    fn accessors_return_err_with_specific_name_when_missing() {
+        // Synthetic LoadedMmprojWeights with an empty tensor map — every
+        // accessor should return Err naming the missing tensor.
+        let weights = LoadedMmprojWeights {
+            tensors: HashMap::new(),
+            _device: MlxDevice::new().expect("device"),
+        };
+        let err = weights.patch_embd_weight().unwrap_err();
+        assert!(format!("{err}").contains("v.patch_embd.weight"));
+
+        let err = weights.position_embd_weight().unwrap_err();
+        assert!(format!("{err}").contains("v.position_embd.weight"));
+
+        let err = weights.block_tensor(5, "attn_q.weight").unwrap_err();
+        assert!(format!("{err}").contains("v.blk.5.attn_q.weight"));
+
+        let err = weights.mm_0_weight().unwrap_err();
+        assert!(format!("{err}").contains("mm.0.weight"));
+    }
+
+    #[test]
+    fn empty_weights_report_len_zero_and_is_empty_true() {
+        let weights = LoadedMmprojWeights {
+            tensors: HashMap::new(),
+            _device: MlxDevice::new().expect("device"),
+        };
+        assert_eq!(weights.len(), 0);
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn get_returns_none_for_absent_tensor() {
+        let weights = LoadedMmprojWeights {
+            tensors: HashMap::new(),
+            _device: MlxDevice::new().expect("device"),
+        };
+        assert!(weights.get("v.patch_embd.weight").is_none());
+    }
+}

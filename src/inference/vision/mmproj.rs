@@ -245,75 +245,79 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
     format!("v.blk.{}.{}", layer_idx, suffix)
 }
 
-/// Per-block suffixes every ViT transformer layer must carry. Biases
-/// are NOT in this list because Gemma 4's SigLIP-derived tower omits
-/// them; bias tensors are accepted-if-present but never required.
-const BLOCK_REQUIRED_SUFFIXES: &[&str] = &[
-    "attn_q.weight",
-    "attn_k.weight",
-    "attn_v.weight",
-    "attn_output.weight",
-    "attn_norm.weight",
-    "ffn_up.weight",
-    "ffn_down.weight",
-    "ffn_norm.weight",
-];
-
-/// Build the list of tensor names a fully-featured mmproj GGUF MUST
-/// contain given its parsed `MmprojConfig`. Missing any of these is a
-/// producer bug or a truncated file — the server must fail-fast rather
-/// than hitting a NotFound mid-forward-pass.
+/// Supported architectural profile for an mmproj GGUF. Different
+/// producers (SigLIP, CLIP, Gemma 4 vision tower) carry different
+/// tensor-name conventions. The profile is auto-detected from the
+/// actual tensor set at startup; forward-pass dispatch branches on it.
 ///
-/// Covers the ViT stem (`v.patch_embd.weight`, `v.position_embd.weight`),
-/// every ViT block's required weights (see `BLOCK_REQUIRED_SUFFIXES`),
-/// the ViT post-LN (`v.post_ln.weight`), and the projector head.
-/// Projector tensors vary by type:
-///
-///   - `Mlp`       → `mm.0.weight`, `mm.2.weight`.
-///   - `Resampler` → no required-tensor list (server refuses to run —
-///     unsupported). Empty projector section.
-///   - `Other(_)`  → same as Resampler.
-///
-/// Bias tensors (`v.patch_embd.bias`, `v.post_ln.bias`, per-block
-/// `*.bias`, `mm.0.bias`) are intentionally NOT listed as required —
-/// Gemma 4's SigLIP vision tower omits all biases.
-pub fn expected_tensor_names(cfg: &MmprojConfig) -> Vec<String> {
-    let mut out = Vec::with_capacity(
-        4 + (cfg.num_hidden_layers as usize) * BLOCK_REQUIRED_SUFFIXES.len() + 2,
-    );
-    // --- ViT stem ---
-    out.push(TENSOR_PATCH_EMBD.to_string());
-    out.push(TENSOR_POS_EMBD.to_string());
-    out.push(TENSOR_POST_LN_WEIGHT.to_string());
-    // --- ViT transformer blocks ---
-    for layer_idx in 0..cfg.num_hidden_layers as usize {
-        for suffix in BLOCK_REQUIRED_SUFFIXES {
-            out.push(vit_layer_tensor(layer_idx, suffix));
-        }
-    }
-    // --- Projector head ---
-    match &cfg.projector {
-        ProjectorType::Mlp => {
-            out.push(TENSOR_MM_0_WEIGHT.to_string());
-            out.push(TENSOR_MM_2_WEIGHT.to_string());
-        }
-        ProjectorType::Resampler | ProjectorType::Other(_) => {
-            // No required-tensor list for unsupported projectors;
-            // validate_tensor_set flags the unsupported case explicitly
-            // so we never advertise a vision capability we can't back.
-        }
-    }
-    out
+/// Detection rule (order matters — first match wins):
+///   - `Gemma4Siglip` — per-block has `ln1.weight`, `ln2.weight`, and
+///     `post_ffw_norm.weight` (Gemma 4's dual-LN SigLIP variant).
+///   - `ClipClassic`  — per-block has `attn_norm.weight` (llama.cpp's
+///     default CLIP-style writer).
+///   - `Unknown`      — neither pattern found. Forward pass not supported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchProfile {
+    Gemma4Siglip,
+    ClipClassic,
+    Unknown,
 }
 
-/// Validate that `actual_names` (from `GgufFile::tensor_names()`)
-/// contains every tensor in `expected_tensor_names(cfg)`. Unsupported
-/// projector types fail with a dedicated error before the tensor-name
-/// walk so the operator sees the actual remedy.
+impl ArchProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArchProfile::Gemma4Siglip => "gemma4_siglip",
+            ArchProfile::ClipClassic => "clip_classic",
+            ArchProfile::Unknown => "unknown",
+        }
+    }
+    pub fn is_supported(&self) -> bool {
+        !matches!(self, ArchProfile::Unknown)
+    }
+}
+
+/// Detect the mmproj's tensor-naming profile from a tensor-name list.
+/// Used by startup validation + forward-pass dispatch.
 ///
-/// Missing tensors are batched into one error listing up to 10 names —
-/// prevents one-at-a-time whack-a-mole on restart when a producer bug
-/// drops a whole block's weights.
+/// This is cheap: a ~10-element probe over the block-0 tensor set.
+/// Returns `Unknown` when the file has neither marker, which the
+/// validator maps to a 400 `no_mmproj_loaded`-style error at request time.
+pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
+    let set: std::collections::HashSet<&str> = actual_names.iter().copied().collect();
+    if set.contains("v.blk.0.ln1.weight")
+        && set.contains("v.blk.0.ln2.weight")
+        && set.contains("v.blk.0.post_ffw_norm.weight")
+    {
+        return ArchProfile::Gemma4Siglip;
+    }
+    if set.contains("v.blk.0.attn_norm.weight") {
+        return ArchProfile::ClipClassic;
+    }
+    ArchProfile::Unknown
+}
+
+/// Minimal, arch-agnostic tensor-set sanity check for an mmproj GGUF.
+///
+/// Verifies only the tensors EVERY ViT mmproj must carry regardless of
+/// the underlying arch:
+///   - `v.patch_embd.weight` (pixel → patch-embedding)
+///   - `v.position_embd.weight` (learned position encoding)
+///   - `v.blk.0.attn_q.weight` + `attn_k.weight` + `attn_v.weight` +
+///     `attn_output.weight` (block 0's QKV + output projection)
+///   - at least one of `mm.0.weight` / `mm.2.weight` (the projector head)
+///   - per `MmprojConfig.num_hidden_layers`, the same QKV+output set for
+///     every block (catches truncated files)
+///
+/// Does NOT require arch-specific tensors like `attn_norm.weight` or
+/// `ln1.weight` — those are detected via `ArchProfile` separately and
+/// drive forward-pass dispatch, not boot validation.
+///
+/// Unsupported projector types (`Resampler`, `Other(_)`) still fail
+/// the check outright — forward pass can't run regardless of tensor
+/// completeness.
+///
+/// Missing tensors batched into one error listing up to 10 names so a
+/// producer bug doesn't become one-at-a-time whack-a-mole on restart.
 pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<()> {
     if !cfg.projector.is_supported() {
         return Err(anyhow!(
@@ -324,13 +328,34 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
         ));
     }
 
-    let expected = expected_tensor_names(cfg);
     let actual_set: std::collections::HashSet<&str> = actual_names.iter().copied().collect();
-    let mut missing: Vec<String> = expected
+
+    // Universal tensors (arch-agnostic).
+    let mut required: Vec<String> = vec![
+        TENSOR_PATCH_EMBD.to_string(),
+        TENSOR_POS_EMBD.to_string(),
+    ];
+    // Per-block QKV + output (present in both CLIP + Gemma 4).
+    for layer_idx in 0..cfg.num_hidden_layers as usize {
+        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"] {
+            required.push(vit_layer_tensor(layer_idx, suffix));
+        }
+    }
+
+    let mut missing: Vec<String> = required
         .iter()
         .filter(|name| !actual_set.contains(name.as_str()))
         .cloned()
         .collect();
+
+    // Projector: accept EITHER mm.0.weight alone (Gemma 4 single-linear)
+    // OR the CLIP 2-layer MLP pair. Absence of both is a missing projector.
+    if !actual_set.contains(TENSOR_MM_0_WEIGHT) && !actual_set.contains(TENSOR_MM_2_WEIGHT) {
+        missing.push(format!(
+            "{} (or {})",
+            TENSOR_MM_0_WEIGHT, TENSOR_MM_2_WEIGHT
+        ));
+    }
 
     if missing.is_empty() {
         return Ok(());
@@ -452,17 +477,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expected_tensor_names + validate_tensor_set (iter 30)
+    // validate_tensor_set + detect_arch_profile (iter 30 + iter 31 rewrite
+    // against real Gemma 4 mmproj data)
     // -----------------------------------------------------------------------
 
     fn mlp_cfg(num_layers: u32) -> MmprojConfig {
         MmprojConfig {
             image_size: 224,
-            patch_size: 14,
-            num_patches_side: 16,
-            hidden_size: 768,
-            intermediate_size: 3072,
-            num_attention_heads: 12,
+            patch_size: 16,
+            num_patches_side: 14,
+            hidden_size: 1152,
+            intermediate_size: 4304,
+            num_attention_heads: 16,
             num_hidden_layers: num_layers,
             layer_norm_eps: 1e-6,
             projector: ProjectorType::Mlp,
@@ -471,115 +497,115 @@ mod tests {
         }
     }
 
-    #[test]
-    fn expected_tensor_names_mlp_small_is_well_formed() {
-        // 2-layer MLP mmproj: 3 stem + 2*8 block + 2 projector = 21 tensors.
-        let cfg = mlp_cfg(2);
-        let names = expected_tensor_names(&cfg);
-        assert_eq!(names.len(), 3 + 2 * 8 + 2);
-        // Stem (first 3).
-        assert!(names.contains(&TENSOR_PATCH_EMBD.to_string()));
-        assert!(names.contains(&TENSOR_POS_EMBD.to_string()));
-        assert!(names.contains(&TENSOR_POST_LN_WEIGHT.to_string()));
-        // Every block has every required suffix.
-        for layer_idx in 0..2 {
-            for suffix in BLOCK_REQUIRED_SUFFIXES {
-                assert!(
-                    names.contains(&vit_layer_tensor(layer_idx, suffix)),
-                    "missing v.blk.{}.{}",
-                    layer_idx,
-                    suffix
-                );
-            }
-        }
-        // MLP projector.
-        assert!(names.contains(&TENSOR_MM_0_WEIGHT.to_string()));
-        assert!(names.contains(&TENSOR_MM_2_WEIGHT.to_string()));
-    }
-
-    #[test]
-    fn expected_tensor_names_resampler_has_empty_projector_section() {
-        // Resampler is unsupported — projector tensors aren't required;
-        // validate_tensor_set rejects the config outright.
-        let mut cfg = mlp_cfg(1);
-        cfg.projector = ProjectorType::Resampler;
-        let names = expected_tensor_names(&cfg);
-        // Stem (3) + block suffixes (8) = 11, no mm.*.
-        assert_eq!(names.len(), 3 + 8);
-        assert!(!names.iter().any(|n| n.starts_with("mm.")));
-    }
-
-    #[test]
-    fn expected_tensor_names_gemma4_production_shape() {
-        // Gemma 4 vision tower: 27 layers MLP.
-        // Total = 3 stem + 27*8 block + 2 projector = 221 tensors.
-        let cfg = mlp_cfg(27);
-        let names = expected_tensor_names(&cfg);
-        assert_eq!(names.len(), 3 + 27 * 8 + 2);
-    }
-
-    #[test]
-    fn validate_tensor_set_ok_when_all_present() {
-        let cfg = mlp_cfg(1);
-        let expected = expected_tensor_names(&cfg);
-        let actual: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
-        validate_tensor_set(&cfg, &actual).expect("all present → Ok");
-    }
-
-    #[test]
-    fn validate_tensor_set_ok_with_extra_tensors() {
-        // Producers may add biases + extras; we tolerate unknowns.
-        let cfg = mlp_cfg(1);
-        let expected = expected_tensor_names(&cfg);
-        let mut actual: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
-        actual.push("v.patch_embd.bias"); // optional bias — not required but present
-        actual.push("mm.0.bias");
-        actual.push("some.future.tensor"); // unknown producer extension
-        validate_tensor_set(&cfg, &actual).expect("extras are tolerated");
-    }
-
-    #[test]
-    fn validate_tensor_set_flags_missing_single_tensor() {
-        let cfg = mlp_cfg(1);
-        let expected = expected_tensor_names(&cfg);
-        // Drop the last one (mm.2.weight) to simulate a truncated producer.
-        let actual: Vec<&str> = expected[..expected.len() - 1]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("missing 1 required tensor"), "got: {msg}");
-        assert!(msg.contains("mm.2.weight"), "got: {msg}");
-    }
-
-    #[test]
-    fn validate_tensor_set_batches_many_missing_tensors() {
-        // Simulate a producer bug that drops all block tensors.
-        let cfg = mlp_cfg(2); // 2 layers × 8 = 16 missing block tensors.
-        let stem_and_projector: Vec<String> = vec![
+    /// Build the arch-agnostic minimum tensor set for a given num_layers:
+    /// patch_embd + pos_embd + per-block QKV+output + mm.0.weight.
+    fn minimum_tensor_names(num_layers: u32) -> Vec<String> {
+        let mut names = vec![
             TENSOR_PATCH_EMBD.to_string(),
             TENSOR_POS_EMBD.to_string(),
-            TENSOR_POST_LN_WEIGHT.to_string(),
             TENSOR_MM_0_WEIGHT.to_string(),
-            TENSOR_MM_2_WEIGHT.to_string(),
         ];
-        let actual: Vec<&str> = stem_and_projector.iter().map(|s| s.as_str()).collect();
-        let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("missing 16 required tensor"), "got: {msg}");
-        // 10 shown + overflow marker.
-        assert!(msg.contains("+ 6 more"), "got: {msg}");
+        for layer_idx in 0..num_layers as usize {
+            for suffix in [
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            ] {
+                names.push(vit_layer_tensor(layer_idx, suffix));
+            }
+        }
+        names
     }
 
     #[test]
-    fn validate_tensor_set_rejects_unsupported_projector_before_tensor_walk() {
+    fn validate_tensor_set_ok_when_minimum_present() {
+        let cfg = mlp_cfg(2);
+        let names = minimum_tensor_names(2);
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        validate_tensor_set(&cfg, &actual).expect("minimum set should pass");
+    }
+
+    #[test]
+    fn validate_tensor_set_ok_with_mm_2_instead_of_mm_0() {
+        // CLIP classic mmproj has mm.0 AND mm.2. If only mm.2 is present,
+        // we still accept — some producers might only ship the 2nd layer.
+        let cfg = mlp_cfg(1);
+        let mut names = minimum_tensor_names(1);
+        // Remove mm.0.weight; add mm.2.weight.
+        names.retain(|n| n != TENSOR_MM_0_WEIGHT);
+        names.push(TENSOR_MM_2_WEIGHT.to_string());
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        validate_tensor_set(&cfg, &actual).expect("mm.2 alone should pass");
+    }
+
+    #[test]
+    fn validate_tensor_set_ok_with_arch_specific_extras() {
+        // Real Gemma 4 mmproj has 13 tensors per block (our minimum has 4).
+        // All 9 extras (ln1, ln2, post_ffw_norm, attn_{q,k}_norm, ffn_up,
+        // ffn_down, ffn_gate, ffn_norm) are arch-specific and tolerated.
+        let cfg = mlp_cfg(1);
+        let mut names = minimum_tensor_names(1);
+        for suffix in [
+            "ln1.weight",
+            "ln2.weight",
+            "post_ffw_norm.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+            "ffn_gate.weight",
+            "ffn_norm.weight",
+        ] {
+            names.push(vit_layer_tensor(0, suffix));
+        }
+        names.push("v.std_bias".into());
+        names.push("v.std_scale".into());
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        validate_tensor_set(&cfg, &actual).expect("gemma-style extras should pass");
+    }
+
+    #[test]
+    fn validate_tensor_set_flags_missing_patch_embd() {
+        let cfg = mlp_cfg(1);
+        let mut names = minimum_tensor_names(1);
+        names.retain(|n| n != TENSOR_PATCH_EMBD);
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("v.patch_embd.weight"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_tensor_set_flags_missing_projector() {
+        // Neither mm.0.weight nor mm.2.weight present.
+        let cfg = mlp_cfg(1);
+        let mut names = minimum_tensor_names(1);
+        names.retain(|n| n != TENSOR_MM_0_WEIGHT);
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("mm.0.weight"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_tensor_set_flags_missing_whole_block() {
+        // 2-layer cfg, only block 0's tensors present.
+        let cfg = mlp_cfg(2);
+        let names = minimum_tensor_names(1); // only 1 layer's tensors
+        let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
+        let msg = format!("{err}");
+        // 4 missing: v.blk.1.{attn_q, attn_k, attn_v, attn_output}.weight
+        assert!(msg.contains("missing 4 required tensor"), "got: {msg}");
+        assert!(msg.contains("v.blk.1.attn_q.weight"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_tensor_set_rejects_unsupported_projector() {
         let mut cfg = mlp_cfg(1);
         cfg.projector = ProjectorType::Resampler;
-        // Even with EVERY possible tensor name, unsupported projector
-        // short-circuits before the walk so operators see the actual remedy.
-        let actual: Vec<&str> = vec![];
-        let err = validate_tensor_set(&cfg, &actual).expect_err("unsupported projector");
+        let err = validate_tensor_set(&cfg, &[]).expect_err("unsupported projector");
         let msg = format!("{err}");
         assert!(msg.contains("'resampler' is not yet supported"), "got: {msg}");
     }
@@ -591,5 +617,61 @@ mod tests {
         let err = validate_tensor_set(&cfg, &[]).expect_err("unsupported projector");
         let msg = format!("{err}");
         assert!(msg.contains("'q-former'"), "got: {msg}");
+    }
+
+    #[test]
+    fn detect_arch_profile_gemma4_siglip_from_ln1_ln2_post_ffw() {
+        let names: Vec<&str> = vec![
+            "v.patch_embd.weight",
+            "v.blk.0.ln1.weight",
+            "v.blk.0.ln2.weight",
+            "v.blk.0.post_ffw_norm.weight",
+            "v.blk.0.attn_q.weight",
+        ];
+        assert_eq!(detect_arch_profile(&names), ArchProfile::Gemma4Siglip);
+    }
+
+    #[test]
+    fn detect_arch_profile_clip_classic_from_attn_norm() {
+        let names: Vec<&str> = vec![
+            "v.patch_embd.weight",
+            "v.blk.0.attn_norm.weight",
+            "v.blk.0.attn_q.weight",
+        ];
+        assert_eq!(detect_arch_profile(&names), ArchProfile::ClipClassic);
+    }
+
+    #[test]
+    fn detect_arch_profile_unknown_when_neither_marker_present() {
+        let names: Vec<&str> = vec!["v.patch_embd.weight", "v.blk.0.attn_q.weight"];
+        assert_eq!(detect_arch_profile(&names), ArchProfile::Unknown);
+    }
+
+    #[test]
+    fn detect_arch_profile_prefers_gemma4_when_both_markers_present() {
+        // Pathological case: producer emits both. Gemma 4 dispatch wins
+        // (more specific — 3-tensor match beats 1-tensor match).
+        let names: Vec<&str> = vec![
+            "v.patch_embd.weight",
+            "v.blk.0.ln1.weight",
+            "v.blk.0.ln2.weight",
+            "v.blk.0.post_ffw_norm.weight",
+            "v.blk.0.attn_norm.weight",
+        ];
+        assert_eq!(detect_arch_profile(&names), ArchProfile::Gemma4Siglip);
+    }
+
+    #[test]
+    fn arch_profile_is_supported_rejects_unknown_only() {
+        assert!(ArchProfile::Gemma4Siglip.is_supported());
+        assert!(ArchProfile::ClipClassic.is_supported());
+        assert!(!ArchProfile::Unknown.is_supported());
+    }
+
+    #[test]
+    fn arch_profile_as_str_is_snake_case() {
+        assert_eq!(ArchProfile::Gemma4Siglip.as_str(), "gemma4_siglip");
+        assert_eq!(ArchProfile::ClipClassic.as_str(), "clip_classic");
+        assert_eq!(ArchProfile::Unknown.as_str(), "unknown");
     }
 }
