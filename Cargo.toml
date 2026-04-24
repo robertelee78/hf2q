@@ -49,6 +49,9 @@ thiserror = "2"
 #   mlx-native = { path = "/opt/mlx-native" }
 mlx-native = "0.3"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# Transitive via tokenizers but we consume it directly to construct
+# the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
+ahash = "0.8"
 
 # Async runtime + HTTP server (for `serve` subcommand)
 tokio = { version = "1", features = ["full"] }

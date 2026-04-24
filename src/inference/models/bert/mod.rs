@@ -35,10 +35,15 @@
 #![allow(dead_code)] // forward pass lands in a later iter
 
 pub mod config;
+pub mod tokenizer;
 #[allow(unused_imports)]
 pub use config::{
     bert_layer_tensor, BertConfig, PoolingType, TENSOR_EMBED_NORM_BIAS, TENSOR_EMBED_NORM_WEIGHT,
     TENSOR_POS_EMBD, TENSOR_TOKEN_EMBD, TENSOR_TOKEN_TYPES,
+};
+#[allow(unused_imports)]
+pub use tokenizer::{
+    build_token_to_id_map, build_wordpiece_tokenizer, BertSpecialTokens, BertVocab,
 };
 
 /// GGUF architecture identifier for the BERT family.

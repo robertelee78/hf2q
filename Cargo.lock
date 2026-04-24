@@ -1364,6 +1364,7 @@ dependencies = [
 name = "hf2q"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "assert_cmd",
  "async-stream",
