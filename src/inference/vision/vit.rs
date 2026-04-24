@@ -252,6 +252,17 @@ pub fn gelu_tanh_approx(input: &mut [f32]) {
 /// (64×64 patches × 1152 hidden × 3 × 196) ~= 2.7 GFLOP per image. This
 /// is the CPU-correctness reference; the GPU port is where performance
 /// lives.
+///
+/// # Storage-layout note (iter 33 real-data check)
+///
+/// Gemma 4's `v.patch_embd.weight` is stored as a 2D tensor
+/// `[hidden, 3·p·p]` (shape `[1152, 768]` for Gemma 4). This is
+/// byte-identical to a 4D `[hidden, 3, p, p]` tensor in row-major
+/// order — the inner `3·p·p` dim iterates `ic*(p*p) + dy*p + dx`
+/// exactly like the 4D layout's `[ic, dy, dx]` nested iteration. So
+/// the formula above and `weight[oc*3*p*p + ic*p*p + dy*p + dx]`
+/// produces correct output against either layout's raw bytes
+/// without reshape.
 pub fn patch_embed_forward(
     pixel_values: &[f32],
     patch_embd_weight: &[f32],
@@ -348,6 +359,39 @@ pub fn patch_embed_forward(
         }
     }
     Ok(out)
+}
+
+/// Drive `patch_embed_forward` from a `LoadedMmprojWeights` + parsed
+/// `MmprojConfig`, reading the `v.patch_embd.weight` buffer directly
+/// off the GPU. This is the hook iter 34+ will call from the handler's
+/// `process_multimodal_content` path once the full ViT forward is
+/// wired; iter 33 only validates that the call-path returns sensible
+/// patch embeddings on real Gemma 4 weights.
+///
+/// Note: reads the Metal buffer back to CPU via `MlxBuffer::as_slice`
+/// — which is a zero-copy view into the unified-memory region on
+/// Apple Silicon (no H→D copy). The CPU forward is the correctness
+/// reference; the GPU dispatch port follows when the whole ViT's
+/// CPU parity is locked.
+pub fn patch_embed_from_mmproj_weights(
+    pixel_values: &[f32],
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+) -> Result<Vec<f32>> {
+    let patch_buf = weights
+        .patch_embd_weight()
+        .map_err(|e| anyhow!("patch_embd_forward: {e}"))?;
+    let weight: &[f32] = patch_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("patch_embd_forward as_slice f32: {e}"))?;
+    patch_embed_forward(
+        pixel_values,
+        weight,
+        None, // Gemma 4 vision tower has no patch_embd bias
+        cfg.image_size,
+        cfg.patch_size,
+        cfg.hidden_size,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -943,5 +987,83 @@ mod tests {
         for v in &out {
             assert!((*v - 3.04).abs() < 1e-3, "expected 3.04, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_embed_from_mmproj_weights — real-data integration (iter 33)
+    // -----------------------------------------------------------------------
+
+    const GEMMA4_MMPROJ_PATH: &str =
+        "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf";
+
+    #[test]
+    fn patch_embed_from_real_gemma4_weights_produces_sensible_embeddings() {
+        // Real-data check: load the Gemma 4 mmproj, preprocess a solid-
+        // gray synthetic PNG to [3, 224, 224] f32, run patch_embed →
+        // assert shape = [196, 1152] and the output has non-trivial
+        // magnitude + non-zero variance (catches silent zeroed-weights /
+        // wrong-stride bugs).
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open gemma4 mmproj");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        assert_eq!(cfg.image_size, 224);
+        assert_eq!(cfg.patch_size, 16);
+        assert_eq!(cfg.hidden_size, 1152);
+        let num_patches_side = (cfg.image_size / cfg.patch_size) as usize;
+        assert_eq!(num_patches_side, 14);
+        let num_patches = num_patches_side * num_patches_side;
+        assert_eq!(num_patches, 196);
+
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Build a deterministic synthetic [3, 224, 224] pixel tensor with
+        // a gentle gradient — non-constant to exercise the full kernel.
+        let img = cfg.image_size as usize;
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    let idx = c * img * img + y * img + x;
+                    pixels[idx] = ((c + 1) as f32) * 0.1
+                        + (y as f32) * 0.001
+                        + (x as f32) * 0.001;
+                }
+            }
+        }
+
+        let out = patch_embed_from_mmproj_weights(&pixels, &weights, &cfg)
+            .expect("patch_embed_from_mmproj_weights");
+        assert_eq!(out.len(), num_patches * (cfg.hidden_size as usize));
+
+        // Variance + magnitude sanity: pretrained weights against a
+        // non-trivial input should produce a non-trivial output. A silent
+        // all-zeros dequant or wrong-stride bug would yield out[..] == 0.
+        let mean: f32 = out.iter().sum::<f32>() / (out.len() as f32);
+        let var: f32 = out.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (out.len() as f32);
+        assert!(var > 1e-4, "output variance unexpectedly low: {var}");
+        let max_abs = out.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        assert!(max_abs > 1e-3, "output max_abs unexpectedly low: {max_abs}");
+
+        // Non-trivial cross-patch variation: different spatial patches
+        // of the gradient input should produce different embedding rows.
+        // Compare patch 0 (top-left) vs patch 195 (bottom-right).
+        let p0 = &out[0..cfg.hidden_size as usize];
+        let p_last = &out[195 * (cfg.hidden_size as usize)..196 * (cfg.hidden_size as usize)];
+        let l2_diff: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2_diff > 1e-3, "patch 0 and patch 195 are identical — stride bug");
     }
 }
