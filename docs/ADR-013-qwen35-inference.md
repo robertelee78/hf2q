@@ -934,6 +934,41 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 2 · P0 COMPLETE (SSM_CONV landed)
+
+**Scope:** Phase P0 Decision 7 (SSM depthwise causal 1D conv + SiLU).
+
+**Delivered in `mlx-native`:**
+- `src/shaders/ssm_conv.metal` — 4 kernels (forward + state-update × f32/bf16). Depthwise causal conv with K=4 (parameterized), fused SiLU, per-seq ring-buffer state. Memory layout `x/y [channels, n_tokens, n_seqs]`, `kernel [K, channels]`, `state [K-1, channels, n_seqs]`. f32 accumulation regardless of input dtype.
+- `src/ops/ssm_conv.rs` — `SsmConvParams` struct + `dispatch_ssm_conv()` that encodes BOTH the forward and state-update kernels back-to-back (separate dispatches to avoid `old_state`/`new_state` aliasing when `n_tokens < K-1`). Full shape/dtype validation.
+- `tests/test_ssm_conv.rs` — 8 tests including:
+  - **ADR acceptance #2** spec-driven: 1-seq × 4-ch × 6-tok × K=4 with random kernel/state; hand-coded scalar CPU reference (`cpu_reference()`) with `|delta| < 1e-4`.
+  - **ADR acceptance #3** ring-buffer correctness: monolithic `[0..8]` vs chunked `[0..4] + [4..8]` byte-identical (tolerance 1e-6).
+  - Tiny hand-computed 1-ch × 2-tok × K=4 with all taps derived in comments.
+  - Multi-seq independence (2 sequences with different state).
+  - Decode regime (n_tokens=1 < K-1, exercises state-update's `old_state` branch).
+  - BF16 path at 1e-2 tolerance.
+  - Zero-channels / K=1 rejection.
+- `src/kernel_registry.rs` / `src/ops/mod.rs` — registered all 4 kernels.
+
+**Verification:**
+- 8/8 SSM_CONV tests green.
+- Library test suite: 95/95 pass (no regression).
+
+**Phase map status (updated):**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | **COMPLETE** (L2_NORM ✓, CUMSUM ✓, SSM_CONV ✓ @ mlx-native) |
+| P1  | 5         | Next iter — TRI_SOLVE |
+| P2  | 10 (mlx)  | Pending |
+| P3  | 6         | Pending |
+| P4–P13 | 1, 2, 8–18 | Pending |
+
+**Total P0 footprint:** 24 spec-driven tests green, ~350 lines Rust dispatch + ~550 lines Metal. Cross-repo: `mlx-native@<HEAD+1>`.
+
+**Next iter target:** P1 TRI_SOLVE (forward-substitution on lower-triangular unit-diagonal matrix, multi-column RHS, batched over leading dims).
+
 ### 2026-04-23 — /loop iter 1 · P0 partial (L2_NORM + CUMSUM)
 
 **Scope:** Phase P0 Decisions 3 & 4 (SSM_CONV deferred to iter 2).
