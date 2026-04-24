@@ -484,6 +484,20 @@ pub fn merge_moe_experts_in_tensor_map(
 
 /// Merge all per-expert tensors in a `QuantizedModel` for the `qwen35moe` arch.
 ///
+/// # DEPRECATED (2026-04-24)
+///
+/// This post-quantization variant is superseded by
+/// `merge_moe_experts_in_tensor_map` which runs BEFORE quantization.
+/// The post-quant variant's internal byte-size check against
+/// `original_dtype.element_size()` trips on Q4_0-quantized data (0.5
+/// bytes/elem vs 2 bytes for F16 declared dtype). The pre-quant
+/// variant does not have that issue and is the active code path
+/// called from `src/main.rs` Phase 1.5.
+///
+/// Kept for now as a reference implementation of the QuantizedModel
+/// surface. Not called from any active code path; exercised only by
+/// its own unit tests.
+///
 /// # Layer-streaming orchestration (ADR-012 Decision 9)
 ///
 /// For each MoE layer N (identified by tensors named
@@ -507,6 +521,11 @@ pub fn merge_moe_experts_in_tensor_map(
 ///
 /// If `num_experts` is absent from metadata, the model is dense and this
 /// function returns `Ok(())` immediately without touching any tensors.
+#[deprecated(
+    since = "0.1.0",
+    note = "use merge_moe_experts_in_tensor_map; this post-quant variant trips on Q4_0 byte-size check"
+)]
+#[allow(dead_code)]
 pub fn merge_moe_experts_in_place(
     model: &mut crate::ir::QuantizedModel,
 ) -> Result<(), ConvertError> {
