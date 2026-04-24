@@ -351,12 +351,29 @@ impl Qwen35Model {
             let attn_out = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => {
                     let shape = FullAttnShape::from_config(cfg);
+                    // Resolve the persistent full-attn cache slot for this layer so
+                    // decode attends to all prior tokens, not just the current step.
+                    // slot_index_for_layer returns the index into kv_cache.full_attn;
+                    // for FullAttention layers it returns FullAttn(rank).
+                    let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                        other => {
+                            return Err(anyhow!(
+                                "layer {layer_idx}: expected FullAttn slot, got {:?}",
+                                other
+                            ))
+                        }
+                    };
+                    let max_seq = kv_cache.max_seq_len;
+                    let slot = &mut kv_cache.full_attn[full_attn_rank];
                     build_gated_attn_layer(
                         &device,
                         &mut registry,
                         &hidden,
                         &pos_buf,
                         attn,
+                        Some(slot),
+                        max_seq,
                         seq_len,
                         shape.hidden_size,
                         shape.n_head,

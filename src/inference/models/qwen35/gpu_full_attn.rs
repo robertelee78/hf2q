@@ -702,12 +702,23 @@ pub fn apply_sdpa_with_kv_cache(
 /// GGUF-quantised weights, the caller should use `quantized_matmul_ggml`
 /// directly and integrate with the KV-cache path.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_gated_attn_layer(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     x: &MlxBuffer,
     positions: &MlxBuffer,
     weights_gpu: &FullAttnWeightsGpu,
+    // NEW: KV cache slot for this layer + its allocated capacity. Decode-time
+    // correctness requires attending to all stored K/V (0..current_len + seq_len),
+    // not just the current step's tokens. Prefill passes a fresh slot with
+    // current_len == 0; decode passes the persistent slot from HybridKvCache.
+    //
+    // Pass `None` to run SDPA statelessly (legacy behavior — synthetic unit
+    // tests that don't care about cache threading). Production forward_gpu
+    // passes Some(slot) per-layer.
+    kv_cache_slot: Option<&mut FullAttnKvSlot>,
+    max_seq_len: u32,
     seq_len: u32,
     hidden_size: u32,
     n_heads: u32,
@@ -790,16 +801,32 @@ pub fn build_gated_attn_layer(
     )?;
     enc.commit_and_wait().context("commit op4 k rope")?;
 
-    // ---- Op 5: SDPA (causal, GQA, with seq→head permute) ----
-    // apply_sdpa_causal_from_seq_major handles download/permute/upload internally;
-    // it needs a fresh encoder (its own commit_and_wait inside).
-    let mut enc = device.command_encoder().context("enc op5")?;
-    let attn_out = apply_sdpa_causal_from_seq_major(
-        &mut enc, registry, device,
-        &q_rope, &k_rope, &v_flat,
-        seq_len, n_heads, n_kv_heads, head_dim,
-    )?;
-    // attn_out is now [seq * n_heads, head_dim] seq-major, uploaded back.
+    // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
+    //
+    // Two code paths:
+    //   - With kv_cache_slot: decode/prefill uses the persistent HybridKvCache
+    //     slot. apply_sdpa_with_kv_cache writes current K/V into the slot at
+    //     position slot.current_len[0], runs SDPA over [0..current_len+seq_len],
+    //     and increments current_len. This is the correct behavior: every
+    //     decode step attends to ALL prior tokens.
+    //   - Without (None): legacy stateless SDPA for synthetic unit tests that
+    //     don't construct a full HybridKvCache.
+    let attn_out = match kv_cache_slot {
+        Some(slot) => apply_sdpa_with_kv_cache(
+            device, registry,
+            &q_rope, &k_rope, &v_flat,
+            slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+        )?,
+        None => {
+            let mut enc = device.command_encoder().context("enc op5")?;
+            apply_sdpa_causal_from_seq_major(
+                &mut enc, registry, device,
+                &q_rope, &k_rope, &v_flat,
+                seq_len, n_heads, n_kv_heads, head_dim,
+            )?
+        }
+    };
+    // attn_out is now [seq * n_heads, head_dim] seq-major.
 
     // ---- Op 6: sigmoid-gate multiply ----
     let n_elem = seq_len * q_total;
@@ -1357,12 +1384,17 @@ mod tests {
             .expect("mut")
             .copy_from_slice(&positions_flat);
 
+        // Parity test passes `None` for the cache — stateless SDPA path.
+        // Production decode uses Some(slot) via forward_gpu.rs; this test
+        // exercises the ops-wiring correctness, not cache threading.
         let gpu_out_buf = build_gated_attn_layer(
             &device,
             &mut registry,
             &x_gpu,
             &pos_buf,
             &gpu_weights,
+            None,
+            0,
             seq_len,
             shape.hidden_size,
             shape.n_head,
