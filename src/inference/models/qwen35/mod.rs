@@ -25,6 +25,7 @@
 use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
 
+pub mod delta_net;
 pub mod dense;
 pub mod ffn;
 pub mod full_attn;

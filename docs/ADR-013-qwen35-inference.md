@@ -934,6 +934,62 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 12 · P8 PARTIAL (DeltaNet layer scalar CPU reference)
+
+**Scope:** Phase P8 Decision 8 — scalar CPU reference for the full Gated DeltaNet linear-attention layer. Orchestrates all the DeltaNet primitives (pre-norm, QKV+Z projection, conv1d, α/β gating, L2 norm, GATED_DELTA_NET recurrence, output norm, output projection).
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/delta_net.rs` (new file, ~520 LOC):
+  - `DeltaNetLayerWeights` struct with 10 tensors (attn_norm, attn_qkv, attn_gate, ssm_conv1d, ssm_alpha, ssm_dt_bias, ssm_beta, ssm_a, ssm_norm, ssm_out).
+  - `DeltaNetLayerShape` + `DeltaNetLayerShape::from_config(cfg)` + `qkv_channels()` helper.
+  - **`delta_net_layer_cpu_ref(x, weights, shape, state_in, conv_state) -> (output, new_state, new_conv_state)`** — the full forward pass.
+
+**Op order (ADR Decision 8 verbatim):**
+1. Pre-attention RMSNorm on x.
+2. QKV concatenated projection (`attn_qkv @ x_norm`) → `[seq, 2*n_k*D_k + n_v*D_v]`.
+3. Z-gate projection (`attn_gate @ x_norm`) → `[seq, n_v*D_v]`.
+4. Depthwise causal conv1d + SiLU (matches mlx-native's ssm_conv spec exactly).
+5. Split conv output into Q (`[seq, n_k, D_k]`), K, V.
+6. **L2 norm** per-head on Q and K (ADR Decision 3, applied BEFORE the recurrence).
+7. α/β gate projections: `g = softplus(ssm_alpha @ x_norm + dt_bias) * exp(ssm_a)`; `beta = sigmoid(ssm_beta @ x_norm)`.
+8. **GATED_DELTA_NET recurrence** via `mlx_native::ops::gated_delta_net::cpu_reference_f32` — not re-implemented; the layer ref owns only orchestration.
+9. Output gating: `ssm_norm(attn_out) * sigmoid(Z)` (both ops elementwise).
+10. Output projection via `ssm_out`.
+
+**Tests (6 new, all green):**
+- `shape_qkv_channels` — `2*n_k*D_k + n_v*D_v = 32` for the small test shape.
+- `delta_net_layer_produces_expected_shape` — end-to-end smoke: finite, non-trivial output + correct state/conv_state shapes.
+- `delta_net_layer_deterministic` — bit-for-bit determinism across re-runs.
+- `delta_net_layer_state_in_affects_output` — non-zero initial state must change output vs zero initial state (state propagation works).
+- **`delta_net_layer_chunked_equals_monolithic`** — THE critical correctness invariant: running [token 0] then [token 1] through two calls (using intermediate state + conv_state) produces the same output as one call on [token 0, token 1]. Validates state propagation across calls.
+- `delta_net_layer_rejects_wrong_state_shape` — guard.
+
+**Verification:**
+- 6/6 new DeltaNet layer tests green.
+- 508/508 hf2q test suite green (+6 from iter 11's 502, zero regressions).
+
+**Design notes:**
+- `transpose_for_gdn` is a no-op in the 1-seq case because `[seq, n_heads, D]` row-major with D innermost coincides with mlx-native's `[D, n_heads, seq, 1]` column-major convention when the seq dim has stride `n_heads × D`. The explicit function is kept for documentation and to make the multi-seq extension trivial.
+- ssm_a is stored as log(|A|); `g = softplus(logit) * exp(ssm_a)` reconstructs the positive decay rate (matches ADR-012 Gotcha #2).
+- The 10 layer tensors are exactly what the apex GGUF emits per linear-attention layer (see hf2q's `moe.rs::LINEAR_LAYER_TENSOR_SUFFIXES`).
+- The chunked-equals-monolithic test is a key regression safety net: it validates that `state_out` and `new_conv_state` are correctly propagated, which is the #1 source of DeltaNet bugs.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | PARTIAL — CPU reference ✓; GPU builder pending |
+| P8     | 8          | **PARTIAL** — CPU reference ✓; GPU builder pending |
+| P9     | 13, 14     | PARTIAL — CPU references ✓; GPU builders pending |
+| P10    | 15         | Pending (simple, MTP load-only) |
+| P11-P13| 16-18      | Pending (E2E wire-up, ActivationCapture, sourdough+bench) |
+
+**All CPU references now landed.** The three layer-level GPU builders (P7b, P8b, P9b) can now be implemented against these oracles.
+
+**Next iter target:** P10 MTP load path (small — ~100 LOC per ADR) + start on P7b GPU builder for full-attention (the simplest of the three since mlx-native has all the primitives).
+
 ### 2026-04-23 — /loop iter 11 · P9 PARTIAL (FFN scalar CPU references — dense + MoE)
 
 **Scope:** Phase P9 Decisions 13 + 14 — pure-Rust scalar CPU references for both dense SwiGLU and MoE FFN variants. Mirrors the iter-10 pattern: CPU reference ships first as the authoritative spec; GPU builders come in a follow-up iter.
