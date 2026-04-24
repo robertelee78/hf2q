@@ -1,8 +1,22 @@
 # ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
 
-**Status:** Proposed (2026-04-23)
+**Status:** In progress (2026-04-24) — P0 shipped, P1–P7 pending
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
+
+## Phase status
+
+| Phase | Status | Commit | Notes |
+|---|---|---|---|
+| P0 — Broken-window fix (Decision 10) | ✅ shipped 2026-04-24 | `4a2b1e6` | DWQ bit-pair parameterization; 4 new CLI variants (4-8/6-8/2-8 alongside 4-6); --bits+DWQ now errors; auto-naming dwq46/48/68/28. 18 CLI integration tests green, zero new clippy errors. Solo-merged via CFA session `cfa-20260424-adr012-P0-dwq-bitpair` (Codex dual-mode driver failed stdin binding; Claude driver shipped clean). |
+| P1 — Config ingestion (Decisions 2, 3) | 🟡 pending | — | Next. |
+| P2 — qwen35 module + V-head reorder (4, 5) | ⚪ blocked on P1 | — | |
+| P3 — Non-reorder transforms (6) | ⚪ blocked on P2 | — | |
+| P4 — GGUF metadata + tensor naming (1, 7, 8, 11) | ⚪ blocked on P3 | — | |
+| P5 — Expert merge (9, MoE only) | ⚪ blocked on P4 | — | |
+| P6 — DWQ hybrid-arch calibration (12, 13) | ⚪ blocked on P5 | — | Hard blocker: no weight-space fallback wired; requires inference session's `ActivationCapture` impl (Decision 13). |
+| P7 — Integration + HF download + docs (14, 15) | ⚪ blocked on P6 | — | |
+
 **Related memories:** `project_qwen36_architecture.md`, `project_model_class_split.md`, `project_pure_rust_crate_factory.md`, `project_mlx_native_is_the_strategic_destination.md`, `feedback_hf2q_sovereignty.md`, `feedback_llama_cpp_over_candle.md`, `feedback_no_broken_windows.md`, `feedback_correct_outcomes.md`
 
 ---
