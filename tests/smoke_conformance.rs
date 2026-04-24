@@ -219,6 +219,54 @@ fn smoke_help_documents_local_dir_flag() {
 }
 
 #[test]
+fn smoke_dry_run_prints_arch_entry_report_with_quality_thresholds() {
+    // --dry-run prints the ArchEntry diagnostic report before preflight
+    // so operators see what the smoke run would do + what thresholds
+    // would apply even when preflight fails on a missing prerequisite.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "qwen35",
+            "--quant",
+            "q4_0",
+            "--dry-run",
+            "--local-dir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Required fields per Decision 16 §CLI — must appear in the report.
+    assert!(stdout.contains("arch:"), "report must name arch");
+    assert!(stdout.contains("qwen35"));
+    assert!(stdout.contains("tensor_catalog:"), "report must show catalog size");
+    assert!(stdout.contains("disk_floor_gb:"), "report must show disk floor");
+    assert!(
+        stdout.contains("quality_thresholds:"),
+        "report must show thresholds"
+    );
+    assert!(
+        stdout.contains("1.10"),
+        "report must show dwq46 threshold"
+    );
+    assert!(
+        stdout.contains("1.05"),
+        "report must show dwq48 threshold"
+    );
+    assert!(
+        stdout.contains("0.02"),
+        "report must show max median KL"
+    );
+    assert!(
+        stdout.contains("transcript_path:"),
+        "report must show transcript path"
+    );
+}
+
+#[test]
 fn smoke_unknown_arch_still_rejected_with_local_dir() {
     // Sanity: --local-dir does not weaken the arch-registry dispatch.
     // An unregistered arch is STILL rejected with the uniform error,

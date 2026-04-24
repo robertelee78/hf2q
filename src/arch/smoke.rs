@@ -236,6 +236,13 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         }
     };
 
+    // Print the dry-run informational report BEFORE preflight — operators
+    // see what the run WOULD do even when preflight surfaces a missing
+    // prerequisite (so the fix is actionable on the first read).
+    if args.dry_run {
+        print_dry_run_report(entry, args);
+    }
+
     // Step 1: preflight. --local-dir skips HF_TOKEN + repo-resolve checks.
     let local_dir_provided = args.local_dir.is_some();
     if let Err((code, reason)) = preflight_with_local(entry, env, local_dir_provided) {
@@ -430,6 +437,60 @@ fn find_llama_cli() -> Result<PathBuf, String> {
         }
     }
     Err("llama-cli not found".into())
+}
+
+/// Emit a human-readable summary of what the smoke run WOULD do,
+/// triggered by `--dry-run`. Decision 16 §1 calls for preflight
+/// verification with visible feedback; this renders the arch entry's
+/// knobs so operators see what transcript path, disk floor, HF repos,
+/// tensor catalog, and quality thresholds apply before committing to
+/// a long convert.
+pub fn print_dry_run_report(entry: &ArchEntry, args: &SmokeArgs) {
+    println!("═══ hf2q smoke dry-run ═══");
+    println!("  arch:              {}", entry.arch);
+    println!("  quant:             {}", args.quant);
+    println!("  has_mtp:           {}", entry.has_mtp);
+    println!("  has_vision:        {}", entry.has_vision);
+    println!(
+        "  disk_floor_gb:     {} (+10 GB buffer = {} required)",
+        entry.disk_floor_gb,
+        entry.disk_floor_gb + 10
+    );
+    println!(
+        "  hf_architectures:  {}",
+        entry.hf_architectures.join(", ")
+    );
+    println!("  hf_repos:          {}", entry.hf_repos.join(", "));
+    println!(
+        "  tensor_catalog:    {} template entries",
+        entry.tensor_catalog.entries.len()
+    );
+    println!("  quality_thresholds:");
+    println!(
+        "    ppl_ratio_dwq46: ≤ {:.2}×",
+        entry.quality_thresholds.ppl_ratio_dwq46
+    );
+    println!(
+        "    ppl_ratio_dwq48: ≤ {:.2}×",
+        entry.quality_thresholds.ppl_ratio_dwq48
+    );
+    println!(
+        "    max_median_kl:   < {:.2} nats",
+        entry.quality_thresholds.max_median_kl
+    );
+    println!(
+        "  smoke_prompts:     {}",
+        entry.smoke_prompts.first().unwrap_or(&"(none)")
+    );
+    let path = resolve_transcript_path(args, entry);
+    println!("  transcript_path:   {}", path.display());
+    if args.local_dir.is_some() {
+        println!(
+            "  local_dir:         {} (HF_TOKEN preflight skipped)",
+            args.local_dir.as_ref().unwrap().display()
+        );
+    }
+    println!("═══════════════════════════");
 }
 
 /// Resolve the canonical transcript output path for this invocation.
