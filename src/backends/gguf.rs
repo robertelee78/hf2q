@@ -230,9 +230,12 @@ impl OutputBackend for GgufBackend {
         let mut tensor_infos: Vec<TensorWriteInfo> = Vec::with_capacity(tensor_names.len());
         let mut tensor_data_offset: u64 = 0;
 
+        // Resolve GGUF arch once for tensor name mapping (ADR-012 Decision 1)
+        let resolved_arch_for_tensors = arch_gguf_name(&model.metadata);
+
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
+            let gguf_name = hf_name_to_gguf(name, &resolved_arch_for_tensors);
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
@@ -1466,6 +1469,17 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
                 ("layer_scalar", "layer_output_scale.weight"),
             ]);
         }
+        // Qwen3.5 family (dense + MoE): post_attention_layernorm is `attn_post_norm`
+        // in the model struct (llama-model.cpp:7628/7565), which maps to
+        // LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm" (llama-arch.cpp:367).
+        // There is NO separate ffn_norm tensor — the post-attn norm gates the FFN.
+        // ADR-012 Decision 8: post_attention_layernorm verdict.
+        "qwen35" | "qwen35moe" => {
+            map.extend_from_slice(&[
+                // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
+                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+            ]);
+        }
         // LLaMA-like default: covers llama, mistral, qwen2, qwen3, phi, etc.
         // post_attention_layernorm IS the FFN pre-norm (there is no separate
         // pre_feedforward_layernorm in these architectures).
@@ -1561,6 +1575,53 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
                 }
                 // Pass through unknown layer suffixes with best-effort mapping
                 return format!("blk.{}.{}", layer_num, suffix);
+            }
+        }
+    }
+
+    // ADR-012 Decision 11: MTP (Multi-Token Prediction) tensor mapping for qwen35/qwen35moe.
+    //
+    // HF naming: "mtp.layers.{mtp_idx}.{suffix}"
+    // GGUF naming: "blk.{num_hidden_layers + mtp_idx}.nextn.{gguf_suffix}"
+    //
+    // llama-arch.cpp:447-450 (LLM_TENSOR_NEXTN_*):
+    //   LLM_TENSOR_NEXTN_EH_PROJ       → "blk.%d.nextn.eh_proj"
+    //   LLM_TENSOR_NEXTN_EMBED_TOKENS  → "blk.%d.nextn.embed_tokens"
+    //   LLM_TENSOR_NEXTN_ENORM         → "blk.%d.nextn.enorm"
+    //   LLM_TENSOR_NEXTN_HNORM         → "blk.%d.nextn.hnorm"
+    //
+    // The MTP block index in GGUF = num_hidden_layers (e.g. 40 for qwen35moe, 64 for qwen35 dense).
+    // This is stored in num_layers from config.json "num_hidden_layers".
+    // Callers that handle MTP tensors must pass the num_hidden_layers context; for the generic
+    // hf_name_to_gguf path we cannot know num_layers, so we use a sentinel prefix "mtp.blk.N."
+    // and resolve the block index in the caller's pipeline.
+    //
+    // For now: emit "mtp.layers.{mtp_idx}.{suffix}" → "blk.mtp{mtp_idx}.nextn.{gguf_suffix}"
+    // The dispatch path that handles qwen35 conversion resolves the real block number.
+    if (arch == "qwen35" || arch == "qwen35moe") && hf_name.starts_with("mtp.layers.") {
+        // Strip "mtp.layers." prefix
+        if let Some(rest) = hf_name.strip_prefix("mtp.layers.") {
+            if let Some(dot_pos) = rest.find('.') {
+                let mtp_idx = &rest[..dot_pos];
+                let suffix = &rest[dot_pos + 1..];
+                // Map known MTP suffixes to GGUF nextn names
+                // llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ → "blk.%d.nextn.eh_proj"
+                // llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS → "blk.%d.nextn.embed_tokens"
+                // llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM → "blk.%d.nextn.enorm"
+                // llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM → "blk.%d.nextn.hnorm"
+                let nextn_suffix = match suffix {
+                    "enorm.weight"        => Some("nextn.enorm.weight"),
+                    "hnorm.weight"        => Some("nextn.hnorm.weight"),
+                    "embed_tokens.weight" => Some("nextn.embed_tokens.weight"),
+                    "eh_proj.weight"      => Some("nextn.eh_proj.weight"),
+                    _ => None,
+                };
+                if let Some(ns) = nextn_suffix {
+                    // We use "mtp{idx}" as a placeholder block number;
+                    // the real block index (num_hidden_layers + mtp_idx) must be resolved
+                    // by the qwen35 conversion pipeline at write time.
+                    return format!("blk.mtp{}.{}", mtp_idx, ns);
+                }
             }
         }
     }
@@ -1953,7 +2014,10 @@ fn resolve_special_token_id(
 /// Build the GGUF metadata key-value list from model metadata.
 fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, MetaValue)> {
     let meta = &model.metadata;
-    let arch = &meta.model_type; // e.g. "llama", "gemma4"
+    // ADR-012 Decision 1: resolve GGUF arch from architectures[0] for qwen35/qwen35moe.
+    // For all other arches this returns model_type unchanged.
+    let arch_owned = arch_gguf_name(meta);
+    let arch = &arch_owned; // e.g. "llama", "gemma4", "qwen35", "qwen35moe"
 
     let mut kv: Vec<(String, MetaValue)> = Vec::new();
 
@@ -2172,12 +2236,163 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         }
     }
 
+    // ADR-012 Decision 7: qwen35 / qwen35moe metadata emission.
+    // Both variants share the majority of keys; MoE adds expert_* keys.
+    if arch == "qwen35" || arch == "qwen35moe" {
+        emit_qwen35_metadata(meta, arch, &mut kv);
+    }
+
     // Load and embed tokenizer metadata from input directory
     if let Some(tok_kv) = load_tokenizer_metadata(input_dir, arch) {
         kv.extend(tok_kv);
     }
 
     kv
+}
+
+/// Emit Qwen3.5-family (dense + MoE) GGUF metadata keys.
+///
+/// # Key catalog with citations (ADR-012 Decision 7)
+///
+/// All keys are prefixed `{arch}.*` where arch is `"qwen35"` or `"qwen35moe"`.
+/// Every key cited below is mandatory unless marked (optional).
+///
+/// ## SSM / linear-attention hparams — llama-model.cpp:2811-2815 (qwen35)
+///                                      llama-model.cpp:2842-2846 (qwen35moe)
+/// - `{arch}.ssm.conv_kernel`   = linear_conv_kernel_dim   (llama-arch.cpp:268, LLM_KV_SSM_CONV_KERNEL)
+/// - `{arch}.ssm.inner_size`    = linear_value_head_dim * linear_num_value_heads (llama-arch.cpp:269)
+/// - `{arch}.ssm.state_size`    = linear_key_head_dim       (llama-arch.cpp:270, LLM_KV_SSM_STATE_SIZE)
+/// - `{arch}.ssm.time_step_rank = linear_num_value_heads    (llama-arch.cpp:271, LLM_KV_SSM_TIME_STEP_RANK)
+/// - `{arch}.ssm.group_count`   = linear_num_key_heads      (llama-arch.cpp:272, LLM_KV_SSM_GROUP_COUNT)
+///
+/// ## Full-attention hparams
+/// - `{arch}.attention.layer_norm_rms_epsilon`  = rms_norm_eps  (llama-arch.cpp:220, llama-model.cpp:2807)
+/// - `{arch}.attention.key_length`              = head_dim       (llama-arch.cpp:217)
+/// - `{arch}.attention.value_length`            = head_dim       (llama-arch.cpp:218)
+///
+/// ## RoPE hparams — llama-model.cpp:2808 reads rope_dimension_sections (mandatory)
+/// - `{arch}.rope.freq_base`          = rope_theta             (llama-arch.cpp:249)
+/// - `{arch}.rope.dimension_count`    = floor(head_dim * partial_rotary_factor) * 2 (llama-arch.cpp:246)
+/// - `{arch}.rope.dimension_sections` = [mrope_section[0..4]]  (llama-arch.cpp:248)
+///
+/// ## Layer-type hparams
+/// - `{arch}.full_attention_interval` = full_attention_interval (llama-arch.cpp:211, optional default 4)
+///
+/// ## MTP
+/// - `{arch}.nextn_predict_layers` = mtp_num_hidden_layers (llama-arch.cpp:194, optional default 0)
+///
+/// ## MoE-only keys
+/// - `{arch}.expert_count`                      (llama-arch.cpp:182, llama-model.cpp:2835 optional)
+/// - `{arch}.expert_used_count`                 (llama-arch.cpp:183, llama-model.cpp:2836 optional)
+/// - `{arch}.expert_feed_forward_length`        (llama-arch.cpp:175, llama-model.cpp:2835 optional)
+/// - `{arch}.expert_shared_feed_forward_length` (llama-arch.cpp:176, llama-model.cpp:2836 optional)
+fn emit_qwen35_metadata(
+    meta: &crate::ir::ModelMetadata,
+    arch: &str,
+    kv: &mut Vec<(String, MetaValue)>,
+) {
+    // SSM inner_size = linear_value_head_dim * linear_num_value_heads
+    // convert_hf_to_gguf.py:4779  add_ssm_inner_size(hparams["linear_value_head_dim"] * hparams["linear_num_value_heads"])
+    if let (Some(vdim), Some(vheads)) = (meta.linear_value_head_dim, meta.linear_num_value_heads) {
+        // llama-arch.cpp:268 LLM_KV_SSM_CONV_KERNEL → "%s.ssm.conv_kernel"
+        // llama-model.cpp:2811/2842 mandatory read
+        if let Some(conv_k) = meta.linear_conv_kernel_dim {
+            kv.push((format!("{}.ssm.conv_kernel", arch), MetaValue::Uint32(conv_k)));
+        }
+        // llama-arch.cpp:269 LLM_KV_SSM_INNER_SIZE → "%s.ssm.inner_size"
+        // llama-model.cpp:2812/2843 mandatory read
+        kv.push((format!("{}.ssm.inner_size", arch), MetaValue::Uint32(vdim * vheads)));
+    }
+    // llama-arch.cpp:270 LLM_KV_SSM_STATE_SIZE → "%s.ssm.state_size"
+    // llama-model.cpp:2813/2844 mandatory read = ssm_d_state = linear_key_head_dim
+    if let Some(kd) = meta.linear_key_head_dim {
+        kv.push((format!("{}.ssm.state_size", arch), MetaValue::Uint32(kd)));
+    }
+    // llama-arch.cpp:271 LLM_KV_SSM_TIME_STEP_RANK → "%s.ssm.time_step_rank"
+    // llama-model.cpp:2814/2845 mandatory read = ssm_dt_rank = linear_num_value_heads
+    if let Some(vheads) = meta.linear_num_value_heads {
+        kv.push((format!("{}.ssm.time_step_rank", arch), MetaValue::Uint32(vheads)));
+    }
+    // llama-arch.cpp:272 LLM_KV_SSM_GROUP_COUNT → "%s.ssm.group_count"
+    // llama-model.cpp:2815/2846 mandatory read = ssm_n_group = linear_num_key_heads
+    if let Some(kheads) = meta.linear_num_key_heads {
+        kv.push((format!("{}.ssm.group_count", arch), MetaValue::Uint32(kheads)));
+    }
+
+    // RMS norm epsilon — llama-arch.cpp:220 LLM_KV_ATTENTION_LAYERNORM_RMS_EPS
+    // llama-model.cpp:2807/2837 mandatory read
+    let rms_eps = meta.raw_config
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
+    kv.push((format!("{}.attention.layer_norm_rms_epsilon", arch), MetaValue::Float32(rms_eps)));
+
+    // head_dim: key_length and value_length — llama-arch.cpp:217-218
+    // convert_hf_to_gguf.py:1192-1193  add_key_length / add_value_length from hparams["head_dim"]
+    if let Some(hd) = meta.head_dim {
+        kv.push((format!("{}.attention.key_length", arch), MetaValue::Uint32(hd)));
+        kv.push((format!("{}.attention.value_length", arch), MetaValue::Uint32(hd)));
+    }
+
+    // RoPE freq_base — llama-arch.cpp:249 LLM_KV_ROPE_FREQ_BASE
+    // convert_hf_to_gguf.py:1157-1159  add_rope_freq_base from rope_parameters.rope_theta
+    if let Some(ref rp) = meta.rope_parameters {
+        // rope_theta = 10_000_000 for Qwen3.5-MoE apex (rope_parameters.rope_theta)
+        let rope_theta = if rp.rope_theta > 0.0 { rp.rope_theta } else { 10_000_000.0 };
+        kv.push((format!("{}.rope.freq_base", arch), MetaValue::Float32(rope_theta as f32)));
+
+        // RoPE dimension_sections — llama-arch.cpp:248 LLM_KV_ROPE_DIMENSION_SECTIONS
+        // llama-model.cpp:2808/2839 mandatory read via get_key_or_arr
+        // convert_hf_to_gguf.py:1149-1154 emits mrope_section padded to 4 elements
+        let mut sections = rp.mrope_section.clone();
+        while sections.len() < 4 {
+            sections.push(0);
+        }
+        let sections_u32: Vec<u32> = sections.iter().take(4).copied().collect();
+        kv.push((format!("{}.rope.dimension_sections", arch), MetaValue::ArrayUint32(sections_u32)));
+
+        // RoPE dimension_count — llama-arch.cpp:246 LLM_KV_ROPE_DIMENSION_COUNT
+        // convert_hf_to_gguf.py:4783  rope_dim = int(head_dim * partial_rotary_factor)
+        // partial_rotary_factor: prefer rp.partial_rotary_factor; fallback to meta field; then 0.25
+        if let Some(hd) = meta.head_dim {
+            let prf = if rp.partial_rotary_factor > 0.0 {
+                rp.partial_rotary_factor
+            } else {
+                meta.partial_rotary_factor.unwrap_or(0.25)
+            };
+            let rope_dim = (hd as f32 * prf) as u32;
+            kv.push((format!("{}.rope.dimension_count", arch), MetaValue::Uint32(rope_dim)));
+        }
+    }
+
+    // full_attention_interval — llama-arch.cpp:211 LLM_KV_FULL_ATTENTION_INTERVAL
+    // llama-model.cpp:2820/2851 optional read, default 4
+    let fai = meta.full_attention_interval.unwrap_or(4);
+    kv.push((format!("{}.full_attention_interval", arch), MetaValue::Uint32(fai)));
+
+    // nextn_predict_layers — llama-arch.cpp:194 LLM_KV_NEXTN_PREDICT_LAYERS
+    // optional, default 0; MTP block count.  mtp_num_hidden_layers = 1 for the apex model.
+    if let Some(mtp) = meta.mtp_num_hidden_layers {
+        if mtp > 0 {
+            kv.push((format!("{}.nextn_predict_layers", arch), MetaValue::Uint32(mtp)));
+        }
+    }
+
+    // MoE-only keys
+    if arch == "qwen35moe" {
+        // llama-arch.cpp:175 LLM_KV_EXPERT_FEED_FORWARD_LENGTH → "%s.expert_feed_forward_length"
+        // llama-model.cpp:2835 optional read
+        if let Some(ff_exp) = meta.moe_intermediate_size {
+            kv.push((format!("{}.expert_feed_forward_length", arch), MetaValue::Uint32(ff_exp)));
+        }
+        // llama-arch.cpp:176 LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH → "%s.expert_shared_feed_forward_length"
+        // llama-model.cpp:2836 optional read
+        if let Some(ff_shexp) = meta.shared_expert_intermediate_size {
+            kv.push((format!("{}.expert_shared_feed_forward_length", arch), MetaValue::Uint32(ff_shexp)));
+        }
+        // Note: expert_count and expert_used_count are already emitted by the common
+        // path in build_metadata (lines 2004-2015) using meta.num_experts / meta.top_k_experts.
+    }
 }
 
 /// Map global bit width to a GGML file type code.
@@ -2308,6 +2523,31 @@ fn align_up(offset: u64, alignment: u64) -> u64 {
         offset
     } else {
         offset + (alignment - remainder)
+    }
+}
+
+/// Resolve the GGUF architecture string for a model.
+///
+/// # Decision 1 (ADR-012 P4): arch routing from `config.architectures[0]`
+///
+/// llama.cpp uses `general.architecture` in the GGUF file to select the model
+/// builder.  For Qwen3.5-family models the HF `model_type` field is not stable
+/// (e.g. `"qwen3_5_moe_text"` instead of the GGUF arch `"qwen35moe"`), so we
+/// normalize from `architectures[0]` (stored in `metadata.architecture`).
+///
+/// Mapping (llama-arch.cpp:42-43):
+///   `"Qwen3_5ForCausalLM"`    → `"qwen35"`      (LLM_ARCH_QWEN35)
+///   `"Qwen3_5MoeForCausalLM"` → `"qwen35moe"`   (LLM_ARCH_QWEN35MOE)
+///
+/// All other architectures fall back to `metadata.model_type` unchanged — this
+/// preserves the gemma4 path and every other existing arch.
+pub(crate) fn arch_gguf_name(metadata: &crate::ir::ModelMetadata) -> String {
+    match metadata.architecture.as_str() {
+        // llama-arch.cpp:42  { LLM_ARCH_QWEN35,    "qwen35"    }
+        "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => "qwen35".to_string(),
+        // llama-arch.cpp:43  { LLM_ARCH_QWEN35MOE, "qwen35moe" }
+        "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => "qwen35moe".to_string(),
+        _ => metadata.model_type.clone(),
     }
 }
 
@@ -2861,5 +3101,160 @@ mod tests {
     #[test]
     fn test_ggml_tensor_size_f16() {
         assert_eq!(ggml_tensor_size(1024, GGML_TYPE_F16), 2048);
+    }
+
+    // ---------------------------------------------------------------------------
+    // ADR-012 Decision 1: arch routing tests
+    // ---------------------------------------------------------------------------
+
+    fn meta_qwen35_dense() -> ModelMetadata {
+        ModelMetadata {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            model_type: "qwen3_5_text".into(), // HF model_type is NOT the GGUF arch
+            param_count: 27_000_000_000,
+            hidden_size: 5120, num_layers: 64, layer_types: vec![],
+            num_attention_heads: 40, num_kv_heads: Some(8), vocab_size: 248320,
+            dtype: "bfloat16".into(), shard_count: 1, num_experts: None,
+            top_k_experts: None, intermediate_size: Some(13824),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None, full_attention_interval: Some(4),
+            attn_output_gate: Some(true), head_dim: Some(256),
+            partial_rotary_factor: Some(0.25), rope_parameters: None,
+            linear_conv_kernel_dim: Some(4), linear_key_head_dim: Some(128),
+            linear_num_key_heads: Some(16), linear_value_head_dim: Some(128),
+            linear_num_value_heads: Some(32), mamba_ssm_dtype: None,
+            moe_intermediate_size: None, shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: Some(1), mtp_use_dedicated_embeddings: Some(false),
+            output_router_logits: None, router_aux_loss_coef: None,
+        }
+    }
+
+    fn meta_qwen35_moe() -> ModelMetadata {
+        ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".into(),
+            model_type: "qwen3_5_moe_text".into(), // HF model_type is NOT the GGUF arch
+            param_count: 35_000_000_000,
+            hidden_size: 2048, num_layers: 40, layer_types: vec![],
+            num_attention_heads: 16, num_kv_heads: Some(2), vocab_size: 248320,
+            dtype: "bfloat16".into(), shard_count: 1, num_experts: Some(256),
+            top_k_experts: Some(8), intermediate_size: None,
+            raw_config: serde_json::json!({"rms_norm_eps": 1e-6}),
+            explicit_layer_types: None, full_attention_interval: Some(4),
+            attn_output_gate: Some(true), head_dim: Some(256),
+            partial_rotary_factor: Some(0.25),
+            rope_parameters: Some(crate::ir::RopeParameters {
+                mrope_interleaved: true,
+                mrope_section: vec![11, 11, 10],
+                rope_theta: 10_000_000.0,
+                rope_type: "default".into(),
+                partial_rotary_factor: 0.25,
+            }),
+            linear_conv_kernel_dim: Some(4), linear_key_head_dim: Some(128),
+            linear_num_key_heads: Some(16), linear_value_head_dim: Some(128),
+            linear_num_value_heads: Some(32), mamba_ssm_dtype: None,
+            moe_intermediate_size: Some(512),
+            shared_expert_intermediate_size: Some(512),
+            mtp_num_hidden_layers: Some(1), mtp_use_dedicated_embeddings: Some(false),
+            output_router_logits: None, router_aux_loss_coef: None,
+        }
+    }
+
+    /// Decision 1: architectures[0] == "Qwen3_5ForCausalLM" → arch string "qwen35".
+    /// llama-arch.cpp:42  { LLM_ARCH_QWEN35, "qwen35" }
+    #[test]
+    fn arch_routing_qwen35_dense() {
+        let m = meta_qwen35_dense();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35",
+            "Qwen3_5ForCausalLM must route to GGUF arch 'qwen35' (llama-arch.cpp:42)"
+        );
+    }
+
+    /// Decision 1: architectures[0] == "Qwen3_5MoeForCausalLM" → arch string "qwen35moe".
+    /// llama-arch.cpp:43  { LLM_ARCH_QWEN35MOE, "qwen35moe" }
+    #[test]
+    fn arch_routing_qwen35_moe() {
+        let m = meta_qwen35_moe();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35moe",
+            "Qwen3_5MoeForCausalLM must route to GGUF arch 'qwen35moe' (llama-arch.cpp:43)"
+        );
+    }
+
+    /// Decision 1: Non-qwen35 architectures pass model_type through unchanged.
+    /// Chesterton's fence: gemma4 must continue to emit "gemma4".
+    #[test]
+    fn arch_routing_gemma4_unchanged() {
+        let mut m = meta();
+        m.architecture = "Gemma4ForConditionalGeneration".into();
+        m.model_type = "gemma4".into();
+        assert_eq!(arch_gguf_name(&m), "gemma4");
+    }
+
+    /// Decision 1: llama architecture passes through unchanged.
+    #[test]
+    fn arch_routing_llama_unchanged() {
+        let m = meta();
+        assert_eq!(arch_gguf_name(&m), "llama");
+    }
+
+    // ---------------------------------------------------------------------------
+    // ADR-012 Decision 8: qwen35 tensor name mapping tests (via hf_name_to_gguf)
+    // ---------------------------------------------------------------------------
+
+    /// Decision 8: post_attention_layernorm → post_attention_norm for qwen35.
+    /// llama-arch.cpp:367, llama-model.cpp:7628.
+    #[test]
+    fn test_qwen35_post_attention_norm_mapping() {
+        assert_eq!(
+            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "qwen35"),
+            "blk.0.post_attention_norm.weight",
+            "qwen35: post_attention_layernorm must map to post_attention_norm, not ffn_norm"
+        );
+        assert_eq!(
+            hf_name_to_gguf("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
+            "blk.5.post_attention_norm.weight",
+            "qwen35moe: post_attention_layernorm must map to post_attention_norm"
+        );
+    }
+
+    /// Regression: LLaMA-like archs still map post_attention_layernorm → ffn_norm.
+    #[test]
+    fn test_llama_post_attention_norm_unchanged() {
+        for arch in &["llama", "qwen3", "mistral"] {
+            assert_eq!(
+                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                "blk.0.ffn_norm.weight",
+                "LLaMA-like arch '{}' must still map to ffn_norm", arch
+            );
+        }
+    }
+
+    /// Decision 11: MTP tensors map to blk.mtpN.nextn.* for qwen35/qwen35moe.
+    /// llama-arch.cpp:447-450 LLM_TENSOR_NEXTN_*.
+    #[test]
+    fn test_qwen35_mtp_tensor_mapping() {
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe"),
+            "blk.mtp0.nextn.enorm.weight",
+            "MTP enorm must map to nextn.enorm (llama-arch.cpp:449)"
+        );
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35"),
+            "blk.mtp0.nextn.hnorm.weight",
+            "MTP hnorm must map to nextn.hnorm (llama-arch.cpp:450)"
+        );
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe"),
+            "blk.mtp0.nextn.embed_tokens.weight",
+            "MTP embed_tokens must map to nextn.embed_tokens (llama-arch.cpp:448)"
+        );
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe"),
+            "blk.mtp0.nextn.eh_proj.weight",
+            "MTP eh_proj must map to nextn.eh_proj (llama-arch.cpp:447)"
+        );
     }
 }

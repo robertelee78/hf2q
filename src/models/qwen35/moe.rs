@@ -77,9 +77,17 @@ pub fn hf_tensor_name_to_gguf_moe(
         return Some(name);
     }
 
-    // --- MoE router ---
+    // --- MoE router (sparse experts) ---
+    // tensor_mapping.py:443 + llama-arch.cpp:393: mlp.gate.weight → blk.N.ffn_gate_inp.weight
     if suffix == "mlp.gate.weight" {
         return Some(format!("{}.ffn_gate_inp.weight", blk));
+    }
+
+    // --- Shared-expert scalar gate ---
+    // tensor_mapping.py:447 + llama-arch.cpp:394: mlp.shared_expert_gate → blk.N.ffn_gate_inp_shexp.weight
+    // llama-model.cpp:7596: layer.ffn_gate_inp_shexp = create_tensor(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", i)
+    if suffix == "mlp.shared_expert_gate.weight" {
+        return Some(format!("{}.ffn_gate_inp_shexp.weight", blk));
     }
 
     // --- Per-expert weights (gate / up / down) ---
@@ -149,30 +157,70 @@ fn map_full_attn_suffix(suffix: &str, blk: &str) -> Option<String> {
 }
 
 /// Map linear-attention suffix → GGUF name (shared with dense).
+///
+/// Same mapping table as dense — identical linear-attention architecture in
+/// both variants.  See `dense.rs:map_linear_attn_suffix` for full citation chain.
+///
+/// | HF suffix             | GGUF suffix        | Source |
+/// |---|---|---|
+/// | in_proj_qkv.weight    | attn_qkv.weight    | llama-arch.cpp:382 |
+/// | in_proj_z.weight      | attn_gate.weight   | llama-arch.cpp:370 |
+/// | in_proj_a.weight      | ssm_alpha.weight   | llama-arch.cpp:400 |
+/// | in_proj_b.weight      | ssm_beta.weight    | llama-arch.cpp:416 |
+/// | out_proj.weight       | ssm_out.weight     | llama-arch.cpp:402 |
+/// | A_log                 | ssm_a              | llama-arch.cpp:395 |
+/// | dt_bias               | ssm_dt.bias        | llama-arch.cpp:397 + convert_hf_to_gguf.py:4791 |
+/// | conv1d.weight         | ssm_conv1d.weight  | llama-arch.cpp:396 |
+/// | norm.weight           | ssm_norm.weight    | llama-arch.cpp:401 |
 fn map_linear_attn_suffix(suffix: &str, blk: &str) -> Option<String> {
     let rest = suffix.strip_prefix("linear_attn.")?;
     let gguf = match rest {
-        "in_proj_qkv.weight" => format!("{}.lin_attn_in_proj_qkv.weight", blk),
-        "in_proj_z.weight"   => format!("{}.lin_attn_in_proj_z.weight", blk),
-        "in_proj_a.weight"   => format!("{}.lin_attn_in_proj_a.weight", blk),
-        "in_proj_b.weight"   => format!("{}.lin_attn_in_proj_b.weight", blk),
-        "out_proj.weight"    => format!("{}.lin_attn_out_proj.weight", blk),
-        "A_log"              => format!("{}.lin_attn_A_log", blk),
-        "dt_bias"            => format!("{}.lin_attn_dt_bias", blk),
-        "dt_proj.weight"     => format!("{}.lin_attn_dt_proj.weight", blk),
-        "conv1d.weight"      => format!("{}.lin_attn_conv1d.weight", blk),
-        "conv1d.bias"        => format!("{}.lin_attn_conv1d.bias", blk),
-        "norm.weight"        => format!("{}.lin_attn_norm.weight", blk),
+        // llama-arch.cpp:382 LLM_TENSOR_ATTN_QKV → "blk.%d.attn_qkv"
+        "in_proj_qkv.weight" => format!("{}.attn_qkv.weight", blk),
+        // llama-arch.cpp:370 LLM_TENSOR_ATTN_GATE → "blk.%d.attn_gate"
+        "in_proj_z.weight"   => format!("{}.attn_gate.weight", blk),
+        // llama-arch.cpp:400 LLM_TENSOR_SSM_ALPHA → "blk.%d.ssm_alpha"
+        "in_proj_a.weight"   => format!("{}.ssm_alpha.weight", blk),
+        // llama-arch.cpp:416 LLM_TENSOR_SSM_BETA → "blk.%d.ssm_beta"
+        "in_proj_b.weight"   => format!("{}.ssm_beta.weight", blk),
+        // llama-arch.cpp:402 LLM_TENSOR_SSM_OUT → "blk.%d.ssm_out"
+        "out_proj.weight"    => format!("{}.ssm_out.weight", blk),
+        // llama-arch.cpp:395 LLM_TENSOR_SSM_A_NOSCAN → "blk.%d.ssm_a"
+        "A_log"              => format!("{}.ssm_a", blk),
+        // convert_hf_to_gguf.py:4791 dt_bias → dt_proj.bias; llama-arch.cpp:397 → "blk.%d.ssm_dt.bias"
+        "dt_bias"            => format!("{}.ssm_dt.bias", blk),
+        // llama-arch.cpp:396 LLM_TENSOR_SSM_CONV1D → "blk.%d.ssm_conv1d"
+        "conv1d.weight"      => format!("{}.ssm_conv1d.weight", blk),
+        "conv1d.bias"        => format!("{}.ssm_conv1d.bias", blk),
+        // llama-arch.cpp:401 LLM_TENSOR_SSM_NORM → "blk.%d.ssm_norm"
+        "norm.weight"        => format!("{}.ssm_norm.weight", blk),
         _ => return None,
     };
     Some(gguf)
 }
 
 /// Map layer-norm / RMS-norm suffix → GGUF name (shared with dense).
+///
+/// # post_attention_layernorm verdict (ADR-012 P4 audit)
+///
+/// Source: llama-model.cpp:7564-7565 (qwen35moe tensor load):
+///   `layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), …)`
+///   `layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), …)`
+///
+/// Source: llama-arch.cpp:367:
+///   `{ LLM_TENSOR_ATTN_POST_NORM, "blk.%d.post_attention_norm" }`
+///
+/// Qwen3.5-MoE uses `attn_post_norm` (GGUF: `post_attention_norm`), NOT `ffn_norm`.
+/// The MoE variant follows the exact same norm pattern as dense — same field names,
+/// same GGUF key.  `ffn_norm` would cause llama.cpp to reject the file.
 fn map_norm_suffix(suffix: &str, blk: &str) -> Option<String> {
     match suffix {
-        "input_layernorm.weight"          => Some(format!("{}.attn_norm.weight", blk)),
-        "post_attention_layernorm.weight" => Some(format!("{}.ffn_norm.weight", blk)),
+        "input_layernorm.weight" => Some(format!("{}.attn_norm.weight", blk)),
+        // llama-model.cpp:7565 loads layer.attn_post_norm via LLM_TENSOR_ATTN_POST_NORM
+        // llama-arch.cpp:367: LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
+        "post_attention_layernorm.weight" => {
+            Some(format!("{}.post_attention_norm.weight", blk))
+        }
         _ => None,
     }
 }
@@ -216,26 +264,56 @@ pub fn merge_expert_tensors(
 }
 
 // ---------------------------------------------------------------------------
-// Metadata emission (P4 stub)
+// Metadata emission (P4 — implemented)
 // ---------------------------------------------------------------------------
 
-/// Write Qwen3.5-MoE–specific GGUF metadata keys.
+/// Validate the Qwen3.5-MoE convert context and confirm all required
+/// metadata hparams for the MoE variant are present.
 ///
-/// # Phase stub (P4)
+/// # P4 implementation (ADR-012 Decision 7)
 ///
-/// The body — writing `qwen35moe.*` keys including `expert_count`,
-/// `expert_used_count`, `expert_feed_forward_length`,
-/// `expert_shared_feed_forward_length` — is scheduled for P4.
+/// The actual GGUF key-value emission for `qwen35moe.*` keys is performed by
+/// `src/backends/gguf.rs::build_metadata_qwen35moe`.  This function validates
+/// the context; callers then emit KVs inline.
 ///
-/// Callers MUST check the error return.
-#[allow(dead_code)]
-pub fn emit_metadata_moe(
-    _ctx: &Qwen35ConvertContext,
-) -> Result<(), ConvertError> {
-    Err(ConvertError::PhaseStub {
-        phase: "P4",
-        what: "emit_metadata_moe body — writes qwen35moe.* GGUF metadata keys",
-    })
+/// ## Keys emitted by the caller (all prefixed `qwen35moe.*`):
+/// Shared keys (same as qwen35 dense, arch prefix changes):
+/// - `qwen35moe.block_count`, `.context_length`, `.embedding_length`
+/// - `qwen35moe.attention.head_count`, `.head_count_kv`, `.key_length`, `.value_length`
+/// - `qwen35moe.attention.layer_norm_rms_epsilon`  — llama-model.cpp:2837 (mandatory)
+/// - `qwen35moe.rope.freq_base`, `.dimension_count`, `.dimension_sections`
+///   — llama-model.cpp:2839 (mandatory via get_key_or_arr)
+/// - `qwen35moe.full_attention_interval`            — llama-model.cpp:2851 (optional, default 4)
+/// - `qwen35moe.ssm.conv_kernel`                    — llama-model.cpp:2842 (mandatory)
+/// - `qwen35moe.ssm.inner_size`                     — llama-model.cpp:2843 (mandatory)
+/// - `qwen35moe.ssm.state_size`                     — llama-model.cpp:2844 (mandatory)
+/// - `qwen35moe.ssm.time_step_rank`                 — llama-model.cpp:2845 (mandatory)
+/// - `qwen35moe.ssm.group_count`                    — llama-model.cpp:2846 (mandatory)
+/// - `qwen35moe.nextn_predict_layers`               — llama-arch.cpp:194 (optional, default 0)
+///
+/// MoE-only keys:
+/// - `qwen35moe.expert_count`                       — llama-arch.cpp:182 (LLM_KV_EXPERT_COUNT)
+/// - `qwen35moe.expert_used_count`                  — llama-arch.cpp:183 (LLM_KV_EXPERT_USED_COUNT)
+/// - `qwen35moe.expert_feed_forward_length`         — llama-arch.cpp:175 / llama-model.cpp:2835 (optional)
+/// - `qwen35moe.expert_shared_feed_forward_length`  — llama-arch.cpp:176 / llama-model.cpp:2836 (optional)
+pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError> {
+    // Validate MoE-specific required fields
+    if ctx.num_experts.is_none() {
+        return Err(ConvertError::MissingHparam {
+            field: "num_experts (required for qwen35moe expert_count)",
+        });
+    }
+    if ctx.top_k_experts.is_none() {
+        return Err(ConvertError::MissingHparam {
+            field: "top_k_experts (required for qwen35moe expert_used_count)",
+        });
+    }
+    if ctx.moe_intermediate_size.is_none() {
+        return Err(ConvertError::MissingHparam {
+            field: "moe_intermediate_size (required for qwen35moe expert_feed_forward_length)",
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -373,22 +451,68 @@ mod tests {
                 "model.layers.0.linear_attn.out_proj.weight",
                 &ctx
             ),
-            Some("blk.0.lin_attn_out_proj.weight".to_string())
+            Some("blk.0.ssm_out.weight".to_string()) // llama-arch.cpp:402 LLM_TENSOR_SSM_OUT
         );
     }
 
-    /// dt_bias maps to lin_attn_dt_bias in GGUF (MoE).
+    /// dt_bias maps to ssm_dt.bias in GGUF (ADR-012 Decision 8 P4 implementation).
     ///
-    /// The `.dt_bias` → `.dt_proj.bias` GGUF rename happens at the name-mapping
-    /// layer per `convert_hf_to_gguf.py:4790-4791`. This test asserts the current
-    /// mapping key is `lin_attn_dt_bias`; P4 will adjust the GGUF key to match
-    /// llama.cpp convention.
+    /// convert_hf_to_gguf.py:4791 renames ".dt_bias" → ".dt_proj.bias" before GGUF mapping.
+    /// llama-arch.cpp:397 LLM_TENSOR_SSM_DT → "blk.%d.ssm_dt" with suffix "bias".
+    /// Full GGUF key: "blk.N.ssm_dt.bias".
     #[test]
-    fn dt_bias_maps_to_gguf_name_moe() {
+    fn dt_bias_maps_to_ssm_dt_bias_moe() {
         let ctx = moe_ctx();
         assert_eq!(
             hf_tensor_name_to_gguf_moe("model.layers.0.linear_attn.dt_bias", &ctx),
-            Some("blk.0.lin_attn_dt_bias".to_string())
+            Some("blk.0.ssm_dt.bias".to_string()),
+            "dt_bias must map to ssm_dt.bias (llama-arch.cpp:397, convert_hf_to_gguf.py:4791)"
+        );
+    }
+
+    /// post_attention_layernorm maps to post_attention_norm (ADR-012 P4 verdict).
+    ///
+    /// llama-model.cpp:7565 loads layer.attn_post_norm via LLM_TENSOR_ATTN_POST_NORM.
+    /// llama-arch.cpp:367: LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm".
+    #[test]
+    fn post_attention_layernorm_maps_to_post_attention_norm_moe() {
+        let ctx = moe_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_moe("model.layers.3.post_attention_layernorm.weight", &ctx),
+            Some("blk.3.post_attention_norm.weight".to_string()),
+            "post_attention_layernorm must map to post_attention_norm (llama-arch.cpp:367)"
+        );
+    }
+
+    /// in_proj_qkv maps to attn_qkv (ADR-012 Decision 8).
+    #[test]
+    fn in_proj_qkv_maps_to_attn_qkv_moe() {
+        let ctx = moe_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_moe("model.layers.0.linear_attn.in_proj_qkv.weight", &ctx),
+            Some("blk.0.attn_qkv.weight".to_string()),
+        );
+    }
+
+    /// in_proj_z maps to attn_gate (ADR-012 Decision 8).
+    #[test]
+    fn in_proj_z_maps_to_attn_gate_moe() {
+        let ctx = moe_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_moe("model.layers.0.linear_attn.in_proj_z.weight", &ctx),
+            Some("blk.0.attn_gate.weight".to_string()),
+        );
+    }
+
+    /// shared_expert_gate maps to ffn_gate_inp_shexp (ADR-012 Decision 8).
+    /// tensor_mapping.py:447 + llama-arch.cpp:394
+    #[test]
+    fn shared_expert_gate_maps_correctly() {
+        let ctx = moe_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_moe("model.layers.0.mlp.shared_expert_gate.weight", &ctx),
+            Some("blk.0.ffn_gate_inp_shexp.weight".to_string()),
+            "shared_expert_gate must map to ffn_gate_inp_shexp (tensor_mapping.py:447)"
         );
     }
 
@@ -425,16 +549,39 @@ mod tests {
         );
     }
 
+    /// emit_metadata_moe returns Ok when context is valid (P4 implementation).
     #[test]
-    fn emit_metadata_moe_returns_phase_stub() {
+    fn emit_metadata_moe_returns_ok_when_valid() {
         let ctx = moe_ctx();
-        let err = emit_metadata_moe(&ctx).expect_err("emit_metadata_moe should return PhaseStub");
         assert!(
-            matches!(
-                err,
-                crate::models::qwen35::ConvertError::PhaseStub { phase: "P4", .. }
-            ),
-            "expected PhaseStub(P4), got: {err}"
+            emit_metadata_moe(&ctx).is_ok(),
+            "emit_metadata_moe should return Ok for a valid MoE context with all required fields"
+        );
+    }
+
+    /// emit_metadata_moe returns error when num_experts is absent.
+    #[test]
+    fn emit_metadata_moe_errors_when_missing_num_experts() {
+        let mut ctx = moe_ctx();
+        ctx.num_experts = None;
+        let err = emit_metadata_moe(&ctx)
+            .expect_err("emit_metadata_moe should return error when num_experts is None");
+        assert!(
+            matches!(err, crate::models::qwen35::ConvertError::MissingHparam { .. }),
+            "expected MissingHparam, got: {err}"
+        );
+    }
+
+    /// emit_metadata_moe returns error when moe_intermediate_size is absent.
+    #[test]
+    fn emit_metadata_moe_errors_when_missing_moe_ff_size() {
+        let mut ctx = moe_ctx();
+        ctx.moe_intermediate_size = None;
+        let err = emit_metadata_moe(&ctx)
+            .expect_err("emit_metadata_moe should return error when moe_intermediate_size is None");
+        assert!(
+            matches!(err, crate::models::qwen35::ConvertError::MissingHparam { .. }),
+            "expected MissingHparam, got: {err}"
         );
     }
 }
