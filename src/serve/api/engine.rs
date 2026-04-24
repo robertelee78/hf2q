@@ -822,6 +822,12 @@ fn generate_stream_once(
         Ok(())
     };
 
+    // Snapshot mlx-native process-global GPU counters pre-generation so we
+    // can report the per-request delta on the terminal `Done` event's
+    // StreamStats (mirrors the non-streaming path's x_hf2q_timing counters).
+    let pre_dispatches = mlx_native::dispatch_count();
+    let pre_syncs = mlx_native::sync_count();
+
     // --- Prefill ---
     let prefill_start = Instant::now();
     let next_token_result =
@@ -945,8 +951,10 @@ fn generate_stream_once(
         } else {
             0.0
         }),
-        gpu_sync_count: None,
-        gpu_dispatch_count: None,
+        gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
+        gpu_dispatch_count: Some(
+            mlx_native::dispatch_count().saturating_sub(pre_dispatches),
+        ),
         cached_prompt_tokens: None,
         reasoning_tokens: if reasoning_token_count > 0 {
             Some(reasoning_token_count)
