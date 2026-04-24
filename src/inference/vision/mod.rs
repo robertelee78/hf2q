@@ -37,6 +37,7 @@
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
+pub mod mmproj;
 pub mod preprocess;
 
 #[allow(unused_imports)]
