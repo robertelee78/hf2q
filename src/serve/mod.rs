@@ -115,7 +115,7 @@ fn detect_hardware_info() -> (String, u64) {
 
 /// Hardcoded fallback chat template used ONLY when no GGUF-embedded template
 /// exists and the user has not passed `--chat-template` / `--chat-template-file`.
-pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
+const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
     "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n";
 
 /// Resolve the chat template per ADR-005 Phase 1 priority order:
@@ -356,6 +356,36 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     ).context("print header prefill")?;
 
     // Decode
+    // HF2Q_DECODE_INPUT_TOKENS: fixed-token replay override (ADR-007 iter-19, catalog #22).
+    // Format: space-separated decimal u32 token IDs (e.g. "15 823 12 99 ...").
+    // When set, the model's argmax output at each decode step is replaced with the
+    // corresponding token from this list, so both dense and TQ runs consume IDENTICAL
+    // token sequences. This eliminates apples-to-oranges tensor comparisons.
+    //
+    // Usage:
+    //   Run dense: HF2Q_USE_DENSE=1 hf2q generate ... 2>/tmp/dense-tokens.txt
+    //   Run tq:    HF2Q_DECODE_INPUT_TOKENS="$(cat /tmp/dense-tokens.txt)" hf2q generate ...
+    //
+    // Emit: "[HF2Q_DECODE_OVERRIDE] step=N actual=X override=Y" on stderr when overriding.
+    // Emit: "[HF2Q_DECODE_EMIT] step=N token=X" on stderr when NOT overriding (record mode).
+    let decode_overrides: Option<Vec<u32>> = std::env::var("HF2Q_DECODE_INPUT_TOKENS").ok()
+        .and_then(|s| {
+            let tokens: Vec<u32> = s.split_whitespace()
+                .filter_map(|tok| tok.parse::<u32>().ok())
+                .collect();
+            if tokens.is_empty() { None } else { Some(tokens) }
+        });
+    if let Some(ref ov) = decode_overrides {
+        eprintln!("[HF2Q_DECODE_INPUT_TOKENS] replay mode: {} token overrides loaded", ov.len());
+    }
+    // emit_tokens mode: when HF2Q_DECODE_EMIT_TOKENS=1 (and no override), emit each
+    // generated token to stderr in "[HF2Q_DECODE_EMIT] step=N token=X" format.
+    let emit_tokens = std::env::var("HF2Q_DECODE_EMIT_TOKENS").ok().as_deref() == Some("1");
+    // iter-23 Gate C: HF2Q_EMIT_NLL=1 — emit NLL for each decode step.
+    // Format: "[HF2Q_NLL] step=N token=X nll=Y" on stderr.
+    // Computed from logits left in the activations buffer immediately after forward_decode.
+    let emit_nll = std::env::var("HF2Q_EMIT_NLL").ok().as_deref() == Some("1");
+
     let mut all_tokens = prompt_tokens.to_vec();
     let mut next_token = last_token;
     all_tokens.push(next_token);
@@ -370,6 +400,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let mut kernel_profiles: Vec<forward_mlx::KernelTypeProfile> = Vec::new();
     let kernel_profile_warmup = 2usize;
     let kernel_profile_measure = 3usize;
+    let mut decode_step = 0usize;
     for _ in 1..params.max_tokens {
         if eos_token_ids.contains(&next_token) {
             break;
@@ -393,11 +424,41 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             }
         } else {
             let mut p = profiler.start_token();
-            next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+            let actual_tok = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
             profiler.finish_token(p);
+            // iter-23 Gate C: emit NLL immediately after forward_decode (logits still live).
+            if emit_nll {
+                match mlx_w.token_nll_from_logits(actual_tok) {
+                    Ok(nll) => eprintln!("[HF2Q_NLL] step={decode_step} token={actual_tok} nll={nll:.6}"),
+                    Err(e) => eprintln!("[HF2Q_NLL] step={decode_step} error: {e}"),
+                }
+            }
+            // Apply fixed-token replay override (catalog #22).
+            next_token = if let Some(ref ov) = decode_overrides {
+                let override_tok = ov.get(decode_step).copied().unwrap_or(actual_tok);
+                // Always emit the model's actual argmax in replay mode (Gate B measurement).
+                // "[HF2Q_DECODE_EMIT] step=N token=X" is the argmax the model chose;
+                // the override is what gets fed as next-token input.
+                if emit_tokens {
+                    eprintln!("[HF2Q_DECODE_EMIT] step={decode_step} token={actual_tok}");
+                }
+                if override_tok != actual_tok {
+                    eprintln!(
+                        "[HF2Q_DECODE_OVERRIDE] step={decode_step} actual={actual_tok} override={override_tok}"
+                    );
+                }
+                override_tok
+            } else {
+                // Emit mode: record the actual tokens so they can be replayed.
+                if emit_tokens {
+                    eprintln!("[HF2Q_DECODE_EMIT] step={decode_step} token={actual_tok}");
+                }
+                actual_tok
+            };
         }
         all_tokens.push(next_token);
         generated += 1;
+        decode_step += 1;
         {
             let token_str = tokenizer.decode(&[next_token], false).unwrap_or_default();
             print!("{}", token_str);
@@ -458,13 +519,6 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run the `serve` subcommand — start the OpenAI-compatible HTTP API server.
-///
-/// ADR-005 Phase 2a iter-2 backbone: exposes `/health`, `/readyz`,
-/// `/v1/models`, `/v1/models/:id`. Chat completions + embeddings land in
-/// the next iter with the engine wiring.
-///
-/// Behavior:
 ///   1. Build `ServerConfig` from CLI args + env vars.
 ///   2. If `--model` is supplied, validate the GGUF header opens cleanly
 ///      (fail-fast on bad weights, per Decision #15). No tensor data is
@@ -513,49 +567,30 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
     }
 
-    // --- Optionally load the model + spawn the engine ---
-    // When --model is supplied, we eagerly load (Decision #15 fail-fast) and
-    // spawn the serialized-FIFO worker thread. Warmup runs on the worker
-    // thread (dispatched via Engine::warmup) and once it completes we flip
-    // `ready_for_gen` on the AppState so /readyz returns 200 and
-    // /v1/chat/completions accepts requests.
-    let engine_opt = if let Some(model_path) = args.model.as_ref() {
+    // --- Fail-fast GGUF validation (if --model supplied) ---
+    if let Some(model_path) = &args.model {
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
             model_path.display()
         );
-        // Header-only parse surfaces bad magic immediately without loading
-        // any tensor data.
-        {
-            let gguf = mlx_native::gguf::GgufFile::open(model_path)
-                .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
-            tracing::info!(
-                path = %model_path.display(),
-                tensors = gguf.tensor_count(),
-                metadata = gguf.metadata_count(),
-                "Validated GGUF header"
-            );
-        }
-
-        let load_opts = api::engine::LoadOptions {
-            model_path: model_path.clone(),
-            tokenizer_path: args.tokenizer.clone(),
-            config_path: args.config.clone(),
-        };
-        let loaded = api::engine::LoadedModel::load(&load_opts)?;
-        let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
-        Some(engine)
-    } else {
-        None
-    };
+        // Header-only parse; no tensor data read.
+        let gguf = mlx_native::gguf::GgufFile::open(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+        tracing::info!(
+            path = %model_path.display(),
+            tensors = gguf.tensor_count(),
+            metadata = gguf.metadata_count(),
+            "Validated GGUF header"
+        );
+        // NOTE: actual model load + warmup lands with the /v1/chat iter.
+        // This `--model` argument is accepted now so the CLI contract is
+        // stable; the engine wiring is the only thing still missing, not
+        // the flag shape.
+    }
 
     // --- Build router ---
-    let state = match engine_opt {
-        Some(engine) => api::AppState::with_engine(config.clone(), engine),
-        None => api::AppState::new(config.clone()),
-    };
-    let state_for_warmup = state.clone();
+    let state = api::AppState::new(config.clone());
     let router = api::build_router(state);
 
     // --- Async runtime + serve ---
@@ -575,27 +610,6 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             "hf2q HTTP server listening"
         );
         eprintln!("hf2q serving on http://{}", bind);
-
-        // Dispatch warmup in the background if an engine was spawned.
-        // /readyz returns 503 while this runs; it flips to 200 when the
-        // warmup Reply arrives. Done in a spawn so the server can already
-        // accept non-generation endpoints (health/models) during warmup.
-        if let Some(engine) = state_for_warmup.engine.clone() {
-            let ready_flag = state_for_warmup.ready_for_gen.clone();
-            tokio::spawn(async move {
-                match engine.warmup().await {
-                    Ok(()) => {
-                        ready_flag.store(true, std::sync::atomic::Ordering::Release);
-                        tracing::info!("hf2q engine warmup complete; /readyz now 200");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "engine warmup failed");
-                        // Leave ready_for_gen false — /readyz stays 503 so
-                        // orchestrators don't route traffic.
-                    }
-                }
-            });
-        }
 
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown_signal())

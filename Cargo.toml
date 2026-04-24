@@ -69,7 +69,10 @@ ctrlc = { version = "3.4", features = ["termination"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# iter-20 audit binary: pattern matching for tok/s parsing
+regex = "1"
 
 # Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
 # common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
@@ -81,10 +84,10 @@ predicates = "3"
 tempfile = "3"
 criterion = "0.5"
 regex = "1"
-# tower::ServiceExt::oneshot for router-level integration tests
-# (ADR-005 Phase 2a iter 2). tower is already in the transitive graph
-# via axum; this pins a direct version for tests.
-tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "iter23_audit"
+path = "src/bin/iter23_audit.rs"
 
 [[bench]]
 name = "quantize_bench"
