@@ -59,7 +59,7 @@ use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use mlx_native::ops::rms_norm;
 
 // ================================================================
-// Debug dump helpers (HF2Q_DUMP_LAYER_N env gate)
+// Debug dump helpers (HF2Q_DUMP_LAYER_N / HF2Q_DUMP_LAYER_ACTIVATIONS env gates)
 // ================================================================
 
 /// Returns Some(n) if HF2Q_DUMP_LAYER_N=n env var is set, else None.
@@ -70,6 +70,40 @@ fn dump_layer_n() -> Option<usize> {
             .ok()
             .and_then(|s| s.parse().ok())
     })
+}
+
+/// Returns the path prefix for HF2Q_DUMP_LAYER_ACTIVATIONS, or None.
+/// When set, write per-layer last-token hidden state as f32 binary to
+/// `<prefix>NN.bin` after each layer's residual add.
+fn dump_layer_activations_prefix() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE.get_or_init(|| std::env::var("HF2Q_DUMP_LAYER_ACTIVATIONS").ok()).clone()
+}
+
+/// Write the last-token row of `hidden` [seq, H] as f32 bytes to `path`.
+fn dump_layer_bin(path: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u32) {
+    match download_f32(buf) {
+        Ok(data) => {
+            let h = hidden_size as usize;
+            let last_start = ((seq_len as usize).saturating_sub(1)) * h;
+            let row = &data[last_start..last_start + h.min(data.len().saturating_sub(last_start))];
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4)
+            };
+            if let Err(e) = std::fs::write(path, bytes) {
+                eprintln!("[DUMP_LAYER] write {path} failed: {e}");
+            } else {
+                eprintln!("[DUMP_LAYER] wrote {} f32 → {path}", row.len());
+            }
+        }
+        Err(e) => eprintln!("[DUMP_LAYER] download failed for {path}: {e}"),
+    }
+}
+
+/// Write the embedding (token 0 row, since seq=1 during decode) as f32 bytes.
+fn dump_embed_bin(prefix: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u32) {
+    let path = format!("{prefix}embed.bin");
+    dump_layer_bin(&path, buf, seq_len, hidden_size);
 }
 
 /// Print stats of the last-token row of a hidden buffer to stderr.
@@ -342,6 +376,9 @@ impl Qwen35Model {
         if dump_layer_n().is_some() {
             dump_hidden_stats("embed", &hidden, seq_len, h);
         }
+        if let Some(ref prefix) = dump_layer_activations_prefix() {
+            dump_embed_bin(prefix, &hidden, seq_len, h);
+        }
 
         // ---- Step 2: per-layer forward pass ----
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
@@ -578,6 +615,13 @@ impl Qwen35Model {
                     dump_hidden_stats(&format!("layer{layer_idx}_attn_out"), &attn_out, seq_len, h);
                     dump_hidden_stats(&format!("layer{layer_idx}_ffn_out"), &ffn_out, seq_len, h);
                 }
+            }
+
+            // --- HF2Q_DUMP_LAYER_ACTIVATIONS binary dump ---
+            // Writes last-token hidden state as f32 to <prefix>NN.bin after each layer.
+            if let Some(ref prefix) = dump_layer_activations_prefix() {
+                let path = format!("{prefix}{:02}.bin", layer_idx);
+                dump_layer_bin(&path, &hidden, seq_len, h);
             }
         }
 
