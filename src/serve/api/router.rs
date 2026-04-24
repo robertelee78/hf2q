@@ -359,6 +359,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completions_stream_without_engine_returns_model_not_loaded() {
+        // Even with stream:true, the engine gate runs first — no engine →
+        // 400 model_not_loaded. This is the documented Decision #16 / #26
+        // ordering; the streaming path itself is only reached after the
+        // gate passes.
+        let app = build_router(state_default());
+        let body = r#"{"model":"nope","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
     async fn chat_completions_malformed_json_returns_400() {
         let app = build_router(state_default());
         let body = r#"{ not valid json"#;

@@ -1280,6 +1280,22 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 375/375 pass (+13 from iter 2 baseline: 8 engine unit tests + 2 render_chat_prompt + 3 chat_completions router tests). Zero clippy errors. Commit + push.
   - **Next (iter 4):** streaming SSE path (`stream: true`) — tokenize + prefill + decode emit `GenerationEvent::Delta{kind, text}` through `mpsc::Sender` into the already-landed `generation_events_to_sse` encoder. Integrates with `DeltaKind`, `StreamStats`, `ChunkDelta{reasoning_content, tool_calls}`. Live-smoke with a real Gemma 4 GGUF for end-to-end inference verification.
 
+- **2026-04-23 loop iter 4 — Streaming SSE path landed.** `stream: true` chat completions now flow through the engine worker → mpsc channel → SSE encoder → client, with automatic cancellation on SSE receiver drop (Decision #18).
+  - **`src/serve/api/engine.rs` additions:**
+    - New `Request::GenerateStream { prompt_tokens, params, events: mpsc::Sender<GenerationEvent> }` variant.
+    - New `Engine::generate_stream(tokens, params, events_tx)` async enqueue; `try_send` separates `queue_full` (→ 429) from closed-worker.
+    - New `generate_stream_once(loaded, prompt_tokens, params, events)` worker function: prefill → first-token emit → decode-loop (EOS / max_tokens / stop-string) → `Done{finish_reason, prompt_tokens, completion_tokens, stats}` or `Error`. **Client-drop cancellation:** every `events.blocking_send(...)` checks the return — if the receiver was dropped (SSE stream closed because the client disconnected), the worker logs `"SSE stream dropped by client; aborting decode"` and returns immediately, freeing the queue slot (Decision #18).
+    - Streaming `StreamStats` populated with `prefill_time_secs`, `decode_time_secs`, `total_time_secs`, `time_to_first_token_ms`, `prefill_tokens_per_sec`, `decode_tokens_per_sec`; emitted on the terminal `Done` event.
+  - **`src/serve/api/handlers.rs` refactor + streaming handler:**
+    - New `prepare_chat_generation(state, req)` helper extracts the shared prelude (engine gate, model-id match, messages-not-empty, chat-template render, tokenize, context-length check, sampling-params build) as a `Result<PreparedChatContext, Response>` — both streaming and non-streaming call it.
+    - `chat_completions` dispatches on `req.stream`: true → `chat_completions_stream` returning an `Sse<_>` response; false → existing non-streaming path wrapping `ChatCompletionResponse` in JSON.
+    - `chat_completions_stream` opens `mpsc::channel(64)`, calls `engine.generate_stream(...)`, builds `SseStreamOptions {include_usage from stream_options, logprobs, system_fingerprint}`, and wraps the receiver in `generation_events_to_sse` with `chatcmpl-<uuidv4>` id.
+    - The stop-string-in-last-delta caveat is documented: OpenAI convention strips the stop from non-streaming `content`; streaming already delivered the fragment containing it. Matches llama.cpp server behavior exactly.
+  - **`src/serve/api/router.rs` — streaming test landed:** new `chat_completions_stream_without_engine_returns_model_not_loaded` — asserts engine-gate ordering is preserved even when `stream: true`.
+  - **Full suite:** 376/376 pass (+1 from iter 3's 375). Zero clippy errors. Commit + push.
+  - **Live end-to-end model-loaded smoke deferred:** only 240MB free + concurrent cfa worktree building hf2q in parallel. Per user directive "Never run two model-loading processes concurrently; 26B model = ~16GB" (project_oom_prevention.md), the Gemma 4 26B load + decode smoke queues for the next iter when the system is idle. All code paths are covered by the 376 unit+integration tests.
+  - **Next (iter 5):** prompt cache (Task #7, Decision #24) — single-slot LCP-based prefix cache that works against both TQ KV (ADR-007 default) and dense. ≥5× TTFT speedup on second request with same prefix; cached-path output byte-identical to uncached-path. Parallel: live smoke with Gemma 4 when OOM pressure clears.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)

@@ -59,95 +59,27 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    // --- Engine gate ---
-    let Some(engine) = state.engine.as_ref() else {
-        return ApiError::model_not_loaded(&req.model).into_response();
+    // Shared prelude: engine gate, model-id match, chat-template render,
+    // tokenize, sampling-params build. Returns either a prepared context or
+    // an error response to return directly.
+    let prepared = match prepare_chat_generation(&state, &req) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
-    if !state.is_ready_for_gen() {
-        return ApiError::not_ready().into_response();
-    }
-    // --- Streaming not yet landed ---
+
+    // --- Dispatch streaming vs non-streaming ---
     if req.stream.unwrap_or(false) {
-        return ApiError::invalid_request(
-            "stream: true is not yet supported by this hf2q build. Use stream: false \
-             or upgrade; streaming lands in the next Phase 2a iter.",
-            Some("stream".into()),
-        )
-        .into_response();
+        return chat_completions_stream(state.clone(), req, prepared).await;
     }
 
-    // --- Model id match ---
-    // In iter 3 there's one loaded model at a time; accept either the exact
-    // id or the filename stem the user may have supplied.
-    if req.model != engine.model_id() {
-        return ApiError::model_not_loaded(&req.model).into_response();
-    }
+    let PreparedChatContext {
+        engine: _engine_ref,
+        prompt_tokens,
+        params,
+    } = prepared;
+    let engine = state.engine.as_ref().expect("engine gate above ensures Some");
 
-    // --- Validate messages ---
-    if req.messages.is_empty() {
-        return ApiError::invalid_request(
-            "messages must contain at least one entry",
-            Some("messages".into()),
-        )
-        .into_response();
-    }
-
-    // --- Render chat template ---
-    let rendered = match engine::render_chat_prompt(engine.chat_template(), &req.messages) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "chat template render failed");
-            return ApiError::invalid_request(
-                format!("chat template render failed: {e}"),
-                Some("messages".into()),
-            )
-            .into_response();
-        }
-    };
-
-    // --- Tokenize ---
-    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "tokenization failed");
-            return ApiError::internal_error().into_response();
-        }
-    };
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-    let prompt_len = prompt_tokens.len();
-
-    // Hard-fail when prompt exceeds context budget. Overflow-policy behavior
-    // (summarize / truncate_left / reject) lands with Decision #23 in a
-    // future iter. Today we return `context_length_exceeded` — matches the
-    // `reject` policy exactly, which is one of the documented Decision #23
-    // options so this is not a stub, just the narrowest-scope first impl.
-    if let Some(ctx_len) = engine.context_length() {
-        if prompt_len >= ctx_len {
-            return ApiError::context_length_exceeded(ctx_len, prompt_len).into_response();
-        }
-    }
-
-    // --- Sampling params ---
-    let max_tokens = req
-        .max_completion_tokens
-        .or(req.max_tokens)
-        .unwrap_or(SamplingParams::default().max_tokens);
-    let stop_strings = req
-        .stop
-        .clone()
-        .map(|s| s.into_vec())
-        .unwrap_or_default();
-
-    let params = SamplingParams {
-        temperature: req.temperature.unwrap_or(0.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
-        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
-        max_tokens,
-        stop_strings,
-    };
-
-    // --- Generate ---
+    // --- Generate (non-streaming) ---
     let gen_started = std::time::Instant::now();
     let result = match engine.generate(prompt_tokens, params).await {
         Ok(r) => r,
@@ -224,6 +156,141 @@ pub async fn chat_completions(
         x_hf2q_timing: Some(timing),
     };
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Everything the non-streaming + streaming paths both need to start the
+/// generation on the worker thread.
+struct PreparedChatContext {
+    /// Kept for symmetry; the actual engine ref is re-fetched from `state`
+    /// at the call site because the async streaming body needs to take a
+    /// `'static` clone of the handle.
+    engine: (),
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+}
+
+/// Run every validation + rendering + tokenization step common to the
+/// streaming and non-streaming chat-completion paths. Returns the prepared
+/// context on success, or an `axum::Response` to return directly on failure.
+fn prepare_chat_generation(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+) -> std::result::Result<PreparedChatContext, Response> {
+    // --- Engine gate ---
+    let Some(engine) = state.engine.as_ref() else {
+        return Err(ApiError::model_not_loaded(&req.model).into_response());
+    };
+    if !state.is_ready_for_gen() {
+        return Err(ApiError::not_ready().into_response());
+    }
+    if req.model != engine.model_id() {
+        return Err(ApiError::model_not_loaded(&req.model).into_response());
+    }
+    if req.messages.is_empty() {
+        return Err(ApiError::invalid_request(
+            "messages must contain at least one entry",
+            Some("messages".into()),
+        )
+        .into_response());
+    }
+    let rendered =
+        match engine::render_chat_prompt(engine.chat_template(), &req.messages) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "chat template render failed");
+                return Err(ApiError::invalid_request(
+                    format!("chat template render failed: {e}"),
+                    Some("messages".into()),
+                )
+                .into_response());
+            }
+        };
+    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "tokenization failed");
+            return Err(ApiError::internal_error().into_response());
+        }
+    };
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_len = prompt_tokens.len();
+    if let Some(ctx_len) = engine.context_length() {
+        if prompt_len >= ctx_len {
+            return Err(
+                ApiError::context_length_exceeded(ctx_len, prompt_len).into_response(),
+            );
+        }
+    }
+    let max_tokens = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or(SamplingParams::default().max_tokens);
+    let stop_strings = req
+        .stop
+        .clone()
+        .map(|s| s.into_vec())
+        .unwrap_or_default();
+    let params = SamplingParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        max_tokens,
+        stop_strings,
+    };
+    Ok(PreparedChatContext {
+        engine: (),
+        prompt_tokens,
+        params,
+    })
+}
+
+/// Streaming chat-completion path. Opens an `mpsc::channel(64)`, hands the
+/// sender to the engine worker, and wraps the receiver in the SSE encoder
+/// built at `src/serve/api/sse.rs::generation_events_to_sse`. If the engine
+/// queue is full, returns 429 + Retry-After instead of starting the stream.
+async fn chat_completions_stream(
+    state: AppState,
+    req: ChatCompletionRequest,
+    prepared: PreparedChatContext,
+) -> Response {
+    use super::sse::{generation_events_to_sse, SseStreamOptions};
+
+    let engine = match state.engine.as_ref() {
+        Some(e) => e.clone(),
+        None => return ApiError::model_not_loaded(&req.model).into_response(),
+    };
+
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+    if let Err(e) = engine
+        .generate_stream(prepared.prompt_tokens, prepared.params, events_tx)
+        .await
+    {
+        let msg = format!("{e}");
+        if msg.contains("queue_full") {
+            return ApiError::queue_full().into_response();
+        }
+        tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
+        return ApiError::generation_error(msg).into_response();
+    }
+
+    // SSE options: include_usage follows Decision #22 (Tier 2 — `stream_options.include_usage`).
+    // logprobs follow Tier 4 — the grammar-aware sampler will feed Logprobs
+    // events in the iter that lands top_logprobs.
+    let opts = SseStreamOptions {
+        include_usage: req
+            .stream_options
+            .as_ref()
+            .and_then(|s| s.include_usage)
+            .unwrap_or(false),
+        logprobs: req.logprobs.unwrap_or(false),
+        system_fingerprint: state.config.system_fingerprint.clone(),
+    };
+
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono_seconds();
+    let sse = generation_events_to_sse(events_rx, request_id, req.model, created, opts);
+    sse.into_response()
 }
 
 /// Current Unix epoch seconds (used for response `created` field).

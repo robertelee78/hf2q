@@ -133,6 +133,17 @@ enum Request {
         params: SamplingParams,
         reply: oneshot::Sender<Result<GenerationResult>>,
     },
+    /// Streaming generation — tokens flow back to the handler via `events`
+    /// as `GenerationEvent::Delta{ kind, text }` per decode step, then a
+    /// terminating `Done { finish_reason, prompt_tokens, completion_tokens,
+    /// stats }` (or `Error`). When the handler's SSE stream is dropped
+    /// (client disconnect per Decision #18), `events.send` returns Err and
+    /// the worker breaks early — the queue slot is freed immediately.
+    GenerateStream {
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        events: mpsc::Sender<super::sse::GenerationEvent>,
+    },
     /// Graceful-shutdown sentinel.
     Shutdown,
 }
@@ -383,6 +394,32 @@ impl Engine {
         reply_rx.await.context("generation reply dropped")?
     }
 
+    /// Enqueue a streaming generation. The caller owns `events_rx` (returned
+    /// separately) and wraps it in the SSE encoder. Returns immediately after
+    /// queueing; the worker emits tokens into `events_tx` as they decode.
+    ///
+    /// Dropping `events_rx` (handler-side) causes the next worker `send` to
+    /// fail and the worker aborts the decode loop, freeing the queue slot
+    /// (Decision #18). Queue-full returns an error that the handler maps to
+    /// 429 + Retry-After.
+    pub async fn generate_stream(
+        &self,
+        prompt_tokens: Vec<u32>,
+        params: SamplingParams,
+        events_tx: mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Result<()> {
+        let req = Request::GenerateStream {
+            prompt_tokens,
+            params,
+            events: events_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
+            Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("engine worker is gone"),
+        }
+    }
+
     /// Request a clean shutdown of the worker. Drains in-flight work (since
     /// the channel is FIFO) before exiting.
     pub async fn shutdown(&self) {
@@ -411,6 +448,17 @@ fn worker_run(mut loaded: LoadedModel, mut rx: mpsc::Receiver<Request>) {
             } => {
                 let result = generate_once(&mut loaded, &prompt_tokens, &params);
                 let _ = reply.send(result);
+            }
+            Request::GenerateStream {
+                prompt_tokens,
+                params,
+                events,
+            } => {
+                // The streaming path sends every event (Delta / Done / Error)
+                // via `events`. Errors stay inside the function — the
+                // terminal event is always one of Done/Error, unless the
+                // receiver was dropped (client disconnect → early exit).
+                generate_stream_once(&mut loaded, &prompt_tokens, &params, &events);
             }
             Request::Shutdown => {
                 tracing::info!("hf2q-engine worker received Shutdown; exiting");
@@ -565,6 +613,156 @@ fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<Strin
         .into_iter()
         .max_by_key(|(_, n)| *n)
         .map(|(k, _)| k.to_string())
+}
+
+/// Streaming variant of `generate_once`. Sends `GenerationEvent::Delta` per
+/// decoded token, followed by a terminating `Done` (with finish_reason +
+/// usage) or `Error`. If the `events` receiver is dropped (SSE client
+/// disconnect, Decision #18), the next `blocking_send` returns Err and the
+/// loop exits early — no more events are sent, the queue slot is freed.
+fn generate_stream_once(
+    loaded: &mut LoadedModel,
+    prompt_tokens: &[u32],
+    params: &SamplingParams,
+    events: &mpsc::Sender<super::sse::GenerationEvent>,
+) {
+    use super::sse::{DeltaKind, GenerationEvent, StreamStats};
+
+    // Helper: send an event; return false if the receiver is gone.
+    macro_rules! send {
+        ($ev:expr) => {
+            if events.blocking_send($ev).is_err() {
+                tracing::info!("SSE stream dropped by client; aborting decode");
+                return;
+            }
+        };
+    }
+
+    if prompt_tokens.is_empty() {
+        send!(GenerationEvent::Error(
+            "generate_stream_once: empty prompt_tokens".into()
+        ));
+        return;
+    }
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+
+    // --- Prefill ---
+    let prefill_start = Instant::now();
+    let next_token_result =
+        loaded
+            .weights
+            .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx);
+    let prefill_duration = prefill_start.elapsed();
+    let mut next_token = match next_token_result {
+        Ok(t) => t,
+        Err(e) => {
+            send!(GenerationEvent::Error(format!("prefill failed: {e}")));
+            return;
+        }
+    };
+
+    // --- Decode loop ---
+    let decode_start = Instant::now();
+    let mut completion_tokens = 0usize;
+    let mut accumulated_text = String::new();
+    let mut finish_reason: &'static str = "length";
+    let mut profiler = ProfileAccumulator::new(0);
+
+    // Emit prefill-produced first token:
+    let first_text = loaded
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut is_eos_first = loaded.eos_token_ids.contains(&next_token);
+    if !is_eos_first && !first_text.is_empty() {
+        accumulated_text.push_str(&first_text);
+        send!(GenerationEvent::Delta {
+            kind: DeltaKind::Content,
+            text: first_text,
+        });
+    }
+    completion_tokens += 1;
+    if is_eos_first {
+        finish_reason = "stop";
+    } else if hit_stop_string(&accumulated_text, &params.stop_strings) {
+        finish_reason = "stop";
+        is_eos_first = true;
+    }
+
+    if !is_eos_first {
+        for _ in 1..max_tokens {
+            let pos = prompt_len + completion_tokens - 1;
+            let mut p = profiler.start_token();
+            let dec_result =
+                loaded
+                    .weights
+                    .forward_decode(next_token, pos, &mut loaded.ctx, &mut p);
+            profiler.finish_token(p);
+            next_token = match dec_result {
+                Ok(t) => t,
+                Err(e) => {
+                    send!(GenerationEvent::Error(format!("decode failed: {e}")));
+                    return;
+                }
+            };
+
+            if loaded.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            completion_tokens += 1;
+            let fragment = loaded
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            accumulated_text.push_str(&fragment);
+            send!(GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: fragment,
+            });
+            if hit_stop_string(&accumulated_text, &params.stop_strings) {
+                finish_reason = "stop";
+                // NOTE: we cannot "unsend" the last delta that included the
+                // stop string. OpenAI's convention is to strip the stop from
+                // the non-streaming response's `content` field; the streaming
+                // path already delivered the fragment containing it.
+                // Acceptable — matches llama.cpp server behavior.
+                break;
+            }
+        }
+    }
+    let decode_duration = decode_start.elapsed();
+
+    let stats = StreamStats {
+        prefill_time_secs: Some(prefill_duration.as_secs_f64()),
+        decode_time_secs: Some(decode_duration.as_secs_f64()),
+        total_time_secs: Some(
+            (prefill_duration + decode_duration).as_secs_f64(),
+        ),
+        time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
+        prefill_tokens_per_sec: Some(if prefill_duration.as_secs_f64() > 0.0 {
+            prompt_len as f64 / prefill_duration.as_secs_f64()
+        } else {
+            0.0
+        }),
+        decode_tokens_per_sec: Some(if decode_duration.as_secs_f64() > 0.0 {
+            completion_tokens as f64 / decode_duration.as_secs_f64()
+        } else {
+            0.0
+        }),
+        gpu_sync_count: None,
+        gpu_dispatch_count: None,
+        cached_prompt_tokens: None,
+        reasoning_tokens: None,
+    };
+
+    send!(GenerationEvent::Done {
+        finish_reason,
+        prompt_tokens: prompt_len,
+        completion_tokens,
+        stats,
+    });
 }
 
 fn hit_stop_string(text: &str, stops: &[String]) -> bool {
