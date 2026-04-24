@@ -1434,6 +1434,21 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Full suite:** 511/512 pass (+3 from iter 13's 508; 1 unrelated qwen35::mtp test failure is another session's territory — my 188 serve::api tests are all green). `scripts/smoke_api.sh`: 26/26 still pass.
   - **Next (iter 15):** integration tests for the overflow-policy paths — spin up the server with `--overflow-policy={reject,truncate_left,summarize}` and exercise each branch via smoke_api.sh additions. Alternative: begin BERT config + GGUF loader path scaffolding for Phase 2b (pure data-structure port, testable without live compute).
 
+- **2026-04-24 loop iter 15 — Phase 2b BERT config scaffolding (Task #13 begins).** Data-structure scaffolding for encoder-only BERT embedding models. Pure compute, no model load required; forward-pass port lands when OOM pressure clears.
+  - **`src/inference/models/bert/` — new module:**
+    - `mod.rs` — crate root, `ARCH_BERT = "bert"` GGUF architecture id, re-exports.
+    - `config.rs` (~330 LOC + 9 tests):
+      - `PoolingType` enum (NONE=0, MEAN=1, CLS=2, LAST=3, RANK=4) matching llama.cpp's `llama_pooling_type` byte-for-byte.
+      - `BertConfig` struct: `hidden_size`, `num_attention_heads`, `num_hidden_layers`, `intermediate_size`, `max_position_embeddings`, `vocab_size`, `type_vocab_size`, `layer_norm_eps`, `hidden_act`, `pooling_type`, `causal_attention`.
+      - `BertConfig::from_config_json(&Path)` — parses HuggingFace `config.json`. Accepts both `layer_norm_eps` + `layer_norm_epsilon` key variants (different BERTs use different spellings).
+      - `BertConfig::from_hf_value(&Value)` — pre-parsed JSON variant (avoids re-IO when the caller already has the value).
+      - `BertConfig::from_gguf(&GgufFile)` — parses llama.cpp's `bert.*` GGUF metadata keys; accepts `bert.attention.layer_norm_epsilon` or `bert.layer_norm_epsilon`; falls back to inferring `vocab_size` from the token_embd tensor shape when the explicit key is missing. Rejects GGUFs whose `general.architecture != "bert"` with a clear error.
+      - Tensor-name constants + `bert_layer_tensor(n, suffix)` helper — single source of truth for the llama.cpp BERT GGUF tensor-name convention (`blk.{n}.attn_q.weight`, `token_embd.weight`, etc.). A test pins the exact string values so a future refactor that renames them silently would fail.
+    - **9 unit tests cover:** `PoolingType` byte-value round-trip (0-4), string stability, HF config.json parse (shape mimicking bge-small-en-v1.5), alt `layer_norm_epsilon` key, missing-required-field error path, explicit `pooling_type` + `is_decoder` override, `bert_layer_tensor` formatting, tensor-name constants lock, `head_dim` divisor check.
+  - **Deliberate scope split:** forward pass (`forward.rs`) + GGUF weight loader + tokenizer handoff are **NOT** in this iter. Each requires either a live model to validate or a substantial pure-compute port. Splitting keeps the iter green on tests today and queues the forward-pass port for when OOM clears — exactly when live validation is possible.
+  - **Full suite:** 520/521 pass (+9 from iter 14's 511 effective serve::api count; 1 unrelated qwen35::mtp failure is another session's territory). BERT sub-module: 9/9 green. `scripts/smoke_api.sh`: 26/26 still green.
+  - **Next (iter 16):** `/v1/embeddings` handler scaffolding wired to accept `--embedding-model <X.gguf>`, open the GGUF via `BertConfig::from_gguf`, and return a documented 501 when the forward pass isn't plumbed yet (still pre-compute). OR: BERT tensor-name loader (reads weight tensors from GGUF into mlx-native buffers; the dispatch graph waits for live validation).
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
