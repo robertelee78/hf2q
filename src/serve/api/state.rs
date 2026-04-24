@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use super::engine::Engine;
 use super::schema::OverflowPolicy;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
@@ -112,22 +113,45 @@ pub fn default_cache_dir() -> Option<PathBuf> {
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub started_at: Arc<Instant>,
-    /// `true` once the server is ready to serve generation. In this iter no
-    /// generation endpoint is routed; later iters flip this after the
-    /// model-load warmup pass completes.
+    /// `true` once the server is ready to serve generation. When `engine` is
+    /// `None`, generation endpoints return 400 `model_not_loaded`. When
+    /// `engine` is `Some` but `ready_for_gen` is `false`, they return 503
+    /// `not_ready` + `Retry-After: 1` (Decision #16, warmup-in-progress).
     pub ready_for_gen: Arc<AtomicBool>,
     /// Monotonic counter for request-id generation + metrics.
     pub request_counter: Arc<AtomicU64>,
+    /// Inference engine. `None` means no `--model` was supplied at startup
+    /// (the HTTP backbone still serves `/health`, `/readyz`, `/v1/models`).
+    /// `Some(engine)` means a model is loaded and the worker thread is up;
+    /// generation endpoints gate on `ready_for_gen` for warmup status.
+    pub engine: Option<Engine>,
 }
 
 impl AppState {
+    /// Construct `AppState` without an engine. Only `/health`, `/readyz`,
+    /// `/v1/models` will serve real data; generation endpoints return
+    /// `model_not_loaded`. Used by the iter-2 backbone path and by tests.
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config: Arc::new(config),
             started_at: Arc::new(Instant::now()),
-            // iter 2: no gen routed → trivially ready.
+            // No engine → no warmup needed → ready.
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
+            engine: None,
+        }
+    }
+
+    /// Construct `AppState` with an engine. The engine worker thread is
+    /// already running at this point; `ready_for_gen` starts `false` until
+    /// the warmup task flips it.
+    pub fn with_engine(config: ServerConfig, engine: Engine) -> Self {
+        Self {
+            config: Arc::new(config),
+            started_at: Arc::new(Instant::now()),
+            ready_for_gen: Arc::new(AtomicBool::new(false)),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            engine: Some(engine),
         }
     }
 

@@ -25,27 +25,233 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use super::engine::{self, SamplingParams};
 use super::schema::{
-    ApiError, HealthResponse, ModelListResponse, ModelObject, ReadyzResponse,
+    ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
+    ReadyzResponse, UsageStats,
 };
 use super::state::AppState;
+
+// ---------------------------------------------------------------------------
+// POST /v1/chat/completions (non-streaming)
+// ---------------------------------------------------------------------------
+
+/// Handler for `POST /v1/chat/completions` — non-streaming path.
+///
+/// Flow:
+///   1. If no engine is loaded: return 400 `model_not_loaded` (Decision #26).
+///   2. If not warmed up yet: return 503 `not_ready` + `Retry-After: 1`.
+///   3. If `request.model` doesn't match the loaded engine: 400
+///      `model_not_loaded` naming the mismatched id.
+///   4. Render the chat template over the OpenAI messages array.
+///   5. Tokenize, enforce context budget (max_tokens capped by
+///      `engine.context_length - prompt_len`; TODO iter 4: overflow policy).
+///   6. Build `SamplingParams` from request tier 1+2+3 fields.
+///   7. Call `engine.generate(...)` — returns after the worker thread
+///      completes the decode.
+///   8. Wrap result in OpenAI `ChatCompletionResponse`.
+///
+/// Streaming (SSE) lands in the next iter; this path only handles
+/// `stream: false` or absent. A request with `stream: true` returns 400
+/// pointing to the iter-4 placeholder until streaming lands.
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Response {
+    // --- Engine gate ---
+    let Some(engine) = state.engine.as_ref() else {
+        return ApiError::model_not_loaded(&req.model).into_response();
+    };
+    if !state.is_ready_for_gen() {
+        return ApiError::not_ready().into_response();
+    }
+    // --- Streaming not yet landed ---
+    if req.stream.unwrap_or(false) {
+        return ApiError::invalid_request(
+            "stream: true is not yet supported by this hf2q build. Use stream: false \
+             or upgrade; streaming lands in the next Phase 2a iter.",
+            Some("stream".into()),
+        )
+        .into_response();
+    }
+
+    // --- Model id match ---
+    // In iter 3 there's one loaded model at a time; accept either the exact
+    // id or the filename stem the user may have supplied.
+    if req.model != engine.model_id() {
+        return ApiError::model_not_loaded(&req.model).into_response();
+    }
+
+    // --- Validate messages ---
+    if req.messages.is_empty() {
+        return ApiError::invalid_request(
+            "messages must contain at least one entry",
+            Some("messages".into()),
+        )
+        .into_response();
+    }
+
+    // --- Render chat template ---
+    let rendered = match engine::render_chat_prompt(engine.chat_template(), &req.messages) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "chat template render failed");
+            return ApiError::invalid_request(
+                format!("chat template render failed: {e}"),
+                Some("messages".into()),
+            )
+            .into_response();
+        }
+    };
+
+    // --- Tokenize ---
+    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "tokenization failed");
+            return ApiError::internal_error().into_response();
+        }
+    };
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_len = prompt_tokens.len();
+
+    // Hard-fail when prompt exceeds context budget. Overflow-policy behavior
+    // (summarize / truncate_left / reject) lands with Decision #23 in a
+    // future iter. Today we return `context_length_exceeded` — matches the
+    // `reject` policy exactly, which is one of the documented Decision #23
+    // options so this is not a stub, just the narrowest-scope first impl.
+    if let Some(ctx_len) = engine.context_length() {
+        if prompt_len >= ctx_len {
+            return ApiError::context_length_exceeded(ctx_len, prompt_len).into_response();
+        }
+    }
+
+    // --- Sampling params ---
+    let max_tokens = req
+        .max_completion_tokens
+        .or(req.max_tokens)
+        .unwrap_or(SamplingParams::default().max_tokens);
+    let stop_strings = req
+        .stop
+        .clone()
+        .map(|s| s.into_vec())
+        .unwrap_or_default();
+
+    let params = SamplingParams {
+        temperature: req.temperature.unwrap_or(0.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        top_k: req.top_k.map(|v| v as usize).unwrap_or(0),
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
+        max_tokens,
+        stop_strings,
+    };
+
+    // --- Generate ---
+    let gen_started = std::time::Instant::now();
+    let result = match engine.generate(prompt_tokens, params).await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            // Distinguish queue_full (→ 429) from other engine errors (→ 500).
+            if msg.contains("queue_full") {
+                return ApiError::queue_full().into_response();
+            }
+            tracing::error!(error = %msg, "chat_completion generation failed");
+            return ApiError::generation_error(msg).into_response();
+        }
+    };
+    let total_time = gen_started.elapsed();
+
+    // --- Wrap in OpenAI response envelope ---
+    let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono_seconds();
+    let system_fingerprint = state.config.system_fingerprint.clone();
+
+    let prefill_time_secs = result.prefill_duration.as_secs_f64();
+    let decode_time_secs = result.decode_duration.as_secs_f64();
+    let total_time_secs = total_time.as_secs_f64();
+    let prefill_tokens_per_sec = if prefill_time_secs > 0.0 {
+        result.prompt_tokens as f64 / prefill_time_secs
+    } else {
+        0.0
+    };
+    let decode_tokens_per_sec = if decode_time_secs > 0.0 {
+        result.completion_tokens as f64 / decode_time_secs
+    } else {
+        0.0
+    };
+    let ttft_ms = prefill_time_secs * 1000.0;
+    let timing = super::schema::TimingInfo {
+        prefill_time_secs,
+        decode_time_secs,
+        total_time_secs,
+        time_to_first_token_ms: ttft_ms,
+        prefill_tokens_per_sec,
+        decode_tokens_per_sec,
+        gpu_sync_count: 0,
+        gpu_dispatch_count: 0,
+    };
+
+    let resp = ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion",
+        created,
+        model: req.model.clone(),
+        system_fingerprint,
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text(result.text)),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            finish_reason: result.finish_reason.to_string(),
+            logprobs: None,
+        }],
+        usage: UsageStats {
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
+            total_tokens: result.prompt_tokens + result.completion_tokens,
+            // Prompt caching (Decision #24) lands with Task #7 — no cached
+            // tokens reported until then.
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            completion_tokens_details: None,
+        },
+        x_hf2q_timing: Some(timing),
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Current Unix epoch seconds (used for response `created` field).
+fn chrono_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // GET /health
 // ---------------------------------------------------------------------------
 
 /// Handler for `GET /health`. Always returns 200 while the HTTP server is
-/// running. The response includes currently-loaded model id (once a future
-/// iter wires a model into `AppState`), backend name, context length, and
-/// process uptime in seconds.
+/// running. The response includes currently-loaded model id (when an engine
+/// is wired into `AppState`), backend name, context length, and process
+/// uptime in seconds.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let (model, context_length) = match state.engine.as_ref() {
+        Some(e) => (Some(e.model_id().to_string()), e.context_length()),
+        None => (None, None),
+    };
     let resp = HealthResponse {
         status: "ok".to_string(),
-        // iter 2: no engine wired → no model id/context-length yet. Future
-        // iter: pull from state.engine.model_id / state.engine.context_length.
-        model: None,
+        model,
         backend: "mlx-native",
-        context_length: None,
+        context_length,
         uptime_seconds: state.uptime_seconds(),
     };
     (StatusCode::OK, Json(resp))
@@ -95,19 +301,42 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 /// request hot path responsive.
 pub async fn list_models(State(state): State<AppState>) -> Response {
     let cache_dir = state.config.cache_dir.clone();
-    let models = match tokio::task::spawn_blocking(move || scan_cache_dir(cache_dir.as_deref()))
-        .await
-    {
-        Ok(Ok(models)) => models,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "model cache scan failed");
-            return ApiError::internal_error().into_response();
+    let mut models =
+        match tokio::task::spawn_blocking(move || scan_cache_dir(cache_dir.as_deref())).await {
+            Ok(Ok(models)) => models,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "model cache scan failed");
+                return ApiError::internal_error().into_response();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "spawn_blocking panicked in list_models");
+                return ApiError::internal_error().into_response();
+            }
+        };
+    // Mark the currently-loaded model as loaded=true. If the loaded model
+    // isn't in the cache catalog (e.g. loaded from a path outside
+    // ~/.cache/hf2q/), prepend it.
+    if let Some(engine) = state.engine.as_ref() {
+        let loaded_id = engine.model_id().to_string();
+        match models.iter_mut().find(|m| m.id == loaded_id) {
+            Some(m) => m.loaded = true,
+            None => {
+                models.insert(
+                    0,
+                    ModelObject {
+                        id: loaded_id,
+                        object: "model",
+                        created: chrono_seconds(),
+                        owned_by: "hf2q",
+                        context_length: engine.context_length(),
+                        quant_type: engine.quant_type().map(|s| s.to_string()),
+                        backend: Some("mlx-native"),
+                        loaded: true,
+                    },
+                );
+            }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "spawn_blocking panicked in list_models");
-            return ApiError::internal_error().into_response();
-        }
-    };
+    }
     let resp = ModelListResponse {
         object: "list",
         data: models,

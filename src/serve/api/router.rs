@@ -18,7 +18,7 @@
 //!   401 responses to carry the request-id for correlation.
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use super::handlers;
@@ -39,6 +39,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(handlers::readyz))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
+        .route("/v1/chat/completions", post(handlers::chat_completions))
         .fallback(fallback)
         // Apply layers outside-in. The axum convention is `.layer()` wraps,
         // so the last `.layer(X)` call becomes the outermost layer.
@@ -315,6 +316,62 @@ mod tests {
     }
 
     // --- 404 fallback still emits request-id + correct shape ---
+
+    // --- /v1/chat/completions (non-streaming path, no engine) ---
+
+    #[tokio::test]
+    async fn chat_completions_without_engine_returns_model_not_loaded() {
+        let app = build_router(state_default());
+        let body = r#"{"model":"gemma4","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_text = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_empty_messages() {
+        // Even without an engine, an empty messages array should fail
+        // validation before the engine gate — BUT the handler currently
+        // gates on engine first, so this returns model_not_loaded. The
+        // validation path is exercised once the engine is wired in iter 4
+        // tests. This test documents the current ordering.
+        let app = build_router(state_default());
+        let body = r#"{"model":"gemma4","messages":[]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // With no engine, the handler returns model_not_loaded first.
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_malformed_json_returns_400() {
+        let app = build_router(state_default());
+        let body = r#"{ not valid json"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // axum's default JSON extractor rejection surface.
+        assert_eq!(resp.status().as_u16() / 100, 4, "4xx expected");
+    }
 
     #[tokio::test]
     async fn unknown_route_with_auth_still_gets_401_before_404() {

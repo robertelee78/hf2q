@@ -115,7 +115,7 @@ fn detect_hardware_info() -> (String, u64) {
 
 /// Hardcoded fallback chat template used ONLY when no GGUF-embedded template
 /// exists and the user has not passed `--chat-template` / `--chat-template-file`.
-const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
+pub(crate) const FALLBACK_GEMMA4_CHAT_TEMPLATE: &str =
     "<bos><|turn>system\n<|think|><turn|>\n<|turn>user\n{{PROMPT}}<turn|>\n<|turn>model\n";
 
 /// Resolve the chat template per ADR-005 Phase 1 priority order:
@@ -513,30 +513,49 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
     }
 
-    // --- Fail-fast GGUF validation (if --model supplied) ---
-    if let Some(model_path) = &args.model {
+    // --- Optionally load the model + spawn the engine ---
+    // When --model is supplied, we eagerly load (Decision #15 fail-fast) and
+    // spawn the serialized-FIFO worker thread. Warmup runs on the worker
+    // thread (dispatched via Engine::warmup) and once it completes we flip
+    // `ready_for_gen` on the AppState so /readyz returns 200 and
+    // /v1/chat/completions accepts requests.
+    let engine_opt = if let Some(model_path) = args.model.as_ref() {
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
             model_path.display()
         );
-        // Header-only parse; no tensor data read.
-        let gguf = mlx_native::gguf::GgufFile::open(model_path)
-            .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
-        tracing::info!(
-            path = %model_path.display(),
-            tensors = gguf.tensor_count(),
-            metadata = gguf.metadata_count(),
-            "Validated GGUF header"
-        );
-        // NOTE: actual model load + warmup lands with the /v1/chat iter.
-        // This `--model` argument is accepted now so the CLI contract is
-        // stable; the engine wiring is the only thing still missing, not
-        // the flag shape.
-    }
+        // Header-only parse surfaces bad magic immediately without loading
+        // any tensor data.
+        {
+            let gguf = mlx_native::gguf::GgufFile::open(model_path)
+                .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+            tracing::info!(
+                path = %model_path.display(),
+                tensors = gguf.tensor_count(),
+                metadata = gguf.metadata_count(),
+                "Validated GGUF header"
+            );
+        }
+
+        let load_opts = api::engine::LoadOptions {
+            model_path: model_path.clone(),
+            tokenizer_path: args.tokenizer.clone(),
+            config_path: args.config.clone(),
+        };
+        let loaded = api::engine::LoadedModel::load(&load_opts)?;
+        let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
+        Some(engine)
+    } else {
+        None
+    };
 
     // --- Build router ---
-    let state = api::AppState::new(config.clone());
+    let state = match engine_opt {
+        Some(engine) => api::AppState::with_engine(config.clone(), engine),
+        None => api::AppState::new(config.clone()),
+    };
+    let state_for_warmup = state.clone();
     let router = api::build_router(state);
 
     // --- Async runtime + serve ---
@@ -556,6 +575,27 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             "hf2q HTTP server listening"
         );
         eprintln!("hf2q serving on http://{}", bind);
+
+        // Dispatch warmup in the background if an engine was spawned.
+        // /readyz returns 503 while this runs; it flips to 200 when the
+        // warmup Reply arrives. Done in a spawn so the server can already
+        // accept non-generation endpoints (health/models) during warmup.
+        if let Some(engine) = state_for_warmup.engine.clone() {
+            let ready_flag = state_for_warmup.ready_for_gen.clone();
+            tokio::spawn(async move {
+                match engine.warmup().await {
+                    Ok(()) => {
+                        ready_flag.store(true, std::sync::atomic::Ordering::Release);
+                        tracing::info!("hf2q engine warmup complete; /readyz now 200");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "engine warmup failed");
+                        // Leave ready_for_gen false — /readyz stays 503 so
+                        // orchestrators don't route traffic.
+                    }
+                }
+            });
+        }
 
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown_signal())

@@ -26,6 +26,7 @@ pub mod schema;
 pub mod sse;
 pub mod state;
 pub mod middleware;
+pub mod engine;
 pub mod handlers;
 pub mod router;
 
