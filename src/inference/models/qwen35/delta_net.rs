@@ -12,8 +12,8 @@
 //!  6. Q = L2Norm(Q over D_k)                     (ADR Decision 3)
 //!     K = L2Norm(K over D_k)
 //!  7. alpha_logit = ssm_alpha @ x_norm + ssm_dt_bias     // [seq, n_v]
-//!     g = softplus(alpha_logit) * ssm_a                  // ssm_a is pre-computed decay
-//!     (exp(-g) is applied inside GATED_DELTA_NET)
+//!     g = softplus(alpha_logit) * (-ssm_a)               // ssm_a = -exp(A_log) in GGUF
+//!     (alpha = exp(-g) is applied inside GATED_DELTA_NET)
 //!     beta_logit  = ssm_beta  @ x_norm                    // [seq, n_v]
 //!     beta = sigmoid(beta_logit)
 //!  8. (output, state') = GATED_DELTA_NET(Q, K, V, g, beta, state)  (Decision 6)
@@ -69,8 +69,8 @@ pub struct DeltaNetLayerWeights {
     pub ssm_beta: Vec<f32>,
     /// Per-head log-decay base: `[n_v_heads]`. Note ADR-012 Gotcha #2
     /// (A_log negation): this is stored as log(|A|) with sign handled by
-    /// Used as `g = softplus(logit) * ssm_a` (direct multiply, no exp).
-    /// Stored as pre-computed `-A_log.exp()` values in the model GGUF.
+    /// Used as `g = softplus(logit) * (-ssm_a)`.
+    /// Stored as `-exp(A_log)` (negated from HF model) by convert_hf_to_gguf.py.
     pub ssm_a: Vec<f32>,
     /// Output per-head RMSNorm: `[n_v_heads * D_v]`.
     pub ssm_norm: Vec<f32>,
@@ -324,10 +324,12 @@ pub fn delta_net_layer_cpu_ref(
     for t in 0..seq {
         for h_idx in 0..nv {
             let a_logit = alpha_logits[t * nv + h_idx] + weights.ssm_dt_bias[h_idx];
-            // g = softplus(a_logit) * ssm_a[h_idx].
-            // ssm_a contains pre-computed values (stored as -A_log.exp() in model).
-            // Matches llama.cpp: gate = ggml_mul(alpha_softplus, ssm_a) — no extra exp().
-            g[t * nv + h_idx] = softplus(a_logit) * weights.ssm_a[h_idx];
+            // ssm_a_gguf stores -exp(A_log) (negated in llama.cpp convert_hf_to_gguf.py).
+            // HF formula: g = softplus(delta) * exp(A_log)
+            // GGUF:        ssm_a = -exp(A_log), so exp(A_log) = -ssm_a
+            // Therefore:   g = softplus(delta) * (-ssm_a[h_idx])
+            // g must be positive so alpha = exp(-g) is in (0, 1).
+            g[t * nv + h_idx] = softplus(a_logit) * (-weights.ssm_a[h_idx]);
             beta[t * nv + h_idx] = sigmoid(beta_logits[t * nv + h_idx]);
         }
     }
