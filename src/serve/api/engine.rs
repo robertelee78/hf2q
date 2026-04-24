@@ -48,9 +48,12 @@ use crate::serve::header;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Sampling parameters passed to the engine worker. Subset of OpenAI
-/// Tier 2/3 — the fields actually wired to `sampler_pure::SamplingParams`
-/// in this iter. Tier 4 logits (logit_bias, logprobs) land later.
+/// Sampling parameters passed to the engine worker. Full Tier 2/3/4
+/// surface plumbed from the request; sampler_pure currently honors the
+/// first four (temperature, top_p, top_k, repetition_penalty, max_tokens).
+/// The remaining fields (frequency/presence penalty, min_p, seed,
+/// logit_bias) plumb through untouched until the forward-decode refactor
+/// exposes logits so they can be applied at sample time.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -61,6 +64,32 @@ pub struct SamplingParams {
     /// Stop strings — if one appears in the running decoded text, generation
     /// halts with finish_reason `stop`. Case-sensitive.
     pub stop_strings: Vec<String>,
+
+    // --- Tier 2 additions (plumbed, not all wired into sampler yet) ---
+    /// Nucleus-sampling lower bound used with `top_p`. OpenAI Tier 2.
+    pub frequency_penalty: f32,
+    /// OpenAI Tier 2.
+    pub presence_penalty: f32,
+    /// Optional RNG seed for reproducible sampling. `None` → thread RNG.
+    /// Greedy (T=0) decodes are deterministic regardless.
+    pub seed: Option<u64>,
+
+    // --- Tier 3 addition (llama.cpp / ollama extension) ---
+    /// Min-p sampling cutoff. `0.0` disables. Tier 3.
+    pub min_p: f32,
+
+    // --- Tier 4 (power-user) ---
+    /// Per-token-id logit bias map. Applied before softmax once the
+    /// forward-decode refactor exposes logits.
+    pub logit_bias: std::collections::HashMap<u32, f32>,
+    /// If `true`, include top-k logprobs in the response. Tier 4.
+    pub logprobs: bool,
+    /// Number of top alternatives to report per chosen token. 0 = only the
+    /// chosen token's logprob.
+    pub top_logprobs: u32,
+    /// `true` = allow multiple tool calls in the same turn. Tier 4. Plumbs
+    /// through to the grammar-constrained decode path when it lands.
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for SamplingParams {
@@ -75,6 +104,14 @@ impl Default for SamplingParams {
             repetition_penalty: 1.0,
             max_tokens: 512,
             stop_strings: Vec::new(),
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            seed: None,
+            min_p: 0.0,
+            logit_bias: std::collections::HashMap::new(),
+            logprobs: false,
+            top_logprobs: 0,
+            parallel_tool_calls: true,
         }
     }
 }
@@ -152,10 +189,14 @@ enum Request {
     /// stats }` (or `Error`). When the handler's SSE stream is dropped
     /// (client disconnect per Decision #18), `events.send` returns Err and
     /// the worker breaks early — the queue slot is freed immediately.
+    /// `cancellation_counter` (if `Some`) is incremented by 1 when the
+    /// worker aborts because the receiver was dropped; surfaced via
+    /// `hf2q_sse_cancellations` in `/metrics`.
     GenerateStream {
         prompt_tokens: Vec<u32>,
         params: SamplingParams,
         events: mpsc::Sender<super::sse::GenerationEvent>,
+        cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
     },
     /// Graceful-shutdown sentinel.
     Shutdown,
@@ -440,11 +481,13 @@ impl Engine {
         prompt_tokens: Vec<u32>,
         params: SamplingParams,
         events_tx: mpsc::Sender<super::sse::GenerationEvent>,
+        cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Result<()> {
         let req = Request::GenerateStream {
             prompt_tokens,
             params,
             events: events_tx,
+            cancellation_counter,
         };
         match self.inner.tx.try_send(req) {
             Ok(()) => Ok(()),
@@ -492,12 +535,22 @@ fn worker_run(
                 prompt_tokens,
                 params,
                 events,
+                cancellation_counter,
             } => {
                 // The streaming path sends every event (Delta / Done / Error)
                 // via `events`. Errors stay inside the function — the
                 // terminal event is always one of Done/Error, unless the
                 // receiver was dropped (client disconnect → early exit).
-                generate_stream_once(&mut loaded, &prompt_tokens, &params, &events, registration.as_ref());
+                // When the early-exit path fires, we bump the cancellation
+                // counter if supplied (→ hf2q_sse_cancellations in /metrics).
+                generate_stream_once(
+                    &mut loaded,
+                    &prompt_tokens,
+                    &params,
+                    &events,
+                    registration.as_ref(),
+                    cancellation_counter.as_deref(),
+                );
             }
             Request::Shutdown => {
                 tracing::info!("hf2q-engine worker received Shutdown; exiting");
@@ -704,14 +757,19 @@ fn generate_stream_once(
     params: &SamplingParams,
     events: &mpsc::Sender<super::sse::GenerationEvent>,
     registration: Option<&super::registry::ModelRegistration>,
+    cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
 ) {
     use super::sse::{DeltaKind, GenerationEvent, StreamStats};
 
-    // Helper: send an event; return false if the receiver is gone.
+    // Helper: send an event; if the receiver is gone, bump the
+    // cancellation counter (→ hf2q_sse_cancellations in /metrics) and bail.
     macro_rules! send {
         ($ev:expr) => {
             if events.blocking_send($ev).is_err() {
                 tracing::info!("SSE stream dropped by client; aborting decode");
+                if let Some(c) = cancellation_counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return;
             }
         };

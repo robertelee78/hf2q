@@ -96,7 +96,7 @@ pub async fn chat_completions(
             // Distinguish queue_full (→ 429) from other engine errors (→ 500).
             if msg.contains("queue_full") {
                 state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
-                return ApiError::queue_full().into_response();
+                return queue_full_with_rate_limit_headers(&state);
             }
             tracing::error!(error = %msg, "chat_completion generation failed");
             return ApiError::generation_error(msg).into_response();
@@ -260,6 +260,18 @@ fn prepare_chat_generation(
         .clone()
         .map(|s| s.into_vec())
         .unwrap_or_default();
+    // Translate request logit_bias (HashMap<String, f32>) → HashMap<u32, f32>.
+    // OpenAI keys are stringified token ids; we accept any string that parses
+    // as an unsigned int. Malformed keys are silently dropped + warned.
+    let logit_bias: std::collections::HashMap<u32, f32> = req
+        .logit_bias
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, *v)))
+                .collect()
+        })
+        .unwrap_or_default();
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
@@ -267,6 +279,14 @@ fn prepare_chat_generation(
         repetition_penalty: req.repetition_penalty.unwrap_or(1.0),
         max_tokens,
         stop_strings,
+        frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        presence_penalty: req.presence_penalty.unwrap_or(0.0),
+        seed: req.seed,
+        min_p: req.min_p.unwrap_or(0.0),
+        logit_bias,
+        logprobs: req.logprobs.unwrap_or(false),
+        top_logprobs: req.top_logprobs.unwrap_or(0),
+        parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
     };
     Ok(PreparedChatContext {
         engine: (),
@@ -292,13 +312,27 @@ async fn chat_completions_stream(
     };
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
+    // Worker bumps this counter if it aborts because the SSE receiver was
+    // dropped (client disconnect per Decision #18). Shared atomic lives on
+    // ServerMetrics so /metrics surfaces it.
+    let cancellation_counter =
+        Some(state.metrics.sse_cancellations_counter_arc());
     if let Err(e) = engine
-        .generate_stream(prepared.prompt_tokens, prepared.params, events_tx)
+        .generate_stream(
+            prepared.prompt_tokens,
+            prepared.params,
+            events_tx,
+            cancellation_counter,
+        )
         .await
     {
         let msg = format!("{e}");
         if msg.contains("queue_full") {
-            return ApiError::queue_full().into_response();
+            state
+                .metrics
+                .chat_completions_queue_full
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return queue_full_with_rate_limit_headers(&state);
         }
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
         return ApiError::generation_error(msg).into_response();
@@ -379,6 +413,38 @@ ws ::= | " " | "\n" [ \t]{0,20}
             .into_response());
     }
     Ok(())
+}
+
+/// Build a 429 `queue_full` response with OpenAI-convention rate-limit
+/// headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`).
+/// The OpenAI error envelope is preserved; these headers supplement
+/// `Retry-After` with the advisory values the client can use to pace
+/// retries.
+///
+/// Values:
+///   - `Limit`    = configured queue capacity.
+///   - `Remaining` = 0 when we're returning 429 (queue is at capacity).
+///   - `Reset`    = seconds until retry is likely to succeed (same as
+///                  Retry-After — 1 second heuristic for queue-based backoff).
+fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
+    use axum::http::{header::HeaderName, HeaderValue};
+    let err = ApiError::queue_full();
+    let mut resp = err.into_response();
+    let cap = state.config.queue_capacity as u64;
+    let headers = resp.headers_mut();
+    // OpenAI convention uses dashed Title-Case header names.
+    if let Ok(v) = HeaderValue::from_str(&cap.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-limit"), v);
+    }
+    headers.insert(
+        HeaderName::from_static("x-ratelimit-remaining"),
+        HeaderValue::from_static("0"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-ratelimit-reset"),
+        HeaderValue::from_static("1"),
+    );
+    resp
 }
 
 /// Current Unix epoch seconds (used for response `created` field).

@@ -108,6 +108,11 @@ pub fn default_cache_dir() -> Option<PathBuf> {
 
 /// Process-wide metric counters surfaced via `/metrics` in Prometheus text
 /// format (Decision #11). Cheap atomics; handler code bumps them inline.
+///
+/// `sse_cancellations` is wrapped in `Arc<AtomicU64>` because it needs to
+/// be shared with the engine worker thread (the worker detects the
+/// receiver drop and bumps the counter directly). The other counters are
+/// bumped from the handler thread and don't need the extra Arc hop.
 #[derive(Debug, Default)]
 pub struct ServerMetrics {
     /// Total number of HTTP requests that reached a handler (post-auth).
@@ -121,14 +126,23 @@ pub struct ServerMetrics {
     /// `queue_full` (FIFO at capacity → 429).
     pub chat_completions_queue_full: AtomicU64,
     /// Total number of SSE stream cancellations (client dropped the
-    /// connection mid-generation; Decision #18).
-    pub sse_cancellations: AtomicU64,
+    /// connection mid-generation; Decision #18). Shared Arc so the
+    /// engine worker thread can bump directly.
+    pub sse_cancellations: Arc<AtomicU64>,
     /// Total tokens decoded across all completions (cumulative counter).
     pub decode_tokens_total: AtomicU64,
     /// Total prompt tokens ingested across all completions.
     pub prompt_tokens_total: AtomicU64,
     /// Total requests rejected at handler boundary (auth, malformed, etc.).
     pub requests_rejected_total: AtomicU64,
+}
+
+impl ServerMetrics {
+    /// Clone the shared `sse_cancellations` Arc so the engine worker thread
+    /// can bump it from outside the handler.
+    pub fn sse_cancellations_counter_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.sse_cancellations)
+    }
 }
 
 /// Shared runtime state threaded through axum handlers.
