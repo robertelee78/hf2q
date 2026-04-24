@@ -193,26 +193,58 @@ if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PROMPT_CONTENT" \
   echo "hf2q failed. See $LOG_HF2Q" >&2; exit 3
 fi
 
-# 3. Common-byte-prefix diff. hf2q's stdout has a 4-line header (per
-#    src/serve/header.rs) that we strip before comparison, matching
-#    sourdough_gate.sh's approach.
+# 3. Common-byte-prefix diff.
+#    - hf2q's stdout has a 4-line header (per src/serve/header.rs) that
+#      we strip before comparison.
+#    - llama-cli's stdout has a banner + loading progress + ASCII art
+#      logo + single-turn chat prompt line + "| [Start thinking]" marker
+#      that we also strip. The generated text starts after the assistant
+#      prompt line. Strip from the start up through the last `\n> ` + the
+#      next `\n` (the prompt-echo line) before comparison.
 DIFF_TSV="/tmp/sourdough_qwen35_diff.tsv"
 python3 - "$OUT_LLAMA" "$OUT_HF2Q" "$DIFF_TSV" <<'PY'
 import sys, json
-a = open(sys.argv[1], "rb").read()
+a_raw = open(sys.argv[1], "rb").read()
 b_raw = open(sys.argv[2], "rb").read()
 out = sys.argv[3]
-# Strip hf2q's 4-line stdout header ("hf2q · <chip> · <backend>" etc.)
-if b_raw.startswith(b"hf2q \xc2\xb7 "):
+
+def strip_hf2q_header(buf):
+    """hf2q prints 4 leader lines before the generated text."""
+    if not buf.startswith(b"hf2q \xc2\xb7 "):
+        return buf
     pos = 0
     for _ in range(4):
-        nl = b_raw.find(b"\n", pos)
+        nl = buf.find(b"\n", pos)
         if nl < 0:
-            break
+            return buf
         pos = nl + 1
-    b = b_raw[pos:]
-else:
-    b = b_raw
+    return buf[pos:]
+
+def strip_llama_banner(buf):
+    """llama-cli emits: progress spinner + ASCII logo + build/model/
+    modalities + available-commands + a prompt-echo line starting with
+    `> `. The generated text begins immediately after that echo line's
+    newline. Scan for the '\\n> ' prompt-echo and skip past its line."""
+    # Find the last occurrence of a line starting with "> " — that's
+    # llama-cli's echo of the user prompt before generation.
+    needle = b"\n> "
+    idx = buf.rfind(needle)
+    if idx < 0:
+        return buf
+    # Skip past the newline-terminated prompt-echo line.
+    nl = buf.find(b"\n", idx + 1)
+    if nl < 0:
+        return buf[idx + len(needle):]
+    return buf[nl + 1:]
+
+a = strip_llama_banner(a_raw)
+b = strip_hf2q_header(b_raw)
+# Also trim trailing llama-cli footer ("\n[ Prompt: ... | Generation: ... ]\nExiting...\n")
+tail_marker = b"\n[ Prompt: "
+tidx = a.rfind(tail_marker)
+if tidx >= 0:
+    a = a[:tidx]
+
 n = min(len(a), len(b))
 i = 0
 while i < n and a[i] == b[i]:
