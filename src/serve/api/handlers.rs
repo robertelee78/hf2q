@@ -1115,6 +1115,29 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
             );
         }
     }
+    // Prepend the mmproj if one was supplied via --mmproj. Context length
+    // doesn't apply to a vision-tower projector, so it's left `None`;
+    // clients that care can inspect the id (file stem) to correlate with
+    // their chat model. Listed with `loaded: true` — header+config are
+    // resident in memory, weight loading happens on first multimodal
+    // request in a later iter.
+    if let Some(m) = state.mmproj.as_ref() {
+        if !models.iter().any(|existing| existing.id == m.model_id) {
+            models.insert(
+                0,
+                ModelObject {
+                    id: m.model_id.clone(),
+                    object: "model",
+                    created: chrono_seconds(),
+                    owned_by: "hf2q",
+                    context_length: None,
+                    quant_type: None,
+                    backend: Some("mlx-native"),
+                    loaded: true,
+                },
+            );
+        }
+    }
     let resp = ModelListResponse {
         object: "list",
         data: models,

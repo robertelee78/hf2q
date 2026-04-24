@@ -22,6 +22,7 @@ use std::time::Instant;
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
 use crate::inference::models::bert::BertConfig;
+use crate::inference::vision::mmproj::MmprojConfig;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
@@ -170,6 +171,12 @@ pub struct AppState {
     /// via `BertConfig::from_gguf` — the forward pass that consumes this
     /// lands in a later iter (ADR-005 Phase 2b).
     pub embedding_config: Option<EmbeddingModel>,
+    /// Multimodal projector (mmproj GGUF) loaded at startup from
+    /// `--mmproj <path>`. When `Some`, the chat handler accepts
+    /// `image_url` content parts and routes them through the vision
+    /// preprocessor + ViT forward pass that this mmproj describes.
+    /// `None` means the server is text-only.
+    pub mmproj: Option<LoadedMmproj>,
     /// Process-wide metric counters surfaced via `/metrics`.
     pub metrics: Arc<ServerMetrics>,
 }
@@ -220,6 +227,19 @@ impl EmbeddingModel {
     }
 }
 
+/// Loaded mmproj (multimodal projector) descriptor. Captures the GGUF
+/// path + the parsed `MmprojConfig` header + a stable `model_id` (file
+/// stem). Weights are NOT loaded here — the ViT forward-pass iter
+/// (ADR-005 Phase 2c Task #15) will memory-map the tensors on demand.
+///
+/// Cheap to clone (PathBuf + small struct + String).
+#[derive(Debug, Clone)]
+pub struct LoadedMmproj {
+    pub gguf_path: PathBuf,
+    pub config: MmprojConfig,
+    pub model_id: String,
+}
+
 impl AppState {
     /// Construct `AppState` without an engine. Only `/health`, `/readyz`,
     /// `/v1/models` will serve real data; generation endpoints return
@@ -233,6 +253,7 @@ impl AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: None,
             embedding_config: None,
+            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
@@ -248,6 +269,7 @@ impl AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: Some(engine),
             embedding_config: None,
+            mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
@@ -257,6 +279,14 @@ impl AppState {
     /// GGUF header.
     pub fn with_embedding_model(mut self, em: EmbeddingModel) -> Self {
         self.embedding_config = Some(em);
+        self
+    }
+
+    /// Attach an mmproj descriptor. Called by `cmd_serve` after validating
+    /// the supplied mmproj GGUF header. The ViT forward pass that consumes
+    /// this lands in ADR-005 Phase 2c Task #15.
+    pub fn with_mmproj(mut self, m: LoadedMmproj) -> Self {
+        self.mmproj = Some(m);
         self
     }
 
@@ -380,5 +410,38 @@ mod tests {
         let ids = em.encode("hello world").expect("encode");
         assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
         assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
+    }
+
+    #[test]
+    fn with_mmproj_attaches_descriptor_to_state() {
+        // Verifies the `with_mmproj` builder — iter 25 multimodal wiring.
+        // Exercises the typed plumbing (field presence, model_id, path
+        // round-trip) without touching a real GGUF; parsing is covered by
+        // `inference::vision::mmproj::tests`.
+        use crate::inference::vision::mmproj::{MmprojConfig, ProjectorType};
+        let cfg = MmprojConfig {
+            image_size: 896,
+            patch_size: 14,
+            num_patches_side: 64,
+            hidden_size: 1152,
+            intermediate_size: 4304,
+            num_attention_heads: 16,
+            num_hidden_layers: 27,
+            layer_norm_eps: 1e-6,
+            projector: ProjectorType::Mlp,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+        };
+        let m = LoadedMmproj {
+            gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
+            config: cfg.clone(),
+            model_id: "synthetic-mmproj".into(),
+        };
+        let state = AppState::new(ServerConfig::default()).with_mmproj(m);
+        let attached = state.mmproj.as_ref().expect("mmproj should be Some");
+        assert_eq!(attached.model_id, "synthetic-mmproj");
+        assert_eq!(attached.gguf_path.file_name().unwrap(), "synthetic-mmproj.gguf");
+        assert_eq!(attached.config, cfg);
+        assert!(attached.config.projector.is_supported());
     }
 }

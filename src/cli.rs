@@ -330,6 +330,15 @@ pub struct ServeArgs {
     /// (ADR-005 Phase 2b, Task #13).
     #[arg(long)]
     pub embedding_model: Option<PathBuf>,
+
+    /// Path to a multimodal projector GGUF (mmproj). When supplied, the
+    /// server validates the file's GGUF header + parses the
+    /// `MmprojConfig` at startup and surfaces it via `/v1/models`.
+    /// Required for `image_url` content parts in `/v1/chat/completions`.
+    /// Without it, the server is text-only and rejects image parts with
+    /// 400 `no_mmproj_loaded` (ADR-005 Phase 2c Task #14).
+    #[arg(long)]
+    pub mmproj: Option<PathBuf>,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to

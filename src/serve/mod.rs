@@ -594,6 +594,43 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         None
     };
 
+    // --- Optionally validate + load the mmproj (multimodal projector) ---
+    // Header parse only; weight loading lands alongside the ViT forward
+    // pass (ADR-005 Phase 2c Task #15). Fail fast if the file is absent
+    // or malformed so the server never advertises multimodal capability
+    // it can't back.
+    let mmproj = if let Some(mmp_path) = args.mmproj.as_ref() {
+        anyhow::ensure!(
+            mmp_path.exists(),
+            "mmproj not found: {}",
+            mmp_path.display()
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(mmp_path)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF header parse failed: {e}"))?;
+        let mmp_config = crate::inference::vision::mmproj::MmprojConfig::from_gguf(&gguf)
+            .map_err(|e| anyhow::anyhow!("mmproj GGUF config parse failed: {e}"))?;
+        let model_id = mmp_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "mmproj".into());
+        tracing::info!(
+            path = %mmp_path.display(),
+            image_size = mmp_config.image_size,
+            patch_size = mmp_config.patch_size,
+            hidden = mmp_config.hidden_size,
+            layers = mmp_config.num_hidden_layers,
+            projector = mmp_config.projector.as_str(),
+            "Validated mmproj GGUF header"
+        );
+        Some(api::state::LoadedMmproj {
+            gguf_path: mmp_path.clone(),
+            config: mmp_config,
+            model_id,
+        })
+    } else {
+        None
+    };
+
     // --- Build router ---
     let mut state = match engine_opt {
         Some(engine) => api::AppState::with_engine(config.clone(), engine),
@@ -601,6 +638,9 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     };
     if let Some(em) = embedding_model {
         state = state.with_embedding_model(em);
+    }
+    if let Some(m) = mmproj {
+        state = state.with_mmproj(m);
     }
     let state_for_warmup = state.clone();
     let router = api::build_router(state);
