@@ -34,6 +34,10 @@ fn top_level_help_lists_smoke_subcommand() {
 
 #[test]
 fn smoke_help_documents_required_flags() {
+    // Full SmokeArgs surface per src/cli.rs::SmokeArgs — every flag the
+    // subcommand accepts must appear in --help (clap derive discovers
+    // these automatically; this test catches an accidental `skip`
+    // attribute that would suppress an otherwise-live flag).
     hf2q()
         .args(["smoke", "--help"])
         .env_remove("HF_TOKEN")
@@ -42,7 +46,12 @@ fn smoke_help_documents_required_flags() {
         .stdout(predicate::str::contains("--arch"))
         .stdout(predicate::str::contains("--quant"))
         .stdout(predicate::str::contains("--with-vision"))
-        .stdout(predicate::str::contains("--dry-run"));
+        .stdout(predicate::str::contains("--skip-convert"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--fixtures-root"))
+        .stdout(predicate::str::contains("--local-dir"))
+        .stdout(predicate::str::contains("--convert-output-dir"))
+        .stdout(predicate::str::contains("--llama-cli-override"));
 }
 
 #[test]
