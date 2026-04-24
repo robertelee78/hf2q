@@ -2473,4 +2473,175 @@ mod tests {
         let inv = transform_linear_attn_tensor(fwd, &ctx_inv).unwrap();
         assert_eq!(inv.data, original_data, "case6 round-trip (fwd then inv) failed");
     }
+
+    // ----------------------------------------------------------------
+    // apply_qwen35_linear_attn_transforms_in_tensor_map walker tests
+    // ----------------------------------------------------------------
+    //
+    // These prove the walker dispatches correctly, short-circuits for
+    // non-Qwen3.5 arches, and produces the same byte-output as direct
+    // `transform_linear_attn_tensor` calls. Flips from UNWIRED to WIRED
+    // is a separate commit that updates the older fixture shapes +
+    // turns on the Phase 1.7 invocation in main.rs.
+
+    use crate::ir::{ModelMetadata, RopeParameters, TensorMap};
+
+    fn walker_metadata_qwen35moe(nk: u32, nv: u32) -> ModelMetadata {
+        ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".to_string(),
+            model_type: "qwen3_5_moe_text".to_string(),
+            num_layers: 4,
+            num_attention_heads: 4,
+            num_kv_heads: Some(1),
+            hidden_size: 64,
+            intermediate_size: Some(128),
+            vocab_size: 128,
+            head_dim: Some(16),
+            num_experts: Some(4),
+            top_k_experts: Some(2),
+            param_count: 0,
+            layer_types: vec![],
+            dtype: "float16".to_string(),
+            shard_count: 1,
+            partial_rotary_factor: Some(0.25),
+            rope_parameters: Some(RopeParameters {
+                mrope_interleaved: false,
+                mrope_section: vec![3, 3, 2],
+                rope_theta: 10_000_000.0,
+                rope_type: "mrope".to_string(),
+                partial_rotary_factor: 0.25,
+            }),
+            full_attention_interval: Some(4),
+            attn_output_gate: Some(true),
+            mamba_ssm_dtype: Some("float32".to_string()),
+            moe_intermediate_size: Some(64),
+            shared_expert_intermediate_size: Some(64),
+            mtp_num_hidden_layers: Some(0),
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+            explicit_layer_types: None,
+            linear_num_value_heads: Some(nv),
+            linear_num_key_heads: Some(nk),
+            linear_key_head_dim: Some(16),
+            linear_value_head_dim: Some(16),
+            linear_conv_kernel_dim: Some(4),
+            raw_config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    #[test]
+    fn walker_noop_when_nv_equals_nk() {
+        // Short-circuit: transform_linear_attn_tensor returns input unchanged
+        // when nv_per_k == 1 (nk == nv). Walker must preserve that behavior.
+        let mut tm = TensorMap::new();
+        // A tensor whose name matches but shapes don't matter because
+        // the short-circuit fires first.
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: vec![0xAAu8; 16],
+        });
+        let meta = walker_metadata_qwen35moe(4, 4); // nk == nv
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        assert_eq!(t.data, vec![0xAAu8; 16], "nv == nk must short-circuit unchanged");
+    }
+
+    #[test]
+    fn walker_skips_non_qwen35_arch() {
+        // Non-Qwen3.5 arches (Gemma, LLaMA) must be no-op.
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: vec![0xCCu8; 16],
+        });
+        let mut meta = walker_metadata_qwen35moe(2, 4);
+        meta.architecture = "Gemma4ForCausalLM".to_string();
+        meta.model_type = "gemma4".to_string();
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        assert_eq!(t.data, vec![0xCCu8; 16], "non-Qwen3.5 arches must be no-op");
+    }
+
+    #[test]
+    fn walker_skips_tensors_without_linear_attn_prefix() {
+        // Tensors that don't contain "linear_attn." must pass through.
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![64, 64],
+            dtype: DType::F16,
+            data: vec![0xBBu8; 64 * 64 * 2],
+        });
+        let meta = walker_metadata_qwen35moe(2, 4);
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.attn_q.weight").unwrap();
+        assert_eq!(
+            t.data,
+            vec![0xBBu8; 64 * 64 * 2],
+            "non-linear_attn tensor must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn walker_applies_v_head_reorder_to_a_log() {
+        // nk=2, nv=4 → nv_per_k = 2. A_log is 1-D [nv] = [4].
+        // Hand-computed reorder: src index → dst index per case 4.
+        // With ndim==1, Python unsqueezes to [4, 1], reorders, squeezes back.
+        //
+        // The reorder formula from case 3/4:
+        //   src[k * nv_per_k + v] → dst[v * nk + k] for k in [0,nk), v in [0,nv_per_k)
+        //
+        // Seed: [0x01, 0x02, 0x03, 0x04] (F32 values 1..4 as bytes — but
+        // actually we want known-distinct F32 values). Use 1.0, 2.0, 3.0, 4.0.
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let mut data = Vec::with_capacity(16);
+        for v in &values {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: data.clone(),
+        });
+        let meta = walker_metadata_qwen35moe(2, 4); // nk=2, nv=4
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        let out: Vec<f32> = t
+            .data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        // A_log applies BOTH the negation (`data = -exp(data)` per
+        // convert_hf_to_gguf.py:4788-4789) AND the V-head reorder.
+        // Negation first then reorder:
+        //   [1, 2, 3, 4] → [-e^1, -e^2, -e^3, -e^4]
+        // V-head reorder with nk=2, nv_per_k=2 (tiled layout):
+        //   src K0V0=-e^1, K0V1=-e^2, K1V0=-e^3, K1V1=-e^4
+        //   dst K0V0=-e^1, K1V0=-e^3, K0V1=-e^2, K1V1=-e^4
+        let e = std::f32::consts::E;
+        let expected = vec![-e, -e.powi(3), -e.powi(2), -e.powi(4)];
+        for (i, (&g, &x)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - x).abs() < 1e-4,
+                "idx {} expected {} got {} (negation + V-head reorder)",
+                i,
+                x,
+                g
+            );
+        }
+    }
 }
