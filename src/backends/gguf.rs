@@ -3231,6 +3231,30 @@ mod tests {
         assert_eq!(arch_gguf_name(&m), "gemma4");
     }
 
+    /// Decision 1: Qwen3.5 ships two HF architecture aliases per variant —
+    /// `*ForCausalLM` (pure language model) and `*ForConditionalGeneration`
+    /// (multimodal / vision-tower shipping models). Both must route to the
+    /// same llama.cpp arch string. Dropping either alias in a "simpler"
+    /// refactor would silently misroute multimodal checkpoints.
+    #[test]
+    fn arch_routing_qwen35_conditional_generation() {
+        let mut m = meta_qwen35_dense();
+        m.architecture = "Qwen3_5ForConditionalGeneration".into();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35",
+            "Qwen3_5ForConditionalGeneration must route to 'qwen35' same as *ForCausalLM"
+        );
+
+        let mut m = meta_qwen35_moe();
+        m.architecture = "Qwen3_5MoeForConditionalGeneration".into();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35moe",
+            "Qwen3_5MoeForConditionalGeneration must route to 'qwen35moe' same as *ForCausalLM"
+        );
+    }
+
     /// Decision 1: llama architecture passes through unchanged.
     #[test]
     fn arch_routing_llama_unchanged() {
