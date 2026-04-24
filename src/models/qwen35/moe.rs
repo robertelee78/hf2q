@@ -406,11 +406,7 @@ pub fn merge_moe_experts_in_tensor_map(
     tensor_map: &mut crate::ir::TensorMap,
     metadata: &crate::ir::ModelMetadata,
 ) -> Result<(), ConvertError> {
-    let arch_str = metadata.architecture.as_str();
-    if arch_str != "Qwen3_5MoeForCausalLM"
-        && arch_str != "Qwen3_5MoeForConditionalGeneration"
-        && metadata.model_type != "qwen3_5_moe_text"
-    {
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
         return Ok(());
     }
     let num_experts = match metadata.num_experts {
@@ -529,12 +525,11 @@ pub fn merge_moe_experts_in_tensor_map(
 pub fn merge_moe_experts_in_place(
     model: &mut crate::ir::QuantizedModel,
 ) -> Result<(), ConvertError> {
-    let arch_str = model.metadata.architecture.as_str();
     // Only act on qwen35moe architecture.
-    if arch_str != "Qwen3_5MoeForCausalLM"
-        && arch_str != "Qwen3_5MoeForConditionalGeneration"
-        && model.metadata.model_type != "qwen3_5_moe_text"
-    {
+    if !super::is_qwen35moe_architecture(
+        &model.metadata.architecture,
+        &model.metadata.model_type,
+    ) {
         return Ok(());
     }
 

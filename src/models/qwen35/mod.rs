@@ -133,6 +133,39 @@ pub enum Qwen35Arch {
 }
 
 // ---------------------------------------------------------------------------
+// Architecture-string predicates (Decision 1 dispatch surface)
+// ---------------------------------------------------------------------------
+
+/// True for any Qwen3.5-family model (dense OR MoE) based on
+/// `config.architectures[0]` + `config.model_type`.
+///
+/// Accepts four HF architecture aliases (`*ForCausalLM` and
+/// `*ForConditionalGeneration` for each of dense + MoE) plus two
+/// `model_type` fallbacks (`qwen3_5` / `qwen3_5_moe_text`). Kept in
+/// one place so the four historical call sites that duplicated this
+/// six-alternative match cannot drift — dropping an alias at one site
+/// but keeping it at another silently corrupts the convert pipeline.
+pub(crate) fn is_qwen35_family_architecture(architecture: &str, model_type: &str) -> bool {
+    matches!(
+        architecture,
+        "Qwen3_5ForCausalLM"
+            | "Qwen3_5ForConditionalGeneration"
+            | "Qwen3_5MoeForCausalLM"
+            | "Qwen3_5MoeForConditionalGeneration"
+    ) || matches!(model_type, "qwen3_5" | "qwen3_5_moe_text")
+}
+
+/// True for Qwen3.5-MoE **only** (rejects dense variants). Used by the
+/// MoE-specific expert-merge walkers; dense models must not enter those
+/// paths because they have no expert tensors to merge.
+pub(crate) fn is_qwen35moe_architecture(architecture: &str, model_type: &str) -> bool {
+    matches!(
+        architecture,
+        "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration"
+    ) || model_type == "qwen3_5_moe_text"
+}
+
+// ---------------------------------------------------------------------------
 // Convert context
 // ---------------------------------------------------------------------------
 
@@ -1178,15 +1211,7 @@ pub fn apply_qwen35_linear_attn_transforms_in_tensor_map(
     tensor_map: &mut crate::ir::TensorMap,
     metadata: &crate::ir::ModelMetadata,
 ) -> Result<(), ConvertError> {
-    let arch_str = metadata.architecture.as_str();
-    let model_type = metadata.model_type.as_str();
-    let is_qwen35 = arch_str == "Qwen3_5ForCausalLM"
-        || arch_str == "Qwen3_5ForConditionalGeneration"
-        || arch_str == "Qwen3_5MoeForCausalLM"
-        || arch_str == "Qwen3_5MoeForConditionalGeneration"
-        || model_type == "qwen3_5"
-        || model_type == "qwen3_5_moe_text";
-    if !is_qwen35 {
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
         return Ok(());
     }
 
@@ -1246,15 +1271,7 @@ pub fn apply_rms_norm_plus_one_in_tensor_map(
     // Arch gate — Qwen3.5 family only. convert_hf_to_gguf.py:4794 is
     // scoped to Qwen3NextModel which Qwen3_5TextModel + Qwen3_5MoeTextModel
     // both inherit from (py:5259, 5427-5434).
-    let arch_str = metadata.architecture.as_str();
-    let model_type = metadata.model_type.as_str();
-    let is_qwen35 = arch_str == "Qwen3_5ForCausalLM"
-        || arch_str == "Qwen3_5ForConditionalGeneration"
-        || arch_str == "Qwen3_5MoeForCausalLM"
-        || arch_str == "Qwen3_5MoeForConditionalGeneration"
-        || model_type == "qwen3_5"
-        || model_type == "qwen3_5_moe_text";
-    if !is_qwen35 {
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
         return Ok(());
     }
 
@@ -1385,6 +1402,96 @@ pub(crate) fn dtype_elem_size(dtype: DType) -> usize {
 mod tests {
     use super::*;
     use crate::ir::DType;
+
+    // -------------------------------------------------------------------------
+    // Architecture-predicate tests (Decision 1 dispatch surface)
+    // -------------------------------------------------------------------------
+
+    /// `is_qwen35_family_architecture` must accept all 4 HF architecture
+    /// aliases (dense+MoE × ForCausalLM+ForConditionalGeneration) plus
+    /// both `model_type` fallbacks. Silent-drift regression gate —
+    /// dropping any alias at any call site now surfaces here.
+    #[test]
+    fn is_qwen35_family_accepts_all_six_forms() {
+        // All 4 architecture strings with empty model_type.
+        for arch in [
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+        ] {
+            assert!(
+                is_qwen35_family_architecture(arch, ""),
+                "{arch} must be accepted as Qwen3.5 family"
+            );
+        }
+        // Both model_type fallbacks with empty architecture.
+        for mt in ["qwen3_5", "qwen3_5_moe_text"] {
+            assert!(
+                is_qwen35_family_architecture("", mt),
+                "model_type={mt:?} must be accepted as Qwen3.5 family"
+            );
+        }
+    }
+
+    #[test]
+    fn is_qwen35_family_rejects_other_archs() {
+        for (arch, mt) in [
+            ("LlamaForCausalLM", "llama"),
+            ("Gemma4ForConditionalGeneration", "gemma4"),
+            ("MistralForCausalLM", "mistral"),
+            ("MixtralForCausalLM", "mixtral"),
+            // Case sensitivity — the check is exact-match (not
+            // case-insensitive), so lowercase variants must NOT trip.
+            ("qwen3_5forcausallm", ""),
+            ("QWEN3_5MoeForCausalLM", ""),
+            ("", ""),
+        ] {
+            assert!(
+                !is_qwen35_family_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must NOT be accepted as Qwen3.5 family"
+            );
+        }
+    }
+
+    /// `is_qwen35moe_architecture` accepts ONLY the MoE aliases (2 archs
+    /// + 1 model_type) — dense variants must be rejected since the MoE
+    /// expert-merge path requires expert tensors that dense models do
+    /// not carry.
+    #[test]
+    fn is_qwen35moe_accepts_only_moe_forms() {
+        for (arch, mt) in [
+            ("Qwen3_5MoeForCausalLM", ""),
+            ("Qwen3_5MoeForConditionalGeneration", ""),
+            ("", "qwen3_5_moe_text"),
+        ] {
+            assert!(
+                is_qwen35moe_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must be accepted as qwen35moe"
+            );
+        }
+    }
+
+    #[test]
+    fn is_qwen35moe_rejects_dense_variants() {
+        for (arch, mt) in [
+            // Dense arch aliases must NOT be treated as MoE — expert-merge
+            // walkers would otherwise try to find expert tensors in a
+            // dense model and produce confusing errors.
+            ("Qwen3_5ForCausalLM", ""),
+            ("Qwen3_5ForConditionalGeneration", ""),
+            ("", "qwen3_5"),
+            // Other archs.
+            ("LlamaForCausalLM", "llama"),
+            ("Gemma4ForConditionalGeneration", "gemma4"),
+            ("", ""),
+        ] {
+            assert!(
+                !is_qwen35moe_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must NOT be accepted as qwen35moe"
+            );
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Helpers
