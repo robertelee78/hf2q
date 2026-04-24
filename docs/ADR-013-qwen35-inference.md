@@ -1158,6 +1158,58 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 
 **Next iter target:** Weight data load — replace the zero-filled buffers in `empty_from_cfg` with `mlx_native::load_tensor_f32` calls against the GGUF's actual tensors. This exercises the P5 dequant path end-to-end on all ~733 apex tensors.
 
+### 2026-04-24 — /loop iter 18+ · **P7b COMPLETE** — GPU full-attn end-to-end parity (commit 3378a83)
+
+**Scope:** Complete the remaining gap in the P7b GPU builder: linear projections (wq/wk/wv/w_gate/wo), SDPA dispatch, top-level compositor `build_gated_attn_layer`, and full-layer parity test vs `gated_full_attention_cpu_ref`.
+
+**Gap identified:** gpu_full_attn.rs had 5 of 7 ops verified individually (RMSNorm, per-head RMSNorm, IMROPE, sigmoid-gate multiply). Missing:
+- Op 2: Q/K/V/G projections (4× linear projection dispatches)
+- Op 5: SDPA (with layout permutation: seq-major → head-major required by sdpa kernel)
+- Op 7: output projection (wo)
+- `build_gated_attn_layer()` compositor
+
+**Delivered in `hf2q/gpu_full_attn.rs`:**
+- **`apply_linear_projection_f32()`** — casts F32 weight → BF16 on GPU via `cast(CastDirection::F32ToBF16)`, then calls `dense_matmul_bf16_f32_tensor`. Returns F32 output `[seq_len, out_features]`. Used for wq, wk, wv, w_gate, wo.
+- **`permute_seq_head_dim_to_head_seq_dim_cpu()`** — CPU helper: `[seq, heads, dim]` → `[heads, seq, dim]` for SDPA's head-major layout requirement.
+- **`apply_sdpa_causal()`** — wraps `sdpa::sdpa` with batch=1, causal masking (scale = 1/√head_dim), GQA support (n_heads / n_kv_heads broadcast). Input must already be in head-major layout.
+- **`apply_sdpa_causal_from_seq_major()`** — orchestrates download → CPU permute → re-upload → SDPA → download → permute back → re-upload, so callers stay in seq-major layout throughout.
+- **`build_gated_attn_layer()`** — top-level compositor: 7 op-groups, 1 encoder per op (commit-and-wait before each side-effect), returns residual contribution `[seq_len, hidden_size]` F32.
+
+**Tests added (2 new):**
+- **`full_layer_gpu_matches_cpu_ref`** — THE acceptance criterion for P7b. Synthetic 4-token sequence, small shapes (hidden=32, n_head=4, n_kv=2, head_dim=16). Runs `gated_full_attention_cpu_ref` (CPU oracle) and `build_gated_attn_layer` (GPU) on identical inputs. Result: **max_abs_err = 8.31e-4 < 1e-3 F32** (BF16 projection rounding within stated bound).
+- **`linear_projection_matches_cpu_ref`** — isolated F32-via-BF16 projection parity against naive CPU matmul. max_err < 1e-3.
+
+**Broken windows fixed in same commit:**
+- `Cargo.toml`: added `tower = { version = "0.4", features = ["util"] }` to dev-deps so `router.rs` test module's `use tower::ServiceExt` compiles. Pre-existing E0432 was blocking all 56 test-mode compilation.
+- `src/models/qwen35/moe.rs::merge_expert_tensors`: removed `debug_assert_ne!` that panicked before the `Err` return path, causing `merge_expert_tensors_dense_guard_fires` to panic instead of verifying the expected error.
+
+**Verification:**
+- **753/753** hf2q tests green (0 failures, up from 0 runnable due to pre-existing router.rs compile error).
+- `cargo build --release` clean (3 pre-existing warnings, none new).
+- qwen35 integration tests (12/12) green.
+- Gemma-4 surface (forward_mlx.rs, config.rs, forward_prefill_batched.rs) untouched (confirmed via `git diff`).
+
+**Parity numbers:**
+- F32 (BF16-cast projection path): max_abs_err = **8.31e-4** (bound: 1e-3) ✅
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| **P7** | **9**        | **COMPLETE** — `build_gated_attn_layer` + full-layer parity 8.31e-4 < 1e-3 ✅ |
+| P8     | 8          | PARTIAL — CPU ref ✓; GPU pending (DeltaNet) |
+| P9     | 13, 14     | PARTIAL — CPU refs ✓; GPU pending |
+| P10    | 15         | COMPLETE |
+| P11    | 16         | PARTIAL — Qwen35Model scaffold + forward_cpu ✓; GPU wiring pending P8b/P9b |
+| P12    | 17         | COMPLETE |
+| P13    | 17, 18     | Pending (sourdough + bench) |
+
+**Next iter target:** P8b — GPU DeltaNet (Gated DeltaNet linear-attention layer forward pass).
+
+---
+
 ### 2026-04-24 — /loop iter 17 · P7b continued (sigmoid-mul kernel + gate-mul parity)
 
 **Scope:** Landed the sigmoid-mul Metal kernel in mlx-native and wired it into hf2q's full-attention pipeline. Output-gate application now GPU-verified.
