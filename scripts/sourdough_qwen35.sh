@@ -92,12 +92,15 @@ done
 [[ -f "$PROMPT_FILE" ]] || err "prompt fixture not found: $PROMPT_FILE"
 [[ -x "$HF2Q_BIN"  ]] || err "hf2q binary not found at $HF2Q_BIN (run: cargo build --release)"
 
-if command -v llama-cli >/dev/null 2>&1; then
-  LLAMA_BIN="$(command -v llama-cli)"
-elif [[ -x "/opt/llama.cpp/build/bin/llama-cli" ]]; then
+# Prefer our built-from-/opt/llama.cpp binary over any PATH-resolved one
+# (homebrew ships an older llama-cli that lacks -no-cnv / -st; using a
+# non-matching reference would invalidate the byte-parity oracle).
+if [[ -x "/opt/llama.cpp/build/bin/llama-cli" ]]; then
   LLAMA_BIN="/opt/llama.cpp/build/bin/llama-cli"
+elif command -v llama-cli >/dev/null 2>&1; then
+  LLAMA_BIN="$(command -v llama-cli)"
 else
-  err "llama-cli not found on PATH or at /opt/llama.cpp/build/bin/llama-cli"
+  err "llama-cli not found at /opt/llama.cpp/build/bin/llama-cli or on PATH (run: cmake --build /opt/llama.cpp/build --config Release)"
 fi
 
 # Validate arch: file MUST be qwen35 or qwen35moe. Read general.architecture
@@ -169,9 +172,13 @@ echo
 #    -ngl 999: offload all layers to Metal (match hf2q's GPU path).
 #    --seed 42: deterministic sampling state (matters for T=0 tiebreaks).
 echo "--- Running llama-cli (T=0 greedy, $MAX_TOKENS tokens) ---"
+# -st = single-turn (applies chat template, exits after one reply; implies no-cnv)
+# -ngl 999 = offload all layers to Metal (match hf2q's GPU path)
+# --no-display-prompt = omit the echoed prompt from stdout
+# --seed = deterministic sampling state (matters only for T=0 tiebreaks)
 if ! "$LLAMA_BIN" --model "$GGUF_PATH" --prompt "$PROMPT_CONTENT" \
       --predict "$MAX_TOKENS" --temp 0 --seed 42 \
-      --no-display-prompt -no-cnv -st -ngl 999 \
+      --no-display-prompt -st -ngl 999 \
       </dev/null >"$OUT_LLAMA" 2>"$LOG_LLAMA"; then
   echo "llama-cli failed. See $LOG_LLAMA" >&2; exit 3
 fi

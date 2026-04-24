@@ -81,12 +81,13 @@ done
 [[ -x "$HF2Q_BIN"  ]] || err "hf2q binary not found at $HF2Q_BIN (run: cargo build --release)"
 
 if [[ $SKIP_LLAMA -eq 0 ]]; then
-  if command -v llama-bench >/dev/null 2>&1; then
-    LLAMA_BIN="$(command -v llama-bench)"
-  elif [[ -x "/opt/llama.cpp/build/bin/llama-bench" ]]; then
+  # Prefer our built-from-/opt/llama.cpp binary over homebrew's older one.
+  if [[ -x "/opt/llama.cpp/build/bin/llama-bench" ]]; then
     LLAMA_BIN="/opt/llama.cpp/build/bin/llama-bench"
+  elif command -v llama-bench >/dev/null 2>&1; then
+    LLAMA_BIN="$(command -v llama-bench)"
   else
-    err "llama-bench not found on PATH or at /opt/llama.cpp/build/bin/llama-bench (use --skip-llama to run only hf2q)"
+    err "llama-bench not found at /opt/llama.cpp/build/bin/llama-bench or on PATH (use --skip-llama to run only hf2q)"
   fi
 fi
 
