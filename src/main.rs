@@ -484,6 +484,29 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 // Try loading tokenizer for activation-based calibration
                 let has_tokenizer = config.input_dir.join("tokenizer.json").exists();
 
+                // Resolve the DWQ architecture for routing (ADR-012 Decision 13).
+                // qwen35 / qwen35moe MUST use ActivationCapture — no weight-space fallback.
+                let dwq_arch = quantize::dwq::DwqArch::from_hf_architecture(
+                    &metadata.architecture,
+                    metadata.is_moe(),
+                );
+
+                // ADR-012 Decision 13 no-fallback guard:
+                // If the model is qwen35 or qwen35moe, we MUST have an ActivationCapture
+                // implementation from the inference session.  At present (pre-ADR-013 real
+                // impl), we error clearly rather than silently running weight-space DWQ.
+                // When ADR-013 P12 real ActivationCapture lands, this block is replaced by
+                // the real capture injection.
+                if dwq_arch.requires_activation_capture() {
+                    // No real ActivationCapture impl available yet — error clearly.
+                    // Per ADR-012 Decision 13 / no-fallback mantra: fix the blocker upstream,
+                    // do not route around it with weight-space fallback.
+                    return Err(AppError::Conversion(anyhow::anyhow!(
+                        "{}",
+                        quantize::dwq::DwqError::NoActivationCapture
+                    )));
+                }
+
                 let dwq_config = quantize::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
@@ -491,6 +514,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     base_bits,
                     sensitive_bits,
                     use_activations: has_tokenizer,
+                    arch: dwq_arch,
                     ..quantize::dwq::DwqConfig::default()
                 };
 
@@ -505,6 +529,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     dwq_quantizer.name()
                 );
 
+                // Activation-based calibration path (non-qwen35 archs with tokenizer).
+                // For qwen35/qwen35moe the guard above has already returned an error,
+                // so this branch is unreachable for those archs.
                 if dwq_config.use_activations {
                     tracing::info!("Tokenizer found, using activation-based DWQ calibration");
                     match quantize::dwq_activation::run_dwq_activation_calibration(
@@ -516,6 +543,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     ) {
                         Ok(model) => model,
                         Err(e) => {
+                            // ADR-012 Decision 13: the weight-space fallback below is ONLY
+                            // reachable for non-qwen35 archs (guard above enforces this).
+                            // For qwen35/qwen35moe we never reach here.
                             warn!(
                                 "Activation-based DWQ failed ({}), falling back to weight-space calibration",
                                 e

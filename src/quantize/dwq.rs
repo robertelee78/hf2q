@@ -18,6 +18,47 @@ use crate::progress::ProgressReporter;
 use crate::quantize::mixed::MixedBitQuantizer;
 use crate::quantize::{LayerQuantConfig, QuantizeError, Quantizer};
 
+/// Architecture family for DWQ calibration routing.
+///
+/// ADR-012 Decision 13: qwen35 / qwen35moe DWQ requires an `ActivationCapture`
+/// implementation from the inference session.  Weight-space fallback is NOT
+/// available for these architectures.  All other archs remain on the existing
+/// weight-space path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DwqArch {
+    /// Qwen3.5 dense — requires ActivationCapture (ADR-012 D13, ADR-013 P12).
+    Qwen35Dense,
+    /// Qwen3.5-MoE — requires ActivationCapture (ADR-012 D13, ADR-013 P12).
+    Qwen35MoE,
+    /// All other architectures — weight-space calibration path (existing behaviour).
+    Other,
+}
+
+impl DwqArch {
+    /// Resolve from the HuggingFace architecture string stored in `ModelMetadata.architecture`.
+    ///
+    /// Both `"Qwen3_5ForCausalLM"` (dense) and `"Qwen3_5MoeForCausalLM"` (MoE)
+    /// are matched case-insensitively on the `"qwen3_5"` substring.
+    pub fn from_hf_architecture(arch: &str, is_moe: bool) -> Self {
+        let lower = arch.to_lowercase();
+        if lower.contains("qwen3_5") {
+            if is_moe {
+                DwqArch::Qwen35MoE
+            } else {
+                DwqArch::Qwen35Dense
+            }
+        } else {
+            DwqArch::Other
+        }
+    }
+
+    /// Whether this architecture requires an `ActivationCapture` impl to proceed.
+    /// Returns `false` for `Other` (weight-space path OK).
+    pub fn requires_activation_capture(&self) -> bool {
+        matches!(self, DwqArch::Qwen35Dense | DwqArch::Qwen35MoE)
+    }
+}
+
 /// Errors from DWQ calibration.
 #[derive(Error, Debug)]
 pub enum DwqError {
@@ -33,6 +74,21 @@ pub enum DwqError {
     #[error("Tokenizer error: {reason}")]
     #[allow(dead_code)]
     TokenizerError { reason: String },
+
+    /// ADR-012 Decision 13 / no-fallback rule.
+    ///
+    /// qwen35 / qwen35moe DWQ calibration requires an `ActivationCapture`
+    /// implementation from the inference session.  Weight-space fallback is
+    /// explicitly not available — per the no-fallback mantra, the blocker must
+    /// be fixed upstream (land ADR-013 P12 real impl), not routed around.
+    #[error(
+        "qwen35/qwen35moe DWQ calibration requires an ActivationCapture implementation from \
+         the inference session (see ADR-013 P12 / ADR-012 Decision 13). \
+         Weight-space fallback is not available. \
+         Fix: ensure the inference session provides a real ActivationCapture impl before \
+         invoking DWQ conversion for this architecture."
+    )]
+    NoActivationCapture,
 }
 
 /// Configuration for DWQ calibration.
@@ -56,6 +112,16 @@ pub struct DwqConfig {
     /// Whether to use activation-based calibration (requires GPU + tokenizer).
     /// When false, falls back to weight-space calibration.
     pub use_activations: bool,
+    /// Architecture family for routing the calibration path.
+    ///
+    /// ADR-012 Decision 13: qwen35 / qwen35moe MUST use ActivationCapture.
+    /// Defaults to `DwqArch::Other` (weight-space path).  Callers in main.rs
+    /// must set this from `DwqArch::from_hf_architecture(&metadata.architecture, metadata.is_moe())`.
+    ///
+    /// `run_dwq_calibration` enforces this by returning `DwqError::NoActivationCapture`
+    /// if `arch.requires_activation_capture()` is true — a second line of defence
+    /// in case the call site in main.rs is ever bypassed.
+    pub arch: DwqArch,
 }
 
 impl Default for DwqConfig {
@@ -69,6 +135,7 @@ impl Default for DwqConfig {
             max_iterations: 10,
             convergence_threshold: 0.001,
             use_activations: false,
+            arch: DwqArch::Other,
         }
     }
 }
@@ -139,13 +206,22 @@ impl Quantizer for DwqQuantizer {
 /// the closed-form solution: optimal_scale = dot(W, Q) / dot(Q, Q).
 /// This is exact — no iterations or inference needed. CPU-only.
 ///
-/// Phase 2 will add activation-based calibration via Candle GPU forward passes.
+/// # ADR-012 Decision 13 — No-fallback guard
+///
+/// If `config.arch.requires_activation_capture()` is true (qwen35 / qwen35moe),
+/// this function returns `DwqError::NoActivationCapture` immediately.
+/// This is a second line of defence: the primary guard lives in `main.rs`.
 pub fn run_dwq_calibration(
     tensor_map: &TensorMap,
     metadata: &ModelMetadata,
     config: &DwqConfig,
     progress: &ProgressReporter,
 ) -> Result<QuantizedModel, DwqError> {
+    // ADR-012 Decision 13 — no-fallback: qwen35/qwen35moe must not reach this path.
+    if config.arch.requires_activation_capture() {
+        return Err(DwqError::NoActivationCapture);
+    }
+
     let num_layers = metadata.num_layers as usize;
     let _hidden_size = metadata.hidden_size as usize;
     let total_steps = 2 + (num_layers as u64) * (1 + config.max_iterations as u64) + 1;
@@ -442,6 +518,147 @@ mod tests {
         assert_eq!(config.group_size, 64);
         assert_eq!(config.max_iterations, 10);
         assert!(!config.use_activations);
+        // Default arch is Other (weight-space path)
+        assert_eq!(config.arch, DwqArch::Other);
+    }
+
+    // --- ADR-012 Decision 13: DwqArch no-fallback tests ---
+
+    #[test]
+    fn test_dwq_arch_from_hf_qwen35_dense() {
+        let arch = DwqArch::from_hf_architecture("Qwen3_5ForCausalLM", false);
+        assert_eq!(arch, DwqArch::Qwen35Dense);
+        assert!(arch.requires_activation_capture());
+    }
+
+    #[test]
+    fn test_dwq_arch_from_hf_qwen35moe() {
+        let arch = DwqArch::from_hf_architecture("Qwen3_5MoeForCausalLM", true);
+        assert_eq!(arch, DwqArch::Qwen35MoE);
+        assert!(arch.requires_activation_capture());
+    }
+
+    #[test]
+    fn test_dwq_arch_from_hf_other_archs_do_not_require_capture() {
+        for (hf_arch, is_moe) in &[
+            ("Gemma4ForConditionalGeneration", true),
+            ("LlamaForCausalLM", false),
+            ("MistralForCausalLM", false),
+            ("MixtralForCausalLM", true),
+        ] {
+            let arch = DwqArch::from_hf_architecture(hf_arch, *is_moe);
+            assert_eq!(arch, DwqArch::Other, "Expected Other for {hf_arch}");
+            assert!(
+                !arch.requires_activation_capture(),
+                "{hf_arch} should not require ActivationCapture"
+            );
+        }
+    }
+
+    /// ADR-012 D13 / no-fallback: error text must be unambiguous.
+    #[test]
+    fn test_no_activation_capture_error_message() {
+        let err = DwqError::NoActivationCapture;
+        let msg = format!("{err}");
+        assert!(msg.contains("ActivationCapture"), "Error must name the trait");
+        assert!(msg.contains("ADR-013"), "Error must cite ADR-013 P12");
+        assert!(msg.contains("ADR-012"), "Error must cite ADR-012 D13");
+        // The message must state that weight-space fallback is NOT available
+        // (i.e. it names fallback only to say it isn't offered, not to offer it).
+        assert!(
+            msg.contains("not available"),
+            "Error must state weight-space fallback is not available"
+        );
+    }
+
+    /// ADR-012 D13: weight-space calibration succeeds for Other arch (Gemma regression).
+    #[test]
+    fn test_weight_space_calibration_succeeds_for_other_arch() {
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
+        let config = DwqConfig {
+            arch: DwqArch::Other,
+            ..DwqConfig::default()
+        };
+        let progress = ProgressReporter::new();
+        let result = run_dwq_calibration(&tensor_map, &metadata, &config, &progress);
+        assert!(result.is_ok(), "Other arch should succeed on weight-space path");
+    }
+
+    /// ADR-012 D13: run_dwq_calibration returns NoActivationCapture for qwen35.
+    ///
+    /// Defence-in-depth: even if main.rs guard is bypassed, the calibration function
+    /// itself rejects qwen35/qwen35moe.
+    #[test]
+    fn test_run_dwq_calibration_rejects_qwen35_dense() {
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
+        let config = DwqConfig {
+            arch: DwqArch::Qwen35Dense,
+            ..DwqConfig::default()
+        };
+        let progress = ProgressReporter::new();
+        let result = run_dwq_calibration(&tensor_map, &metadata, &config, &progress);
+        assert!(result.is_err(), "qwen35 dense must error — no weight-space fallback");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DwqError::NoActivationCapture),
+            "Must be NoActivationCapture, got: {err}"
+        );
+    }
+
+    /// ADR-012 D13: run_dwq_calibration returns NoActivationCapture for qwen35moe.
+    #[test]
+    fn test_run_dwq_calibration_rejects_qwen35moe() {
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
+        let config = DwqConfig {
+            arch: DwqArch::Qwen35MoE,
+            ..DwqConfig::default()
+        };
+        let progress = ProgressReporter::new();
+        let result = run_dwq_calibration(&tensor_map, &metadata, &config, &progress);
+        assert!(
+            matches!(result.unwrap_err(), DwqError::NoActivationCapture),
+            "qwen35moe must return NoActivationCapture"
+        );
+    }
+
+    /// ADR-012 D13: MockActivationCapture feeds deterministic tensors into scorer.
+    ///
+    /// This test validates that the cross-ADR ActivationCapture contract works:
+    /// MockActivationCapture (from ADR-013 P12) produces expected-shape LayerActivations
+    /// that the sensitivity scorer can consume.
+    #[test]
+    fn test_mock_activation_capture_feeds_scorer() {
+        use crate::inference::models::qwen35::activation_capture::{
+            ActivationCapture, MockActivationCapture,
+        };
+        use crate::quantize::sensitivity::compute_layer_sensitivity;
+
+        let mut mock = MockActivationCapture::new(4, 8);
+        let tokens = vec![42u32, 100, 7, 255];
+        let act = mock
+            .run_calibration_prompt(&tokens)
+            .expect("MockActivationCapture must succeed");
+        act.validate().expect("LayerActivations must be valid");
+
+        // Feed layer_inputs into the sensitivity scorer
+        let sensitivities = compute_layer_sensitivity(&act.layer_inputs)
+            .expect("Scorer must accept MockActivationCapture output");
+
+        assert_eq!(sensitivities.len(), 4, "One sensitivity per layer");
+        // Mock formula increments by 0.01 per layer → sensitivities increase
+        for s in &sensitivities {
+            assert!(s.score.is_finite(), "Sensitivity score must be finite");
+        }
+        // Scores should be strictly monotonically increasing (mock adds 0.01 per layer)
+        for w in sensitivities.windows(2) {
+            assert!(
+                w[1].score > w[0].score,
+                "Mock-derived sensitivities should be monotonically increasing"
+            );
+        }
     }
 
     #[test]

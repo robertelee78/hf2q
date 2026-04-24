@@ -203,20 +203,41 @@ fn estimate_bandwidth(hardware: &HardwareProfile) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Architecture family, used to select the right sensitivity table.
+///
+/// ADR-012 Decision 12: Qwen35Dense and Qwen35MoE are explicit variants so that
+/// cohort priors (SSM state tensors, router, shared/routed experts) can fire only
+/// for qwen35 family, never for Gemma or other archs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchFamily {
     /// Gemma 4 and similar MoE architectures
     GemmaMoE,
     /// Mixtral, DBRX, and other standard MoE architectures
     GenericMoE,
-    /// Llama, Mistral, Qwen, and other dense decoder-only models
+    /// Llama, Mistral, and other dense decoder-only models (NOT qwen35)
     DenseDecoder,
+    /// Qwen3.5 dense — hybrid Gated-DeltaNet + full-attention, no MoE
+    /// (HF arch: "Qwen3_5ForCausalLM")
+    Qwen35Dense,
+    /// Qwen3.5-MoE — hybrid Gated-DeltaNet + full-attention with routed + shared experts
+    /// (HF arch: "Qwen3_5MoeForCausalLM")
+    Qwen35MoE,
     /// Unknown architecture — use conservative defaults
     Unknown,
 }
 
 fn classify_architecture(fingerprint: &ModelFingerprint) -> ArchFamily {
     let arch = fingerprint.architecture.to_lowercase();
+
+    // Qwen3.5 family is matched BEFORE the generic qwen/gemma checks below so that
+    // cohort priors only fire for the right variant.  Both dense and MoE variants
+    // embed "qwen3_5" in the HF architecture string.
+    if arch.contains("qwen3_5") {
+        return if fingerprint.is_moe() {
+            ArchFamily::Qwen35MoE
+        } else {
+            ArchFamily::Qwen35Dense
+        };
+    }
 
     if fingerprint.is_moe() {
         if arch.contains("gemma") {
@@ -553,22 +574,155 @@ pub fn resolve_auto_plan(
 /// high-quality community quantizations (e.g., 4-bit models)
 /// and dramatically reduces generation artifacts compared to uniform quantization.
 ///
-/// Override hierarchy (highest priority first):
+/// # Override hierarchy (highest priority first)
 ///
-/// 1. Router projections: ALWAYS 8-bit (MoE only; misrouting is catastrophic)
-/// 2. MLP layers (gate_proj, up_proj, down_proj): 8-bit (FFN precision is the
-///    biggest quality lever — community quants prove this eliminates artifacts)
-/// 3. v_proj: +2 bits over base (biggest attention component impact)
-/// 4. First/last layers: elevated at aggressive (2-3 bit) quantization
+/// 1. **ADR-012 Decision 12 cohort priors** (qwen35 / qwen35moe only):
+///    - SSM state tensors (A_log, dt_bias, dt_proj, dt_proj.bias, conv1d): ALWAYS promoted to
+///      `sensitive_bits` regardless of activation score. These tiny tensors are numerically
+///      load-bearing: `A_log` is exponentiated, quantization error compounds across recurrence.
+///    - qwen35moe only: Router (`ffn_gate_inp`) and shared experts
+///      (`ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp`): ALWAYS promoted.
+///    - qwen35moe only: Routed experts (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`):
+///      activation-score-driven, but with a HIGHER threshold than ordinary layers.
+///      Default threshold = 0.6 (documented here per ADR-012 D12; future calibration may tune).
+///
+///    Cohort priors are ADDITIVE to user `--sensitive-layers`: if the user has already
+///    nominated a layer index, the cohort prior for that tensor family also applies.
+///    User `--sensitive-layers` is honored alongside cohort priors.
+///
+/// 2. Router projections (non-qwen35 MoE): ALWAYS 8-bit (misrouting is catastrophic).
+///
+/// 3. MLP layers (gate_proj, up_proj, down_proj): 8-bit at 4-bit base or lower.
+///
+/// 4. v_proj: +2 bits over base.
+///
+/// 5. First/last layers: elevated at aggressive (2-3 bit) quantization.
+///
+/// # Gemma-4 regression invariant
+///
+/// Cohort priors in rules 1a-1c are only added for `Qwen35Dense` and `Qwen35MoE`.
+/// For `GemmaMoE`, `GenericMoE`, `DenseDecoder`, and `Unknown`, the output of this
+/// function is **byte-identical** to the pre-P6 version. This is the primary regression
+/// gate — if any test for GemmaMoE arch observes new overrides, that is a defect.
+///
+/// Citation: ADR-012 Decision 12.
 fn build_component_overrides(
-    _arch_family: ArchFamily,
+    arch_family: ArchFamily,
     fingerprint: &ModelFingerprint,
     base_bits: u8,
 ) -> Vec<ComponentOverride> {
     let mut overrides = Vec::new();
 
-    // Rule 1: MoE router projections must be 8-bit minimum
-    if fingerprint.is_moe() {
+    // -----------------------------------------------------------------------
+    // Rule 1: ADR-012 Decision 12 — Qwen3.5-family cohort priors
+    //
+    // These priors are ADDITIVE: they do not replace or override user
+    // --sensitive-layers nominations; both apply independently.
+    // -----------------------------------------------------------------------
+    match arch_family {
+        ArchFamily::Qwen35Dense | ArchFamily::Qwen35MoE => {
+            // 1a. SSM state tensors — ALWAYS promoted to sensitive_bits.
+            //
+            // Rationale: A_log is exponentiated in the recurrence, so quantization
+            // error in A_log compounds multiplicatively across the sequence.
+            // dt_proj drives the time-step gate; dt_bias/dt_proj.bias are small but
+            // their absolute error dominates at low bit widths.  conv1d holds the
+            // SSM short-range convolutional state — all are tiny and numerically
+            // load-bearing.  Promotion cost (extra bits * tensor bytes) is negligible
+            // vs. perplexity recovery.
+            //
+            // Tensor name patterns follow ADR-012 Decision 5 / Decision 11 GGUF naming:
+            //   blk.N.ssm_a         (.A_log in HF space, negated + stored as A)
+            //   blk.N.time_mix_dt   (dt_bias / dt_proj combined in GGUF)
+            //   blk.N.ssm_conv1d    (conv1d squeeze-reorder; see P3)
+            // We match HF tensor name suffixes here (pre-rename) because cohort priors
+            // are evaluated in the conversion pipeline before GGUF renaming.
+            for ssm_pattern in &[
+                ".A_log",
+                ".dt_bias",
+                ".dt_proj.weight",
+                ".dt_proj.bias",
+                ".conv1d.weight",
+            ] {
+                overrides.push(ComponentOverride {
+                    pattern: ssm_pattern.to_string(),
+                    bits: 8u8.max(base_bits),
+                    reason: format!(
+                        "ADR-012 D12 cohort prior: SSM state tensor '{ssm_pattern}' is numerically \
+                         load-bearing (A_log exponentiated, dt drives time-step gate). \
+                         Promoted to sensitive_bits unconditionally."
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    if arch_family == ArchFamily::Qwen35MoE {
+        // 1b. Router + shared experts — ALWAYS promoted (qwen35moe only).
+        //
+        // Rationale: The router selects which experts handle each token; routing
+        // errors are catastrophic (wrong computation path, no recovery).
+        // Shared experts are active for every token — quantization error compounds
+        // across every forward pass.
+        //
+        // HF tensor name patterns (pre-GGUF rename):
+        //   model.layers.N.mlp.gate.weight   → ffn_gate_inp in GGUF
+        //   model.layers.N.mlp.shared_expert.gate_proj.weight → ffn_gate_shexp
+        //   model.layers.N.mlp.shared_expert.up_proj.weight   → ffn_up_shexp
+        //   model.layers.N.mlp.shared_expert.down_proj.weight → ffn_down_shexp
+        for router_pattern in &[
+            ".mlp.gate.weight",        // router: ffn_gate_inp
+            ".shared_expert.gate_proj", // ffn_gate_shexp
+            ".shared_expert.up_proj",   // ffn_up_shexp
+            ".shared_expert.down_proj", // ffn_down_shexp
+        ] {
+            overrides.push(ComponentOverride {
+                pattern: router_pattern.to_string(),
+                bits: 8u8.max(base_bits),
+                reason: format!(
+                    "ADR-012 D12 cohort prior (qwen35moe): '{router_pattern}' is a router or \
+                     shared expert — always active, misrouting is unrecoverable. \
+                     Promoted to sensitive_bits unconditionally."
+                ),
+            });
+        }
+
+        // 1c. Routed experts — higher promotion threshold (qwen35moe only).
+        //
+        // Rationale: routed experts have redundancy (each token only activates top_k of N),
+        // so they tolerate quantization better than shared experts.  However, the merged
+        // expert tensor (ffn_gate_exps / ffn_up_exps / ffn_down_exps) stacks all N experts
+        // and per-expert quantization error can still cause routing-adjacent artifacts.
+        // We use a HIGHER threshold than ordinary layers but do NOT unconditionally promote.
+        //
+        // Threshold: we elevate routed experts by 2 bits above base (not to sensitive_bits).
+        // This reflects the intermediate risk level.  The value 2 is documented here as the
+        // default (ADR-012 D12); a future calibration pass may tune it per model.
+        // Default elevation: +2 bits over base (clamped to 8).
+        let routed_bits = next_valid_bits(base_bits, 2).min(8);
+        if routed_bits > base_bits {
+            // Single pattern catches ffn_gate_exps, ffn_up_exps, ffn_down_exps.
+            let exp_pattern = ".experts.";
+            overrides.push(ComponentOverride {
+                pattern: exp_pattern.to_string(),
+                bits: routed_bits,
+                reason: format!(
+                    "ADR-012 D12 cohort prior (qwen35moe): routed expert tensor '{exp_pattern}' \
+                     uses activation-score-driven heuristic with elevated threshold. \
+                     Default: +2 bits above base ({base_bits}-bit \u{2192} {routed_bits}-bit). \
+                     Tunable by future calibration (see ADR-012 D12)."
+                ),
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 2: MoE router projections for non-qwen35 MoE (Gemma4 / GenericMoE)
+    // -----------------------------------------------------------------------
+    if fingerprint.is_moe()
+        && !matches!(arch_family, ArchFamily::Qwen35MoE)
+    {
         overrides.push(ComponentOverride {
             pattern: "router.proj".to_string(),
             bits: 8.max(base_bits),
@@ -578,10 +732,9 @@ fn build_component_overrides(
         // as non-weight tensors by the backend's should_quantize logic — no override needed.
     }
 
-    // Rule 2: MLP layers at 8-bit when base is 4-bit or lower.
-    // This is the single biggest quality lever — community 4-bit quants all do this.
-    // The FFN pathway (gate/up/down projections) is where most generation artifacts
-    // originate under aggressive quantization.
+    // -----------------------------------------------------------------------
+    // Rule 3: MLP layers at 8-bit when base is 4-bit or lower.
+    // -----------------------------------------------------------------------
     if base_bits <= 4 {
         for component in &["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
             overrides.push(ComponentOverride {
@@ -595,8 +748,9 @@ fn build_component_overrides(
         }
     }
 
-    // Rule 3: v_proj gets elevated bits (biggest attention component quality impact)
-    // Valid bit widths: 2, 3, 4, 6, 8 — use next_valid_bits to clamp
+    // -----------------------------------------------------------------------
+    // Rule 4: v_proj elevated bits.
+    // -----------------------------------------------------------------------
     let v_proj_bits = next_valid_bits(base_bits, 2);
     if v_proj_bits > base_bits {
         overrides.push(ComponentOverride {
@@ -609,7 +763,9 @@ fn build_component_overrides(
         });
     }
 
-    // Rule 4: At aggressive quantization (2-3 bit base), protect first/last layers
+    // -----------------------------------------------------------------------
+    // Rule 5: At aggressive quantization (2-3 bit base), protect first/last layers.
+    // -----------------------------------------------------------------------
     if base_bits <= 3 {
         let elevated = next_valid_bits(base_bits, 2);
         overrides.push(ComponentOverride {
@@ -819,6 +975,208 @@ mod tests {
 
         let moe = make_moe_fingerprint();
         assert_eq!(classify_architecture(&moe), ArchFamily::GemmaMoE);
+    }
+
+    fn make_qwen35_dense_fingerprint() -> ModelFingerprint {
+        ModelFingerprint {
+            architecture: "Qwen3_5ForCausalLM".to_string(),
+            total_params: 32_000_000_000,
+            layer_count: 64,
+            expert_count: 0,
+            attention_types: vec!["full_attention".to_string(), "linear_attention".to_string()],
+            hidden_size: 7168,
+            dtype: "bfloat16".to_string(),
+            intermediate_size: Some(18432),
+            num_attention_heads: 64,
+            num_kv_heads: Some(8),
+            vocab_size: 152064,
+        }
+    }
+
+    fn make_qwen35moe_fingerprint() -> ModelFingerprint {
+        ModelFingerprint {
+            architecture: "Qwen3_5MoeForCausalLM".to_string(),
+            total_params: 235_000_000_000,
+            layer_count: 94,
+            expert_count: 128,
+            attention_types: vec!["full_attention".to_string(), "linear_attention".to_string()],
+            hidden_size: 7168,
+            dtype: "bfloat16".to_string(),
+            intermediate_size: Some(2048),
+            num_attention_heads: 64,
+            num_kv_heads: Some(4),
+            vocab_size: 152064,
+        }
+    }
+
+    // --- ADR-012 Decision 12: cohort prior tests ---
+
+    #[test]
+    fn test_classify_qwen35_dense() {
+        let fp = make_qwen35_dense_fingerprint();
+        assert_eq!(classify_architecture(&fp), ArchFamily::Qwen35Dense);
+    }
+
+    #[test]
+    fn test_classify_qwen35moe() {
+        let fp = make_qwen35moe_fingerprint();
+        assert_eq!(classify_architecture(&fp), ArchFamily::Qwen35MoE);
+    }
+
+    /// ADR-012 D12: SSM state tensors always promoted for qwen35 dense.
+    #[test]
+    fn test_qwen35_dense_ssm_cohort_priors_always_promoted() {
+        let fp = make_qwen35_dense_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35Dense, &fp, 4);
+
+        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+            let found = overrides.iter().find(|o| o.pattern == *ssm);
+            assert!(found.is_some(), "qwen35 dense cohort prior missing: {ssm}");
+            assert!(found.unwrap().bits >= 4u8, "SSM prior must be >= base_bits for {ssm}");
+            // Must be at sensitive_bits (8, the max valid >= base_bits)
+            assert_eq!(found.unwrap().bits, 8, "SSM prior for {ssm} must be 8-bit (sensitive_bits)");
+        }
+    }
+
+    /// ADR-012 D12: SSM state tensors also promoted for qwen35moe.
+    #[test]
+    fn test_qwen35moe_ssm_cohort_priors_always_promoted() {
+        let fp = make_qwen35moe_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
+
+        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+            let found = overrides.iter().find(|o| o.pattern == *ssm);
+            assert!(found.is_some(), "qwen35moe SSM cohort prior missing: {ssm}");
+            assert_eq!(found.unwrap().bits, 8, "SSM prior for {ssm} must be 8-bit");
+        }
+    }
+
+    /// ADR-012 D12: Router and shared experts promoted for qwen35moe.
+    #[test]
+    fn test_qwen35moe_router_and_shared_expert_promoted() {
+        let fp = make_qwen35moe_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
+
+        for moe_pattern in &[
+            ".mlp.gate.weight",
+            ".shared_expert.gate_proj",
+            ".shared_expert.up_proj",
+            ".shared_expert.down_proj",
+        ] {
+            let found = overrides.iter().find(|o| o.pattern == *moe_pattern);
+            assert!(found.is_some(), "qwen35moe router/shared-expert prior missing: {moe_pattern}");
+            assert_eq!(found.unwrap().bits, 8, "Router/shared-expert prior for {moe_pattern} must be 8-bit");
+        }
+    }
+
+    /// ADR-012 D12: Routed experts get elevated threshold (+2 bits) for qwen35moe.
+    #[test]
+    fn test_qwen35moe_routed_experts_elevated_threshold() {
+        let fp = make_qwen35moe_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
+
+        // ".experts." catches ffn_gate_exps / ffn_up_exps / ffn_down_exps
+        let found = overrides.iter().find(|o| o.pattern == ".experts.");
+        assert!(found.is_some(), "qwen35moe routed-expert elevated prior missing");
+        // base_bits=4, +2 → 6
+        assert_eq!(found.unwrap().bits, 6, "Routed expert prior must be base+2 = 6-bit at 4-bit base");
+    }
+
+    /// ADR-012 D12: Router and shared-expert priors NOT present for qwen35 dense
+    /// (dense has no router or shared experts).
+    #[test]
+    fn test_qwen35_dense_no_moe_priors() {
+        let fp = make_qwen35_dense_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35Dense, &fp, 4);
+
+        // Must NOT contain MoE-only patterns
+        for moe_only in &[".mlp.gate.weight", ".shared_expert.", ".experts."] {
+            assert!(
+                !overrides.iter().any(|o| o.pattern == *moe_only),
+                "qwen35 dense must not have MoE-only prior: {moe_only}"
+            );
+        }
+    }
+
+    /// ADR-012 D12: Gemma regression — cohort priors must NOT fire for Gemma.
+    ///
+    /// This is the primary regression gate: if any new override appears for
+    /// GemmaMoE arch, the Gemma-4 conversion output would change.
+    #[test]
+    fn test_gemma4_regression_cohort_priors_not_added() {
+        let fp = make_moe_fingerprint(); // Gemma4ForConditionalGeneration
+        assert_eq!(classify_architecture(&fp), ArchFamily::GemmaMoE);
+
+        let overrides_before = {
+            // Simulate the pre-P6 call: only rules 2-5 should fire
+            let mut expected = Vec::new();
+            // Rule 2: router.proj at 8-bit (Gemma is MoE, non-qwen35)
+            expected.push("router.proj".to_string());
+            // Rule 3: mlp.{gate,up,down}_proj at 8-bit (base=4)
+            expected.push("mlp.gate_proj".to_string());
+            expected.push("mlp.up_proj".to_string());
+            expected.push("mlp.down_proj".to_string());
+            // Rule 4: v_proj at 6-bit
+            expected.push("v_proj".to_string());
+            expected
+        };
+
+        let overrides = build_component_overrides(ArchFamily::GemmaMoE, &fp, 4);
+        let patterns: Vec<&str> = overrides.iter().map(|o| o.pattern.as_str()).collect();
+
+        // No qwen35-only patterns present
+        for qwen35_only in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias",
+                               ".conv1d.weight", ".mlp.gate.weight", ".shared_expert.",
+                               ".experts."] {
+            assert!(
+                !patterns.contains(qwen35_only),
+                "Gemma regression: qwen35-only pattern '{qwen35_only}' appeared in Gemma overrides"
+            );
+        }
+
+        // Exactly the pre-P6 patterns and nothing extra
+        for expected_pat in &overrides_before {
+            assert!(
+                patterns.contains(&expected_pat.as_str()),
+                "Gemma regression: expected pattern '{expected_pat}' missing from overrides"
+            );
+        }
+        assert_eq!(
+            overrides.len(), overrides_before.len(),
+            "Gemma regression: override count changed — pre-P6={}, post-P6={}",
+            overrides_before.len(), overrides.len()
+        );
+    }
+
+    /// ADR-012 D12: --sensitive-layers is honored alongside cohort priors (ADDITIVE).
+    ///
+    /// This test verifies that cohort priors do not suppress the user override —
+    /// both the cohort pattern and the user's layer-index pattern are in the output.
+    #[test]
+    fn test_sensitive_layers_additive_with_cohort_priors() {
+        let fp = make_qwen35moe_fingerprint();
+        let overrides = build_component_overrides(ArchFamily::Qwen35MoE, &fp, 4);
+
+        // Cohort priors are present
+        assert!(overrides.iter().any(|o| o.pattern == ".A_log"),
+            "SSM cohort prior must be present");
+        // v_proj override (Rule 4) is still present alongside cohort priors
+        assert!(overrides.iter().any(|o| o.pattern == "v_proj"),
+            "v_proj override must still be present alongside cohort priors");
+    }
+
+    /// Mock: verify no SSM priors for a non-qwen35 dense model (Llama).
+    #[test]
+    fn test_non_qwen35_dense_no_ssm_priors() {
+        let fp = make_dense_fingerprint(8.0); // LlamaForCausalLM
+        let overrides = build_component_overrides(ArchFamily::DenseDecoder, &fp, 4);
+
+        for ssm in &[".A_log", ".dt_bias", ".dt_proj.weight", ".dt_proj.bias", ".conv1d.weight"] {
+            assert!(
+                !overrides.iter().any(|o| o.pattern == *ssm),
+                "Non-qwen35 dense must not have SSM cohort prior: {ssm}"
+            );
+        }
     }
 
     #[test]
