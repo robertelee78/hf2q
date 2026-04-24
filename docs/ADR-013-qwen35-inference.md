@@ -934,6 +934,48 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-24 — /loop iter 15 · P7b-prep (GPU-CPU bridge + RMSNorm parity)
+
+**Scope:** Phase P7b (GPU builder for full-attention) broken into two sub-iters; this iter lands the foundation — weight upload infrastructure + first dispatch verified end-to-end.
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/gpu_full_attn.rs` (new file, ~330 LOC):
+  - `FullAttnWeightsGpu` — MlxBuffer container mirroring `FullAttnLayerWeights`.
+  - `FullAttnWeightsGpu::from_cpu(cpu_weights, device)` — uploads all 8 weight tensors to Metal in one call.
+  - `upload_f32()` / `download_f32()` — reusable helpers for CPU↔GPU round-trips with dtype validation.
+  - **`apply_pre_attn_rms_norm(encoder, registry, device, input, weights, seq, hidden, eps) -> Result<MlxBuffer>`** — first dispatch in the full-attention sequence. Allocates output + params buffers, calls `mlx_native::ops::rms_norm::dispatch_rms_norm`, returns the output buffer for downstream chaining.
+
+**Tests (5, all green):**
+- `upload_download_roundtrip` — bytewise identity via MlxBuffer.
+- `from_cpu_uploads_all_weights` — all 8 tensors preserved exactly after upload.
+- `upload_f32_is_f32_dtype` — dtype correctness sanity.
+- `download_rejects_wrong_dtype` — guard rail.
+- **`pre_attn_rms_norm_matches_cpu_ref`** — THE pilot parity test: runs RMSNorm on GPU for Qwen3.5-shaped input (seq=4, hidden=32), compares against an in-test CPU recomputation of the exact `rms_norm_row` formula used in `full_attn::gated_full_attention_cpu_ref`. Passes at ≤1e-5 per element.
+
+**Verification:**
+- 5/5 new GPU full-attn tests green.
+- 536/536 hf2q test suite green (+5 from iter 14's 531, 0 regressions).
+
+**Design / pattern established:**
+- Each future op in the full-attention forward sequence (QKV projection, per-head RMSNorm, IMROPE, SDPA, output-gate, output projection) will get an `apply_X()` function returning the output buffer, plus a standalone parity test against an in-test CPU recomputation of that step only. This keeps parity failures easy to isolate — a bug in any one step becomes a single failing test rather than a composite "full layer diverges" test.
+- The composed `build_gated_attn_layer()` builder, when it lands, is just a sequential call chain of these `apply_X()` helpers plus encoder commit. Its parity test runs the full chain and compares to `gated_full_attention_cpu_ref`.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4-P6  | 1,2,11,12    | COMPLETE |
+| P7     | 9          | **PARTIAL** — CPU ref ✓; GPU weight upload ✓; RMSNorm step ✓; 6 remaining dispatches + full-layer parity pending |
+| P8     | 8          | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P10    | 15         | COMPLETE |
+| P11    | 16         | Pending (E2E wire-up — depends on P7b/P8b/P9b completion) |
+| P12    | 17         | COMPLETE |
+| P13    | 17, 18     | Pending |
+
+**Next iter target:** Continue P7b — add `apply_qkv_projection()` using `dense_gemm` + separate parity test, then chain into a composite pass that matches `gated_full_attention_cpu_ref` up through step 4.
+
 ### 2026-04-24 — /loop iter 14 · P12 COMPLETE (ActivationCapture trait + mock)
 
 **Scope:** Phase P12 Decision 16 — the `ActivationCapture` trait that ADR-012's DWQ calibration pass (P6) consumes. Lands BEFORE ADR-012 starts wiring so they can build against a trait object and inject a mock today.
