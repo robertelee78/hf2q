@@ -331,6 +331,81 @@ fn write_tiny_qwen35_local_dir(dir: &std::path::Path) {
 
 #[cfg(unix)]
 #[test]
+fn smoke_transcript_byte_identical_across_two_runs() {
+    // Decision 16 §Acceptance: "Both transcripts are byte-identical
+    // across two fresh runs on the same M5 Max (proves --seed 42
+    // --temp 0 determinism is real — flags a non-deterministic
+    // tokenizer or forward path immediately if it fails)."
+    //
+    // With a deterministic mock llama-cli, the only way two transcripts
+    // could differ is if hf2q's own output generation (transcript
+    // template, arg ordering, convert step) is non-deterministic.
+    // Same input + same mock = byte-identical transcript.
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local-qwen35");
+    write_tiny_qwen35_local_dir(&local);
+
+    let mock = tmp.path().join("mock-llama-cli.sh");
+    write_mock_llama_cli(&mock);
+
+    let fixtures_a = tmp.path().join("fxA");
+    let fixtures_b = tmp.path().join("fxB");
+    let convert_a = tmp.path().join("convertA");
+    let convert_b = tmp.path().join("convertB");
+
+    let run = |fixtures: &std::path::Path, convert_out: &std::path::Path| {
+        hf2q()
+            .args([
+                "smoke",
+                "--arch",
+                "qwen35",
+                "--quant",
+                "q4",
+                "--local-dir",
+                local.to_str().unwrap(),
+                "--llama-cli-override",
+                mock.to_str().unwrap(),
+                "--fixtures-root",
+                fixtures.to_str().unwrap(),
+                "--convert-output-dir",
+                convert_out.to_str().unwrap(),
+            ])
+            .env_remove("HF_TOKEN")
+            .output()
+            .expect("exec hf2q")
+    };
+
+    let out_a = run(&fixtures_a, &convert_a);
+    // Skip on debug build per the release-check preflight.
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    if !out_a.status.success() && stderr_a.contains("release build") {
+        eprintln!("skipped — debug build; run with `cargo test --release`");
+        return;
+    }
+    assert!(out_a.status.success(), "run A failed: {}", stderr_a);
+
+    let out_b = run(&fixtures_b, &convert_b);
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(out_b.status.success(), "run B failed: {}", stderr_b);
+
+    let ta = fixtures_a.join("smoke-transcripts").join("qwen35-q4.txt");
+    let tb = fixtures_b.join("smoke-transcripts").join("qwen35-q4.txt");
+    let bytes_a = std::fs::read(&ta).expect("read transcript A");
+    let bytes_b = std::fs::read(&tb).expect("read transcript B");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "Decision 16 AC violated: transcripts differ across two fresh runs"
+    );
+    // Same-length check with a useful error surface.
+    assert!(
+        !bytes_a.is_empty(),
+        "transcript must be non-empty ({} bytes)",
+        bytes_a.len()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn smoke_full_q4_0_pipeline_with_mock_llama_cli_emits_transcript() {
     // Exercises the full `run_q4_0_pipeline` path — convert the
     // synthetic local dir, invoke the mock llama-cli stub, assert the
