@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 pub mod mmproj;
 pub mod preprocess;
+pub mod vit;
 
 #[allow(unused_imports)]
 pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG};
