@@ -43,6 +43,20 @@ pub mod preprocess;
 #[allow(unused_imports)]
 pub use preprocess::{preprocess_rgb_chw, PreprocessConfig, GEMMA4_VISION_CONFIG};
 
+/// A single preprocessed image ready for the ViT forward pass.
+///
+/// `pixel_values` carries the CHW-layout f32 tensor produced by
+/// `preprocess_rgb_chw` (length = `3 × target_size × target_size`).
+/// `source_label` is a debug/log-friendly id (mime type for data URIs,
+/// file-name stem for file paths) so request-level tracing can
+/// correlate per-image timings without leaking the full URL or payload.
+#[derive(Debug, Clone)]
+pub struct PreprocessedImage {
+    pub pixel_values: Vec<f32>,
+    pub target_size: u32,
+    pub source_label: String,
+}
+
 // ---------------------------------------------------------------------------
 // ImageInput parsing
 // ---------------------------------------------------------------------------

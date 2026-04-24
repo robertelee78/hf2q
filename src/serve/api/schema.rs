@@ -167,6 +167,23 @@ impl ApiError {
         )
     }
 
+    /// No mmproj configured (HTTP 400) — the request contains `image_url`
+    /// content parts but the server was started without `--mmproj`.
+    /// Lands in the 400 class (not 501) because the request is malformed
+    /// against THIS server configuration: the client needs to either omit
+    /// images or use a server instance that has a mmproj loaded.
+    pub fn no_mmproj_loaded() -> Self {
+        Self::bare(
+            StatusCode::BAD_REQUEST,
+            "Request includes image_url content parts but this server \
+             was started without a multimodal projector. Start with \
+             `--mmproj <path>` or send a text-only request.",
+            "invalid_request_error",
+            Some("no_mmproj_loaded"),
+            Some("messages".into()),
+        )
+    }
+
     /// Grammar-rejection (HTTP 400) — a malformed JSON schema or GBNF grammar
     /// was supplied in `response_format` or `tools` (Decision #6).
     pub fn grammar_error(detail: impl Into<String>) -> Self {

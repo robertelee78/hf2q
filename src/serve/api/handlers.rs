@@ -265,15 +265,25 @@ fn prepare_chat_generation(
         .into_response());
     }
 
-    // --- Multimodal validation (Phase 2c — Decision #1) ---
-    // Scan message content parts for image_url entries. Each URL is
-    // parsed at request time so bad URLs surface as 400 before the
-    // generation is queued. If any images ARE supplied and pass parse,
-    // return 501: the ViT forward pass that consumes them lands in a
-    // later iter (live-model validation required). Per mantra: honest
-    // 501 rather than silently stripping images.
-    if let Err(resp) = validate_multimodal_content(&req.messages) {
-        return Err(resp);
+    // --- Multimodal content pipeline (Phase 2c — Decision #1) ---
+    // Scan messages for `image_url` content parts; if any are present,
+    // require a mmproj, parse each URL, load the bytes, and preprocess
+    // (resize/normalize/CHW) to a ViT-ready pixel tensor. Full error
+    // taxonomy:
+    //   images absent                     → Ok(empty), text-only flow
+    //   images present, mmproj missing    → 400 no_mmproj_loaded
+    //   image URL malformed               → 400 invalid_request (per part)
+    //   image load/decode/preprocess fails→ 400 invalid_request (per part)
+    //   all images preprocessed OK        → 501 ViT forward pending
+    // (The 501 is because the forward-pass path lands in Task #15. When
+    // that lands, the preprocessed tensors get threaded into generate().)
+    let preprocessed_images =
+        match process_multimodal_content(&req.messages, state.mmproj.as_ref()) {
+            Ok(imgs) => imgs,
+            Err(resp) => return Err(resp),
+        };
+    if !preprocessed_images.is_empty() {
+        return Err(vit_forward_pending_response(preprocessed_images.len()));
     }
 
     // Pre-compile the response_format grammar (Decision #6). Fails fast on
@@ -741,59 +751,132 @@ mod truncate_tests {
     }
 }
 
-/// Scan message content parts for `image_url` entries. Validates each URL
-/// via `crate::inference::vision::parse_image_url` (catches malformed URLs
-/// at request time) and returns:
+/// Top-level multimodal content pipeline for a chat-completion request.
 ///
-///   - `Ok(())` when no images are present → normal text-only flow.
-///   - `Err(400 invalid_request)` when any URL is malformed — with the
-///     specific parse error in the message.
-///   - `Err(501 not_implemented)` when images parse cleanly but the ViT
-///     forward-pass path that would inject them isn't wired yet.
+/// Behavior matrix:
 ///
-/// Per mantra ("no stubs"): we REFUSE to silently strip images from a
-/// request that supplied them. The 501 surfaces the feature gap plainly
-/// so clients know to either omit images or wait for the ViT iter.
-fn validate_multimodal_content(
+/// | images present | mmproj loaded | outcome                              |
+/// |----------------|---------------|--------------------------------------|
+/// | no             | either        | Ok(vec![]) — normal text-only flow.  |
+/// | yes            | no            | Err(400 no_mmproj_loaded).           |
+/// | yes            | yes           | preprocess each → Ok(Vec<Preprocessed>)    |
+/// | yes (bad URL)  | either        | Err(400 invalid_request on that part).     |
+///
+/// Returns the preprocessed image tensors in message order. Empty vec when
+/// the request is text-only. The caller is responsible for deciding what
+/// to do with a non-empty vec: until the ViT forward pass lands (Task #15),
+/// the handler short-circuits with a 501.
+///
+/// Per mantra ("no stubs"): we refuse to silently strip images from a
+/// request that supplied them, and we refuse to claim the ViT forward
+/// pass is ready when it isn't. The preprocessing stage IS done for real
+/// so the request exercises the full load→decode→normalize→CHW pipeline.
+fn process_multimodal_content(
     messages: &[super::schema::ChatMessage],
-) -> std::result::Result<(), Response> {
+    mmproj: Option<&super::state::LoadedMmproj>,
+) -> std::result::Result<Vec<crate::inference::vision::PreprocessedImage>, Response> {
     use super::schema::{ContentPart, MessageContent};
-    let mut has_images = false;
+    // Pass 1: gather (msg_idx, part_idx, &ImageUrl) refs without parsing.
+    // A separate pass keeps the early-exit policy decisions (mmproj absent)
+    // from wasting work on the load/decode pipeline.
+    let mut image_refs: Vec<(usize, usize, &super::schema::ImageUrl)> = Vec::new();
     for (mi, msg) in messages.iter().enumerate() {
         if let Some(MessageContent::Parts(parts)) = msg.content.as_ref() {
             for (pi, p) in parts.iter().enumerate() {
                 if let ContentPart::ImageUrl { image_url } = p {
-                    // Fail fast on malformed URLs (even though we'd 501 below
-                    // for forward-pass-pending, a bad URL is a client bug).
-                    if let Err(e) = crate::inference::vision::parse_image_url(&image_url.url) {
-                        return Err(ApiError::invalid_request(
-                            format!(
-                                "messages[{}].content[{}].image_url parse failed: {}",
-                                mi, pi, e
-                            ),
-                            Some(format!("messages[{}].content[{}]", mi, pi)),
-                        )
-                        .into_response());
-                    }
-                    has_images = true;
+                    image_refs.push((mi, pi, image_url));
                 }
             }
         }
     }
-    if has_images {
-        let err = ApiError::invalid_request(
-            "multimodal vision (image_url content parts) is not yet implemented \
-             in this build. The image URLs parsed correctly; the ViT forward \
-             pass that consumes them lands in a later hf2q iter (ADR-005 \
-             Phase 2c, Task #15). Send a text-only message to exercise the \
-             chat path.",
-            Some("messages".into()),
-        );
-        let mut resp = err.into_response();
-        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-        return Err(resp);
+    if image_refs.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    // Images present — confirm we have an mmproj before running any I/O.
+    let mmproj = match mmproj {
+        Some(m) => m,
+        None => return Err(ApiError::no_mmproj_loaded().into_response()),
+    };
+    let preprocess_cfg = mmproj.config.preprocess_config();
+
+    let mut out: Vec<crate::inference::vision::PreprocessedImage> =
+        Vec::with_capacity(image_refs.len());
+    for (mi, pi, image_url) in image_refs {
+        // Parse the URL (data URI / file:// / bare path / http).
+        let parsed = crate::inference::vision::parse_image_url(&image_url.url)
+            .map_err(|e| {
+                ApiError::invalid_request(
+                    format!(
+                        "messages[{}].content[{}].image_url parse failed: {}",
+                        mi, pi, e
+                    ),
+                    Some(format!("messages[{}].content[{}]", mi, pi)),
+                )
+                .into_response()
+            })?;
+        // Compute a source_label before consuming `parsed` into the loader.
+        let source_label = match &parsed {
+            crate::inference::vision::ImageInput::DataUri { mime_type, .. } => mime_type.clone(),
+            crate::inference::vision::ImageInput::FilePath(p) => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .to_string(),
+            crate::inference::vision::ImageInput::HttpUrl(u) => u.clone(),
+        };
+        // Load raw bytes (base64 decode / file read / http reject).
+        let bytes = crate::inference::vision::load_image_bytes(&parsed).map_err(|e| {
+            ApiError::invalid_request(
+                format!(
+                    "messages[{}].content[{}].image_url load failed: {}",
+                    mi, pi, e
+                ),
+                Some(format!("messages[{}].content[{}]", mi, pi)),
+            )
+            .into_response()
+        })?;
+        // Decode + resize + normalize + CHW. This is CPU-heavy per image
+        // (896×896 bilinear resize + 2.4M float normalizes); future work
+        // can move it to a rayon pool if a multi-image request becomes a
+        // hot path.
+        let pixel_values = crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
+            .map_err(|e| {
+                ApiError::invalid_request(
+                    format!(
+                        "messages[{}].content[{}].image_url preprocess failed: {}",
+                        mi, pi, e
+                    ),
+                    Some(format!("messages[{}].content[{}]", mi, pi)),
+                )
+                .into_response()
+            })?;
+        out.push(crate::inference::vision::PreprocessedImage {
+            pixel_values,
+            target_size: preprocess_cfg.target_size,
+            source_label,
+        });
+    }
+    Ok(out)
+}
+
+/// Emit the 501 for "images preprocessed successfully, ViT forward pass
+/// not yet wired". Centralized so the streaming and non-streaming paths
+/// phrase it identically.
+fn vit_forward_pending_response(n_images: usize) -> Response {
+    let err = ApiError::invalid_request(
+        format!(
+            "Request carries {n} image(s); all parsed + preprocessed \
+             successfully into ViT pixel tensors. The ViT forward pass \
+             that consumes them lands in a later hf2q iter (ADR-005 \
+             Phase 2c, Task #15). Send a text-only message to exercise \
+             the chat path today.",
+            n = n_images
+        ),
+        Some("messages".into()),
+    );
+    let mut resp = err.into_response();
+    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    resp
 }
 
 /// Pre-compile the request's `response_format` to a GBNF grammar and parse
@@ -1406,5 +1489,186 @@ mod tests {
         let p = std::env::temp_dir().join(format!("{tag}-{pid}-{nanos}"));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multimodal content pipeline tests (iter 26 — Task #14 extraction layer).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+    use crate::inference::vision::mmproj::{MmprojConfig, ProjectorType};
+    use crate::serve::api::schema::{ChatMessage, ContentPart, ImageUrl, MessageContent};
+    use crate::serve::api::state::LoadedMmproj;
+
+    /// Build a tiny (4×4) PNG and base64-encode it into an OpenAI-style
+    /// data URI. Keeps the test payload under 200 bytes and doesn't touch
+    /// the filesystem.
+    fn synthetic_png_data_uri() -> String {
+        use base64::Engine;
+        use image::{ImageBuffer, ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+        let img: RgbImage = ImageBuffer::from_fn(4, 4, |_x, _y| Rgb([200u8, 100, 50]));
+        let mut buf: Vec<u8> = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .expect("encode png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        format!("data:image/png;base64,{b64}")
+    }
+
+    /// Build a synthetic `LoadedMmproj` matching the Gemma-4 vision tower
+    /// shape (896×896, patch 14, MLP projector). `target_size` is shrunk
+    /// to 8 in tests to keep preprocess cheap.
+    fn synthetic_mmproj() -> LoadedMmproj {
+        let cfg = MmprojConfig {
+            image_size: 8,
+            patch_size: 1,
+            num_patches_side: 8,
+            hidden_size: 1152,
+            intermediate_size: 4304,
+            num_attention_heads: 16,
+            num_hidden_layers: 27,
+            layer_norm_eps: 1e-6,
+            projector: ProjectorType::Mlp,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+        };
+        LoadedMmproj {
+            gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
+            config: cfg,
+            model_id: "synthetic-mmproj".into(),
+        }
+    }
+
+    fn user_text(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text(text.into())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn user_with_image(text: &str, image_url: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: text.into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: image_url.into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn text_only_returns_empty_and_does_not_need_mmproj() {
+        // Text-only request, no mmproj configured — must succeed with an
+        // empty vec so the handler proceeds to the text-only flow.
+        let msgs = vec![user_text("hi")];
+        let got = process_multimodal_content(&msgs, None).expect("ok");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn images_without_mmproj_return_400_no_mmproj_loaded() {
+        let uri = synthetic_png_data_uri();
+        let msgs = vec![user_with_image("describe this", &uri)];
+        let resp = process_multimodal_content(&msgs, None).expect_err("image without mmproj should 400");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn single_image_preprocesses_to_chw_f32_tensor() {
+        // With a synthetic 8×8 mmproj, a 4×4 PNG resizes to 8×8 → 3×8×8
+        // f32 = 192 floats. Normalized with mean/std = 0.5 → values in
+        // [-1, 1] ish range.
+        let uri = synthetic_png_data_uri();
+        let msgs = vec![user_with_image("describe", &uri)];
+        let mmproj = synthetic_mmproj();
+        let got = process_multimodal_content(&msgs, Some(&mmproj)).expect("ok");
+        assert_eq!(got.len(), 1);
+        let img = &got[0];
+        assert_eq!(img.target_size, 8);
+        assert_eq!(img.pixel_values.len(), 3 * 8 * 8);
+        assert_eq!(img.source_label, "image/png");
+        // Source pixel [200, 100, 50] / 255 then (x-0.5)/0.5 range:
+        //   R: (200/255-0.5)/0.5 ≈ 0.569
+        //   G: (100/255-0.5)/0.5 ≈ -0.216
+        //   B: (50/255-0.5)/0.5 ≈ -0.608
+        // With bilinear resize of a solid fill, interior pixels keep the
+        // source value ± tiny filter error.
+        let r = img.pixel_values[0];
+        let g = img.pixel_values[64];
+        let b = img.pixel_values[128];
+        assert!((r - 0.569).abs() < 0.05, "R approx 0.569, got {r}");
+        assert!((g - (-0.216)).abs() < 0.05, "G approx -0.216, got {g}");
+        assert!((b - (-0.608)).abs() < 0.05, "B approx -0.608, got {b}");
+    }
+
+    #[test]
+    fn multiple_images_preserve_message_order() {
+        let uri = synthetic_png_data_uri();
+        let msgs = vec![
+            user_with_image("first", &uri),
+            user_text("middle"),
+            user_with_image("second", &uri),
+        ];
+        let mmproj = synthetic_mmproj();
+        let got = process_multimodal_content(&msgs, Some(&mmproj)).expect("ok");
+        assert_eq!(got.len(), 2);
+        // Both from the same PNG source, so source_label is identical —
+        // what we care about is ordering survived the scan→preprocess split.
+        assert_eq!(got[0].source_label, "image/png");
+        assert_eq!(got[1].source_label, "image/png");
+    }
+
+    #[test]
+    fn malformed_url_returns_400_with_location() {
+        let msgs = vec![user_with_image("x", "not-a-url")];
+        let mmproj = synthetic_mmproj();
+        let resp = process_multimodal_content(&msgs, Some(&mmproj))
+            .expect_err("bad URL should 400");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn unsupported_mime_type_returns_400() {
+        // GIF is deliberately rejected by parse_image_url.
+        let msgs = vec![user_with_image("x", "data:image/gif;base64,R0lGODlh")];
+        let mmproj = synthetic_mmproj();
+        let resp = process_multimodal_content(&msgs, Some(&mmproj))
+            .expect_err("gif should 400");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_png_bytes_returns_400() {
+        use base64::Engine;
+        // base64 of gibberish bytes → valid base64 but invalid PNG.
+        let payload = base64::engine::general_purpose::STANDARD.encode(b"this is not a png");
+        let uri = format!("data:image/png;base64,{payload}");
+        let msgs = vec![user_with_image("x", &uri)];
+        let mmproj = synthetic_mmproj();
+        let resp = process_multimodal_content(&msgs, Some(&mmproj))
+            .expect_err("bad PNG payload should 400");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn vit_forward_pending_response_is_501_with_messages_param() {
+        let resp = vit_forward_pending_response(2);
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 }
