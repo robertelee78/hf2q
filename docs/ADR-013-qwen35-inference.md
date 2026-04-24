@@ -934,6 +934,71 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 7 · P5 PARTIAL (Q5_K+I16 type recognition + tensor-name tables)
+
+**Scope:** Phase P5 Decision 12 — two of three sub-deliverables (type recognition + tensor-name enumeration). Full dequant kernels deferred to iter 8+.
+
+**Delivered in `mlx-native`:**
+- `src/gguf/mod.rs` — added `GGML_TYPE_Q5_K` (13) + `GGML_TYPE_I16` (17) to the type-ID constants and the `ggml_type_from_u32` dispatch.
+- `src/ops/quantized_matmul_ggml.rs` — added `GgmlType::Q5_K` (256 values / 176 bytes per block) and `GgmlType::I16` (1 value / 2 bytes per "block") enum variants. Updated `block_values()`, `block_bytes()`, and all three kernel-name matches (mv / mm / mm_tensor) to classify Q5_K + I16 as `"unsupported"` for matmul dispatch — they can be loaded as opaque bytes via `load_tensor_raw()` but not yet dequantized for on-GPU arithmetic.
+- `src/gguf/mod.rs::dequantize_to_f32` — explicit error for Q5_K/I16 pointing to the follow-up iter. `load_tensor_raw` accepts both via the existing opaque-bytes path.
+- `src/ops/quantized_matmul_id_ggml.rs` — MoE-dispatch kernel-name matches updated to classify Q5_K/I16 unsupported consistently.
+
+**Apex-unblock:** `parses_real_apex_gguf` integration test (previously skipping on "unsupported GGML type ID 13") **now runs end-to-end and asserts every Qwen35Config field** against the known values from the 2026-04-23 dump:
+- num_hidden_layers=40, hidden_size=2048, head_dim=256
+- linear_num_key_heads=16, linear_num_value_heads=32, linear_*_head_dim=128
+- rope_theta=1e7, rotary_dim=64, mrope_section=[11,11,10,0]
+- num_experts=256, num_experts_per_tok=8, shared_expert_intermediate_size=512
+
+**Delivered in `hf2q`:**
+- `src/inference/models/qwen35/moe.rs` — `LINEAR_LAYER_TENSOR_SUFFIXES` (19 items: 11 DeltaNet-specific + 8 MoE FFN) and `FULL_LAYER_TENSOR_SUFFIXES` (17 items: 9 full-attn-specific + 8 MoE FFN). Plus `GLOBAL_TENSORS` (3) and `tensor_names_for_layer(layer_idx, kind)` helper. Each tensor documented inline with shape semantics, cross-referenced to the apex GGUF dump.
+- `src/inference/models/qwen35/dense.rs` — `DENSE_FFN_TENSOR_SUFFIXES` (3: ffn_gate / ffn_up / ffn_down) plus `dense_layer_tensor_suffixes()` that re-uses the MoE norm+attention+ssm set and substitutes SwiGLU for MoE FFN.
+
+**Tensor-name spec (grounded in apex dump):**
+
+Per linear-attention layer (14 Qwen3.5-specific + 8 MoE FFN):
+- `attn_norm.weight`, `attn_qkv.weight`, `attn_gate.weight` (DeltaNet Z-gate, distinct from full-attn output gate)
+- `ssm_conv1d.weight`, `ssm_dt.bias`, `ssm_a` (raw, no `.weight`), `ssm_alpha.weight`, `ssm_beta.weight`, `ssm_norm.weight`, `ssm_out.weight`
+- `post_attention_norm.weight`
+- MoE: `ffn_gate_inp.weight`, `ffn_{gate,up,down}_exps.weight`, `ffn_gate_inp_shexp.weight`, `ffn_{gate,up,down}_shexp.weight`
+
+Per full-attention layer (9 Qwen3.5-specific + 8 MoE FFN):
+- `attn_norm.weight`, `attn_q.weight`, `attn_k.weight`, `attn_v.weight`
+- `attn_q_norm.weight`, `attn_k_norm.weight` (per-head RMSNorm)
+- `attn_gate.weight` (output gate; NOT fused with attn_q in GGUF, unlike llama.cpp's in-memory `wq`)
+- `attn_output.weight`, `post_attention_norm.weight`
+- MoE FFN (same 8 as linear layers).
+
+**Tests added (8 new):**
+- `linear_layer_names_start_with_blk_prefix` — prefix formatting correctness.
+- `full_layer_names_include_split_qkv` — verifies Q/K/V/Q-norm/K-norm are separate tensors (not fused).
+- `full_layer_has_no_ssm_tensors` — linear-specific tensors excluded from full-attn.
+- `linear_layer_has_no_split_qkv` — full-specific tensors excluded from linear.
+- `global_tensors_have_three` — token_embd / output / output_norm.
+- `dense_ffn_has_swiglu_not_moe` — dense variant FFN schema.
+- `dense_full_layer_excludes_moe_ffn_tensors` — MoE FFN stripped, SwiGLU present.
+- `dense_linear_layer_keeps_ssm_tensors` — cross-variant SSM sharing.
+
+**Verification:**
+- 13/13 qwen35 unit tests green (5 from iter 6 + 8 new).
+- 438/438 hf2q full suite (+0 regressions).
+- 95/95 mlx-native library suite (+0 regressions).
+- **parses_real_apex_gguf (#[ignore]d) now PASSES** — full field-by-field assertion against the real 25 GB apex GGUF.
+
+**Still pending (P5 remainder → iter 8):**
+- Q5_K f32 dequant (super-block logic: 2 fp16 scales + 12-byte compressed scale/min + 32-byte qh + 128-byte qs → 256 f32 values).
+- I16 f32 dequant (per-tensor scale lookup via GGUF metadata, ~20 LOC per ADR).
+- Weight-loading wire-up in future `Qwen35Dense::load` / `Qwen35Moe::load` (downstream of both dequants).
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0-P3  | 3,4,5,6,7,10 | COMPLETE (mlx-native kernels) |
+| P4    | 1, 2       | COMPLETE (hf2q scaffold) |
+| P5    | 12         | **PARTIAL** — type recognition ✓, name tables ✓; Q5_K+I16 dequant pending |
+| P6–P13| 8–18       | Pending |
+
 ### 2026-04-23 — /loop iter 6 · P4 COMPLETE (hf2q scaffold + Qwen35Config parser)
 
 **Scope:** Phase P4 Decisions 1 & 2 — hf2q-side module scaffolding and `Qwen35Config` parser.
