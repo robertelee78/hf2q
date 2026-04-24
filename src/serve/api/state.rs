@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
+use crate::inference::models::bert::BertConfig;
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
@@ -164,8 +165,24 @@ pub struct AppState {
     /// `Some(engine)` means a model is loaded and the worker thread is up;
     /// generation endpoints gate on `ready_for_gen` for warmup status.
     pub engine: Option<Engine>,
+    /// BERT embedding model config (from `--embedding-model <path>`).
+    /// `None` when no embedding model was supplied. Validated at startup
+    /// via `BertConfig::from_gguf` — the forward pass that consumes this
+    /// lands in a later iter (ADR-005 Phase 2b).
+    pub embedding_config: Option<EmbeddingModel>,
     /// Process-wide metric counters surfaced via `/metrics`.
     pub metrics: Arc<ServerMetrics>,
+}
+
+/// BERT embedding model, discovered from `--embedding-model <path>` at
+/// startup. Holds the config + the GGUF path so later iters can load
+/// weights on demand.
+#[derive(Debug, Clone)]
+pub struct EmbeddingModel {
+    pub gguf_path: PathBuf,
+    pub config: BertConfig,
+    /// Model id (file stem) — surfaced via `/v1/models`.
+    pub model_id: String,
 }
 
 impl AppState {
@@ -180,6 +197,7 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: None,
+            embedding_config: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
     }
@@ -194,8 +212,17 @@ impl AppState {
             ready_for_gen: Arc::new(AtomicBool::new(false)),
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: Some(engine),
+            embedding_config: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
+    }
+
+    /// Attach a BERT embedding model config. Cheap (clones internal
+    /// references). Called by `cmd_serve` after validating the supplied
+    /// GGUF header.
+    pub fn with_embedding_model(mut self, em: EmbeddingModel) -> Self {
+        self.embedding_config = Some(em);
+        self
     }
 
     /// Seconds since the server started.

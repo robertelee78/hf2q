@@ -320,6 +320,16 @@ pub struct ServeArgs {
     /// `hf2q_overflow_policy` overrides this.
     #[arg(long, value_enum, default_value = "summarize")]
     pub overflow_policy: OverflowPolicyArg,
+
+    /// Path to a dedicated embedding GGUF (BERT family — nomic-embed-text,
+    /// mxbai-embed-large, bge-small-en, etc.). When supplied, the server
+    /// validates the file's GGUF header + parses the BERT config at
+    /// startup and surfaces it via `/v1/models` with extension fields
+    /// (`pooling`, `context_length`, `hidden_size`). The forward pass
+    /// that backs `/v1/embeddings` requests lands in a later iter
+    /// (ADR-005 Phase 2b, Task #13).
+    #[arg(long)]
+    pub embedding_model: Option<PathBuf>,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to

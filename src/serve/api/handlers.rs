@@ -817,6 +817,30 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
             }
         }
     }
+    // Prepend the embedding model if one was supplied via --embedding-model.
+    // Listed with `loaded: true` since the config is resident in memory even
+    // if the forward-pass path isn't wired yet.
+    if let Some(em) = state.embedding_config.as_ref() {
+        if !models.iter().any(|m| m.id == em.model_id) {
+            models.insert(
+                0,
+                ModelObject {
+                    id: em.model_id.clone(),
+                    object: "model",
+                    created: chrono_seconds(),
+                    owned_by: "hf2q",
+                    context_length: Some(em.config.max_position_embeddings),
+                    // Embedding GGUFs are typically F16/F32 — we don't
+                    // run infer_quant_type for them because they're
+                    // identified via the --embedding-model flag, not the
+                    // cache scan.
+                    quant_type: None,
+                    backend: Some("mlx-native"),
+                    loaded: true,
+                },
+            );
+        }
+    }
     let resp = ModelListResponse {
         object: "list",
         data: models,

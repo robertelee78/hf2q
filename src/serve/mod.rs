@@ -550,11 +550,50 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         None
     };
 
+    // --- Optionally validate + load the BERT embedding model config ---
+    // Decision: load config only (header parse), NOT weights. Per
+    // ADR-005 Phase 2b iter 16: the forward pass that consumes weights
+    // lands when live-model validation is possible (OOM-blocked today).
+    // The startup failure path still works: a bad GGUF at this path fails
+    // the server boot cleanly.
+    let embedding_model = if let Some(emb_path) = args.embedding_model.as_ref() {
+        anyhow::ensure!(
+            emb_path.exists(),
+            "Embedding model not found: {}",
+            emb_path.display()
+        );
+        let gguf = mlx_native::gguf::GgufFile::open(emb_path)
+            .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
+        let emb_config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
+            .map_err(|e| anyhow::anyhow!("Embedding GGUF config parse failed: {e}"))?;
+        let model_id = emb_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "embedding-model".into());
+        tracing::info!(
+            path = %emb_path.display(),
+            hidden = emb_config.hidden_size,
+            layers = emb_config.num_hidden_layers,
+            pooling = ?emb_config.pooling_type,
+            "Validated embedding GGUF header"
+        );
+        Some(api::state::EmbeddingModel {
+            gguf_path: emb_path.clone(),
+            config: emb_config,
+            model_id,
+        })
+    } else {
+        None
+    };
+
     // --- Build router ---
-    let state = match engine_opt {
+    let mut state = match engine_opt {
         Some(engine) => api::AppState::with_engine(config.clone(), engine),
         None => api::AppState::new(config.clone()),
     };
+    if let Some(em) = embedding_model {
+        state = state.with_embedding_model(em);
+    }
     let state_for_warmup = state.clone();
     let router = api::build_router(state);
 
