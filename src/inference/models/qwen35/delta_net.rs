@@ -299,13 +299,26 @@ pub fn delta_net_layer_cpu_ref(
             .copy_from_slice(&qkv_conv[base + q_span + k_span..base + qkv_channels]);
     }
 
-    // 6. L2 norm Q and K per-head (over D_k).
+    // 6. L2 norm Q and K per-head (over D_k), then scale Q by 1/sqrt(D_k).
+    //
+    // llama.cpp delta-net-base.cpp build_delta_net_{autoregressive,chunking}:
+    //   const float scale = 1.0f / sqrtf(S_k);
+    //   q = ggml_scale(ctx0, q, scale);   // applied after ggml_l2_norm
+    //
+    // This is equivalent to computing L2-normalised Q with unit magnitude and
+    // then multiplying by 1/sqrt(D_k), so the GDN dot-product output (state @ q)
+    // is scaled down by the same factor.  Without this the output magnitude is
+    // sqrt(D_k) ≈ 11× too large for D_k=128, which corrupts the residual stream
+    // after 30 DeltaNet layers and produces incorrect logits.
+    let q_scale = 1.0 / (dk as f32).sqrt();
     for t in 0..seq {
         for h_idx in 0..nk {
             let off = (t * nk + h_idx) * dk;
             let row = &q_buf[off..off + dk];
             let normed = l2_norm_row(row, shape.rms_norm_eps);
-            q_buf[off..off + dk].copy_from_slice(&normed);
+            for (dst, v) in q_buf[off..off + dk].iter_mut().zip(normed.iter()) {
+                *dst = v * q_scale;
+            }
         }
         for h_idx in 0..nk {
             let off = (t * nk + h_idx) * dk;

@@ -39,6 +39,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use std::sync::OnceLock;
 
 use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
@@ -56,6 +57,47 @@ use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use mlx_native::ops::rms_norm;
+
+// ================================================================
+// Debug dump helpers (HF2Q_DUMP_LAYER_N env gate)
+// ================================================================
+
+/// Returns Some(n) if HF2Q_DUMP_LAYER_N=n env var is set, else None.
+fn dump_layer_n() -> Option<usize> {
+    static CACHE: OnceLock<Option<usize>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HF2Q_DUMP_LAYER_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+}
+
+/// Print stats of the last-token row of a hidden buffer to stderr.
+fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u32) {
+    match download_f32(buf) {
+        Ok(data) => {
+            let seq = seq_len as usize;
+            let h = hidden_size as usize;
+            let last_start = (seq - 1) * h;
+            let row = &data[last_start..last_start + h.min(data.len() - last_start)];
+            let sum_sq: f32 = row.iter().map(|x| x * x).sum();
+            let rms = (sum_sq / h as f32).sqrt();
+            let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let max_tok: f32 = if seq > 0 {
+                let tok0 = &data[0..h];
+                tok0.iter().map(|x| x.abs()).fold(0.0f32, f32::max)
+            } else { 0.0 };
+            eprintln!(
+                "[DUMP] {} last-tok: rms={:.4} max_abs={:.4} tok0_max_abs={:.4} seq={} h={}",
+                label, rms, max_abs, max_tok, seq, h
+            );
+            // Also print first 8 values of last token
+            let preview: Vec<String> = row[..8.min(row.len())].iter().map(|x| format!("{:.4}", x)).collect();
+            eprintln!("[DUMP]   first8={}", preview.join(", "));
+        }
+        Err(e) => eprintln!("[DUMP] {} download failed: {e}", label),
+    }
+}
 
 // ================================================================
 // GPU layer weight containers — one GPU bundle per layer
@@ -174,6 +216,11 @@ fn apply_output_head_gpu(
     .context("lm_head projection")?;
     enc.commit_and_wait().context("commit lm_head")?;
 
+    // Optional: dump output-norm stats to stderr.
+    if dump_layer_n().is_some() {
+        dump_hidden_stats("output_norm", &normed, seq_len, hidden_size);
+    }
+
     download_f32(&logits_buf).context("download logits")
 }
 
@@ -291,6 +338,10 @@ impl Qwen35Model {
             &device,
         )
         .context("embed_tokens_gpu")?;
+
+        if dump_layer_n().is_some() {
+            dump_hidden_stats("embed", &hidden, seq_len, h);
+        }
 
         // ---- Step 2: per-layer forward pass ----
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
@@ -499,6 +550,18 @@ impl Qwen35Model {
             // Matches llama.cpp: `cur = ggml_add(cur, ffn_residual)`.
             hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device)
                 .with_context(|| format!("residual ffn layer {layer_idx}"))?;
+
+            // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---
+            if let Some(dump_n) = dump_layer_n() {
+                if layer_idx <= dump_n {
+                    dump_hidden_stats(&format!("layer{layer_idx}"), &hidden, seq_len, h);
+                }
+                if layer_idx == dump_n {
+                    // Also dump attn_out and ffn_out for the target layer.
+                    dump_hidden_stats(&format!("layer{layer_idx}_attn_out"), &attn_out, seq_len, h);
+                    dump_hidden_stats(&format!("layer{layer_idx}_ffn_out"), &ffn_out, seq_len, h);
+                }
+            }
         }
 
         // ---- Step 3: final output head → logits ----

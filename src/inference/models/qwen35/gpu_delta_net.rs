@@ -741,11 +741,29 @@ pub fn build_delta_net_layer(
 
     // ---- Op 5: per-head L2 norm on Q and K ----
     let mut enc = device.command_encoder().context("enc op5q")?;
-    let q_normed = apply_l2_norm_per_head(
+    let q_l2 = apply_l2_norm_per_head(
         &mut enc, registry, device, &q_gpu,
         seq_len, n_k_heads, d_k, rms_norm_eps,
     )?;
     enc.commit_and_wait().context("commit op5q")?;
+
+    // ---- Q scaling: multiply by 1/sqrt(D_k) after L2 norm ----
+    //
+    // llama.cpp delta-net-base.cpp (both build_delta_net_autoregressive and
+    // build_delta_net_chunking) applies:
+    //   const float scale = 1.0f / sqrtf(S_k);
+    //   q = ggml_scale(ctx0, q, scale);
+    // after the L2 norm on Q.  Without this, GDN output = state @ q is
+    // sqrt(D_k) ≈ 11× too large (for D_k=128), corrupting the residual stream
+    // across 30 DeltaNet layers and producing wrong logits.
+    let q_normed = {
+        let q_scale = 1.0_f32 / (dk as f32).sqrt();
+        let mut q_scaled_cpu = download_f32(&q_l2)?;
+        for v in q_scaled_cpu.iter_mut() {
+            *v *= q_scale;
+        }
+        upload_f32(&q_scaled_cpu, device)?
+    };
 
     let mut enc = device.command_encoder().context("enc op5k")?;
     let k_normed = apply_l2_norm_per_head(

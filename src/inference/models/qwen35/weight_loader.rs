@@ -189,7 +189,30 @@ pub fn load_delta_net_layer(
         .with_context(|| format!("layer {layer_idx} post_attention_norm"))?;
     let attn_qkv = load_f32_tensor(gguf, &format!("{p}.attn_qkv.weight"), device)?;
     let attn_gate = load_f32_tensor(gguf, &format!("{p}.attn_gate.weight"), device)?;
-    let ssm_conv1d = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
+    // ssm_conv1d.weight GGUF layout: [channels_outer, K_inner] — i.e., the flat vec
+    // stores element (channel, k_pos) at index channel * K + k_pos. This is the
+    // TRANSPOSE of what the CPU reference expects: kernel[kk * channels + c] needs
+    // [K_outer, channels_inner]. We transpose here so that DeltaNetLayerWeights
+    // stores the CPU-ref convention, and DeltaNetWeightsGpu::from_cpu correctly
+    // transposes back to [channels_outer, K_inner] for the Metal ssm_conv kernel.
+    let ssm_conv1d_gguf = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
+    let k_width_usize = cfg.linear_conv_kernel_dim as usize;
+    let qkv_channels_usize = (2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+        + cfg.linear_num_value_heads * cfg.linear_value_head_dim) as usize;
+    // Transpose from [channels, K] (GGUF) → [K, channels] (CPU-ref convention).
+    let ssm_conv1d = {
+        let channels = qkv_channels_usize;
+        let k = k_width_usize;
+        let mut out = vec![0.0f32; k * channels];
+        for c in 0..channels {
+            for ki in 0..k {
+                // GGUF src: element(c, ki) = src[c * k + ki]
+                // CPU dst:  element(ki, c) = dst[ki * channels + c]
+                out[ki * channels + c] = ssm_conv1d_gguf[c * k + ki];
+            }
+        }
+        out
+    };
     let ssm_alpha = load_f32_tensor(gguf, &format!("{p}.ssm_alpha.weight"), device)?;
     let ssm_dt_bias = load_f32_tensor(gguf, &format!("{p}.ssm_dt.bias"), device)?;
     let ssm_beta = load_f32_tensor(gguf, &format!("{p}.ssm_beta.weight"), device)?;
