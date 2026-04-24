@@ -929,3 +929,37 @@ Every gotcha from `project_qwen36_architecture.md` is addressed in this ADR. ADR
 | #10 Expert weights scale | — | **Decision 13 (applied in MoE forward)** |
 
 Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does not transform them; the inference engine applies them at op execution time.
+
+---
+
+## Progress log (reverse chronological)
+
+### 2026-04-23 — /loop iter 1 · P0 partial (L2_NORM + CUMSUM)
+
+**Scope:** Phase P0 Decisions 3 & 4 (SSM_CONV deferred to iter 2).
+
+**Delivered in `mlx-native`:**
+- `src/shaders/l2_norm.metal` — f32/f16/bf16 kernels; per-row Euclidean normalization with f32 accumulation. Formula `x / sqrt(sum(x^2) + eps)` derived from the mathematical definition; no llama.cpp source referenced.
+- `src/ops/l2_norm.rs` — Rust dispatch wrapper + `register()` helper. 8 spec-driven tests: 3-4-5 triangle, multirow independence, round-trip reconstruction, zero-row with eps, eps damping, bf16 path, zero-rows rejection, dtype-mismatch rejection.
+- `src/shaders/cumsum.metal` — f32/bf16 kernels; Hillis-Steele scan with per-thread chunk (CHUNK=32); f32 accumulation. Covers `dim ≤ tg_size × 32 = 8192`.
+- `src/ops/cumsum.rs` — Rust dispatch wrapper. 8 spec-driven tests: textbook `[1,2,3,4]→[1,3,6,10]`, negatives/zeros, multirow, large-ones (dim=512), non-power-of-2 random parity (dim=257), bf16 path, zero-dim rejection, oversized-dim rejection.
+- `tests/bench_sdpa_tq.rs` — pre-existing broken-window fix: added missing `ring_start: 0` to `FlashAttnVecTqParams` literal (unblocks test-crate compile).
+- `src/kernel_registry.rs` / `src/ops/mod.rs` — wired both new kernels into the static registry.
+
+**Verification:**
+- 16 new tests all green.
+- Full mlx-native lib test suite: 95/95 pass (no regression).
+- Pre-existing `test_q4_0_id_vs_norid*` failures (3) confirmed pre-existing — unrelated to this iter; will be tracked as a separate broken window.
+- Full hf2q build clean.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | **2/3 done** (L2_NORM ✓, CUMSUM ✓, SSM_CONV pending iter 2) |
+| P1  | 5         | Pending |
+| P2  | 10 (mlx side) | Pending |
+| P3  | 6         | Pending |
+| P4–P13 | 1, 2, 8–18 | Pending |
+
+**Next iter target:** SSM_CONV (completes P0), then P1 TRI_SOLVE.

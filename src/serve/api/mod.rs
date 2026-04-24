@@ -14,3 +14,4 @@
 #![allow(dead_code)] // handlers and downstream wiring land in later iterations
 
 pub mod schema;
+pub mod sse;

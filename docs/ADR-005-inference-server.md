@@ -1243,6 +1243,19 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Files under the `src/serve/api/` submodule (`mod.rs` + `schema.rs`) are gated with `#![allow(dead_code)]` until handlers land in iter 2+. No existing code paths changed; build is fully backwards-compatible.**
   - **Next (iter 2):** restore `sse.rs` with `tool_parser` stripped + rewired to a future stats type; skeleton `handlers.rs`, `router.rs`, `state.rs`, `middleware.rs`. Grammar stack (GBNF parser + JSON-schema→GBNF + sampler) port begins in a parallel swarm.
 
+- **2026-04-23 loop iter 1 (continued) — `sse.rs` restored, `tool_parser` stripped, reasoning + logprobs + tool-call deltas wired.** New file `src/serve/api/sse.rs` (~370 LOC + 220 LOC of tests, 8 unit tests passing). Engine-agnostic by construction:
+  - **Deleted imports (per Decision #6 + ADR-008):** `super::tool_parser::{...}` (grammar-constrained decoding obsoletes post-hoc parsing) and `crate::inference::engine::GenerationStats` (candle-era type, replaced by neutral `StreamStats`).
+  - **New `DeltaKind { Content, Reasoning }`** — per Decision #21, token fragments are classified upstream by the per-model boundary-marker state machine (lands with tool-call registration); the SSE encoder just routes to `delta.content` or `delta.reasoning_content`.
+  - **`GenerationEvent` enum** — neutral event protocol between the blocking generation thread and the async SSE encoder: `Delta{kind, text}`, `ToolCallDelta{index, id, call_type, name, arguments}`, `Logprobs(ChoiceLogprobs)`, `Done{finish_reason, prompt_tokens, completion_tokens, stats}`, `Error(String)`. No candle dependency.
+  - **`StreamStats` struct** — all-`Option` timing/usage handoff: `prefill_time_secs`, `decode_time_secs`, `total_time_secs`, `time_to_first_token_ms`, `prefill_tokens_per_sec`, `decode_tokens_per_sec`, `gpu_sync_count`, `gpu_dispatch_count`, `cached_prompt_tokens` (Decision #24), `reasoning_tokens` (Decision #21).
+  - **`SseStreamOptions`** — `include_usage` (from `stream_options.include_usage`, Tier 2), `logprobs` (Tier 4), `system_fingerprint`.
+  - **Grammar-first tool-call path:** `ToolCallDelta` events are emitted directly by the upstream grammar-aware sampler; the SSE encoder wraps them into OpenAI's per-chunk `delta.tool_calls` shape with proper first-chunk id/type + subsequent arguments-only deltas.
+  - **Keepalive (Decision #20):** 15s interval, empty comment frame (`:\n\n`). Reverse-proxy and OpenAI SDK clients tolerate.
+  - **`finish_reason` set:** `"stop"` | `"length"` | `"tool_calls"` | `"error"` — terminates cleanly on all paths including unexpected sender-drop.
+  - **Two-tier API:** public `generation_events_to_sse()` returns the `Sse<impl Stream>` with keepalive; inner `generation_events_stream()` returns the raw `Stream<Item=Result<Event,Infallible>>` for handler-internal composition and tests.
+  - **Tests (8 passing):** role chunk first → content → done; reasoning routing; `include_usage` + `cached_prompt_tokens` + `reasoning_tokens`; error-event termination; channel-closed termination; tool-call delta round-trip (first chunk has id+type, subsequent chunks are arguments-only); logprobs attach to next content chunk when enabled; logprobs ignored when disabled.
+  - **Full suite:** 329/329 pass (+8 from iter 1). Zero warnings. Commit + push.
+
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
