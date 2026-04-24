@@ -130,6 +130,90 @@ error. Inference coherence is out of scope for the convert acceptance contract
 
 ---
 
+## Running `hf2q smoke` (ADR-012 Decision 16)
+
+`hf2q smoke` is the automated end-gate harness. Preflights the environment,
+then runs convert + 8-token inference deterministically, asserts transcript
+integrity, and lands the transcript under `tests/fixtures/smoke-transcripts/`.
+
+```bash
+# Dry-run just runs preflight; useful in CI to catch missing prerequisites.
+cargo run --release -- smoke --arch qwen35 --quant q4_0 --dry-run
+
+# Full smoke (requires HF_TOKEN, free disk per arch floor, /opt/llama.cpp built).
+cargo run --release -- smoke --arch qwen35 --quant q4_0
+cargo run --release -- smoke --arch qwen35moe --quant q4_0
+```
+
+**Preflight exit codes (single-line failure mode naming the prerequisite):**
+
+| Exit | Meaning |
+|---|---|
+| 2 | `HF_TOKEN` missing or empty |
+| 3 | Insufficient free disk (`disk_floor_gb + 10 GB` buffer) |
+| 4 | `llama-cli` not at `/opt/llama.cpp/build/bin/` or in `$PATH` |
+| 5 | hf2q not built in release mode |
+| 6 | HF repo unresolvable (private / bad token / network) |
+| 7 | Unknown arch — known arches: `qwen35`, `qwen35moe` |
+| 8 | Smoke transcript assertion failed (tensor count / n_eval / regression pattern) |
+
+Determinism is real (`--seed 42 --temp 0 --no-warmup`): two fresh runs on the
+same host produce byte-identical transcripts.
+
+**CI note:** the full smoke path is NOT invoked by CI (disk + HF + wall-clock
+requirements). `tests/smoke_conformance.rs` exercises every preflight exit
+code via `assert_cmd` + `env_remove` — zero disk / HF / token dependency.
+
+---
+
+## How P11 catches MTP regressions (manual bisection)
+
+`tests/convert_qwen35_mtp_roundtrip.rs` (ADR-012 Decision 19, landed with
+ADR-013 P14 cross-link) converts a synthetic `mtp_num_hidden_layers: 1`
+model and asserts the 4 MTP tensors land at the exact GGUF names ADR-013's
+loader + llama.cpp expect:
+
+```
+blk.{num_hidden_layers}.nextn.enorm.weight        (llama-arch.cpp:449)
+blk.{num_hidden_layers}.nextn.hnorm.weight        (llama-arch.cpp:450)
+blk.{num_hidden_layers}.nextn.embed_tokens.weight (llama-arch.cpp:448)
+blk.{num_hidden_layers}.nextn.eh_proj.weight      (llama-arch.cpp:447)
+```
+
+### Bisection: renaming any suffix trips the gate
+
+To confirm the gate is live, introduce a one-letter regression in
+`src/backends/gguf.rs:hf_name_to_gguf`:
+
+```diff
+-                    "embed_tokens.weight" => Some("nextn.embed_tokens.weight"),
++                    "embed_tokens.weight" => Some("nextn.emb_tokens.weight"),
+```
+
+then:
+
+```bash
+cargo test --test convert_qwen35_mtp_roundtrip qwen35_mtp_roundtrip
+```
+
+Expected failure message names the missing tensor exactly:
+
+```
+missing MTP tensor "blk.4.nextn.embed_tokens.weight" in converted GGUF.
+Found names: ["blk.4.nextn.emb_tokens.weight", ...]
+```
+
+Revert the diff when done.
+
+### Bisection: re-introducing the P4 stub form trips the gate
+
+Earlier P4 emission used `blk.mtp{idx}.nextn.*` as a literal-"mtp" placeholder
+for the block index. The P11 gate's negative assertion forbids that — if a
+future refactor re-introduces it, the round-trip fails with `P4 stub MTP
+placeholder ... should never reach GGUF — see ADR-012 P11`.
+
+---
+
 ## Acceptance criteria (shipping contract)
 
 A converted qwen35 / qwen35moe GGUF is accepted when:

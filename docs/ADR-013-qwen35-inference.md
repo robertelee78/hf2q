@@ -744,6 +744,24 @@ GPU forward-pass wire in `gpu_delta_net.rs` + `mod.rs` registration.
 
 **Estimated LOC:** ~250.
 
+### P14 — MTP speculative-decoding execution (planned; blocked on ADR-012 P11)
+
+**Status:** ⏳ **planned** — new phase added 2026-04-24 alongside ADR-012 Decision 19's conversion-side MTP tensor round-trip gate.
+
+**Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
+
+**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate). If P11 is not green, P14 is not started — the cross-link exists precisely so a "we'll do the inference side later" stub cannot silently accumulate on this side of the boundary.
+
+**Deliverables (provisional, to be refined when P14 opens):**
+- `src/inference/models/qwen35/mtp.rs` — load-only scaffold is promoted to a full forward implementation. The `MtpWeights` bag-of-tensors structure gains a `forward_draft` entry point.
+- Rejection sampling loop in `src/inference/models/qwen35/model.rs` (both dense + MoE variants).
+- Unit tests for the rejection sampler against a hand-authored log-prob fixture.
+- Acceptance: speculative decoding does not change output logits vs. greedy single-token decode at temperature 0. Throughput improvement measured on a small-fixture generate; must be positive (≥ 10%) on at least one prompt set.
+
+**Cross-link:** ADR-012 P11 landed 2026-04-24. That commit is the precondition for this phase. When P14 opens, both ADRs update their phase tables together.
+
+**Estimated LOC:** ~500 (MTP forward + rejection sampling + tests).
+
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 
 **Scope:** Decisions 17, 18.

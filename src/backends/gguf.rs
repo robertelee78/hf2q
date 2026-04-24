@@ -235,7 +235,11 @@ impl OutputBackend for GgufBackend {
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let gguf_name = hf_name_to_gguf(name, &resolved_arch_for_tensors);
+            let gguf_name = hf_name_to_gguf(
+                name,
+                &resolved_arch_for_tensors,
+                model.metadata.num_layers as u32,
+            );
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
@@ -623,7 +627,11 @@ fn write_mmproj_gguf(
 
     for name in &vision_tensor_names {
         let qt = &model.tensors[*name];
-        let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
+        let gguf_name = hf_name_to_gguf(
+            name,
+            &model.metadata.model_type,
+            model.metadata.num_layers as u32,
+        );
         let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
         // Vision tensors are preserved as F16 — no repacking needed, data passes through
@@ -1498,7 +1506,18 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
 /// `arch` is the model architecture string (e.g. "llama", "gemma4", "qwen3")
 /// from `model.metadata.model_type`. Different architectures use different
 /// GGUF names for the same HF tensor suffixes.
-fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
+///
+/// `num_hidden_layers` is required for MTP tensor resolution (ADR-012
+/// Decision 11). Non-MTP callers may pass 0.
+/// Convenience wrapper for non-MTP callers (tests, one-off probes). Uses
+/// `num_hidden_layers = 0` — MTP paths hit the `mtp.layers.` branch which
+/// requires the real value, so this is only correct for non-MTP inputs.
+#[cfg(test)]
+fn hf_name_to_gguf_no_mtp(hf_name: &str, arch: &str) -> String {
+    hf_name_to_gguf(hf_name, arch, 0)
+}
+
+fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String {
     // Strip language_model. prefix (Gemma4 conditional-generation models)
     let hf_name = hf_name.replace("language_model.", "");
     let hf_name = hf_name.as_str();
@@ -1590,25 +1609,16 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
     //   LLM_TENSOR_NEXTN_ENORM         → "blk.%d.nextn.enorm"
     //   LLM_TENSOR_NEXTN_HNORM         → "blk.%d.nextn.hnorm"
     //
-    // The MTP block index in GGUF = num_hidden_layers (e.g. 40 for qwen35moe, 64 for qwen35 dense).
-    // This is stored in num_layers from config.json "num_hidden_layers".
-    // Callers that handle MTP tensors must pass the num_hidden_layers context; for the generic
-    // hf_name_to_gguf path we cannot know num_layers, so we use a sentinel prefix "mtp.blk.N."
-    // and resolve the block index in the caller's pipeline.
-    //
-    // For now: emit "mtp.layers.{mtp_idx}.{suffix}" → "blk.mtp{mtp_idx}.nextn.{gguf_suffix}"
-    // The dispatch path that handles qwen35 conversion resolves the real block number.
+    // ADR-012 P11 fix (2026-04-24): resolved block index = num_hidden_layers + mtp_idx.
+    // Previously used sentinel "blk.mtp{idx}.nextn.*" placeholder which P4 left as a
+    // "resolve at write time" TODO. P11's MTP round-trip gate caught the stub —
+    // llama.cpp's loader + ADR-013's load_mtp_weights_if_present BOTH expect the
+    // resolved name `blk.{num_hidden_layers}.nextn.*`, not the placeholder.
     if (arch == "qwen35" || arch == "qwen35moe") && hf_name.starts_with("mtp.layers.") {
-        // Strip "mtp.layers." prefix
         if let Some(rest) = hf_name.strip_prefix("mtp.layers.") {
             if let Some(dot_pos) = rest.find('.') {
-                let mtp_idx = &rest[..dot_pos];
+                let mtp_idx: u32 = rest[..dot_pos].parse().unwrap_or(0);
                 let suffix = &rest[dot_pos + 1..];
-                // Map known MTP suffixes to GGUF nextn names
-                // llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ → "blk.%d.nextn.eh_proj"
-                // llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS → "blk.%d.nextn.embed_tokens"
-                // llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM → "blk.%d.nextn.enorm"
-                // llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM → "blk.%d.nextn.hnorm"
                 let nextn_suffix = match suffix {
                     "enorm.weight"        => Some("nextn.enorm.weight"),
                     "hnorm.weight"        => Some("nextn.hnorm.weight"),
@@ -1617,10 +1627,8 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
                     _ => None,
                 };
                 if let Some(ns) = nextn_suffix {
-                    // We use "mtp{idx}" as a placeholder block number;
-                    // the real block index (num_hidden_layers + mtp_idx) must be resolved
-                    // by the qwen35 conversion pipeline at write time.
-                    return format!("blk.mtp{}.{}", mtp_idx, ns);
+                    let block_idx = num_hidden_layers.saturating_add(mtp_idx);
+                    return format!("blk.{}.{}", block_idx, ns);
                 }
             }
         }
@@ -2608,9 +2616,9 @@ mod tests {
     #[test]
     fn test_name_mapping_llama() {
         // Static mappings (arch-independent)
-        assert_eq!(hf_name_to_gguf("model.embed_tokens.weight", "llama"), "token_embd.weight");
-        assert_eq!(hf_name_to_gguf("model.norm.weight", "llama"), "output_norm.weight");
-        assert_eq!(hf_name_to_gguf("lm_head.weight", "llama"), "output.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.embed_tokens.weight", "llama"), "token_embd.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.norm.weight", "llama"), "output_norm.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("lm_head.weight", "llama"), "output.weight");
         // Layer mappings for LLaMA-family
         let cases = [
             ("model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
@@ -2623,14 +2631,14 @@ mod tests {
             ("model.layers.0.input_layernorm.weight", "blk.0.attn_norm.weight"),
             ("model.layers.0.post_attention_layernorm.weight", "blk.0.ffn_norm.weight"),
         ];
-        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf(hf, "llama"), gguf, "mapping failed for {}", hf); }
+        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf_no_mtp(hf, "llama"), gguf, "mapping failed for {}", hf); }
         // Unknown passthrough
-        assert_eq!(hf_name_to_gguf("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
-        assert_eq!(hf_name_to_gguf("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
         // Verify LLaMA-like archs all behave the same
         for arch in &["mistral", "qwen3", "qwen2", "phi"] {
             assert_eq!(
-                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
                 "LLaMA-like arch '{}' should map post_attention_layernorm to ffn_norm", arch,
             );
@@ -2641,78 +2649,78 @@ mod tests {
     fn test_name_mapping_gemma4() {
         // Gemma4: post_attention_layernorm is a distinct norm, NOT ffn_norm
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma4"),
             "blk.0.post_attention_norm.weight",
         );
         // Gemma4: pre_feedforward_layernorm IS ffn_norm
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
             "blk.0.ffn_norm.weight",
         );
         // MoE norms
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
             "blk.5.post_ffw_norm_1.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
             "blk.5.post_ffw_norm_2.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
             "blk.5.pre_ffw_norm_2.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm.weight", "gemma4"),
             "blk.5.post_ffw_norm.weight",
         );
         // MoE routing
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.proj.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.proj.weight", "gemma4"),
             "blk.3.ffn_gate_inp.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.scale", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.scale", "gemma4"),
             "blk.3.ffn_gate_inp.scale",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.experts.gate_up_proj", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.experts.gate_up_proj", "gemma4"),
             "blk.3.ffn_gate_up_exps.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.experts.down_proj", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.experts.down_proj", "gemma4"),
             "blk.3.ffn_down_exps.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.per_expert_scale", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.per_expert_scale", "gemma4"),
             "blk.3.ffn_down_exps.scale",
         );
         // Layer scalar
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.layer_scalar", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.layer_scalar", "gemma4"),
             "blk.0.layer_output_scale.weight",
         );
         // Shared entries still work for Gemma4
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.self_attn.q_proj.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.self_attn.q_proj.weight", "gemma4"),
             "blk.0.attn_q.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.input_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.input_layernorm.weight", "gemma4"),
             "blk.0.attn_norm.weight",
         );
         // Gemma3/Gemma2 behave the same as Gemma4
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma3"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma3"),
             "blk.0.post_attention_norm.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma2"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma2"),
             "blk.0.post_attention_norm.weight",
         );
         // language_model. prefix stripping still works
         assert_eq!(
-            hf_name_to_gguf("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
             "blk.0.ffn_norm.weight",
         );
     }
@@ -3209,12 +3217,12 @@ mod tests {
     #[test]
     fn test_qwen35_post_attention_norm_mapping() {
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "qwen35"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "qwen35"),
             "blk.0.post_attention_norm.weight",
             "qwen35: post_attention_layernorm must map to post_attention_norm, not ffn_norm"
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
             "blk.5.post_attention_norm.weight",
             "qwen35moe: post_attention_layernorm must map to post_attention_norm"
         );
@@ -3225,36 +3233,50 @@ mod tests {
     fn test_llama_post_attention_norm_unchanged() {
         for arch in &["llama", "qwen3", "mistral"] {
             assert_eq!(
-                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
                 "LLaMA-like arch '{}' must still map to ffn_norm", arch
             );
         }
     }
 
-    /// Decision 11: MTP tensors map to blk.mtpN.nextn.* for qwen35/qwen35moe.
+    /// Decision 11 + P11 fix: MTP tensors map to blk.{num_hidden_layers + mtp_idx}.nextn.*
+    /// for qwen35/qwen35moe — the resolved block index, NOT a "blk.mtpN" placeholder.
     /// llama-arch.cpp:447-450 LLM_TENSOR_NEXTN_*.
+    ///
+    /// The earlier "blk.mtp{idx}" form was a P4 stub that ADR-012 P11 (2026-04-24)
+    /// caught via the MTP round-trip gate: llama.cpp's loader + ADR-013's
+    /// load_mtp_weights_if_present both look for `blk.{num_hidden_layers}.nextn.*`.
+    /// The placeholder was silently dropping MTP tensors from converted GGUFs.
     #[test]
     fn test_qwen35_mtp_tensor_mapping() {
+        // With num_hidden_layers=40 (Qwen3.5-MoE / Qwen3.6-35B-A3B), mtp_idx=0 →
+        // block index 40. The resolved names are what llama.cpp's loader expects.
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe"),
-            "blk.mtp0.nextn.enorm.weight",
-            "MTP enorm must map to nextn.enorm (llama-arch.cpp:449)"
+            hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe", 40),
+            "blk.40.nextn.enorm.weight",
+            "MTP enorm must map to nextn.enorm at resolved block (llama-arch.cpp:449)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35"),
-            "blk.mtp0.nextn.hnorm.weight",
-            "MTP hnorm must map to nextn.hnorm (llama-arch.cpp:450)"
+            hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35", 64),
+            "blk.64.nextn.hnorm.weight",
+            "MTP hnorm must map to nextn.hnorm at resolved block (llama-arch.cpp:450)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe"),
-            "blk.mtp0.nextn.embed_tokens.weight",
-            "MTP embed_tokens must map to nextn.embed_tokens (llama-arch.cpp:448)"
+            hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe", 40),
+            "blk.40.nextn.embed_tokens.weight",
+            "MTP embed_tokens at resolved block (llama-arch.cpp:448)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe"),
-            "blk.mtp0.nextn.eh_proj.weight",
-            "MTP eh_proj must map to nextn.eh_proj (llama-arch.cpp:447)"
+            hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe", 40),
+            "blk.40.nextn.eh_proj.weight",
+            "MTP eh_proj at resolved block (llama-arch.cpp:447)"
+        );
+        // Second MTP block (mtp_idx=1) with 40 layers → block 41.
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.1.enorm.weight", "qwen35moe", 40),
+            "blk.41.nextn.enorm.weight",
+            "mtp_idx=1 with num_layers=40 → block 41"
         );
     }
 }
