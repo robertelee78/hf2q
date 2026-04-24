@@ -458,6 +458,144 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run the `serve` subcommand — start the OpenAI-compatible HTTP API server.
+///
+/// ADR-005 Phase 2a iter-2 backbone: exposes `/health`, `/readyz`,
+/// `/v1/models`, `/v1/models/:id`. Chat completions + embeddings land in
+/// the next iter with the engine wiring.
+///
+/// Behavior:
+///   1. Build `ServerConfig` from CLI args + env vars.
+///   2. If `--model` is supplied, validate the GGUF header opens cleanly
+///      (fail-fast on bad weights, per Decision #15). No tensor data is
+///      read — that happens when the engine loads in iter 3.
+///   3. Build the axum router and bind the listener.
+///   4. Serve until SIGINT / SIGTERM (graceful shutdown per Decision #17).
+pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
+    use api::state::ServerConfig;
+    use api::schema::OverflowPolicy;
+
+    // --- Resolve config ---
+    let auth_token = args
+        .auth_token
+        .clone()
+        .or_else(|| std::env::var("HF2Q_AUTH_TOKEN").ok().filter(|s| !s.is_empty()));
+
+    let overflow_policy = match args.overflow_policy {
+        cli::OverflowPolicyArg::Reject => OverflowPolicy::Reject,
+        cli::OverflowPolicyArg::TruncateLeft => OverflowPolicy::TruncateLeft,
+        cli::OverflowPolicyArg::Summarize => OverflowPolicy::Summarize,
+    };
+
+    let cache_dir = args.cache_dir.clone().or_else(api::state::default_cache_dir);
+
+    let config = ServerConfig {
+        host: args.host.clone(),
+        port: args.port,
+        auth_token,
+        cors_allowed_origins: args.cors_origins.clone(),
+        queue_capacity: args.queue_capacity,
+        max_concurrent_requests: 0,
+        request_timeout_seconds: 0,
+        default_overflow_policy: overflow_policy,
+        cache_dir,
+        system_fingerprint: Some(system_fingerprint()),
+    };
+
+    // Warn when exposing beyond localhost. Decision #7 + #13 — public-internet
+    // is NOT a supported deployment target.
+    if args.host == "0.0.0.0" {
+        tracing::warn!(
+            "Server bound to 0.0.0.0 — exposes API on all interfaces. \
+             Public-internet exposure is NOT a supported deployment target \
+             (see ADR-005 Decision #13: reverse-proxy assumption). \
+             For LAN-only Open WebUI, this is the intended usage."
+        );
+    }
+
+    // --- Fail-fast GGUF validation (if --model supplied) ---
+    if let Some(model_path) = &args.model {
+        anyhow::ensure!(
+            model_path.exists(),
+            "Model not found: {}",
+            model_path.display()
+        );
+        // Header-only parse; no tensor data read.
+        let gguf = mlx_native::gguf::GgufFile::open(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+        tracing::info!(
+            path = %model_path.display(),
+            tensors = gguf.tensor_count(),
+            metadata = gguf.metadata_count(),
+            "Validated GGUF header"
+        );
+        // NOTE: actual model load + warmup lands with the /v1/chat iter.
+        // This `--model` argument is accepted now so the CLI contract is
+        // stable; the engine wiring is the only thing still missing, not
+        // the flag shape.
+    }
+
+    // --- Build router ---
+    let state = api::AppState::new(config.clone());
+    let router = api::build_router(state);
+
+    // --- Async runtime + serve ---
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+
+    rt.block_on(async move {
+        let bind = format!("{}:{}", config.host, config.port);
+        let listener = tokio::net::TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("binding to {bind}"))?;
+        let local_addr = listener.local_addr().ok();
+        tracing::info!(
+            addr = %local_addr.map(|a| a.to_string()).unwrap_or_else(|| bind.clone()),
+            "hf2q HTTP server listening"
+        );
+        eprintln!("hf2q serving on http://{}", bind);
+
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("axum::serve")?;
+        tracing::info!("hf2q HTTP server shut down cleanly");
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// Build the server's `system_fingerprint` — `hf2q-<short-git-sha-or-ver>-mlx-native`.
+fn system_fingerprint() -> String {
+    // Prefer the CARGO_PKG_VERSION (baked at build time). Git sha could be
+    // added via a build.rs; for now the pkg version + backend is sufficient
+    // identity for OpenAI's `system_fingerprint` contract.
+    format!("hf2q-{}-mlx-native", env!("CARGO_PKG_VERSION"))
+}
+
+/// Graceful-shutdown signal handler: wait for Ctrl-C or SIGTERM (Decision #17).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
 /// Run the `parity` subcommand (ADR-009 Phase 2).
 ///
 /// `parity check` — compare hf2q output against locked reference fixtures.

@@ -143,10 +143,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Doctor => doctor::run_doctor().map_err(AppError::Conversion),
         Command::Completions(args) => cmd_completions(args).map_err(AppError::Input),
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
-        Command::Serve(_args) => {
-            eprintln!("Serve mode not yet implemented. Use `generate` for now.");
-            Ok(())
-        }
+        Command::Serve(args) => serve::cmd_serve(args).map_err(AppError::Conversion),
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
     }
 }

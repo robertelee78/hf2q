@@ -222,29 +222,72 @@ pub struct GenerateArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ServeArgs {
-    /// Path to GGUF model file
+    /// Path to GGUF model file. Optional in the iter-2 backbone which only
+    /// exposes /health, /readyz, /v1/models; required once /v1/chat and
+    /// /v1/embeddings route. Fail-fast on bad weights is preserved: if
+    /// --model is supplied, the GGUF header is validated at startup.
     #[arg(long)]
-    pub model: PathBuf,
+    pub model: Option<PathBuf>,
 
-    /// Path to tokenizer.json (if not alongside GGUF)
+    /// Path to tokenizer.json (if not alongside GGUF).
     #[arg(long)]
     pub tokenizer: Option<PathBuf>,
 
-    /// Path to config.json (if not alongside GGUF)
+    /// Path to config.json (if not alongside GGUF).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Host to bind to
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Host to bind to. Defaults to 127.0.0.1 (localhost only) per ADR-005
+    /// Decision #7. Use `--host 0.0.0.0` to expose on the LAN; public-internet
+    /// is NOT a supported deployment target (reverse-proxy assumption,
+    /// Decision #13).
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Port to listen on
+    /// Port to listen on.
     #[arg(long, default_value = "8080")]
     pub port: u16,
 
-    /// Maximum sequence length
+    /// Maximum sequence length (reserved for future iterations — context
+    /// length is read from GGUF metadata).
     #[arg(long, default_value = "4096")]
     pub max_seq_len: usize,
+
+    /// Bearer token required on every request (Decision #8). Unset = no auth.
+    /// Also read from `HF2Q_AUTH_TOKEN` env var if --auth-token is absent
+    /// (handled inside `cmd_serve`, not via clap's `env` feature to keep the
+    /// `clap` feature set minimal).
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// CORS allowed origin. Repeatable. Empty = allow any (localhost dev);
+    /// non-empty = restrictive allowlist (Decision #9).
+    #[arg(long = "cors-origin", value_name = "ORIGIN")]
+    pub cors_origins: Vec<String>,
+
+    /// Hard cap on the FIFO generation queue. Overflow returns 429 +
+    /// Retry-After (Decision #19).
+    #[arg(long, default_value = "32")]
+    pub queue_capacity: usize,
+
+    /// Cache directory to scan for /v1/models listings. Defaults to
+    /// $HOME/.cache/hf2q (Decision #26).
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Default context-overflow policy (Decision #23). Per-request
+    /// `hf2q_overflow_policy` overrides this.
+    #[arg(long, value_enum, default_value = "summarize")]
+    pub overflow_policy: OverflowPolicyArg,
+}
+
+/// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
+/// avoid leaking the schema module into the CLI arg parser.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum OverflowPolicyArg {
+    Reject,
+    TruncateLeft,
+    Summarize,
 }
 
 #[derive(Subcommand, Debug)]

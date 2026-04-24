@@ -81,6 +81,10 @@ predicates = "3"
 tempfile = "3"
 criterion = "0.5"
 regex = "1"
+# tower::ServiceExt::oneshot for router-level integration tests
+# (ADR-005 Phase 2a iter 2). tower is already in the transitive graph
+# via axum; this pins a direct version for tests.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "quantize_bench"
