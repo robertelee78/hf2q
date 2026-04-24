@@ -102,6 +102,19 @@ pub enum ConvertError {
     /// A reorder invariant was violated (e.g. total element count changed).
     #[error("Reorder invariant violated for tensor '{name}': {reason}")]
     ReorderInvariantViolated { name: String, reason: String },
+
+    /// `merge_expert_tensors` was called from a dense-arch context.
+    /// Dense FFN tensors are emitted as singletons — expert merge is MoE-only.
+    #[error("merge_expert_tensors called from a Dense arch context; expert merge is MoE-only")]
+    DenseContextMergeCall,
+
+    /// `merge_expert_tensors` was called with an empty expert slice.
+    #[error("merge_expert_tensors: expert_tensors slice is empty")]
+    ExpertMergeEmpty,
+
+    /// A tensor's shape or dtype does not match expert 0.
+    #[error("merge_expert_tensors: expert {expert_idx} mismatch — {reason}")]
+    ExpertMergeShapeMismatch { expert_idx: usize, reason: String },
 }
 
 // ---------------------------------------------------------------------------

@@ -226,41 +226,300 @@ fn map_norm_suffix(suffix: &str, blk: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Expert merge (P5 stub)
+// Expert merge (P5 — implemented)
 // ---------------------------------------------------------------------------
+
+/// Which expert projection this merge is for.
+///
+/// Encodes the per-projection stacking rule verified against llama-model.cpp:3281-3283
+/// for the `qwen35moe` arch:
+///
+/// ```text
+/// layer.ffn_gate_exps = create_tensor(…, {n_embd, n_ff_exp, n_expert}, …);
+/// layer.ffn_down_exps = create_tensor(…, {n_ff_exp, n_embd, n_expert}, …);
+/// layer.ffn_up_exps   = create_tensor(…, {n_embd, n_ff_exp, n_expert}, …);
+/// ```
+///
+/// GGML ne is stored innermost-first.  PyTorch (outermost-first) stacked shape:
+/// - gate / up:  `[N_experts, moe_inter, hidden]` → GGML ne `{hidden, moe_inter, N_experts}`
+/// - down:       `[N_experts, hidden, moe_inter]` → GGML ne `{moe_inter, hidden, N_experts}`
+///
+/// HF per-expert weight shapes (PyTorch, outermost-first):
+/// - gate_proj / up_proj:  `[moe_inter, hidden]`   (out_features × in_features)
+/// - down_proj:            `[hidden, moe_inter]`
+///
+/// Stacking along dim 0 gives the correct PyTorch layout for all three projections;
+/// only the per-expert shapes differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertProj {
+    /// gate_proj — HF shape per expert: `[moe_inter, hidden]`
+    Gate,
+    /// up_proj   — HF shape per expert: `[moe_inter, hidden]`
+    Up,
+    /// down_proj — HF shape per expert: `[hidden, moe_inter]`
+    Down,
+}
 
 /// Stack per-expert weight tensors into a single merged GGUF tensor.
 ///
-/// # Phase stub (P5)
+/// # ADR-012 Decision 9 (P5)
 ///
-/// The merge body — stacking N expert tensors along dim 0 to produce
-/// `[num_experts, out_features, in_features]` — is scheduled for P5
-/// (ADR-012 Decision 9).
+/// `expert_tensors`: ordered by expert index 0..N, all with the same 2-D shape
+/// and dtype.  All HF per-expert weights are 2-D: `[out_features, in_features]`.
 ///
-/// # Signature contract
+/// The merge concatenates raw bytes in expert order along a new first axis,
+/// producing a 3-D tensor `[N, out_features, in_features]`.  This matches
+/// `torch.stack(datas, dim=0)` from `convert_hf_to_gguf.py:4628`.
 ///
-/// `expert_tensors`: ordered by expert index 0..N.
-/// All tensors must have the same shape and dtype.
+/// The `proj` parameter documents (but does not alter) the stacking — all
+/// projections use the same `dim=0` stack; the distinction matters only for
+/// the shape interpretation by the caller and for the `ExpertProj::Down`
+/// dim-order documentation.
 ///
-/// Returns a single `TensorRef` whose first dimension is `num_experts`.
+/// # Dense arch guard
 ///
-/// Callers MUST check the error return.
-#[allow(dead_code)]
+/// Call sites are arch-gated.  Calling this from a dense context is a
+/// programming error; a `debug_assert` fires in debug builds and a typed
+/// `ConvertError::DenseContextMergeCall` error is returned in all builds.
+///
+/// # Errors
+///
+/// - `ConvertError::DenseContextMergeCall` if `arch` is Dense.
+/// - `ConvertError::ExpertMergeEmpty` if `expert_tensors` is empty.
+/// - `ConvertError::ExpertMergeShapeMismatch` if any tensor's shape/dtype/data
+///   length differs from the first tensor's.
 pub fn merge_expert_tensors(
     expert_tensors: &[TensorRef],
+    _proj: ExpertProj,
+    arch: super::Qwen35Arch,
 ) -> Result<TensorRef, ConvertError> {
-    // Validate early even though we don't implement yet — so the caller
-    // knows the contract is being checked.
+    // Dense arch guard — programming error if called from dense context.
+    debug_assert_ne!(
+        arch,
+        super::Qwen35Arch::Dense,
+        "merge_expert_tensors must never be called from a dense-arch context"
+    );
+    if arch == super::Qwen35Arch::Dense {
+        return Err(ConvertError::DenseContextMergeCall);
+    }
+
     if expert_tensors.is_empty() {
-        return Err(ConvertError::PhaseStub {
-            phase: "P5",
-            what: "merge_expert_tensors: called with empty slice",
+        return Err(ConvertError::ExpertMergeEmpty);
+    }
+
+    let first = &expert_tensors[0];
+
+    // All tensors must be 2-D with the same shape and dtype.
+    if first.shape.len() != 2 {
+        return Err(ConvertError::ExpertMergeShapeMismatch {
+            expert_idx: 0,
+            reason: format!(
+                "expected 2-D tensor, got {} dims",
+                first.shape.len()
+            ),
         });
     }
-    Err(ConvertError::PhaseStub {
-        phase: "P5",
-        what: "merge_expert_tensors body — stacks N expert tensors along dim 0",
+
+    let expected_bytes = first.shape.iter().product::<usize>() * first.dtype.element_size();
+    if first.data.len() != expected_bytes {
+        return Err(ConvertError::TensorLengthMismatch {
+            name: first.name.clone(),
+            expected: expected_bytes,
+            actual: first.data.len(),
+        });
+    }
+
+    let n = expert_tensors.len();
+    let rows = first.shape[0];
+    let cols = first.shape[1];
+    let bytes_per_expert = first.data.len();
+
+    // Validate all subsequent tensors match.
+    for (i, t) in expert_tensors.iter().enumerate().skip(1) {
+        if t.shape != first.shape {
+            return Err(ConvertError::ExpertMergeShapeMismatch {
+                expert_idx: i,
+                reason: format!(
+                    "shape {:?} differs from expert 0 shape {:?}",
+                    t.shape, first.shape
+                ),
+            });
+        }
+        if t.dtype != first.dtype {
+            return Err(ConvertError::ExpertMergeShapeMismatch {
+                expert_idx: i,
+                reason: format!(
+                    "dtype {:?} differs from expert 0 dtype {:?}",
+                    t.dtype, first.dtype
+                ),
+            });
+        }
+        let expected = t.shape.iter().product::<usize>() * t.dtype.element_size();
+        if t.data.len() != expected {
+            return Err(ConvertError::TensorLengthMismatch {
+                name: t.name.clone(),
+                expected,
+                actual: t.data.len(),
+            });
+        }
+    }
+
+    // Stack: concatenate raw bytes in expert order — equivalent to
+    // torch.stack(datas, dim=0) producing shape [N, rows, cols].
+    let mut merged_data = Vec::with_capacity(n * bytes_per_expert);
+    for t in expert_tensors {
+        merged_data.extend_from_slice(&t.data);
+    }
+
+    // The merged tensor name encodes the layer/projection pattern.
+    // Callers supply the canonical GGUF name; we derive it from expert[0]'s name
+    // as a best-effort annotation — the caller is responsible for final naming.
+    let merged_name = format!("{}_merged_experts", first.name);
+
+    Ok(TensorRef {
+        name: merged_name,
+        shape: vec![n, rows, cols],
+        dtype: first.dtype,
+        data: merged_data,
     })
+}
+
+/// Merge all per-expert tensors in a `QuantizedModel` for the `qwen35moe` arch.
+///
+/// # Layer-streaming orchestration (ADR-012 Decision 9)
+///
+/// For each MoE layer N (identified by tensors named
+/// `model.layers.N.mlp.experts.E.{gate,up,down}_proj.weight`):
+/// 1. Collect E=0..num_experts tensors for each projection.
+/// 2. Merge each projection into a single 3-D `QuantizedTensor`.
+/// 3. Insert the merged tensor under its canonical HF merged name
+///    (`model.layers.N.mlp.experts.{gate,up,down}_proj.weight`).
+/// 4. Remove the 256 per-expert tensors for that projection from the map.
+///
+/// Layer N is fully processed before layer N+1 is touched.  At peak,
+/// 256 per-expert tensors for one projection are held simultaneously,
+/// then dropped before the next projection is collected.
+///
+/// # Shared experts
+///
+/// Shared expert tensors (`mlp.shared_expert.{gate,up,down}_proj.weight`)
+/// are **not** touched — they're already singletons and pass through as-is.
+///
+/// # No-op for dense
+///
+/// If `num_experts` is absent from metadata, the model is dense and this
+/// function returns `Ok(())` immediately without touching any tensors.
+pub fn merge_moe_experts_in_place(
+    model: &mut crate::ir::QuantizedModel,
+) -> Result<(), ConvertError> {
+    let arch_str = model.metadata.architecture.as_str();
+    // Only act on qwen35moe architecture.
+    if arch_str != "Qwen3_5MoeForCausalLM"
+        && arch_str != "Qwen3_5MoeForConditionalGeneration"
+        && model.metadata.model_type != "qwen3_5_moe_text"
+    {
+        return Ok(());
+    }
+
+    let num_experts = match model.metadata.num_experts {
+        Some(n) => n as usize,
+        None => return Ok(()), // dense — no-op
+    };
+
+    // Determine which layers have MoE experts by scanning tensor names once.
+    let mut moe_layers: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for name in model.tensors.keys() {
+        // Pattern: "model.layers.N.mlp.experts.E.gate_proj.weight"
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot].parse::<usize>() {
+                    let suffix = &rest[dot + 1..];
+                    if suffix.starts_with("mlp.experts.") {
+                        moe_layers.insert(layer_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    for proj in &["gate_proj", "up_proj", "down_proj"] {
+        let expert_proj = match *proj {
+            "gate_proj" => ExpertProj::Gate,
+            "up_proj"   => ExpertProj::Up,
+            "down_proj" => ExpertProj::Down,
+            _           => unreachable!(),
+        };
+
+        // Process one layer at a time to bound peak memory.
+        for &layer_idx in &moe_layers {
+            // Collect expert tensors E=0..num_experts in order.
+            let mut expert_tensors: Vec<TensorRef> = Vec::with_capacity(num_experts);
+            let mut expert_keys: Vec<String> = Vec::with_capacity(num_experts);
+
+            for e in 0..num_experts {
+                let hf_name = format!(
+                    "model.layers.{}.mlp.experts.{}.{}.weight",
+                    layer_idx, e, proj
+                );
+                let qt = match model.tensors.get(&hf_name) {
+                    Some(t) => t,
+                    None => {
+                        // Not all layers are MoE layers (e.g., full-attention layers
+                        // may not have experts).  Skip gracefully.
+                        break;
+                    }
+                };
+                expert_tensors.push(TensorRef {
+                    name: hf_name.clone(),
+                    shape: qt.shape.clone(),
+                    dtype: qt.original_dtype,
+                    data: qt.data.clone(),
+                });
+                expert_keys.push(hf_name);
+            }
+
+            // If we didn't collect all expected experts, this layer might not
+            // be a full MoE layer.  Skip it.
+            if expert_tensors.len() != num_experts {
+                continue;
+            }
+
+            // Merge into a single 3-D tensor.
+            let merged_ref = merge_expert_tensors(
+                &expert_tensors,
+                expert_proj,
+                super::Qwen35Arch::Moe,
+            )?;
+
+            // Build the merged QuantizedTensor — preserved at original dtype.
+            let merged_qt = crate::ir::QuantizedTensor {
+                name: format!(
+                    "model.layers.{}.mlp.experts.{}.weight",
+                    layer_idx, proj
+                ),
+                shape: merged_ref.shape.clone(),
+                original_dtype: merged_ref.dtype,
+                data: merged_ref.data,
+                quant_info: crate::ir::TensorQuantInfo {
+                    method: "passthrough".to_string(),
+                    bits: merged_ref.dtype.element_size() as u8 * 8,
+                    group_size: 1,
+                    preserved: true,
+                    scales: None,
+                    biases: None,
+                    ggml_type: None,
+                },
+            };
+
+            // Remove the N per-expert tensors and insert the merged tensor.
+            for key in &expert_keys {
+                model.tensors.remove(key);
+            }
+            model.tensors.insert(merged_qt.name.clone(), merged_qt);
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -516,37 +775,189 @@ mod tests {
         );
     }
 
+    // --------------------------------------------------------------------- //
+    // P5: merge_expert_tensors — correctness tests (ADR-012 Decision 9)    //
+    // --------------------------------------------------------------------- //
+
+    /// Helper: build a TensorRef whose F32 data is filled with the value `fill`
+    /// (as f32 bytes), with shape [rows, cols].
+    fn make_expert_f32(name: &str, rows: usize, cols: usize, fill: f32) -> TensorRef {
+        use crate::ir::DType;
+        let data: Vec<u8> = (0..rows * cols)
+            .flat_map(|_| fill.to_le_bytes())
+            .collect();
+        TensorRef {
+            name: name.to_string(),
+            shape: vec![rows, cols],
+            dtype: DType::F32,
+            data,
+        }
+    }
+
+    /// 4-expert stacking: each expert E has fill value E as f32.
+    /// After merge, shape must be [4, rows, cols] and slice [E, :, :] must
+    /// equal all-E values.
     #[test]
-    fn merge_expert_tensors_returns_phase_stub_empty() {
-        let err = merge_expert_tensors(&[])
-            .expect_err("merge_expert_tensors([]) should return PhaseStub");
+    fn merge_expert_tensors_4_expert_stacking_gate_up() {
+        use crate::ir::DType;
+        let moe_inter = 8usize;
+        let hidden = 4usize;
+
+        // gate/up: per-expert shape [moe_inter, hidden]
+        let experts: Vec<TensorRef> = (0..4_u32)
+            .map(|e| make_expert_f32(
+                &format!("blk.0.expert.{}.gate_proj.weight", e),
+                moe_inter,
+                hidden,
+                e as f32,
+            ))
+            .collect();
+
+        let merged = merge_expert_tensors(
+            &experts,
+            ExpertProj::Gate,
+            crate::models::qwen35::Qwen35Arch::Moe,
+        )
+        .expect("merge_expert_tensors must succeed for valid inputs");
+
+        // Shape: [N_experts, moe_inter, hidden]
+        assert_eq!(merged.shape, vec![4, moe_inter, hidden]);
+        assert_eq!(merged.dtype, DType::F32);
+        assert_eq!(merged.data.len(), 4 * moe_inter * hidden * 4);
+
+        // Each expert's slice must contain its fill value.
+        let elem_size = 4usize; // F32
+        let bytes_per_expert = moe_inter * hidden * elem_size;
+        for e in 0..4_usize {
+            let start = e * bytes_per_expert;
+            let end = start + bytes_per_expert;
+            let slice = &merged.data[start..end];
+            let expected_val = e as f32;
+            for chunk in slice.chunks_exact(4) {
+                let v = f32::from_le_bytes(chunk.try_into().unwrap());
+                assert_eq!(
+                    v, expected_val,
+                    "expert {e} slice must contain value {expected_val}, got {v}"
+                );
+            }
+        }
+    }
+
+    /// Down-proj has transposed per-expert shape [hidden, moe_inter].
+    /// Stacking produces [N, hidden, moe_inter] — verified shape only;
+    /// data correctness follows from the same byte-copy logic.
+    #[test]
+    fn merge_expert_tensors_4_expert_stacking_down() {
+        use crate::ir::DType;
+        let hidden = 4usize;
+        let moe_inter = 8usize;
+
+        // down: per-expert shape [hidden, moe_inter]
+        let experts: Vec<TensorRef> = (0..4_u32)
+            .map(|e| make_expert_f32(
+                &format!("blk.0.expert.{}.down_proj.weight", e),
+                hidden,
+                moe_inter,
+                e as f32,
+            ))
+            .collect();
+
+        let merged = merge_expert_tensors(
+            &experts,
+            ExpertProj::Down,
+            crate::models::qwen35::Qwen35Arch::Moe,
+        )
+        .expect("merge_expert_tensors must succeed for valid inputs");
+
+        // Shape: [N_experts, hidden, moe_inter]
+        assert_eq!(merged.shape, vec![4, hidden, moe_inter],
+            "down_proj merged shape must be [N, hidden, moe_inter]");
+        assert_eq!(merged.dtype, DType::F32);
+
+        // Verify expert 2 slice contains value 2.0.
+        let bytes_per_expert = hidden * moe_inter * 4;
+        let start = 2 * bytes_per_expert;
+        let end = start + bytes_per_expert;
+        for chunk in merged.data[start..end].chunks_exact(4) {
+            let v = f32::from_le_bytes(chunk.try_into().unwrap());
+            assert_eq!(v, 2.0f32, "expert 2 down slice must contain 2.0");
+        }
+    }
+
+    /// Dense arch guard: calling merge_expert_tensors with Dense arch returns
+    /// DenseContextMergeCall error — never succeeds.
+    #[test]
+    fn merge_expert_tensors_dense_guard_fires() {
+        let t = make_expert_f32("dummy", 4, 8, 1.0);
+        let err = merge_expert_tensors(
+            &[t],
+            ExpertProj::Gate,
+            crate::models::qwen35::Qwen35Arch::Dense,
+        )
+        .expect_err("dense arch must return DenseContextMergeCall");
         assert!(
-            matches!(
-                err,
-                crate::models::qwen35::ConvertError::PhaseStub { phase: "P5", .. }
-            ),
-            "expected PhaseStub(P5), got: {err}"
+            matches!(err, crate::models::qwen35::ConvertError::DenseContextMergeCall),
+            "expected DenseContextMergeCall, got: {err}"
         );
     }
 
+    /// Empty slice returns ExpertMergeEmpty error.
     #[test]
-    fn merge_expert_tensors_returns_phase_stub_non_empty() {
-        use crate::ir::DType;
-        let t = TensorRef {
-            name: "test_expert".to_string(),
-            shape: vec![2048, 4096],
-            dtype: DType::F32,
-            data: vec![0u8; 2048 * 4096 * 4],
-        };
-        let err = merge_expert_tensors(&[t])
-            .expect_err("merge_expert_tensors should return PhaseStub");
+    fn merge_expert_tensors_empty_slice_errors() {
+        let err = merge_expert_tensors(
+            &[],
+            ExpertProj::Gate,
+            crate::models::qwen35::Qwen35Arch::Moe,
+        )
+        .expect_err("empty slice must return ExpertMergeEmpty");
+        assert!(
+            matches!(err, crate::models::qwen35::ConvertError::ExpertMergeEmpty),
+            "expected ExpertMergeEmpty, got: {err}"
+        );
+    }
+
+    /// Shape mismatch between experts returns ExpertMergeShapeMismatch.
+    #[test]
+    fn merge_expert_tensors_shape_mismatch_errors() {
+        let t0 = make_expert_f32("e0", 4, 8, 0.0);
+        let t1 = make_expert_f32("e1", 4, 16, 1.0); // wrong cols
+        let err = merge_expert_tensors(
+            &[t0, t1],
+            ExpertProj::Gate,
+            crate::models::qwen35::Qwen35Arch::Moe,
+        )
+        .expect_err("shape mismatch must return ExpertMergeShapeMismatch");
         assert!(
             matches!(
                 err,
-                crate::models::qwen35::ConvertError::PhaseStub { phase: "P5", .. }
+                crate::models::qwen35::ConvertError::ExpertMergeShapeMismatch { expert_idx: 1, .. }
             ),
-            "expected PhaseStub(P5), got: {err}"
+            "expected ExpertMergeShapeMismatch at idx 1, got: {err}"
         );
+    }
+
+    /// Shared expert tensors (singletons) do NOT go through merge_expert_tensors.
+    /// They map directly to their GGUF names via hf_tensor_name_to_gguf_moe.
+    /// This test confirms the naming round-trip (compile-time guarantee — no
+    /// merge call site exists for shared_expert).
+    #[test]
+    fn shared_expert_singleton_not_merged() {
+        let ctx = moe_ctx();
+        // Shared expert tensors must map to singleton GGUF names (no _exps suffix).
+        for proj in &["gate_proj", "up_proj", "down_proj"] {
+            let hf = format!("model.layers.0.mlp.shared_expert.{}.weight", proj);
+            let gguf = hf_tensor_name_to_gguf_moe(&hf, &ctx)
+                .unwrap_or_else(|| panic!("shared_expert {proj} must map to a GGUF name"));
+            // Must end in _shexp.weight, NOT _exps.weight.
+            assert!(
+                gguf.contains("_shexp"),
+                "shared expert {proj} must map to a _shexp tensor, got: {gguf}"
+            );
+            assert!(
+                !gguf.contains("_exps"),
+                "shared expert {proj} must NOT map to an _exps (merged) tensor, got: {gguf}"
+            );
+        }
     }
 
     /// emit_metadata_moe returns Ok when context is valid (P4 implementation).
