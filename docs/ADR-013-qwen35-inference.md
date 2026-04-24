@@ -934,6 +934,46 @@ Gotchas #7 and #10 are runtime concerns exclusive to this ADR. Conversion does n
 
 ## Progress log (reverse chronological)
 
+### 2026-04-23 — /loop iter 4 · P2 COMPLETE (ROPE_MULTI / IMROPE landed)
+
+**Scope:** Phase P2 Decision 10 (Multi-section RoPE + IMROPE interleaved mode).
+
+**Delivered in `mlx-native`:**
+- `src/shaders/rope_multi.metal` — f32/bf16 kernels supporting both modes 8 (standard MROPE, contiguous sections) and 40 (IMROPE, `sector % 3` cycling). Shared helpers `pick_axis` / `compute_cos_sin`. NeoX-style pair indexing `(x[p], x[p + head_dim/2])`. Partial-rotary tail (pairs ≥ rope_dim/2) passes through unchanged.
+- `src/ops/rope_multi.rs` — `RopeMultiMode` enum (repr(u32) with wire values 8/40), `RopeMultiParams`, `dispatch_rope_multi()`, and `build_rope_multi_buffers()` convenience for the 3 small param buffers. Full validation (even dims, rope_dim ≤ head_dim, finite freq_base, positions length 4×seq_len, i32/u32 positions dtype).
+- `tests/test_rope_multi.rs` — 8 tests:
+  - **ADR spec-driven small case** (n_rot=8, sections=[2,2,1,0]): hand-derived sector-axis assignment table in comments, hand-computed expected `pair 0` rotation verified independently, CPU-reference parity across all pairs at 1e-5.
+  - **MROPE vs IMROPE divergence**: proves pair 1 picks different axes between modes (sanity that the sector-cycling actually kicks in).
+  - **Random-input CPU-parity** at head_dim=32, rope_dim=16 with distinct sections + multi-head + multi-seq.
+  - **Qwen3.5 exact shape** (head_dim=256, rope_dim=64, sections=[11,11,10,0], freq_base=1e7): bit-stable determinism across 3 repeated dispatches; CPU-parity at 1e-4; partial-rotary tail (pairs 32..127) verified untouched.
+  - **Text-only IMROPE == NeoX RoPE**: proves the sector-cycling reduces correctly when all 4 position axes are equal (the typical Qwen3.5 text case).
+  - **BF16 path** within 5e-2 tolerance of the F32 output.
+  - Odd-head_dim and rope_dim>head_dim rejection.
+- `src/kernel_registry.rs` / `src/ops/mod.rs` — registered both kernels.
+
+**Verification:**
+- 8/8 rope_multi tests green.
+- Library suite: 95/95 pass.
+
+**Notes on spec derivation:**
+- For text-only Qwen3.5 (positions identical across 4 axes), IMROPE output equals plain NeoX RoPE — the sector-cycling degenerates trivially. Kernel still implements the full multi-axis machinery so the same op serves future multimodal Qwen variants where axes diverge.
+- Per-pair frequency: `theta = position[axis] * freq_base^(-2p/rope_dim)` (rope_dim in denominator, not head_dim — matches llama.cpp's `theta_scale = freq_base^(-2/n_dims)` where n_dims is rope_dim). This differs from mlx-native's existing `rope_neox_*` which uses head_dim — deliberate sovereignty choice: we implement to llama.cpp's math for end-gate byte-parity.
+- Positions buffer layout: int32 array of length `4 × seq_len`; `positions[axis * seq_len + i]` is the axis-position for token i. Matches llama.cpp `ggml_rope_multi` convention where `src1` is a `[4, seq_len]` tensor stored row-major per axis.
+
+**Phase map status:**
+
+| Phase | Decisions | Status |
+|---|---|---|
+| P0  | 3, 4, 7   | COMPLETE |
+| P1  | 5         | COMPLETE |
+| P2  | 10 (mlx)  | **COMPLETE** |
+| P3  | 6         | Next iter — GATED_DELTA_NET fused kernel (the centerpiece) |
+| P4–P13 | 1, 2, 8–18 | Pending |
+
+**Aggregate:** 39 spec-driven kernel tests across 5 of 6 Qwen3.5-novel mlx-native kernels (L2_NORM, CUMSUM, SSM_CONV, TRI_SOLVE, ROPE_MULTI). Remaining mlx-native kernel: **GATED_DELTA_NET fused (P3)** — the centerpiece, ~500 Rust + ~700 Metal estimated.
+
+**Next iter target:** P3 GATED_DELTA_NET fused kernel. Largest single-kernel effort — scalar CPU reference will land first (used as test oracle), then Metal NSG-parameterized dispatch.
+
 ### 2026-04-23 — /loop iter 3 · P1 COMPLETE (TRI_SOLVE landed)
 
 **Scope:** Phase P1 Decision 5 (lower-triangular unit-diagonal solve).
