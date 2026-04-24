@@ -177,12 +177,47 @@ pub struct AppState {
 /// BERT embedding model, discovered from `--embedding-model <path>` at
 /// startup. Holds the config + the GGUF path so later iters can load
 /// weights on demand.
-#[derive(Debug, Clone)]
+/// Loaded BERT embedding model, discovered from `--embedding-model <path>`
+/// at startup. Holds the config + vocab + a ready-to-use WordPiece
+/// tokenizer so embedding requests tokenize without re-parsing the GGUF
+/// metadata. Weights load on-demand in the forward-pass iter.
+///
+/// Shared via `Arc` so multiple handler calls can tokenize concurrently
+/// against the same immutable tokenizer.
+#[derive(Clone)]
 pub struct EmbeddingModel {
     pub gguf_path: PathBuf,
     pub config: BertConfig,
+    pub vocab: Arc<crate::inference::models::bert::BertVocab>,
+    /// Ready-to-use WordPiece tokenizer. Wrapped in `Arc` because
+    /// `tokenizers::Tokenizer` is not trivially `Clone` across its
+    /// generic-type-erased form, but `Arc<Tokenizer>` is cheap to share.
+    pub tokenizer: Arc<tokenizers::Tokenizer>,
     /// Model id (file stem) — surfaced via `/v1/models`.
     pub model_id: String,
+}
+
+impl std::fmt::Debug for EmbeddingModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingModel")
+            .field("gguf_path", &self.gguf_path)
+            .field("config", &self.config)
+            .field("vocab_len", &self.vocab.len())
+            .field("model_id", &self.model_id)
+            .finish()
+    }
+}
+
+impl EmbeddingModel {
+    /// Convenience: tokenize a single input string using the embedded
+    /// WordPiece tokenizer. Returns the token-id vector.
+    pub fn encode(&self, input: &str) -> anyhow::Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(input, false)
+            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    }
 }
 
 impl AppState {
@@ -294,5 +329,56 @@ mod tests {
         let c = state.next_request_seq();
         assert_eq!(a + 1, b);
         assert_eq!(b + 1, c);
+    }
+
+    #[test]
+    fn embedding_model_encode_round_trips_hello() {
+        // Build a minimal 6-token synthetic BERT vocab + tokenizer.
+        // Verifies the EmbeddingModel::encode wrapper wires through the
+        // tokenizers crate correctly (integration of iter-20 tokenizer
+        // builder with iter-21 state struct).
+        use crate::inference::models::bert::{
+            build_wordpiece_tokenizer, BertConfig, BertSpecialTokens, BertVocab, PoolingType,
+        };
+        let vocab = BertVocab {
+            tokens: vec![
+                "[UNK]".into(),
+                "[CLS]".into(),
+                "[SEP]".into(),
+                "[PAD]".into(),
+                "hello".into(),
+                "world".into(),
+            ],
+            specials: BertSpecialTokens {
+                cls: 1,
+                sep: 2,
+                pad: 3,
+                unk: 0,
+                mask: 0,
+            },
+        };
+        let tokenizer = build_wordpiece_tokenizer(&vocab).expect("build");
+        let em = EmbeddingModel {
+            gguf_path: "/tmp/synthetic.gguf".into(),
+            config: BertConfig {
+                hidden_size: 384,
+                num_attention_heads: 12,
+                num_hidden_layers: 12,
+                intermediate_size: 1536,
+                max_position_embeddings: 512,
+                vocab_size: 6,
+                type_vocab_size: 2,
+                layer_norm_eps: 1e-12,
+                hidden_act: "gelu".into(),
+                pooling_type: PoolingType::Mean,
+                causal_attention: false,
+            },
+            vocab: Arc::new(vocab),
+            tokenizer: Arc::new(tokenizer),
+            model_id: "synthetic-embed".into(),
+        };
+        let ids = em.encode("hello world").expect("encode");
+        assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
+        assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
     }
 }

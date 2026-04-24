@@ -566,6 +566,11 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
         let emb_config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF config parse failed: {e}"))?;
+        // Extract vocab + build WordPiece tokenizer (iter 20).
+        let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
+            .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
+        let tokenizer = crate::inference::models::bert::build_wordpiece_tokenizer(&vocab)
+            .map_err(|e| anyhow::anyhow!("Embedding tokenizer build failed: {e}"))?;
         let model_id = emb_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -575,11 +580,14 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             hidden = emb_config.hidden_size,
             layers = emb_config.num_hidden_layers,
             pooling = ?emb_config.pooling_type,
-            "Validated embedding GGUF header"
+            vocab_size = vocab.len(),
+            "Validated embedding GGUF header + tokenizer"
         );
         Some(api::state::EmbeddingModel {
             gguf_path: emb_path.clone(),
             config: emb_config,
+            vocab: std::sync::Arc::new(vocab),
+            tokenizer: std::sync::Arc::new(tokenizer),
             model_id,
         })
     } else {
