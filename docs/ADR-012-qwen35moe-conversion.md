@@ -9,8 +9,8 @@
 | Phase | Status | Commit | Notes |
 |---|---|---|---|
 | P0 — Broken-window fix (Decision 10) | ✅ shipped 2026-04-24 | `4a2b1e6` | DWQ bit-pair parameterization; 4 new CLI variants (4-8/6-8/2-8 alongside 4-6); --bits+DWQ now errors; auto-naming dwq46/48/68/28. 18 CLI integration tests green, zero new clippy errors. Solo-merged via CFA session `cfa-20260424-adr012-P0-dwq-bitpair` (Codex dual-mode driver failed stdin binding; Claude driver shipped clean). |
-| P1 — Config ingestion (Decisions 2, 3) | 🟡 pending | — | Next. |
-| P2 — qwen35 module + V-head reorder (4, 5) | ⚪ blocked on P1 | — | |
+| P1 — Config ingestion (Decisions 2, 3) | ✅ shipped 2026-04-24 | `c7b1296` | 18 new `Option<T>` fields on `ModelMetadata` + nested `RopeParameters`; `resolved_layer_types()` dual-support getter (prefers explicit `layer_types` over derived `full_attention_interval`); `validate_required_qwen35moe_fields()` public API for P2; preflight hybrid sanity check + `LinearAttentionWithoutFullAttention` error variant. 12 files, 1118 insertions, 12 new tests (apex config parses all 18 fields; Gemma-4 AST unchanged; malformed qwen35moe errors with field name; preflight 100%-linear fails). 650 binary tests + integration tests green; zero new clippy in touched files. Cross-cutting: P2+ MUST call `resolved_layer_types()`, not the legacy `layer_types` Vec. |
+| P2 — qwen35 module + V-head reorder (4, 5) | 🟡 pending | — | Next. |
 | P3 — Non-reorder transforms (6) | ⚪ blocked on P2 | — | |
 | P4 — GGUF metadata + tensor naming (1, 7, 8, 11) | ⚪ blocked on P3 | — | |
 | P5 — Expert merge (9, MoE only) | ⚪ blocked on P4 | — | |
