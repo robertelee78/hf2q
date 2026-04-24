@@ -57,6 +57,7 @@ use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::full_attn::FullAttnLayerWeights;
+use super::kv_cache::FullAttnKvSlot;
 
 /// GPU-side weight handles for a single Qwen3.5 full-attention layer.
 ///
@@ -543,6 +544,134 @@ pub fn apply_sdpa_causal_from_seq_major(
             out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
         }
     }
+
+    upload_f32(&out_sm, device)
+}
+
+// ================================================================
+// KV-cache-aware SDPA
+// ================================================================
+
+/// Apply SDPA with a pre-allocated KV cache.
+///
+/// Writes the current K/V tokens (from `k_seq_major`, `v_seq_major`) into the
+/// cache at position `slot.current_len[0]`, then runs SDPA over all stored
+/// K/V (0 .. current_len + seq_len), finally increments `current_len` by
+/// `seq_len`.
+///
+/// # Cache layout
+///
+/// `slot.k` / `slot.v` are `[1, n_kv_heads, max_seq_len, head_dim]` F32
+/// (SDPA-native layout, n_seqs=1 for single-sequence inference). The maximum
+/// context this slot can hold is `max_seq_len` tokens. Overflow silently
+/// stops writing (last token wins); callers should size the cache appropriately.
+///
+/// # Inputs
+///
+/// - `q_seq_major`: `[seq_len * n_heads,    head_dim]` F32 (seq-major, IMROPE'd).
+/// - `k_seq_major`: `[seq_len * n_kv_heads, head_dim]` F32 (seq-major, IMROPE'd).
+/// - `v_seq_major`: `[seq_len * n_kv_heads, head_dim]` F32 (seq-major, NOT rope'd).
+///
+/// # Returns
+///
+/// `[seq_len * n_heads, head_dim]` F32 (seq-major) — same shape/layout as Q.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sdpa_with_kv_cache(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    slot: &mut FullAttnKvSlot,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_seq_len: u32,
+) -> Result<MlxBuffer> {
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+    let max_sl = max_seq_len as usize;
+    let cur_len = slot.current_len[0] as usize;
+
+    // Download current Q/K/V (seq-major [seq*heads, dim]).
+    let q_cpu = download_f32(q_seq_major)?;
+    let k_cpu_new = download_f32(k_seq_major)?;
+    let v_cpu_new = download_f32(v_seq_major)?;
+
+    // --- Write new K/V into cache (head-major layout) ---
+    // Cache layout: [1, n_kv_heads, max_seq_len, head_dim] F32.
+    // Element at (head h, position p, dim d) = offset h * max_seq_len * head_dim + p * head_dim + d.
+    let kv_cache_elems = nkv * max_sl * d;
+    let k_cache_cpu = slot.k.as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
+    let v_cache_cpu = slot.v.as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
+
+    // Write seq_len new tokens into the cache, starting at position cur_len.
+    // k_cpu_new / v_cpu_new are [seq, nkv, d] seq-major.
+    for t in 0..seq {
+        let abs_pos = cur_len + t;
+        if abs_pos >= max_sl {
+            break; // cache full — stop writing, SDPA will see cur_len + t tokens
+        }
+        for h in 0..nkv {
+            let src_base = (t * nkv + h) * d;
+            let dst_base = h * max_sl * d + abs_pos * d;
+            k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
+            v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
+        }
+    }
+    // Ensure k_cache_cpu / v_cache_cpu borrows are dropped before we use the buffers as GPU input.
+    drop(k_cache_cpu);
+    drop(v_cache_cpu);
+
+    let kv_seq_len = (cur_len + seq).min(max_sl) as u32;
+
+    // --- Permute Q to head-major for SDPA ---
+    let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
+    let q_gpu = upload_f32(&q_hm, device)?;
+
+    // --- SDPA over full KV cache ---
+    let out_buf = device
+        .alloc_buffer(nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
+        .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
+
+    let params = SdpaParams {
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len,
+        kv_seq_len,
+        scale: 1.0 / (d as f32).sqrt(),
+        kv_capacity: max_seq_len,
+    };
+
+    // We need the K/V Metal buffers directly; they are already head-major in the cache.
+    let mut enc = device.command_encoder().context("enc sdpa kv-cache")?;
+    sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
+        .context("sdpa with kv cache")?;
+    enc.commit_and_wait().context("commit sdpa kv-cache")?;
+
+    // --- Permute output from head-major [n_heads, seq, head_dim] back to seq-major ---
+    let out_hm_cpu = download_f32(&out_buf)?;
+    let mut out_sm = vec![0.0f32; seq * nh * d];
+    for h in 0..nh {
+        for t in 0..seq {
+            let src = (h * seq + t) * d;
+            let dst = (t * nh + h) * d;
+            out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+        }
+    }
+
+    // --- Update current_len cursor ---
+    let new_len = (cur_len + seq).min(max_sl) as u32;
+    slot.current_len[0] = new_len;
+
+    // Ensure kv_cache_elems is used (avoid dead-code warning).
+    let _ = kv_cache_elems;
 
     upload_f32(&out_sm, device)
 }

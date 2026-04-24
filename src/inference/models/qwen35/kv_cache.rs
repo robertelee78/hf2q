@@ -240,16 +240,19 @@ fn alloc_full_attn_slot(
     max_seq_len: u32,
     n_seqs: u32,
 ) -> Result<FullAttnKvSlot> {
-    let elems = (cfg.head_dim as usize)
+    // Layout: [n_seqs, n_kv_heads, max_seq_len, head_dim] — matches SDPA kernel's
+    // expected K/V layout: [batch, n_kv_heads, kv_seq_len, head_dim] (head_dim innermost).
+    // kv_capacity = max_seq_len; kv_seq_len = current_len at forward time.
+    let elems = (n_seqs as usize)
         * (cfg.num_key_value_heads as usize)
         * (max_seq_len as usize)
-        * (n_seqs as usize);
+        * (cfg.head_dim as usize);
     let bytes = elems * 4;
     let shape = vec![
-        cfg.head_dim as usize,
+        n_seqs as usize,
         cfg.num_key_value_heads as usize,
         max_seq_len as usize,
-        n_seqs as usize,
+        cfg.head_dim as usize,
     ];
     let k = device
         .alloc_buffer(bytes, DType::F32, shape.clone())
@@ -437,10 +440,10 @@ mod tests {
         let s = &cache.full_attn[0];
         assert_eq!(s.k.dtype(), DType::F32);
         assert_eq!(s.v.dtype(), DType::F32);
-        // Expected element count: head_dim * n_kv * max_seq_len * n_seqs
-        // = 256 * 2 * 64 * 2 = 65536.
-        assert_eq!(s.k.element_count(), 256 * 2 * 64 * 2);
-        assert_eq!(s.v.element_count(), 256 * 2 * 64 * 2);
+        // Expected element count: n_seqs * n_kv * max_seq_len * head_dim
+        // = 2 * 2 * 64 * 256 = 65536.  Layout is SDPA-native [n_seqs, n_kv, max_seq, head_dim].
+        assert_eq!(s.k.element_count(), 2 * 2 * 64 * 256);
+        assert_eq!(s.v.element_count(), 2 * 2 * 64 * 256);
         assert_eq!(s.current_len.len(), 2);
         assert!(s.current_len.iter().all(|&c| c == 0));
     }
