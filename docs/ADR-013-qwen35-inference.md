@@ -700,14 +700,32 @@ GPU forward-pass wire in `gpu_delta_net.rs` + `mod.rs` registration.
 
 ### P9 — hf2q: MoE FFN + Dense FFN forward + variant dispatch
 
-**Scope:** Decisions 13, 14.
+#### P9a COMPLETE — commit `731b485` (2026-04-24)
+CPU scalar references for both Dense SwiGLU and MoE FFN.  Authoritative parity
+oracles used by P9b.  See ffn.rs.
 
-**Deliverables:**
-- `moe.rs::build_moe_ffn_layer` (256 experts, shared-expert gate, reuses mlx-native moe_dispatch)
-- `dense.rs::build_dense_ffn_layer` (SwiGLU)
-- Variant dispatch glue in `mod.rs::build_layer_ffn`
+#### P9b COMPLETE — commit `cbc2379` (2026-04-24)
 
-**Acceptance:** Synthetic 4-expert + 1-shared test passes (MoE); synthetic SwiGLU test passes (dense); no cross-variant code path execution.
+**Scope:** Decisions 13, 14 — GPU builders bridging ffn.rs CPU refs to Metal.
+
+**Deliverables (new file: `src/inference/models/qwen35/gpu_ffn.rs`):**
+- `DenseFfnWeightsGpu` + `build_dense_ffn_layer_gpu` — 4-op Dense SwiGLU:
+    gate=gate_proj(x), up=up_proj(x), hidden=silu(gate)*up, out=down_proj(hidden).
+    Uses `apply_linear_projection_f32` (BF16-cast path from P7b) for all 3 matmuls.
+    SiLU×up via CPU bridge (no standalone GPU SiLU shader in P9b; fuse in P11).
+- `MoeFfnWeightsGpu` + `build_moe_ffn_layer_gpu` — full MoE op order:
+    router (GPU) → softmax+top-k+renorm (CPU) → per-expert SwiGLU (GPU proj + CPU silu_mul)
+    → shared expert (GPU proj × 3 + CPU silu_mul) → sigmoid gate (CPU scalar) → combine.
+    Sigmoid (not swish) on the shared-expert gate — per llama.cpp qwen35moe.cpp:406-420
+    and HF `modeling_qwen3_5.py:689`.
+- `gpu_ffn` registered in `mod.rs`.
+
+**Parity results (measured 2026-04-24, M5 Max):**
+- Dense SwiGLU: max_abs_err = **8.25e-5** < 1e-3 (deterministic)
+- MoE FFN:      max_abs_err observed range **8e-6 – 1.3e-3** < 2e-3
+    (GPU non-determinism from Metal threadgroup order; same budget as P8b DeltaNet 1.96e-3)
+
+**Tests added:** 8 new tests in `gpu_ffn::tests`; suite 820/820 passing (was 812 pre-P9b, +8 from P9b).
 
 **Estimated LOC:** ~400.
 
@@ -1004,7 +1022,7 @@ The DeltaNet output RMSNorm weight is a single `[D_v=128]` vector broadcast acro
 | P0-P6 | COMPLETE |
 | P7     | PARTIAL — CPU + 5 GPU ops |
 | P8     | PARTIAL — CPU ref only |
-| P9     | PARTIAL — CPU refs only |
+| P9     | COMPLETE (P9b commit cbc2379) |
 | P10    | COMPLETE |
 | P11    | **CPU side COMPLETE + real weight loader** |
 | P12    | COMPLETE |
@@ -1060,7 +1078,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P0-P6  | COMPLETE |
 | P7     | PARTIAL — CPU ref ✓; 5 of 7 GPU ops |
 | P8     | PARTIAL — CPU ref ✓; GPU pending |
-| P9     | PARTIAL — CPU refs ✓; GPU pending |
+| P9     | COMPLETE (P9b commit cbc2379) |
 | P10    | COMPLETE |
 | P11    | **CPU SIDE COMPLETE** — forward_cpu() assembles every stage end-to-end |
 | P12    | COMPLETE |
@@ -1123,7 +1141,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P0-P6 | COMPLETE |
 | P7     | PARTIAL — CPU ref + 5 of 7 GPU ops |
 | P8     | PARTIAL — CPU ref only |
-| P9     | PARTIAL — CPU refs only |
+| P9     | COMPLETE (P9b commit cbc2379) |
 | P10    | COMPLETE |
 | P11    | **Type scaffold ✓; all CPU components ✓**; integrated forward + GPU wiring remaining |
 | P12    | COMPLETE |
@@ -1179,7 +1197,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | PARTIAL — CPU ref ✓; GPU 5 of 7 ops verified (+1 sigmoid_mul kernel landed); SDPA + full-layer composition pending |
 | P8     | 8          | PARTIAL — CPU ref ✓; GPU pending |
-| P9     | 13, 14     | PARTIAL — CPU refs ✓; GPU pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | COMPLETE |
 | P11    | 16         | **SCAFFOLD DONE** — Qwen35Model type + empty/load_from_gguf up to shape level. Real weight data load + forward() impl pending |
 | P12    | 17         | COMPLETE |
@@ -1231,7 +1249,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | **P7** | **9**        | **COMPLETE** — `build_gated_attn_layer` + full-layer parity 8.31e-4 < 1e-3 ✅ |
 | P8     | 8          | PARTIAL — CPU ref ✓; GPU pending (DeltaNet) |
-| P9     | 13, 14     | PARTIAL — CPU refs ✓; GPU pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | COMPLETE |
 | P11    | 16         | PARTIAL — Qwen35Model scaffold + forward_cpu ✓; GPU wiring pending P8b/P9b |
 | P12    | 17         | COMPLETE |
@@ -1344,7 +1362,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | **PARTIAL** — CPU ref ✓; GPU weight upload ✓; RMSNorm step ✓; 6 remaining dispatches + full-layer parity pending |
 | P8     | 8          | PARTIAL — CPU ✓; GPU pending |
-| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | COMPLETE |
 | P11    | 16         | Pending (E2E wire-up — depends on P7b/P8b/P9b completion) |
 | P12    | 17         | COMPLETE |
@@ -1390,7 +1408,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | PARTIAL — CPU ✓; GPU pending |
 | P8     | 8          | PARTIAL — CPU ✓; GPU pending |
-| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | COMPLETE |
 | P11    | 16         | Pending (end-to-end forward wire-up — largest remaining piece) |
 | P12    | 17         | **COMPLETE** (trait + mock; real impl deferred until P11 lands) |
@@ -1432,7 +1450,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | PARTIAL — CPU ✓; GPU pending |
 | P8     | 8          | PARTIAL — CPU ✓; GPU pending |
-| P9     | 13, 14     | PARTIAL — CPU ✓; GPU pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | **COMPLETE** |
 | P11    | 16         | Pending (end-to-end forward wire-up) |
 | P12    | 17         | Pending (ActivationCapture for ADR-012) |
@@ -1488,7 +1506,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | PARTIAL — CPU reference ✓; GPU builder pending |
 | P8     | 8          | **PARTIAL** — CPU reference ✓; GPU builder pending |
-| P9     | 13, 14     | PARTIAL — CPU references ✓; GPU builders pending |
+| P9     | 13, 14     | COMPLETE — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10    | 15         | Pending (simple, MTP load-only) |
 | P11-P13| 16-18      | Pending (E2E wire-up, ActivationCapture, sourdough+bench) |
 
@@ -1537,7 +1555,7 @@ for both dense and MoE variants, with argmax sampling validated. Test models use
 | P4-P6  | 1,2,11,12    | COMPLETE |
 | P7     | 9          | PARTIAL — CPU reference ✓; GPU builder pending |
 | P8     | 8          | Pending — DeltaNet layer CPU reference + GPU builder |
-| P9     | 13, 14     | **PARTIAL** — CPU references ✓ (dense + MoE); GPU builders pending |
+| P9     | 13, 14     | **COMPLETE** — P9b commit cbc2379; dense max_abs_err=8.25e-5, MoE max_abs_err<2e-3 |
 | P10-P13| 15-18      | Pending |
 
 **Design notes:**
