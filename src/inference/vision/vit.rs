@@ -360,6 +360,51 @@ pub fn softmax_last_dim(input: &mut [f32], hidden: usize) -> Result<()> {
     Ok(())
 }
 
+/// SiLU (Swish) activation, in-place: `y = x · σ(x) = x / (1 + exp(-x))`.
+///
+/// The gating activation for SwiGLU FFNs (used by Gemma / Llama / Mistral
+/// / SigLIP2 vision towers, among others). Matches PyTorch
+/// `nn.functional.silu(x)` byte-for-byte.
+///
+/// Numerical notes:
+/// - For large positive `x`, `1/(1+exp(-x)) → 1`, so SiLU(x) → x.
+/// - For large negative `x`, `1/(1+exp(-x)) → 0`, so SiLU(x) → 0.
+/// - At `x = 0`, SiLU = 0 exactly.
+/// - The implementation guards against exp overflow by clamping the
+///   input to `exp(-x)` above a threshold — for `x < -40`, `exp(-x)`
+///   would be huge but `x · σ(x) → 0` anyway; for `x > 40`, `exp(-x)`
+///   is effectively 0 and we just return `x`. Rust's f32::exp handles
+///   both ends without NaN.
+pub fn silu_in_place(input: &mut [f32]) {
+    for v in input.iter_mut() {
+        let x = *v;
+        *v = x / (1.0 + (-x).exp());
+    }
+}
+
+/// Elementwise in-place multiply: `a[i] *= b[i]`. Shape-validated.
+///
+/// Used in SwiGLU gating (`silu(gate) * up`) and any other
+/// elementwise-modulation path. Named wrapper mirrors `residual_add`:
+/// keeps the block-construction call site self-documenting.
+///
+/// # Errors
+///
+/// - `a.len() != b.len()`
+pub fn elementwise_mul_in_place(a: &mut [f32], b: &[f32]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(anyhow!(
+            "elementwise_mul_in_place: a len {} != b len {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        *ai *= *bi;
+    }
+    Ok(())
+}
+
 /// GELU activation, tanh-approximation form.
 ///
 /// ```text
@@ -1153,6 +1198,237 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // silu_in_place + elementwise_mul_in_place + SwiGLU gated (iter 39)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn silu_zero_is_zero_exactly() {
+        let mut x = vec![0.0f32];
+        silu_in_place(&mut x);
+        assert_eq!(x[0], 0.0);
+    }
+
+    #[test]
+    fn silu_reference_values_match_pytorch() {
+        // PyTorch F.silu reference values:
+        //   silu(-3) ≈ -0.14227
+        //   silu(-1) ≈ -0.26894
+        //   silu(-0.5) ≈ -0.18877
+        //   silu(0.5) ≈  0.31123
+        //   silu(1)  ≈  0.73106
+        //   silu(3)  ≈  2.85773
+        let inputs = [-3.0f32, -1.0, -0.5, 0.5, 1.0, 3.0];
+        let expected = [
+            -0.14227762_f32,
+            -0.26894143,
+            -0.18877034,
+            0.31122967,
+            0.73105858,
+            2.85772238,
+        ];
+        let mut x = inputs.to_vec();
+        silu_in_place(&mut x);
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-5, "got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn silu_large_positive_approaches_x() {
+        // x=20 → σ(x) ≈ 1 → silu(x) ≈ x.
+        let mut x = vec![20.0f32];
+        silu_in_place(&mut x);
+        assert!((x[0] - 20.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silu_large_negative_approaches_zero() {
+        let mut x = vec![-20.0f32];
+        silu_in_place(&mut x);
+        assert!(x[0].abs() < 1e-4);
+    }
+
+    #[test]
+    fn silu_has_local_minimum_near_negative_point_two_eight() {
+        // SiLU has a local min at x ≈ -1.2785 where value ≈ -0.27846.
+        // Probe x=-1, x=-1.28, x=-1.5; x=-1.28 should be the lowest.
+        let mut x = vec![-1.0f32, -1.28, -1.5];
+        silu_in_place(&mut x);
+        assert!(x[1] < x[0] && x[1] < x[2], "got {:?}", x);
+    }
+
+    #[test]
+    fn elementwise_mul_pairs_each_index() {
+        let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![5.0f32, 6.0, 7.0, 8.0];
+        elementwise_mul_in_place(&mut a, &b).unwrap();
+        assert_eq!(a, vec![5.0, 12.0, 21.0, 32.0]);
+    }
+
+    #[test]
+    fn elementwise_mul_with_zero_zeros_everything() {
+        let mut a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![0f32; 3];
+        elementwise_mul_in_place(&mut a, &b).unwrap();
+        assert_eq!(a, vec![0f32; 3]);
+    }
+
+    #[test]
+    fn elementwise_mul_rejects_shape_mismatch() {
+        let mut a = vec![0f32; 4];
+        let b = vec![0f32; 3];
+        let err = elementwise_mul_in_place(&mut a, &b).unwrap_err();
+        assert!(format!("{err}").contains("len"));
+    }
+
+    #[test]
+    fn swiglu_gated_activation_on_real_gemma4_ffn() {
+        // Runs iter 38's full attention-half chain + iter 39's new
+        // stages: gate = linear(pre_ffn, ffn_gate), up = linear(pre_ffn,
+        // ffn_up), silu(gate), gate *= up. Output shape: [196, 4304].
+        // This is the exact input that iter 40's ffn_down + residual
+        // + post_ffw_norm will consume.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        // Stages 1-7 (iter 38's chain, condensed).
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let residual_stream =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        let mut hidden_states = residual_stream.clone();
+        rms_norm_forward(
+            &mut hidden_states,
+            weights
+                .block_tensor(0, "ln1.weight")
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap(),
+            hidden,
+            1e-6,
+        )
+        .unwrap();
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            weights.block_tensor(0, "attn_q.weight").unwrap().as_slice::<f32>().unwrap(),
+            weights.block_tensor(0, "attn_k.weight").unwrap().as_slice::<f32>().unwrap(),
+            weights.block_tensor(0, "attn_v.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            hidden,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut q,
+            weights.block_tensor(0, "attn_q_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut k,
+            weights.block_tensor(0, "attn_k_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        let attn =
+            scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
+        let attn_projected = linear_forward(
+            &attn,
+            weights.block_tensor(0, "attn_output.weight").unwrap().as_slice::<f32>().unwrap(),
+            None,
+            num_patches,
+            hidden,
+            hidden,
+        )
+        .unwrap();
+        let mut post_attn = residual_stream.clone();
+        residual_add(&mut post_attn, &attn_projected).unwrap();
+        let mut pre_ffn = post_attn.clone();
+        rms_norm_forward(
+            &mut pre_ffn,
+            weights.block_tensor(0, "ln2.weight").unwrap().as_slice::<f32>().unwrap(),
+            hidden,
+            1e-6,
+        )
+        .unwrap();
+
+        // Stage 8 (NEW): SwiGLU gated activation.
+        // gate_w: [intermediate, hidden] = [4304, 1152]
+        // up_w:   [intermediate, hidden] = [4304, 1152]
+        let ffn_gate_buf = weights.block_tensor(0, "ffn_gate.weight").expect("ffn_gate");
+        let ffn_up_buf = weights.block_tensor(0, "ffn_up.weight").expect("ffn_up");
+        let intermediate = cfg.intermediate_size as usize;
+        assert_eq!(intermediate, 4304);
+        let gate_w: &[f32] = ffn_gate_buf.as_slice::<f32>().unwrap();
+        let up_w: &[f32] = ffn_up_buf.as_slice::<f32>().unwrap();
+        assert_eq!(gate_w.len(), intermediate * hidden);
+        assert_eq!(up_w.len(), intermediate * hidden);
+
+        // gate = pre_ffn @ gate_w.T → [num_patches, intermediate]
+        let mut gate =
+            linear_forward(&pre_ffn, gate_w, None, num_patches, hidden, intermediate)
+                .expect("gate proj");
+        let up = linear_forward(&pre_ffn, up_w, None, num_patches, hidden, intermediate)
+            .expect("up proj");
+
+        silu_in_place(&mut gate);
+        elementwise_mul_in_place(&mut gate, &up).expect("mul");
+
+        let activated = gate; // rename for clarity
+        assert_eq!(activated.len(), num_patches * intermediate);
+        for val in &activated {
+            assert!(val.is_finite(), "non-finite: {val}");
+        }
+        // Sanity: activated has non-trivial variance. A silent silu-no-op
+        // or wrong-stride bug would collapse the distribution.
+        let mean: f32 = activated.iter().sum::<f32>() / (activated.len() as f32);
+        let var: f32 = activated
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f32>()
+            / (activated.len() as f32);
+        assert!(var > 1e-6, "activated variance too low: {var}");
+        // Different patches should produce different post-gate rows.
+        let p0 = &activated[0..intermediate];
+        let p_last =
+            &activated[(num_patches - 1) * intermediate..num_patches * intermediate];
+        let l2_diff: f32 = p0.iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2_diff > 1e-3, "all patches produce identical gated output");
     }
 
     // -----------------------------------------------------------------------
