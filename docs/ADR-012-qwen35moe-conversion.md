@@ -389,7 +389,7 @@ Shared experts are **not** merged — they're singletons: `ffn_gate_shexp`, `ffn
 **Acceptance criteria.**
 - Unit test (MoE): builds 4 fake expert tensors with distinguishable values, merges them, asserts shape is `[4, inter, hidden]` and each expert's data appears at its expected slice.
 - Unit test (dense): dense convert path does not invoke `merge_expert_tensors` (compile-time guarantee via arch enum dispatch, or runtime assertion if called incorrectly).
-- Memory profile during 35B MoE conversion stays under 64 GB peak (target: comparable to Gemma-4 26B's ~54 GB peak per ADR-004 decision 8 extrapolated to 35B expert count). If the layer-streaming discipline isn't enough for 256 experts × 3 projections × 40 layers, sub-layer streaming (per-projection) is the documented fallback — but only invoke after measuring. 27B dense conversion should comfortably stay under 32 GB peak (no expert blow-up).
+- Memory profile during 35B MoE conversion stays under 64 GB peak (target: comparable to Gemma-4 26B's ~54 GB peak per ADR-004 decision 8 extrapolated to 35B expert count). If the layer-streaming discipline isn't enough for 256 experts × 3 projections × 40 layers, sub-layer streaming (per-projection) is the implementation strategy — the output is identical, only the memory-management granularity changes, so this is not a correctness fallback. Measure before selecting granularity. 27B dense conversion should comfortably stay under 32 GB peak (no expert blow-up).
 
 ### 10. DWQ bit-pair parameterization + close the broken window
 
@@ -435,7 +435,7 @@ Shared experts are **not** merged — they're singletons: `ffn_gate_shexp`, `ffn
 **Decision.** Extend the sensitivity scorer with arch-aware cohort priors:
 
 - **Both variants:** SSM state tensors (`A_log`, `dt_bias`, `dt_proj`, `conv1d`) are **always** promoted to `sensitive_bits` (never base_bits), regardless of activation score.
-- **MoE only:** Router gate tensors (`ffn_gate_inp`) always promoted. Shared expert tensors (`ffn_*_shexp`) always promoted. Individual expert tensors (`ffn_*_exps`) use the existing activation-score-driven heuristic but with a higher promotion threshold (details: exact threshold tuned empirically against measured KL-divergence per ADR-004 decision 7's fallback methodology).
+- **MoE only:** Router gate tensors (`ffn_gate_inp`) always promoted. Shared expert tensors (`ffn_*_shexp`) always promoted. Individual expert tensors (`ffn_*_exps`) use the existing activation-score-driven heuristic but with a higher promotion threshold (details: exact threshold tuned empirically against measured KL-divergence per the ADR-004 decision 7 block-size methodology used for K-quant type selection).
 - **Dense only:** Dense FFN tensors use the existing activation-score-driven heuristic unchanged.
 - **Full-attention tensors** (both variants) unchanged from current heuristic.
 
@@ -450,7 +450,7 @@ Shared experts are **not** merged — they're singletons: `ffn_gate_shexp`, `ffn
 
 ### 13. DWQ activation calibration for hybrid arch
 
-**Problem.** Activation-based DWQ calibration requires a forward pass. The existing forward pass at `src/quantize/dwq.rs` hooks into hf2q's Gemma inference engine (layer-streamed per ADR-004 decision 8). qwen35moe forward passes through linear-attention layers require SSM state, GATED_DELTA_NET Metal kernels, and MROPE — all of which live in `/opt/mlx-native` and are being built by the parallel inference session.
+**Problem.** Activation-based DWQ calibration requires a forward pass. The existing forward pass at `src/quantize/dwq.rs` hooks into hf2q's Gemma inference engine (layer-streamed per ADR-004 decision 8). Qwen3.5 / Qwen3.5-MoE forward passes through linear-attention layers require SSM state, GATED_DELTA_NET Metal kernels, and MROPE — all of which live in `/opt/mlx-native` and are being built by the parallel inference session.
 
 **Decision.** Define a stable activation-capture API that the inference session implements, and the DWQ pipeline consumes. Interface sketch:
 
@@ -467,12 +467,15 @@ pub struct LayerActivations {
 }
 ```
 
-The inference session's qwen35moe forward implements `ActivationCapture`. hf2q's DWQ pipeline owns the trait definition and the sensitivity scorer; the inference engine owns the implementation. Cross-session coordination point: the trait definition.
+The inference session's qwen35 / qwen35moe forward implements `ActivationCapture`. hf2q's DWQ pipeline owns the trait definition and the sensitivity scorer; the inference engine owns the implementation. Cross-session coordination point: the trait definition.
+
+**No fallback.** Per the mantra and `feedback_no_shortcuts.md` / `feedback_correct_outcomes.md`: weight-space DWQ is not a valid substitute for activation-based DWQ. Activation-based produces measurably better quantization; accepting weight-space output means accepting lesser output, which is a fallback and forbidden. If the inference session's activation capture isn't ready when the rest of the pipeline is, **P6 blocks and we fix the blocker**. Options when blocked: (a) help the inference session land activation capture faster, (b) narrow the trait surface to the minimum viable for sensitivity scoring, (c) hold P6 until real. Not an option: ship weight-space DWQ output and call it done.
 
 **Acceptance criteria.**
-- Trait definition lands in hf2q before inference session starts coding its implementation.
-- A mock `ActivationCapture` that returns zeros is used for hf2q-side unit tests; the real inference-engine-backed implementation is used only for end-to-end conversion.
-- If the inference session's engine isn't ready when the rest of Phase 1-4 lands, DWQ falls back to weight-space calibration (existing fallback path at `src/quantize/dwq.rs` when `use_activations: false`). **This fallback is named and dated — it expires when the inference engine lands. Per `feedback_never_ship_fallback_without_rootcause.md`.**
+- Trait definition lands in hf2q before inference session starts coding its implementation — this reduces rework on their side.
+- A mock `ActivationCapture` that returns deterministic but structurally-correct tensors is used for hf2q-side unit tests (so P6's own tests don't depend on a working inference engine to exercise the scorer logic).
+- Real DWQ conversion of Qwen3.5 / Qwen3.5-MoE weights requires the inference session's real `ActivationCapture` implementation and does not proceed without it.
+- The existing `use_activations: false` weight-space code path at `src/quantize/dwq.rs` remains for Gemma's pre-existing invocation only; it is not extended, referenced, or invoked from any qwen35 / qwen35moe convert path.
 
 ### 14. HF download robustness for 35B
 
@@ -609,7 +612,7 @@ Phases are **dependency-ordered**, not priority-ordered. Each phase has a single
 - Cohort-prior extension to sensitivity scorer per Decision 12
 - `ActivationCapture` trait definition per Decision 13
 - Mock implementation for hf2q-side tests
-- Wire into convert pipeline with documented fallback when inference engine isn't ready
+- Wire into convert pipeline; if inference engine isn't ready, P6 blocks and we fix the blocker — no weight-space fallback path is wired into the qwen35 / qwen35moe convert flow
 - KL-divergence regression guard on Gemma-4 DWQ-4-6
 
 **Acceptance:** Decisions 12 & 13 criteria met.
@@ -700,8 +703,8 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 ### R3: DWQ calibration can't run because inference session isn't ready
 
 **Likelihood:** High — cross-session coordination is the hardest schedule to align.
-**Impact:** P6 stalls; we can only produce weight-space DWQ, which is inferior.
-**Mitigation:** Weight-space fallback is explicitly allowed with dated exit condition (Decision 13 acceptance). First-ship uses weight-space; activation-based is a landed-but-gated improvement. `feedback_never_ship_fallback_without_rootcause.md` satisfied by the dated exit.
+**Impact:** P6 stalls. No conversion output ships for qwen35 / qwen35moe until activation capture is real.
+**Mitigation:** No weight-space fallback is offered — that would be shipping lesser output, which the mantra forbids. Instead: (a) land the `ActivationCapture` trait definition as early as possible in this ADR (P6 kicks off with just the trait in place) so the inference session has a stable target to code against; (b) keep the trait surface minimal — only what the sensitivity scorer actually consumes — to reduce the inference-side work; (c) if stalled, help the inference session directly rather than routing around them. Fix the blocker, don't fall back.
 
 ### R4: 35B conversion OOMs
 
@@ -742,7 +745,7 @@ Acceptance: llama-cli loads the file without errors and emits 8 tokens. (Coheren
 
 ## Dependencies on other work (cross-ADR)
 
-- **Inference session (separate ADR, in flight):** Implements qwen35 / qwen35moe forward pass in Rust including linear-attention, MROPE, SSM state, Metal kernels in `/opt/mlx-native`. Activation-capture trait (Decision 13) is the cross-session coordination point. **Needed by P6 for activation-based DWQ; weight-space fallback unblocks P6 landing without it.**
+- **Inference session (separate ADR, in flight):** Implements qwen35 / qwen35moe forward pass in Rust including linear-attention, MROPE, SSM state, Metal kernels in `/opt/mlx-native`. Activation-capture trait (Decision 13) is the cross-session coordination point. **Hard blocker for P6:** no weight-space fallback path exists for the qwen35 / qwen35moe convert flow. If the inference engine isn't ready, P6 doesn't ship; the answer is to fix the blocker, not route around it.
 - **`/opt/mlx-native` Metal kernels:** GATED_DELTA_NET, SSM_CONV, TRI_SOLVE, L2_NORM, CumSum per `project_qwen36_architecture.md`. **Not needed for conversion;** needed by inference session. Conversion happens on safetensors weights and does not invoke these kernels.
 - **Tokenizer pipeline:** Existing hf2q tokenizer embed path is assumed sufficient for 248K vocab. **If it isn't, follow-up ADR; not in this scope.**
 
