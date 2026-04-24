@@ -44,7 +44,10 @@ use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
 use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
-use super::gpu_ffn::{build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu, DenseFfnWeightsGpu, MoeFfnWeightsGpu};
+use super::gpu_ffn::{
+    build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q,
+    DenseFfnWeightsGpu, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
+};
 use super::gpu_full_attn::{
     apply_linear_projection_f32, build_gated_attn_layer, download_f32, upload_f32,
     FullAttnWeightsGpu,
@@ -72,7 +75,10 @@ enum LayerWeightsGpu {
 
 enum FfnWeightsGpu {
     Dense(DenseFfnWeightsGpu),
+    /// F32 MoE (unit-test / synthetic model path).
     Moe(MoeFfnWeightsGpu),
+    /// Quantized MoE (production GGUF load path — no OOM).
+    MoeQ(MoeFfnWeightsGpuQ),
 }
 
 // ================================================================
@@ -416,15 +422,29 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    // MoE GPU path needs CPU weights for expert slice extraction.
+                    // F32 MoE path: needs CPU weights for per-expert slice extraction.
                     let w_cpu = match &layer_cpu.ffn() {
                         Qwen35FfnWeights::Moe(w) => w,
                         _ => return Err(anyhow!(
-                            "layer {layer_idx} config says MoE but weights are Dense"
+                            "layer {layer_idx} config says F32-MoE but weights are different variant"
                         )),
                     };
                     build_moe_ffn_layer_gpu(&device, &mut registry, &hidden, w_gpu, w_cpu, shape)
                         .with_context(|| format!("moe_ffn layer {layer_idx}"))?
+                }
+                FfnWeightsGpu::MoeQ(w_gpu) => {
+                    let moe = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("MoE FFN missing moe config (layer {layer_idx})")
+                    })?;
+                    let shape = MoeFfnShape {
+                        hidden_size: h,
+                        num_experts: moe.num_experts,
+                        num_experts_per_tok: moe.num_experts_per_tok,
+                        moe_intermediate_size: moe.moe_intermediate_size,
+                        shared_intermediate_size: moe.shared_expert_intermediate_size,
+                    };
+                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &hidden, w_gpu, shape)
+                        .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
                 }
             };
 
@@ -466,6 +486,31 @@ impl Qwen35Model {
                     MoeFfnWeightsGpu::from_cpu(w, device)
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
                 ),
+                Qwen35FfnWeights::MoeQ(w) => {
+                    // Expert buffers already on Metal device; only router and
+                    // shared-expert F32 vecs need uploading.
+                    let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("layer {i}: MoeQ but no moe config")
+                    })?;
+                    FfnWeightsGpu::MoeQ(
+                        MoeFfnWeightsGpuQ::from_quantized(
+                            // Clone the Metal buffer handle (ARC retain — no data copy).
+                            w.expert_gate_q.clone(),
+                            w.expert_up_q.clone(),
+                            w.expert_down_q.clone(),
+                            w.ggml_type,
+                            moe_cfg.num_experts,
+                            moe_cfg.moe_intermediate_size,
+                            cfg.hidden_size,
+                            &w.router,
+                            &w.shared_gate_logit,
+                            &w.shared_gate,
+                            &w.shared_up,
+                            &w.shared_down,
+                            device,
+                        ).with_context(|| format!("upload moe_ffn_q layer {i}"))?,
+                    )
+                }
             };
             let layer_gpu = match layer {
                 Qwen35LayerWeights::FullAttn { attn, .. } => LayerWeightsGpu::FullAttn {
@@ -597,7 +642,7 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
-                        Qwen35FfnWeights::Moe(_) => {
+                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");
                         }
                     }
@@ -631,7 +676,7 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
-                        Qwen35FfnWeights::Moe(_) => {
+                        Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");
                         }
                     }

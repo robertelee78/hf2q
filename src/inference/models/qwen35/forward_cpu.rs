@@ -168,6 +168,15 @@ impl Qwen35Model {
                     };
                     moe_ffn_cpu_ref(&hidden, w, shape)
                 }
+                // MoeQ is a GGUF-loaded quantized variant; forward_cpu does not
+                // support it (expert weights are Metal buffers, not f32 vecs).
+                // CPU-only inference is not needed for the production path.
+                Qwen35FfnWeights::MoeQ(_) => {
+                    return Err(anyhow!(
+                        "forward_cpu does not support MoeQ (quantized expert weights \
+                         loaded from GGUF); use forward_gpu instead"
+                    ));
+                }
             };
 
             // Residual after FFN.

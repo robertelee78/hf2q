@@ -27,13 +27,43 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::gguf::GgufFile;
-use mlx_native::MlxDevice;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights};
 use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+
+// ============================================================================
+// Quantized MoE weight container
+// ============================================================================
+
+/// Per-layer MoE FFN weights with expert tensors kept in their native GGML
+/// quantization.  Small tensors (router, shared-expert) are still f32.
+///
+/// This struct is the bridge between GGUF disk bytes and
+/// `MoeFfnWeightsGpuQ`: it holds the raw Metal buffers that `GgufFile::load_tensor`
+/// produced, plus the f32 scalars needed for routing and shared-expert computation.
+pub struct MoeFfnWeightsQ {
+    /// Router: `[num_experts, hidden_size]` F32.
+    pub router: Vec<f32>,
+    /// Stacked expert gate_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_gate_q: MlxBuffer,
+    /// Stacked expert up_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_up_q: MlxBuffer,
+    /// Stacked expert down_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_down_q: MlxBuffer,
+    /// GGML quantization type for all three expert buffers.
+    pub ggml_type: GgmlType,
+    /// Shared-expert sigmoid gate: `[hidden_size]` F32.
+    pub shared_gate_logit: Vec<f32>,
+    /// Shared-expert SwiGLU weights (F32).
+    pub shared_gate: Vec<f32>,
+    pub shared_up: Vec<f32>,
+    pub shared_down: Vec<f32>,
+}
 
 /// Load a tensor from the GGUF, dequantize to f32, and download into
 /// a `Vec<f32>`.
@@ -199,6 +229,74 @@ pub fn load_moe_ffn(
     })
 }
 
+/// Load an MoE FFN layer's weights, keeping expert tensors in their native
+/// GGML quantization (e.g. Q6_K).
+///
+/// Expert weight buffers (`ffn_{gate,up,down}_exps`) are loaded via
+/// `GgufFile::load_tensor` (raw GGML blocks, DType::U8 on Metal) rather than
+/// `load_tensor_f32`.  This avoids the ~3.2 GB per-layer F32 expansion that
+/// causes the OOM on the 35B apex model.
+///
+/// Small tensors (router, shared-expert) are still dequantized to f32 because
+/// they are projected with the existing F32 dense kernel.
+pub fn load_moe_ffn_quantized(
+    gguf: &GgufFile,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<MoeFfnWeightsQ> {
+    let p = format!("blk.{}", layer_idx);
+
+    // Router and shared-expert weights are small — dequantize to f32.
+    let router = load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?;
+    let shared_gate_logit =
+        load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?;
+    let shared_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?;
+    let shared_up   = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
+    let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
+
+    // Expert weights: load raw GGML blocks, preserving quantization.
+    let expert_gate_q = gguf
+        .load_tensor(&format!("{p}.ffn_gate_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
+    let expert_up_q = gguf
+        .load_tensor(&format!("{p}.ffn_up_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
+    let expert_down_q = gguf
+        .load_tensor(&format!("{p}.ffn_down_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
+
+    // All three expert tensors must have the same quantization type.
+    let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
+    let ggml_type = gate_info.ggml_type;
+
+    // Validate that the type is supported by quantized_matmul_id_ggml.
+    // Q5_K uses the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
+    // also use mv_id for decode and mm_id for prefill batches > 8 tokens.
+    match ggml_type {
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q5_K | GgmlType::Q6_K => {}
+        other => {
+            return Err(anyhow!(
+                "layer {layer_idx}: expert weights have unsupported quant type {:?} \
+                 (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+                other
+            ));
+        }
+    }
+
+    Ok(MoeFfnWeightsQ {
+        router,
+        expert_gate_q,
+        expert_up_q,
+        expert_down_q,
+        ggml_type,
+        shared_gate_logit,
+        shared_gate,
+        shared_up,
+        shared_down,
+    })
+}
+
 /// Load a dense FFN layer's weights.
 pub fn load_dense_ffn(
     gguf: &GgufFile,
@@ -226,9 +324,18 @@ pub fn load_layer(
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
+    // MoE variant: route to the quantized Q path — MoeFfnWeightsQ preserves
+    // the GGUF's native Q6_K/Q8_0 expert tensor layout and avoids the 128 GB
+    // F32 expansion that OOMs on the real 35B-A3B model (256 experts × 40
+    // layers × 3 tensors × 2048×512 × 4 bytes exceeds Metal's 112 GB working
+    // set cap). The F32 `load_moe_ffn` / `Qwen35FfnWeights::Moe` variant is
+    // preserved for synthetic-weight unit tests that deliberately use F32
+    // inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
     let ffn = match cfg.variant {
         Qwen35Variant::Dense => Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?),
-        Qwen35Variant::Moe => Qwen35FfnWeights::Moe(load_moe_ffn(gguf, layer_idx, device)?),
+        Qwen35Variant::Moe => {
+            Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(gguf, layer_idx, device)?)
+        }
     };
 
     match kind {
