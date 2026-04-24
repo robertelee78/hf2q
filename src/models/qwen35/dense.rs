@@ -279,6 +279,21 @@ mod tests {
         );
     }
 
+    /// dt_bias maps to lin_attn_dt_bias in GGUF (dense).
+    ///
+    /// The `.dt_bias` → `.dt_proj.bias` GGUF rename happens at the name-mapping
+    /// layer per `convert_hf_to_gguf.py:4790-4791`. This test asserts the current
+    /// mapping key is `lin_attn_dt_bias`; P4 will adjust the GGUF key to match
+    /// llama.cpp convention.
+    #[test]
+    fn dt_bias_maps_to_gguf_name_dense() {
+        let ctx = dense_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_dense("model.layers.0.linear_attn.dt_bias", &ctx),
+            Some("blk.0.lin_attn_dt_bias".to_string())
+        );
+    }
+
     #[test]
     fn emit_metadata_dense_returns_phase_stub() {
         let ctx = dense_ctx();

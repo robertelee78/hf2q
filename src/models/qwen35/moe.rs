@@ -377,6 +377,21 @@ mod tests {
         );
     }
 
+    /// dt_bias maps to lin_attn_dt_bias in GGUF (MoE).
+    ///
+    /// The `.dt_bias` → `.dt_proj.bias` GGUF rename happens at the name-mapping
+    /// layer per `convert_hf_to_gguf.py:4790-4791`. This test asserts the current
+    /// mapping key is `lin_attn_dt_bias`; P4 will adjust the GGUF key to match
+    /// llama.cpp convention.
+    #[test]
+    fn dt_bias_maps_to_gguf_name_moe() {
+        let ctx = moe_ctx();
+        assert_eq!(
+            hf_tensor_name_to_gguf_moe("model.layers.0.linear_attn.dt_bias", &ctx),
+            Some("blk.0.lin_attn_dt_bias".to_string())
+        );
+    }
+
     #[test]
     fn merge_expert_tensors_returns_phase_stub_empty() {
         let err = merge_expert_tensors(&[])
