@@ -122,51 +122,61 @@ fn setup(dir: &Path) {
     fs::write(dir.join("model.safetensors"), build_safetensors_bytes(tensors)).unwrap();
 }
 
-/// Pre-P12: `hf2q convert --quant dwq-mixed-4-6` on qwen35 MUST fail
-/// with the structured NoActivationCapture error, NOT fall back to
-/// weight-space silently. When P12 lands, this test is updated to
-/// assert success + sensitivity JSON is produced.
+/// Pre-P12: `hf2q convert --quant dwq-mixed-N-M` on qwen35 MUST fail
+/// with the structured NoActivationCapture error for EVERY DWQ variant,
+/// NOT fall back to weight-space silently. If a future edit narrowed
+/// the guard from `.requires_activation_capture()` to `== Qwen35` for
+/// only one variant, the other three would silently accept DWQ with
+/// weight-space — the exact antipattern Decision 13 rejects.
+///
+/// When P12 lands, this test is updated to assert success + sensitivity
+/// JSON is produced.
 #[test]
 fn dwq_on_qwen35_surfaces_not_ready_not_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("qwen35-dwq-in");
-    let output = tmp.path().join("out.gguf");
     setup(&input);
 
-    let out = Command::cargo_bin("hf2q")
-        .unwrap()
-        .args([
-            "convert",
-            "--input", input.to_str().unwrap(),
-            "--format", "gguf",
-            "--quant", "dwq-mixed-4-6",
-            "--output", output.to_str().unwrap(),
-            "--yes",
-            "--skip-quality",
-        ])
-        .output()
-        .expect("exec hf2q");
+    for variant in ["dwq-mixed-2-8", "dwq-mixed-4-6", "dwq-mixed-4-8", "dwq-mixed-6-8"] {
+        let output = tmp.path().join(format!("out-{variant}.gguf"));
+        let out = Command::cargo_bin("hf2q")
+            .unwrap()
+            .args([
+                "convert",
+                "--input", input.to_str().unwrap(),
+                "--format", "gguf",
+                "--quant", variant,
+                "--output", output.to_str().unwrap(),
+                "--yes",
+                "--skip-quality",
+            ])
+            .output()
+            .expect("exec hf2q");
 
-    assert!(
-        !out.status.success(),
-        "DWQ on qwen35 pre-P12 MUST NOT succeed (silent weight-space fallback)"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    // Structured error surface — names ActivationCapture explicitly.
-    assert!(
-        stderr.contains("activation")
-            || stderr.contains("ActivationCapture")
-            || stderr.contains("not available")
-            || stderr.contains("Not Ready")
-            || stderr.contains("NotReady"),
-        "error message must name the ActivationCapture dependency, got: {}",
-        stderr
-    );
-    // Negative — not a silent fallback.
-    assert!(
-        !output.exists(),
-        "no output GGUF should have been produced — DWQ must fail-fast"
-    );
+        assert!(
+            !out.status.success(),
+            "DWQ variant {} on qwen35 pre-P12 MUST NOT succeed (silent weight-space fallback)",
+            variant
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Structured error surface — names ActivationCapture explicitly.
+        assert!(
+            stderr.contains("activation")
+                || stderr.contains("ActivationCapture")
+                || stderr.contains("not available")
+                || stderr.contains("Not Ready")
+                || stderr.contains("NotReady"),
+            "variant {} error must name the ActivationCapture dependency, got: {}",
+            variant,
+            stderr
+        );
+        // Negative — not a silent fallback.
+        assert!(
+            !output.exists(),
+            "variant {}: no output GGUF should have been produced — DWQ must fail-fast",
+            variant
+        );
+    }
 }
 
 /// Dense model without ActivationCapture dependency (e.g. `q4`) still
