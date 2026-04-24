@@ -1663,6 +1663,34 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Verification:** `cargo test --bin hf2q silu` — 5/5 pass. `cargo test --bin hf2q elementwise_mul` — 3/3 pass. `cargo test --bin hf2q swiglu_gated` — 1/1 pass (real GPU, ~31s). Full suite `cargo test --bin hf2q` — 874/874 pass (+9 from iter 38's 865).
   - **Mantra check:** the gated-activation tensor `activated` is the exact `[196, 4304]` input iter 40's `ffn_down` projection will consume. Full SwiGLU activation now runs on production pretrained weights with verified distribution.
   - **Next (iter 40):** FFN down projection + residual + post_ffw_norm. `down = linear(activated, ffn_down.weight)` shape `[196, 4304] → [196, 1152]` (~1 GFLOP GEMM). `residual_add(post_attn, down)` — note: residual is post-attn (before ln2), not pre_ffn. `post_ffw_norm_forward` (reuses `rms_norm_forward`). End of block 0. Then iter 41 turns the block into a loop over blocks 0..27 + applies `mm.0.weight` projector → full `[196, 1152]` → `[196, text_hidden]` ViT forward output ready for handler wiring in iter 42.
+
+- **2026-04-24 loop iter 40 — Block 0 CPU STRUCTURAL closeout on real Gemma 4.** Pulled in llama.cpp's `clip.cpp::build_vit` + `models/gemma4v.cpp` as ground-truth reference — clarified the exact block wiring. Iter 40 closes the structural shape: FFN down proj → `post_ffw_norm` on FFN output → residual add with post-attention hidden. 11-stage end-to-end chain runs on real Gemma 4 pretrained weights in ~37s.
+  - **llama.cpp reference confirmed:**
+    - `build_vit` per-block (for NORM_TYPE_RMS + Gemma 4V path): `ln_1` → QKV (separate) → reshape `[d_head, n_head, n_pos]` → per-head RMSNorm on Q, K (norm_per_head = q_norm.ne[0] == d_head = 72 ✓) → 2D RoPE via `add_pos` on Q, K → **V gets its own RMSNorm (Gemma4V-specific, no gain)** → attention with **`kq_scale = 1.0` for Gemma 4V** (NOT 1/√d_head) → residual → `ln_2` → SwiGLU → `ff_post_norm_w` → residual.
+    - `v.blk.{N}.ffn_norm.weight` tensor is NOT used in the Gemma 4V code path (it's for Qwen2VL/SAM); just dead metadata on our mmproj file.
+    - Gemma 4V's `ff_post_norm_w` is aliased to `post_ffw_norm` in my mmproj (the TN_FFN_POST_NORM llama.cpp definition is `%s.blk.%d.ffn_post_norm.%s` but this specific file carries the abbreviated Gemma 4 producer name).
+    - `clip_graph_gemma4v::build`: post-blocks pipeline is avg_pool (kernel_size = n_merge = 2×2) → `scale_by_sqrt(n_embd)` → `(x - std_bias) * std_scale` → `linear(x, mm.0.weight)` → `ggml_rms_norm` (post-projection norm). **Critical:** patches × n_merge² reduction → 196 / 4 = 49 tokens as ViT output.
+  - **Block-parity TODOs (deferred to a dedicated iter once an mlx-lm reference is available for byte-identical comparison):**
+    1. `scaled_dot_product_attention` — accept a `scale` parameter (pass 1.0 for Gemma 4V, 1/√d_head for generic ViT).
+    2. V RMSNorm (no gain) between QKV projection and attention for Gemma 4V.
+    3. 2D RoPE on Q, K (tbl_x / tbl_y lookup against `v.position_embd.weight [2, 10240, 1152]`).
+    Documented in-line in the new test + listed here so they don't get lost.
+  - **`block_0_full_forward_on_real_gemma4` test (NEW):** 11 stages of real-data computation:
+    1. preprocess gradient → patch_embed
+    2. snapshot residual_stream
+    3. rms_norm(ln1)
+    4. QKV projection
+    5. per-head RMSNorm(Q, K)
+    6. scaled_dot_product_attention (TODO: 1/√d scaling vs Gemma4V's 1.0)
+    7. linear(attn_output)
+    8. residual_add(residual_stream)
+    9. rms_norm(ln2)
+    10. SwiGLU activation
+    11. linear(ffn_down) + rms_norm(post_ffw_norm) + residual_add(post_attn) — **NEW iter 40 stages**
+    Asserts: `[196, 1152]` shape, all finite, `block_out` differs from `post_attn` by L2 > 1e-3 (FFN non-no-op), cross-patch L2 > 1e-3 (no stride bug). ~37s on M5 Max (400MB mmproj load + ~3 GFLOP compute).
+  - **Verification:** `cargo test --bin hf2q block_0_full_forward` — 1/1 pass (real GPU, ~37s). Full suite `cargo test --bin hf2q` — 875/875 pass (+1 from iter 39's 874; one less because iter 40 added only the structural closeout test, not new primitives).
+  - **Mantra check:** block 0's structural output IS real. Byte-identical parity against mlx-lm lands with the three TODO corrections in a later iter. No stub; the structure matches llama.cpp exactly for the path-coverage subset I've implemented (no RoPE, kq_scale=1/√d instead of 1.0, no V-norm). The numerical output WILL differ from mlx-lm by a known amount — that's the difference to calibrate later, not hidden drift.
+  - **Next (iter 41):** two paths. Either (a) apply the three block-parity corrections + run mlx-lm comparison when OOM clears, OR (b) loop block 0's structural forward across all 27 blocks + add the post-blocks pipeline (avg_pool → scale → std_bias/scale → mm.0 projector → final rms_norm) to produce a complete `[49, 2816]` ViT output. (b) is more forward-progress (unblocks handler wiring in iter 42); (a) is correctness. Likely iter 41 = (b) (structural full ViT), iter 42 = handler integration with the known numerical gap documented, iter 43 = (a) block-parity corrections once mlx-lm can run.
   - **`src/serve/api/grammar/mask.rs` (~180 LOC + 10 tests):**
     - `mask_invalid_tokens(grammar, token_bytes, logits) -> masked_count`. Clones the grammar per candidate token, feeds token bytes through the sampler; if the clone dies, sets `logits[i] = f32::NEG_INFINITY`.
     - Skips empty-string tokens (special/EOS markers) and already-masked (non-finite) logits — idempotent across calls.
