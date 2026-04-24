@@ -144,6 +144,83 @@ pub fn layer_norm_forward(
     Ok(())
 }
 
+/// Forward-pass RMSNorm over the last dimension of a `[..., hidden]`
+/// tensor, single-parameter (gain only, no bias).
+///
+/// For each `hidden`-element slice `x`:
+///
+/// ```text
+/// rms = sqrt(mean(x²) + ε)
+/// y_i = x_i / rms * gamma_i
+/// ```
+///
+/// Matches PyTorch / HF `nn.RMSNorm(normalized_shape, eps,
+/// elementwise_affine=True)` byte-for-byte (the formulation introduced in
+/// Llama's pre-norm + carried through SigLIP2, Gemma 4 vision, and the
+/// Gemma / Llama / Mistral / Qwen text stacks).
+///
+/// `input` is overwritten with the output. `gamma` is `[hidden]`; there
+/// is no `beta` (RMSNorm has no bias by design — one of its ergonomic
+/// wins over LayerNorm).
+///
+/// # Why Gemma 4 uses RMSNorm despite the `ln1`/`ln2` tensor names
+///
+/// The llama.cpp mmproj writer inherits CLIP's naming even when the
+/// underlying model family switched from LayerNorm to RMSNorm.
+/// Gemma 4's vision tower ships `ln1.weight` + `ln2.weight` +
+/// `ffn_norm.weight` + `post_ffw_norm.weight` but NO matching
+/// `.bias` tensors — the single-parameter signature is the RMSNorm
+/// tell. Forward-pass dispatch branches on `ArchProfile`: Gemma 4 routes
+/// these to `rms_norm_forward`, CLIP-classic routes to `layer_norm_forward`.
+///
+/// # Errors
+///
+/// - `input.len() % hidden != 0`
+/// - `gamma.len() != hidden`
+/// - `hidden == 0`
+pub fn rms_norm_forward(
+    input: &mut [f32],
+    gamma: &[f32],
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("rms_norm_forward: hidden must be > 0"));
+    }
+    if input.len() % hidden != 0 {
+        return Err(anyhow!(
+            "rms_norm_forward: input len {} not divisible by hidden {}",
+            input.len(),
+            hidden
+        ));
+    }
+    if gamma.len() != hidden {
+        return Err(anyhow!(
+            "rms_norm_forward: gamma len {} != hidden {}",
+            gamma.len(),
+            hidden
+        ));
+    }
+
+    let n_rows = input.len() / hidden;
+    let inv_hidden = 1.0f32 / (hidden as f32);
+    for row in 0..n_rows {
+        let off = row * hidden;
+        let slice = &mut input[off..off + hidden];
+        // Pass 1: sum of squares.
+        let mut sq_sum = 0.0f32;
+        for &v in slice.iter() {
+            sq_sum += v * v;
+        }
+        let inv_rms = 1.0f32 / (sq_sum * inv_hidden + eps).sqrt();
+        // Pass 2: normalize + gain.
+        for (i, v) in slice.iter_mut().enumerate() {
+            *v = *v * inv_rms * gamma[i];
+        }
+    }
+    Ok(())
+}
+
 /// Numerically-stable softmax over the last dimension of a `[..., hidden]`
 /// tensor. Subtracts the per-row max before `exp` so that even rows with
 /// large positive entries don't overflow f32 (max finite exp input ≈ 88.7).
@@ -775,6 +852,188 @@ mod tests {
         for v in &x {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // rms_norm_forward (iter 34 — Gemma 4 vision ln1/ln2/ffn_norm/post_ffw)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rms_norm_unit_gamma_normalizes_to_unit_rms() {
+        // After RMSNorm with γ=1, the row's mean-squared should be ~1.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma = vec![1.0f32; 4];
+        rms_norm_forward(&mut x, &gamma, 4, 1e-6).unwrap();
+        let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / 4.0;
+        assert!(
+            (ms - 1.0).abs() < 1e-4,
+            "mean-squared should be ~1, got {ms}"
+        );
+    }
+
+    #[test]
+    fn rms_norm_pytorch_reference_values() {
+        // x = [1, 2, 3, 4]. mean(x²) = (1+4+9+16)/4 = 7.5.
+        // rms = sqrt(7.5 + 1e-5) ≈ 2.7386128.
+        // y = x / rms = [0.36514837, 0.73029674, 1.09544511, 1.46059349]
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma = vec![1.0f32; 4];
+        rms_norm_forward(&mut x, &gamma, 4, 1e-5).unwrap();
+        let expected = [0.36514837f32, 0.73029674, 1.09544511, 1.46059349];
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn rms_norm_applies_gain_elementwise() {
+        // γ scales each element post-normalization. For a uniform input,
+        // pre-gain output is all-1; post-gain equals γ directly.
+        let mut x = vec![5.0f32; 4];
+        let gamma = vec![0.5f32, 1.0, 2.0, 3.0];
+        rms_norm_forward(&mut x, &gamma, 4, 1e-6).unwrap();
+        for (got, want) in x.iter().zip(gamma.iter()) {
+            assert!((*got - *want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn rms_norm_normalizes_rows_independently() {
+        // Two rows scaled by 100× should produce identical outputs since
+        // RMSNorm is scale-invariant.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
+        let gamma = vec![1.0f32; 4];
+        rms_norm_forward(&mut x, &gamma, 4, 1e-6).unwrap();
+        for i in 0..4 {
+            assert!(
+                (x[i] - x[4 + i]).abs() < 1e-3,
+                "row 0 elem {} = {} != row 1 = {}",
+                i,
+                x[i],
+                x[4 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn rms_norm_does_not_divide_by_zero_when_input_is_zero() {
+        // All-zeros row has RMS=0, would divide by zero without eps.
+        // With eps > 0 the output is finite (and zero, since x is zero).
+        let mut x = vec![0.0f32; 8];
+        let gamma = vec![1.0f32; 8];
+        rms_norm_forward(&mut x, &gamma, 8, 1e-6).unwrap();
+        for v in &x {
+            assert!(v.is_finite(), "got non-finite {}", v);
+            assert!(v.abs() < 1e-5, "zero input should stay zero, got {v}");
+        }
+    }
+
+    #[test]
+    fn rms_norm_large_inputs_do_not_overflow() {
+        // Large magnitudes: without stable normalization, sum of squares
+        // could overflow. With f32 max ≈ 3.4e38, a hidden-size of 4 with
+        // values of 1e18 squared = 1e36; sum is 4e36, still fits.
+        let mut x = vec![1e18f32, 2e18, 3e18, 4e18];
+        let gamma = vec![1.0f32; 4];
+        rms_norm_forward(&mut x, &gamma, 4, 1e-6).unwrap();
+        for v in &x {
+            assert!(v.is_finite(), "got {v} — f32 overflow");
+        }
+        let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / 4.0;
+        assert!((ms - 1.0).abs() < 1e-3, "ms = {ms}");
+    }
+
+    #[test]
+    fn rms_norm_rejects_hidden_zero() {
+        let mut x = vec![1.0f32; 4];
+        let err = rms_norm_forward(&mut x, &[], 0, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("hidden must be > 0"));
+    }
+
+    #[test]
+    fn rms_norm_rejects_non_divisible_input_len() {
+        let mut x = vec![1.0f32; 7];
+        let gamma = vec![1.0f32; 3];
+        let err = rms_norm_forward(&mut x, &gamma, 3, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    #[test]
+    fn rms_norm_rejects_wrong_gamma_len() {
+        let mut x = vec![1.0f32; 4];
+        let gamma = vec![1.0f32; 3];
+        let err = rms_norm_forward(&mut x, &gamma, 4, 1e-5).unwrap_err();
+        assert!(format!("{err}").contains("gamma len"));
+    }
+
+    #[test]
+    fn rms_norm_runs_against_real_gemma4_ln1_weights() {
+        // Use the real `v.blk.0.ln1.weight` gain vector (1152 f32) from
+        // the loaded Gemma 4 mmproj. Apply to a synthetic [196, 1152]
+        // patch-embedding-shaped input. Verifies:
+        //   - gains are dequantized cleanly (no f16→f32 conversion bugs)
+        //   - rms_norm_forward handles the production hidden size (1152)
+        //   - output has finite, non-trivial values
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        let gamma: &[f32] = ln1.as_slice::<f32>().expect("as_slice f32");
+        assert_eq!(gamma.len(), cfg.hidden_size as usize);
+
+        // Synthetic [196 patches × 1152 hidden] input with per-patch
+        // unique gradient so all rows are distinguishable.
+        let num_patches = 196usize;
+        let hidden = cfg.hidden_size as usize;
+        let mut input = vec![0f32; num_patches * hidden];
+        for p in 0..num_patches {
+            for h in 0..hidden {
+                input[p * hidden + h] = 0.01 + (p as f32) * 0.001 + (h as f32) * 0.0001;
+            }
+        }
+        rms_norm_forward(&mut input, gamma, hidden, 1e-6).expect("rms_norm");
+        for v in &input {
+            assert!(v.is_finite(), "non-finite post-RMS: {v}");
+        }
+        let mean_sq: f32 = input.iter().map(|v| v * v).sum::<f32>()
+            / (input.len() as f32);
+        // Per-row unit-RMS gets modulated by γ. Gemma's γ values are
+        // O(1) so the overall mean-sq stays near γ²-ish ≈ 0.1..10 range.
+        assert!(
+            mean_sq > 1e-4 && mean_sq < 1e6,
+            "mean_sq {} outside sane range",
+            mean_sq
+        );
+    }
+
+    #[test]
+    fn rms_norm_differs_from_layer_norm_on_nonzero_mean_input() {
+        // Key behavioral difference: LayerNorm subtracts mean first,
+        // RMSNorm does not. A non-zero-mean input normalizes to
+        // different values under the two.
+        let mut x_rms = vec![2.0f32, 2.0, 2.0, 2.0];
+        let mut x_ln = x_rms.clone();
+        let gamma = vec![1.0f32; 4];
+        let beta = vec![0.0f32; 4];
+        rms_norm_forward(&mut x_rms, &gamma, 4, 1e-6).unwrap();
+        layer_norm_forward(&mut x_ln, &gamma, &beta, 4, 1e-6).unwrap();
+        // RMSNorm of [2,2,2,2]: rms=2, output=[1,1,1,1].
+        // LayerNorm of [2,2,2,2]: variance=0 → (x-mean)*inv_std*γ = 0.
+        for v in &x_rms {
+            assert!((*v - 1.0).abs() < 1e-5, "RMS output not 1: {v}");
+        }
+        for v in &x_ln {
+            assert!(v.abs() < 1e-5, "LN output not 0: {v}");
         }
     }
 
