@@ -79,6 +79,8 @@ pub struct DwqQuantizer {
     config: DwqConfig,
     /// Internal mixed-bit quantizer
     mixed_quantizer: MixedBitQuantizer,
+    /// Derived name string (e.g. "dwq-mixed-4-6")
+    name: String,
 }
 
 impl DwqQuantizer {
@@ -100,16 +102,19 @@ impl DwqQuantizer {
             config.group_size,
         )?;
 
+        let name = format!("dwq-mixed-{}-{}", config.base_bits, config.sensitive_bits);
+
         Ok(Self {
             config,
             mixed_quantizer,
+            name,
         })
     }
 }
 
 impl Quantizer for DwqQuantizer {
     fn name(&self) -> &str {
-        "dwq-mixed-4-6"
+        &self.name
     }
 
     fn requires_calibration(&self) -> bool {
@@ -270,7 +275,7 @@ pub fn run_dwq_calibration(
     Ok(QuantizedModel {
         metadata: metadata.clone(),
         tensors: quantized_tensors,
-        quant_method: "dwq-mixed-4-6".to_string(),
+        quant_method: format!("dwq-mixed-{}-{}", config.base_bits, config.sensitive_bits),
         group_size: config.group_size,
         bits: config.base_bits,
     })
@@ -448,6 +453,27 @@ mod tests {
     }
 
     #[test]
+    fn test_dwq_quantizer_name_derived_from_config() {
+        // DwqMixed46 path — Gemma-4 regression snapshot
+        let config46 = DwqConfig { base_bits: 4, sensitive_bits: 6, ..DwqConfig::default() };
+        let q46 = DwqQuantizer::new(config46).unwrap();
+        assert_eq!(q46.name(), "dwq-mixed-4-6", "Gemma-4 regression: name must be 'dwq-mixed-4-6'");
+
+        // New variants
+        let config48 = DwqConfig { base_bits: 4, sensitive_bits: 8, ..DwqConfig::default() };
+        let q48 = DwqQuantizer::new(config48).unwrap();
+        assert_eq!(q48.name(), "dwq-mixed-4-8");
+
+        let config68 = DwqConfig { base_bits: 6, sensitive_bits: 8, ..DwqConfig::default() };
+        let q68 = DwqQuantizer::new(config68).unwrap();
+        assert_eq!(q68.name(), "dwq-mixed-6-8");
+
+        let config28 = DwqConfig { base_bits: 2, sensitive_bits: 8, ..DwqConfig::default() };
+        let q28 = DwqQuantizer::new(config28).unwrap();
+        assert_eq!(q28.name(), "dwq-mixed-2-8");
+    }
+
+    #[test]
     fn test_generate_calibration_tokens() {
         let tokens = generate_calibration_tokens(1024, 32000);
         assert!(!tokens.is_empty());
@@ -503,10 +529,8 @@ mod tests {
         assert!(format!("{}", tok_err).contains("Tokenizer error"));
     }
 
-    #[test]
-    fn test_run_dwq_weight_space() {
-        let tensor_map = TensorMap::new();
-        let metadata = ModelMetadata {
+    fn make_metadata() -> ModelMetadata {
+        ModelMetadata {
             architecture: "Test".to_string(),
             model_type: "test".to_string(),
             param_count: 0,
@@ -522,7 +546,13 @@ mod tests {
             top_k_experts: None,
             intermediate_size: None,
             raw_config: serde_json::Value::Null,
-        };
+        }
+    }
+
+    #[test]
+    fn test_run_dwq_weight_space() {
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
         let config = DwqConfig::default();
         let progress = ProgressReporter::new();
 
@@ -531,5 +561,60 @@ mod tests {
         assert!(result.is_ok());
         let model = result.unwrap();
         assert_eq!(model.quant_method, "dwq-mixed-4-6");
+    }
+
+    #[test]
+    fn test_run_dwq_calibration_quant_method_derived_from_config() {
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
+        let progress = ProgressReporter::new();
+
+        // Gemma-4 regression snapshot: (4,6) must produce "dwq-mixed-4-6"
+        let config46 = DwqConfig { base_bits: 4, sensitive_bits: 6, ..DwqConfig::default() };
+        let model46 = run_dwq_calibration(&tensor_map, &metadata, &config46, &progress).unwrap();
+        assert_eq!(
+            model46.quant_method, "dwq-mixed-4-6",
+            "Gemma-4 regression: quant_method must be 'dwq-mixed-4-6'"
+        );
+
+        // New variants
+        let config48 = DwqConfig { base_bits: 4, sensitive_bits: 8, ..DwqConfig::default() };
+        let model48 = run_dwq_calibration(&tensor_map, &metadata, &config48, &progress).unwrap();
+        assert_eq!(model48.quant_method, "dwq-mixed-4-8");
+
+        let config68 = DwqConfig { base_bits: 6, sensitive_bits: 8, ..DwqConfig::default() };
+        let model68 = run_dwq_calibration(&tensor_map, &metadata, &config68, &progress).unwrap();
+        assert_eq!(model68.quant_method, "dwq-mixed-6-8");
+
+        let config28 = DwqConfig { base_bits: 2, sensitive_bits: 8, ..DwqConfig::default() };
+        let model28 = run_dwq_calibration(&tensor_map, &metadata, &config28, &progress).unwrap();
+        assert_eq!(model28.quant_method, "dwq-mixed-2-8");
+    }
+
+    #[test]
+    fn test_gemma4_regression_full_snapshot() {
+        // Full Gemma-4 struct-value snapshot:
+        // All observables of the DwqMixed46 code path must be byte-identical to
+        // pre-change values. If any of these fail, the Gemma-4 quantization
+        // output would differ from pre-change HEAD.
+        let config = DwqConfig { base_bits: 4, sensitive_bits: 6, ..DwqConfig::default() };
+        assert_eq!(config.base_bits, 4, "base_bits must be 4 for Gemma-4 path");
+        assert_eq!(config.sensitive_bits, 6, "sensitive_bits must be 6 for Gemma-4 path");
+
+        let quantizer = DwqQuantizer::new(config.clone()).unwrap();
+        assert_eq!(
+            quantizer.name(), "dwq-mixed-4-6",
+            "DwqQuantizer::name() must be 'dwq-mixed-4-6' for Gemma-4 path"
+        );
+
+        let tensor_map = TensorMap::new();
+        let metadata = make_metadata();
+        let progress = ProgressReporter::new();
+        let model = run_dwq_calibration(&tensor_map, &metadata, &config, &progress).unwrap();
+        assert_eq!(
+            model.quant_method, "dwq-mixed-4-6",
+            "QuantizedModel.quant_method must be 'dwq-mixed-4-6' for Gemma-4 path"
+        );
+        assert_eq!(model.bits, 4, "QuantizedModel.bits must be 4 for Gemma-4 path");
     }
 }

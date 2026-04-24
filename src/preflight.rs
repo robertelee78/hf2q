@@ -396,7 +396,10 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
             // Average of low and high bits
             5.0 * 1.1
         }
-        QuantMethod::DwqMixed46 => 5.0 * 1.1,
+        QuantMethod::DwqMixed46
+        | QuantMethod::DwqMixed48
+        | QuantMethod::DwqMixed68
+        | QuantMethod::DwqMixed28 => 5.0 * 1.1,
         QuantMethod::Apex => 4.0 * 1.1,
         QuantMethod::Auto => 4.0 * 1.1, // Conservative estimate
     };

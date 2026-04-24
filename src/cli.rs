@@ -429,6 +429,12 @@ pub enum QuantMethod {
     Mixed46,
     #[value(name = "dwq-mixed-4-6")]
     DwqMixed46,
+    #[value(name = "dwq-mixed-4-8")]
+    DwqMixed48,
+    #[value(name = "dwq-mixed-6-8")]
+    DwqMixed68,
+    #[value(name = "dwq-mixed-2-8")]
+    DwqMixed28,
     /// Apex: imatrix-calibrated, per-tensor optimal precision (requires Phase 2 GPU support)
     Apex,
 }
@@ -445,7 +451,38 @@ impl std::fmt::Display for QuantMethod {
             Self::Mixed36 => write!(f, "mixed-3-6"),
             Self::Mixed46 => write!(f, "mixed-4-6"),
             Self::DwqMixed46 => write!(f, "dwq-mixed-4-6"),
+            Self::DwqMixed48 => write!(f, "dwq-mixed-4-8"),
+            Self::DwqMixed68 => write!(f, "dwq-mixed-6-8"),
+            Self::DwqMixed28 => write!(f, "dwq-mixed-2-8"),
             Self::Apex => write!(f, "apex"),
+        }
+    }
+}
+
+impl QuantMethod {
+    /// Return the (base_bits, sensitive_bits) pair for DWQ variants.
+    /// Returns None for non-DWQ variants.
+    pub fn dwq_bit_pair(self) -> Option<(u8, u8)> {
+        match self {
+            Self::DwqMixed46 => Some((4, 6)),
+            Self::DwqMixed48 => Some((4, 8)),
+            Self::DwqMixed68 => Some((6, 8)),
+            Self::DwqMixed28 => Some((2, 8)),
+            _ => None,
+        }
+    }
+
+    /// Return the default output filename suffix for this quant method.
+    ///
+    /// DWQ variants produce compact suffixes like "dwq46", "dwq48", etc.
+    /// All other variants return their Display string unchanged (e.g. "mixed-4-6", "q4").
+    pub fn default_filename_suffix(self) -> String {
+        match self {
+            Self::DwqMixed46 => "dwq46".to_string(),
+            Self::DwqMixed48 => "dwq48".to_string(),
+            Self::DwqMixed68 => "dwq68".to_string(),
+            Self::DwqMixed28 => "dwq28".to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -599,9 +636,10 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "model".to_string());
+            let suffix = args.quant.default_filename_suffix();
             match args.format {
-                OutputFormat::Gguf => PathBuf::from(format!("{}-{}.gguf", model_name, args.quant)),
-                _ => PathBuf::from(format!("{}-{}-{}", model_name, args.format, args.quant)),
+                OutputFormat::Gguf => PathBuf::from(format!("{}-{}.gguf", model_name, suffix)),
+                _ => PathBuf::from(format!("{}-{}-{}", model_name, args.format, suffix)),
             }
         }
     };
@@ -614,7 +652,10 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         QuantMethod::Mixed26 | QuantMethod::Mixed36 | QuantMethod::Mixed46 => {
             // Mixed-bit quantization
         }
-        QuantMethod::DwqMixed46 => {
+        QuantMethod::DwqMixed46
+        | QuantMethod::DwqMixed48
+        | QuantMethod::DwqMixed68
+        | QuantMethod::DwqMixed28 => {
             // DWQ weight-space calibration (no inference needed)
         }
         QuantMethod::Apex => {
@@ -683,5 +724,93 @@ mod tests {
         assert_eq!(GroupSize::G32.as_usize(), 32);
         assert_eq!(GroupSize::G64.as_usize(), 64);
         assert_eq!(GroupSize::G128.as_usize(), 128);
+    }
+
+    // ---- DWQ bit-pair dispatch table ----
+
+    #[test]
+    fn test_dwq_bit_pair_dispatch_table() {
+        assert_eq!(QuantMethod::DwqMixed46.dwq_bit_pair(), Some((4, 6)));
+        assert_eq!(QuantMethod::DwqMixed48.dwq_bit_pair(), Some((4, 8)));
+        assert_eq!(QuantMethod::DwqMixed68.dwq_bit_pair(), Some((6, 8)));
+        assert_eq!(QuantMethod::DwqMixed28.dwq_bit_pair(), Some((2, 8)));
+    }
+
+    #[test]
+    fn test_non_dwq_variants_return_none_for_bit_pair() {
+        assert_eq!(QuantMethod::Auto.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::F16.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Q8.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Q4.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Q2.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Mixed26.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Mixed36.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Mixed46.dwq_bit_pair(), None);
+        assert_eq!(QuantMethod::Apex.dwq_bit_pair(), None);
+    }
+
+    // ---- Default filename suffix helper ----
+
+    #[test]
+    fn test_dwq_default_filename_suffix() {
+        assert_eq!(QuantMethod::DwqMixed46.default_filename_suffix(), "dwq46");
+        assert_eq!(QuantMethod::DwqMixed48.default_filename_suffix(), "dwq48");
+        assert_eq!(QuantMethod::DwqMixed68.default_filename_suffix(), "dwq68");
+        assert_eq!(QuantMethod::DwqMixed28.default_filename_suffix(), "dwq28");
+    }
+
+    #[test]
+    fn test_non_dwq_filename_suffix_byte_identical_to_display() {
+        // All non-DWQ variants must return their Display string unchanged.
+        for m in [
+            QuantMethod::Auto,
+            QuantMethod::F16,
+            QuantMethod::Q8,
+            QuantMethod::Q4,
+            QuantMethod::Q2,
+            QuantMethod::Mixed26,
+            QuantMethod::Mixed36,
+            QuantMethod::Mixed46,
+            QuantMethod::Apex,
+        ] {
+            assert_eq!(
+                m.default_filename_suffix(),
+                m.to_string(),
+                "non-DWQ suffix diverged from Display for {:?}",
+                m
+            );
+        }
+    }
+
+    // ---- Display strings ----
+
+    #[test]
+    fn test_dwq_display_strings() {
+        assert_eq!(QuantMethod::DwqMixed46.to_string(), "dwq-mixed-4-6");
+        assert_eq!(QuantMethod::DwqMixed48.to_string(), "dwq-mixed-4-8");
+        assert_eq!(QuantMethod::DwqMixed68.to_string(), "dwq-mixed-6-8");
+        assert_eq!(QuantMethod::DwqMixed28.to_string(), "dwq-mixed-2-8");
+    }
+
+    // ---- Gemma-4 regression snapshot guard ----
+    // Asserts that the DwqMixed46 dispatch path continues to produce
+    // (base_bits=4, sensitive_bits=6) — byte-identical to pre-change behaviour.
+    // This guard will fail if any future refactor silently changes the Gemma-4
+    // quantization parameters.
+
+    #[test]
+    fn test_gemma4_regression_dwq_mixed46_dispatch_unchanged() {
+        // Dispatch table entry must still be (4, 6).
+        assert_eq!(
+            QuantMethod::DwqMixed46.dwq_bit_pair(),
+            Some((4, 6)),
+            "Gemma-4 regression: DwqMixed46 must dispatch to (base=4, sensitive=6)"
+        );
+        // Default filename suffix (new behaviour per ADR Decision 10(c)).
+        assert_eq!(
+            QuantMethod::DwqMixed46.default_filename_suffix(),
+            "dwq46",
+            "Gemma-4 regression: DwqMixed46 filename suffix must be 'dwq46'"
+        );
     }
 }

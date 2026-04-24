@@ -24,7 +24,7 @@ pub enum MixedQuantError {
     #[error("Invalid sensitive layer range: {0}")]
     InvalidLayerRange(String),
 
-    #[error("Invalid mixed-bit preset: {0}. Valid presets: mixed-2-6, mixed-3-6, mixed-4-6")]
+    #[error("Invalid mixed-bit preset: {0}. Valid presets: mixed-2-6, mixed-3-6, mixed-4-6, mixed-2-8, mixed-4-8, mixed-6-8")]
     InvalidPreset(String),
 }
 
@@ -56,6 +56,21 @@ impl MixedBitPreset {
             "mixed-4-6" => Ok(Self {
                 base_bits: 4,
                 sensitive_bits: 6,
+                name: name.to_string(),
+            }),
+            "mixed-4-8" => Ok(Self {
+                base_bits: 4,
+                sensitive_bits: 8,
+                name: name.to_string(),
+            }),
+            "mixed-6-8" => Ok(Self {
+                base_bits: 6,
+                sensitive_bits: 8,
+                name: name.to_string(),
+            }),
+            "mixed-2-8" => Ok(Self {
+                base_bits: 2,
+                sensitive_bits: 8,
                 name: name.to_string(),
             }),
             _ => Err(MixedQuantError::InvalidPreset(name.to_string())),
@@ -293,12 +308,40 @@ mod tests {
         let preset = MixedBitPreset::from_name("mixed-3-6").unwrap();
         assert_eq!(preset.base_bits, 3);
         assert_eq!(preset.sensitive_bits, 6);
+
+        // New DWQ-backing presets
+        let preset = MixedBitPreset::from_name("mixed-4-8").unwrap();
+        assert_eq!(preset.base_bits, 4);
+        assert_eq!(preset.sensitive_bits, 8);
+        assert_eq!(preset.name, "mixed-4-8");
+
+        let preset = MixedBitPreset::from_name("mixed-6-8").unwrap();
+        assert_eq!(preset.base_bits, 6);
+        assert_eq!(preset.sensitive_bits, 8);
+        assert_eq!(preset.name, "mixed-6-8");
+
+        let preset = MixedBitPreset::from_name("mixed-2-8").unwrap();
+        assert_eq!(preset.base_bits, 2);
+        assert_eq!(preset.sensitive_bits, 8);
+        assert_eq!(preset.name, "mixed-2-8");
     }
 
     #[test]
     fn test_invalid_preset() {
         assert!(MixedBitPreset::from_name("mixed-5-8").is_err());
         assert!(MixedBitPreset::from_name("q4").is_err());
+    }
+
+    #[test]
+    fn test_invalid_preset_error_message_lists_all_valid_keys() {
+        let err = MixedBitPreset::from_name("mixed-5-7").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mixed-2-6"), "error must mention mixed-2-6");
+        assert!(msg.contains("mixed-3-6"), "error must mention mixed-3-6");
+        assert!(msg.contains("mixed-4-6"), "error must mention mixed-4-6");
+        assert!(msg.contains("mixed-4-8"), "error must mention mixed-4-8");
+        assert!(msg.contains("mixed-6-8"), "error must mention mixed-6-8");
+        assert!(msg.contains("mixed-2-8"), "error must mention mixed-2-8");
     }
 
     #[test]

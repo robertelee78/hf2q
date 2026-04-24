@@ -271,6 +271,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 "mixed-2-6" => cli::QuantMethod::Mixed26,
                 "apex" => cli::QuantMethod::Apex,
                 "dwq-mixed-4-6" => cli::QuantMethod::DwqMixed46,
+                "dwq-mixed-4-8" => cli::QuantMethod::DwqMixed48,
+                "dwq-mixed-6-8" => cli::QuantMethod::DwqMixed68,
+                "dwq-mixed-2-8" => cli::QuantMethod::DwqMixed28,
                 other => {
                     warn!(
                         "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
@@ -294,14 +297,15 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "model".to_string());
+                let suffix = config.quant.default_filename_suffix();
                 config.output_dir = match config.format {
                     crate::cli::OutputFormat::Gguf => std::path::PathBuf::from(format!(
                         "{}-{}.gguf",
-                        model_name, config.quant
+                        model_name, suffix
                     )),
                     _ => std::path::PathBuf::from(format!(
                         "{}-{}-{}",
-                        model_name, config.format, config.quant
+                        model_name, config.format, suffix
                     )),
                 };
             }
@@ -311,6 +315,15 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     } else {
         None
     };
+
+    // Validate that --bits is not combined with a DWQ variant.
+    // DWQ bit selection is encoded in the --quant variant name itself;
+    // --bits has no effect and would silently mislead users.
+    if config.bits.is_some() && config.quant.dwq_bit_pair().is_some() {
+        return Err(AppError::Conversion(anyhow::anyhow!(
+            "--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants"
+        )));
+    }
 
     // Phase 0.5: Pre-flight validation
     let preflight_report = preflight::validate(&config, &metadata)
@@ -455,7 +468,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .context("Mixed-bit quantization failed")
                 .map_err(AppError::Conversion)?
             }
-            cli::QuantMethod::DwqMixed46 => {
+            cli::QuantMethod::DwqMixed46
+            | cli::QuantMethod::DwqMixed48
+            | cli::QuantMethod::DwqMixed68
+            | cli::QuantMethod::DwqMixed28 => {
+                // Derive (base_bits, sensitive_bits) from the chosen variant.
+                // dwq_bit_pair() is guaranteed Some(_) for all DWQ variants.
+                let (base_bits, sensitive_bits) = config
+                    .quant
+                    .dwq_bit_pair()
+                    .expect("DWQ variant must have a valid bit pair");
+
                 // Try loading tokenizer for activation-based calibration
                 let has_tokenizer = config.input_dir.join("tokenizer.json").exists();
 
@@ -463,8 +486,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
                     group_size: config.group_size,
-                    base_bits: 4,
-                    sensitive_bits: 6,
+                    base_bits,
+                    sensitive_bits,
                     use_activations: has_tokenizer,
                     ..quantize::dwq::DwqConfig::default()
                 };
@@ -1079,7 +1102,14 @@ fn detect_quant_method_from_path(path: &std::path::Path) -> String {
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    let known = ["q2", "q4", "q8", "f16", "mixed-2-6", "mixed-3-6", "mixed-4-6", "dwq-mixed-4-6", "apex"];
+    // Long forms before short to avoid substring collisions (e.g. "dwq-mixed-4-6" before "mixed-4-6").
+    let known = [
+        "dwq-mixed-4-8", "dwq-mixed-6-8", "dwq-mixed-2-8", "dwq-mixed-4-6",
+        "dwq48", "dwq68", "dwq28", "dwq46",
+        "mixed-2-6", "mixed-3-6", "mixed-4-6",
+        "q2", "q4", "q8", "f16",
+        "apex",
+    ];
     for method in &known {
         if name.contains(method) {
             return method.to_string();
@@ -1100,6 +1130,9 @@ fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
         cli::QuantMethod::Mixed36 => 4,
         cli::QuantMethod::Mixed46 => 4,
         cli::QuantMethod::DwqMixed46 => 4,
+        cli::QuantMethod::DwqMixed48 => 4,
+        cli::QuantMethod::DwqMixed68 => 6,
+        cli::QuantMethod::DwqMixed28 => 2,
         cli::QuantMethod::Apex => 4,
     }
 }
