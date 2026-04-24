@@ -48,6 +48,14 @@ pub struct SmokeArgs {
     /// repeat smoke runs don't accumulate disk. Retained for diagnosis
     /// when `--keep-outputs` is passed.
     pub convert_output_dir: Option<PathBuf>,
+    /// Override path for the llama-cli binary. When set, smoke uses
+    /// this path instead of searching `/opt/llama.cpp/build/bin/` or
+    /// `$PATH`. Enables CI tests via a shell-script stub that emits
+    /// a deterministic transcript (per Decision 16 §Acceptance:
+    /// "CI runs a dedicated unit test suite ... via a mock llama-cli
+    /// stub"). Also bypasses the preflight llama-cli-present check
+    /// since the override itself is the proof of presence.
+    pub llama_cli_override: Option<PathBuf>,
 }
 
 /// Environment probes — a trait so tests can inject mock
@@ -115,13 +123,14 @@ pub type PreflightResult = Result<(), (u8, String)>;
 
 /// Run the preflight per Decision 16 §1.
 ///
-/// When `local_dir_provided` is true, the HF_TOKEN + HF-repo-resolution
-/// checks are skipped (the smoke runner uses a pre-downloaded local
-/// safetensors dir and never touches HuggingFace).
-pub fn preflight_with_local(
+/// - `local_dir_provided` true: skip HF_TOKEN + HF-repo-resolve checks.
+/// - `llama_cli_override` Some: skip the default llama-cli search path
+///   (the override itself is the proof-of-presence).
+pub fn preflight_full(
     entry: &ArchEntry,
     env: &dyn SmokeEnv,
     local_dir_provided: bool,
+    llama_cli_override: Option<&Path>,
 ) -> PreflightResult {
     // 1. HF_TOKEN — present AND non-empty per Decision 16 §1.
     //    Skipped when --local-dir is set (no download needed).
@@ -153,19 +162,33 @@ pub fn preflight_with_local(
         }
     }
 
-    // 3. llama-cli exists.
-    let llama_cli_candidates = &[
-        Path::new("/opt/llama.cpp/build/bin/llama-cli"),
-        Path::new("/usr/local/bin/llama-cli"),
-    ];
-    let has_llama_cli = llama_cli_candidates.iter().any(|p| p.is_file())
-        || env.which("llama-cli").is_some();
-    if !has_llama_cli {
-        return Err((
-            EXIT_LLAMA_CLI_MISSING,
-            "llama-cli not found (looked in /opt/llama.cpp/build/bin/, PATH). \
-             Build llama.cpp or install to /usr/local/bin/.".into(),
-        ));
+    // 3. llama-cli exists — either via the explicit override path, or
+    //    via the default search list.
+    if let Some(override_path) = llama_cli_override {
+        if !override_path.is_file() {
+            return Err((
+                EXIT_LLAMA_CLI_MISSING,
+                format!(
+                    "--llama-cli-override path {:?} does not exist",
+                    override_path
+                ),
+            ));
+        }
+    } else {
+        let llama_cli_candidates = &[
+            Path::new("/opt/llama.cpp/build/bin/llama-cli"),
+            Path::new("/usr/local/bin/llama-cli"),
+        ];
+        let has_llama_cli = llama_cli_candidates.iter().any(|p| p.is_file())
+            || env.which("llama-cli").is_some();
+        if !has_llama_cli {
+            return Err((
+                EXIT_LLAMA_CLI_MISSING,
+                "llama-cli not found (looked in /opt/llama.cpp/build/bin/, PATH). \
+                 Build llama.cpp or install to /usr/local/bin/, or pass \
+                 --llama-cli-override <path>.".into(),
+            ));
+        }
     }
 
     // 4. hf2q release build.
@@ -192,9 +215,20 @@ pub fn preflight_with_local(
     Ok(())
 }
 
-/// Compatibility wrapper — old callers that don't pass `--local-dir`.
+/// Compatibility wrapper — old callers that don't pass `--local-dir`
+/// or `--llama-cli-override`.
 pub fn preflight(entry: &ArchEntry, env: &dyn SmokeEnv) -> PreflightResult {
-    preflight_with_local(entry, env, false)
+    preflight_full(entry, env, false, None)
+}
+
+/// Preflight helper for the (most common) case of `--local-dir` without
+/// an llama-cli override.
+pub fn preflight_with_local(
+    entry: &ArchEntry,
+    env: &dyn SmokeEnv,
+    local_dir_provided: bool,
+) -> PreflightResult {
+    preflight_full(entry, env, local_dir_provided, None)
 }
 
 /// Kinds of outcome that the smoke binary emits. Structured so `hf2q
@@ -243,9 +277,15 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         print_dry_run_report(entry, args);
     }
 
-    // Step 1: preflight. --local-dir skips HF_TOKEN + repo-resolve checks.
+    // Step 1: preflight. --local-dir skips HF_TOKEN + repo-resolve checks;
+    // --llama-cli-override skips the default llama-cli search.
     let local_dir_provided = args.local_dir.is_some();
-    if let Err((code, reason)) = preflight_with_local(entry, env, local_dir_provided) {
+    if let Err((code, reason)) = preflight_full(
+        entry,
+        env,
+        local_dir_provided,
+        args.llama_cli_override.as_deref(),
+    ) {
         return SmokeOutcome::PreflightFailed {
             exit_code: code,
             reason,
@@ -353,7 +393,11 @@ fn run_q4_0_pipeline(
     }
 
     // llama-cli invocation — deterministic per Decision 16 §3.
-    let llama_cli = find_llama_cli()?;
+    // Prefer the explicit override (CI stub) over the system-search path.
+    let llama_cli = match &args.llama_cli_override {
+        Some(p) => p.clone(),
+        None => find_llama_cli()?,
+    };
     let prompt = entry
         .smoke_prompts
         .first()
@@ -587,6 +631,7 @@ mod tests {
             fixtures_root: Some(PathBuf::from("tests/fixtures")),
             local_dir: None,
             convert_output_dir: None,
+            llama_cli_override: None,
         }
     }
 

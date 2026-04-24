@@ -127,6 +127,13 @@ pub struct SmokeArgs {
     /// so repeat smoke runs don't accumulate disk.
     #[arg(long)]
     pub convert_output_dir: Option<PathBuf>,
+
+    /// Override path for llama-cli. When set, preflight skips the default
+    /// llama-cli search (/opt/llama.cpp/build/bin/ + PATH) and the smoke
+    /// runner uses this path directly. Enables CI tests to inject a
+    /// mock stub emitting a deterministic transcript.
+    #[arg(long)]
+    pub llama_cli_override: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
