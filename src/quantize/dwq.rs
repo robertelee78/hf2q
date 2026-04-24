@@ -538,6 +538,43 @@ mod tests {
         assert!(arch.requires_activation_capture());
     }
 
+    /// `DwqArch::from_hf_architecture` does a case-insensitive substring
+    /// match via `arch.to_lowercase().contains("qwen3_5")`. If the
+    /// `.to_lowercase()` call is ever removed, the canonical-case tests
+    /// above still pass because the constants happen to match. This
+    /// test anchors the case-insensitivity contract — future HF
+    /// checkpoints that ship with variant casing (`"qwen3_5"`,
+    /// `"QWEN3_5"`) continue to route correctly.
+    #[test]
+    fn test_dwq_arch_case_insensitive_match() {
+        for hf_arch in [
+            "qwen3_5forcausallm",        // all lowercase
+            "QWEN3_5FORCAUSALLM",        // all uppercase
+            "Qwen3_5ForCausalLM",        // canonical (existing)
+            "qwen3_5_For_CausalLM",      // mixed
+        ] {
+            let arch = DwqArch::from_hf_architecture(hf_arch, false);
+            assert_eq!(
+                arch,
+                DwqArch::Qwen35Dense,
+                "case-insensitive match must resolve {hf_arch} to Qwen35Dense"
+            );
+            assert!(arch.requires_activation_capture());
+        }
+        for hf_arch in [
+            "qwen3_5moeforcausallm",
+            "QWEN3_5MOEFORCAUSALLM",
+            "Qwen3_5MoeForCausalLM",
+        ] {
+            let arch = DwqArch::from_hf_architecture(hf_arch, true);
+            assert_eq!(
+                arch,
+                DwqArch::Qwen35MoE,
+                "case-insensitive match must resolve {hf_arch} to Qwen35MoE"
+            );
+        }
+    }
+
     #[test]
     fn test_dwq_arch_from_hf_other_archs_do_not_require_capture() {
         for (hf_arch, is_moe) in &[
