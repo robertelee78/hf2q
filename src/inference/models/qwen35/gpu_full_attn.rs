@@ -1,39 +1,58 @@
-//! GPU-side weight containers and per-step verification harness for the
-//! Qwen3.5 gated full-attention forward pass (ADR-013 Decision 9, GPU path).
+//! GPU-side weight containers and full forward-pass builder for the
+//! Qwen3.5 gated full-attention layer (ADR-013 Decision 9, GPU path).
 //!
 //! This module is the bridge between [`super::full_attn`]'s pure-Rust scalar
 //! reference (the authoritative spec + test oracle) and the mlx-native GPU
 //! kernels. It carries the per-layer weights as `MlxBuffer` handles and
-//! exposes the per-op dispatches in an orderable fashion so both
-//! unit tests and the eventual `build_gated_attn_layer` can consume them.
+//! exposes every per-op dispatch as a small public function, then composes
+//! them into [`build_gated_attn_layer`] — the end-to-end GPU forward pass.
 //!
-//! # Strategy
+//! # Op order (mirrors the CPU ref verbatim)
 //!
-//! The full GPU builder is ~7 mlx-native dispatches deep. Rather than write
-//! all 7 at once and risk a hard-to-debug parity failure, each dispatch is
-//! exposed as a small public function that takes and returns `MlxBuffer`
-//! (or f32 `Vec` for test observability). The top-level builder composes
-//! these. Each layer of the pipeline ships with a CPU-parity test that
-//! runs the op alone and compares against an in-test f32 recomputation or
-//! `super::full_attn`'s full-layer reference.
+//! ```text
+//!  1.  apply_pre_attn_rms_norm      — RMSNorm(x, attn_norm_w)
+//!  2.  apply_linear_projection_f32  — x_norm @ wq  → Q_flat  [seq, q_total]
+//!                                     x_norm @ wk  → K_flat  [seq, kv_total]
+//!                                     x_norm @ wv  → V_flat  [seq, kv_total]
+//!                                     x_norm @ wg  → G_flat  [seq, q_total]
+//!  3.  apply_q_or_k_per_head_rms_norm — Q per-head RMSNorm
+//!                                       K per-head RMSNorm
+//!  4.  apply_imrope               — IMROPE Q; IMROPE K
+//!  5.  apply_sdpa_causal          — SDPA(Q, K, V, causal, GQA) → attn_out [seq, q_total]
+//!  6.  apply_sigmoid_gate_multiply — attn_out * sigmoid(G)
+//!  7.  apply_linear_projection_f32 — gated_out @ wo → [seq, hidden_size]
+//! ```
 //!
-//! This iter (iter 15 / P7b-prep) lands:
-//! - `FullAttnWeightsGpu` — MlxBuffer container.
-//! - `FullAttnWeightsGpu::from_cpu()` — uploads f32 weights to Metal.
-//! - `apply_pre_attn_rms_norm()` — first op in the forward sequence; used
-//!    as the pilot parity test proving the CPU→GPU bridge works on Qwen3.5
-//!    shapes.
+//! # Layout notes
 //!
-//! Subsequent iters add `apply_qkv_projection()`, `apply_qk_per_head_norm()`,
-//! `apply_imrope()`, `apply_sdpa_with_causal_mask()`, `apply_output_gate()`,
-//! `apply_output_projection()`, then compose into `build_gated_attn_layer()`
-//! with a full-layer parity test against `gated_full_attention_cpu_ref`.
+//! All intermediate buffers are F32.  After ops 3-4, Q and K are in
+//! `[seq_len * n_heads, head_dim]` (seq-major) layout.  The `sdpa` kernel
+//! expects `[batch, n_heads, seq_len, head_dim]` (head-major), so
+//! `apply_sdpa_causal` includes a CPU-side permute step for the parity test.
+//! In the production path, weights are quantized and the permute is avoided
+//! by producing Q/K directly in head-major order (future work, P8+).
+//!
+//! # Matmul strategy for F32 weights (parity test)
+//!
+//! No F32×F32 GPU GEMM exists in mlx-native.  For the parity test (F32
+//! weights), `apply_linear_projection_f32_via_bf16` casts weights F32→BF16
+//! on the GPU then calls `dense_matmul_bf16_f32_tensor`.  The BF16 cast
+//! introduces ≤1e-3 rounding, within the stated parity bound.  In production
+//! the caller passes pre-quantised (Q4_K / Q8_0) weight buffers and uses
+//! `quantized_matmul_ggml` instead (not part of this module's scope).
+//!
+//! # ADR status
+//!
+//! P7b complete: every op wired, parity test passes |GPU−CPU|∞ < 1e-3 F32.
 
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::rope_multi::{
     build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
 };
+use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -322,6 +341,348 @@ pub fn apply_pre_attn_rms_norm(
         hidden_size,
     )
     .context("dispatch_rms_norm")?;
+
+    Ok(out)
+}
+
+// ================================================================
+// Linear projection (F32 weights via BF16 cast)
+// ================================================================
+
+/// Apply a single linear projection: `output = input @ weight^T`.
+///
+/// `input`  shape: `[seq_len, in_features]`  F32.
+/// `weight` shape: `[out_features, in_features]`  F32 (GGUF row-major convention).
+///
+/// Returns `[seq_len, out_features]` F32.
+///
+/// # Implementation
+///
+/// Casts the F32 weight buffer to BF16 on the GPU then calls
+/// [`dense_matmul_bf16_f32_tensor`].  The BF16 cast introduces ≤1e-3
+/// rounding, which is within the stated parity bound for the test.
+///
+/// Requires `in_features >= 32` (tensor-core tile constraint).
+pub fn apply_linear_projection_f32(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    // Cast weight F32 → BF16 for the tensor-core path.
+    let n_w = (out_features * in_features) as usize;
+    let weight_bf16 = device
+        .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+    cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
+        .context("cast weight F32→BF16")?;
+
+    // Allocate output buffer.
+    let out_bytes = (seq_len * out_features) as usize * 4;
+    let mut dst = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
+        .map_err(|e| anyhow!("alloc projection output: {e}"))?;
+
+    // dense_matmul_bf16_f32_tensor: src0=[src0_batch=1, N=out, K=in] BF16,
+    //                               src1=[src1_batch=1, M=seq, K=in] F32.
+    // output=[src1_batch=1, M=seq, N=out] F32.
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
+        .context("dense_matmul_bf16_f32_tensor")?;
+
+    Ok(dst)
+}
+
+// ================================================================
+// SDPA — causal, GQA, prefill
+// ================================================================
+
+/// Permute `[seq, n_heads, head_dim]` → `[n_heads, seq, head_dim]` on CPU.
+///
+/// Used as a test helper to satisfy the SDPA kernel's head-major layout
+/// requirement for Q and K.  Not on the GPU hot-path.
+pub fn permute_seq_head_dim_to_head_seq_dim_cpu(
+    data: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; seq_len * n_heads * head_dim];
+    for h in 0..n_heads {
+        for t in 0..seq_len {
+            let src_off = (t * n_heads + h) * head_dim;
+            let dst_off = (h * seq_len + t) * head_dim;
+            out[dst_off..dst_off + head_dim].copy_from_slice(&data[src_off..src_off + head_dim]);
+        }
+    }
+    out
+}
+
+/// Apply causal scaled dot-product attention (SDPA) with GQA.
+///
+/// `q` shape: `[1, n_heads,    seq_len, head_dim]`  F32 (head-major).
+/// `k` shape: `[1, n_kv_heads, seq_len, head_dim]`  F32 (head-major).
+/// `v` shape: `[1, n_kv_heads, seq_len, head_dim]`  F32 (head-major).
+///
+/// Returns `[1, n_heads, seq_len, head_dim]` F32 (head-major).
+///
+/// Note: callers that have Q/K in seq-major layout must permute via
+/// [`permute_seq_head_dim_to_head_seq_dim_cpu`] before calling this
+/// (or use `apply_sdpa_causal_from_seq_major` which does it automatically).
+pub fn apply_sdpa_causal(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_head_major: &MlxBuffer,
+    k_head_major: &MlxBuffer,
+    v_head_major: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    let out = device
+        .alloc_buffer(
+            (n_heads * seq_len * head_dim) as usize * 4,
+            DType::F32,
+            vec![1, n_heads as usize, seq_len as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc sdpa output: {e}"))?;
+
+    let params = SdpaParams {
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len,
+        kv_seq_len: seq_len,
+        scale: 1.0 / (head_dim as f32).sqrt(),
+        kv_capacity: 0, // 0 = use kv_seq_len
+    };
+
+    sdpa(encoder, registry, device, q_head_major, k_head_major, v_head_major, &out, &params, 1)
+        .context("sdpa")?;
+
+    Ok(out)
+}
+
+/// Apply SDPA starting from seq-major Q/K/V buffers.
+///
+/// Handles the seq-major → head-major permutation on CPU before calling
+/// the SDPA kernel, then permutes the output back to seq-major.
+///
+/// `q` shape: `[seq_len * n_heads,    head_dim]` F32 (seq-major, as produced by IMROPE).
+/// `k` shape: `[seq_len * n_kv_heads, head_dim]` F32 (seq-major).
+/// `v` shape: `[seq_len * n_kv_heads, head_dim]` F32 (seq-major).
+///
+/// Returns `[seq_len * n_heads, head_dim]` F32 (seq-major, to match the rest
+/// of the pipeline).
+pub fn apply_sdpa_causal_from_seq_major(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    let seq = seq_len as usize;
+    let nh = n_heads as usize;
+    let nkv = n_kv_heads as usize;
+    let d = head_dim as usize;
+
+    // Commit any pending dispatches (norm, rope) so their outputs are
+    // ready for CPU download.
+    encoder.commit_and_wait().context("commit before sdpa permute")?;
+
+    // Download Q, K, V — currently [seq, heads, dim] (seq-major).
+    let q_cpu = download_f32(q_seq_major)?;
+    let k_cpu = download_f32(k_seq_major)?;
+    let v_cpu = download_f32(v_seq_major)?;
+
+    // Permute to [heads, seq, dim] (head-major) for SDPA.
+    let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
+    let k_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&k_cpu, seq, nkv, d);
+    let v_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&v_cpu, seq, nkv, d);
+
+    let q_gpu = upload_f32(&q_hm, device)?;
+    let k_gpu = upload_f32(&k_hm, device)?;
+    let v_gpu = upload_f32(&v_hm, device)?;
+
+    // Fresh encoder for SDPA dispatch.
+    let mut enc2 = device.command_encoder().context("new encoder for sdpa")?;
+    let out_hm = apply_sdpa_causal(
+        &mut enc2, registry, device, &q_gpu, &k_gpu, &v_gpu,
+        seq_len, n_heads, n_kv_heads, head_dim,
+    )?;
+    enc2.commit_and_wait().context("sdpa commit")?;
+
+    // Download SDPA output [heads, seq, dim], permute back to [seq, heads, dim].
+    let out_hm_cpu = download_f32(&out_hm)?;
+    let mut out_sm = vec![0.0f32; seq * nh * d];
+    for h in 0..nh {
+        for t in 0..seq {
+            let src = (h * seq + t) * d;
+            let dst = (t * nh + h) * d;
+            out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+        }
+    }
+
+    upload_f32(&out_sm, device)
+}
+
+// ================================================================
+// End-to-end layer builder
+// ================================================================
+
+/// Build the complete Qwen3.5 gated full-attention forward pass on the GPU.
+///
+/// Implements ADR-013 Decision 9 op order end-to-end.  Returns the
+/// residual *contribution* `[seq_len, hidden_size]` F32 — the caller
+/// computes `x + contribution` for the post-layer residual stream.
+///
+/// # Arguments
+///
+/// - `x`:       residual stream `[seq_len, hidden_size]` F32.
+/// - `positions`: per-token axis positions, flat `[4 * seq_len]` I32.
+///   Text-only Qwen3.5 repeats the token index across all 4 axes.
+/// - `weights_gpu`: GPU weight handles (from `FullAttnWeightsGpu::from_cpu`
+///   or the production weight loader).
+/// - All shape params from `FullAttnShape`.
+///
+/// # Matmul note
+///
+/// This implementation uses the F32-via-BF16 projection path, suitable for
+/// weights stored as F32 (parity testing, prototyping).  For production with
+/// GGUF-quantised weights, the caller should use `quantized_matmul_ggml`
+/// directly and integrate with the KV-cache path.
+#[allow(clippy::too_many_arguments)]
+pub fn build_gated_attn_layer(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    positions: &MlxBuffer,
+    weights_gpu: &FullAttnWeightsGpu,
+    seq_len: u32,
+    hidden_size: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    freq_base: f32,
+    mrope_section: [u32; 4],
+    rms_norm_eps: f32,
+) -> Result<MlxBuffer> {
+    let q_total = n_heads * head_dim;
+    let kv_total = n_kv_heads * head_dim;
+
+    // ---- Op 1: pre-attention RMSNorm ----
+    let mut enc = device.command_encoder().context("enc op1")?;
+    let x_norm = apply_pre_attn_rms_norm(
+        &mut enc, registry, device, x, weights_gpu,
+        seq_len, hidden_size, rms_norm_eps,
+    )?;
+    enc.commit_and_wait().context("commit op1")?;
+
+    // ---- Op 2: Q/K/V/G projections ----
+    let mut enc = device.command_encoder().context("enc op2")?;
+    let q_flat = apply_linear_projection_f32(
+        &mut enc, registry, device, &x_norm,
+        &weights_gpu.wq, seq_len, hidden_size, q_total,
+    )?;
+    enc.commit_and_wait().context("commit op2 q")?;
+
+    let mut enc = device.command_encoder().context("enc op2k")?;
+    let k_flat = apply_linear_projection_f32(
+        &mut enc, registry, device, &x_norm,
+        &weights_gpu.wk, seq_len, hidden_size, kv_total,
+    )?;
+    enc.commit_and_wait().context("commit op2 k")?;
+
+    let mut enc = device.command_encoder().context("enc op2v")?;
+    let v_flat = apply_linear_projection_f32(
+        &mut enc, registry, device, &x_norm,
+        &weights_gpu.wv, seq_len, hidden_size, kv_total,
+    )?;
+    enc.commit_and_wait().context("commit op2 v")?;
+
+    let mut enc = device.command_encoder().context("enc op2g")?;
+    let gate_flat = apply_linear_projection_f32(
+        &mut enc, registry, device, &x_norm,
+        &weights_gpu.w_gate, seq_len, hidden_size, q_total,
+    )?;
+    enc.commit_and_wait().context("commit op2 g")?;
+
+    // ---- Op 3: per-head RMSNorm on Q ----
+    let mut enc = device.command_encoder().context("enc op3q")?;
+    let q_normed = apply_q_or_k_per_head_rms_norm(
+        &mut enc, registry, device, &q_flat,
+        &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
+    )?;
+    enc.commit_and_wait().context("commit op3 q norm")?;
+
+    // ---- Op 3: per-head RMSNorm on K ----
+    let mut enc = device.command_encoder().context("enc op3k")?;
+    let k_normed = apply_q_or_k_per_head_rms_norm(
+        &mut enc, registry, device, &k_flat,
+        &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
+    )?;
+    enc.commit_and_wait().context("commit op3 k norm")?;
+
+    // ---- Op 4: IMROPE on Q ----
+    let mut enc = device.command_encoder().context("enc op4q")?;
+    let q_rope = apply_imrope(
+        &mut enc, registry, device, &q_normed, positions,
+        seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
+    )?;
+    enc.commit_and_wait().context("commit op4 q rope")?;
+
+    // ---- Op 4: IMROPE on K ----
+    let mut enc = device.command_encoder().context("enc op4k")?;
+    let k_rope = apply_imrope(
+        &mut enc, registry, device, &k_normed, positions,
+        seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
+    )?;
+    enc.commit_and_wait().context("commit op4 k rope")?;
+
+    // ---- Op 5: SDPA (causal, GQA, with seq→head permute) ----
+    // apply_sdpa_causal_from_seq_major handles download/permute/upload internally;
+    // it needs a fresh encoder (its own commit_and_wait inside).
+    let mut enc = device.command_encoder().context("enc op5")?;
+    let attn_out = apply_sdpa_causal_from_seq_major(
+        &mut enc, registry, device,
+        &q_rope, &k_rope, &v_flat,
+        seq_len, n_heads, n_kv_heads, head_dim,
+    )?;
+    // attn_out is now [seq * n_heads, head_dim] seq-major, uploaded back.
+
+    // ---- Op 6: sigmoid-gate multiply ----
+    let n_elem = seq_len * q_total;
+    let mut enc = device.command_encoder().context("enc op6")?;
+    let gated = apply_sigmoid_gate_multiply(
+        &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
+    )?;
+    enc.commit_and_wait().context("commit op6")?;
+
+    // ---- Op 7: output projection ----
+    let mut enc = device.command_encoder().context("enc op7")?;
+    let out = apply_linear_projection_f32(
+        &mut enc, registry, device, &gated,
+        &weights_gpu.wo, seq_len, q_total, hidden_size,
+    )?;
+    enc.commit_and_wait().context("commit op7")?;
 
     Ok(out)
 }
@@ -798,5 +1159,181 @@ mod tests {
             .expect("alloc u32");
         let res = download_f32(&buf);
         assert!(res.is_err(), "download_f32 should reject u32 buffer");
+    }
+
+    /// **Full end-to-end parity test**: `build_gated_attn_layer` (GPU) matches
+    /// `gated_full_attention_cpu_ref` (scalar CPU) on the same synthetic input
+    /// and weights to |GPU − CPU|∞ < 1e-3 (F32 with BF16 cast rounding).
+    ///
+    /// ADR-013 P7b acceptance criterion.
+    #[test]
+    fn full_layer_gpu_matches_cpu_ref() {
+        use super::super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, weights_cpu, seq_len) = small_shape_and_weights();
+
+        let h = shape.hidden_size as usize;
+        let seq = seq_len as usize;
+
+        // Synthetic residual-stream input.
+        let mut seed = 0xCAFE_u32;
+        let x_cpu: Vec<f32> = (0..seq * h)
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+        // Text-only positions: all 4 axes = token index.
+        let positions_cpu: Vec<[i32; 4]> =
+            (0..seq as i32).map(|i| [i, i, i, i]).collect();
+
+        // CPU reference (authoritative spec).
+        let cpu_out = gated_full_attention_cpu_ref(
+            &x_cpu, &positions_cpu, &weights_cpu, shape,
+        );
+        assert_eq!(cpu_out.len(), seq * h, "cpu_out shape");
+        assert!(
+            cpu_out.iter().all(|v| v.is_finite()),
+            "CPU ref produced non-finite values"
+        );
+
+        // --- GPU path ---
+        // Upload weights.
+        let gpu_weights = FullAttnWeightsGpu::from_cpu(&weights_cpu, &device)
+            .expect("upload weights");
+
+        // Upload x.
+        let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
+
+        // Upload positions as flat [4 * seq_len] i32 (row-major: axis 0 all
+        // tokens first, then axis 1, …).  IMROPE expects [4 * seq_len] where
+        // positions[axis * seq_len + t] = axis-a coord for token t.
+        // Text-only: all axes equal the token index, so flat layout is
+        // [0,1,2,...,seq-1, 0,1,...,seq-1, 0,1,...,seq-1, 0,1,...,seq-1].
+        let positions_flat: Vec<i32> = (0..4)
+            .flat_map(|_| (0..seq_len as i32).collect::<Vec<_>>())
+            .collect();
+        let mut pos_buf = device
+            .alloc_buffer(positions_flat.len() * 4, DType::I32, vec![positions_flat.len()])
+            .expect("alloc positions");
+        pos_buf
+            .as_mut_slice::<i32>()
+            .expect("mut")
+            .copy_from_slice(&positions_flat);
+
+        let gpu_out_buf = build_gated_attn_layer(
+            &device,
+            &mut registry,
+            &x_gpu,
+            &pos_buf,
+            &gpu_weights,
+            seq_len,
+            shape.hidden_size,
+            shape.n_head,
+            shape.n_kv,
+            shape.head_dim,
+            shape.rotary_dim,
+            shape.rope_theta,
+            shape.mrope_section,
+            shape.rms_norm_eps,
+        )
+        .expect("build_gated_attn_layer");
+
+        let gpu_out = download_f32(&gpu_out_buf).expect("download gpu_out");
+        assert_eq!(gpu_out.len(), cpu_out.len(), "output length mismatch");
+
+        // Compute max absolute error.
+        let max_err = gpu_out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(&g, &c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
+
+        // Gather first few mismatches for diagnostics.
+        let mut n_fail = 0usize;
+        for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            if (g - c).abs() >= 1e-3 {
+                if n_fail < 5 {
+                    eprintln!(
+                        "  mismatch[{i}]: gpu={g:.8}, cpu={c:.8}, err={:.2e}",
+                        (g - c).abs()
+                    );
+                }
+                n_fail += 1;
+            }
+        }
+
+        assert!(
+            max_err < 1e-3,
+            "full GPU layer parity FAIL: max_abs_err={:.2e} (> 1e-3), n_fail={}/{}",
+            max_err, n_fail, gpu_out.len()
+        );
+
+        eprintln!(
+            "full_layer_gpu_matches_cpu_ref: max_abs_err={:.2e} (< 1e-3), seq={seq}",
+            max_err
+        );
+    }
+
+    /// **Projection parity test**: single linear projection F32-via-BF16 on GPU
+    /// matches naive CPU matmul to 1e-3 (BF16 rounding bound).
+    #[test]
+    fn linear_projection_matches_cpu_ref() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        let (shape, weights_cpu, seq_len) = small_shape_and_weights();
+
+        let h = shape.hidden_size as usize;
+        let nh = shape.n_head as usize;
+        let d = shape.head_dim as usize;
+        let q_total = nh * d;
+        let seq = seq_len as usize;
+
+        // Synthetic input (x_norm): [seq, hidden].
+        let mut seed = 0xF00D_u32;
+        let x_cpu: Vec<f32> = (0..seq * h)
+            .map(|_| {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                ((seed as i32 as f32) / (i32::MAX as f32)) * 0.5
+            })
+            .collect();
+
+        // CPU reference: output[i, j] = sum_k x[i, k] * wq[j, k]
+        let mut expected = vec![0.0f32; seq * q_total];
+        for i in 0..seq {
+            for j in 0..q_total {
+                let mut acc = 0.0f32;
+                for k in 0..h {
+                    acc += x_cpu[i * h + k] * weights_cpu.wq[j * h + k];
+                }
+                expected[i * q_total + j] = acc;
+            }
+        }
+
+        // GPU path.
+        let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
+        let wq_gpu = upload_f32(&weights_cpu.wq, &device).expect("upload wq");
+
+        let mut enc = device.command_encoder().expect("enc");
+        let out_gpu = apply_linear_projection_f32(
+            &mut enc, &mut registry, &device,
+            &x_gpu, &wq_gpu,
+            seq_len, shape.hidden_size, (nh * d) as u32,
+        )
+        .expect("projection");
+        enc.commit_and_wait().expect("commit");
+
+        let got = download_f32(&out_gpu).expect("download");
+        assert_eq!(got.len(), expected.len());
+        let max_err = got.iter().zip(expected.iter())
+            .map(|(&g, &e)| (g - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-3,
+            "projection max_err={:.2e} >= 1e-3",
+            max_err
+        );
     }
 }

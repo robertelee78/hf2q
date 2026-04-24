@@ -293,12 +293,10 @@ pub fn merge_expert_tensors(
     _proj: ExpertProj,
     arch: super::Qwen35Arch,
 ) -> Result<TensorRef, ConvertError> {
-    // Dense arch guard — programming error if called from dense context.
-    debug_assert_ne!(
-        arch,
-        super::Qwen35Arch::Dense,
-        "merge_expert_tensors must never be called from a dense-arch context"
-    );
+    // Dense arch guard — return an error if called from a dense-arch context.
+    // The caller should never route here for Dense arch, but we handle it
+    // gracefully via error return rather than assert-panic so callers can
+    // propagate the error and the test can verify the guard.
     if arch == super::Qwen35Arch::Dense {
         return Err(ConvertError::DenseContextMergeCall);
     }
