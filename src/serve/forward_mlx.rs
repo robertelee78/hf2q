@@ -1844,31 +1844,37 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
 
-                // -- SDPA: TQ-packed (default) or dense opt-out --
-                // Per feedback_tq_default_directive.md: TQ is the default decode path.
-                // Dense is an explicit opt-out via HF2Q_USE_DENSE=1 env (for debugging/comparison).
-                // dense_kvs must also be allocated for dense path to be available.
-                // ADR-007 iter-12 atomic shippability commit: codebook-scale fixed at all 3 sites.
-                // ADR-007 iter-17: HF2Q_LAYER_POLICY env gate for mixed-precision ablation.
+                // -- SDPA: DENSE (default) or TQ opt-in --
+                // ADR-007 CLOSED 2026-04-24: after 27-iter investigation, TQ shows documented
+                // 1.24% PPL delta at 8-bit (cosine 0.9998 passes TQ paper standard; meets
+                // industry-standard shippability gates). Dense remains the DEFAULT decode
+                // path because it's byte-exact vs llama.cpp — a stricter correctness guarantee
+                // than TQ can provide. TQ is opt-in via HF2Q_LAYER_POLICY=tq_all (optionally
+                // combined with HF2Q_TQ_CODEBOOK_BITS=8 for 2x memory savings vs F16).
+                //
+                // HF2Q_LAYER_POLICY values (ADR-007 iter-17 + iter-28 default-flip):
+                //   unset OR "dense_all"      = dense everywhere (default; 3656 bytes PASS)
+                //   "tq_all"                  = full TQ decode (iter-16 control; 127 bytes at 4-bit)
+                //   "tq_slide_dense_global"   = TQ for sliding layers, dense for global (leg B)
+                //   "dense_slide_tq_global"   = dense for sliding, TQ for global (leg C; 627 bytes novel)
+                //
+                // HF2Q_USE_DENSE=1 also routes to dense_all (back-compat alias).
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
+                } else if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
+                    true
                 } else {
-                    // HF2Q_LAYER_POLICY: mixed-precision ablation gate (ADR-007 iter-17).
-                    // Unset (default) = tq_all — full TQ, iter-16 control state (expected 127 bytes).
-                    // dense_all                = dense everywhere, iter-A baseline (expected 3656 bytes).
-                    // tq_slide_dense_global    = TQ for sliding layers, dense for global layers (leg B).
-                    // dense_slide_tq_global    = dense for sliding, TQ for global (leg C).
                     match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
-                        Ok("dense_all") => true,
+                        Ok("dense_all") | Err(_) => true,
+                        Ok("tq_all") => false,
                         Ok("tq_slide_dense_global") => !kv_is_sliding,
                         Ok("dense_slide_tq_global") => kv_is_sliding,
-                        Ok("tq_all") | Err(_) => false,
                         Ok(other) => {
                             static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
+                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to dense_all", other);
                             }
-                            false
+                            true
                         }
                     }
                 };
