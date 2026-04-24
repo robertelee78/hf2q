@@ -244,6 +244,13 @@ tail_marker = b"\n[ Prompt: "
 tidx = a.rfind(tail_marker)
 if tidx >= 0:
     a = a[:tidx]
+# llama-cli -st prepends a thinking-mode indicator before the model output:
+# "\n| [Start thinking]\n" (may include ANSI color codes or spinner chars).
+# hf2q does not emit this header. Strip it so we compare model tokens only.
+think_marker = b"[Start thinking]\n"
+tmidx = a.find(think_marker)
+if tmidx >= 0:
+    a = a[tmidx + len(think_marker):]
 
 n = min(len(a), len(b))
 i = 0
