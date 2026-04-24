@@ -394,6 +394,53 @@ impl Qwen35Model {
             hidden = residual_add_gpu(&hidden, &attn_out, &device)
                 .with_context(|| format!("residual attn layer {layer_idx}"))?;
 
+            // --- Post-attention RMSNorm ---
+            // Applied between the attention residual and the FFN input.
+            // Stored as `blk.{i}.post_attention_norm.weight` in the apex GGUF.
+            // llama.cpp applies this at qwen35moe.cpp:56; without it hidden states
+            // blow up across 40 layers → uniform logits → constant `!` output.
+            {
+                let post_norm_w = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
+                    LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
+                };
+                let normed = {
+                    let out = device
+                        .alloc_buffer(
+                            (seq_len * h) as usize * 4,
+                            DType::F32,
+                            vec![seq_len as usize, h as usize],
+                        )
+                        .map_err(|e| anyhow!("alloc post_attn_norm output layer {layer_idx}: {e}"))?;
+                    let mut params = device
+                        .alloc_buffer(8, DType::F32, vec![2])
+                        .map_err(|e| anyhow!("alloc post_attn_norm params: {e}"))?;
+                    {
+                        let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+                        s[0] = eps;
+                        s[1] = h as f32;
+                    }
+                    let mut enc = device.command_encoder()
+                        .with_context(|| format!("enc post_attn_norm layer {layer_idx}"))?;
+                    rms_norm::dispatch_rms_norm(
+                        &mut enc,
+                        &mut registry,
+                        device.metal_device(),
+                        &hidden,
+                        post_norm_w,
+                        &out,
+                        &params,
+                        seq_len,
+                        h,
+                    )
+                    .with_context(|| format!("dispatch_rms_norm post_attn layer {layer_idx}"))?;
+                    enc.commit_and_wait()
+                        .with_context(|| format!("commit post_attn_norm layer {layer_idx}"))?;
+                    out
+                };
+                hidden = normed;
+            }
+
             // --- FFN ---
             let ffn_weights_gpu = match layer_gpu {
                 LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
@@ -498,7 +545,8 @@ impl Qwen35Model {
                             w.expert_gate_q.clone(),
                             w.expert_up_q.clone(),
                             w.expert_down_q.clone(),
-                            w.ggml_type,
+                            w.ggml_type_gate_up,
+                            w.ggml_type_down,
                             moe_cfg.num_experts,
                             moe_cfg.moe_intermediate_size,
                             cfg.hidden_size,

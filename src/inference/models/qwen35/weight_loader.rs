@@ -55,8 +55,12 @@ pub struct MoeFfnWeightsQ {
     pub expert_up_q: MlxBuffer,
     /// Stacked expert down_proj: raw GGML blocks, dtype U8 on Metal.
     pub expert_down_q: MlxBuffer,
-    /// GGML quantization type for all three expert buffers.
-    pub ggml_type: GgmlType,
+    /// GGML quantization type for the gate and up expert buffers (must match).
+    /// In the apex GGUF these are Q5_K.
+    pub ggml_type_gate_up: GgmlType,
+    /// GGML quantization type for the down expert buffer (may differ from gate/up).
+    /// In the apex GGUF this is Q6_K.
+    pub ggml_type_down: GgmlType,
     /// Shared-expert sigmoid gate: `[hidden_size]` F32.
     pub shared_gate_logit: Vec<f32>,
     /// Shared-expert SwiGLU weights (F32).
@@ -128,6 +132,8 @@ pub fn load_full_attn_layer(
         .with_context(|| format!("layer {layer_idx} attn_k_norm"))?;
     let wo = load_f32_tensor(gguf, &format!("{p}.attn_output.weight"), device)
         .with_context(|| format!("layer {layer_idx} attn_output"))?;
+    let post_attn_norm = load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)
+        .with_context(|| format!("layer {layer_idx} post_attention_norm"))?;
 
     // Sanity check shapes.
     let h = cfg.hidden_size as usize;
@@ -149,6 +155,7 @@ pub fn load_full_attn_layer(
     assert_eq!(attn_q_norm.len(), d, "attn_q_norm layer {layer_idx} shape");
     assert_eq!(attn_k_norm.len(), d, "attn_k_norm layer {layer_idx} shape");
     assert_eq!(wo.len(), h * q_total, "attn_output layer {layer_idx} shape");
+    assert_eq!(post_attn_norm.len(), h, "post_attn_norm layer {layer_idx} shape");
 
     // Split fused q_fused into wq (first q_total rows) and w_gate (second q_total rows).
     // Layout: [2*q_total, h] row-major; wq = rows [0..q_total], w_gate = rows [q_total..2*q_total].
@@ -158,6 +165,7 @@ pub fn load_full_attn_layer(
 
     Ok(FullAttnLayerWeights {
         attn_norm,
+        post_attn_norm,
         wq,
         wk,
         wv,
@@ -177,6 +185,8 @@ pub fn load_delta_net_layer(
 ) -> Result<DeltaNetLayerWeights> {
     let p = format!("blk.{}", layer_idx);
     let attn_norm = load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?;
+    let post_attn_norm = load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)
+        .with_context(|| format!("layer {layer_idx} post_attention_norm"))?;
     let attn_qkv = load_f32_tensor(gguf, &format!("{p}.attn_qkv.weight"), device)?;
     let attn_gate = load_f32_tensor(gguf, &format!("{p}.attn_gate.weight"), device)?;
     let ssm_conv1d = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
@@ -189,6 +199,7 @@ pub fn load_delta_net_layer(
 
     Ok(DeltaNetLayerWeights {
         attn_norm,
+        post_attn_norm,
         attn_qkv,
         attn_gate,
         ssm_conv1d,
@@ -265,23 +276,36 @@ pub fn load_moe_ffn_quantized(
         .load_tensor(&format!("{p}.ffn_down_exps.weight"), device)
         .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
 
-    // All three expert tensors must have the same quantization type.
+    // Gate and up may have a different quant type than down (e.g. Q5_K vs Q6_K
+    // in the apex GGUF).  Read each separately.
     let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate_exps.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
-    let ggml_type = gate_info.ggml_type;
+    let ggml_type_gate_up = gate_info.ggml_type;
 
-    // Validate that the type is supported by quantized_matmul_id_ggml.
+    let down_info = gguf.tensor_info(&format!("{p}.ffn_down_exps.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
+    let ggml_type_down = down_info.ggml_type;
+
+    let supported = |t: GgmlType| matches!(t,
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q5_K | GgmlType::Q6_K
+    );
+
+    // Validate that the types are supported by quantized_matmul_id_ggml.
     // Q5_K uses the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
     // also use mv_id for decode and mm_id for prefill batches > 8 tokens.
-    match ggml_type {
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q5_K | GgmlType::Q6_K => {}
-        other => {
-            return Err(anyhow!(
-                "layer {layer_idx}: expert weights have unsupported quant type {:?} \
-                 (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
-                other
-            ));
-        }
+    if !supported(ggml_type_gate_up) {
+        return Err(anyhow!(
+            "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+            ggml_type_gate_up
+        ));
+    }
+    if !supported(ggml_type_down) {
+        return Err(anyhow!(
+            "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+            ggml_type_down
+        ));
     }
 
     Ok(MoeFfnWeightsQ {
@@ -289,7 +313,8 @@ pub fn load_moe_ffn_quantized(
         expert_gate_q,
         expert_up_q,
         expert_down_q,
-        ggml_type,
+        ggml_type_gate_up,
+        ggml_type_down,
         shared_gate_logit,
         shared_gate,
         shared_up,

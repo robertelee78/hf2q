@@ -265,6 +265,7 @@ fn empty_full_attn_weights(cfg: &Qwen35Config) -> FullAttnLayerWeights {
     let kv_total = nkv * d;
     FullAttnLayerWeights {
         attn_norm: vec![1.0f32; h],
+        post_attn_norm: vec![1.0f32; h],
         wq: vec![0.0f32; q_total * h],
         wk: vec![0.0f32; kv_total * h],
         wv: vec![0.0f32; kv_total * h],
@@ -286,6 +287,7 @@ fn empty_delta_net_weights(cfg: &Qwen35Config) -> DeltaNetLayerWeights {
     let z_channels = nv * dv;
     DeltaNetLayerWeights {
         attn_norm: vec![1.0f32; h],
+        post_attn_norm: vec![1.0f32; h],
         attn_qkv: vec![0.0f32; qkv_channels * h],
         attn_gate: vec![0.0f32; z_channels * h],
         ssm_conv1d: vec![0.0f32; k_width * qkv_channels],

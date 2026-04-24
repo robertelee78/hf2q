@@ -144,15 +144,18 @@ impl MoeFfnWeightsGpu {
 /// Quantized GPU weight container for a Qwen3.5-MoE FFN layer.
 ///
 /// Expert weights (`gate`, `up`, `down`) are stored as raw GGML blocks (U8
-/// dtype, typically Q6_K) — the same bytes that came off disk.  The Metal
+/// dtype) — the same bytes that came off disk.  The Metal
 /// `quantized_matmul_id_ggml` kernel dequantizes on-the-fly during the
 /// matrix multiply, so no F32 expansion is required.
+///
+/// In the apex GGUF: gate/up are Q5_K and down is Q6_K — each with their
+/// own quant type, block geometry, and byte stride.
 ///
 /// # Memory savings vs `MoeFfnWeightsGpu`
 ///
 /// For the 35B apex GGUF (256 experts, hidden=2048, moe_intermediate=512):
 ///   F32 path: 256 × 512 × 2048 × 3 × 4 bytes = 3.2 GB per layer
-///   Q6_K path: 256 × 512 × 2048 × (210/256) × 3 = ~0.82 GB per layer
+///   Q5_K+Q6_K path: ~0.78 GB per layer
 ///   Savings per layer: ~2.4 GB; across 40 MoE layers: ~96 GB
 ///
 /// Router (`[num_experts, hidden]`) and shared-expert weights are kept
@@ -161,18 +164,16 @@ pub struct MoeFfnWeightsGpuQ {
     /// Router F32 projection: `[num_experts, hidden_size]`.
     pub router: MlxBuffer,
     /// Stacked expert gate projections, raw GGML blocks.
-    /// Shape: `[num_experts, moe_intermediate_size, hidden_size]` in Q6_K.
     pub expert_gate_q: MlxBuffer,
     /// Stacked expert up projections, raw GGML blocks.
     pub expert_up_q: MlxBuffer,
     /// Stacked expert down projections, raw GGML blocks.
-    /// Shape: `[num_experts, hidden_size, moe_intermediate_size]` in Q6_K.
     pub expert_down_q: MlxBuffer,
-    /// GGML quantization type for all three expert weight buffers.
-    pub ggml_type: GgmlType,
+    /// GGML quantization type for gate/up expert weight buffers.
+    pub ggml_type_gate_up: GgmlType,
+    /// GGML quantization type for down expert weight buffers (may differ).
+    pub ggml_type_down: GgmlType,
     /// Byte stride between consecutive expert slices in each stacked buffer.
-    /// For gate/up: `moe_intermediate_size * hidden_size` packed into GGML blocks.
-    /// For down: `hidden_size * moe_intermediate_size` packed into GGML blocks.
     pub expert_gate_stride: u64,
     pub expert_up_stride: u64,
     pub expert_down_stride: u64,
@@ -188,6 +189,18 @@ pub struct MoeFfnWeightsGpuQ {
     pub shared_down: MlxBuffer,
 }
 
+fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
+    let qk = t.block_values() as usize;
+    let block_bytes = t.block_bytes() as usize;
+    let elems = rows * cols;
+    anyhow::ensure!(
+        elems % qk == 0,
+        "elems {} not divisible by block QK {} for {:?}",
+        elems, qk, t
+    );
+    Ok(((elems / qk) * block_bytes) as u64)
+}
+
 impl MoeFfnWeightsGpuQ {
     /// Construct from pre-loaded quantized Metal buffers.
     ///
@@ -199,7 +212,8 @@ impl MoeFfnWeightsGpuQ {
         expert_gate_q: MlxBuffer,
         expert_up_q: MlxBuffer,
         expert_down_q: MlxBuffer,
-        ggml_type: GgmlType,
+        ggml_type_gate_up: GgmlType,
+        ggml_type_down: GgmlType,
         num_experts: u32,
         moe_intermediate_size: u32,
         hidden_size: u32,
@@ -210,33 +224,31 @@ impl MoeFfnWeightsGpuQ {
         shared_down_f32: &[f32],
         device: &MlxDevice,
     ) -> Result<Self> {
-        // Compute per-expert byte strides from the GGML block geometry.
-        let qk = ggml_type.block_values() as usize;
-        let block_bytes = ggml_type.block_bytes() as usize;
+        // Gate/up: [num_experts, moe_intermediate_size, hidden_size]
+        // Each expert slice: moe_intermediate_size rows × hidden_size cols.
+        let gate_stride = ggml_type_stride(
+            ggml_type_gate_up,
+            moe_intermediate_size as usize,
+            hidden_size as usize,
+        ).context("gate/up stride")?;
 
-        let gate_elems = (moe_intermediate_size * hidden_size) as usize;
-        let down_elems = (hidden_size * moe_intermediate_size) as usize;
-        anyhow::ensure!(
-            gate_elems % qk == 0,
-            "gate_elems {} not divisible by block QK {}",
-            gate_elems, qk
-        );
-        anyhow::ensure!(
-            down_elems % qk == 0,
-            "down_elems {} not divisible by block QK {}",
-            down_elems, qk
-        );
-        let gate_stride = ((gate_elems / qk) * block_bytes) as u64;
-        let down_stride = ((down_elems / qk) * block_bytes) as u64;
+        // Down: [num_experts, hidden_size, moe_intermediate_size]
+        // Each expert slice: hidden_size rows × moe_intermediate_size cols.
+        let down_stride = ggml_type_stride(
+            ggml_type_down,
+            hidden_size as usize,
+            moe_intermediate_size as usize,
+        ).context("down stride")?;
 
         Ok(Self {
             router: upload_f32(router_f32, device).context("upload router")?,
             expert_gate_q,
             expert_up_q,
             expert_down_q,
-            ggml_type,
+            ggml_type_gate_up,
+            ggml_type_down,
             expert_gate_stride: gate_stride,
-            expert_up_stride: gate_stride,   // gate and up have same dimensions
+            expert_up_stride: gate_stride,   // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
             shared_gate_inp: upload_f32(shared_gate_inp_f32, device)
@@ -753,7 +765,7 @@ pub fn build_moe_ffn_layer_gpu_q(
             k: h32,
             n_experts: ne32,
             expert_stride: weights.expert_gate_stride,
-            ggml_type: weights.ggml_type,
+            ggml_type: weights.ggml_type_gate_up,
         };
         let mut enc = device.command_encoder().context("enc gate_all qmatmul")?;
         quantized_matmul_id_ggml(
@@ -777,7 +789,7 @@ pub fn build_moe_ffn_layer_gpu_q(
             k: h32,
             n_experts: ne32,
             expert_stride: weights.expert_up_stride,
-            ggml_type: weights.ggml_type,
+            ggml_type: weights.ggml_type_gate_up,
         };
         let mut enc = device.command_encoder().context("enc up_all qmatmul")?;
         quantized_matmul_id_ggml(
@@ -818,7 +830,7 @@ pub fn build_moe_ffn_layer_gpu_q(
             k: m_moe32,
             n_experts: ne32,
             expert_stride: weights.expert_down_stride,
-            ggml_type: weights.ggml_type,
+            ggml_type: weights.ggml_type_down,
         };
         let mut enc = device.command_encoder().context("enc y_all qmatmul")?;
         quantized_matmul_id_ggml(
@@ -1446,7 +1458,8 @@ mod tests {
             expert_gate_q: expert_gate_buf,
             expert_up_q:   expert_up_buf,
             expert_down_q: expert_down_buf,
-            ggml_type,
+            ggml_type_gate_up: ggml_type,
+            ggml_type_down: ggml_type,
             expert_gate_stride: gate_stride,
             expert_up_stride:   gate_stride,
             expert_down_stride: down_stride,

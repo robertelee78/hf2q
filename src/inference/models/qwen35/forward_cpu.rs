@@ -133,14 +133,16 @@ impl Qwen35Model {
             // Residual after attention.
             residual_add(&mut hidden, &attn_out);
 
-            // Post-attention norm (using the layer's attn_norm weight as the
-            // FFN-pre-norm proxy — apex GGUF emits a distinct tensor named
-            // `post_attention_norm.weight` per layer, but the CPU-ref layer
-            // functions already consume `attn_norm` internally. For the
-            // integrated reference we rely on the layer fn's internal norm
-            // and skip an extra outer norm here. A more precise impl would
-            // carry the post-attention norm weight in the layer struct;
-            // deferred to P11 GPU wiring iter).
+            // Post-attention RMSNorm: applied between the attention residual and
+            // the FFN input.  Stored as `blk.{i}.post_attention_norm.weight` in
+            // the apex GGUF.  llama.cpp applies it at qwen35moe.cpp:56 before
+            // `build_layer_ffn`.  Without this norm, hidden states blow up across
+            // 40 layers → uniform logits → constant `!` output.
+            let post_norm_w = match layer {
+                Qwen35LayerWeights::FullAttn { attn, .. } => &attn.post_attn_norm,
+                Qwen35LayerWeights::LinearAttn { attn, .. } => &attn.post_attn_norm,
+            };
+            rms_norm_rows(&mut hidden, post_norm_w, h, eps);
 
             // FFN contribution.
             let ffn_out = match &layer.ffn() {

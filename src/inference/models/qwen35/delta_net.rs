@@ -48,6 +48,12 @@ use crate::inference::models::qwen35::Qwen35Config;
 pub struct DeltaNetLayerWeights {
     /// Pre-attention RMSNorm: `[hidden_size]`.
     pub attn_norm: Vec<f32>,
+    /// Post-attention RMSNorm applied between the attention residual and the FFN:
+    /// `[hidden_size]`.  Stored as `blk.{i}.post_attention_norm.weight` in GGUF.
+    /// Applied in the forward pass as: `hidden = RMSNorm(hidden, post_attn_norm)`
+    /// before the FFN projection.  Omitting this causes hidden-state blow-up
+    /// across 40 layers → uniform logits → constant output token.
+    pub post_attn_norm: Vec<f32>,
     /// QKV concatenated projection: `[qkv_total, hidden_size]` where
     /// `qkv_total = 2 * n_k_heads * D_k + n_v_heads * D_v`.
     pub attn_qkv: Vec<f32>,
@@ -465,6 +471,7 @@ mod tests {
                 }
                 v
             },
+            post_attn_norm: vec![1.0f32; h],
             attn_qkv: mk_rand(&mut seed, qkv_channels * h, 0.1),
             attn_gate: mk_rand(&mut seed, z_channels * h, 0.1),
             ssm_conv1d: mk_rand(&mut seed, k_width * qkv_channels, 0.1),

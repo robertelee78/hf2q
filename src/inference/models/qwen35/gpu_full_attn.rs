@@ -64,6 +64,9 @@ use super::full_attn::FullAttnLayerWeights;
 /// held by the model + read by the per-token forward.
 pub struct FullAttnWeightsGpu {
     pub attn_norm: MlxBuffer,
+    /// Post-attention RMSNorm weight: `[hidden_size]`.
+    /// Applied to the residual stream after attention, before the FFN.
+    pub post_attn_norm: MlxBuffer,
     pub wq: MlxBuffer,
     pub wk: MlxBuffer,
     pub wv: MlxBuffer,
@@ -78,6 +81,7 @@ impl FullAttnWeightsGpu {
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
             wq: upload_f32(&weights.wq, device)?,
             wk: upload_f32(&weights.wk, device)?,
             wv: upload_f32(&weights.wv, device)?,
@@ -732,6 +736,7 @@ mod tests {
                 }
                 v
             },
+            post_attn_norm: vec![1.0f32; h],
             wq: mk_rand(&mut seed, q_total * h, 0.1),
             wk: mk_rand(&mut seed, kv_total * h, 0.1),
             wv: mk_rand(&mut seed, kv_total * h, 0.1),

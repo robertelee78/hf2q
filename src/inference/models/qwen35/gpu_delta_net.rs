@@ -82,6 +82,9 @@ use super::gpu_full_attn::{download_f32, upload_f32};
 /// the CPU/GGUF format (see module-level layout notes).
 pub struct DeltaNetWeightsGpu {
     pub attn_norm: MlxBuffer,
+    /// Post-attention RMSNorm weight: `[hidden_size]`.
+    /// Applied to the residual stream after attention, before the FFN.
+    pub post_attn_norm: MlxBuffer,
     /// QKV concat projection `[qkv_channels, hidden_size]` — GGUF row-major.
     pub attn_qkv: MlxBuffer,
     /// Z-gate projection `[nv*dv, hidden_size]`.
@@ -121,6 +124,7 @@ impl DeltaNetWeightsGpu {
         );
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
             attn_qkv: upload_f32(&weights.attn_qkv, device)?,
             attn_gate: upload_f32(&weights.attn_gate, device)?,
             ssm_conv1d: upload_f32(&conv1d_t, device)?,
@@ -852,6 +856,7 @@ mod tests {
                 }
                 v
             },
+            post_attn_norm: vec![1.0f32; h],
             attn_qkv: mk_rand(&mut seed, qkv_channels * h, 0.1),
             attn_gate: mk_rand(&mut seed, z_channels * h, 0.1),
             ssm_conv1d: mk_rand(&mut seed, k_width * qkv_channels, 0.1),
