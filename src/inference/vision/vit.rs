@@ -438,6 +438,123 @@ pub fn patch_embed_forward(
     Ok(out)
 }
 
+/// Dense linear layer forward: `y = x @ W.T` (+ optional bias).
+///
+/// This is the workhorse primitive for every projection in the ViT
+/// (Q/K/V, attn_output, FFN up/gate/down, and `mm.0` projector).
+/// PyTorch's `nn.Linear(in, out)` stores `weight` as `[out, in]` so
+/// `y[n, o] = Σᵢ x[n, i] * weight[o, i]`; this function consumes the
+/// exact same memory layout, no transpose required at the call site.
+///
+/// `input` shape: `[batch, in_features]` row-major.
+/// `weight` shape: `[out_features, in_features]` row-major.
+/// `bias`: `Some([out_features])` or `None`.
+/// Output shape: `[batch, out_features]` row-major, freshly allocated.
+///
+/// # Errors
+///
+/// - `input.len() != batch * in_features`
+/// - `weight.len() != out_features * in_features`
+/// - `bias.map(|b| b.len() != out_features).unwrap_or(false)`
+/// - any dim is 0
+///
+/// Algorithm is the naive triple-nested-loop GEMM. CPU correctness
+/// reference only; the GPU port substitutes `mlx_native::ops::mul_mm`
+/// or BLAS. For Gemma 4's per-block Q projection (196 × 1152 × 1152)
+/// this is ~450 MFLOP — CPU runs it in ~50ms unoptimized, acceptable
+/// for the reference path.
+pub fn linear_forward(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || in_features == 0 || out_features == 0 {
+        return Err(anyhow!(
+            "linear_forward: batch ({}), in_features ({}), out_features ({}) must all be > 0",
+            batch,
+            in_features,
+            out_features
+        ));
+    }
+    if input.len() != batch * in_features {
+        return Err(anyhow!(
+            "linear_forward: input len {} != batch*in_features = {}*{} = {}",
+            input.len(),
+            batch,
+            in_features,
+            batch * in_features
+        ));
+    }
+    if weight.len() != out_features * in_features {
+        return Err(anyhow!(
+            "linear_forward: weight len {} != out_features*in_features = {}*{} = {}",
+            weight.len(),
+            out_features,
+            in_features,
+            out_features * in_features
+        ));
+    }
+    if let Some(b) = bias {
+        if b.len() != out_features {
+            return Err(anyhow!(
+                "linear_forward: bias len {} != out_features {}",
+                b.len(),
+                out_features
+            ));
+        }
+    }
+
+    let mut out = vec![0f32; batch * out_features];
+    for n in 0..batch {
+        let x_off = n * in_features;
+        let y_off = n * out_features;
+        for o in 0..out_features {
+            let w_off = o * in_features;
+            let mut acc: f32 = match bias {
+                Some(b) => b[o],
+                None => 0.0,
+            };
+            for i in 0..in_features {
+                acc += input[x_off + i] * weight[w_off + i];
+            }
+            out[y_off + o] = acc;
+        }
+    }
+    Ok(out)
+}
+
+/// Apply the three Q/K/V projections from a ViT attention block. Returns
+/// `(q, k, v)` each of shape `[batch, hidden]` (for Gemma 4 at
+/// `hidden=1152`; head reshape is a separate downstream op).
+///
+/// Bias is `None` across the board for Gemma 4's SigLIP vision tower.
+/// CLIP-classic producers carry biases; when that arch lands, this
+/// signature gains `Option<&[f32]>` per-projection (or the dispatch
+/// wraps `linear_forward` directly at the call site).
+///
+/// # Errors
+///
+/// Propagated from `linear_forward` for any of the three calls.
+pub fn qkv_projection_forward(
+    input: &[f32],
+    q_weight: &[f32],
+    k_weight: &[f32],
+    v_weight: &[f32],
+    batch: usize,
+    hidden: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let q = linear_forward(input, q_weight, None, batch, hidden, hidden)
+        .map_err(|e| anyhow!("qkv_projection_forward Q: {e}"))?;
+    let k = linear_forward(input, k_weight, None, batch, hidden, hidden)
+        .map_err(|e| anyhow!("qkv_projection_forward K: {e}"))?;
+    let v = linear_forward(input, v_weight, None, batch, hidden, hidden)
+        .map_err(|e| anyhow!("qkv_projection_forward V: {e}"))?;
+    Ok((q, k, v))
+}
+
 /// Drive `patch_embed_forward` from a `LoadedMmprojWeights` + parsed
 /// `MmprojConfig`, reading the `v.patch_embd.weight` buffer directly
 /// off the GPU. This is the hook iter 34+ will call from the handler's
@@ -852,6 +969,208 @@ mod tests {
         for v in &x {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // linear_forward + qkv_projection_forward (iter 35)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn linear_identity_weight_preserves_input() {
+        // W = I_d (identity) → y = x. batch=2, d=4.
+        let d = 4;
+        let batch = 2;
+        let mut weight = vec![0f32; d * d];
+        for i in 0..d {
+            weight[i * d + i] = 1.0;
+        }
+        let input: Vec<f32> = (0..(batch * d)).map(|i| i as f32).collect();
+        let out = linear_forward(&input, &weight, None, batch, d, d).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn linear_all_ones_weight_produces_row_sum_per_output() {
+        // W[o, i] = 1 for all (o, i) → y[n, o] = sum(x[n, :]) for every o.
+        let batch = 3;
+        let d_in = 4;
+        let d_out = 2;
+        let weight = vec![1f32; d_out * d_in];
+        let input: Vec<f32> = vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.];
+        let out = linear_forward(&input, &weight, None, batch, d_in, d_out).unwrap();
+        // Row 0 sum = 10, row 1 sum = 26, row 2 sum = 42.
+        let expected = [10.0, 10.0, 26.0, 26.0, 42.0, 42.0];
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-5, "got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn linear_applies_bias_per_output_once() {
+        // All-zero weight, nonzero bias → output = bias repeated per row.
+        let batch = 3;
+        let d_in = 2;
+        let d_out = 3;
+        let weight = vec![0f32; d_out * d_in];
+        let bias = vec![0.5f32, 1.5, 2.5];
+        let input = vec![99f32; batch * d_in]; // garbage, weights zero
+        let out = linear_forward(&input, &weight, Some(&bias), batch, d_in, d_out).unwrap();
+        assert_eq!(out.len(), batch * d_out);
+        for n in 0..batch {
+            for o in 0..d_out {
+                assert!((out[n * d_out + o] - bias[o]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn linear_reference_dot_product() {
+        // y[n, o] = sum_i x[n, i] * W[o, i].
+        // batch=1, d_in=3, d_out=2.
+        // x = [1, 2, 3]
+        // W = [[0.1, 0.2, 0.3],   → y[0] = 1*0.1 + 2*0.2 + 3*0.3 = 1.4
+        //      [0.4, 0.5, 0.6]]   → y[1] = 1*0.4 + 2*0.5 + 3*0.6 = 3.2
+        let input = vec![1.0f32, 2.0, 3.0];
+        let weight = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let out = linear_forward(&input, &weight, None, 1, 3, 2).unwrap();
+        assert!((out[0] - 1.4).abs() < 1e-5);
+        assert!((out[1] - 3.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_rejects_mismatched_input_len() {
+        let weight = vec![0f32; 6];
+        let input = vec![0f32; 5]; // should be 2*3 = 6 for batch=2, in=3
+        let err = linear_forward(&input, &weight, None, 2, 3, 2).unwrap_err();
+        assert!(format!("{err}").contains("input len"));
+    }
+
+    #[test]
+    fn linear_rejects_mismatched_weight_len() {
+        let weight = vec![0f32; 5]; // should be 2*3 = 6 for out=2, in=3
+        let input = vec![0f32; 6];
+        let err = linear_forward(&input, &weight, None, 2, 3, 2).unwrap_err();
+        assert!(format!("{err}").contains("weight len"));
+    }
+
+    #[test]
+    fn linear_rejects_wrong_bias_len() {
+        let weight = vec![0f32; 6];
+        let input = vec![0f32; 6];
+        let bias = vec![0f32; 3]; // should be 2 (out_features)
+        let err = linear_forward(&input, &weight, Some(&bias), 2, 3, 2).unwrap_err();
+        assert!(format!("{err}").contains("bias len"));
+    }
+
+    #[test]
+    fn linear_rejects_zero_dims() {
+        let err = linear_forward(&[], &[], None, 0, 1, 1).unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
+    }
+
+    #[test]
+    fn qkv_projection_returns_three_tensors_of_expected_shape() {
+        // Synthetic: all Q weights = 1.0, K = 2.0, V = 3.0. Uniform input
+        // x = 1. For hidden=4, batch=2: each output element of Q should
+        // be = 4 (sum of 4 ones), K = 8, V = 12.
+        let batch = 2;
+        let hidden = 4;
+        let input = vec![1f32; batch * hidden];
+        let q_w = vec![1f32; hidden * hidden];
+        let k_w = vec![2f32; hidden * hidden];
+        let v_w = vec![3f32; hidden * hidden];
+        let (q, k, v) =
+            qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden).unwrap();
+        assert_eq!(q.len(), batch * hidden);
+        assert_eq!(k.len(), batch * hidden);
+        assert_eq!(v.len(), batch * hidden);
+        for val in &q { assert!((*val - 4.0).abs() < 1e-5); }
+        for val in &k { assert!((*val - 8.0).abs() < 1e-5); }
+        for val in &v { assert!((*val - 12.0).abs() < 1e-5); }
+    }
+
+    #[test]
+    fn qkv_projection_propagates_shape_errors() {
+        // Deliberately broken K-weight size to verify error reaches caller.
+        let batch = 2;
+        let hidden = 4;
+        let input = vec![1f32; batch * hidden];
+        let q_w = vec![1f32; hidden * hidden];
+        let k_w = vec![2f32; hidden * hidden - 1]; // too short
+        let v_w = vec![3f32; hidden * hidden];
+        let err = qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("qkv_projection_forward K"), "got: {msg}");
+    }
+
+    #[test]
+    fn qkv_projection_against_real_gemma4_block0_weights() {
+        // End-to-end real-data chain test — the most valuable test in
+        // this module so far. Load real Gemma 4 mmproj, reads block-0's
+        // q/k/v weights, feeds a synthetic [196, 1152] input (the shape
+        // that falls out of patch_embed → rms_norm), asserts q/k/v
+        // output shapes + sanity distribution properties.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("attn_q");
+        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("attn_k");
+        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("attn_v");
+        let q_w: &[f32] = q_buf.as_slice::<f32>().expect("q as_slice");
+        let k_w: &[f32] = k_buf.as_slice::<f32>().expect("k as_slice");
+        let v_w: &[f32] = v_buf.as_slice::<f32>().expect("v as_slice");
+        let hidden = cfg.hidden_size as usize;
+        assert_eq!(q_w.len(), hidden * hidden);
+        assert_eq!(k_w.len(), hidden * hidden);
+        assert_eq!(v_w.len(), hidden * hidden);
+
+        // Synthetic [196, 1152] input shaped like a post-rms-norm
+        // patch embedding block. Small magnitudes so no overflow.
+        let batch = 196;
+        let mut input = vec![0f32; batch * hidden];
+        for p in 0..batch {
+            for h in 0..hidden {
+                input[p * hidden + h] = 0.01 + (p as f32) * 0.0001 + (h as f32) * 1e-5;
+            }
+        }
+        let (q, k, v) = qkv_projection_forward(&input, q_w, k_w, v_w, batch, hidden)
+            .expect("qkv");
+        assert_eq!(q.len(), batch * hidden);
+
+        // Sanity: Q, K, V distributions should differ (they're separate
+        // projections with independent weights). Compare variances;
+        // identical variance would suggest a weight-alias bug.
+        let var = |t: &[f32]| {
+            let m = t.iter().sum::<f32>() / (t.len() as f32);
+            t.iter().map(|x| (x - m).powi(2)).sum::<f32>() / (t.len() as f32)
+        };
+        let q_var = var(&q);
+        let k_var = var(&k);
+        let v_var = var(&v);
+        assert!(q_var > 1e-6, "Q variance too low: {q_var}");
+        assert!(k_var > 1e-6, "K variance too low: {k_var}");
+        assert!(v_var > 1e-6, "V variance too low: {v_var}");
+        // Pretrained Q/K/V weights are trained to be distinct.
+        assert!(
+            (q_var - k_var).abs() > 1e-8 || (q_var - v_var).abs() > 1e-8,
+            "Q/K/V variances all equal — weight aliasing bug?"
+        );
+        // Finite outputs (catches NaN from bad dequant).
+        for t in [&q, &k, &v] {
+            for val in t.iter() {
+                assert!(val.is_finite(), "non-finite in projection output: {val}");
+            }
         }
     }
 
