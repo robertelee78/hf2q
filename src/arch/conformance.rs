@@ -337,4 +337,38 @@ mod tests {
             PathBuf::from("tests/fixtures/smoke-transcripts/qwen35-q4_0.txt")
         );
     }
+
+    /// Decision 16 AC — "exit with the distinct non-zero code listed
+    /// above (2/3/4/5/6)". Exit codes are the user's debugging handle
+    /// when a preflight fails; two constants colliding on the same
+    /// integer would silently conflate two different prerequisites.
+    /// Load-bearing guard as future ADRs register new arches that may
+    /// need new exit codes (Decision 20 §extensibility).
+    #[test]
+    fn exit_codes_are_all_distinct() {
+        let codes: Vec<(&str, u8)> = vec![
+            ("EXIT_OK", EXIT_OK),
+            ("EXIT_HF_TOKEN_MISSING", EXIT_HF_TOKEN_MISSING),
+            ("EXIT_INSUFFICIENT_DISK", EXIT_INSUFFICIENT_DISK),
+            ("EXIT_LLAMA_CLI_MISSING", EXIT_LLAMA_CLI_MISSING),
+            ("EXIT_HF2Q_BINARY_NOT_RELEASE", EXIT_HF2Q_BINARY_NOT_RELEASE),
+            ("EXIT_HF_REPO_UNRESOLVABLE", EXIT_HF_REPO_UNRESOLVABLE),
+            ("EXIT_UNKNOWN_ARCH", EXIT_UNKNOWN_ARCH),
+            ("EXIT_SMOKE_ASSERTION_FAILED", EXIT_SMOKE_ASSERTION_FAILED),
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(
+                    codes[i].1, codes[j].1,
+                    "exit code collision: {} and {} both = {}",
+                    codes[i].0, codes[j].0, codes[i].1
+                );
+            }
+        }
+        // Decision 16 §AC also implies all non-zero codes are non-zero —
+        // EXIT_OK is the only zero; everything else is a real failure.
+        for (name, c) in codes.iter().filter(|(n, _)| *n != "EXIT_OK") {
+            assert_ne!(*c, 0, "{name} must be non-zero (it signals failure)");
+        }
+    }
 }

@@ -485,6 +485,99 @@ fn smoke_full_q4_0_pipeline_with_mock_llama_cli_emits_transcript() {
     );
 }
 
+/// Writes a mock llama-cli that emits a regression-pattern line on
+/// stderr ("error: ..."). This trips `scan_llama_cli_stderr` in
+/// `src/arch/conformance.rs:94`, which bubbles up to `run_q4_0_pipeline`
+/// returning Err, and the smoke CLI should exit with EXIT_SMOKE_ASSERTION_FAILED
+/// (code 8).
+#[cfg(unix)]
+fn write_bad_mock_llama_cli(path: &std::path::Path) {
+    let script = r#"#!/bin/sh
+# Bad-output mock llama-cli for ADR-012 P8 negative smoke test.
+# Includes an `error:` line that scan_llama_cli_stderr rejects.
+>&2 echo "llama_model_load: loaded tensor 0x1"
+>&2 echo "error: simulated load failure"
+>&2 echo "llama_print_timings: n_eval = 8 runs"
+exit 0
+"#;
+    std::fs::write(path, script).expect("write bad mock llama-cli");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+/// Decision 16 §4 — "No line matching `error|ERROR|panic|assertion|segfault`
+/// on stderr". A mock stub that emits a regression-pattern line MUST trip
+/// the assertion and produce exit code 8 (EXIT_SMOKE_ASSERTION_FAILED).
+/// Closes the last uncovered exit-code path for ADR-012 P8.
+#[cfg(unix)]
+#[test]
+fn smoke_bad_transcript_mock_returns_assertion_failed_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local-qwen35-bad");
+    write_tiny_qwen35_local_dir(&local);
+
+    let mock = tmp.path().join("bad-mock-llama-cli.sh");
+    write_bad_mock_llama_cli(&mock);
+
+    let fixtures = tmp.path().join("fixtures");
+    let convert_out = tmp.path().join("convert-out");
+
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "qwen35",
+            "--quant",
+            "q4",
+            "--local-dir",
+            local.to_str().unwrap(),
+            "--llama-cli-override",
+            mock.to_str().unwrap(),
+            "--fixtures-root",
+            fixtures.to_str().unwrap(),
+            "--convert-output-dir",
+            convert_out.to_str().unwrap(),
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+
+    // Debug-build skip path, same as the positive test above.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && stderr.contains("release build") {
+        eprintln!("skipped — debug build");
+        return;
+    }
+    // Expected failure: exit code 8 (EXIT_SMOKE_ASSERTION_FAILED).
+    assert!(
+        !out.status.success(),
+        "bad-transcript mock MUST fail; success means scan_llama_cli_stderr regressed"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(8),
+        "expected EXIT_SMOKE_ASSERTION_FAILED (code 8); got code {:?} · stderr: {}",
+        out.status.code(),
+        stderr
+    );
+    // The structured error must name the offending regression pattern.
+    assert!(
+        stderr.contains("error") || stderr.contains("regression pattern"),
+        "stderr should name the regression pattern tripped; got: {}",
+        stderr
+    );
+    // NO transcript should have been written — assertion failure means
+    // the smoke run did not pass, so no artifact is produced.
+    let transcript = fixtures.join("smoke-transcripts").join("qwen35-q4.txt");
+    assert!(
+        !transcript.exists(),
+        "transcript must NOT be written on assertion failure; found at {:?}",
+        transcript
+    );
+}
+
 #[test]
 fn smoke_dry_run_prints_arch_entry_report_with_quality_thresholds() {
     // --dry-run prints the ArchEntry diagnostic report before preflight
