@@ -506,6 +506,46 @@ pub struct MlxModelWeights {
     pub dense_kvs: Option<Vec<DenseKvBuffers>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
+    /// iter-20 Leg F: F32 KV shadow cache filled from TQ dequant each step.
+    ///
+    /// When `HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1`, K/V are still TQ-encoded
+    /// but simultaneously dequantized into these F32 buffers. The dense
+    /// `flash_attn_vec` kernel then operates on the dequantized K/V,
+    /// isolating the SDPA kernel math from TQ representation noise.
+    ///
+    /// Same layout as `dense_kvs`: `[nkv_heads, capacity, head_dim]` F32,
+    /// ring-buffer for sliding layers, linear for global layers.
+    pub leg_f_kvs: Option<Vec<DenseKvBuffers>>,
+    /// Tmp buffer for flash_attn_vec in Leg F path.
+    pub leg_f_sdpa_tmp: Option<MlxBuffer>,
+    /// iter-21 Track B: byte-packed higher-bit (5/6-bit) KV encoded cache.
+    ///
+    /// When `HF2Q_TQ_CODEBOOK_BITS=5|6`, K/V are encoded to byte-packed
+    /// 5/6-bit Lloyd-Max indices via `hadamard_quantize_kv_hb`, stored here,
+    /// then dequantized into `leg_f_kvs` (F32 shadow) for dense SDPA.
+    ///
+    /// Layout: `[nkv_heads, capacity, head_dim]` U8 (1 byte per element).
+    /// Norms: same layout as 4-bit caches (D=256: 1 norm/pos, D=512: 2/pos).
+    pub leg_hb_encoded: Option<Vec<HbKvBuffers>>,
+}
+
+/// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
+pub struct HbKvBuffers {
+    /// Byte-packed K indices `[nkv_heads, capacity, head_dim]` U8.
+    pub k_packed: MlxBuffer,
+    /// K per-position norms (same layout as 4-bit: D=256 → 1/pos, D=512 → 2/pos).
+    pub k_norms: MlxBuffer,
+    /// Byte-packed V indices `[nkv_heads, capacity, head_dim]` U8.
+    pub v_packed: MlxBuffer,
+    /// V per-position norms.
+    pub v_norms: MlxBuffer,
+    /// Cache capacity in positions.
+    pub capacity: usize,
+    /// True if ring-buffer (sliding) semantics.
+    pub is_sliding: bool,
+    /// Norms per position (1 for D=256, 2 for D=512).
+    #[allow(dead_code)]
+    pub norms_per_pos: usize,
 }
 
 /// Per-layer dense F32 KV buffers for dense attention path (ADR-009).
@@ -849,20 +889,27 @@ impl MlxModelWeights {
                 cfg.sliding_window
             };
             // TurboQuant 4-bit nibble-packed indices + F32 norms (ADR-007 Phase 1.2).
+            // D=256: 1 norm per position (norms_per_pos=1).
+            // D=512: 2 per-block norms per position (norms_per_pos=2),
+            //   per AmesianX cpy-utils.cuh:241-269 (ADR-007 iter-15 per-block norm).
             let packed_bytes = nkv * capacity * (hd / 2);
-            let norms_bytes = nkv * capacity * 4;
+            let norms_per_pos = (hd / 256).max(1);
+            let norms_elements = nkv * capacity * norms_per_pos;
+            let norms_bytes = norms_elements * 4; // f32 = 4 bytes
 
             let k_packed = mlx_device.alloc_buffer(
                 packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
             ).map_err(|e| anyhow::anyhow!("KV cache K packed alloc: {e}"))?;
             let k_norms = mlx_device.alloc_buffer(
-                norms_bytes, mlx_native::DType::F32, vec![nkv, capacity],
+                norms_bytes, mlx_native::DType::F32,
+                if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] },
             ).map_err(|e| anyhow::anyhow!("KV cache K norms alloc: {e}"))?;
             let v_packed = mlx_device.alloc_buffer(
                 packed_bytes, mlx_native::DType::U8, vec![nkv, capacity, hd / 2],
             ).map_err(|e| anyhow::anyhow!("KV cache V packed alloc: {e}"))?;
             let v_norms = mlx_device.alloc_buffer(
-                norms_bytes, mlx_native::DType::F32, vec![nkv, capacity],
+                norms_bytes, mlx_native::DType::F32,
+                if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] },
             ).map_err(|e| anyhow::anyhow!("KV cache V norms alloc: {e}"))?;
 
             kv_caches.push(MlxKvCache {
@@ -925,6 +972,9 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             dense_kvs: None,
             dense_sdpa_tmp: None,
+            leg_f_kvs: None,
+            leg_f_sdpa_tmp: None,
+            leg_hb_encoded: None,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -992,7 +1042,30 @@ impl MlxModelWeights {
         // ADR-009 Phase 3A: boundary dump at specific token position.
         // Temporary diagnostic — to be merged into parity capture workflow.
         let dump_pos: Option<usize> = INVESTIGATION_ENV.dump_boundary;
-        let dump_layers: bool = INVESTIGATION_ENV.dump_layers == Some(seq_pos);
+        // iter-23: HF2Q_DUMP_SDPA_MAX_POS=N — when set along with HF2Q_DUMP_ALL_CACHE=1,
+        // dump sdpa_out for all layers at every decode STEP < N (decode-step index, not
+        // absolute seq_pos, so it is prompt-length independent).
+        // The atomic counter increments on each forward_decode call regardless of layer.
+        // This enables the Gate A cosine-sim harness without requiring N separate hf2q runs.
+        let dump_sdpa_max_pos: Option<usize> = {
+            static MAX_POS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            *MAX_POS.get_or_init(|| {
+                std::env::var("HF2Q_DUMP_SDPA_MAX_POS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+        };
+        // Decode-step counter: counts forward_decode invocations (resets at process start).
+        let decode_step_for_dump: usize = {
+            static STEP: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            // fetch_add returns OLD value; the returned value is this call's step index.
+            STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let dump_layers: bool = INVESTIGATION_ENV.dump_layers == Some(seq_pos)
+            || dump_sdpa_max_pos.map_or(false, |max| {
+                decode_step_for_dump < max && INVESTIGATION_ENV.dump_all_cache
+            });
 
         // --- Pre-session CPU work ---
         // Write position buffer (same for all layers)
@@ -1015,6 +1088,80 @@ impl MlxModelWeights {
             kv_info.push((is_sliding, write_pos, capacity, seq_len));
         }
 
+        // iter-21 Track B: lazy allocation of leg_hb_encoded and leg_f_kvs on first decode.
+        // forward_prefill may have already allocated these; if not, do it here.
+        // We can only check the env var once (OnceLock), so read it directly to match.
+        {
+            let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+                Ok("5") => 5, Ok("6") => 6, Ok("8") => 8, _ => 0,
+            };
+            if cb_bits >= 5 && self.leg_hb_encoded.is_none() {
+                let (exec, _reg) = gpu.split();
+                let dev = exec.device();
+                let sw = self.sliding_window;
+                // Use kv_caches[0] write_pos - 1 to infer linear capacity. In practice
+                // we use the same capacity as kv_caches per layer (the KV cache was sized
+                // for the full sequence at init time).
+                let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
+                for layer_idx in 0..num_layers {
+                    let nkv = self.layers[layer_idx].num_kv_heads;
+                    let hd = self.layers[layer_idx].head_dim;
+                    let is_ring = self.kv_caches[layer_idx].is_sliding;
+                    let cap = self.kv_caches[layer_idx].capacity;
+                    let norms_per_pos = (hd / 256).max(1);
+                    let norms_n = nkv * cap * norms_per_pos;
+                    // byte-packed: 1 byte per element
+                    let k_packed = dev.alloc_buffer(nkv * cap * hd, mlx_native::DType::U8,
+                        vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_hb K packed L{layer_idx}: {e}"))?;
+                    let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                        if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
+                        .map_err(|e| anyhow::anyhow!("leg_hb K norms L{layer_idx}: {e}"))?;
+                    let v_packed = dev.alloc_buffer(nkv * cap * hd, mlx_native::DType::U8,
+                        vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_hb V packed L{layer_idx}: {e}"))?;
+                    let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                        if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
+                        .map_err(|e| anyhow::anyhow!("leg_hb V norms L{layer_idx}: {e}"))?;
+                    leg_hb_vec.push(HbKvBuffers {
+                        k_packed, k_norms, v_packed, v_norms,
+                        capacity: cap, is_sliding: is_ring, norms_per_pos,
+                    });
+                    let _ = sw; // sw only needed for leg_f_kvs sizing which mirrors kv_caches
+                }
+                eprintln!("[iter-21 Track B] Allocated leg_hb_encoded ({} layers, {}-bit)", num_layers, cb_bits);
+                self.leg_hb_encoded = Some(leg_hb_vec);
+            }
+            // Ensure leg_f_kvs shadow cache is also allocated for Track B SDPA.
+            if cb_bits >= 5 && self.leg_f_kvs.is_none() {
+                let (exec, _reg) = gpu.split();
+                let dev = exec.device();
+                let max_nh = self.num_attention_heads;
+                let max_hd = self.layers.iter().map(|l| l.head_dim).max().unwrap_or(512);
+                let mut leg_f_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                for layer_idx in 0..num_layers {
+                    let nkv = self.layers[layer_idx].num_kv_heads;
+                    let hd = self.layers[layer_idx].head_dim;
+                    let is_ring = self.kv_caches[layer_idx].is_sliding;
+                    let cap = self.kv_caches[layer_idx].capacity;
+                    let n = nkv * cap * hd;
+                    let k = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f K lazy L{layer_idx}: {e}"))?;
+                    let v = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f V lazy L{layer_idx}: {e}"))?;
+                    leg_f_vec.push(DenseKvBuffers { k, v, capacity: cap, is_sliding: is_ring });
+                }
+                let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+                    max_nh as u32, max_hd as u32);
+                let leg_f_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
+                    vec![tmp_bytes / 4])
+                    .map_err(|e| anyhow::anyhow!("leg_f_sdpa_tmp lazy: {e}"))?;
+                eprintln!("[iter-21 Track B] Allocated leg_f_kvs shadow cache ({} layers)", num_layers);
+                self.leg_f_kvs = Some(leg_f_vec);
+                self.leg_f_sdpa_tmp = Some(leg_f_tmp);
+            }
+        }
+
         // =====================================================================
         // SINGLE SESSION: Embedding + All 30 Layers + Head
         //
@@ -1022,6 +1169,80 @@ impl MlxModelWeights {
         // Zero CPU readbacks.  All norms, adds, MoE routing, scalar multiplies,
         // softcap, and argmax run on GPU.
         // =====================================================================
+        // iter-18 S2B: D=512 per-block scale factor for encoder+decoder ablation.
+        // HF2Q_SCALE_FORMULA: bare (1.0), sqrt256 (16.0), sqrt512 (≈22.627).
+        // Read once per decode call; passed to dispatch_hadamard_quantize_kv + SDPA params.
+        let tq_scale_factor_d512: f32 = {
+            static SCALE_FACTOR: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+            *SCALE_FACTOR.get_or_init(|| {
+                match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+                    Ok("sqrt256") => {
+                        eprintln!("[HF2Q_SCALE_FORMULA] D=512 scale_factor = sqrt(256) = 16.0");
+                        16.0_f32
+                    }
+                    Ok("sqrt512") => {
+                        let v = 512.0_f32.sqrt();
+                        eprintln!("[HF2Q_SCALE_FORMULA] D=512 scale_factor = sqrt(512) = {v:.4}");
+                        v
+                    }
+                    Ok("bare") | Err(_) => {
+                        // Default: bare (iter-16 control state)
+                        1.0_f32
+                    }
+                    Ok(other) => {
+                        eprintln!("[HF2Q_SCALE_FORMULA] unknown value {other:?}; using bare (1.0)");
+                        1.0_f32
+                    }
+                }
+            })
+        };
+
+        // iter-20 Leg F: dense SDPA on TQ-dequantized K/V ablation gate.
+        // When HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV=1: TQ encode proceeds normally,
+        // then K/V are dequantized into leg_f_kvs (F32 shadow cache) and
+        // flash_attn_vec (dense) dispatches on those values instead of
+        // flash_attn_vec_tq. Isolates SDPA kernel math from representation noise.
+        let force_dense_sdpa_on_tq_kv: bool = {
+            static FORCE_DENSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *FORCE_DENSE.get_or_init(|| {
+                let v = std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok().as_deref() == Some("1");
+                if v {
+                    eprintln!("[HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV] Leg F ablation enabled: \
+                               dense SDPA on TQ-dequantized K/V");
+                }
+                v
+            })
+        };
+
+        // iter-21 Track B: higher-bit codebook ablation gate.
+        // HF2Q_TQ_CODEBOOK_BITS=5|6|8 selects higher-bit Lloyd-Max codebook.
+        // iter-24: adds 8-bit (256-centroid) support and native HB SDPA kernel.
+        // 0 = default (4-bit TQ native SDPA), 5/6/8 = higher-bit native HB SDPA.
+        let tq_codebook_bits: u32 = {
+            static CODEBOOK_BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            *CODEBOOK_BITS.get_or_init(|| {
+                match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+                    Ok("5") => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 5-bit Lloyd-Max native HB SDPA");
+                        5u32
+                    }
+                    Ok("6") => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 6-bit Lloyd-Max native HB SDPA");
+                        6u32
+                    }
+                    Ok("8") => {
+                        eprintln!("[HF2Q_TQ_CODEBOOK_BITS] iter-24: 8-bit Lloyd-Max native HB SDPA");
+                        8u32
+                    }
+                    _ => 0u32, // default: 4-bit TQ native SDPA path
+                }
+            })
+        };
+        // iter-24: native HB SDPA replaces force-dense-SDPA for all higher-bit paths.
+        // force_dense_sdpa_on_tq_kv_hb is now FALSE — we use flash_attn_vec_tq_hb directly.
+        let _force_dense_sdpa_on_tq_kv_hb = false;
+        let use_native_hb_sdpa = tq_codebook_bits >= 5;
+
         let session_start = Instant::now();
         let mut total_dispatches = 0usize;
         {
@@ -1072,6 +1293,10 @@ impl MlxModelWeights {
             // --- 2. Transformer layers ---
             // Phase 3A: sub-layer detail dump (which specific layer to break down)
             let dump_detail_layer: Option<usize> = INVESTIGATION_ENV.dump_layer_detail;
+            // iter-18 S2C: first-divergence dump for layer 0 (sliding, hd=256), decode positions 1..=10.
+            // Gate: HF2Q_DUMP_SLIDING_LAYER_0=1 env var. Run name: HF2Q_DUMP_RUN_NAME (dense|tq).
+            let dump_sliding_l0: bool = std::env::var("HF2Q_DUMP_SLIDING_LAYER_0").ok().as_deref() == Some("1");
+            let dump_run_name: Option<String> = std::env::var("HF2Q_DUMP_RUN_NAME").ok();
 
             for layer_idx in 0..num_layers {
                 let hd = self.layers[layer_idx].head_dim;
@@ -1307,6 +1532,8 @@ impl MlxModelWeights {
                         &self.kv_caches[layer_idx].k_norms,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                         kv_is_sliding,
+                        Some(tq_scale_factor_d512),
+                        None, // rms_scratch: handled below by HF2Q_DEBUG_TQ_RMS path
                     ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
                     mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
@@ -1316,8 +1543,159 @@ impl MlxModelWeights {
                         &self.kv_caches[layer_idx].v_norms,
                         nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                         kv_is_sliding,
+                        Some(tq_scale_factor_d512),
+                        None, // rms_scratch: probe not wired here
                     ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
+                }
+
+                // iter-24: higher-bit (5/6/8-bit) KV encode into leg_hb_encoded.
+                // When HF2Q_TQ_CODEBOOK_BITS=5|6|8, encode K/V to byte-packed HB format
+                // for native HB SDPA dispatch.
+                if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode {
+                    if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
+                        let cache_pos_val = if kv_is_sliding {
+                            (kv_write_pos % kv_capacity) as u32
+                        } else {
+                            kv_write_pos as u32
+                        };
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed, v_src],
+                            &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms,
+                              &leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
+                        );
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_hb_enc[layer_idx].k_packed,
+                            &leg_hb_enc[layer_idx].k_norms,
+                            nkv as u32, hd as u32,
+                            leg_hb_enc[layer_idx].capacity as u32,
+                            cache_pos_val,
+                            leg_hb_enc[layer_idx].is_sliding,
+                            tq_scale_factor_d512,
+                            tq_codebook_bits,
+                        ).map_err(|e| anyhow::anyhow!("hb_quantize K L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &leg_hb_enc[layer_idx].v_packed,
+                            &leg_hb_enc[layer_idx].v_norms,
+                            nkv as u32, hd as u32,
+                            leg_hb_enc[layer_idx].capacity as u32,
+                            cache_pos_val,
+                            leg_hb_enc[layer_idx].is_sliding,
+                            tq_scale_factor_d512,
+                            tq_codebook_bits,
+                        ).map_err(|e| anyhow::anyhow!("hb_quantize V L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
+                }
+
+                // iter-18 S2A: HF2Q_DEBUG_TQ_RMS — POST-SCALE RMS probe (Codex HIGH-1 fix).
+                // Previous iter reported stored blk_norm (pre-scale ~0.06), which was WRONG.
+                // This iter reports actual post-scale quantizer-input RMS by:
+                //   1. Committing the encode command buffer.
+                //   2. Reading back the stored norm from k_norms (blk_norm).
+                //   3. Computing the post-scale RMS analytically:
+                //      post_scale_rms = scale_factor * blk_norm / blk_norm = scale_factor
+                //      (exact: after FWHT_norm, block RMS = blk_norm; scale = inv_blk_norm * sf;
+                //       → post_scale_elem_rms = sqrt(mean(e^2)) = sf).
+                //   4. Probing via scratch buffer (16 samples/block) for empirical verification.
+                //
+                // Reports both SLIDING (hd=256) and GLOBAL (hd=512) — spec AC-1 requires both.
+                if std::env::var("HF2Q_DEBUG_TQ_RMS").ok().as_deref() == Some("1") {
+                    // iter-19 A1: Fixed RMS probe (catalog #21 — write ALL EPT samples per lane).
+                    // Previous iter-18 bug: scratch=[nkv, norms_per_pos, 16], only 8 values written
+                    // for D=256 (EPT=8), rest zeros; host divided by 16 → RMS ≈ sqrt(0.5) * true_RMS.
+                    // Fix: scratch=[1_head, head_dim] = 256 elements for D=256 (32 lanes × EPT=8).
+                    //      For D=512: 512 elements (32 lanes × EPT=16); blk0=[0..255], blk1=[256..511].
+                    //      Host divisor = 256 per block.
+                    //
+                    // iter-19 A2: RMS band LOCKED at [0.8, 1.2] (catalog #11).
+                    // No expected*0.5/expected*2.0 arithmetic; constants are literal.
+                    const RMS_BAND_LOW: f32 = 0.8;
+                    const RMS_BAND_HIGH: f32 = 1.2;
+
+                    // Commit the encode command buffer.
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS finish L{layer_idx}: {e}"))?;
+
+                    let norms_per_pos = (hd / 256).max(1);
+                    // Allocate scratch buffer: [1_head, head_dim] f32 = head_dim elements.
+                    // All 32 lanes × EPT elements each = head_dim total samples per block (D=256)
+                    // or head_dim total samples covering both blocks (D=512: blk0=[0..255], blk1=[256..511]).
+                    let scratch_n = hd; // 256 for D=256, 512 for D=512
+                    let mut scratch_buf = dev.alloc_buffer(
+                        scratch_n * 4, mlx_native::DType::F32,
+                        vec![1, hd],
+                    ).map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS alloc scratch L{layer_idx}: {e}"))?;
+                    // Zero-initialize scratch.
+                    {
+                        let scratch_slice: &mut [f32] = scratch_buf.as_mut_slice()
+                            .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS scratch zero L{layer_idx}: {e}"))?;
+                        scratch_slice.iter_mut().for_each(|v| *v = 0.0);
+                    }
+
+                    // Compute actual write position for this token.
+                    let actual_pos = if kv_is_sliding {
+                        kv_write_pos % kv_capacity
+                    } else {
+                        kv_write_pos.min(kv_capacity - 1)
+                    };
+                    // Re-dispatch probe for head=0 only using a fresh command buffer.
+                    let probe_kind = if kv_is_sliding { "sliding" } else { "global" };
+                    let mut sp = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS probe begin L{layer_idx}: {e}"))?;
+                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+                        sp.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_k_normed,
+                        &self.kv_caches[layer_idx].k_packed,
+                        &self.kv_caches[layer_idx].k_norms,
+                        1u32, // probe head=0 only
+                        hd as u32, kv_capacity as u32, actual_pos as u32,
+                        kv_is_sliding,
+                        Some(tq_scale_factor_d512),
+                        Some(&scratch_buf),
+                    ).map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS probe dispatch L{layer_idx}: {e}"))?;
+                    sp.finish()
+                        .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS probe finish L{layer_idx}: {e}"))?;
+
+                    // Read back scratch: [1 head, head_dim] f32 — ALL samples written.
+                    // D=256: 256 samples (1 block). D=512: 512 samples (2 blocks).
+                    let scratch_raw: &[f32] = scratch_buf.as_slice()
+                        .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS scratch read L{layer_idx}: {e}"))?;
+
+                    for blk in 0..norms_per_pos {
+                        // Each block = 256 consecutive elements in scratch.
+                        // D=256: blk=0, offset=0, 256 elements.
+                        // D=512: blk=0 offset=0 (elements 0..255); blk=1 offset=256 (elements 256..511).
+                        let blk_start = blk * 256;
+                        let blk_end = (blk_start + 256).min(scratch_raw.len());
+                        let samples: &[f32] = &scratch_raw[blk_start..blk_end];
+                        // Compute RMS: divide by 256 (full block sample count).
+                        let rms = if samples.len() == 256 {
+                            let sum_sq: f32 = samples.iter().map(|v| v * v).sum();
+                            (sum_sq / 256.0_f32).sqrt()
+                        } else {
+                            // Partial block (shouldn't happen, but guard):
+                            let sum_sq: f32 = samples.iter().map(|v| v * v).sum();
+                            if samples.is_empty() { 0.0 } else { (sum_sq / samples.len() as f32).sqrt() }
+                        };
+                        // iter-19 A2: band LOCKED at [0.8, 1.2] (catalog #11).
+                        // This is the spec band for bare scale_factor=1.0 which is the iter-16 control.
+                        // Only bare is valid (iter-16 result); sqrt256/sqrt512 are FALSIFIED (iter-16/18).
+                        let status = if rms >= RMS_BAND_LOW && rms <= RMS_BAND_HIGH { "PASS" } else { "FAIL" };
+                        eprintln!(
+                            "[HF2Q_DEBUG_TQ_RMS] layer={layer_idx} kind={probe_kind} head=0 \
+                             blk={blk} rms={rms:.4} band=[{RMS_BAND_LOW:.3},{RMS_BAND_HIGH:.3}] \
+                             status={status} (divisor=256 samples)"
+                        );
+                    }
+
+                    s = exec.begin()
+                        .map_err(|e| anyhow::anyhow!("HF2Q_DEBUG_TQ_RMS re-begin: {e}"))?;
                 }
 
                 // C-1-unlock: post-hadamard_quantize pre-SDPA dump (decode step 1, layer 0).
@@ -1408,8 +1786,9 @@ impl MlxModelWeights {
 
                     // meta_post_quant.json — production call-site params + provenance
                     {
+                        // iter-25 Subtask B fix: use corrected ring_start formula (oldest slot).
                         let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                            (kv_write_pos % kv_capacity) as u32
+                            ((kv_write_pos + 1) % kv_capacity) as u32
                         } else {
                             0u32
                         };
@@ -1465,11 +1844,34 @@ impl MlxModelWeights {
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
 
-                // -- SDPA: dense or TQ-packed (ADR-009 Track 3) --
-                // When dense_kvs is available (set by forward_prefill), use
-                // flash_attn_vec with F32 K,V for reference-parity attention.
-                // Otherwise fall back to the original TQ SDPA path.
-                let use_dense_sdpa = self.dense_kvs.is_some();
+                // -- SDPA: TQ-packed (default) or dense opt-out --
+                // Per feedback_tq_default_directive.md: TQ is the default decode path.
+                // Dense is an explicit opt-out via HF2Q_USE_DENSE=1 env (for debugging/comparison).
+                // dense_kvs must also be allocated for dense path to be available.
+                // ADR-007 iter-12 atomic shippability commit: codebook-scale fixed at all 3 sites.
+                // ADR-007 iter-17: HF2Q_LAYER_POLICY env gate for mixed-precision ablation.
+                let use_dense_sdpa = if self.dense_kvs.is_none() {
+                    false
+                } else {
+                    // HF2Q_LAYER_POLICY: mixed-precision ablation gate (ADR-007 iter-17).
+                    // Unset (default) = tq_all — full TQ, iter-16 control state (expected 127 bytes).
+                    // dense_all                = dense everywhere, iter-A baseline (expected 3656 bytes).
+                    // tq_slide_dense_global    = TQ for sliding layers, dense for global layers (leg B).
+                    // dense_slide_tq_global    = dense for sliding, TQ for global (leg C).
+                    match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
+                        Ok("dense_all") => true,
+                        Ok("tq_slide_dense_global") => !kv_is_sliding,
+                        Ok("dense_slide_tq_global") => kv_is_sliding,
+                        Ok("tq_all") | Err(_) => false,
+                        Ok(other) => {
+                            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
+                            }
+                            false
+                        }
+                    }
+                };
 
                 if use_dense_sdpa {
                     // -- Dense decode SDPA (ADR-009 Track 3) --
@@ -1629,18 +2031,272 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("dense flash_attn_vec L{layer_idx}: {e}"))?;
                     total_dispatches += 2; // main + reduce
+                } else if !INVESTIGATION_ENV.skip_tq_sdpa && force_dense_sdpa_on_tq_kv {
+                    // -- Leg F: dense SDPA on TQ-dequantized K/V (iter-20 ablation) --
+                    //
+                    // K/V have already been TQ-encoded into k_packed/k_norms above.
+                    // Here we: (a) dequantize the full TQ KV cache into a F32 shadow cache
+                    // (leg_f_kvs), then (b) dispatch flash_attn_vec (dense) on those values.
+                    //
+                    // The dequantize kernel writes into the shadow cache at `kv_write_pos`.
+                    // Q remains unrotated (no FWHT pre-mult) because flash_attn_vec
+                    // operates in the original (non-rotated) domain. The dequantize
+                    // kernel writes the FWHT-rotated values, then IFWHT undoes them
+                    // to recover the original domain — but since the encoder encodes
+                    // sign*K via FWHT → quantize, and dequant → IFWHT would give sign*K_approx,
+                    // the Q · K dot product is (Q) · (sign*K_approx) / sqrt(d).
+                    //
+                    // IMPORTANT: The dequant output is in the FWHT-rotated domain.
+                    // For correct dot products with unrotated Q we need to inverse-FWHT
+                    // the dequantized K and V before storing. However, this adds complexity.
+                    // For the ablation purpose: we use pre-rotated Q (same as TQ SDPA)
+                    // + dequantized K/V (also rotated), then IFWHT the output — exactly
+                    // matching the TQ SDPA domain. This way the comparison is fair.
+                    //
+                    // Decision: pre-rotate Q via FWHT sign-premult (same as TQ path),
+                    // dequantize K/V at current position into leg_f_kvs shadow cache,
+                    // dispatch flash_attn_vec on the shadow cache, then IFWHT output.
+                    if let Some(ref leg_f_kvs) = self.leg_f_kvs {
+                        let leg_f_cap = leg_f_kvs[layer_idx].capacity;
+                        let leg_f_is_ring = leg_f_kvs[layer_idx].is_sliding;
+                        let write_slot = if leg_f_is_ring {
+                            (seq_pos % leg_f_cap) as u32
+                        } else {
+                            seq_pos as u32
+                        };
+
+                        // (a) Dequantize current position's K and V into shadow cache.
+                        // The dequant kernel reads from k_packed/k_norms at kv_write_pos
+                        // and writes [nkv, hd] f32 to a flat buffer. We then copy that
+                        // into the shadow cache at write_slot via kv_cache_copy_batch_f32.
+                        //
+                        // We reuse attn_k_normed as scratch for the single-position dequant
+                        // output (attn_k_normed is [nkv*hd] f32, which is exactly [nkv, hd]).
+                        // attn_k_normed is not used again after this point in the layer.
+                        let cache_write_pos = kv_write_pos as u32;
+                        // Wrap the physical write pos for ring buffers.
+                        let read_pos_phys = if kv_is_sliding {
+                            (kv_write_pos % kv_capacity) as u32
+                        } else {
+                            kv_write_pos as u32
+                        };
+
+                        s.barrier_between(
+                            &[&self.kv_caches[layer_idx].k_packed,
+                              &self.kv_caches[layer_idx].k_norms],
+                            &[&self.activations.attn_k_normed],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.kv_caches[layer_idx].k_packed,
+                            &self.kv_caches[layer_idx].k_norms,
+                            &self.activations.attn_k_normed,
+                            nkv as u32, hd as u32, kv_capacity as u32,
+                            read_pos_phys, tq_scale_factor_d512,
+                        ).map_err(|e| anyhow::anyhow!("tq_dequantize_k L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // Copy dequantized K into shadow cache at write_slot.
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed],
+                            &[&leg_f_kvs[layer_idx].k],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_f_kvs[layer_idx].k,
+                            nkv as u32, hd as u32, leg_f_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("leg_f K cache copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // Dequantize V: reuse attn_k_normed again (after K copy is done).
+                        let v_src_for_dq = {
+                            // v_src is attn_k_normed or attn_v — both are [nkv,hd] f32.
+                            // We need a separate read for V norms/packed.
+                            // Use activations.attn_k_normed as scratch again (K copy is committed).
+                            &self.activations.attn_k_normed
+                        };
+                        let _ = cache_write_pos; // suppress unused warning
+                        s.barrier_between(
+                            &[&self.kv_caches[layer_idx].v_packed,
+                              &self.kv_caches[layer_idx].v_norms],
+                            &[v_src_for_dq],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.kv_caches[layer_idx].v_packed,
+                            &self.kv_caches[layer_idx].v_norms,
+                            v_src_for_dq,
+                            nkv as u32, hd as u32, kv_capacity as u32,
+                            read_pos_phys, tq_scale_factor_d512,
+                        ).map_err(|e| anyhow::anyhow!("tq_dequantize_v L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        s.barrier_between(
+                            &[v_src_for_dq],
+                            &[&leg_f_kvs[layer_idx].v],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src_for_dq,
+                            &leg_f_kvs[layer_idx].v,
+                            nkv as u32, hd as u32, leg_f_cap as u32, write_slot,
+                        ).map_err(|e| anyhow::anyhow!("leg_f V cache copy L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // (b) Pre-rotate Q for flash_attn_vec on the rotated-domain K/V.
+                        // Dequantized K/V are in FWHT-rotated domain; pre-rotate Q to match.
+                        s.barrier_between(
+                            &[&self.activations.attn_q_normed],
+                            &[&self.activations.attn_q_normed],
+                        );
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_q_normed,
+                            nh as u32, hd as u32,
+                        ).map_err(|e| anyhow::anyhow!("Leg F FWHT Q sign-premult L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // (c) Dense flash_attn_vec on shadow cache.
+                        let leg_f_sdpa_tmp = self.leg_f_sdpa_tmp.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("leg_f_sdpa_tmp not allocated"))?;
+                        let leg_f_kv_seq_len = if leg_f_is_ring {
+                            ((seq_pos + 1).min(leg_f_cap)) as u32
+                        } else {
+                            (seq_pos + 1) as u32
+                        };
+                        let p = mlx_native::ops::flash_attn_vec::FlashAttnVecParams {
+                            num_heads: nh as u32,
+                            num_kv_heads: nkv as u32,
+                            head_dim: hd as u32,
+                            kv_seq_len: leg_f_kv_seq_len,
+                            kv_capacity: leg_f_cap as u32,
+                            scale: 1.0,
+                            mask_type: 1, // causal; ring handles the sliding constraint
+                            sliding_window: 0,
+                            softcap: 0.0,
+                        };
+                        s.barrier_between(
+                            &[&self.activations.attn_q_normed,
+                              &leg_f_kvs[layer_idx].k, &leg_f_kvs[layer_idx].v],
+                            &[&self.activations.sdpa_out],
+                        );
+                        mlx_native::ops::flash_attn_vec::flash_attn_vec(
+                            s.encoder_mut(), reg, dev,
+                            &self.activations.attn_q_normed,
+                            &leg_f_kvs[layer_idx].k,
+                            &leg_f_kvs[layer_idx].v,
+                            &self.activations.sdpa_out,
+                            leg_f_sdpa_tmp,
+                            &p,
+                        ).map_err(|e| anyhow::anyhow!("Leg F flash_attn_vec L{layer_idx}: {e}"))?;
+                        total_dispatches += 2; // main + reduce
+
+                        // (d) Inverse-rotate SDPA output (matches TQ path sign-undo).
+                        s.barrier_between(
+                            &[&self.activations.sdpa_out],
+                            &[&self.activations.sdpa_out],
+                        );
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.sdpa_out,
+                            nh as u32, hd as u32,
+                        ).map_err(|e| anyhow::anyhow!("Leg F FWHT sign-undo L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
+                } else if !INVESTIGATION_ENV.skip_tq_sdpa && use_native_hb_sdpa {
+                    // -- iter-24: native HB SDPA (5/6/8-bit byte-packed K/V) --
+                    //
+                    // K/V have been HB-encoded into leg_hb_encoded above.
+                    // We dispatch flash_attn_vec_tq_hb which reads byte-packed K/V
+                    // and applies the appropriate codebook inline — no dequant step needed.
+                    if let Some(ref leg_hb_enc) = &self.leg_hb_encoded {
+                        let hb_cap = leg_hb_enc[layer_idx].capacity;
+                        let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
+
+                        // Pre-rotate Q via FWHT with D1 sign pre-mult (same as 4-bit path).
+                        s.barrier_between(
+                            &[&self.activations.attn_q_normed],
+                            &[&self.activations.attn_q_normed],
+                        );
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_q_normed,
+                            nh as u32, hd as u32,
+                        ).map_err(|e| anyhow::anyhow!("HB FWHT Q sign-premult L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // Native HB SDPA (pre-rotated Q → rotated-domain output).
+                        let hb_kv_seq_len = if hb_is_ring {
+                            ((kv_write_pos + 1).min(hb_cap)) as u32
+                        } else {
+                            (kv_write_pos + 1) as u32
+                        };
+                        let ring_start_hb = if hb_is_ring && hb_kv_seq_len as usize >= hb_cap {
+                            ((kv_write_pos + 1) % hb_cap) as u32
+                        } else {
+                            0u32
+                        };
+                        s.barrier_between(
+                            &[&self.activations.attn_q_normed,
+                              &leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms,
+                              &leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
+                            &[&self.activations.sdpa_out],
+                        );
+                        let p_hb = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+                            num_heads: nh as u32,
+                            num_kv_heads: nkv as u32,
+                            head_dim: hd as u32,
+                            kv_seq_len: hb_kv_seq_len,
+                            kv_capacity: hb_cap as u32,
+                            scale: 1.0,
+                            mask_type: if is_sliding { 2 } else { 1 },
+                            sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                            softcap: 0.0,
+                            ring_start: ring_start_hb,
+                            scale_factor_d512: tq_scale_factor_d512,
+                            codebook_bits: tq_codebook_bits,
+                        };
+                        mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+                            s.encoder_mut(), reg, dev,
+                            &self.activations.attn_q_normed,
+                            &leg_hb_enc[layer_idx].k_packed,
+                            &leg_hb_enc[layer_idx].k_norms,
+                            &leg_hb_enc[layer_idx].v_packed,
+                            &leg_hb_enc[layer_idx].v_norms,
+                            &self.activations.sdpa_out,
+                            &self.activations.sdpa_tmp,
+                            &p_hb,
+                        ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq_hb L{layer_idx}: {e}"))?;
+                        total_dispatches += 2; // main + reduce (conservative)
+
+                        // Inverse-rotate SDPA output.
+                        s.barrier_between(
+                            &[&self.activations.sdpa_out],
+                            &[&self.activations.sdpa_out],
+                        );
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.sdpa_out,
+                            nh as u32, hd as u32,
+                        ).map_err(|e| anyhow::anyhow!("HB FWHT sign-undo L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
                 } else if !INVESTIGATION_ENV.skip_tq_sdpa {
                     // -- TQ-packed SDPA (original path) --
-                    // Pre-rotate Q via standalone FWHT (1× per head).
+                    // Pre-rotate Q via FWHT with D1 sign pre-mult (ADR-007 iter-14 SRHT).
+                    // Applies sign_j * Q_j before FWHT so Q_rotated = FWHT(sign*Q)/sqrt(d).
+                    // K was encoded as FWHT(sign*K)/sqrt(d); dot product = (sign*Q)·(sign*K) = Q·K.
+                    // Sign tables verbatim from AmesianX cpy-utils.cuh:158-163/211-220.
                     s.barrier_between(
                         &[&self.activations.attn_q_normed],
                         &[&self.activations.attn_q_normed],
                     );
-                    mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.attn_q_normed,
                         nh as u32, hd as u32,
-                    ).map_err(|e| anyhow::anyhow!("FWHT Q pre-rotate L{layer_idx}: {e}"))?;
+                    ).map_err(|e| anyhow::anyhow!("FWHT Q sign-premult pre-rotate L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
 
                     // TQ SDPA (pre-rotated Q → rotated-domain output)
@@ -1650,8 +2306,11 @@ impl MlxModelWeights {
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                         &[&self.activations.sdpa_out],
                     );
+                    // iter-25 Subtask B fix: ring_start must be the physical slot of the OLDEST
+                    // entry (not newest). kv_write_pos is pre-increment (the slot just written
+                    // this step). After wrap: oldest = (kv_write_pos + 1) % capacity.
                     let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                        (kv_write_pos % kv_capacity) as u32
+                        ((kv_write_pos + 1) % kv_capacity) as u32
                     } else {
                         0
                     };
@@ -1666,6 +2325,7 @@ impl MlxModelWeights {
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
                         ring_start,
+                        scale_factor_d512: tq_scale_factor_d512,
                     };
                     mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
                         s.encoder_mut(), reg, dev,
@@ -1679,16 +2339,18 @@ impl MlxModelWeights {
                         &p,
                     ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq L{layer_idx}: {e}"))?;
 
-                    // Inverse-rotate SDPA output (1× per head).
+                    // Inverse-rotate SDPA output with D1 sign undo (ADR-007 iter-14 SRHT).
+                    // Applies FWHT (= IWHT for normalized H) → sign_j * elem_j.
+                    // Output accumulated sign*V_weighted; sign undo recovers V_weighted.
                     s.barrier_between(
                         &[&self.activations.sdpa_out],
                         &[&self.activations.sdpa_out],
                     );
-                    mlx_native::ops::fwht_standalone::dispatch_fwht_f32(
+                    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
                         s.encoder_mut(), reg, metal_dev,
                         &self.activations.sdpa_out,
                         nh as u32, hd as u32,
-                    ).map_err(|e| anyhow::anyhow!("FWHT inv-rotate L{layer_idx}: {e}"))?;
+                    ).map_err(|e| anyhow::anyhow!("FWHT sign-undo inv-rotate L{layer_idx}: {e}"))?;
                     total_dispatches += 1;
                     total_dispatches += 2; // main + reduce
                 }
@@ -1703,6 +2365,78 @@ impl MlxModelWeights {
                         "sdpa_out", Some(layer_idx), seq_pos)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out re-begin L{layer_idx}: {e}"))?;
+                }
+
+                // iter-18 S2C: first-divergence dump (layer=0, sliding, decode steps 1..=10).
+                // kv_seq_len=23 = first decode step (prompt len 22 + 1), so steps 1..10 = seq_len 23..32.
+                let s2c_step = if kv_seq_len >= 23 && kv_seq_len <= 32 { kv_seq_len - 22 } else { 0 };
+                if dump_sliding_l0 && layer_idx == 0 && kv_is_sliding && s2c_step >= 1 {
+                    if let Some(ref run_name) = dump_run_name {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("S2C dump finish step={s2c_step}: {e}"))?;
+                        let dump_base = "/tmp/cfa-iter18/dumps";
+                        std::fs::create_dir_all(dump_base)
+                            .map_err(|e| anyhow::anyhow!("S2C mkdir: {e}"))?;
+                        let p = s2c_step;
+                        let run = run_name.as_str();
+                        // Q (post-RoPE): [nh, hd] f32
+                        {
+                            let q_raw: &[f32] = self.activations.attn_q_normed.as_slice()
+                                .map_err(|e| anyhow::anyhow!("S2C q read: {e}"))?;
+                            let q_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                q_raw.as_ptr() as *const u8, nh * hd * 4) };
+                            std::fs::write(format!("{dump_base}/pos-{p}-layer-0-q-{run}.bin"), q_bytes)
+                                .map_err(|e| anyhow::anyhow!("S2C write q: {e}"))?;
+                        }
+                        // K cache slot 0: dense path reads from dense_kvs; TQ path reads from k_norms.
+                        // We dump K_norms (f32) for TQ and the cache K for dense.
+                        if use_dense_sdpa {
+                            if let Some(ref dkvs) = self.dense_kvs {
+                                let k_raw: &[f32] = dkvs[layer_idx].k.as_slice()
+                                    .map_err(|e| anyhow::anyhow!("S2C dense k read: {e}"))?;
+                                let slot0_bytes = nkv * hd * 4;
+                                let k_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                    k_raw.as_ptr() as *const u8, slot0_bytes.min(k_raw.len() * 4)) };
+                                std::fs::write(format!("{dump_base}/pos-{p}-layer-0-k-{run}.bin"), k_bytes)
+                                    .map_err(|e| anyhow::anyhow!("S2C write dense k: {e}"))?;
+                                let v_raw: &[f32] = dkvs[layer_idx].v.as_slice()
+                                    .map_err(|e| anyhow::anyhow!("S2C dense v read: {e}"))?;
+                                let v_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                    v_raw.as_ptr() as *const u8, slot0_bytes.min(v_raw.len() * 4)) };
+                                std::fs::write(format!("{dump_base}/pos-{p}-layer-0-v-{run}.bin"), v_bytes)
+                                    .map_err(|e| anyhow::anyhow!("S2C write dense v: {e}"))?;
+                            }
+                        } else {
+                            // TQ path: dump k_norms + k_packed (representative)
+                            let npp = (hd / 256).max(1);
+                            let k_norms_raw: &[f32] = self.kv_caches[layer_idx].k_norms.as_slice()
+                                .map_err(|e| anyhow::anyhow!("S2C tq k_norms read: {e}"))?;
+                            let k_norms_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                k_norms_raw.as_ptr() as *const u8,
+                                nkv * kv_capacity * npp * 4) };
+                            std::fs::write(format!("{dump_base}/pos-{p}-layer-0-k-{run}.bin"), k_norms_bytes)
+                                .map_err(|e| anyhow::anyhow!("S2C write tq k: {e}"))?;
+                            let v_norms_raw: &[f32] = self.kv_caches[layer_idx].v_norms.as_slice()
+                                .map_err(|e| anyhow::anyhow!("S2C tq v_norms read: {e}"))?;
+                            let v_norms_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                v_norms_raw.as_ptr() as *const u8,
+                                nkv * kv_capacity * npp * 4) };
+                            std::fs::write(format!("{dump_base}/pos-{p}-layer-0-v-{run}.bin"), v_norms_bytes)
+                                .map_err(|e| anyhow::anyhow!("S2C write tq v: {e}"))?;
+                        }
+                        // SDPA output: [nh, hd] f32
+                        {
+                            let sdpa_raw: &[f32] = self.activations.sdpa_out.as_slice()
+                                .map_err(|e| anyhow::anyhow!("S2C sdpa read: {e}"))?;
+                            let sdpa_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                                sdpa_raw.as_ptr() as *const u8, nh * hd * 4) };
+                            std::fs::write(format!("{dump_base}/pos-{p}-layer-0-sdpa-{run}.bin"), sdpa_bytes)
+                                .map_err(|e| anyhow::anyhow!("S2C write sdpa: {e}"))?;
+                        }
+                        eprintln!("[HF2Q_S2C] pos={p} layer=0 dumped q/k/v/sdpa run={run}");
+                        s = exec.begin()
+                            .map_err(|e| anyhow::anyhow!("S2C re-begin step={s2c_step}: {e}"))?;
+                    }
                 }
 
                 // -- O-proj --
@@ -2415,6 +3149,16 @@ impl MlxModelWeights {
             kv_info.push((is_sliding, write_pos, capacity, seq_len));
         }
 
+        // iter-18 S2B: scale factor for kernel profile path (same OnceLock as forward_decode).
+        let tq_scale_factor_d512: f32 = {
+            static SCALE_FACTOR_KP: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+            *SCALE_FACTOR_KP.get_or_init(|| match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+                Ok("sqrt256") => 16.0_f32,
+                Ok("sqrt512") => 512.0_f32.sqrt(),
+                _ => 1.0_f32,
+            })
+        };
+
         // --- Embedding (tiny, single session) ---
         {
             let (exec, reg) = gpu.split();
@@ -2579,6 +3323,8 @@ impl MlxModelWeights {
                     &self.kv_caches[layer_idx].k_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                     kv_is_sliding,
+                    Some(tq_scale_factor_d512),
+                    None,
                 ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
                 mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                     s.encoder_mut(), reg, metal_dev,
@@ -2587,6 +3333,8 @@ impl MlxModelWeights {
                     &self.kv_caches[layer_idx].v_norms,
                     nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                     kv_is_sliding,
+                    Some(tq_scale_factor_d512),
+                    None,
                 ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
@@ -2604,12 +3352,14 @@ impl MlxModelWeights {
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("sdpa begin L{layer_idx}: {e}"))?;
 
                 {
-                    // ADR-009 Track 2: ring_start for correct sliding-window
-                    // chronology after wrap. Before wrap, ring_start = 0
-                    // (physical == logical). After wrap, ring_start = write_pos
-                    // % capacity (physical slot of the oldest cached entry).
+                    // ADR-009 Track 2 + iter-25 Subtask B fix: ring_start must be the
+                    // physical slot of the OLDEST entry (not newest).
+                    // kv_write_pos is pre-increment (the slot just written this step).
+                    // After wrap: oldest = (kv_write_pos + 1) % capacity.
+                    // The kernel formula: logical_idx = (k_pos - ring_start + cap) % cap
+                    // maps ring_start → logical 0 (oldest). Matches HB dispatch.
                     let ring_start = if kv_is_sliding && kv_seq_len >= kv_capacity {
-                        (kv_write_pos % kv_capacity) as u32
+                        ((kv_write_pos + 1) % kv_capacity) as u32
                     } else {
                         0
                     };
@@ -2624,6 +3374,7 @@ impl MlxModelWeights {
                         sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
                         softcap: 0.0,
                         ring_start,
+                        scale_factor_d512: tq_scale_factor_d512,
                     };
                     mlx_native::ops::flash_attn_vec_tq::flash_attn_vec_tq(
                         s.encoder_mut(), reg, dev,
@@ -3149,6 +3900,34 @@ impl MlxModelWeights {
         eprintln!("NOTE: Per-session overhead (~30-50 us/session) inflates all groups.");
         eprintln!("      The ratio shows relative slowness, not absolute kernel time.");
         eprintln!("      {} sessions/token vs 1 in production mode.", 8 * num_layers + 2);
+    }
+
+    /// Compute NLL (negative log-likelihood) for `token_id` from the logits buffer
+    /// that was produced by the most recent `forward_decode` call.
+    ///
+    /// Uses log-sum-exp for numerical stability. The logits may include a soft-cap
+    /// (tanh * 30) already applied by the kernel; we use them as-is since both
+    /// dense and TQ paths apply the same cap, so the relative NLL is fair.
+    ///
+    /// Returns: -log P(token_id) under the softmax distribution.
+    /// Call ONLY immediately after `forward_decode`; the logits buffer is live.
+    pub fn token_nll_from_logits(&self, token_id: u32) -> Result<f32> {
+        let logits: &[f32] = self.activations.logits.as_slice()
+            .map_err(|e| anyhow::anyhow!("token_nll logits read: {e}"))?;
+        let v = self.vocab_size;
+        anyhow::ensure!(
+            (token_id as usize) < v,
+            "token_nll: token_id {token_id} >= vocab_size {v}"
+        );
+        let slice = &logits[..v];
+        // Log-sum-exp with max subtraction for numerical stability.
+        let max_logit = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f64 = slice.iter()
+            .map(|&l| ((l - max_logit) as f64).exp())
+            .sum();
+        let log_sum_exp = max_logit as f64 + sum_exp.ln();
+        let log_prob = (logits[token_id as usize] as f64) - log_sum_exp;
+        Ok(-log_prob as f32)
     }
 
 }

@@ -80,6 +80,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
 
+# iter-20+ audit binaries (ADR-007): pattern matching for tok/s parsing
+regex = "1"
+
 # Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
 # common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
 minijinja = "2"
@@ -90,10 +93,18 @@ predicates = "3"
 tempfile = "3"
 criterion = "0.5"
 regex = "1"
-# tower::ServiceExt::oneshot for router-level integration tests
-# (ADR-005 Phase 2a iter 2). tower is already in the transitive graph
-# via axum; this pins a direct version for tests.
-tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "iter23_audit"
+path = "src/bin/iter23_audit.rs"
+
+[[bin]]
+name = "iter24_audit"
+path = "src/bin/iter24_audit.rs"
+
+[[bin]]
+name = "iter25_audit"
+path = "src/bin/iter25_audit.rs"
 
 [[bench]]
 name = "quantize_bench"

@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
 use super::forward_mlx::{
-    MlxModelWeights, DenseKvBuffers, dispatch_qmatmul,
+    MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
 use super::config::LayerType;
@@ -132,6 +132,102 @@ impl MlxModelWeights {
 
         tracing::debug!("Prefill: {} tokens × {} layers (dense SDPA)", seq_len, num_layers);
 
+        // Track A fix (iter-21): allocate leg_f_kvs shadow cache BEFORE the token
+        // loop so the per-token populate code (below) can write into it.
+        // In iter-20 the allocation appeared at the END of this function (after
+        // the loop), so self.leg_f_kvs was always None when the populate block ran.
+        {
+            let force_dense_on_tq =
+                std::env::var("HF2Q_FORCE_DENSE_SDPA_ON_TQ_KV").ok().as_deref() == Some("1");
+            if force_dense_on_tq {
+                eprintln!("[iter-21 Track A] Allocating Leg F shadow KV cache before prefill loop");
+                let mut leg_f_kvs_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let nkv = layer.num_kv_heads;
+                    let hd = layer.head_dim;
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    let n = nkv * capacity * hd;
+                    let f32_bytes = std::mem::size_of::<f32>();
+                    let k = dev.alloc_buffer(n * f32_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f early K L{layer_idx}: {e}"))?;
+                    let v = dev.alloc_buffer(n * f32_bytes, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f early V L{layer_idx}: {e}"))?;
+                    leg_f_kvs_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
+                }
+                let leg_f_tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+                    max_nh as u32, max_hd as u32);
+                let leg_f_sdpa_tmp = dev.alloc_buffer(leg_f_tmp_bytes, mlx_native::DType::F32,
+                    vec![leg_f_tmp_bytes / 4])
+                    .map_err(|e| anyhow::anyhow!("leg_f early sdpa_tmp: {e}"))?;
+                self.leg_f_kvs = Some(leg_f_kvs_vec);
+                self.leg_f_sdpa_tmp = Some(leg_f_sdpa_tmp);
+                eprintln!("[iter-21 Track A] Leg F shadow KV cache ready ({} layers)", num_layers);
+            }
+        }
+
+        // iter-21 Track B: allocate leg_hb_encoded byte-packed cache + leg_f_kvs shadow.
+        // HF2Q_TQ_CODEBOOK_BITS=5|6 → allocate per-layer byte-packed HB buffers.
+        // Also allocates leg_f_kvs (F32 shadow) if not already allocated by Leg F above.
+        let tq_codebook_bits_prefill: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("5") => 5, Ok("6") => 6, Ok("8") => 8, _ => 0,
+        };
+        if tq_codebook_bits_prefill >= 5 {
+            eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",
+                      tq_codebook_bits_prefill, num_layers);
+            let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                let capacity = if layer_is_ring { sw } else { linear_capacity };
+                let norms_per_pos = (hd / 256).max(1);
+                let norms_n = nkv * capacity * norms_per_pos;
+                let k_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
+                    vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("leg_hb prefill K packed L{layer_idx}: {e}"))?;
+                let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                    if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
+                    .map_err(|e| anyhow::anyhow!("leg_hb prefill K norms L{layer_idx}: {e}"))?;
+                let v_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
+                    vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("leg_hb prefill V packed L{layer_idx}: {e}"))?;
+                let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                    if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
+                    .map_err(|e| anyhow::anyhow!("leg_hb prefill V norms L{layer_idx}: {e}"))?;
+                leg_hb_vec.push(HbKvBuffers {
+                    k_packed, k_norms, v_packed, v_norms,
+                    capacity, is_sliding: layer_is_ring, norms_per_pos,
+                });
+            }
+            self.leg_hb_encoded = Some(leg_hb_vec);
+
+            // Also ensure leg_f_kvs shadow (F32) is allocated for the dequant→SDPA step.
+            if self.leg_f_kvs.is_none() {
+                let mut leg_f_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let nkv = layer.num_kv_heads;
+                    let hd = layer.head_dim;
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    let n = nkv * capacity * hd;
+                    let k = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f hb-path K L{layer_idx}: {e}"))?;
+                    let v = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                        .map_err(|e| anyhow::anyhow!("leg_f hb-path V L{layer_idx}: {e}"))?;
+                    leg_f_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
+                }
+                let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+                    max_nh as u32, max_hd as u32);
+                let leg_f_sdpa_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
+                    vec![tmp_bytes / 4])
+                    .map_err(|e| anyhow::anyhow!("leg_f hb-path sdpa_tmp: {e}"))?;
+                self.leg_f_kvs = Some(leg_f_vec);
+                self.leg_f_sdpa_tmp = Some(leg_f_sdpa_tmp);
+            }
+            eprintln!("[iter-21 Track B] leg_hb_encoded + leg_f_kvs ready ({} layers)", num_layers);
+        }
+
         // ADR-010 one-shot norm weight dump: read self.layers[L].norms.input_layernorm
         // as the hf2q kernel sees it, compare against the raw GGUF tensor.
         // Gated on HF2Q_DUMP_NORM_WEIGHT="layer" (e.g. "7"). Writes to HF2Q_DUMP_DIR.
@@ -154,6 +250,18 @@ impl MlxModelWeights {
         // Controlled by HF2Q_PREFILL_DUMP="layer,tok" e.g. "7,34".
         let prefill_dump: Option<(usize, usize)> = INVESTIGATION_ENV.prefill_dump;
         let dump_dir: &str = &INVESTIGATION_ENV.dump_dir;
+
+        // Track A fix (iter-21): Leg F shadow-cache prefill population.
+        // tq_scale_factor_d512 matches the decode-path value so prefill and
+        // decode dequant use the same scale, keeping the shadow KV cache
+        // byte-compatible across the prefill→decode boundary.
+        let tq_scale_factor_d512: f32 = {
+            match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+                Ok("sqrt256") => 16.0_f32,
+                Ok("sqrt512") => 512.0_f32.sqrt(),
+                _ => 1.0_f32, // bare (iter-16 default)
+            }
+        };
 
         // ===================================================================
         // Process each prompt token through all layers
@@ -426,6 +534,8 @@ impl MlxModelWeights {
                             &self.kv_caches[layer_idx].k_norms,
                             nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                             kv_is_sliding,
+                            None, // scale_factor_d512: bare=1.0 for prefill
+                            None, // rms_scratch: probe not used during prefill
                         ).map_err(|e| anyhow::anyhow!("prefill TQ K L{layer_idx} T{tok_i}: {e}"))?;
                         mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
                             s.encoder_mut(), reg, metal_dev,
@@ -434,8 +544,197 @@ impl MlxModelWeights {
                             &self.kv_caches[layer_idx].v_norms,
                             nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
                             kv_is_sliding,
+                            None, // scale_factor_d512: bare=1.0 for prefill
+                            None, // rms_scratch: probe not used during prefill
                         ).map_err(|e| anyhow::anyhow!("prefill TQ V L{layer_idx} T{tok_i}: {e}"))?;
                     }
+
+                    // Track A fix (iter-21): populate leg_f_kvs shadow cache
+                    // during prefill so decode Leg F can attend over all prompt
+                    // positions.  Without this, the shadow cache was all-zeros
+                    // for positions 0..seq_len-1, making Q*K^T garbage (6 bytes).
+                    //
+                    // Pipeline mirrors the decode path (forward_mlx.rs:1869-1945):
+                    //   dequant K → copy to leg_f_kvs.k, dequant V → copy to leg_f_kvs.v.
+                    // Both K and V are dequantized from the just-written TQ cache position.
+                    // Guard: only when TQ encode ran (skip_tq_encode == false).
+                    // Guard: skip if Track B (tq_codebook_bits >= 5) — Track B populates
+                    //   leg_f_kvs from HB-encoded data below, not 4-bit TQ dequant.
+                    //   Running both would corrupt leg_f_kvs with 4-bit values before
+                    //   Track B overwrites them, and more importantly the Leg F dequant
+                    //   would overwrite attn_k_normed before the HB encode reads it.
+                    if !INVESTIGATION_ENV.skip_tq_encode && tq_codebook_bits_prefill == 0 {
+                    if let Some(ref leg_f_kvs) = self.leg_f_kvs {
+                        let leg_f_cap = leg_f_kvs[layer_idx].capacity;
+                        let leg_f_is_ring = leg_f_kvs[layer_idx].is_sliding;
+                        let lf_write_slot = if leg_f_is_ring {
+                            (tok_i % leg_f_cap) as u32
+                        } else {
+                            tok_i as u32
+                        };
+                        let cache_pos_read = if kv_is_sliding {
+                            (kv_write_pos % kv_capacity) as u32
+                        } else {
+                            kv_write_pos as u32
+                        };
+
+                        // Dequantize K into attn_k_normed scratch.
+                        s.barrier_between(
+                            &[&self.kv_caches[layer_idx].k_packed,
+                              &self.kv_caches[layer_idx].k_norms],
+                            &[&self.activations.attn_k_normed],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.kv_caches[layer_idx].k_packed,
+                            &self.kv_caches[layer_idx].k_norms,
+                            &self.activations.attn_k_normed,
+                            nkv as u32, hd as u32, kv_capacity as u32,
+                            cache_pos_read, tq_scale_factor_d512,
+                        ).map_err(|e| anyhow::anyhow!("legF prefill dequant_k L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // Copy dequantized K into shadow cache at lf_write_slot.
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed],
+                            &[&leg_f_kvs[layer_idx].k],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_f_kvs[layer_idx].k,
+                            nkv as u32, hd as u32, leg_f_cap as u32, lf_write_slot,
+                        ).map_err(|e| anyhow::anyhow!("legF prefill K cache copy L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // Dequantize V into attn_k_normed scratch (K copy is committed).
+                        s.barrier_between(
+                            &[&self.kv_caches[layer_idx].v_packed,
+                              &self.kv_caches[layer_idx].v_norms],
+                            &[&self.activations.attn_k_normed],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.kv_caches[layer_idx].v_packed,
+                            &self.kv_caches[layer_idx].v_norms,
+                            &self.activations.attn_k_normed,
+                            nkv as u32, hd as u32, kv_capacity as u32,
+                            cache_pos_read, tq_scale_factor_d512,
+                        ).map_err(|e| anyhow::anyhow!("legF prefill dequant_v L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // Copy dequantized V into shadow cache at lf_write_slot.
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed],
+                            &[&leg_f_kvs[layer_idx].v],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_f_kvs[layer_idx].v,
+                            nkv as u32, hd as u32, leg_f_cap as u32, lf_write_slot,
+                        ).map_err(|e| anyhow::anyhow!("legF prefill V cache copy L{layer_idx} T{tok_i}: {e}"))?;
+                    } // end if let Some(leg_f_kvs)
+                    } // end if !skip_tq_encode
+
+                    // iter-21 Track B: HB encode + dequant → leg_f_kvs shadow during prefill.
+                    // When HF2Q_TQ_CODEBOOK_BITS=5|6, also encode K/V to byte-packed HB,
+                    // then dequantize into leg_f_kvs so decode Track B SDPA sees all positions.
+                    if tq_codebook_bits_prefill >= 5 && !INVESTIGATION_ENV.skip_tq_encode {
+                    if let (Some(ref leg_hb_enc), Some(ref leg_f_kvs)) =
+                        (&self.leg_hb_encoded, &self.leg_f_kvs)
+                    {
+                        let hb_cap = leg_hb_enc[layer_idx].capacity;
+                        let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
+                        let hb_write_slot = if hb_is_ring {
+                            (tok_i % hb_cap) as u32
+                        } else {
+                            tok_i as u32
+                        };
+                        let lf_cap = leg_f_kvs[layer_idx].capacity;
+                        let lf_is_ring = leg_f_kvs[layer_idx].is_sliding;
+                        let lf_write_slot = if lf_is_ring {
+                            (tok_i % lf_cap) as u32
+                        } else {
+                            tok_i as u32
+                        };
+
+                        // HB encode K → leg_hb_enc.k_packed
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed, v_src],
+                            &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms],
+                        );
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_hb_enc[layer_idx].k_packed,
+                            &leg_hb_enc[layer_idx].k_norms,
+                            nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
+                            hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb_encode K L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // HB encode V → leg_hb_enc.v_packed
+                        s.barrier_between(
+                            &[v_src],
+                            &[&leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
+                        );
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &leg_hb_enc[layer_idx].v_packed,
+                            &leg_hb_enc[layer_idx].v_norms,
+                            nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
+                            hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb_encode V L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // Dequantize HB K → attn_k_normed scratch → leg_f_kvs.k
+                        s.barrier_between(
+                            &[&leg_hb_enc[layer_idx].k_packed, &leg_hb_enc[layer_idx].k_norms],
+                            &[&self.activations.attn_k_normed],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &leg_hb_enc[layer_idx].k_packed,
+                            &leg_hb_enc[layer_idx].k_norms,
+                            &self.activations.attn_k_normed,
+                            nkv as u32, hd as u32, hb_cap as u32,
+                            hb_write_slot, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb_dequant_k L{layer_idx} T{tok_i}: {e}"))?;
+
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed],
+                            &[&leg_f_kvs[layer_idx].k],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_f_kvs[layer_idx].k,
+                            nkv as u32, hd as u32, lf_cap as u32, lf_write_slot,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb K→lf copy L{layer_idx} T{tok_i}: {e}"))?;
+
+                        // Dequantize HB V → attn_k_normed scratch → leg_f_kvs.v
+                        s.barrier_between(
+                            &[&leg_hb_enc[layer_idx].v_packed, &leg_hb_enc[layer_idx].v_norms],
+                            &[&self.activations.attn_k_normed],
+                        );
+                        mlx_native::ops::tq_dequantize_kv::dispatch_tq_dequantize_hb_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &leg_hb_enc[layer_idx].v_packed,
+                            &leg_hb_enc[layer_idx].v_norms,
+                            &self.activations.attn_k_normed,
+                            nkv as u32, hd as u32, hb_cap as u32,
+                            hb_write_slot, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb_dequant_v L{layer_idx} T{tok_i}: {e}"))?;
+
+                        s.barrier_between(
+                            &[&self.activations.attn_k_normed],
+                            &[&leg_f_kvs[layer_idx].v],
+                        );
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &leg_f_kvs[layer_idx].v,
+                            nkv as u32, hd as u32, lf_cap as u32, lf_write_slot,
+                        ).map_err(|e| anyhow::anyhow!("prefill hb V→lf copy L{layer_idx} T{tok_i}: {e}"))?;
+                    } // end if let (leg_hb_enc, leg_f_kvs)
+                    } // end if tq_codebook_bits_prefill >= 5
 
                     // ====================================================
                     // DENSE SDPA (ADR-009 Track 1 key change)
@@ -959,6 +1258,10 @@ impl MlxModelWeights {
         // for dense attention during the decode phase (ADR-009 Track 3).
         self.dense_kvs = Some(dense_kvs_vec);
         self.dense_sdpa_tmp = Some(sdpa_tmp);
+
+        // Note: iter-20 had leg_f_kvs allocation here (after the loop).
+        // iter-21 Track A moved it to BEFORE the loop (see above) so the
+        // per-token populate block can write into it during prefill.
 
         Ok(last_token)
     }
