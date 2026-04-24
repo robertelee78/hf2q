@@ -12,8 +12,8 @@
 //!  6. Q = L2Norm(Q over D_k)                     (ADR Decision 3)
 //!     K = L2Norm(K over D_k)
 //!  7. alpha_logit = ssm_alpha @ x_norm + ssm_dt_bias     // [seq, n_v]
-//!     g = softplus(alpha_logit) * exp(ssm_a)             // ssm_a is log-decay base
-//!     (alpha = exp(-g) is applied inside GATED_DELTA_NET)
+//!     g = softplus(alpha_logit) * ssm_a                  // ssm_a is pre-computed decay
+//!     (exp(-g) is applied inside GATED_DELTA_NET)
 //!     beta_logit  = ssm_beta  @ x_norm                    // [seq, n_v]
 //!     beta = sigmoid(beta_logit)
 //!  8. (output, state') = GATED_DELTA_NET(Q, K, V, g, beta, state)  (Decision 6)
@@ -69,7 +69,8 @@ pub struct DeltaNetLayerWeights {
     pub ssm_beta: Vec<f32>,
     /// Per-head log-decay base: `[n_v_heads]`. Note ADR-012 Gotcha #2
     /// (A_log negation): this is stored as log(|A|) with sign handled by
-    /// `g = softplus(logit) * exp(ssm_a)` producing a positive decay rate.
+    /// Used as `g = softplus(logit) * ssm_a` (direct multiply, no exp).
+    /// Stored as pre-computed `-A_log.exp()` values in the model GGUF.
     pub ssm_a: Vec<f32>,
     /// Output per-head RMSNorm: `[n_v_heads * D_v]`.
     pub ssm_norm: Vec<f32>,
@@ -323,8 +324,10 @@ pub fn delta_net_layer_cpu_ref(
     for t in 0..seq {
         for h_idx in 0..nv {
             let a_logit = alpha_logits[t * nv + h_idx] + weights.ssm_dt_bias[h_idx];
-            // g = softplus(a_logit) * exp(ssm_a[h]). ssm_a is log-decay base.
-            g[t * nv + h_idx] = softplus(a_logit) * weights.ssm_a[h_idx].exp();
+            // g = softplus(a_logit) * ssm_a[h_idx].
+            // ssm_a contains pre-computed values (stored as -A_log.exp() in model).
+            // Matches llama.cpp: gate = ggml_mul(alpha_softplus, ssm_a) — no extra exp().
+            g[t * nv + h_idx] = softplus(a_logit) * weights.ssm_a[h_idx];
             beta[t * nv + h_idx] = sigmoid(beta_logits[t * nv + h_idx]);
         }
     }

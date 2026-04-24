@@ -435,8 +435,13 @@ pub fn apply_l2_norm_per_head(
     Ok(out)
 }
 
-/// Compute `g[t, vh] = softplus(alpha_logit[t, vh] + dt_bias[vh]) * exp(ssm_a[vh])`
+/// Compute `g[t, vh] = softplus(alpha_logit[t, vh] + dt_bias[vh]) * ssm_a[vh]`
 /// and `beta[t, vh] = sigmoid(beta_logit[t, vh])` on the CPU.
+///
+/// Note: `ssm_a` contains the pre-computed values directly (stored as
+/// `-A_log.exp()` in the model, already negative).  The formula matches
+/// llama.cpp qwen35moe.cpp: `gate = ggml_mul(alpha_softplus, ssm_a)`.
+/// Do NOT apply `exp()` to ssm_a — it is used as-is.
 ///
 /// Both inputs are `[seq_len, nv]` F32 (token-major). Returns `(g, beta)` same
 /// shape. Done CPU-side because nv is small (32 for MoE, 48 for dense) and the
@@ -445,7 +450,7 @@ pub fn compute_g_and_beta_cpu(
     alpha_logit_cpu: &[f32],  // [seq, nv]
     beta_logit_cpu: &[f32],   // [seq, nv]
     dt_bias: &[f32],          // [nv]
-    ssm_a: &[f32],            // [nv]
+    ssm_a: &[f32],            // [nv]: pre-computed -A_log.exp() values, used directly
     seq_len: usize,
     nv: usize,
 ) -> (Vec<f32>, Vec<f32>) {
@@ -454,7 +459,9 @@ pub fn compute_g_and_beta_cpu(
     for t in 0..seq_len {
         for vh in 0..nv {
             let a_logit = alpha_logit_cpu[t * nv + vh] + dt_bias[vh];
-            g[t * nv + vh] = softplus_f32(a_logit) * ssm_a[vh].exp();
+            // Direct multiply — ssm_a is already the pre-computed scaling factor.
+            // llama.cpp: gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a)
+            g[t * nv + vh] = softplus_f32(a_logit) * ssm_a[vh];
             beta[t * nv + vh] = sigmoid_f32(beta_logit_cpu[t * nv + vh]);
         }
     }
