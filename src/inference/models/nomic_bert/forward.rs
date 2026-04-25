@@ -364,62 +364,30 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // kernel, passes the byte offset via `setBuffer:offset:atIndex:`.
     // The matmul kernel reads `out_features × in_features` from the
     // bound buffer and stays within the slice region.
-    // **Iter 79 bug discovery + workaround.** The original implementation
-    // used `MlxBuffer::slice_view(byte_offset, n_elements)` to expose
-    // Q/K/V sub-regions of the fused weight as separate "buffers" that
-    // the kernel would see at the right Metal offset. Cosine vs
-    // llama-embedding came in at **0.098** instead of the ≥ 0.999 gate.
-    // Bisection in iter 79:
-    //   - bge full-forward parity: 0.999985 ✓ → shared primitives are correct
-    //   - SwiGLU operand swap: 0.039 (worse) → operand order was already correct
-    //   - Skip RoPE: 0.094 (no change) → RoPE not the bug
-    //   - Replace slice_view with byte-copy: **0.999962** ✓ → bug is in slice_view
+    // **Iter 80 fix landed in mlx-native v0.4.3.** `MlxBuffer::slice_view`
+    // now propagates `byte_offset` through `KernelArg::Buffer` (encoder.rs:166
+    // changed `0` → `buf.byte_offset()`), making the documented contract of
+    // `slice_view` honored end-to-end through the matmul kernel. The fused
+    // QKV weight `[3*hidden, hidden]` (ggml shape `{ne0=in_features=hidden,
+    // ne1=out_features=3*hidden}`, out-dim contiguous-by-block) is sliced
+    // directly: Q at byte offset 0, K at `hidden·hidden·4`, V at
+    // `2·hidden·hidden·4`. Each slice exposes `[hidden, hidden]` weights
+    // for one logical projection — `bert_linear_gpu`'s internal cast +
+    // matmul reads them correctly.
     //
-    // **Root cause:** `mlx_native::encoder::apply_bindings` at line 166
-    // (mlx-native v0.4.2) binds `KernelArg::Buffer(buf)` with hardcoded
-    // `set_buffer(index, ..., 0)` — ignoring `MlxBuffer::byte_offset`.
-    // For a sliced view on the fused QKV weight, all three Q/K/V
-    // matmuls saw the SAME bytes (Q's region) → K and V projections
-    // collapsed onto Q's, gutting the attention. mlx-native callers
-    // that explicitly use `KernelArg::BufferWithOffset` (e.g., other
-    // code paths in the same file at lines 513/549/596/729) work
-    // correctly; the bug is specific to `KernelArg::Buffer` when
-    // combined with `slice_view`.
-    //
-    // **Workaround in this composer:** copy each Q/K/V weight region
-    // into its own fresh `[hidden, hidden]` buffer at offset 0, then
-    // pass that buffer (offset-0) to `bert_linear_gpu`. Costs an extra
-    // 3 × hidden × hidden × 4 bytes per layer per request (~7 MB at
-    // hidden=768; 84 MB total across 12 layers). Eliminated when
-    // mlx-native ships the upstream fix (iter 80+: encoder.rs:166
-    // changes `0` → `buf.byte_offset()`). Documented in ADR-005 iter 79.
+    // Iter 79 history: pre-fix this composer needed a 3 × hidden × hidden
+    // × 4 = 7 MB per-layer per-request copy workaround. v0.4.3 eliminates
+    // it; cosine parity vs llama-embedding stays ≥ 0.999.
     let weight_bytes_per_block = (hidden as usize) * (hidden as usize) * 4;
     let weight_elems_per_block = (hidden as usize) * (hidden as usize);
-
-    let make_block_copy =
-        |device: &MlxDevice, fused: &MlxBuffer, byte_off: usize| -> Result<MlxBuffer> {
-            let dst = device
-                .alloc_buffer(
-                    weight_bytes_per_block,
-                    DType::F32,
-                    vec![hidden as usize, hidden as usize],
-                )
-                .map_err(|e| anyhow!("alloc qkv slice copy: {e}"))?;
-            // SAFETY: just-allocated F32 buffer, exclusive access; src is
-            // an F32 buffer of length ≥ byte_off + weight_bytes_per_block.
-            let src_base: *const f32 = unsafe {
-                (fused.contents_ptr() as *const u8).add(byte_off) as *const f32
-            };
-            let dst_ptr: *mut f32 = dst.contents_ptr() as *mut f32;
-            unsafe {
-                std::ptr::copy_nonoverlapping(src_base, dst_ptr, weight_elems_per_block);
-            }
-            Ok(dst)
-        };
-
-    let q_w = make_block_copy(device, tensors.qkv_w, 0)?;
-    let k_w = make_block_copy(device, tensors.qkv_w, weight_bytes_per_block)?;
-    let v_w = make_block_copy(device, tensors.qkv_w, 2 * weight_bytes_per_block)?;
+    let q_w = tensors.qkv_w.slice_view(0, weight_elems_per_block);
+    let k_w = tensors
+        .qkv_w
+        .slice_view(weight_bytes_per_block as u64, weight_elems_per_block);
+    let v_w = tensors.qkv_w.slice_view(
+        (2 * weight_bytes_per_block) as u64,
+        weight_elems_per_block,
+    );
 
     // Optional bias also slices three ways (each is `[hidden]` of the
     // `[3*hidden]` fused bias). nomic-embed-text-v1.5 has none, but a

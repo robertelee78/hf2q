@@ -1930,6 +1930,31 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 80 — mlx-native fix landed upstream (v0.4.3); hf2q workaround removed. Cosine parity stays GREEN with the clean `slice_view` path: bge 0.999985, nomic-bert 0.999962. No more 84 MB-per-request copy overhead.**
+  - **Upstream fix (`/opt/mlx-native` commit `fed406d`).** Two binding paths in `encoder.rs` now propagate `MlxBuffer::byte_offset` for `KernelArg::Buffer`:
+    1. `apply_bindings` (line 166) — direct dispatch. `set_buffer(..., 0)` → `set_buffer(..., buf.byte_offset())`.
+    2. `record_arg_bindings` (line 397) — capture-mode replay. `offset: 0` → `offset: buf.byte_offset()`.
+    Other binding paths in the same file (lines 382, 513, 549, 596, 729) already used `buf.byte_offset()` correctly. The two outliers above were the bug. `KernelArg::BufferWithOffset` semantics unchanged — explicit offset still takes priority.
+  - **Regression test in mlx-native** (`tests/test_dense_mm_bf16.rs::slice_view_kernel_arg_buffer_propagates_byte_offset`):
+    - Allocates a 3-block fused weight `[3*N, K]` with distinct seeds per block.
+    - Slices the MIDDLE block via `slice_view(N*K*2, N*K)`.
+    - Runs `dense_matmul_bf16_f32_tensor` with the slice as src0.
+    - Asserts max_err vs CPU-reference-on-middle-block ≤ 1e-1.
+    - Sanity: max_err vs CPU-reference-on-block-0 > 0.2 (test must be discriminating).
+    Pre-fix this fails with max_err ≈ 1.0+; post-fix max_err is bf16 tolerance.
+  - **mlx-native version bump.** `0.4.2` → `0.4.3`. hf2q `Cargo.toml` updated; `.cargo/config.toml` `[patch.crates-io]` re-activated to point at `/opt/mlx-native` until v0.4.3 ships to crates.io.
+  - **Workaround removed.** `apply_nomic_bert_encoder_block_gpu` reverts to clean three-`slice_view` path (Q at offset 0, K at hidden·hidden·4, V at 2·hidden·hidden·4). Eliminates 3 × hidden × hidden × 4 = 7 MB per-layer per-request copy that iter 79 needed (84 MB at hidden=768 × 12 layers per request).
+  - **Verification.**
+    - mlx-native: 280+/283 tests pass; 3 pre-existing `test_quantized_matmul_id_ggml` failures are 1-ULP float drift unrelated to this fix.
+    - mlx-native new regression test: pass.
+    - hf2q: 77/77 BERT + nomic_bert tests pass.
+    - **Cosine parity preserved end-to-end:** bge 0.999985 (max_diff 7.95e-4), nomic-bert 0.999962 (max_diff 1.10e-3). Both gates run in CI by default (no `#[ignore]`).
+  - **Why this matters for the larger codebase.** `slice_view` is now a fully sound primitive for any future per-arch code that needs to expose sub-views of a fused tensor (qwen vision, LoRA adapters, partial weight quantization, etc.). The previous behavior was a silent footgun — `slice_view` on a buffer + `KernelArg::Buffer` would compile, run, and produce wrong results without any indication. Now the contract holds.
+  - **Lane discipline.** `/opt/mlx-native` (we own it) — `src/encoder.rs`, `tests/test_dense_mm_bf16.rs`, `Cargo.{toml,lock}`. `/opt/hf2q` — `.cargo/config.toml` (re-enable patch), `Cargo.toml` (version bump), `src/inference/models/nomic_bert/forward.rs` (revert workaround).
+  - **Phase 2b Task #16 status: CORRECTNESS LEG CLOSED + clean primitives.** What remains for Task #16:
+    - **Iter 81 (handler integration):** Phase 3 — extend `state.rs::EmbeddingModel` with arch dispatch (`Bert | NomicBert`); `cmd_serve` GGUF-arch sniff; handler routes through `apply_nomic_bert_full_forward_gpu` for nomic GGUFs. End-to-end test against `--embedding-model nomic-embed-text-v1.5-f16.gguf`.
+    - **Iter 82 (perf):** measure decode/encode wall-time vs `llama-embedding` on the same prompt. Target: parity or better. Per the user's directive — "best possible implementations, as fast as or faster than llama.cpp".
+
 - **2026-04-26 loop iter 79 — Task #16 cosine-parity gate GREEN at 0.999962 (was 0.098589). Bug isolated to `MlxBuffer::slice_view` + `KernelArg::Buffer` interaction in mlx-native v0.4.2; workaround landed in nomic_bert composer.**
   - **Bisection sequence (4 A/B steps; each one rules out a hypothesis).**
     1. **bge bisection-step-zero (BERT lane, llama-embedding parity).** Added `bge_full_forward_matches_llama_embedding_on_hello_world` in `bert_gpu.rs::tests` with the 384-float ground-truth vector embedded as a constant. Result: **cosine = 0.999985, max_abs_diff = 7.95e-4 ✓**. Conclusion: the shared primitives (`bert_linear_gpu`, `bert_layer_norm_gpu`, `bert_attention_with_mask_gpu`, `bert_pool_gpu`, `bert_l2_normalize_gpu`) are correct. The bug is **nomic-specific**.
