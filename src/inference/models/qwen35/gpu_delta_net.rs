@@ -60,7 +60,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
-use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
@@ -93,14 +93,20 @@ pub struct DeltaNetWeightsGpu {
     pub ssm_conv1d: MlxBuffer,
     /// Alpha logit projection `[nv, hidden_size]`.
     pub ssm_alpha: MlxBuffer,
-    /// Alpha time-step bias `[nv]`.
+    /// Alpha time-step bias `[nv]` — GPU buffer.
     pub ssm_dt_bias: MlxBuffer,
+    /// Alpha time-step bias `[nv]` — CPU copy, avoids GPU download on hot path.
+    pub ssm_dt_bias_cpu: Vec<f32>,
     /// Beta logit projection `[nv, hidden_size]`.
     pub ssm_beta: MlxBuffer,
-    /// Log-decay base `[nv]`.
+    /// Log-decay base `[nv]` — GPU buffer.
     pub ssm_a: MlxBuffer,
+    /// Log-decay base `[nv]` — CPU copy, avoids GPU download on hot path.
+    pub ssm_a_cpu: Vec<f32>,
     /// Output per-head RMSNorm `[nv*dv]`.
     pub ssm_norm: MlxBuffer,
+    /// Output per-head RMSNorm `[nv*dv]` — CPU copy for apply_ssm_norm_and_gate.
+    pub ssm_norm_cpu: Vec<f32>,
     /// Output projection `[hidden_size, nv*dv]`.
     pub ssm_out: MlxBuffer,
 }
@@ -130,9 +136,12 @@ impl DeltaNetWeightsGpu {
             ssm_conv1d: upload_f32(&conv1d_t, device)?,
             ssm_alpha: upload_f32(&weights.ssm_alpha, device)?,
             ssm_dt_bias: upload_f32(&weights.ssm_dt_bias, device)?,
+            ssm_dt_bias_cpu: weights.ssm_dt_bias.clone(),
             ssm_beta: upload_f32(&weights.ssm_beta, device)?,
             ssm_a: upload_f32(&weights.ssm_a, device)?,
+            ssm_a_cpu: weights.ssm_a.clone(),
             ssm_norm: upload_f32(&weights.ssm_norm, device)?,
+            ssm_norm_cpu: weights.ssm_norm.clone(),
             ssm_out: upload_f32(&weights.ssm_out, device)?,
         })
     }
@@ -584,28 +593,28 @@ pub fn apply_gated_delta_net(
 ///
 /// Gate: SiLU(x) = x / (1 + exp(-x)), matching llama.cpp build_norm_gated
 /// which calls `ggml_silu(ctx0, gate)`.
+///
+/// This variant accepts CPU slices directly, avoiding GPU downloads.
+/// Callers must ensure any pending GPU work for `attn_out_cpu` and `z_cpu`
+/// has already been committed and downloaded before calling this function.
 pub fn apply_ssm_norm_and_gate(
-    encoder: &mut mlx_native::CommandEncoder,
+    _encoder: &mut mlx_native::CommandEncoder,
     _registry: &mut KernelRegistry,
     device: &MlxDevice,
     attn_out: &MlxBuffer,
     z_flat: &MlxBuffer,
-    ssm_norm_w: &MlxBuffer,
+    ssm_norm_w_cpu: &[f32],  // CPU weight copy — no download needed
     seq_len: u32,
-    z_channels: u32,  // = n_v_heads * d_v (kept for API compatibility)
+    z_channels: u32,  // = n_v_heads * d_v
     eps: f32,
 ) -> Result<MlxBuffer> {
-    // We can't use dispatch_rms_norm here because ssm_norm_w has shape [dv],
-    // not [z_channels]. We need per-head normalization with weight broadcasting.
-    // Download to CPU and apply per-head.
-    encoder.commit_and_wait().context("commit before ssm_norm_gate")?;
-
+    // Download attn_out and z from GPU (results of prior GPU kernels).
+    // ssm_norm_w is a weight constant — passed as CPU slice to avoid a download.
     let attn_out_cpu = download_f32(attn_out).context("download attn_out ssm_norm")?;
     let z_cpu = download_f32(z_flat).context("download z ssm_norm")?;
-    let norm_w_cpu = download_f32(ssm_norm_w).context("download ssm_norm_w")?;
 
     let n_total = (seq_len * z_channels) as usize;
-    let dv = norm_w_cpu.len(); // actual D_v from the norm weight shape
+    let dv = ssm_norm_w_cpu.len(); // actual D_v from the norm weight shape
     // z_channels should be n_v_heads * dv, but we infer nv from the two:
     let nv = if dv > 0 { z_channels as usize / dv } else { 1 };
 
@@ -621,7 +630,7 @@ pub fn apply_ssm_norm_and_gate(
             let sum_sq: f32 = head_row.iter().map(|v| v * v).sum();
             let inv = ((sum_sq / (dv as f32)) + eps).sqrt().recip();
             for d in 0..dv {
-                let normed_val = head_row[d] * inv * norm_w_cpu[d];
+                let normed_val = head_row[d] * inv * ssm_norm_w_cpu[d];
                 let z_val = z_cpu[head_off + d];
                 // SiLU: x / (1 + exp(-x)) — matches llama.cpp ggml_silu
                 let z_silu = z_val / (1.0 + (-z_val).exp());
@@ -740,23 +749,30 @@ pub fn build_delta_net_layer(
     let k_gpu = upload_f32(&k_cpu, device)?;
     let v_gpu = upload_f32(&v_cpu, device)?;
 
-    // ---- Op 5q: per-head L2 norm on Q (must commit before CPU Q-scale) ----
+    // ---- Op 5q: per-head L2 norm on Q + scalar scale (GPU, no CPU round-trip) ----
+    // llama.cpp delta-net-base.cpp applies scale = 1/sqrt(D_k) after L2 norm on Q.
+    // We chain L2-norm → scalar_mul_f32 in one encoder + one commit.
     let q_normed = {
-        let mut enc = device.command_encoder().context("enc op5q")?;
+        let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+        let q_scale = 1.0_f32 / (dk as f32).sqrt();
+        let q_scaled = device
+            .alloc_buffer(n_q_elems * 4, DType::F32, vec![n_q_elems])
+            .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
+
+        let mut enc = device.command_encoder().context("enc op5q+scale")?;
         let q_l2 = apply_l2_norm_per_head(
             &mut enc, registry, device, &q_gpu,
             seq_len, n_k_heads, d_k, rms_norm_eps,
         )?;
-        enc.commit_and_wait().context("commit op5q")?;
-
-        // Q scaling: multiply by 1/sqrt(D_k) after L2 norm.
-        // llama.cpp delta-net-base.cpp applies this scale after the L2 norm on Q.
-        let q_scale = 1.0_f32 / (dk as f32).sqrt();
-        let mut q_scaled_cpu = download_f32(&q_l2)?;
-        for v in q_scaled_cpu.iter_mut() {
-            *v *= q_scale;
-        }
-        upload_f32(&q_scaled_cpu, device)?
+        // Barrier: scalar_mul reads q_l2 written by L2-norm above.
+        enc.memory_barrier();
+        scalar_mul_f32(
+            &mut enc, registry, device.metal_device(),
+            &q_l2, &q_scaled, n_q_elems, q_scale,
+        )
+        .context("scalar_mul_f32 q_scale")?;
+        enc.commit_and_wait().context("commit op5q+scale")?;
+        q_scaled
     };
 
     // ---- Ops 5k + 6a + 6b: K L2-norm, alpha proj, beta proj ----
@@ -782,12 +798,11 @@ pub fn build_delta_net_layer(
     };
 
     // ---- Op 6c: compute g and beta on CPU ----
+    // dt_bias and ssm_a are weight constants; use CPU copies to avoid GPU downloads.
     let alpha_logit_cpu = download_f32(&alpha_logit_buf)?;
     let beta_logit_cpu = download_f32(&beta_logit_buf)?;
-    let dt_bias_cpu = download_f32(&weights.ssm_dt_bias)?;
-    let ssm_a_cpu = download_f32(&weights.ssm_a)?;
     let (g_cpu, beta_cpu) = compute_g_and_beta_cpu(
-        &alpha_logit_cpu, &beta_logit_cpu, &dt_bias_cpu, &ssm_a_cpu,
+        &alpha_logit_cpu, &beta_logit_cpu, &weights.ssm_dt_bias_cpu, &weights.ssm_a_cpu,
         seq, nv,
     );
 
@@ -806,23 +821,23 @@ pub fn build_delta_net_layer(
     // output is [D_v, n_v_heads, n_tokens, n_seqs] col-major = [n_tokens, n_v_heads, d_v]
     // for n_seqs=1 when d_v is innermost. This matches our attn_out allocation shape.
 
-    // ---- Op 8: output RMSNorm + sigmoid(Z) gate ----
-    // Reshape attn_out to [seq * z_channels] — it already has that count.
-    let mut enc = device.command_encoder().context("enc op8")?;
+    // ---- Op 8: output RMSNorm + sigmoid(Z) gate (CPU bridge) ----
+    // apply_ssm_norm_and_gate downloads attn_out and z from GPU, applies
+    // per-head RMSNorm using the cached CPU weight, then re-uploads.
+    // ssm_norm_cpu avoids one GPU download compared to using ssm_norm (MlxBuffer).
+    let mut enc = device.command_encoder().context("enc op8-9")?;
     let gated = apply_ssm_norm_and_gate(
         &mut enc, registry, device, &attn_out, &z,
-        &weights.ssm_norm,
+        &weights.ssm_norm_cpu,
         seq_len, z_channels, rms_norm_eps,
     )?;
-    // apply_ssm_norm_and_gate does its own commit_and_wait internally.
 
-    // ---- Op 9: output projection ----
-    let mut enc = device.command_encoder().context("enc op9")?;
+    // ---- Op 9: output projection (shared encoder with op 8 upload) ----
     let output = apply_proj(
         &mut enc, registry, device, &gated,
         &weights.ssm_out, seq_len, z_channels, hidden_size,
     )?;
-    enc.commit_and_wait().context("commit op9")?;
+    enc.commit_and_wait().context("commit op8-9")?;
 
     Ok((output, new_conv_state, new_recurrent_state))
 }

@@ -66,6 +66,7 @@ use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F3
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::quantized_matmul_id_ggml::{quantized_matmul_id_ggml, GgmlQuantizedMatmulIdParams};
+use mlx_native::ops::silu_mul::silu_mul_gpu;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
@@ -302,6 +303,9 @@ fn proj(
         CastDirection::F32ToBF16,
     )
     .context("cast weight F32→BF16")?;
+
+    // barrier: matmul reads weight_bf16 written by the cast above
+    encoder.memory_barrier();
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -735,10 +739,18 @@ pub fn build_moe_ffn_layer_gpu_q(
     let m_moe32 = shape.moe_intermediate_size;
     let m_sh32 = shape.shared_intermediate_size;
 
-    // ---- Step 1: router logits = router(x)  [seq, num_experts] ----
-    let mut enc = device.command_encoder().context("enc moe_q router")?;
-    let logits_buf = proj(&mut enc, registry, device, x, &weights.router, seq_len, h32, ne32)?;
-    enc.commit_and_wait().context("commit moe_q router")?;
+    // ---- Steps 1+4+6+7: router + shared expert projections — all read from x ----
+    // Batch all four projections into one encoder + one commit.
+    // CPU step 2 (softmax + top-k) and step 5 (sigmoid) proceed after download.
+    let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
+        let mut enc = device.command_encoder().context("enc router+shared")?;
+        let logits_buf    = proj(&mut enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
+        let sh_logit_buf  = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf       = proj(&mut enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
+        let b_s_buf       = proj(&mut enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
+        enc.commit_and_wait().context("commit router+shared")?;
+        (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
+    };
 
     // ---- Step 2: softmax + top-k + renorm  [CPU] ----
     let logits_cpu = download_f32(&logits_buf).context("download router logits")?;
@@ -752,7 +764,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     let ids_buf = upload_u32(&topk_idx, device).context("upload ids")?;
 
     // ---- Steps 3a+3b: gate_all and up_all via quantized MoE dispatch ----
-    // Both reads from `x` (already on GPU) and produce independent output
+    // Both read from `x` (already on GPU) and produce independent output
     // buffers. Collapse into one encoder + one commit.
     let gate_all_bytes = total_rows * m_moe * 4;
     let mut gate_all_buf = device
@@ -799,6 +811,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     let gate_all_cpu = download_f32(&gate_all_buf).context("download gate_all")?;
     let up_all_cpu = download_f32(&up_all_buf).context("download up_all")?;
     let h_all_cpu = silu_mul_cpu(&gate_all_cpu, &up_all_cpu);
+    let h_all_buf = upload_f32(&h_all_cpu, device).context("upload h_all")?;
 
     // ---- Step 3d: y_all = qmatmul_id(h_all, expert_down_q, arange_ids) ----
     // h_all is [n_tokens * top_k, moe_intermediate] — one row per (token, slot).
@@ -810,7 +823,6 @@ pub fn build_moe_ffn_layer_gpu_q(
     // We need y[t*topk+s] = expert_down[topk_idx[t*topk+s]] @ h_all[t*topk+s].
     // This is exactly what qmatmul_id does with n_tokens=total_rows, top_k=1,
     // ids = topk_idx (same buffer, one-to-one mapping).
-    let h_all_buf = upload_f32(&h_all_cpu, device).context("upload h_all")?;
     let y_all_bytes = total_rows * h * 4;
     let mut y_all_buf = device
         .alloc_buffer(y_all_bytes, DType::F32, vec![total_rows, h])
@@ -847,18 +859,7 @@ pub fn build_moe_ffn_layer_gpu_q(
         }
     }
 
-    // ---- Shared expert: sigmoid-gated SwiGLU (F32, unchanged) ----
-    // Steps 4+6+7: sh_logit, shared_gate_proj, shared_up_proj all read from x.
-    // Collapse into one encoder + one commit before any CPU downloads.
-    let (sh_logit_buf, a_s_buf, b_s_buf) = {
-        let mut enc = device.command_encoder().context("enc sh_logit+gate+up")?;
-        let sh_logit_buf = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-        let a_s_buf = proj(&mut enc, registry, device, x, &weights.shared_gate, seq_len, h32, m_sh32)?;
-        let b_s_buf = proj(&mut enc, registry, device, x, &weights.shared_up, seq_len, h32, m_sh32)?;
-        enc.commit_and_wait().context("commit sh_logit+gate+up")?;
-        (sh_logit_buf, a_s_buf, b_s_buf)
-    };
-
+    // ---- Shared expert: sigmoid-gated SwiGLU ----
     // Step 5: sh_gate_val = sigmoid(sh_logit)  [CPU]
     let sh_logit_cpu = download_f32(&sh_logit_buf).context("download sh_logit")?;
     let sh_gate_vals: Vec<f32> = sh_logit_cpu
