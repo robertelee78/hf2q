@@ -73,6 +73,17 @@ fn smoke_unknown_arch_bogus_returns_uniform_error() {
         .expect("exec hf2q");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "stderr={}", stderr);
+    // Decision 16 §preflight exit code 7 = EXIT_UNKNOWN_ARCH. After
+    // commit 14700c3's AppError::Smoke variant, the smoke-specific
+    // code now propagates to the OS process exit instead of being
+    // collapsed to AppError::Conversion=1. Anchor the propagation
+    // against future regression.
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "EXIT_UNKNOWN_ARCH (code 7) must propagate to process exit; got {:?}",
+        out.status.code()
+    );
     assert!(
         stderr.contains("unknown arch"),
         "expected 'unknown arch' in stderr, got: {}",
