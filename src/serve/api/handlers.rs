@@ -29,8 +29,9 @@ use super::engine::{self, SamplingParams};
 use super::grammar;
 use super::schema::{
     ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
-    ReadyzResponse, ResponseFormat, UsageStats,
+    EmbeddingObject, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, HealthResponse,
+    MessageContent, ModelListResponse, ModelObject, PromptTokensDetails, ReadyzResponse,
+    ResponseFormat, UsageStats,
 };
 use super::state::AppState;
 
@@ -1049,6 +1050,195 @@ fn chrono_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/embeddings  (Phase 2b — BERT-family embedding model)
+// ---------------------------------------------------------------------------
+
+/// Minimum sequence length for the BERT attention path (post-softmax
+/// `scores @ V` matmul has K = seq_len, and the BF16 tensor matmul
+/// kernel rejects K < 32). Tokenized inputs shorter than this are
+/// right-padded with the `[PAD]` token to reach exactly 32 tokens.
+///
+/// Mean-pool with [PAD] padding introduces a small bias proportional to
+/// `(pad_count / seq_len)`. CLS pooling (the default for sentence-
+/// embedding BERTs) is unaffected because position 0 always carries
+/// the real `[CLS]` token. A future iter (proper attention masking)
+/// removes the bias for Mean-pool models on short inputs.
+const BERT_MIN_SEQ_LEN: usize = 32;
+
+/// Handler for `POST /v1/embeddings`. Tokenizes each input string,
+/// runs the full BERT forward pass on GPU, and returns OpenAI-shaped
+/// `{object: "list", data: [{object: "embedding", embedding, index}],
+/// model, usage}`.
+///
+/// Failure modes:
+///   - No `--embedding-model` was supplied at startup → 503
+///     `model_not_loaded` naming the requested id.
+///   - `req.model` doesn't match the loaded embedding model id → 400
+///     `model_not_loaded`.
+///   - `encoding_format = "base64"` → 400 `invalid_request_error`
+///     (only `"float"` is supported today).
+///   - Tokenization or forward-pass error → 500 `generation_error`.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    // --- Validate the embedding model is loaded ---
+    let em = match state.embedding_config.as_ref() {
+        Some(em) => em.clone(),
+        None => {
+            return ApiError::model_not_loaded(&req.model).into_response();
+        }
+    };
+    if req.model != em.model_id {
+        return ApiError::model_not_loaded(&req.model).into_response();
+    }
+    let weights = match em.weights.as_ref() {
+        Some(w) => w.clone(),
+        None => {
+            return ApiError::generation_error(
+                "embedding model has no loaded weights (server startup did not eagerly load)"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    // --- Validate request format ---
+    if let Some(fmt) = req.encoding_format.as_deref() {
+        if fmt != "float" {
+            return ApiError::invalid_request(
+                format!("encoding_format='{fmt}' not supported (only 'float')"),
+                Some("encoding_format".into()),
+            )
+            .into_response();
+        }
+    }
+    let inputs = req.input.into_vec();
+    if inputs.is_empty() {
+        return ApiError::invalid_request(
+            "input must be a non-empty string or array of strings".to_string(),
+            Some("input".into()),
+        )
+        .into_response();
+    }
+
+    // --- Run the forward pass per input ---
+    // The blocking GPU dispatch runs inside spawn_blocking so the tokio
+    // runtime is not held up while the per-input forward (~ms-scale)
+    // executes. Each input gets its own GraphSession + KernelRegistry —
+    // amortizing kernel-compile across requests is iter-63's perf work.
+    let cfg = em.config.clone();
+    let model_id = em.model_id.clone();
+    let tokenizer = em.tokenizer.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EmbeddingResponse> {
+        use crate::inference::models::bert::bert_gpu::{
+            apply_bert_full_forward_gpu, register_bert_custom_shaders,
+        };
+        use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
+
+        // Per-call device handle. The underlying Metal device is shared
+        // with the eager-loaded weights (Apple Silicon: same hardware
+        // visible through every MlxDevice handle).
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding forward: {e}"))?;
+        let executor = GraphExecutor::new(device);
+
+        let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
+        let mut total_tokens: usize = 0;
+
+        for (i, input) in inputs.into_iter().enumerate() {
+            // Tokenize.
+            let enc = tokenizer
+                .encode(input.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            let raw_ids = enc.get_ids();
+            total_tokens += raw_ids.len();
+
+            // Pad / truncate to satisfy the matmul K floor (32) and the
+            // model's max position embedding cap.
+            let mut ids: Vec<u32> = raw_ids.to_vec();
+            if ids.len() < BERT_MIN_SEQ_LEN {
+                ids.resize(BERT_MIN_SEQ_LEN, 0u32);
+            }
+            if ids.len() > cfg.max_position_embeddings {
+                ids.truncate(cfg.max_position_embeddings);
+            }
+            let seq_len = ids.len() as u32;
+
+            // Upload ids to the device (per-request — small buffers).
+            let device_ref: *const MlxDevice = executor.device() as *const _;
+            // SAFETY: executor outlives this closure scope.
+            let device: &MlxDevice = unsafe { &*device_ref };
+            let ids_buf = device
+                .alloc_buffer(
+                    ids.len() * 4,
+                    mlx_native::DType::U32,
+                    vec![ids.len()],
+                )
+                .map_err(|e| anyhow::anyhow!("alloc ids buf: {e}"))?;
+            // SAFETY: just-allocated u32 buffer; exclusive access.
+            let s: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(ids_buf.contents_ptr() as *mut u32, ids.len())
+            };
+            s.copy_from_slice(&ids);
+
+            // Dispatch the forward pass.
+            let mut session = executor
+                .begin()
+                .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
+            let mut registry = KernelRegistry::new();
+            register_bert_custom_shaders(&mut registry);
+            let out = apply_bert_full_forward_gpu(
+                session.encoder_mut(),
+                &mut registry,
+                device,
+                &ids_buf,
+                None, // type_ids: single-segment input
+                &weights,
+                &cfg,
+                seq_len,
+            )?;
+            session
+                .finish()
+                .map_err(|e| anyhow::anyhow!("session finish: {e}"))?;
+
+            // Read back the [hidden] vector.
+            let slice = out
+                .as_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("readback: {e}"))?;
+            let embedding = slice.to_vec();
+
+            data.push(EmbeddingObject {
+                object: "embedding",
+                embedding,
+                index: i,
+            });
+        }
+
+        Ok(EmbeddingResponse {
+            object: "list",
+            data,
+            model: model_id,
+            usage: EmbeddingUsage {
+                prompt_tokens: total_tokens,
+                total_tokens,
+            },
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(e)) => ApiError::generation_error(format!("embedding forward: {e}")).into_response(),
+        Err(join_err) => {
+            ApiError::generation_error(format!("embedding worker panicked: {join_err}"))
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

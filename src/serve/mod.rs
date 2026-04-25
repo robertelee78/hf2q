@@ -575,13 +575,24 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "embedding-model".into());
+        // Validate the tensor manifest before the multi-MB load so the
+        // operator gets a specific missing-tensor list rather than a
+        // generic mid-load failure.
+        crate::inference::models::bert::weights::validate_tensor_set(&gguf, &emb_config)
+            .map_err(|e| anyhow::anyhow!("Embedding GGUF tensor validation: {e}"))?;
+        let device = mlx_native::MlxDevice::new()
+            .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding load: {e}"))?;
+        let weights =
+            crate::inference::models::bert::weights::LoadedBertWeights::load(&gguf, &emb_config, device)
+                .map_err(|e| anyhow::anyhow!("Embedding weights load failed: {e}"))?;
         tracing::info!(
             path = %emb_path.display(),
             hidden = emb_config.hidden_size,
             layers = emb_config.num_hidden_layers,
             pooling = ?emb_config.pooling_type,
             vocab_size = vocab.len(),
-            "Validated embedding GGUF header + tokenizer"
+            tensor_count = weights.len(),
+            "Validated embedding GGUF + loaded weights onto device"
         );
         Some(api::state::EmbeddingModel {
             gguf_path: emb_path.clone(),
@@ -589,6 +600,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             vocab: std::sync::Arc::new(vocab),
             tokenizer: std::sync::Arc::new(tokenizer),
             model_id,
+            weights: Some(std::sync::Arc::new(weights)),
         })
     } else {
         None

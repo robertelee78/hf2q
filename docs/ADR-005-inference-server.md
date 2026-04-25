@@ -1930,6 +1930,28 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 62 — Phase 2b `/v1/embeddings` handler wired up — endpoint accepts OpenAI-shaped requests + dispatches the GPU forward pass per input.**
+  - **What landed.**
+    - `EmbeddingModel.weights: Option<Arc<LoadedBertWeights>>` — new field on `src/serve/api/state.rs::EmbeddingModel`. Eager-loaded at server startup so first-request latency excludes the multi-MB load. `Option` because `#[cfg(test)]` paths construct an `EmbeddingModel` without a device buffer.
+    - `serve::cmd_serve` now also: validates the BERT GGUF tensor manifest (via `validate_tensor_set` from iter 55) before the load, builds an `MlxDevice`, calls `LoadedBertWeights::load`, wraps in `Arc`. Fail-fast: a missing required tensor surfaces by name *before* the multi-MB allocation.
+    - `/v1/embeddings` POST route added to `src/serve/api/router.rs` alongside `/v1/chat/completions`.
+    - `pub async fn embeddings(...)` in `src/serve/api/handlers.rs` (~150 LOC):
+      1. Validates `state.embedding_config` is `Some` (else 400 `model_not_loaded`).
+      2. Validates `req.model == em.model_id` (else 400 `model_not_loaded`).
+      3. Validates `weights` is `Some` (else 500 `generation_error`).
+      4. Validates `encoding_format` is missing or `"float"` (else 400 `invalid_request_error` naming `encoding_format`).
+      5. Validates `input` non-empty (else 400 with `param: "input"`).
+      6. Inside `tokio::task::spawn_blocking` (so the GPU dispatch doesn't stall the tokio runtime): for each input string, tokenize → pad to `max(BERT_MIN_SEQ_LEN=32, tokenized_len)` (matmul K floor) → truncate to `cfg.max_position_embeddings` → upload IDs → `apply_bert_full_forward_gpu` → readback `[hidden]` F32 vector.
+      7. Returns OpenAI-shaped `{object: "list", data: [{object: "embedding", embedding, index}], model, usage: {prompt_tokens, total_tokens}}`.
+    - **`BERT_MIN_SEQ_LEN = 32`** documented as a per-handler constant — surfaces the matmul K floor at the boundary where padding is applied. Mean-pool with `[PAD]=0` introduces a small bias proportional to `(pad_count / seq_len)`; CLS pool (default for sentence-embedding BERTs) is unaffected because position 0 carries the real `[CLS]` token. A future iter will add proper attention masking to remove the Mean-pool bias on short inputs.
+  - **Tests (2 new, all pass; full suite 970/970 +2):**
+    - `embeddings_route_returns_400_when_no_embedding_model_loaded` — POST without `--embedding-model` configured returns 400 with `error.type = "invalid_request_error"` and `error.code = "model_not_loaded"` (the OpenAI 400-on-config-issue shape).
+    - `embeddings_route_rejects_malformed_json_with_4xx` — JSON parse failure returns 4xx (axum's default extractor rejection).
+    - The 200-happy-path test would need a real BERT GGUF on disk; that lands in iter 63 (accuracy gate vs `llama-embedding`).
+  - **Verification.** `cargo test --bin hf2q embeddings_route` — 2/2 pass. Full suite **970/970 pass** (+2 from iter 61's 968), 8 ignored. `cargo check --bin hf2q` clean.
+  - **Lane discipline observed.** Edits in `src/serve/api/{handlers,router,state}.rs`, `src/serve/mod.rs::cmd_serve` (the embedding-model boot block), and `docs/ADR-005-inference-server.md`. No edits to other lanes. The chat-model lane and the BERT compute lane (`src/inference/models/bert/**`) are untouched.
+  - **Next (iter 63):** Phase 2b accuracy gate — download `bge-small-en-v1.5.gguf` (~30MB), run hf2q's `/v1/embeddings` against it on a canonical prompt set, run `llama-embedding` from `/opt/llama.cpp` on the same set, and assert cosine similarity ≥ 0.999 between hf2q and llama.cpp output (the parity bar Phase 2b's accuracy criterion specifies). If the gate passes, Phase 2b closes. If it doesn't, the diff localizes which sub-primitive (most likely the BF16-cast linear or attention) needs a tighter implementation — same iter-50 BF16-saturated-softmax characterization methodology.
+
 - **2026-04-26 loop iter 61 — Phase 2b BERT full forward composer (`apply_bert_full_forward_gpu`) — embed → N×encoder block → pool → L2 normalize, end-to-end on GPU.**
   - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
     - `apply_bert_full_forward_gpu(input_ids, type_ids_opt, weights: &LoadedBertWeights, cfg: &BertConfig, seq_len)` — single-call BERT inference. Composes:

@@ -203,6 +203,15 @@ pub struct EmbeddingModel {
     pub tokenizer: Arc<tokenizers::Tokenizer>,
     /// Model id (file stem) — surfaced via `/v1/models`.
     pub model_id: String,
+    /// All BERT tensors loaded onto a Metal device as F32. `Arc` so each
+    /// `/v1/embeddings` request clones a cheap reference and dispatches
+    /// the forward pass against the same on-device buffers. Loaded
+    /// eagerly at server startup so first-request latency excludes the
+    /// load cost. `None` when the eager-load path was skipped (test
+    /// scaffolding only — the production path always populates this).
+    pub weights: Option<
+        Arc<crate::inference::models::bert::weights::LoadedBertWeights>,
+    >,
 }
 
 impl std::fmt::Debug for EmbeddingModel {
@@ -412,6 +421,7 @@ mod tests {
             vocab: Arc::new(vocab),
             tokenizer: Arc::new(tokenizer),
             model_id: "synthetic-embed".into(),
+            weights: None,
         };
         let ids = em.encode("hello world").expect("encode");
         assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
