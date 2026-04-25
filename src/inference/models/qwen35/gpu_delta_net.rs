@@ -714,8 +714,10 @@ pub fn apply_ssm_norm_and_gate(
 ///
 /// # State management
 ///
-/// `old_conv_state` is read (CPU layout) and the function writes the new
-/// conv state into the returned `Vec<f32>`.
+/// `conv_state_in` / `conv_state_out`: GPU-resident ping-pong buffers in
+/// `[conv_channels, K-1, n_seqs]` layout (kernel native).  The ssm_conv kernel
+/// reads from `conv_state_in` and writes the updated state to `conv_state_out`.
+/// Caller swaps them (O(1) pointer swap) after each decode step.
 ///
 /// `state_in` is the current recurrent state (read-only).
 /// `state_out` is the destination for the updated recurrent state (write-only).
@@ -724,21 +726,21 @@ pub fn apply_ssm_norm_and_gate(
 /// for swapping `state_in` / `state_out` between decode steps to implement a
 /// zero-copy ping-pong, avoiding the prior 2 MB/layer CPU memcpy scheme.
 ///
-/// `old_conv_state` is `[K-1, qkv_channels]` F32 (CPU layout).
 /// `state_in`/`state_out` are `[d_k * d_v * n_v_heads]` F32 (kernel layout).
 ///
 /// # Returns
 ///
-/// `(output, new_conv_state)`.
+/// `output`: `[seq_len, hidden_size]` F32.
 #[allow(clippy::too_many_arguments)]
 pub fn build_delta_net_layer(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     x: &MlxBuffer,
     weights: &DeltaNetWeightsGpu,
-    old_conv_state: &[f32],  // [K-1, qkv_channels] CPU layout
-    state_in: &MlxBuffer,    // current recurrent state (read-only)
-    state_out: &MlxBuffer,   // next recurrent state (write-only, must != state_in)
+    conv_state_in: &MlxBuffer,  // [conv_channels, K-1] GPU ping-pong (read)
+    conv_state_out: &MlxBuffer, // [conv_channels, K-1] GPU ping-pong (write)
+    state_in: &MlxBuffer,       // current recurrent state (read-only)
+    state_out: &MlxBuffer,      // next recurrent state (write-only, must != state_in)
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -747,14 +749,14 @@ pub fn build_delta_net_layer(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
-) -> Result<(MlxBuffer, Vec<f32>)> {
+) -> Result<MlxBuffer> {
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
     let q_span = n_k_heads * d_k;
     let k_span = n_k_heads * d_k;
 
-    let km1 = (k_width - 1) as usize;
-    let channels = qkv_channels as usize;
+    let _km1 = (k_width - 1) as usize;
+    let _channels = qkv_channels as usize;
     let seq = seq_len as usize;
     let nk = n_k_heads as usize;
     let nv = n_v_heads as usize;
@@ -772,10 +774,24 @@ pub fn build_delta_net_layer(
     let n_seqs = 1u32;
     let out_elems = (n_v_heads * seq_len * d_v) as usize;
 
-    // Pre-allocate all intermediate buffers (must outlive the encoder).
-    let (ssm_old_state_buf, ssm_new_state_buf, qkv_conv, ssm_params_buf, ssm_conv_params) =
-        prepare_ssm_conv_buffers(device, old_conv_state, seq_len, qkv_channels, k_width)
-            .context("prepare_ssm_conv_buffers")?;
+    // Pre-allocate ssm_conv output (qkv_conv) and params buffers.
+    // conv_state_in/conv_state_out are passed directly from the kv_cache
+    // (GPU ping-pong buffers in kernel-native layout) — no upload/download needed.
+    let qkv_conv = device
+        .alloc_buffer(
+            (seq_len * qkv_channels) as usize * 4,
+            DType::F32,
+            vec![seq as usize, qkv_ch],
+        )
+        .map_err(|e| anyhow!("alloc qkv_conv: {e}"))?;
+    let mut ssm_params_buf = device
+        .alloc_buffer(4 * 4, DType::U32, vec![4])
+        .map_err(|e| anyhow!("alloc ssm params: {e}"))?;
+    {
+        let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = qkv_channels; s[1] = seq_len; s[2] = 1; s[3] = k_width;
+    }
+    let ssm_conv_params = SsmConvParams { channels: qkv_channels, n_tokens: seq_len, n_seqs: 1, k_width };
     let q_scaled = device.alloc_buffer(n_q_elems * 4, DType::F32, vec![n_q_elems])
         .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
     let g_buf = device.alloc_buffer(g_n * 4, DType::F32, vec![g_n])
@@ -803,13 +819,17 @@ pub fn build_delta_net_layer(
     let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
         .map_err(|e| anyhow!("build gdn params: {e}"))?;
 
-    let (output, new_conv_state) = if seq == 1 {
+    let output = if seq == 1 {
         // ---- DECODE PATH (seq=1): single encoder for ALL ops 1-9 ----
         //
-        // For single-token decode we can fuse ops1-3 and ops5-9 into ONE
-        // command buffer, eliminating 1 commit_and_wait per delta-net layer.
-        // The seq=1 Q/K/V split is zero-copy (slice_view = CPU-side pointer
-        // arithmetic), so there is no CPU work between ops3 and ops5.
+        // conv_state_in/conv_state_out are GPU-resident ping-pong buffers
+        // in [channels, K-1] layout (kernel native).  The ssm_conv kernel
+        // reads conv_state_in and writes conv_state_out directly — no CPU
+        // transpose, no upload/download, no CPU wait for conv state extraction.
+        //
+        // All 9 ops fit in ONE command buffer (same as the original pre-split
+        // design), restored now that the CPU round-trip is gone.  commit()
+        // without wait pipelines into the next layer's fused_residual_norm.
         //
         // Barrier order:
         //   op1 → BARRIER → ops2a+2b+2c → BARRIER → op3 (ssm_conv)
@@ -818,14 +838,8 @@ pub fn build_delta_net_layer(
         //   → BARRIER → op7 (GDN)
         //   → BARRIER → op8 (ssm_norm_gate)
         //   → BARRIER → op9 (out_proj)
-        //
-        // The new conv state (ssm_new_state_buf) is extracted CPU-side after
-        // the commit since it's on unified memory (zero-copy read).
 
         // Pre-create slice views into qkv_conv (CPU-side only, no GPU op).
-        // These read offsets into qkv_conv which will be written by ssm_conv
-        // (op3); the BARRIER after op3 ensures they're ready when the l2_norm
-        // dispatches read them.
         let q_gpu = qkv_conv.slice_view(0,                           q_sp);
         let k_gpu = qkv_conv.slice_view((q_sp * 4) as u64,          k_sp);
         let v_gpu = qkv_conv.slice_view(((q_sp + k_sp) * 4) as u64, nv * dv);
@@ -847,10 +861,10 @@ pub fn build_delta_net_layer(
             &weights.attn_gate, seq_len, hidden_size, z_channels,
         )?;
         enc.memory_barrier();
-        // Op 3: ssm_conv (reads qkv_raw, writes qkv_conv)
+        // Op 3: ssm_conv — reads conv_state_in (GPU ping-pong), writes qkv_conv + conv_state_out.
         dispatch_ssm_conv(
             &mut enc, registry, device.metal_device(),
-            &qkv_raw, &weights.ssm_conv1d, &ssm_old_state_buf, &ssm_new_state_buf,
+            &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
             &qkv_conv, &ssm_params_buf, ssm_conv_params,
         ).context("dispatch_ssm_conv ops3")?;
         enc.memory_barrier();
@@ -904,13 +918,11 @@ pub fn build_delta_net_layer(
             &mut enc, registry, device, &gated_buf,
             &weights.ssm_out, seq_len, z_channels, hidden_size,
         )?;
-        enc.commit_and_wait().context("commit ops1-9 decode")?;
-
-        // Extract new conv state after commit (unified memory → zero-copy).
-        let new_conv_state = extract_new_conv_state(&ssm_new_state_buf, km1, channels)
-            .context("extract_new_conv_state")?;
-        // state_out now holds the updated recurrent state (caller swaps ping-pong).
-        (output, new_conv_state)
+        // commit() without wait: output is fed into fused_residual_norm
+        // on the same Metal serial queue; GPU ordering is guaranteed.
+        // state_out/conv_state_out hold the updated states; caller swaps ping-pong.
+        enc.commit();
+        output
     } else {
         // ---- PREFILL PATH (seq>1): two encoders — CPU de-interleave between ----
         //
@@ -935,15 +947,13 @@ pub fn build_delta_net_layer(
             enc.memory_barrier();
             dispatch_ssm_conv(
                 &mut enc, registry, device.metal_device(),
-                &qkv_raw, &weights.ssm_conv1d, &ssm_old_state_buf, &ssm_new_state_buf,
+                &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
                 &qkv_conv, &ssm_params_buf, ssm_conv_params,
             ).context("dispatch_ssm_conv ops3 prefill")?;
             enc.commit_and_wait().context("commit ops1-3 prefill")?;
             (x_norm, qkv_conv, z)
         };
-
-        let new_conv_state = extract_new_conv_state(&ssm_new_state_buf, km1, channels)
-            .context("extract_new_conv_state")?;
+        // conv_state_out now holds the updated conv state (caller swaps ping-pong).
 
         // Download and de-interleave.
         let qkv_conv_cpu = download_f32(&qkv_conv_out)?;
@@ -1013,11 +1023,11 @@ pub fn build_delta_net_layer(
             enc.commit_and_wait().context("commit ops5-9 prefill")?;
             output
         };
-        // state_out now holds updated recurrent state (caller swaps ping-pong).
-        (output, new_conv_state)
+        // state_out/conv_state_out now hold updated states (caller swaps ping-pong).
+        output
     };
 
-    Ok((output, new_conv_state))
+    Ok(output)
 }
 
 // ================================================================

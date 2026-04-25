@@ -15,8 +15,9 @@
 //!     ├─ v: MlxBuffer [head_dim, n_kv, max_seq_len, n_seqs]  f32
 //!     └─ current_len:  Vec<u32>        one per seq
 //!   linear_attn: Vec<LinearAttnStateSlot>  len = # linear-attention layers
-//!     ├─ conv_state: MlxBuffer [K-1, conv_channels, n_seqs]      f32
-//!     └─ recurrent:  MlxBuffer [D_k, D_v, num_v_heads, n_seqs]   f32
+//!     ├─ conv_state:         MlxBuffer [conv_channels, K-1, n_seqs] f32 (kernel native)
+//!     ├─ conv_state_scratch: MlxBuffer [conv_channels, K-1, n_seqs] f32 (ping-pong)
+//!     └─ recurrent:          MlxBuffer [D_k, D_v, num_v_heads, n_seqs] f32
 //! ```
 //!
 //! # Per-layer ordering
@@ -58,9 +59,17 @@ pub struct FullAttnKvSlot {
 
 /// Per-linear-attention-layer SSM state + conv ring buffer.
 pub struct LinearAttnStateSlot {
-    /// DeltaNet conv1d ring buffer: `[K-1, conv_channels, n_seqs]` f32.
-    /// Holds the last (K-1) tokens' conv inputs, per sequence.
+    /// DeltaNet conv1d ring buffer (active read buffer): `[conv_channels, K-1, n_seqs]` f32.
+    ///
+    /// Layout matches the ssm_conv kernel's expected `state[i, c, s]` at offset
+    /// `s * (K-1) * channels + c * (K-1) + i`, i.e. channels-major with K-1 stride 1.
+    /// Ping-pong semantics: `conv_state` is the active (read) buffer.
+    /// `conv_state_scratch` is the inactive (write) buffer.  After each decode
+    /// step the caller swaps via [`LinearAttnStateSlot::swap_conv_state`].
     pub conv_state: MlxBuffer,
+    /// DeltaNet conv1d ring buffer (scratch, write target for ssm_conv kernel).
+    /// Same shape as `conv_state`.  Swapped after each decode step.
+    pub conv_state_scratch: MlxBuffer,
     /// DeltaNet recurrent state (current): `[D_k, D_v, num_v_heads, n_seqs]` f32.
     ///
     /// Ping-pong semantics: `recurrent` is the active (read) state buffer.
@@ -75,6 +84,14 @@ pub struct LinearAttnStateSlot {
 }
 
 impl LinearAttnStateSlot {
+    /// Swap the active and scratch conv state buffers (O(1) pointer swap).
+    /// Call this after every decode step to make the just-written scratch the
+    /// new current conv state.
+    #[inline]
+    pub fn swap_conv_state(&mut self) {
+        std::mem::swap(&mut self.conv_state, &mut self.conv_state_scratch);
+    }
+
     /// Swap the active and scratch recurrent state buffers (O(1) pointer swap).
     /// Call this after every decode step to make the just-written scratch the
     /// new current state.
@@ -218,6 +235,11 @@ impl HybridKvCache {
                     *v = 0.0;
                 }
             }
+            if let Ok(s) = slot.conv_state_scratch.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
             if let Ok(s) = slot.recurrent.as_mut_slice::<f32>() {
                 for v in s.iter_mut() {
                     *v = 0.0;
@@ -239,6 +261,7 @@ impl HybridKvCache {
         }
         for s in &self.linear_attn {
             n += s.conv_state.element_count() * 4
+                + s.conv_state_scratch.element_count() * 4
                 + s.recurrent.element_count() * 4
                 + s.recurrent_scratch.element_count() * 4;
         }
@@ -298,16 +321,22 @@ fn alloc_linear_attn_slot(
     k_minus1: u32,
     n_seqs: u32,
 ) -> Result<LinearAttnStateSlot> {
-    // Conv state: [K-1, conv_channels, n_seqs].
+    // Conv state ping-pong: [conv_channels, K-1, n_seqs] — kernel native layout.
+    // The ssm_conv kernel expects state[i, c, s] at offset
+    // s*(K-1)*channels + c*(K-1) + i, which corresponds to column-major
+    // [channels, K-1] per sequence — i.e. channels-major with K-1 stride-1.
+    // Storing in this layout avoids per-token CPU transpose + upload/download.
     let conv_elems =
-        (k_minus1 as usize) * (conv_channels as usize) * (n_seqs as usize);
+        (conv_channels as usize) * (k_minus1 as usize) * (n_seqs as usize);
+    let conv_shape = vec![conv_channels as usize, k_minus1 as usize, n_seqs as usize];
     let conv_state = device
-        .alloc_buffer(
-            conv_elems * 4,
-            DType::F32,
-            vec![k_minus1 as usize, conv_channels as usize, n_seqs as usize],
-        )
+        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape.clone())
         .map_err(|e| anyhow!("alloc conv_state: {e}"))?;
+    // Scratch buffer for ping-pong: ssm_conv writes new state here; caller
+    // swaps conv_state ↔ conv_state_scratch after each decode step.
+    let conv_state_scratch = device
+        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape)
+        .map_err(|e| anyhow!("alloc conv_state_scratch: {e}"))?;
 
     // Recurrent state: [D_k, D_v, num_v_heads, n_seqs] — d_k innermost (matches
     // mlx-native's gated_delta_net kernel layout).
@@ -334,6 +363,7 @@ fn alloc_linear_attn_slot(
 
     Ok(LinearAttnStateSlot {
         conv_state,
+        conv_state_scratch,
         recurrent,
         recurrent_scratch,
     })

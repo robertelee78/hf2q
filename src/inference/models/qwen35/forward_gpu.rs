@@ -558,49 +558,52 @@ impl Qwen35Model {
                         * cfg.linear_num_value_heads) as usize;
 
                     // --- Read SSM state from kv_cache (slot indexed by linear-attn rank) ---
-                    // Pass recurrent state as MlxBuffer directly — no CPU round-trip.
-                    let (old_conv_state, linear_slot_idx) =
+                    // Conv state and recurrent state both use GPU ping-pong — no CPU round-trip.
+                    let linear_slot_idx =
                         match kv_cache.slot_index_for_layer(layer_idx as u32) {
-                            Some(super::kv_cache::LayerSlot::Linear(rank)) => {
-                                let slot = &kv_cache.linear_attn[rank as usize];
-                                let conv = slot.conv_state.as_slice::<f32>()
-                                    .map_err(|e| anyhow!("conv_state as_slice: {e}"))?
-                                    .to_vec();
-                                (conv, rank as usize)
-                            }
+                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
                             _ => {
                                 tracing::warn!(
-                                    "forward_gpu: no linear-attn slot for layer {layer_idx}, using zero state"
+                                    "forward_gpu: no linear-attn slot for layer {layer_idx}"
                                 );
-                                (vec![0.0f32; km1 * qkv_channels], usize::MAX)
+                                usize::MAX
                             }
                         };
 
-                    // Ping-pong recurrent state: GDN reads slot.recurrent (state_in)
-                    // and writes slot.recurrent_scratch (state_out).  After the call
-                    // we swap the two handles — O(1) pointer swap, zero CPU copy.
-                    // Metal prohibits read-write aliasing in the same compute pass.
+                    // Ping-pong buffers: GPU reads from `_in`, writes to `_out`.
+                    // After the call, caller swaps them (O(1) pointer swap).
+                    let zero_conv_in: MlxBuffer;
+                    let zero_conv_out: MlxBuffer;
                     let zero_rec_buf_in: MlxBuffer;
                     let zero_rec_buf_out: MlxBuffer;
-                    let (state_in_ref, state_out_ref): (&MlxBuffer, &MlxBuffer) =
+                    let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
+                        (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
                         if linear_slot_idx != usize::MAX {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (&slot.recurrent, &slot.recurrent_scratch)
+                            (&slot.conv_state, &slot.conv_state_scratch,
+                             &slot.recurrent, &slot.recurrent_scratch)
                         } else {
                             // Fallback: allocate throwaway scratch buffers.
-                            let zero_cpu = vec![0.0f32; rec_size];
-                            zero_rec_buf_in = upload_f32(&zero_cpu, &device)
+                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                            let zero_rec_cpu = vec![0.0f32; rec_size];
+                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_in")?;
+                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_out")?;
+                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
                                 .context("alloc zero recurrent state_in")?;
-                            zero_rec_buf_out = upload_f32(&zero_cpu, &device)
+                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
                                 .context("alloc zero recurrent state_out")?;
-                            (&zero_rec_buf_in, &zero_rec_buf_out)
+                            (&zero_conv_in, &zero_conv_out,
+                             &zero_rec_buf_in, &zero_rec_buf_out)
                         };
-                    let (out, new_conv_state) = build_delta_net_layer(
+                    let out = build_delta_net_layer(
                         &device,
                         &mut registry,
                         &hidden,
                         attn,
-                        &old_conv_state,
+                        conv_in_ref,
+                        conv_out_ref,
                         state_in_ref,
                         state_out_ref,
                         seq_len,
@@ -614,15 +617,10 @@ impl Qwen35Model {
                     )
                     .with_context(|| format!("delta_net layer {layer_idx}"))?;
 
-                    // --- Write back conv state; swap recurrent ping-pong ---
+                    // --- Swap conv + recurrent ping-pong (O(1) pointer swap, zero copy) ---
                     if linear_slot_idx != usize::MAX {
                         let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                        // conv_state: CPU layout, copy from Vec<f32>.
-                        let dst = slot.conv_state.as_mut_slice::<f32>()
-                            .map_err(|e| anyhow!("conv_state as_mut_slice: {e}"))?;
-                        dst.copy_from_slice(&new_conv_state);
-                        // Swap ping-pong: scratch → active, active → scratch.
-                        // GDN wrote to recurrent_scratch; it is now the current state.
+                        slot.swap_conv_state();
                         slot.swap_recurrent();
                     }
 
