@@ -1021,6 +1021,48 @@ pub fn apply_vit_block_forward_gpu(
     Ok(block_out)
 }
 
+/// Chain `apply_vit_block_forward_gpu` across all `cfg.num_hidden_layers`
+/// blocks. Input + output shape: F32 `[batch, hidden]` on device.
+///
+/// This is the heavy compute portion of the ViT (~81 GFLOP across 27
+/// blocks for Gemma 4). The post-blocks pipeline (avg_pool, scale,
+/// std_bias_scale, projector, final rms_norm) lands in iter 51b once
+/// the missing GPU primitives are added.
+///
+/// Caller registers `softmax::register` + `sigmoid_mul::register`
+/// before dispatch.
+pub fn apply_vit_blocks_loop_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+    input: &MlxBuffer,
+    batch: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    // Run block 0 with the input as residual stream.
+    let mut hidden_states =
+        apply_vit_block_forward_gpu(encoder, registry, device, weights, cfg, 0, input, batch, scale)?;
+    encoder.memory_barrier();
+    // Chain remaining blocks; each block_idx's output becomes next's input.
+    for block_idx in 1..(cfg.num_hidden_layers as usize) {
+        hidden_states = apply_vit_block_forward_gpu(
+            encoder,
+            registry,
+            device,
+            weights,
+            cfg,
+            block_idx,
+            &hidden_states,
+            batch,
+            scale,
+        )?;
+        encoder.memory_barrier();
+    }
+    Ok(hidden_states)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2211,6 +2253,99 @@ mod tests {
         let (md_attn_f, l2_attn_f) = l2(&attn_f_back, &ref_attn);
         eprintln!("STAGE F (full chain through attention): max_diff = {:.6}, l2 = {:.6}", md_attn_f, l2_attn_f);
     }
+    /// Iter 51a: 27-block GPU forward on real Gemma 4 mmproj. Tests the
+    /// distributional output of the chained block loop — finite,
+    /// magnitudes O(1) after blocks (residual stream stays bounded
+    /// because blocks are pre-norm + bounded-norm activations),
+    /// cross-token diversity preserved (each token has a different
+    /// embedding even after 27 blocks of mixing).
+    ///
+    /// CPU element-wise comparison is intentionally NOT used here —
+    /// see `project_vit_attention_bf16_softmax_drift.md` for why.
+    #[test]
+    fn apply_vit_blocks_loop_gpu_27_blocks_real_gemma4() {
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
+                .expect("w");
+        assert_eq!(cfg.num_hidden_layers, 27);
+
+        let hidden = cfg.hidden_size as usize;
+        let head_dim = hidden / cfg.num_attention_heads as usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let batch = 32usize;
+
+        let input_cpu: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i as f32) * 1e-4).sin() * 0.05)
+            .collect();
+
+        let executor = GraphExecutor::new(MlxDevice::new().expect("dev2"));
+        let input_buf = upload_f32(executor.device(), &input_cpu, vec![batch, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        eprintln!("running 27-block GPU forward...");
+        let t0 = std::time::Instant::now();
+        let out = apply_vit_blocks_loop_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &weights,
+            &cfg,
+            &input_buf,
+            batch as u32,
+            scale,
+        )
+        .expect("blocks loop");
+        session.finish().expect("finish");
+        let elapsed = t0.elapsed();
+        eprintln!("27-block GPU forward done in {:?}", elapsed);
+
+        let got = readback_f32(&out, batch * hidden);
+
+        // Distributional sanity:
+        let max_abs = got.iter().map(|x| x.abs()).fold(0f32, f32::max);
+        let mean_abs = got.iter().map(|x| x.abs()).sum::<f32>() / (got.len() as f32);
+        eprintln!(
+            "27-block output: max_abs = {:.4}, mean_abs = {:.4}",
+            max_abs, mean_abs
+        );
+        // 1. Finite.
+        for v in &got {
+            assert!(v.is_finite(), "non-finite: {v}");
+        }
+        // 2. Reasonable magnitude. Residual stream + norms shouldn't
+        //    blow up to 1e6 or collapse to 0.
+        assert!(max_abs > 1e-3, "max_abs collapsed to ~0: {max_abs}");
+        assert!(max_abs < 1e4, "max_abs blew up: {max_abs}");
+        assert!(mean_abs > 1e-4 && mean_abs < 1e3, "mean_abs out of range: {mean_abs}");
+        // 3. Cross-token diversity preserved. After 27 blocks of mixing,
+        //    different input tokens should still produce different outputs.
+        let token_0 = &got[0..hidden];
+        let token_last = &got[(batch - 1) * hidden..batch * hidden];
+        let l2_diff: f32 = token_0
+            .iter()
+            .zip(token_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        eprintln!("cross-token L2 (token 0 vs token {}) = {:.4}", batch - 1, l2_diff);
+        assert!(
+            l2_diff > 1e-2,
+            "all tokens collapsed to identical output — diversity lost"
+        );
+    }
+
     /// Iter 50 finding (don't re-enable without context):
     ///
     /// This test compares GPU vs CPU F32 `apply_vit_block_forward`

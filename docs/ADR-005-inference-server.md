@@ -1838,6 +1838,18 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Verification:** `cargo test --bin hf2q` — 914/914 pass, 8 ignored (+2 diagnostic tests vs iter 49's 912).
   - **Next (iter 51):** chain all 27 blocks + post-blocks pipeline (avg_pool → scale → std_bias/scale → mm.0 projector → final rms_norm) into `apply_vit_full_forward_gpu`. Real-data integration test on synthetic preprocessed image input → full ViT output → distributional sanity (no zeros, magnitudes match the CPU reference's macro stats, cross-token diversity preserved). The full forward should run end-to-end on GPU in well under 1 second vs the CPU's ~17 minutes.
 
+- **2026-04-25 loop iter 51a — 27-block ViT compute backbone on Metal in 57 ms (vs CPU's ~17 min).** Iter 51 split: 51a chains all blocks (this iter); 51b adds the post-blocks pipeline (avg_pool, scale, std_bias_scale, projector, final norm) once those GPU primitives exist.
+  - **`apply_vit_blocks_loop_gpu(encoder, registry, device, weights, cfg, input, batch, scale)`:** chains `apply_vit_block_forward_gpu` across all `cfg.num_hidden_layers` blocks. `encoder.memory_barrier()` between blocks (each block reads the previous block's output). Caller registers `softmax::register` + `sigmoid_mul::register` before dispatch. Returns the final residual stream `[batch, hidden]`.
+  - **Real-data test `apply_vit_blocks_loop_gpu_27_blocks_real_gemma4`:** loads real Gemma 4 mmproj, runs the full 27-block GPU loop on a synthetic [batch=32, hidden=1152] sine input, validates distributional sanity. **Output:**
+    - `max_abs = 1163`, `mean_abs = 80.4` (residual-stream growth is expected for pre-norm architectures; will be normalized down by the post-blocks pipeline's std_bias_scale)
+    - `cross-token L2 (token 0 vs 31) = 6786.7` — strong diversity preservation through 27 blocks of mixing
+    - All output values finite — no NaN/Inf overflow
+    - **Total runtime: 57 ms** for the full 27-block compute (~81 GFLOP). vs CPU's ~17 minutes = **~18,000× speedup**. The full ViT compute backbone is now GPU-resident.
+  - **Per element-wise CPU/GPU divergence policy** (from iter 50): NOT compared. macro stats and structural sanity ARE the bar; the BF16-saturated-softmax drift is intrinsic to the BF16 attention path and must be validated against mlx-lm output, not CPU F32.
+  - **Verification:** `cargo test --bin hf2q apply_vit_blocks_loop_gpu_27` — 1/1 pass (~9.4s including 400MB load + 57 ms compute). Full suite 915/915 pass, 8 ignored.
+  - **Mantra check:** real production-shape compute on real pretrained weights running at GPU speed. Output ready to feed into the post-blocks pipeline once that lands.
+  - **Next (iter 51b):** add the missing GPU primitives — `vit_avg_pool_2x2_gpu` (custom Metal kernel or compose-via-elementwise; mlx-native has no avg_pool currently), `vit_scale_gpu` (thin wrap around `scalar_mul_f32`), `vit_std_bias_scale_gpu` (custom kernel: `(x - bias) × scale` per-channel). Then `apply_vit_full_forward_gpu` chains: blocks_loop → avg_pool(14, 1152) → scale(√1152) → std_bias_scale → linear(mm.0) → rms_norm(no-gain) → `[49, 2816]` final output. Iter 52 wires `process_multimodal_content` to invoke the GPU full forward, 501 → 200.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
