@@ -217,7 +217,7 @@ mod tests {
             explicit_layer_types: None,
             full_attention_interval: None,
             attn_output_gate: None,
-            head_dim: Some(hidden_size as u32 / 4),
+            head_dim: Some(hidden_size / 4),
             partial_rotary_factor: None,
             rope_parameters: None,
             linear_conv_kernel_dim: None,
