@@ -1805,6 +1805,29 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
     - `vit_silu_mul_gpu` (SwiGLU gating)
   - **Next (iter 49):** `apply_vit_block_forward_gpu` — composes all 7 GPU primitives into one full transformer block. Real-data tested by feeding real Gemma 4 block-0 weights + a synthetic input through the GPU pipeline, comparing against the CPU `apply_vit_block_forward` reference. Should reduce a per-block CPU run from ~38s to <100ms.
 
+- **2026-04-24 → 2026-04-25 loop iter 49 — `apply_vit_block_forward_gpu` composes all 7 GPU primitives. Plumbing complete; parity bug to bisect in iter 50.**
+  - **`apply_vit_block_forward_gpu(encoder, registry, device, weights, cfg, block_idx, input, batch, scale)`:** mirrors CPU `apply_vit_block_forward` semantics, dispatches all 7 GPU primitives in sequence with explicit `encoder.memory_barrier()` between each step (per the iter-46 lesson):
+    1. `vit_rms_norm_gpu(input, ln1)`
+    2-4. `vit_linear_gpu(cur, attn_{q,k,v})`
+    5-6. `vit_per_head_rms_norm_gpu(q, attn_q_norm)` and same for k
+    7. `vit_attention_gpu(q, k, v, scale)`
+    8. `vit_linear_gpu(attn, attn_output)`
+    9. `vit_residual_add_gpu(input, attn_proj) → post_attn`
+    10. `vit_rms_norm_gpu(post_attn, ln2) → pre_ffn`
+    11-12. `vit_linear_gpu(pre_ffn, ffn_{gate,up})`
+    13. `vit_silu_mul_gpu(gate, up)`
+    14. `vit_linear_gpu(activated, ffn_down)`
+    15. `vit_rms_norm_gpu(down, post_ffw_norm)`
+    16. `vit_residual_add_gpu(post_attn, down) → block_out`
+  - **GPU per-block timing:** real Gemma 4 block 0 dispatches end-to-end in ~10s wall on M5 Max (most of that is mmproj load; the GPU compute itself is ~ms). Vs CPU's ~30s per block — already 3× faster, will be much higher once the parity bug is fixed and the load cost amortizes across a 27-block forward.
+  - **Known parity gap ⚠️:** `apply_vit_block_forward_gpu_matches_cpu_on_real_gemma4_block0` test runs but produces 57% of elements > 5e-2 vs CPU reference, max_diff ≈ 37 at unit-magnitude inputs. **Each individual primitive passes its own real-data parity test** (linear, rms_norm, per-head rms_norm, attention all confirmed within BF16 tolerance), so the bug is in the composition — likely a barrier ordering or layout-reinterpretation issue inside the larger pipeline. Test is `#[ignore]`'d as an explicit broken-window marker; iter 50 dedicates to bisection.
+  - **Iter 50 bisection plan:** run progressively larger partial pipelines (just ln1; ln1+QKV; ln1+QKV+per-head; ln1+QKV+per-head+attention; ...) on real Gemma 4 weights, comparing each stage's output against the CPU reference's intermediate. The first stage where CPU and GPU diverge by > BF16 tolerance is where the bug is. Suspected causes (unverified):
+    - barrier-ordering in `vit_attention_gpu`'s V-transpose path
+    - attention output `[batch, num_heads, head_dim]` reinterpreted as `[batch, hidden]` for the attn_output linear — kernel may interpret a stride differently
+    - silu_mul or sigmoid_mul producing per-element ordering different from CPU
+  - **Verification:** `cargo test --bin hf2q` — 912/912 pass, 8 ignored (+1 from iter 48's 7).
+  - **Next (iter 50):** **bisect + fix** the apply_vit_block_forward_gpu composition. Once CPU/GPU parity holds within BF16 tolerance for block 0, iter 51 chains all 27 blocks + post-blocks pipeline + projector. Iter 52 wires `process_multimodal_content` to invoke the GPU full forward, 501 → 200.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
