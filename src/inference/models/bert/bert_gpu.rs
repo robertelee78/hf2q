@@ -3810,4 +3810,236 @@ mod tests {
         assert!(err.is_err(), "hidden % num_heads != 0 must error");
         drop(session);
     }
+
+    /// llama-embedding ground-truth vector for "hello world" tokenized
+    /// against `bge-small-en-v1.5-f16.gguf`. Generated 2026-04-26 via:
+    ///   `llama-embedding -m bge-small-en-v1.5-f16.gguf -p "hello world" --embd-output-format json`
+    /// (binary: `/opt/homebrew/Cellar/llama.cpp/8680/bin/llama-embedding`,
+    /// release b8680). bge uses pooling_type=2 (CLS) per its GGUF
+    /// metadata, so the output is the L2-normalized first-row hidden
+    /// state. ||y||_2 = 1.000000.
+    #[rustfmt::skip]
+    const BGE_GROUND_TRUTH_HELLO_WORLD: [f32; 384] = [
+        1.5245200e-02f32, -2.2694700e-02f32, 8.5904000e-03f32, -7.4250800e-02f32,
+        3.8820000e-03f32, 2.7334000e-03f32, -3.1268600e-02f32, 4.4632100e-02f32,
+        4.4025500e-02f32, -7.8715000e-03f32, -2.5214700e-02f32, -3.3416000e-02f32,
+        1.4413500e-02f32, 4.6410600e-02f32, 8.6145000e-03f32, -1.6080500e-02f32,
+        7.4887000e-03f32, -1.8985500e-02f32, -1.1456510e-01f32, -1.8153900e-02f32,
+        1.2628550e-01f32, 2.9765000e-02f32, 2.5295900e-02f32, -3.4199300e-02f32,
+        -4.1072000e-02f32, 6.6354000e-03f32, 1.0337600e-02f32, 2.2416600e-02f32,
+        4.4387000e-03f32, -1.2735740e-01f32, -1.6072700e-02f32, -2.0363500e-02f32,
+        4.7341200e-02f32, 1.1577300e-02f32, 6.8168700e-02f32, 7.3822000e-03f32,
+        -1.7995200e-02f32, 4.0913100e-02f32, -1.0225900e-02f32, 2.3681300e-02f32,
+        1.0515600e-02f32, -2.8547400e-02f32, 8.1570000e-03f32, -1.5209600e-02f32,
+        3.0877500e-02f32, -6.5933600e-02f32, -2.2227600e-02f32, 5.3976200e-02f32,
+        2.6597000e-03f32, 2.2453900e-02f32, -9.1692300e-02f32, -4.5221700e-02f32,
+        -4.2084000e-03f32, -5.5980000e-03f32, -5.4037000e-03f32, 9.8472100e-02f32,
+        6.0502400e-02f32, 7.4229000e-03f32, 1.3882200e-02f32, 2.6891000e-03f32,
+        4.7620100e-02f32, 2.8700200e-02f32, -1.5526920e-01f32, 6.8964400e-02f32,
+        3.0246500e-02f32, -1.7961500e-02f32, 2.0926600e-02f32, 2.1297000e-02f32,
+        1.4070900e-02f32, 2.0100000e-03f32, 2.6726000e-03f32, 3.9320000e-03f32,
+        4.1020500e-02f32, 6.5808500e-02f32, -6.1782000e-03f32, -1.6395200e-02f32,
+        8.2713000e-03f32, -4.9068900e-02f32, -2.1074200e-02f32, -3.0809100e-02f32,
+        -4.0618500e-02f32, 5.9307100e-02f32, 1.8110800e-02f32, -4.4221500e-02f32,
+        7.0220000e-04f32, -2.7995600e-02f32, -4.0511900e-02f32, -1.1288300e-02f32,
+        -2.4989100e-02f32, 9.6083000e-03f32, -1.7424800e-02f32, -2.7018600e-02f32,
+        -1.5503500e-02f32, -5.5615000e-03f32, -4.1466900e-02f32, 7.1377000e-03f32,
+        7.0550000e-03f32, 9.7625000e-03f32, 6.9740000e-04f32, 3.4366410e-01f32,
+        -9.5348500e-02f32, -2.0391000e-03f32, 2.8154300e-02f32, -9.1379400e-02f32,
+        5.9625200e-02f32, 2.4833900e-02f32, -1.6368100e-02f32, -2.9081900e-02f32,
+        -8.2563000e-03f32, 1.5810900e-02f32, 1.2835300e-02f32, -6.4291800e-02f32,
+        1.4440600e-02f32, -1.3786200e-02f32, 1.0548000e-03f32, -1.9413000e-02f32,
+        5.0069200e-02f32, -2.7956000e-03f32, 9.3218700e-02f32, -2.9476600e-02f32,
+        -8.1660000e-03f32, 3.0733500e-02f32, -4.4089600e-02f32, -4.1517000e-03f32,
+        5.2847200e-02f32, -6.4513800e-02f32, 5.8293600e-02f32, 7.7707000e-02f32,
+        1.1471900e-02f32, 6.9841600e-02f32, -5.4241000e-03f32, 5.9807100e-02f32,
+        -2.6379400e-02f32, -8.6844000e-03f32, 2.7463500e-02f32, -1.4279000e-02f32,
+        -1.8396800e-02f32, -1.3933100e-02f32, 3.5396400e-02f32, -5.6796000e-02f32,
+        8.2031000e-03f32, -7.6783700e-02f32, -2.2572900e-02f32, -1.1289320e-01f32,
+        3.3520000e-04f32, 3.0491700e-02f32, -7.3323700e-02f32, 2.4644000e-02f32,
+        -1.9628000e-02f32, -2.4151000e-02f32, -3.8864300e-02f32, 7.8660000e-02f32,
+        4.9657000e-03f32, -1.6394300e-02f32, 7.9038000e-03f32, 5.4956400e-02f32,
+        -1.2885100e-02f32, 6.8558700e-02f32, 7.6886000e-03f32, 8.7973000e-03f32,
+        -1.8497000e-03f32, -1.2487900e-02f32, -1.3336700e-02f32, 6.6981000e-03f32,
+        -1.7702300e-02f32, -1.2828940e-01f32, 9.9775000e-03f32, 1.9581100e-02f32,
+        -7.2369000e-03f32, 8.7490000e-04f32, 3.3446000e-03f32, 1.6448400e-02f32,
+        -3.9572100e-02f32, 2.8781000e-02f32, 1.0959640e-01f32, 7.5352000e-03f32,
+        -4.0438000e-03f32, 4.4518800e-02f32, -4.7362600e-02f32, 2.4964000e-02f32,
+        6.0060000e-02f32, -5.0817200e-02f32, -4.1762900e-02f32, 1.9128400e-02f32,
+        2.8170000e-02f32, -2.5297200e-02f32, -2.0765900e-02f32, -3.0412200e-02f32,
+        6.2295800e-02f32, 6.7060100e-02f32, -2.3187700e-02f32, 1.0734500e-02f32,
+        -3.1954700e-02f32, -3.4281000e-02f32, -8.4273100e-02f32, 3.2644000e-03f32,
+        3.3854400e-02f32, -8.1071600e-02f32, 1.3342300e-02f32, -2.1539200e-02f32,
+        1.4645080e-01f32, 5.3104200e-02f32, 3.9373000e-03f32, 2.8793300e-02f32,
+        5.2210000e-04f32, 4.2053000e-03f32, 4.0630400e-02f32, 6.3329000e-03f32,
+        4.4674100e-02f32, 1.3358900e-02f32, -2.4087900e-02f32, -1.5090700e-02f32,
+        7.3155600e-02f32, -6.5968000e-03f32, 2.1938400e-02f32, -4.2962600e-02f32,
+        -1.0111400e-02f32, 7.4725400e-02f32, 2.3953400e-02f32, 4.7187100e-02f32,
+        -3.9791600e-02f32, 1.0862900e-02f32, -2.2080500e-02f32, -2.6233610e-01f32,
+        1.8241100e-02f32, 8.3272000e-03f32, -3.3388000e-03f32, -3.4754400e-02f32,
+        2.3121200e-02f32, 3.8076700e-02f32, -5.1632600e-02f32, 1.0183660e-01f32,
+        -9.0856000e-03f32, 8.7150100e-02f32, -5.9687000e-02f32, -8.4066000e-03f32,
+        -3.6316700e-02f32, 1.7526600e-02f32, 2.3206900e-02f32, -1.4118300e-02f32,
+        1.6098100e-02f32, -1.0101000e-02f32, -2.2810100e-02f32, 2.8593400e-02f32,
+        2.2963600e-02f32, 4.3393100e-02f32, -4.7477900e-02f32, 4.4480400e-02f32,
+        -5.9617800e-02f32, 1.4664930e-01f32, 8.3677600e-02f32, -2.0353100e-02f32,
+        2.4272500e-02f32, 3.6327000e-02f32, -2.8053600e-02f32, -9.2974000e-03f32,
+        -1.1975370e-01f32, -2.5626800e-02f32, 7.3649500e-02f32, -3.4565200e-02f32,
+        -6.7101600e-02f32, -9.6649400e-02f32, -2.2320300e-02f32, -1.2381200e-02f32,
+        1.3812800e-02f32, -4.1045900e-02f32, -4.1482000e-03f32, -2.4175200e-02f32,
+        -7.4918800e-02f32, -5.2708000e-02f32, 9.8539000e-03f32, -5.2184100e-02f32,
+        -1.2405700e-02f32, -1.1600300e-02f32, 2.2357500e-02f32, 5.7255500e-02f32,
+        5.9955200e-02f32, 1.9182300e-02f32, -4.6006900e-02f32, 1.5220000e-03f32,
+        -5.6150000e-04f32, -1.1537300e-02f32, 3.2410700e-02f32, -1.4726500e-02f32,
+        -2.2231900e-02f32, 1.5891200e-02f32, -3.6683100e-02f32, 1.1616600e-02f32,
+        3.5017200e-02f32, -6.1055400e-02f32, -2.4773600e-02f32, 4.9781600e-02f32,
+        -1.7490500e-02f32, -1.8016700e-02f32, -3.5791000e-02f32, 2.1147000e-02f32,
+        -1.6487700e-02f32, 3.6262300e-02f32, 1.4208100e-02f32, -4.6354000e-03f32,
+        -2.3338500e-02f32, -3.9657500e-02f32, -2.8176300e-02f32, -5.5650000e-03f32,
+        1.1481100e-02f32, 5.8364500e-02f32, 1.4236800e-02f32, 3.2630400e-02f32,
+        5.4060100e-02f32, 6.4761900e-02f32, 7.6997000e-03f32, 3.5554700e-02f32,
+        -1.6068700e-02f32, -1.2872200e-02f32, 4.1160900e-02f32, -5.3329000e-03f32,
+        -6.9779300e-02f32, 1.1296000e-02f32, 1.6109300e-02f32, -2.9520580e-01f32,
+        2.7797900e-02f32, -3.0543000e-03f32, 2.1346000e-02f32, 4.0104000e-03f32,
+        2.1070500e-02f32, 4.1065700e-02f32, -2.6940000e-04f32, -5.7391000e-02f32,
+        2.2403100e-02f32, -7.7541100e-02f32, 2.0342000e-02f32, 1.6253200e-02f32,
+        -6.6938100e-02f32, 8.0250000e-04f32, 2.0220900e-02f32, -2.4065000e-03f32,
+        -1.1099900e-02f32, 1.7103700e-02f32, -1.9624700e-02f32, 2.0817000e-03f32,
+        2.2252900e-02f32, 2.2973500e-01f32, -2.3067100e-02f32, 5.6796500e-02f32,
+        3.9116400e-02f32, -9.2091000e-03f32, 4.5408000e-03f32, 5.4877500e-02f32,
+        1.9218000e-02f32, -9.8172600e-02f32, -1.4690000e-04f32, 3.1628200e-02f32,
+        -1.5647900e-02f32, 3.5432100e-02f32, 1.1029000e-02f32, -6.8190800e-02f32,
+        -2.8878400e-02f32, 2.3841100e-02f32, -5.3042700e-02f32, -2.5050200e-02f32,
+        2.2473200e-02f32, -4.5994900e-02f32, 7.0341900e-02f32, 3.4573300e-02f32,
+        -7.7199700e-02f32, -1.3507200e-02f32, -4.9011200e-02f32, -3.9882000e-03f32,
+        3.7250900e-02f32, -2.8179500e-02f32, -7.9685900e-02f32, 5.6049000e-03f32,
+        3.2035800e-02f32, -3.0435800e-02f32, 1.5001600e-02f32, 1.4733000e-02f32,
+        -8.9100000e-03f32, 1.6160500e-02f32, -6.3414600e-02f32, 2.1236900e-02f32,
+        -6.2079000e-03f32, 4.9397100e-02f32, 2.2779600e-02f32, 2.6059400e-02f32,
+    ];
+
+    /// **Bisection-step-zero (iter 79):** does the BERT lane produce
+    /// llama-embedding-parity output for bge-small-en-v1.5 (CLS pool)
+    /// with "hello world" tokenized? Cosine ≥ 0.999 expected.
+    ///
+    /// **Why this is the right first step.** The nomic-bert iter-78
+    /// parity gate FAILED (cosine = 0.098) — structural divergence in
+    /// either shared primitives or nomic-specific code. bge uses the
+    /// SAME shared primitives (bert_linear_gpu, bert_layer_norm_gpu,
+    /// bert_attention_with_mask_gpu, bert_pool_gpu) but DIFFERS in:
+    ///   - Pooling (bge=CLS, nomic=Mean)
+    ///   - QKV layout (bge=separate Q/K/V tensors, nomic=fused split)
+    ///   - Position encoding (bge=position_embd lookup, nomic=RoPE)
+    ///   - MLP (bge=GeLU, nomic=SwiGLU)
+    ///
+    /// If bge passes ≥ 0.999, the bug is nomic-specific (one of: fused
+    /// QKV slice, RoPE, SwiGLU). If bge fails, shared primitives are
+    /// the issue.
+    ///
+    /// Skips when the bge GGUF isn't on disk.
+    #[test]
+    fn bge_full_forward_matches_llama_embedding_on_hello_world() {
+        use std::path::Path;
+        use mlx_native::gguf::GgufFile;
+        use super::super::config::{BertConfig, PoolingType};
+        use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
+        use super::super::weights::LoadedBertWeights;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: bge GGUF fixture not at {}", model_path.display());
+            return;
+        }
+
+        // Load config + tokenizer + weights from real GGUF.
+        let gguf = GgufFile::open(model_path).expect("open bge GGUF");
+        let cfg = BertConfig::from_gguf(&gguf).expect("parse bge config");
+        assert_eq!(cfg.hidden_size, 384, "expected bge hidden=384");
+        assert_eq!(cfg.num_hidden_layers, 12);
+        assert_eq!(cfg.num_attention_heads, 12);
+        assert_eq!(cfg.pooling_type, PoolingType::Cls, "bge GGUF must declare CLS pool");
+
+        let vocab = BertVocab::from_gguf(&gguf).expect("parse bge vocab");
+        let tok = BertWpmTokenizer::new(&vocab);
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count: u32 = real_ids.len() as u32;
+        assert_eq!(real_ids.len(), 4, "bge tokenizer must produce 4 tokens for hello world, got {real_ids:?}");
+
+        // Pad to seq_len=32 with [PAD].
+        let seq_len: u32 = 32;
+        let pad_id = tok.specials().pad;
+        let mut padded_ids: Vec<u32> = real_ids.clone();
+        while padded_ids.len() < seq_len as usize {
+            padded_ids.push(pad_id);
+        }
+
+        // Build device + load real weights.
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+
+        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
+            .expect("load bge weights");
+
+        // Build input_ids buffer.
+        let input_ids = device
+            .alloc_buffer(
+                (seq_len as usize) * 4,
+                DType::U32,
+                vec![seq_len as usize],
+            )
+            .expect("alloc input_ids");
+        {
+            let slice: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    input_ids.contents_ptr() as *mut u32,
+                    seq_len as usize,
+                )
+            };
+            slice.copy_from_slice(&padded_ids);
+        }
+
+        // Run hf2q full forward (bge: CLS pool).
+        let mut encoder = device.command_encoder().expect("command_encoder");
+        let pooled = apply_bert_full_forward_gpu(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_ids,
+            None,
+            &weights,
+            &cfg,
+            seq_len,
+            valid_token_count,
+        )
+        .expect("bge full forward");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        // Cosine vs ground truth.
+        let view: &[f32] = pooled.as_slice::<f32>().expect("read pooled f32");
+        assert_eq!(view.len(), 384);
+        let truth: &[f32] = &BGE_GROUND_TRUTH_HELLO_WORLD;
+        let dot: f32 = view.iter().zip(truth.iter()).map(|(a, b)| a * b).sum();
+        let na: f32 = view.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = truth.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cosine = dot / (na * nb);
+        let max_abs_diff = view.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+
+        eprintln!(
+            "[bge parity] cosine={:.6}, ||hf2q||_2={:.6}, ||truth||_2={:.6}, max_abs_diff={:.4e}",
+            cosine, na, nb, max_abs_diff
+        );
+        eprintln!(
+            "  hf2q  first4 = {:?}
+  truth first4 = {:?}",
+            &view[..4], &truth[..4]
+        );
+
+        assert!(
+            cosine >= 0.999,
+            "bge cosine {cosine:.6} below 0.999 — shared primitive bug"
+        );
+    }
+
 }
