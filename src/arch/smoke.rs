@@ -744,6 +744,39 @@ mod tests {
         }
     }
 
+    /// `--llama-cli-override <path>` with a path that doesn't exist
+    /// must trip preflight exit code 4 (EXIT_LLAMA_CLI_MISSING) with
+    /// an actionable error naming the missing path. Without this test,
+    /// a refactor that removed the `is_file()` check at smoke.rs:168
+    /// would silently swallow the missing-override case and either
+    /// proceed to the convert step (which would fail later with a
+    /// less-actionable error) or exec the missing path (which would
+    /// fail at the syscall layer).
+    #[test]
+    fn llama_cli_override_missing_path_returns_exit_4() {
+        let env = MockEnv::default();
+        let entry = ArchRegistry::global().get("qwen35").unwrap();
+        let nonexistent = Path::new("/this/path/definitely/does/not/exist/llama-cli");
+        let result = preflight_full(entry, &env, true, Some(nonexistent));
+        match result {
+            Err((code, reason)) => {
+                assert_eq!(
+                    code, EXIT_LLAMA_CLI_MISSING,
+                    "missing override path must trip EXIT_LLAMA_CLI_MISSING (4)"
+                );
+                assert!(
+                    reason.contains("--llama-cli-override"),
+                    "error must name the offending flag, got: {reason}"
+                );
+                assert!(
+                    reason.contains("does not exist"),
+                    "error must explain the missing-file condition, got: {reason}"
+                );
+            }
+            Ok(()) => panic!("preflight must fail on missing override path"),
+        }
+    }
+
     #[test]
     fn unknown_arch_returns_uniform_outcome_for_every_non_registered_key() {
         let env = MockEnv::default();
