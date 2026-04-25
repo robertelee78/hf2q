@@ -72,7 +72,7 @@ use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_no
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
-use super::gpu_full_attn::{download_f32, upload_f32};
+use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
 
 // ================================================================
 // GPU weight container
@@ -80,8 +80,13 @@ use super::gpu_full_attn::{download_f32, upload_f32};
 
 /// GPU-side weight handles for a single Qwen3.5 Gated DeltaNet layer.
 ///
-/// All buffers are F32. `ssm_conv1d_gpu` is stored transposed relative to
-/// the CPU/GGUF format (see module-level layout notes).
+/// Large projection weights (attn_qkv, attn_gate, ssm_alpha, ssm_beta,
+/// ssm_out) are pre-cast to BF16 at load time to avoid per-inference
+/// F32→BF16 casts in `apply_proj` (previously ~69ms per token across
+/// 30 delta-net layers). Small weights (norms, conv, dt_bias, ssm_a)
+/// stay F32 because they are consumed by custom kernels that require F32.
+/// `ssm_conv1d_gpu` is stored transposed relative to the CPU/GGUF format
+/// (see module-level layout notes).
 pub struct DeltaNetWeightsGpu {
     pub attn_norm: MlxBuffer,
     /// Post-attention RMSNorm weight: `[hidden_size]`.
@@ -131,20 +136,24 @@ impl DeltaNetWeightsGpu {
             qkv_channels,
         );
         Ok(Self {
+            // Small F32 weights: consumed by custom kernels (rms_norm, ssm_conv,
+            // compute_g_beta, ssm_norm_gate) that require F32 input.
             attn_norm: upload_f32(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
-            attn_qkv: upload_f32(&weights.attn_qkv, device)?,
-            attn_gate: upload_f32(&weights.attn_gate, device)?,
             ssm_conv1d: upload_f32(&conv1d_t, device)?,
-            ssm_alpha: upload_f32(&weights.ssm_alpha, device)?,
             ssm_dt_bias: upload_f32(&weights.ssm_dt_bias, device)?,
             ssm_dt_bias_cpu: weights.ssm_dt_bias.clone(),
-            ssm_beta: upload_f32(&weights.ssm_beta, device)?,
             ssm_a: upload_f32(&weights.ssm_a, device)?,
             ssm_a_cpu: weights.ssm_a.clone(),
             ssm_norm: upload_f32(&weights.ssm_norm, device)?,
             ssm_norm_cpu: weights.ssm_norm.clone(),
-            ssm_out: upload_f32(&weights.ssm_out, device)?,
+            // Large projection weights: pre-cast to BF16 to skip per-inference
+            // F32→BF16 GPU cast in apply_proj (avoids ~69ms/token across 30 layers).
+            attn_qkv: upload_bf16_from_f32(&weights.attn_qkv, device)?,
+            attn_gate: upload_bf16_from_f32(&weights.attn_gate, device)?,
+            ssm_alpha: upload_bf16_from_f32(&weights.ssm_alpha, device)?,
+            ssm_beta: upload_bf16_from_f32(&weights.ssm_beta, device)?,
+            ssm_out: upload_bf16_from_f32(&weights.ssm_out, device)?,
         })
     }
 }
@@ -249,7 +258,10 @@ pub fn apply_pre_norm(
 
 /// Apply a single linear projection: `output = input @ weight^T`.
 ///
-/// Uses F32-via-BF16 cast path (same as P7b `apply_linear_projection_f32`).
+/// If `weight` is already BF16 (pre-cast at load time), the inline
+/// F32→BF16 cast is skipped entirely — saving one GPU dispatch and one
+/// memory_barrier per projection call.  If `weight` is F32, falls back
+/// to the legacy per-inference cast path.
 /// Requires `in_features >= 32`.
 pub fn apply_proj(
     encoder: &mut mlx_native::CommandEncoder,
@@ -262,25 +274,38 @@ pub fn apply_proj(
     out_features: u32,
 ) -> Result<MlxBuffer> {
     let n_w = (out_features * in_features) as usize;
-    let weight_bf16 = device
-        .alloc_buffer(
-            n_w * 2,
-            DType::BF16,
-            vec![out_features as usize, in_features as usize],
+
+    // Determine the BF16 weight buffer: pre-cast (zero extra cost) or cast inline.
+    let weight_bf16_owned: Option<MlxBuffer>;
+    let weight_bf16: &MlxBuffer;
+    if weight.dtype() == DType::BF16 {
+        // Pre-cast at load time: use directly, no barrier needed.
+        weight_bf16_owned = None;
+        weight_bf16 = weight;
+    } else {
+        // Legacy F32 path: cast inline and barrier before matmul.
+        let buf = device
+            .alloc_buffer(
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+        cast(
+            encoder,
+            registry,
+            device.metal_device(),
+            weight,
+            &buf,
+            n_w,
+            CastDirection::F32ToBF16,
         )
-        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-    cast(
-        encoder,
-        registry,
-        device.metal_device(),
-        weight,
-        &weight_bf16,
-        n_w,
-        CastDirection::F32ToBF16,
-    )
-    .context("cast weight F32→BF16")?;
-    // barrier: matmul reads weight_bf16 written by the cast above.
-    encoder.memory_barrier();
+        .context("cast weight F32→BF16")?;
+        // Barrier: matmul reads weight_bf16 written by the cast above.
+        encoder.memory_barrier();
+        weight_bf16_owned = Some(buf);
+        weight_bf16 = weight_bf16_owned.as_ref().unwrap();
+    }
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -302,7 +327,7 @@ pub fn apply_proj(
         encoder,
         registry,
         device,
-        &weight_bf16,
+        weight_bf16,
         input,
         &mut dst,
         &params,

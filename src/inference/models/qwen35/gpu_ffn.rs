@@ -70,7 +70,7 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::ffn::{DenseFfnShape, DenseFfnWeights, MoeFfnShape, MoeFfnWeights};
-use super::gpu_full_attn::{download_f32, upload_f32};
+use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
 
 // ================================================================
 // GPU weight containers
@@ -88,11 +88,14 @@ pub struct DenseFfnWeightsGpu {
 
 impl DenseFfnWeightsGpu {
     /// Upload a [`DenseFfnWeights`] (pure-Rust f32) to Metal buffers.
+    ///
+    /// Weights pre-cast to BF16 to avoid per-inference F32→BF16 GPU cast
+    /// in `proj()`.
     pub fn from_cpu(weights: &DenseFfnWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
-            gate: upload_f32(&weights.gate, device)?,
-            up: upload_f32(&weights.up, device)?,
-            down: upload_f32(&weights.down, device)?,
+            gate: upload_bf16_from_f32(&weights.gate, device)?,
+            up:   upload_bf16_from_f32(&weights.up,   device)?,
+            down: upload_bf16_from_f32(&weights.down, device)?,
         })
     }
 }
@@ -124,16 +127,19 @@ pub struct MoeFfnWeightsGpu {
 
 impl MoeFfnWeightsGpu {
     /// Upload a [`MoeFfnWeights`] (pure-Rust f32) to Metal buffers.
+    ///
+    /// All projection weights pre-cast to BF16 to avoid per-inference
+    /// F32→BF16 GPU cast in `proj()`.
     pub fn from_cpu(weights: &MoeFfnWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
-            router: upload_f32(&weights.router, device)?,
-            expert_gate: upload_f32(&weights.expert_gate, device)?,
-            expert_up: upload_f32(&weights.expert_up, device)?,
-            expert_down: upload_f32(&weights.expert_down, device)?,
-            shared_gate_inp: upload_f32(&weights.shared_gate_logit, device)?,
-            shared_gate: upload_f32(&weights.shared_gate, device)?,
-            shared_up: upload_f32(&weights.shared_up, device)?,
-            shared_down: upload_f32(&weights.shared_down, device)?,
+            router:         upload_bf16_from_f32(&weights.router,           device)?,
+            expert_gate:    upload_bf16_from_f32(&weights.expert_gate,      device)?,
+            expert_up:      upload_bf16_from_f32(&weights.expert_up,        device)?,
+            expert_down:    upload_bf16_from_f32(&weights.expert_down,      device)?,
+            shared_gate_inp: upload_bf16_from_f32(&weights.shared_gate_logit, device)?,
+            shared_gate:    upload_bf16_from_f32(&weights.shared_gate,      device)?,
+            shared_up:      upload_bf16_from_f32(&weights.shared_up,        device)?,
+            shared_down:    upload_bf16_from_f32(&weights.shared_down,      device)?,
         })
     }
 }
@@ -242,7 +248,9 @@ impl MoeFfnWeightsGpuQ {
         ).context("down stride")?;
 
         Ok(Self {
-            router: upload_f32(router_f32, device).context("upload router")?,
+            // Router is small (~2MB) but also benefits from pre-cast since
+            // `proj()` now checks dtype — keep BF16 for consistency.
+            router: upload_bf16_from_f32(router_f32, device).context("upload router bf16")?,
             expert_gate_q,
             expert_up_q,
             expert_down_q,
@@ -252,11 +260,16 @@ impl MoeFfnWeightsGpuQ {
             expert_up_stride: gate_stride,   // gate and up have the same dimensions
             expert_down_stride: down_stride,
             num_experts,
-            shared_gate_inp: upload_f32(shared_gate_inp_f32, device)
-                .context("upload shared_gate_inp")?,
-            shared_gate: upload_f32(shared_gate_f32, device).context("upload shared_gate")?,
-            shared_up: upload_f32(shared_up_f32, device).context("upload shared_up")?,
-            shared_down: upload_f32(shared_down_f32, device).context("upload shared_down")?,
+            // Pre-cast shared expert weights to BF16 to avoid per-inference
+            // F32→BF16 cast in proj() (~46MB each × 40 layers).
+            shared_gate_inp: upload_bf16_from_f32(shared_gate_inp_f32, device)
+                .context("upload shared_gate_inp bf16")?,
+            shared_gate: upload_bf16_from_f32(shared_gate_f32, device)
+                .context("upload shared_gate bf16")?,
+            shared_up: upload_bf16_from_f32(shared_up_f32, device)
+                .context("upload shared_up bf16")?,
+            shared_down: upload_bf16_from_f32(shared_down_f32, device)
+                .context("upload shared_down bf16")?,
         })
     }
 }
@@ -286,26 +299,37 @@ fn proj(
     out_features: u32,
 ) -> Result<MlxBuffer> {
     let n_w = (out_features * in_features) as usize;
-    let weight_bf16 = device
-        .alloc_buffer(
-            n_w * 2,
-            DType::BF16,
-            vec![out_features as usize, in_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-    cast(
-        encoder,
-        registry,
-        device.metal_device(),
-        weight,
-        &weight_bf16,
-        n_w,
-        CastDirection::F32ToBF16,
-    )
-    .context("cast weight F32→BF16")?;
 
-    // barrier: matmul reads weight_bf16 written by the cast above
-    encoder.memory_barrier();
+    // If the weight is already BF16 (pre-cast at load time), use it directly;
+    // otherwise cast inline and barrier before the matmul.
+    let weight_bf16_owned: Option<MlxBuffer>;
+    let weight_bf16: &MlxBuffer;
+    if weight.dtype() == DType::BF16 {
+        weight_bf16_owned = None;
+        weight_bf16 = weight;
+    } else {
+        let buf = device
+            .alloc_buffer(
+                n_w * 2,
+                DType::BF16,
+                vec![out_features as usize, in_features as usize],
+            )
+            .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+        cast(
+            encoder,
+            registry,
+            device.metal_device(),
+            weight,
+            &buf,
+            n_w,
+            CastDirection::F32ToBF16,
+        )
+        .context("cast weight F32→BF16")?;
+        // Barrier: matmul reads weight_bf16 written by the cast above.
+        encoder.memory_barrier();
+        weight_bf16_owned = Some(buf);
+        weight_bf16 = weight_bf16_owned.as_ref().unwrap();
+    }
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -323,7 +347,7 @@ fn proj(
         src0_batch: 1,
         src1_batch: 1,
     };
-    dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
+    dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
         .context("dense_matmul_bf16_f32_tensor")?;
     Ok(dst)
 }
