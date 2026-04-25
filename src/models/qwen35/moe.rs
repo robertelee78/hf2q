@@ -427,6 +427,40 @@ pub fn merge_moe_experts_in_tensor_map(
             }
         }
     }
+    tracing::info!(
+        moe_layers_found = moe_layers.len(),
+        "qwen35moe expert merge: scanning {} tensor names, found {} MoE-bearing layers",
+        tensor_map.tensors.len(),
+        moe_layers.len()
+    );
+
+    // ADR-012 P9b real-model finding (jenerallee78/Qwen3.6-35B-A3B-...): some
+    // MoE checkpoints ship the experts ALREADY PRE-MERGED — the safetensors
+    // contain a single tensor per (layer, projection) with shape
+    // `[num_experts, out_features, in_features]` named
+    // `model.layers.N.mlp.experts.{proj}.weight`, not 256 separate per-expert
+    // tensors. Detect the pre-merged form and skip the merge body for those
+    // layer/proj combinations (the tensor is already in the canonical
+    // post-merge name expected by `qwen35_linear_attn_layer_map`'s
+    // `mlp.experts.{proj}.weight` → `ffn_{proj}_exps.weight` mapping).
+    let pre_merged_count = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            let s = n.as_str();
+            s.starts_with("model.layers.")
+                && (s.ends_with(".mlp.experts.gate_proj.weight")
+                    || s.ends_with(".mlp.experts.up_proj.weight")
+                    || s.ends_with(".mlp.experts.down_proj.weight"))
+        })
+        .count();
+    if pre_merged_count > 0 {
+        tracing::info!(
+            count = pre_merged_count,
+            "qwen35moe expert merge: detected {} pre-merged expert tensors; skipping merge for those (input is already in canonical form)",
+            pre_merged_count
+        );
+    }
 
     for proj in &["gate_proj", "up_proj", "down_proj"] {
         let expert_proj = match *proj {
@@ -436,6 +470,16 @@ pub fn merge_moe_experts_in_tensor_map(
             _ => unreachable!(),
         };
         for &layer_idx in &moe_layers {
+            // Skip if the pre-merged form is already present in the input
+            // (real Qwen3.6 ships this way — see comment block above).
+            let pre_merged_name = format!(
+                "model.layers.{}.mlp.experts.{}.weight",
+                layer_idx, proj
+            );
+            if tensor_map.tensors.contains_key(&pre_merged_name) {
+                continue;
+            }
+
             let mut collected: Vec<TensorRef> = Vec::with_capacity(num_experts);
             let mut keys: Vec<String> = Vec::with_capacity(num_experts);
             for e in 0..num_experts {
