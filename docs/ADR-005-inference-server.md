@@ -1930,6 +1930,50 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 85 — three day-one BERT-family models now have automated cosine ≥ 0.999 gates; per-layer dispatch profile locked + fusion plan for iter 86.**
+  - **mxbai-embed-large-v1 cosine-parity gate added** (`bert_gpu.rs::tests::mxbai_full_forward_matches_llama_embedding_on_hello_world`):
+    ```
+    cosine = 0.999990
+    max_abs_diff = 4.61e-4
+    hf2q  first4 = [0.022889221, 0.032153126, 0.016481405, -0.04050532]
+    truth first4 = [0.022862,    0.0322294,   0.0165009,    -0.0404254]
+    ```
+    Best parity of all three day-one models. Production-shape exercise of the BERT lane at hidden=1024, layers=24, heads=16, CLS pool — strictly stronger validation than bge's smaller dimensions. 1024-float ground-truth vector embedded as `MXBAI_GROUND_TRUTH_HELLO_WORLD: [f32; 1024]`.
+  - **Phase-2b "3 day-one models" goal closed.** Decision #4 from this ADR (`nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, `bge-small-en-v1.5`) — every one now has an automated cosine ≥ 0.999 gate that runs in CI by default:
+    ```
+    bge-small-en-v1.5    (12L, 384h,  CLS):                 cosine 0.999985
+    mxbai-embed-large-v1 (24L, 1024h, CLS):                 cosine 0.999990
+    nomic-embed-text-v1.5 (12L, 768h, Mean+RoPE+SwiGLU):    cosine 0.999962
+    ```
+  - **Per-layer dispatch profile (nomic-bert, BF16 fast path).** Counted manually from `apply_nomic_bert_encoder_block_gpu` source. Per layer:
+    | Stage | Dispatches (BF16 fast path) |
+    | ----- | --------------------------- |
+    | Q/K/V matmuls | 3 |
+    | RoPE on Q + K | 2 |
+    | Attention with mask (internally: scores, scale, mask-add, softmax, V-permute, V-cast, V-transpose, scores@V, permute) | ~10 |
+    | attn_output linear | 1 (BF16) |
+    | Residual + LayerNorm (post-attention) | 2 |
+    | ffn_up + ffn_gate + silu_mul + ffn_down | 4 |
+    | Residual + LayerNorm (post-FFN) | 2 |
+    | **Per-layer total** | **~24** |
+    × 12 layers = **~290 dispatches per forward**. At measured ~20 µs Metal dispatch overhead → ~5.8 ms of pure dispatch overhead. Aligns with the 6.73 ms in-process forward floor (the rest is real GPU compute + barriers).
+  - **Iter-86 fusion candidates (priority order, expected savings).**
+    1. **residual_add + layer_norm fused.** 2 dispatches → 1 per layer × 12 layers × 2 fusion sites (post-attn, post-FFN) = **48 dispatches saved** → ~960 µs theoretical savings. Cleanest experiment because the pattern (`norm(a + b)`) appears verbatim in BERT, nomic-bert, and most modern transformer encoders. Single new kernel `bert_residual_layer_norm_f32` reads `a`, `b`, gamma, beta, writes `out`.
+    2. **Q/K/V matmuls into one fused matmul.** 3 → 1 per layer × 12 = **24 dispatches saved**. Requires either a fused-matmul kernel that produces `[seq, 3*hidden]` + a per-row split kernel, OR upgrading the matmul to support a "batched src0" mode that runs three concurrent matmuls in one dispatch. Higher-effort; defer.
+    3. **silu_mul + ffn_down fused.** 2 → 1 per layer × 12 = **12 dispatches saved**. Requires a fused kernel that reads `up`, `gate`, applies `silu(gate)*up`, then matmuls against `ffn_down`. Saves one writethrough of the intermediate `silu_gated` buffer.
+    4. **bert_attention's internal sub-dispatch chain.** ~10 dispatches → potentially 4–5 with proper Flash Attention. Highest leverage but largest implementation cost (Flash Attention kernel for non-causal bidirectional attention). Multi-iter scope; deferred.
+  - **Verification.** 53/53 BERT + nomic_bert tests pass (1 ignored = `forward_timing_10x_warm`). Bench script `scripts/bench_embedding.sh` (iter 84) consistently shows hf2q HTTP /v1/embeddings 7.3-9.5 ms mean vs llama.cpp prompt_eval 4.3 ms — full-stack ratio 1.7-2.2× depending on system thermals.
+  - **Lane discipline.** mxbai test is one new test block in `bert_gpu.rs::tests`. Zero changes to forward composers, mlx-native, handler, or state.
+  - **Next (iter 86):** implement `bert_residual_layer_norm_f32` fused kernel. Expected savings: ~960 µs / 14% of the in-process forward time. Validation: cosine parity must hold ≥ 0.999 for all three day-one models post-fusion. If the fused kernel checks out, follow with the other fusion candidates in priority order.
+
+- **2026-04-26 loop iter 84 — bench methodology locked.** New `scripts/bench_embedding.sh` runs llama-embedding (5× cold, internal `prompt_eval` extracted) + hf2q (20× warm via Python urllib persistent session, steady-state mean reported over reqs 11-20). Output table prints both numbers + the ratio. Eliminates curl-per-request noise (~150-180 ms of process+TCP+DNS overhead per curl) that the iter-82 measurement mistakenly attributed to hf2q. Sample (M5 Max, 2026-04-26):
+  ```
+  llama.cpp internal prompt_eval (mean)      4.34 ms
+  hf2q HTTP /v1/embeddings (warm mean)       7.32 ms (run A) / 9.52 ms (run B)
+  ratio (hf2q full-stack / llama bare-GPU)   1.69× / 2.19×
+  ```
+  Future regressions show against this baseline. Lane: scripts/ only (no source changes).
+
 - **2026-04-26 loop iter 83 — perf optimization shipped. hf2q `/v1/embeddings` warm steady-state: **9.59 ms mean / 9.35 ms min** vs llama.cpp's internal `prompt_eval` 4.54 ms. 20× speedup over the iter-82 baseline (190 ms → 9.6 ms). Cosine parity intact: bge 0.999985, nomic 0.999962. The user-stated bar ("as fast as or faster than llama.cpp") is now within 2.1× of llama.cpp's bare-GPU forward — including ALL of hf2q's HTTP request parse, spawn_blocking dispatch, MlxDevice creation, GPU forward, JSON serialization, and HTTP response.**
   - **Three optimizations landed in this iter, not the one I originally hypothesized.**
     1. **Persistent pre-warmed `KernelRegistry` in `AppState`.** Instead of `KernelRegistry::new()` per request (which was forcing every Metal pipeline to recompile on EVERY `/v1/embeddings` call — ~150 ms of shader-compile cost), boot-time `cmd_serve` builds one registry, registers the right kernels for the loaded arch, runs ONE warmup forward (compiles every pipeline + caches them), then stashes the registry behind `Arc<Mutex<KernelRegistry>>` in `AppState::embedding_registry`. Per-request handlers `lock()` the mutex briefly, dispatch with cached pipelines, `drop()` the guard so subsequent requests can dispatch concurrently while the response serializes.
