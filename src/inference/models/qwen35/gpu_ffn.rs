@@ -63,6 +63,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
@@ -349,8 +350,15 @@ fn proj(
         src0_batch: 1,
         src1_batch: 1,
     };
-    dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
-        .context("dense_matmul_bf16_f32_tensor")?;
+    if seq_len == 1 {
+        // GEMV path for single-token decode — bandwidth-optimized, ~2× faster
+        // than tiled MM for M=1 on Apple Silicon.
+        dense_gemv_bf16_f32(encoder, registry, device, weight_bf16, input, &mut dst, &params)
+            .context("dense_gemv_bf16_f32 proj M=1")?;
+    } else {
+        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
+            .context("dense_matmul_bf16_f32_tensor")?;
+    }
     Ok(dst)
 }
 

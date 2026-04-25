@@ -764,9 +764,15 @@ fn cmd_generate_qwen35(
 
         // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
         // Eliminates ~5ms/token vocabulary download for greedy decode.
+        let _t_step = if std::env::var("HF2Q_STEP_PROFILE").is_ok() {
+            Some(std::time::Instant::now())
+        } else { None };
         next_token = model
             .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
             .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
+        if let Some(t) = _t_step {
+            eprintln!("[STEP_PROFILE] step={step} total={:.2}ms", t.elapsed().as_micros() as f64 / 1000.0);
+        }
         generated += 1;
 
         let s = tokenizer.decode(&[next_token], false).unwrap_or_default();

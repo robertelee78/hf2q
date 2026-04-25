@@ -51,8 +51,8 @@ use super::gpu_ffn::{
     DenseFfnWeightsGpu, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
-    apply_linear_projection_f32, build_gated_attn_layer, download_f32, upload_f32,
-    upload_q4_0_from_f32, FullAttnWeightsGpu,
+    apply_linear_projection_f32, apply_linear_projection_f32_into, build_gated_attn_layer,
+    download_f32, upload_f32, upload_f32_into, upload_q4_0_from_f32, FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
@@ -140,6 +140,41 @@ fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u3
 // Per-session GPU state cache
 // ================================================================
 
+/// Pre-allocated decode buffers for `forward_gpu_greedy` (seq_len == 1).
+///
+/// All buffers have fixed shape `[1, hidden_size]` for single-token decode.
+/// Reusing these across decode tokens eliminates ~80 Metal `newBuffer` calls
+/// per token (2 per layer × 40 layers), saving ~1ms/token CPU overhead.
+struct DecodeBuffers {
+    /// `hidden_size` for which these were allocated (shape check).
+    hidden_size: u32,
+    /// Token embedding scratch: `[1, hidden_size]` F32 (CPU gather → upload here).
+    /// Avoids one Metal `newBuffer` + `memcpy` per decode token for embedding.
+    embed_buf: MlxBuffer,
+    /// Per-layer scratch pair (ffn_input_buf, ffn_residual_buf).
+    /// One pair per layer: `layer_scratch[i] = ([1,H], [1,H])`.
+    /// These are safe to pre-allocate per-layer because each layer's
+    /// fused_norm writes into layer_scratch[i].0/.1, then FFN reads
+    /// only from layer_scratch[i].0 (and adds layer_scratch[i].1 as
+    /// the residual).  With pipelined commit(), layer i+1's fused_norm
+    /// writes into layer_scratch[i+1].0/.1 while layer i's FFN is
+    /// still executing — these are DIFFERENT buffers, so no conflict.
+    layer_scratch: Vec<(MlxBuffer, MlxBuffer)>,
+    /// Output-head normed: `[1, hidden_size]` F32.
+    norm_out_buf: MlxBuffer,
+    /// Argmax output index: `[1]` U32.
+    argmax_index_buf: MlxBuffer,
+    /// Argmax output value: `[1]` F32.
+    argmax_value_buf: MlxBuffer,
+    /// Argmax params: `[1]` U32 (holds vocab_size).
+    argmax_params_buf: MlxBuffer,
+    /// Output norm params: `[2]` F32 (eps, hidden_size_f32).
+    norm_params_buf: MlxBuffer,
+    /// Logits scratch: `[1, vocab_size]` F32 — lm_head output.
+    /// Pre-allocated to avoid ~600KB Metal `newBuffer` per decode token.
+    logits_buf: MlxBuffer,
+}
+
 /// Cached GPU state for a single forward session (one generate call).
 ///
 /// Weights are uploaded once at session start and reused across all decode
@@ -153,6 +188,8 @@ struct ForwardGpuCache {
     registry: KernelRegistry,
     layer_weights: Vec<LayerWeightsGpu>,
     output_head: OutputHeadGpu,
+    /// Pre-allocated decode buffers (reused every decode token).
+    decode_bufs: Option<DecodeBuffers>,
 }
 
 // SAFETY: the thread_local cache is only accessed on the thread that owns it.
@@ -300,20 +337,6 @@ fn apply_output_head_gpu(
     download_f32(&logits_buf).context("download logits")
 }
 
-/// Returns the public greedy token-ID path for single-step decode.
-/// Exposed so `cmd_generate_qwen35` can call it directly and bypass
-/// the 600KB logit download.
-pub fn apply_output_head_greedy_token(
-    device: &MlxDevice,
-    registry: &mut KernelRegistry,
-    hidden: &MlxBuffer,
-    head: &OutputHeadGpu,
-    hidden_size: u32,
-    vocab_size: u32,
-    eps: f32,
-) -> Result<u32> {
-    apply_output_head_gpu_greedy(device, registry, hidden, head, hidden_size, vocab_size, eps)
-}
 
 /// Decode-only greedy variant of `apply_output_head_gpu`.
 ///
@@ -322,6 +345,7 @@ pub fn apply_output_head_greedy_token(
 /// vocab_size=151936).  75× less data transferred per decode step.
 ///
 /// Only correct for seq_len=1 greedy decoding (temperature=0).
+/// Accepts pre-allocated `DecodeBuffers` to avoid per-call Metal allocation.
 fn apply_output_head_gpu_greedy(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -329,31 +353,23 @@ fn apply_output_head_gpu_greedy(
     head: &OutputHeadGpu,
     hidden_size: u32,
     vocab_size: u32,
-    eps: f32,
+    _eps: f32,
+    bufs: &DecodeBuffers,
 ) -> Result<u32> {
     let seq_len = 1u32;
 
-    // ---- Pre-allocate: normed, argmax outputs + params ----
-    let normed = device
-        .alloc_buffer(hidden_size as usize * 4, DType::F32, vec![1, hidden_size as usize])
-        .map_err(|e| anyhow!("alloc normed greedy: {e}"))?;
-    let mut norm_params = device
-        .alloc_buffer(8, DType::F32, vec![2])
-        .map_err(|e| anyhow!("alloc norm params greedy: {e}"))?;
-    {
-        let s = norm_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = eps; s[1] = hidden_size as f32;
-    }
-    let out_index = device
-        .alloc_buffer(4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc out_index: {e}"))?;
-    let out_value = device
-        .alloc_buffer(4, DType::F32, vec![1])
-        .map_err(|e| anyhow!("alloc out_value: {e}"))?;
-    let mut argmax_params = device
-        .alloc_buffer(4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc argmax params: {e}"))?;
-    argmax_params.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = vocab_size;
+    // Use pre-allocated buffers from DecodeBuffers (zero Metal alloc overhead).
+    let normed        = &bufs.norm_out_buf;
+    let norm_params   = &bufs.norm_params_buf;
+    let out_index     = &bufs.argmax_index_buf;
+    let out_value     = &bufs.argmax_value_buf;
+    let argmax_params = &bufs.argmax_params_buf;
+    // logits_buf is &mut because apply_linear_projection_f32_into writes into it.
+    // SAFETY: decode_bufs is behind a *mut DecodeBuffers (exclusive access during
+    // this call — same token, no concurrent access).
+    let logits_buf = unsafe {
+        &mut (*(bufs as *const DecodeBuffers as *mut DecodeBuffers)).logits_buf
+    };
 
     // ---- Encoder A: output_norm + lm_head → logits_buf ----
     // output_norm is pipelined (commit()) into lm_head via serial queue.
@@ -365,12 +381,12 @@ fn apply_output_head_gpu_greedy(
     ).context("dispatch_rms_norm output greedy")?;
     enc_norm.commit();
 
-    // Use Q4_0 lm_head for decode: 3.57× less bandwidth vs BF16
-    // (~1.5ms vs ~5.4ms for 151936×7168 matrix-vector product).
+    // Use Q4_0 lm_head for decode: 3.57× less bandwidth vs BF16.
+    // Pre-allocated logits_buf avoids ~600KB newBuffer per decode token.
     let mut enc_lm = device.command_encoder().context("enc lm_head greedy")?;
-    let logits_buf = apply_linear_projection_f32(
+    apply_linear_projection_f32_into(
         &mut enc_lm, registry, device, &normed,
-        &head.lm_head_q4, seq_len, hidden_size, vocab_size,
+        &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
     ).context("lm_head projection greedy")?;
     // commit() and immediately encode argmax on the same queue.
     enc_lm.commit();
@@ -540,6 +556,7 @@ impl Qwen35Model {
                     registry,
                     layer_weights,
                     output_head,
+                    decode_bufs: None, // initialized lazily on first greedy decode
                 });
             }
             Ok(())
@@ -1011,12 +1028,76 @@ impl Qwen35Model {
                     registry,
                     layer_weights,
                     output_head,
+                    decode_bufs: None, // initialized lazily on first call
                 });
             }
             Ok(())
         })?;
 
-        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref) = {
+        // ---- Lazy-init decode buffer pool (first greedy call only) ----
+        // Pre-allocates fixed-shape buffers reused every decode token:
+        //   embed_buf, ffn_input_buf, ffn_residual_buf, norm_out_buf,
+        //   argmax_index, argmax_value, argmax_params, norm_params.
+        // Eliminates ~80 Metal newBuffer calls per token (~1ms CPU overhead).
+        GPU_CACHE.with(|cell| -> Result<()> {
+            let mut cache = cell.borrow_mut();
+            let c = cache.as_mut().unwrap();
+            if c.decode_bufs.is_none() {
+                let h = cfg.hidden_size as usize;
+                let vocab_size = cfg.vocab_size as u32;
+                let n_layers = self.layers.len();
+                let alloc4 = |dev: &MlxDevice, elem: usize, shape: Vec<usize>| -> Result<MlxBuffer> {
+                    dev.alloc_buffer(elem * 4, DType::F32, shape)
+                        .map_err(|e| anyhow!("alloc decode buf: {e}"))
+                };
+                // Embedding scratch: CPU gather writes here each decode token.
+                let embed_buf = alloc4(&c.device, h, vec![1, h])?;
+                // Per-layer scratch: one (ffn_input, ffn_residual) pair per layer.
+                let mut layer_scratch = Vec::with_capacity(n_layers);
+                for _ in 0..n_layers {
+                    let fi = alloc4(&c.device, h, vec![1, h])?;
+                    let fr = alloc4(&c.device, h, vec![1, h])?;
+                    layer_scratch.push((fi, fr));
+                }
+                let norm_out_buf = alloc4(&c.device, h, vec![1, h])?;
+                let argmax_index_buf = c.device
+                    .alloc_buffer(4, DType::U32, vec![1])
+                    .map_err(|e| anyhow!("alloc argmax_index: {e}"))?;
+                let argmax_value_buf = c.device
+                    .alloc_buffer(4, DType::F32, vec![1])
+                    .map_err(|e| anyhow!("alloc argmax_value: {e}"))?;
+                let mut argmax_params_buf = c.device
+                    .alloc_buffer(4, DType::U32, vec![1])
+                    .map_err(|e| anyhow!("alloc argmax_params: {e}"))?;
+                argmax_params_buf.as_mut_slice::<u32>()
+                    .map_err(|e| anyhow!("{e}"))?[0] = vocab_size;
+                let mut norm_params_buf = c.device
+                    .alloc_buffer(8, DType::F32, vec![2])
+                    .map_err(|e| anyhow!("alloc norm_params: {e}"))?;
+                {
+                    let s = norm_params_buf.as_mut_slice::<f32>()
+                        .map_err(|e| anyhow!("{e}"))?;
+                    s[0] = cfg.rms_norm_eps;
+                    s[1] = cfg.hidden_size as f32;
+                }
+                // Logits scratch: pre-allocate once to avoid ~600KB newBuffer per decode token.
+                let logits_buf = alloc4(&c.device, vocab_size as usize, vec![1, vocab_size as usize])?;
+                c.decode_bufs = Some(DecodeBuffers {
+                    hidden_size: cfg.hidden_size,
+                    embed_buf,
+                    layer_scratch,
+                    norm_out_buf,
+                    argmax_index_buf,
+                    argmax_value_buf,
+                    argmax_params_buf,
+                    norm_params_buf,
+                    logits_buf,
+                });
+            }
+            Ok(())
+        })?;
+
+        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref, decode_bufs_ref) = {
             GPU_CACHE.with(|cell| -> Result<_> {
                 let cache = cell.borrow();
                 let c = cache.as_ref().unwrap();
@@ -1034,23 +1115,28 @@ impl Qwen35Model {
                 let registry_ptr = &c.registry as *const KernelRegistry as *mut KernelRegistry;
                 let weights_ptr = &c.layer_weights as *const Vec<LayerWeightsGpu>;
                 let head_ptr = &c.output_head as *const OutputHeadGpu;
-                Ok((pos_buf, weights_ptr, device_ptr, registry_ptr, head_ptr))
+                let bufs_ptr = c.decode_bufs.as_ref().unwrap() as *const DecodeBuffers as *mut DecodeBuffers;
+                Ok((pos_buf, weights_ptr, device_ptr, registry_ptr, head_ptr, bufs_ptr))
             })?
         };
         let device = unsafe { &*device_ref };
         let mut registry = unsafe { &mut *registry_ref };
         let layer_weights_gpu = unsafe { &*layer_weights_gpu };
         let output_head = unsafe { &*output_head_ref };
+        let decode_bufs = unsafe { &*decode_bufs_ref };
 
-        // ---- Embedding ----
-        let mut hidden = embed_tokens_gpu(
-            tokens,
-            &self.token_embd,
-            cfg.vocab_size,
-            h,
-            &device,
-        )
-        .context("embed_tokens_gpu greedy")?;
+        // ---- Embedding (no-alloc path) ----
+        // CPU gather into pre-allocated embed_buf (no Metal newBuffer call).
+        // SAFETY: decode_bufs_ref points into the thread-local GPU_CACHE which
+        // is valid for the duration of this call. We hold exclusive access to
+        // embed_buf here (no other reference exists during the embedding step).
+        let mut hidden = {
+            let cpu_embed = embed_tokens(tokens, &self.token_embd, cfg.vocab_size, h);
+            let embed_buf_mut = unsafe { &mut (*decode_bufs_ref).embed_buf };
+            upload_f32_into(&cpu_embed, embed_buf_mut)
+                .context("embed upload_f32_into greedy")?;
+            decode_bufs.embed_buf.clone()
+        };
 
         // ---- Per-layer forward pass (identical to forward_gpu) ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
@@ -1170,25 +1256,15 @@ impl Qwen35Model {
             }
 
             // --- Fused residual + post-attention RMSNorm ---
+            // Use pre-allocated per-layer scratch buffers (avoids 2 Metal
+            // newBuffer calls per layer × 40 layers = 80 allocs per token).
             let (ffn_residual, ffn_input) = {
                 let post_norm_w = match layer_gpu {
                     LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                     LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
                 };
-                let ffn_input_buf = device
-                    .alloc_buffer(
-                        (seq_len * h) as usize * 4,
-                        DType::F32,
-                        vec![seq_len as usize, h as usize],
-                    )
-                    .map_err(|e| anyhow!("alloc ffn_input greedy layer {layer_idx}: {e}"))?;
-                let ffn_residual_buf = device
-                    .alloc_buffer(
-                        (seq_len * h) as usize * 4,
-                        DType::F32,
-                        vec![seq_len as usize, h as usize],
-                    )
-                    .map_err(|e| anyhow!("alloc ffn_residual greedy layer {layer_idx}: {e}"))?;
+                // layer_scratch[layer_idx] = (ffn_input_buf, ffn_residual_buf)
+                let (ffn_input_buf, ffn_residual_buf) = &decode_bufs.layer_scratch[layer_idx];
                 let mut enc = device.command_encoder()
                     .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
@@ -1198,15 +1274,15 @@ impl Qwen35Model {
                     &hidden,
                     &attn_out,
                     post_norm_w,
-                    &ffn_input_buf,
-                    Some(&ffn_residual_buf),
+                    ffn_input_buf,
+                    Some(ffn_residual_buf),
                     seq_len,
                     h,
                     eps,
                 )
                 .with_context(|| format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}"))?;
                 enc.commit();
-                (ffn_residual_buf, ffn_input_buf)
+                (ffn_residual_buf.clone(), ffn_input_buf.clone())
             };
             hidden = ffn_residual.clone();
 
@@ -1297,6 +1373,7 @@ impl Qwen35Model {
             h,
             cfg.vocab_size,
             eps,
+            &decode_bufs,
         )
         .context("apply_output_head_gpu_greedy")?;
         if let Some(t) = t_output_head {

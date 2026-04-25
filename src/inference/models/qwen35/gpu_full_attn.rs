@@ -225,6 +225,28 @@ pub fn upload_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> {
     Ok(buf)
 }
 
+/// Copy `data` into an existing `MlxBuffer` (no allocation).
+///
+/// Used for decode-path hot buffers that are pre-allocated once and reused
+/// every decode token to avoid repeated `newBuffer` Metal API calls.
+///
+/// # Errors
+/// Returns an error if `buf` is too small or has the wrong dtype.
+pub fn upload_f32_into(data: &[f32], buf: &mut MlxBuffer) -> Result<()> {
+    anyhow::ensure!(
+        buf.dtype() == DType::F32,
+        "upload_f32_into: expected F32 buffer, got {:?}", buf.dtype()
+    );
+    anyhow::ensure!(
+        buf.element_count() >= data.len(),
+        "upload_f32_into: buf too small (cap={} < data={})",
+        buf.element_count(), data.len()
+    );
+    let slice = buf.as_mut_slice::<f32>().map_err(|e| anyhow!("mut_slice: {e}"))?;
+    slice[..data.len()].copy_from_slice(data);
+    Ok(())
+}
+
 /// Download an `MlxBuffer` of f32 values into a `Vec<f32>`.
 pub fn download_f32(buf: &MlxBuffer) -> Result<Vec<f32>> {
     if buf.dtype() != DType::F32 {
@@ -568,6 +590,77 @@ pub fn apply_linear_projection_f32(
     }
 
     Ok(dst)
+}
+
+/// Like `apply_linear_projection_f32` but writes into a caller-supplied output
+/// buffer instead of allocating a new one.
+///
+/// Used by the decode hot-path to avoid one ~600KB `newBuffer` per token for
+/// the lm_head logits output.  The caller is responsible for ensuring `dst`
+/// has capacity ≥ `seq_len × out_features × sizeof(f32)` and dtype == F32.
+pub fn apply_linear_projection_f32_into(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    dst: &mut MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<()> {
+    match weight.dtype() {
+        DType::U8 => {
+            let params = GgmlQuantizedMatmulParams {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                ggml_type: GgmlType::Q4_0,
+            };
+            quantized_matmul_ggml(encoder, registry, device, input, weight, dst, &params)
+                .context("quantized_matmul_ggml Q4_0 (into)")?;
+        }
+        DType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            if seq_len == 1 {
+                dense_gemv_bf16_f32(encoder, registry, device, weight, input, dst, &params)
+                    .context("dense_gemv_bf16_f32 (M=1, into)")?;
+            } else {
+                dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, dst, &params)
+                    .context("dense_matmul_bf16_f32_tensor (into)")?;
+            }
+        }
+        DType::F32 => {
+            let n_w = (out_features * in_features) as usize;
+            let weight_bf16 = device
+                .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
+                .context("cast weight F32→BF16 (into)")?;
+            encoder.memory_barrier();
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, dst, &params)
+                .context("dense_matmul_bf16_f32_tensor F32 legacy (into)")?;
+        }
+        other => {
+            return Err(anyhow!(
+                "apply_linear_projection_f32_into: unsupported weight dtype {:?}", other
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ================================================================
