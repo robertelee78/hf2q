@@ -857,11 +857,24 @@ pub struct EmbeddingRequest {
     pub user: Option<String>,
 }
 
-/// A single embedding object in the response.
+/// A single embedding object in the response. The `embedding` field
+/// can be either a list of floats (`encoding_format="float"`) or a
+/// base64-encoded string of little-endian F32 bytes (the OpenAI Python
+/// SDK's *default* encoding — chosen to reduce JSON payload size).
+/// Serialized as an untagged union so JSON output looks like OpenAI's:
+///   { "object": "embedding", "embedding": [0.1, 0.2, ...], "index": 0 }
+///   { "object": "embedding", "embedding": "base64string==", "index": 0 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingPayload {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingObject {
     pub object: &'static str,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingPayload,
     pub index: usize,
 }
 
@@ -1337,8 +1350,16 @@ mod tests {
         let resp = EmbeddingResponse {
             object: "list",
             data: vec![
-                EmbeddingObject { object: "embedding", embedding: vec![0.1, 0.2], index: 0 },
-                EmbeddingObject { object: "embedding", embedding: vec![0.3, 0.4], index: 1 },
+                EmbeddingObject {
+                    object: "embedding",
+                    embedding: EmbeddingPayload::Float(vec![0.1, 0.2]),
+                    index: 0,
+                },
+                EmbeddingObject {
+                    object: "embedding",
+                    embedding: EmbeddingPayload::Float(vec![0.3, 0.4]),
+                    index: 1,
+                },
             ],
             model: "test".to_string(),
             usage: EmbeddingUsage { prompt_tokens: 10, total_tokens: 10 },

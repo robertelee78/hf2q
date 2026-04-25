@@ -29,9 +29,9 @@ use super::engine::{self, SamplingParams};
 use super::grammar;
 use super::schema::{
     ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    EmbeddingObject, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, HealthResponse,
-    MessageContent, ModelListResponse, ModelObject, PromptTokensDetails, ReadyzResponse,
-    ResponseFormat, UsageStats,
+    EmbeddingObject, EmbeddingPayload, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
+    HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
+    ReadyzResponse, ResponseFormat, UsageStats,
 };
 use super::state::AppState;
 
@@ -1108,15 +1108,20 @@ pub async fn embeddings(
     };
 
     // --- Validate request format ---
-    if let Some(fmt) = req.encoding_format.as_deref() {
-        if fmt != "float" {
+    // OpenAI accepts {"float", "base64"}. The Python SDK defaults to
+    // base64 to reduce JSON payload size; we support both. Anything
+    // else is a 400.
+    let want_base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
             return ApiError::invalid_request(
-                format!("encoding_format='{fmt}' not supported (only 'float')"),
+                format!("encoding_format='{other}' not supported (only 'float' or 'base64')"),
                 Some("encoding_format".into()),
             )
             .into_response();
         }
-    }
+    };
     let inputs = req.input.into_vec();
     if inputs.is_empty() {
         return ApiError::invalid_request(
@@ -1215,15 +1220,26 @@ pub async fn embeddings(
                 .finish()
                 .map_err(|e| anyhow::anyhow!("session finish: {e}"))?;
 
-            // Read back the [hidden] vector.
+            // Read back the [hidden] vector and encode per the request's
+            // encoding_format. OpenAI's spec: float = list of f32; base64
+            // = standard base64 of little-endian F32 bytes.
             let slice = out
                 .as_slice::<f32>()
                 .map_err(|e| anyhow::anyhow!("readback: {e}"))?;
-            let embedding = slice.to_vec();
+            let payload = if want_base64 {
+                let mut bytes = Vec::with_capacity(slice.len() * 4);
+                for v in slice {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                use base64::Engine;
+                EmbeddingPayload::Base64(base64::engine::general_purpose::STANDARD.encode(&bytes))
+            } else {
+                EmbeddingPayload::Float(slice.to_vec())
+            };
 
             data.push(EmbeddingObject {
                 object: "embedding",
-                embedding,
+                embedding: payload,
                 index: i,
             });
         }
