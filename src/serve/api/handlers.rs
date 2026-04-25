@@ -1151,15 +1151,11 @@ pub async fn embeddings(
         let mut total_tokens: usize = 0;
 
         for (i, input) in inputs.into_iter().enumerate() {
-            // Tokenize. `add_special_tokens=true` so BERT's [CLS] /
-            // [SEP] markers are inserted — without them the encoder
-            // sees a sentence missing its sentinels and the embedding
-            // diverges from llama-embedding (and from any
-            // sentence-transformers / HuggingFace baseline).
-            let enc = tokenizer
-                .encode(input.as_str(), true)
-                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-            let raw_ids = enc.get_ids();
+            // Tokenize via the llama.cpp-compatible WPM tokenizer.
+            // `add_special_tokens=true` wraps the output in
+            // `[CLS] ... [SEP]` — without that the embedding diverges
+            // from llama-embedding's reference output.
+            let raw_ids: Vec<u32> = tokenizer.encode(input.as_str(), true);
             total_tokens += raw_ids.len();
 
             // Pad / truncate to satisfy the matmul K floor (32) and the

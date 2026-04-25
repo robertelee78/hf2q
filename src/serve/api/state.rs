@@ -197,10 +197,13 @@ pub struct EmbeddingModel {
     pub gguf_path: PathBuf,
     pub config: BertConfig,
     pub vocab: Arc<crate::inference::models::bert::BertVocab>,
-    /// Ready-to-use WordPiece tokenizer. Wrapped in `Arc` because
-    /// `tokenizers::Tokenizer` is not trivially `Clone` across its
-    /// generic-type-erased form, but `Arc<Tokenizer>` is cheap to share.
-    pub tokenizer: Arc<tokenizers::Tokenizer>,
+    /// llama.cpp-compatible WordPiece tokenizer (uses ▁-prefix word
+    /// starters, matches the bge / nomic / mxbai GGUF format byte-for-
+    /// byte). Replaces the prior HF `tokenizers::Tokenizer` because
+    /// the HF crate's WordPiece hardcodes the `##`-continuation
+    /// convention which is incompatible with how llama.cpp serializes
+    /// BERT vocabularies into GGUF.
+    pub tokenizer: Arc<crate::inference::models::bert::BertWpmTokenizer>,
     /// Model id (file stem) — surfaced via `/v1/models`.
     pub model_id: String,
     /// All BERT tensors loaded onto a Metal device as F32. `Arc` so each
@@ -227,13 +230,11 @@ impl std::fmt::Debug for EmbeddingModel {
 
 impl EmbeddingModel {
     /// Convenience: tokenize a single input string using the embedded
-    /// WordPiece tokenizer. Returns the token-id vector.
-    pub fn encode(&self, input: &str) -> anyhow::Result<Vec<u32>> {
-        let enc = self
-            .tokenizer
-            .encode(input, false)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        Ok(enc.get_ids().to_vec())
+    /// WordPiece tokenizer. Returns the token-id vector. Matches
+    /// llama.cpp's WPM tokenizer; pass `add_special_tokens=true` to
+    /// wrap the output in `[CLS] ... [SEP]`.
+    pub fn encode(&self, input: &str, add_special_tokens: bool) -> Vec<u32> {
+        self.tokenizer.encode(input, add_special_tokens)
     }
 }
 
@@ -385,14 +386,18 @@ mod tests {
         use crate::inference::models::bert::{
             build_wordpiece_tokenizer, BertConfig, BertSpecialTokens, BertVocab, PoolingType,
         };
+        // Synthetic vocab using llama.cpp's BERT-WPM convention:
+        // word-starter tokens are prefixed with ▁ (U+2581). The
+        // BertWpmTokenizer prepends ▁ to every input word before
+        // greedy lookup, so the vocab MUST store the ▁-prefixed form.
         let vocab = BertVocab {
             tokens: vec![
                 "[UNK]".into(),
                 "[CLS]".into(),
                 "[SEP]".into(),
                 "[PAD]".into(),
-                "hello".into(),
-                "world".into(),
+                "\u{2581}hello".into(),
+                "\u{2581}world".into(),
             ],
             specials: BertSpecialTokens {
                 cls: 1,
@@ -418,12 +423,13 @@ mod tests {
                 pooling_type: PoolingType::Mean,
                 causal_attention: false,
             },
-            vocab: Arc::new(vocab),
-            tokenizer: Arc::new(tokenizer),
+            vocab: Arc::new(vocab.clone()),
+            tokenizer: Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(&vocab)),
             model_id: "synthetic-embed".into(),
             weights: None,
         };
-        let ids = em.encode("hello world").expect("encode");
+        let _ = tokenizer; // legacy HF tokenizer no longer used; kept for shape only
+        let ids = em.encode("hello world", false);
         assert!(ids.contains(&4), "expected 'hello'=4 in {:?}", ids);
         assert!(ids.contains(&5), "expected 'world'=5 in {:?}", ids);
     }

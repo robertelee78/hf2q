@@ -566,11 +566,14 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
         let emb_config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF config parse failed: {e}"))?;
-        // Extract vocab + build WordPiece tokenizer (iter 20).
+        // Extract vocab + build llama.cpp-compatible WPM tokenizer.
+        // The HF `tokenizers` crate's WordPiece path is incompatible with
+        // the bge / nomic / mxbai GGUF vocab format (▁-prefixed word
+        // starters); iter 64 ported llama.cpp's `llm_tokenizer_wpm`
+        // directly to Rust.
         let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
-        let tokenizer = crate::inference::models::bert::build_wordpiece_tokenizer(&vocab)
-            .map_err(|e| anyhow::anyhow!("Embedding tokenizer build failed: {e}"))?;
+        let tokenizer = crate::inference::models::bert::BertWpmTokenizer::new(&vocab);
         let model_id = emb_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())

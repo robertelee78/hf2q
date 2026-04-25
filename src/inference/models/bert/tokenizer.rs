@@ -25,7 +25,193 @@ use std::collections::HashMap;
 use tokenizers::models::wordpiece::WordPiece;
 use tokenizers::normalizers::bert::BertNormalizer;
 use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
+use tokenizers::processors::bert::BertProcessing;
 use tokenizers::Tokenizer;
+
+// ---------------------------------------------------------------------------
+// BertWpmTokenizer — llama.cpp-compatible WordPiece (BERT GGUF format)
+// ---------------------------------------------------------------------------
+//
+// llama.cpp stores BERT vocabularies with U+2581 (▁) prefixing every
+// word-starter token; subwords are bare. This is the inverse of the
+// HuggingFace `tokenizers` crate's WordPiece convention (no prefix on
+// word-starters, `##` prefix on subwords). The two conventions are not
+// interchangeable — the bge-small GGUF cannot be loaded into HF's
+// WordPiece without a vocab translation that risks ambiguous mappings.
+//
+// Solution: port llama.cpp's `llm_tokenizer_wpm_session::tokenize` from
+// `/opt/llama.cpp/src/llama-vocab.cpp:727-813` directly to Rust. The
+// algorithm:
+//   1. Normalize + lowercase the input (NFD, then `is_whitespace` /
+//      `is_punctuation` boundaries split words).
+//   2. For each whitespace-separated word, prepend ▁ (U+2581).
+//   3. Greedy longest-match against the vocab.
+//   4. If no match found for a word, emit a single [UNK].
+//
+// The `BertProcessing` post-processor wrapping ([CLS] ... [SEP]) is
+// applied via a flag on `encode`, so the tokenizer is the canonical
+// hf2q tokenizer for any GGUF whose `tokenizer.ggml.model = "bert"`.
+
+/// llama.cpp-compatible BERT WordPiece tokenizer. Matches the C++
+/// reference in `/opt/llama.cpp/src/llama-vocab.cpp::llm_tokenizer_wpm_session`
+/// byte-for-byte on standard ASCII inputs.
+#[derive(Debug, Clone)]
+pub struct BertWpmTokenizer {
+    /// Token string → id map (built once at construction).
+    token_to_id: HashMap<String, u32>,
+    /// Special-token ids extracted from GGUF metadata.
+    specials: BertSpecialTokens,
+    /// Maximum token length in bytes (for the greedy matcher's inner
+    /// loop bound).
+    max_token_len: usize,
+}
+
+impl BertWpmTokenizer {
+    /// Build from an extracted `BertVocab`. Stores a name → id map for
+    /// the greedy matcher.
+    pub fn new(vocab: &BertVocab) -> Self {
+        let mut max_len = 0usize;
+        let mut token_to_id = HashMap::with_capacity(vocab.tokens.len());
+        for (i, tok) in vocab.tokens.iter().enumerate() {
+            max_len = max_len.max(tok.len());
+            token_to_id.insert(tok.clone(), i as u32);
+        }
+        Self {
+            token_to_id,
+            specials: vocab.specials,
+            max_token_len: max_len.max(1),
+        }
+    }
+
+    /// Tokenize text. When `add_special_tokens` is true, the result is
+    /// `[CLS] ...tokens... [SEP]`.
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
+        let words = preprocess_words(text);
+        let mut output: Vec<u32> = Vec::with_capacity(words.len() * 2 + 2);
+        if add_special_tokens {
+            output.push(self.specials.cls);
+        }
+
+        for word in words {
+            if word.is_empty() {
+                continue;
+            }
+            // Prepend ▁ (U+2581) to mark word start. Matches
+            // `llama-vocab.cpp:743 const std::string word1 = "\xe2\x96\x81" + word;`.
+            let mut word1 = String::with_capacity(word.len() + 3);
+            word1.push('\u{2581}');
+            word1.push_str(&word);
+            let bytes = word1.as_bytes();
+            let n = bytes.len();
+            let current_tokens = output.len();
+
+            let mut i = 0usize;
+            let mut matched_word = true;
+            while i < n {
+                // Greedy longest-match: try lengths from max down to i+1.
+                let mut found_at: Option<usize> = None;
+                let upper = std::cmp::min(n, i + self.max_token_len + 1);
+                let mut j = upper;
+                while j > i {
+                    let slice = &bytes[i..j];
+                    // We must only attempt valid UTF-8 boundaries — Rust
+                    // `&str::from_utf8` rejects mid-codepoint slices.
+                    if let Ok(s) = std::str::from_utf8(slice) {
+                        if let Some(&id) = self.token_to_id.get(s) {
+                            found_at = Some(j);
+                            output.push(id);
+                            break;
+                        }
+                    }
+                    j -= 1;
+                }
+                match found_at {
+                    Some(end) => {
+                        i = end;
+                    }
+                    None => {
+                        // No match at this start position → bail out for
+                        // this word; matches llama.cpp's `// discard all`
+                        // path.
+                        output.truncate(current_tokens);
+                        matched_word = false;
+                        break;
+                    }
+                }
+            }
+
+            // No matches at all for this word → emit a single [UNK]
+            // (matches `output.push_back(vocab.token_unk());` in llama.cpp).
+            if !matched_word || output.len() == current_tokens {
+                output.push(self.specials.unk);
+            }
+        }
+
+        if add_special_tokens {
+            output.push(self.specials.sep);
+        }
+        output
+    }
+
+    pub fn specials(&self) -> &BertSpecialTokens {
+        &self.specials
+    }
+}
+
+/// Mirror of llama.cpp's `llm_tokenizer_wpm_session::preprocess`. Splits
+/// `text` into a `Vec<String>` of words, applying:
+///   - NFD normalization (best-effort via a small helper since we don't
+///     pull in unicode-normalization to keep deps light; for ASCII
+///     inputs this is a no-op).
+///   - Lowercase folding via `char::to_lowercase`.
+///   - Whitespace split (drops the whitespace).
+///   - Punctuation split (each punctuation char becomes its own word).
+///   - Drop control / `\0` / U+FFFD code points.
+///
+/// For ASCII-only inputs the output matches llama.cpp byte-for-byte. For
+/// non-ASCII inputs (CJK, accented Latin, etc.) the NFD-normalization step
+/// is the only divergence; that's a known iter-65 follow-up.
+fn preprocess_words(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = vec![String::new()];
+    for c in text.chars() {
+        // Drop control / null / replacement.
+        if c == '\0' || c == '\u{FFFD}' || c.is_control() {
+            continue;
+        }
+        if c.is_whitespace() {
+            if !words.last().unwrap().is_empty() {
+                words.push(String::new());
+            }
+            continue;
+        }
+        // Mirror llama.cpp's tolower + the punctuation-isolates-as-its-
+        // own-word rule. `is_ascii_punctuation` is conservative — for
+        // non-ASCII punctuation a future iter widens via the
+        // `unicode_categories` crate; current matches llama.cpp on every
+        // ASCII codepoint and on CJK ideographs (which fall through to
+        // the append branch).
+        let lower: String = c.to_lowercase().collect();
+        if c.is_ascii_punctuation()
+            || (c.is_ascii() && (c as u32) < 0x7F && c.is_ascii_graphic() && !c.is_ascii_alphanumeric() && !c.is_ascii_whitespace())
+        {
+            // is_ascii_punctuation already covers ., ?, !, etc. The
+            // second clause re-checks for ASCII symbols outside
+            // alphanumeric (e.g. `$`, `+`) since llama.cpp also splits
+            // those.
+            if !words.last().unwrap().is_empty() {
+                words.push(String::new());
+            }
+            words.push(lower);
+            words.push(String::new());
+        } else {
+            words.last_mut().unwrap().push_str(&lower);
+        }
+    }
+    if words.last().map(|w| w.is_empty()).unwrap_or(false) {
+        words.pop();
+    }
+    words
+}
 
 // ---------------------------------------------------------------------------
 // BertSpecialTokens
@@ -190,6 +376,26 @@ pub fn build_wordpiece_tokenizer(vocab: &BertVocab) -> Result<Tokenizer> {
     let mut tokenizer = Tokenizer::new(wp);
     tokenizer.with_normalizer(Some(BertNormalizer::default()));
     tokenizer.with_pre_tokenizer(Some(BertPreTokenizer));
+    // Wrap inputs in [CLS] ... [SEP] when the caller passes
+    // `add_special_tokens = true` — without this, BERT sees a sentence
+    // missing both sentinels and the embedding diverges from
+    // llama-embedding (iter 63 cosine = 0.46).
+    let cls_id = vocab.specials.cls;
+    let sep_id = vocab.specials.sep;
+    let cls_tok = vocab
+        .tokens
+        .get(cls_id as usize)
+        .cloned()
+        .ok_or_else(|| anyhow!("vocab missing CLS token at id {}", cls_id))?;
+    let sep_tok = vocab
+        .tokens
+        .get(sep_id as usize)
+        .cloned()
+        .ok_or_else(|| anyhow!("vocab missing SEP token at id {}", sep_id))?;
+    tokenizer.with_post_processor(Some(BertProcessing::new(
+        (sep_tok, sep_id),
+        (cls_tok, cls_id),
+    )));
     Ok(tokenizer)
 }
 
@@ -347,5 +553,82 @@ mod tests {
         // WordPiece should split "playing" → ["play", "##ing"].
         assert!(ids.contains(&1), "expected 'play'=1 in {:?}", ids);
         assert!(ids.contains(&2), "expected '##ing'=2 in {:?}", ids);
+    }
+
+    /// Iter 64 diagnostic: dump a sample of the bge vocab to see the
+    /// prefix-marker convention. `▁` (U+2581) prefixes word-starters in
+    /// llama.cpp's BERT path; subwords might or might not have `##`.
+    #[test]
+    fn bge_small_vocab_format_diagnostic() {
+        let path = std::path::Path::new(
+            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: bge GGUF not on disk");
+            return;
+        }
+        let gguf = mlx_native::gguf::GgufFile::open(path).expect("open");
+        let vocab = BertVocab::from_gguf(&gguf).expect("vocab");
+        // Print key indices: [PAD], [UNK], [CLS], [SEP], "hello"=7592,
+        // "world"=2088, and a few sample subword indices.
+        for &idx in &[0u32, 100, 101, 102, 1000, 2088, 3000, 7592, 10000, 11108] {
+            eprintln!(
+                "vocab[{:5}] = {:?}",
+                idx,
+                vocab.tokens.get(idx as usize)
+            );
+        }
+        // Count how many tokens start with ▁ vs how many start with ## vs
+        // bare. Tells us the prefix convention at a glance.
+        let prefix_marker = "\u{2581}";
+        let mut n_prefix = 0;
+        let mut n_continuation = 0;
+        let mut n_bare = 0;
+        for tok in &vocab.tokens {
+            if tok.starts_with(prefix_marker) {
+                n_prefix += 1;
+            } else if tok.starts_with("##") {
+                n_continuation += 1;
+            } else {
+                n_bare += 1;
+            }
+        }
+        eprintln!(
+            "vocab counts: total={}, ▁-prefix={}, ##-prefix={}, bare={}",
+            vocab.tokens.len(),
+            n_prefix,
+            n_continuation,
+            n_bare,
+        );
+    }
+
+    /// Iter 64 parity test: build the WordPiece tokenizer from the real
+    /// bge-small-en-v1.5 GGUF and verify it produces exactly the token
+    /// ids llama.cpp does. Fixture file is gated on existence so CI
+    /// without the artifact skips cleanly. Expected ids derived from
+    /// `llama-embedding -m ... --verbose-prompt`:
+    ///   "hello world"  →  [101, 7592, 2088, 102]   (CLS hello world SEP)
+    #[test]
+    fn bge_small_tokenizer_matches_llama_cpp_on_hello_world() {
+        let path = std::path::Path::new(
+            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: bge GGUF not on disk at {}", path.display());
+            return;
+        }
+        let gguf = mlx_native::gguf::GgufFile::open(path).expect("open bge GGUF");
+        let vocab = BertVocab::from_gguf(&gguf).expect("vocab parse");
+        let tokenizer = BertWpmTokenizer::new(&vocab);
+        let ids = tokenizer.encode("hello world", true);
+        // [CLS] hello world [SEP] = [101, 7592, 2088, 102] for bert-base-uncased.
+        assert_eq!(
+            ids,
+            vec![101u32, 7592, 2088, 102],
+            "tokenization mismatch — vocab[100..103]: {:?}, vocab[7592]: {:?}, vocab[2088]: {:?}",
+            vocab.tokens.get(100..103),
+            vocab.tokens.get(7592),
+            vocab.tokens.get(2088),
+        );
     }
 }

@@ -46,6 +46,7 @@ pub use config::{
 #[allow(unused_imports)]
 pub use tokenizer::{
     build_token_to_id_map, build_wordpiece_tokenizer, BertSpecialTokens, BertVocab,
+    BertWpmTokenizer,
 };
 #[allow(unused_imports)]
 pub use weights::{
