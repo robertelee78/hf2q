@@ -51,7 +51,7 @@ fn parse_llama_arch_citation(s: &str) -> Option<(usize, String)> {
     let (num_str, rest) = after.split_at(after.find(|c: char| !c.is_ascii_digit())?);
     let line: usize = num_str.parse().ok()?;
     // Find LLM_TENSOR_* constant after the line number.
-    let rest = rest.trim_start_matches(|c: char| c == ' ' || c == ';');
+    let rest = rest.trim_start_matches([' ', ';']);
     // Grab first LLM_ or LLM_TENSOR_ identifier.
     let start = rest.find("LLM_")?;
     let ident_body = &rest[start..];
