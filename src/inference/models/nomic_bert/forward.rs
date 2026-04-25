@@ -1052,4 +1052,153 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("seq_len") && msg.contains("32"), "error: {msg}");
     }
+
+    /// End-to-end smoke against the on-disk `nomic-embed-text-v1.5-f16.gguf`.
+    /// Loads the real config + weights + tokenizer, encodes "hello world",
+    /// pads to seq_len=32, runs the full forward, asserts the pooled
+    /// 768-dim output is unit-norm and finite. Validates that the
+    /// production-shape forward composes correctly at scale (hidden=768,
+    /// n_heads=12, head_dim=64, n_ff=3072, num_layers=12) with REAL
+    /// weights — strictly stronger than the synthetic-min-shape gate.
+    ///
+    /// Skips cleanly when the model isn't on disk so CI / fresh checkouts
+    /// don't false-fail.
+    ///
+    /// The cosine-≥0.999 parity-vs-llama-embedding test lands in iter 78
+    /// — once the ground-truth vector is generated and burned in as a
+    /// constant array. This test is the prerequisite gate ("can the
+    /// production-scale forward actually run?").
+    #[test]
+    fn full_forward_at_production_scale_on_real_nomic_gguf_produces_unit_norm_output() {
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
+
+        use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!(
+                "skipping: nomic GGUF fixture not at {}",
+                model_path.display()
+            );
+            return;
+        }
+
+        // Open + parse config.
+        let gguf = GgufFile::open(model_path).expect("open nomic GGUF");
+        let cfg = NomicBertConfig::from_gguf(&gguf).expect("parse nomic config");
+        // Validate the production-shape parameters we expect for
+        // nomic-embed-text-v1.5 — protects against a different model
+        // accidentally being placed at this path.
+        assert_eq!(cfg.hidden_size, 768, "expected nomic-embed-text-v1.5 hidden=768");
+        assert_eq!(cfg.num_hidden_layers, 12, "expected 12 blocks");
+        assert_eq!(cfg.num_attention_heads, 12, "expected 12 heads");
+        assert_eq!(cfg.intermediate_size, 3072, "expected n_ff=3072");
+
+        // Tokenize "hello world" with [CLS]/[SEP] brackets.
+        let tok = build_nomic_wordpiece_tokenizer(model_path).expect("build tokenizer");
+        let real_ids = tok.encode("hello world", true);
+        assert_eq!(real_ids.len(), 4, "expected [CLS] hello world [SEP], got {real_ids:?}");
+
+        // Pad right with [PAD] up to seq_len = 32 (the kernel-floor minimum).
+        let seq_len: u32 = 32;
+        let pad_id = tok.specials().pad;
+        let mut padded_ids: Vec<u32> = real_ids.clone();
+        while padded_ids.len() < seq_len as usize {
+            padded_ids.push(pad_id);
+        }
+        let valid_token_count: u32 = real_ids.len() as u32;
+
+        // Build the device + registry.
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_nomic_bert_kernels(&mut registry);
+
+        // Load real weights.
+        let weights = LoadedNomicBertWeights::load_from_path(model_path, &cfg)
+            .expect("load real nomic weights");
+        assert!(weights.len() > 0, "loader returned zero tensors");
+        // 12 blocks × 9 required suffixes + 3 stem (token_embd, embd_norm.{w,b})
+        // + 1 token_types = 112 tensors. Lock that to detect manifest drift.
+        assert_eq!(
+            weights.len(),
+            112,
+            "expected 112 tensors loaded from nomic GGUF, got {}",
+            weights.len()
+        );
+
+        // Build input_ids buffer.
+        let input_ids = device
+            .alloc_buffer(
+                (seq_len as usize) * 4,
+                DType::U32,
+                vec![seq_len as usize],
+            )
+            .expect("alloc input_ids");
+        {
+            let slice: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    input_ids.contents_ptr() as *mut u32,
+                    seq_len as usize,
+                )
+            };
+            slice.copy_from_slice(&padded_ids);
+        }
+
+        // Run full forward.
+        let mut encoder = device.command_encoder().expect("command_encoder");
+        let pooled = apply_nomic_bert_full_forward_gpu(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_ids,
+            None, // single-segment input → loader synthesizes zero type_ids
+            &weights,
+            &cfg,
+            seq_len,
+            valid_token_count,
+        )
+        .expect("nomic full forward at production scale");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        // ---- Asserts ----
+        assert_eq!(
+            pooled.element_count(),
+            cfg.hidden_size,
+            "expected output dim = hidden_size = 768"
+        );
+        let view: &[f32] = pooled.as_slice::<f32>().expect("read pooled f32");
+        let norm: f32 = view.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "expected ||y||₂ ≈ 1.0 (post-l2-normalize), got {norm}"
+        );
+        // Most components should be non-trivial (real weights => meaningful
+        // output). Threshold 1e-6 is generous; a healthy output has
+        // magnitudes around 1/sqrt(hidden) ≈ 0.036 average per component.
+        let n_nontrivial = view.iter().filter(|v| v.abs() > 1e-6).count();
+        assert!(
+            n_nontrivial >= 700,
+            "expected most of 768 components non-trivial, got {n_nontrivial}"
+        );
+        for &v in view {
+            assert!(v.is_finite(), "non-finite output element: {v}");
+        }
+        // Per-element magnitude sanity: max abs should be small (post-L2
+        // ||y||=1 on 768 components → max element bounded by 1.0; real
+        // embeddings rarely exceed 0.5).
+        let max_abs = view.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_abs < 1.0,
+            "max |y_i| = {max_abs} unexpectedly large (post-l2 should be ≤ 1.0)"
+        );
+        eprintln!(
+            "[nomic real-gguf smoke] hidden={}, ||y||₂={:.6}, max|y|={:.4}, first4={:?}",
+            view.len(),
+            norm,
+            max_abs,
+            &view[..4]
+        );
+    }
 }

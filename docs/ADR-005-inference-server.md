@@ -1930,6 +1930,21 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 77 — Task #16 Phase 2 production-scale smoke gate cleared. Real `nomic-embed-text-v1.5-f16.gguf` loaded end-to-end; tokenized "hello world"; full forward at production shape (hidden=768, n_heads=12, n_ff=3072, layers=12) produces ||y||₂=1.000000 with max|y|=0.1187 and all 768 components finite.**
+  - **What landed.** New test `full_forward_at_production_scale_on_real_nomic_gguf_produces_unit_norm_output` in `src/inference/models/nomic_bert/forward.rs`. Drives the full pipeline against the on-disk GGUF: open + parse `NomicBertConfig` (locks hidden=768, layers=12, heads=12, n_ff=3072) → build `BertWpmTokenizer` from the GGUF vocab → encode "hello world" to 4 tokens → pad to seq_len=32 with `[PAD]` → load 112 tensors via `LoadedNomicBertWeights::load_from_path` → run `apply_nomic_bert_full_forward_gpu` → assert unit-norm + finite + non-trivial-magnitude. Skips cleanly when the model isn't on disk.
+  - **Verbose output (with `--nocapture`):** `[nomic real-gguf smoke] hidden=768, ||y||₂=1.000000, max|y|=0.1187, first4=[-0.021736357, 0.03072114, 0.019727444, -0.035211857]`. Magnitude profile is exactly what a healthy unit-norm 768-dim embedding looks like (max element ≈ 1/8 — no component dominates; expected since post-l2 the largest is bounded by 1.0 and real BERT-derived embeddings spread their energy).
+  - **Why this is strictly stronger than the iter-76 synthetic gate.** Synthetic min-shape (hidden=64, layers=2, n_ff=128) only validates that the topology / barriers / numerics work IN PRINCIPLE. The production-scale gate exercises:
+    - Real embedding tables (vocab=30528 × 768 = 23.4M-element gather)
+    - Real per-layer 768×3·768 fused QKV weights (sliced into three logical Q/K/V projections)
+    - Real per-layer 3072×768 SwiGLU intermediates
+    - Real RoPE base period from GGUF (`nomic-bert.rope.freq_base`)
+    - 12 sequential blocks (the synthetic test only ran 2; barrier ordering across 12 blocks could surface latent issues that 2 blocks hide)
+    - 112-tensor manifest validator pass (real GGUF tensor names + shapes match `NOMIC_BERT_BLOCK_REQUIRED_SUFFIXES` exactly)
+  - **What this does NOT yet prove.** Numerical correctness vs llama-embedding output. "Unit-norm with finite components" is a necessary condition, not sufficient. The cosine-≥0.999 parity test against `llama-embedding -m … -p "hello world"` is iter 78's gate; it'll lock the EXACT 768-dim ground-truth vector and assert dot-product ≥ 0.999.
+  - **Verification.** `cargo test --release --bin hf2q -- inference::models::nomic_bert::forward::tests::full_forward_at_production_scale_on_real_nomic_gguf` — 1/1 pass. Full nomic_bert lane: 17/17 pass. Full BERT lane: 58/58 pass (no regression).
+  - **Lane discipline.** Edits in `src/inference/models/nomic_bert/forward.rs` only.
+  - **Next (iter 78):** generate `llama-embedding -m nomic-embed-text-v1.5-f16.gguf -p "hello world" --pooling mean --embd-output-format json`, parse the 768-float vector, embed it as a constant array in a new test, run hf2q's forward against the same input, assert cosine ≥ 0.999. **This is the gate that closes Task #16's correctness leg** — handler integration (Phase 3) follows once the parity is locked.
+
 - **2026-04-26 loop iter 76 — Task #16 Phase 2: nomic-bert encoder forward composer (`apply_nomic_bert_full_forward_gpu`). Synthetic minimal-shape full-forward produces unit-norm output; zero new mlx-native kernels needed.**
   - **What landed.** New `src/inference/models/nomic_bert/forward.rs` (~620 LOC) with the full encoder forward composer. Public surface:
     - `register_nomic_bert_kernels(registry)` — registers BERT custom shaders + mlx-native RoPE-NeoX-F32 + SiLU-mul-F32 sources. Idempotent.
