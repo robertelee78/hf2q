@@ -512,6 +512,65 @@ fn smoke_full_q4_0_pipeline_with_mock_llama_cli_emits_transcript() {
     );
 }
 
+/// `--with-vision` integration: mock pipeline runs convert with
+/// `--emit-vision-tower` (per build_convert_args wiring in commit
+/// f0ff204). The synthetic local-dir has no vision_config, so the
+/// convert side silent-skips per Decision 18 / commit 18cbaaa.
+/// End-to-end test: smoke harness CLI flag → SmokeArgs threading
+/// → build_convert_args wiring → convert subprocess accepts the
+/// flag → silent-skip → llama-cli runs → transcript success.
+#[cfg(unix)]
+#[test]
+fn smoke_with_vision_flag_passes_through_to_convert_when_arch_advertises() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local-qwen35-vision");
+    write_tiny_qwen35_local_dir(&local);
+
+    let mock = tmp.path().join("mock-llama-cli.sh");
+    write_mock_llama_cli(&mock);
+
+    let fixtures = tmp.path().join("fixtures");
+    let convert_out = tmp.path().join("convert-out");
+
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "qwen35", // has_vision=true in registry
+            "--quant",
+            "q4",
+            "--with-vision", // the flag under test
+            "--local-dir",
+            local.to_str().unwrap(),
+            "--llama-cli-override",
+            mock.to_str().unwrap(),
+            "--fixtures-root",
+            fixtures.to_str().unwrap(),
+            "--convert-output-dir",
+            convert_out.to_str().unwrap(),
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && stderr.contains("release build") {
+        eprintln!("skipped — debug build");
+        return;
+    }
+    // Convert silent-skips because synthetic config has no
+    // vision_config — full pipeline still succeeds.
+    assert!(
+        out.status.success(),
+        "--with-vision pipeline must succeed via silent-skip path: stderr={stderr}"
+    );
+    let transcript = fixtures.join("smoke-transcripts").join("qwen35-q4.txt");
+    assert!(
+        transcript.exists(),
+        "transcript must be written even with --with-vision when convert silent-skipped"
+    );
+}
+
 /// Writes a mock llama-cli that emits a regression-pattern line on
 /// stderr ("error: ..."). This trips `scan_llama_cli_stderr` in
 /// `src/arch/conformance.rs:94`, which bubbles up to `run_q4_0_pipeline`
