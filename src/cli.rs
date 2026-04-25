@@ -481,7 +481,14 @@ impl std::fmt::Display for OutputFormat {
 pub enum QuantMethod {
     Auto,
     F16,
+    #[value(alias = "q8_0")]
     Q8,
+    /// `q4_0` is accepted as an alias — the smoke harness's default
+    /// (`hf2q smoke --arch ... --quant q4_0` per Decision 16 §3) was
+    /// previously rejected by clap because only the bare `q4` form
+    /// was registered. Both names refer to the same bit-identical
+    /// 4-bit emission.
+    #[value(alias = "q4_0")]
     Q4,
     Q2,
     #[value(name = "mixed-2-6")]

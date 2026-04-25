@@ -109,6 +109,52 @@ fn test_convert_q8_gguf() {
     assert_has_gguf(&output_dir);
 }
 
+/// `--quant q4_0` and `--quant q8_0` are GGUF-canonical names; they're
+/// what the smoke harness's default and any user familiar with
+/// llama.cpp's tensor-type naming would type. Pre-fix clap rejected
+/// these because only the bare `q4` / `q8` value enum names were
+/// registered, breaking `hf2q smoke --arch qwen35` (default --quant
+/// q4_0) at the convert subprocess step.
+#[test]
+fn test_convert_quant_q4_0_alias_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q4_0",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+}
+
+#[test]
+fn test_convert_quant_q8_0_alias_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q8_0",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+}
+
 #[test]
 fn test_convert_missing_input_fails() {
     Command::cargo_bin("hf2q")
