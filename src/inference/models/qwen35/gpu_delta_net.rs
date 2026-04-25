@@ -68,6 +68,7 @@ use mlx_native::ops::gated_delta_net::{
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, SsmConvParams};
+use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_norm_gate};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
@@ -310,6 +311,72 @@ pub fn apply_proj(
     Ok(dst)
 }
 
+/// Allocate and prepare all SSM conv buffers, returning them for dispatch.
+///
+/// This helper allocates the output y buffer, new_state_buf, params_buf,
+/// and uploads old_state (transposed). Caller is responsible for dispatch.
+///
+/// Returns `(old_state_buf, new_state_buf, y, params_buf, conv_params)`.
+pub fn prepare_ssm_conv_buffers(
+    device: &MlxDevice,
+    old_conv_state_km1_c: &[f32], // [K-1, channels] CPU layout
+    seq_len: u32,
+    qkv_channels: u32,
+    k_width: u32,
+) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer, MlxBuffer, SsmConvParams)> {
+    let km1 = (k_width - 1) as usize;
+    let channels = qkv_channels as usize;
+
+    // Transpose old_state from [K-1, channels] → [channels, K-1] for the kernel.
+    let old_state_ck = transpose_state_km1_c_to_c_km1(old_conv_state_km1_c, km1, channels);
+    let old_state_buf = upload_f32(&old_state_ck, device)?;
+
+    let s_elems = km1 * channels;
+    let new_state_buf = device
+        .alloc_buffer(s_elems * 4, DType::F32, vec![channels, km1])
+        .map_err(|e| anyhow!("alloc new_state_buf: {e}"))?;
+
+    let y = device
+        .alloc_buffer(
+            (seq_len * qkv_channels) as usize * 4,
+            DType::F32,
+            vec![seq_len as usize, qkv_channels as usize],
+        )
+        .map_err(|e| anyhow!("alloc ssm_conv y: {e}"))?;
+
+    let mut params_buf = device
+        .alloc_buffer(4 * 4, DType::U32, vec![4])
+        .map_err(|e| anyhow!("alloc ssm_conv params: {e}"))?;
+    {
+        let s = params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = qkv_channels;
+        s[1] = seq_len;
+        s[2] = 1; // n_seqs
+        s[3] = k_width;
+    }
+
+    let conv_params = SsmConvParams {
+        channels: qkv_channels,
+        n_tokens: seq_len,
+        n_seqs: 1,
+        k_width,
+    };
+
+    Ok((old_state_buf, new_state_buf, y, params_buf, conv_params))
+}
+
+/// Extract new_conv_state from GPU buffer after ssm_conv commit.
+///
+/// Downloads new_state_buf and transposes from [channels, K-1] → [K-1, channels].
+pub fn extract_new_conv_state(
+    new_state_buf: &MlxBuffer,
+    km1: usize,
+    channels: usize,
+) -> Result<Vec<f32>> {
+    let new_state_ck = download_f32(new_state_buf)?;
+    Ok(transpose_state_c_km1_to_km1_c(&new_state_ck, km1, channels))
+}
+
 /// Run SSM causal conv1d + SiLU on the QKV projection.
 ///
 /// `qkv_seq_major`: `[seq_len, qkv_channels]` F32 (token-major, channels
@@ -336,47 +403,8 @@ pub fn apply_ssm_conv(
     let km1 = (k_width - 1) as usize;
     let channels = qkv_channels as usize;
 
-    // Transpose old_state from [K-1, channels] → [channels, K-1] for the kernel.
-    let old_state_ck = transpose_state_km1_c_to_c_km1(old_conv_state_km1_c, km1, channels);
-
-    // Upload old_state in kernel layout.
-    let old_state_buf = upload_f32(&old_state_ck, device)?;
-
-    // Allocate new_state buffer (kernel will write it in [channels, K-1] layout).
-    let s_elems = km1 * channels; // n_seqs=1
-    let new_state_buf = device
-        .alloc_buffer(s_elems * 4, DType::F32, vec![channels, km1])
-        .map_err(|e| anyhow!("alloc new_state_buf: {e}"))?;
-
-    // Allocate y output.
-    let y = device
-        .alloc_buffer(
-            (seq_len * qkv_channels) as usize * 4,
-            DType::F32,
-            vec![seq_len as usize, qkv_channels as usize],
-        )
-        .map_err(|e| anyhow!("alloc ssm_conv y: {e}"))?;
-
-    // Build params buffer: [channels, n_tokens, n_seqs, k_width].
-    let mut params_buf = device
-        .alloc_buffer(4 * 4, DType::U32, vec![4])
-        .map_err(|e| anyhow!("alloc ssm_conv params: {e}"))?;
-    {
-        let s = params_buf
-            .as_mut_slice::<u32>()
-            .map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels;
-        s[1] = seq_len;
-        s[2] = 1; // n_seqs
-        s[3] = k_width;
-    }
-
-    let conv_params = SsmConvParams {
-        channels: qkv_channels,
-        n_tokens: seq_len,
-        n_seqs: 1,
-        k_width,
-    };
+    let (old_state_buf, new_state_buf, y, params_buf, conv_params) =
+        prepare_ssm_conv_buffers(device, old_conv_state_km1_c, seq_len, qkv_channels, k_width)?;
 
     let mut enc = device.command_encoder().context("enc ssm_conv")?;
     dispatch_ssm_conv(
@@ -394,10 +422,7 @@ pub fn apply_ssm_conv(
     .context("dispatch_ssm_conv")?;
     enc.commit_and_wait().context("commit ssm_conv")?;
 
-    // Download new_state and transpose back from [channels, K-1] → [K-1, channels].
-    let new_state_ck = download_f32(&new_state_buf)?;
-    let new_state_km1_c = transpose_state_c_km1_to_km1_c(&new_state_ck, km1, channels);
-
+    let new_state_km1_c = extract_new_conv_state(&new_state_buf, km1, channels)?;
     Ok((y, new_state_km1_c))
 }
 
@@ -688,13 +713,20 @@ pub fn build_delta_net_layer(
     let q_span = n_k_heads * d_k;
     let k_span = n_k_heads * d_k;
 
-    // ---- Ops 1–2: pre-norm + QKV/Z-gate projections ----
-    // All three ops read from `x` / `x_norm` and write to new buffers — no
-    // CPU readback needed until op3 (ssm_conv owns its own encoder).
-    // Collapse norm + two projections into one encoder + one commit.
-    // A memory_barrier() between op1 and ops 2a/2b ensures x_norm is visible.
-    let (x_norm, qkv, z) = {
-        let mut enc = device.command_encoder().context("enc ops1-2")?;
+    // ---- Ops 1–3: pre-norm + QKV/Z-gate projections + SSM conv ----
+    // Batched into ONE encoder to eliminate a commit_and_wait per layer.
+    // Memory barriers separate data-dependent stages:
+    //   op1 (norm) writes x_norm → barrier → ops 2a/2b read x_norm
+    //   ops 2a (qkv_proj) writes qkv → barrier → op3 (ssm_conv) reads qkv
+    // z_proj (op2b) and ssm_conv (op3) can overlap since they read different buffers.
+    let km1 = (k_width - 1) as usize;
+    let channels = qkv_channels as usize;
+    let (ssm_old_state_buf, ssm_new_state_buf, qkv_conv, ssm_params_buf, ssm_conv_params) =
+        prepare_ssm_conv_buffers(device, old_conv_state, seq_len, qkv_channels, k_width)
+            .context("prepare_ssm_conv_buffers")?;
+
+    let (x_norm, qkv_conv, z) = {
+        let mut enc = device.command_encoder().context("enc ops1-3")?;
         let x_norm = apply_pre_norm(
             &mut enc, registry, device, x, &weights.attn_norm,
             seq_len, hidden_size, rms_norm_eps,
@@ -709,16 +741,20 @@ pub fn build_delta_net_layer(
             &mut enc, registry, device, &x_norm,
             &weights.attn_gate, seq_len, hidden_size, z_channels,
         )?;
-        enc.commit_and_wait().context("commit ops1-2")?;
-        (x_norm, qkv, z)
+        // Barrier: ssm_conv reads qkv written by qkv_proj above.
+        enc.memory_barrier();
+        dispatch_ssm_conv(
+            &mut enc, registry, device.metal_device(),
+            &qkv, &weights.ssm_conv1d, &ssm_old_state_buf, &ssm_new_state_buf,
+            &qkv_conv, &ssm_params_buf, ssm_conv_params,
+        ).context("dispatch_ssm_conv ops3")?;
+        enc.commit_and_wait().context("commit ops1-3")?;
+        (x_norm, qkv_conv, z)
     };
 
-    // ---- Op 3: SSM conv1d + SiLU ----
-    // apply_ssm_conv owns its own encoder internally.
-    let (qkv_conv, new_conv_state) = apply_ssm_conv(
-        device, registry, &qkv, &weights.ssm_conv1d,
-        old_conv_state, seq_len, qkv_channels, k_width,
-    )?;
+    // Extract new conv_state from GPU (zero-copy slice read on unified memory).
+    let new_conv_state = extract_new_conv_state(&ssm_new_state_buf, km1, channels)
+        .context("extract_new_conv_state")?;
 
     // ---- Op 4: split QKV conv output ----
     // qkv_conv is [seq_len, qkv_channels] F32 (token-major).
@@ -766,36 +802,14 @@ pub fn build_delta_net_layer(
         v_gpu = upload_f32(&v_cpu, device)?;
     }
 
-    // ---- Op 5q: per-head L2 norm on Q + scalar scale (GPU, no CPU round-trip) ----
-    // llama.cpp delta-net-base.cpp applies scale = 1/sqrt(D_k) after L2 norm on Q.
-    // We chain L2-norm → scalar_mul_f32 in one encoder + one commit.
-    let q_normed = {
-        let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
-        let q_scale = 1.0_f32 / (dk as f32).sqrt();
-        let q_scaled = device
-            .alloc_buffer(n_q_elems * 4, DType::F32, vec![n_q_elems])
-            .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
-
-        let mut enc = device.command_encoder().context("enc op5q+scale")?;
-        let q_l2 = apply_l2_norm_per_head(
-            &mut enc, registry, device, &q_gpu,
-            seq_len, n_k_heads, d_k, rms_norm_eps,
-        )?;
-        // Barrier: scalar_mul reads q_l2 written by L2-norm above.
-        enc.memory_barrier();
-        scalar_mul_f32(
-            &mut enc, registry, device.metal_device(),
-            &q_l2, &q_scaled, n_q_elems, q_scale,
-        )
-        .context("scalar_mul_f32 q_scale")?;
-        enc.commit_and_wait().context("commit op5q+scale")?;
-        q_scaled
-    };
-
-    // ---- Ops 5k + 6a + 6b + 6c: K L2-norm, alpha proj, beta proj, compute g/beta ----
-    // All ops read from GPU buffers complete after the QKV split above.
-    // Batched into ONE encoder: k_l2 | alpha_proj | beta_proj → barrier → g_beta kernel.
-    // This eliminates a separate commit for compute_g_beta, reducing sync points.
+    // ---- Ops 5q + 5k + 6a + 6b + 6c: Q L2-norm+scale, K L2-norm, alpha/beta projs, g/beta ----
+    // All ops read from q_gpu/k_gpu/x_norm — fully available after the ops1-3 commit.
+    // Batched into ONE encoder: q_l2/k_l2/alpha/beta all independent → barrier → q_scale + g_beta.
+    let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
+    let q_scale_val = 1.0_f32 / (dk as f32).sqrt();
+    let q_scaled = device
+        .alloc_buffer(n_q_elems * 4, DType::F32, vec![n_q_elems])
+        .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
     let g_n = (seq_len * n_v_heads) as usize;
     let g_buf = device
         .alloc_buffer(g_n * 4, DType::F32, vec![g_n])
@@ -812,11 +826,14 @@ pub fn build_delta_net_layer(
         s[1] = seq_len;
     }
 
-    let (k_normed, _alpha_logit_buf, _beta_logit_buf) = {
-        let mut enc = device.command_encoder().context("enc ops5k-6abc")?;
+    let (_q_normed, _k_normed, attn_out, new_recurrent_state) = {
+        let mut enc = device.command_encoder().context("enc ops5q+5k+6+7")?;
+        // These 4 ops are independent (different inputs, different outputs) — run concurrently.
+        let q_l2 = apply_l2_norm_per_head(
+            &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+        )?;
         let k_normed = apply_l2_norm_per_head(
-            &mut enc, registry, device, &k_gpu,
-            seq_len, n_k_heads, d_k, rms_norm_eps,
+            &mut enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
         )?;
         let alpha_logit_buf = apply_proj(
             &mut enc, registry, device, &x_norm,
@@ -826,34 +843,46 @@ pub fn build_delta_net_layer(
             &mut enc, registry, device, &x_norm,
             &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
         )?;
-        // Barrier: compute_g_beta reads alpha_logit_buf + beta_logit_buf written above.
+        // Barrier: q_scale reads q_l2; compute_g_beta reads alpha/beta.
         enc.memory_barrier();
+        scalar_mul_f32(
+            &mut enc, registry, device.metal_device(),
+            &q_l2, &q_scaled, n_q_elems, q_scale_val,
+        )
+        .context("scalar_mul_f32 q_scale")?;
         dispatch_compute_g_beta(
-            &mut enc,
-            registry,
-            device.metal_device(),
-            &alpha_logit_buf,
-            &beta_logit_buf,
-            &weights.ssm_dt_bias,
-            &weights.ssm_a,
-            &g_buf,
-            &beta_buf,
-            &g_params_buf,
-            seq_len,
-            n_v_heads,
+            &mut enc, registry, device.metal_device(),
+            &alpha_logit_buf, &beta_logit_buf,
+            &weights.ssm_dt_bias, &weights.ssm_a,
+            &g_buf, &beta_buf, &g_params_buf,
+            seq_len, n_v_heads,
         ).context("dispatch_compute_g_beta")?;
-        enc.commit_and_wait().context("commit ops5k-6abc")?;
-        (k_normed, alpha_logit_buf, beta_logit_buf)
+        // Barrier: GDN reads q_scaled/k_normed/g_buf/beta_buf written above.
+        enc.memory_barrier();
+        // ---- Op 7: fused Gated DeltaNet (inlined into this encoder) ----
+        let n_seqs = 1u32;
+        let out_elems = (n_v_heads * seq_len * d_v) as usize;
+        let attn_out_buf = device
+            .alloc_buffer(out_elems * 4, DType::F32, vec![out_elems])
+            .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
+        let state_elems = (d_k * d_v * n_v_heads) as usize;
+        let state_out_buf = device
+            .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
+            .map_err(|e| anyhow!("alloc gdn state_out: {e}"))?;
+        let gdn_params = GatedDeltaNetParams {
+            d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
+        };
+        let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
+            .map_err(|e| anyhow!("build gdn params: {e}"))?;
+        dispatch_gated_delta_net(
+            &mut enc, registry, device.metal_device(),
+            &q_scaled, &k_normed, &v_gpu,
+            &g_buf, &beta_buf, state_in,
+            &attn_out_buf, &state_out_buf, &gdn_params_buf, gdn_params,
+        ).context("dispatch_gated_delta_net")?;
+        enc.commit_and_wait().context("commit ops5+6+7")?;
+        (q_scaled, k_normed, attn_out_buf, state_out_buf)
     };
-
-    // ---- Op 7: fused Gated DeltaNet ----
-    // apply_gated_delta_net owns its encoder internally.
-    let (attn_out, new_recurrent_state) = apply_gated_delta_net(
-        device, registry,
-        &q_normed, &k_normed, &v_gpu,
-        &g_buf, &beta_buf, state_in,
-        seq_len, n_k_heads, n_v_heads, d_k, d_v,
-    )?;
     // attn_out from kernel is [d_v * n_v_heads * n_tokens * n_seqs] but with layout
     // [n_tokens, n_v_heads, d_v] (same as our v_gpu layout). The kernel's output
     // buffer is just a flat allocation; the CPU ref's step 8 re-reads it as
@@ -861,20 +890,34 @@ pub fn build_delta_net_layer(
     // output is [D_v, n_v_heads, n_tokens, n_seqs] col-major = [n_tokens, n_v_heads, d_v]
     // for n_seqs=1 when d_v is innermost. This matches our attn_out allocation shape.
 
-    // ---- Op 8: output RMSNorm + sigmoid(Z) gate (CPU bridge) ----
-    // apply_ssm_norm_and_gate downloads attn_out and z from GPU, applies
-    // per-head RMSNorm using the cached CPU weight, then re-uploads.
-    // ssm_norm_cpu avoids one GPU download compared to using ssm_norm (MlxBuffer).
-    let mut enc = device.command_encoder().context("enc op8-9")?;
-    let gated = apply_ssm_norm_and_gate(
-        &mut enc, registry, device, &attn_out, &z,
-        &weights.ssm_norm_cpu,
-        seq_len, z_channels, rms_norm_eps,
-    )?;
+    // ---- Op 8: per-head RMSNorm + SiLU gate (GPU kernel — no CPU bridge) ----
+    // ssm_norm_gate_f32 computes:
+    //   normed[row, d] = attn_out[row, d] * rms_inv(attn_out[row, :]) * ssm_norm_w[d]
+    //   output[row, d] = normed[row, d] * silu(z[row, d])
+    // where row = (t, vh) and d indexes d_v.  Both attn_out and z are [seq, nv, d_v]
+    // contiguous = [rows, d_v] with rows = seq * n_v_heads.
+    // This replaces 2 GPU→CPU downloads + CPU compute + 1 CPU→GPU upload.
+    let rows_op8 = seq_len * n_v_heads;
+    let gated_elems = (rows_op8 * d_v) as usize;
+    let gated_buf = device
+        .alloc_buffer(gated_elems * 4, DType::F32, vec![gated_elems])
+        .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
+    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
+        .map_err(|e| anyhow!("op8 params: {e}"))?;
 
-    // ---- Op 9: output projection (shared encoder with op 8 upload) ----
+    let mut enc = device.command_encoder().context("enc op8-9")?;
+    dispatch_ssm_norm_gate(
+        &mut enc, registry, device.metal_device(),
+        &attn_out, &weights.ssm_norm, &z,
+        &gated_buf, &op8_params,
+        rows_op8, d_v,
+    ).context("dispatch_ssm_norm_gate")?;
+    // Barrier: op9 matmul reads gated written by op8.
+    enc.memory_barrier();
+
+    // ---- Op 9: output projection ----
     let output = apply_proj(
-        &mut enc, registry, device, &gated,
+        &mut enc, registry, device, &gated_buf,
         &weights.ssm_out, seq_len, z_channels, hidden_size,
     )?;
     enc.commit_and_wait().context("commit op8-9")?;
