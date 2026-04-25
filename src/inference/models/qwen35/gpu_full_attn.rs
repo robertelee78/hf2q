@@ -789,7 +789,12 @@ pub fn apply_sdpa_with_kv_cache(
             kv_seq_len, max_seq_len,
             1.0 / (d as f32).sqrt(),
         ).context("sdpa_decode kv-cache")?;
-        enc.commit_and_wait().context("commit kv-cache+sdpa decode")?;
+        // commit() without wait: out_buf is fed into ops6-7 on the same Metal
+        // serial queue; GPU ordering guarantees SDPA completes first.
+        // slot.current_len update below is a CPU-only counter — safe to update
+        // before GPU completes; the next read of current_len is on the next token
+        // by which time the queue is drained.
+        enc.commit();
     } else {
         // Prefill path (seq > 1) or non-standard head_dim:
         // CPU K/V permute is required for the head-major cache layout.
