@@ -1072,6 +1072,53 @@ Both fallbacks keep path (a) intact; neither requires path (b).
 
 **Acceptance (P9b close):** all 7 sub-tasks shipped; new integration test green on synthetic qwen35-dense + qwen35-moe; old P9b-pending guard message removed from `src/main.rs`; intermediate GGUF cleanup verified by test on both happy-path and panic-path (Drop runs).
 
+#### P9b cost-model & optimization candidates (2026-04-25 audit)
+
+Captured here so future profiling has a concrete baseline. All numbers are theoretical from layout + dtype reasoning; the real-model run on apex MoE (Task #16) will validate or correct them.
+
+**Per-stage RAM peak — apex Qwen3.6-35B-A3B (40 layers MoE, 256 experts, hidden_size=2048):**
+
+| Stage | What's resident | Bytes | Apex peak |
+|---|---|---|---|
+| 1. Read safetensors → `tensor_map` | BF16 weights (no F32 expansion of MoE experts) | bf16: 2 B/elem × ~16B params | ~32 GB |
+| 1.7. Apply qwen35 transforms (V-tile, RMS+1, MoE merge, qkvz split) | Same shape, in-place transforms; transient ~1–2 GB | | +~2 GB transient |
+| 9b.2. `emit_gguf_from_tensor_map` → `quantize_model` step | tensor_map + new `QuantizedModel` HashMap (preserved, F16 path is essentially a copy) | tensor_map (32 GB) + QuantizedModel (~30 GB after BF16→F16) | **~62 GB peak (worst point in two-pass path)** |
+| 9b.2. `GgufBackend::write` step | tensor_map + QuantizedModel + write buffer (BufWriter ~MB) | as above | ~62 GB |
+| 9b.3b. `RealActivationCapture::new` → `Qwen35Model::load_from_gguf` | tensor_map + `Qwen35Model` (F32 dequant of attention weights + native-quantized MoE experts via `MoeFfnWeightsQ`) | tensor_map (32 GB) + Qwen35Model (~12 GB: attn F32 ~2 GB × 40 layers × 0.15 = ~6 GB + MoE-Q raw blocks ~6 GB) | ~44 GB |
+| 9b.3a. `run_calibration_prompt` | + small per-step buffers + activations capture (~MB scale per layer × 40) | as above + ~1–2 GB activations | ~46 GB |
+| Capture done; `drop(capture)` releases `Qwen35Model` | tensor_map only | 32 GB | ~32 GB |
+| DWQ pass on tensor_map | tensor_map + new QuantizedModel (DWQ-output, ~12 GB at dwq46 average) | 32 + 12 GB | ~44 GB |
+| Write final GGUF | tensor_map (released after write) + QuantizedModel + write buffer | 32 + 12 GB | ~44 GB peak (post-capture) |
+
+**Apex MoE peak verdict:** ~62 GB during step 9b.2 quantize-as-F16. Tight on 64 GB systems; comfortable on 96 GB. The held-tensor_map fallback (drop after emit, re-read from safetensors after capture) reduces this peak to ~32 GB at the cost of ~30 s re-read I/O — kept in reserve and not yet wired (ADR-012 doesn't currently observe a 64 GB system as the bottleneck because Robert's hardware is 128 GB).
+
+**Disk peak — apex MoE:** ~30 GB intermediate F16 GGUF + ~12 GB final dwq46 GGUF + ~30 GB safetensors = ~72 GB peak (intermediate is dropped via `tempfile::TempDir` Drop after capture; final + safetensors persist).
+
+**Optimization candidates (none required for P9b close; ranked by ROI):**
+
+1. **Skip `QuantizedModel` materialization in `emit_gguf_from_tensor_map`.** The F16 + preserve-everything path through `quantize::quantize_model` produces a `QuantizedModel` whose `data: Vec<u8>` is essentially a duplicate of `tensor_map`'s bytes (BF16→F16 conversion is the only real work). A direct `tensor_map → GGUF write` path would save ~30 GB at the worst-case stage (step 9b.2). **Effort:** medium — requires duplicating ~50 LOC of `GgufBackend::write` for the TensorMap input, or refactoring `write` to accept either input via a trait. **ROI:** highest among candidates — eliminates the absolute peak.
+
+2. **Streamed F16 GGUF emission.** Even with optimization (1), `BufWriter` buffers ~MBs of tensor data per write. A streaming emit (write each tensor's bytes immediately to disk, no in-memory intermediate) is ~zero RAM beyond the tensor itself. **Effort:** low — `GgufBackend::write` already iterates tensors sequentially; the savings is in not buffering the QuantizedModel struct. Combined with (1), peak drops to ~32 GB. **ROI:** high.
+
+3. **Drop-and-reload tensor_map across capture.** Document the OOM-mitigation fallback in code (currently in ADR comment only): drop tensor_map after step 9b.2 emit, re-read from `config.input_dir` safetensors after capture, redo qwen35 transforms (idempotent). **Effort:** low — wraps existing `input::read_model` + transforms in a closure. **ROI:** medium — only relevant on <64 GB systems. Defer until someone reports a real-world OOM.
+
+4. **F16-only Qwen35Model.** Currently `Qwen35Model::load_from_gguf` dequantizes attention weights to F32 (per `weight_loader::load_*` shape; ~2 GB/layer × 40 layers × 0.15 nonzero ≈ 12 GB F32). An F16 in-memory model would halve this to ~6 GB peak post-capture. **Effort:** very high — touches all CPU forward kernels (rms_norm, projections, RoPE, SDPA, GDN); changes the residual-stream dtype contract. **ROI:** low for P9 close (peak is already at 9b.2, not capture); revisit if F16 unifies with a future GPU forward.
+
+**Wall-clock estimate for apex MoE two-pass conversion (Robert's M5 Max, est.):**
+
+| Stage | Est. time |
+|---|---|
+| Safetensors read + qwen35 transforms | ~25 s |
+| 9b.2 emit_gguf_from_tensor_map (F16 quantize + write 30 GB) | ~120 s |
+| 9b.3b RealActivationCapture::new (Qwen35Model::load_from_gguf, dequant 30 GB) | ~80 s |
+| 9b.3a run_calibration_prompt (1024 tokens × 40-layer hybrid forward, CPU) | ~60–180 s |
+| `compute_layer_sensitivity` + `allocate_bits_by_sensitivity` (40 × 2048 elements) | <1 s |
+| DWQ closed-form scale calibration (dwq46/dwq48, 40 layers × hundreds of tensors) | ~30 s |
+| Final GGUF write (~12 GB dwq46) | ~50 s |
+| **Total estimated** | **~6–8 min per (model × variant)** |
+
+Times to be replaced with measured numbers when Task #16 runs. Treat as upper-bound order-of-magnitude pending real data.
+
 ### P10 — Pure-Rust mmproj vision-tower emitter (defense-in-depth)
 
 **Scope:** Decision 18 with all four defense layers (party-mode Option 5). Independent of P9 — can ship in parallel.

@@ -2866,6 +2866,11 @@ mod tests {
     /// the orchestration wiring (TensorMap → StaticQuantizer("f16") →
     /// quantize_model → GgufBackend::write) works end-to-end without a
     /// full convert-pipeline run.
+    ///
+    /// Prints wall-time + tensor byte count to stderr for benchmark
+    /// regression visibility (test never asserts a time bound — CI-safe).
+    /// At apex MoE scale, expect ~120 s for ~30 GB. This synthetic case
+    /// provides a sub-millisecond baseline to scale from linearly.
     #[test]
     fn test_emit_gguf_from_tensor_map_smoke() {
         use crate::ir::{DType, TensorMap, TensorRef};
@@ -2884,10 +2889,16 @@ mod tests {
             data: vec![0u8; 16 * 2],
         });
 
+        let total_input_bytes: usize = tm
+            .tensors
+            .values()
+            .map(|t| t.data.len())
+            .sum();
         let metadata = meta();
         let tmp = tempfile::tempdir().unwrap();
         let out_path = tmp.path().join("intermediate.gguf");
 
+        let t0 = std::time::Instant::now();
         let manifest = super::emit_gguf_from_tensor_map(
             &tm,
             &metadata,
@@ -2896,6 +2907,7 @@ mod tests {
             &ProgressReporter::new(),
         )
         .expect("emit_gguf_from_tensor_map should succeed for tiny tensor_map");
+        let elapsed = t0.elapsed();
 
         assert_eq!(manifest.shard_count, 1);
         assert_eq!(manifest.files.len(), 1);
@@ -2908,6 +2920,14 @@ mod tests {
             u32::from_le_bytes(data[4..8].try_into().unwrap()),
             GGUF_VERSION,
             "GGUF version"
+        );
+
+        eprintln!(
+            "[bench] emit_gguf_from_tensor_map: {} input bytes → {} output bytes in {:?} ({} tensors)",
+            total_input_bytes,
+            data.len(),
+            elapsed,
+            tm.tensors.len()
         );
     }
 

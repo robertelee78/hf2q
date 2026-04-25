@@ -524,6 +524,11 @@ mod tests {
             ..DwqConfig::default()
         };
 
+        // Wall-time visibility — print without asserting a bound (CI-safe).
+        // At apex MoE scale, expect ~60–180s for the calibration step
+        // alone (1024 tokens × 40-layer hybrid forward, CPU). This tiny
+        // synthetic gives a sub-millisecond baseline.
+        let t0 = std::time::Instant::now();
         let model_out = run_dwq_activation_calibration(
             &tensor_map,
             &metadata,
@@ -534,6 +539,13 @@ mod tests {
         .expect(
             "real-Qwen35Model-wrapped activation calibration must succeed \
              on a zero-weighted hybrid model",
+        );
+        let elapsed = t0.elapsed();
+        eprintln!(
+            "[bench] run_dwq_activation_calibration (real Qwen35Model, \
+             num_layers={num_layers}, hidden_size={hidden_size}, \
+             samples={}): {:?}",
+            config.calibration_samples, elapsed
         );
 
         // Method tag reflects the configured bit pair.
