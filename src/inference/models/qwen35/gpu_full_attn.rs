@@ -596,15 +596,13 @@ pub fn apply_sdpa_with_kv_cache(
     let max_sl = max_seq_len as usize;
     let cur_len = slot.current_len[0] as usize;
 
-    // Download current Q/K/V (seq-major [seq*heads, dim]).
-    let q_cpu = download_f32(q_seq_major)?;
+    // --- Write new K/V into cache (head-major layout) ---
+    // Cache layout: [1, n_kv_heads, max_seq_len, head_dim] F32.
+    // We need K_new and V_new as CPU slices to write into the Metal KV cache buffer.
+    // For decode (seq=1), this is just nkv × d = small writes.
     let k_cpu_new = download_f32(k_seq_major)?;
     let v_cpu_new = download_f32(v_seq_major)?;
 
-    // --- Write new K/V into cache (head-major layout) ---
-    // Cache layout: [1, n_kv_heads, max_seq_len, head_dim] F32.
-    // Element at (head h, position p, dim d) = offset h * max_seq_len * head_dim + p * head_dim + d.
-    let kv_cache_elems = nkv * max_sl * d;
     let k_cache_cpu = slot.k.as_mut_slice::<f32>()
         .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
     let v_cache_cpu = slot.v.as_mut_slice::<f32>()
@@ -624,15 +622,27 @@ pub fn apply_sdpa_with_kv_cache(
             v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
         }
     }
-    // Ensure k_cache_cpu / v_cache_cpu borrows are dropped before we use the buffers as GPU input.
+    // Drop CPU borrows before using the buffers as GPU inputs.
     drop(k_cache_cpu);
     drop(v_cache_cpu);
 
     let kv_seq_len = (cur_len + seq).min(max_sl) as u32;
 
-    // --- Permute Q to head-major for SDPA ---
-    let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
-    let q_gpu = upload_f32(&q_hm, device)?;
+    // --- Optionally permute Q to head-major for SDPA ---
+    // For seq=1, [seq*nh, d] seq-major == [nh*seq, d] head-major (same bytes).
+    // Skip the download+permute+upload round-trip by using q_seq_major directly.
+    let q_permuted: Option<MlxBuffer>;
+    let q_ref: &MlxBuffer;
+    if seq == 1 {
+        // seq=1: permute is identity; use q_seq_major directly — no CPU round-trip.
+        q_permuted = None;
+        q_ref = q_seq_major;
+    } else {
+        let q_cpu = download_f32(q_seq_major)?;
+        let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
+        q_permuted = Some(upload_f32(&q_hm, device)?);
+        q_ref = q_permuted.as_ref().unwrap();
+    }
 
     // --- SDPA over full KV cache ---
     let out_buf = device
@@ -649,31 +659,34 @@ pub fn apply_sdpa_with_kv_cache(
         kv_capacity: max_seq_len,
     };
 
-    // We need the K/V Metal buffers directly; they are already head-major in the cache.
+    // K/V Metal buffers are already head-major in the cache.
     let mut enc = device.command_encoder().context("enc sdpa kv-cache")?;
-    sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
+    sdpa(&mut enc, registry, device, q_ref, &slot.k, &slot.v, &out_buf, &params, 1)
         .context("sdpa with kv cache")?;
     enc.commit_and_wait().context("commit sdpa kv-cache")?;
-
-    // --- Permute output from head-major [n_heads, seq, head_dim] back to seq-major ---
-    let out_hm_cpu = download_f32(&out_buf)?;
-    let mut out_sm = vec![0.0f32; seq * nh * d];
-    for h in 0..nh {
-        for t in 0..seq {
-            let src = (h * seq + t) * d;
-            let dst = (t * nh + h) * d;
-            out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
-        }
-    }
+    drop(q_permuted);
 
     // --- Update current_len cursor ---
     let new_len = (cur_len + seq).min(max_sl) as u32;
     slot.current_len[0] = new_len;
 
-    // Ensure kv_cache_elems is used (avoid dead-code warning).
-    let _ = kv_cache_elems;
-
-    upload_f32(&out_sm, device)
+    // --- Permute output from head-major [n_heads, seq, head_dim] back to seq-major ---
+    // For seq=1, out_buf [1, nh, 1, d] head-major == [nh*1, d] seq-major (same bytes).
+    // Skip the download+permute+upload round-trip by returning out_buf directly.
+    if seq == 1 {
+        Ok(out_buf)
+    } else {
+        let out_hm_cpu = download_f32(&out_buf)?;
+        let mut out_sm = vec![0.0f32; seq * nh * d];
+        for h in 0..nh {
+            for t in 0..seq {
+                let src = (h * seq + t) * d;
+                let dst = (t * nh + h) * d;
+                out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+            }
+        }
+        upload_f32(&out_sm, device)
+    }
 }
 
 // ================================================================

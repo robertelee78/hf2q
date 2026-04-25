@@ -464,10 +464,18 @@ impl Qwen35Model {
         }
 
         // ---- Step 2: per-layer forward pass ----
+        let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
+        let mut total_attn_us = 0u64;
+        let mut total_ffn_us = 0u64;
+        let mut total_norm_us = 0u64;
+        let mut total_residual_us = 0u64;
+        let mut total_linear_attn_us = 0u64;
+        let mut total_full_attn_us = 0u64;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
 
             // --- Attention ---
+            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             let attn_out = match layer_gpu {
                 LayerWeightsGpu::FullAttn { attn, .. } => {
                     let shape = FullAttnShape::from_config(cfg);
@@ -515,35 +523,43 @@ impl Qwen35Model {
                         * cfg.linear_num_value_heads) as usize;
 
                     // --- Read SSM state from kv_cache (slot indexed by linear-attn rank) ---
-                    let (old_conv_state, old_rec_state, linear_slot_idx) =
+                    // Pass recurrent state as MlxBuffer directly — no CPU round-trip.
+                    let (old_conv_state, linear_slot_idx) =
                         match kv_cache.slot_index_for_layer(layer_idx as u32) {
                             Some(super::kv_cache::LayerSlot::Linear(rank)) => {
                                 let slot = &kv_cache.linear_attn[rank as usize];
                                 let conv = slot.conv_state.as_slice::<f32>()
                                     .map_err(|e| anyhow!("conv_state as_slice: {e}"))?
                                     .to_vec();
-                                let rec = slot.recurrent.as_slice::<f32>()
-                                    .map_err(|e| anyhow!("recurrent as_slice: {e}"))?
-                                    .to_vec();
-                                (conv, rec, rank as usize)
+                                (conv, rank as usize)
                             }
                             _ => {
-                                // Fallback: fresh zero state (should not happen when kv_cache
-                                // is correctly sized for this model).
                                 tracing::warn!(
                                     "forward_gpu: no linear-attn slot for layer {layer_idx}, using zero state"
                                 );
-                                (vec![0.0f32; km1 * qkv_channels], vec![0.0f32; rec_size], usize::MAX)
+                                (vec![0.0f32; km1 * qkv_channels], usize::MAX)
                             }
                         };
 
-                    let (out, new_conv_state, new_rec_state) = build_delta_net_layer(
+                    // Get recurrent state as MlxBuffer (or zero buffer for fallback)
+                    let rec_buf_ref: &MlxBuffer;
+                    let zero_rec_buf: MlxBuffer;
+                    if linear_slot_idx != usize::MAX {
+                        rec_buf_ref = &kv_cache.linear_attn[linear_slot_idx].recurrent;
+                    } else {
+                        let zero_cpu = vec![0.0f32; rec_size];
+                        zero_rec_buf = upload_f32(&zero_cpu, &device)
+                            .context("alloc zero recurrent state")?;
+                        rec_buf_ref = &zero_rec_buf;
+                    }
+
+                    let (out, new_conv_state, new_rec_buf) = build_delta_net_layer(
                         &device,
                         &mut registry,
                         &hidden,
                         attn,
                         &old_conv_state,
-                        &old_rec_state,
+                        rec_buf_ref,
                         seq_len,
                         shape.hidden_size,
                         shape.n_k_heads,
@@ -558,19 +574,21 @@ impl Qwen35Model {
                     // --- Write back updated state into kv_cache slot ---
                     if linear_slot_idx != usize::MAX {
                         let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                        // conv_state: kv_cache stores [K-1, channels] CPU layout (same as
-                        // what build_delta_net_layer returns for new_conv_state).
+                        // conv_state: CPU layout, copy from Vec<f32>
                         {
                             let dst = slot.conv_state.as_mut_slice::<f32>()
                                 .map_err(|e| anyhow!("conv_state as_mut_slice: {e}"))?;
                             dst.copy_from_slice(&new_conv_state);
                         }
-                        // recurrent: kv_cache and kernel both use [d_k * d_v * n_v_heads]
-                        // flat layout for n_seqs=1.
+                        // recurrent: copy new GPU buffer data → slot.recurrent (unified memory).
+                        // Both are MlxBuffer with shared memory; this is a CPU memcpy avoiding
+                        // a full Metal buffer allocation+copy round-trip.
                         {
+                            let src = new_rec_buf.as_slice::<f32>()
+                                .map_err(|e| anyhow!("new_rec as_slice: {e}"))?;
                             let dst = slot.recurrent.as_mut_slice::<f32>()
                                 .map_err(|e| anyhow!("recurrent as_mut_slice: {e}"))?;
-                            dst.copy_from_slice(&new_rec_state);
+                            dst.copy_from_slice(src);
                         }
                     }
 
@@ -578,11 +596,23 @@ impl Qwen35Model {
                 }
             };
 
+            if let Some(t) = t_attn_start {
+                let us = t.elapsed().as_micros() as u64;
+                total_attn_us += us;
+                match layer_gpu {
+                    LayerWeightsGpu::LinearAttn { .. } => total_linear_attn_us += us,
+                    LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
+                }
+            }
+
             // --- Residual after attention ---
+            let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             hidden = residual_add_gpu(&hidden, &attn_out, &device, &mut registry)
                 .with_context(|| format!("residual attn layer {layer_idx}"))?;
+            if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
 
             // --- Post-attention RMSNorm ---
+            let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             // The normed value is the FFN *input* only.  The FFN output is added
             // back to `ffn_residual` (the pre-norm value), matching llama.cpp:
             //   ffn_residual = cur;                // after attn residual, BEFORE norm
@@ -629,7 +659,10 @@ impl Qwen35Model {
                 out
             };
 
+            if let Some(t) = t_norm_start { total_norm_us += t.elapsed().as_micros() as u64; }
+
             // --- FFN (takes normed ffn_input, not the pre-norm residual) ---
+            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             let ffn_weights_gpu = match layer_gpu {
                 LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
                 LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
@@ -683,10 +716,14 @@ impl Qwen35Model {
                 }
             };
 
+            if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
+
             // --- Residual after FFN: add to pre-norm ffn_residual, not normed ---
             // Matches llama.cpp: `cur = ggml_add(cur, ffn_residual)`.
+            let t_res2_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
                 .with_context(|| format!("residual ffn layer {layer_idx}"))?;
+            if let Some(t) = t_res2_start { total_residual_us += t.elapsed().as_micros() as u64; }
 
             // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---
             if let Some(dump_n) = dump_layer_n() {
@@ -706,6 +743,19 @@ impl Qwen35Model {
                 let path = format!("{prefix}{:02}.bin", layer_idx);
                 dump_layer_bin(&path, &hidden, seq_len, h);
             }
+        }
+
+        if decode_profile {
+            let total_us = total_attn_us + total_ffn_us + total_norm_us + total_residual_us;
+            eprintln!(
+                "[DECODE_PROFILE] linear_attn={:.1}ms full_attn={:.1}ms ffn={:.1}ms norm={:.1}ms residual={:.1}ms total_layers={:.1}ms",
+                total_linear_attn_us as f64 / 1000.0,
+                total_full_attn_us as f64 / 1000.0,
+                total_ffn_us as f64 / 1000.0,
+                total_norm_us as f64 / 1000.0,
+                total_residual_us as f64 / 1000.0,
+                total_us as f64 / 1000.0,
+            );
         }
 
         // ---- Step 3: final output head → logits ----

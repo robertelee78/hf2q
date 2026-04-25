@@ -59,6 +59,7 @@
 //! P8b: every op wired, parity test targets |GPU−CPU|∞ < 1e-3 F32.
 
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::compute_g_beta::dispatch_compute_g_beta;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
@@ -277,6 +278,8 @@ pub fn apply_proj(
         CastDirection::F32ToBF16,
     )
     .context("cast weight F32→BF16")?;
+    // barrier: matmul reads weight_bf16 written by the cast above.
+    encoder.memory_barrier();
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -503,15 +506,14 @@ fn sigmoid_f32(x: f32) -> f32 {
 ///
 /// - `q`, `k`: `[seq_len, n_k_heads, d_k]` F32 (token-major, d_k innermost).
 /// - `v`: `[seq_len, n_v_heads, d_v]` F32.
-/// - `g`, `beta`: `[seq_len, n_v_heads]` F32.
-/// - `state_in_f`: flat `[d_k * d_v * n_v_heads]` F32 (matches kernel layout
-///   `[d_k, d_v, n_v_heads]` with d_k innermost for n_seqs=1).
+/// - `g`, `beta`: `[seq_len, n_v_heads]` F32 GPU buffers (output of `compute_g_beta_gpu`).
+/// - `state_in`: flat `[d_k * d_v * n_v_heads]` F32 GPU buffer.
 ///
 /// # Returns
 ///
 /// `(output, new_state_flat)` where:
 /// - `output`: `[seq_len, n_v_heads, d_v]` F32 in token-major.
-/// - `new_state_flat`: same layout as `state_in_f`.
+/// - `new_state_flat`: same layout as `state_in`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_gated_delta_net(
     device: &MlxDevice,
@@ -519,21 +521,18 @@ pub fn apply_gated_delta_net(
     q: &MlxBuffer,
     k: &MlxBuffer,
     v: &MlxBuffer,
-    g_cpu: &[f32],
-    beta_cpu: &[f32],
-    state_in_f: &[f32],
+    g_buf: &MlxBuffer,
+    beta_buf: &MlxBuffer,
+    state_in: &MlxBuffer,
     seq_len: u32,
     n_k_heads: u32,
     n_v_heads: u32,
     d_k: u32,
     d_v: u32,
-) -> Result<(MlxBuffer, Vec<f32>)> {
+) -> Result<(MlxBuffer, MlxBuffer)> {
     let n_seqs = 1u32;
-
-    // Upload g, beta, state_in.
-    let g_buf = upload_f32(g_cpu, device)?;
-    let beta_buf = upload_f32(beta_cpu, device)?;
-    let state_in_buf = upload_f32(state_in_f, device)?;
+    // g_buf and beta_buf are already GPU buffers — no upload needed.
+    // state_in is already a GPU buffer — no upload needed.
 
     // Allocate output and state_out.
     let out_elems = (n_v_heads * seq_len * d_v) as usize;
@@ -564,9 +563,9 @@ pub fn apply_gated_delta_net(
         q,
         k,
         v,
-        &g_buf,
-        &beta_buf,
-        &state_in_buf,
+        g_buf,
+        beta_buf,
+        state_in,
         &output_buf,
         &state_out_buf,
         &params_buf,
@@ -575,8 +574,9 @@ pub fn apply_gated_delta_net(
     .context("dispatch_gated_delta_net")?;
     enc.commit_and_wait().context("commit gdn")?;
 
-    let new_state = download_f32(&state_out_buf)?;
-    Ok((output_buf, new_state))
+    // Return state_out_buf as a GPU buffer — caller copies it back to slot.recurrent
+    // via memcpy (unified memory write) to avoid a CPU round-trip.
+    Ok((output_buf, state_out_buf))
 }
 
 /// Apply per-head output RMSNorm then element-wise SiLU-gate multiply.
@@ -673,7 +673,7 @@ pub fn build_delta_net_layer(
     x: &MlxBuffer,
     weights: &DeltaNetWeightsGpu,
     old_conv_state: &[f32], // [K-1, qkv_channels] CPU layout
-    state_in: &[f32],       // [d_k * d_v * n_v_heads] kernel layout
+    state_in: &MlxBuffer,   // [d_k * d_v * n_v_heads] GPU buffer (recurrent state)
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -682,7 +682,7 @@ pub fn build_delta_net_layer(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
-) -> Result<(MlxBuffer, Vec<f32>, Vec<f32>)> {
+) -> Result<(MlxBuffer, Vec<f32>, MlxBuffer)> {
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
     let q_span = n_k_heads * d_k;
@@ -722,8 +722,16 @@ pub fn build_delta_net_layer(
 
     // ---- Op 4: split QKV conv output ----
     // qkv_conv is [seq_len, qkv_channels] F32 (token-major).
-    // After commit, download and split on CPU, then re-upload.
-    let qkv_conv_cpu = download_f32(&qkv_conv)?;
+    // For seq=1: Q/K/V are contiguous runs within the flat [qkv_channels] buffer.
+    //   Q at byte offset 0,             size q_span   elements
+    //   K at byte offset q_span*4,      size k_span   elements
+    //   V at byte offset (q_sp+k_sp)*4, size nv*dv    elements
+    // We create zero-copy slice_view handles into qkv_conv — no download needed.
+    //
+    // For seq>1: qkv_conv is [seq, qkv_channels] (token-major, NOT split-major).
+    // Each token's Q/K/V interleaved within a row: row t = [q_t | k_t | v_t].
+    // A contiguous view of a single segment works only for seq=1 where the
+    // entire buffer is one row.
     let seq = seq_len as usize;
     let nk = n_k_heads as usize;
     let nv = n_v_heads as usize;
@@ -733,21 +741,30 @@ pub fn build_delta_net_layer(
     let q_sp = q_span as usize;
     let k_sp = k_span as usize;
 
-    let mut q_cpu = vec![0.0f32; seq * nk * dk];
-    let mut k_cpu = vec![0.0f32; seq * nk * dk];
-    let mut v_cpu = vec![0.0f32; seq * nv * dv];
-    for t in 0..seq {
-        let base = t * qkv_ch;
-        q_cpu[t * q_sp..(t + 1) * q_sp].copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
-        k_cpu[t * k_sp..(t + 1) * k_sp]
-            .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
-        v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
-            .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
+    let (q_gpu, k_gpu, v_gpu);
+    if seq == 1 {
+        // Zero-copy split: create views into qkv_conv without any download/upload.
+        q_gpu = qkv_conv.slice_view(0,                          q_sp);
+        k_gpu = qkv_conv.slice_view((q_sp * 4) as u64,         k_sp);
+        v_gpu = qkv_conv.slice_view(((q_sp + k_sp) * 4) as u64, nv * dv);
+    } else {
+        // Multi-token prefill: rows are interleaved; must download and de-interleave.
+        let qkv_conv_cpu = download_f32(&qkv_conv)?;
+        let mut q_cpu = vec![0.0f32; seq * nk * dk];
+        let mut k_cpu = vec![0.0f32; seq * nk * dk];
+        let mut v_cpu = vec![0.0f32; seq * nv * dv];
+        for t in 0..seq {
+            let base = t * qkv_ch;
+            q_cpu[t * q_sp..(t + 1) * q_sp].copy_from_slice(&qkv_conv_cpu[base..base + q_sp]);
+            k_cpu[t * k_sp..(t + 1) * k_sp]
+                .copy_from_slice(&qkv_conv_cpu[base + q_sp..base + q_sp + k_sp]);
+            v_cpu[t * (nv * dv)..(t + 1) * (nv * dv)]
+                .copy_from_slice(&qkv_conv_cpu[base + q_sp + k_sp..base + qkv_ch]);
+        }
+        q_gpu = upload_f32(&q_cpu, device)?;
+        k_gpu = upload_f32(&k_cpu, device)?;
+        v_gpu = upload_f32(&v_cpu, device)?;
     }
-
-    let q_gpu = upload_f32(&q_cpu, device)?;
-    let k_gpu = upload_f32(&k_cpu, device)?;
-    let v_gpu = upload_f32(&v_cpu, device)?;
 
     // ---- Op 5q: per-head L2 norm on Q + scalar scale (GPU, no CPU round-trip) ----
     // llama.cpp delta-net-base.cpp applies scale = 1/sqrt(D_k) after L2 norm on Q.
@@ -775,12 +792,28 @@ pub fn build_delta_net_layer(
         q_scaled
     };
 
-    // ---- Ops 5k + 6a + 6b: K L2-norm, alpha proj, beta proj ----
-    // All three read from GPU buffers that are complete after the CPU split
-    // (k_gpu from upload, x_norm from the ops1-2 batch above).
-    // Collapse into one encoder + one commit before the CPU downloads.
-    let (k_normed, alpha_logit_buf, beta_logit_buf) = {
-        let mut enc = device.command_encoder().context("enc ops5k-6ab")?;
+    // ---- Ops 5k + 6a + 6b + 6c: K L2-norm, alpha proj, beta proj, compute g/beta ----
+    // All ops read from GPU buffers complete after the QKV split above.
+    // Batched into ONE encoder: k_l2 | alpha_proj | beta_proj → barrier → g_beta kernel.
+    // This eliminates a separate commit for compute_g_beta, reducing sync points.
+    let g_n = (seq_len * n_v_heads) as usize;
+    let g_buf = device
+        .alloc_buffer(g_n * 4, DType::F32, vec![g_n])
+        .map_err(|e| anyhow!("alloc g_buf: {e}"))?;
+    let beta_buf = device
+        .alloc_buffer(g_n * 4, DType::F32, vec![g_n])
+        .map_err(|e| anyhow!("alloc beta_buf: {e}"))?;
+    let mut g_params_buf = device
+        .alloc_buffer(8, DType::U32, vec![2])
+        .map_err(|e| anyhow!("alloc g_params: {e}"))?;
+    {
+        let s = g_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = n_v_heads;
+        s[1] = seq_len;
+    }
+
+    let (k_normed, _alpha_logit_buf, _beta_logit_buf) = {
+        let mut enc = device.command_encoder().context("enc ops5k-6abc")?;
         let k_normed = apply_l2_norm_per_head(
             &mut enc, registry, device, &k_gpu,
             seq_len, n_k_heads, d_k, rms_norm_eps,
@@ -793,25 +826,32 @@ pub fn build_delta_net_layer(
             &mut enc, registry, device, &x_norm,
             &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
         )?;
-        enc.commit_and_wait().context("commit ops5k-6ab")?;
+        // Barrier: compute_g_beta reads alpha_logit_buf + beta_logit_buf written above.
+        enc.memory_barrier();
+        dispatch_compute_g_beta(
+            &mut enc,
+            registry,
+            device.metal_device(),
+            &alpha_logit_buf,
+            &beta_logit_buf,
+            &weights.ssm_dt_bias,
+            &weights.ssm_a,
+            &g_buf,
+            &beta_buf,
+            &g_params_buf,
+            seq_len,
+            n_v_heads,
+        ).context("dispatch_compute_g_beta")?;
+        enc.commit_and_wait().context("commit ops5k-6abc")?;
         (k_normed, alpha_logit_buf, beta_logit_buf)
     };
-
-    // ---- Op 6c: compute g and beta on CPU ----
-    // dt_bias and ssm_a are weight constants; use CPU copies to avoid GPU downloads.
-    let alpha_logit_cpu = download_f32(&alpha_logit_buf)?;
-    let beta_logit_cpu = download_f32(&beta_logit_buf)?;
-    let (g_cpu, beta_cpu) = compute_g_and_beta_cpu(
-        &alpha_logit_cpu, &beta_logit_cpu, &weights.ssm_dt_bias_cpu, &weights.ssm_a_cpu,
-        seq, nv,
-    );
 
     // ---- Op 7: fused Gated DeltaNet ----
     // apply_gated_delta_net owns its encoder internally.
     let (attn_out, new_recurrent_state) = apply_gated_delta_net(
         device, registry,
         &q_normed, &k_normed, &v_gpu,
-        &g_cpu, &beta_cpu, state_in,
+        &g_buf, &beta_buf, state_in,
         seq_len, n_k_heads, n_v_heads, d_k, d_v,
     )?;
     // attn_out from kernel is [d_v * n_v_heads * n_tokens * n_seqs] but with layout
@@ -965,13 +1005,14 @@ mod tests {
         .expect("from_cpu");
 
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
+        let state_in_gpu = upload_f32(&state_in, &device).expect("upload state_in");
         let (gpu_out_buf, _, _) = build_delta_net_layer(
             &device,
             &mut registry,
             &x_gpu,
             &gpu_weights,
             &conv_state,
-            &state_in,
+            &state_in_gpu,
             seq_len,
             shape.hidden_size,
             shape.n_k_heads,
@@ -1114,9 +1155,10 @@ mod tests {
 
         // Monolithic: 2 tokens at once.
         let x_full_gpu = upload_f32(&x_full, &device).expect("upload");
+        let state_zeros_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros mono");
         let (mono_buf, _, _) = build_delta_net_layer(
             &device, &mut registry, &x_full_gpu, &gpu_weights,
-            &conv_zeros, &state_zeros,
+            &conv_zeros, &state_zeros_gpu,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("mono");
@@ -1127,9 +1169,10 @@ mod tests {
         let x_t1 = x_full[h..2 * h].to_vec();
 
         let x_t0_gpu = upload_f32(&x_t0, &device).expect("upload t0");
+        let state_zeros_t0_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros t0");
         let (t0_buf, conv_after_t0, state_after_t0) = build_delta_net_layer(
             &device, &mut registry, &x_t0_gpu, &gpu_weights,
-            &conv_zeros, &state_zeros,
+            &conv_zeros, &state_zeros_t0_gpu,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t0");

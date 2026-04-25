@@ -807,11 +807,14 @@ pub fn build_moe_ffn_layer_gpu_q(
         enc.commit_and_wait().context("commit gate+up")?;
     }
 
-    // ---- Step 3c: h_all = silu(gate_all) * up_all  [CPU] ----
-    let gate_all_cpu = download_f32(&gate_all_buf).context("download gate_all")?;
-    let up_all_cpu = download_f32(&up_all_buf).context("download up_all")?;
-    let h_all_cpu = silu_mul_cpu(&gate_all_cpu, &up_all_cpu);
-    let h_all_buf = upload_f32(&h_all_cpu, device).context("upload h_all")?;
+    // ---- Step 3c: h_all = silu(gate_all) * up_all  [GPU] ----
+    // Fused GPU kernel replaces: download gate_all + download up_all + silu_mul_cpu + upload h_all.
+    // gate_all_buf and up_all_buf are already committed from the encoder above.
+    let h_all_buf = {
+        let n_elems = (total_rows * m_moe) as u32;
+        silu_mul_gpu(registry, device, &gate_all_buf, &up_all_buf, n_elems)
+            .context("silu_mul_gpu gate+up")?
+    };
 
     // ---- Step 3d: y_all = qmatmul_id(h_all, expert_down_q, arange_ids) ----
     // h_all is [n_tokens * top_k, moe_intermediate] — one row per (token, slot).
