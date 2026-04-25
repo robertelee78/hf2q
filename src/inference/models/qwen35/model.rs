@@ -21,9 +21,11 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::mtp::{load_mtp_weights_if_present, MtpWeights};
-use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use super::weight_loader::MoeFfnWeightsQ;
+use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 
 use mlx_native::gguf::GgufFile;
+use mlx_native::MlxDevice;
 
 // ================================================================
 // Layer weight enums
@@ -34,7 +36,12 @@ use mlx_native::gguf::GgufFile;
 /// expert. Exactly one variant is populated per layer per model.
 pub enum Qwen35FfnWeights {
     Dense(DenseFfnWeights),
+    /// F32-dequantized MoE weights (unit tests / synthetic models only).
     Moe(MoeFfnWeights),
+    /// Quantized MoE weights loaded directly from GGUF (production path).
+    /// Expert tensors stay in GGML block format on the Metal device;
+    /// no F32 expansion occurs during load.
+    MoeQ(MoeFfnWeightsQ),
 }
 
 impl Qwen35FfnWeights {
@@ -42,6 +49,7 @@ impl Qwen35FfnWeights {
         match self {
             Qwen35FfnWeights::Dense(_) => "dense",
             Qwen35FfnWeights::Moe(_) => "moe",
+            Qwen35FfnWeights::MoeQ(_) => "moe-q",
         }
     }
 }
@@ -149,22 +157,72 @@ impl Qwen35Model {
 
     /// Load a complete model from a GGUF file.
     ///
-    /// **Current state (ADR-013 P11 scaffold):** parses the config and
-    /// MTP scaffold from the GGUF but does NOT yet load the dense tensor
-    /// content — that requires the full GGUF → f32 dequant pipeline
-    /// (ADR-013 P11 + P5-tail), which lands in a follow-up iter.
+    /// Acquires a Metal GPU device for dequantization, loads the three
+    /// global tensors (`token_embd`, `output`, `output_norm`), then
+    /// iterates over all layers.
     ///
-    /// For now the returned model carries `cfg` + `mtp` populated with
-    /// real values from the GGUF, and `layers` / `token_embd` /
-    /// `output_*` populated with zeros of the correct shape. Callers
-    /// wanting actual inference must complete the weight load themselves
-    /// (bridge path until P11 finalizes).
+    /// For MoE models the expert weight tensors (`ffn_{gate,up,down}_exps`)
+    /// are kept in their native GGML block quantization via
+    /// [`weight_loader::load_moe_ffn_quantized`].  This prevents the ~128 GB
+    /// Metal working-set OOM that an F32-expanded load would cause for the
+    /// 35B-A3B apex model.
+    ///
+    /// For Dense models the behaviour is unchanged: weights are dequantized
+    /// to f32 via [`weight_loader::load_layer`].
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
         let cfg = Self::load_config_only(gguf)?;
         let mtp = load_mtp_weights_if_present(gguf, cfg.num_hidden_layers)?;
-        let mut model = Self::empty_from_cfg(cfg);
-        model.mtp = mtp;
-        Ok(model)
+
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+
+        let (token_embd, output_weight, output_norm) =
+            weight_loader::load_global_tensors(gguf, &cfg, &device)
+                .context("load_global_tensors")?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
+        for i in 0..cfg.num_hidden_layers {
+            let layer = match cfg.variant {
+                Qwen35Variant::Moe => {
+                    // Use quantized loader for MoE: expert weights stay as GGML
+                    // blocks on Metal; no F32 expansion.
+                    let kind = cfg
+                        .layer_types
+                        .get(i as usize)
+                        .copied()
+                        .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
+                    let ffn = weight_loader::load_moe_ffn_quantized(gguf, i, &device)
+                        .with_context(|| format!("load_moe_ffn_quantized layer {i}"))?;
+                    let ffn_weights = Qwen35FfnWeights::MoeQ(ffn);
+                    match kind {
+                        Qwen35LayerKind::FullAttention => {
+                            let attn = weight_loader::load_full_attn_layer(gguf, &cfg, i, &device)
+                                .with_context(|| format!("load_full_attn layer {i}"))?;
+                            Qwen35LayerWeights::FullAttn { attn, ffn: ffn_weights }
+                        }
+                        Qwen35LayerKind::LinearAttention => {
+                            let attn = weight_loader::load_delta_net_layer(gguf, &cfg, i, &device)
+                                .with_context(|| format!("load_delta_net layer {i}"))?;
+                            Qwen35LayerWeights::LinearAttn { attn, ffn: ffn_weights }
+                        }
+                    }
+                }
+                Qwen35Variant::Dense => {
+                    weight_loader::load_layer(gguf, &cfg, i, &device)
+                        .with_context(|| format!("load_layer {i}"))?
+                }
+            };
+            layers.push(layer);
+        }
+
+        Ok(Self {
+            cfg,
+            layers,
+            token_embd,
+            output_weight,
+            output_norm,
+            mtp,
+        })
     }
 
     /// Report the active FFN variant (Dense or Moe) determined by config.
@@ -207,6 +265,7 @@ fn empty_full_attn_weights(cfg: &Qwen35Config) -> FullAttnLayerWeights {
     let kv_total = nkv * d;
     FullAttnLayerWeights {
         attn_norm: vec![1.0f32; h],
+        post_attn_norm: vec![1.0f32; h],
         wq: vec![0.0f32; q_total * h],
         wk: vec![0.0f32; kv_total * h],
         wv: vec![0.0f32; kv_total * h],
@@ -228,6 +287,7 @@ fn empty_delta_net_weights(cfg: &Qwen35Config) -> DeltaNetLayerWeights {
     let z_channels = nv * dv;
     DeltaNetLayerWeights {
         attn_norm: vec![1.0f32; h],
+        post_attn_norm: vec![1.0f32; h],
         attn_qkv: vec![0.0f32; qkv_channels * h],
         attn_gate: vec![0.0f32; z_channels * h],
         ssm_conv1d: vec![0.0f32; k_width * qkv_channels],
@@ -235,7 +295,8 @@ fn empty_delta_net_weights(cfg: &Qwen35Config) -> DeltaNetLayerWeights {
         ssm_dt_bias: vec![0.0f32; nv],
         ssm_beta: vec![0.0f32; nv * h],
         ssm_a: vec![0.0f32; nv],
-        ssm_norm: vec![1.0f32; z_channels],
+        // ssm_norm shape is [D_v], broadcast across n_v_heads per token.
+        ssm_norm: vec![1.0f32; dv],
         ssm_out: vec![0.0f32; h * z_channels],
     }
 }
@@ -276,12 +337,6 @@ fn empty_ffn_for(cfg: &Qwen35Config) -> Qwen35FfnWeights {
     }
 }
 
-// Suppress the unused-import warning when tests aren't compiled; `anyhow` is
-// only used for the Result alias in the `Result` return type above.
-#[allow(dead_code)]
-fn _touch_anyhow() -> anyhow::Error {
-    anyhow!("")
-}
 
 // ================================================================
 // Tests

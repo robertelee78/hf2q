@@ -46,6 +46,11 @@ use crate::inference::models::qwen35::Qwen35Config;
 pub struct FullAttnLayerWeights {
     /// Pre-attention RMSNorm weight: `[hidden_size]`.
     pub attn_norm: Vec<f32>,
+    /// Post-attention RMSNorm applied between attention residual and FFN:
+    /// `[hidden_size]`.  Stored as `blk.{i}.post_attention_norm.weight` in GGUF.
+    /// Applied as: `hidden = RMSNorm(hidden, post_attn_norm)` before the FFN.
+    /// Omitting this causes hidden-state blow-up → uniform logits → constant token.
+    pub post_attn_norm: Vec<f32>,
     /// Q projection: `[n_head * head_dim, hidden_size]`.
     pub wq: Vec<f32>,
     /// K projection: `[n_kv * head_dim, hidden_size]`.
@@ -384,6 +389,7 @@ mod tests {
 
         FullAttnLayerWeights {
             attn_norm: mk_norm(&mut seed, h),
+            post_attn_norm: vec![1.0f32; h],
             wq: mk(&mut seed, q_total * h),
             wk: mk(&mut seed, kv_total * h),
             wv: mk(&mut seed, kv_total * h),

@@ -41,6 +41,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/models/:model_id", get(handlers::get_model))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route("/v1/embeddings", post(handlers::embeddings))
         .fallback(fallback)
         // Apply layers outside-in. The axum convention is `.layer()` wraps,
         // so the last `.layer(X)` call becomes the outermost layer.
@@ -73,8 +74,10 @@ mod tests {
     }
 
     fn state_with_auth(token: &str) -> AppState {
-        let mut cfg = ServerConfig::default();
-        cfg.auth_token = Some(token.to_string());
+        let cfg = ServerConfig {
+            auth_token: Some(token.to_string()),
+            ..Default::default()
+        };
         AppState::new(cfg)
     }
 
@@ -143,8 +146,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_models_returns_empty_list_when_cache_unset() {
-        let mut cfg = ServerConfig::default();
-        cfg.cache_dir = None;
+        let cfg = ServerConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
         let state = AppState::new(cfg);
         let app = build_router(state);
         let req = Request::builder()
@@ -161,8 +166,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_model_returns_404_when_absent() {
-        let mut cfg = ServerConfig::default();
-        cfg.cache_dir = None;
+        let cfg = ServerConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
         let state = AppState::new(cfg);
         let app = build_router(state);
         let req = Request::builder()
@@ -547,6 +554,42 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         // axum's default JSON extractor rejection surface.
+        assert_eq!(resp.status().as_u16() / 100, 4, "4xx expected");
+    }
+
+    #[tokio::test]
+    async fn embeddings_route_returns_400_when_no_embedding_model_loaded() {
+        // Server has no `--embedding-model` configured → embedding_config
+        // is None → handler must return `model_not_loaded` (400).
+        let app = build_router(state_default());
+        let body = r#"{"model": "any", "input": "hello"}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // `model_not_loaded` is an `invalid_request_error` with the
+        // `code` field set to "model_not_loaded" (matches OpenAI's
+        // 400-on-config-issue shape).
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn embeddings_route_rejects_malformed_json_with_4xx() {
+        let app = build_router(state_default());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{ not valid"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status().as_u16() / 100, 4, "4xx expected");
     }
 

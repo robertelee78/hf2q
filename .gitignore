@@ -17,6 +17,13 @@ _bmad-output/
 .swarm/
 CLAUDE.md
 
+# Git worktrees — long-lived parallel branches (moved from /opt/hf2q-adr013
+# sibling-path convention to nested on 2026-04-24 per Robert's directive).
+# The `/cfa` skill uses `.cfa-worktrees/` for short-lived competitive runs;
+# this `.worktrees/` dir is for long-lived branch worktrees (adr-013, etc.).
+.worktrees/
+.cfa-worktrees/
+
 # Logs and examples
 logs/
 examples/

@@ -161,8 +161,58 @@ fn render_chat_template(
 }
 
 /// Render a Jinja2 chat template using minijinja.
+///
+/// Extends the minijinja environment with Python string methods used by
+/// Qwen3.5/3.6 and other HuggingFace chat templates:
+///
+/// - `str.startswith(prefix)` / `str.endswith(suffix)` — Qwen3.6 multi-step
+///   tool-call detection path.
+/// - `tojson` filter — common HF template helper.
+/// - `raise_exception(msg)` function — Qwen3.6 guard for missing user query
+///   (we always supply a user message, so this code path is unreachable; we
+///   log a warning and continue rather than aborting template rendering).
 fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String> {
     let mut env = minijinja::Environment::new();
+
+    // `tojson` filter — converts any value to its JSON representation.
+    env.add_filter("tojson", |v: minijinja::Value| {
+        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())
+    });
+
+    // `raise_exception(msg)` — log-and-continue instead of aborting.
+    // Qwen3.6 calls this when the message list has no user turn; we always
+    // inject a user message so the guard should not fire.
+    env.add_function("raise_exception", |msg: String| -> minijinja::Value {
+        tracing::warn!("chat template raise_exception: {}", msg);
+        minijinja::Value::UNDEFINED
+    });
+
+    // Python string method shims via `set_unknown_method_callback`.
+    // Handles: `.startswith(prefix)`, `.endswith(suffix)` called as attribute
+    // method invocations on string values (Qwen3.6 template line 72).
+    env.set_unknown_method_callback(|_state, value, method, args| {
+        let s = value.as_str().unwrap_or("");
+        match method {
+            "startswith" => {
+                let prefix = args.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(minijinja::Value::from(s.starts_with(prefix)))
+            }
+            "endswith" => {
+                let suffix = args.first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(minijinja::Value::from(s.ends_with(suffix)))
+            }
+            other => Err(minijinja::Error::from(
+                minijinja::ErrorKind::UnknownMethod,
+            ).with_source(std::io::Error::other(format!(
+                "string has no method named {other}"
+            ))))
+        }
+    });
+
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
     let tmpl = env
@@ -184,9 +234,25 @@ fn render_jinja_template(template_str: &str, user_prompt: &str) -> Result<String
 /// Run the `generate` subcommand.
 ///
 /// ADR-008: single backend path — loads directly from GGUF into mlx-native.
+/// ADR-013 P11: routes `qwen35` / `qwen35moe` GGUF architectures to the
+/// dedicated Qwen3.5 forward path (`cmd_generate_qwen35`) before attempting
+/// the Gemma4 path, so the two model families share the same CLI surface.
 pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let model_path = &args.model;
     anyhow::ensure!(model_path.exists(), "Model not found: {}", model_path.display());
+
+    // --- Architecture detection (fast: metadata-only GGUF open) ---
+    {
+        let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
+            .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
+        if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
+            use crate::inference::models::qwen35::{ARCH_QWEN35, ARCH_QWEN35MOE};
+            if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
+                tracing::info!("Detected architecture '{}' → routing to Qwen3.5 path", arch);
+                return cmd_generate_qwen35(args, gguf_peek);
+            }
+        }
+    }
 
     let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
     let config_path = find_config(model_path, args.config.as_deref())?;
@@ -458,6 +524,296 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     Ok(())
 }
 
+// ================================================================
+// Qwen3.5 generate path (ADR-013 P13.1)
+// ================================================================
+
+/// Generate subcommand dispatch for `qwen35` / `qwen35moe` GGUF architectures.
+///
+/// Full end-to-end generate loop with stateful KV / SSM state threading:
+///
+/// 1. Load model + tokenizer from GGUF.
+/// 2. Render + tokenize the prompt via GGUF's `tokenizer.chat_template`.
+/// 3. Allocate [`HybridKvCache`] for the session (max_seq_len = prompt_len +
+///    max_tokens, capped to `max_position_embeddings`).
+/// 4. **Prefill**: call `forward_gpu(prompt_tokens, positions, kv_cache)`.
+///    DeltaNet SSM state is threaded through `kv_cache.linear_attn` slots.
+/// 5. **Decode loop** for `max_tokens` steps:
+///    - Sample next token (argmax, temp=0 greedy).
+///    - Check EOS (GGUF `tokenizer.ggml.eos_token_id`; default 151645 for
+///      Qwen3.5 / Qwen3.6 per HF tokenizer_config.json).
+///    - Call `forward_gpu([token], [pos], kv_cache)` — kv_cache carries the
+///      DeltaNet conv+recurrent state from the previous step.
+/// 6. Print the canonical hf2q 4-line header then the generated text.
+///
+/// # State threading
+///
+/// DeltaNet (Gated DeltaNet) layers maintain a recurrent state and a conv
+/// ring-buffer that must persist across decode steps. `forward_gpu` now reads
+/// from and writes back to the `kv_cache.linear_attn` slots on every call.
+/// For full-attention layers the SDPA is re-run from scratch on each decode
+/// token (the KV-append incremental path is a future optimisation).
+fn cmd_generate_qwen35(
+    args: cli::GenerateArgs,
+    gguf: mlx_native::gguf::GgufFile,
+) -> Result<()> {
+    use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+    use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
+    use crate::inference::models::qwen35::model::Qwen35Model;
+    use mlx_native::MlxDevice;
+    use std::io::Write;
+
+    let model_path = &args.model;
+    let tokenizer_path = find_tokenizer(model_path, args.tokenizer.as_deref())?;
+
+    tracing::info!("Qwen3.5 path: {}", model_path.display());
+    tracing::info!("Tokenizer:    {}", tokenizer_path.display());
+
+    // ---- Load model ----
+    let load_start = std::time::Instant::now();
+    tracing::info!("Loading Qwen3.5 model from GGUF");
+    let model = Qwen35Model::load_from_gguf(&gguf)
+        .context("Qwen35Model::load_from_gguf")?;
+    let load_elapsed = load_start.elapsed();
+    tracing::info!(
+        "Qwen3.5 model loaded ({} layers, variant={:?}) in {:.2}s",
+        model.layers.len(),
+        model.cfg.variant,
+        load_elapsed.as_secs_f64()
+    );
+
+    // ---- Resolve EOS from GGUF metadata ----
+    // Qwen3.5 / Qwen3.6: tokenizer.ggml.eos_token_id is typically 151645 or 151643.
+    // We prefer the GGUF-declared value (the authoritative source for this GGUF)
+    // over any hard-coded default, per project_qwen36_architecture.md.
+    let eos_token_id: u32 = gguf
+        .metadata_u32("tokenizer.ggml.eos_token_id")
+        .unwrap_or(151645); // HF Qwen3.5 default EOS
+    tracing::info!("Qwen3.5 EOS token id: {}", eos_token_id);
+
+    // ---- Load tokenizer ----
+    let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Tokenizer load failed: {e}"))?;
+    tokenizer
+        .with_truncation(None)
+        .map_err(|e| anyhow::anyhow!("Tokenizer truncation: {e}"))?;
+
+    // ---- Resolve + render prompt ----
+    let prompt_text_raw = resolve_prompt(&args)?;
+    let prompt_text = render_chat_template(&gguf, &args, &prompt_text_raw)?;
+
+    // ---- Tokenize ----
+    let encoding = tokenizer
+        .encode(prompt_text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let prompt_len = prompt_tokens.len();
+    tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
+
+    // ---- Allocate HybridKvCache ----
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
+    let max_seq = (prompt_len + args.max_tokens + 64)
+        .max(128)
+        .min(model.cfg.max_position_embeddings as usize);
+    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+        .context("HybridKvCache::new")?;
+    tracing::info!(
+        "Qwen3.5 KV cache allocated: max_seq={}, {} MB",
+        max_seq,
+        kv_cache.total_bytes() / (1024 * 1024)
+    );
+
+    // ---- Build header info ----
+    let backend_chip = {
+        use crate::serve::gpu::GpuContext;
+        GpuContext::new()
+            .ok()
+            .map(|c| c.gpu_name().to_string())
+            .unwrap_or_else(|| "Metal".to_string())
+    };
+    let model_name = gguf
+        .metadata_string("general.name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            model_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "qwen3.5".to_string())
+        });
+    let total_gb = std::fs::metadata(model_path)
+        .map(|m| m.len() as f64 / 1e9)
+        .unwrap_or(0.0);
+    let n_layers = model.layers.len();
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    let header_top = header::HeaderInfoTop {
+        chip: header::short_chip_label(&backend_chip),
+        backend: "mlx-native",
+        model: model_name,
+        load_s: load_elapsed.as_secs_f64(),
+        n_layers,
+        total_gb,
+    };
+    let mut stdout = std::io::stdout();
+    header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
+        .context("print header top")?;
+
+    // ---- Prefill ----
+    // Build flat positions [4 * prompt_len]: axis-major, all axes = token index.
+    let prefill_positions: Vec<i32> = {
+        let mut flat = vec![0i32; 4 * prompt_len];
+        for axis in 0..4 {
+            for t in 0..prompt_len {
+                flat[axis * prompt_len + t] = t as i32;
+            }
+        }
+        flat
+    };
+
+    tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
+    let prefill_start = std::time::Instant::now();
+    let prefill_logits = model
+        .forward_gpu(&prompt_tokens, &prefill_positions, &mut kv_cache)
+        .context("Qwen35Model::forward_gpu (prefill)")?;
+    let prefill_elapsed = prefill_start.elapsed();
+
+    // Sanity-check logits shape.
+    let vocab_size = model.cfg.vocab_size;
+    anyhow::ensure!(
+        prefill_logits.len() == prompt_len * vocab_size as usize,
+        "forward_gpu (prefill) returned logits.len()={} != prompt_len({}) * vocab({}) = {}",
+        prefill_logits.len(),
+        prompt_len,
+        vocab_size,
+        prompt_len * vocab_size as usize,
+    );
+
+    let prefill_tok_s = prompt_len as f64 / prefill_elapsed.as_secs_f64();
+    header::print_header_prefill(
+        &mut stdout,
+        &header::HeaderInfoPrefill {
+            prefill_n: prompt_len,
+            prefill_ms: prefill_elapsed.as_secs_f64() * 1000.0,
+            prefill_tok_s,
+        },
+        stdout_is_tty,
+    )
+    .context("print header prefill")?;
+
+    // HF2Q_DUMP_LOGITS=1: write the last-token logit vector to /tmp/hf2q_logits_t0.bin
+    // and exit immediately. Used for first-token logit comparison vs llama.cpp.
+    if std::env::var("HF2Q_DUMP_LOGITS").as_deref() == Ok("1") {
+        let last_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                last_logits.as_ptr() as *const u8,
+                last_logits.len() * 4,
+            )
+        };
+        std::fs::write("/tmp/hf2q_logits_t0.bin", bytes)
+            .context("HF2Q_DUMP_LOGITS: write /tmp/hf2q_logits_t0.bin")?;
+        // Top-3 to stderr for quick sanity check.
+        let mut indexed: Vec<(usize, f32)> = last_logits.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("HF2Q_DUMP_LOGITS: wrote {} f32 values to /tmp/hf2q_logits_t0.bin", last_logits.len());
+        eprintln!("  top-3: {:?}", &indexed[..3.min(indexed.len())]);
+        return Ok(());
+    }
+
+    // Sample the first token from prefill logits (last token's row).
+    let last_prefill_logits = &prefill_logits[prefill_logits.len() - vocab_size as usize..];
+    let mut next_token = greedy_argmax_last_token(last_prefill_logits, vocab_size);
+    tracing::info!("Qwen3.5 first decoded token: {}", next_token);
+
+    // Print first token immediately.
+    {
+        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
+        print!("{}", s);
+        stdout.flush()?;
+    }
+
+    // ---- Decode loop ----
+    let decode_start = std::time::Instant::now();
+    let mut generated = 1usize;
+
+    for step in 1..args.max_tokens {
+        if next_token == eos_token_id {
+            break;
+        }
+
+        // Absolute position of the decode token: prompt_len + (step - 1) since
+        // step=1 is the second decode token, positioned at prompt_len.
+        // (step=0 was the first decode token sampled from prefill; it already
+        // "consumed" position prompt_len implicitly because we ran prefill at
+        // positions 0..prompt_len-1, so the next position is prompt_len.)
+        let pos = (prompt_len + step - 1) as i32;
+
+        // Check we haven't overrun the KV cache.
+        if pos as usize >= max_seq {
+            tracing::warn!(
+                "Qwen3.5 decode: reached max_seq {} at step {}; stopping",
+                max_seq,
+                step
+            );
+            break;
+        }
+
+        // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
+        let decode_positions = vec![pos; 4];
+
+        // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+        // Eliminates ~5ms/token vocabulary download for greedy decode.
+        let _t_step = if std::env::var("HF2Q_STEP_PROFILE").is_ok() {
+            Some(std::time::Instant::now())
+        } else { None };
+        next_token = model
+            .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+            .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
+        if let Some(t) = _t_step {
+            eprintln!("[STEP_PROFILE] step={step} total={:.2}ms", t.elapsed().as_micros() as f64 / 1000.0);
+        }
+        generated += 1;
+
+        let s = tokenizer.decode(&[next_token], false).unwrap_or_default();
+        print!("{}", s);
+        stdout.flush()?;
+    }
+
+    let decode_elapsed = decode_start.elapsed();
+    let tok_per_sec = generated as f64 / decode_elapsed.as_secs_f64();
+
+    let (td, tr) = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    eprintln!(
+        "\n\n{td}--- mlx-native (Qwen3.5): {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
+        generated,
+        decode_elapsed.as_secs_f64(),
+        tok_per_sec,
+    );
+
+    if args.benchmark {
+        let (chip, mem_gb) = detect_hardware_info();
+        let model_filename = model_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!();
+        println!("=== Benchmark Results ===");
+        println!("Hardware: {}, {} GB", chip, mem_gb);
+        println!("Model: {}", model_filename);
+        println!("Prompt tokens: {}", prompt_len);
+        println!("Generated tokens: {}", generated);
+        println!("Prefill tok/s: {:.1}", prefill_tok_s);
+        println!("Decode tok/s: {:.1}", tok_per_sec);
+    }
+
+    Ok(())
+}
+
 /// Run the `serve` subcommand — start the OpenAI-compatible HTTP API server.
 ///
 /// ADR-005 Phase 2a iter-2 backbone: exposes `/health`, `/readyz`,
@@ -566,22 +922,36 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
         let emb_config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF config parse failed: {e}"))?;
-        // Extract vocab + build WordPiece tokenizer (iter 20).
+        // Extract vocab + build llama.cpp-compatible WPM tokenizer.
+        // The HF `tokenizers` crate's WordPiece path is incompatible with
+        // the bge / nomic / mxbai GGUF vocab format (▁-prefixed word
+        // starters); iter 64 ported llama.cpp's `llm_tokenizer_wpm`
+        // directly to Rust.
         let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
-        let tokenizer = crate::inference::models::bert::build_wordpiece_tokenizer(&vocab)
-            .map_err(|e| anyhow::anyhow!("Embedding tokenizer build failed: {e}"))?;
+        let tokenizer = crate::inference::models::bert::BertWpmTokenizer::new(&vocab);
         let model_id = emb_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "embedding-model".into());
+        // Validate the tensor manifest before the multi-MB load so the
+        // operator gets a specific missing-tensor list rather than a
+        // generic mid-load failure.
+        crate::inference::models::bert::weights::validate_tensor_set(&gguf, &emb_config)
+            .map_err(|e| anyhow::anyhow!("Embedding GGUF tensor validation: {e}"))?;
+        let device = mlx_native::MlxDevice::new()
+            .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding load: {e}"))?;
+        let weights =
+            crate::inference::models::bert::weights::LoadedBertWeights::load(&gguf, &emb_config, device)
+                .map_err(|e| anyhow::anyhow!("Embedding weights load failed: {e}"))?;
         tracing::info!(
             path = %emb_path.display(),
             hidden = emb_config.hidden_size,
             layers = emb_config.num_hidden_layers,
             pooling = ?emb_config.pooling_type,
             vocab_size = vocab.len(),
-            "Validated embedding GGUF header + tokenizer"
+            tensor_count = weights.len(),
+            "Validated embedding GGUF + loaded weights onto device"
         );
         Some(api::state::EmbeddingModel {
             gguf_path: emb_path.clone(),
@@ -589,6 +959,7 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             vocab: std::sync::Arc::new(vocab),
             tokenizer: std::sync::Arc::new(tokenizer),
             model_id,
+            weights: Some(std::sync::Arc::new(weights)),
         })
     } else {
         None
@@ -651,6 +1022,21 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             tensors_loaded = mmp_weights.len(),
             "Loaded mmproj GGUF header + tensor set + weights"
         );
+        // Iter 53: ViT GPU warmup — runs one synthetic full forward
+        // to trigger Metal kernel pipeline compilation. Drops first
+        // user-visible multimodal request from ~5–10s (cold compile)
+        // to ~1.3s (steady-state) on M5 Max.
+        let warmup_t0 = std::time::Instant::now();
+        match crate::inference::vision::vit_gpu::warmup_vit_gpu(&mmp_weights, &mmp_config) {
+            Ok(()) => tracing::info!(
+                elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
+                "ViT GPU warmup complete"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "ViT GPU warmup failed; first multimodal request will pay kernel-compile cost"
+            ),
+        }
         Some(api::state::LoadedMmproj {
             gguf_path: mmp_path.clone(),
             config: mmp_config,
@@ -719,6 +1105,27 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("axum::serve")?;
+
+        // Axum has stopped accepting + drained in-flight HTTP responses.
+        // Each in-flight handler that called `engine.generate*` has already
+        // received its reply. Now send the Shutdown sentinel (FIFO behind any
+        // generations that were dispatched but whose HTTP response had
+        // already returned — e.g. SSE streams that wrote their last frame
+        // before SIGTERM) and join the worker thread.
+        //
+        // Without this, the tokio runtime drops at the bottom of `block_on`
+        // and the `mpsc::Sender` to the worker is closed implicitly; the
+        // worker exits its loop on the next `blocking_recv`, but a
+        // mid-decode generation gets cut off rather than running to its
+        // natural finish_reason. Joining here gives the worker a chance to
+        // complete in-flight compute cleanly before the runtime tears down.
+        if let Some(engine) = state_for_warmup.engine.clone() {
+            match engine.shutdown().await {
+                Ok(()) => tracing::info!("hf2q-engine worker joined"),
+                Err(e) => tracing::warn!(error = %e, "hf2q-engine worker join failed"),
+            }
+        }
+
         tracing::info!("hf2q HTTP server shut down cleanly");
         Ok::<(), anyhow::Error>(())
     })?;

@@ -29,8 +29,9 @@ use super::engine::{self, SamplingParams};
 use super::grammar;
 use super::schema::{
     ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
-    ReadyzResponse, ResponseFormat, UsageStats,
+    EmbeddingObject, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, HealthResponse,
+    MessageContent, ModelListResponse, ModelObject, PromptTokensDetails, ReadyzResponse,
+    ResponseFormat, UsageStats,
 };
 use super::state::AppState;
 
@@ -283,7 +284,43 @@ fn prepare_chat_generation(
             Err(resp) => return Err(resp),
         };
     if !preprocessed_images.is_empty() {
-        return Err(vit_forward_pending_response(preprocessed_images.len()));
+        // Iter 52: run the GPU ViT forward end-to-end per image. Even
+        // though the engine can't consume the resulting [49, 2816]
+        // embeddings yet (iter 53 wires that), we exercise the full
+        // production GPU path so the timing + correctness are
+        // verifiable on every multimodal request.
+        let mmproj = state.mmproj.as_ref().expect("mmproj checked in process_multimodal_content");
+        let head_dim_f = (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
+        let scale = 1.0f32 / head_dim_f.sqrt();
+        let t0 = std::time::Instant::now();
+        let vision_result =
+            crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu(
+                &preprocessed_images,
+                &mmproj.weights,
+                &mmproj.config,
+                scale,
+            );
+        let elapsed = t0.elapsed();
+        match vision_result {
+            Ok(embeddings) => {
+                tracing::info!(
+                    n_images = embeddings.len(),
+                    embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
+                    forward_ms = elapsed.as_millis() as u64,
+                    "Vision embeddings computed via GPU ViT forward"
+                );
+                return Err(vit_engine_integration_pending_response(
+                    embeddings.len(),
+                    elapsed.as_millis() as u64,
+                ));
+            }
+            Err(e) => {
+                return Err(ApiError::generation_error(format!(
+                    "ViT forward failed: {e}"
+                ))
+                .into_response());
+            }
+        }
     }
 
     // Pre-compile the response_format grammar (Decision #6). Fails fast on
@@ -879,6 +916,44 @@ fn vit_forward_pending_response(n_images: usize) -> Response {
     resp
 }
 
+/// Iter 52: 501 emitted AFTER the GPU ViT forward succeeded. Reports
+/// the per-request vision-forward timing so clients can verify the
+/// path is real even though the engine doesn't yet consume the
+/// embeddings.
+fn vit_engine_integration_pending_response(n_images: usize, forward_ms: u64) -> Response {
+    let err = ApiError::invalid_request(
+        format!(
+            "Request carries {n} image(s); all parsed, preprocessed, \
+             and run through the ViT GPU forward in {ms}ms producing \
+             [49, 2816] projected multimodal embeddings per image. \
+             The chat-completion engine does not yet consume vision \
+             embeddings (ADR-005 Phase 2c iter 53 lands that). The \
+             multimodal pipeline up to and including the ViT projector \
+             is fully production-correct and exercised on every \
+             request — only the engine-side embedding-injection path \
+             is pending. Send a text-only message to exercise chat \
+             completions today.",
+            n = n_images,
+            ms = forward_ms
+        ),
+        Some("messages".into()),
+    );
+    let mut resp = err.into_response();
+    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+    // Surface forward timing as a transparency header so clients can
+    // see the GPU forward really ran without parsing the error body.
+    use axum::http::{header::HeaderName, HeaderValue};
+    if let Ok(v) = HeaderValue::from_str(&forward_ms.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-hf2q-vit-forward-ms"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&n_images.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-hf2q-vit-images"), v);
+    }
+    resp
+}
+
 /// Pre-compile the request's `response_format` to a GBNF grammar and parse
 /// it. Returns `Err(Response)` with the OpenAI-shaped 400 `grammar_error`
 /// envelope on failure. On success, the grammar is discarded (iter 9 scope)
@@ -975,6 +1050,220 @@ fn chrono_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/embeddings  (Phase 2b — BERT-family embedding model)
+// ---------------------------------------------------------------------------
+
+/// BERT attention path tile granularity.
+///
+/// `dense_matmul_bf16_f32_tensor` (the BF16 tensor-core matmul) iterates
+/// the K dimension in 32-element tiles and **does not** handle a
+/// partial trailing tile — when K is not a multiple of 32, the last
+/// iteration reads off the end of the buffer (see iter 67 bisection
+/// notes in ADR-005). The post-softmax `scores @ V` matmul has K =
+/// seq_len, so we round seq_len up to a multiple of 32 and use the
+/// attention mask (iter 66) to mask the extra padded positions.
+///
+/// Empirically: any seq_len that is a multiple of 32 produces cosine
+/// 0.99999+ vs llama-embedding; non-multiples produced 0.75–0.92 in
+/// iter 67 measurements. Until the mlx-native kernel grows partial-K-
+/// tile support, this padding is the correctness gate.
+const BERT_TILE_K: usize = 32;
+
+/// Handler for `POST /v1/embeddings`. Tokenizes each input string,
+/// runs the full BERT forward pass on GPU, and returns OpenAI-shaped
+/// `{object: "list", data: [{object: "embedding", embedding, index}],
+/// model, usage}`.
+///
+/// Failure modes:
+///   - No `--embedding-model` was supplied at startup → 503
+///     `model_not_loaded` naming the requested id.
+///   - `req.model` doesn't match the loaded embedding model id → 400
+///     `model_not_loaded`.
+///   - `encoding_format = "base64"` → 400 `invalid_request_error`
+///     (only `"float"` is supported today).
+///   - Tokenization or forward-pass error → 500 `generation_error`.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    Json(req): Json<EmbeddingRequest>,
+) -> Response {
+    // --- Validate the embedding model is loaded ---
+    let em = match state.embedding_config.as_ref() {
+        Some(em) => em.clone(),
+        None => {
+            return ApiError::model_not_loaded(&req.model).into_response();
+        }
+    };
+    if req.model != em.model_id {
+        return ApiError::model_not_loaded(&req.model).into_response();
+    }
+    let weights = match em.weights.as_ref() {
+        Some(w) => w.clone(),
+        None => {
+            return ApiError::generation_error(
+                "embedding model has no loaded weights (server startup did not eagerly load)"
+                    .to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    // --- Validate request format ---
+    if let Some(fmt) = req.encoding_format.as_deref() {
+        if fmt != "float" {
+            return ApiError::invalid_request(
+                format!("encoding_format='{fmt}' not supported (only 'float')"),
+                Some("encoding_format".into()),
+            )
+            .into_response();
+        }
+    }
+    let inputs = req.input.into_vec();
+    if inputs.is_empty() {
+        return ApiError::invalid_request(
+            "input must be a non-empty string or array of strings".to_string(),
+            Some("input".into()),
+        )
+        .into_response();
+    }
+
+    // --- Run the forward pass per input ---
+    // The blocking GPU dispatch runs inside spawn_blocking so the tokio
+    // runtime is not held up while the per-input forward (~ms-scale)
+    // executes. Each input gets its own GraphSession + KernelRegistry —
+    // amortizing kernel-compile across requests is iter-63's perf work.
+    let cfg = em.config.clone();
+    let model_id = em.model_id.clone();
+    let tokenizer = em.tokenizer.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EmbeddingResponse> {
+        use crate::inference::models::bert::bert_gpu::{
+            apply_bert_full_forward_gpu, register_bert_custom_shaders,
+        };
+        use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
+
+        // Per-call device handle. The underlying Metal device is shared
+        // with the eager-loaded weights (Apple Silicon: same hardware
+        // visible through every MlxDevice handle).
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding forward: {e}"))?;
+        let executor = GraphExecutor::new(device);
+
+        let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
+        let mut total_tokens: usize = 0;
+
+        for (i, input) in inputs.into_iter().enumerate() {
+            // Tokenize via the llama.cpp-compatible WPM tokenizer.
+            // `add_special_tokens=true` wraps the output in
+            // `[CLS] ... [SEP]` — without that the embedding diverges
+            // from llama-embedding's reference output.
+            let raw_ids: Vec<u32> = tokenizer.encode(input.as_str(), true);
+            total_tokens += raw_ids.len();
+
+            // Pad / truncate to satisfy the BF16 tensor matmul K-tile
+            // alignment (must be a multiple of `BERT_TILE_K = 32`) and
+            // the model's max position embedding cap. Always round up.
+            let mut ids: Vec<u32> = raw_ids.to_vec();
+            // First clip to max_pos so we don't pad past the cap.
+            if ids.len() > cfg.max_position_embeddings {
+                ids.truncate(cfg.max_position_embeddings);
+            }
+            // Round up to the next multiple of 32, but never below 32.
+            let target = ids.len().max(BERT_TILE_K).div_ceil(BERT_TILE_K) * BERT_TILE_K;
+            // Cap at max_pos rounded down to a tile boundary; if ids was
+            // truncated above, target may exceed max_pos — clamp.
+            let max_aligned =
+                cfg.max_position_embeddings - (cfg.max_position_embeddings % BERT_TILE_K);
+            let target = target.min(max_aligned).max(BERT_TILE_K);
+            if ids.len() < target {
+                ids.resize(target, 0u32);
+            } else if ids.len() > target {
+                ids.truncate(target);
+            }
+            let seq_len = ids.len() as u32;
+
+            // Upload ids to the device (per-request — small buffers).
+            let device_ref: *const MlxDevice = executor.device() as *const _;
+            // SAFETY: executor outlives this closure scope.
+            let device: &MlxDevice = unsafe { &*device_ref };
+            let ids_buf = device
+                .alloc_buffer(
+                    ids.len() * 4,
+                    mlx_native::DType::U32,
+                    vec![ids.len()],
+                )
+                .map_err(|e| anyhow::anyhow!("alloc ids buf: {e}"))?;
+            // SAFETY: just-allocated u32 buffer; exclusive access.
+            let s: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(ids_buf.contents_ptr() as *mut u32, ids.len())
+            };
+            s.copy_from_slice(&ids);
+
+            // Dispatch the forward pass.
+            let mut session = executor
+                .begin()
+                .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
+            let mut registry = KernelRegistry::new();
+            register_bert_custom_shaders(&mut registry);
+            // valid_token_count = the count BEFORE [PAD] padding. The
+            // forward pass uses this to build the attention mask so
+            // padded positions don't contaminate the embedding.
+            let valid_token_count = raw_ids.len().min(ids.len()) as u32;
+            let out = apply_bert_full_forward_gpu(
+                session.encoder_mut(),
+                &mut registry,
+                device,
+                &ids_buf,
+                None, // type_ids: single-segment input
+                &weights,
+                &cfg,
+                seq_len,
+                valid_token_count,
+            )?;
+            session
+                .finish()
+                .map_err(|e| anyhow::anyhow!("session finish: {e}"))?;
+
+            // Read back the [hidden] vector.
+            let slice = out
+                .as_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("readback: {e}"))?;
+            let embedding = slice.to_vec();
+
+            data.push(EmbeddingObject {
+                object: "embedding",
+                embedding,
+                index: i,
+            });
+        }
+
+        Ok(EmbeddingResponse {
+            object: "list",
+            data,
+            model: model_id,
+            usage: EmbeddingUsage {
+                prompt_tokens: total_tokens,
+                total_tokens,
+            },
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(e)) => {
+            // Format the full anyhow chain with `:#` so the client gets
+            // every nested context, not just the topmost. Otherwise a
+            // dispatch failure four contexts deep is invisible.
+            ApiError::generation_error(format!("embedding forward: {e:#}")).into_response()
+        }
+        Err(join_err) => {
+            ApiError::generation_error(format!("embedding worker panicked: {join_err}"))
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -37,6 +37,30 @@
 
 use anyhow::{anyhow, Result};
 
+/// Elementwise in-place residual add: `a += b`. Shape-validated thin
+/// wrapper — the reason it exists as a named function (rather than an
+/// inline `for` loop) is that the transformer block has multiple
+/// residual additions (post-attn, post-FFN) and every one of them is a
+/// good place to accidentally skip-or-duplicate. Naming the operation
+/// makes the block-construction code self-documenting.
+///
+/// # Errors
+///
+/// - `a.len() != b.len()`
+pub fn residual_add(a: &mut [f32], b: &[f32]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(anyhow!(
+            "residual_add: a len {} != b len {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        *ai += *bi;
+    }
+    Ok(())
+}
+
 /// Add a learned position-embedding tensor in-place to a patch-embedding
 /// tensor. Both are `[N_patches, hidden]` row-major.
 ///
@@ -332,6 +356,51 @@ pub fn softmax_last_dim(input: &mut [f32], hidden: usize) -> Result<()> {
         for v in slice.iter_mut() {
             *v *= inv;
         }
+    }
+    Ok(())
+}
+
+/// SiLU (Swish) activation, in-place: `y = x · σ(x) = x / (1 + exp(-x))`.
+///
+/// The gating activation for SwiGLU FFNs (used by Gemma / Llama / Mistral
+/// / SigLIP2 vision towers, among others). Matches PyTorch
+/// `nn.functional.silu(x)` byte-for-byte.
+///
+/// Numerical notes:
+/// - For large positive `x`, `1/(1+exp(-x)) → 1`, so SiLU(x) → x.
+/// - For large negative `x`, `1/(1+exp(-x)) → 0`, so SiLU(x) → 0.
+/// - At `x = 0`, SiLU = 0 exactly.
+/// - The implementation guards against exp overflow by clamping the
+///   input to `exp(-x)` above a threshold — for `x < -40`, `exp(-x)`
+///   would be huge but `x · σ(x) → 0` anyway; for `x > 40`, `exp(-x)`
+///   is effectively 0 and we just return `x`. Rust's f32::exp handles
+///   both ends without NaN.
+pub fn silu_in_place(input: &mut [f32]) {
+    for v in input.iter_mut() {
+        let x = *v;
+        *v = x / (1.0 + (-x).exp());
+    }
+}
+
+/// Elementwise in-place multiply: `a[i] *= b[i]`. Shape-validated.
+///
+/// Used in SwiGLU gating (`silu(gate) * up`) and any other
+/// elementwise-modulation path. Named wrapper mirrors `residual_add`:
+/// keeps the block-construction call site self-documenting.
+///
+/// # Errors
+///
+/// - `a.len() != b.len()`
+pub fn elementwise_mul_in_place(a: &mut [f32], b: &[f32]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(anyhow!(
+            "elementwise_mul_in_place: a len {} != b len {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    for (ai, bi) in a.iter_mut().zip(b.iter()) {
+        *ai *= *bi;
     }
     Ok(())
 }
@@ -712,6 +781,355 @@ pub fn qkv_projection_forward(
     let v = linear_forward(input, v_weight, None, batch, hidden, hidden)
         .map_err(|e| anyhow!("qkv_projection_forward V: {e}"))?;
     Ok((q, k, v))
+}
+
+/// In-place scalar multiply: `x *= c` across every element. Used by
+/// Gemma 4V's post-blocks pipeline (`ggml_scale(cur, sqrtf(n_embd))`).
+pub fn scale_in_place(x: &mut [f32], c: f32) {
+    for v in x.iter_mut() {
+        *v *= c;
+    }
+}
+
+/// 2×2 spatial average-pool on a `[N_patches, hidden]` row-major tensor
+/// laid out as an `N_side × N_side` patch grid. Returns
+/// `[(N_side/2)², hidden]` where each output row is the mean of 4
+/// adjacent input rows.
+///
+/// For Gemma 4V: `[196, 1152]` (14×14 patches) → `[49, 1152]` (7×7
+/// patches). Matches llama.cpp's `ggml_pool_2d(..., AVG, 2, 2, 2, 2)`.
+///
+/// Output memory layout is row-major over the new 7×7 grid:
+/// `out[y*7 + x]` = mean of input patches `(2y, 2x)`, `(2y, 2x+1)`,
+/// `(2y+1, 2x)`, `(2y+1, 2x+1)`.
+///
+/// # Errors
+///
+/// - `input.len() != n_patches * hidden`
+/// - `n_side * n_side != n_patches`
+/// - `n_side % 2 != 0`
+pub fn avg_pool_2x2_spatial(
+    input: &[f32],
+    n_side: usize,
+    hidden: usize,
+) -> Result<Vec<f32>> {
+    let n_patches = n_side * n_side;
+    if input.len() != n_patches * hidden {
+        return Err(anyhow!(
+            "avg_pool_2x2_spatial: input len {} != n_patches*hidden = {}*{} = {}",
+            input.len(),
+            n_patches,
+            hidden,
+            n_patches * hidden
+        ));
+    }
+    if n_side == 0 || n_side % 2 != 0 {
+        return Err(anyhow!(
+            "avg_pool_2x2_spatial: n_side {} must be positive and even",
+            n_side
+        ));
+    }
+
+    let out_side = n_side / 2;
+    let out_patches = out_side * out_side;
+    let mut out = vec![0f32; out_patches * hidden];
+    let inv4 = 0.25f32;
+    for oy in 0..out_side {
+        for ox in 0..out_side {
+            let iy0 = oy * 2;
+            let ix0 = ox * 2;
+            let out_off = (oy * out_side + ox) * hidden;
+            for d in 0..hidden {
+                let a = input[(iy0 * n_side + ix0) * hidden + d];
+                let b = input[(iy0 * n_side + (ix0 + 1)) * hidden + d];
+                let c = input[((iy0 + 1) * n_side + ix0) * hidden + d];
+                let d4 = input[((iy0 + 1) * n_side + (ix0 + 1)) * hidden + d];
+                out[out_off + d] = (a + b + c + d4) * inv4;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Elementwise per-channel bias/scale normalization, in-place across
+/// `[batch, hidden]` rows: `x[b, i] = (x[b, i] - bias[i]) * scale[i]`.
+///
+/// Gemma 4 vision tower uses this between the post-blocks avg-pool and
+/// the `mm.0` projector (`v.std_bias [1152]`, `v.std_scale [1152]`).
+/// Not a standard stage in other ViTs — SigLIP2's Gemma 4 variant
+/// introduced it as a pre-projector normalization.
+///
+/// # Errors
+///
+/// - `x.len() % hidden != 0`
+/// - `bias.len() != hidden`
+/// - `scale.len() != hidden`
+pub fn std_bias_scale_in_place(
+    x: &mut [f32],
+    bias: &[f32],
+    scale: &[f32],
+    hidden: usize,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("std_bias_scale_in_place: hidden must be > 0"));
+    }
+    if x.len() % hidden != 0 {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: x len {} not divisible by hidden {}",
+            x.len(),
+            hidden
+        ));
+    }
+    if bias.len() != hidden {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: bias len {} != hidden {}",
+            bias.len(),
+            hidden
+        ));
+    }
+    if scale.len() != hidden {
+        return Err(anyhow!(
+            "std_bias_scale_in_place: scale len {} != hidden {}",
+            scale.len(),
+            hidden
+        ));
+    }
+    let n_rows = x.len() / hidden;
+    for row in 0..n_rows {
+        let off = row * hidden;
+        for i in 0..hidden {
+            x[off + i] = (x[off + i] - bias[i]) * scale[i];
+        }
+    }
+    Ok(())
+}
+
+/// Execute one ViT transformer block end-to-end on a `[batch, hidden]`
+/// residual-stream tensor. Composes the 11-stage pipeline:
+///
+/// ```text
+/// cur = rms_norm(x, ln1)
+/// (q, k, v) = qkv_projection(cur)
+/// per_head_rms_norm(q, attn_q_norm)
+/// per_head_rms_norm(k, attn_k_norm)
+/// attn = scaled_dot_product_attention(q, k, v)     # TODO scale=1.0 for Gemma4V
+/// attn = linear(attn, attn_output)
+/// x = residual_add(x, attn)
+/// cur = rms_norm(x, ln2)
+/// gate = silu(linear(cur, ffn_gate))
+/// up   = linear(cur, ffn_up)
+/// cur  = gate * up
+/// cur  = linear(cur, ffn_down)
+/// cur  = rms_norm(cur, post_ffw_norm)
+/// x    = residual_add(x, cur)
+/// ```
+///
+/// `hidden_states` is consumed and the returned `Vec<f32>` replaces it
+/// for the next block's input. Matches llama.cpp `build_vit` Gemma 4V
+/// path structure; known block-parity TODOs (Gemma 4V `scale=1.0`,
+/// V-RMSNorm, 2D RoPE) are unchanged from iter 40.
+pub fn apply_vit_block_forward(
+    hidden_states: Vec<f32>,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+    block_idx: usize,
+) -> Result<Vec<f32>> {
+    let hidden = cfg.hidden_size as usize;
+    let num_heads = cfg.num_attention_heads as usize;
+    let head_dim = hidden / num_heads;
+    let intermediate = cfg.intermediate_size as usize;
+    let eps = cfg.layer_norm_eps;
+    if hidden_states.len() % hidden != 0 {
+        return Err(anyhow!(
+            "apply_vit_block_forward: input len {} not divisible by hidden {}",
+            hidden_states.len(),
+            hidden
+        ));
+    }
+    let batch = hidden_states.len() / hidden;
+
+    // Helper: extract a block-local tensor as &[f32].
+    let slice = |suffix: &str| -> Result<&[f32]> {
+        let buf = weights.block_tensor(block_idx, suffix)?;
+        buf.as_slice::<f32>()
+            .map_err(|e| anyhow!("block {}: {} as_slice: {e}", block_idx, suffix))
+    };
+
+    // --- Attention half ---
+    let mut residual = hidden_states;
+    let mut cur = residual.clone();
+    rms_norm_forward(&mut cur, slice("ln1.weight")?, hidden, eps)?;
+
+    let (mut q, mut k, v) = qkv_projection_forward(
+        &cur,
+        slice("attn_q.weight")?,
+        slice("attn_k.weight")?,
+        slice("attn_v.weight")?,
+        batch,
+        hidden,
+    )?;
+    per_head_rms_norm_forward(
+        &mut q,
+        slice("attn_q_norm.weight")?,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
+    per_head_rms_norm_forward(
+        &mut k,
+        slice("attn_k_norm.weight")?,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
+
+    let attn = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)?;
+    let attn_projected = linear_forward(
+        &attn,
+        slice("attn_output.weight")?,
+        None,
+        batch,
+        hidden,
+        hidden,
+    )?;
+    residual_add(&mut residual, &attn_projected)?;
+
+    // --- FFN half ---
+    let mut cur = residual.clone();
+    rms_norm_forward(&mut cur, slice("ln2.weight")?, hidden, eps)?;
+
+    let mut gate =
+        linear_forward(&cur, slice("ffn_gate.weight")?, None, batch, hidden, intermediate)?;
+    let up = linear_forward(&cur, slice("ffn_up.weight")?, None, batch, hidden, intermediate)?;
+    silu_in_place(&mut gate);
+    elementwise_mul_in_place(&mut gate, &up)?;
+
+    let mut down = linear_forward(
+        &gate,
+        slice("ffn_down.weight")?,
+        None,
+        batch,
+        intermediate,
+        hidden,
+    )?;
+    rms_norm_forward(&mut down, slice("post_ffw_norm.weight")?, hidden, eps)?;
+    residual_add(&mut residual, &down)?;
+
+    Ok(residual)
+}
+
+/// Full CPU ViT forward: pixel tensor → projected multimodal embeddings.
+///
+/// Pipeline (from llama.cpp `clip_graph_gemma4v::build`):
+///
+/// ```text
+///   1. hidden = patch_embed(pixels)                          [196, 1152]
+///   2. for block in 0..n_layers:
+///          hidden = apply_vit_block_forward(hidden, block)
+///   3. hidden = avg_pool_2x2_spatial(hidden, 14, 1152)       [49, 1152]
+///   4. scale_in_place(hidden, sqrt(n_embd))
+///   5. std_bias_scale_in_place(hidden, v.std_bias, v.std_scale)
+///   6. hidden = linear(hidden, mm.0.weight)                  [49, text_hidden]
+///   7. rms_norm(hidden, gamma=ones, eps)    # no-gain RMSNorm
+/// ```
+///
+/// Returns the final `[num_patches_side² / 4, text_hidden]` tensor
+/// ready to be injected into the chat model's token stream.
+///
+/// # Cost
+///
+/// Per-block CPU compute ≈ 3 GFLOP; 27 blocks + post-blocks ≈ 81 GFLOP.
+/// Naive-loop GEMM on a single CPU thread runs this in ~15–17 min —
+/// which is why the full-forward integration test below is
+/// `#[ignore]`'d. The GPU port dispatches `mlx_native::ops::mul_mm`
+/// + `flash_attn_*` and runs in <1s for the same pipeline.
+///
+/// # Parity TODOs (from iter 40)
+///
+/// Not yet applied — mlx-lm reference needed for byte-identical
+/// validation:
+///   1. `scaled_dot_product_attention` scale=1.0 for Gemma 4V
+///      (not 1/√d_head).
+///   2. V RMSNorm (no gain) between QKV and attention.
+///   3. 2D RoPE on Q, K against `v.position_embd.weight`.
+///
+/// # Errors
+///
+/// Propagated from any stage; see individual function docs.
+pub fn apply_vit_full_forward(
+    pixel_values: &[f32],
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+) -> Result<Vec<f32>> {
+    // --- Stage 1: patch embedding ---
+    let mut hidden_states = patch_embed_from_mmproj_weights(pixel_values, weights, cfg)?;
+
+    // --- Stage 2: transformer blocks ---
+    let n_layers = cfg.num_hidden_layers as usize;
+    for block_idx in 0..n_layers {
+        hidden_states = apply_vit_block_forward(hidden_states, weights, cfg, block_idx)?;
+    }
+
+    // --- Stage 3: 2×2 spatial avg-pool ---
+    let n_side = cfg.num_patches_side as usize;
+    let hidden = cfg.hidden_size as usize;
+    let mut hidden_states = avg_pool_2x2_spatial(&hidden_states, n_side, hidden)?;
+
+    // --- Stage 4: scale by sqrt(n_embd) ---
+    scale_in_place(&mut hidden_states, (hidden as f32).sqrt());
+
+    // --- Stage 5: std_bias / std_scale normalization ---
+    let std_bias_buf = weights
+        .get("v.std_bias")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing v.std_bias"))?;
+    let std_scale_buf = weights
+        .get("v.std_scale")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing v.std_scale"))?;
+    let std_bias: &[f32] = std_bias_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("std_bias as_slice: {e}"))?;
+    let std_scale: &[f32] = std_scale_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("std_scale as_slice: {e}"))?;
+    std_bias_scale_in_place(&mut hidden_states, std_bias, std_scale, hidden)?;
+
+    // --- Stage 6: mm.0 projector [n_patches_out, hidden] → [n_patches_out, text_hidden] ---
+    let mm0_buf = weights
+        .get("mm.0.weight")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward: missing mm.0.weight"))?;
+    let mm0: &[f32] = mm0_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("mm.0 as_slice: {e}"))?;
+    // Shape: mm.0.weight is [text_hidden, hidden] per PyTorch nn.Linear
+    // convention. Text hidden = mm0.len() / hidden.
+    let text_hidden = mm0.len() / hidden;
+    if mm0.len() != text_hidden * hidden {
+        return Err(anyhow!(
+            "mm.0.weight len {} not divisible by hidden {}",
+            mm0.len(),
+            hidden
+        ));
+    }
+    let n_patches_out = hidden_states.len() / hidden;
+    let mut projected = linear_forward(
+        &hidden_states,
+        mm0,
+        None,
+        n_patches_out,
+        hidden,
+        text_hidden,
+    )?;
+
+    // --- Stage 7: no-gain final RMSNorm ---
+    // llama.cpp calls ggml_rms_norm without a weight param, so gamma is
+    // effectively all-ones. Allocate once per call; cheap relative to
+    // the ~81 GFLOP that preceded.
+    let ones = vec![1.0f32; text_hidden];
+    rms_norm_forward(&mut projected, &ones, text_hidden, cfg.layer_norm_eps)?;
+
+    Ok(projected)
 }
 
 /// Drive `patch_embed_forward` from a `LoadedMmprojWeights` + parsed
@@ -1129,6 +1547,911 @@ mod tests {
             assert!(v.is_finite(), "got non-finite {}", v);
             assert!(v.abs() < 1e-5, "constant row should normalize to 0, got {v}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // std_bias_scale_in_place + apply_vit_full_forward (iter 42)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn std_bias_scale_subtracts_and_scales_per_channel() {
+        // batch=2, hidden=3. bias=[1, 2, 3], scale=[10, 20, 30].
+        // Row 0: [5, 10, 15] → (row - bias) = [4, 8, 12] → * scale = [40, 160, 360].
+        // Row 1: [10, 20, 30] → (row - bias) = [9, 18, 27] → * scale = [90, 360, 810].
+        let mut x = vec![5.0f32, 10.0, 15.0, 10.0, 20.0, 30.0];
+        let bias = vec![1.0f32, 2.0, 3.0];
+        let scale = vec![10.0f32, 20.0, 30.0];
+        std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap();
+        assert_eq!(x, vec![40.0, 160.0, 360.0, 90.0, 360.0, 810.0]);
+    }
+
+    #[test]
+    fn std_bias_scale_zero_bias_unit_scale_is_identity() {
+        let mut x = vec![0.5f32, 1.7, -2.3, 4.1];
+        let snap = x.clone();
+        let bias = vec![0.0f32; 2];
+        let scale = vec![1.0f32; 2];
+        std_bias_scale_in_place(&mut x, &bias, &scale, 2).unwrap();
+        assert_eq!(x, snap);
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_hidden_zero() {
+        let mut x = vec![0f32; 4];
+        let err = std_bias_scale_in_place(&mut x, &[], &[], 0).unwrap_err();
+        assert!(format!("{err}").contains("hidden must be > 0"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_non_divisible_len() {
+        let mut x = vec![0f32; 7];
+        let bias = vec![0f32; 3];
+        let scale = vec![1f32; 3];
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_wrong_bias_len() {
+        let mut x = vec![0f32; 6];
+        let bias = vec![0f32; 2]; // should be 3
+        let scale = vec![1f32; 3];
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("bias len"));
+    }
+
+    #[test]
+    fn std_bias_scale_rejects_wrong_scale_len() {
+        let mut x = vec![0f32; 6];
+        let bias = vec![0f32; 3];
+        let scale = vec![1f32; 2]; // should be 3
+        let err = std_bias_scale_in_place(&mut x, &bias, &scale, 3).unwrap_err();
+        assert!(format!("{err}").contains("scale len"));
+    }
+
+    // Retired 2026-04-24 per "CPU inference == poop" directive: the
+    // 27-block CPU full-forward test (formerly ignored at ~15-17 min
+    // CPU runtime) is deleted. Production test coverage lives in
+    // `vit_gpu::tests` — those GPU dispatches run in <1s each. The
+    // CPU `apply_vit_full_forward` function itself stays as a
+    // tiny-input parity reference only, invoked by `vit_gpu::tests`
+    // on 4×4 or 8×8 synthetic shapes to byte-compare each GPU op's
+    // output. It is NEVER invoked on production `[196, 1152]` shapes.
+    #[allow(dead_code)]
+    fn _retired_cpu_full_forward_stub() {
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Preprocess a deterministic gradient image to [3, 224, 224] f32.
+        let img = cfg.image_size as usize;
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let out = apply_vit_full_forward(&pixels, &weights, &cfg).expect("full forward");
+        let elapsed = t0.elapsed();
+        eprintln!("apply_vit_full_forward: {:?}", elapsed);
+
+        // Expected shape: [49 patches, text_hidden=2816].
+        let n_patches_out = 49;
+        let mm0_buf = weights.get("mm.0.weight").expect("mm.0");
+        let mm0_slice: &[f32] = mm0_buf.as_slice::<f32>().expect("slice");
+        let text_hidden = mm0_slice.len() / (cfg.hidden_size as usize);
+        assert_eq!(text_hidden, 2816, "Gemma 4 projector output width");
+        assert_eq!(out.len(), n_patches_out * text_hidden);
+
+        // Every element finite.
+        for v in &out {
+            assert!(v.is_finite(), "non-finite in ViT output: {v}");
+        }
+        // Post-final-RMSNorm mean(x²) per row ≈ 1 (no-gain norm).
+        for p in 0..n_patches_out {
+            let row = &out[p * text_hidden..(p + 1) * text_hidden];
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / (text_hidden as f32);
+            assert!(
+                (ms - 1.0).abs() < 1e-2,
+                "patch {p} mean(x²) = {ms}, expected ≈ 1.0 after no-gain RMSNorm"
+            );
+        }
+        // Cross-patch distinction preserved.
+        let p0 = &out[0..text_hidden];
+        let p_last = &out[(n_patches_out - 1) * text_hidden..n_patches_out * text_hidden];
+        let l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2 > 1e-3, "token 0 and token 48 collapsed to identical output");
+    }
+
+    // -----------------------------------------------------------------------
+    // scale_in_place + avg_pool_2x2_spatial + apply_vit_block_forward (iter 41)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scale_in_place_multiplies_every_element() {
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        scale_in_place(&mut x, 2.5);
+        assert_eq!(x, vec![2.5, 5.0, 7.5, 10.0]);
+    }
+
+    #[test]
+    fn scale_in_place_by_one_is_identity() {
+        let mut x = vec![0.1f32, -2.3, 7.7];
+        let snap = x.clone();
+        scale_in_place(&mut x, 1.0);
+        assert_eq!(x, snap);
+    }
+
+    #[test]
+    fn scale_in_place_by_zero_zeros_everything() {
+        let mut x = vec![1.0f32, 2.0, 3.0];
+        scale_in_place(&mut x, 0.0);
+        assert_eq!(x, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn avg_pool_2x2_averages_each_2x2_block() {
+        // 4×4 grid × 2 hidden dims → 2×2 output.
+        // Each output should be the mean of 4 input values per dim.
+        // Layout: input[y*4 + x] has hidden=2 values.
+        // Values: input[y*4+x][0] = y*4+x, input[...][1] = (y*4+x)*10.
+        let n_side = 4;
+        let hidden = 2;
+        let mut input = vec![0f32; n_side * n_side * hidden];
+        for y in 0..n_side {
+            for x in 0..n_side {
+                let patch = y * n_side + x;
+                input[patch * hidden + 0] = patch as f32;
+                input[patch * hidden + 1] = (patch as f32) * 10.0;
+            }
+        }
+        let out = avg_pool_2x2_spatial(&input, n_side, hidden).unwrap();
+        // Expected out[0,0] = avg(patches 0,1,4,5) = avg(0,1,4,5) = 2.5
+        // Expected out[0,1] = avg(patches 2,3,6,7) = avg(2,3,6,7) = 4.5
+        // Expected out[1,0] = avg(patches 8,9,12,13) = 10.5
+        // Expected out[1,1] = avg(patches 10,11,14,15) = 12.5
+        assert_eq!(out.len(), 2 * 2 * hidden);
+        assert!((out[0 * hidden + 0] - 2.5).abs() < 1e-6);
+        assert!((out[0 * hidden + 1] - 25.0).abs() < 1e-6);
+        assert!((out[1 * hidden + 0] - 4.5).abs() < 1e-6);
+        assert!((out[1 * hidden + 1] - 45.0).abs() < 1e-6);
+        assert!((out[2 * hidden + 0] - 10.5).abs() < 1e-6);
+        assert!((out[2 * hidden + 1] - 105.0).abs() < 1e-6);
+        assert!((out[3 * hidden + 0] - 12.5).abs() < 1e-6);
+        assert!((out[3 * hidden + 1] - 125.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn avg_pool_gemma4_shape_14x14_to_7x7() {
+        // Production Gemma 4 shape: 196 patches (14×14) × 1152 hidden
+        // → 49 patches (7×7) × 1152 hidden.
+        let n_side = 14;
+        let hidden = 1152;
+        let input = vec![1.0f32; n_side * n_side * hidden];
+        let out = avg_pool_2x2_spatial(&input, n_side, hidden).unwrap();
+        assert_eq!(out.len(), 7 * 7 * hidden);
+        // Uniform input → uniform output at the same value.
+        for v in &out {
+            assert!((*v - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn avg_pool_rejects_non_even_n_side() {
+        let err = avg_pool_2x2_spatial(&[0f32; 27], 3, 3).unwrap_err();
+        assert!(format!("{err}").contains("positive and even"));
+    }
+
+    #[test]
+    fn avg_pool_rejects_mismatched_input_len() {
+        let err = avg_pool_2x2_spatial(&[0f32; 15], 4, 2).unwrap_err();
+        assert!(format!("{err}").contains("input len"));
+    }
+
+    #[test]
+    fn apply_vit_block_forward_real_gemma4_block0_matches_inline_chain() {
+        // Wraps iter 40's inline block-0 chain into one function call.
+        // Asserts output shape + that the new API produces the same
+        // block-out distribution as the iter 40 explicit pipeline.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let patch_embed =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+
+        // NEW API: single call replaces iter 40's inline 11-stage chain.
+        let block_out =
+            apply_vit_block_forward(patch_embed, &weights, &cfg, 0).expect("block_forward");
+
+        assert_eq!(block_out.len(), num_patches * hidden);
+        for v in &block_out {
+            assert!(v.is_finite(), "non-finite: {v}");
+        }
+        // Cross-patch differentiation (no stride bug inside the wrapper).
+        let p0 = &block_out[0..hidden];
+        let p_last = &block_out[(num_patches - 1) * hidden..num_patches * hidden];
+        let l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2 > 1e-3, "wrapper produced stride-bugged output");
+    }
+
+    #[test]
+    fn apply_vit_block_forward_rejects_mismatched_hidden() {
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        // Wrong-shape hidden state: len not divisible by hidden.
+        let bad = vec![0f32; 196 * 1152 + 1];
+        let err = apply_vit_block_forward(bad, &weights, &cfg, 0).unwrap_err();
+        assert!(format!("{err}").contains("not divisible"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Block 0 CPU parity — full forward through one transformer block (iter 40)
+    // -----------------------------------------------------------------------
+    //
+    // Structural closeout. Known Gemma4V block-parity deltas (documented
+    // here; fixed in a dedicated "block parity iter" once an mlx-lm
+    // reference is available for byte-identical comparison):
+    //   1. `kq_scale = 1.0` for Gemma 4V (iter 37 uses 1/√d_head default).
+    //   2. V gets its own RMSNorm (no gain) before attention (currently skipped).
+    //   3. 2D RoPE on Q and K (not yet ported).
+    // Ordering + tensor wiring below matches llama.cpp's clip.cpp
+    // `build_vit` exactly for the Gemma 4V path.
+
+    #[test]
+    fn block_0_full_forward_on_real_gemma4() {
+        // 11-stage end-to-end block 0 on real Gemma 4 pretrained weights:
+        //   1. preprocess(pixel gradient) → patch_embed
+        //   2. snapshot residual_stream
+        //   3. rms_norm(residual_stream, ln1) → hidden
+        //   4. QKV projection → Q, K, V
+        //   5. per-head RMSNorm on Q, K (V skipped — block-parity TODO)
+        //   6. scaled-dot-product attention (TODO: kq_scale=1.0 for Gemma 4V)
+        //   7. linear(attn, attn_output) → attn_projected
+        //   8. residual_add(residual_stream, attn_projected) → post_attn
+        //   9. rms_norm(post_attn, ln2) → pre_ffn
+        //  10. SwiGLU(pre_ffn) = silu(gate) * up → activated
+        //  11. linear(activated, ffn_down) → down            [NEW]
+        //      rms_norm(down, post_ffw_norm)                 [NEW]
+        //      residual_add(post_attn, down) → block_out     [NEW]
+        //
+        // Output: [196, 1152] block_0 residual stream, input to block 1.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let intermediate = cfg.intermediate_size as usize;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        // === Stages 1-10 (condensed from iter 39's chain) ===
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let residual_stream =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        let mut hidden_states = residual_stream.clone();
+        let slice = |name: &str| -> &[f32] {
+            // SAFETY: as_slice returns an &[f32] tied to the &MlxBuffer borrow;
+            // each closure call gets a fresh borrow through the weights ref.
+            weights
+                .block_tensor(0, name)
+                .expect(name)
+                .as_slice::<f32>()
+                .expect(name)
+        };
+        rms_norm_forward(&mut hidden_states, slice("ln1.weight"), hidden, 1e-6).unwrap();
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            slice("attn_q.weight"),
+            slice("attn_k.weight"),
+            slice("attn_v.weight"),
+            num_patches,
+            hidden,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut q,
+            slice("attn_q_norm.weight"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut k,
+            slice("attn_k_norm.weight"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        let attn =
+            scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
+        let attn_projected = linear_forward(
+            &attn,
+            slice("attn_output.weight"),
+            None,
+            num_patches,
+            hidden,
+            hidden,
+        )
+        .unwrap();
+        let mut post_attn = residual_stream.clone();
+        residual_add(&mut post_attn, &attn_projected).unwrap();
+        let mut pre_ffn = post_attn.clone();
+        rms_norm_forward(&mut pre_ffn, slice("ln2.weight"), hidden, 1e-6).unwrap();
+        let mut gate = linear_forward(
+            &pre_ffn,
+            slice("ffn_gate.weight"),
+            None,
+            num_patches,
+            hidden,
+            intermediate,
+        )
+        .unwrap();
+        let up = linear_forward(
+            &pre_ffn,
+            slice("ffn_up.weight"),
+            None,
+            num_patches,
+            hidden,
+            intermediate,
+        )
+        .unwrap();
+        silu_in_place(&mut gate);
+        elementwise_mul_in_place(&mut gate, &up).unwrap();
+        let activated = gate;
+
+        // === Stage 11 (NEW iter 40): FFN down projection + post-norm + residual ===
+        let mut down = linear_forward(
+            &activated,
+            slice("ffn_down.weight"),
+            None,
+            num_patches,
+            intermediate,
+            hidden,
+        )
+        .expect("ffn_down");
+        assert_eq!(down.len(), num_patches * hidden);
+
+        // post_ffw_norm applied to the FFN output BEFORE the residual add
+        // (matches llama.cpp build_vit: `cur = build_norm(cur, ff_post_norm_w)`
+        // before `cur = inpL + cur`).
+        rms_norm_forward(&mut down, slice("post_ffw_norm.weight"), hidden, 1e-6)
+            .expect("post_ffw_norm");
+
+        let mut block_out = post_attn.clone();
+        residual_add(&mut block_out, &down).expect("ffn residual");
+
+        // --- Invariants ---
+        assert_eq!(block_out.len(), num_patches * hidden);
+        for val in &block_out {
+            assert!(val.is_finite(), "block_out non-finite: {val}");
+        }
+        // block_out differs from post_attn (FFN half contributed).
+        let delta_l2: f32 = post_attn
+            .iter()
+            .zip(block_out.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(delta_l2 > 1e-3, "FFN half was a silent no-op");
+        // Cross-patch distinction preserved through the entire block.
+        let p0 = &block_out[0..hidden];
+        let p_last = &block_out[(num_patches - 1) * hidden..num_patches * hidden];
+        let cross_l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            cross_l2 > 1e-3,
+            "token 0 and token 195 identical post-block — probable stride bug"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // silu_in_place + elementwise_mul_in_place + SwiGLU gated (iter 39)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn silu_zero_is_zero_exactly() {
+        let mut x = vec![0.0f32];
+        silu_in_place(&mut x);
+        assert_eq!(x[0], 0.0);
+    }
+
+    #[test]
+    fn silu_reference_values_match_pytorch() {
+        // PyTorch F.silu reference values:
+        //   silu(-3) ≈ -0.14227
+        //   silu(-1) ≈ -0.26894
+        //   silu(-0.5) ≈ -0.18877
+        //   silu(0.5) ≈  0.31123
+        //   silu(1)  ≈  0.73106
+        //   silu(3)  ≈  2.85773
+        let inputs = [-3.0f32, -1.0, -0.5, 0.5, 1.0, 3.0];
+        let expected = [
+            -0.14227762_f32,
+            -0.26894143,
+            -0.18877034,
+            0.31122967,
+            0.73105858,
+            2.85772238,
+        ];
+        let mut x = inputs.to_vec();
+        silu_in_place(&mut x);
+        for (got, want) in x.iter().zip(expected.iter()) {
+            assert!((*got - *want).abs() < 1e-5, "got {got} want {want}");
+        }
+    }
+
+    #[test]
+    fn silu_large_positive_approaches_x() {
+        // x=20 → σ(x) ≈ 1 → silu(x) ≈ x.
+        let mut x = vec![20.0f32];
+        silu_in_place(&mut x);
+        assert!((x[0] - 20.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silu_large_negative_approaches_zero() {
+        let mut x = vec![-20.0f32];
+        silu_in_place(&mut x);
+        assert!(x[0].abs() < 1e-4);
+    }
+
+    #[test]
+    fn silu_has_local_minimum_near_negative_point_two_eight() {
+        // SiLU has a local min at x ≈ -1.2785 where value ≈ -0.27846.
+        // Probe x=-1, x=-1.28, x=-1.5; x=-1.28 should be the lowest.
+        let mut x = vec![-1.0f32, -1.28, -1.5];
+        silu_in_place(&mut x);
+        assert!(x[1] < x[0] && x[1] < x[2], "got {:?}", x);
+    }
+
+    #[test]
+    fn elementwise_mul_pairs_each_index() {
+        let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![5.0f32, 6.0, 7.0, 8.0];
+        elementwise_mul_in_place(&mut a, &b).unwrap();
+        assert_eq!(a, vec![5.0, 12.0, 21.0, 32.0]);
+    }
+
+    #[test]
+    fn elementwise_mul_with_zero_zeros_everything() {
+        let mut a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![0f32; 3];
+        elementwise_mul_in_place(&mut a, &b).unwrap();
+        assert_eq!(a, vec![0f32; 3]);
+    }
+
+    #[test]
+    fn elementwise_mul_rejects_shape_mismatch() {
+        let mut a = vec![0f32; 4];
+        let b = vec![0f32; 3];
+        let err = elementwise_mul_in_place(&mut a, &b).unwrap_err();
+        assert!(format!("{err}").contains("len"));
+    }
+
+    #[test]
+    fn swiglu_gated_activation_on_real_gemma4_ffn() {
+        // Runs iter 38's full attention-half chain + iter 39's new
+        // stages: gate = linear(pre_ffn, ffn_gate), up = linear(pre_ffn,
+        // ffn_up), silu(gate), gate *= up. Output shape: [196, 4304].
+        // This is the exact input that iter 40's ffn_down + residual
+        // + post_ffw_norm will consume.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        // Stages 1-7 (iter 38's chain, condensed).
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let residual_stream =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        let mut hidden_states = residual_stream.clone();
+        rms_norm_forward(
+            &mut hidden_states,
+            weights
+                .block_tensor(0, "ln1.weight")
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap(),
+            hidden,
+            1e-6,
+        )
+        .unwrap();
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            weights.block_tensor(0, "attn_q.weight").unwrap().as_slice::<f32>().unwrap(),
+            weights.block_tensor(0, "attn_k.weight").unwrap().as_slice::<f32>().unwrap(),
+            weights.block_tensor(0, "attn_v.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            hidden,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut q,
+            weights.block_tensor(0, "attn_q_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        per_head_rms_norm_forward(
+            &mut k,
+            weights.block_tensor(0, "attn_k_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .unwrap();
+        let attn =
+            scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
+        let attn_projected = linear_forward(
+            &attn,
+            weights.block_tensor(0, "attn_output.weight").unwrap().as_slice::<f32>().unwrap(),
+            None,
+            num_patches,
+            hidden,
+            hidden,
+        )
+        .unwrap();
+        let mut post_attn = residual_stream.clone();
+        residual_add(&mut post_attn, &attn_projected).unwrap();
+        let mut pre_ffn = post_attn.clone();
+        rms_norm_forward(
+            &mut pre_ffn,
+            weights.block_tensor(0, "ln2.weight").unwrap().as_slice::<f32>().unwrap(),
+            hidden,
+            1e-6,
+        )
+        .unwrap();
+
+        // Stage 8 (NEW): SwiGLU gated activation.
+        // gate_w: [intermediate, hidden] = [4304, 1152]
+        // up_w:   [intermediate, hidden] = [4304, 1152]
+        let ffn_gate_buf = weights.block_tensor(0, "ffn_gate.weight").expect("ffn_gate");
+        let ffn_up_buf = weights.block_tensor(0, "ffn_up.weight").expect("ffn_up");
+        let intermediate = cfg.intermediate_size as usize;
+        assert_eq!(intermediate, 4304);
+        let gate_w: &[f32] = ffn_gate_buf.as_slice::<f32>().unwrap();
+        let up_w: &[f32] = ffn_up_buf.as_slice::<f32>().unwrap();
+        assert_eq!(gate_w.len(), intermediate * hidden);
+        assert_eq!(up_w.len(), intermediate * hidden);
+
+        // gate = pre_ffn @ gate_w.T → [num_patches, intermediate]
+        let mut gate =
+            linear_forward(&pre_ffn, gate_w, None, num_patches, hidden, intermediate)
+                .expect("gate proj");
+        let up = linear_forward(&pre_ffn, up_w, None, num_patches, hidden, intermediate)
+            .expect("up proj");
+
+        silu_in_place(&mut gate);
+        elementwise_mul_in_place(&mut gate, &up).expect("mul");
+
+        let activated = gate; // rename for clarity
+        assert_eq!(activated.len(), num_patches * intermediate);
+        for val in &activated {
+            assert!(val.is_finite(), "non-finite: {val}");
+        }
+        // Sanity: activated has non-trivial variance. A silent silu-no-op
+        // or wrong-stride bug would collapse the distribution.
+        let mean: f32 = activated.iter().sum::<f32>() / (activated.len() as f32);
+        let var: f32 = activated
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f32>()
+            / (activated.len() as f32);
+        assert!(var > 1e-6, "activated variance too low: {var}");
+        // Different patches should produce different post-gate rows.
+        let p0 = &activated[0..intermediate];
+        let p_last =
+            &activated[(num_patches - 1) * intermediate..num_patches * intermediate];
+        let l2_diff: f32 = p0.iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(l2_diff > 1e-3, "all patches produce identical gated output");
+    }
+
+    // -----------------------------------------------------------------------
+    // residual_add + full attention-half block 0 (iter 38)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn residual_add_is_elementwise() {
+        let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![10.0f32, 20.0, 30.0, 40.0];
+        residual_add(&mut a, &b).unwrap();
+        assert_eq!(a, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn residual_add_with_zero_is_identity() {
+        let mut a = vec![0.5f32, -1.2, 3.7];
+        let snap = a.clone();
+        let b = vec![0.0f32; 3];
+        residual_add(&mut a, &b).unwrap();
+        assert_eq!(a, snap);
+    }
+
+    #[test]
+    fn residual_add_rejects_shape_mismatch() {
+        let mut a = vec![0f32; 4];
+        let b = vec![0f32; 3];
+        let err = residual_add(&mut a, &b).unwrap_err();
+        assert!(format!("{err}").contains("len"));
+    }
+
+    #[test]
+    fn residual_add_is_commutative_against_add_in_place_loop() {
+        // Sanity check vs a hand-rolled loop — catches any silent
+        // sign-flip or off-by-one in the iterator.
+        let a: Vec<f32> = (0..10).map(|i| i as f32 * 0.3).collect();
+        let b: Vec<f32> = (0..10).map(|i| i as f32 * 0.7).collect();
+        let mut via_fn = a.clone();
+        residual_add(&mut via_fn, &b).unwrap();
+        let mut via_loop = a.clone();
+        for (x, y) in via_loop.iter_mut().zip(b.iter()) {
+            *x += *y;
+        }
+        assert_eq!(via_fn, via_loop);
+    }
+
+    #[test]
+    fn attention_half_block_end_to_end_real_gemma4() {
+        // Completes the attention half of ViT block 0 on real Gemma 4
+        // weights: chain from iter 37 extended with attn_output
+        // projection, residual add (pre-attn → post-attn), and ln2
+        // RMSNorm. This is the exact input that the FFN half (iter 39+)
+        // will consume.
+        use super::super::mmproj::MmprojConfig;
+        use super::super::mmproj_weights::LoadedMmprojWeights;
+        use mlx_native::gguf::GgufFile;
+        let path = std::path::Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = mlx_native::MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let num_heads = cfg.num_attention_heads as usize;
+        let head_dim = hidden / num_heads;
+        let num_patches = 196usize;
+        let img = cfg.image_size as usize;
+
+        // Stage 1: preprocess + patch_embed → residual_stream.
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+        let residual_stream =
+            patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+
+        // Stage 2: copy → ln1 → QKV → per-head norm → attention.
+        let mut hidden_states = residual_stream.clone();
+        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        rms_norm_forward(
+            &mut hidden_states,
+            ln1.as_slice::<f32>().expect("ln1 slice"),
+            hidden,
+            1e-6,
+        )
+        .expect("rms ln1");
+
+        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("q");
+        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("k");
+        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("v");
+        let (mut q, mut k, v) = qkv_projection_forward(
+            &hidden_states,
+            q_buf.as_slice::<f32>().expect("q slice"),
+            k_buf.as_slice::<f32>().expect("k slice"),
+            v_buf.as_slice::<f32>().expect("v slice"),
+            num_patches,
+            hidden,
+        )
+        .expect("qkv");
+
+        let q_norm = weights
+            .block_tensor(0, "attn_q_norm.weight")
+            .expect("attn_q_norm");
+        let k_norm = weights
+            .block_tensor(0, "attn_k_norm.weight")
+            .expect("attn_k_norm");
+        per_head_rms_norm_forward(
+            &mut q,
+            q_norm.as_slice::<f32>().expect("q_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head Q");
+        per_head_rms_norm_forward(
+            &mut k,
+            k_norm.as_slice::<f32>().expect("k_norm slice"),
+            num_patches,
+            num_heads,
+            head_dim,
+            1e-6,
+        )
+        .expect("per-head K");
+
+        let attn = scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim)
+            .expect("attention");
+
+        // Stage 3 (NEW): attn_output projection.
+        let attn_output = weights
+            .block_tensor(0, "attn_output.weight")
+            .expect("attn_output");
+        let attn_output_w: &[f32] =
+            attn_output.as_slice::<f32>().expect("attn_output slice");
+        assert_eq!(attn_output_w.len(), hidden * hidden);
+        let attn_projected =
+            linear_forward(&attn, attn_output_w, None, num_patches, hidden, hidden)
+                .expect("attn_output proj");
+
+        // Stage 4 (NEW): residual add → post-attention hidden states.
+        let mut post_attn = residual_stream.clone();
+        residual_add(&mut post_attn, &attn_projected).expect("residual");
+
+        // Stage 5 (NEW): ln2 RMSNorm.
+        let mut pre_ffn = post_attn.clone();
+        let ln2 = weights.block_tensor(0, "ln2.weight").expect("ln2");
+        rms_norm_forward(
+            &mut pre_ffn,
+            ln2.as_slice::<f32>().expect("ln2 slice"),
+            hidden,
+            1e-6,
+        )
+        .expect("rms ln2");
+
+        // Sanity: every stage's output is finite, shape-correct, and
+        // differs from the bare patch_embed (stages have changed the
+        // signal, not silently no-oped).
+        for t in [&attn_projected, &post_attn, &pre_ffn] {
+            assert_eq!(t.len(), num_patches * hidden);
+            for v in t.iter() {
+                assert!(v.is_finite(), "non-finite: {v}");
+            }
+        }
+        // post_attn = residual + attn_projected, so it should differ
+        // from the raw residual unless attention produced all-zero
+        // output (which would itself be a real problem).
+        let delta_l2: f32 = residual_stream
+            .iter()
+            .zip(post_attn.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            delta_l2 > 1e-3,
+            "post-attn residual is identical to pre-attn — attn_output all zero?"
+        );
+        // pre_ffn (post-LN) should differ from post_attn (pre-LN) — catches
+        // LN being a silent no-op.
+        let ln_delta: f32 = post_attn
+            .iter()
+            .zip(pre_ffn.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(ln_delta > 1e-3, "ln2 was a no-op");
     }
 
     // -----------------------------------------------------------------------

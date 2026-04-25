@@ -32,7 +32,8 @@
 //! order) is preserved by construction.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -157,6 +158,11 @@ pub struct Engine {
 
 struct EngineInner {
     tx: mpsc::Sender<Request>,
+    /// Worker-thread join handle. Held in a `Mutex<Option<...>>` so
+    /// `Engine::shutdown` can `take()` it once and `.join()` the thread, and
+    /// callers can be cheap-clone an `Engine` without contending on the
+    /// handle. Outside of shutdown, the slot is read-only.
+    worker_handle: Mutex<Option<JoinHandle<()>>>,
     /// Metadata exposed to handlers without touching the worker thread.
     /// Immutable for the lifetime of the engine.
     model_id: String,
@@ -386,7 +392,7 @@ impl Engine {
 
         // Move registration into the worker closure in addition to the handle.
         let worker_registration = registration.clone();
-        std::thread::Builder::new()
+        let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine".into())
             .spawn(move || worker_run(loaded, rx, worker_registration))
             .expect("spawn hf2q-engine thread");
@@ -394,6 +400,7 @@ impl Engine {
         Engine {
             inner: Arc::new(EngineInner {
                 tx,
+                worker_handle: Mutex::new(Some(worker_handle)),
                 model_id,
                 context_length,
                 quant_type,
@@ -496,10 +503,48 @@ impl Engine {
         }
     }
 
-    /// Request a clean shutdown of the worker. Drains in-flight work (since
-    /// the channel is FIFO) before exiting.
-    pub async fn shutdown(&self) {
+    /// Request a clean shutdown of the worker. Drains in-flight + queued work
+    /// (FIFO ordering means the `Shutdown` sentinel runs after every request
+    /// already enqueued) and then joins the worker thread.
+    ///
+    /// Returns `Ok(())` once the worker thread has fully exited; returns
+    /// `Err(...)` only if the join itself panicked.
+    ///
+    /// Idempotent: calling twice (or on a clone whose sibling already
+    /// joined) is a no-op — the second call observes `worker_handle = None`
+    /// and returns immediately. The blocking `.join()` runs inside
+    /// `tokio::task::spawn_blocking` so the calling tokio runtime is not
+    /// blocked while the worker drains a long generation.
+    pub async fn shutdown(&self) -> Result<()> {
+        // Send Shutdown sentinel. Errors here mean the worker tx was already
+        // dropped/closed — the thread has already exited; treat as success
+        // for the join step below.
         let _ = self.inner.tx.send(Request::Shutdown).await;
+
+        // Take the JoinHandle exactly once. Subsequent shutdown() calls
+        // observe None and return Ok(()).
+        let handle = match self.inner.worker_handle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None, // poisoned mutex => worker already gone
+        };
+
+        if let Some(handle) = handle {
+            // Join can block until the in-flight Generate finishes; do it
+            // off-runtime so we don't stall axum's drain phase. The handle's
+            // ownership has already been moved out of `inner`, so this
+            // closure can take it.
+            tokio::task::spawn_blocking(move || handle.join())
+                .await
+                .context("spawn_blocking for worker join")?
+                .map_err(|panic| {
+                    anyhow::anyhow!(
+                        "engine worker thread panicked on shutdown: {:?}",
+                        panic
+                    )
+                })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1261,5 +1306,96 @@ assistant:
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         // Image part is silently dropped (iter 3 scope); text parts joined.
         assert_eq!(out.trim(), "what is this?|");
+    }
+
+    // -----------------------------------------------------------------
+    // Engine::shutdown — joins the worker thread (Phase 2a Decision #17)
+    //
+    // These tests stand up an `Engine` with a stub worker thread that
+    // drains the channel and exits on the `Shutdown` sentinel. The real
+    // worker (`worker_run`) requires a `LoadedModel` (GGUF + tokenizer);
+    // for unit-testing the lifecycle wiring we substitute a no-op worker
+    // that exercises the same exit path. The point of the test is to
+    // verify that `Engine::shutdown` actually joins the OS thread, that
+    // it is idempotent, and that it propagates a panic in the worker.
+    // -----------------------------------------------------------------
+
+    fn make_test_engine_with_worker<F>(worker: F) -> Engine
+    where
+        F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel::<Request>(8);
+        let handle = std::thread::Builder::new()
+            .name("hf2q-engine-test".into())
+            .spawn(move || worker(rx))
+            .expect("spawn test worker");
+
+        Engine {
+            inner: Arc::new(EngineInner {
+                tx,
+                worker_handle: Mutex::new(Some(handle)),
+                model_id: "test-model".into(),
+                context_length: None,
+                quant_type: None,
+                eos_token_ids: vec![],
+                tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+                chat_template: Arc::new(String::new()),
+                registration: None,
+            }),
+        }
+    }
+
+    /// Stub worker: drain until `Shutdown`, then exit cleanly.
+    fn drain_until_shutdown(mut rx: mpsc::Receiver<Request>) {
+        while let Some(req) = rx.blocking_recv() {
+            if matches!(req, Request::Shutdown) {
+                break;
+            }
+            // Other request kinds are not exercised by these tests; in the
+            // production worker they have replies, but here we just drop
+            // them — the senders never await a reply.
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_joins_worker_thread() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        // Worker should be live before shutdown.
+        {
+            let guard = engine.inner.worker_handle.lock().unwrap();
+            assert!(guard.is_some(), "worker handle present pre-shutdown");
+        }
+        engine.shutdown().await.expect("clean shutdown");
+        // Handle must have been taken (and joined) by shutdown.
+        let guard = engine.inner.worker_handle.lock().unwrap();
+        assert!(guard.is_none(), "worker handle taken post-shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_is_idempotent() {
+        let engine = make_test_engine_with_worker(drain_until_shutdown);
+        engine.shutdown().await.expect("first shutdown");
+        // A second call must not panic and must not deadlock; the
+        // worker_handle slot is empty so the join step is skipped, and
+        // the Sender is closed so `tx.send` errors silently.
+        engine.shutdown().await.expect("second shutdown is no-op");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_propagates_worker_panic() {
+        // Worker panics on its first message. shutdown() sends Shutdown,
+        // which the worker receives → panics → join returns Err → our
+        // shutdown() returns Err with the panic context.
+        let engine = make_test_engine_with_worker(|mut rx| {
+            let _ = rx.blocking_recv();
+            panic!("test panic in worker");
+        });
+        let res = engine.shutdown().await;
+        let err = res.expect_err("expected join failure");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("panicked"),
+            "shutdown error should name 'panicked', got: {msg}"
+        );
     }
 }

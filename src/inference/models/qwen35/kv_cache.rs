@@ -15,8 +15,9 @@
 //!     ├─ v: MlxBuffer [head_dim, n_kv, max_seq_len, n_seqs]  f32
 //!     └─ current_len:  Vec<u32>        one per seq
 //!   linear_attn: Vec<LinearAttnStateSlot>  len = # linear-attention layers
-//!     ├─ conv_state: MlxBuffer [K-1, conv_channels, n_seqs]      f32
-//!     └─ recurrent:  MlxBuffer [D_k, D_v, num_v_heads, n_seqs]   f32
+//!     ├─ conv_state:         MlxBuffer [conv_channels, K-1, n_seqs] f32 (kernel native)
+//!     ├─ conv_state_scratch: MlxBuffer [conv_channels, K-1, n_seqs] f32 (ping-pong)
+//!     └─ recurrent:          MlxBuffer [D_k, D_v, num_v_heads, n_seqs] f32
 //! ```
 //!
 //! # Per-layer ordering
@@ -58,14 +59,46 @@ pub struct FullAttnKvSlot {
 
 /// Per-linear-attention-layer SSM state + conv ring buffer.
 pub struct LinearAttnStateSlot {
-    /// DeltaNet conv1d ring buffer: `[K-1, conv_channels, n_seqs]` f32.
-    /// Holds the last (K-1) tokens' conv inputs, per sequence.
+    /// DeltaNet conv1d ring buffer (active read buffer): `[conv_channels, K-1, n_seqs]` f32.
+    ///
+    /// Layout matches the ssm_conv kernel's expected `state[i, c, s]` at offset
+    /// `s * (K-1) * channels + c * (K-1) + i`, i.e. channels-major with K-1 stride 1.
+    /// Ping-pong semantics: `conv_state` is the active (read) buffer.
+    /// `conv_state_scratch` is the inactive (write) buffer.  After each decode
+    /// step the caller swaps via [`LinearAttnStateSlot::swap_conv_state`].
     pub conv_state: MlxBuffer,
-    /// DeltaNet recurrent state: `[D_k, D_v, num_v_heads, n_seqs]` f32.
-    /// Matches the memory layout consumed by
-    /// `mlx_native::ops::gated_delta_net::dispatch_gated_delta_net`
-    /// (d_k innermost for per-thread contiguous reads).
+    /// DeltaNet conv1d ring buffer (scratch, write target for ssm_conv kernel).
+    /// Same shape as `conv_state`.  Swapped after each decode step.
+    pub conv_state_scratch: MlxBuffer,
+    /// DeltaNet recurrent state (current): `[D_k, D_v, num_v_heads, n_seqs]` f32.
+    ///
+    /// Ping-pong semantics: `recurrent` is the active (read) state buffer.
+    /// `recurrent_scratch` is the inactive (write) buffer.  After each
+    /// decode step the caller swaps the two handles via
+    /// [`LinearAttnStateSlot::swap_recurrent`], turning last step's output
+    /// into this step's input — zero copies, zero allocations.
     pub recurrent: MlxBuffer,
+    /// DeltaNet recurrent state (scratch, write target for GDN kernel).
+    /// Same shape as `recurrent`.  Swapped with `recurrent` each decode step.
+    pub recurrent_scratch: MlxBuffer,
+}
+
+impl LinearAttnStateSlot {
+    /// Swap the active and scratch conv state buffers (O(1) pointer swap).
+    /// Call this after every decode step to make the just-written scratch the
+    /// new current conv state.
+    #[inline]
+    pub fn swap_conv_state(&mut self) {
+        std::mem::swap(&mut self.conv_state, &mut self.conv_state_scratch);
+    }
+
+    /// Swap the active and scratch recurrent state buffers (O(1) pointer swap).
+    /// Call this after every decode step to make the just-written scratch the
+    /// new current state.
+    #[inline]
+    pub fn swap_recurrent(&mut self) {
+        std::mem::swap(&mut self.recurrent, &mut self.recurrent_scratch);
+    }
 }
 
 /// Top-level hybrid cache holding both full-attention and linear-attention
@@ -202,7 +235,17 @@ impl HybridKvCache {
                     *v = 0.0;
                 }
             }
+            if let Ok(s) = slot.conv_state_scratch.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
             if let Ok(s) = slot.recurrent.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
+            if let Ok(s) = slot.recurrent_scratch.as_mut_slice::<f32>() {
                 for v in s.iter_mut() {
                     *v = 0.0;
                 }
@@ -217,7 +260,10 @@ impl HybridKvCache {
             n += s.k.element_count() * 4 + s.v.element_count() * 4;
         }
         for s in &self.linear_attn {
-            n += s.conv_state.element_count() * 4 + s.recurrent.element_count() * 4;
+            n += s.conv_state.element_count() * 4
+                + s.conv_state_scratch.element_count() * 4
+                + s.recurrent.element_count() * 4
+                + s.recurrent_scratch.element_count() * 4;
         }
         n
     }
@@ -240,16 +286,19 @@ fn alloc_full_attn_slot(
     max_seq_len: u32,
     n_seqs: u32,
 ) -> Result<FullAttnKvSlot> {
-    let elems = (cfg.head_dim as usize)
+    // Layout: [n_seqs, n_kv_heads, max_seq_len, head_dim] — matches SDPA kernel's
+    // expected K/V layout: [batch, n_kv_heads, kv_seq_len, head_dim] (head_dim innermost).
+    // kv_capacity = max_seq_len; kv_seq_len = current_len at forward time.
+    let elems = (n_seqs as usize)
         * (cfg.num_key_value_heads as usize)
         * (max_seq_len as usize)
-        * (n_seqs as usize);
+        * (cfg.head_dim as usize);
     let bytes = elems * 4;
     let shape = vec![
-        cfg.head_dim as usize,
+        n_seqs as usize,
         cfg.num_key_value_heads as usize,
         max_seq_len as usize,
-        n_seqs as usize,
+        cfg.head_dim as usize,
     ];
     let k = device
         .alloc_buffer(bytes, DType::F32, shape.clone())
@@ -272,16 +321,22 @@ fn alloc_linear_attn_slot(
     k_minus1: u32,
     n_seqs: u32,
 ) -> Result<LinearAttnStateSlot> {
-    // Conv state: [K-1, conv_channels, n_seqs].
+    // Conv state ping-pong: [conv_channels, K-1, n_seqs] — kernel native layout.
+    // The ssm_conv kernel expects state[i, c, s] at offset
+    // s*(K-1)*channels + c*(K-1) + i, which corresponds to column-major
+    // [channels, K-1] per sequence — i.e. channels-major with K-1 stride-1.
+    // Storing in this layout avoids per-token CPU transpose + upload/download.
     let conv_elems =
-        (k_minus1 as usize) * (conv_channels as usize) * (n_seqs as usize);
+        (conv_channels as usize) * (k_minus1 as usize) * (n_seqs as usize);
+    let conv_shape = vec![conv_channels as usize, k_minus1 as usize, n_seqs as usize];
     let conv_state = device
-        .alloc_buffer(
-            conv_elems * 4,
-            DType::F32,
-            vec![k_minus1 as usize, conv_channels as usize, n_seqs as usize],
-        )
+        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape.clone())
         .map_err(|e| anyhow!("alloc conv_state: {e}"))?;
+    // Scratch buffer for ping-pong: ssm_conv writes new state here; caller
+    // swaps conv_state ↔ conv_state_scratch after each decode step.
+    let conv_state_scratch = device
+        .alloc_buffer(conv_elems * 4, DType::F32, conv_shape)
+        .map_err(|e| anyhow!("alloc conv_state_scratch: {e}"))?;
 
     // Recurrent state: [D_k, D_v, num_v_heads, n_seqs] — d_k innermost (matches
     // mlx-native's gated_delta_net kernel layout).
@@ -289,22 +344,28 @@ fn alloc_linear_attn_slot(
         * (cfg.linear_value_head_dim as usize)
         * (cfg.linear_num_value_heads as usize)
         * (n_seqs as usize);
+    let rec_shape = vec![
+        cfg.linear_key_head_dim as usize,
+        cfg.linear_value_head_dim as usize,
+        cfg.linear_num_value_heads as usize,
+        n_seqs as usize,
+    ];
     let recurrent = device
-        .alloc_buffer(
-            rec_elems * 4,
-            DType::F32,
-            vec![
-                cfg.linear_key_head_dim as usize,
-                cfg.linear_value_head_dim as usize,
-                cfg.linear_num_value_heads as usize,
-                n_seqs as usize,
-            ],
-        )
+        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape.clone())
         .map_err(|e| anyhow!("alloc recurrent: {e}"))?;
+    // Scratch buffer for ping-pong: same shape, zero-initialized.
+    // GDN kernel writes here; after each decode step the caller swaps
+    // `recurrent` and `recurrent_scratch`, making the new output the
+    // new current state without any CPU copy.
+    let recurrent_scratch = device
+        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape)
+        .map_err(|e| anyhow!("alloc recurrent_scratch: {e}"))?;
 
     Ok(LinearAttnStateSlot {
         conv_state,
+        conv_state_scratch,
         recurrent,
+        recurrent_scratch,
     })
 }
 
@@ -437,10 +498,10 @@ mod tests {
         let s = &cache.full_attn[0];
         assert_eq!(s.k.dtype(), DType::F32);
         assert_eq!(s.v.dtype(), DType::F32);
-        // Expected element count: head_dim * n_kv * max_seq_len * n_seqs
-        // = 256 * 2 * 64 * 2 = 65536.
-        assert_eq!(s.k.element_count(), 256 * 2 * 64 * 2);
-        assert_eq!(s.v.element_count(), 256 * 2 * 64 * 2);
+        // Expected element count: n_seqs * n_kv * max_seq_len * head_dim
+        // = 2 * 2 * 64 * 256 = 65536.  Layout is SDPA-native [n_seqs, n_kv, max_seq, head_dim].
+        assert_eq!(s.k.element_count(), 2 * 2 * 64 * 256);
+        assert_eq!(s.v.element_count(), 2 * 2 * 64 * 256);
         assert_eq!(s.current_len.len(), 2);
         assert!(s.current_len.iter().all(|&c| c == 0));
     }

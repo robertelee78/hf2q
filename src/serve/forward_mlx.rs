@@ -3939,6 +3939,9 @@ impl MlxModelWeights {
     ///
     /// Returns: -log P(token_id) under the softmax distribution.
     /// Call ONLY immediately after `forward_decode`; the logits buffer is live.
+    ///
+    /// Public surface for downstream eval/scoring crates; no internal caller.
+    #[allow(dead_code)]
     pub fn token_nll_from_logits(&self, token_id: u32) -> Result<f32> {
         let logits: &[f32] = self.activations.logits.as_slice()
             .map_err(|e| anyhow::anyhow!("token_nll logits read: {e}"))?;
