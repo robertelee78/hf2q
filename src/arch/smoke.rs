@@ -694,10 +694,10 @@ pub fn print_dry_run_report(entry: &ArchEntry, args: &SmokeArgs) {
     );
     let path = resolve_transcript_path(args, entry);
     println!("  transcript_path:   {}", path.display());
-    if args.local_dir.is_some() {
+    if let Some(local_dir) = &args.local_dir {
         println!(
             "  local_dir:         {} (HF_TOKEN preflight skipped)",
-            args.local_dir.as_ref().unwrap().display()
+            local_dir.display()
         );
     }
     println!("═══════════════════════════");
