@@ -454,6 +454,53 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
+    // Phase 1.4: ADR-012 P9b real-model finding — strip `language_model.`
+    // prefix from all tensor names before the qwen35 transforms run.
+    //
+    // Real Qwen3.6 safetensors use the nested
+    //   `model.language_model.layers.N.*`
+    // namespace (mirroring the `Qwen3_5{,Moe}ForConditionalGeneration` HF
+    // class hierarchy). The qwen35 transforms downstream were written for
+    // the simpler `model.layers.N.*` namespace:
+    //   - `apply_qwen35_linear_attn_transforms_in_tensor_map` uses
+    //     `.contains()` substring matches (incidentally robust to either
+    //     prefix).
+    //   - `merge_moe_experts_in_tensor_map` uses exact-format matches
+    //     `model.layers.{N}.mlp.experts.{E}.{proj}.weight` (silently
+    //     no-ops on `language_model.` variants — caught by the qwen35moe
+    //     real-model run on jenerallee78/Qwen3.6-35B-A3B-...).
+    //
+    // Normalizing globally here matches what `hf_name_to_gguf` does at
+    // GGUF-write time (line ~1599: `replace("language_model.", "")`), so
+    // the input-side and output-side namespaces stay consistent for the
+    // entire pipeline.
+    //
+    // Vision tensors (`model.vision_tower.*`, `model.embed_vision.*`) and
+    // root-level non-language_model paths are unaffected (the strip is a
+    // simple `.replace` and only fires on tensors that actually contain
+    // the literal `language_model.` segment).
+    {
+        let renames: Vec<(String, String)> = tensor_map
+            .tensors
+            .keys()
+            .filter(|n| n.contains("language_model."))
+            .map(|n| (n.clone(), n.replace("language_model.", "")))
+            .collect();
+        if !renames.is_empty() {
+            tracing::info!(
+                count = renames.len(),
+                "qwen35 P9b real-model finding: stripping `language_model.` prefix from {} tensors",
+                renames.len()
+            );
+            for (old_name, new_name) in renames {
+                if let Some(mut tensor) = tensor_map.tensors.remove(&old_name) {
+                    tensor.name = new_name.clone();
+                    tensor_map.tensors.insert(new_name, tensor);
+                }
+            }
+        }
+    }
+
     // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
     //
     // Must run BEFORE quantization: `merge_moe_experts_in_tensor_map`
