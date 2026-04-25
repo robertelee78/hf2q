@@ -29,6 +29,7 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
+use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// GPU dense linear projection `y = x @ W.T`.
@@ -239,6 +240,66 @@ pub fn vit_per_head_rms_norm_gpu(
     vit_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, head_dim, eps)
 }
 
+/// GPU softmax along the last dimension of a `[rows, cols]` F32 tensor.
+///
+/// Wraps `mlx_native::ops::softmax::dispatch_softmax`. Numerically
+/// stable (subtracts per-row max before exp). One threadgroup per row.
+///
+/// Allocates a fresh `[rows, cols]` F32 output buffer.
+///
+/// # Errors
+///
+/// - any dim is 0
+/// - propagated from mlx-native dispatch
+pub fn vit_softmax_last_dim_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<MlxBuffer> {
+    if rows == 0 || cols == 0 {
+        return Err(anyhow!(
+            "vit_softmax_last_dim_gpu: rows ({}) and cols ({}) must be > 0",
+            rows,
+            cols
+        ));
+    }
+
+    let out_bytes = (rows as usize) * (cols as usize) * 4;
+    let output = device
+        .alloc_buffer(out_bytes, DType::F32, vec![rows as usize, cols as usize])
+        .map_err(|e| anyhow!("vit_softmax_last_dim_gpu: alloc output: {e}"))?;
+
+    // Params buffer: 2 × f32 holding [cols_as_f32, 0].
+    let params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("vit_softmax_last_dim_gpu: alloc params: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; no aliasing.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
+        };
+        s[0] = cols as f32;
+        s[1] = 0.0;
+    }
+
+    dispatch_softmax(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        &params_buf,
+        rows,
+        cols,
+    )
+    .context("vit_softmax_last_dim_gpu: dispatch_softmax")?;
+
+    Ok(output)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -248,7 +309,7 @@ mod tests {
     use super::*;
     use crate::inference::vision::vit::{
         linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
-        rms_norm_forward as rms_norm_cpu,
+        rms_norm_forward as rms_norm_cpu, softmax_last_dim as softmax_cpu,
     };
     use crate::inference::vision::mmproj::MmprojConfig;
     use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
@@ -694,6 +755,118 @@ mod tests {
             .map(|(g, e)| (g - e).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-4, "per_head_rms GPU vs CPU max_diff = {max_diff}");
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_softmax_last_dim_gpu (iter 45)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_softmax_last_dim_gpu_matches_cpu_reference() {
+        // 4 rows × 8 cols. Numerically stable softmax — GPU should match
+        // CPU within float epsilon (no BF16 round-trip; everything F32).
+        let rows = 4usize;
+        let cols = 8usize;
+        let input_cpu: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.3).sin() + 0.5)
+            .collect();
+        let mut expected = input_cpu.clone();
+        softmax_cpu(&mut expected, cols).expect("cpu ref");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input_buf = upload_f32(executor.device(), &input_cpu, vec![rows, cols]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        // Softmax shaders need source registration before dispatch.
+        mlx_native::ops::softmax::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_softmax_last_dim_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_buf,
+            rows as u32,
+            cols as u32,
+        )
+        .expect("softmax");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, rows * cols);
+
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-5, "softmax GPU vs CPU max_diff = {max_diff}");
+
+        // Sanity: each row sums to 1.
+        for r in 0..rows {
+            let row_sum: f32 = got[r * cols..(r + 1) * cols].iter().sum();
+            assert!((row_sum - 1.0).abs() < 1e-4, "row {r} sum = {row_sum}");
+        }
+    }
+
+    #[test]
+    fn vit_softmax_last_dim_gpu_numerically_stable_for_large_inputs() {
+        // x = [1000, 999, 998] should not overflow with the
+        // subtract-max trick (without it, exp(1000) → +∞).
+        let rows = 1usize;
+        let cols = 3usize;
+        let input_cpu = vec![1000.0f32, 999.0, 998.0];
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input_buf = upload_f32(executor.device(), &input_cpu, vec![rows, cols]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_softmax_last_dim_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_buf,
+            rows as u32,
+            cols as u32,
+        )
+        .expect("softmax");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, rows * cols);
+
+        for v in &got {
+            assert!(v.is_finite(), "non-finite: {v}");
+        }
+        // Expected: softmax([2, 1, 0]) ≈ [0.6652, 0.2447, 0.0900].
+        assert!((got[0] - 0.6652).abs() < 1e-3, "got[0] = {}", got[0]);
+        assert!((got[1] - 0.2447).abs() < 1e-3, "got[1] = {}", got[1]);
+        assert!((got[2] - 0.0900).abs() < 1e-3, "got[2] = {}", got[2]);
+    }
+
+    #[test]
+    fn vit_softmax_last_dim_gpu_rejects_zero_dims() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input = executor
+            .device()
+            .alloc_buffer(16 * 4, DType::F32, vec![4, 4])
+            .expect("a");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_softmax_last_dim_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            0,
+            4,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
     }
 
     #[test]

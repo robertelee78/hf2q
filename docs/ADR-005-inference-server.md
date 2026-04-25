@@ -1746,6 +1746,15 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
     - `vit_per_head_rms_norm_gpu_rejects_zero_dims`.
   - **Verification:** `cargo test --bin hf2q inference::vision::vit_gpu` — 9/9 pass. Full suite — 899/899 pass (+5 from iter 43's 894).
 
+- **2026-04-24 loop iter 45 — `vit_softmax_last_dim_gpu` (foundation for attention).** ViT bidirectional attention doesn't need a mask, so used plain `mlx_native::ops::softmax::dispatch_softmax` (vs the masked `scale_mask_softmax`). Allocates a 2-element `[cols_as_f32, 0]` params buffer per call; one threadgroup per row; numerically stable (subtract-max trick).
+  - **`vit_softmax_last_dim_gpu(encoder, registry, device, input, rows, cols) -> MlxBuffer`:** F32 in-place-style — fresh F32 output buffer with `softmax(x, dim=-1)`. Caller registers softmax sources before dispatch (`mlx_native::ops::softmax::register(registry)`).
+  - **Tests (3 new, all passing):**
+    - `matches_cpu_reference` — synthetic [4 × 8] sine input, GPU vs CPU `softmax_last_dim` max_diff < 1e-5; row-sum sanity check (each row sums to 1).
+    - `numerically_stable_for_large_inputs` — `x=[1000, 999, 998]` would overflow `exp(1000)` without the subtract-max trick; GPU output matches the [0.6652, 0.2447, 0.0900] reference within 1e-3.
+    - `rejects_zero_dims`.
+  - **Verification:** `cargo test --bin hf2q vit_softmax` — 3/3 pass. Full suite — 902/902 pass (+3 from iter 44's 899).
+  - **Iter 45 also surveyed flash_attn variants for iter 46:** Gemma 4's `head_dim=72` doesn't match the existing `flash_attn_prefill_bf16_d256` (D=256) or `flash_attn_prefill_d512` (D=512) variants. Iter 46 will compose `vit_attention_gpu` from three `dense_matmul_bf16_f32_tensor` GEMMs (Q@K^T, scale, softmax_last_dim, scores@V) using the existing `vit_linear_gpu` + `vit_softmax_last_dim_gpu` building blocks. Skip the flash-attn fast path for now; correctness first via composed primitives, fast path lands when a head_dim=72 kernel is added (or when 72→128 padding is acceptable).
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
