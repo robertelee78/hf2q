@@ -110,7 +110,7 @@ fn build_tiny_vit_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{p}.self_attn.o_proj.weight"), vec![h, h]);
             push_f16_zeros(&mut tensors, &format!("{p}.self_attn.gate.weight"), vec![1, h]);
         } else {
-            let qkv = (4 + 1 + 8) * 16;
+            // Spec-correct shape: 2*nk*hk + nv*hv = 2*4*16 + 8*16 = 256.
             let qkv_rows = 4 * 16 * 2 + 8 * 16;
             push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
             push_f16_zeros(&mut tensors, &format!("{p}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);

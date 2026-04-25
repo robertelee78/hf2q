@@ -90,7 +90,7 @@ fn build_qwen35moe_safetensors() -> Vec<u8> {
     let num_heads: usize = 4;
     let kv_heads: usize = 1;
     let head_dim: usize = 16;
-    let lin_v_heads: usize = 8;
+    let _lin_v_heads: usize = 8;
     let num_layers: usize = 4;
     let f16 = 2usize;
 

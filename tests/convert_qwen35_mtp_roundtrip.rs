@@ -163,7 +163,6 @@ fn build_qwen35_dense_mtp_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.o_proj.weight"), vec![hidden, q_size]);
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
-            let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
             // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
             let nk = 4usize;
             let hk = head_dim;
@@ -229,7 +228,6 @@ fn build_qwen35moe_mtp_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.o_proj.weight"), vec![hidden, q_size]);
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
-            let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
             // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
             let nk = 4usize;
             let hk = head_dim;
