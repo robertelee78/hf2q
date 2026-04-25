@@ -732,74 +732,73 @@ pub fn build_gated_attn_layer(
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
-    // ---- Op 1: pre-attention RMSNorm ----
-    let mut enc = device.command_encoder().context("enc op1")?;
-    let x_norm = apply_pre_attn_rms_norm(
-        &mut enc, registry, device, x, weights_gpu,
-        seq_len, hidden_size, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op1")?;
+    // ---- Ops 1–4: norm, Q/K/V/G projections, Q/K head-norm, IMROPE Q+K ----
+    // All ops in this chain write to new output buffers and read from buffers
+    // written by earlier dispatches in the same encoder.  A memory_barrier()
+    // between dependent stages ensures the GPU sees the preceding output before
+    // the next dispatch reads it (same pattern as llama.cpp's single command
+    // buffer with memoryBarrierWithScope:MTLBarrierScopeBuffers).
+    // Collapse into a single encoder + one commit_and_wait.
+    let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = {
+        let mut enc = device.command_encoder().context("enc ops1-4")?;
 
-    // ---- Op 2: Q/K/V/G projections ----
-    let mut enc = device.command_encoder().context("enc op2")?;
-    let q_flat = apply_linear_projection_f32(
-        &mut enc, registry, device, &x_norm,
-        &weights_gpu.wq, seq_len, hidden_size, q_total,
-    )?;
-    enc.commit_and_wait().context("commit op2 q")?;
+        // Op 1: pre-attention RMSNorm → x_norm
+        let x_norm = apply_pre_attn_rms_norm(
+            &mut enc, registry, device, x, weights_gpu,
+            seq_len, hidden_size, rms_norm_eps,
+        )?;
+        // Barrier: ops 2 read from x_norm written above.
+        enc.memory_barrier();
 
-    let mut enc = device.command_encoder().context("enc op2k")?;
-    let k_flat = apply_linear_projection_f32(
-        &mut enc, registry, device, &x_norm,
-        &weights_gpu.wk, seq_len, hidden_size, kv_total,
-    )?;
-    enc.commit_and_wait().context("commit op2 k")?;
+        // Op 2: Q/K/V/G projections (all read from x_norm)
+        let q_flat = apply_linear_projection_f32(
+            &mut enc, registry, device, &x_norm,
+            &weights_gpu.wq, seq_len, hidden_size, q_total,
+        )?;
+        let k_flat = apply_linear_projection_f32(
+            &mut enc, registry, device, &x_norm,
+            &weights_gpu.wk, seq_len, hidden_size, kv_total,
+        )?;
+        let v_flat = apply_linear_projection_f32(
+            &mut enc, registry, device, &x_norm,
+            &weights_gpu.wv, seq_len, hidden_size, kv_total,
+        )?;
+        let gate_flat = apply_linear_projection_f32(
+            &mut enc, registry, device, &x_norm,
+            &weights_gpu.w_gate, seq_len, hidden_size, q_total,
+        )?;
+        // Barrier: ops 3 read from q_flat / k_flat written above.
+        enc.memory_barrier();
 
-    let mut enc = device.command_encoder().context("enc op2v")?;
-    let v_flat = apply_linear_projection_f32(
-        &mut enc, registry, device, &x_norm,
-        &weights_gpu.wv, seq_len, hidden_size, kv_total,
-    )?;
-    enc.commit_and_wait().context("commit op2 v")?;
+        // Op 3: per-head RMSNorm on Q and K
+        let q_normed = apply_q_or_k_per_head_rms_norm(
+            &mut enc, registry, device, &q_flat,
+            &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
+        )?;
+        let k_normed = apply_q_or_k_per_head_rms_norm(
+            &mut enc, registry, device, &k_flat,
+            &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
+        )?;
+        // Barrier: ops 4 read from q_normed / k_normed written above.
+        enc.memory_barrier();
 
-    let mut enc = device.command_encoder().context("enc op2g")?;
-    let gate_flat = apply_linear_projection_f32(
-        &mut enc, registry, device, &x_norm,
-        &weights_gpu.w_gate, seq_len, hidden_size, q_total,
-    )?;
-    enc.commit_and_wait().context("commit op2 g")?;
+        // Op 4: IMROPE on Q and K
+        let q_rope = apply_imrope(
+            &mut enc, registry, device, &q_normed, positions,
+            seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        )?;
+        let k_rope = apply_imrope(
+            &mut enc, registry, device, &k_normed, positions,
+            seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
+        )?;
 
-    // ---- Op 3: per-head RMSNorm on Q ----
-    let mut enc = device.command_encoder().context("enc op3q")?;
-    let q_normed = apply_q_or_k_per_head_rms_norm(
-        &mut enc, registry, device, &q_flat,
-        &weights_gpu.attn_q_norm, seq_len, n_heads, head_dim, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op3 q norm")?;
-
-    // ---- Op 3: per-head RMSNorm on K ----
-    let mut enc = device.command_encoder().context("enc op3k")?;
-    let k_normed = apply_q_or_k_per_head_rms_norm(
-        &mut enc, registry, device, &k_flat,
-        &weights_gpu.attn_k_norm, seq_len, n_kv_heads, head_dim, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op3 k norm")?;
-
-    // ---- Op 4: IMROPE on Q ----
-    let mut enc = device.command_encoder().context("enc op4q")?;
-    let q_rope = apply_imrope(
-        &mut enc, registry, device, &q_normed, positions,
-        seq_len, n_heads, head_dim, rotary_dim, freq_base, mrope_section,
-    )?;
-    enc.commit_and_wait().context("commit op4 q rope")?;
-
-    // ---- Op 4: IMROPE on K ----
-    let mut enc = device.command_encoder().context("enc op4k")?;
-    let k_rope = apply_imrope(
-        &mut enc, registry, device, &k_normed, positions,
-        seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
-    )?;
-    enc.commit_and_wait().context("commit op4 k rope")?;
+        // Single commit for the entire pre-SDPA chain.
+        enc.commit_and_wait().context("commit ops1-4")?;
+        (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope)
+    };
+    // Suppress unused variable warnings for intermediate buffers that were
+    // consumed by downstream ops within the same encoder.
+    let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
 
     // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
     //
@@ -828,21 +827,22 @@ pub fn build_gated_attn_layer(
     };
     // attn_out is now [seq * n_heads, head_dim] seq-major.
 
-    // ---- Op 6: sigmoid-gate multiply ----
-    let n_elem = seq_len * q_total;
-    let mut enc = device.command_encoder().context("enc op6")?;
-    let gated = apply_sigmoid_gate_multiply(
-        &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
-    )?;
-    enc.commit_and_wait().context("commit op6")?;
-
-    // ---- Op 7: output projection ----
-    let mut enc = device.command_encoder().context("enc op7")?;
-    let out = apply_linear_projection_f32(
-        &mut enc, registry, device, &gated,
-        &weights_gpu.wo, seq_len, q_total, hidden_size,
-    )?;
-    enc.commit_and_wait().context("commit op7")?;
+    // ---- Ops 6–7: sigmoid-gate multiply + output projection ----
+    // gate_flat is already on GPU; attn_out returned by SDPA is on GPU.
+    // Collapse into one encoder + one commit.
+    let out = {
+        let n_elem = seq_len * q_total;
+        let mut enc = device.command_encoder().context("enc ops6-7")?;
+        let gated = apply_sigmoid_gate_multiply(
+            &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
+        )?;
+        let out = apply_linear_projection_f32(
+            &mut enc, registry, device, &gated,
+            &weights_gpu.wo, seq_len, q_total, hidden_size,
+        )?;
+        enc.commit_and_wait().context("commit ops6-7")?;
+        out
+    };
 
     Ok(out)
 }

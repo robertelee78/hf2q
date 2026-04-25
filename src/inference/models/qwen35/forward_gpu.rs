@@ -39,6 +39,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::ops::elementwise::elementwise_add;
 use std::sync::OnceLock;
 
 use super::delta_net::DeltaNetLayerShape;
@@ -131,6 +132,34 @@ fn dump_hidden_stats(label: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u3
         }
         Err(e) => eprintln!("[DUMP] {} download failed: {e}", label),
     }
+}
+
+// ================================================================
+// Per-session GPU state cache
+// ================================================================
+
+/// Cached GPU state for a single forward session (one generate call).
+///
+/// Weights are uploaded once at session start and reused across all decode
+/// tokens.  The cache is keyed by the raw pointer of the `Qwen35Model`
+/// to detect model swaps.  Since the serve loop runs single-threaded, a
+/// `thread_local` RefCell is safe and avoids making `MlxBuffer` `Send`.
+struct ForwardGpuCache {
+    /// Raw pointer of the model whose weights are cached.
+    model_ptr: *const (),
+    device: MlxDevice,
+    registry: KernelRegistry,
+    layer_weights: Vec<LayerWeightsGpu>,
+    output_head: OutputHeadGpu,
+}
+
+// SAFETY: the thread_local cache is only accessed on the thread that owns it.
+// MlxBuffer is not Send but we never move the cache across thread boundaries.
+unsafe impl Send for ForwardGpuCache {}
+
+thread_local! {
+    static GPU_CACHE: std::cell::RefCell<Option<ForwardGpuCache>> =
+        std::cell::RefCell::new(None);
 }
 
 // ================================================================
@@ -262,25 +291,40 @@ fn apply_output_head_gpu(
 // Residual add (GPU → CPU → GPU, fast for small hidden dims)
 // ================================================================
 
-/// In-place residual add on the GPU: `dst[i] += src[i]`.
+/// Residual add on the GPU: returns a new buffer containing `dst + src`.
 ///
-/// Downloads both buffers, adds on CPU, re-uploads.  This matches P7b–P9b's
-/// CPU-bridge pattern for ops without a dedicated GPU shader.
+/// Uses the `elementwise_add_f32` Metal kernel — no CPU round-trip.
+/// This replaces the previous download→add→upload pattern and eliminates
+/// 2 GPU syncs per residual connection (2 per layer × 40 layers = 80 per token).
 fn residual_add_gpu(
     dst: &MlxBuffer,
     src: &MlxBuffer,
     device: &MlxDevice,
+    registry: &mut KernelRegistry,
 ) -> Result<MlxBuffer> {
-    let d = download_f32(dst).context("residual dst download")?;
-    let s = download_f32(src).context("residual src download")?;
+    let n = dst.element_count();
     anyhow::ensure!(
-        d.len() == s.len(),
+        n == src.element_count(),
         "residual_add_gpu: length mismatch dst={} src={}",
-        d.len(),
-        s.len()
+        n, src.element_count()
     );
-    let result: Vec<f32> = d.iter().zip(s.iter()).map(|(a, b)| a + b).collect();
-    upload_f32(&result, device).context("residual add upload")
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, vec![n])
+        .map_err(|e| anyhow!("residual_add_gpu alloc: {e}"))?;
+    let mut enc = device.command_encoder().context("enc residual_add")?;
+    elementwise_add(
+        &mut enc,
+        registry,
+        device.metal_device(),
+        dst,
+        src,
+        &out,
+        n,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("elementwise_add: {e}"))?;
+    enc.commit_and_wait().context("commit residual_add")?;
+    Ok(out)
 }
 
 // ================================================================
@@ -337,31 +381,70 @@ impl Qwen35Model {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
+        let self_ptr = self as *const _ as *const ();
 
-        // ---- Acquire GPU device + kernel registry ----
-        let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
-        let mut registry = KernelRegistry::new();
+        // ---- Acquire GPU device + kernel registry + per-layer weights ----
+        //
+        // Weights are expensive to upload (25 GB GGUF).  We cache them in a
+        // thread-local on first call and reuse across all decode tokens.
+        // If the model pointer changes (rare; only on model swap) we rebuild.
+        GPU_CACHE.with(|cell| -> Result<()> {
+            let mut cache = cell.borrow_mut();
+            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
+                let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
+                let registry = KernelRegistry::new();
+                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                let output_head = OutputHeadGpu {
+                    norm_w: upload_f32(&self.output_norm, &device)
+                        .context("upload output_norm")?,
+                    lm_head: upload_f32(&self.output_weight, &device)
+                        .context("upload lm_head")?,
+                };
+                *cache = Some(ForwardGpuCache {
+                    model_ptr: self_ptr,
+                    device,
+                    registry,
+                    layer_weights,
+                    output_head,
+                });
+            }
+            Ok(())
+        })?;
 
         // ---- Upload positions buffer ----
-        let pos_buf = {
-            let byte_len = positions_flat.len() * 4;
-            let mut buf = device
-                .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
-                .map_err(|e| anyhow!("alloc positions: {e}"))?;
-            buf.as_mut_slice::<i32>()
-                .map_err(|e| anyhow!("positions mut_slice: {e}"))?
-                .copy_from_slice(positions_flat);
-            buf
+        // Positions change every call (new token index) so they cannot be cached.
+        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref) = {
+            // SAFETY: we borrow the cache immutably after ensuring it's populated.
+            // We extract raw pointers to avoid lifetime issues with the RefCell borrow
+            // extending across the long function body.  The cache is only invalidated
+            // above (at the start of this function), never during a call.
+            GPU_CACHE.with(|cell| -> Result<_> {
+                let cache = cell.borrow();
+                let c = cache.as_ref().unwrap();
+                let pos_buf = {
+                    let byte_len = positions_flat.len() * 4;
+                    let mut buf = c.device
+                        .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
+                        .map_err(|e| anyhow!("alloc positions: {e}"))?;
+                    buf.as_mut_slice::<i32>()
+                        .map_err(|e| anyhow!("positions mut_slice: {e}"))?
+                        .copy_from_slice(positions_flat);
+                    buf
+                };
+                // Return raw pointers; the cache borrow is dropped here.
+                // Callers must not trigger cache invalidation while using these pointers.
+                let device_ptr = &c.device as *const MlxDevice;
+                let registry_ptr = &c.registry as *const KernelRegistry as *mut KernelRegistry;
+                let weights_ptr = &c.layer_weights as *const Vec<LayerWeightsGpu>;
+                let head_ptr = &c.output_head as *const OutputHeadGpu;
+                Ok((pos_buf, weights_ptr, device_ptr, registry_ptr, head_ptr))
+            })?
         };
-
-        // ---- Upload per-layer GPU weights ----
-        let layer_weights_gpu = self.upload_layer_weights_gpu(&device)?;
-
-        // ---- Upload output head ----
-        let output_head = OutputHeadGpu {
-            norm_w: upload_f32(&self.output_norm, &device).context("upload output_norm")?,
-            lm_head: upload_f32(&self.output_weight, &device).context("upload lm_head")?,
-        };
+        // SAFETY: cache is populated above and not modified below.
+        let device = unsafe { &*device_ref };
+        let mut registry = unsafe { &mut *registry_ref };
+        let layer_weights_gpu = unsafe { &*layer_weights_gpu };
+        let output_head = unsafe { &*output_head_ref };
 
         // ---- Step 1: embedding lookup → hidden ----
         let mut hidden = embed_tokens_gpu(
@@ -496,7 +579,7 @@ impl Qwen35Model {
             };
 
             // --- Residual after attention ---
-            hidden = residual_add_gpu(&hidden, &attn_out, &device)
+            hidden = residual_add_gpu(&hidden, &attn_out, &device, &mut registry)
                 .with_context(|| format!("residual attn layer {layer_idx}"))?;
 
             // --- Post-attention RMSNorm ---
@@ -602,7 +685,7 @@ impl Qwen35Model {
 
             // --- Residual after FFN: add to pre-norm ffn_residual, not normed ---
             // Matches llama.cpp: `cur = ggml_add(cur, ffn_residual)`.
-            hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device)
+            hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
                 .with_context(|| format!("residual ffn layer {layer_idx}"))?;
 
             // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---

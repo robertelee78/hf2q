@@ -679,29 +679,30 @@ pub fn build_delta_net_layer(
     let q_span = n_k_heads * d_k;
     let k_span = n_k_heads * d_k;
 
-    // ---- Op 1: pre-norm ----
-    let mut enc = device.command_encoder().context("enc op1")?;
-    let x_norm = apply_pre_norm(
-        &mut enc, registry, device, x, &weights.attn_norm,
-        seq_len, hidden_size, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op1")?;
-
-    // ---- Op 2a: QKV projection ----
-    let mut enc = device.command_encoder().context("enc op2a")?;
-    let qkv = apply_proj(
-        &mut enc, registry, device, &x_norm,
-        &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
-    )?;
-    enc.commit_and_wait().context("commit op2a")?;
-
-    // ---- Op 2b: Z-gate projection ----
-    let mut enc = device.command_encoder().context("enc op2b")?;
-    let z = apply_proj(
-        &mut enc, registry, device, &x_norm,
-        &weights.attn_gate, seq_len, hidden_size, z_channels,
-    )?;
-    enc.commit_and_wait().context("commit op2b")?;
+    // ---- Ops 1–2: pre-norm + QKV/Z-gate projections ----
+    // All three ops read from `x` / `x_norm` and write to new buffers — no
+    // CPU readback needed until op3 (ssm_conv owns its own encoder).
+    // Collapse norm + two projections into one encoder + one commit.
+    // A memory_barrier() between op1 and ops 2a/2b ensures x_norm is visible.
+    let (x_norm, qkv, z) = {
+        let mut enc = device.command_encoder().context("enc ops1-2")?;
+        let x_norm = apply_pre_norm(
+            &mut enc, registry, device, x, &weights.attn_norm,
+            seq_len, hidden_size, rms_norm_eps,
+        )?;
+        // Barrier: ops 2a/2b read from x_norm written by op 1.
+        enc.memory_barrier();
+        let qkv = apply_proj(
+            &mut enc, registry, device, &x_norm,
+            &weights.attn_qkv, seq_len, hidden_size, qkv_channels,
+        )?;
+        let z = apply_proj(
+            &mut enc, registry, device, &x_norm,
+            &weights.attn_gate, seq_len, hidden_size, z_channels,
+        )?;
+        enc.commit_and_wait().context("commit ops1-2")?;
+        (x_norm, qkv, z)
+    };
 
     // ---- Op 3: SSM conv1d + SiLU ----
     // apply_ssm_conv owns its own encoder internally.
@@ -739,24 +740,17 @@ pub fn build_delta_net_layer(
     let k_gpu = upload_f32(&k_cpu, device)?;
     let v_gpu = upload_f32(&v_cpu, device)?;
 
-    // ---- Op 5: per-head L2 norm on Q and K ----
-    let mut enc = device.command_encoder().context("enc op5q")?;
-    let q_l2 = apply_l2_norm_per_head(
-        &mut enc, registry, device, &q_gpu,
-        seq_len, n_k_heads, d_k, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op5q")?;
-
-    // ---- Q scaling: multiply by 1/sqrt(D_k) after L2 norm ----
-    //
-    // llama.cpp delta-net-base.cpp (both build_delta_net_autoregressive and
-    // build_delta_net_chunking) applies:
-    //   const float scale = 1.0f / sqrtf(S_k);
-    //   q = ggml_scale(ctx0, q, scale);
-    // after the L2 norm on Q.  Without this, GDN output = state @ q is
-    // sqrt(D_k) ≈ 11× too large (for D_k=128), corrupting the residual stream
-    // across 30 DeltaNet layers and producing wrong logits.
+    // ---- Op 5q: per-head L2 norm on Q (must commit before CPU Q-scale) ----
     let q_normed = {
+        let mut enc = device.command_encoder().context("enc op5q")?;
+        let q_l2 = apply_l2_norm_per_head(
+            &mut enc, registry, device, &q_gpu,
+            seq_len, n_k_heads, d_k, rms_norm_eps,
+        )?;
+        enc.commit_and_wait().context("commit op5q")?;
+
+        // Q scaling: multiply by 1/sqrt(D_k) after L2 norm.
+        // llama.cpp delta-net-base.cpp applies this scale after the L2 norm on Q.
         let q_scale = 1.0_f32 / (dk as f32).sqrt();
         let mut q_scaled_cpu = download_f32(&q_l2)?;
         for v in q_scaled_cpu.iter_mut() {
@@ -765,28 +759,27 @@ pub fn build_delta_net_layer(
         upload_f32(&q_scaled_cpu, device)?
     };
 
-    let mut enc = device.command_encoder().context("enc op5k")?;
-    let k_normed = apply_l2_norm_per_head(
-        &mut enc, registry, device, &k_gpu,
-        seq_len, n_k_heads, d_k, rms_norm_eps,
-    )?;
-    enc.commit_and_wait().context("commit op5k")?;
-
-    // ---- Op 6a: alpha logit projection + dt_bias ----
-    let mut enc = device.command_encoder().context("enc op6a")?;
-    let alpha_logit_buf = apply_proj(
-        &mut enc, registry, device, &x_norm,
-        &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
-    )?;
-    enc.commit_and_wait().context("commit op6a")?;
-
-    // ---- Op 6b: beta logit projection ----
-    let mut enc = device.command_encoder().context("enc op6b")?;
-    let beta_logit_buf = apply_proj(
-        &mut enc, registry, device, &x_norm,
-        &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
-    )?;
-    enc.commit_and_wait().context("commit op6b")?;
+    // ---- Ops 5k + 6a + 6b: K L2-norm, alpha proj, beta proj ----
+    // All three read from GPU buffers that are complete after the CPU split
+    // (k_gpu from upload, x_norm from the ops1-2 batch above).
+    // Collapse into one encoder + one commit before the CPU downloads.
+    let (k_normed, alpha_logit_buf, beta_logit_buf) = {
+        let mut enc = device.command_encoder().context("enc ops5k-6ab")?;
+        let k_normed = apply_l2_norm_per_head(
+            &mut enc, registry, device, &k_gpu,
+            seq_len, n_k_heads, d_k, rms_norm_eps,
+        )?;
+        let alpha_logit_buf = apply_proj(
+            &mut enc, registry, device, &x_norm,
+            &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+        )?;
+        let beta_logit_buf = apply_proj(
+            &mut enc, registry, device, &x_norm,
+            &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+        )?;
+        enc.commit_and_wait().context("commit ops5k-6ab")?;
+        (k_normed, alpha_logit_buf, beta_logit_buf)
+    };
 
     // ---- Op 6c: compute g and beta on CPU ----
     let alpha_logit_cpu = download_f32(&alpha_logit_buf)?;

@@ -751,53 +751,48 @@ pub fn build_moe_ffn_layer_gpu_q(
     let total_rows = seq * topk;
     let ids_buf = upload_u32(&topk_idx, device).context("upload ids")?;
 
-    // ---- Step 3a: gate_all = qmatmul_id(x, expert_gate_q, ids) ----
-    // Output: [n_tokens * top_k, moe_intermediate_size]
+    // ---- Steps 3a+3b: gate_all and up_all via quantized MoE dispatch ----
+    // Both reads from `x` (already on GPU) and produce independent output
+    // buffers. Collapse into one encoder + one commit.
     let gate_all_bytes = total_rows * m_moe * 4;
     let mut gate_all_buf = device
         .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
         .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
-    {
-        let params = GgmlQuantizedMatmulIdParams {
-            n_tokens: seq_len,
-            top_k: shape.num_experts_per_tok,
-            n: m_moe32,
-            k: h32,
-            n_experts: ne32,
-            expert_stride: weights.expert_gate_stride,
-            ggml_type: weights.ggml_type_gate_up,
-        };
-        let mut enc = device.command_encoder().context("enc gate_all qmatmul")?;
-        quantized_matmul_id_ggml(
-            &mut enc, registry, device,
-            x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
-            &params,
-        ).map_err(|e| anyhow!("gate_all qmatmul_id: {e}"))?;
-        enc.commit_and_wait().context("commit gate_all")?;
-    }
-
-    // ---- Step 3b: up_all = qmatmul_id(x, expert_up_q, ids) ----
     let up_all_bytes = total_rows * m_moe * 4;
     let mut up_all_buf = device
         .alloc_buffer(up_all_bytes, DType::F32, vec![total_rows, m_moe])
         .map_err(|e| anyhow!("alloc up_all: {e}"))?;
     {
-        let params = GgmlQuantizedMatmulIdParams {
-            n_tokens: seq_len,
-            top_k: shape.num_experts_per_tok,
-            n: m_moe32,
-            k: h32,
-            n_experts: ne32,
-            expert_stride: weights.expert_up_stride,
-            ggml_type: weights.ggml_type_gate_up,
-        };
-        let mut enc = device.command_encoder().context("enc up_all qmatmul")?;
+        let mut enc = device.command_encoder().context("enc gate+up qmatmul")?;
+        // Step 3a: gate_all
+        quantized_matmul_id_ggml(
+            &mut enc, registry, device,
+            x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
+            &GgmlQuantizedMatmulIdParams {
+                n_tokens: seq_len,
+                top_k: shape.num_experts_per_tok,
+                n: m_moe32,
+                k: h32,
+                n_experts: ne32,
+                expert_stride: weights.expert_gate_stride,
+                ggml_type: weights.ggml_type_gate_up,
+            },
+        ).map_err(|e| anyhow!("gate_all qmatmul_id: {e}"))?;
+        // Step 3b: up_all
         quantized_matmul_id_ggml(
             &mut enc, registry, device,
             x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
-            &params,
+            &GgmlQuantizedMatmulIdParams {
+                n_tokens: seq_len,
+                top_k: shape.num_experts_per_tok,
+                n: m_moe32,
+                k: h32,
+                n_experts: ne32,
+                expert_stride: weights.expert_up_stride,
+                ggml_type: weights.ggml_type_gate_up,
+            },
         ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
-        enc.commit_and_wait().context("commit up_all")?;
+        enc.commit_and_wait().context("commit gate+up")?;
     }
 
     // ---- Step 3c: h_all = silu(gate_all) * up_all  [CPU] ----
@@ -853,10 +848,16 @@ pub fn build_moe_ffn_layer_gpu_q(
     }
 
     // ---- Shared expert: sigmoid-gated SwiGLU (F32, unchanged) ----
-    // Step 4: sh_logit = shared_gate_inp(x)  [seq, 1]
-    let mut enc = device.command_encoder().context("enc sh_gate_inp")?;
-    let sh_logit_buf = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-    enc.commit_and_wait().context("commit sh_gate_inp")?;
+    // Steps 4+6+7: sh_logit, shared_gate_proj, shared_up_proj all read from x.
+    // Collapse into one encoder + one commit before any CPU downloads.
+    let (sh_logit_buf, a_s_buf, b_s_buf) = {
+        let mut enc = device.command_encoder().context("enc sh_logit+gate+up")?;
+        let sh_logit_buf = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf = proj(&mut enc, registry, device, x, &weights.shared_gate, seq_len, h32, m_sh32)?;
+        let b_s_buf = proj(&mut enc, registry, device, x, &weights.shared_up, seq_len, h32, m_sh32)?;
+        enc.commit_and_wait().context("commit sh_logit+gate+up")?;
+        (sh_logit_buf, a_s_buf, b_s_buf)
+    };
 
     // Step 5: sh_gate_val = sigmoid(sh_logit)  [CPU]
     let sh_logit_cpu = download_f32(&sh_logit_buf).context("download sh_logit")?;
@@ -864,16 +865,6 @@ pub fn build_moe_ffn_layer_gpu_q(
         .iter()
         .map(|&v| 1.0 / (1.0 + (-v).exp()))
         .collect();
-
-    // Step 6: a_s = shared_gate_proj(x)  [seq, m_sh]
-    let mut enc = device.command_encoder().context("enc sh_gate")?;
-    let a_s_buf = proj(&mut enc, registry, device, x, &weights.shared_gate, seq_len, h32, m_sh32)?;
-    enc.commit_and_wait().context("commit sh_gate")?;
-
-    // Step 7: b_s = shared_up_proj(x)  [seq, m_sh]
-    let mut enc = device.command_encoder().context("enc sh_up")?;
-    let b_s_buf = proj(&mut enc, registry, device, x, &weights.shared_up, seq_len, h32, m_sh32)?;
-    enc.commit_and_wait().context("commit sh_up")?;
 
     // Step 8: h_s = silu(a_s) * b_s  [CPU]
     let a_s_cpu = download_f32(&a_s_buf).context("download a_s")?;
