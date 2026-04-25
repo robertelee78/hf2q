@@ -66,13 +66,16 @@ use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
+use mlx_native::ops::quantized_matmul_ggml::{
+    quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
+};
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, SsmConvParams};
 use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_norm_gate};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
-use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32};
+use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_q4_0_from_f32};
 
 // ================================================================
 // GPU weight container
@@ -147,13 +150,14 @@ impl DeltaNetWeightsGpu {
             ssm_a_cpu: weights.ssm_a.clone(),
             ssm_norm: upload_f32(&weights.ssm_norm, device)?,
             ssm_norm_cpu: weights.ssm_norm.clone(),
-            // Large projection weights: pre-cast to BF16 to skip per-inference
-            // F32→BF16 GPU cast in apply_proj (avoids ~69ms/token across 30 layers).
-            attn_qkv: upload_bf16_from_f32(&weights.attn_qkv, device)?,
-            attn_gate: upload_bf16_from_f32(&weights.attn_gate, device)?,
-            ssm_alpha: upload_bf16_from_f32(&weights.ssm_alpha, device)?,
-            ssm_beta: upload_bf16_from_f32(&weights.ssm_beta, device)?,
-            ssm_out: upload_bf16_from_f32(&weights.ssm_out, device)?,
+            // Large projection weights: quantized to Q4_0 GGML blocks for 3.56×
+            // bandwidth reduction vs BF16.  Uses quantized_matmul_ggml dispatch_mv
+            // (decode) / dispatch_mm (prefill) — same deterministic kernel as FFN.
+            attn_qkv:  upload_q4_0_from_f32(&weights.attn_qkv,  device)?,
+            attn_gate: upload_q4_0_from_f32(&weights.attn_gate, device)?,
+            ssm_alpha: upload_q4_0_from_f32(&weights.ssm_alpha, device)?,
+            ssm_beta:  upload_q4_0_from_f32(&weights.ssm_beta,  device)?,
+            ssm_out:   upload_q4_0_from_f32(&weights.ssm_out,   device)?,
         })
     }
 }
@@ -258,10 +262,12 @@ pub fn apply_pre_norm(
 
 /// Apply a single linear projection: `output = input @ weight^T`.
 ///
-/// If `weight` is already BF16 (pre-cast at load time), the inline
-/// F32→BF16 cast is skipped entirely — saving one GPU dispatch and one
-/// memory_barrier per projection call.  If `weight` is F32, falls back
-/// to the legacy per-inference cast path.
+/// Dispatches based on weight dtype:
+/// - **U8** (Q4_0 GGML blocks): `quantized_matmul_ggml` (dispatch_mv for M=1 decode,
+///   dispatch_mm for M>8 prefill). 3.56× less bandwidth than BF16; deterministic.
+/// - **BF16**: `dense_matmul_bf16_f32_tensor` (MMA tensor-core tiled GEMM).
+/// - **F32**: inline cast to BF16 then MMA GEMM (legacy path).
+///
 /// Requires `in_features >= 32`.
 pub fn apply_proj(
     encoder: &mut mlx_native::CommandEncoder,
@@ -273,40 +279,6 @@ pub fn apply_proj(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    let n_w = (out_features * in_features) as usize;
-
-    // Determine the BF16 weight buffer: pre-cast (zero extra cost) or cast inline.
-    let weight_bf16_owned: Option<MlxBuffer>;
-    let weight_bf16: &MlxBuffer;
-    if weight.dtype() == DType::BF16 {
-        // Pre-cast at load time: use directly, no barrier needed.
-        weight_bf16_owned = None;
-        weight_bf16 = weight;
-    } else {
-        // Legacy F32 path: cast inline and barrier before matmul.
-        let buf = device
-            .alloc_buffer(
-                n_w * 2,
-                DType::BF16,
-                vec![out_features as usize, in_features as usize],
-            )
-            .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-        cast(
-            encoder,
-            registry,
-            device.metal_device(),
-            weight,
-            &buf,
-            n_w,
-            CastDirection::F32ToBF16,
-        )
-        .context("cast weight F32→BF16")?;
-        // Barrier: matmul reads weight_bf16 written by the cast above.
-        encoder.memory_barrier();
-        weight_bf16_owned = Some(buf);
-        weight_bf16 = weight_bf16_owned.as_ref().unwrap();
-    }
-
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
         .alloc_buffer(
@@ -316,23 +288,60 @@ pub fn apply_proj(
         )
         .map_err(|e| anyhow!("alloc proj out: {e}"))?;
 
-    let params = DenseMmBf16F32Params {
-        m: seq_len,
-        n: out_features,
-        k: in_features,
-        src0_batch: 1,
-        src1_batch: 1,
-    };
-    dense_matmul_bf16_f32_tensor(
-        encoder,
-        registry,
-        device,
-        weight_bf16,
-        input,
-        &mut dst,
-        &params,
-    )
-    .context("dense_matmul_bf16_f32_tensor proj")?;
+    match weight.dtype() {
+        DType::U8 => {
+            // Q4_0 GGML block path — fast decode (dispatch_mv) + prefill (dispatch_mm).
+            let params = GgmlQuantizedMatmulParams {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                ggml_type: GgmlType::Q4_0,
+            };
+            quantized_matmul_ggml(encoder, registry, device, input, weight, &mut dst, &params)
+                .context("quantized_matmul_ggml Q4_0")?;
+        }
+        DType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(
+                encoder, registry, device, weight, input, &mut dst, &params,
+            )
+            .context("dense_matmul_bf16_f32_tensor proj")?;
+        }
+        DType::F32 => {
+            // Legacy inline cast path.
+            let n_w = (out_features * in_features) as usize;
+            let weight_bf16 = device
+                .alloc_buffer(
+                    n_w * 2,
+                    DType::BF16,
+                    vec![out_features as usize, in_features as usize],
+                )
+                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
+                .context("cast weight F32→BF16")?;
+            encoder.memory_barrier();
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(
+                encoder, registry, device, &weight_bf16, input, &mut dst, &params,
+            )
+            .context("dense_matmul_bf16_f32_tensor proj (F32 legacy)")?;
+        }
+        other => {
+            return Err(anyhow!("apply_proj: unsupported weight dtype {:?}", other));
+        }
+    }
     Ok(dst)
 }
 
