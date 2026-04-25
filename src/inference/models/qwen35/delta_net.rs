@@ -12,7 +12,7 @@
 //!  6. Q = L2Norm(Q over D_k)                     (ADR Decision 3)
 //!     K = L2Norm(K over D_k)
 //!  7. alpha_logit = ssm_alpha @ x_norm + ssm_dt_bias     // [seq, n_v]
-//!     g = softplus(alpha_logit) * exp(ssm_a)             // ssm_a is log-decay base
+//!     g = softplus(alpha_logit) * (-ssm_a)               // ssm_a = -exp(A_log) in GGUF
 //!     (alpha = exp(-g) is applied inside GATED_DELTA_NET)
 //!     beta_logit  = ssm_beta  @ x_norm                    // [seq, n_v]
 //!     beta = sigmoid(beta_logit)
@@ -48,6 +48,12 @@ use crate::inference::models::qwen35::Qwen35Config;
 pub struct DeltaNetLayerWeights {
     /// Pre-attention RMSNorm: `[hidden_size]`.
     pub attn_norm: Vec<f32>,
+    /// Post-attention RMSNorm applied between the attention residual and the FFN:
+    /// `[hidden_size]`.  Stored as `blk.{i}.post_attention_norm.weight` in GGUF.
+    /// Applied in the forward pass as: `hidden = RMSNorm(hidden, post_attn_norm)`
+    /// before the FFN projection.  Omitting this causes hidden-state blow-up
+    /// across 40 layers → uniform logits → constant output token.
+    pub post_attn_norm: Vec<f32>,
     /// QKV concatenated projection: `[qkv_total, hidden_size]` where
     /// `qkv_total = 2 * n_k_heads * D_k + n_v_heads * D_v`.
     pub attn_qkv: Vec<f32>,
@@ -63,7 +69,8 @@ pub struct DeltaNetLayerWeights {
     pub ssm_beta: Vec<f32>,
     /// Per-head log-decay base: `[n_v_heads]`. Note ADR-012 Gotcha #2
     /// (A_log negation): this is stored as log(|A|) with sign handled by
-    /// `g = softplus(logit) * exp(ssm_a)` producing a positive decay rate.
+    /// Used as `g = softplus(logit) * (-ssm_a)`.
+    /// Stored as `-exp(A_log)` (negated from HF model) by convert_hf_to_gguf.py.
     pub ssm_a: Vec<f32>,
     /// Output per-head RMSNorm: `[n_v_heads * D_v]`.
     pub ssm_norm: Vec<f32>,
@@ -241,7 +248,9 @@ pub fn delta_net_layer_cpu_ref(
     assert_eq!(weights.ssm_dt_bias.len(), nv);
     assert_eq!(weights.ssm_beta.len(), nv * h);
     assert_eq!(weights.ssm_a.len(), nv);
-    assert_eq!(weights.ssm_norm.len(), z_channels);
+    // ssm_norm has shape [D_v] (per-head dim only), broadcast across n_v_heads.
+    // This matches the apex GGUF's blk.{i}.ssm_norm.weight shape = [D_v].
+    assert_eq!(weights.ssm_norm.len(), dv);
     assert_eq!(weights.ssm_out.len(), h * z_channels);
     assert_eq!(state_in.len(), dk * dv * nv);
     assert_eq!(conv_state.len(), km1 * qkv_channels);
@@ -290,13 +299,26 @@ pub fn delta_net_layer_cpu_ref(
             .copy_from_slice(&qkv_conv[base + q_span + k_span..base + qkv_channels]);
     }
 
-    // 6. L2 norm Q and K per-head (over D_k).
+    // 6. L2 norm Q and K per-head (over D_k), then scale Q by 1/sqrt(D_k).
+    //
+    // llama.cpp delta-net-base.cpp build_delta_net_{autoregressive,chunking}:
+    //   const float scale = 1.0f / sqrtf(S_k);
+    //   q = ggml_scale(ctx0, q, scale);   // applied after ggml_l2_norm
+    //
+    // This is equivalent to computing L2-normalised Q with unit magnitude and
+    // then multiplying by 1/sqrt(D_k), so the GDN dot-product output (state @ q)
+    // is scaled down by the same factor.  Without this the output magnitude is
+    // sqrt(D_k) ≈ 11× too large for D_k=128, which corrupts the residual stream
+    // after 30 DeltaNet layers and produces incorrect logits.
+    let q_scale = 1.0 / (dk as f32).sqrt();
     for t in 0..seq {
         for h_idx in 0..nk {
             let off = (t * nk + h_idx) * dk;
             let row = &q_buf[off..off + dk];
             let normed = l2_norm_row(row, shape.rms_norm_eps);
-            q_buf[off..off + dk].copy_from_slice(&normed);
+            for (dst, v) in q_buf[off..off + dk].iter_mut().zip(normed.iter()) {
+                *dst = v * q_scale;
+            }
         }
         for h_idx in 0..nk {
             let off = (t * nk + h_idx) * dk;
@@ -315,8 +337,12 @@ pub fn delta_net_layer_cpu_ref(
     for t in 0..seq {
         for h_idx in 0..nv {
             let a_logit = alpha_logits[t * nv + h_idx] + weights.ssm_dt_bias[h_idx];
-            // g = softplus(a_logit) * exp(ssm_a[h]). ssm_a is log-decay base.
-            g[t * nv + h_idx] = softplus(a_logit) * weights.ssm_a[h_idx].exp();
+            // ssm_a_gguf stores -exp(A_log) (negated in llama.cpp convert_hf_to_gguf.py).
+            // HF formula: g = softplus(delta) * exp(A_log)
+            // GGUF:        ssm_a = -exp(A_log), so exp(A_log) = -ssm_a
+            // Therefore:   g = softplus(delta) * (-ssm_a[h_idx])
+            // g must be positive so alpha = exp(-g) is in (0, 1).
+            g[t * nv + h_idx] = softplus(a_logit) * (-weights.ssm_a[h_idx]);
             beta[t * nv + h_idx] = sigmoid(beta_logits[t * nv + h_idx]);
         }
     }
@@ -372,15 +398,33 @@ pub fn delta_net_layer_cpu_ref(
         }
     }
 
-    // 9. Output RMSNorm per-token over z_channels, then gate by sigmoid(Z).
-    //    ssm_norm is shared across the entire z_channels vector (one weight
-    //    per value), applied as RMSNorm.
+    // 9. Output RMSNorm per-head then SiLU-gate by z.
+    //    ssm_norm has shape [D_v] and is BROADCAST across all n_v_heads per token.
+    //    For each token and each value head, RMSNorm is applied independently over
+    //    the D_v elements of that head using the same ssm_norm weights.
+    //    Gate uses SiLU (x * sigmoid(x)) matching llama.cpp's build_norm_gated:
+    //      ggml_silu(ctx0, gate) — SiLU, not plain sigmoid.
+    //    See llama.cpp qwen35moe.cpp::build_layer_attn_linear.
+    assert_eq!(
+        weights.ssm_norm.len(),
+        dv,
+        "ssm_norm shape mismatch: expected [D_v={}] got {}",
+        dv,
+        weights.ssm_norm.len()
+    );
     let mut gated = vec![0.0f32; seq * z_channels];
     for t in 0..seq {
-        let row = &attn_out[t * z_channels..(t + 1) * z_channels];
-        let normed = rms_norm_row(row, &weights.ssm_norm, shape.rms_norm_eps);
-        for i in 0..z_channels {
-            gated[t * z_channels + i] = normed[i] * sigmoid(z[t * z_channels + i]);
+        for vh in 0..nv {
+            let head_off = t * z_channels + vh * dv;
+            let head_row = &attn_out[head_off..head_off + dv];
+            let normed = rms_norm_row(head_row, &weights.ssm_norm, shape.rms_norm_eps);
+            for d in 0..dv {
+                let z_val = z[head_off + d];
+                // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                // Matches llama.cpp build_norm_gated: ggml_silu(ctx0, gate)
+                let z_silu = z_val / (1.0 + (-z_val).exp());
+                gated[head_off + d] = normed[d] * z_silu;
+            }
         }
     }
 
@@ -465,6 +509,7 @@ mod tests {
                 }
                 v
             },
+            post_attn_norm: vec![1.0f32; h],
             attn_qkv: mk_rand(&mut seed, qkv_channels * h, 0.1),
             attn_gate: mk_rand(&mut seed, z_channels * h, 0.1),
             ssm_conv1d: mk_rand(&mut seed, k_width * qkv_channels, 0.1),
@@ -472,8 +517,9 @@ mod tests {
             ssm_dt_bias: mk_rand(&mut seed, nv, 0.05),
             ssm_beta: mk_rand(&mut seed, nv * h, 0.1),
             ssm_a: mk_rand(&mut seed, nv, 0.1),
+            // ssm_norm shape is [D_v] (broadcast across heads), not [z_channels].
             ssm_norm: {
-                let mut v = vec![1.0f32; z_channels];
+                let mut v = vec![1.0f32; dv];
                 for (i, x) in v.iter_mut().enumerate() {
                     *x += 0.01 * (i as f32);
                 }

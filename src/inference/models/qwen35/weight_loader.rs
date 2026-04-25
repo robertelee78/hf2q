@@ -27,13 +27,47 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::gguf::GgufFile;
-use mlx_native::MlxDevice;
+use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights};
 use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+
+// ============================================================================
+// Quantized MoE weight container
+// ============================================================================
+
+/// Per-layer MoE FFN weights with expert tensors kept in their native GGML
+/// quantization.  Small tensors (router, shared-expert) are still f32.
+///
+/// This struct is the bridge between GGUF disk bytes and
+/// `MoeFfnWeightsGpuQ`: it holds the raw Metal buffers that `GgufFile::load_tensor`
+/// produced, plus the f32 scalars needed for routing and shared-expert computation.
+pub struct MoeFfnWeightsQ {
+    /// Router: `[num_experts, hidden_size]` F32.
+    pub router: Vec<f32>,
+    /// Stacked expert gate_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_gate_q: MlxBuffer,
+    /// Stacked expert up_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_up_q: MlxBuffer,
+    /// Stacked expert down_proj: raw GGML blocks, dtype U8 on Metal.
+    pub expert_down_q: MlxBuffer,
+    /// GGML quantization type for the gate and up expert buffers (must match).
+    /// In the apex GGUF these are Q5_K.
+    pub ggml_type_gate_up: GgmlType,
+    /// GGML quantization type for the down expert buffer (may differ from gate/up).
+    /// In the apex GGUF this is Q6_K.
+    pub ggml_type_down: GgmlType,
+    /// Shared-expert sigmoid gate: `[hidden_size]` F32.
+    pub shared_gate_logit: Vec<f32>,
+    /// Shared-expert SwiGLU weights (F32).
+    pub shared_gate: Vec<f32>,
+    pub shared_up: Vec<f32>,
+    pub shared_down: Vec<f32>,
+}
 
 /// Load a tensor from the GGUF, dequantize to f32, and download into
 /// a `Vec<f32>`.
@@ -98,6 +132,8 @@ pub fn load_full_attn_layer(
         .with_context(|| format!("layer {layer_idx} attn_k_norm"))?;
     let wo = load_f32_tensor(gguf, &format!("{p}.attn_output.weight"), device)
         .with_context(|| format!("layer {layer_idx} attn_output"))?;
+    let post_attn_norm = load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)
+        .with_context(|| format!("layer {layer_idx} post_attention_norm"))?;
 
     // Sanity check shapes.
     let h = cfg.hidden_size as usize;
@@ -119,15 +155,29 @@ pub fn load_full_attn_layer(
     assert_eq!(attn_q_norm.len(), d, "attn_q_norm layer {layer_idx} shape");
     assert_eq!(attn_k_norm.len(), d, "attn_k_norm layer {layer_idx} shape");
     assert_eq!(wo.len(), h * q_total, "attn_output layer {layer_idx} shape");
+    assert_eq!(post_attn_norm.len(), h, "post_attn_norm layer {layer_idx} shape");
 
-    // Split fused q_fused into wq (first q_total rows) and w_gate (second q_total rows).
-    // Layout: [2*q_total, h] row-major; wq = rows [0..q_total], w_gate = rows [q_total..2*q_total].
-    let wq: Vec<f32> = q_fused[0..q_total * h].to_vec();
-    let w_gate: Vec<f32> = q_fused[q_total * h..2 * q_total * h].to_vec();
+    // De-interleave fused q_fused into wq and w_gate.
+    // llama.cpp layout (confirmed from build_layer_attn): Q and gate are INTERLEAVED
+    // at head granularity. For head h: rows [2*h*d .. (2*h+1)*d-1] = Q[h], rows
+    // [(2*h+1)*d .. (2*h+2)*d-1] = gate[h]. Each "row" is h (hidden_size) floats wide.
+    // So in the flat vec: head h Q starts at offset (2*h*d)*h, gate starts at (2*h+1)*d*h.
+    let mut wq = vec![0.0f32; q_total * h];
+    let mut w_gate = vec![0.0f32; q_total * h];
+    for head_idx in 0..nh {
+        let src_q_start = (head_idx * 2 * d) * h;
+        let src_g_start = ((head_idx * 2 + 1) * d) * h;
+        let dst_start = head_idx * d * h;
+        wq[dst_start..dst_start + d * h]
+            .copy_from_slice(&q_fused[src_q_start..src_q_start + d * h]);
+        w_gate[dst_start..dst_start + d * h]
+            .copy_from_slice(&q_fused[src_g_start..src_g_start + d * h]);
+    }
     drop(q_fused);
 
     Ok(FullAttnLayerWeights {
         attn_norm,
+        post_attn_norm,
         wq,
         wk,
         wv,
@@ -138,7 +188,88 @@ pub fn load_full_attn_layer(
     })
 }
 
+/// Un-reorder a slice whose V-head dimension was permuted from grouped
+/// `[n_k, n_vpk, head_dim, ...]` to tiled `[n_vpk, n_k, head_dim, ...]` by
+/// `_LinearAttentionVReorderBase._reorder_v_heads` during GGUF conversion.
+///
+/// This is the inverse of that permutation.
+///
+/// Arguments:
+///   `data`       — flat slice in GGUF tiled order, length = n_v * head_dim * row_stride
+///   `n_k`        — number of K-heads (= linear_num_key_heads, 16 for apex)
+///   `n_vpk`      — number of V-heads per K-head (= n_v / n_k, 2 for apex)
+///   `head_dim`   — per-head element count (128 for apex)
+///   `row_stride` — elements per "row" beyond the head block (1 for ordinary rows,
+///                  hidden_size for weight matrices along the output dim)
+///
+/// The input tiled order for a single row: `[n_vpk, n_k, head_dim]` flattened.
+/// The output grouped order:               `[n_k,   n_vpk, head_dim]` flattened.
+fn un_reorder_v_heads_rows(
+    data: &[f32],
+    n_k: usize,
+    n_vpk: usize,
+    head_dim: usize,
+    row_stride: usize,
+) -> Vec<f32> {
+    // Total rows = n_v = n_k * n_vpk; each row has `row_stride` elements.
+    let n_v = n_k * n_vpk;
+    assert_eq!(data.len(), n_v * row_stride, "un_reorder_v_heads_rows: size mismatch");
+    let mut out = vec![0.0f32; data.len()];
+    // GGUF tiled ordering: row index = i_vpk * n_k + i_k
+    // Grouped ordering:    row index = i_k   * n_vpk + i_vpk
+    for i_k in 0..n_k {
+        for i_vpk in 0..n_vpk {
+            let tiled_row   = i_vpk * n_k + i_k;
+            let grouped_row = i_k * n_vpk + i_vpk;
+            let src = tiled_row   * row_stride;
+            let dst = grouped_row * row_stride;
+            out[dst..dst + row_stride].copy_from_slice(&data[src..src + row_stride]);
+        }
+    }
+    let _ = head_dim; // head_dim not needed when row_stride already encodes it
+    out
+}
+
+/// Un-reorder a 1-D tensor of n_v scalar elements (one per V-head) from
+/// GGUF tiled order back to grouped order.
+fn un_reorder_v_heads_1d(data: &[f32], n_k: usize, n_vpk: usize) -> Vec<f32> {
+    let n_v = n_k * n_vpk;
+    assert_eq!(data.len(), n_v, "un_reorder_v_heads_1d: size mismatch");
+    let mut out = vec![0.0f32; n_v];
+    for i_k in 0..n_k {
+        for i_vpk in 0..n_vpk {
+            let tiled_idx   = i_vpk * n_k + i_k;
+            let grouped_idx = i_k * n_vpk + i_vpk;
+            out[grouped_idx] = data[tiled_idx];
+        }
+    }
+    out
+}
+
 /// Load a single linear-attention (DeltaNet) layer's weights.
+///
+/// # V-head un-reordering
+///
+/// `convert_hf_to_gguf.py`'s `_LinearAttentionVReorderBase._reorder_v_heads`
+/// permutes V-head dimensions from **grouped** order `[n_k, n_vpk, d]` to
+/// **tiled** order `[n_vpk, n_k, d]` so that ggml's broadcast semantics align
+/// K and V heads.  Our Metal GDN kernel maps `k_head = v_head / group_ratio`,
+/// which expects **grouped** order.  We undo the permutation here before
+/// storing tensors in `DeltaNetLayerWeights`.
+///
+/// Affected tensors (apex GGUF: n_k=16, n_vpk=2, d_v=128, hidden=2048):
+/// - `attn_qkv.weight`: V rows only (last `n_v * d_v` of the `qkv_total` rows)
+/// - `attn_gate.weight`: all rows (`[n_v * d_v, hidden]`)
+/// - `ssm_alpha.weight`: all rows (`[n_v, hidden]`)
+/// - `ssm_beta.weight`:  all rows (`[n_v, hidden]`)
+/// - `ssm_a`:            1-D `[n_v]`
+/// - `ssm_dt.bias`:      1-D `[n_v]`
+/// - `ssm_conv1d.weight` V channels only (last `n_v * d_v` channels of
+///                       `qkv_total` channels in the raw GGUF layout)
+/// - `ssm_out.weight`: V-head columns (dim=1); stored `[hidden, n_v * d_v]`
+///                     — reorder rows in the transposed view, i.e. reorder
+///                     contiguous row blocks in the `[n_v * d_v, hidden]`
+///                     interpretation.
 pub fn load_delta_net_layer(
     gguf: &GgufFile,
     cfg: &Qwen35Config,
@@ -146,19 +277,149 @@ pub fn load_delta_net_layer(
     device: &MlxDevice,
 ) -> Result<DeltaNetLayerWeights> {
     let p = format!("blk.{}", layer_idx);
+
+    // Key dimensions.
+    let nk     = cfg.linear_num_key_heads as usize;
+    let nv     = cfg.linear_num_value_heads as usize;
+    let n_vpk  = nv / nk;          // V-heads per K-head (2 for apex)
+    let dk     = cfg.linear_key_head_dim as usize;
+    let dv     = cfg.linear_value_head_dim as usize;
+    let h      = cfg.hidden_size as usize;
+    let k_width = cfg.linear_conv_kernel_dim as usize;
+    let qkv_channels = 2 * nk * dk + nv * dv;
+
     let attn_norm = load_f32_tensor(gguf, &format!("{p}.attn_norm.weight"), device)?;
-    let attn_qkv = load_f32_tensor(gguf, &format!("{p}.attn_qkv.weight"), device)?;
-    let attn_gate = load_f32_tensor(gguf, &format!("{p}.attn_gate.weight"), device)?;
-    let ssm_conv1d = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
-    let ssm_alpha = load_f32_tensor(gguf, &format!("{p}.ssm_alpha.weight"), device)?;
-    let ssm_dt_bias = load_f32_tensor(gguf, &format!("{p}.ssm_dt.bias"), device)?;
-    let ssm_beta = load_f32_tensor(gguf, &format!("{p}.ssm_beta.weight"), device)?;
-    let ssm_a = load_f32_tensor(gguf, &format!("{p}.ssm_a"), device)?; // no .weight suffix
+    let post_attn_norm = load_f32_tensor(gguf, &format!("{p}.post_attention_norm.weight"), device)
+        .with_context(|| format!("layer {layer_idx} post_attention_norm"))?;
+
+    // ---- attn_qkv ----
+    // GGUF shape: [qkv_total, hidden] = [(2*nk*dk + nv*dv), h]
+    // Only the V rows (the last nv*dv rows) are in tiled order; Q and K rows are unchanged.
+    let attn_qkv_raw = load_f32_tensor(gguf, &format!("{p}.attn_qkv.weight"), device)?;
+    let qk_rows = 2 * nk * dk; // number of Q+K rows (unchanged)
+    let v_rows  = nv * dv;     // number of V rows (need un-reorder)
+    assert_eq!(attn_qkv_raw.len(), (qk_rows + v_rows) * h, "attn_qkv shape");
+    let attn_qkv = {
+        let mut out = attn_qkv_raw.clone();
+        // Un-reorder only the V portion.
+        let v_raw = &attn_qkv_raw[qk_rows * h..];
+        // V has n_v rows, each row = dv * h elements? No — each of the n_v*dv rows has h elements.
+        // un_reorder_v_heads_rows treats each V "head" as dv rows of h elements each.
+        // row_stride = dv * h (all elements belonging to one V-head).
+        let v_reordered = un_reorder_v_heads_rows(v_raw, nk, n_vpk, dv, dv * h);
+        out[qk_rows * h..].copy_from_slice(&v_reordered);
+        out
+    };
+    drop(attn_qkv_raw);
+
+    // ---- attn_gate ----
+    // GGUF shape: [nv*dv, h]. All rows are in tiled order.
+    let attn_gate_raw = load_f32_tensor(gguf, &format!("{p}.attn_gate.weight"), device)?;
+    assert_eq!(attn_gate_raw.len(), nv * dv * h, "attn_gate shape");
+    let attn_gate = un_reorder_v_heads_rows(&attn_gate_raw, nk, n_vpk, dv, dv * h);
+    drop(attn_gate_raw);
+
+    // ---- ssm_conv1d ----
+    // GGUF layout: [channels, K] where channels = qkv_channels.
+    // The V portion of channels (last nv*dv channels) is in tiled order.
+    // Step 1: split off Q+K vs V channels, un-reorder V, reassemble.
+    // Step 2: transpose from [channels, K] to [K, channels] for CPU-ref.
+    let ssm_conv1d_gguf = load_f32_tensor(gguf, &format!("{p}.ssm_conv1d.weight"), device)?;
+    assert_eq!(ssm_conv1d_gguf.len(), qkv_channels * k_width, "ssm_conv1d shape");
+    let ssm_conv1d = {
+        // In [channels, K] layout:
+        // channels 0 .. qk_rows-1    = Q channels (unchanged)
+        // channels qk_rows .. qk_rows + nk*dk - 1 = K channels (unchanged; wait — qk_rows = 2*nk*dk, these are Q+K already)
+        // Actually qk_channels = 2*nk*dk (Q+K channels), v_channels = nv*dv.
+        let qk_ch = 2 * nk * dk;  // same as qk_rows for this model
+        let _v_ch  = nv * dv;  // kept for documentation; not used separately
+        let mut channels_reord = ssm_conv1d_gguf.clone();
+        // Un-reorder the V channel block. Each V "head" spans dv channels.
+        // In the [channels, K] view, V channels are channels qk_ch .. qk_ch+v_ch-1.
+        // Each channel is a K-element row. So each V-head = dv channels = dv * k_width elements.
+        let v_raw_ch = &ssm_conv1d_gguf[qk_ch * k_width..];
+        let v_reord_ch = un_reorder_v_heads_rows(v_raw_ch, nk, n_vpk, dv, dv * k_width);
+        channels_reord[qk_ch * k_width..].copy_from_slice(&v_reord_ch);
+
+        // Transpose [channels, K] → [K, channels].
+        let mut out = vec![0.0f32; k_width * qkv_channels];
+        for c in 0..qkv_channels {
+            for ki in 0..k_width {
+                out[ki * qkv_channels + c] = channels_reord[c * k_width + ki];
+            }
+        }
+        out
+    };
+    drop(ssm_conv1d_gguf);
+
+    // ---- ssm_alpha ----
+    // GGUF shape: [nv, h]. All rows in tiled order. row_stride = h (one row per V-head).
+    let ssm_alpha_raw = load_f32_tensor(gguf, &format!("{p}.ssm_alpha.weight"), device)?;
+    assert_eq!(ssm_alpha_raw.len(), nv * h, "ssm_alpha shape");
+    let ssm_alpha = un_reorder_v_heads_rows(&ssm_alpha_raw, nk, n_vpk, 1, h);
+    drop(ssm_alpha_raw);
+
+    // ---- ssm_dt_bias ----
+    // GGUF shape: [nv] (1-D). Tiled order.
+    let ssm_dt_raw = load_f32_tensor(gguf, &format!("{p}.ssm_dt.bias"), device)?;
+    assert_eq!(ssm_dt_raw.len(), nv, "ssm_dt_bias shape");
+    let ssm_dt_bias = un_reorder_v_heads_1d(&ssm_dt_raw, nk, n_vpk);
+    drop(ssm_dt_raw);
+
+    // ---- ssm_beta ----
+    // GGUF shape: [nv, h]. All rows in tiled order. row_stride = h.
+    let ssm_beta_raw = load_f32_tensor(gguf, &format!("{p}.ssm_beta.weight"), device)?;
+    assert_eq!(ssm_beta_raw.len(), nv * h, "ssm_beta shape");
+    let ssm_beta = un_reorder_v_heads_rows(&ssm_beta_raw, nk, n_vpk, 1, h);
+    drop(ssm_beta_raw);
+
+    // ---- ssm_a ----
+    // GGUF shape: [nv] (1-D). Tiled order.
+    let ssm_a_raw = load_f32_tensor(gguf, &format!("{p}.ssm_a"), device)?;
+    assert_eq!(ssm_a_raw.len(), nv, "ssm_a shape");
+    let ssm_a = un_reorder_v_heads_1d(&ssm_a_raw, nk, n_vpk);
+    drop(ssm_a_raw);
+
+    // ---- ssm_norm ----
+    // GGUF shape: [dv] (one norm shared across all V-heads — NOT [nv*dv]).
+    // No reordering needed.
     let ssm_norm = load_f32_tensor(gguf, &format!("{p}.ssm_norm.weight"), device)?;
-    let ssm_out = load_f32_tensor(gguf, &format!("{p}.ssm_out.weight"), device)?;
+
+    // ---- ssm_out ----
+    // GGUF shape: [hidden, nv*dv] (output projection, columns are V-head elements).
+    // The column dimension is reordered — equivalent to: in the transposed view
+    // [nv*dv, hidden], rows are in tiled order. Since we store ssm_out as
+    // [hidden, nv*dv] (row-major), the V-head groups are in the column (inner) dim.
+    // To un-reorder: treat this as n_v blocks of dv columns; reorder the blocks
+    // from tiled to grouped in the column dimension.
+    let ssm_out_raw = load_f32_tensor(gguf, &format!("{p}.ssm_out.weight"), device)?;
+    assert_eq!(ssm_out_raw.len(), h * nv * dv, "ssm_out shape");
+    let ssm_out = {
+        // [h, nv*dv] — for each row, un-reorder the nv*dv column elements.
+        // Each "V-head block" in a row is dv elements; there are nv such blocks in tiled order.
+        let n_cols = nv * dv;
+        let mut out = vec![0.0f32; h * n_cols];
+        for row in 0..h {
+            let src = &ssm_out_raw[row * n_cols..(row + 1) * n_cols];
+            let dst = &mut out[row * n_cols..(row + 1) * n_cols];
+            // Un-reorder the V-head blocks within this row.
+            for i_k in 0..nk {
+                for i_vpk in 0..n_vpk {
+                    let tiled_block   = i_vpk * nk + i_k;
+                    let grouped_block = i_k * n_vpk + i_vpk;
+                    let src_off = tiled_block   * dv;
+                    let dst_off = grouped_block * dv;
+                    dst[dst_off..dst_off + dv].copy_from_slice(&src[src_off..src_off + dv]);
+                }
+            }
+        }
+        out
+    };
+    drop(ssm_out_raw);
 
     Ok(DeltaNetLayerWeights {
         attn_norm,
+        post_attn_norm,
         attn_qkv,
         attn_gate,
         ssm_conv1d,
@@ -199,6 +460,88 @@ pub fn load_moe_ffn(
     })
 }
 
+/// Load an MoE FFN layer's weights, keeping expert tensors in their native
+/// GGML quantization (e.g. Q6_K).
+///
+/// Expert weight buffers (`ffn_{gate,up,down}_exps`) are loaded via
+/// `GgufFile::load_tensor` (raw GGML blocks, DType::U8 on Metal) rather than
+/// `load_tensor_f32`.  This avoids the ~3.2 GB per-layer F32 expansion that
+/// causes the OOM on the 35B apex model.
+///
+/// Small tensors (router, shared-expert) are still dequantized to f32 because
+/// they are projected with the existing F32 dense kernel.
+pub fn load_moe_ffn_quantized(
+    gguf: &GgufFile,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<MoeFfnWeightsQ> {
+    let p = format!("blk.{}", layer_idx);
+
+    // Router and shared-expert weights are small — dequantize to f32.
+    let router = load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp.weight"), device)?;
+    let shared_gate_logit =
+        load_f32_tensor(gguf, &format!("{p}.ffn_gate_inp_shexp.weight"), device)?;
+    let shared_gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate_shexp.weight"), device)?;
+    let shared_up   = load_f32_tensor(gguf, &format!("{p}.ffn_up_shexp.weight"), device)?;
+    let shared_down = load_f32_tensor(gguf, &format!("{p}.ffn_down_shexp.weight"), device)?;
+
+    // Expert weights: load raw GGML blocks, preserving quantization.
+    let expert_gate_q = gguf
+        .load_tensor(&format!("{p}.ffn_gate_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_gate_exps (quantized)"))?;
+    let expert_up_q = gguf
+        .load_tensor(&format!("{p}.ffn_up_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_up_exps (quantized)"))?;
+    let expert_down_q = gguf
+        .load_tensor(&format!("{p}.ffn_down_exps.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_down_exps (quantized)"))?;
+
+    // Gate and up may have a different quant type than down (e.g. Q5_K vs Q6_K
+    // in the apex GGUF).  Read each separately.
+    let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
+    let ggml_type_gate_up = gate_info.ggml_type;
+
+    let down_info = gguf.tensor_info(&format!("{p}.ffn_down_exps.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
+    let ggml_type_down = down_info.ggml_type;
+
+    let supported = |t: GgmlType| matches!(t,
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q5_K | GgmlType::Q6_K
+    );
+
+    // Validate that the types are supported by quantized_matmul_id_ggml.
+    // Q5_K uses the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
+    // also use mv_id for decode and mm_id for prefill batches > 8 tokens.
+    if !supported(ggml_type_gate_up) {
+        return Err(anyhow!(
+            "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+            ggml_type_gate_up
+        ));
+    }
+    if !supported(ggml_type_down) {
+        return Err(anyhow!(
+            "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q5_K, or Q6_K)",
+            ggml_type_down
+        ));
+    }
+
+    Ok(MoeFfnWeightsQ {
+        router,
+        expert_gate_q,
+        expert_up_q,
+        expert_down_q,
+        ggml_type_gate_up,
+        ggml_type_down,
+        shared_gate_logit,
+        shared_gate,
+        shared_up,
+        shared_down,
+    })
+}
+
 /// Load a dense FFN layer's weights.
 pub fn load_dense_ffn(
     gguf: &GgufFile,
@@ -226,9 +569,18 @@ pub fn load_layer(
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
+    // MoE variant: route to the quantized Q path — MoeFfnWeightsQ preserves
+    // the GGUF's native Q6_K/Q8_0 expert tensor layout and avoids the 128 GB
+    // F32 expansion that OOMs on the real 35B-A3B model (256 experts × 40
+    // layers × 3 tensors × 2048×512 × 4 bytes exceeds Metal's 112 GB working
+    // set cap). The F32 `load_moe_ffn` / `Qwen35FfnWeights::Moe` variant is
+    // preserved for synthetic-weight unit tests that deliberately use F32
+    // inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
     let ffn = match cfg.variant {
         Qwen35Variant::Dense => Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?),
-        Qwen35Variant::Moe => Qwen35FfnWeights::Moe(load_moe_ffn(gguf, layer_idx, device)?),
+        Qwen35Variant::Moe => {
+            Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(gguf, layer_idx, device)?)
+        }
     };
 
     match kind {

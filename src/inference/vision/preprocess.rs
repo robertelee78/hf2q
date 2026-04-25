@@ -88,13 +88,15 @@ pub fn preprocess_rgb_chw(bytes: &[u8], config: &PreprocessConfig) -> Result<Vec
     let mut out = vec![0f32; 3 * hw];
     for (y, row) in rgb.rows().enumerate() {
         for (x, pix) in row.enumerate() {
-            let r = pix[0] as f32 / 255.0;
-            let g = pix[1] as f32 / 255.0;
-            let b = pix[2] as f32 / 255.0;
+            let channels = [
+                pix[0] as f32 / 255.0,
+                pix[1] as f32 / 255.0,
+                pix[2] as f32 / 255.0,
+            ];
             let idx = y * size + x;
-            out[0 * hw + idx] = (r - config.mean[0]) / config.std[0];
-            out[1 * hw + idx] = (g - config.mean[1]) / config.std[1];
-            out[2 * hw + idx] = (b - config.mean[2]) / config.std[2];
+            for (c, &channel) in channels.iter().enumerate() {
+                out[c * hw + idx] = (channel - config.mean[c]) / config.std[c];
+            }
         }
     }
     Ok(out)

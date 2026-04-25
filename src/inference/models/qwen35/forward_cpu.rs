@@ -133,16 +133,22 @@ impl Qwen35Model {
             // Residual after attention.
             residual_add(&mut hidden, &attn_out);
 
-            // Post-attention norm (using the layer's attn_norm weight as the
-            // FFN-pre-norm proxy — apex GGUF emits a distinct tensor named
-            // `post_attention_norm.weight` per layer, but the CPU-ref layer
-            // functions already consume `attn_norm` internally. For the
-            // integrated reference we rely on the layer fn's internal norm
-            // and skip an extra outer norm here. A more precise impl would
-            // carry the post-attention norm weight in the layer struct;
-            // deferred to P11 GPU wiring iter).
+            // Post-attention RMSNorm: the normed value is the FFN *input* only.
+            // The FFN output is added back to `ffn_residual` (the pre-norm value),
+            // matching llama.cpp qwen35moe.cpp:
+            //   ffn_residual = cur;               // after attn residual, BEFORE norm
+            //   attn_post_norm = build_norm(cur); // norm for FFN input
+            //   cur = build_layer_ffn(attn_post_norm);
+            //   cur = ggml_add(cur, ffn_residual);// FFN residual is pre-norm
+            let ffn_residual = hidden.clone();
+            let mut ffn_input = hidden.clone();
+            let post_norm_w = match layer {
+                Qwen35LayerWeights::FullAttn { attn, .. } => &attn.post_attn_norm,
+                Qwen35LayerWeights::LinearAttn { attn, .. } => &attn.post_attn_norm,
+            };
+            rms_norm_rows(&mut ffn_input, post_norm_w, h, eps);
 
-            // FFN contribution.
+            // FFN contribution (takes normed input, not pre-norm residual).
             let ffn_out = match &layer.ffn() {
                 Qwen35FfnWeights::Dense(w) => {
                     let m = self
@@ -153,7 +159,7 @@ impl Qwen35Model {
                         hidden_size: self.cfg.hidden_size,
                         intermediate_size: m,
                     };
-                    dense_swiglu_cpu_ref(&hidden, w, shape)
+                    dense_swiglu_cpu_ref(&ffn_input, w, shape)
                 }
                 Qwen35FfnWeights::Moe(w) => {
                     let moe = self.cfg.moe.as_ref().ok_or_else(|| {
@@ -166,11 +172,22 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    moe_ffn_cpu_ref(&hidden, w, shape)
+                    moe_ffn_cpu_ref(&ffn_input, w, shape)
+                }
+                // MoeQ is a GGUF-loaded quantized variant; forward_cpu does not
+                // support it (expert weights are Metal buffers, not f32 vecs).
+                // CPU-only inference is not needed for the production path.
+                Qwen35FfnWeights::MoeQ(_) => {
+                    return Err(anyhow!(
+                        "forward_cpu does not support MoeQ (quantized expert weights \
+                         loaded from GGUF); use forward_gpu instead"
+                    ));
                 }
             };
 
-            // Residual after FFN.
+            // Residual after FFN: add to pre-norm value (ffn_residual), not normed.
+            // This matches llama.cpp's `cur = ggml_add(cur, ffn_residual)`.
+            hidden = ffn_residual;
             residual_add(&mut hidden, &ffn_out);
         }
 

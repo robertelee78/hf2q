@@ -1107,19 +1107,16 @@ mod tests {
         let fp = make_moe_fingerprint(); // Gemma4ForConditionalGeneration
         assert_eq!(classify_architecture(&fp), ArchFamily::GemmaMoE);
 
-        let overrides_before = {
-            // Simulate the pre-P6 call: only rules 2-5 should fire
-            let mut expected = Vec::new();
+        let overrides_before = vec![
             // Rule 2: router.proj at 8-bit (Gemma is MoE, non-qwen35)
-            expected.push("router.proj".to_string());
+            "router.proj".to_string(),
             // Rule 3: mlp.{gate,up,down}_proj at 8-bit (base=4)
-            expected.push("mlp.gate_proj".to_string());
-            expected.push("mlp.up_proj".to_string());
-            expected.push("mlp.down_proj".to_string());
+            "mlp.gate_proj".to_string(),
+            "mlp.up_proj".to_string(),
+            "mlp.down_proj".to_string(),
             // Rule 4: v_proj at 6-bit
-            expected.push("v_proj".to_string());
-            expected
-        };
+            "v_proj".to_string(),
+        ];
 
         let overrides = build_component_overrides(ArchFamily::GemmaMoE, &fp, 4);
         let patterns: Vec<&str> = overrides.iter().map(|o| o.pattern.as_str()).collect();
