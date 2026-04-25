@@ -1930,6 +1930,37 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 82 — speed baseline measured. hf2q `/v1/embeddings` warm: 190 ms/req. llama-embedding cold (incl. model load): 565 ms/run. Internal llama.cpp prompt-eval time on the same input: 4.54 ms. hf2q's 190 ms vs llama.cpp's 4.5 ms is a **42× compute gap** — the user-stated bar ("as fast as or faster than llama.cpp") is missed by a wide margin. Root cause identified, optimization plan locked.**
+  - **Measurement methodology.** Same model (`nomic-embed-text-v1.5-f16.gguf`), same input (`"hello world"`), same machine. `llama-embedding -m … -p "hello world" --pooling mean` invoked 5× cold (each run loads the model from disk + runs forward + frees). hf2q server booted once with the same model, then 10 sequential `curl POST /v1/embeddings` warm requests. All values via `python3 time.perf_counter()` wall clock around the curl.
+  - **Numbers.**
+    ```
+    llama-embedding cold (5 runs):  629  565  564  548  557 ms
+                          mean ≈ 565 ms (includes ~500 ms model load per call)
+    llama-embedding internal:    prompt_eval=4.54 ms / 4 tokens (forward only)
+
+    hf2q warm (10 runs):          198  194  193  187  191
+                                  187  193  189  195  190 ms
+                          mean ≈ 191 ms (forward + HTTP + JSON serialize)
+    ```
+    hf2q's "warm-vs-cold" beats llama-embedding because we amortize model load. But warm-vs-warm — the actual per-request compute we should be benchmarking against — is 191 ms vs 4.54 ms. **Not acceptable.**
+  - **Why the warm-vs-warm gap is real (not a methodology artifact).**
+    - hf2q's 191 ms is uniform across all 10 requests (req 1 = 198 ms, req 10 = 190 ms — drift of ~5%). If shader compilation were dominant, req 1 would be ~150–200 ms slower than req 10. It's not. The cost is structural per-request.
+    - llama.cpp's `prompt_eval = 4.54 ms / 4 tokens` is the GPU forward only (after model load + warmup). Adding HTTP / JSON layers wouldn't move the needle.
+    - Apple Silicon GPU for a 12-layer × 768-hidden encoder forward on 32 padded tokens should be in the ~5–15 ms range with proper dispatch. We're 12–40× slower than the hardware can do.
+  - **Root cause hypothesis (highest signal first).**
+    1. **Per-request F32→BF16 weight cast.** `bert_linear_gpu` (called by both BERT and nomic-bert composers) allocates a fresh BF16 buffer and dispatches a cast kernel on EVERY call: line 514–531 of `bert/bert_gpu.rs`. nomic-bert at 12 layers calls it ~7× per layer (Q, K, V, attn_out, ffn_up, ffn_gate, ffn_down) = **~84 cast dispatches per request**. Each cast is a full encoder dispatch (alloc + kernel + barrier). Even at 1 ms each that's 84 ms; at 2 ms each that's 168 ms — fits the 190 ms budget exactly.
+    2. Each request also creates a fresh `MlxDevice`, fresh `KernelRegistry`, fresh `GraphExecutor`. `MlxDevice::new()` is cheap; `KernelRegistry::new()` only registers shader sources (no compile until first `get_pipeline`). After the first request these would all be one-time costs anyway, but right now they're per-request.
+    3. Per-call buffer allocs (mask, position_ids, rope_params, intermediates) — each is small (~KB) but adds up across the dispatch chain.
+  - **Optimization plan (iter 83).**
+    1. **Pre-cast weights to BF16 at load time.** Extend `LoadedBertWeights` / `LoadedNomicBertWeights` to optionally store both F32 (for kernels that need it like LayerNorm, embed gather) AND BF16 (for matmul). On load, walk every linear-style tensor (any 2D weight whose name matches `attn_*.weight | ffn_*.weight | attn_qkv.weight`), cast once, store the BF16 in the same map under the same key. `bert_linear_gpu` checks for a pre-cast BF16 and skips the cast dispatch. Non-linear tensors (norms, embeddings) stay F32. Per-request cast dispatches drop from ~84 to ~0.
+    2. **Persistent `KernelRegistry`.** Add `Arc<Mutex<KernelRegistry>>` to `AppState`, pre-warm at boot via one forward. Per-request: lock briefly, get cached pipelines, dispatch, release. Eliminates per-request shader-source-register cost (small but real).
+    3. **Pre-allocated output buffer.** For pooled output (single `[hidden]` F32), keep a per-arch ring of allocated buffers. Eliminates one alloc per request. Marginal.
+    4. **Validation gate.** After each optimization, re-run cosine parity (≥ 0.999) AND re-run the warm-10-request benchmark. Cosine MUST stay green; speed MUST monotonically decrease.
+  - **Expected outcome.** Pre-casting alone should drop ~150 ms (84 dispatches × ~1.8 ms). Persistent registry might shave ~5–10 ms. Target: ≤ 20 ms per warm request. **Stretch goal: ≤ 10 ms** — within 2× of llama.cpp's 4.5 ms forward.
+  - **Verification artifact.** `scripts/bench_embedding.sh` (next iter) — locks the 5×llama-cold + 10×hf2q-warm methodology so future regressions show up against this baseline.
+  - **Lane discipline.** Read-only this iter (measurement + analysis). No code changed.
+  - **Next (iter 83):** implement optimization #1 (pre-cast weights to BF16 at load). Target: warm-request median ≤ 30 ms. Land cosine parity + benchmark gates that fire in CI.
+
 - **2026-04-26 loop iter 81 — Task #16 CLOSED. Handler integration shipped: `EmbeddingArch` enum drives arch dispatch through `/v1/embeddings`. End-to-end smoke against real `nomic-embed-text-v1.5-f16.gguf` produces dim=768, ||y||₂=1.000000, first4 bit-identical to the cosine-parity test output.**
   - **What landed.** `EmbeddingModel` refactored from BERT-only to arch-agnostic via a new `EmbeddingArch` enum:
     ```rust
