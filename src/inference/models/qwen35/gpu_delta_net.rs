@@ -1155,12 +1155,15 @@ mod tests {
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
         let state_in_gpu = upload_f32(&state_in, &device).expect("upload state_in");
         let state_out_gpu = upload_f32(&state_in, &device).expect("upload state_out scratch");
-        let (gpu_out_buf, _) = build_delta_net_layer(
+        let conv_state_in_gpu = upload_f32(&conv_state, &device).expect("upload conv_state_in");
+        let conv_state_out_gpu = upload_f32(&conv_state, &device).expect("alloc conv_state_out");
+        let gpu_out_buf = build_delta_net_layer(
             &device,
             &mut registry,
             &x_gpu,
             &gpu_weights,
-            &conv_state,
+            &conv_state_in_gpu,
+            &conv_state_out_gpu,
             &state_in_gpu,
             &state_out_gpu,
             seq_len,
@@ -1307,37 +1310,46 @@ mod tests {
         let x_full_gpu = upload_f32(&x_full, &device).expect("upload");
         let state_zeros_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros mono");
         let state_scratch_mono = upload_f32(&state_zeros, &device).expect("state scratch mono");
-        let (mono_buf, _) = build_delta_net_layer(
+        let conv_zeros_gpu_mono = upload_f32(&conv_zeros, &device).expect("upload conv mono in");
+        let conv_scratch_mono = upload_f32(&conv_zeros, &device).expect("alloc conv mono out");
+        let mono_buf = build_delta_net_layer(
             &device, &mut registry, &x_full_gpu, &gpu_weights,
-            &conv_zeros, &state_zeros_gpu, &state_scratch_mono,
+            &conv_zeros_gpu_mono, &conv_scratch_mono,
+            &state_zeros_gpu, &state_scratch_mono,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("mono");
         let mono_out = download_f32(&mono_buf).expect("dl mono");
 
         // Chunked: token 0 then token 1.
-        // Use ping-pong: after t0, state_after_t0_gpu holds the new state.
-        // Feed it as state_in for t1.
+        // Use ping-pong: after t0, conv_t0_out / state_t0_out hold the new
+        // conv-state and recurrent-state; feed them in for t1.
         let x_t0 = x_full[0..h].to_vec();
         let x_t1 = x_full[h..2 * h].to_vec();
 
         let x_t0_gpu = upload_f32(&x_t0, &device).expect("upload t0");
         let state_t0_in = upload_f32(&state_zeros, &device).expect("upload state t0 in");
         let state_t0_out = upload_f32(&state_zeros, &device).expect("alloc state t0 out");
-        let (t0_buf, conv_after_t0) = build_delta_net_layer(
+        let conv_t0_in = upload_f32(&conv_zeros, &device).expect("upload conv t0 in");
+        let conv_t0_out = upload_f32(&conv_zeros, &device).expect("alloc conv t0 out");
+        let t0_buf = build_delta_net_layer(
             &device, &mut registry, &x_t0_gpu, &gpu_weights,
-            &conv_zeros, &state_t0_in, &state_t0_out,
+            &conv_t0_in, &conv_t0_out,
+            &state_t0_in, &state_t0_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t0");
         let t0_out = download_f32(&t0_buf).expect("dl t0");
 
-        // state_t0_out holds state after t0; use it as state_in for t1.
+        // conv_t0_out / state_t0_out now hold post-t0 ping-pong state;
+        // feed each as the *_in for t1 and allocate fresh _out scratch.
         let x_t1_gpu = upload_f32(&x_t1, &device).expect("upload t1");
         let state_t1_out = upload_f32(&state_zeros, &device).expect("alloc state t1 out");
-        let (t1_buf, _) = build_delta_net_layer(
+        let conv_t1_out = upload_f32(&conv_zeros, &device).expect("alloc conv t1 out");
+        let t1_buf = build_delta_net_layer(
             &device, &mut registry, &x_t1_gpu, &gpu_weights,
-            &conv_after_t0, &state_t0_out, &state_t1_out,
+            &conv_t0_out, &conv_t1_out,
+            &state_t0_out, &state_t1_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t1");
