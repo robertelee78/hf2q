@@ -63,7 +63,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
-use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
 use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
@@ -399,6 +399,10 @@ fn silu_mul_cpu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 ///
 /// `|GPU − dense_swiglu_cpu_ref(x, weights, shape)|∞ < 1e-3` F32.
 /// Source: three BF16-cast projections each contribute ≤1e-3 rounding.
+///
+/// When `add_residual` is `Some(r)`, the kernel folds `r` into the output
+/// in the same command buffer, eliminating a separate `residual_add_gpu`
+/// commit per dense FFN layer.
 #[allow(clippy::too_many_arguments)]
 pub fn build_dense_ffn_layer_gpu(
     device: &MlxDevice,
@@ -406,11 +410,13 @@ pub fn build_dense_ffn_layer_gpu(
     x: &MlxBuffer,
     weights_gpu: &DenseFfnWeightsGpu,
     shape: DenseFfnShape,
+    add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size;
     let m = shape.intermediate_size;
     let seq_len = (x.element_count() / h as usize) as u32;
     let n_h = (seq_len * m) as u32;
+    let n_out = seq_len as usize * h as usize;
 
     // Pre-allocate intermediate buffers (must outlive the encoder).
     let hidden_buf = device
@@ -421,8 +427,7 @@ pub fn build_dense_ffn_layer_gpu(
         .map_err(|e| anyhow!("alloc dense silu params: {e}"))?;
     silu_params.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
 
-    // Single encoder: gate+up projs (concurrent) → silu_mul → down proj.
-    // Saves 2 commit_and_wait calls vs the previous 3-encoder approach.
+    // Single encoder: gate+up projs (concurrent) → silu_mul → down proj [→ residual add].
     let mut enc = device.command_encoder().context("enc dense swiglu")?;
     // Ops 1+2: gate and up projections — concurrent (both read from x)
     let gate_buf = proj(&mut enc, registry, device, x, &weights_gpu.gate, seq_len, h, m)?;
@@ -437,9 +442,26 @@ pub fn build_dense_ffn_layer_gpu(
     // Barrier: down proj reads hidden written above.
     enc.memory_barrier();
     // Op 4: out = down_proj(hidden)
-    let out = proj(&mut enc, registry, device, &hidden_buf, &weights_gpu.down, seq_len, m, h)?;
+    let down_out = proj(&mut enc, registry, device, &hidden_buf, &weights_gpu.down, seq_len, m, h)?;
+
+    // Op 5 (optional): out += residual — folded into this encoder to save 1 commit per layer.
+    let result = if let Some(res) = add_residual {
+        let sum_buf = device
+            .alloc_buffer(n_out * 4, DType::F32, vec![n_out])
+            .map_err(|e| anyhow!("alloc dense ffn residual sum: {e}"))?;
+        // Barrier: elementwise_add reads down_out written by Op 4.
+        enc.memory_barrier();
+        elementwise_add(
+            &mut enc, registry, device.metal_device(),
+            &down_out, res, &sum_buf, n_out, DType::F32,
+        ).context("dense ffn residual add")?;
+        sum_buf
+    } else {
+        down_out
+    };
+
     enc.commit_and_wait().context("commit dense swiglu")?;
-    Ok(out)
+    Ok(result)
 }
 
 // ================================================================
@@ -1020,7 +1042,7 @@ mod tests {
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
 
         let gpu_buf =
-            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape)
+            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape, None)
                 .expect("build_dense_ffn_layer_gpu");
 
         let gpu_out = download_f32(&gpu_buf).expect("download gpu out");
@@ -1082,7 +1104,7 @@ mod tests {
         let weights_gpu = DenseFfnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
         let gpu_buf =
-            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape)
+            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape, None)
                 .expect("gpu ffn");
         let gpu_out = download_f32(&gpu_buf).expect("download");
 
@@ -1120,7 +1142,7 @@ mod tests {
         let weights_gpu = DenseFfnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
         let gpu_buf =
-            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape)
+            build_dense_ffn_layer_gpu(&device, &mut registry, &x_buf, &weights_gpu, shape, None)
                 .expect("gpu ffn");
         let gpu_out = download_f32(&gpu_buf).expect("download");
         for (i, &v) in gpu_out.iter().enumerate() {

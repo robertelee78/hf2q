@@ -683,7 +683,11 @@ impl Qwen35Model {
                         hidden_size: h,
                         intermediate_size: m,
                     };
-                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape)
+                    // Fold the post-FFN residual add into the dense FFN command buffer,
+                    // saving 1 commit_and_wait per dense layer (30 layers × 1 = 30 fewer
+                    // GPU syncs per decode token).
+                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
+                        Some(&ffn_residual))
                         .with_context(|| format!("dense_ffn layer {layer_idx}"))?
                 }
                 FfnWeightsGpu::Moe(w_gpu) => {
@@ -735,8 +739,9 @@ impl Qwen35Model {
             // Keep a clone for the optional layer dump below; only paid when dump is active.
             let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
             hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) => {
-                    // Residual already folded in build_moe_ffn_layer_gpu_q.
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) => {
+                    // Residual already folded in build_moe_ffn_layer_gpu_q /
+                    // build_dense_ffn_layer_gpu (with add_residual=Some).
                     ffn_out
                 }
                 _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
