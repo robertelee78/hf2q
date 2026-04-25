@@ -58,8 +58,8 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::super::bert::bert_gpu::{
     alloc_bert_attention_mask, bert_attention_with_mask_gpu, bert_embed_gather_gpu,
-    bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_gpu, bert_pool_gpu, bert_residual_add_gpu,
-    register_bert_custom_shaders, BertPoolKind,
+    bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu, bert_linear_gpu,
+    bert_pool_gpu, bert_residual_add_gpu, register_bert_custom_shaders, BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
 use super::config::NomicBertConfig;
@@ -264,26 +264,37 @@ fn alloc_silu_mul_params(device: &MlxDevice, n: u32) -> Result<MlxBuffer> {
 /// Caller pulls each tensor from `LoadedNomicBertWeights`. Biases are
 /// optional (nomic-embed-text-v1.5 ships zero biases on its linears).
 pub struct NomicBertEncoderBlockTensors<'a> {
-    /// Fused QKV projection: `[hidden, 3*hidden]` weight + optional
+    /// Fused QKV projection: `[3*hidden, hidden]` F32 weight + optional
     /// `[3*hidden]` bias. Splitting happens at use site via `slice_view`.
     pub qkv_w: &'a MlxBuffer,
     pub qkv_b: Option<&'a MlxBuffer>,
-    /// Attention output projection: `[hidden, hidden]` + optional `[hidden]` bias.
+    /// Pre-cast BF16 fused QKV weight (`[3*hidden, hidden]`, 2 bytes/elem).
+    /// When `Some`, the composer slices this BF16 buffer for Q/K/V and
+    /// dispatches `bert_linear_bf16_gpu` (no per-call cast). When `None`,
+    /// falls back to the F32 path via `bert_linear_gpu`. Iter-83 perf
+    /// optimization — populated by `LoadedNomicBertWeights::block_weight_bf16`.
+    pub qkv_w_bf16: Option<&'a MlxBuffer>,
+    /// Attention output projection: `[hidden, hidden]` F32 + optional bias.
     pub o_w: &'a MlxBuffer,
     pub o_b: Option<&'a MlxBuffer>,
-    /// Post-attention LayerNorm γ, β. Both `[hidden]`.
+    /// Pre-cast BF16 attention output weight (`[hidden, hidden]`).
+    pub o_w_bf16: Option<&'a MlxBuffer>,
+    /// Post-attention LayerNorm γ, β. Both `[hidden]` F32.
     pub attn_norm_gamma: &'a MlxBuffer,
     pub attn_norm_beta: &'a MlxBuffer,
-    /// FFN up projection: `[intermediate, hidden]` + optional `[intermediate]` bias.
+    /// FFN up projection: `[intermediate, hidden]` F32 + optional bias.
     pub up_w: &'a MlxBuffer,
     pub up_b: Option<&'a MlxBuffer>,
-    /// FFN gate projection: `[intermediate, hidden]` + optional `[intermediate]` bias.
+    pub up_w_bf16: Option<&'a MlxBuffer>,
+    /// FFN gate projection: `[intermediate, hidden]` F32 + optional bias.
     pub gate_w: &'a MlxBuffer,
     pub gate_b: Option<&'a MlxBuffer>,
-    /// FFN down projection: `[hidden, intermediate]` + optional `[hidden]` bias.
+    pub gate_w_bf16: Option<&'a MlxBuffer>,
+    /// FFN down projection: `[hidden, intermediate]` F32 + optional bias.
     pub down_w: &'a MlxBuffer,
     pub down_b: Option<&'a MlxBuffer>,
-    /// Post-FFN LayerNorm γ, β. Both `[hidden]`.
+    pub down_w_bf16: Option<&'a MlxBuffer>,
+    /// Post-FFN LayerNorm γ, β. Both `[hidden]` F32.
     pub ffn_norm_gamma: &'a MlxBuffer,
     pub ffn_norm_beta: &'a MlxBuffer,
 }
@@ -364,28 +375,30 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // kernel, passes the byte offset via `setBuffer:offset:atIndex:`.
     // The matmul kernel reads `out_features × in_features` from the
     // bound buffer and stays within the slice region.
-    // **Iter 80 fix landed in mlx-native v0.4.3.** `MlxBuffer::slice_view`
-    // now propagates `byte_offset` through `KernelArg::Buffer` (encoder.rs:166
-    // changed `0` → `buf.byte_offset()`), making the documented contract of
-    // `slice_view` honored end-to-end through the matmul kernel. The fused
-    // QKV weight `[3*hidden, hidden]` (ggml shape `{ne0=in_features=hidden,
-    // ne1=out_features=3*hidden}`, out-dim contiguous-by-block) is sliced
-    // directly: Q at byte offset 0, K at `hidden·hidden·4`, V at
-    // `2·hidden·hidden·4`. Each slice exposes `[hidden, hidden]` weights
-    // for one logical projection — `bert_linear_gpu`'s internal cast +
-    // matmul reads them correctly.
+    // **Iter 83 perf fast path: BF16 pre-cast.** When `qkv_w_bf16` is
+    // present (production lane via `LoadedNomicBertWeights::load`), slice
+    // it directly into Q/K/V BF16 sub-views and dispatch
+    // `bert_linear_bf16_gpu` (no per-call cast, no per-call BF16 alloc).
+    // Eliminates 3 × 12 = 36 cast dispatches per request for the QKV
+    // step alone. Falls back to F32 path when BF16 is absent (test
+    // scaffolding only). Slice math: BF16 is 2 bytes/elem so per-block
+    // byte offsets are half the F32 ones, while element counts stay
+    // the same.
     //
-    // Iter 79 history: pre-fix this composer needed a 3 × hidden × hidden
-    // × 4 = 7 MB per-layer per-request copy workaround. v0.4.3 eliminates
-    // it; cosine parity vs llama-embedding stays ≥ 0.999.
-    let weight_bytes_per_block = (hidden as usize) * (hidden as usize) * 4;
+    // **Iter 80 enabling fix (mlx-native v0.4.3+):** `MlxBuffer::slice_view`
+    // now propagates `byte_offset` through `KernelArg::Buffer` (was
+    // hardcoded 0 pre-fix), making the documented slice contract honored
+    // end-to-end through the matmul kernel.
     let weight_elems_per_block = (hidden as usize) * (hidden as usize);
+    let weight_bytes_per_block_f32 = weight_elems_per_block * 4;
+    let weight_bytes_per_block_bf16 = weight_elems_per_block * 2;
+
     let q_w = tensors.qkv_w.slice_view(0, weight_elems_per_block);
     let k_w = tensors
         .qkv_w
-        .slice_view(weight_bytes_per_block as u64, weight_elems_per_block);
+        .slice_view(weight_bytes_per_block_f32 as u64, weight_elems_per_block);
     let v_w = tensors.qkv_w.slice_view(
-        (2 * weight_bytes_per_block) as u64,
+        (2 * weight_bytes_per_block_f32) as u64,
         weight_elems_per_block,
     );
 
@@ -405,21 +418,50 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     let k_b_ref = k_b.as_ref();
     let v_b_ref = v_b.as_ref();
 
-    let q_proj = bert_linear_gpu(
-        encoder, registry, device, input, &q_w, q_b_ref, seq_len, hidden, hidden,
-    )
-    .context("nomic block: q_proj linear")?;
-    encoder.memory_barrier();
-    let k_proj = bert_linear_gpu(
-        encoder, registry, device, input, &k_w, k_b_ref, seq_len, hidden, hidden,
-    )
-    .context("nomic block: k_proj linear")?;
-    encoder.memory_barrier();
-    let v_proj = bert_linear_gpu(
-        encoder, registry, device, input, &v_w, v_b_ref, seq_len, hidden, hidden,
-    )
-    .context("nomic block: v_proj linear")?;
-    encoder.memory_barrier();
+    // Dispatch QKV via BF16 fast path when pre-cast is available; else
+    // F32 (the cast happens inside bert_linear_gpu per-call).
+    let (q_proj, k_proj, v_proj) = if let Some(qkv_bf16) = tensors.qkv_w_bf16 {
+        let q_w_bf16 = qkv_bf16.slice_view(0, weight_elems_per_block);
+        let k_w_bf16 =
+            qkv_bf16.slice_view(weight_bytes_per_block_bf16 as u64, weight_elems_per_block);
+        let v_w_bf16 = qkv_bf16.slice_view(
+            (2 * weight_bytes_per_block_bf16) as u64,
+            weight_elems_per_block,
+        );
+        let q = bert_linear_bf16_gpu(
+            encoder, registry, device, input, &q_w_bf16, q_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: q_proj bf16 linear")?;
+        encoder.memory_barrier();
+        let k = bert_linear_bf16_gpu(
+            encoder, registry, device, input, &k_w_bf16, k_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: k_proj bf16 linear")?;
+        encoder.memory_barrier();
+        let v = bert_linear_bf16_gpu(
+            encoder, registry, device, input, &v_w_bf16, v_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: v_proj bf16 linear")?;
+        encoder.memory_barrier();
+        (q, k, v)
+    } else {
+        let q = bert_linear_gpu(
+            encoder, registry, device, input, &q_w, q_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: q_proj linear (f32 fallback)")?;
+        encoder.memory_barrier();
+        let k = bert_linear_gpu(
+            encoder, registry, device, input, &k_w, k_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: k_proj linear (f32 fallback)")?;
+        encoder.memory_barrier();
+        let v = bert_linear_gpu(
+            encoder, registry, device, input, &v_w, v_b_ref, seq_len, hidden, hidden,
+        )
+        .context("nomic block: v_proj linear (f32 fallback)")?;
+        encoder.memory_barrier();
+        (q, k, v)
+    };
 
     // ---- 2. RoPE-NeoX on Q and K (V unrotated) ----
     //
@@ -489,18 +531,17 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     encoder.memory_barrier();
 
     // ---- 4. Output projection ----
-    let attn_proj = bert_linear_gpu(
-        encoder,
-        registry,
-        device,
-        &attn_out,
-        tensors.o_w,
-        tensors.o_b,
-        seq_len,
-        hidden,
-        hidden,
-    )
-    .context("nomic block: attention output projection")?;
+    let attn_proj = if let Some(o_w_bf16) = tensors.o_w_bf16 {
+        bert_linear_bf16_gpu(
+            encoder, registry, device, &attn_out, o_w_bf16, tensors.o_b, seq_len, hidden, hidden,
+        )
+        .context("nomic block: attention output bf16 projection")?
+    } else {
+        bert_linear_gpu(
+            encoder, registry, device, &attn_out, tensors.o_w, tensors.o_b, seq_len, hidden, hidden,
+        )
+        .context("nomic block: attention output projection (f32 fallback)")?
+    };
     encoder.memory_barrier();
 
     // ---- 5. Residual + post-attention LayerNorm ----
@@ -543,32 +584,34 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // `ops/silu_mul.rs:25-26`.
     let n_ffn = (seq_len as usize) * (intermediate as usize);
 
-    let up_proj = bert_linear_gpu(
-        encoder,
-        registry,
-        device,
-        &after_attn_norm,
-        tensors.up_w,
-        tensors.up_b,
-        seq_len,
-        hidden,
-        intermediate,
-    )
-    .context("nomic block: ffn_up linear")?;
+    let up_proj = if let Some(up_w_bf16) = tensors.up_w_bf16 {
+        bert_linear_bf16_gpu(
+            encoder, registry, device, &after_attn_norm, up_w_bf16, tensors.up_b, seq_len, hidden,
+            intermediate,
+        )
+        .context("nomic block: ffn_up bf16 linear")?
+    } else {
+        bert_linear_gpu(
+            encoder, registry, device, &after_attn_norm, tensors.up_w, tensors.up_b, seq_len,
+            hidden, intermediate,
+        )
+        .context("nomic block: ffn_up linear (f32 fallback)")?
+    };
     encoder.memory_barrier();
 
-    let gate_proj = bert_linear_gpu(
-        encoder,
-        registry,
-        device,
-        &after_attn_norm,
-        tensors.gate_w,
-        tensors.gate_b,
-        seq_len,
-        hidden,
-        intermediate,
-    )
-    .context("nomic block: ffn_gate linear")?;
+    let gate_proj = if let Some(gate_w_bf16) = tensors.gate_w_bf16 {
+        bert_linear_bf16_gpu(
+            encoder, registry, device, &after_attn_norm, gate_w_bf16, tensors.gate_b, seq_len,
+            hidden, intermediate,
+        )
+        .context("nomic block: ffn_gate bf16 linear")?
+    } else {
+        bert_linear_gpu(
+            encoder, registry, device, &after_attn_norm, tensors.gate_w, tensors.gate_b, seq_len,
+            hidden, intermediate,
+        )
+        .context("nomic block: ffn_gate linear (f32 fallback)")?
+    };
     encoder.memory_barrier();
 
     let silu_gated = device
@@ -600,18 +643,19 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     .map_err(|e| anyhow!("nomic block: silu_mul: {e}"))?;
     encoder.memory_barrier();
 
-    let down_proj = bert_linear_gpu(
-        encoder,
-        registry,
-        device,
-        &silu_gated,
-        tensors.down_w,
-        tensors.down_b,
-        seq_len,
-        intermediate,
-        hidden,
-    )
-    .context("nomic block: ffn_down linear")?;
+    let down_proj = if let Some(down_w_bf16) = tensors.down_w_bf16 {
+        bert_linear_bf16_gpu(
+            encoder, registry, device, &silu_gated, down_w_bf16, tensors.down_b, seq_len,
+            intermediate, hidden,
+        )
+        .context("nomic block: ffn_down bf16 linear")?
+    } else {
+        bert_linear_gpu(
+            encoder, registry, device, &silu_gated, tensors.down_w, tensors.down_b, seq_len,
+            intermediate, hidden,
+        )
+        .context("nomic block: ffn_down linear (f32 fallback)")?
+    };
     encoder.memory_barrier();
 
     // ---- 7. Residual + post-FFN LayerNorm ----
@@ -773,16 +817,21 @@ pub fn apply_nomic_bert_full_forward_gpu(
         let tensors = NomicBertEncoderBlockTensors {
             qkv_w: weights.block_required(layer_idx, "attn_qkv.weight")?,
             qkv_b: weights.block_optional(layer_idx, "attn_qkv.bias"),
+            qkv_w_bf16: weights.block_weight_bf16(layer_idx, "attn_qkv.weight"),
             o_w: weights.block_required(layer_idx, "attn_output.weight")?,
             o_b: weights.block_optional(layer_idx, "attn_output.bias"),
+            o_w_bf16: weights.block_weight_bf16(layer_idx, "attn_output.weight"),
             attn_norm_gamma: weights.block_required(layer_idx, "attn_output_norm.weight")?,
             attn_norm_beta: weights.block_required(layer_idx, "attn_output_norm.bias")?,
             up_w: weights.block_required(layer_idx, "ffn_up.weight")?,
             up_b: weights.block_optional(layer_idx, "ffn_up.bias"),
+            up_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_up.weight"),
             gate_w: weights.block_required(layer_idx, "ffn_gate.weight")?,
             gate_b: weights.block_optional(layer_idx, "ffn_gate.bias"),
+            gate_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_gate.weight"),
             down_w: weights.block_required(layer_idx, "ffn_down.weight")?,
             down_b: weights.block_optional(layer_idx, "ffn_down.bias"),
+            down_w_bf16: weights.block_weight_bf16(layer_idx, "ffn_down.weight"),
             ffn_norm_gamma: weights.block_required(layer_idx, "layer_output_norm.weight")?,
             ffn_norm_beta: weights.block_required(layer_idx, "layer_output_norm.bias")?,
         };
@@ -1436,6 +1485,93 @@ mod tests {
             norm,
             max_abs,
             &view[..4]
+        );
+    }
+
+    /// Iter-83 perf isolation test: time 10 sequential full-forward
+    /// dispatches on the same loaded weights, single process, no HTTP /
+    /// spawn_blocking overhead. Identifies the floor cost of the
+    /// forward pass alone. Comparison target: llama-embedding's
+    /// internal `prompt_eval=4.54 ms` for the same 4-token input.
+    ///
+    /// `#[ignore]` because it depends on the real GGUF and the timing
+    /// is environment-sensitive; run with
+    /// `cargo test --release --bin hf2q -- forward_timing_10x_warm --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf timing test; run with --ignored --nocapture"]
+    fn forward_timing_10x_warm() {
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
+        use std::time::Instant;
+
+        use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: nomic GGUF fixture not at {}", model_path.display());
+            return;
+        }
+
+        let gguf = GgufFile::open(model_path).expect("open nomic GGUF");
+        let cfg = NomicBertConfig::from_gguf(&gguf).expect("parse cfg");
+        let tok = build_nomic_wordpiece_tokenizer(model_path).expect("tok");
+
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count = real_ids.len() as u32;
+        let seq_len: u32 = 32;
+        let pad_id = tok.specials().pad;
+        let mut padded_ids: Vec<u32> = real_ids.clone();
+        while padded_ids.len() < seq_len as usize {
+            padded_ids.push(pad_id);
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+        register_nomic_bert_kernels(&mut registry);
+        let weights = LoadedNomicBertWeights::load_from_path(model_path, &cfg).expect("load");
+
+        let input_ids = device
+            .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
+            .expect("alloc input_ids");
+        unsafe {
+            let s: &mut [u32] = std::slice::from_raw_parts_mut(
+                input_ids.contents_ptr() as *mut u32,
+                seq_len as usize,
+            );
+            s.copy_from_slice(&padded_ids);
+        }
+
+        // 10 sequential forwards. Each gets its own encoder + commit.
+        eprintln!("--- 10 sequential forwards (single process, no HTTP) ---");
+        let mut timings: Vec<f64> = Vec::with_capacity(10);
+        for i in 0..10 {
+            let t0 = Instant::now();
+            let mut encoder = device.command_encoder().expect("encoder");
+            let pooled = apply_nomic_bert_full_forward_gpu(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input_ids,
+                None,
+                &weights,
+                &cfg,
+                seq_len,
+                valid_token_count,
+            )
+            .expect("forward");
+            encoder.commit_and_wait().expect("commit");
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            timings.push(elapsed_ms);
+            // Force a memory read so the GPU is forced to finish.
+            let _ = pooled.as_slice::<f32>().expect("read")[0];
+            eprintln!("  forward {}: {:.2} ms", i + 1, elapsed_ms);
+        }
+        let mean = timings.iter().sum::<f64>() / timings.len() as f64;
+        let min = timings.iter().cloned().fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "  --> mean {:.2} ms, min {:.2} ms (llama-embedding reference: ~4.54 ms)",
+            mean, min
         );
     }
 

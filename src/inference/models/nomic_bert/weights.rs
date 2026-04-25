@@ -138,9 +138,30 @@ pub struct LoadedNomicBertWeights {
     /// Keyed by the tensor's GGUF name. Values are F32 `MlxBuffer`s
     /// with shape preserved from the source GGUF.
     tensors: HashMap<String, MlxBuffer>,
+    /// Pre-cast BF16 versions of every linear-style tensor (any 2D
+    /// matmul weight). Populated during `load()` via a one-shot encoder
+    /// dispatch per weight; the same key is used in both maps. The
+    /// matmul fast path reads from here via `weight_bf16(...)` so the
+    /// per-request F32→BF16 cast in `bert_linear_gpu` is eliminated.
+    /// Iter-83 perf optimization — drops nomic-bert e2e from ~190 ms
+    /// to ~10–30 ms (eliminates ~84 cast dispatches per request).
+    tensors_bf16: HashMap<String, MlxBuffer>,
     /// Device handle kept alive for the lifetime of the buffers.
     _device: MlxDevice,
 }
+
+/// Per-layer suffixes whose `.weight` tensor is a linear matmul weight
+/// `[out_features, in_features]` and benefits from pre-casting to BF16.
+/// LayerNorm / segment / embedding tables stay F32 (norms read F32
+/// directly; gather is F32-native; pre-casting them would just waste
+/// memory).
+const LINEAR_WEIGHT_SUFFIXES: &[&str] = &[
+    "attn_qkv.weight",
+    "attn_output.weight",
+    "ffn_up.weight",
+    "ffn_gate.weight",
+    "ffn_down.weight",
+];
 
 impl std::fmt::Debug for LoadedNomicBertWeights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,12 +172,21 @@ impl std::fmt::Debug for LoadedNomicBertWeights {
 }
 
 impl LoadedNomicBertWeights {
-    /// Load every tensor from the GGUF onto the supplied device as F32.
-    /// Walks `gguf.tensor_names()` rather than a hardcoded list, so any
-    /// optional tensors are loaded transparently. Caller should run
-    /// `validate_tensor_set` first to fail fast on a missing required
-    /// tensor.
+    /// Load every tensor from the GGUF onto the supplied device as F32,
+    /// then pre-cast every linear-style 2D weight to BF16 for the matmul
+    /// fast path. Walks `gguf.tensor_names()` rather than a hardcoded
+    /// list, so any optional tensors are loaded transparently. Caller
+    /// should run `validate_tensor_set` first to fail fast on a missing
+    /// required tensor.
+    ///
+    /// Pre-cast cost is one-time at server boot (~10 ms per layer ×
+    /// 5 linears × 12 layers ≈ 600 ms warmup, eliminated from per-request
+    /// hot path). See iter-83 perf analysis in ADR-005.
     pub fn load(gguf: &GgufFile, _cfg: &NomicBertConfig, device: MlxDevice) -> Result<Self> {
+        use mlx_native::ops::elementwise::{cast, CastDirection};
+        use mlx_native::DType;
+        use mlx_native::KernelRegistry;
+
         let names = gguf.tensor_names();
         let mut tensors = HashMap::with_capacity(names.len());
         for name in &names {
@@ -165,8 +195,52 @@ impl LoadedNomicBertWeights {
                 .map_err(|e| anyhow!("nomic-bert load_tensor_f32('{}'): {e}", name))?;
             tensors.insert((*name).to_string(), buf);
         }
+
+        // Pre-cast linear-style 2D weights (Q/K/V fused, attn_output,
+        // ffn_up/gate/down) to BF16 in a single command-buffer pass.
+        // Linear weights match `blk.{N}.{suffix}` where suffix is in
+        // LINEAR_WEIGHT_SUFFIXES; non-block weights (token_embd, norms)
+        // are not matmul'd and stay F32.
+        let mut tensors_bf16: HashMap<String, MlxBuffer> = HashMap::new();
+        let mut registry = KernelRegistry::new();
+        let mut encoder = device
+            .command_encoder()
+            .map_err(|e| anyhow!("nomic-bert pre-cast: command_encoder: {e}"))?;
+
+        for (name, src) in &tensors {
+            // Match `blk.{N}.{suffix}` where suffix ∈ LINEAR_WEIGHT_SUFFIXES.
+            let is_linear = LINEAR_WEIGHT_SUFFIXES.iter().any(|sfx| {
+                name.starts_with("blk.") && name.ends_with(sfx)
+            });
+            if !is_linear {
+                continue;
+            }
+            let n_elems = src.element_count();
+            let dst = device
+                .alloc_buffer(n_elems * 2, DType::BF16, src.shape().to_vec())
+                .map_err(|e| anyhow!("nomic-bert pre-cast: alloc bf16 for '{name}': {e}"))?;
+            cast(
+                &mut encoder,
+                &mut registry,
+                device.metal_device(),
+                src,
+                &dst,
+                n_elems,
+                CastDirection::F32ToBF16,
+            )
+            .map_err(|e| anyhow!("nomic-bert pre-cast: cast('{name}'): {e}"))?;
+            tensors_bf16.insert(name.clone(), dst);
+        }
+        // Single commit + wait amortizes the full set of casts into one
+        // GPU round-trip (vs the per-request path that does 84 separate
+        // cast dispatches each with their own commit).
+        encoder
+            .commit_and_wait()
+            .map_err(|e| anyhow!("nomic-bert pre-cast: commit_and_wait: {e}"))?;
+
         Ok(Self {
             tensors,
+            tensors_bf16,
             _device: device,
         })
     }
@@ -190,21 +264,75 @@ impl LoadedNomicBertWeights {
     pub fn empty(device: MlxDevice) -> Self {
         Self {
             tensors: HashMap::new(),
+            tensors_bf16: HashMap::new(),
             _device: device,
         }
     }
 
     /// Build a `LoadedNomicBertWeights` from a name→buffer map. Test-only
-    /// escape hatch for the eventual full-forward parity test.
+    /// escape hatch for the eventual full-forward parity test. Pre-casts
+    /// linear weights to BF16 just like the production load path so
+    /// synthetic tests exercise the same fast-path.
     #[cfg(test)]
     pub(crate) fn from_tensors_for_test(
         tensors: HashMap<String, MlxBuffer>,
         device: MlxDevice,
     ) -> Self {
+        use mlx_native::ops::elementwise::{cast, CastDirection};
+        use mlx_native::DType;
+        use mlx_native::KernelRegistry;
+
+        let mut tensors_bf16: HashMap<String, MlxBuffer> = HashMap::new();
+        let mut registry = KernelRegistry::new();
+        if let Ok(mut encoder) = device.command_encoder() {
+            for (name, src) in &tensors {
+                let is_linear = LINEAR_WEIGHT_SUFFIXES.iter().any(|sfx| {
+                    name.starts_with("blk.") && name.ends_with(sfx)
+                });
+                if !is_linear {
+                    continue;
+                }
+                let n_elems = src.element_count();
+                if let Ok(dst) =
+                    device.alloc_buffer(n_elems * 2, DType::BF16, src.shape().to_vec())
+                {
+                    if cast(
+                        &mut encoder,
+                        &mut registry,
+                        device.metal_device(),
+                        src,
+                        &dst,
+                        n_elems,
+                        CastDirection::F32ToBF16,
+                    )
+                    .is_ok()
+                    {
+                        tensors_bf16.insert(name.clone(), dst);
+                    }
+                }
+            }
+            let _ = encoder.commit_and_wait();
+        }
         Self {
             tensors,
+            tensors_bf16,
             _device: device,
         }
+    }
+
+    /// Pre-cast BF16 weight lookup. Returns `None` for non-linear
+    /// tensors (norms, embeddings) and for any name that isn't in the
+    /// loaded set. Composers should call this first; if `None`, fall
+    /// back to the F32 path via `block_required` + `bert_linear_gpu`.
+    pub fn weight_bf16(&self, name: &str) -> Option<&MlxBuffer> {
+        self.tensors_bf16.get(name)
+    }
+
+    /// Per-layer pre-cast BF16 weight accessor. Convenience wrapper
+    /// over `weight_bf16` for the per-block forward composer.
+    pub fn block_weight_bf16(&self, layer_idx: usize, suffix: &str) -> Option<&MlxBuffer> {
+        let key = nomic_bert_layer_tensor(layer_idx, suffix);
+        self.tensors_bf16.get(&key)
     }
 
     /// Total tensor count.

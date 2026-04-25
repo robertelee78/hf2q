@@ -1590,23 +1590,33 @@ pub async fn embeddings(
     // amortizing kernel-compile across requests is iter-63's perf work.
     let model_id = em.model_id.clone();
     let tokenizer = em.tokenizer.clone();
+    let shared_registry = state.embedding_registry.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<EmbeddingResponse> {
-        use crate::inference::models::bert::bert_gpu::{
-            apply_bert_full_forward_gpu, register_bert_custom_shaders,
-        };
-        use crate::inference::models::nomic_bert::{
-            apply_nomic_bert_full_forward_gpu, register_nomic_bert_kernels,
-        };
+        use crate::inference::models::bert::bert_gpu::apply_bert_full_forward_gpu;
+        use crate::inference::models::nomic_bert::apply_nomic_bert_full_forward_gpu;
         use crate::serve::api::state::EmbeddingArch;
-        use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
+        use mlx_native::{GraphExecutor, MlxDevice};
 
         // Per-call device handle. The underlying Metal device is shared
         // with the eager-loaded weights (Apple Silicon: same hardware
-        // visible through every MlxDevice handle).
+        // visible through every MlxDevice handle). `MlxDevice::new()` is
+        // sub-millisecond; not a hot-path concern per iter-83 timing.
         let device = MlxDevice::new()
             .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding forward: {e}"))?;
         let executor = GraphExecutor::new(device);
+
+        // Lock the shared, pre-warmed kernel registry. Held for the
+        // full forward pass; on a single-stream embedding workload the
+        // serialization cost is negligible (forward is ~7 ms post-fix).
+        // No fallback path: the registry MUST be populated before any
+        // /v1/embeddings request reaches this handler — populated by
+        // `cmd_serve` immediately after weight load.
+        let registry_arc = shared_registry.ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding registry not pre-warmed (server boot did not initialize it)"
+            )
+        })?;
 
         let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
         let mut total_tokens: usize = 0;
@@ -1650,36 +1660,36 @@ pub async fn embeddings(
             };
             s.copy_from_slice(&ids);
 
-            // Dispatch the forward pass — arch-aware.
+            // Dispatch the forward pass — arch-aware. Uses the shared,
+            // pre-warmed KernelRegistry: every `get_pipeline()` call
+            // hits the cache (no shader compile in the hot path).
             let mut session = executor
                 .begin()
                 .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
-            let mut registry = KernelRegistry::new();
+            let mut registry_guard = registry_arc.lock().map_err(|e| {
+                anyhow::anyhow!("embedding registry mutex poisoned: {e}")
+            })?;
             // valid_token_count = the count BEFORE [PAD] padding. The
             // forward pass uses this to build the attention mask so
             // padded positions don't contaminate the embedding.
             let valid_token_count = raw_ids.len().min(ids.len()) as u32;
 
             let out = match &arch {
-                EmbeddingArch::Bert { config, weights } => {
-                    register_bert_custom_shaders(&mut registry);
-                    apply_bert_full_forward_gpu(
-                        session.encoder_mut(),
-                        &mut registry,
-                        device,
-                        &ids_buf,
-                        None, // type_ids: single-segment input
-                        weights,
-                        config,
-                        seq_len,
-                        valid_token_count,
-                    )?
-                }
+                EmbeddingArch::Bert { config, weights } => apply_bert_full_forward_gpu(
+                    session.encoder_mut(),
+                    &mut registry_guard,
+                    device,
+                    &ids_buf,
+                    None, // type_ids: single-segment input
+                    weights,
+                    config,
+                    seq_len,
+                    valid_token_count,
+                )?,
                 EmbeddingArch::NomicBert { config, weights } => {
-                    register_nomic_bert_kernels(&mut registry);
                     apply_nomic_bert_full_forward_gpu(
                         session.encoder_mut(),
-                        &mut registry,
+                        &mut registry_guard,
                         device,
                         &ids_buf,
                         None, // type_ids: single-segment input
@@ -1693,6 +1703,9 @@ pub async fn embeddings(
             session
                 .finish()
                 .map_err(|e| anyhow::anyhow!("session finish: {e}"))?;
+            // Drop the registry guard early so subsequent requests can
+            // begin dispatching while we serialize the response.
+            drop(registry_guard);
 
             // Read back the [hidden] vector and encode per the request's
             // encoding_format. OpenAI's spec: float = list of f32; base64

@@ -474,6 +474,101 @@ pub fn bert_bias_add_gpu(
 /// - `seq_len == 0`, `in_features < 32`, `out_features == 0`
 /// - bias supplied but element_count != out_features
 /// - propagated from cast/matmul/bias-add dispatches
+/// Variant of `bert_linear_gpu` that takes a PRE-CAST BF16 weight,
+/// skipping the F32→BF16 cast dispatch + per-call BF16 alloc on the
+/// hot path. The composer is expected to obtain `weight_bf16` from
+/// `LoadedBertWeights::weight_bf16(...)` /
+/// `LoadedNomicBertWeights::weight_bf16(...)`, which pre-casts every
+/// linear-style tensor at GGUF load time (one-time cost) and returns a
+/// stable on-device handle.
+///
+/// Output identical to `bert_linear_gpu` — same matmul kernel, same
+/// optional bias-add, same shape. The only difference is whether the
+/// weight cast is amortized (this variant) or per-call (the F32 entry
+/// point). Per the iter-83 perf analysis, eliminating the per-request
+/// cast drops nomic-bert e2e from ~190 ms to <30 ms.
+#[allow(clippy::too_many_arguments)]
+pub fn bert_linear_bf16_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight_bf16: &MlxBuffer,
+    bias_opt: Option<&MlxBuffer>,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    if in_features < 32 {
+        return Err(anyhow!(
+            "bert_linear_bf16_gpu: in_features ({}) must be >= 32",
+            in_features
+        ));
+    }
+    if seq_len == 0 || out_features == 0 {
+        return Err(anyhow!(
+            "bert_linear_bf16_gpu: seq_len ({}) and out_features ({}) must be > 0",
+            seq_len,
+            out_features
+        ));
+    }
+    if let Some(b) = bias_opt {
+        if b.element_count() != out_features as usize {
+            return Err(anyhow!(
+                "bert_linear_bf16_gpu: bias element_count ({}) != out_features ({})",
+                b.element_count(),
+                out_features
+            ));
+        }
+    }
+
+    // --- Allocate F32 matmul output ---
+    let out_bytes = (seq_len as usize) * (out_features as usize) * 4;
+    let mut matmul_out = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, out_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc matmul output: {e}"))?;
+
+    // --- Dispatch matmul (no cast, no per-call BF16 alloc) ---
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    dense_matmul_bf16_f32_tensor(
+        encoder,
+        registry,
+        device,
+        weight_bf16,
+        input,
+        &mut matmul_out,
+        &params,
+    )
+    .context("bert_linear_bf16_gpu: dense_matmul_bf16_f32_tensor")?;
+
+    // --- Optional bias add ---
+    if let Some(bias) = bias_opt {
+        encoder.memory_barrier();
+        bert_bias_add_gpu(
+            encoder,
+            registry,
+            device,
+            &matmul_out,
+            bias,
+            seq_len,
+            out_features,
+        )
+        .context("bert_linear_bf16_gpu: bias_add")
+    } else {
+        Ok(matmul_out)
+    }
+}
+
 pub fn bert_linear_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,

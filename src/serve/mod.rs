@@ -19,6 +19,101 @@ use crate::cli;
 use crate::debug::INVESTIGATION_ENV;
 use config::Gemma4Config;
 
+/// Build a `KernelRegistry` with every shader the embedding forward
+/// path needs registered AND compiled. One warmup forward is run
+/// against the loaded weights so every `get_pipeline()` call hits the
+/// cache thereafter. Returns the warmed registry; caller wraps it in
+/// `Arc<Mutex<>>` and stashes in `AppState::embedding_registry` so
+/// per-request handlers reuse the cached pipelines instead of paying
+/// ~150 ms of shader-compile cost on every `/v1/embeddings` call.
+fn build_warmed_embedding_registry(
+    em: &api::state::EmbeddingModel,
+) -> Result<mlx_native::KernelRegistry> {
+    use crate::inference::models::bert::bert_gpu::{
+        apply_bert_full_forward_gpu, register_bert_custom_shaders,
+    };
+    use crate::inference::models::nomic_bert::{
+        apply_nomic_bert_full_forward_gpu, register_nomic_bert_kernels,
+    };
+    use api::state::EmbeddingArch;
+    use mlx_native::{DType, KernelRegistry, MlxDevice};
+
+    let arch = em
+        .arch
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("registry warmup: EmbeddingModel has no arch"))?;
+
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("registry warmup: MlxDevice::new: {e}"))?;
+    let mut registry = KernelRegistry::new();
+
+    // Synthetic warmup input: a single padded-to-32 sequence of [PAD]
+    // tokens. The exact ids don't matter — we just need to drive every
+    // kernel through one full forward so all pipelines compile. Using
+    // pad_id (which is in-vocab) keeps gather happy.
+    let seq_len: u32 = 32;
+    let pad_id = em.tokenizer.specials().pad;
+    let ids: Vec<u32> = vec![pad_id; seq_len as usize];
+    let ids_buf = device
+        .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
+        .map_err(|e| anyhow::anyhow!("registry warmup: alloc ids: {e}"))?;
+    // SAFETY: just-allocated u32 buffer; exclusive access.
+    unsafe {
+        let s: &mut [u32] = std::slice::from_raw_parts_mut(
+            ids_buf.contents_ptr() as *mut u32,
+            seq_len as usize,
+        );
+        s.copy_from_slice(&ids);
+    }
+
+    let mut encoder = device
+        .command_encoder()
+        .map_err(|e| anyhow::anyhow!("registry warmup: command_encoder: {e}"))?;
+    let valid_token_count: u32 = 1; // any value ≥ 1 ≤ seq_len works for warmup.
+
+    let _out = match arch {
+        EmbeddingArch::Bert { config, weights } => {
+            register_bert_custom_shaders(&mut registry);
+            apply_bert_full_forward_gpu(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &ids_buf,
+                None,
+                weights,
+                config,
+                seq_len,
+                valid_token_count,
+            )?
+        }
+        EmbeddingArch::NomicBert { config, weights } => {
+            register_nomic_bert_kernels(&mut registry);
+            apply_nomic_bert_full_forward_gpu(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &ids_buf,
+                None,
+                weights,
+                config,
+                seq_len,
+                valid_token_count,
+            )?
+        }
+    };
+    encoder
+        .commit_and_wait()
+        .map_err(|e| anyhow::anyhow!("registry warmup: commit_and_wait: {e}"))?;
+
+    tracing::info!(
+        arch = arch.arch_name(),
+        cached_pipelines = registry.cached_count(),
+        "Warmed embedding kernel registry"
+    );
+
+    Ok(registry)
+}
+
 /// Resolve the tokenizer path: explicit flag, or look next to GGUF / in parent dirs.
 fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
     if let Some(p) = explicit {
@@ -1109,7 +1204,17 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         None => api::AppState::new(config.clone()),
     };
     if let Some(em) = embedding_model {
-        state = state.with_embedding_model(em);
+        // Pre-warm a persistent kernel registry: register all kernels
+        // the arch needs + run one warmup forward against the loaded
+        // weights so every Metal pipeline compiles and caches before
+        // the first /v1/embeddings request. Eliminates the ~150 ms
+        // per-request shader-compile cost surfaced by iter-82
+        // benchmarking. Stashes the registry behind an Arc<Mutex<>>
+        // for handler dispatch.
+        let registry = build_warmed_embedding_registry(&em).context("warm embedding registry")?;
+        state = state
+            .with_embedding_model(em)
+            .with_embedding_registry(std::sync::Arc::new(std::sync::Mutex::new(registry)));
     }
     if let Some(m) = mmproj {
         state = state.with_mmproj(m);

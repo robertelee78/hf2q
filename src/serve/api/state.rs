@@ -175,6 +175,14 @@ pub struct AppState {
     /// via `BertConfig::from_gguf` — the forward pass that consumes this
     /// lands in a later iter (ADR-005 Phase 2b).
     pub embedding_config: Option<EmbeddingModel>,
+    /// Persistent kernel registry for embedding forwards. Pre-warmed at
+    /// server boot via one warmup forward so all needed pipelines are
+    /// compiled and cached. Per-request handlers lock briefly, dispatch
+    /// against the cached registry, release. Eliminates the ~150 ms
+    /// per-request shader-compile cost the iter-82 benchmark surfaced
+    /// (kept registry per-request → recompiled every shader; HTTP-path
+    /// hit ~190 ms vs in-process ~8 ms forward floor).
+    pub embedding_registry: Option<Arc<std::sync::Mutex<mlx_native::KernelRegistry>>>,
     /// Multimodal projector (mmproj GGUF) loaded at startup from
     /// `--mmproj <path>`. When `Some`, the chat handler accepts
     /// `image_url` content parts and routes them through the vision
@@ -326,6 +334,7 @@ impl AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: None,
             embedding_config: None,
+            embedding_registry: None,
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
@@ -342,6 +351,7 @@ impl AppState {
             request_counter: Arc::new(AtomicU64::new(0)),
             engine: Some(engine),
             embedding_config: None,
+            embedding_registry: None,
             mmproj: None,
             metrics: Arc::new(ServerMetrics::default()),
         }
@@ -352,6 +362,20 @@ impl AppState {
     /// GGUF header.
     pub fn with_embedding_model(mut self, em: EmbeddingModel) -> Self {
         self.embedding_config = Some(em);
+        self
+    }
+
+    /// Attach a pre-warmed kernel registry for embedding forwards.
+    /// Caller is responsible for registering the right kernels for the
+    /// loaded arch (BERT custom shaders + mlx-native rope + silu_mul as
+    /// appropriate) and running one warmup forward to compile every
+    /// pipeline before stashing. Per-request handlers lock the inner
+    /// `Mutex` briefly, dispatch against cached pipelines, release.
+    pub fn with_embedding_registry(
+        mut self,
+        registry: Arc<std::sync::Mutex<mlx_native::KernelRegistry>>,
+    ) -> Self {
+        self.embedding_registry = Some(registry);
         self
     }
 
