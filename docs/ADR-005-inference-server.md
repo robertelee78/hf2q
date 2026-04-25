@@ -1930,6 +1930,29 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 72 — Phase 2a Task #11 lifecycle audit closed: SIGTERM drain verified end-to-end with a 2-phase smoke test.**
+  - **Coverage.** Decision #17 contract: "SIGTERM drains in-flight + queue then exits." Iter 54 wired the chat-engine drain path; iter 72 verifies the **embedding-handler drain path** (the `tokio::task::spawn_blocking` GPU dispatch) and the **idle-exit path** end-to-end against a real binary.
+  - **`scripts/smoke_lifecycle_drain.sh` — 2-phase test** (passes on both):
+    - **Phase 1 (in-flight drain).** Boot hf2q with `--embedding-model bge-small-en-v1.5-f16`, issue an 80-input batch embedding request in the background (~600ms wall-clock at 7-9ms/request serial), wait 200ms (long enough for the request to be received and mid-batch in `spawn_blocking`, well short of the natural response time), send SIGTERM, wait for the client to complete and the server to exit. Asserts: client got HTTP 200 with all 80 unit-normalized embeddings; server exited ≤5s after SIGTERM; client must complete BEFORE server exit (drain ordering). Observed: client completed **363ms after SIGTERM**, server exited **4ms later**. Clean.
+    - **Phase 2 (idle exit).** Boot, send SIGTERM with no in-flight requests, assert exit ≤500ms. Observed: server exited **67ms after SIGTERM**.
+  - **What this catches:**
+    - axum's `with_graceful_shutdown` not waiting for in-flight HTTP responses → connection reset / 502.
+    - Embedding handler's `spawn_blocking` task being dropped before it completes → truncated response or panic.
+    - Server hanging on signal handler → exit timeout > 5s.
+    - Process hanging on cleanup → wait deadline exceeded.
+  - **Architecturally why it works:**
+    - axum's `with_graceful_shutdown(shutdown_signal())` returns when SIGTERM/SIGINT arrives, then awaits in-flight HTTP responses to complete naturally.
+    - The handler awaits its own `spawn_blocking` join handle — that future resolves when the blocking task finishes the GPU dispatch.
+    - tokio's spawn_blocking pool threads run to completion regardless of runtime drop ordering; the runtime won't shut down until they return. The chat-engine's worker-thread join (iter 54) runs after `axum::serve` returns, joining the dedicated `hf2q-engine` thread — orthogonal to the embedding path.
+  - **Verification.** `bash scripts/smoke_lifecycle_drain.sh` → `ALL PHASES PASSED ✓`. `cargo test --bin hf2q api::` 234/234 pass.
+  - **Lane discipline observed.** New file `scripts/smoke_lifecycle_drain.sh` only — no source-code changes. The lifecycle code path under test was shipped in iter 54 (chat engine) and iter 62 (embedding handler).
+  - **Phase 2a Task #11 status: CLOSED.** SIGTERM drain audited end-to-end with a 2-phase smoke that catches every realistic failure mode. The chat-engine drain (iter 54), the embedding-handler drain (iter 62), and the idle-exit path (axum + tokio runtime drop) are all verified production-correct.
+  - **Next (iter 73):** continue Phase 2a tail. Highest-leverage remaining items in my lane:
+    - Task #9 summarize-overflow plumbing: server-side state machine for context-overflow policy, transparency headers (`X-HF2Q-Overflow-Policy`, `X-HF2Q-Summarized-Messages`, `X-HF2Q-Summary-Tokens`), SSE keepalive comment frame. Server-side parts are lane-safe; the actual summarization pass is cross-lane (chat engine).
+    - Task #14 mmproj producer: hf2q produces mmproj GGUF from safetensors. Open scope; can be staged.
+    - Task #5 grammar parser port from llama.cpp: substantial multi-iter chunk; right candidate once chat-engine OOM constraint relaxes (engine wiring needed).
+    - Task #7 prompt cache engine integration: ditto — engine wiring needed.
+
 - **2026-04-26 loop iter 71 — Phase 2 "validate, benchmark" — embedding latency measured + `dimensions` parameter validation added.**
   - **Latency benchmark.** Measured `/v1/embeddings` p50/p95 with the official `openai` Python client (server-resident, warm) on bge-small + mxbai-large, 20 samples each:
     ```
