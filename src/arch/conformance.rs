@@ -273,6 +273,53 @@ mod tests {
         assert!(err.contains("expected 8"));
     }
 
+    /// Missing `n_eval` line — `extract_n_eval` returns None and the
+    /// validator surfaces the actionable "missing n_eval" error.
+    /// Defends against an upstream llama-cli format change that drops
+    /// the timings block, which would silently pass an old smoke
+    /// transcript by reading nothing as "okay".
+    #[test]
+    fn assert_smoke_transcript_rejects_missing_n_eval_line() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        let stderr = "llama_model_load: loaded tensor 0x2e1\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(
+            err.contains("n_eval"),
+            "missing-n_eval error must name the line, got: {err}"
+        );
+    }
+
+    /// Missing `loaded tensor` line — `extract_loaded_tensor_count`
+    /// returns None and the validator surfaces "missing `loaded tensor`".
+    /// Defends against an upstream llama-cli format change that drops
+    /// the model-load summary, which would silently pass.
+    #[test]
+    fn assert_smoke_transcript_rejects_missing_loaded_tensor_line() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        let stderr = "llama_print_timings: n_eval = 8 runs\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(
+            err.contains("loaded tensor"),
+            "missing-loaded-tensor error must name the line, got: {err}"
+        );
+    }
+
     #[test]
     fn quality_report_q4_0_passes_without_thresholds() {
         let report = QualityReport {
