@@ -437,6 +437,13 @@ fn run_q4_0_pipeline(
 
     let combined_stderr = String::from_utf8_lossy(&llama_out.stderr);
     let combined_stdout = String::from_utf8_lossy(&llama_out.stdout);
+    // Decision 16 §AC requires byte-identical transcripts across two
+    // fresh runs, but real llama-cli emits per-run timing data
+    // (ms / tokens-per-second) that varies with system load. Sanitize
+    // decimal numbers (the timestamps + rates) to placeholders before
+    // writing — integer counts (n_runs, n_tokens) are preserved so
+    // the structural assertion still has its scrape targets.
+    let sanitized_stderr = sanitize_timestamps(&combined_stderr);
     let transcript_body = format!(
         "# hf2q smoke transcript\n\
          # arch:  {}\n\
@@ -445,7 +452,7 @@ fn run_q4_0_pipeline(
          # (timestamps stripped; byte-stable across runs)\n\n\
          ---stdout---\n{}\n\
          ---stderr---\n{}\n",
-        entry.arch, args.quant, prompt, combined_stdout, combined_stderr
+        entry.arch, args.quant, prompt, combined_stdout, sanitized_stderr
     );
 
     // Scan stderr for regression patterns per conformance helpers.
@@ -473,6 +480,58 @@ fn run_q4_0_pipeline(
     std::fs::write(&transcript_path, transcript_body)
         .map_err(|e| format!("write transcript {:?}: {}", transcript_path, e))?;
     Ok(transcript_path)
+}
+
+/// Replace decimal-number sequences (`X.YZ`) with `<X.XX>` so the
+/// transcript stays byte-identical across runs even with real llama-cli
+/// emitting per-run timing data. Integer counts (n_runs, n_tokens) are
+/// preserved — only sequences with an embedded `.` are normalised, so
+/// version strings like "GGUF V3" pass through.
+///
+/// Conservative implementation: walk the chars once, identify a
+/// digit-dot-digit run, replace the whole run with the placeholder.
+/// Does not touch leading whitespace (column alignment in real
+/// llama-cli output stays bit-stable).
+fn sanitize_timestamps(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            // Scan the integer prefix.
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // If followed by `.<digit>`, swallow the decimal part and
+            // emit the placeholder. Otherwise, keep the integer.
+            let has_decimal = i + 1 < bytes.len()
+                && bytes[i] == b'.'
+                && bytes[i + 1].is_ascii_digit();
+            if has_decimal {
+                i += 1; // dot
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push_str("<X.XX>");
+            } else {
+                out.push_str(&s[start..i]);
+            }
+        } else {
+            // SAFETY: i was at a valid char boundary because we only
+            // advance by ASCII digits which are 1-byte. Non-ASCII is
+            // emitted unchanged.
+            let ch_start = i;
+            // Find next char boundary.
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            out.push_str(&s[ch_start..i]);
+        }
+    }
+    out
 }
 
 fn find_llama_cli() -> Result<PathBuf, String> {
@@ -819,5 +878,47 @@ mod tests {
     fn normalize_quant_label_lowercases() {
         assert_eq!(normalize_quant_label("Q4_0"), "q4_0");
         assert_eq!(normalize_quant_label("DWQ-Mixed-4-6"), "dwq-mixed-4-6");
+    }
+
+    #[test]
+    fn sanitize_timestamps_strips_decimals_keeps_integers() {
+        let real_eval_line = "llama_perf_context_print:        eval time =      58.90 ms /     8 runs   (    8.41 ms per token,   118.85 tokens per second)";
+        let s = sanitize_timestamps(real_eval_line);
+        // Decimal numbers replaced.
+        assert!(!s.contains("58.90"), "got: {s}");
+        assert!(!s.contains("8.41"), "got: {s}");
+        assert!(!s.contains("118.85"), "got: {s}");
+        // Placeholders present.
+        assert!(s.contains("<X.XX>"), "got: {s}");
+        // Integer count preserved (the load-bearing bit).
+        assert!(s.contains("/     8 runs"), "got: {s}");
+        // Structural keywords preserved.
+        assert!(s.contains("eval time"));
+        assert!(s.contains("ms per token"));
+        assert!(s.contains("tokens per second"));
+    }
+
+    #[test]
+    fn sanitize_timestamps_preserves_integer_only_tokens() {
+        // "GGUF V3" — version is integer-only, must NOT be sanitized.
+        let s = sanitize_timestamps("GGUF V3 (latest) and 737 tensors");
+        assert!(s.contains("V3"), "version preserved: {s}");
+        assert!(s.contains("737 tensors"), "tensor count preserved: {s}");
+        assert!(!s.contains("<X.XX>"), "no decimal seen: {s}");
+    }
+
+    #[test]
+    fn sanitize_timestamps_byte_identical_across_two_calls_with_different_decimals() {
+        // Same structural content, different decimal values — the two
+        // sanitized outputs MUST be byte-identical. This is the
+        // load-bearing property for Decision 16's byte-identical AC.
+        let stderr_a = "eval time =     58.90 ms /     8 runs   (    8.41 ms per token,   118.85 tokens per second)\n";
+        let stderr_b = "eval time =     67.12 ms /     8 runs   (    9.55 ms per token,   119.20 tokens per second)\n";
+        assert_ne!(stderr_a, stderr_b, "raw inputs must differ for the test to be meaningful");
+        assert_eq!(
+            sanitize_timestamps(stderr_a),
+            sanitize_timestamps(stderr_b),
+            "sanitized transcripts must be byte-identical"
+        );
     }
 }
