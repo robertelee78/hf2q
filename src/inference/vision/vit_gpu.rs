@@ -28,6 +28,7 @@
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// GPU dense linear projection `y = x @ W.T`.
@@ -130,6 +131,114 @@ pub fn vit_linear_gpu(
     Ok(dst)
 }
 
+/// GPU RMSNorm with affine gain (single-parameter; no bias).
+///
+/// Wraps `mlx_native::ops::rms_norm::dispatch_rms_norm`. Computes
+/// `y[r, i] = x[r, i] * rsqrt(mean(x[r,:]²) + eps) * gain[i]` per row.
+///
+/// Dtype contract:
+///   - `input` is F32 `[rows, dim]` row-major on device.
+///   - `gain` is F32 `[dim]`.
+///   - Output is F32 `[rows, dim]` row-major (freshly allocated).
+///
+/// `eps` matches PyTorch's `nn.RMSNorm(eps)` semantic — added inside the
+/// `sqrt(mean(x²) + eps)`. Typical Gemma 4 vision tower value: `1e-6`
+/// (from `MmprojConfig.layer_norm_eps`).
+///
+/// # Errors
+///
+/// - `rows == 0` or `dim == 0`
+/// - input/gain shape mismatches (propagated from mlx-native)
+pub fn vit_rms_norm_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gain_f32: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if rows == 0 || dim == 0 {
+        return Err(anyhow!(
+            "vit_rms_norm_gpu: rows ({}) and dim ({}) must be > 0",
+            rows,
+            dim
+        ));
+    }
+
+    // Allocate output [rows, dim] f32.
+    let out_bytes = (rows as usize) * (dim as usize) * 4;
+    let output = device
+        .alloc_buffer(out_bytes, DType::F32, vec![rows as usize, dim as usize])
+        .map_err(|e| anyhow!("vit_rms_norm_gpu: alloc output: {e}"))?;
+
+    // Allocate the params buffer expected by the kernel: 2 × f32 holding
+    // [eps, dim_as_f32]. Filled via direct CPU pointer write (Apple
+    // unified memory means the same address is GPU-visible).
+    let params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("vit_rms_norm_gpu: alloc params: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; no aliasing.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
+        };
+        s[0] = eps;
+        s[1] = dim as f32;
+    }
+
+    dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        gain_f32,
+        &output,
+        &params_buf,
+        rows,
+        dim,
+    )
+    .context("vit_rms_norm_gpu: dispatch_rms_norm")?;
+
+    Ok(output)
+}
+
+/// GPU per-head RMSNorm. Identical math to `vit_rms_norm_gpu` but
+/// "per-head" semantically: input shape `[batch, num_heads, head_dim]`
+/// is byte-equivalent to `[batch * num_heads, head_dim]` row-major, so
+/// dispatch with `rows = batch * num_heads, dim = head_dim`. Gain is
+/// `[head_dim]` shared across heads (Gemma 4 SigLIP convention).
+///
+/// # Errors
+///
+/// - any dim is 0
+/// - propagated from `vit_rms_norm_gpu`
+pub fn vit_per_head_rms_norm_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gain_f32: &MlxBuffer,
+    batch: u32,
+    num_heads: u32,
+    head_dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "vit_per_head_rms_norm_gpu: batch ({}), num_heads ({}), head_dim ({}) must all be > 0",
+            batch,
+            num_heads,
+            head_dim
+        ));
+    }
+    let rows = batch
+        .checked_mul(num_heads)
+        .ok_or_else(|| anyhow!("vit_per_head_rms_norm_gpu: batch*num_heads overflow"))?;
+    vit_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, head_dim, eps)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -137,7 +246,10 @@ pub fn vit_linear_gpu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::vision::vit::linear_forward as linear_cpu;
+    use crate::inference::vision::vit::{
+        linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
+        rms_norm_forward as rms_norm_cpu,
+    };
     use crate::inference::vision::mmproj::MmprojConfig;
     use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
     use mlx_native::gguf::GgufFile;
@@ -393,5 +505,219 @@ mod tests {
             fail_frac * 100.0,
             max_diff
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_rms_norm_gpu (iter 44)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_rms_norm_gpu_matches_cpu_reference_on_small_input() {
+        // 8 rows × 16 dim. F32 throughout. Compare GPU vs CPU
+        // rms_norm_forward within float epsilon — RMSNorm has no
+        // BF16 round-trip (input + gain stay F32), so tolerance is
+        // tight.
+        let rows = 8usize;
+        let dim = 16usize;
+        let eps = 1e-6f32;
+        let input_cpu: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i as f32) * 0.05).sin() + 0.5)
+            .collect();
+        let gain_cpu: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32) * 0.05).collect();
+
+        // CPU reference (mutates in place).
+        let mut expected = input_cpu.clone();
+        rms_norm_cpu(&mut expected, &gain_cpu, dim, eps).expect("cpu ref");
+
+        // GPU path.
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input_buf = upload_f32(executor.device(), &input_cpu, vec![rows, dim]);
+        let gain_buf = upload_f32(executor.device(), &gain_cpu, vec![dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_rms_norm_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_buf,
+            &gain_buf,
+            rows as u32,
+            dim as u32,
+            eps,
+        )
+        .expect("rms_norm");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, rows * dim);
+
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-4, "rms_norm GPU vs CPU max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_rms_norm_gpu_rejects_zero_dims() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input = executor.device().alloc_buffer(16 * 4, DType::F32, vec![4, 4]).expect("a");
+        let gain = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("b");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_rms_norm_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            &gain,
+            0,
+            4,
+            1e-6,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
+    }
+
+    #[test]
+    fn vit_rms_norm_gpu_on_real_gemma4_ln1_matches_cpu() {
+        // Real-data parity: load real Gemma 4 mmproj, read v.blk.0.ln1.weight
+        // as the f32 gain vector (1152 elements), apply GPU RMSNorm to a
+        // synthetic [8, 1152] input. Compare against CPU rms_norm_forward.
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
+
+        let hidden = cfg.hidden_size as usize;
+        let rows = 8usize;
+        let ln1_buf = weights.block_tensor(0, "ln1.weight").expect("ln1");
+        let gain_f32: &[f32] = ln1_buf.as_slice::<f32>().expect("ln1 slice");
+        assert_eq!(gain_f32.len(), hidden);
+        let gain_cpu: Vec<f32> = gain_f32.to_vec();
+
+        let input_cpu: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as f32) * 1e-3).sin() * 0.5)
+            .collect();
+
+        let mut expected = input_cpu.clone();
+        rms_norm_cpu(&mut expected, &gain_cpu, hidden, cfg.layer_norm_eps).expect("cpu ref");
+
+        let exec_dev = MlxDevice::new().expect("device2");
+        let executor = GraphExecutor::new(exec_dev);
+        let input_buf = upload_f32(executor.device(), &input_cpu, vec![rows, hidden]);
+        let gain_buf = upload_f32(executor.device(), &gain_cpu, vec![hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device_inner: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_rms_norm_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device_inner,
+            &input_buf,
+            &gain_buf,
+            rows as u32,
+            hidden as u32,
+            cfg.layer_norm_eps,
+        )
+        .expect("rms_norm");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, rows * hidden);
+
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-3, "real-data rms_norm max_diff = {max_diff}");
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_per_head_rms_norm_gpu
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_per_head_rms_norm_gpu_matches_cpu_reference() {
+        // batch=4, num_heads=8, head_dim=16. GPU should match CPU
+        // per_head_rms_norm_forward.
+        let batch = 4usize;
+        let num_heads = 8usize;
+        let head_dim = 16usize;
+        let total = batch * num_heads * head_dim;
+        let eps = 1e-6f32;
+
+        let input_cpu: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.03).cos()).collect();
+        let gain_cpu: Vec<f32> = (0..head_dim).map(|i| 1.0 + (i as f32) * 0.1).collect();
+
+        let mut expected = input_cpu.clone();
+        per_head_rms_cpu(&mut expected, &gain_cpu, batch, num_heads, head_dim, eps)
+            .expect("cpu ref");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input_buf =
+            upload_f32(executor.device(), &input_cpu, vec![batch, num_heads, head_dim]);
+        let gain_buf = upload_f32(executor.device(), &gain_cpu, vec![head_dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_per_head_rms_norm_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_buf,
+            &gain_buf,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            eps,
+        )
+        .expect("per-head rms");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, total);
+
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-4, "per_head_rms GPU vs CPU max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_per_head_rms_norm_gpu_rejects_zero_dims() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let input = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
+        let gain = executor.device().alloc_buffer(8 * 4, DType::F32, vec![8]).expect("b");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_per_head_rms_norm_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            &gain,
+            0,
+            8,
+            8,
+            1e-6,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
     }
 }

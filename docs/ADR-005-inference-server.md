@@ -1735,6 +1735,17 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
     - **`vit_linear_gpu_on_real_gemma4_mm0_matches_cpu_at_small_seq`** — real data test. Loads real Gemma 4 mmproj (~400MB), reads `mm.0.weight [2816, 1152]` as F32, runs GPU matmul on a synthetic [4, 1152] F32 input, reads back, compares against CPU `linear_forward` reference. Passes with >99% of 11,264 output elements within 5e-2 (BF16 weight round-trip on real pretrained magnitudes).
   - **CPU full-forward test retired.** Deleted the `#[ignore]`'d ~15-min test per directive — production test coverage lives in `vit_gpu`; CPU `apply_vit_full_forward` stays only as tiny-input parity reference invoked from `vit_gpu::tests`.
   - **Verification:** `cargo test --bin hf2q inference::vision::vit_gpu` — 4/4 pass (~10s including real GPU dispatch). Full suite `cargo test --bin hf2q` — 894/894 pass (+4 new GPU tests, -1 retired ignored), 7 ignored.
+- **2026-04-24 loop iter 44 — `vit_rms_norm_gpu` + `vit_per_head_rms_norm_gpu` on real Gemma 4.** Two GPU primitives wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`. CPU equivalents (`rms_norm_forward`, `per_head_rms_norm_forward`) become parity refs only.
+  - **`vit_rms_norm_gpu(encoder, registry, device, input, gain, rows, dim, eps) -> MlxBuffer`:** F32 input × F32 gain → F32 output. Allocates a 2-element `[eps, dim_as_f32]` params buffer that the kernel reads. One threadgroup per row.
+  - **`vit_per_head_rms_norm_gpu(encoder, registry, device, input, gain, batch, num_heads, head_dim, eps) -> MlxBuffer`:** thin wrapper — `[batch, num_heads, head_dim]` is byte-equivalent to `[batch * num_heads, head_dim]`, so dispatch with `rows = batch * num_heads`. Same gain `[head_dim]` shared across heads.
+  - **Tests (5 new, all passing in ~10s):**
+    - `vit_rms_norm_gpu_matches_cpu_reference_on_small_input` — synthetic [8 × 16] F32 GPU vs CPU `rms_norm_forward` max_diff < 1e-4.
+    - `vit_rms_norm_gpu_rejects_zero_dims`.
+    - **`vit_rms_norm_gpu_on_real_gemma4_ln1_matches_cpu`** — real-data: reads Gemma 4 `v.blk.0.ln1.weight [1152]`, applies GPU RMSNorm to synthetic [8, 1152], compares against CPU. max_diff < 1e-3.
+    - `vit_per_head_rms_norm_gpu_matches_cpu_reference` — synthetic [4, 8, 16] vs CPU `per_head_rms_norm_forward` max_diff < 1e-4.
+    - `vit_per_head_rms_norm_gpu_rejects_zero_dims`.
+  - **Verification:** `cargo test --bin hf2q inference::vision::vit_gpu` — 9/9 pass. Full suite — 899/899 pass (+5 from iter 43's 894).
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
