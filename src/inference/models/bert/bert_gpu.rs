@@ -1022,6 +1022,26 @@ fn alloc_position_ids(device: &MlxDevice, seq_len: u32) -> Result<MlxBuffer> {
     Ok(buf)
 }
 
+/// Build a U32 buffer holding `[0, 0, ..., 0]` of length `seq_len` —
+/// the default BERT segment ids for single-segment input. Used by
+/// `apply_bert_full_forward_gpu` when the caller passes `type_ids = None`
+/// but the model has a token_types embedding table to keep parity with
+/// llama-embedding's default behavior.
+fn alloc_zero_type_ids(device: &MlxDevice, seq_len: u32) -> Result<MlxBuffer> {
+    let n = seq_len as usize;
+    let buf = device
+        .alloc_buffer(n * 4, DType::U32, vec![n])
+        .map_err(|e| anyhow!("alloc zero type_ids: {e}"))?;
+    // SAFETY: just-allocated u32 buffer; exclusive access. Zero-init
+    // explicit (alloc_buffer doesn't guarantee zeroed contents).
+    let slice: &mut [u32] =
+        unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, n) };
+    for slot in slice.iter_mut() {
+        *slot = 0;
+    }
+    Ok(buf)
+}
+
 /// Full BERT embeddings layer:
 /// `out = LayerNorm(token_embd[input_ids] + position_embd[0..seq] + maybe token_types[type_ids])`
 ///
@@ -1387,15 +1407,38 @@ pub fn apply_bert_full_forward_gpu(
     }
 
     // --- Embeddings ---
+    // BERT GGUFs serialize `token_types.weight` whether or not the
+    // caller has explicit type_ids, and llama-embedding adds
+    // `token_types[0]` for every position on single-segment input.
+    // To keep parity with that behavior, when the caller passes
+    // `type_ids_opt = None` and the model HAS a token_types table,
+    // synthesize an all-zeros `[seq_len]` u32 buffer and pass it
+    // through. That matches HuggingFace's BertEmbeddings default
+    // behavior for single-segment inputs.
+    let synthesized_type_ids: Option<MlxBuffer> = match (type_ids_opt, weights.token_types_weight()) {
+        (None, Some(_)) => Some(alloc_zero_type_ids(device, seq_len)?),
+        _ => None,
+    };
+    let effective_type_ids: Option<&MlxBuffer> = match (type_ids_opt, synthesized_type_ids.as_ref()) {
+        (Some(b), _) => Some(b),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let token_types_for_call = if effective_type_ids.is_some() {
+        weights.token_types_weight()
+    } else {
+        None
+    };
+
     let mut hidden_states = bert_embeddings_gpu(
         encoder,
         registry,
         device,
         input_ids,
-        type_ids_opt,
+        effective_type_ids,
         weights.token_embd_weight()?,
         weights.position_embd_weight()?,
-        weights.token_types_weight(),
+        token_types_for_call,
         weights.embed_norm_weight()?,
         weights.embed_norm_bias()?,
         eps,

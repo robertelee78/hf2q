@@ -1151,9 +1151,13 @@ pub async fn embeddings(
         let mut total_tokens: usize = 0;
 
         for (i, input) in inputs.into_iter().enumerate() {
-            // Tokenize.
+            // Tokenize. `add_special_tokens=true` so BERT's [CLS] /
+            // [SEP] markers are inserted — without them the encoder
+            // sees a sentence missing its sentinels and the embedding
+            // diverges from llama-embedding (and from any
+            // sentence-transformers / HuggingFace baseline).
             let enc = tokenizer
-                .encode(input.as_str(), false)
+                .encode(input.as_str(), true)
                 .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
             let raw_ids = enc.get_ids();
             total_tokens += raw_ids.len();
@@ -1233,7 +1237,12 @@ pub async fn embeddings(
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(e)) => ApiError::generation_error(format!("embedding forward: {e}")).into_response(),
+        Ok(Err(e)) => {
+            // Format the full anyhow chain with `:#` so the client gets
+            // every nested context, not just the topmost. Otherwise a
+            // dispatch failure four contexts deep is invisible.
+            ApiError::generation_error(format!("embedding forward: {e:#}")).into_response()
+        }
         Err(join_err) => {
             ApiError::generation_error(format!("embedding worker panicked: {join_err}"))
                 .into_response()
