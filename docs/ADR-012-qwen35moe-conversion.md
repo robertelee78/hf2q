@@ -587,12 +587,13 @@ The inference session's qwen35 / qwen35moe forward implements `ActivationCapture
    - The arch's target repos (`ArchEntry::hf_repos`) are resolvable via `huggingface-cli repo info` (no download yet) — exit code 6
 2. **Converts** each variant at the requested quant. For `--quant q4_0` (P8 baseline, pre-P9): bit-identical emission with no calibration dependency, unblocks the gate today. For `--quant dwq-mixed-4-*` (P9 follow-up): requires P9's real-activation wire-up and runs PPL/KL measurement inline.
 3. **Loads and infers** for 8 tokens under maximum determinism:
-   - `llama-cli --model <path> --prompt <ArchEntry::smoke_prompt> -n 8 --seed 42 --temp 0 --log-disable --no-warmup`
-   - `--temp 0` + `--seed 42` makes the output byte-stable across the M5 Max fleet
-4. **Asserts** each transcript:
-   - Exactly 8 generated tokens (`llama_print_timings: n_eval = 8`)
-   - No line matching `error|ERROR|panic|assertion|segfault` on stderr
-   - Tensor-count line `llama_model_load: loaded tensor 0x%x` matches `ArchEntry::tensor_catalog.len()` (sourced from the registry, not a side-file — single source of truth)
+   - `llama-cli --model <path> --prompt <ArchEntry::smoke_prompt> -n 8 --seed 42 --temp 0 --no-warmup`
+   - `--temp 0` + `--seed 42` makes the output byte-stable across the M5 Max fleet.
+   - **No `--log-disable`** (revised 2026-04-24, fix `99bbd0a` / next): real llama-cli's loader summary + timing block both flow through `LLAMA_LOG_INFO` (`/opt/llama.cpp/src/llama-context.cpp:3486`) which `--log-disable` suppresses, leaving the harness's transcript parsers staring at empty stderr. The `-n 8` token bound keeps log volume small without requiring suppression.
+4. **Asserts** each transcript (parsers accept BOTH real-llama-cli + synthetic mock formats per fix `47ccddb`):
+   - Exactly 8 generated tokens — real format `llama_print_timings: eval time = X ms / 8 runs`; synthetic-fixture format `n_eval = 8`.
+   - No line matching `error|ERROR|panic|assertion|segfault` on stderr.
+   - Tensor-count line — real format `llama_model_loader: loaded meta data with K key-value pairs and N tensors from ...`; synthetic-fixture format `llama_model_load: loaded tensor 0xN`. Asserted count matches `ArchEntry::tensor_catalog.expected_tensor_count(metadata)` (sourced from the registry, not a side-file — single source of truth).
 5. **(DWQ only)** Runs PPL + KL measurement against the F16 reference path (Decision 17) using `ArchEntry::ppl_corpus` and asserts the thresholds in `ArchEntry::quality_thresholds`.
 6. **Commits** each passing transcript under `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt` (≤ 2 KB, timestamps stripped). These are tracked artifacts — they are the evidence that this ADR's closure is real.
 

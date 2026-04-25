@@ -326,9 +326,19 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
 ///
 /// 1. Resolve input directory (either `--local-dir` or the first HF repo).
 /// 2. `hf2q convert --quant q4 --output <tmpdir>/smoke.gguf`.
-/// 3. `llama-cli --model ... -n 8 --seed 42 --temp 0 --log-disable --no-warmup`.
+/// 3. `llama-cli --model ... -n 8 --seed 42 --temp 0 --no-warmup`.
 /// 4. Assert transcript: no error lines, 8 tokens generated.
 /// 5. Write transcript to `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt`.
+///
+/// **Why no `--log-disable`:** real llama-cli routes both the model-
+/// loader summary (`loaded meta data with N tensors ...`) and the
+/// timing block (`eval time = X ms / N runs`) through `LLAMA_LOG_INFO`
+/// (see `/opt/llama.cpp/src/llama-context.cpp:3486`). Adding
+/// `--log-disable` (which calls `common_log_pause`) suppresses both
+/// — leaving the smoke harness's transcript-assertion parsers
+/// looking at empty stderr. The transcript itself is bounded
+/// (`-n 8`) so the log volume stays small without requiring
+/// suppression.
 fn run_q4_0_pipeline(
     entry: &ArchEntry,
     args: &SmokeArgs,
@@ -416,7 +426,10 @@ fn run_q4_0_pipeline(
             "42",
             "--temp",
             "0",
-            "--log-disable",
+            // No `--log-disable` — real llama-cli's loader summary +
+            // timing block both flow through LLAMA_LOG_INFO and would
+            // be suppressed, leaving the transcript-assertion parsers
+            // staring at empty stderr. See run_q4_0_pipeline doc comment.
             "--no-warmup",
         ])
         .output()
