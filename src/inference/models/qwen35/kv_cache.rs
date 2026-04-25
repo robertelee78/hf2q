@@ -564,12 +564,20 @@ mod tests {
         let cache = HybridKvCache::new(&cfg, &device, 32, 1).expect("alloc");
 
         // Full-attn: 10 × 2 × 256 × 2 × 32 × 1 × 4 bytes = 10 × 131072 = 1.3 MB
+        // (no ping-pong on full-attn KV cache — single buffer per slot)
         let full_expected = 10 * 2 * (256 * 2 * 32 * 1) * 4;
-        // Linear-attn: 30 × (conv + rec)
-        //   conv: 3 × 8192 × 1 × 4 = 98304 bytes
-        //   rec:  128 × 128 × 32 × 1 × 4 = 2097152 bytes
-        //   each slot: 2195456 bytes × 30 = 65,863,680
-        let linear_expected = 30 * (3 * 8192 * 1 * 4 + 128 * 128 * 32 * 1 * 4);
+        // Linear-attn (post P13.3): each slot allocates ping-pong buffers
+        // (active + scratch) for both conv_state and recurrent. The swap
+        // happens on each decode step (LinearAttnStateSlot::swap_*); both
+        // buffers are resident together. Per-slot footprint:
+        //   conv_state             : 3 × 8192 × 1 × 4 = 98304 bytes
+        //   conv_state_scratch     : 3 × 8192 × 1 × 4 = 98304 bytes  (ping-pong)
+        //   recurrent              : 128 × 128 × 32 × 1 × 4 = 2097152 bytes
+        //   recurrent_scratch      : 128 × 128 × 32 × 1 × 4 = 2097152 bytes (ping-pong)
+        //   each slot: 4_390_912 bytes × 30 = 131_727_360
+        let conv_bytes = 3 * 8192 * 1 * 4;
+        let rec_bytes = 128 * 128 * 32 * 1 * 4;
+        let linear_expected = 30 * (2 * conv_bytes + 2 * rec_bytes);
         let expected = full_expected + linear_expected;
         assert_eq!(cache.total_bytes(), expected);
     }

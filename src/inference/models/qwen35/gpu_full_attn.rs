@@ -1217,6 +1217,16 @@ mod tests {
     }
 
     /// Weight upload into `FullAttnWeightsGpu` preserves all 8 tensors.
+    ///
+    /// Two upload paths exist post P13.x:
+    ///   - F32 norms (attn_norm, post_attn_norm, attn_q_norm, attn_k_norm)
+    ///     upload via `upload_f32` and round-trip bit-exact.
+    ///   - Q4_0 projection weights (wq, wk, wv, w_gate, wo) upload via
+    ///     `upload_q4_0_from_f32` as a U8 buffer of GGML Q4_0 blocks.
+    ///     Q4_0 is lossy by design (4-bit quantization with F16 per-block
+    ///     scale), so a bit-exact F32 round-trip is impossible. We assert
+    ///     the buffer is the right dtype (U8) and the right byte count
+    ///     (one Q4_0 block per 32 source f32 values, 18 bytes per block).
     #[test]
     fn from_cpu_uploads_all_weights() {
         let device = MlxDevice::new().expect("device");
@@ -1230,26 +1240,50 @@ mod tests {
         let q_total = nh * d;
         let kv_total = nkv * d;
 
-        // Verify every buffer was uploaded with correct contents.
+        // F32 norms: bit-exact round-trip.
         for (name, expected, buf) in [
             ("attn_norm", &weights_cpu.attn_norm, &gpu.attn_norm),
+            ("post_attn_norm", &weights_cpu.post_attn_norm, &gpu.post_attn_norm),
+            ("attn_q_norm", &weights_cpu.attn_q_norm, &gpu.attn_q_norm),
+            ("attn_k_norm", &weights_cpu.attn_k_norm, &gpu.attn_k_norm),
+        ] {
+            assert_eq!(buf.dtype(), DType::F32, "{name}: expected F32 dtype");
+            let got = download_f32(buf).expect("download");
+            assert_eq!(got.len(), expected.len(), "{name}: length mismatch");
+            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(g.to_bits(), e.to_bits(), "{name}[{i}]");
+            }
+        }
+
+        // Q4_0 projection weights: dtype + byte-count contract.
+        // Each Q4_0 block covers 32 source f32 values and serializes to
+        // 18 bytes (2-byte F16 scale + 16 bytes packed nibbles).
+        const QK: usize = 32;
+        const Q4_0_BLOCK_BYTES: usize = 18;
+        for (name, expected_f32, buf) in [
             ("wq", &weights_cpu.wq, &gpu.wq),
             ("wk", &weights_cpu.wk, &gpu.wk),
             ("wv", &weights_cpu.wv, &gpu.wv),
             ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
-            ("attn_q_norm", &weights_cpu.attn_q_norm, &gpu.attn_q_norm),
-            ("attn_k_norm", &weights_cpu.attn_k_norm, &gpu.attn_k_norm),
             ("wo", &weights_cpu.wo, &gpu.wo),
         ] {
-            let got = download_f32(buf).expect("download");
             assert_eq!(
-                got.len(),
-                expected.len(),
-                "{name}: length mismatch"
+                buf.dtype(),
+                DType::U8,
+                "{name}: Q4_0 weight must be uploaded as U8 buffer"
             );
-            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
-                assert_eq!(g.to_bits(), e.to_bits(), "{name}[{i}]");
-            }
+            let n_src = expected_f32.len();
+            assert_eq!(
+                n_src % QK,
+                0,
+                "{name}: source f32 length ({n_src}) not divisible by Q4_0 block size {QK}"
+            );
+            let expected_bytes = (n_src / QK) * Q4_0_BLOCK_BYTES;
+            assert_eq!(
+                buf.element_count(),
+                expected_bytes,
+                "{name}: Q4_0 byte count mismatch (source f32 elems: {n_src})"
+            );
         }
 
         // Suppress unused warnings for shape dims used in the fixture.
@@ -1729,10 +1763,21 @@ mod tests {
             .map(|(&g, &c)| (g - c).abs())
             .fold(0.0f32, f32::max);
 
+        // Tolerance budget post-Q4_0 weight upload (P13.x):
+        // wq/wk/wv/w_gate/wo are uploaded as Q4_0 (4-bit GGML blocks) for
+        // the bandwidth-efficient `quantized_matmul_ggml` dispatch.  Q4_0
+        // introduces ~1% per-projection error; a full attention layer
+        // chains ~5 quantized projections (Q + K + V + gate-applied-to-Q +
+        // O_proj) — error compounds. CPU reference uses raw F32 weights,
+        // so the GPU/CPU parity gap reflects the quantization cost, not a
+        // logic bug. Empirical max on the small synthetic shape: ~1.9e-2
+        // (committed in test logs). 5e-2 tolerance gives ~3× margin.
+        const Q4_0_PARITY_TOLERANCE: f32 = 5e-2;
+
         // Gather first few mismatches for diagnostics.
         let mut n_fail = 0usize;
         for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
-            if (g - c).abs() >= 1e-3 {
+            if (g - c).abs() >= Q4_0_PARITY_TOLERANCE {
                 if n_fail < 5 {
                     eprintln!(
                         "  mismatch[{i}]: gpu={g:.8}, cpu={c:.8}, err={:.2e}",
@@ -1744,14 +1789,15 @@ mod tests {
         }
 
         assert!(
-            max_err < 1e-3,
-            "full GPU layer parity FAIL: max_abs_err={:.2e} (> 1e-3), n_fail={}/{}",
-            max_err, n_fail, gpu_out.len()
+            max_err < Q4_0_PARITY_TOLERANCE,
+            "full GPU layer parity FAIL: max_abs_err={:.2e} (> {:.2e} \
+             Q4_0 budget), n_fail={}/{}",
+            max_err, Q4_0_PARITY_TOLERANCE, n_fail, gpu_out.len()
         );
 
         eprintln!(
-            "full_layer_gpu_matches_cpu_ref: max_abs_err={:.2e} (< 1e-3), seq={seq}",
-            max_err
+            "full_layer_gpu_matches_cpu_ref: max_abs_err={:.2e} (< {:.2e} Q4_0 budget), seq={seq}",
+            max_err, Q4_0_PARITY_TOLERANCE
         );
     }
 
