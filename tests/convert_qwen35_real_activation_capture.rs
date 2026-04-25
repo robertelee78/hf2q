@@ -1,18 +1,47 @@
 //! ADR-012 P9 — RealActivationCapture integration tests.
 //!
-//! Pre-ADR-013-P12 these assertions are the "dependency wall" proof —
-//! they verify that invoking DWQ calibration on qwen35/qwen35moe does
-//! NOT silently fall back to weight-space, does NOT panic, and surfaces
-//! a structured NotReady error citing ADR-013 P12 as the blocker. When
-//! P12 ships bit-stable (post-weight-load + post-forward), the negative
-//! assertions below are replaced with positive ones (sensitivity JSON
-//! differs from weight-space-only scoring, per Decision 17 §"Structural
-//! acceptance criteria").
+//! # History
 //!
-//! Per `feedback_never_ship_fallback_without_rootcause.md`: the NotReady
-//! error is the concrete antipattern guard. Any future change that
-//! inserts a "fall back to weight-space" path for qwen35/qwen35moe
-//! MUST first present an amendment to this file — trips this test.
+//! Pre-ADR-013-P12 (≤ 2026-04-25 morning): these assertions were the
+//! "dependency wall" proof — convert failed at the P9b-pending guard
+//! at `src/main.rs:601-624` with stderr text "ADR-012 P9b: convert-
+//! pipeline activation-capture wire-up pending".
+//!
+//! Post-P9b.2/3b (this iteration): the P9b-pending guard is removed.
+//! The two-pass pipeline now executes:
+//!
+//!   1. `emit_gguf_from_tensor_map` writes an intermediate F16 GGUF.
+//!   2. `RealActivationCapture::new(intermediate, tokenizer)` calls
+//!      `Qwen35Model::load_from_gguf` to produce a live model.
+//!   3. `run_dwq_activation_calibration` drives DWQ via the real
+//!      forward pass.
+//!
+//! On the synthetic all-zero qwen35 fixture below, step (2) fails
+//! because `Qwen35Model::load_from_gguf` rejects fixtures that don't
+//! satisfy every `Qwen35Config::from_gguf` invariant. The error
+//! surface still contains "ActivationCapture" / "RealActivationCapture"
+//! — the anchored contract is unchanged: **no silent weight-space
+//! fallback for qwen35/qwen35moe DWQ**, regardless of which stage of
+//! the two-pass pipeline trips.
+//!
+//! # What this test guards
+//!
+//! Per `feedback_never_ship_fallback_without_rootcause.md`: any future
+//! change that inserts a "fall back to weight-space" path for
+//! qwen35/qwen35moe MUST first present an amendment to this file —
+//! trips this test. The anchored properties:
+//!
+//! - DWQ on qwen35/qwen35moe with synthetic fixtures **must** fail.
+//! - The error message **must** name the ActivationCapture dependency.
+//! - **No** output GGUF must be produced (silent rescue antipattern).
+//! - q4 (no ActivationCapture dependency) on the same fixture must
+//!   still succeed — proves the failure is arch-AND-quant-specific.
+//!
+//! # Real-model green-path test
+//!
+//! The positive-path test (real qwen35 safetensors → DWQ GGUF →
+//! PPL/KL gates) is gated on HF_TOKEN + ~30 GB disk and is tracked
+//! as Task #16 in the ADR-012 P9 close-out.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -122,15 +151,23 @@ fn setup(dir: &Path) {
     fs::write(dir.join("model.safetensors"), build_safetensors_bytes(tensors)).unwrap();
 }
 
-/// Pre-P12: `hf2q convert --quant dwq-mixed-N-M` on qwen35 MUST fail
-/// with the structured NoActivationCapture error for EVERY DWQ variant,
-/// NOT fall back to weight-space silently. If a future edit narrowed
-/// the guard from `.requires_activation_capture()` to `== Qwen35` for
-/// only one variant, the other three would silently accept DWQ with
-/// weight-space — the exact antipattern Decision 13 rejects.
+/// `hf2q convert --quant dwq-mixed-N-M` on qwen35 with a synthetic
+/// fixture MUST fail with a structured ActivationCapture-named error
+/// for EVERY DWQ variant, NOT fall back to weight-space silently.
 ///
-/// When P12 lands, this test is updated to assert success + sensitivity
-/// JSON is produced.
+/// If a future edit narrowed the guard from
+/// `.requires_activation_capture()` to `== Qwen35` for only one
+/// variant, the other three would silently accept DWQ with weight-
+/// space — the exact antipattern Decision 13 rejects.
+///
+/// Post-P9b.2/3b (this iteration): the failure surface has shifted
+/// from the P9b-pending guard to `RealActivationCapture::new` →
+/// `Qwen35Model::load_from_gguf` rejecting the synthetic fixture.
+/// The contract — error names ActivationCapture, no output GGUF —
+/// is unchanged.
+///
+/// The real-model green-path test (Task #16) is gated on HF_TOKEN +
+/// ~30 GB disk; this test stays at the synthetic-fail-fast tier.
 #[test]
 fn dwq_on_qwen35_surfaces_not_ready_not_fallback() {
     let tmp = tempfile::tempdir().unwrap();
@@ -179,9 +216,14 @@ fn dwq_on_qwen35_surfaces_not_ready_not_fallback() {
     }
 }
 
-/// Dense model without ActivationCapture dependency (e.g. `q4`) still
-/// converts successfully. This proves the NotReady guard is arch-
-/// specific (qwen35/qwen35moe only, not a blanket refusal).
+/// Dense quant without ActivationCapture dependency (e.g. `q4`) still
+/// converts successfully on the same synthetic fixture. Proves the
+/// activation-capture guard is arch-AND-quant-specific (qwen35/
+/// qwen35moe DWQ only), not a blanket refusal of qwen35 conversions.
+///
+/// (Function name retains `_pre_p12` for git-blame stability; ADR-013
+/// P12 has shipped — see the file header for the post-P12 anchored
+/// contract.)
 #[test]
 fn q4_0_on_qwen35_still_works_pre_p12() {
     let tmp = tempfile::tempdir().unwrap();
