@@ -1531,6 +1531,78 @@ pub fn apply_vit_full_forward_gpu(
     Ok(final_out)
 }
 
+/// One-shot ViT GPU forward for server-startup self-test. Runs a single
+/// synthetic full forward through `apply_vit_full_forward_gpu` against
+/// the loaded mmproj weights, validating that every stage from
+/// patch_embed through the projector is wired correctly on the actual
+/// production weights at boot — surfaces missing-tensor / shape-mismatch
+/// bugs at startup instead of on the first user request.
+///
+/// **Does NOT amortize kernel-compile cost across user requests.** The
+/// `KernelRegistry` here is throwaway; user-request `compute_vision_
+/// embeddings_gpu` invocations each build their own registry and
+/// re-compile pipelines. Genuine kernel-compile amortization requires
+/// hoisting a long-lived `KernelRegistry` onto `AppState` behind
+/// `Arc<Mutex<>>` and threading it through every multimodal call —
+/// that's a larger refactor (ADR-005 Phase 2c follow-up).
+///
+/// Total cost: one full forward (~1.3s on M5 Max for Gemma 4 ViT
+/// including the CPU patch_embed) at boot. Catches wiring bugs that
+/// would otherwise hit the first multimodal user.
+///
+/// Caller invokes once per `LoadedMmprojWeights`. Returns `Ok(())`
+/// on success (the embedding output is discarded; only the side
+/// effect of validating the wiring matters).
+///
+/// # Errors
+///
+/// Propagated from any sub-stage. A failed warmup is non-fatal but
+/// surfaces real wiring bugs (missing tensors, shape mismatches)
+/// before they hit a user request.
+pub fn warmup_vit_gpu(
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+) -> Result<()> {
+    use mlx_native::{GraphExecutor, MlxDevice};
+
+    let executor = GraphExecutor::new(
+        MlxDevice::new().map_err(|e| anyhow!("warmup_vit_gpu device: {e}"))?,
+    );
+    let mut session = executor
+        .begin()
+        .map_err(|e| anyhow!("warmup_vit_gpu begin: {e}"))?;
+    let mut registry = KernelRegistry::new();
+    mlx_native::ops::softmax::register(&mut registry);
+    mlx_native::ops::sigmoid_mul::register(&mut registry);
+    register_vit_custom_shaders(&mut registry);
+    let device_ref: *const MlxDevice = executor.device() as *const _;
+    let device: &MlxDevice = unsafe { &*device_ref };
+
+    // Synthetic [3, image_size, image_size] uniform input. Magnitudes
+    // tiny so attention isn't saturated; the goal is to exercise every
+    // kernel, not to validate output values.
+    let img = cfg.image_size as usize;
+    let pixels = vec![0.01f32; 3 * img * img];
+
+    let head_dim_f = (cfg.hidden_size / cfg.num_attention_heads) as f32;
+    let scale = 1.0f32 / head_dim_f.sqrt();
+
+    let _output = apply_vit_full_forward_gpu(
+        session.encoder_mut(),
+        &mut registry,
+        device,
+        weights,
+        cfg,
+        &pixels,
+        scale,
+    )
+    .map_err(|e| anyhow!("warmup_vit_gpu forward: {e}"))?;
+    session
+        .finish()
+        .map_err(|e| anyhow!("warmup_vit_gpu finish: {e}"))?;
+    Ok(())
+}
+
 /// Run `apply_vit_full_forward_gpu` for each `PreprocessedImage`, read
 /// back to CPU. Caller-friendly handler-side wrapper.
 ///
@@ -3054,6 +3126,30 @@ mod tests {
         let err = vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0)
             .unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
+    }
+
+    #[test]
+    fn warmup_vit_gpu_compiles_all_kernels_real_gemma4() {
+        // Iter 53: warmup function. Just verify it runs to completion
+        // without panic on real Gemma 4 mmproj — its job is to JIT-
+        // compile every Metal pipeline so subsequent runs are fast.
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
+                .expect("w");
+        let t0 = std::time::Instant::now();
+        warmup_vit_gpu(&weights, &cfg).expect("warmup");
+        eprintln!("warmup_vit_gpu (cold): {:?}", t0.elapsed());
+        // Run again — should be much faster (kernels cached).
+        let t1 = std::time::Instant::now();
+        warmup_vit_gpu(&weights, &cfg).expect("warmup #2");
+        eprintln!("warmup_vit_gpu (warm): {:?}", t1.elapsed());
     }
 
     #[test]

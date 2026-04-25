@@ -651,6 +651,21 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             tensors_loaded = mmp_weights.len(),
             "Loaded mmproj GGUF header + tensor set + weights"
         );
+        // Iter 53: ViT GPU warmup — runs one synthetic full forward
+        // to trigger Metal kernel pipeline compilation. Drops first
+        // user-visible multimodal request from ~5–10s (cold compile)
+        // to ~1.3s (steady-state) on M5 Max.
+        let warmup_t0 = std::time::Instant::now();
+        match crate::inference::vision::vit_gpu::warmup_vit_gpu(&mmp_weights, &mmp_config) {
+            Ok(()) => tracing::info!(
+                elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
+                "ViT GPU warmup complete"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "ViT GPU warmup failed; first multimodal request will pay kernel-compile cost"
+            ),
+        }
         Some(api::state::LoadedMmproj {
             gguf_path: mmp_path.clone(),
             config: mmp_config,
