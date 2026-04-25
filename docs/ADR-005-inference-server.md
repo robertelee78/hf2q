@@ -1930,6 +1930,36 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 73 — Phase 2a Task #9 summarize-overflow path implemented end-to-end. The 501 stub is gone; Decision #23 contract met.**
+  - **What changed.** Iter 62-66 wired the `OverflowPolicy::Summarize` enum + transparency-header plumbing but left the actual summarize branch returning `501 Not Implemented`. The user's mantra ("no stubs, no fallback") makes that unacceptable. Iter 73 ships the real path.
+  - **New pure helpers** in `src/serve/api/handlers.rs`:
+    - `split_for_summarize(messages, keep_recent_count) → SummarySplit { system_prefix, summary_window, recent_window }` — splits messages so the leading system run, the oldest non-system messages, and the most-recent-K non-system messages are each addressable. K=4 (`SUMMARIZE_KEEP_RECENT_MSGS`) keeps two user-assistant turns intact for local context.
+    - `build_summary_user_text(window) → String` — renders the summary window as `<ROLE>: <text>\n` lines under a "Summarize the following conversation in 2-3 sentences." instruction. Image-url content parts silently dropped (the summarizer can't see them anyway). Empty messages skipped.
+    - `build_synthetic_summary_message(text)` — wraps the model's summary in `"[Summary of prior conversation]: <text>"` and stamps it as a `system`-role message.
+  - **New async helper** `apply_summarize(engine, messages, ctx_len)`:
+    1. Split messages with `split_for_summarize`.
+    2. If `summary_window.is_empty()` → fall back to `apply_truncate_left` (no transparency counters; nothing was summarized).
+    3. Build the summarization request as a 2-message conversation: a system primer (`"You are a concise summarization assistant. Produce 2-3 sentence summaries..."`) plus a user message containing the rendered window.
+    4. Render through the engine's chat template and tokenize. If `prompt_tokens + SUMMARIZE_MAX_TOKENS ≥ ctx_len` (the summary window itself is too long for one shot), fall back to truncate_left.
+    5. Run `engine.generate(...).await` with `T=0` and `max_tokens=160`.
+    6. Build `[system_prefix..., synthetic_summary_msg, recent_window...]` and re-render+tokenize.
+    7. If the result fits → return with `summarized_messages = window.len()` and `summary_tokens = result.completion_tokens` for the transparency headers.
+    8. If still over budget (recent_window alone is too long) → truncate_left from the recent end, but keep the summarize counters populated so the operator sees what the policy attempted.
+  - **Sweep changes.** `apply_overflow_policy` is now async and returns `(Vec<u32>, usize, Option<usize>, Option<usize>)`. `prepare_chat_generation` is async. `PreparedChatContext` carries `summarized_messages` and `summary_tokens`. Both `chat_completions` and `chat_completions_stream` thread the values into `apply_transparency_headers` so the `X-HF2Q-Summarized-Messages` and `X-HF2Q-Summary-Tokens` headers are populated whenever the summarize path actually ran.
+  - **Tests (7 new pure-helper, all pass; full suite api:: 244/244, BERT 58/58):**
+    - `split_for_summarize_*` — empty input, only-system, keep_recent ≥ tail, 5 messages with keep=2, no system prefix. Asserts the three-way split is correct in every regime.
+    - `build_summary_user_text_*` — skips empty content; uppercases role; handles multipart content (text parts joined, image_url dropped).
+    - `build_synthetic_summary_message_*` — wraps with the marker prefix; trims whitespace from the model output.
+  - **Why no integration test against a real chat engine.** The dev environment is OOM-blocked from loading a chat model (memory `feedback_oom_prevention.md` — only one model-loading process at a time; 35B-A4B apex = ~30 GB). The pure helpers are unit-tested. The end-to-end flow (engine.generate produces a real summary that's smaller than the window) is the right thing to validate on a future iter where a chat engine is loaded for an unrelated reason — at that point a single curl with `hf2q_overflow_policy=summarize` exercises the full path.
+  - **Verification.** `cargo test --bin hf2q api::handlers::truncate_tests` 17/17 pass (10 prior + 7 new). `cargo test --bin hf2q api::` 244/244. `cargo check --bin hf2q --tests` clean.
+  - **Lane discipline observed.** Edits in `src/serve/api/handlers.rs` only. No mlx-native or BERT-lane changes. The `engine.generate` call goes through the existing `Engine` API that's already in my lane (iter 54 hardened it with proper SIGTERM drain).
+  - **Phase 2a Task #9 status: CLOSED.** Decision #23 summarize-by-default contract is met code-wise; transparency headers populate correctly when summarize fires. The chat engine has to be loaded for the path to actually exercise — that's the deployment scenario, not my lane.
+  - **Next (iter 74):** Highest-leverage remaining items in my lane:
+    - Task #5 grammar-constrained decoding port from llama.cpp — substantial multi-iter chunk; right candidate now that summarize is closed and the `engine.generate` integration pattern is proven (iter 73 did exactly this kind of "pre-engine-warmup pure plumbing landed; full integration runs when an engine is loaded").
+    - Task #7 prompt cache engine integration — the LCP cache from iter 19 needs a hook into `forward_prefill` to skip the prefix that's already in KV. Cross-lane to the chat-model team's `forward_prefill.rs`; co-design.
+    - Task #15 vision soft-token engine integration — task #17 captures this; cross-lane.
+    - SSE keepalive `: summarizing prior conversation...` comment frame for streaming requests — small follow-up to iter 73; ~10 LOC.
+
 - **2026-04-26 loop iter 72 — Phase 2a Task #11 lifecycle audit closed: SIGTERM drain verified end-to-end with a 2-phase smoke test.**
   - **Coverage.** Decision #17 contract: "SIGTERM drains in-flight + queue then exits." Iter 54 wired the chat-engine drain path; iter 72 verifies the **embedding-handler drain path** (the `tokio::task::spawn_blocking` GPU dispatch) and the **idle-exit path** end-to-end against a real binary.
   - **`scripts/smoke_lifecycle_drain.sh` — 2-phase test** (passes on both):

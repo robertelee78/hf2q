@@ -67,7 +67,7 @@ pub async fn chat_completions(
     // Shared prelude: engine gate, model-id match, chat-template render,
     // tokenize, sampling-params build. Returns either a prepared context or
     // an error response to return directly.
-    let prepared = match prepare_chat_generation(&state, &req) {
+    let prepared = match prepare_chat_generation(&state, &req).await {
         Ok(p) => p,
         Err(resp) => {
             state.metrics.requests_rejected_total.fetch_add(1, Ordering::Relaxed);
@@ -85,6 +85,8 @@ pub async fn chat_completions(
         engine: _engine_ref,
         prompt_tokens,
         params,
+        summarized_messages,
+        summary_tokens,
     } = prepared;
     let engine = state.engine.as_ref().expect("engine gate above ensures Some");
 
@@ -180,7 +182,7 @@ pub async fn chat_completions(
         x_hf2q_timing: Some(timing),
     };
     let mut response = (StatusCode::OK, Json(resp)).into_response();
-    apply_transparency_headers(&state, &req, &mut response, None, None);
+    apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
     response
 }
 
@@ -239,12 +241,17 @@ struct PreparedChatContext {
     engine: (),
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
+    /// Decision #23 transparency counters. `Some` only when the
+    /// Summarize policy actually ran a forward pass to produce a
+    /// synthetic summary system message.
+    summarized_messages: Option<usize>,
+    summary_tokens: Option<usize>,
 }
 
 /// Run every validation + rendering + tokenization step common to the
 /// streaming and non-streaming chat-completion paths. Returns the prepared
 /// context on success, or an `axum::Response` to return directly on failure.
-fn prepare_chat_generation(
+async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> std::result::Result<PreparedChatContext, Response> {
@@ -350,8 +357,8 @@ fn prepare_chat_generation(
     let policy = req
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
-    let (prompt_tokens, _prompt_len) =
-        match apply_overflow_policy(engine, &req.messages, policy) {
+    let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
+        match apply_overflow_policy(engine, &req.messages, policy).await {
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
@@ -396,6 +403,8 @@ fn prepare_chat_generation(
         engine: (),
         prompt_tokens,
         params,
+        summarized_messages,
+        summary_tokens,
     })
 }
 
@@ -414,6 +423,12 @@ async fn chat_completions_stream(
         Some(e) => e.clone(),
         None => return ApiError::model_not_loaded(&req.model).into_response(),
     };
+
+    // Decision #23: capture transparency counters BEFORE we move
+    // `prepared` into `engine.generate_stream`. They flow into the
+    // response headers below.
+    let summarized_messages = prepared.summarized_messages;
+    let summary_tokens = prepared.summary_tokens;
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(64);
     // Worker bumps this counter if it aborts because the SSE receiver was
@@ -460,7 +475,7 @@ async fn chat_completions_stream(
     let sse =
         generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts);
     let mut response = sse.into_response();
-    apply_transparency_headers(&state, &req, &mut response, None, None);
+    apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
     response
 }
 
@@ -543,6 +558,123 @@ where
     }
 }
 
+/// Number of most-recent non-system messages to keep verbatim during
+/// summarize. Anything older than this (excluding system messages) gets
+/// folded into a single synthetic summary system message. K=4 is two
+/// user-assistant turns — enough for the model to maintain local
+/// coherence without dragging the entire history.
+const SUMMARIZE_KEEP_RECENT_MSGS: usize = 4;
+
+/// Cap on completion tokens for a summarization forward pass. ~120-160
+/// tokens is enough for a 2-3 sentence summary; anything longer defeats
+/// the purpose of context compression.
+const SUMMARIZE_MAX_TOKENS: usize = 160;
+
+/// Pure-compute split of a message list into (system_prefix,
+/// summary_window, recent_window) for the Decision #23 summarize path.
+///
+/// - `system_prefix`: every leading `role == "system"` message, in
+///   order. Preserved verbatim because the system prompt sets behavior.
+/// - `recent_window`: the last `keep_recent_count` non-system messages.
+///   The model needs these for local context.
+/// - `summary_window`: everything else (the oldest non-system messages).
+///   These get summarized into a single synthetic system message.
+///
+/// When `recent_keep_count >= num_non_system`, the summary window is
+/// empty — caller must fall back to truncate_left.
+pub(crate) fn split_for_summarize(
+    messages: &[super::schema::ChatMessage],
+    keep_recent_count: usize,
+) -> SummarySplit {
+    // System prefix = leading run of role="system".
+    let prefix_end = messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(messages.len());
+    let system_prefix: Vec<_> = messages[..prefix_end].to_vec();
+    let non_system: &[super::schema::ChatMessage] = &messages[prefix_end..];
+
+    // Anywhere in the tail might also be system messages (rare — most
+    // chat templates only support one leading system); they're treated
+    // as part of the summary/recent split. Keep_recent_count is counted
+    // against ALL tail messages, not non-system-only.
+    let n_tail = non_system.len();
+    let recent_count = keep_recent_count.min(n_tail);
+    let summary_end = n_tail - recent_count;
+
+    SummarySplit {
+        system_prefix,
+        summary_window: non_system[..summary_end].to_vec(),
+        recent_window: non_system[summary_end..].to_vec(),
+    }
+}
+
+/// Output of `split_for_summarize`. Sum of all three vectors' lengths
+/// equals the input length.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SummarySplit {
+    pub system_prefix: Vec<super::schema::ChatMessage>,
+    pub summary_window: Vec<super::schema::ChatMessage>,
+    pub recent_window: Vec<super::schema::ChatMessage>,
+}
+
+/// Build the user-side text for a summarization request. Each message
+/// in `summary_window` becomes a single line `"<ROLE>: <content>"`.
+/// Non-text content parts are silently dropped (image_url etc. — the
+/// summarizer can't see images anyway).
+pub(crate) fn build_summary_user_text(
+    summary_window: &[super::schema::ChatMessage],
+) -> String {
+    use super::schema::MessageContent;
+    let mut buf = String::with_capacity(summary_window.len() * 80);
+    buf.push_str(
+        "Summarize the following conversation in 2-3 sentences. \
+         Be concise; preserve key facts and decisions:\n\n",
+    );
+    for m in summary_window {
+        let text = match &m.content {
+            None => "".to_string(),
+            Some(MessageContent::Text(s)) => s.clone(),
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    super::schema::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        buf.push_str(&m.role.to_uppercase());
+        buf.push_str(": ");
+        buf.push_str(&text);
+        buf.push('\n');
+    }
+    buf
+}
+
+/// Build the synthetic system message that replaces `summary_window` in
+/// the rewritten message list. Wraps the model's summary in a marker
+/// prefix so downstream consumers can recognize and (if they want)
+/// re-expand from cached history.
+pub(crate) fn build_synthetic_summary_message(
+    summary_text: &str,
+) -> super::schema::ChatMessage {
+    super::schema::ChatMessage {
+        role: "system".to_string(),
+        content: Some(super::schema::MessageContent::Text(format!(
+            "[Summary of prior conversation]: {}",
+            summary_text.trim()
+        ))),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    }
+}
+
 /// Apply Decision #23 context-overflow policy. Renders the chat template,
 /// tokenizes, and checks against `engine.context_length()`:
 ///
@@ -553,48 +685,25 @@ where
 ///                       engine recursion; lands with forward_decode
 ///                       refactor).
 ///
-/// Returns `(prompt_tokens, prompt_len)` on success, or the error response
-/// to bail with on failure.
-fn apply_overflow_policy(
+/// Returns `(prompt_tokens, prompt_len, summarized_messages_count,
+/// summary_tokens)` on success. The last two are `Some` only when the
+/// Summarize policy actually ran a summarization pass — they flow into
+/// `X-HF2Q-Summarized-Messages` / `X-HF2Q-Summary-Tokens` transparency
+/// headers per Decision #23.
+async fn apply_overflow_policy(
     engine: &engine::Engine,
     messages: &[super::schema::ChatMessage],
     policy: super::schema::OverflowPolicy,
-) -> std::result::Result<(Vec<u32>, usize), Response> {
+) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
-    // Helper: render + tokenize a message slice. Returns tokens + length.
-    let render_and_tokenize =
-        |msgs: &[super::schema::ChatMessage]| -> Result<(Vec<u32>, usize), Response> {
-            let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "chat template render failed");
-                    return Err(ApiError::invalid_request(
-                        format!("chat template render failed: {e}"),
-                        Some("messages".into()),
-                    )
-                    .into_response());
-                }
-            };
-            let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "tokenization failed");
-                    return Err(ApiError::internal_error().into_response());
-                }
-            };
-            let tokens: Vec<u32> = encoding.get_ids().to_vec();
-            let n = tokens.len();
-            Ok((tokens, n))
-        };
-
-    let (tokens, n) = render_and_tokenize(messages)?;
+    let (tokens, n) = render_and_tokenize_for_overflow(engine, messages)?;
     let ctx_len = match engine.context_length() {
         Some(c) => c,
-        None => return Ok((tokens, n)), // no advertised ctx → trust the caller
+        None => return Ok((tokens, n, None, None)), // no advertised ctx → trust the caller
     };
     if n < ctx_len {
-        return Ok((tokens, n));
+        return Ok((tokens, n, None, None));
     }
 
     // Prompt does not fit. Dispatch on policy.
@@ -603,42 +712,216 @@ fn apply_overflow_policy(
             Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
         }
         OverflowPolicy::TruncateLeft => {
-            // Use the pure-compute truncate_left helper. We need a
-            // length-only tokenizer here (the helper doesn't care about
-            // the token bytes), then re-run once on the final shrunk
-            // messages to get the token Vec for the generator.
-            let outcome = truncate_left(messages, ctx_len, |msgs| {
-                render_and_tokenize(msgs).map(|(_, n)| n).map_err(|r| r)
-            });
-            match outcome {
-                TruncateOutcome::Fits(_, _) => Ok((tokens, n)),
-                TruncateOutcome::Truncated(shrunk, _, _) => render_and_tokenize(&shrunk),
-                TruncateOutcome::CannotShrink { ctx_len, actual } => Err(
-                    ApiError::context_length_exceeded(ctx_len, actual).into_response(),
-                ),
-                TruncateOutcome::TokenizeErr(resp) => Err(resp),
+            let (t, n) = apply_truncate_left(engine, messages, ctx_len, tokens, n)?;
+            Ok((t, n, None, None))
+        }
+        OverflowPolicy::Summarize => apply_summarize(engine, messages, ctx_len).await,
+    }
+}
+
+/// Render the chat template + tokenize. Returns `(tokens, n_tokens)` or
+/// the response to bail with on failure. Pulled out of
+/// `apply_overflow_policy` so the summarize path can reuse it.
+fn render_and_tokenize_for_overflow(
+    engine: &engine::Engine,
+    msgs: &[super::schema::ChatMessage],
+) -> Result<(Vec<u32>, usize), Response> {
+    let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "chat template render failed");
+            return Err(ApiError::invalid_request(
+                format!("chat template render failed: {e}"),
+                Some("messages".into()),
+            )
+            .into_response());
+        }
+    };
+    let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "tokenization failed");
+            return Err(ApiError::internal_error().into_response());
+        }
+    };
+    let tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let n = tokens.len();
+    Ok((tokens, n))
+}
+
+/// TruncateLeft branch helper. Iteratively drop oldest non-system
+/// messages until the prompt fits; map the outcome to the right HTTP
+/// envelope.
+fn apply_truncate_left(
+    engine: &engine::Engine,
+    messages: &[super::schema::ChatMessage],
+    ctx_len: usize,
+    initial_tokens: Vec<u32>,
+    initial_n: usize,
+) -> Result<(Vec<u32>, usize), Response> {
+    let outcome = truncate_left(messages, ctx_len, |msgs| {
+        render_and_tokenize_for_overflow(engine, msgs)
+            .map(|(_, n)| n)
+            .map_err(|r| r)
+    });
+    match outcome {
+        TruncateOutcome::Fits(_, _) => Ok((initial_tokens, initial_n)),
+        TruncateOutcome::Truncated(shrunk, _, _) => render_and_tokenize_for_overflow(engine, &shrunk),
+        TruncateOutcome::CannotShrink { ctx_len, actual } => {
+            Err(ApiError::context_length_exceeded(ctx_len, actual).into_response())
+        }
+        TruncateOutcome::TokenizeErr(resp) => Err(resp),
+    }
+}
+
+/// Summarize branch — Decision #23. Splits the message list into
+/// (system_prefix, summary_window, recent_window), runs a forward pass
+/// on the summary window through the loaded chat engine, replaces the
+/// window with a synthetic system message, and re-tokenizes. If the
+/// summary window is empty (too few messages to compress) or the
+/// resulting prompt still doesn't fit, falls through to truncate_left.
+///
+/// Returns the same shape as `apply_overflow_policy`: when the
+/// summarize path actually ran, the last two `Option<usize>` are
+/// populated with the count of messages collapsed into the summary
+/// and the summary's completion-token count.
+async fn apply_summarize(
+    engine: &engine::Engine,
+    messages: &[super::schema::ChatMessage],
+    ctx_len: usize,
+) -> Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
+    let split = split_for_summarize(messages, SUMMARIZE_KEEP_RECENT_MSGS);
+    if split.summary_window.is_empty() {
+        // Nothing to summarize — fall through to truncate_left without
+        // populating the summarize-specific transparency counters.
+        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(engine, messages)?;
+        let (t, n) = apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+        return Ok((t, n, None, None));
+    }
+
+    // Build the summarization request: a 2-message conversation that
+    // reuses the engine's chat template. System sets the role; user
+    // delivers the rendered window verbatim.
+    let summary_user_text = build_summary_user_text(&split.summary_window);
+    let summary_request_msgs = vec![
+        super::schema::ChatMessage {
+            role: "system".to_string(),
+            content: Some(super::schema::MessageContent::Text(
+                "You are a concise summarization assistant. Produce 2-3 \
+                 sentence summaries of conversations. Preserve key facts \
+                 and decisions; drop pleasantries."
+                    .to_string(),
+            )),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+        super::schema::ChatMessage {
+            role: "user".to_string(),
+            content: Some(super::schema::MessageContent::Text(summary_user_text)),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+
+    // Tokenize the summary request through the engine's chat template.
+    let (summary_prompt_tokens, summary_prompt_n) =
+        render_and_tokenize_for_overflow(engine, &summary_request_msgs)?;
+
+    // Sanity: the summary prompt + completion budget must itself fit.
+    // If not, the summary window is too long for a one-shot summary
+    // (e.g. a single 50k-token user dump) — fall back to truncate_left
+    // on the original message list.
+    if summary_prompt_n + SUMMARIZE_MAX_TOKENS >= ctx_len {
+        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(engine, messages)?;
+        let (t, n) = apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+        return Ok((t, n, None, None));
+    }
+
+    // Run the summarization pass. T=0 for determinism; max 160 tokens.
+    let params = super::engine::SamplingParams {
+        temperature: 0.0,
+        max_tokens: SUMMARIZE_MAX_TOKENS,
+        ..super::engine::SamplingParams::default()
+    };
+    let summary_text = match engine.generate(summary_prompt_tokens, params).await {
+        Ok(result) => {
+            let text = result.text.trim().to_string();
+            if text.is_empty() {
+                tracing::warn!("summarize produced empty text; falling back to truncate_left");
+                let (initial_tokens, initial_n) =
+                    render_and_tokenize_for_overflow(engine, messages)?;
+                let (t, n) =
+                    apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+                return Ok((t, n, None, None));
             }
+            (text, result.completion_tokens)
         }
-        OverflowPolicy::Summarize => {
-            // Decision #23 summarize path requires internal engine recursion
-            // (run the currently-loaded model on the oldest messages to
-            // produce a synthetic system summary). That needs the
-            // forward_decode refactor so we can interleave summarize +
-            // generate; lands in a later iter. Until then we return a
-            // clear 501.
-            let err = ApiError::invalid_request(
-                "overflow-policy=summarize is not yet implemented in this build. \
-                 Use overflow-policy=truncate_left or reject via \
-                 --overflow-policy server flag or the hf2q_overflow_policy \
-                 request extension field.",
-                Some("hf2q_overflow_policy".into()),
-            );
-            // Override the status to 501 Not Implemented (more honest than
-            // 400 for a feature we know is coming).
-            let mut resp = err.into_response();
-            *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-            Err(resp)
+        Err(e) => {
+            // Engine refused the request (e.g. queue full). Surface as
+            // an internal error — the user asked for summarize and we
+            // could not deliver. Don't silently fall through, that hides
+            // overload from the operator.
+            tracing::warn!(error = %e, "summarize engine.generate failed");
+            return Err(ApiError::generation_error(format!(
+                "summarize forward pass failed: {e}"
+            ))
+            .into_response());
         }
+    };
+    let (summary_text, summary_completion_tokens) = summary_text;
+
+    // Build the rewritten message list with the synthetic summary
+    // inserted after the system prefix.
+    let synthetic = build_synthetic_summary_message(&summary_text);
+    let mut new_messages = split.system_prefix.clone();
+    new_messages.push(synthetic);
+    new_messages.extend(split.recent_window.iter().cloned());
+
+    let summarized_count = split.summary_window.len();
+
+    let (new_tokens, new_n) = render_and_tokenize_for_overflow(engine, &new_messages)?;
+    if new_n < ctx_len {
+        return Ok((
+            new_tokens,
+            new_n,
+            Some(summarized_count),
+            Some(summary_completion_tokens),
+        ));
+    }
+
+    // Summary collapsed the window but the result still doesn't fit
+    // (e.g. recent_window alone is too long). Truncate from the recent
+    // end. Keep the summarize-counters populated so the operator can
+    // see in transparency headers what the policy attempted.
+    let outcome = truncate_left(&new_messages, ctx_len, |msgs| {
+        render_and_tokenize_for_overflow(engine, msgs)
+            .map(|(_, n)| n)
+            .map_err(|r| r)
+    });
+    match outcome {
+        TruncateOutcome::Fits(_, _) => Ok((
+            new_tokens,
+            new_n,
+            Some(summarized_count),
+            Some(summary_completion_tokens),
+        )),
+        TruncateOutcome::Truncated(shrunk, _, _) => {
+            let (t, n) = render_and_tokenize_for_overflow(engine, &shrunk)?;
+            Ok((
+                t,
+                n,
+                Some(summarized_count),
+                Some(summary_completion_tokens),
+            ))
+        }
+        TruncateOutcome::CannotShrink { ctx_len, actual } => {
+            Err(ApiError::context_length_exceeded(ctx_len, actual).into_response())
+        }
+        TruncateOutcome::TokenizeErr(resp) => Err(resp),
     }
 }
 
@@ -785,6 +1068,151 @@ mod truncate_tests {
         let a = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
         let b = truncate_left::<_, ()>(&msgs, 25, |m| toks_per_msg(m, 10));
         assert_eq!(format!("{:?}", a), format!("{:?}", b));
+    }
+
+    // ----- split_for_summarize -----
+
+    #[test]
+    fn split_for_summarize_no_messages_yields_empty_split() {
+        let s = split_for_summarize(&[], 4);
+        assert!(s.system_prefix.is_empty());
+        assert!(s.summary_window.is_empty());
+        assert!(s.recent_window.is_empty());
+    }
+
+    #[test]
+    fn split_for_summarize_only_system_prefix() {
+        let msgs = vec![msg("system", "s1"), msg("system", "s2")];
+        let s = split_for_summarize(&msgs, 4);
+        assert_eq!(s.system_prefix.len(), 2);
+        assert!(s.summary_window.is_empty());
+        assert!(s.recent_window.is_empty());
+    }
+
+    #[test]
+    fn split_for_summarize_keep_count_exceeds_tail_means_no_summary() {
+        // 1 system + 2 non-system, keep_recent=4 → all non-system in recent.
+        let msgs = vec![
+            msg("system", "s"),
+            msg("user", "u"),
+            msg("assistant", "a"),
+        ];
+        let s = split_for_summarize(&msgs, 4);
+        assert_eq!(s.system_prefix.len(), 1);
+        assert!(s.summary_window.is_empty());
+        assert_eq!(s.recent_window.len(), 2);
+    }
+
+    #[test]
+    fn split_for_summarize_5_messages_keep_2_recent() {
+        let msgs = vec![
+            msg("system", "s"),
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ];
+        let s = split_for_summarize(&msgs, 2);
+        // System prefix: 1
+        // Tail = 5 (u1 a1 u2 a2 u3). keep_recent=2 → recent = [a2, u3], summary = [u1, a1, u2].
+        assert_eq!(s.system_prefix.len(), 1);
+        assert_eq!(s.summary_window.len(), 3);
+        assert_eq!(s.summary_window[0].content,
+            Some(MessageContent::Text("u1".into())));
+        assert_eq!(s.summary_window[2].content,
+            Some(MessageContent::Text("u2".into())));
+        assert_eq!(s.recent_window.len(), 2);
+        assert_eq!(s.recent_window[1].content,
+            Some(MessageContent::Text("u3".into())));
+    }
+
+    #[test]
+    fn split_for_summarize_no_system_prefix() {
+        let msgs = vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+        ];
+        let s = split_for_summarize(&msgs, 2);
+        assert!(s.system_prefix.is_empty());
+        assert_eq!(s.summary_window.len(), 1);
+        assert_eq!(s.summary_window[0].content,
+            Some(MessageContent::Text("u1".into())));
+        assert_eq!(s.recent_window.len(), 2);
+    }
+
+    // ----- build_summary_user_text -----
+
+    #[test]
+    fn build_summary_user_text_skips_empty_content() {
+        let window = vec![
+            msg("user", "hello"),
+            msg("assistant", ""),
+            msg("user", "world"),
+        ];
+        let out = build_summary_user_text(&window);
+        assert!(out.contains("USER: hello"));
+        assert!(out.contains("USER: world"));
+        // Empty assistant message should NOT produce an "ASSISTANT:" line.
+        assert!(!out.contains("ASSISTANT:"));
+    }
+
+    #[test]
+    fn build_summary_user_text_uppercases_role() {
+        let window = vec![msg("user", "x"), msg("tool", "y")];
+        let out = build_summary_user_text(&window);
+        assert!(out.contains("USER: x"));
+        assert!(out.contains("TOOL: y"));
+    }
+
+    #[test]
+    fn build_summary_user_text_handles_multipart_content() {
+        use super::super::schema::{ContentPart, ImageUrl};
+        let m = ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "see this:".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl { url: "data:img...".into(), detail: None },
+                },
+                ContentPart::Text { text: "and this".into() },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let out = build_summary_user_text(&[m]);
+        // Text parts joined; image_url silently dropped.
+        assert!(out.contains("USER: see this: and this"));
+        assert!(!out.contains("data:img"));
+    }
+
+    // ----- build_synthetic_summary_message -----
+
+    #[test]
+    fn build_synthetic_summary_message_wraps_with_marker() {
+        let m = build_synthetic_summary_message("user discussed deployment");
+        assert_eq!(m.role, "system");
+        let content = match m.content {
+            Some(MessageContent::Text(s)) => s,
+            _ => panic!("expected text content"),
+        };
+        assert!(content.starts_with("[Summary of prior conversation]:"));
+        assert!(content.contains("user discussed deployment"));
+    }
+
+    #[test]
+    fn build_synthetic_summary_message_trims_whitespace() {
+        let m = build_synthetic_summary_message("  trimmed text  \n");
+        let content = match m.content {
+            Some(MessageContent::Text(s)) => s,
+            _ => unreachable!(),
+        };
+        // Surrounding whitespace stripped from the model output.
+        assert!(content.ends_with("trimmed text"));
+        assert!(!content.ends_with("trimmed text  "));
     }
 }
 
