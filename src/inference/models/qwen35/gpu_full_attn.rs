@@ -1020,7 +1020,19 @@ pub fn build_gated_attn_layer(
             &mut enc, registry, device, &gated,
             &weights_gpu.wo, seq_len, q_total, hidden_size,
         )?;
-        enc.commit_and_wait().context("commit ops6-7")?;
+        // Decode fast path (seq=1): commit() without wait.
+        // The caller (forward_gpu) feeds `out` into dispatch_fused_residual_norm_f32
+        // via a new encoder on the same Metal serial queue, so the GPU will
+        // execute ops6-7 before fused_residual_norm without a CPU sync.
+        //
+        // Prefill (seq>1): commit_and_wait() because dump_hidden_stats in
+        // forward_gpu may do a CPU read of the returned buffer, and because
+        // prefill throughput is not the hot path.
+        if seq_len == 1 {
+            enc.commit();
+        } else {
+            enc.commit_and_wait().context("commit ops6-7")?;
+        }
         out
     };
 
