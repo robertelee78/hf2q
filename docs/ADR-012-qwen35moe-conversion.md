@@ -36,7 +36,7 @@
 | Benchmark (smoke dry-run preflight) | 6 ms end-to-end (exit 2, clean HF_TOKEN-missing path) |
 | LOC inserted P0→P7 | ~8,600 across 8 feature commits (excluding ADR status updates) |
 | LOC remaining P8→P11 (2026-04-24 party-mode refinement) | ~2,400 (P8 ~500 incl. arch-registry · P9 ~700 incl. PPL/KL infra · P10 ~1,000 three-layer defense · P11 ~200) |
-| Clippy status | zero new warnings in any ADR-012-touched file |
+| Clippy status | zero warnings in any ADR-012-touched src/test file (full sweep landed in 2026-04-24 audit pass — commits `d74212f`, `6c6222c`, `01d4eca`, `dcc1ed6`). Remaining warnings in the workspace are all under `iter*_audit` binaries from ADR-009/ADR-013 territory, out of scope. |
 | Sovereignty check | pure Rust; no candle-* added; no llama.cpp runtime artifact referenced; llama.cpp and convert_hf_to_gguf.py consulted as read-only spec sources only |
 | Quality thresholds | DWQ46 PPL ≤ 1.10× F16 · DWQ48 PPL ≤ 1.05× F16 · median KL < 0.02 nats · mmproj cosine anchor ≈ 1.0 within F16 precision |
 | Future-arch payoff | Gemma parity ~150 LOC · Ministral (ADR-015) ~200–400 LOC · DeepSeek-V3 (ADR-016) ~200–400 LOC — all vs ~1500 LOC/arch without Decision 20 |
