@@ -598,31 +598,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     metadata.is_moe(),
                 );
 
-                // ADR-012 Decision 13 no-fallback guard:
-                // If the model is qwen35 or qwen35moe, we MUST have an ActivationCapture
-                // implementation injected during DWQ calibration. As of commit 28df83c the
-                // real `impl ActivationCapture for Qwen35Model` is shipped (closing
-                // ADR-013 P12's deferred deliverable). The remaining piece — building a
-                // Qwen35Model at convert-time from the HF safetensors *without* having
-                // already emitted an intermediate GGUF — is P9b: convert-pipeline two-
-                // pass integration. Until P9b lands, we still error rather than silently
-                // dropping into weight-space fallback (per `feedback_never_ship_fallback_
-                // without_rootcause.md`). The error message reflects the now-accurate
-                // remaining blocker so the next step is unambiguous.
-                if dwq_arch.requires_activation_capture() {
-                    return Err(AppError::Conversion(anyhow::anyhow!(
-                        "ADR-012 P9b: convert-pipeline activation-capture wire-up pending. \
-                         The real impl ActivationCapture for Qwen35Model is shipped \
-                         (src/inference/models/qwen35/activation_capture_real.rs), but \
-                         capture requires loading the model — Qwen35Model::load_from_gguf \
-                         expects a GGUF path while convert-time only has HF safetensors. \
-                         Two paths to closure: (a) two-pass conversion (emit intermediate \
-                         F16 GGUF, capture, re-quant to dwq46/dwq48), or (b) add \
-                         Qwen35Model::from_safetensors. No weight-space fallback per \
-                         ADR-012 Decision 13."
-                    )));
-                }
-
                 let dwq_config = quantize::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
@@ -645,27 +620,97 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     dwq_quantizer.name()
                 );
 
-                // ADR-012 P9b.3a: activation-based calibration now requires an
-                // `&mut dyn ActivationCapture` — which is not yet plumbed through
-                // the convert pipeline (P9b.2/3b will land that as part of the
-                // qwen35 two-pass branch). For non-qwen35 archs the historical
-                // path was the ADR-008 stub returning an error and falling back
-                // to weight-space; we now skip the stub call entirely and go
-                // directly to weight-space, which matches the realised behaviour.
-                //
-                // For qwen35 / qwen35moe the P9b guard above already returned an
-                // error before reaching this branch, so DwqArch::requires_
-                // activation_capture() == true never falls through here.
-                let _ = dwq_config.use_activations; // field preserved for P9b.3b wire-up
-                tracing::info!("Using DWQ weight-space calibration (activation path requires capture plumbing — P9b.2/3b)");
-                quantize::dwq::run_dwq_calibration(
-                    &tensor_map,
-                    &metadata,
-                    &dwq_config,
-                    &progress,
-                )
-                .context("DWQ calibration failed")
-                .map_err(AppError::Conversion)?
+                if dwq_arch.requires_activation_capture() {
+                    // ADR-012 P9b.2/3b — qwen35 / qwen35moe two-pass conversion.
+                    //
+                    // Decision 13 mandates ActivationCapture for these arches; no
+                    // weight-space fallback. Steps:
+                    //   1. Tokenizer.json is mandatory (capture tokenization
+                    //      contract) — error if missing.
+                    //   2. Emit an intermediate F16 GGUF from the in-memory
+                    //      tensor_map via `emit_gguf_from_tensor_map` (P9b.1).
+                    //      `tensor_map` is held in scope for the subsequent
+                    //      DWQ pass — no double-read from safetensors (P9b.4).
+                    //   3. Construct a `RealActivationCapture` from the
+                    //      intermediate GGUF + tokenizer (P9b.3b). This loads
+                    //      the model into RAM; the file is no longer needed
+                    //      after the constructor returns.
+                    //   4. Run activation-aware DWQ via
+                    //      `run_dwq_activation_calibration` (P9b.3a — the real
+                    //      impl that consumes a `&mut dyn ActivationCapture`).
+                    //   5. The `tempfile::TempDir` is dropped at the end of
+                    //      this scope, removing the intermediate GGUF — RAII
+                    //      cleanup (P9b.5).
+                    let tokenizer_json = config.input_dir.join("tokenizer.json");
+                    if !tokenizer_json.exists() {
+                        return Err(AppError::Conversion(anyhow::anyhow!(
+                            "ADR-012 P9b: qwen35/qwen35moe DWQ requires \
+                             tokenizer.json in {}; not found. No weight-space \
+                             fallback per Decision 13.",
+                            config.input_dir.display()
+                        )));
+                    }
+
+                    let intermediate_dir = tempfile::tempdir()
+                        .context("ADR-012 P9b: failed to create tempdir for intermediate GGUF")
+                        .map_err(AppError::Conversion)?;
+                    let intermediate_path =
+                        intermediate_dir.path().join("intermediate-f16.gguf");
+
+                    tracing::info!(
+                        path = %intermediate_path.display(),
+                        "ADR-012 P9b: emitting intermediate F16 GGUF for activation capture"
+                    );
+                    backends::gguf::emit_gguf_from_tensor_map(
+                        &tensor_map,
+                        &metadata,
+                        &config.input_dir,
+                        &intermediate_path,
+                        &progress,
+                    )
+                    .context("ADR-012 P9b: intermediate F16 GGUF emission failed")
+                    .map_err(AppError::Conversion)?;
+
+                    let mut capture =
+                        inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
+                            &intermediate_path,
+                            &tokenizer_json,
+                        )
+                        .map_err(|e| {
+                            AppError::Conversion(anyhow::anyhow!(
+                                "ADR-012 P9b: RealActivationCapture::new failed: {e}"
+                            ))
+                        })?;
+
+                    tracing::info!(
+                        "ADR-012 P9b: running activation-aware DWQ calibration"
+                    );
+                    let model = quantize::dwq_activation::run_dwq_activation_calibration(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_config,
+                        &mut capture,
+                        &progress,
+                    )
+                    .context("ADR-012 P9b: activation-aware DWQ calibration failed")
+                    .map_err(AppError::Conversion)?;
+
+                    drop(capture); // release Qwen35Model (~30 GB for apex) ASAP
+                    drop(intermediate_dir); // RAII cleanup of tempdir
+                    model
+                } else {
+                    tracing::info!(
+                        "Using DWQ weight-space calibration (non-qwen35 arch)"
+                    );
+                    quantize::dwq::run_dwq_calibration(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_config,
+                        &progress,
+                    )
+                    .context("DWQ calibration failed")
+                    .map_err(AppError::Conversion)?
+                }
             }
             cli::QuantMethod::Apex => {
                 let apex_config = quantize::apex::ApexConfig {

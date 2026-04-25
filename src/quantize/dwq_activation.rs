@@ -56,10 +56,8 @@ use super::sensitivity::{allocate_bits_by_sensitivity, compute_layer_sensitivity
 /// fails, return the error. qwen35 / qwen35moe have no valid weight-space
 /// fallback per Decision 13.
 ///
-/// Currently exercised by tests only — the convert-pipeline wire-up
-/// (`src/main.rs`) lands in P9b.3b. The `#[allow(dead_code)]` below is
-/// removed when that wire-up commits.
-#[allow(dead_code)]
+/// Wired through `src/main.rs` for qwen35/qwen35moe DWQ as of P9b.3b
+/// (commit landing this fn into the convert-pipeline two-pass branch).
 pub fn run_dwq_activation_calibration(
     tensor_map: &TensorMap,
     metadata: &ModelMetadata,
