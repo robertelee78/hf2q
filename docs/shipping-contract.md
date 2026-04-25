@@ -126,13 +126,34 @@ model classes as of ADR-012. Inference coherence is delegated to ADR-013.
 | mmproj (when `--emit-vision-tower` and `vision_config` present) | Pure-Rust emitter at `src/models/vit/`; produces `mmproj-<slug>-F16.gguf` per Decision 18 with three layers of structural / round-trip / spec-driven test coverage |
 | Smoke harness | `hf2q smoke --arch <qwen35\|qwen35moe> --quant q4_0` exits 0 with byte-identical transcripts across two fresh runs (Decision 16) |
 
+### DWQ activation-based quantization for qwen35/qwen35moe
+
+**Shipped 2026-04-25** under ADR-012 P9 + P9b (formerly listed as
+"out-of-scope" pending ADR-013 P12). The convert pipeline now runs
+the full two-pass activation calibration end-to-end:
+
+  1. Emit intermediate F16 GGUF from the in-memory tensor_map
+     (`backends::gguf::emit_gguf_from_tensor_map`, P9b.1).
+  2. Construct `RealActivationCapture::new(intermediate_gguf, tokenizer)`
+     which loads via the ADR-013 `Qwen35Model::load_from_gguf` path
+     (P9b.3b).
+  3. Run `quantize::dwq_activation::run_dwq_activation_calibration`
+     which generates calibration tokens, runs the CPU forward pass
+     through the loaded model, computes per-layer sensitivity, and
+     produces a derived `MixedBitQuantizer` configured with
+     activation-driven sensitive layers (P9b.3a).
+  4. Final GGUF is emitted at the user-specified output path. The
+     intermediate is dropped via `tempfile::TempDir` RAII (P9b.5).
+
+No weight-space fallback for these architectures (Decision 13).
+
+Real-model artifact production for the four end-deliverable GGUFs
+(qwen35/qwen35moe × dwq46/dwq48) is gated only on environment
+(HF_TOKEN + ~150 GB disk + Metal-validated llama.cpp build).
+
 ### Out-of-scope for ADR-012
 
 - Inference coherence (sourdough gate, sliding-window parity) — ADR-013.
-- DWQ activation-based quantization for qwen35/qwen35moe — requires
-  `ActivationCapture` from ADR-013 P12 inference session; ADR-012 Decision 13
-  wires the structured `NoActivationCapture` guard so the convert path
-  fails-fast rather than silently falling back to weight-space.
 - MTP head **inference** (speculative decoding) — ADR-013 P14. ADR-012 P11
   ships the conversion-side tensor round-trip integrity gate; runtime
   draft/accept loops are owned by ADR-013.
