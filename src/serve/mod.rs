@@ -762,19 +762,11 @@ fn cmd_generate_qwen35(
         // Build single-token positions buffer: flat [4 * 1] all set to `pos`.
         let decode_positions = vec![pos; 4];
 
-        // forward_gpu with 1 token; kv_cache carries SSM state from previous step.
-        let decode_logits = model
-            .forward_gpu(&[next_token], &decode_positions, &mut kv_cache)
-            .with_context(|| format!("forward_gpu decode step {step}"))?;
-
-        anyhow::ensure!(
-            decode_logits.len() == vocab_size as usize,
-            "decode step {step}: logits.len()={} != vocab_size={}",
-            decode_logits.len(),
-            vocab_size
-        );
-
-        next_token = greedy_argmax_last_token(&decode_logits, vocab_size);
+        // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
+        // Eliminates ~5ms/token vocabulary download for greedy decode.
+        next_token = model
+            .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+            .with_context(|| format!("forward_gpu_greedy decode step {step}"))?;
         generated += 1;
 
         let s = tokenizer.decode(&[next_token], false).unwrap_or_default();

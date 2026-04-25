@@ -47,6 +47,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_gemv_bf16::dense_gemv_bf16_f32;
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
@@ -520,7 +521,6 @@ pub fn apply_linear_projection_f32(
                 .context("quantized_matmul_ggml Q4_0")?;
         }
         DType::BF16 => {
-            // BF16 tiled GEMM path — MMA tensor-core, used for lm_head.
             let params = DenseMmBf16F32Params {
                 m: seq_len,
                 n: out_features,
@@ -528,8 +528,17 @@ pub fn apply_linear_projection_f32(
                 src0_batch: 1,
                 src1_batch: 1,
             };
-            dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, &mut dst, &params)
-                .context("dense_matmul_bf16_f32_tensor")?;
+            if seq_len == 1 {
+                // GEMV path — bandwidth-optimized for M=1 decode.
+                // mul_mv_bf16_f32_4 port from llama.cpp: processes multiple
+                // weight rows per threadgroup, ~2× faster than tiled MM for M=1.
+                dense_gemv_bf16_f32(encoder, registry, device, weight, input, &mut dst, &params)
+                    .context("dense_gemv_bf16_f32 (M=1)")?;
+            } else {
+                // BF16 tiled GEMM path — MMA tensor-core, optimal for M > 1.
+                dense_matmul_bf16_f32_tensor(encoder, registry, device, weight, input, &mut dst, &params)
+                    .context("dense_matmul_bf16_f32_tensor")?;
+            }
         }
         DType::F32 => {
             // Legacy F32 path: cast inline (per-inference cost, not pre-quantized).

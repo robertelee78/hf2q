@@ -52,13 +52,14 @@ use super::gpu_ffn::{
 };
 use super::gpu_full_attn::{
     apply_linear_projection_f32, build_gated_attn_layer, download_f32, upload_f32,
-    FullAttnWeightsGpu,
+    upload_q4_0_from_f32, FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
+use mlx_native::ops::argmax::dispatch_argmax_f32;
 
 // ================================================================
 // Debug dump helpers (HF2Q_DUMP_LAYER_N / HF2Q_DUMP_LAYER_ACTIVATIONS env gates)
@@ -193,13 +194,13 @@ enum FfnWeightsGpu {
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
-    /// F32 lm_head weight buffer `[vocab_size, hidden_size]`. Kept for prefill
-    /// (M > 1) where the BF16 path may not be pre-cast yet.
+    /// F32 lm_head weight buffer `[vocab_size, hidden_size]`. Used for prefill (M > 1).
     lm_head: MlxBuffer,
-    /// BF16 pre-cast of lm_head — computed once at GPU upload time.
-    /// `apply_linear_projection_f32` skips the per-token cast when the buffer
-    /// is already BF16, saving ~2ms/token for decode.
+    /// BF16 pre-cast of lm_head — used for prefill (M > 1) where MM kernel is optimal.
     lm_head_bf16: MlxBuffer,
+    /// Q4_0 quantized lm_head — used for single-token decode (M=1) for 3.57×
+    /// lower bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode token).
+    lm_head_q4: MlxBuffer,
 }
 
 // ================================================================
@@ -297,6 +298,95 @@ fn apply_output_head_gpu(
     }
 
     download_f32(&logits_buf).context("download logits")
+}
+
+/// Returns the public greedy token-ID path for single-step decode.
+/// Exposed so `cmd_generate_qwen35` can call it directly and bypass
+/// the 600KB logit download.
+pub fn apply_output_head_greedy_token(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<u32> {
+    apply_output_head_gpu_greedy(device, registry, hidden, head, hidden_size, vocab_size, eps)
+}
+
+/// Decode-only greedy variant of `apply_output_head_gpu`.
+///
+/// Runs RMSNorm → lm_head GEMM → GPU argmax, then downloads 4 bytes
+/// (one u32 token ID) instead of `vocab_size * 4` bytes (~600KB for
+/// vocab_size=151936).  75× less data transferred per decode step.
+///
+/// Only correct for seq_len=1 greedy decoding (temperature=0).
+fn apply_output_head_gpu_greedy(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden: &MlxBuffer,
+    head: &OutputHeadGpu,
+    hidden_size: u32,
+    vocab_size: u32,
+    eps: f32,
+) -> Result<u32> {
+    let seq_len = 1u32;
+
+    // ---- Pre-allocate: normed, argmax outputs + params ----
+    let normed = device
+        .alloc_buffer(hidden_size as usize * 4, DType::F32, vec![1, hidden_size as usize])
+        .map_err(|e| anyhow!("alloc normed greedy: {e}"))?;
+    let mut norm_params = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc norm params greedy: {e}"))?;
+    {
+        let s = norm_params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
+        s[0] = eps; s[1] = hidden_size as f32;
+    }
+    let out_index = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc out_index: {e}"))?;
+    let out_value = device
+        .alloc_buffer(4, DType::F32, vec![1])
+        .map_err(|e| anyhow!("alloc out_value: {e}"))?;
+    let mut argmax_params = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc argmax params: {e}"))?;
+    argmax_params.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = vocab_size;
+
+    // ---- Encoder A: output_norm + lm_head → logits_buf ----
+    // output_norm is pipelined (commit()) into lm_head via serial queue.
+    let mut enc_norm = device.command_encoder().context("enc output_norm greedy")?;
+    rms_norm::dispatch_rms_norm(
+        &mut enc_norm, registry, device.metal_device(),
+        hidden, &head.norm_w, &normed, &norm_params,
+        seq_len, hidden_size,
+    ).context("dispatch_rms_norm output greedy")?;
+    enc_norm.commit();
+
+    // Use Q4_0 lm_head for decode: 3.57× less bandwidth vs BF16
+    // (~1.5ms vs ~5.4ms for 151936×7168 matrix-vector product).
+    let mut enc_lm = device.command_encoder().context("enc lm_head greedy")?;
+    let logits_buf = apply_linear_projection_f32(
+        &mut enc_lm, registry, device, &normed,
+        &head.lm_head_q4, seq_len, hidden_size, vocab_size,
+    ).context("lm_head projection greedy")?;
+    // commit() and immediately encode argmax on the same queue.
+    enc_lm.commit();
+
+    // ---- Encoder B: argmax on logits_buf → out_index ----
+    let mut enc_argmax = device.command_encoder().context("enc argmax greedy")?;
+    dispatch_argmax_f32(
+        &mut enc_argmax, registry, device.metal_device(),
+        &logits_buf, &out_index, &out_value, &argmax_params, vocab_size,
+    ).context("dispatch_argmax_f32 greedy")?;
+    enc_argmax.commit_and_wait().context("commit argmax greedy")?;
+
+    // Download only 4 bytes (the winning token ID).
+    let token_id = out_index.as_slice::<u32>()
+        .map_err(|e| anyhow!("out_index as_slice: {e}"))?[0];
+    Ok(token_id)
 }
 
 // ================================================================
@@ -432,11 +522,17 @@ impl Qwen35Model {
                     enc.commit_and_wait().context("commit lm_head cast")?;
                     bf16_buf
                 };
+                // Pre-quantize lm_head to Q4_0 for decode (M=1) — 3.57× less
+                // bandwidth vs BF16 (~1.5ms vs ~5.4ms per decode step).
+                // K=hidden_size=7168 is divisible by 32, so Q4_0 is valid.
+                let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
+                    .context("upload lm_head_q4")?;
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32(&self.output_norm, &device)
                         .context("upload output_norm")?,
                     lm_head: lm_head_f32,
                     lm_head_bf16,
+                    lm_head_q4,
                 };
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
@@ -837,6 +933,376 @@ impl Qwen35Model {
             eprintln!("[DECODE_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
         }
         Ok(logits)
+    }
+
+    /// Greedy decode variant of `forward_gpu` — returns a single token ID.
+    ///
+    /// Identical to `forward_gpu` for the layer loop, but replaces the final
+    /// `apply_output_head_gpu` (which downloads `vocab_size * 4` ≈ 600 KB) with
+    /// `apply_output_head_gpu_greedy` (GPU argmax → downloads 4 bytes).
+    ///
+    /// Only valid for `tokens.len() == 1` (single-step decode, temperature=0).
+    pub fn forward_gpu_greedy(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<u32> {
+        debug_assert_eq!(tokens.len(), 1, "forward_gpu_greedy: tokens must be length 1");
+        if tokens.is_empty() {
+            return Err(anyhow!("forward_gpu_greedy: tokens must be non-empty"));
+        }
+        let seq_len = tokens.len() as u32;
+        let expected_pos_len = 4 * seq_len as usize;
+        if positions_flat.len() != expected_pos_len {
+            return Err(anyhow!(
+                "forward_gpu_greedy: positions_flat.len() = {} != 4 * seq_len = {}",
+                positions_flat.len(),
+                expected_pos_len
+            ));
+        }
+
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let eps = cfg.rms_norm_eps;
+        let self_ptr = self as *const _ as *const ();
+
+        // Populate GPU cache (same as forward_gpu).
+        GPU_CACHE.with(|cell| -> Result<()> {
+            let mut cache = cell.borrow_mut();
+            if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
+                let device = MlxDevice::new().context("forward_gpu_greedy: MlxDevice::new")?;
+                let mut registry = KernelRegistry::new();
+                let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                let lm_head_f32 = upload_f32(&self.output_weight, &device)
+                    .context("upload lm_head")?;
+                let n_w = self.output_weight.len();
+                let lm_head_bf16 = {
+                    let bf16_buf = device
+                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
+                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
+                    let mut enc = device.command_encoder()
+                        .context("enc lm_head_bf16 cast")?;
+                    mlx_native::ops::elementwise::cast(
+                        &mut enc,
+                        &mut registry,
+                        device.metal_device(),
+                        &lm_head_f32,
+                        &bf16_buf,
+                        n_w,
+                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                    )
+                    .context("cast lm_head F32→BF16 at load")?;
+                    enc.commit_and_wait().context("commit lm_head cast")?;
+                    bf16_buf
+                };
+                let lm_head_q4 = upload_q4_0_from_f32(&self.output_weight, &device)
+                    .context("upload lm_head_q4 greedy")?;
+                let output_head = OutputHeadGpu {
+                    norm_w: upload_f32(&self.output_norm, &device)
+                        .context("upload output_norm")?,
+                    lm_head: lm_head_f32,
+                    lm_head_bf16,
+                    lm_head_q4,
+                };
+                *cache = Some(ForwardGpuCache {
+                    model_ptr: self_ptr,
+                    device,
+                    registry,
+                    layer_weights,
+                    output_head,
+                });
+            }
+            Ok(())
+        })?;
+
+        let (pos_buf, layer_weights_gpu, device_ref, registry_ref, output_head_ref) = {
+            GPU_CACHE.with(|cell| -> Result<_> {
+                let cache = cell.borrow();
+                let c = cache.as_ref().unwrap();
+                let pos_buf = {
+                    let byte_len = positions_flat.len() * 4;
+                    let mut buf = c.device
+                        .alloc_buffer(byte_len, DType::I32, vec![positions_flat.len()])
+                        .map_err(|e| anyhow!("alloc positions: {e}"))?;
+                    buf.as_mut_slice::<i32>()
+                        .map_err(|e| anyhow!("positions mut_slice: {e}"))?
+                        .copy_from_slice(positions_flat);
+                    buf
+                };
+                let device_ptr = &c.device as *const MlxDevice;
+                let registry_ptr = &c.registry as *const KernelRegistry as *mut KernelRegistry;
+                let weights_ptr = &c.layer_weights as *const Vec<LayerWeightsGpu>;
+                let head_ptr = &c.output_head as *const OutputHeadGpu;
+                Ok((pos_buf, weights_ptr, device_ptr, registry_ptr, head_ptr))
+            })?
+        };
+        let device = unsafe { &*device_ref };
+        let mut registry = unsafe { &mut *registry_ref };
+        let layer_weights_gpu = unsafe { &*layer_weights_gpu };
+        let output_head = unsafe { &*output_head_ref };
+
+        // ---- Embedding ----
+        let mut hidden = embed_tokens_gpu(
+            tokens,
+            &self.token_embd,
+            cfg.vocab_size,
+            h,
+            &device,
+        )
+        .context("embed_tokens_gpu greedy")?;
+
+        // ---- Per-layer forward pass (identical to forward_gpu) ----
+        let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
+        let mut total_linear_attn_us = 0u64;
+        let mut total_full_attn_us = 0u64;
+        let mut total_ffn_us = 0u64;
+        for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
+            let layer_cpu = &self.layers[layer_idx];
+            let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let attn_out = match layer_gpu {
+                LayerWeightsGpu::FullAttn { attn, .. } => {
+                    let shape = FullAttnShape::from_config(cfg);
+                    let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                        Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                        other => {
+                            return Err(anyhow!(
+                                "layer {layer_idx}: expected FullAttn slot, got {:?}",
+                                other
+                            ))
+                        }
+                    };
+                    let max_seq = kv_cache.max_seq_len;
+                    let slot = &mut kv_cache.full_attn[full_attn_rank];
+                    build_gated_attn_layer(
+                        &device,
+                        &mut registry,
+                        &hidden,
+                        &pos_buf,
+                        attn,
+                        Some(slot),
+                        max_seq,
+                        seq_len,
+                        shape.hidden_size,
+                        shape.n_head,
+                        shape.n_kv,
+                        shape.head_dim,
+                        shape.rotary_dim,
+                        shape.rope_theta,
+                        shape.mrope_section,
+                        shape.rms_norm_eps,
+                    )
+                    .with_context(|| format!("full_attn greedy layer {layer_idx}"))?
+                }
+                LayerWeightsGpu::LinearAttn { attn, .. } => {
+                    let shape = DeltaNetLayerShape::from_config(cfg);
+                    let km1 = (cfg.linear_conv_kernel_dim.saturating_sub(1).max(1)) as usize;
+                    let qkv_channels = shape.qkv_channels() as usize;
+                    let rec_size = (cfg.linear_key_head_dim
+                        * cfg.linear_value_head_dim
+                        * cfg.linear_num_value_heads) as usize;
+
+                    let linear_slot_idx =
+                        match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                            Some(super::kv_cache::LayerSlot::Linear(rank)) => rank as usize,
+                            _ => usize::MAX,
+                        };
+
+                    let zero_conv_in: MlxBuffer;
+                    let zero_conv_out: MlxBuffer;
+                    let zero_rec_buf_in: MlxBuffer;
+                    let zero_rec_buf_out: MlxBuffer;
+                    let (conv_in_ref, conv_out_ref, state_in_ref, state_out_ref):
+                        (&MlxBuffer, &MlxBuffer, &MlxBuffer, &MlxBuffer) =
+                        if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (&slot.conv_state, &slot.conv_state_scratch,
+                             &slot.recurrent, &slot.recurrent_scratch)
+                        } else {
+                            let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
+                            let zero_rec_cpu = vec![0.0f32; rec_size];
+                            zero_conv_in = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_in")?;
+                            zero_conv_out = upload_f32(&zero_conv_cpu, &device)
+                                .context("alloc zero conv state_out")?;
+                            zero_rec_buf_in = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_in")?;
+                            zero_rec_buf_out = upload_f32(&zero_rec_cpu, &device)
+                                .context("alloc zero recurrent state_out")?;
+                            (&zero_conv_in, &zero_conv_out,
+                             &zero_rec_buf_in, &zero_rec_buf_out)
+                        };
+                    let out = build_delta_net_layer(
+                        &device,
+                        &mut registry,
+                        &hidden,
+                        attn,
+                        conv_in_ref,
+                        conv_out_ref,
+                        state_in_ref,
+                        state_out_ref,
+                        seq_len,
+                        shape.hidden_size,
+                        shape.n_k_heads,
+                        shape.n_v_heads,
+                        shape.d_k,
+                        shape.d_v,
+                        shape.conv_kernel,
+                        shape.rms_norm_eps,
+                    )
+                    .with_context(|| format!("delta_net greedy layer {layer_idx}"))?;
+
+                    if linear_slot_idx != usize::MAX {
+                        let slot = &mut kv_cache.linear_attn[linear_slot_idx];
+                        slot.swap_conv_state();
+                        slot.swap_recurrent();
+                    }
+                    out
+                }
+            };
+
+            if let Some(t) = t_attn_start {
+                let us = t.elapsed().as_micros() as u64;
+                match layer_gpu {
+                    LayerWeightsGpu::LinearAttn { .. } => total_linear_attn_us += us,
+                    LayerWeightsGpu::FullAttn { .. } => total_full_attn_us += us,
+                }
+            }
+
+            // --- Fused residual + post-attention RMSNorm ---
+            let (ffn_residual, ffn_input) = {
+                let post_norm_w = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
+                    LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
+                };
+                let ffn_input_buf = device
+                    .alloc_buffer(
+                        (seq_len * h) as usize * 4,
+                        DType::F32,
+                        vec![seq_len as usize, h as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc ffn_input greedy layer {layer_idx}: {e}"))?;
+                let ffn_residual_buf = device
+                    .alloc_buffer(
+                        (seq_len * h) as usize * 4,
+                        DType::F32,
+                        vec![seq_len as usize, h as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc ffn_residual greedy layer {layer_idx}: {e}"))?;
+                let mut enc = device.command_encoder()
+                    .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
+                dispatch_fused_residual_norm_f32(
+                    &mut enc,
+                    &mut registry,
+                    device.metal_device(),
+                    &hidden,
+                    &attn_out,
+                    post_norm_w,
+                    &ffn_input_buf,
+                    Some(&ffn_residual_buf),
+                    seq_len,
+                    h,
+                    eps,
+                )
+                .with_context(|| format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}"))?;
+                enc.commit();
+                (ffn_residual_buf, ffn_input_buf)
+            };
+            hidden = ffn_residual.clone();
+
+            // --- FFN ---
+            let ffn_weights_gpu = match layer_gpu {
+                LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
+                LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
+            };
+            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let ffn_out = match ffn_weights_gpu {
+                FfnWeightsGpu::Dense(w) => {
+                    let m = cfg.intermediate_size.ok_or_else(|| {
+                        anyhow!("dense FFN missing intermediate_size greedy (layer {layer_idx})")
+                    })?;
+                    let shape = DenseFfnShape {
+                        hidden_size: h,
+                        intermediate_size: m,
+                    };
+                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
+                        Some(&ffn_residual))
+                        .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
+                }
+                FfnWeightsGpu::Moe(w_gpu) => {
+                    let moe = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                    })?;
+                    let shape = MoeFfnShape {
+                        hidden_size: h,
+                        num_experts: moe.num_experts,
+                        num_experts_per_tok: moe.num_experts_per_tok,
+                        moe_intermediate_size: moe.moe_intermediate_size,
+                        shared_intermediate_size: moe.shared_expert_intermediate_size,
+                    };
+                    let w_cpu = match &layer_cpu.ffn() {
+                        Qwen35FfnWeights::Moe(w) => w,
+                        _ => return Err(anyhow!(
+                            "layer {layer_idx} config says F32-MoE but weights are different"
+                        )),
+                    };
+                    build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
+                        .with_context(|| format!("moe_ffn greedy layer {layer_idx}"))?
+                }
+                FfnWeightsGpu::MoeQ(w_gpu) => {
+                    let moe = cfg.moe.as_ref().ok_or_else(|| {
+                        anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                    })?;
+                    let shape = MoeFfnShape {
+                        hidden_size: h,
+                        num_experts: moe.num_experts,
+                        num_experts_per_tok: moe.num_experts_per_tok,
+                        moe_intermediate_size: moe.moe_intermediate_size,
+                        shared_intermediate_size: moe.shared_expert_intermediate_size,
+                    };
+                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape,
+                        Some(&ffn_residual))
+                        .with_context(|| format!("moe_ffn_q greedy layer {layer_idx}"))?
+                }
+            };
+
+            if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
+
+            // --- Residual after FFN ---
+            hidden = match ffn_weights_gpu {
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) => ffn_out,
+                _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
+                    .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
+            };
+        }
+
+        if decode_profile {
+            let total_layers_us = total_linear_attn_us + total_full_attn_us + total_ffn_us;
+            eprintln!(
+                "[GREEDY_PROFILE] linear_attn={:.1}ms full_attn={:.1}ms ffn={:.1}ms total_layers={:.1}ms",
+                total_linear_attn_us as f64 / 1000.0,
+                total_full_attn_us as f64 / 1000.0,
+                total_ffn_us as f64 / 1000.0,
+                total_layers_us as f64 / 1000.0,
+            );
+        }
+
+        // ---- Output head: GPU argmax → 4-byte download ----
+        let t_output_head = if decode_profile { Some(std::time::Instant::now()) } else { None };
+        let token_id = apply_output_head_gpu_greedy(
+            &device,
+            &mut registry,
+            &hidden,
+            &output_head,
+            h,
+            cfg.vocab_size,
+            eps,
+        )
+        .context("apply_output_head_gpu_greedy")?;
+        if let Some(t) = t_output_head {
+            eprintln!("[GREEDY_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
+        }
+        Ok(token_id)
     }
 
     /// Upload all per-layer weights to GPU once, returning the GPU bundle vec.
