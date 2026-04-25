@@ -32,8 +32,10 @@
 
 #![allow(dead_code)] // forward pass + handler wiring lands in subsequent iters
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use mlx_native::metal::MTLSize;
+use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -120,6 +122,30 @@ kernel void bert_layer_norm_f32(
         output[row_off + i] = ((x - mean) * inv_std) * gamma[i] + beta[i];
     }
 }
+
+struct BiasAddParams {
+    uint rows;
+    uint cols;
+};
+
+// out[r, c] = input[r, c] + bias[c]. The matmul produces `[rows, cols]`
+// row-major; this kernel broadcasts the per-column bias along rows.
+//
+// In-place is supported (input == output): each thread reads `input` and
+// writes `output` at the same offset, so no aliasing hazard.
+kernel void bert_bias_add_f32(
+    device const float* input  [[buffer(0)]],
+    device const float* bias   [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant BiasAddParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint c = gid.x;
+    uint r = gid.y;
+    if (c >= params.cols || r >= params.rows) return;
+    uint idx = r * params.cols + c;
+    output[idx] = input[idx] + bias[c];
+}
 "#;
 
 #[repr(C)]
@@ -128,6 +154,13 @@ struct LayerNormGpuParams {
     hidden: u32,
     batch: u32,
     eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BiasAddGpuParams {
+    rows: u32,
+    cols: u32,
 }
 
 /// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
@@ -149,6 +182,12 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
 /// `KernelRegistry`.
 pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("bert_layer_norm_f32", BERT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("bert_bias_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
+    // mlx-native's GeLU lives in its own ops module; register it here so
+    // every `register_bert_custom_shaders` caller gets a registry that
+    // can dispatch the FFN GeLU activation without touching mlx-native
+    // op-level registration directly.
+    mlx_native::ops::gelu::register(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,11 +294,329 @@ fn prev_pow2(n: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Bias add — GPU dispatch
+// ---------------------------------------------------------------------------
+
+/// Broadcast-add a per-column bias to a `[rows, cols]` row-major matrix.
+/// `out[r, c] = in[r, c] + bias[c]`. Allocates and returns a fresh F32
+/// `[rows, cols]` output buffer.
+///
+/// `bias` shape `[cols]` F32. Supports any input matrix shape that
+/// matmul produces (typically `[seq_len, out_features]`).
+///
+/// # Errors
+/// - `rows == 0` or `cols == 0`
+/// - propagated from kernel pipeline compile failures
+pub fn bert_bias_add_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    bias: &MlxBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<MlxBuffer> {
+    if rows == 0 || cols == 0 {
+        return Err(anyhow!(
+            "bert_bias_add_gpu: rows ({}) and cols ({}) must be > 0",
+            rows,
+            cols
+        ));
+    }
+    let total = (rows as usize) * (cols as usize);
+    let output = device
+        .alloc_buffer(total * 4, DType::F32, vec![rows as usize, cols as usize])
+        .map_err(|e| anyhow!("alloc bert_bias_add output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("bert_bias_add_f32", device.metal_device())
+        .map_err(|e| anyhow!("bert_bias_add_gpu: get_pipeline: {e}"))?;
+
+    let params = BiasAddGpuParams { rows, cols };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(cols as u64, rows as u64, 1);
+    let tg_x = std::cmp::min(64, cols as u64);
+    let tg = MTLSize::new(tg_x, 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(bias)),
+            (2, KernelArg::Buffer(&output)),
+            (3, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Linear (Wx + b) — GPU dispatch
+// ---------------------------------------------------------------------------
+
+/// GPU linear projection: `out = input @ weight.T + bias` (when bias
+/// supplied), or `input @ weight.T` (when `bias_opt = None`).
+///
+/// Inputs:
+/// - `input`   F32 `[seq_len, in_features]`
+/// - `weight`  F32 `[out_features, in_features]` (cast to BF16 for the
+///             matmul tensor-core path; same precision profile as
+///             `vit_linear_gpu`)
+/// - `bias_opt` Optional F32 `[out_features]`
+///
+/// Returns F32 `[seq_len, out_features]`.
+///
+/// # Why BF16 weight cast (and what it costs)
+///
+/// The hot matmul path on M5 Max is `dense_matmul_bf16_f32_tensor`,
+/// which casts the weight to BF16 to use Apple's BF16 tensor-core
+/// pipeline. Per-element error from the F32→BF16 round-trip is ≈ 2⁻⁷.
+/// For BERT linear projections this is acceptable — input magnitudes
+/// after LayerNorm are O(1), so post-bias output noise is bounded by
+/// `|x| × 2⁻⁷ × √hidden ≈ 2⁻⁷ × √384 ≈ 0.15`. Within the F16 round-off
+/// llama.cpp's BERT path itself accumulates.
+///
+/// **What this means for attention.** ViT iter 50 documented that the
+/// same BF16 K cast plus saturated softmax flips winners. BERT's
+/// activations after LayerNorm are unit-normalized so attention scores
+/// stay near zero pre-softmax — saturated-softmax flips are unlikely.
+/// The full attention path lands separately (iter 58); this iter's
+/// `bert_linear_gpu` is correct for QKV/output/up/down projections.
+///
+/// `in_features < 32` is rejected because the BF16 tensor matmul kernel
+/// requires K ≥ 32 (matches `vit_linear_gpu`'s constraint).
+///
+/// Caller registers `register_bert_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+/// - `seq_len == 0`, `in_features < 32`, `out_features == 0`
+/// - bias supplied but element_count != out_features
+/// - propagated from cast/matmul/bias-add dispatches
+pub fn bert_linear_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight_f32: &MlxBuffer,
+    bias_opt: Option<&MlxBuffer>,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    if in_features < 32 {
+        return Err(anyhow!(
+            "bert_linear_gpu: in_features ({}) must be >= 32",
+            in_features
+        ));
+    }
+    if seq_len == 0 || out_features == 0 {
+        return Err(anyhow!(
+            "bert_linear_gpu: seq_len ({}) and out_features ({}) must be > 0",
+            seq_len,
+            out_features
+        ));
+    }
+    if let Some(b) = bias_opt {
+        if b.element_count() != out_features as usize {
+            return Err(anyhow!(
+                "bert_linear_gpu: bias element_count ({}) != out_features ({})",
+                b.element_count(),
+                out_features
+            ));
+        }
+    }
+
+    let metal_dev = device.metal_device();
+
+    // --- Cast weight F32 → BF16 once ---
+    let n_w = (out_features as usize) * (in_features as usize);
+    let weight_bf16 = device
+        .alloc_buffer(
+            n_w * 2,
+            DType::BF16,
+            vec![out_features as usize, in_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+    cast(
+        encoder,
+        registry,
+        metal_dev,
+        weight_f32,
+        &weight_bf16,
+        n_w,
+        CastDirection::F32ToBF16,
+    )
+    .context("bert_linear_gpu: F32→BF16 cast")?;
+    // RAW: matmul reads `weight_bf16` written by the cast above.
+    // mlx-native uses MTLDispatchType::Concurrent, so without this
+    // barrier the matmul could read pre-cast garbage.
+    encoder.memory_barrier();
+
+    // --- Allocate F32 matmul output ---
+    let out_bytes = (seq_len as usize) * (out_features as usize) * 4;
+    let mut matmul_out = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, out_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc matmul output: {e}"))?;
+
+    // --- Dispatch matmul ---
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    dense_matmul_bf16_f32_tensor(
+        encoder,
+        registry,
+        device,
+        &weight_bf16,
+        input,
+        &mut matmul_out,
+        &params,
+    )
+    .context("bert_linear_gpu: dense_matmul_bf16_f32_tensor")?;
+
+    // --- Optional bias add ---
+    if let Some(bias) = bias_opt {
+        // RAW: bias_add reads `matmul_out` written by the matmul. Same
+        // concurrent-dispatch rule applies. Without this, bias_add reads
+        // freshly-allocated uninitialized F32 bytes — observed empirically
+        // as max_diff ≈ 1200 in the iter-57 dev cycle.
+        encoder.memory_barrier();
+        bert_bias_add_gpu(
+            encoder,
+            registry,
+            device,
+            &matmul_out,
+            bias,
+            seq_len,
+            out_features,
+        )
+        .context("bert_linear_gpu: bias_add")
+    } else {
+        Ok(matmul_out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeLU activation — GPU dispatch (pytorch_tanh variant)
+// ---------------------------------------------------------------------------
+
+/// GPU GeLU activation, **pytorch_tanh variant** (matches llama.cpp's
+/// `ggml_gelu`):
+/// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
+///
+/// llama.cpp's BERT path uses this same approximation regardless of
+/// whether the upstream HF model declared `gelu` or `gelu_new` — and
+/// the Phase 2b accuracy gate is parity with llama.cpp's output, so we
+/// use it unconditionally. The day-one models (`nomic-embed-text-v1.5`,
+/// `mxbai-embed-large-v1`, `bge-small-en-v1.5`) all clear this gate
+/// because their HF-released checkpoints' GeLU choices either are this
+/// approximation or are within the F16 round-off llama.cpp is graded
+/// against.
+///
+/// `input` is any F32 buffer; output is a fresh F32 buffer with the
+/// same element count and shape. F16/BF16 dtypes are also accepted
+/// transparently (mlx-native's GeLU dispatches the matching variant).
+///
+/// Caller registers `register_bert_custom_shaders(&mut registry)` first
+/// (which calls `mlx_native::ops::gelu::register`).
+pub fn bert_gelu_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+) -> Result<MlxBuffer> {
+    let n = input.element_count();
+    if n == 0 {
+        return Err(anyhow!("bert_gelu_gpu: input must have at least one element"));
+    }
+    let bytes = match input.dtype() {
+        DType::F32 => n * 4,
+        DType::F16 | DType::BF16 => n * 2,
+        other => {
+            return Err(anyhow!(
+                "bert_gelu_gpu: unsupported dtype {:?} (expected F32/F16/BF16)",
+                other
+            ));
+        }
+    };
+    let output = device
+        .alloc_buffer(bytes, input.dtype(), input.shape().to_vec())
+        .map_err(|e| anyhow!("alloc bert_gelu output: {e}"))?;
+    mlx_native::ops::gelu::dispatch_gelu(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+    )
+    .map_err(|e| anyhow!("bert_gelu_gpu: dispatch_gelu: {e}"))?;
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // CPU reference (parity oracle for tests)
 // ---------------------------------------------------------------------------
 
 /// CPU reference LayerNorm — used by tests only. F32 throughout. Output
 /// shape `[batch, hidden]` row-major matches the GPU kernel.
+/// CPU reference linear projection: `out[m, n] = sum_k input[m, k] *
+/// weight[n, k] + bias[n]` (when bias supplied; zero otherwise).
+/// Test-only; F32 throughout.
+#[cfg(test)]
+fn bert_linear_cpu_ref(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    seq: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Vec<f32> {
+    assert_eq!(input.len(), seq * in_features);
+    assert_eq!(weight.len(), out_features * in_features);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), out_features);
+    }
+    let mut out = vec![0.0f32; seq * out_features];
+    for m in 0..seq {
+        for n in 0..out_features {
+            let mut acc = 0.0f64;
+            for k in 0..in_features {
+                acc += (input[m * in_features + k] as f64) * (weight[n * in_features + k] as f64);
+            }
+            let mut v = acc as f32;
+            if let Some(b) = bias {
+                v += b[n];
+            }
+            out[m * out_features + n] = v;
+        }
+    }
+    out
+}
+
+/// CPU reference GeLU pytorch_tanh: `0.5 * x * (1 + tanh(sqrt(2/pi) *
+/// (x + 0.044715 * x^3)))`. Test-only; F32 throughout. Constants match
+/// llama.cpp's `ggml_gelu_f32` (`/opt/llama.cpp/ggml/src/ggml.c`).
+#[cfg(test)]
+fn bert_gelu_cpu_ref(input: &[f32]) -> Vec<f32> {
+    const GELU_COEF_A: f32 = 0.044715;
+    const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+    input
+        .iter()
+        .map(|&x| {
+            let inner = SQRT_2_OVER_PI * (x + GELU_COEF_A * x * x * x);
+            0.5 * x * (1.0 + inner.tanh())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn bert_layer_norm_cpu_ref(
     input: &[f32],
@@ -548,5 +905,304 @@ mod tests {
         // (both calls errored before encode). Dropping aborts the
         // command buffer cleanly.
         drop(session);
+    }
+
+    // -----------------------------------------------------------------
+    // bert_linear_gpu — Wx + b on real Metal
+    // -----------------------------------------------------------------
+
+    fn run_linear(
+        input_data: &[f32],
+        weight_data: &[f32],
+        bias_data: Option<&[f32]>,
+        seq_len: usize,
+        in_features: usize,
+        out_features: usize,
+    ) -> Vec<f32> {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        // SAFETY: executor outlives session.
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let input = upload_f32(device, input_data, vec![seq_len, in_features]);
+        let weight = upload_f32(device, weight_data, vec![out_features, in_features]);
+        let bias_buf = bias_data.map(|b| upload_f32(device, b, vec![out_features]));
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let output = bert_linear_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            &weight,
+            bias_buf.as_ref(),
+            seq_len as u32,
+            in_features as u32,
+            out_features as u32,
+        )
+        .expect("gpu dispatch");
+        session.finish().expect("finish");
+        readback_f32(&output, seq_len * out_features)
+    }
+
+    #[test]
+    fn linear_no_bias_matches_cpu_on_small_input() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 4usize;
+        let in_f = 64usize; // ≥ 32 (BF16 matmul kernel constraint)
+        let out_f = 32usize;
+        let input: Vec<f32> = (0..seq * in_f).map(|i| 0.01 * (i as f32) - 0.3).collect();
+        let weight: Vec<f32> = (0..out_f * in_f)
+            .map(|i| 0.005 * (i as f32) - 0.4)
+            .collect();
+        let cpu = bert_linear_cpu_ref(&input, &weight, None, seq, in_f, out_f);
+        let gpu = run_linear(&input, &weight, None, seq, in_f, out_f);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        // BF16 weight cast: per-element bound is K × max(|x|) × max(|w|)
+        // × 2⁻⁸ (BF16 half-ULP). For K=64, |x|<0.5, |w|<0.5: bound ≈
+        // 64 × 0.5 × 0.5 × 4e-3 = 0.064. Observed 0.139 in dev — within
+        // 2× of the worst-case bound; pick 0.20 for a stable envelope
+        // that's still tight enough to catch a real correctness regression.
+        assert!(max_diff < 0.20, "max_diff {} > 0.20", max_diff);
+    }
+
+    #[test]
+    fn linear_with_bias_matches_cpu_on_small_input() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 4usize;
+        let in_f = 64usize;
+        let out_f = 32usize;
+        let input: Vec<f32> = (0..seq * in_f).map(|i| 0.01 * (i as f32) - 0.3).collect();
+        let weight: Vec<f32> = (0..out_f * in_f)
+            .map(|i| 0.005 * (i as f32) - 0.4)
+            .collect();
+        let bias: Vec<f32> = (0..out_f).map(|i| 0.1 * i as f32 - 1.0).collect();
+        let cpu = bert_linear_cpu_ref(&input, &weight, Some(&bias), seq, in_f, out_f);
+        let gpu = run_linear(&input, &weight, Some(&bias), seq, in_f, out_f);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        // Bias add is exact (F32 add); same noise budget as no-bias
+        // (~K × |x|×|w|×2⁻⁸ ≈ 0.064 worst-case for K=64). Same envelope.
+        assert!(max_diff < 0.20, "max_diff {} > 0.20 (bias path)", max_diff);
+    }
+
+    #[test]
+    fn linear_at_bge_small_qkv_shape() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // Q-projection shape for bge-small-en-v1.5: seq=32, hidden=384.
+        let seq = 32usize;
+        let hidden = 384usize;
+        let input: Vec<f32> = (0..seq * hidden)
+            .map(|i| ((i.wrapping_mul(2654435761) % 1000) as f32) * 0.001 - 0.5)
+            .collect();
+        let weight: Vec<f32> = (0..hidden * hidden)
+            .map(|i| ((i.wrapping_mul(40503) % 600) as f32) * 0.001 - 0.3)
+            .collect();
+        let bias: Vec<f32> = (0..hidden).map(|i| 0.0001 * i as f32).collect();
+        let cpu = bert_linear_cpu_ref(&input, &weight, Some(&bias), seq, hidden, hidden);
+        let gpu = run_linear(&input, &weight, Some(&bias), seq, hidden, hidden);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        // K=384 with |x|<0.5 |w|<0.3: budget ≈ 0.5 × 0.3 × 8e-3 × √384
+        //                                    ≈ 0.024.
+        assert!(
+            max_diff < 5e-2,
+            "max_diff {} > 0.05 at bge-small QKV shape",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn linear_rejects_in_features_below_32() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let input = upload_f32(device, &[0.0; 16], vec![1, 16]);
+        let weight = upload_f32(device, &[0.0; 16 * 8], vec![8, 16]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = bert_linear_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            &weight,
+            None,
+            1,
+            16, // in_features < 32 → reject
+            8,
+        );
+        assert!(err.is_err(), "in_features=16 must error");
+        drop(session);
+    }
+
+    #[test]
+    fn linear_rejects_bias_size_mismatch() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let input = upload_f32(device, &[0.0; 64], vec![1, 64]);
+        let weight = upload_f32(device, &[0.0; 64 * 8], vec![8, 64]);
+        let bias_wrong = upload_f32(device, &[0.0; 4], vec![4]); // expected 8
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = bert_linear_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input,
+            &weight,
+            Some(&bias_wrong),
+            1,
+            64,
+            8,
+        );
+        assert!(err.is_err(), "bias size mismatch must error");
+        drop(session);
+    }
+
+    // -----------------------------------------------------------------
+    // bert_gelu_gpu — pytorch_tanh approximation
+    // -----------------------------------------------------------------
+
+    fn run_gelu(input_data: &[f32]) -> Vec<f32> {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let input = upload_f32(device, input_data, vec![input_data.len()]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let output =
+            bert_gelu_gpu(session.encoder_mut(), &mut registry, device, &input).expect("gpu");
+        session.finish().expect("finish");
+        readback_f32(&output, input_data.len())
+    }
+
+    #[test]
+    fn gelu_cpu_ref_known_values() {
+        // gelu(0) = 0; gelu(1) ≈ 0.8412; gelu(-1) ≈ -0.1588.
+        let out = bert_gelu_cpu_ref(&[0.0, 1.0, -1.0]);
+        assert!(out[0].abs() < 1e-6);
+        assert!((out[1] - 0.8411920071).abs() < 1e-4);
+        assert!((out[2] - -0.1588079929).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gelu_gpu_matches_cpu_small_input() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let input: Vec<f32> = (-32..32).map(|i| 0.1 * i as f32).collect();
+        let cpu = bert_gelu_cpu_ref(&input);
+        let gpu = run_gelu(&input);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        assert!(max_diff < 1e-5, "gelu max_diff: {max_diff}");
+    }
+
+    #[test]
+    fn gelu_gpu_matches_cpu_at_bge_small_ffn_shape() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // bge-small FFN intermediate: seq=32, intermediate=1536. Total
+        // 49152 elements — exercises the linear thread-grid sweep.
+        let n: usize = 32 * 1536;
+        let input: Vec<f32> = (0..n)
+            .map(|i| ((i.wrapping_mul(2654435761usize) % 1000) as f32) * 0.005 - 2.5)
+            .collect();
+        let cpu = bert_gelu_cpu_ref(&input);
+        let gpu = run_gelu(&input);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        assert!(max_diff < 1e-5, "gelu max_diff at bge FFN shape: {max_diff}");
+    }
+
+    // -----------------------------------------------------------------
+    // bert_bias_add_gpu — per-column broadcast add
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bias_add_gpu_matches_cpu_small() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let rows = 5usize;
+        let cols = 7usize;
+        let input: Vec<f32> = (0..rows * cols).map(|i| 0.01 * i as f32).collect();
+        let bias: Vec<f32> = (0..cols).map(|i| 0.1 * i as f32 - 0.3).collect();
+        let inp_buf = upload_f32(device, &input, vec![rows, cols]);
+        let bias_buf = upload_f32(device, &bias, vec![cols]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out_buf = bert_bias_add_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &inp_buf,
+            &bias_buf,
+            rows as u32,
+            cols as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                let expected = input[r * cols + c] + bias[c];
+                let actual = got[r * cols + c];
+                assert!(
+                    (expected - actual).abs() < 1e-6,
+                    "row {} col {}: got {} expected {}",
+                    r,
+                    c,
+                    actual,
+                    expected
+                );
+            }
+        }
     }
 }
