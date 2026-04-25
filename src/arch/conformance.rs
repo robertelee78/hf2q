@@ -203,7 +203,9 @@ pub fn assert_smoke_transcript(
     expected_n_gen: u32,
 ) -> Result<(), String> {
     scan_llama_cli_stderr(stderr)?;
-    let n_eval = extract_n_eval(stderr).ok_or("missing `n_eval` line in llama-cli output")?;
+    let n_eval = extract_n_eval(stderr).ok_or(
+        "missing `eval time =` (real llama-cli) or `n_eval =` (mock) line in stderr",
+    )?;
     if n_eval != expected_n_gen {
         return Err(format!(
             "generated tokens: expected {}, got {}",
@@ -212,7 +214,11 @@ pub fn assert_smoke_transcript(
     }
     let expected = entry.expected_tensor_count(exp);
     let Some(actual) = extract_loaded_tensor_count(stderr) else {
-        return Err("missing `loaded tensor` line in llama-cli output".into());
+        return Err(
+            "missing `loaded meta data with N tensors` (real llama-cli) or \
+             `loaded tensor 0xN` (mock) line in stderr"
+                .into(),
+        );
     };
     if actual != expected {
         return Err(format!(
