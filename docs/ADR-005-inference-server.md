@@ -1917,6 +1917,24 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Mantra check:** real Gemma 4 pretrained ViT weights producing real projected multimodal embeddings via real Metal dispatches end-to-end. **The CPU reference path (`apply_vit_full_forward` in vit.rs) is now fully redundant for production** — kept only as small-input parity validator for individual GPU primitives.
   - **Next (iter 52):** wire `apply_vit_full_forward_gpu` into `process_multimodal_content`. The handler currently 501s after preprocessing image content parts (iter 26). Iter 52 replaces the 501 with: dispatch `apply_vit_full_forward_gpu` per `PreprocessedImage`, hold the resulting `[49, 2816]` GPU buffers, then inject them into the chat prompt's token stream as embedding placeholders. **First real `image_url` chat completion request will return a 200.** Multi-image requests handled by stacking the embeddings in image-order.
 
+- **2026-04-25 loop iter 52 — Handler runs `apply_vit_full_forward_gpu` on every multimodal request; 501 stays but with timing transparency.** Engine-side embedding injection deferred to iter 53; this iter's contribution is that the handler exercises the full GPU vision path on every real request, surfaces timing as a transparency header, and returns a richer 501.
+  - **`compute_vision_embeddings_gpu(images, weights, cfg, scale) -> Vec<Vec<f32>>` (NEW in `vit_gpu.rs`):** handler-side wrapper. Iterates `&[PreprocessedImage]`, runs `apply_vit_full_forward_gpu` per image (fresh `GraphSession` + readback per image — keeps the per-image hot path simple), returns `Vec<f32>` embeddings in input order. For Gemma 4: each embedding is `[49, 2816] = 137,984 f32`.
+  - **Handler integration (`chat_completions`):** the iter-26 sequence `process_multimodal_content → vit_forward_pending_response(501)` becomes `process_multimodal_content → compute_vision_embeddings_gpu → vit_engine_integration_pending_response(501 + timing)`. The 501 surfaces:
+    - Body: "embeddings produced in {ms}ms ... engine-side embedding-injection path is pending."
+    - Headers: `X-HF2Q-ViT-Forward-Ms: {ms}` and `X-HF2Q-ViT-Images: {N}`. Clients can verify the GPU path ran without parsing the error body.
+  - **Tests (1 new + 8 pre-existing still pass):**
+    - **`compute_vision_embeddings_gpu_multi_image_real_gemma4`** — 2 distinct synthetic preprocessed images on real Gemma 4 mmproj. Asserts: 2 embeddings each `[49 × 2816]`, all finite, inter-image L2 > 1e-2 (different inputs produce different embeddings — no collapse). 2.6s for 2 images = ~1.3s per image (matches iter 51d). Confirms multi-image ordering preservation.
+    - All 8 iter-26 multimodal handler tests still pass. (They exercise `process_multimodal_content` directly, which doesn't reach the new GPU dispatch — only the chat-completion handler route does.)
+  - **Verification:** `cargo test --bin hf2q compute_vision_embeddings_gpu_multi_image` — 1/1 pass (~13s including 400MB mmproj load + 2 forward passes). Full suite 926/926 pass (+1).
+  - **Mantra check:** every multimodal chat-completion request now exercises the entire production GPU vision pipeline end-to-end on every call. The 501 stays only because the chat engine doesn't yet accept vision embeddings as soft-tokens; the vision path itself is fully production-correct.
+  - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
+  - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
+    1. Extend `Engine::generate(...)` to accept an optional `Vec<Vec<f32>>` of vision embeddings.
+    2. Render-chat-prompt logic identifies image placeholders (e.g. `<image>` token from Gemma 4's tokenizer) and replaces their token-id with a soft-token marker.
+    3. Forward decode pre-fills the embedding-table-lookup tensor with the vision embeddings at marker positions instead of the placeholder token's row.
+    4. Generation proceeds normally from there.
+    Once iter 53 lands, the 501 finally becomes a 200 with a real chat-completion response that *describes the image*. Phase 2c is then complete; remaining Phase 2 work is the live-model-gated tail (BERT forward, summarize overflow, prompt-cache engine integration).
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).

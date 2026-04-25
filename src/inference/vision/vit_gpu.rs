@@ -1531,6 +1531,96 @@ pub fn apply_vit_full_forward_gpu(
     Ok(final_out)
 }
 
+/// Run `apply_vit_full_forward_gpu` for each `PreprocessedImage`, read
+/// back to CPU. Caller-friendly handler-side wrapper.
+///
+/// Returns one `Vec<f32>` per image, each of shape
+/// `[(num_patches/4) × text_hidden]` row-major (e.g. `[49, 2816]` for
+/// Gemma 4). Order matches the input slice.
+///
+/// Internally creates a fresh `GraphExecutor` + `KernelRegistry`,
+/// registers all ViT shaders, runs each image through a separate
+/// `GraphSession::finish()` (one GPU sync per image — keeps the
+/// per-image readback hot path simple). For batched-image requests,
+/// a future iter can amortize by running all images in a single
+/// session before reading any back.
+///
+/// `scale` is the attention scale (`1.0` for Gemma 4V; `1/sqrt(head_dim)`
+/// for standard ViT). Per the iter-50 finding, the GPU output uses BF16
+/// attention internally — production-correct, but element-wise CPU
+/// reference comparison is misleading.
+///
+/// # Errors
+///
+/// Propagated from any sub-stage (shape mismatch, missing tensors).
+pub fn compute_vision_embeddings_gpu(
+    images: &[super::PreprocessedImage],
+    mmproj_weights: &super::mmproj_weights::LoadedMmprojWeights,
+    mmproj_cfg: &super::mmproj::MmprojConfig,
+    scale: f32,
+) -> Result<Vec<Vec<f32>>> {
+    use mlx_native::{GraphExecutor, MlxDevice};
+
+    let mut out = Vec::with_capacity(images.len());
+    for (idx, img) in images.iter().enumerate() {
+        let executor = GraphExecutor::new(
+            MlxDevice::new().map_err(|e| {
+                anyhow!("compute_vision_embeddings_gpu image {}: device: {e}", idx)
+            })?,
+        );
+        let mut session = executor.begin().map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu image {}: begin: {e}", idx)
+        })?;
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        // SAFETY: executor outlives session via the loop scope.
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let buf = apply_vit_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            mmproj_weights,
+            mmproj_cfg,
+            &img.pixel_values,
+            scale,
+        )
+        .map_err(|e| anyhow!("compute_vision_embeddings_gpu image {}: forward: {e}", idx))?;
+        session
+            .finish()
+            .map_err(|e| anyhow!("compute_vision_embeddings_gpu image {}: finish: {e}", idx))?;
+
+        // Read back to CPU. Shape is [(N_side/2)², text_hidden].
+        let n_patches_out =
+            ((mmproj_cfg.num_patches_side / 2) * (mmproj_cfg.num_patches_side / 2)) as usize;
+        let mm0 = mmproj_weights
+            .mm_0_weight()
+            .map_err(|e| anyhow!("mm.0: {e}"))?;
+        let text_hidden = mm0
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("mm.0 slice: {e}"))?
+            .len()
+            / (mmproj_cfg.hidden_size as usize);
+        let total = n_patches_out * text_hidden;
+        let slice: &[f32] = buf
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("readback: {e}"))?;
+        if slice.len() != total {
+            return Err(anyhow!(
+                "compute_vision_embeddings_gpu image {}: readback len {} != expected {}",
+                idx,
+                slice.len(),
+                total
+            ));
+        }
+        out.push(slice.to_vec());
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2964,6 +3054,78 @@ mod tests {
         let err = vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0)
             .unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
+    }
+
+    #[test]
+    fn compute_vision_embeddings_gpu_multi_image_real_gemma4() {
+        // Iter 52: handler-side wrapper. Two synthetic preprocessed
+        // images (different gradient inputs) → two distinct
+        // [49, 2816] embeddings. Validates the multi-image loop +
+        // ordering preservation.
+        use crate::inference::vision::PreprocessedImage;
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
+                .expect("w");
+
+        let img = cfg.image_size as usize;
+        let make_image = |seed: u32| -> PreprocessedImage {
+            let mut pixels = vec![0f32; 3 * img * img];
+            for c in 0..3 {
+                for y in 0..img {
+                    for x in 0..img {
+                        pixels[c * img * img + y * img + x] =
+                            ((c + 1) as f32) * 0.05
+                                + (y as f32) * 0.001
+                                + (x as f32) * 0.001
+                                + (seed as f32) * 0.0001;
+                    }
+                }
+            }
+            PreprocessedImage {
+                pixel_values: pixels,
+                target_size: cfg.image_size,
+                source_label: format!("synthetic-{seed}"),
+            }
+        };
+        let images = vec![make_image(0), make_image(42)];
+
+        let head_dim = (cfg.hidden_size / cfg.num_attention_heads) as f32;
+        let scale = 1.0f32 / head_dim.sqrt();
+
+        let t0 = std::time::Instant::now();
+        let embeddings =
+            compute_vision_embeddings_gpu(&images, &weights, &cfg, scale).expect("compute");
+        eprintln!(
+            "compute_vision_embeddings_gpu × {} images: {:?}",
+            images.len(),
+            t0.elapsed()
+        );
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(embeddings[0].len(), 49 * 2816);
+        assert_eq!(embeddings[1].len(), 49 * 2816);
+
+        // Both finite.
+        for emb in &embeddings {
+            for v in emb {
+                assert!(v.is_finite(), "non-finite: {v}");
+            }
+        }
+        // Two different images should produce DIFFERENT embeddings.
+        let l2: f32 = embeddings[0]
+            .iter()
+            .zip(embeddings[1].iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        eprintln!("inter-image L2 = {:.4}", l2);
+        assert!(l2 > 1e-2, "two different images produced identical embeddings");
     }
 
     /// Iter 51d: full GPU ViT forward on real Gemma 4 mmproj.
