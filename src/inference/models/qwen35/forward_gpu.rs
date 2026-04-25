@@ -543,25 +543,33 @@ impl Qwen35Model {
                             }
                         };
 
-                    // Get recurrent state as MlxBuffer (or zero buffer for fallback)
-                    let rec_buf_ref: &MlxBuffer;
-                    let zero_rec_buf: MlxBuffer;
-                    if linear_slot_idx != usize::MAX {
-                        rec_buf_ref = &kv_cache.linear_attn[linear_slot_idx].recurrent;
-                    } else {
-                        let zero_cpu = vec![0.0f32; rec_size];
-                        zero_rec_buf = upload_f32(&zero_cpu, &device)
-                            .context("alloc zero recurrent state")?;
-                        rec_buf_ref = &zero_rec_buf;
-                    }
-
-                    let (out, new_conv_state, new_rec_buf) = build_delta_net_layer(
+                    // Ping-pong recurrent state: GDN reads slot.recurrent (state_in)
+                    // and writes slot.recurrent_scratch (state_out).  After the call
+                    // we swap the two handles — O(1) pointer swap, zero CPU copy.
+                    // Metal prohibits read-write aliasing in the same compute pass.
+                    let zero_rec_buf_in: MlxBuffer;
+                    let zero_rec_buf_out: MlxBuffer;
+                    let (state_in_ref, state_out_ref): (&MlxBuffer, &MlxBuffer) =
+                        if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (&slot.recurrent, &slot.recurrent_scratch)
+                        } else {
+                            // Fallback: allocate throwaway scratch buffers.
+                            let zero_cpu = vec![0.0f32; rec_size];
+                            zero_rec_buf_in = upload_f32(&zero_cpu, &device)
+                                .context("alloc zero recurrent state_in")?;
+                            zero_rec_buf_out = upload_f32(&zero_cpu, &device)
+                                .context("alloc zero recurrent state_out")?;
+                            (&zero_rec_buf_in, &zero_rec_buf_out)
+                        };
+                    let (out, new_conv_state) = build_delta_net_layer(
                         &device,
                         &mut registry,
                         &hidden,
                         attn,
                         &old_conv_state,
-                        rec_buf_ref,
+                        state_in_ref,
+                        state_out_ref,
                         seq_len,
                         shape.hidden_size,
                         shape.n_k_heads,
@@ -573,25 +581,16 @@ impl Qwen35Model {
                     )
                     .with_context(|| format!("delta_net layer {layer_idx}"))?;
 
-                    // --- Write back updated state into kv_cache slot ---
+                    // --- Write back conv state; swap recurrent ping-pong ---
                     if linear_slot_idx != usize::MAX {
                         let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                        // conv_state: CPU layout, copy from Vec<f32>
-                        {
-                            let dst = slot.conv_state.as_mut_slice::<f32>()
-                                .map_err(|e| anyhow!("conv_state as_mut_slice: {e}"))?;
-                            dst.copy_from_slice(&new_conv_state);
-                        }
-                        // recurrent: copy new GPU buffer data → slot.recurrent (unified memory).
-                        // Both are MlxBuffer with shared memory; this is a CPU memcpy avoiding
-                        // a full Metal buffer allocation+copy round-trip.
-                        {
-                            let src = new_rec_buf.as_slice::<f32>()
-                                .map_err(|e| anyhow!("new_rec as_slice: {e}"))?;
-                            let dst = slot.recurrent.as_mut_slice::<f32>()
-                                .map_err(|e| anyhow!("recurrent as_mut_slice: {e}"))?;
-                            dst.copy_from_slice(src);
-                        }
+                        // conv_state: CPU layout, copy from Vec<f32>.
+                        let dst = slot.conv_state.as_mut_slice::<f32>()
+                            .map_err(|e| anyhow!("conv_state as_mut_slice: {e}"))?;
+                        dst.copy_from_slice(&new_conv_state);
+                        // Swap ping-pong: scratch → active, active → scratch.
+                        // GDN wrote to recurrent_scratch; it is now the current state.
+                        slot.swap_recurrent();
                     }
 
                     out

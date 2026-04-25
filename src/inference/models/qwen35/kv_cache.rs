@@ -61,11 +61,27 @@ pub struct LinearAttnStateSlot {
     /// DeltaNet conv1d ring buffer: `[K-1, conv_channels, n_seqs]` f32.
     /// Holds the last (K-1) tokens' conv inputs, per sequence.
     pub conv_state: MlxBuffer,
-    /// DeltaNet recurrent state: `[D_k, D_v, num_v_heads, n_seqs]` f32.
-    /// Matches the memory layout consumed by
-    /// `mlx_native::ops::gated_delta_net::dispatch_gated_delta_net`
-    /// (d_k innermost for per-thread contiguous reads).
+    /// DeltaNet recurrent state (current): `[D_k, D_v, num_v_heads, n_seqs]` f32.
+    ///
+    /// Ping-pong semantics: `recurrent` is the active (read) state buffer.
+    /// `recurrent_scratch` is the inactive (write) buffer.  After each
+    /// decode step the caller swaps the two handles via
+    /// [`LinearAttnStateSlot::swap_recurrent`], turning last step's output
+    /// into this step's input — zero copies, zero allocations.
     pub recurrent: MlxBuffer,
+    /// DeltaNet recurrent state (scratch, write target for GDN kernel).
+    /// Same shape as `recurrent`.  Swapped with `recurrent` each decode step.
+    pub recurrent_scratch: MlxBuffer,
+}
+
+impl LinearAttnStateSlot {
+    /// Swap the active and scratch recurrent state buffers (O(1) pointer swap).
+    /// Call this after every decode step to make the just-written scratch the
+    /// new current state.
+    #[inline]
+    pub fn swap_recurrent(&mut self) {
+        std::mem::swap(&mut self.recurrent, &mut self.recurrent_scratch);
+    }
 }
 
 /// Top-level hybrid cache holding both full-attention and linear-attention
@@ -207,6 +223,11 @@ impl HybridKvCache {
                     *v = 0.0;
                 }
             }
+            if let Ok(s) = slot.recurrent_scratch.as_mut_slice::<f32>() {
+                for v in s.iter_mut() {
+                    *v = 0.0;
+                }
+            }
         }
     }
 
@@ -217,7 +238,9 @@ impl HybridKvCache {
             n += s.k.element_count() * 4 + s.v.element_count() * 4;
         }
         for s in &self.linear_attn {
-            n += s.conv_state.element_count() * 4 + s.recurrent.element_count() * 4;
+            n += s.conv_state.element_count() * 4
+                + s.recurrent.element_count() * 4
+                + s.recurrent_scratch.element_count() * 4;
         }
         n
     }
@@ -292,22 +315,27 @@ fn alloc_linear_attn_slot(
         * (cfg.linear_value_head_dim as usize)
         * (cfg.linear_num_value_heads as usize)
         * (n_seqs as usize);
+    let rec_shape = vec![
+        cfg.linear_key_head_dim as usize,
+        cfg.linear_value_head_dim as usize,
+        cfg.linear_num_value_heads as usize,
+        n_seqs as usize,
+    ];
     let recurrent = device
-        .alloc_buffer(
-            rec_elems * 4,
-            DType::F32,
-            vec![
-                cfg.linear_key_head_dim as usize,
-                cfg.linear_value_head_dim as usize,
-                cfg.linear_num_value_heads as usize,
-                n_seqs as usize,
-            ],
-        )
+        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape.clone())
         .map_err(|e| anyhow!("alloc recurrent: {e}"))?;
+    // Scratch buffer for ping-pong: same shape, zero-initialized.
+    // GDN kernel writes here; after each decode step the caller swaps
+    // `recurrent` and `recurrent_scratch`, making the new output the
+    // new current state without any CPU copy.
+    let recurrent_scratch = device
+        .alloc_buffer(rec_elems * 4, DType::F32, rec_shape)
+        .map_err(|e| anyhow!("alloc recurrent_scratch: {e}"))?;
 
     Ok(LinearAttnStateSlot {
         conv_state,
         recurrent,
+        recurrent_scratch,
     })
 }
 

@@ -704,26 +704,31 @@ pub fn apply_ssm_norm_and_gate(
 ///
 /// # State management
 ///
-/// `old_conv_state` and `state_in` are read from the caller's
-/// [`HybridKvCache`] and passed here by value (as slices). The returned
-/// `(new_conv_state, new_recurrent_state)` must be written back to the
-/// cache by the caller.
+/// `old_conv_state` is read (CPU layout) and the function writes the new
+/// conv state into the returned `Vec<f32>`.
+///
+/// `state_in` is the current recurrent state (read-only).
+/// `state_out` is the destination for the updated recurrent state (write-only).
+/// They MUST be different buffers (Metal prohibits aliased read-write bindings
+/// in the same compute pass). The caller (e.g. forward_gpu.rs) is responsible
+/// for swapping `state_in` / `state_out` between decode steps to implement a
+/// zero-copy ping-pong, avoiding the prior 2 MB/layer CPU memcpy scheme.
 ///
 /// `old_conv_state` is `[K-1, qkv_channels]` F32 (CPU layout).
-/// `state_in` is `[d_k * d_v * n_v_heads]` F32 (kernel layout = recurrent
-/// state in HybridKvCache).
+/// `state_in`/`state_out` are `[d_k * d_v * n_v_heads]` F32 (kernel layout).
 ///
 /// # Returns
 ///
-/// `(output, new_conv_state, new_recurrent_state)`.
+/// `(output, new_conv_state)`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_delta_net_layer(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
     x: &MlxBuffer,
     weights: &DeltaNetWeightsGpu,
-    old_conv_state: &[f32], // [K-1, qkv_channels] CPU layout
-    state_in: &MlxBuffer,   // [d_k * d_v * n_v_heads] GPU buffer (recurrent state)
+    old_conv_state: &[f32],  // [K-1, qkv_channels] CPU layout
+    state_in: &MlxBuffer,    // current recurrent state (read-only)
+    state_out: &MlxBuffer,   // next recurrent state (write-only, must != state_in)
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -732,7 +737,7 @@ pub fn build_delta_net_layer(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
-) -> Result<(MlxBuffer, Vec<f32>, MlxBuffer)> {
+) -> Result<(MlxBuffer, Vec<f32>)> {
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
     let q_span = n_k_heads * d_k;
@@ -756,7 +761,6 @@ pub fn build_delta_net_layer(
     let gated_elems = (rows_op8 * d_v) as usize;
     let n_seqs = 1u32;
     let out_elems = (n_v_heads * seq_len * d_v) as usize;
-    let state_elems = (d_k * d_v * n_v_heads) as usize;
 
     // Pre-allocate all intermediate buffers (must outlive the encoder).
     let (ssm_old_state_buf, ssm_new_state_buf, qkv_conv, ssm_params_buf, ssm_conv_params) =
@@ -781,15 +785,15 @@ pub fn build_delta_net_layer(
         .map_err(|e| anyhow!("op8 params: {e}"))?;
     let attn_out_buf = device.alloc_buffer(out_elems * 4, DType::F32, vec![out_elems])
         .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
-    let state_out_buf = device.alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
-        .map_err(|e| anyhow!("alloc gdn state_out: {e}"))?;
+    // state_in and state_out are caller-provided buffers (ping-pong).
+    // Metal requires distinct buffers for read and write bindings.
     let gdn_params = GatedDeltaNetParams {
         d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
     };
     let gdn_params_buf = build_gated_delta_net_params(device, gdn_params)
         .map_err(|e| anyhow!("build gdn params: {e}"))?;
 
-    let (new_conv_state, output) = if seq == 1 {
+    let (output, new_conv_state) = if seq == 1 {
         // ---- DECODE PATH (seq=1): single encoder for ALL ops 1-9 ----
         //
         // For single-token decode we can fuse ops1-3 and ops5-9 into ONE
@@ -869,12 +873,12 @@ pub fn build_delta_net_layer(
             seq_len, n_v_heads,
         ).context("dispatch_compute_g_beta")?;
         enc.memory_barrier();
-        // Op 7: GDN
+        // Op 7: GDN — reads state_in, writes state_out (ping-pong buffers).
         dispatch_gated_delta_net(
             &mut enc, registry, device.metal_device(),
             &q_scaled, &k_normed, &v_gpu,
             &g_buf, &beta_buf, state_in,
-            &attn_out_buf, &state_out_buf, &gdn_params_buf, gdn_params,
+            &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
         ).context("dispatch_gated_delta_net")?;
         enc.memory_barrier();
         // Op 8: ssm_norm_gate
@@ -895,7 +899,8 @@ pub fn build_delta_net_layer(
         // Extract new conv state after commit (unified memory → zero-copy).
         let new_conv_state = extract_new_conv_state(&ssm_new_state_buf, km1, channels)
             .context("extract_new_conv_state")?;
-        (new_conv_state, output)
+        // state_out now holds the updated recurrent state (caller swaps ping-pong).
+        (output, new_conv_state)
     } else {
         // ---- PREFILL PATH (seq>1): two encoders — CPU de-interleave between ----
         //
@@ -976,11 +981,12 @@ pub fn build_delta_net_layer(
                 seq_len, n_v_heads,
             ).context("dispatch_compute_g_beta prefill")?;
             enc.memory_barrier();
+            // GDN prefill — reads state_in, writes state_out (ping-pong buffers).
             dispatch_gated_delta_net(
                 &mut enc, registry, device.metal_device(),
                 &q_scaled, &k_normed, &v_gpu,
                 &g_buf, &beta_buf, state_in,
-                &attn_out_buf, &state_out_buf, &gdn_params_buf, gdn_params,
+                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
             ).context("dispatch_gated_delta_net prefill")?;
             enc.memory_barrier();
             dispatch_ssm_norm_gate(
@@ -997,10 +1003,11 @@ pub fn build_delta_net_layer(
             enc.commit_and_wait().context("commit ops5-9 prefill")?;
             output
         };
-        (new_conv_state, output)
+        // state_out now holds updated recurrent state (caller swaps ping-pong).
+        (output, new_conv_state)
     };
 
-    Ok((output, new_conv_state, state_out_buf))
+    Ok((output, new_conv_state))
 }
 
 // ================================================================
@@ -1127,13 +1134,15 @@ mod tests {
 
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
         let state_in_gpu = upload_f32(&state_in, &device).expect("upload state_in");
-        let (gpu_out_buf, _, _) = build_delta_net_layer(
+        let state_out_gpu = upload_f32(&state_in, &device).expect("upload state_out scratch");
+        let (gpu_out_buf, _) = build_delta_net_layer(
             &device,
             &mut registry,
             &x_gpu,
             &gpu_weights,
             &conv_state,
             &state_in_gpu,
+            &state_out_gpu,
             seq_len,
             shape.hidden_size,
             shape.n_k_heads,
@@ -1277,32 +1286,38 @@ mod tests {
         // Monolithic: 2 tokens at once.
         let x_full_gpu = upload_f32(&x_full, &device).expect("upload");
         let state_zeros_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros mono");
-        let (mono_buf, _, _) = build_delta_net_layer(
+        let state_scratch_mono = upload_f32(&state_zeros, &device).expect("state scratch mono");
+        let (mono_buf, _) = build_delta_net_layer(
             &device, &mut registry, &x_full_gpu, &gpu_weights,
-            &conv_zeros, &state_zeros_gpu,
+            &conv_zeros, &state_zeros_gpu, &state_scratch_mono,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("mono");
         let mono_out = download_f32(&mono_buf).expect("dl mono");
 
         // Chunked: token 0 then token 1.
+        // Use ping-pong: after t0, state_after_t0_gpu holds the new state.
+        // Feed it as state_in for t1.
         let x_t0 = x_full[0..h].to_vec();
         let x_t1 = x_full[h..2 * h].to_vec();
 
         let x_t0_gpu = upload_f32(&x_t0, &device).expect("upload t0");
-        let state_zeros_t0_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros t0");
-        let (t0_buf, conv_after_t0, state_after_t0) = build_delta_net_layer(
+        let state_t0_in = upload_f32(&state_zeros, &device).expect("upload state t0 in");
+        let state_t0_out = upload_f32(&state_zeros, &device).expect("alloc state t0 out");
+        let (t0_buf, conv_after_t0) = build_delta_net_layer(
             &device, &mut registry, &x_t0_gpu, &gpu_weights,
-            &conv_zeros, &state_zeros_t0_gpu,
+            &conv_zeros, &state_t0_in, &state_t0_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t0");
         let t0_out = download_f32(&t0_buf).expect("dl t0");
 
+        // state_t0_out holds state after t0; use it as state_in for t1.
         let x_t1_gpu = upload_f32(&x_t1, &device).expect("upload t1");
-        let (t1_buf, _, _) = build_delta_net_layer(
+        let state_t1_out = upload_f32(&state_zeros, &device).expect("alloc state t1 out");
+        let (t1_buf, _) = build_delta_net_layer(
             &device, &mut registry, &x_t1_gpu, &gpu_weights,
-            &conv_after_t0, &state_after_t0,
+            &conv_after_t0, &state_t0_out, &state_t1_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t1");

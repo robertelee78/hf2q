@@ -52,6 +52,7 @@ use mlx_native::ops::rms_norm;
 use mlx_native::ops::rope_multi::{
     build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
 };
+use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
@@ -656,78 +657,74 @@ pub fn apply_sdpa_with_kv_cache(
     let max_sl = max_seq_len as usize;
     let cur_len = slot.current_len[0] as usize;
 
-    // --- Write new K/V into cache (head-major layout) ---
-    // Cache layout: [1, n_kv_heads, max_seq_len, head_dim] F32.
-    // We need K_new and V_new as CPU slices to write into the Metal KV cache buffer.
-    // For decode (seq=1), this is just nkv × d = small writes.
-    let k_cpu_new = download_f32(k_seq_major)?;
-    let v_cpu_new = download_f32(v_seq_major)?;
-
-    let k_cache_cpu = slot.k.as_mut_slice::<f32>()
-        .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
-    let v_cache_cpu = slot.v.as_mut_slice::<f32>()
-        .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
-
-    // Write seq_len new tokens into the cache, starting at position cur_len.
-    // k_cpu_new / v_cpu_new are [seq, nkv, d] seq-major.
-    for t in 0..seq {
-        let abs_pos = cur_len + t;
-        if abs_pos >= max_sl {
-            break; // cache full — stop writing, SDPA will see cur_len + t tokens
-        }
-        for h in 0..nkv {
-            let src_base = (t * nkv + h) * d;
-            let dst_base = h * max_sl * d + abs_pos * d;
-            k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
-            v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
-        }
-    }
-    // Drop CPU borrows before using the buffers as GPU inputs.
-    drop(k_cache_cpu);
-    drop(v_cache_cpu);
-
-    let kv_seq_len = (cur_len + seq).min(max_sl) as u32;
-
-    // --- Optionally permute Q to head-major for SDPA ---
-    // For seq=1, [seq*nh, d] seq-major == [nh*seq, d] head-major (same bytes).
-    // Skip the download+permute+upload round-trip by using q_seq_major directly.
-    let q_permuted: Option<MlxBuffer>;
-    let q_ref: &MlxBuffer;
-    if seq == 1 {
-        // seq=1: permute is identity; use q_seq_major directly — no CPU round-trip.
-        q_permuted = None;
-        q_ref = q_seq_major;
-    } else {
-        let q_cpu = download_f32(q_seq_major)?;
-        let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
-        q_permuted = Some(upload_f32(&q_hm, device)?);
-        q_ref = q_permuted.as_ref().unwrap();
-    }
+    let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
+    let kv_seq_len = (cur_len + kv_write_tokens).min(max_sl) as u32;
 
     // --- SDPA over full KV cache ---
-    // For seq=1 (decode) with head_dim divisible by 32, use sdpa_decode:
-    //   - SIMD-vectorized F32 Q/K/V (no half-precision quantization)
-    //   - 32 threads cooperate on each QK dot product via simd_sum
-    //   - Avoids the scalar inner loop of the generic sdpa kernel
+    // For seq=1 (decode) with head_dim divisible by 32: fused GPU path:
+    //   - kv_cache_copy_seq_f32_dual: write K and V into cache in one GPU dispatch
+    //     (no CPU download/copy, no CPU barrier)
+    //   - memory_barrier within same encoder
+    //   - sdpa_decode: SIMD-vectorized F32 Q/K/V (simd_sum QK dot products)
+    //   Single commit_and_wait for both K/V cache write + SDPA.
     //
-    // Falls back to sdpa for seq > 1 (prefill) or non-standard head_dim.
+    // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
     let out_buf = device
         .alloc_buffer(nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
         .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
 
-    let mut enc = device.command_encoder().context("enc sdpa kv-cache")?;
     if seq == 1 && head_dim % 32 == 0 {
-        // Decode fast path: vectorized F32 SDPA with simd_sum QK dot products.
-        // Q layout for seq=1: [n_heads, head_dim] = same in both seq-major and head-major.
+        // Decode fast path: fused GPU K/V cache write + SIMD SDPA.
+        // Q layout for seq=1: [n_heads, head_dim] is identical in seq-major and head-major.
+        // K/V source: [seq*n_kv_heads, head_dim] = [n_kv_heads, head_dim] for seq=1,
+        //   which kv_cache_copy_seq_f32_dual treats as [n_tokens=1, n_heads, head_dim].
+        let mut enc = device.command_encoder().context("enc kv-cache+sdpa decode")?;
+        if kv_write_tokens > 0 {
+            dispatch_kv_cache_copy_seq_f32_dual(
+                &mut enc, registry, device.metal_device(),
+                k_seq_major, v_seq_major,
+                &slot.k, &slot.v,
+                n_kv_heads, head_dim, max_seq_len,
+                cur_len as u32, kv_write_tokens as u32, 0,
+            ).context("kv_cache_copy kv-cache decode")?;
+            // Barrier: sdpa_decode reads slot.k/slot.v written above.
+            enc.memory_barrier();
+        }
         dispatch_sdpa_decode(
             &mut enc, registry, device,
-            q_ref, &slot.k, &slot.v, &out_buf,
+            q_seq_major, &slot.k, &slot.v, &out_buf,
             n_heads, n_kv_heads, head_dim,
             kv_seq_len, max_seq_len,
             1.0 / (d as f32).sqrt(),
         ).context("sdpa_decode kv-cache")?;
+        enc.commit_and_wait().context("commit kv-cache+sdpa decode")?;
     } else {
-        // Prefill path or non-standard head_dim: generic SDPA.
+        // Prefill path (seq > 1) or non-standard head_dim:
+        // CPU K/V permute is required for the head-major cache layout.
+        let k_cpu_new = download_f32(k_seq_major)?;
+        let v_cpu_new = download_f32(v_seq_major)?;
+
+        let k_cache_cpu = slot.k.as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("kv_cache k as_mut_slice: {e}"))?;
+        let v_cache_cpu = slot.v.as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("kv_cache v as_mut_slice: {e}"))?;
+
+        for t in 0..kv_write_tokens {
+            let abs_pos = cur_len + t;
+            for h in 0..nkv {
+                let src_base = (t * nkv + h) * d;
+                let dst_base = h * max_sl * d + abs_pos * d;
+                k_cache_cpu[dst_base..dst_base + d].copy_from_slice(&k_cpu_new[src_base..src_base + d]);
+                v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
+            }
+        }
+        drop(k_cache_cpu);
+        drop(v_cache_cpu);
+
+        let q_cpu = download_f32(q_seq_major)?;
+        let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);
+        let q_gpu = upload_f32(&q_hm, device)?;
+
         let params = SdpaParams {
             n_heads,
             n_kv_heads,
@@ -737,22 +734,12 @@ pub fn apply_sdpa_with_kv_cache(
             scale: 1.0 / (d as f32).sqrt(),
             kv_capacity: max_seq_len,
         };
-        sdpa(&mut enc, registry, device, q_ref, &slot.k, &slot.v, &out_buf, &params, 1)
-            .context("sdpa with kv cache")?;
-    }
-    enc.commit_and_wait().context("commit sdpa kv-cache")?;
-    drop(q_permuted);
+        let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
+        sdpa(&mut enc, registry, device, &q_gpu, &slot.k, &slot.v, &out_buf, &params, 1)
+            .context("sdpa with kv cache prefill")?;
+        enc.commit_and_wait().context("commit sdpa kv-cache prefill")?;
 
-    // --- Update current_len cursor ---
-    let new_len = (cur_len + seq).min(max_sl) as u32;
-    slot.current_len[0] = new_len;
-
-    // --- Permute output from head-major [n_heads, seq, head_dim] back to seq-major ---
-    // For seq=1, out_buf [1, nh, 1, d] head-major == [nh*1, d] seq-major (same bytes).
-    // Skip the download+permute+upload round-trip by returning out_buf directly.
-    if seq == 1 {
-        Ok(out_buf)
-    } else {
+        // Permute output from head-major [n_heads, seq, head_dim] → seq-major.
         let out_hm_cpu = download_f32(&out_buf)?;
         let mut out_sm = vec![0.0f32; seq * nh * d];
         for h in 0..nh {
@@ -762,8 +749,17 @@ pub fn apply_sdpa_with_kv_cache(
                 out_sm[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
             }
         }
-        upload_f32(&out_sm, device)
+        // --- Update current_len cursor (prefill path) ---
+        let new_len = kv_seq_len;
+        slot.current_len[0] = new_len;
+        return upload_f32(&out_sm, device);
     }
+
+    // --- Update current_len cursor (decode path) ---
+    slot.current_len[0] = kv_seq_len;
+
+    // For seq=1 out_buf is [1, nh, 1, d] head-major == [nh, d] seq-major (same bytes).
+    Ok(out_buf)
 }
 
 // ================================================================
