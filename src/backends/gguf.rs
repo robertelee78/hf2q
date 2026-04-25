@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{BackendError, OutputBackend};
 use crate::ir::{
-    FormatWarning, OutputFile, OutputManifest, QuantizedModel,
-    TensorQuantInfo, WarningSeverity,
+    FormatWarning, ModelMetadata, OutputFile, OutputManifest, QuantizedModel,
+    TensorMap, TensorQuantInfo, WarningSeverity,
 };
 use crate::progress::ProgressReporter;
 
@@ -72,6 +72,53 @@ impl Default for GgufBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Emit an F16 GGUF from an in-memory `TensorMap` to `output_path`.
+///
+/// All weight tensors are converted to F16 (no DWQ / k-quant compression).
+/// Norms, biases, and other preserved tensors pass through at their original
+/// precision. Used by ADR-012 P9b two-pass conversion to produce an
+/// intermediate GGUF that `Qwen35Model::load_from_gguf` can consume for
+/// activation capture, before the final DWQ pass over the held tensor_map.
+///
+/// `input_dir` is required because tokenizer metadata (chat-template,
+/// vocab, etc.) is loaded from `tokenizer.json` / `tokenizer_config.json`
+/// during `build_metadata`.
+///
+/// `output_path` is treated as a `.gguf` file path when it ends in `.gguf`,
+/// otherwise as an output directory in which the file is auto-named — the
+/// same dispatch as `OutputBackend::write`.
+///
+/// **Reuses `GgufBackend::write` end-to-end** — the only behavioral
+/// difference vs. a normal `hf2q convert --quant f16` is that this fn is
+/// callable mid-pipeline without going through CLI parsing. Layout, tensor
+/// name mapping, metadata emission, MTP scaffolding, etc. are all handled
+/// by the existing tested write path.
+pub fn emit_gguf_from_tensor_map(
+    tensor_map: &TensorMap,
+    metadata: &ModelMetadata,
+    input_dir: &Path,
+    output_path: &Path,
+    progress: &ProgressReporter,
+) -> Result<OutputManifest, BackendError> {
+    use crate::quantize::{quantize_model, static_quant::StaticQuantizer};
+
+    let quantizer = StaticQuantizer::new("f16").map_err(|e| BackendError::WriteFailed {
+        reason: format!("StaticQuantizer init for intermediate F16 emit: {e}"),
+    })?;
+
+    // bits=16 / group_size=32 are required by the quantizer signature but
+    // the f16 path treats every weight as `convert_to_f16` (no grouping)
+    // and every preserved tensor as `preserve_tensor`. See
+    // `static_quant.rs::Quantizer::quantize_tensor`.
+    let quantized = quantize_model(tensor_map, metadata, &quantizer, 16, 32, progress)
+        .map_err(|e| BackendError::WriteFailed {
+            reason: format!("F16 intermediate quantize step: {e}"),
+        })?;
+
+    let backend = GgufBackend::new();
+    backend.write(&quantized, input_dir, output_path, progress)
 }
 
 // ---------------------------------------------------------------------------
@@ -2810,6 +2857,58 @@ mod tests {
         for (input, expected) in [(0, 0), (1, 32), (32, 32), (33, 64), (63, 64), (64, 64)] {
             assert_eq!(align_up(input, 32), expected);
         }
+    }
+
+    /// ADR-012 P9b.1: smoke test for `emit_gguf_from_tensor_map`.
+    ///
+    /// Build a tiny TensorMap (one F16 weight + one F16 norm), call the
+    /// helper, verify the output file has GGUF magic + version. Confirms
+    /// the orchestration wiring (TensorMap → StaticQuantizer("f16") →
+    /// quantize_model → GgufBackend::write) works end-to-end without a
+    /// full convert-pipeline run.
+    #[test]
+    fn test_emit_gguf_from_tensor_map_smoke() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "model.embed_tokens.weight".into(),
+            shape: vec![8, 16],
+            dtype: DType::F16,
+            data: vec![0u8; 8 * 16 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.norm.weight".into(),
+            shape: vec![16],
+            dtype: DType::F16,
+            data: vec![0u8; 16 * 2],
+        });
+
+        let metadata = meta();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("intermediate.gguf");
+
+        let manifest = super::emit_gguf_from_tensor_map(
+            &tm,
+            &metadata,
+            tmp.path(),
+            &out_path,
+            &ProgressReporter::new(),
+        )
+        .expect("emit_gguf_from_tensor_map should succeed for tiny tensor_map");
+
+        assert_eq!(manifest.shard_count, 1);
+        assert_eq!(manifest.files.len(), 1);
+        assert!(out_path.exists(), "expected GGUF written at {:?}", out_path);
+
+        let data = std::fs::read(&out_path).unwrap();
+        assert!(data.len() >= 16, "GGUF must have at least magic + version + counts");
+        assert_eq!(&data[0..4], &GGUF_MAGIC, "GGUF magic");
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            GGUF_VERSION,
+            "GGUF version"
+        );
     }
 
     #[test]
