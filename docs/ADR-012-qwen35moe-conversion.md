@@ -1049,17 +1049,20 @@ Phases are **dependency-ordered**, not priority-ordered. Each phase has a single
 
 **P9b sub-tasks:**
 
-| # | Sub-task | LOC | File(s) |
-|---|---|-----|---------|
-| 9b.1 | Extract `emit_gguf_from_tensor_map(tensor_map, metadata, path) -> Result<()>` from existing `GgufBackend` write path; produce reusable function for intermediate emission. | ~30 | `src/backends/gguf.rs` |
-| 9b.2 | Convert-pipeline branch: when `dwq_arch.requires_activation_capture()`, emit intermediate F16 GGUF to a tempdir before quantization. | ~25 | `src/main.rs:600-625` (replace P9b guard) |
-| 9b.3 | Construct `RealActivationCapture::new(intermediate_gguf, tokenizer)`; pass into `run_dwq_activation_calibration`. | ~15 | `src/main.rs` |
-| 9b.4 | Hold `tensor_map` reference live across capture; re-feed to DWQ with captured activations after capture returns. | ~20 | `src/main.rs` + `src/quantize/dwq_activation.rs` |
-| 9b.5 | RAII cleanup for intermediate GGUF; `tempfile::TempPath`-based or explicit `Drop` impl. | ~15 | `src/main.rs` |
-| 9b.6 | Integration test: exercise full two-pass on tiny synthetic qwen35 (dense + moe); assert intermediate GGUF lifecycle (created → loaded → captured → deleted). | ~80 | `tests/convert_qwen35_two_pass_capture.rs` (new) |
-| 9b.7 | Update `tests/convert_qwen35_real_activation_capture.rs`: drop the no-longer-applicable P9b-pending guard error; assert the two-pass path runs end-to-end. | ~20 | existing test |
+| # | Sub-task | Status | LOC | File(s) |
+|---|---|---|-----|---------|
+| 9b.1 | Extract `emit_gguf_from_tensor_map(tensor_map, metadata, path) -> Result<()>` from existing `GgufBackend` write path; produce reusable function for intermediate emission. | ✅ shipped `7b7cbbb` | ~100 (incl. smoke test) | `src/backends/gguf.rs` |
+| 9b.2 | Convert-pipeline branch: when `dwq_arch.requires_activation_capture()`, emit intermediate F16 GGUF to a tempdir before quantization. | pending | ~25 | `src/main.rs:600-625` (replace P9b guard) |
+| 9b.3a | **Newly discovered** — `quantize::dwq_activation::run_dwq_activation_calibration` is a stub (returns ADR-008 error, falls back to weight-space). Replace with real impl: take optional `&dyn ActivationCapture`; generate calibration tokens; run capture; compute per-layer sensitivity via existing `compute_layer_sensitivity` (`src/quantize/sensitivity.rs`); allocate bits via existing `allocate_bits_by_sensitivity`; feed per-layer bits into `MixedBitQuantizer`. | pending | ~150 | `src/quantize/dwq_activation.rs` (rewrite from stub) |
+| 9b.3b | Construct `RealActivationCapture::new(intermediate_gguf, tokenizer)`; pass into the new `run_dwq_activation_calibration`. | pending | ~15 | `src/main.rs` |
+| 9b.4 | Hold `tensor_map` reference live across capture; re-feed to DWQ with captured activations after capture returns. | pending | ~20 | `src/main.rs` + `src/quantize/dwq_activation.rs` |
+| 9b.5 | RAII cleanup for intermediate GGUF; `tempfile::TempPath`-based or explicit `Drop` impl. | pending | ~15 | `src/main.rs` |
+| 9b.6 | Integration test: exercise full two-pass on tiny synthetic qwen35 (dense + moe); assert intermediate GGUF lifecycle (created → loaded → captured → deleted). | pending | ~80 | `tests/convert_qwen35_two_pass_capture.rs` (new) |
+| 9b.7 | Update `tests/convert_qwen35_real_activation_capture.rs`: drop the no-longer-applicable P9b-pending guard error; assert the two-pass path runs end-to-end. | pending | ~20 | existing test |
 
-**Total P9b LOC:** ~205. Builds on top of P9 foundation already shipped.
+**Total P9b LOC:** ~425 (revised from 205 after the 2026-04-25 stub-discovery — `run_dwq_activation_calibration` is not a wire-up target but a stub returning `DwqError::GpuError`. Replacing it with a real activation-driven sensitivity scorer is in P9b.3a, ~150 LOC sourcing from existing `src/quantize/sensitivity.rs` building blocks).
+
+**Discovery note (2026-04-25):** P9b.3 was originally framed as "construct + pass `RealActivationCapture` into the existing `run_dwq_activation_calibration`". Reading the latter at HEAD `7b7cbbb` showed it's a 30-line stub since ADR-008 candle removal — every call returns an error and falls back to weight-space. The "wire-up" is therefore a re-implementation: tokens → capture → sensitivity → bits → MixedBitQuantizer. Existing scoring (`sensitivity.rs`) and quantizer (`mixed.rs`) are reusable; the stub gets replaced by ~150 LOC orchestration. No fallback retained — qwen35 always uses activation calibration once P9b lands.
 
 **OOM risk mitigation (R12 follow-up):** Per memory `feedback_oom_prevention.md`, the apex MoE is ~30 GB at f32 dequantized + ~30 GB tensor_map at f16 = ~60 GB peak. If the held tensor_map proves untenable on a 64 GB system during real-model capture, fallback (in priority order):
 1. Drop tensor_map after step 9b.2; re-read from safetensors after capture (~30 s extra I/O).
