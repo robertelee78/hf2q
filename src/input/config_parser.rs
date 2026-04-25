@@ -552,7 +552,14 @@ pub fn format_info(metadata: &ModelMetadata) -> String {
     lines.push(format!("  Hidden size:  {}", metadata.hidden_size));
     lines.push(format!("  Layers:       {}", metadata.num_layers));
 
-    let unique_types = metadata.unique_layer_types();
+    // ADR-012 Decision 2 contract: use resolved_layer_types() rather than
+    // the raw `layer_types` field for diagnostics. For Qwen3.5 configs that
+    // supply only `full_attention_interval` (no explicit per-layer
+    // enumeration), the raw field is the parser placeholder `["attention"; N]`
+    // — a misleading display that hides the actual hybrid layer mix.
+    let mut unique_types: Vec<String> = metadata.resolved_layer_types();
+    unique_types.sort();
+    unique_types.dedup();
     if !unique_types.is_empty() {
         lines.push(format!("  Layer types:  {}", unique_types.join(", ")));
     }
@@ -1200,5 +1207,71 @@ mod tests {
         let rp = extract_rope_parameters(&config).expect("parsed");
         assert_eq!(rp.rope_theta, 0.0);
         assert_eq!(rp.mrope_section, vec![1, 2, 3]);
+    }
+
+    /// Decision 2 contract: format_info must use resolved_layer_types() so
+    /// a Qwen3.5 config with `full_attention_interval=4` (no explicit
+    /// per-layer enumeration) shows the actual hybrid layer mix in the
+    /// "Layer types:" line — not the parser placeholder `["attention"; N]`.
+    /// Pre-fix output: `Layer types:  attention`. Post-fix:
+    /// `Layer types:  full_attention, linear_attention`.
+    #[test]
+    fn format_info_renders_resolved_layer_types_for_qwen35_derived() {
+        let config: Value = serde_json::from_str(
+            r#"{
+                "architectures": ["Qwen3_5MoeForCausalLM"],
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2048,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 16,
+                "vocab_size": 248320,
+                "dtype": "bfloat16",
+                "full_attention_interval": 4
+            }"#,
+        )
+        .unwrap();
+        let meta = parse_config_value(&config, Path::new("/nonexistent/config.json"))
+            .unwrap();
+
+        // Sanity: raw layer_types is the parser placeholder.
+        assert!(
+            meta.layer_types.iter().all(|t| t == "moe_attention" || t == "attention"),
+            "raw layer_types must be parser placeholder for Qwen3.5 derived config"
+        );
+
+        let info = format_info(&meta);
+        let layer_types_line = info
+            .lines()
+            .find(|l| l.contains("Layer types:"))
+            .expect("Layer types line present");
+        // Pre-fix: line was `Layer types:  attention` (placeholder).
+        // Post-fix: line is `Layer types:  full_attention, linear_attention`
+        // (resolved hybrid). The presence of both qualified types proves
+        // resolved_layer_types() drove the diagnostic, not the raw field.
+        assert!(
+            layer_types_line.contains("full_attention"),
+            "Layer types line must include `full_attention` — got: {layer_types_line}"
+        );
+        assert!(
+            layer_types_line.contains("linear_attention"),
+            "Layer types line must include `linear_attention` — got: {layer_types_line}"
+        );
+        // Negative — the bare placeholder string `attention` (with no
+        // qualifying prefix) must not appear as a standalone token.
+        // Using comma-separated parsing for a precise membership check.
+        let after_colon = layer_types_line
+            .split_once("Layer types:")
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        let tokens: Vec<&str> = after_colon.split(',').map(|s| s.trim()).collect();
+        assert!(
+            !tokens.contains(&"attention"),
+            "bare `attention` placeholder must not appear in tokenised layer types: \
+             tokens={tokens:?}"
+        );
+        assert!(
+            !tokens.contains(&"moe_attention"),
+            "bare `moe_attention` placeholder must not appear: tokens={tokens:?}"
+        );
     }
 }
