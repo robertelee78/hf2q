@@ -488,10 +488,17 @@ fn run_q4_0_pipeline(
 /// preserved — only sequences with an embedded `.` are normalised, so
 /// version strings like "GGUF V3" pass through.
 ///
-/// Conservative implementation: walk the chars once, identify a
-/// digit-dot-digit run, replace the whole run with the placeholder.
-/// Does not touch leading whitespace (column alignment in real
-/// llama-cli output stays bit-stable).
+/// **Whitespace handling:** real llama-cli uses width-padded format
+/// specifiers (`%10.2f`) so a number like "58.90" (5 chars) gets 5
+/// leading spaces while "158.90" (6 chars) gets only 4. To remain
+/// byte-identical across magnitudes, the sanitizer absorbs any
+/// whitespace immediately preceding a decimal-number run into the
+/// placeholder.
+///
+/// Conservative: only whitespace ADJACENT to a decimal is absorbed.
+/// Whitespace before integer-only tokens (e.g. "/     8 runs") is
+/// preserved because integer counts use the same `%5d` width
+/// specifier and their column positions stay stable.
 fn sanitize_timestamps(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -504,8 +511,9 @@ fn sanitize_timestamps(s: &str) -> String {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            // If followed by `.<digit>`, swallow the decimal part and
-            // emit the placeholder. Otherwise, keep the integer.
+            // If followed by `.<digit>`, swallow the decimal part,
+            // remove any whitespace already pushed onto out (the
+            // width-padding leading spaces), and emit the placeholder.
             let has_decimal = i + 1 < bytes.len()
                 && bytes[i] == b'.'
                 && bytes[i + 1].is_ascii_digit();
@@ -513,6 +521,12 @@ fn sanitize_timestamps(s: &str) -> String {
                 i += 1; // dot
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
+                }
+                // Trim trailing whitespace from out — that's the
+                // width-padding before this decimal that varies
+                // with the number's magnitude.
+                while out.ends_with(' ') || out.ends_with('\t') {
+                    out.pop();
                 }
                 out.push_str("<X.XX>");
             } else {
@@ -920,5 +934,27 @@ mod tests {
             sanitize_timestamps(stderr_b),
             "sanitized transcripts must be byte-identical"
         );
+    }
+
+    /// Magnitudes-vary case: real llama-cli uses `%10.2f` so e.g.
+    /// "58.90" gets 5 leading spaces while "158.90" gets 4 (right-padded
+    /// to 10 chars). The sanitizer must absorb that variable-width
+    /// padding into the placeholder so two runs with different timing
+    /// magnitudes still produce byte-identical sanitized output.
+    #[test]
+    fn sanitize_timestamps_byte_identical_across_different_magnitudes() {
+        // Width-padded magnitudes: "58.90" (5 chars, 5 leading spaces)
+        // vs "158.90" (6 chars, 4 leading spaces). Both occupy 10 cols.
+        let stderr_a = "eval time =     58.90 ms /     8 runs   (    8.41 ms per token,   118.85 tokens per second)\n";
+        let stderr_b = "eval time =    158.90 ms /     8 runs   (   18.41 ms per token,  1118.85 tokens per second)\n";
+        let sa = sanitize_timestamps(stderr_a);
+        let sb = sanitize_timestamps(stderr_b);
+        assert_eq!(
+            sa, sb,
+            "magnitude-varying widths must collapse to identical sanitized output\nA: {sa}\nB: {sb}"
+        );
+        // Integer column ("/ 8 runs") must be preserved (load-bearing
+        // for the parser — Decision 16 §4 asserts the runs count).
+        assert!(sa.contains("/     8 runs"));
     }
 }
