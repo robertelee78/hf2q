@@ -795,9 +795,32 @@ pub fn apply_nomic_bert_full_forward_gpu(
     }
 
     // ---- Pool ----
-    let pooled =
-        bert_pool_gpu(encoder, registry, device, &hidden_states, pool_kind, seq_len, hidden)
-            .context("nomic full-forward: pool")?;
+    //
+    // Pass `valid_token_count` (not `seq_len`) so:
+    //   - Mean averages over real positions only (sum 0..valid / valid).
+    //     The existing `bert_pool_mean_f32` kernel iterates `[0, seq_len)`
+    //     of the kernel-binding param and divides by that value — passing
+    //     `valid_token_count` yields the correct masked mean over real
+    //     positions, with no kernel change needed.
+    //   - Last reads row `valid_token_count - 1` (the actual last token,
+    //     not a padded position).
+    //   - Cls reads row 0 unconditionally — unaffected by either argument.
+    //
+    // Without this, mean-pooled output diverges from llama-embedding on
+    // any input shorter than `seq_len` (which is essentially every input
+    // due to the K=32 floor). nomic-embed-text-v1.5 uses Mean pool per
+    // its GGUF metadata `nomic-bert.pooling_type = 1`, so this fix is
+    // load-bearing for cosine parity.
+    let pooled = bert_pool_gpu(
+        encoder,
+        registry,
+        device,
+        &hidden_states,
+        pool_kind,
+        valid_token_count,
+        hidden,
+    )
+    .context("nomic full-forward: pool")?;
     encoder.memory_barrier();
 
     // ---- L2 normalize ----
@@ -1053,6 +1076,209 @@ mod tests {
         assert!(msg.contains("seq_len") && msg.contains("32"), "error: {msg}");
     }
 
+    /// llama-embedding ground-truth vector for "hello world" tokenized
+    /// against `nomic-embed-text-v1.5-f16.gguf` with `--pooling mean`.
+    /// Generated 2026-04-26 via:
+    ///   `llama-embedding -m nomic-embed-text-v1.5-f16.gguf -p "hello world" --pooling mean --embd-output-format json`
+    /// (binary: `/opt/homebrew/Cellar/llama.cpp/8680/bin/llama-embedding`,
+    /// release b8680). The output is l2-normalized (||y||₂ ≈ 1.000000)
+    /// per llama-embedding's default normalization.
+    #[rustfmt::skip]
+    const LLAMA_EMBEDDING_GROUND_TRUTH_HELLO_WORLD: [f32; 768] = [
+        -6.6696000e-03f32, -1.3524000e-03f32, -1.7149610e-01f32, 8.4113000e-03f32,
+        5.8636000e-03f32, 6.9821200e-02f32, -2.0240000e-04f32, -4.3022800e-02f32,
+        -1.4626900e-02f32, -5.4056500e-02f32, 5.4160000e-04f32, 3.9272200e-02f32,
+        2.7769300e-02f32, 8.0812800e-02f32, 4.5334100e-02f32, -6.2951900e-02f32,
+        1.0281800e-02f32, -2.9656100e-02f32, -4.2753000e-02f32, 2.9597000e-02f32,
+        -3.7053000e-03f32, -9.4301000e-02f32, -7.5451000e-03f32, 3.8064000e-02f32,
+        9.2231700e-02f32, -1.4276000e-02f32, -1.4984500e-02f32, 6.1637500e-02f32,
+        6.4217000e-03f32, -2.1997000e-02f32, -1.1787000e-03f32, -1.0889600e-02f32,
+        -2.0770000e-04f32, 1.5721300e-02f32, 3.9444200e-02f32, 2.7844000e-03f32,
+        3.2542000e-02f32, 1.7387900e-02f32, 1.6315700e-02f32, 5.8692000e-03f32,
+        -4.7176000e-03f32, -1.4858700e-02f32, 1.1955900e-02f32, 1.0195000e-02f32,
+        6.5921400e-02f32, -1.5323000e-03f32, -4.1892000e-03f32, 2.5850000e-04f32,
+        8.6810500e-02f32, -6.0505200e-02f32, -1.8267700e-02f32, 5.3402000e-03f32,
+        -9.7460000e-04f32, 6.0159100e-02f32, 6.7261100e-02f32, 3.5314900e-02f32,
+        4.9696500e-02f32, -6.1601000e-02f32, 2.4186600e-02f32, 3.4579300e-02f32,
+        2.1759600e-02f32, 4.3670700e-02f32, 3.2912600e-02f32, 6.5303800e-02f32,
+        -1.7461700e-02f32, -3.3584400e-02f32, -2.5229100e-02f32, 3.5515100e-02f32,
+        -2.7050000e-03f32, 1.8090300e-02f32, 7.3137600e-02f32, 4.2705000e-03f32,
+        1.0861100e-02f32, 1.4041100e-02f32, 2.4605300e-02f32, 2.8004000e-02f32,
+        1.8594200e-02f32, 7.9048000e-03f32, -9.1900000e-04f32, -1.1905300e-02f32,
+        3.5421100e-02f32, -4.1623100e-02f32, 5.5484100e-02f32, -4.4268500e-02f32,
+        -3.2420500e-02f32, -7.3050200e-02f32, -4.0210600e-02f32, 1.5107500e-02f32,
+        -7.4528400e-02f32, -2.3277800e-02f32, 7.2323200e-02f32, 2.4769200e-02f32,
+        -5.1810000e-04f32, -1.8537900e-02f32, -4.0699700e-02f32, 2.0469300e-02f32,
+        -4.6032500e-02f32, -1.4164000e-03f32, -2.0057200e-02f32, -1.0966100e-02f32,
+        1.5139200e-02f32, -2.6177000e-02f32, -2.1159000e-03f32, 3.9117600e-02f32,
+        7.4003400e-02f32, 3.3914800e-02f32, -4.2793600e-02f32, -1.1042500e-02f32,
+        -5.4241700e-02f32, -3.8041700e-02f32, -3.3099100e-02f32, 1.0952800e-02f32,
+        -7.7578000e-03f32, 1.6444700e-02f32, 1.1090300e-02f32, -1.8598600e-02f32,
+        3.7661700e-02f32, -8.0060300e-02f32, 1.3430200e-02f32, 3.8800400e-02f32,
+        -3.6834600e-02f32, -3.0368000e-03f32, -3.9599900e-02f32, 1.6384100e-02f32,
+        5.1860500e-02f32, 5.1746800e-02f32, -7.9243300e-02f32, -1.9026100e-02f32,
+        2.3724100e-02f32, 5.8361000e-03f32, 1.3606100e-02f32, -3.2963600e-02f32,
+        -2.5896500e-02f32, -2.4711400e-02f32, -2.5973700e-02f32, 1.4827800e-02f32,
+        -1.5112600e-02f32, -1.5942600e-02f32, 5.6933500e-02f32, 3.3677600e-02f32,
+        8.9373000e-03f32, 1.3058600e-02f32, 2.4422200e-02f32, -4.9721500e-02f32,
+        -4.0742700e-02f32, -3.7903000e-02f32, 6.7944700e-02f32, -5.4161300e-02f32,
+        2.5137400e-02f32, -2.9522100e-02f32, 1.1179000e-03f32, 4.3306200e-02f32,
+        4.2004700e-02f32, 3.6765400e-02f32, 1.7319600e-02f32, -9.2276000e-03f32,
+        -1.9733600e-02f32, 2.4374200e-02f32, 3.7715700e-02f32, -4.6261000e-02f32,
+        1.3235600e-02f32, -8.5385000e-03f32, -7.7219000e-03f32, 1.0578100e-02f32,
+        3.6785100e-02f32, -5.5686800e-02f32, 3.2216600e-02f32, 6.3634400e-02f32,
+        4.7028000e-03f32, 3.2951100e-02f32, -3.6591600e-02f32, -3.8097500e-02f32,
+        3.5200100e-02f32, -3.2147600e-02f32, -2.0294400e-02f32, -8.4025000e-03f32,
+        -8.9155000e-03f32, -2.8797300e-02f32, 2.7853000e-02f32, 6.2297000e-03f32,
+        1.7037400e-02f32, -4.1399900e-02f32, 5.3571000e-03f32, 2.3880700e-02f32,
+        -1.3950300e-02f32, -2.4504100e-02f32, -2.2816600e-02f32, 2.1248000e-03f32,
+        2.1516600e-02f32, -3.5409700e-02f32, -8.3450000e-03f32, 1.7045600e-02f32,
+        -6.2701600e-02f32, -3.6372200e-02f32, 2.0275800e-02f32, -6.0924000e-03f32,
+        1.9449000e-02f32, 1.3768700e-02f32, 2.3274300e-02f32, -8.7041200e-02f32,
+        -4.0821800e-02f32, -1.5951000e-03f32, -2.7441100e-02f32, -2.3361100e-02f32,
+        -1.2320000e-04f32, 8.0487700e-02f32, 4.9427200e-02f32, 3.5657900e-02f32,
+        3.8404300e-02f32, 1.3656900e-02f32, 6.7240500e-02f32, -6.1013000e-02f32,
+        -5.1268500e-02f32, -1.9204600e-02f32, -1.8456100e-02f32, -9.4280000e-03f32,
+        -1.3013600e-02f32, -3.9915000e-02f32, -6.8722000e-03f32, -5.2381000e-03f32,
+        4.1953500e-02f32, -3.7336400e-02f32, 4.6914900e-02f32, 1.5287100e-02f32,
+        6.0664000e-02f32, -4.3220000e-04f32, -7.6455200e-02f32, 3.9420000e-04f32,
+        -6.3508300e-02f32, 2.0475900e-02f32, -3.1551200e-02f32, -6.4586800e-02f32,
+        1.8433200e-02f32, 2.4937000e-02f32, -1.7175900e-02f32, 3.8528800e-02f32,
+        4.5732900e-02f32, 6.8505000e-02f32, -1.3920300e-02f32, -2.9826000e-02f32,
+        -2.9718900e-02f32, 3.1809800e-02f32, 1.2525400e-02f32, -3.7864700e-02f32,
+        -4.5741600e-02f32, 2.0945800e-02f32, 1.3378600e-02f32, 3.9765000e-03f32,
+        -1.6016100e-02f32, 7.9120000e-04f32, -5.0325400e-02f32, -2.6335300e-02f32,
+        -2.0792100e-02f32, 1.3855000e-03f32, 2.7455600e-02f32, -1.1552200e-02f32,
+        -1.8247500e-02f32, 1.2089200e-02f32, 1.1794200e-02f32, -1.8306400e-02f32,
+        2.4806100e-02f32, -1.1313790e-01f32, 3.8121800e-02f32, -2.6435400e-02f32,
+        -4.8520900e-02f32, 3.4552000e-02f32, -4.8187700e-02f32, 3.4003100e-02f32,
+        3.5869800e-02f32, -4.3102900e-02f32, 1.2138600e-02f32, 9.6684000e-03f32,
+        9.5008000e-03f32, 2.7620800e-02f32, -4.3571100e-02f32, -6.1012000e-03f32,
+        2.4550600e-02f32, 1.4137200e-02f32, -2.1751800e-02f32, 1.8641100e-02f32,
+        -2.5030500e-02f32, -3.0357800e-02f32, -1.2105300e-02f32, -3.4376800e-02f32,
+        8.0324000e-03f32, 1.1767000e-02f32, -9.7419000e-03f32, 1.2958400e-02f32,
+        -3.3330700e-02f32, -1.3954200e-02f32, 1.3599500e-02f32, 4.6106700e-02f32,
+        3.0477600e-02f32, 6.9333100e-02f32, 1.2361600e-02f32, 2.9699600e-02f32,
+        2.6872200e-02f32, 2.8872900e-02f32, -1.1028400e-02f32, -9.7210000e-03f32,
+        -1.2504600e-02f32, -3.0737000e-03f32, 5.5915000e-02f32, -5.5938000e-03f32,
+        -1.8363800e-02f32, 2.6282000e-03f32, 7.4948300e-02f32, -1.8678300e-02f32,
+        4.8992800e-02f32, -4.4942000e-03f32, -4.6219300e-02f32, 7.8223400e-02f32,
+        -9.1623600e-02f32, -2.8647000e-03f32, -5.4467100e-02f32, 4.3308000e-02f32,
+        -2.0742300e-02f32, 3.2399100e-02f32, 6.9515000e-02f32, 1.8378400e-02f32,
+        -3.8602500e-02f32, -5.0964700e-02f32, 2.5752500e-02f32, -3.2207600e-02f32,
+        -2.0015000e-03f32, 2.2829800e-02f32, 3.4840500e-02f32, 2.6006800e-02f32,
+        2.3608000e-02f32, -4.8204200e-02f32, -1.4688700e-02f32, 1.2953900e-02f32,
+        -4.0061300e-02f32, -4.3547100e-02f32, -1.5404500e-02f32, 4.3021400e-02f32,
+        1.4217300e-02f32, -1.9293600e-02f32, -4.3386300e-02f32, 5.0931100e-02f32,
+        -5.2732000e-03f32, 2.3002600e-02f32, 4.0056100e-02f32, -1.2371900e-02f32,
+        -2.2102400e-02f32, -1.9255200e-02f32, -2.2667500e-02f32, 1.6477400e-02f32,
+        -1.5024500e-02f32, 2.3886200e-02f32, 6.4518000e-03f32, 2.5857200e-02f32,
+        -3.7417800e-02f32, 2.5491300e-02f32, 6.3017000e-03f32, 2.4324100e-02f32,
+        1.1121200e-02f32, 3.2617300e-02f32, 9.7421000e-03f32, -6.4688500e-02f32,
+        -2.6930400e-02f32, -1.0810000e-03f32, 1.4429800e-02f32, -1.4482400e-02f32,
+        -2.9594800e-02f32, 3.6383500e-02f32, 2.7113400e-02f32, 6.3338000e-03f32,
+        2.5931000e-02f32, -1.8233900e-02f32, -9.2634000e-03f32, -2.1566000e-02f32,
+        1.7372000e-03f32, 3.1390600e-02f32, 2.2766800e-02f32, 6.7679000e-03f32,
+        -4.8544900e-02f32, -3.4086800e-02f32, 8.0462000e-03f32, 4.0696200e-02f32,
+        -1.6917700e-02f32, -2.5898600e-02f32, 3.7125400e-02f32, -2.8145100e-02f32,
+        1.1707400e-02f32, 3.4267900e-02f32, 1.5698300e-02f32, -2.7624200e-02f32,
+        6.9315000e-03f32, 3.6654900e-02f32, 1.4375900e-02f32, -2.4399900e-02f32,
+        3.5763000e-03f32, 2.1591000e-03f32, -4.3111000e-03f32, -2.9810300e-02f32,
+        6.8243000e-03f32, -2.2369500e-02f32, -2.1174000e-02f32, 6.8368000e-03f32,
+        -6.7607000e-03f32, 1.2870100e-02f32, 2.8253000e-02f32, -7.1764500e-02f32,
+        6.3303000e-03f32, -9.4630000e-04f32, -5.1895500e-02f32, -2.5373100e-02f32,
+        8.5210000e-03f32, -1.5810700e-02f32, 6.4544500e-02f32, 6.3795000e-02f32,
+        4.5600200e-02f32, -5.5528200e-02f32, -4.1763200e-02f32, 1.1410400e-02f32,
+        3.6577900e-02f32, -6.8033600e-02f32, -1.2944800e-02f32, -1.1250000e-03f32,
+        1.7747800e-02f32, 7.7825100e-02f32, 9.6088000e-03f32, -1.3749000e-02f32,
+        -3.6817300e-02f32, 6.7867900e-02f32, 2.8122900e-02f32, 2.5646100e-02f32,
+        1.0362000e-03f32, -3.9197900e-02f32, -9.8872000e-03f32, 1.4315400e-02f32,
+        1.8575000e-02f32, 1.2935500e-02f32, -2.2592300e-02f32, -2.4799100e-02f32,
+        4.4715800e-02f32, -1.6318900e-02f32, 3.3302100e-02f32, 3.5868800e-02f32,
+        6.6783100e-02f32, -3.4930700e-02f32, -5.7269400e-02f32, -5.9972000e-03f32,
+        -7.8350000e-03f32, 1.2211830e-01f32, 8.8283900e-02f32, -9.9352000e-03f32,
+        -5.0083900e-02f32, -5.3087000e-03f32, -2.0628500e-02f32, 1.7979200e-02f32,
+        4.4053000e-02f32, 9.6263000e-03f32, 8.6672300e-02f32, -5.0582700e-02f32,
+        4.5380800e-02f32, -1.9539800e-02f32, -4.5610000e-04f32, 4.2559600e-02f32,
+        -1.9513300e-02f32, 6.2631000e-03f32, -3.1664400e-02f32, 8.3836000e-03f32,
+        1.1540100e-02f32, -5.4867100e-02f32, 5.8530000e-04f32, 1.3838000e-03f32,
+        -7.2131000e-03f32, 9.4528000e-03f32, -4.6331800e-02f32, -5.2411900e-02f32,
+        -1.9209000e-02f32, -1.3257400e-02f32, -6.0218300e-02f32, 2.2961200e-02f32,
+        -1.6933200e-02f32, -1.3100100e-02f32, -1.4583500e-02f32, 2.6643300e-02f32,
+        2.7661400e-02f32, 2.8252300e-02f32, -6.9593600e-02f32, 1.6248700e-02f32,
+        5.0440000e-02f32, 6.9895800e-02f32, -1.1571000e-03f32, 1.3644400e-02f32,
+        -1.7439800e-02f32, 7.1650000e-03f32, -2.8896000e-03f32, -2.4393600e-02f32,
+        3.6425400e-02f32, -2.9890000e-04f32, -2.7375400e-02f32, -4.7094000e-03f32,
+        -4.5289300e-02f32, 3.5725500e-02f32, -4.5007200e-02f32, 1.1070000e-03f32,
+        3.8081600e-02f32, -1.1230100e-02f32, 7.1999000e-03f32, 3.3610400e-02f32,
+        6.8639000e-03f32, 2.3139700e-02f32, 2.6155600e-02f32, -5.7708000e-02f32,
+        9.9852000e-03f32, 2.1354700e-02f32, 3.1218800e-02f32, -1.1297100e-02f32,
+        -2.3065700e-02f32, 4.2179300e-02f32, 9.3753200e-02f32, -4.2773900e-02f32,
+        2.5180000e-02f32, -1.1069100e-02f32, -3.0348900e-02f32, 5.0103700e-02f32,
+        1.1354600e-02f32, -1.8240100e-02f32, -3.2781300e-02f32, 1.2266100e-02f32,
+        -7.6380600e-02f32, 6.8787400e-02f32, -1.2997500e-02f32, -5.4016200e-02f32,
+        2.7228400e-02f32, 2.6439900e-02f32, 1.4635100e-02f32, 1.0713200e-02f32,
+        -2.3172800e-02f32, -4.4703300e-02f32, 2.8427700e-02f32, -6.5769000e-03f32,
+        4.3078000e-03f32, 1.5217600e-02f32, 2.5405900e-02f32, 1.5774300e-02f32,
+        -2.9051000e-02f32, -4.0942000e-03f32, -8.7075000e-03f32, -3.5142900e-02f32,
+        4.2014600e-02f32, 3.4278600e-02f32, -5.1490600e-02f32, 1.6976500e-02f32,
+        2.2717700e-02f32, 3.1094700e-02f32, -6.9700300e-02f32, -4.6632600e-02f32,
+        -2.8557600e-02f32, -1.0152700e-02f32, -4.7277100e-02f32, -5.7679200e-02f32,
+        -5.0320000e-04f32, 2.1446700e-02f32, -3.2161400e-02f32, -7.4619700e-02f32,
+        4.6693000e-02f32, 4.7707500e-02f32, -2.4216800e-02f32, 1.5537500e-02f32,
+        3.1047200e-02f32, -5.2569000e-03f32, -1.5880500e-02f32, -1.2518600e-02f32,
+        1.3172300e-02f32, -1.7127400e-02f32, -2.9639000e-02f32, -4.1154700e-02f32,
+        2.2904300e-02f32, -2.9324900e-02f32, 1.6750600e-02f32, -4.9756000e-03f32,
+        4.0822200e-02f32, -4.2819000e-03f32, -6.4213000e-02f32, -1.8390500e-02f32,
+        -7.2800000e-05f32, -5.5501300e-02f32, -5.8984000e-03f32, 5.1533200e-02f32,
+        -1.3947800e-02f32, 1.2336100e-02f32, 5.5780000e-04f32, -7.4789400e-02f32,
+        3.9419300e-02f32, -3.4653400e-02f32, -2.4352800e-02f32, 2.6578200e-02f32,
+        5.3825000e-02f32, -2.4245500e-02f32, -3.2574900e-02f32, 4.9105500e-02f32,
+        -3.9906800e-02f32, -4.3803200e-02f32, -1.7663800e-02f32, -4.4167900e-02f32,
+        -2.9276000e-02f32, 6.4075000e-03f32, 6.0689900e-02f32, -6.9809000e-02f32,
+        4.9774200e-02f32, 7.8172000e-02f32, 8.2345000e-03f32, 4.1580200e-02f32,
+        1.8442300e-02f32, 1.5560500e-02f32, 7.5401900e-02f32, 2.9353300e-02f32,
+        -2.2047500e-02f32, 8.5528000e-03f32, 2.7844900e-02f32, -1.5099400e-02f32,
+        4.2347800e-02f32, -2.0616000e-03f32, -1.7948600e-02f32, -6.9906400e-02f32,
+        -3.4608900e-02f32, -1.5580200e-02f32, 4.9552700e-02f32, 2.4922100e-02f32,
+        2.7784400e-02f32, -6.3345000e-03f32, -4.4251600e-02f32, -5.0236200e-02f32,
+        -5.7502200e-02f32, 6.2764400e-02f32, 4.0139600e-02f32, -6.8978000e-03f32,
+        -6.4271800e-02f32, 2.3647000e-03f32, 1.6232200e-02f32, 2.9681700e-02f32,
+        1.9716900e-02f32, -2.7960000e-03f32, -3.1999600e-02f32, 1.7260500e-02f32,
+        6.1012600e-02f32, 1.3232500e-02f32, 1.8163400e-02f32, 1.7620000e-04f32,
+        1.4968500e-02f32, -4.0804300e-02f32, 4.3764700e-02f32, 2.4680400e-02f32,
+        5.5778100e-02f32, 4.4632200e-02f32, 7.5896700e-02f32, 6.1313200e-02f32,
+        4.8259900e-02f32, -1.3964600e-02f32, -2.7013200e-02f32, -1.1387000e-02f32,
+        1.2016400e-02f32, -2.7300600e-02f32, -8.4480900e-02f32, 2.0433600e-02f32,
+        -1.0788300e-02f32, 2.6292000e-03f32, -6.6455100e-02f32, -2.4444200e-02f32,
+        3.3388000e-02f32, -2.1442300e-02f32, -3.2666300e-02f32, 1.9507800e-02f32,
+        -9.2234800e-02f32, 1.3595900e-02f32, -1.5368600e-02f32, -2.0472100e-02f32,
+        -2.8691200e-02f32, -4.4806300e-02f32, -2.7665200e-02f32, 3.8195300e-02f32,
+        2.7114000e-02f32, 2.2422500e-02f32, 2.9953900e-02f32, 2.4472000e-03f32,
+        1.1154500e-02f32, -1.4125200e-02f32, -4.3632000e-02f32, 3.4539100e-02f32,
+        4.5745500e-02f32, -4.3739300e-02f32, 6.4070700e-02f32, -1.9190600e-02f32,
+        -7.7880300e-02f32, -6.0991400e-02f32, -1.2944600e-02f32, -1.5316700e-02f32,
+        -5.9819000e-03f32, -3.1322900e-02f32, -2.6103200e-02f32, 2.9772100e-02f32,
+        -1.2600200e-02f32, 1.2044100e-02f32, -3.9712600e-02f32, 3.5522000e-02f32,
+        -4.1178100e-02f32, -1.2571100e-02f32, 2.2523000e-02f32, -7.8828000e-03f32,
+        4.6103000e-03f32, -3.9207100e-02f32, 1.3137100e-02f32, 4.1068200e-02f32,
+        -9.2080000e-03f32, -1.5108000e-03f32, -1.3505600e-02f32, 6.4108600e-02f32,
+        1.5352400e-02f32, 3.4981400e-02f32, -9.6561000e-03f32, 4.0101400e-02f32,
+        -2.7272300e-02f32, -1.0268500e-02f32, -6.3159000e-03f32, 5.9788300e-02f32,
+        7.2369200e-02f32, 4.2342700e-02f32, -4.1509400e-02f32, -2.3098600e-02f32,
+        -2.6804800e-02f32, 2.0771000e-03f32, 1.8563900e-02f32, -3.3814200e-02f32,
+        1.5673800e-02f32, -3.7488400e-02f32, -2.7946300e-02f32, -3.7747300e-02f32,
+        -3.2442600e-02f32, 2.8004300e-02f32, -2.6214700e-02f32, 2.7615200e-02f32,
+        -7.3416000e-03f32, -5.4686100e-02f32, 5.0802000e-03f32, -3.3259000e-02f32,
+        -2.3903400e-02f32, -7.0778800e-02f32, 1.7292100e-02f32, 6.2792200e-02f32,
+        -4.9236000e-03f32, -2.3950700e-02f32, 3.4221000e-02f32, 7.2967300e-02f32,
+        -9.6511000e-03f32, -2.0971600e-02f32, 2.4748800e-02f32, 5.5330000e-04f32,
+        -1.0364100e-02f32, -7.1326500e-02f32, -4.3360000e-04f32, 3.6105500e-02f32,
+        9.9634000e-03f32, 2.2385100e-02f32, 6.2977100e-02f32, -4.1682900e-02f32,
+        4.3001200e-02f32, -1.4988600e-02f32, -2.2700000e-04f32, 9.6763000e-03f32,
+        2.5719400e-02f32, -2.6735100e-02f32, -5.0922400e-02f32, -4.4518000e-03f32,
+    ];
+
     /// End-to-end smoke against the on-disk `nomic-embed-text-v1.5-f16.gguf`.
     /// Loads the real config + weights + tokenizer, encodes "hello world",
     /// pads to seq_len=32, runs the full forward, asserts the pooled
@@ -1199,6 +1425,169 @@ mod tests {
             norm,
             max_abs,
             &view[..4]
+        );
+    }
+
+    /// Cosine-parity gate: hf2q's full-forward output for "hello world"
+    /// against `nomic-embed-text-v1.5-f16.gguf` must match
+    /// `llama-embedding`'s output to cosine ≥ 0.999. **This is the
+    /// correctness gate that closes Task #16.**
+    ///
+    /// **STATUS (iter 78): FAILING. Cosine = 0.098589 — structural
+    /// divergence (vectors near-orthogonal despite both being unit-norm
+    /// with similar per-element magnitudes). Marked `#[ignore]` until
+    /// bisection identifies the root cause. Suspect list, in priority
+    /// order:**
+    /// 1. **Fused-QKV slice convention** — verify Q at bytes [0, K·N·4),
+    ///    K at [K·N·4, 2·K·N·4), V at [2·K·N·4, 3·K·N·4) matches the
+    ///    output-dim ordering llama.cpp uses in `create_tensor_qkv`.
+    ///    The diagnostic A/B is to extract Q/K/V into separate buffers
+    ///    at load-time and re-run; if cosine improves to ≥ 0.999, the
+    ///    slice ordering is wrong.
+    /// 2. **RoPE convention** — verify NeoX pair convention matches
+    ///    llama.cpp's `LLAMA_ROPE_TYPE_NORM` for nomic-bert (per
+    ///    llama-arch.cpp:9266). Try interleaved (`dispatch_rope`) as A/B.
+    /// 3. **SwiGLU operand order** — `dispatch_silu_mul(gate, up, out)`
+    ///    computes `silu(gate) * up`. llama.cpp's `swiglu_split(cur=gate,
+    ///    tmp=up)` per graph.cpp:1220. Should match. Verify by swapping
+    ///    args.
+    /// 4. **Pre-existing BERT-lane parity gap** — bge uses CLS pool, so
+    ///    even if the per-token output diverges, CLS taking position 0
+    ///    masks the mismatch. The "cosine ≥ 0.999" claim in the ADR for
+    ///    bge was never automated. Run a BERT-lane parity test as the
+    ///    first bisection step; if it also fails, the issue is in the
+    ///    shared primitives, not nomic-specific.
+    ///
+    /// Diagnostic plan in iter 79:
+    /// - Add a bge cosine-parity test using llama-embedding ground truth
+    ///   on "hello world" with mxbai or bge as the corroborating arch.
+    /// - If bge passes: focus bisection on nomic-specific code (fused
+    ///   QKV split, RoPE, SwiGLU).
+    /// - If bge fails: shared primitive bug (most likely matmul layout
+    ///   convention or mean-pool divisor); fix before nomic.
+    ///
+    /// Both engines see identical tokenized input (`[CLS] hello world
+    /// [SEP]` → 4 tokens). hf2q pads to seq_len=32 with `[PAD]` and
+    /// passes `valid_token_count=4` to the forward, which routes through
+    /// `bert_pool_gpu(Mean, valid_token_count=4)` — sums 4 real-position
+    /// rows and divides by 4, identical semantically to llama-embedding's
+    /// 4-token mean pool.
+    ///
+    /// Both outputs are l2-normalized, so cosine = dot product.
+    ///
+    /// Skips when the model isn't on disk.
+    #[test]
+    #[ignore = "iter-78 parity gate FAILING (cosine=0.098); bisection plan in doc-comment above"]
+    fn full_forward_matches_llama_embedding_on_hello_world() {
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
+
+        use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!(
+                "skipping: nomic GGUF fixture not at {}",
+                model_path.display()
+            );
+            return;
+        }
+
+        // ---- Load model + tokenize ----
+        let gguf = GgufFile::open(model_path).expect("open nomic GGUF");
+        let cfg = NomicBertConfig::from_gguf(&gguf).expect("parse nomic config");
+        let tok = build_nomic_wordpiece_tokenizer(model_path).expect("build tokenizer");
+
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count: u32 = real_ids.len() as u32;
+
+        // ---- Pad right to seq_len=32 with [PAD] ----
+        let seq_len: u32 = 32;
+        let pad_id = tok.specials().pad;
+        let mut padded_ids: Vec<u32> = real_ids.clone();
+        while padded_ids.len() < seq_len as usize {
+            padded_ids.push(pad_id);
+        }
+
+        // ---- Build device + load weights ----
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_nomic_bert_kernels(&mut registry);
+
+        let weights = LoadedNomicBertWeights::load_from_path(model_path, &cfg)
+            .expect("load real nomic weights");
+
+        // ---- Build input_ids buffer ----
+        let input_ids = device
+            .alloc_buffer(
+                (seq_len as usize) * 4,
+                DType::U32,
+                vec![seq_len as usize],
+            )
+            .expect("alloc input_ids");
+        {
+            let slice: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    input_ids.contents_ptr() as *mut u32,
+                    seq_len as usize,
+                )
+            };
+            slice.copy_from_slice(&padded_ids);
+        }
+
+        // ---- Run hf2q full forward ----
+        let mut encoder = device.command_encoder().expect("command_encoder");
+        let pooled = apply_nomic_bert_full_forward_gpu(
+            &mut encoder,
+            &mut registry,
+            &device,
+            &input_ids,
+            None,
+            &weights,
+            &cfg,
+            seq_len,
+            valid_token_count,
+        )
+        .expect("nomic full forward");
+        encoder.commit_and_wait().expect("commit_and_wait");
+
+        // ---- Compute cosine similarity vs ground truth ----
+        let hf2q_view: &[f32] = pooled.as_slice::<f32>().expect("read hf2q pooled f32");
+        assert_eq!(hf2q_view.len(), 768);
+        let truth: &[f32] = &LLAMA_EMBEDDING_GROUND_TRUTH_HELLO_WORLD;
+
+        // Both vectors are l2-normalized so cosine = dot product. We
+        // still divide by ||a|| * ||b|| to be robust to any tiny
+        // post-pool drift in either pipeline (and to surface a
+        // non-unit-norm regression).
+        let dot: f32 = hf2q_view.iter().zip(truth.iter()).map(|(a, b)| a * b).sum();
+        let na: f32 = hf2q_view.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = truth.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cosine = dot / (na * nb);
+
+        let max_abs_diff = hf2q_view
+            .iter()
+            .zip(truth.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        eprintln!(
+            "[nomic parity] cosine={:.6}, ||hf2q||₂={:.6}, ||truth||₂={:.6}, max_abs_diff={:.4e}",
+            cosine, na, nb, max_abs_diff
+        );
+        eprintln!(
+            "  hf2q  first4 = {:?}\n  truth first4 = {:?}",
+            &hf2q_view[..4],
+            &truth[..4]
+        );
+
+        // Cosine gate. The Phase 2b accuracy contract is ≥ 0.999 (the
+        // bge / mxbai accuracy bar). Anything below indicates a real
+        // numerical divergence that must be diagnosed, not papered over.
+        assert!(
+            cosine >= 0.999,
+            "cosine {cosine:.6} below 0.999 gate; hf2q diverges from llama-embedding",
         );
     }
 }
