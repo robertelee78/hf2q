@@ -595,23 +595,54 @@ mod tests {
         }
 
         // MoE FFN tensors also loaded + finite.
-        let moe = match layer.ffn() {
-            Qwen35FfnWeights::Moe(m) => m,
-            _ => panic!("expected MoE FFN"),
-        };
+        // Production loader (`load_layer` for MoE variant) returns
+        // `Qwen35FfnWeights::MoeQ` (native GGML blocks on Metal — no F32
+        // expansion of 256 experts) per the OOM-prevention path. The
+        // F32-expanded `Qwen35FfnWeights::Moe` variant is used only by
+        // synthetic-test fixtures via `empty_from_cfg`. Accept either.
         let moe_cfg = cfg.moe.as_ref().expect("moe cfg");
-        assert_eq!(
-            moe.router.len(),
-            (moe_cfg.num_experts * cfg.hidden_size) as usize
-        );
-        assert_eq!(
-            moe.expert_gate.len(),
-            (moe_cfg.num_experts * moe_cfg.moe_intermediate_size * cfg.hidden_size) as usize
-        );
-
-        // Sanity on router (F32 in apex per type_scan: type 0 = F32).
-        let router_finite = moe.router.iter().all(|v| v.is_finite());
-        assert!(router_finite, "router has non-finite values");
+        let expected_router_len = (moe_cfg.num_experts * cfg.hidden_size) as usize;
+        match layer.ffn() {
+            Qwen35FfnWeights::Moe(m) => {
+                assert_eq!(m.router.len(), expected_router_len);
+                assert_eq!(
+                    m.expert_gate.len(),
+                    (moe_cfg.num_experts * moe_cfg.moe_intermediate_size * cfg.hidden_size)
+                        as usize
+                );
+                let router_finite = m.router.iter().all(|v| v.is_finite());
+                assert!(router_finite, "router has non-finite values");
+            }
+            Qwen35FfnWeights::MoeQ(m) => {
+                // Router stays F32 (small, projected with F32 dense kernel).
+                assert_eq!(m.router.len(), expected_router_len);
+                let router_finite = m.router.iter().all(|v| v.is_finite());
+                assert!(router_finite, "router has non-finite values");
+                // Expert tensors are GGML blocks on the device — assert
+                // dtype is U8 (block bytes) and byte count is non-zero.
+                assert_eq!(
+                    m.expert_gate_q.dtype(),
+                    mlx_native::DType::U8,
+                    "expert_gate_q must be raw GGML blocks (U8)"
+                );
+                assert!(
+                    m.expert_gate_q.element_count() > 0,
+                    "expert_gate_q must have non-zero byte count"
+                );
+                assert!(
+                    m.expert_up_q.element_count() > 0,
+                    "expert_up_q must have non-zero byte count"
+                );
+                assert!(
+                    m.expert_down_q.element_count() > 0,
+                    "expert_down_q must have non-zero byte count"
+                );
+            }
+            _ => panic!(
+                "expected MoE FFN (Moe or MoeQ), got {}",
+                layer.ffn().variant()
+            ),
+        }
     }
 
     /// Integration test for a full-attention layer (layer 3 in apex).
