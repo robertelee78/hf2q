@@ -742,37 +742,80 @@ fn transform_case4_linear_attn_scalar(
     mut tensor: TensorRef,
     nk: u32,
     nv_per_k: u32,
-    elem_size: usize,
+    mut elem_size: usize,
 ) -> Result<TensorRef, ConvertError> {
     let is_a_log = tensor.name.ends_with(".A_log");
 
     // If A_log: negate elementwise — output[i] = -exp(input[i]) (py:4788-4789).
     // Overflow: exp(large x) → +inf, negated → -inf. This matches llama.cpp exactly.
+    //
+    // Real Qwen3.6 ships A_log at BF16 (and earlier f16 variants exist); the
+    // Python reference performs `data_torch.float().exp()` which casts to F32
+    // first. We mirror that by promoting BF16/F16 source data to F32 before
+    // the negation, then leaving the tensor as F32 for the downstream V-head
+    // reorder. Matches `convert_hf_to_gguf.py:4788-4789` semantics exactly.
     if is_a_log {
-        if elem_size != 4 {
-            return Err(ConvertError::ReorderInvariantViolated {
-                name: tensor.name.clone(),
-                reason: format!(
-                    "A_log negation requires F32 data (elem_size=4), got elem_size={}",
-                    elem_size
-                ),
-            });
+        // Promote source data to F32 (no-op when already F32).
+        let promoted_f32: Vec<f32> = match tensor.dtype {
+            DType::F32 => {
+                let n = tensor.data.len() / 4;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 4;
+                    out.push(f32::from_le_bytes([
+                        tensor.data[off],
+                        tensor.data[off + 1],
+                        tensor.data[off + 2],
+                        tensor.data[off + 3],
+                    ]));
+                }
+                out
+            }
+            DType::BF16 => {
+                // BF16 → F32: low 16 bits zero, high 16 bits = BF16 bits.
+                let n = tensor.data.len() / 2;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 2;
+                    let bf16_bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                    let f32_bits = (bf16_bits as u32) << 16;
+                    out.push(f32::from_bits(f32_bits));
+                }
+                out
+            }
+            DType::F16 => {
+                let n = tensor.data.len() / 2;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 2;
+                    let f16_bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                    out.push(half::f16::from_bits(f16_bits).to_f32());
+                }
+                out
+            }
+            _ => {
+                return Err(ConvertError::ReorderInvariantViolated {
+                    name: tensor.name.clone(),
+                    reason: format!(
+                        "A_log negation: unsupported dtype {:?}; expected F32 / BF16 / F16",
+                        tensor.dtype
+                    ),
+                });
+            }
+        };
+
+        // Apply negation: -exp(val). Overflow → -inf; underflow → -1.0.
+        // No clamping — matches llama.cpp / Python exactly.
+        let mut new_bytes = Vec::with_capacity(promoted_f32.len() * 4);
+        for v in promoted_f32 {
+            let negexp = -v.exp();
+            new_bytes.extend_from_slice(&negexp.to_le_bytes());
         }
-        let n_elems = tensor.data.len() / 4;
-        for i in 0..n_elems {
-            let off = i * 4;
-            let val = f32::from_le_bytes([
-                tensor.data[off],
-                tensor.data[off + 1],
-                tensor.data[off + 2],
-                tensor.data[off + 3],
-            ]);
-            // -exp(val): overflow (val >> 0) gives -inf; underflow (val << 0) gives -1.0.
-            // No clamping — match llama.cpp behaviour exactly.
-            let negexp = -val.exp();
-            let bytes = negexp.to_le_bytes();
-            tensor.data[off..off + 4].copy_from_slice(&bytes);
-        }
+
+        // Store as F32; downstream V-head reorder will use the new elem_size.
+        tensor.data = new_bytes;
+        tensor.dtype = DType::F32;
+        elem_size = 4;
     }
 
     // V-head reorder along last dim with head_dim=1 (py:5402-5409).
