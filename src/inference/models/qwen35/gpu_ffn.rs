@@ -787,10 +787,12 @@ pub fn build_moe_ffn_layer_gpu_q(
     let total_rows = seq * topk;
     let ids_buf = upload_u32(&topk_idx, device).context("upload ids")?;
 
-    // ---- Steps 3a-3d: gate+up matmuls → silu_mul → down matmul (one encoder) ----
-    // All three steps are pure GPU compute with data dependencies (no CPU work between them).
-    // Merge into ONE encoder + ONE commit, using memory barriers between dependent stages.
-    // Saves 2 commits vs the previous 3-encoder approach (enc gate+up, silu_mul, enc y_all).
+    // ---- Steps 3a-3d + 8+9: one encoder — expert matmuls + shared SwiGLU ----
+    // Steps 3a-3d: gate+up+silu+down (sequential, barrier-gated)
+    // Steps 8+9:   shared silu_mul + shared_down (both depend on a_s_buf/b_s_buf
+    //              written by commit 1, independent of expert matmuls)
+    // Merging 3a-3d and 8+9 into a single encoder saves 1 commit_and_wait per
+    // MoE layer × 40 layers = 40 fewer GPU syncs per decode token.
     let gate_all_bytes = total_rows * m_moe * 4;
     let mut gate_all_buf = device
         .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
@@ -807,14 +809,23 @@ pub fn build_moe_ffn_layer_gpu_q(
     let mut y_all_buf = device
         .alloc_buffer(y_all_bytes, DType::F32, vec![total_rows, h])
         .map_err(|e| anyhow!("alloc y_all: {e}"))?;
+    let m_sh = m_sh32 as usize;
+    let n_h_s = (seq * m_sh) as u32;
+    let h_s_buf = device
+        .alloc_buffer(n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
+        .map_err(|e| anyhow!("alloc h_s: {e}"))?;
     // params_buf for silu_mul (holds n as u32, must outlive the encoder)
     let mut silu_params_buf = device
         .alloc_buffer(4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc silu params: {e}"))?;
     silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_all;
-    {
-        let mut enc = device.command_encoder().context("enc gate+up+silu+down")?;
-        // Step 3a: gate_all (concurrent with 3b — both read from x, write different bufs)
+    let mut silu_sh_params_buf = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
+    silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
+    let y_s_buf = {
+        let mut enc = device.command_encoder().context("enc expert+shared")?;
+        // Steps 3a+3b: gate_all + up_all (concurrent — both read from x, write different bufs)
         quantized_matmul_id_ggml(
             &mut enc, registry, device,
             x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
@@ -828,7 +839,6 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_gate_up,
             },
         ).map_err(|e| anyhow!("gate_all qmatmul_id: {e}"))?;
-        // Step 3b: up_all (concurrent with 3a)
         quantized_matmul_id_ggml(
             &mut enc, registry, device,
             x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
@@ -842,14 +852,23 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_gate_up,
             },
         ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
-        // Barrier: silu_mul reads gate_all/up_all written above.
+        // Step 8 (shared): h_s = silu(a_s) * b_s
+        // Reads a_s_buf/b_s_buf (from commit 1, already committed) — independent
+        // of gate_all/up_all, so it can run concurrently with steps 3a+3b.
+        dispatch_silu_mul(
+            &mut enc, registry, device.metal_device(),
+            &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
+        ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
+        // Barrier: silu_mul (step 3c) reads gate_all/up_all; shared_down reads h_s.
         enc.memory_barrier();
         // Step 3c: h_all = silu(gate_all) * up_all
         dispatch_silu_mul(
             &mut enc, registry, device.metal_device(),
             &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
         ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
-        // Barrier: down matmul reads h_all written above.
+        // Step 9: y_s = shared_down_proj(h_s) — reads h_s written by step 8.
+        let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
+        // Barrier: step 3d (y_all = expert_down(h_all)) reads h_all.
         enc.memory_barrier();
         // Step 3d: y_all = expert_down(h_all)
         quantized_matmul_id_ggml(
@@ -865,10 +884,12 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_down,
             },
         ).map_err(|e| anyhow!("y_all qmatmul_id: {e}"))?;
-        enc.commit_and_wait().context("commit gate+up+silu+down")?;
-    }
+        enc.commit_and_wait().context("commit expert+shared")?;
+        y_s_buf
+    };
 
     // ---- Step 3e: weighted accumulate moe_out [CPU] ----
+    // y_all and y_s are both available now (single commit above).
     let y_all_cpu = download_f32(&y_all_buf).context("download y_all")?;
     let mut moe_out_cpu = vec![0.0f32; seq * h];
     for (slot, (&w, row)) in topk_w.iter().zip(y_all_cpu.chunks(h)).enumerate() {
@@ -879,37 +900,14 @@ pub fn build_moe_ffn_layer_gpu_q(
         }
     }
 
-    // ---- Shared expert: sigmoid-gated SwiGLU ----
-    // Step 5: sh_gate_val = sigmoid(sh_logit)  [CPU] — only seq values, trivial
+    // ---- Step 5: sh_gate_val = sigmoid(sh_logit) [CPU — only seq scalars] ----
     let sh_logit_cpu = download_f32(&sh_logit_buf).context("download sh_logit")?;
     let sh_gate_vals: Vec<f32> = sh_logit_cpu
         .iter()
         .map(|&v| 1.0 / (1.0 + (-v).exp()))
         .collect();
 
-    // Steps 8+9: h_s = silu(a_s) * b_s → y_s = shared_down_proj(h_s) — GPU only, no CPU bridge.
-    // Fuses the silu_mul (step 8) with the down proj (step 9) into one encoder + one commit.
-    // Replaces: download a_s + download b_s + silu_mul_cpu + upload + separate enc sh_down.
-    let m_sh = m_sh32 as usize;
-    let n_h_s = (seq * m_sh) as u32;
-    let h_s_buf = device
-        .alloc_buffer(n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
-        .map_err(|e| anyhow!("alloc h_s: {e}"))?;
-    let mut silu_sh_params_buf = device
-        .alloc_buffer(4, DType::U32, vec![1])
-        .map_err(|e| anyhow!("alloc silu sh params: {e}"))?;
-    silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
-    let mut enc = device.command_encoder().context("enc sh_silu+down")?;
-    dispatch_silu_mul(
-        &mut enc, registry, device.metal_device(),
-        &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
-    ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
-    enc.memory_barrier();
-    // Step 9: y_s = shared_down_proj(h_s)
-    let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
-    enc.commit_and_wait().context("commit sh_silu+down")?;
-
-    // Step 10: output = moe_out + sh_gate * y_s  [CPU combine]
+    // ---- Step 10: output = moe_out + sh_gate * y_s  [CPU combine] ----
     let y_s_cpu = download_f32(&y_s_buf).context("download y_s")?;
     let mut out_cpu = moe_out_cpu;
     for t in 0..seq {
