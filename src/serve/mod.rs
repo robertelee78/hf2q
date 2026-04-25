@@ -734,6 +734,27 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .context("axum::serve")?;
+
+        // Axum has stopped accepting + drained in-flight HTTP responses.
+        // Each in-flight handler that called `engine.generate*` has already
+        // received its reply. Now send the Shutdown sentinel (FIFO behind any
+        // generations that were dispatched but whose HTTP response had
+        // already returned — e.g. SSE streams that wrote their last frame
+        // before SIGTERM) and join the worker thread.
+        //
+        // Without this, the tokio runtime drops at the bottom of `block_on`
+        // and the `mpsc::Sender` to the worker is closed implicitly; the
+        // worker exits its loop on the next `blocking_recv`, but a
+        // mid-decode generation gets cut off rather than running to its
+        // natural finish_reason. Joining here gives the worker a chance to
+        // complete in-flight compute cleanly before the runtime tears down.
+        if let Some(engine) = state_for_warmup.engine.clone() {
+            match engine.shutdown().await {
+                Ok(()) => tracing::info!("hf2q-engine worker joined"),
+                Err(e) => tracing::warn!(error = %e, "hf2q-engine worker join failed"),
+            }
+        }
+
         tracing::info!("hf2q HTTP server shut down cleanly");
         Ok::<(), anyhow::Error>(())
     })?;
