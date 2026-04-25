@@ -51,13 +51,12 @@ use super::gpu_ffn::{
     DenseFfnWeightsGpu, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
-    build_gated_attn_layer, download_f32, upload_f32,
+    apply_linear_projection_f32, build_gated_attn_layer, download_f32, upload_f32,
     FullAttnWeightsGpu,
 };
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
-use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
 
@@ -274,35 +273,19 @@ fn apply_output_head_gpu(
 
     // ---- LM head projection ----
     // Use the pre-cast BF16 weight to skip the per-token F32→BF16 cast.
-    // IMPORTANT: always use tiled GEMM (dense_matmul_bf16_f32_tensor) for lm_head,
-    // NOT the SIMD mat-vec fast path. The mat-vec uses simd_sum (tree reduction)
-    // while tiled GEMM uses simdgroup_matrix MMA hardware accumulators — for near-tie
-    // logit values the different rounding flips the argmax (sourdough gate drops from
-    // 180 to 86 bytes). Layer projections can safely use mat-vec; lm_head cannot.
+    // apply_linear_projection_f32 detects DType::BF16 and skips the cast.
     let mut enc = device.command_encoder().context("enc lm_head")?;
-    let out_bytes = (seq_len * vocab_size) as usize * 4;
-    let mut logits_buf = device
-        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, vocab_size as usize])
-        .map_err(|e| anyhow!("alloc logits: {e}"))?;
-    {
-        let params = DenseMmBf16F32Params {
-            m: seq_len,
-            n: vocab_size,
-            k: hidden_size,
-            src0_batch: 1,
-            src1_batch: 1,
-        };
-        dense_matmul_bf16_f32_tensor(
-            &mut enc,
-            registry,
-            device,
-            &head.lm_head_bf16,
-            &normed,
-            &mut logits_buf,
-            &params,
-        )
-        .context("lm_head tiled GEMM")?;
-    }
+    let logits_buf = apply_linear_projection_f32(
+        &mut enc,
+        registry,
+        device,
+        &normed,
+        &head.lm_head_bf16,
+        seq_len,
+        hidden_size,
+        vocab_size,
+    )
+    .context("lm_head projection")?;
     enc.commit_and_wait().context("commit lm_head")?;
 
     // Optional: dump output-norm stats to stderr.
