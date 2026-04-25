@@ -1930,6 +1930,24 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 70 — Phase 2a Task #12 closed: OpenAI Python SDK acceptance smoke for `/v1/embeddings`. Surfaced + fixed real wire-format gap (`encoding_format='base64'` is the SDK's default).**
+  - **What this iter shipped.**
+    - `scripts/smoke_openai_sdk_embeddings.sh` — boots hf2q against `bge-small-en-v1.5-f16.gguf`, runs the official `openai` Python client end-to-end, asserts wire-format compatibility on six paths.
+    - `src/serve/api/schema.rs` — `EmbeddingPayload` enum (`Float(Vec<f32>) | Base64(String)`), serialized as `#[serde(untagged)]` so the JSON shape matches OpenAI byte-for-byte (`embedding` field is either a list of floats or a base64 string at the wire level).
+    - `src/serve/api/handlers.rs` — handler now accepts `encoding_format ∈ {None, "float", "base64"}` (was: `{None, "float"}`). When base64 is requested the F32 hidden state is encoded as `base64(little-endian-f32-bytes)` per OpenAI's spec.
+  - **Why this matters: the SDK uses base64 by default.** When the user calls `client.embeddings.create(...)` without specifying `encoding_format`, the OpenAI Python SDK injects `encoding_format="base64"` internally to halve JSON payload size, then auto-decodes the response client-side. Iter 62's handler rejected base64 with 400, breaking *every* OpenAI-SDK consumer that didn't pass `encoding_format="float"` explicitly. The smoke script caught this on first run.
+  - **Smoke coverage (6 checks, all pass):**
+    1. `GET /v1/models` — embedding model present in the list.
+    2. `POST /v1/embeddings` with single string input — 384-dim L2-normalized vector, prompt_tokens populated. Uses the SDK's auto-decode path (encoding_format omitted → SDK sends base64, decodes back to list[float]).
+    3. `POST /v1/embeddings` with batch of 3 strings — 3 properly-indexed vectors at the same dim, total_tokens correct.
+    4. `POST /v1/embeddings` with explicit `encoding_format="float"` — list-of-floats response.
+    5. `POST /v1/embeddings` with explicit `encoding_format="base64"` — manual decode bit-exact to the float path. Observed max_diff = **9.56e-09** (F32 round-off in the to_le_bytes/from_le_bytes round-trip).
+    6. `POST /v1/embeddings` with wrong model id — 400 with `code = model_not_loaded`.
+  - **Verification.** `bash scripts/smoke_openai_sdk_embeddings.sh` → `ALL CHECKS PASSED ✓ / PASS`. `cargo test --bin hf2q api::` 234/234 pass; BERT 58/58 pass.
+  - **Lane discipline observed.** Edits in `src/serve/api/{schema,handlers}.rs` and `scripts/smoke_openai_sdk_embeddings.sh`. No mlx-native or BERT-lane changes.
+  - **Phase 2a Task #12 status: CLOSED.** OpenAI SDK compatibility verified against a real BERT model end-to-end with the official client. Open WebUI, sentence-transformers, LangChain, LlamaIndex — any OpenAI-SDK consumer — now works against hf2q's `/v1/embeddings`.
+  - **Next (iter 71):** continue Phase 2a tail. Most concrete remaining item: **Task #11 lifecycle** — surface the embedding model in `/v1/models` (already done), verify SSE drop-cancel counter increments correctly under concurrent stress, and audit the SIGTERM-drain path under in-flight embedding requests (parallel to the iter-54 chat-engine drain). Or **Task #9 summarize-overflow** server-side state machine + transparency headers (no engine wiring needed yet — just the policy plumbing).
+
 - **2026-04-26 loop iter 69 — Phase 2b validated on second day-one BERT model (`mxbai-embed-large-v1`); 2 of 3 day-one models cleared. `nomic-embed-text-v1.5` is `nomic-bert` arch (RoPE + gated MLP), needs its own model class — deferred to iter 70+.**
   - **What this iter shipped — measurement-only.** Downloaded `mxbai-embed-large-v1_fp16.gguf` (670 MB, 24 layers, hidden=1024, num_heads=16, CLS pool). hf2q boots cleanly (eager weight load, ~10s); `/v1/embeddings` POST returns 200 with the 1024-dim L2-normalized vector. Same code path as bge-small — `BertConfig::from_gguf` parses `bert.*` keys → `LoadedBertWeights::load` → `apply_bert_full_forward_gpu`. No code change required.
   - **Cosine sweep on mxbai vs llama-embedding:**
