@@ -195,7 +195,7 @@ fn qwen35_rms_norm_tensors_still_present_after_plus_one() {
         "blk.1.post_attention_norm.weight",
     ] {
         assert!(
-            names.iter().any(|n| *n == *required),
+            names.contains(required),
             "norm tensor {:?} missing after +1 transform",
             required
         );

@@ -86,7 +86,7 @@ fn build_qwen35_dense_safetensors() -> Vec<u8> {
     let num_heads: usize = 4;
     let kv_heads: usize = 1;
     let head_dim: usize = 16;
-    let lin_v_heads: usize = 8;
+    let _lin_v_heads: usize = 8; // doc-only; spec-correct shapes use literal numbers
     let num_layers: usize = 4;
 
     // F16 byte sizes
@@ -169,8 +169,7 @@ fn build_qwen35_dense_safetensors() -> Vec<u8> {
                 vec![0u8; hidden * f16],
             ));
         } else {
-            // Linear attention block
-            let qkv_size = (num_heads + kv_heads + lin_v_heads) * head_dim;
+            // Linear attention block.
             // Correct Qwen3.5 linear-attn tensor shapes (spec:
             // convert_hf_to_gguf.py Qwen3Next/Qwen3_5 + llama-model.cpp).
             // 2026-04-24 fixture fix — pre-fix shapes (A_log [num_heads],

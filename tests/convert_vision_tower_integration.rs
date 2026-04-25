@@ -106,7 +106,7 @@ fn build_tiny_vit_safetensors() -> Vec<u8> {
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.o_proj.weight"), vec![h, h]);
             push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, h]);
         } else {
-            let qkv = (4 + 1 + 8) * 16;
+            // Spec-correct shape: 2*nk*hk + nv*hv = 2*4*16 + 8*16 = 256.
             let qkv_rows = 4 * 16 * 2 + 8 * 16;
             push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, h]);
             push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![h, 8 * 16]);
@@ -267,13 +267,7 @@ fn layer_a_synthetic_vit_roundtrip_structural() {
             parent, dir_contents
         );
     });
-    let mmproj = Some(mmproj);
-    if mmproj.is_none() {
-        unreachable!("mmproj None path removed above");
-    }
-
-    let mmproj_path = mmproj.unwrap();
-    let gguf = GgufFile::open(&mmproj_path).expect("open mmproj GGUF");
+    let gguf = GgufFile::open(&mmproj).expect("open mmproj GGUF");
     let names: Vec<&str> = gguf.tensor_names();
 
     // Static tensors present.
@@ -288,7 +282,7 @@ fn layer_a_synthetic_vit_roundtrip_structural() {
         "mm.2.bias",
     ] {
         assert!(
-            names.iter().any(|n| *n == *required),
+            names.contains(required),
             "mmproj missing required tensor {:?}",
             required
         );
