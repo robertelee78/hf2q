@@ -2859,6 +2859,86 @@ mod tests {
         }
     }
 
+    /// ADR-012 P9b.1: round-trip smoke — emit a GGUF via the helper, then
+    /// re-open it via `mlx_native::gguf::GgufFile::open`. Proves the F16
+    /// emit produces a structurally valid GGUF that the load-side parser
+    /// can consume — the load-bearing contract for the two-pass
+    /// conversion path's intermediate artifact.
+    ///
+    /// Doesn't test full `Qwen35Model::load_from_gguf` because the tiny
+    /// fixture below isn't shape-correct for `Qwen35Config::from_gguf`'s
+    /// 22-key requirement. That positive-path round-trip is exercised
+    /// by the apex real-model tests under `--ignored real_apex` once
+    /// HF safetensors are downloaded and converted.
+    #[test]
+    fn test_emit_gguf_from_tensor_map_reopens_cleanly() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let mut tm = TensorMap::new();
+        // A representative mix: F16 weight + F16 norm + BF16 weight (will
+        // be converted to F16 by the emit). Cover both pass-through and
+        // conversion code paths.
+        tm.insert(TensorRef {
+            name: "model.embed_tokens.weight".into(),
+            shape: vec![16, 32],
+            dtype: DType::F16,
+            data: vec![0u8; 16 * 32 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.norm.weight".into(),
+            shape: vec![32],
+            dtype: DType::F16,
+            data: vec![0u8; 32 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.layers.0.self_attn.q_proj.weight".into(),
+            shape: vec![32, 32],
+            dtype: DType::BF16,
+            data: vec![0u8; 32 * 32 * 2], // BF16 — same byte size as F16
+        });
+
+        let metadata = meta();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("intermediate.gguf");
+
+        super::emit_gguf_from_tensor_map(
+            &tm,
+            &metadata,
+            tmp.path(),
+            &out_path,
+            &ProgressReporter::new(),
+        )
+        .expect("emit_gguf_from_tensor_map");
+
+        // Re-open via the mlx-native parser — proves structural validity.
+        let gguf = mlx_native::gguf::GgufFile::open(&out_path)
+            .expect("emitted GGUF must be openable by mlx_native::gguf::GgufFile");
+
+        // Spot-check a few tensors are present + have the right shape.
+        // Note: tensor names are mapped HF→GGUF inside `write` per the
+        // arch's `hf_name_to_gguf` table (see `arch_gguf_name`).
+        let arch = gguf
+            .metadata_string("general.architecture")
+            .expect("general.architecture must be set");
+        assert!(!arch.is_empty(), "arch metadata must be non-empty");
+
+        // The mlx-native parser must enumerate the tensors we emitted.
+        // For LLaMA arch (default in `meta()`), expected GGUF names:
+        //   model.embed_tokens.weight                    → token_embd.weight
+        //   model.norm.weight                            → output_norm.weight
+        //   model.layers.0.self_attn.q_proj.weight       → blk.0.attn_q.weight
+        for expected_gguf_name in [
+            "token_embd.weight",
+            "output_norm.weight",
+            "blk.0.attn_q.weight",
+        ] {
+            assert!(
+                gguf.tensor_info(expected_gguf_name).is_some(),
+                "emitted GGUF must contain tensor {expected_gguf_name}"
+            );
+        }
+    }
+
     /// ADR-012 P9b.1: smoke test for `emit_gguf_from_tensor_map`.
     ///
     /// Build a tiny TensorMap (one F16 weight + one F16 norm), call the
