@@ -193,7 +193,13 @@ enum FfnWeightsGpu {
 
 struct OutputHeadGpu {
     norm_w: MlxBuffer,
+    /// F32 lm_head weight buffer `[vocab_size, hidden_size]`. Kept for prefill
+    /// (M > 1) where the BF16 path may not be pre-cast yet.
     lm_head: MlxBuffer,
+    /// BF16 pre-cast of lm_head — computed once at GPU upload time.
+    /// `apply_linear_projection_f32` skips the per-token cast when the buffer
+    /// is already BF16, saving ~2ms/token for decode.
+    lm_head_bf16: MlxBuffer,
 }
 
 // ================================================================
@@ -266,13 +272,15 @@ fn apply_output_head_gpu(
     };
 
     // ---- LM head projection ----
+    // Use the pre-cast BF16 weight to skip the per-token F32→BF16 cast.
+    // apply_linear_projection_f32 detects DType::BF16 and skips the cast.
     let mut enc = device.command_encoder().context("enc lm_head")?;
     let logits_buf = apply_linear_projection_f32(
         &mut enc,
         registry,
         device,
         &normed,
-        &head.lm_head,
+        &head.lm_head_bf16,
         seq_len,
         hidden_size,
         vocab_size,
@@ -394,13 +402,38 @@ impl Qwen35Model {
             let mut cache = cell.borrow_mut();
             if cache.as_ref().map_or(true, |c| c.model_ptr != self_ptr) {
                 let device = MlxDevice::new().context("forward_gpu: MlxDevice::new")?;
-                let registry = KernelRegistry::new();
+                let mut registry = KernelRegistry::new();
                 let layer_weights = self.upload_layer_weights_gpu(&device)?;
+                let lm_head_f32 = upload_f32(&self.output_weight, &device)
+                    .context("upload lm_head")?;
+                // Pre-cast lm_head F32 → BF16 once at load time.
+                // apply_linear_projection_f32 detects DType::BF16 and skips
+                // the per-token cast (~2ms saved per decode step).
+                let n_w = self.output_weight.len();
+                let lm_head_bf16 = {
+                    let bf16_buf = device
+                        .alloc_buffer(n_w * 2, DType::BF16, vec![n_w])
+                        .map_err(|e| anyhow!("alloc lm_head_bf16: {e}"))?;
+                    let mut enc = device.command_encoder()
+                        .context("enc lm_head_bf16 cast")?;
+                    mlx_native::ops::elementwise::cast(
+                        &mut enc,
+                        &mut registry,
+                        device.metal_device(),
+                        &lm_head_f32,
+                        &bf16_buf,
+                        n_w,
+                        mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                    )
+                    .context("cast lm_head F32→BF16 at load")?;
+                    enc.commit_and_wait().context("commit lm_head cast")?;
+                    bf16_buf
+                };
                 let output_head = OutputHeadGpu {
                     norm_w: upload_f32(&self.output_norm, &device)
                         .context("upload output_norm")?,
-                    lm_head: upload_f32(&self.output_weight, &device)
-                        .context("upload lm_head")?,
+                    lm_head: lm_head_f32,
+                    lm_head_bf16,
                 };
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
@@ -784,7 +817,8 @@ impl Qwen35Model {
         }
 
         // ---- Step 3: final output head → logits ----
-        apply_output_head_gpu(
+        let t_output_head = if decode_profile { Some(std::time::Instant::now()) } else { None };
+        let logits = apply_output_head_gpu(
             &device,
             &mut registry,
             &hidden,
@@ -794,7 +828,11 @@ impl Qwen35Model {
             cfg.vocab_size,
             eps,
         )
-        .context("apply_output_head_gpu")
+        .context("apply_output_head_gpu")?;
+        if let Some(t) = t_output_head {
+            eprintln!("[DECODE_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
+        }
+        Ok(logits)
     }
 
     /// Upload all per-layer weights to GPU once, returning the GPU bundle vec.
