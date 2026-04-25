@@ -154,6 +154,36 @@ struct PoolMeanParams {
     uint hidden;
 };
 
+struct AttnMaskAddParams {
+    uint num_heads;
+    uint seq_q;
+    uint seq_k;
+};
+
+// Broadcast-add a `[seq_q, seq_k]` mask to a `[num_heads, seq_q, seq_k]`
+// scores tensor. Mask[r, c] is 0.0 at valid positions and -INF
+// (encoded as a very large negative float) at padded positions; after
+// softmax the padded contributions vanish.
+//
+// In-place safe (input == output): each thread reads from `scores`
+// at one offset and writes to `output` at the same offset. The kernel
+// is bandwidth-bound; no reduction.
+kernel void bert_attention_mask_add_f32(
+    device const float* scores [[buffer(0)]],
+    device const float* mask   [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant AttnMaskAddParams& params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint c = gid.x;
+    uint r = gid.y;
+    uint h = gid.z;
+    if (c >= params.seq_k || r >= params.seq_q || h >= params.num_heads) return;
+    uint scores_idx = (h * params.seq_q + r) * params.seq_k + c;
+    uint mask_idx = r * params.seq_k + c;
+    output[scores_idx] = scores[scores_idx] + mask[mask_idx];
+}
+
 // Mean-pool across the sequence dim:
 //   out[h] = (1/seq_len) * sum_{s=0}^{seq_len-1} input[s * hidden + h]
 //
@@ -199,6 +229,14 @@ struct PoolMeanGpuParams {
     hidden: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttnMaskAddGpuParams {
+    num_heads: u32,
+    seq_q: u32,
+    seq_k: u32,
+}
+
 /// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
 /// structs containing only primitive fields with natural alignment.
 fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
@@ -220,6 +258,7 @@ pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("bert_layer_norm_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_bias_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_pool_mean_f32", BERT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("bert_attention_mask_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
     // mlx-native's per-op kernel sources are needed for the attention
     // chain (delegated to `vit_attention_gpu`), GeLU, embedding gather,
     // and L2 normalization. Modules listed here expose a `register` fn;
@@ -674,6 +713,272 @@ pub fn bert_attention_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Masked bidirectional attention — GPU dispatch
+// ---------------------------------------------------------------------------
+
+/// Apply a `[seq_q, seq_k]` mask broadcast across `num_heads` to a
+/// `[num_heads, seq_q, seq_k]` scores tensor. Mask values: 0.0 at
+/// real positions, large-negative (e.g. `f32::MIN_POSITIVE.recip().neg()`
+/// or just `-1e30`) at padded positions. Output buffer same shape as
+/// input; in-place safe.
+pub fn bert_attention_mask_add_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    scores: &MlxBuffer,
+    mask: &MlxBuffer,
+    num_heads: u32,
+    seq_q: u32,
+    seq_k: u32,
+) -> Result<MlxBuffer> {
+    if num_heads == 0 || seq_q == 0 || seq_k == 0 {
+        return Err(anyhow!(
+            "bert_attention_mask_add_gpu: num_heads/seq_q/seq_k must be > 0"
+        ));
+    }
+    let total = (num_heads as usize) * (seq_q as usize) * (seq_k as usize);
+    let output = device
+        .alloc_buffer(
+            total * 4,
+            DType::F32,
+            vec![num_heads as usize, seq_q as usize, seq_k as usize],
+        )
+        .map_err(|e| anyhow!("alloc mask_add output: {e}"))?;
+    let pipeline = registry
+        .get_pipeline("bert_attention_mask_add_f32", device.metal_device())
+        .map_err(|e| anyhow!("bert_attention_mask_add_gpu: get_pipeline: {e}"))?;
+    let params = AttnMaskAddGpuParams {
+        num_heads,
+        seq_q,
+        seq_k,
+    };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(seq_k as u64, seq_q as u64, num_heads as u64);
+    let tg = MTLSize::new(std::cmp::min(64, seq_k as u64), 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(scores)),
+            (1, KernelArg::Buffer(mask)),
+            (2, KernelArg::Buffer(&output)),
+            (3, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
+}
+
+/// Build a `[seq_len, seq_len]` F32 attention mask for BERT bidirectional
+/// self-attention. Columns `[0, valid_len)` get value 0.0; columns
+/// `[valid_len, seq_len)` get a large negative value (`-1e30`) so the
+/// post-softmax weight is effectively zero. The mask is row-invariant
+/// (same value across all query positions for a given key position) —
+/// matches HuggingFace's `attention_mask` broadcast convention before
+/// the `(1 - mask) * -10000` flip; here we precompute the flipped form
+/// directly.
+///
+/// Allocated on the device's unified memory and populated via direct
+/// CPU pointer write (Apple Silicon: same bytes the GPU sees).
+pub fn alloc_bert_attention_mask(
+    device: &MlxDevice,
+    seq_len: u32,
+    valid_len: u32,
+) -> Result<MlxBuffer> {
+    if seq_len == 0 {
+        return Err(anyhow!("alloc_bert_attention_mask: seq_len must be > 0"));
+    }
+    let n = (seq_len as usize) * (seq_len as usize);
+    let buf = device
+        .alloc_buffer(n * 4, DType::F32, vec![seq_len as usize, seq_len as usize])
+        .map_err(|e| anyhow!("alloc attention mask: {e}"))?;
+    // SAFETY: just-allocated f32 buffer; exclusive access.
+    let s: &mut [f32] =
+        unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, n) };
+    let valid = valid_len.min(seq_len) as usize;
+    let seq = seq_len as usize;
+    for r in 0..seq {
+        for c in 0..seq {
+            s[r * seq + c] = if c < valid { 0.0 } else { -1e30 };
+        }
+    }
+    Ok(buf)
+}
+
+/// Bidirectional self-attention with an explicit padding mask.
+///
+/// Same dispatch chain as `vit_attention_gpu` — Q@K^T → scale → softmax
+/// → permute V → cast → transpose → scores @ V → permute back — but
+/// inserts a `mask_add` step **between scaling and softmax**. Required
+/// for BERT inputs that are right-padded with `[PAD]` to satisfy the
+/// matmul K floor: without the mask, softmax distributes weight across
+/// padded positions and contaminates the output (cosine 0.58 on bge-
+/// small at iter 65 short-prompt; 0.82 on long-prompt where no padding
+/// is needed).
+///
+/// Caller supplies a `[seq_len, seq_len]` F32 mask (build via
+/// `alloc_bert_attention_mask`). The mask is broadcast across `num_heads`.
+///
+/// # Errors
+/// - `head_dim < 32` (matmul kernel constraint)
+/// - any dim is 0
+/// - propagated from any sub-stage
+#[allow(clippy::too_many_arguments)]
+pub fn bert_attention_with_mask_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    v_seq_major: &MlxBuffer,
+    mask: &MlxBuffer,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    use crate::inference::vision::vit_gpu::{
+        vit_attention_scores_gpu, vit_softmax_last_dim_gpu,
+    };
+    use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_bf16};
+
+    if head_dim < 32 {
+        return Err(anyhow!(
+            "bert_attention_with_mask_gpu: head_dim ({}) must be >= 32",
+            head_dim
+        ));
+    }
+    if seq_len == 0 || num_heads == 0 {
+        return Err(anyhow!(
+            "bert_attention_with_mask_gpu: seq_len/num_heads must be > 0"
+        ));
+    }
+    let metal_dev = device.metal_device();
+
+    // --- Stage 1: scores = (Q @ K^T) * scale, [num_heads, seq, seq] ---
+    let scores = vit_attention_scores_gpu(
+        encoder, registry, device, q_seq_major, k_seq_major, seq_len, num_heads, head_dim, scale,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 2 (NEW): apply padding mask before softmax ---
+    let masked_scores = bert_attention_mask_add_gpu(
+        encoder, registry, device, &scores, mask, num_heads, seq_len, seq_len,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 3: softmax along last dim. [num_heads * seq, seq] ---
+    let n_rows = (num_heads as u64) * (seq_len as u64);
+    let softmaxed =
+        vit_softmax_last_dim_gpu(encoder, registry, device, &masked_scores, n_rows as u32, seq_len)?;
+    encoder.memory_barrier();
+
+    // --- Stage 4: V layout transforms (mirrors vit_attention_gpu) ---
+    let n_v = (seq_len as usize) * (num_heads as usize) * (head_dim as usize);
+    let v_perm = device
+        .alloc_buffer(
+            n_v * 4,
+            DType::F32,
+            vec![num_heads as usize, seq_len as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc v_perm: {e}"))?;
+    permute_021_f32(
+        encoder,
+        registry,
+        metal_dev,
+        v_seq_major,
+        &v_perm,
+        seq_len as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )
+    .context("permute V seq→head major")?;
+    encoder.memory_barrier();
+
+    let v_bf16 = device
+        .alloc_buffer(
+            n_v * 2,
+            DType::BF16,
+            vec![num_heads as usize, seq_len as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc v_bf16: {e}"))?;
+    cast(
+        encoder,
+        registry,
+        metal_dev,
+        &v_perm,
+        &v_bf16,
+        n_v,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast V f32→bf16")?;
+    encoder.memory_barrier();
+
+    let v_t_bf16 = device
+        .alloc_buffer(
+            n_v * 2,
+            DType::BF16,
+            vec![num_heads as usize, head_dim as usize, seq_len as usize],
+        )
+        .map_err(|e| anyhow!("alloc v_t_bf16: {e}"))?;
+    transpose_last2_bf16(
+        encoder,
+        registry,
+        metal_dev,
+        &v_bf16,
+        &v_t_bf16,
+        num_heads as usize,
+        seq_len as usize,
+        head_dim as usize,
+    )
+    .context("transpose V last 2")?;
+    encoder.memory_barrier();
+
+    // --- Stage 5: scores @ V matmul ---
+    let n_attn = (num_heads as usize) * (seq_len as usize) * (head_dim as usize);
+    let mut attn_head_major = device
+        .alloc_buffer(
+            n_attn * 4,
+            DType::F32,
+            vec![num_heads as usize, seq_len as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc attn_head_major: {e}"))?;
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: head_dim,
+        k: seq_len,
+        src0_batch: num_heads,
+        src1_batch: num_heads,
+    };
+    dense_matmul_bf16_f32_tensor(
+        encoder, registry, device, &v_t_bf16, &softmaxed, &mut attn_head_major, &params,
+    )
+    .context("attention scores @ V matmul")?;
+    encoder.memory_barrier();
+
+    // --- Stage 6: permute back to seq-major ---
+    let attn_seq_major = device
+        .alloc_buffer(
+            n_attn * 4,
+            DType::F32,
+            vec![seq_len as usize, num_heads as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc attn_seq_major: {e}"))?;
+    permute_021_f32(
+        encoder,
+        registry,
+        metal_dev,
+        &attn_head_major,
+        &attn_seq_major,
+        num_heads as usize,
+        seq_len as usize,
+        head_dim as usize,
+    )
+    .context("permute attn head→seq major")?;
+    Ok(attn_seq_major)
+}
+
+// ---------------------------------------------------------------------------
 // Residual add — GPU dispatch (used internally by the block forward)
 // ---------------------------------------------------------------------------
 
@@ -795,6 +1100,7 @@ pub fn apply_bert_encoder_block_gpu(
     device: &MlxDevice,
     input: &MlxBuffer,
     tensors: &BertEncoderBlockTensors<'_>,
+    attention_mask: Option<&MlxBuffer>,
     seq_len: u32,
     hidden: u32,
     num_heads: u32,
@@ -830,15 +1136,21 @@ pub fn apply_bert_encoder_block_gpu(
     .context("encoder block: V projection")?;
     encoder.memory_barrier();
 
-    // --- Bidirectional attention ---
+    // --- Bidirectional attention (with optional padding mask) ---
     // Q/K/V buffers are `[seq_len, hidden]` F32; the attention dispatch
     // reads them as `[seq_len, num_heads, head_dim]` row-major (same
     // bytes; hidden = num_heads × head_dim by construction above). No
     // copy needed.
-    let attn_out = bert_attention_gpu(
-        encoder, registry, device, &q, &k, &v, seq_len, num_heads, head_dim, scale,
-    )
-    .context("encoder block: bidirectional attention")?;
+    let attn_out = match attention_mask {
+        Some(mask) => bert_attention_with_mask_gpu(
+            encoder, registry, device, &q, &k, &v, mask, seq_len, num_heads, head_dim, scale,
+        )
+        .context("encoder block: masked bidirectional attention")?,
+        None => bert_attention_gpu(
+            encoder, registry, device, &q, &k, &v, seq_len, num_heads, head_dim, scale,
+        )
+        .context("encoder block: bidirectional attention")?,
+    };
     encoder.memory_barrier();
 
     // --- Output projection (W_o + b_o) ---
@@ -1365,6 +1677,7 @@ pub fn apply_bert_full_forward_gpu(
     weights: &super::weights::LoadedBertWeights,
     cfg: &super::config::BertConfig,
     seq_len: u32,
+    valid_token_count: u32,
 ) -> Result<MlxBuffer> {
     use super::config::PoolingType;
 
@@ -1451,6 +1764,18 @@ pub fn apply_bert_full_forward_gpu(
     .context("full forward: embeddings")?;
     encoder.memory_barrier();
 
+    // --- Build attention mask if any padding present ---
+    // Mask is `[seq_len, seq_len]` F32: 0.0 at columns < valid_token_count,
+    // -1e30 at columns ≥ valid_token_count. Broadcast across num_heads
+    // by `bert_attention_mask_add_gpu`. If valid_token_count == seq_len,
+    // every position is real and the mask add becomes a no-op — skip.
+    let mask_opt: Option<MlxBuffer> = if valid_token_count < seq_len {
+        Some(alloc_bert_attention_mask(device, seq_len, valid_token_count)?)
+    } else {
+        None
+    };
+    let mask_ref = mask_opt.as_ref();
+
     // --- N encoder blocks ---
     for layer_idx in 0..cfg.num_hidden_layers {
         let tensors = BertEncoderBlockTensors {
@@ -1477,6 +1802,7 @@ pub fn apply_bert_full_forward_gpu(
             device,
             &hidden_states,
             &tensors,
+            mask_ref,
             seq_len,
             hidden,
             num_heads,
@@ -2567,6 +2893,7 @@ mod tests {
             device,
             &in_buf,
             &tensors,
+            None, // no padding mask in synthetic block test
             seq as u32,
             hidden as u32,
             num_heads as u32,
@@ -3309,6 +3636,7 @@ mod tests {
             &weights,
             &cfg,
             seq as u32,
+            seq as u32, // valid_token_count == seq_len → no mask
         )
         .expect("full forward dispatch");
         session.finish().expect("finish");
@@ -3373,6 +3701,7 @@ mod tests {
             &weights,
             &cfg,
             32,
+            32,
         );
         assert!(err.is_err(), "pooling_type=None must error");
         let msg = format!("{}", err.unwrap_err());
@@ -3422,6 +3751,7 @@ mod tests {
             &weights,
             &cfg,
             16, // < 32 floor
+            16,
         );
         assert!(err.is_err(), "seq_len < 32 must error");
         drop(session);
@@ -3468,6 +3798,7 @@ mod tests {
             device,
             &buf,
             &tensors,
+            None,
             32,
             65, // hidden
             2,  // num_heads → 65 % 2 != 0

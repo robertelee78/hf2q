@@ -1192,6 +1192,10 @@ pub async fn embeddings(
                 .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
             let mut registry = KernelRegistry::new();
             register_bert_custom_shaders(&mut registry);
+            // valid_token_count = the count BEFORE [PAD] padding. The
+            // forward pass uses this to build the attention mask so
+            // padded positions don't contaminate the embedding.
+            let valid_token_count = raw_ids.len().min(ids.len()) as u32;
             let out = apply_bert_full_forward_gpu(
                 session.encoder_mut(),
                 &mut registry,
@@ -1201,6 +1205,7 @@ pub async fn embeddings(
                 &weights,
                 &cfg,
                 seq_len,
+                valid_token_count,
             )?;
             session
                 .finish()
