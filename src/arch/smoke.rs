@@ -299,18 +299,31 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
     // without --dry-run would fail at convert. Catch it here so dry-run
     // is a faithful pre-flight check.
     if let Some(local) = &args.local_dir {
+        // Reuse EXIT_SMOKE_ASSERTION_FAILED (8) for parity with the
+        // post-preflight `run_q4_0_pipeline` local-dir check; both
+        // paths emit the same code so scripts can't distinguish
+        // "caught by preflight" vs "caught by pipeline" — only that
+        // it failed and the message names the missing path.
         if !local.exists() {
             return SmokeOutcome::PreflightFailed {
-                // Reuse EXIT_SMOKE_ASSERTION_FAILED (8) for parity with the
-                // post-preflight `run_q4_0_pipeline` local-dir check; both
-                // paths now emit the same code so scripts can't distinguish
-                // "caught by preflight" vs "caught by pipeline" — only that
-                // it failed and the message names the missing path.
                 exit_code: EXIT_SMOKE_ASSERTION_FAILED,
                 reason: format!(
                     "--local-dir {:?} does not exist (no input safetensors directory \
                      to convert from). Pass a valid path or omit --local-dir to use \
                      the HF download path.",
+                    local
+                ),
+            };
+        }
+        // `.exists()` is true for both files and directories. Reject
+        // file paths early so the convert step doesn't fail later with
+        // a confusing "no config.json in <file>" message.
+        if !local.is_dir() {
+            return SmokeOutcome::PreflightFailed {
+                exit_code: EXIT_SMOKE_ASSERTION_FAILED,
+                reason: format!(
+                    "--local-dir {:?} is not a directory (expected a HuggingFace \
+                     model directory containing config.json + safetensors).",
                     local
                 ),
             };
@@ -803,6 +816,40 @@ mod tests {
             other => panic!(
                 "expected PreflightFailed with EXIT_SMOKE_ASSERTION_FAILED, got: {other:?}"
             ),
+        }
+    }
+
+    /// `--local-dir <path>` pointing at a regular file (not a
+    /// directory) must fail at the dispatch layer with a clear
+    /// "not a directory" message. Without this the convert subprocess
+    /// would later fail with a confusing "no config.json in <file>"
+    /// error, making the user-input mistake harder to diagnose.
+    #[cfg(unix)]
+    #[test]
+    fn local_dir_pointing_at_a_file_returns_preflight_failure() {
+        let env = MockEnv::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("not-a-dir.txt");
+        std::fs::write(&file_path, b"oops").unwrap();
+        assert!(file_path.is_file() && !file_path.is_dir());
+
+        let mut args = args_for("qwen35", "q4_0");
+        args.local_dir = Some(file_path.clone());
+        args.dry_run = true;
+        let outcome = dispatch(&args, &env);
+        match outcome {
+            SmokeOutcome::PreflightFailed { exit_code, reason } => {
+                assert_eq!(exit_code, EXIT_SMOKE_ASSERTION_FAILED);
+                assert!(
+                    reason.contains("not a directory"),
+                    "error must say 'not a directory', got: {reason}"
+                );
+                assert!(
+                    reason.contains(file_path.to_str().unwrap()),
+                    "error must name the offending path, got: {reason}"
+                );
+            }
+            other => panic!("expected PreflightFailed, got: {other:?}"),
         }
     }
 
