@@ -170,7 +170,7 @@ impl Qwen35Model {
     /// For Dense models the behaviour is unchanged: weights are dequantized
     /// to f32 via [`weight_loader::load_layer`].
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
-        let cfg = Self::load_config_only(gguf)?;
+        let mut cfg = Self::load_config_only(gguf)?;
         let mtp = load_mtp_weights_if_present(gguf, cfg.num_hidden_layers)?;
 
         let device = MlxDevice::new()
@@ -179,6 +179,29 @@ impl Qwen35Model {
         let (token_embd, output_weight, output_norm) =
             weight_loader::load_global_tensors(gguf, &cfg, &device)
                 .context("load_global_tensors")?;
+
+        // ADR-012 P9b real-model finding (Qwen3.6-27B): the embedding table is
+        // physically padded for alignment (e.g. 248320 rows) while the metadata
+        // vocab_size reports the logical vocab (e.g. 248044). When they
+        // disagree, take the tensor shape as authoritative for cfg.vocab_size
+        // — the io_heads.rs assertion `token_embd.len() == vocab * hidden`
+        // and the LM head matmul both require the row-count match. The logical
+        // vocab is still recoverable from `tokenizer.ggml.tokens` metadata if
+        // ever needed (e.g. for sampler masking of pad rows).
+        let h = cfg.hidden_size as usize;
+        if h > 0 {
+            let physical_vocab = token_embd.len() / h;
+            if (physical_vocab as u32) != cfg.vocab_size {
+                tracing::info!(
+                    metadata_vocab = cfg.vocab_size,
+                    physical_vocab = physical_vocab,
+                    "qwen35 vocab pad: metadata reports {} but token_embd has {} rows; using physical for cfg.vocab_size",
+                    cfg.vocab_size,
+                    physical_vocab,
+                );
+                cfg.vocab_size = physical_vocab as u32;
+            }
+        }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
         for i in 0..cfg.num_hidden_layers {
