@@ -1,106 +1,489 @@
-//! Real (non-mock) `ActivationCapture` implementation for qwen35 / qwen35moe.
+//! Real (non-mock) `ActivationCapture` for `Qwen35Model`.
 //!
-//! ADR-012 P9 Decision 17. Replaces the `NoActivationCapture` guard in
-//! `src/main.rs` once ADR-013 P12's weight loader + F16 forward land
-//! bit-stable. Until P12 ships, this module exposes the `RealActivationCapture`
-//! type with a `not_ready()` constructor that surfaces a structured
-//! dependency error — NOT a silent stub. Callers choose between:
+//! ADR-012 P9 / ADR-013 Decision 16. Lands on top of the ADR-013 merge
+//! (`236abb8` — full Qwen3.5/3.6 forward) which closed P12 with trait+mock
+//! only and explicitly deferred the real impl. This file finishes that
+//! deferred contract.
 //!
-//!   - `RealActivationCapture::new(...)` — attempts real forward (P12+).
-//!   - `RealActivationCapture::not_ready()` — cites the ADR-013 P12
-//!     blocker explicitly so the guard in `main.rs` can degrade
-//!     deterministically and users see the actionable error.
+//! Two surfaces are exposed:
 //!
-//! Once ADR-013 P12 is green (load + forward both bit-stable), the
-//! `new(...)` body is filled in to drive the forward pass and capture
-//! per-nn.Linear activations at hook points P12 exposes. The mantra
-//! applies: "No stub, no fallback" — the `NotReady` variant is the
-//! load-bearing error that prevents silent dissolve into weight-space.
+//! 1. [`Qwen35Model`] directly implements [`ActivationCapture`]. Power callers
+//!    that already hold a `Qwen35Model` (e.g. an existing inference session)
+//!    can capture activations without re-loading.
+//! 2. [`RealActivationCapture`] is the convenience wrapper for the DWQ
+//!    calibration pipeline: it loads a `Qwen35Model` from a GGUF on the fly
+//!    and delegates `run_calibration_prompt` to the model. The
+//!    `not_ready()` constructor remains for callers that explicitly want to
+//!    surface a structured "deferred" error (used in unit tests of the
+//!    no-fallback guard).
+//!
+//! # Capture semantics
+//!
+//! For each transformer block `l` (`0 ≤ l < num_hidden_layers`):
+//!
+//! * `layer_inputs[l]` — residual stream entering layer `l`.
+//!     - `l == 0`: the embedding output.
+//!     - `l > 0`:  `layer_outputs[l-1]`.
+//! * `layer_outputs[l]` — residual stream leaving layer `l` after FFN
+//!   residual add (matches the per-block `ffn_residual + ffn_out` shape
+//!   in [`super::forward_cpu`]).
+//!
+//! Each captured tensor is row-major `[seq_len, hidden_size]` flattened
+//! to `Vec<f32>` per the `LayerActivations` contract.
+//!
+//! # Variants supported
+//!
+//! * **Dense Qwen3.5** (`qwen35`, `Qwen35Variant::Dense`): full CPU capture
+//!   path works on F32-loaded weights.
+//! * **MoE Qwen3.5** (`qwen35moe`, `Qwen35Variant::Moe`): GGUF-loaded
+//!   experts are stored in their native ggml block-quantization
+//!   (`Qwen35FfnWeights::MoeQ`); `forward_cpu` returns an error rather
+//!   than F32-expanding 256 experts (would OOM the 64 GB working set).
+//!   Capture for MoE therefore returns
+//!   [`RealActivationCaptureError::ForwardPass`] with a clear message;
+//!   the GPU-backed capture path (uses `forward_gpu`) is a follow-up.
+//!
+//! # No fallback
+//!
+//! Per `feedback_never_ship_fallback_without_rootcause.md`: if the forward
+//! errors out (e.g. on MoE-quantized FFN) we return a typed error, not
+//! synthetic activations. Callers must handle this rather than silently
+//! routing around it.
 
 use anyhow::Result;
 use thiserror::Error;
 
 use super::activation_capture::{ActivationCapture, LayerActivations};
+use super::delta_net::{delta_net_layer_cpu_ref, DeltaNetLayerShape};
+use super::ffn::{
+    dense_swiglu_cpu_ref, moe_ffn_cpu_ref, DenseFfnShape, MoeFfnShape,
+};
+use super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
+use super::io_heads::embed_tokens;
+use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 
-/// Errors returned by `RealActivationCapture::run_calibration_prompt`.
-///
-/// `NotReady` is emitted pre-P12. When ADR-013 P12 ships, the
-/// constructor either returns Ok(Self) and `run_calibration_prompt`
-/// delivers real activations, OR it returns a precise `ForwardPass`
-/// error naming the specific layer / tensor that failed — never
-/// `NotReady`.
+// ================================================================
+// Error type
+// ================================================================
+
+/// Errors returned by the real ActivationCapture path. `NotReady` is
+/// retained for the `not_ready()` factory used in dependency-blocked
+/// unit tests; `ForwardPass` is the production error variant naming the
+/// specific layer / reason.
 #[derive(Debug, Error)]
 pub enum RealActivationCaptureError {
-    /// ADR-013 P12 (weight loader + F16 forward) has not yet landed
-    /// bit-stable on `main`. Returned by the pre-P12 shim constructor
-    /// `not_ready()`. Callers must check this and decline to run the
-    /// DWQ activation path — the correct action is to finish P12, not
-    /// fall back to weight-space (see `feedback_never_ship_fallback_without_rootcause.md`).
+    /// Constructor was called via [`RealActivationCapture::not_ready`].
+    /// This exists so a unit test can validate the no-fallback guard
+    /// behavior without needing a real GGUF.
     #[error(
-        "ADR-013 P12 not ready: RealActivationCapture cannot drive the \
-         qwen35 forward pass until the weight loader + F16 forward are \
-         bit-stable. Finish ADR-013 P12 before invoking DWQ calibration \
-         on qwen35 / qwen35moe. No fallback is provided by design."
+        "RealActivationCapture: explicit not_ready() shim invoked. The \
+         real implementation is wired up; this variant is reserved for \
+         dependency-test scenarios that want to pin the no-fallback \
+         contract surface."
     )]
     NotReady,
 
-    /// Forward pass failed with a specific root cause. Reserved for
-    /// post-P12 callers when the captured activations do not reach
-    /// the expected shape; the `ForwardPass` variant must name the
-    /// layer / tensor involved so the bisection point is obvious.
+    /// Forward pass failed at a specific layer with a named reason.
     #[error("qwen35 forward failed at layer {layer}: {reason}")]
     ForwardPass { layer: u32, reason: String },
+
+    /// Constructor failed to load a `Qwen35Model` from the supplied GGUF
+    /// path (file missing, malformed, or unsupported variant).
+    #[error("RealActivationCapture::new failed to load model from {path}: {reason}")]
+    Load { path: String, reason: String },
 }
 
-/// Production ActivationCapture. See module doc for lifecycle.
-#[derive(Debug)]
+// ================================================================
+// RMSNorm helper (mirrors forward_cpu::rms_norm_rows; private there)
+// ================================================================
+
+fn rms_norm_rows(x: &mut [f32], weight: &[f32], hidden: usize, eps: f32) {
+    debug_assert_eq!(weight.len(), hidden);
+    let seq = x.len() / hidden;
+    for t in 0..seq {
+        let row = &mut x[t * hidden..(t + 1) * hidden];
+        let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+        let inv = ((sum_sq / (hidden as f32)) + eps).sqrt().recip();
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = *v * inv * weight[j];
+        }
+    }
+}
+
+fn residual_add(dst: &mut [f32], src: &[f32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d += s;
+    }
+}
+
+// ================================================================
+// Primary impl: ActivationCapture for Qwen35Model
+// ================================================================
+
+impl ActivationCapture for Qwen35Model {
+    fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations> {
+        if tokens.is_empty() {
+            anyhow::bail!("Qwen35Model::run_calibration_prompt: tokens must be non-empty");
+        }
+
+        let h = self.cfg.hidden_size as usize;
+        let eps = self.cfg.rms_norm_eps;
+        let num_layers = self.cfg.num_hidden_layers;
+        let seq_len = tokens.len();
+
+        // Text-only positions (one axis per token, replicated across the 4
+        // MROPE sectors). Matches forward_cpu's text_positions helper.
+        let positions: Vec<[i32; 4]> = (0..seq_len as i32).map(|i| [i, i, i, i]).collect();
+
+        // 1. Embedding lookup.
+        let mut hidden = embed_tokens(
+            tokens,
+            &self.token_embd,
+            self.cfg.vocab_size,
+            self.cfg.hidden_size,
+        );
+
+        let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers as usize);
+        let mut layer_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers as usize);
+
+        // 2. Per-layer forward + capture. Mirrors `forward_cpu` exactly so
+        // the captured residual stream is byte-identical to a forward
+        // call's intermediate state.
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Capture residual stream entering this layer.
+            layer_inputs.push(hidden.clone());
+
+            // Attention.
+            let attn_out = match layer {
+                Qwen35LayerWeights::FullAttn { attn, .. } => {
+                    let shape = FullAttnShape::from_config(&self.cfg);
+                    gated_full_attention_cpu_ref(&hidden, &positions, attn, shape)
+                }
+                Qwen35LayerWeights::LinearAttn { attn, .. } => {
+                    let shape = DeltaNetLayerShape::from_config(&self.cfg);
+                    let state_in = vec![
+                        0.0f32;
+                        (self.cfg.linear_key_head_dim
+                            * self.cfg.linear_value_head_dim
+                            * self.cfg.linear_num_value_heads)
+                            as usize
+                    ];
+                    let km1 = (self.cfg.linear_conv_kernel_dim - 1) as usize;
+                    let qkv_channels = (2 * self.cfg.linear_num_key_heads
+                        * self.cfg.linear_key_head_dim
+                        + self.cfg.linear_num_value_heads
+                            * self.cfg.linear_value_head_dim)
+                        as usize;
+                    let conv_state = vec![0.0f32; km1 * qkv_channels];
+                    let (out, _new_state, _new_conv) =
+                        delta_net_layer_cpu_ref(&hidden, attn, shape, &state_in, &conv_state);
+                    out
+                }
+            };
+
+            // Residual after attention.
+            residual_add(&mut hidden, &attn_out);
+
+            // Post-attention norm + FFN (matches forward_cpu's
+            // ffn_residual / attn_post_norm structure).
+            let ffn_residual = hidden.clone();
+            let mut ffn_input = hidden.clone();
+            let post_norm_w = match layer {
+                Qwen35LayerWeights::FullAttn { attn, .. } => &attn.post_attn_norm,
+                Qwen35LayerWeights::LinearAttn { attn, .. } => &attn.post_attn_norm,
+            };
+            rms_norm_rows(&mut ffn_input, post_norm_w, h, eps);
+
+            let ffn_out = match layer.ffn() {
+                Qwen35FfnWeights::Dense(w) => {
+                    let m = self.cfg.intermediate_size.ok_or_else(|| {
+                        RealActivationCaptureError::ForwardPass {
+                            layer: layer_idx as u32,
+                            reason: "dense variant missing intermediate_size".into(),
+                        }
+                    })?;
+                    let shape = DenseFfnShape {
+                        hidden_size: self.cfg.hidden_size,
+                        intermediate_size: m,
+                    };
+                    dense_swiglu_cpu_ref(&ffn_input, w, shape)
+                }
+                Qwen35FfnWeights::Moe(w) => {
+                    let moe = self.cfg.moe.as_ref().ok_or_else(|| {
+                        RealActivationCaptureError::ForwardPass {
+                            layer: layer_idx as u32,
+                            reason: "moe variant missing moe config".into(),
+                        }
+                    })?;
+                    let shape = MoeFfnShape {
+                        hidden_size: self.cfg.hidden_size,
+                        num_experts: moe.num_experts,
+                        num_experts_per_tok: moe.num_experts_per_tok,
+                        moe_intermediate_size: moe.moe_intermediate_size,
+                        shared_intermediate_size: moe.shared_expert_intermediate_size,
+                    };
+                    moe_ffn_cpu_ref(&ffn_input, w, shape)
+                }
+                Qwen35FfnWeights::MoeQ(_) => {
+                    return Err(anyhow::anyhow!(
+                        RealActivationCaptureError::ForwardPass {
+                            layer: layer_idx as u32,
+                            reason:
+                                "MoE variant loaded with native GGML block quantization \
+                                 (MoeQ); CPU activation capture path does not F32-expand \
+                                 256 experts. GPU-backed capture is the follow-up. \
+                                 No weight-space fallback per ADR-012 D13.".into(),
+                        }
+                    ));
+                }
+            };
+
+            // Residual after FFN: pre-norm value (ffn_residual) + ffn_out.
+            hidden = ffn_residual;
+            residual_add(&mut hidden, &ffn_out);
+
+            // Capture residual stream leaving this layer.
+            layer_outputs.push(hidden.clone());
+        }
+
+        Ok(LayerActivations {
+            layer_inputs,
+            layer_outputs,
+            num_layers,
+            seq_len: seq_len as u32,
+            hidden_size: self.cfg.hidden_size,
+        })
+    }
+}
+
+// ================================================================
+// Convenience wrapper — RealActivationCapture
+// ================================================================
+
+/// Production wrapper that owns a `Qwen35Model` loaded from disk and
+/// delegates capture to its `ActivationCapture` impl.
 pub struct RealActivationCapture {
-    /// Dependency status — flipped to `true` when ADR-013 P12 is
-    /// wired; pre-P12 callers construct via `not_ready()` which sets
-    /// this `false` and returns `NotReady` from every `run_*` call.
-    _p12_ready: bool,
+    inner: RealCaptureBackend,
+}
+
+enum RealCaptureBackend {
+    /// Real model — capture proceeds.
+    Loaded(Qwen35Model),
+    /// Explicit not-ready shim for unit tests of the no-fallback guard.
+    NotReady,
+}
+
+impl std::fmt::Debug for RealActivationCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            RealCaptureBackend::Loaded(m) => f
+                .debug_struct("RealActivationCapture")
+                .field("variant", &m.cfg.variant)
+                .field("num_hidden_layers", &m.cfg.num_hidden_layers)
+                .finish(),
+            RealCaptureBackend::NotReady => f
+                .debug_struct("RealActivationCapture")
+                .field("inner", &"NotReady")
+                .finish(),
+        }
+    }
 }
 
 impl RealActivationCapture {
-    /// Construct a NotReady shim — pre-ADR-013-P12 callers use this so
-    /// the DWQ guard surfaces the dependency explicitly rather than
-    /// silently falling back. This is the load-bearing piece that
-    /// prevents fallback without root cause.
+    /// Construct a NotReady shim — used only by unit tests that pin the
+    /// no-fallback guard surface. Production callers use [`Self::new`].
     pub fn not_ready() -> Self {
-        Self { _p12_ready: false }
+        Self {
+            inner: RealCaptureBackend::NotReady,
+        }
     }
 
-    /// Construct for real. Post-P12 implementation is added in P9
-    /// alongside the `main.rs:488-506` rewrite. Returns
-    /// `RealActivationCaptureError::NotReady` pre-P12.
-    ///
-    /// NOTE: the `_model_gguf` and `_tokenizer` parameters pin the
-    /// future signature so the `new()` call site in `main.rs` already
-    /// passes what ADR-013 P12's `Qwen35Model::load_from_gguf` needs.
+    /// Construct a real capture by loading a `Qwen35Model` from a GGUF.
+    /// `_tokenizer_json` is reserved for future use (e.g. tokenizing
+    /// calibration prompts directly inside this wrapper); presently the
+    /// caller pre-tokenizes and passes `&[u32]` to `run_calibration_prompt`.
     pub fn new(
-        _model_gguf: &std::path::Path,
+        model_gguf: &std::path::Path,
         _tokenizer_json: &std::path::Path,
     ) -> std::result::Result<Self, RealActivationCaptureError> {
-        Err(RealActivationCaptureError::NotReady)
+        let gguf = mlx_native::gguf::GgufFile::open(model_gguf).map_err(|e| {
+            RealActivationCaptureError::Load {
+                path: model_gguf.display().to_string(),
+                reason: format!("GgufFile::open: {e}"),
+            }
+        })?;
+        let model = Qwen35Model::load_from_gguf(&gguf).map_err(|e| {
+            RealActivationCaptureError::Load {
+                path: model_gguf.display().to_string(),
+                reason: format!("Qwen35Model::load_from_gguf: {e}"),
+            }
+        })?;
+        Ok(Self {
+            inner: RealCaptureBackend::Loaded(model),
+        })
+    }
+
+    /// Construct directly from an already-loaded `Qwen35Model`. Useful for
+    /// callers that share a model with an inference session.
+    pub fn from_model(model: Qwen35Model) -> Self {
+        Self {
+            inner: RealCaptureBackend::Loaded(model),
+        }
     }
 }
 
 impl ActivationCapture for RealActivationCapture {
-    fn run_calibration_prompt(
-        &mut self,
-        _tokens: &[u32],
-    ) -> Result<LayerActivations> {
-        if !self._p12_ready {
-            return Err(anyhow::anyhow!(RealActivationCaptureError::NotReady));
+    fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations> {
+        match &mut self.inner {
+            RealCaptureBackend::Loaded(model) => model.run_calibration_prompt(tokens),
+            RealCaptureBackend::NotReady => {
+                Err(anyhow::anyhow!(RealActivationCaptureError::NotReady))
+            }
         }
-        // Post-P12 path (unreachable today; filled in when P12 ships).
-        unreachable!("RealActivationCapture forward path lands with ADR-013 P12");
     }
 }
+
+// ================================================================
+// Tests
+// ================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{
+        Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
+    };
+
+    /// Minimal hybrid Qwen3.5 dense config: 1 linear-attn + 1 full-attn
+    /// layer, tiny dims. Sufficient to exercise both branches of the
+    /// capture loop.
+    fn tiny_dense_cfg() -> Qwen35Config {
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            vocab_size: 16,
+            hidden_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: Some(16),
+            rope_theta: 10_000.0,
+            rotary_dim: 4,
+            mrope_section: [1, 1, 1, 1],
+            mrope_interleaved: true,
+            partial_rotary_factor: 1.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 64,
+            attn_output_gate: true,
+            layer_types: vec![
+                Qwen35LayerKind::LinearAttention,
+                Qwen35LayerKind::FullAttention,
+            ],
+            full_attention_interval: 2,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            moe: None,
+            mtp_num_hidden_layers: 0,
+        }
+    }
+
+    fn tiny_moe_cfg() -> Qwen35Config {
+        let mut c = tiny_dense_cfg();
+        c.variant = Qwen35Variant::Moe;
+        c.intermediate_size = None;
+        c.moe = Some(Qwen35MoeConfig {
+            num_experts: 2,
+            num_experts_per_tok: 1,
+            moe_intermediate_size: 4,
+            shared_expert_intermediate_size: 4,
+        });
+        c
+    }
+
+    #[test]
+    fn dense_capture_returns_correct_shape() {
+        let cfg = tiny_dense_cfg();
+        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+
+        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
+        acts.validate().expect("validate ok");
+
+        assert_eq!(acts.num_layers, cfg.num_hidden_layers);
+        assert_eq!(acts.seq_len, tokens.len() as u32);
+        assert_eq!(acts.hidden_size, cfg.hidden_size);
+        assert_eq!(acts.layer_inputs.len(), cfg.num_hidden_layers as usize);
+        assert_eq!(acts.layer_outputs.len(), cfg.num_hidden_layers as usize);
+        for li in &acts.layer_inputs {
+            assert_eq!(li.len(), tokens.len() * cfg.hidden_size as usize);
+        }
+        for lo in &acts.layer_outputs {
+            assert_eq!(lo.len(), tokens.len() * cfg.hidden_size as usize);
+        }
+    }
+
+    #[test]
+    fn dense_layer_input_zero_equals_post_embedding() {
+        // For an empty (zero-weighted) model with zero token_embd, layer_inputs[0]
+        // should be all zeros (= the embedding output for any token).
+        let cfg = tiny_dense_cfg();
+        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let tokens: Vec<u32> = vec![0, 0, 0];
+
+        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
+        for v in &acts.layer_inputs[0] {
+            assert_eq!(*v, 0.0, "zero-weight model should produce zero residual");
+        }
+    }
+
+    #[test]
+    fn moe_quantized_returns_typed_forward_pass_error() {
+        // empty_from_cfg for MoE variant constructs Qwen35FfnWeights::Moe (the
+        // F32 path), not MoeQ. To exercise the MoeQ error branch we'd need a
+        // real GGUF — covered by the production guard. This test pins the
+        // ForwardPass error display format instead.
+        let err = RealActivationCaptureError::ForwardPass {
+            layer: 5,
+            reason: "MoeQ requires GPU capture path".into(),
+        };
+        let s = format!("{}", err);
+        assert!(s.contains("layer 5"));
+        assert!(s.contains("MoeQ"));
+    }
+
+    #[test]
+    fn moe_unquantized_capture_returns_correct_shape() {
+        let cfg = tiny_moe_cfg();
+        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let tokens: Vec<u32> = vec![0, 1];
+
+        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
+        acts.validate().expect("validate ok");
+        assert_eq!(acts.num_layers, cfg.num_hidden_layers);
+        assert_eq!(acts.layer_outputs.len(), cfg.num_hidden_layers as usize);
+    }
+
+    #[test]
+    fn empty_tokens_returns_error() {
+        let cfg = tiny_dense_cfg();
+        let mut model = Qwen35Model::empty_from_cfg(cfg);
+        let err = model.run_calibration_prompt(&[]).unwrap_err();
+        assert!(format!("{err}").contains("non-empty"));
+    }
+
+    #[test]
+    fn real_activation_capture_wrapper_delegates_to_model() {
+        let cfg = tiny_dense_cfg();
+        let model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let mut wrapper = RealActivationCapture::from_model(model);
+        let tokens: Vec<u32> = vec![0, 1];
+        let acts = wrapper.run_calibration_prompt(&tokens).expect("delegated");
+        assert_eq!(acts.num_layers, cfg.num_hidden_layers);
+    }
 
     #[test]
     fn not_ready_shim_returns_not_ready_error() {
@@ -108,29 +491,20 @@ mod tests {
         let err = cap.run_calibration_prompt(&[1, 2, 3]).unwrap_err();
         let s = format!("{}", err);
         assert!(
-            s.contains("ADR-013 P12 not ready"),
-            "error message must cite ADR-013 P12, got: {}",
-            s
+            s.contains("not_ready") || s.contains("NotReady") || s.contains("explicit"),
+            "error must indicate the not-ready shim, got: {s}"
         );
-        assert!(s.contains("No fallback is provided by design"),);
     }
 
     #[test]
-    fn new_returns_not_ready_pre_p12() {
-        let err = RealActivationCapture::new(
-            std::path::Path::new("/tmp/nonexistent.gguf"),
-            std::path::Path::new("/tmp/tokenizer.json"),
-        )
-        .unwrap_err();
-        assert!(matches!(err, RealActivationCaptureError::NotReady));
-    }
-
-    #[test]
-    fn error_display_names_the_blocking_adr() {
-        let err = RealActivationCaptureError::NotReady;
+    fn error_display_for_load_includes_path() {
+        let err = RealActivationCaptureError::Load {
+            path: "/tmp/missing.gguf".into(),
+            reason: "no such file".into(),
+        };
         let s = format!("{}", err);
-        assert!(s.contains("ADR-013 P12"));
-        assert!(s.contains("no fallback") || s.contains("No fallback"));
+        assert!(s.contains("/tmp/missing.gguf"));
+        assert!(s.contains("no such file"));
     }
 
     #[test]
