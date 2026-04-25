@@ -198,7 +198,7 @@ fn synthetic_mmproj_loads_via_mlx_native_gguf_reader() {
                 .unwrap_or(false)
         });
 
-    let mmproj = Some(mmproj.unwrap_or_else(|| {
+    let path = mmproj.unwrap_or_else(|| {
         let dir_contents: Vec<String> = fs::read_dir(parent)
             .unwrap()
             .filter_map(|e| e.ok().map(|x| x.file_name().to_string_lossy().to_string()))
@@ -208,9 +208,7 @@ fn synthetic_mmproj_loads_via_mlx_native_gguf_reader() {
              Contents: {:?}. See docs/ADR-012-qwen35moe-conversion.md Decision 18 §3.",
             parent, dir_contents
         );
-    }));
-
-    let path = mmproj.unwrap();
+    });
     let gguf = GgufFile::open(&path).expect("open mmproj GGUF");
 
     // The mmproj loader requires `general.architecture == "clip"`. Any
@@ -266,7 +264,7 @@ fn real_27b_dense_mmproj_loads() {
     }
     let gguf = GgufFile::open(&path).expect("open real mmproj");
     assert_eq!(
-        gguf.metadata_string("general.architecture").as_deref(),
+        gguf.metadata_string("general.architecture"),
         Some("clip")
     );
     let num_blocks = gguf.metadata_u32("clip.vision.block_count").unwrap();
