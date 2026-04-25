@@ -34,6 +34,7 @@
 
 #![allow(dead_code)] // forward pass lands in a later iter
 
+pub mod bert_gpu;
 pub mod config;
 pub mod tokenizer;
 pub mod weights;

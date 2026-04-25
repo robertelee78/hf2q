@@ -1930,6 +1930,28 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 56 — Phase 2b BERT LayerNorm GPU primitive — first encoder forward op shipped to Metal.**
+  - **Why a custom kernel.** `mlx-native` ships `dispatch_rms_norm` but no LayerNorm. RMSNorm = `x / sqrt(mean(x²) + eps) * weight`; LayerNorm = `(x - mean) / sqrt(var + eps) * weight + bias`. Mean-centering and bias addition are required by every BERT variant — substituting RMSNorm produces silently-wrong embeddings. Same lane-safe approach as iter-51c's ViT custom shaders: register inline Metal source via `KernelRegistry::register_source(&'static str)` instead of forking mlx-native.
+  - **What landed.** `src/inference/models/bert/bert_gpu.rs` (~250 LOC + 7 tests):
+    - Inline Metal kernel `bert_layer_norm_f32` — two-pass mean/variance per row, parallel reduction in threadgroup memory, F32 throughout. One threadgroup per sequence position; reduction width is `prev_pow2(min(hidden, 256))` so the kernel's `for stride = ntg/2; stride > 0; stride >>= 1` reduction loop is correct without runtime branching.
+    - `register_bert_custom_shaders(registry)` — idempotent registration helper.
+    - `bert_layer_norm_gpu(encoder, registry, device, input, gamma, beta, eps, batch, hidden) -> Result<MlxBuffer>` — GPU dispatch wrapper. Allocates a fresh F32 `[batch, hidden]` output, threadgroup memory sized at `ntg * 4` bytes, dispatched via `encode_threadgroups_with_args_and_shared`.
+    - `LayerNormGpuParams { hidden: u32, batch: u32, eps: f32 }` POD struct + `pod_as_bytes` byte-view helper (mirrors iter-51c's `pod_as_bytes` pattern; 12 bytes contiguous, no padding).
+    - `prev_pow2(n)` — largest power of two ≤ n, via `1 << (31 - n.leading_zeros())`.
+    - `bert_layer_norm_cpu_ref` (test-only) — CPU oracle for parity comparisons. Two-pass identical to GPU for accumulation-order parity; both should converge to within F32 round-off.
+  - **Tests (7 new, all pass; full suite 942/942 +7):**
+    - `prev_pow2_table` — table-driven values: 1→1, 2→2, 3→2, 255→128, 256→256, 257→256, 384→256, 1024→1024 (all four day-one BERT hidden sizes covered).
+    - `cpu_ref_matches_known_value` — hand-computed 4-element example: input=[1,2,3,4] gives mean=2.5, var=1.25, inv_std=1/sqrt(1.25), CPU ref matches inline expected values within 1e-6.
+    - `gpu_matches_cpu_on_synthetic_small_input` — 4×8 synthetic input, deterministic gamma/beta, GPU vs CPU max diff < 1e-5.
+    - `gpu_constant_input_yields_bias_only_output` — input constant per row → mean=x, var=0; output collapses to `beta[h]`. Validates the var=0 edge case (numerator zero, eps doesn't matter) doesn't NaN. Tolerance 1e-6.
+    - `gpu_matches_cpu_at_bge_small_hidden_384` — 32×384 (bge-small-en-v1.5 shape), deterministic pseudo-random input. Max diff < 1e-4.
+    - `gpu_matches_cpu_at_mxbai_large_hidden_1024` — 8×1024 (mxbai-embed-large-v1 shape), deterministic input. Max diff < 2e-4 (slightly looser to accommodate the 1024-wide reduction's accumulation-order divergence).
+    - `gpu_rejects_zero_dimensions` — `bert_layer_norm_gpu(batch=0, ...)` errors; `(hidden=0, ...)` errors. Drops the session without finishing because no dispatch was issued.
+  - **Why parity vs a CPU ref instead of vs llama.cpp.** Phase 2b's accuracy gate (per ADR-005 line 1206) compares full `/v1/embeddings` output to llama.cpp byte-for-byte once a real BERT GGUF is on disk. The iter-56 deliverable is a primitive — a CPU reference is the right oracle for op-level parity because divergence is then localized to this kernel's accumulation order, not entangled with the encoder's other 30+ ops.
+  - **Verification.** `cargo test --bin hf2q inference::models::bert::bert_gpu` — 7/7 pass (~250 ms). Full suite 942/942, 8 ignored. `cargo check --bin hf2q --tests` clean.
+  - **Lane discipline observed.** All edits in `src/inference/models/bert/**`. No mlx-native fork; no changes to other lanes. No edits to `src/serve/` or `src/inference/vision/`.
+  - **Next (iter 57):** GPU primitives for the rest of the encoder: `bert_qkv_projection_gpu` (3× linear), `bert_attention_gpu` (bidirectional self-attention — no causal mask, no RoPE — softmax(QK^T/sqrt(d)) @ V), `bert_ffn_gpu` (linear + GeLU + linear). Each with its own GPU-vs-CPU parity test on synthetic shapes. The composed `apply_bert_block_forward_gpu` lands once every per-op primitive has parity. Same staging discipline as iter 44–51d.
+
 - **2026-04-26 loop iter 55 — Phase 2b BERT weight loader (`LoadedBertWeights`) — pure-compute, mirrors the `LoadedMmprojWeights` pattern.**
   - **What landed.** `src/inference/models/bert/weights.rs` (~250 LOC + 5 tests) introduces:
     - `BERT_BLOCK_REQUIRED_SUFFIXES` / `BERT_BLOCK_OPTIONAL_SUFFIXES` — the per-layer tensor manifest. Required = every linear weight + LayerNorm pair in the encoder block (10 suffixes); optional = the bias variants that some BERTs drop (`attn_q.bias` etc.).
