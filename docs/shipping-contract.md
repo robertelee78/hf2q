@@ -122,15 +122,22 @@ model classes as of ADR-012. Inference coherence is delegated to ADR-013.
 | Tensor naming | Every tensor name matches the ADR-012 Decision 8 naming spec |
 | llama.cpp load | `llama-cli --model out.gguf -p "Hello" -n 8` exits 0 |
 | Sidecar set | `tokenizer.json`, `tokenizer_config.json`, `config.json`, `generation_config.json`, `special_tokens_map.json` (and `chat_template.jinja` when present) are byte-identical copies alongside the GGUF |
+| MTP tensors (when `mtp_num_hidden_layers > 0`) | Round-trip integrity gate at `tests/convert_qwen35_mtp_roundtrip.rs` (Decision 19); 4 tensors land at `blk.{num_hidden_layers}.nextn.{enorm,hnorm,embed_tokens,eh_proj}.weight` |
+| mmproj (when `--emit-vision-tower` and `vision_config` present) | Pure-Rust emitter at `src/models/vit/`; produces `mmproj-<slug>-F16.gguf` per Decision 18 with three layers of structural / round-trip / spec-driven test coverage |
+| Smoke harness | `hf2q smoke --arch <qwen35\|qwen35moe> --quant q4_0` exits 0 with byte-identical transcripts across two fresh runs (Decision 16) |
 
 ### Out-of-scope for ADR-012
 
 - Inference coherence (sourdough gate, sliding-window parity) — ADR-013.
 - DWQ activation-based quantization for qwen35/qwen35moe — requires
-  `ActivationCapture` from ADR-013 inference session; ADR-012 P6 wires the
-  guard that returns a clear error if activation capture is not available.
-- Vision tower for Qwen3.5-27B multimodal — follow-up ADR.
-- MTP head inference — ADR-013.
+  `ActivationCapture` from ADR-013 P12 inference session; ADR-012 Decision 13
+  wires the structured `NoActivationCapture` guard so the convert path
+  fails-fast rather than silently falling back to weight-space.
+- MTP head **inference** (speculative decoding) — ADR-013 P14. ADR-012 P11
+  ships the conversion-side tensor round-trip integrity gate; runtime
+  draft/accept loops are owned by ADR-013.
+- ViT compute path for the converted mmproj — ADR-005 phase 2c. ADR-012 P10
+  ships the GGUF emitter; forward-pass execution is ADR-005's deliverable.
 
 ### CI integration tests
 
