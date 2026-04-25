@@ -35,7 +35,7 @@
 use anyhow::{anyhow, Context, Result};
 use mlx_native::metal::MTLSize;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
-use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -635,6 +635,279 @@ pub fn bert_attention_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Residual add — GPU dispatch (used internally by the block forward)
+// ---------------------------------------------------------------------------
+
+/// GPU residual add: `out[i] = a[i] + b[i]` over `n_elements` F32 values.
+/// Allocates a fresh F32 output. Used internally by the encoder-block
+/// composer; exposed as `pub` so callers can also chain residuals
+/// outside the block path (e.g., the embedding sum in iter 60).
+///
+/// # Errors
+/// - `n_elements == 0`
+pub fn bert_residual_add_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    n_elements: u32,
+) -> Result<MlxBuffer> {
+    if n_elements == 0 {
+        return Err(anyhow!("bert_residual_add_gpu: n_elements must be > 0"));
+    }
+    let out = device
+        .alloc_buffer(
+            (n_elements as usize) * 4,
+            DType::F32,
+            vec![n_elements as usize],
+        )
+        .map_err(|e| anyhow!("alloc residual add output: {e}"))?;
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        a,
+        b,
+        &out,
+        n_elements as usize,
+        DType::F32,
+    )
+    .context("bert_residual_add_gpu: elementwise_add")?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Encoder block — full forward pass composer
+// ---------------------------------------------------------------------------
+
+/// Per-layer tensor refs that drive `apply_bert_encoder_block_gpu`. Keeps
+/// the call site declarative (caller pulls each tensor from
+/// `LoadedBertWeights::block_required` / `block_optional`) and keeps the
+/// composer function signature stable as more variants surface.
+///
+/// All weights are F32 on-device. Biases are optional — variants that
+/// drop biases pass `None` and the corresponding `bert_linear_gpu` call
+/// skips the bias-add dispatch.
+pub struct BertEncoderBlockTensors<'a> {
+    /// Q/K/V projection: `[hidden, hidden]` weight, `[hidden]` optional bias.
+    pub q_w: &'a MlxBuffer,
+    pub q_b: Option<&'a MlxBuffer>,
+    pub k_w: &'a MlxBuffer,
+    pub k_b: Option<&'a MlxBuffer>,
+    pub v_w: &'a MlxBuffer,
+    pub v_b: Option<&'a MlxBuffer>,
+    /// Attention output projection: `[hidden, hidden]` + optional `[hidden]` bias.
+    pub o_w: &'a MlxBuffer,
+    pub o_b: Option<&'a MlxBuffer>,
+    /// Post-attention LayerNorm γ, β. Both `[hidden]`.
+    pub attn_norm_gamma: &'a MlxBuffer,
+    pub attn_norm_beta: &'a MlxBuffer,
+    /// FFN up: `[intermediate, hidden]` + optional `[intermediate]` bias.
+    pub up_w: &'a MlxBuffer,
+    pub up_b: Option<&'a MlxBuffer>,
+    /// FFN down: `[hidden, intermediate]` + optional `[hidden]` bias.
+    pub down_w: &'a MlxBuffer,
+    pub down_b: Option<&'a MlxBuffer>,
+    /// Post-FFN LayerNorm γ, β. Both `[hidden]`.
+    pub ffn_norm_gamma: &'a MlxBuffer,
+    pub ffn_norm_beta: &'a MlxBuffer,
+}
+
+/// One BERT encoder block forward pass on GPU.
+///
+/// **Post-norm topology** (the BERT-original layout, **not** the modern
+/// pre-norm layout that ViT/Llama use):
+///
+/// ```text
+///   attn_in  = x
+///   q, k, v  = LinearWb(attn_in)           // 3 separate projections
+///   y        = bidirectional_attn(q, k, v) // softmax(QK^T / √d) @ V
+///   y        = LinearWb(y)                  // output projection
+///   x'       = LayerNorm(x + y)             // residual + post-attn LN
+///   h        = LinearWb(x')                 // FFN up
+///   h        = GeLU(h)
+///   h        = LinearWb(h)                  // FFN down
+///   x''      = LayerNorm(x' + h)            // residual + post-FFN LN
+///   return x''
+/// ```
+///
+/// Inputs (F32 on device):
+/// - `input`   `[seq_len, hidden]` row-major.
+/// - `tensors` per-layer weight bundle.
+///
+/// Returns F32 `[seq_len, hidden]` row-major.
+///
+/// `seq_len ≥ 32` floor inherited from `bert_attention_gpu` (post-softmax
+/// matmul has K = seq_len).
+///
+/// `head_dim = hidden / num_heads` — the caller passes both so the
+/// composer doesn't recompute and the function is reusable with
+/// uneven splits if a future variant requires them.
+///
+/// Caller registers `register_bert_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+/// Propagated from any sub-primitive; primarily shape mismatches.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_bert_encoder_block_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    tensors: &BertEncoderBlockTensors<'_>,
+    seq_len: u32,
+    hidden: u32,
+    num_heads: u32,
+    intermediate: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if hidden == 0 || num_heads == 0 || hidden % num_heads != 0 {
+        return Err(anyhow!(
+            "apply_bert_encoder_block_gpu: hidden ({}) must be > 0 and divisible by num_heads ({})",
+            hidden,
+            num_heads
+        ));
+    }
+    let head_dim = hidden / num_heads;
+    let n_hidden = (seq_len as usize) * (hidden as usize);
+    let n_inter = (seq_len as usize) * (intermediate as usize);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    // --- Q/K/V projections ---
+    let q = bert_linear_gpu(
+        encoder, registry, device, input, tensors.q_w, tensors.q_b, seq_len, hidden, hidden,
+    )
+    .context("encoder block: Q projection")?;
+    encoder.memory_barrier();
+    let k = bert_linear_gpu(
+        encoder, registry, device, input, tensors.k_w, tensors.k_b, seq_len, hidden, hidden,
+    )
+    .context("encoder block: K projection")?;
+    encoder.memory_barrier();
+    let v = bert_linear_gpu(
+        encoder, registry, device, input, tensors.v_w, tensors.v_b, seq_len, hidden, hidden,
+    )
+    .context("encoder block: V projection")?;
+    encoder.memory_barrier();
+
+    // --- Bidirectional attention ---
+    // Q/K/V buffers are `[seq_len, hidden]` F32; the attention dispatch
+    // reads them as `[seq_len, num_heads, head_dim]` row-major (same
+    // bytes; hidden = num_heads × head_dim by construction above). No
+    // copy needed.
+    let attn_out = bert_attention_gpu(
+        encoder, registry, device, &q, &k, &v, seq_len, num_heads, head_dim, scale,
+    )
+    .context("encoder block: bidirectional attention")?;
+    encoder.memory_barrier();
+
+    // --- Output projection (W_o + b_o) ---
+    let o_proj = bert_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &attn_out,
+        tensors.o_w,
+        tensors.o_b,
+        seq_len,
+        hidden,
+        hidden,
+    )
+    .context("encoder block: attention output projection")?;
+    encoder.memory_barrier();
+
+    // --- Residual add: x + o_proj ---
+    let attn_residual = bert_residual_add_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        &o_proj,
+        n_hidden as u32,
+    )
+    .context("encoder block: attn residual add")?;
+    encoder.memory_barrier();
+
+    // --- Post-attention LayerNorm ---
+    let post_attn = bert_layer_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &attn_residual,
+        tensors.attn_norm_gamma,
+        tensors.attn_norm_beta,
+        eps,
+        seq_len,
+        hidden,
+    )
+    .context("encoder block: post-attn LayerNorm")?;
+    encoder.memory_barrier();
+
+    // --- FFN up: [seq, hidden] → [seq, intermediate] ---
+    let ffn_up = bert_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &post_attn,
+        tensors.up_w,
+        tensors.up_b,
+        seq_len,
+        hidden,
+        intermediate,
+    )
+    .context("encoder block: FFN up projection")?;
+    encoder.memory_barrier();
+
+    // --- GeLU activation ---
+    let ffn_act = bert_gelu_gpu(encoder, registry, device, &ffn_up)
+        .context("encoder block: GeLU")?;
+    encoder.memory_barrier();
+
+    // --- FFN down: [seq, intermediate] → [seq, hidden] ---
+    let ffn_down = bert_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &ffn_act,
+        tensors.down_w,
+        tensors.down_b,
+        seq_len,
+        intermediate,
+        hidden,
+    )
+    .context("encoder block: FFN down projection")?;
+    let _ = n_inter; // documents the intermediate-hidden product; not used after this point.
+    encoder.memory_barrier();
+
+    // --- Residual: post_attn + ffn_down ---
+    let ffn_residual = bert_residual_add_gpu(
+        encoder,
+        registry,
+        device,
+        &post_attn,
+        &ffn_down,
+        n_hidden as u32,
+    )
+    .context("encoder block: FFN residual add")?;
+    encoder.memory_barrier();
+
+    // --- Post-FFN LayerNorm — block output ---
+    bert_layer_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &ffn_residual,
+        tensors.ffn_norm_gamma,
+        tensors.ffn_norm_beta,
+        eps,
+        seq_len,
+        hidden,
+    )
+    .context("encoder block: post-FFN LayerNorm")
+}
+
+// ---------------------------------------------------------------------------
 // CPU reference (parity oracle for tests)
 // ---------------------------------------------------------------------------
 
@@ -761,6 +1034,66 @@ fn bert_attention_cpu_ref(
         }
     }
     out
+}
+
+/// CPU reference for the BERT encoder block. Same math as
+/// `apply_bert_encoder_block_gpu`, intended as a parity oracle for the
+/// composer-level test. Composes the existing CPU references rather
+/// than re-deriving the math.
+///
+/// Tensors are passed by value as `Vec<f32>` slices for test ergonomics.
+/// This is test-only and slow (no SIMD), so it stays behind cfg(test).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn apply_bert_encoder_block_cpu_ref(
+    input: &[f32],
+    q_w: &[f32],
+    q_b: Option<&[f32]>,
+    k_w: &[f32],
+    k_b: Option<&[f32]>,
+    v_w: &[f32],
+    v_b: Option<&[f32]>,
+    o_w: &[f32],
+    o_b: Option<&[f32]>,
+    attn_gamma: &[f32],
+    attn_beta: &[f32],
+    up_w: &[f32],
+    up_b: Option<&[f32]>,
+    down_w: &[f32],
+    down_b: Option<&[f32]>,
+    ffn_gamma: &[f32],
+    ffn_beta: &[f32],
+    seq_len: usize,
+    hidden: usize,
+    num_heads: usize,
+    intermediate: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let head_dim = hidden / num_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    let q = bert_linear_cpu_ref(input, q_w, q_b, seq_len, hidden, hidden);
+    let k = bert_linear_cpu_ref(input, k_w, k_b, seq_len, hidden, hidden);
+    let v = bert_linear_cpu_ref(input, v_w, v_b, seq_len, hidden, hidden);
+    let attn = bert_attention_cpu_ref(&q, &k, &v, seq_len, num_heads, head_dim, scale);
+    let o = bert_linear_cpu_ref(&attn, o_w, o_b, seq_len, hidden, hidden);
+
+    let n_hidden = seq_len * hidden;
+    let mut residual = vec![0.0f32; n_hidden];
+    for i in 0..n_hidden {
+        residual[i] = input[i] + o[i];
+    }
+    let post_attn = bert_layer_norm_cpu_ref(&residual, attn_gamma, attn_beta, eps, seq_len, hidden);
+
+    let ffn_up = bert_linear_cpu_ref(&post_attn, up_w, up_b, seq_len, hidden, intermediate);
+    let ffn_act = bert_gelu_cpu_ref(&ffn_up);
+    let ffn_down = bert_linear_cpu_ref(&ffn_act, down_w, down_b, seq_len, intermediate, hidden);
+
+    let mut residual2 = vec![0.0f32; n_hidden];
+    for i in 0..n_hidden {
+        residual2[i] = post_attn[i] + ffn_down[i];
+    }
+    bert_layer_norm_cpu_ref(&residual2, ffn_gamma, ffn_beta, eps, seq_len, hidden)
 }
 
 #[cfg(test)]
@@ -1513,6 +1846,221 @@ mod tests {
             1.0,
         );
         assert!(err.is_err(), "head_dim=16 must error");
+        drop(session);
+    }
+
+    // -----------------------------------------------------------------
+    // apply_bert_encoder_block_gpu — full block parity vs CPU
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn encoder_block_gpu_matches_cpu_ref_at_minimal_shape() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // Minimal shape that satisfies all constraints:
+        //   seq_len  >= 32 (post-softmax matmul K floor)
+        //   head_dim >= 32 (matmul kernel constraint)
+        //   in_features >= 32 (linear projection constraint)
+        // hidden = 64, num_heads = 2 → head_dim = 32.
+        // intermediate = 128.
+        let seq = 32usize;
+        let hidden = 64usize;
+        let num_heads = 2usize;
+        let intermediate = 128usize;
+        let eps = 1e-12f32;
+
+        // Deterministic pseudo-random tensors. Magnitudes kept small so
+        // softmax stays unsaturated and the CPU/GPU agree within the
+        // BF16-cast envelope of the underlying linear and attention paths.
+        let prand = |seed: usize, n: usize, scale: f32, offset: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2654435761usize).wrapping_add(seed) % 1000) as f32) * scale
+                        + offset
+                })
+                .collect()
+        };
+        let input = prand(1, seq * hidden, 0.001, -0.5);
+        let q_w = prand(2, hidden * hidden, 0.0005, -0.15);
+        let q_b = prand(3, hidden, 0.001, -0.05);
+        let k_w = prand(4, hidden * hidden, 0.0005, -0.15);
+        let k_b = prand(5, hidden, 0.001, -0.05);
+        let v_w = prand(6, hidden * hidden, 0.0005, -0.15);
+        let v_b = prand(7, hidden, 0.001, -0.05);
+        let o_w = prand(8, hidden * hidden, 0.0005, -0.15);
+        let o_b = prand(9, hidden, 0.001, -0.05);
+        let attn_gamma = prand(10, hidden, 0.0001, 1.0); // close to 1.0
+        let attn_beta = prand(11, hidden, 0.001, -0.5);
+        let up_w = prand(12, intermediate * hidden, 0.0005, -0.15);
+        let up_b = prand(13, intermediate, 0.001, -0.5);
+        let down_w = prand(14, hidden * intermediate, 0.0005, -0.15);
+        let down_b = prand(15, hidden, 0.001, -0.5);
+        let ffn_gamma = prand(16, hidden, 0.0001, 1.0);
+        let ffn_beta = prand(17, hidden, 0.001, -0.5);
+
+        let cpu_out = apply_bert_encoder_block_cpu_ref(
+            &input,
+            &q_w,
+            Some(&q_b),
+            &k_w,
+            Some(&k_b),
+            &v_w,
+            Some(&v_b),
+            &o_w,
+            Some(&o_b),
+            &attn_gamma,
+            &attn_beta,
+            &up_w,
+            Some(&up_b),
+            &down_w,
+            Some(&down_b),
+            &ffn_gamma,
+            &ffn_beta,
+            seq,
+            hidden,
+            num_heads,
+            intermediate,
+            eps,
+        );
+
+        // GPU side: upload tensors, run apply_bert_encoder_block_gpu.
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq, hidden]);
+        let q_w_b = upload_f32(device, &q_w, vec![hidden, hidden]);
+        let q_b_b = upload_f32(device, &q_b, vec![hidden]);
+        let k_w_b = upload_f32(device, &k_w, vec![hidden, hidden]);
+        let k_b_b = upload_f32(device, &k_b, vec![hidden]);
+        let v_w_b = upload_f32(device, &v_w, vec![hidden, hidden]);
+        let v_b_b = upload_f32(device, &v_b, vec![hidden]);
+        let o_w_b = upload_f32(device, &o_w, vec![hidden, hidden]);
+        let o_b_b = upload_f32(device, &o_b, vec![hidden]);
+        let attn_gamma_b = upload_f32(device, &attn_gamma, vec![hidden]);
+        let attn_beta_b = upload_f32(device, &attn_beta, vec![hidden]);
+        let up_w_b = upload_f32(device, &up_w, vec![intermediate, hidden]);
+        let up_b_b = upload_f32(device, &up_b, vec![intermediate]);
+        let down_w_b = upload_f32(device, &down_w, vec![hidden, intermediate]);
+        let down_b_b = upload_f32(device, &down_b, vec![hidden]);
+        let ffn_gamma_b = upload_f32(device, &ffn_gamma, vec![hidden]);
+        let ffn_beta_b = upload_f32(device, &ffn_beta, vec![hidden]);
+
+        let tensors = BertEncoderBlockTensors {
+            q_w: &q_w_b,
+            q_b: Some(&q_b_b),
+            k_w: &k_w_b,
+            k_b: Some(&k_b_b),
+            v_w: &v_w_b,
+            v_b: Some(&v_b_b),
+            o_w: &o_w_b,
+            o_b: Some(&o_b_b),
+            attn_norm_gamma: &attn_gamma_b,
+            attn_norm_beta: &attn_beta_b,
+            up_w: &up_w_b,
+            up_b: Some(&up_b_b),
+            down_w: &down_w_b,
+            down_b: Some(&down_b_b),
+            ffn_norm_gamma: &ffn_gamma_b,
+            ffn_norm_beta: &ffn_beta_b,
+        };
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out_buf = apply_bert_encoder_block_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            &tensors,
+            seq as u32,
+            hidden as u32,
+            num_heads as u32,
+            intermediate as u32,
+            eps,
+        )
+        .expect("encoder block dispatch");
+        session.finish().expect("finish");
+        let gpu_out = readback_f32(&out_buf, seq * hidden);
+
+        let mut max_diff = 0.0f32;
+        let mut argmax = 0usize;
+        for (i, (g, c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+                argmax = i;
+            }
+        }
+        // Total noise envelope for the whole block: every linear and
+        // attention cast contributes BF16 round-off, then post-LN
+        // re-normalizes which bounds the absolute output range. Each
+        // element of the post-LN output is bounded by `|γ| + |β|` so the
+        // raw envelope stays small. With our γ ≈ 1, β ≈ ±0.5 inputs:
+        // expect |out| < ~3, max_diff observable around the 0.05–0.20
+        // range. Tolerance set permissively but tight enough to catch
+        // a real correctness regression.
+        assert!(
+            max_diff < 0.50,
+            "encoder-block max_diff {} > 0.50 at i={} (gpu={}, cpu={})",
+            max_diff,
+            argmax,
+            gpu_out[argmax],
+            cpu_out[argmax]
+        );
+    }
+
+    #[test]
+    fn encoder_block_rejects_hidden_not_divisible_by_num_heads() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // hidden=65, num_heads=2 → 65 % 2 == 1 → must reject.
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let buf = upload_f32(device, &[0.0; 32 * 65], vec![32, 65]);
+        let small = upload_f32(device, &[0.0; 65], vec![65]);
+        let small_w = upload_f32(device, &[0.0; 65 * 65], vec![65, 65]);
+        let tensors = BertEncoderBlockTensors {
+            q_w: &small_w,
+            q_b: None,
+            k_w: &small_w,
+            k_b: None,
+            v_w: &small_w,
+            v_b: None,
+            o_w: &small_w,
+            o_b: None,
+            attn_norm_gamma: &small,
+            attn_norm_beta: &small,
+            up_w: &small_w,
+            up_b: None,
+            down_w: &small_w,
+            down_b: None,
+            ffn_norm_gamma: &small,
+            ffn_norm_beta: &small,
+        };
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = apply_bert_encoder_block_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &buf,
+            &tensors,
+            32,
+            65, // hidden
+            2,  // num_heads → 65 % 2 != 0
+            128,
+            1e-12,
+        );
+        assert!(err.is_err(), "hidden % num_heads != 0 must error");
         drop(session);
     }
 }

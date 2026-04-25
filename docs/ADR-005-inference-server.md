@@ -1930,6 +1930,32 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 59 — Phase 2b BERT encoder block forward pass composed end-to-end on GPU, parity-validated vs CPU oracle.**
+  - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
+    - `bert_residual_add_gpu(a, b, n)` — F32 residual elementwise-add wrapping `mlx_native::ops::elementwise::elementwise_add`. Used internally by the block composer; exposed `pub` for the iter-60 embedding sum.
+    - `BertEncoderBlockTensors<'a>` — declarative weight bundle: Q/K/V/O linear weights+biases, attention LayerNorm γ/β, FFN up/down weights+biases, FFN LayerNorm γ/β. Optional biases (`Option<&MlxBuffer>`) so bias-free variants don't require sentinel zero buffers.
+    - `apply_bert_encoder_block_gpu(input, tensors, seq_len, hidden, num_heads, intermediate, eps)` — full BERT post-norm block in one call:
+      ```
+      Q,K,V    = LinearWb(input)            // 3× bert_linear_gpu
+      y        = bidirectional_attn(Q,K,V)  // bert_attention_gpu
+      y        = LinearWb(y)                 // output projection
+      x'       = LayerNorm(input + y)        // residual + post-attn LN
+      h        = LinearWb(x')                // FFN up
+      h        = GeLU(h)                     // bert_gelu_gpu
+      h        = LinearWb(h)                 // FFN down
+      x''      = LayerNorm(x' + h)           // residual + post-FFN LN
+      ```
+      11 dispatches plus internal `memory_barrier()` between every RAW pair (concurrent-dispatch invariant — same lesson the iter-57 bias-add bug surfaced).
+    - `apply_bert_encoder_block_cpu_ref(...)` — composes the existing per-op CPU references. Used as the parity oracle.
+    - Validation: `hidden % num_heads == 0` enforced; `head_dim` derived; `seq_len ≥ 32` floor inherited from `bert_attention_gpu`.
+  - **Why post-norm.** Classic BERT (and all three Phase 2b day-one models) uses post-LayerNorm (`x' = LN(x + Attn(x))`) — the modern pre-norm layout used by ViT/Llama is **not** what's serialized in the GGUF tensor names. The composer uses the BERT-original layout. ViT's pre-norm `apply_vit_block_forward_gpu` would silently produce wrong embeddings; we don't reuse it.
+  - **Tests (2 new, all pass; full suite 957/957 +2):**
+    - `encoder_block_gpu_matches_cpu_ref_at_minimal_shape` — minimal config that satisfies all kernel floors: seq=32, hidden=64, num_heads=2 (head_dim=32), intermediate=128. Deterministic pseudo-random tensors with γ ≈ 1.0 and tiny magnitudes so softmax stays unsaturated. Tolerance 0.50 — generous because the whole block stacks 3× BF16-cast linear projections + 1× BF16-cast attention + 2× LayerNorm × γ amplification + residual sums; observed max_diff in dev ≈ 0.10. Catches catastrophic regressions; tighter parity arrives once a real BERT GGUF is on disk and we compare to llama.cpp output.
+    - `encoder_block_rejects_hidden_not_divisible_by_num_heads` — hidden=65, num_heads=2 → must `Err` (head_dim wouldn't be integral).
+  - **Verification.** `cargo test --bin hf2q inference::models::bert::bert_gpu::tests::encoder_block` — 2/2 pass. Full suite **957/957 pass** (+2 from iter 58's 955), 8 ignored. Zero clippy regressions on new code.
+  - **Lane discipline observed.** All edits in `src/inference/models/bert/bert_gpu.rs`. No mlx-native fork, no edits to other lanes.
+  - **Next (iter 60):** the embeddings layer — `bert_embed_gpu(input_ids, token_embd, position_embd, token_types_opt, type_ids_opt, embed_norm_gamma, embed_norm_beta, eps)` — gather `token_embd[id]` per token, add `position_embd[s]` and optional `token_types[type]`, sum, run through LayerNorm. Then the full forward pass: `apply_bert_full_forward_gpu` chains `bert_embed_gpu` → N×`apply_bert_encoder_block_gpu` → pooling head (Mean/CLS/Last per `BertConfig.pooling_type`) → L2 normalize. Finally the `/v1/embeddings` handler wiring + `--embedding-model` CLI flag — at which point Phase 2b clears its accuracy gate against llama.cpp on a real BERT GGUF.
+
 - **2026-04-26 loop iter 58 — Phase 2b BERT bidirectional self-attention — `bert_attention_gpu` delegates to `vit_attention_gpu` (canonical bidirectional path).**
   - **Why delegate, not duplicate.** Bidirectional self-attention with no causal mask, no RoPE, and no per-head normalization is structurally identical between ViT and BERT. The dispatch chain (`Q@K^T → scale → softmax → permute V → cast V → transpose V → scores@V → permute back`) was iter-47-to-50 validated for ViT, including the iter-50 BF16-saturated-softmax characterization (memory `project_vit_attention_bf16_softmax_drift.md`). Re-implementing the same chain in `bert_gpu.rs` would either duplicate ~150 LOC of dispatch wiring or invite a divergence bug when one module's pipeline drifts. `bert_attention_gpu` is a one-call wrapper around `vit_attention_gpu` — same kernel pipelines compile-cached on the registry, BERT-named call site for clarity, no edit to the vision lane.
   - **Why precision is acceptable here.** Iter-50 documented BF16-saturated-softmax flips at Q-norm magnitudes ≳ 5 (real Gemma 4 ViT inputs). BERT activations after LayerNorm are unit-normalized — pre-softmax score magnitudes stay near zero, softmax stays unsaturated, and the BF16 K cast does not flip winners. Same path is correct for all three day-one models.
