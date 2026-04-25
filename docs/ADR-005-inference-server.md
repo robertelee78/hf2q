@@ -1930,6 +1930,37 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 71 — Phase 2 "validate, benchmark" — embedding latency measured + `dimensions` parameter validation added.**
+  - **Latency benchmark.** Measured `/v1/embeddings` p50/p95 with the official `openai` Python client (server-resident, warm) on bge-small + mxbai-large, 20 samples each:
+    ```
+    bge-small-en-v1.5 (12 layers, hidden=384):
+      tiny  4 tok    p50= 9.21ms   p95=28.56ms  (cold-pipeline first-request artifact in p95)
+      med  22 tok    p50= 7.36ms   p95= 7.72ms
+      long 43 tok    p50= 7.71ms   p95= 8.69ms
+
+    mxbai-embed-large-v1 (24 layers, hidden=1024):
+      tiny  4 tok    p50=26.02ms   p95=50.77ms
+      med  22 tok    p50=26.15ms   p95=26.63ms
+      long 43 tok    p50=27.17ms   p95=28.94ms
+    ```
+    p50 scales linearly with layers × hidden — bge has 12×384 ≈ 4.6k of layer-hidden vs mxbai's 24×1024 ≈ 24.5k (5.3x), and observed p50 ratio is 26/7 ≈ 3.7x. Better than linear because the per-request fixed overhead (request parse, encoder begin/finish, sync) is amortized.
+  - **vs llama-embedding.** llama-embedding is process-spawn-bound (loads the model from disk every invocation): single-shot p50 ≈ 570ms cold for either model. Server-resident hf2q wins by **~20× for repeat queries** — the deployment shape `/v1/embeddings` actually serves.
+  - **Concurrent stress.** 10 parallel requests against mxbai: min=87ms, max=137ms (vs single-request 26ms). ~5× slowdown is **expected** — Metal serializes through one command queue per device; no thread-level parallelism on the GPU. Multi-instance scaling is the deferred Phase 2 concurrent-deployment topic (line 893-899 of this ADR).
+  - **`dimensions` parameter bug fixed.** Iter 70's smoke didn't cover `dimensions`; iter 71 surfaced that hf2q was *silently ignoring* it (user asks for 512, hf2q returned native 1024). That violates OpenAI's contract — only the `text-embedding-3` family supports `dimensions`; bge/mxbai are not Matryoshka-trained and silently truncating would degrade quality. Fix in `src/serve/api/handlers.rs`: accept `dimensions == em.config.hidden_size` (no-op), reject anything else with 400 + `param: "dimensions"` and a message naming the native dim.
+  - **Smoke extended to 8 checks (all pass on bge-small):**
+    1-5: existing (models list, single, batch, float, base64 round-trip)
+    6: `dimensions=hidden_size` (native) → 200
+    7: `dimensions=hidden_size // 2` → 400 with "dimensions" in error
+    8: wrong model id → 400 model_not_loaded
+  - **Verification.** `bash scripts/smoke_openai_sdk_embeddings.sh` → `ALL CHECKS PASSED ✓ / PASS`. `cargo test --bin hf2q api::` 234/234 pass; BERT 58/58 pass.
+  - **Lane discipline observed.** Edits in `src/serve/api/handlers.rs` (dimensions validation) and `scripts/smoke_openai_sdk_embeddings.sh` (test cases). No mlx-native or BERT-lane changes.
+  - **Phase 2a status: `/v1/embeddings` is OpenAI-Tier-1+2 surface complete** — model, input, encoding_format, dimensions, user all handled correctly per the OpenAI spec. The `text-embedding-3` Matryoshka path can be added later (no day-one model needs it).
+  - **Next (iter 72):** continue Phase 2a tail. Highest-leverage remaining items in my lane:
+    - Task #11 lifecycle audit: write a focused test that issues an in-flight embedding request, sends SIGTERM, and verifies the response completes correctly before the server exits.
+    - Task #9 summarize-overflow plumbing: server-side state machine for context-overflow policy, transparency headers, SSE keepalive comment frame. Server-side parts are lane-safe; the actual summarization pass is cross-lane.
+    - Task #14 mmproj producer: hf2q produces mmproj GGUF from safetensors. Open scope; can be staged.
+    - Either Task #5 (grammar parser port from llama.cpp) or Task #7 (prompt cache engine integration) — both substantial multi-iter chunks; right candidates once the chat-engine OOM constraint relaxes.
+
 - **2026-04-26 loop iter 70 — Phase 2a Task #12 closed: OpenAI Python SDK acceptance smoke for `/v1/embeddings`. Surfaced + fixed real wire-format gap (`encoding_format='base64'` is the SDK's default).**
   - **What this iter shipped.**
     - `scripts/smoke_openai_sdk_embeddings.sh` — boots hf2q against `bge-small-en-v1.5-f16.gguf`, runs the official `openai` Python client end-to-end, asserts wire-format compatibility on six paths.

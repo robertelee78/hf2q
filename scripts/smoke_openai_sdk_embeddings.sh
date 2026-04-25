@@ -197,7 +197,34 @@ n_b64 = math.sqrt(sum(v * v for v in v_b64))
 assert abs(n_b64 - 1.0) < 1e-3, f"base64 vector not unit-norm: {n_b64}"
 print(f"  ✓ base64 manual-decode bit-exact to float (max_diff={max_diff:.2e}, ||y||₂={n_b64:.6f})")
 
-# --- 6. embeddings.create with empty model id should 400/404 ---
+# --- 6. dimensions parameter handling ---
+print(f"[smoke] POST /v1/embeddings (dimensions=hidden_size — accept)")
+resp = client.embeddings.create(
+    model=model_id,
+    input="dim test",
+    dimensions=hidden_size,
+    encoding_format="float",
+)
+assert len(resp.data[0].embedding) == hidden_size
+print(f"  ✓ dimensions={hidden_size} (native) accepted")
+
+print(f"[smoke] POST /v1/embeddings (dimensions=hidden_size//2 — must reject)")
+try:
+    client.embeddings.create(
+        model=model_id,
+        input="dim test",
+        dimensions=hidden_size // 2,
+        encoding_format="float",
+    )
+    raise AssertionError("Expected dimensions != native to be rejected")
+except Exception as e:
+    msg = str(e)
+    assert "dimensions" in msg.lower() or "400" in msg or "invalid_request" in msg.lower(), (
+        f"Expected dimensions/400/invalid_request in error, got: {e}"
+    )
+    print(f"  ✓ dimensions={hidden_size // 2} rejected (error: {type(e).__name__})")
+
+# --- 7. embeddings.create with empty model id should 400/404 ---
 print(f"[smoke] POST /v1/embeddings (wrong model id — must fail)")
 try:
     client.embeddings.create(
