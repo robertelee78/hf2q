@@ -1767,6 +1767,22 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Mantra check:** real Metal dispatch composing 3 distinct kernels (permute, cast, matmul) running on real input through real layout transforms. The bug discovered (and fixed) is a class of bug — concurrent-dispatch barrier omission — that's already documented in the qwen35 lane; this codifies it for the vit_gpu lane.
   - **Next (iter 47):** `vit_attention_gpu` — composes iter 46's `vit_attention_scores_gpu` + `vit_softmax_last_dim_gpu` + a `scores @ V` matmul. The V matmul needs V in `[num_heads, head_dim, batch_k]` layout (transposed last 2 of permuted V), so iter 47 also adds the V-transpose path. Result returns to seq-major via final `permute_021_f32`.
 
+- **2026-04-24 loop iter 47 — Full `vit_attention_gpu` matches CPU `scaled_dot_product_attention` end-to-end.**
+  - **`vit_attention_gpu(encoder, registry, device, q, k, v, batch, num_heads, head_dim, scale) -> MlxBuffer`:** complete bidirectional self-attention pipeline composing 5 stages on GPU:
+    1. `vit_attention_scores_gpu` (iter 46) → scores `[num_heads, batch, batch]` F32.
+    2. `vit_softmax_last_dim_gpu` (iter 45) → softmax along last dim over `[num_heads * batch, batch]` rows.
+    3. V layout transforms: `permute_021_f32` (seq→head major) → `cast` F32→BF16 → `transpose_last2_bf16` → V_T `[num_heads, head_dim, batch]` BF16.
+    4. `dense_matmul_bf16_f32_tensor` per head: src0=V_T BF16, src1=softmaxed F32 → `[num_heads, batch_q, head_dim]` F32. `output[h, m, n] = Σ_k V_T[h, n, k] * scores[h, m, k] = Σ_k V[h, k, n] * scores[h, m, k] = attn[h, m, n]`.
+    5. `permute_021_f32` back to seq-major `[batch, num_heads, head_dim]` F32.
+    Explicit `encoder.memory_barrier()` between every dependent dispatch (per the iter-46 lesson).
+  - **Tests (2 new, all passing):**
+    - **`vit_attention_gpu_matches_cpu_scaled_dot_product_attention`** — full GPU vs CPU parity test. batch=32 (≥32 for the second matmul's K=batch contract-dim constraint), num_heads=2, head_dim=64, scale=1/√64=0.125. Synthetic sine/cosine Q/K/V with magnitudes ≤ 0.5. Runs through 5 GPU stages, compares against CPU `scaled_dot_product_attention` reference. **Passes with 100% of 4096 elements within 1e-2 BF16 round-trip tolerance.**
+    - `vit_attention_gpu_rejects_small_head_dim` — head_dim=16 < 32 → error.
+  - **K≥32 constraint observation:** the `dense_matmul_bf16_f32_tensor` kernel requires K≥32 (NK=32 tile). The first matmul has K=head_dim (production: 72 ✓); the second matmul has K=batch_k (production: 196 ✓). Both production shapes satisfy the constraint; tests need batch ≥ 32 to exercise the second matmul.
+  - **Verification:** `cargo test --bin hf2q vit_attention_gpu` — 2/2 pass. Full suite — 908/908 pass (+2 from iter 46's 906).
+  - **Mantra check:** real GPU attention end-to-end. Full bidirectional self-attention (no mask, ViT convention) producing CPU-reference-matching output within BF16 tolerance. The CPU `scaled_dot_product_attention` from iter 37 reduces to a tiny-input parity reference; production goes through `vit_attention_gpu`.
+  - **Next (iter 48):** GPU equivalents for the remaining ViT primitives — `vit_residual_add_gpu` (uses `mlx_native::ops::elementwise::elementwise_add` or in-place add), `vit_silu_mul_gpu` (uses `mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul` — fused silu+gate). Then iter 49 composes `apply_vit_block_forward_gpu` from `vit_linear_gpu`/`vit_rms_norm_gpu`/`vit_per_head_rms_norm_gpu`/`vit_attention_gpu`/`vit_silu_mul_gpu`/`vit_residual_add_gpu` — one full transformer block on GPU, real-data tested against the CPU `apply_vit_block_forward` reference. Iter 50 chains 27 blocks + post-blocks pipeline + projector. Iter 51 wires into `process_multimodal_content` handler — 501 → 200.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
