@@ -372,20 +372,32 @@ fn run_q4_0_pipeline(
     if !args.skip_convert {
         let hf2q_exe = std::env::current_exe()
             .map_err(|e| format!("locate hf2q binary: {}", e))?;
+        // Decision 16 §CLI lists `[--with-vision]` as the smoke flag
+        // that exercises the P10 mmproj emitter path. When set AND the
+        // arch advertises `has_vision`, pass `--emit-vision-tower` to
+        // the convert subprocess. The convert side already handles the
+        // case where vision_config is absent from the model config —
+        // it silent-skips per Decision 18 (commit 18cbaaa). So passing
+        // the flag is safe even when the actual checkpoint has no
+        // vision tower.
+        let mut convert_args: Vec<String> = vec![
+            "convert".into(),
+            "--input".into(),
+            input_dir.to_str().ok_or("input_dir not UTF-8")?.into(),
+            "--format".into(),
+            "gguf".into(),
+            "--quant".into(),
+            args.quant.clone(),
+            "--output".into(),
+            gguf_path.to_str().ok_or("gguf_path not UTF-8")?.into(),
+            "--yes".into(),
+            "--skip-quality".into(),
+        ];
+        if args.with_vision && entry.has_vision {
+            convert_args.push("--emit-vision-tower".into());
+        }
         let convert_out = Command::new(&hf2q_exe)
-            .args([
-                "convert",
-                "--input",
-                input_dir.to_str().ok_or("input_dir not UTF-8")?,
-                "--format",
-                "gguf",
-                "--quant",
-                &args.quant,
-                "--output",
-                gguf_path.to_str().ok_or("gguf_path not UTF-8")?,
-                "--yes",
-                "--skip-quality",
-            ])
+            .args(&convert_args)
             .output()
             .map_err(|e| format!("run hf2q convert: {}", e))?;
         if !convert_out.status.success() {
