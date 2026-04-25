@@ -29,7 +29,9 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
+use mlx_native::ops::elementwise::scalar_mul_f32;
 use mlx_native::ops::softmax::dispatch_softmax;
+use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// GPU dense linear projection `y = x @ W.T`.
@@ -298,6 +300,165 @@ pub fn vit_softmax_last_dim_gpu(
     .context("vit_softmax_last_dim_gpu: dispatch_softmax")?;
 
     Ok(output)
+}
+
+/// GPU attention scores: `scores = (Q @ K^T) * scale` per head.
+///
+/// Input shape: `Q`, `K` each `[batch, num_heads, head_dim]` F32 row-major.
+/// Output shape: `[num_heads, batch_q, batch_k]` F32 (head-major scores).
+///
+/// Pipeline:
+///   1. Permute Q, K from seq-major `[batch, num_heads, head_dim]` to
+///      head-major `[num_heads, batch, head_dim]` via `permute_021_f32`.
+///   2. Cast K_perm F32 → BF16 (tensor-core src0 contract).
+///   3. Dispatch `dense_matmul_bf16_f32_tensor` with src0=K_bf16,
+///      src1=Q_perm. Output: `[num_heads, batch_q, batch_k]` F32.
+///   4. Apply `scale` via `scalar_mul_f32` in-place.
+///
+/// `scale` for standard ViT = `1 / sqrt(head_dim)`. **For Gemma 4V the
+/// correct scale is 1.0** per llama.cpp `clip.cpp` — caller passes the
+/// arch-appropriate value. This function does no implicit scaling.
+///
+/// # Errors
+///
+/// - `head_dim < 32` (tensor-core tile constraint)
+/// - any dim is 0
+/// - propagated from underlying mlx-native dispatches
+pub fn vit_attention_scores_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    k_seq_major: &MlxBuffer,
+    batch: u32,
+    num_heads: u32,
+    head_dim: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    if head_dim < 32 {
+        return Err(anyhow!(
+            "vit_attention_scores_gpu: head_dim ({}) must be >= 32",
+            head_dim
+        ));
+    }
+    if batch == 0 || num_heads == 0 {
+        return Err(anyhow!(
+            "vit_attention_scores_gpu: batch ({}) and num_heads ({}) must be > 0",
+            batch,
+            num_heads
+        ));
+    }
+
+    let metal_dev = device.metal_device();
+    let n_qk_elems = (batch as usize) * (num_heads as usize) * (head_dim as usize);
+
+    // --- Step 1: permute Q, K to head-major layout ---
+    let q_perm = device
+        .alloc_buffer(
+            n_qk_elems * 4,
+            DType::F32,
+            vec![num_heads as usize, batch as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc q_perm: {e}"))?;
+    let k_perm = device
+        .alloc_buffer(
+            n_qk_elems * 4,
+            DType::F32,
+            vec![num_heads as usize, batch as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc k_perm: {e}"))?;
+    permute_021_f32(
+        encoder,
+        registry,
+        metal_dev,
+        q_seq_major,
+        &q_perm,
+        batch as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )
+    .context("permute Q seq→head major")?;
+    permute_021_f32(
+        encoder,
+        registry,
+        metal_dev,
+        k_seq_major,
+        &k_perm,
+        batch as usize,
+        num_heads as usize,
+        head_dim as usize,
+    )
+    .context("permute K seq→head major")?;
+    // mlx-native uses MTLDispatchType::Concurrent — explicit barriers
+    // are required between dispatches with RAW/WAR/WAW dependencies.
+    encoder.memory_barrier();
+
+    // --- Step 2: cast K_perm F32 → BF16 ---
+    let k_bf16 = device
+        .alloc_buffer(
+            n_qk_elems * 2,
+            DType::BF16,
+            vec![num_heads as usize, batch as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
+    cast(
+        encoder,
+        registry,
+        metal_dev,
+        &k_perm,
+        &k_bf16,
+        n_qk_elems,
+        CastDirection::F32ToBF16,
+    )
+    .context("cast K F32→BF16")?;
+    encoder.memory_barrier();
+
+    // --- Step 3: scores = Q @ K^T per head batch ---
+    // Layout: src0=K_bf16 [num_heads, batch_k, head_dim] BF16,
+    //         src1=Q_perm [num_heads, batch_q, head_dim] F32.
+    // output[h, m, n] = sum_k K[h, n, k] * Q[h, m, k] = (Q[h] @ K[h]^T)[m, n].
+    let n_scores = (num_heads as usize) * (batch as usize) * (batch as usize);
+    let mut scores = device
+        .alloc_buffer(
+            n_scores * 4,
+            DType::F32,
+            vec![num_heads as usize, batch as usize, batch as usize],
+        )
+        .map_err(|e| anyhow!("alloc scores: {e}"))?;
+    let params = DenseMmBf16F32Params {
+        m: batch,
+        n: batch,
+        k: head_dim,
+        src0_batch: num_heads,
+        src1_batch: num_heads,
+    };
+    dense_matmul_bf16_f32_tensor(
+        encoder,
+        registry,
+        device,
+        &k_bf16,
+        &q_perm,
+        &mut scores,
+        &params,
+    )
+    .context("attention scores matmul")?;
+
+    // --- Step 4: apply scale (in-place via scalar_mul_f32) ---
+    if scale != 1.0 {
+        encoder.memory_barrier();
+        scalar_mul_f32(
+            encoder,
+            registry,
+            metal_dev,
+            &scores,
+            &scores,
+            n_scores,
+            scale,
+        )
+        .context("scale scores")?;
+    }
+
+    Ok(scores)
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +1004,243 @@ mod tests {
         assert!((got[0] - 0.6652).abs() < 1e-3, "got[0] = {}", got[0]);
         assert!((got[1] - 0.2447).abs() < 1e-3, "got[1] = {}", got[1]);
         assert!((got[2] - 0.0900).abs() < 1e-3, "got[2] = {}", got[2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_attention_scores_gpu (iter 46)
+    // -----------------------------------------------------------------------
+
+    /// CPU reference: scores[h, q_pos, k_pos] = (Σ_d Q[q_pos, h, d]
+    /// * K[k_pos, h, d]) * scale. Q and K are seq-major
+    /// `[batch, num_heads, head_dim]`.
+    fn attention_scores_cpu(
+        q: &[f32],
+        k: &[f32],
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; num_heads * batch * batch];
+        let stride_seq = num_heads * head_dim;
+        for h in 0..num_heads {
+            for q_pos in 0..batch {
+                for k_pos in 0..batch {
+                    let mut acc = 0f32;
+                    let q_off = q_pos * stride_seq + h * head_dim;
+                    let k_off = k_pos * stride_seq + h * head_dim;
+                    for d in 0..head_dim {
+                        acc += q[q_off + d] * k[k_off + d];
+                    }
+                    out[h * batch * batch + q_pos * batch + k_pos] = acc * scale;
+                }
+            }
+        }
+        out
+    }
+
+    /// Diagnostic: verify the permute_021_f32 step produces the right
+    /// layout. Suspected zero-output bug in vit_attention_scores_gpu
+    /// might be in this stage.
+    #[test]
+    fn permute_021_f32_seq_to_head_major_round_trips() {
+        // Tiny [batch=2, num_heads=2, head_dim=4] test — easy to read
+        // back and verify by hand.
+        let batch = 2usize;
+        let num_heads = 2usize;
+        let head_dim = 4usize;
+        let n = batch * num_heads * head_dim;
+        // Input: each element = batch*100 + head*10 + dim — easy decode.
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                let dim = i % head_dim;
+                let head = (i / head_dim) % num_heads;
+                let b = i / (head_dim * num_heads);
+                (b * 100 + head * 10 + dim) as f32
+            })
+            .collect();
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input, vec![batch, num_heads, head_dim]);
+        let out_buf = executor
+            .device()
+            .alloc_buffer(n * 4, DType::F32, vec![num_heads, batch, head_dim])
+            .expect("alloc out");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        permute_021_f32(
+            session.encoder_mut(),
+            &mut registry,
+            executor.device().metal_device(),
+            &in_buf,
+            &out_buf,
+            batch,
+            num_heads,
+            head_dim,
+        )
+        .expect("permute");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, n);
+
+        // Expected: out[head, batch, dim] = in[batch, head, dim].
+        // For (head=0, batch=0): in[0, 0, dim] = 0*100 + 0*10 + dim = dim
+        // For (head=0, batch=1): in[1, 0, dim] = 100 + dim
+        // For (head=1, batch=0): in[0, 1, dim] = 10 + dim
+        // For (head=1, batch=1): in[1, 1, dim] = 110 + dim
+        let layout = |head: usize, b: usize, d: usize| {
+            head * batch * head_dim + b * head_dim + d
+        };
+        for d in 0..head_dim {
+            assert_eq!(got[layout(0, 0, d)], d as f32, "h0 b0 d{d}");
+            assert_eq!(got[layout(0, 1, d)], (100 + d) as f32, "h0 b1 d{d}");
+            assert_eq!(got[layout(1, 0, d)], (10 + d) as f32, "h1 b0 d{d}");
+            assert_eq!(got[layout(1, 1, d)], (110 + d) as f32, "h1 b1 d{d}");
+        }
+    }
+
+    #[test]
+    fn vit_attention_scores_gpu_matches_cpu_reference_on_small_input() {
+        // batch=4, num_heads=2, head_dim=64. scale=0.125 (1/sqrt(64)).
+        let batch = 4usize;
+        let num_heads = 2usize;
+        let head_dim = 64usize;
+        let scale = 0.125f32;
+        let n = batch * num_heads * head_dim;
+
+        let q_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).sin() * 0.3).collect();
+        let k_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).cos() * 0.3).collect();
+
+        let expected = attention_scores_cpu(&q_cpu, &k_cpu, batch, num_heads, head_dim, scale);
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let q_buf = upload_f32(executor.device(), &q_cpu, vec![batch, num_heads, head_dim]);
+        let k_buf = upload_f32(executor.device(), &k_cpu, vec![batch, num_heads, head_dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let scores = vit_attention_scores_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &q_buf,
+            &k_buf,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            scale,
+        )
+        .expect("scores");
+        session.finish().expect("finish");
+        let got = readback_f32(&scores, num_heads * batch * batch);
+
+        // BF16 round-trip on K weight + accumulation across head_dim=64
+        // → expect max_diff bounded by ~1e-3 (≤ 1% of typical magnitudes).
+        let mut max_diff = 0f32;
+        let mut fail_count = 0usize;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            let d = (g - e).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            if d > 5e-3 {
+                fail_count += 1;
+            }
+        }
+        assert!(
+            fail_count == 0,
+            "{}/{} elements exceeded 5e-3, max_diff = {}",
+            fail_count,
+            got.len(),
+            max_diff
+        );
+    }
+
+    #[test]
+    fn vit_attention_scores_gpu_unit_scale_does_not_apply() {
+        // scale=1.0 should skip the scalar_mul — verify by feeding
+        // identical Q=K, expecting per-head diagonal = ||Q[h, q]||^2.
+        let batch = 3usize;
+        let num_heads = 2usize;
+        let head_dim = 32usize;
+        let n = batch * num_heads * head_dim;
+        let qk_cpu: Vec<f32> = (0..n).map(|i| 0.1 + (i as f32) * 0.01).collect();
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let q_buf = upload_f32(executor.device(), &qk_cpu, vec![batch, num_heads, head_dim]);
+        let k_buf = upload_f32(executor.device(), &qk_cpu, vec![batch, num_heads, head_dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let scores = vit_attention_scores_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &q_buf,
+            &k_buf,
+            batch as u32,
+            num_heads as u32,
+            head_dim as u32,
+            1.0,
+        )
+        .expect("scores");
+        session.finish().expect("finish");
+        let got = readback_f32(&scores, num_heads * batch * batch);
+
+        // Diagonal sanity: scores[h, q, q] should = sum_d Q[q,h,d]^2.
+        for h in 0..num_heads {
+            for q in 0..batch {
+                let mut expected_norm_sq = 0f32;
+                for d in 0..head_dim {
+                    let v = qk_cpu[q * num_heads * head_dim + h * head_dim + d];
+                    expected_norm_sq += v * v;
+                }
+                let got_diag = got[h * batch * batch + q * batch + q];
+                let diff = (got_diag - expected_norm_sq).abs();
+                let rel = diff / expected_norm_sq.max(1e-3);
+                // BF16 K weight + f32 accumulation across 32 head_dim
+                // terms → relative error bound ~1e-3.
+                assert!(
+                    rel < 5e-3,
+                    "diag h={h} q={q}: got {got_diag}, want {expected_norm_sq}, rel {rel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vit_attention_scores_gpu_rejects_small_head_dim() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let q = executor
+            .device()
+            .alloc_buffer(2 * 2 * 16 * 4, DType::F32, vec![2, 2, 16])
+            .expect("a");
+        let k = executor
+            .device()
+            .alloc_buffer(2 * 2 * 16 * 4, DType::F32, vec![2, 2, 16])
+            .expect("b");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_attention_scores_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &q,
+            &k,
+            2,
+            2,
+            16,
+            1.0,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("head_dim"));
     }
 
     #[test]
