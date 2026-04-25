@@ -106,9 +106,38 @@ pub fn scan_llama_cli_stderr(stderr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Extract `n_eval` from llama-cli's timing block. Returns `None` if
-/// no `llama_print_timings: n_eval = %d` line is present.
+/// Extract `n_eval` (number of generated tokens) from llama-cli's timing
+/// block. Returns `None` if no recognised line is present.
+///
+/// Accepts two formats:
+/// 1. **Real llama-cli** (`llama_print_timings:        eval time =
+///    XX.XX ms /     N runs ...`). Distinguished from `prompt eval time`
+///    by skipping lines containing `prompt`.
+/// 2. **Synthetic test fixture** (`n_eval = N`) — used by the mock
+///    llama-cli stub in tests/smoke_conformance.rs to keep the harness
+///    CI-safe. Scanning the older format last preserves precedence
+///    when both happen to appear.
 pub fn extract_n_eval(stderr: &str) -> Option<u32> {
+    // Real format: `eval time = X ms / N runs` (NOT `prompt eval time`).
+    for line in stderr.lines() {
+        if line.contains("prompt eval time") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("eval time =") {
+            // Find the `/ N runs` token after the time.
+            if let Some((_, after_slash)) = rest.split_once('/') {
+                let num: String = after_slash
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = num.parse() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    // Synthetic-fixture format: `n_eval = N` (mock llama-cli).
     for line in stderr.lines() {
         if let Some(rest) = line.split_once("n_eval = ") {
             let num: String = rest
@@ -123,11 +152,34 @@ pub fn extract_n_eval(stderr: &str) -> Option<u32> {
 }
 
 /// Extract loaded-tensor count from llama-cli stderr.
-/// Pattern: `llama_model_load: loaded tensor 0x%x`
+///
+/// Accepts two formats:
+/// 1. **Real llama-cli**:
+///    `llama_model_loader: loaded meta data with N key-value pairs
+///    and X tensors from ...` — see `/opt/llama.cpp/src/llama-model-
+///    loader.cpp:704`.
+/// 2. **Synthetic test fixture**: `llama_model_load: loaded tensor 0xN`
+///    (decimal or hex) — emitted by the mock stub in
+///    tests/smoke_conformance.rs.
 pub fn extract_loaded_tensor_count(stderr: &str) -> Option<u64> {
+    // Real format: `... and X tensors from ...`.
+    for line in stderr.lines() {
+        if !line.contains("loaded meta data") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once(" and ") {
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num.parse() {
+                return Some(n);
+            }
+        }
+    }
+    // Synthetic-fixture format: `loaded tensor 0xN` (decimal or hex).
     for line in stderr.lines() {
         if let Some(rest) = line.split_once("loaded tensor ") {
-            // Accept both decimal and 0x-hex forms.
             let token = rest.1.split_whitespace().next()?;
             if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
                 return u64::from_str_radix(hex, 16).ok();
@@ -294,6 +346,47 @@ mod tests {
         assert!(
             err.contains("n_eval"),
             "missing-n_eval error must name the line, got: {err}"
+        );
+    }
+
+    /// Real llama-cli emits `eval time = X ms / N runs` for generated
+    /// tokens (see /opt/llama.cpp docs/multimodal/MobileVLM.md:99). The
+    /// parser must accept this format, NOT just the synthetic
+    /// `n_eval = N` form the mock emits. Without this, P8's "real-model
+    /// close" is impossible — the parser would silently fail to find
+    /// n_eval and return None, falling through to a "missing n_eval"
+    /// error against perfectly valid llama-cli stderr.
+    #[test]
+    fn extract_n_eval_parses_real_llama_cli_format() {
+        let s = "llama_print_timings:      sample time =       1.24 ms /     6 runs   (    0.21 ms per token)\n\
+                 llama_print_timings: prompt eval time =     109.91 ms /     7 tokens (   15.70 ms per token)\n\
+                 llama_print_timings:        eval time =      58.90 ms /     8 runs   (    8.41 ms per token)\n\
+                 llama_print_timings:       total time =     169.31 ms /    14 tokens\n";
+        assert_eq!(extract_n_eval(s), Some(8), "must skip `prompt eval time` and pick `eval time`");
+    }
+
+    /// Real llama-cli's tensor count line:
+    /// `llama_model_loader: loaded meta data with K key-value pairs and N tensors from ...`.
+    /// (`/opt/llama.cpp/src/llama-model-loader.cpp:704`)
+    #[test]
+    fn extract_loaded_tensor_count_parses_real_llama_cli_format() {
+        let s = "llama_model_loader: loaded meta data with 38 key-value pairs and 737 tensors from \
+                 /tmp/qwen35moe.gguf (version GGUF V3 (latest))\n";
+        assert_eq!(extract_loaded_tensor_count(s), Some(737));
+    }
+
+    /// Real llama-cli format must not be tripped by `prompt eval time`'s
+    /// `N tokens` count. Belt-and-braces: `extract_n_eval` already skips
+    /// `prompt eval time` lines explicitly, but if the implementation
+    /// regressed to "first eval-time match wins", this test would fire.
+    #[test]
+    fn extract_n_eval_rejects_prompt_eval_time_token_count() {
+        let s = "llama_print_timings: prompt eval time =     109.91 ms /     7 tokens (...)\n\
+                 llama_print_timings:        eval time =      58.90 ms /     8 runs (...)\n";
+        assert_eq!(
+            extract_n_eval(s),
+            Some(8),
+            "must NOT return 7 (prompt tokens); 8 (eval/generated runs) is correct"
         );
     }
 
