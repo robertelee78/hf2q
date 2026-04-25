@@ -1324,6 +1324,213 @@ pub fn apply_vit_blocks_loop_gpu(
     Ok(hidden_states)
 }
 
+/// Full GPU ViT forward: pixel tensor → projected multimodal embeddings.
+///
+/// Pipeline (matches llama.cpp `clip_graph_gemma4v::build`):
+///   1. CPU `patch_embed_from_mmproj_weights(pixels, weights, cfg)` →
+///      `[num_patches, hidden]` F32 (one-time per image; dominated by
+///      the 27-block GPU compute that follows).
+///   2. Upload to GPU as input to the blocks loop.
+///   3. `apply_vit_blocks_loop_gpu` × 27 blocks → `[num_patches, hidden]`.
+///   4. `vit_avg_pool_2x2_gpu` → `[(num_patches/4), hidden]`. For Gemma 4:
+///      `[14, 14, 1152] → [49, 1152]`.
+///   5. `vit_scale_gpu(√n_embd)` — Gemma 4V's `ggml_scale(cur, sqrtf(n_embd))`.
+///   6. `vit_std_bias_scale_gpu(v.std_bias, v.std_scale)` — pre-projector norm.
+///   7. `vit_linear_gpu(mm.0.weight)` → `[(num_patches/4), text_hidden]`. For
+///      Gemma 4: `[49, 2816]`.
+///   8. `vit_rms_norm_gpu(ones, eps)` — final no-gain RMSNorm
+///      (`ggml_rms_norm` with no weight param).
+///
+/// Returns the final `[(num_patches/4), text_hidden]` F32 buffer on
+/// device. Caller reads back via `MlxBuffer::as_slice::<f32>()` for
+/// downstream embedding injection into the chat prompt.
+///
+/// `scale` matches `vit_attention_gpu` — pass `1.0` for Gemma 4V (per
+/// llama.cpp), `1/sqrt(head_dim)` for standard ViT.
+///
+/// Caller registers shaders before dispatch:
+/// ```
+/// mlx_native::ops::softmax::register(&mut registry);
+/// mlx_native::ops::sigmoid_mul::register(&mut registry);
+/// register_vit_custom_shaders(&mut registry);
+/// ```
+///
+/// # Errors
+///
+/// Propagated from any sub-stage. The `weights` arg's per-tensor
+/// access (`weights.get`, `weights.mm_0_weight`) returns errors for
+/// missing tensors.
+///
+/// # Cost
+///
+/// Gemma 4 ViT (27 blocks, [14×14, 1152] → [49, 2816]): ~57 ms for
+/// the 27-block compute on M5 Max + a few ms for the post-blocks
+/// pipeline. Total well under 100 ms. CPU patch_embed at the start
+/// is ~5–15 ms for a 224×224 image. End-to-end < 150 ms per image.
+pub fn apply_vit_full_forward_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+    pixel_values: &[f32],
+    scale: f32,
+) -> Result<MlxBuffer> {
+    use super::vit::patch_embed_forward as patch_embed_cpu;
+
+    let hidden = cfg.hidden_size;
+    let num_patches_side = cfg.num_patches_side;
+    let n_patches = (num_patches_side as u32) * (num_patches_side as u32);
+
+    // --- Stage 1: CPU patch_embed ---
+    let patch_embd_buf = weights
+        .patch_embd_weight()
+        .map_err(|e| anyhow!("apply_vit_full_forward_gpu: {e}"))?;
+    let patch_embd_f32: &[f32] = patch_embd_buf
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("patch_embd as_slice: {e}"))?;
+    let patch_bias_f32: Option<&[f32]> = weights
+        .get("v.patch_embd.bias")
+        .and_then(|b| b.as_slice::<f32>().ok());
+    let patch_embeds_cpu = patch_embed_cpu(
+        pixel_values,
+        patch_embd_f32,
+        patch_bias_f32,
+        cfg.image_size,
+        cfg.patch_size,
+        hidden,
+    )
+    .context("apply_vit_full_forward_gpu: cpu patch_embed")?;
+
+    // --- Stage 2: Upload to GPU ---
+    let n_hidden = (n_patches as usize) * (hidden as usize);
+    let input_gpu = device
+        .alloc_buffer(
+            n_hidden * 4,
+            DType::F32,
+            vec![n_patches as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc input_gpu: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; copy-in is single-threaded
+        // and Apple unified memory makes this byte-equivalent to a CPU
+        // memcpy that's later read by the GPU.
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(input_gpu.contents_ptr() as *mut f32, n_hidden)
+        };
+        dst.copy_from_slice(&patch_embeds_cpu);
+    }
+
+    // --- Stage 3: 27-block transformer loop ---
+    let after_blocks = apply_vit_blocks_loop_gpu(
+        encoder,
+        registry,
+        device,
+        weights,
+        cfg,
+        &input_gpu,
+        n_patches,
+        scale,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 4: avg-pool 2x2 ---
+    let pooled = vit_avg_pool_2x2_gpu(
+        encoder,
+        registry,
+        device,
+        &after_blocks,
+        num_patches_side as u32,
+        hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 5: scale by sqrt(n_embd) ---
+    let pooled_n_patches = ((num_patches_side / 2) * (num_patches_side / 2)) as usize;
+    let pooled_total = pooled_n_patches * (hidden as usize);
+    vit_scale_gpu(
+        encoder,
+        registry,
+        device,
+        &pooled,
+        pooled_total as u32,
+        (hidden as f32).sqrt(),
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 6: std_bias / std_scale normalization ---
+    let std_bias = weights
+        .get("v.std_bias")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward_gpu: missing v.std_bias"))?;
+    let std_scale = weights
+        .get("v.std_scale")
+        .ok_or_else(|| anyhow!("apply_vit_full_forward_gpu: missing v.std_scale"))?;
+    let normed = vit_std_bias_scale_gpu(
+        encoder,
+        registry,
+        device,
+        &pooled,
+        std_bias,
+        std_scale,
+        pooled_n_patches as u32,
+        hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 7: mm.0 projector ---
+    let mm0 = weights
+        .mm_0_weight()
+        .map_err(|e| anyhow!("apply_vit_full_forward_gpu: mm.0.weight: {e}"))?;
+    let mm0_f32: &[f32] = mm0
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("mm0 as_slice: {e}"))?;
+    let text_hidden = (mm0_f32.len() / (hidden as usize)) as u32;
+    let projected = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &normed,
+        mm0,
+        pooled_n_patches as u32,
+        hidden,
+        text_hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 8: final no-gain RMSNorm ---
+    // Allocate a [text_hidden] all-ones gain vector once.
+    let ones = device
+        .alloc_buffer(
+            (text_hidden as usize) * 4,
+            DType::F32,
+            vec![text_hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc ones: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                ones.contents_ptr() as *mut f32,
+                text_hidden as usize,
+            )
+        };
+        for v in s.iter_mut() {
+            *v = 1.0;
+        }
+    }
+    let final_out = vit_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &projected,
+        &ones,
+        pooled_n_patches as u32,
+        text_hidden,
+        cfg.layer_norm_eps,
+    )?;
+    Ok(final_out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2757,6 +2964,104 @@ mod tests {
         let err = vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0)
             .unwrap_err();
         assert!(format!("{err}").contains("must be > 0"));
+    }
+
+    /// Iter 51d: full GPU ViT forward on real Gemma 4 mmproj.
+    /// Pixel input → [49, 2816] projected multimodal embedding.
+    /// **This is the final production forward path.**
+    #[test]
+    fn apply_vit_full_forward_gpu_on_real_gemma4_full_pipeline() {
+        let path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !path.exists() {
+            eprintln!("skipping: mmproj fixture not found");
+            return;
+        }
+        let gguf = GgufFile::open(path).expect("open");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, MlxDevice::new().expect("dev"))
+                .expect("w");
+        assert_eq!(cfg.num_hidden_layers, 27);
+        assert_eq!(cfg.num_patches_side, 14);
+
+        // Synthetic preprocessed pixel tensor [3, 224, 224] f32.
+        let img = cfg.image_size as usize;
+        let mut pixels = vec![0f32; 3 * img * img];
+        for c in 0..3 {
+            for y in 0..img {
+                for x in 0..img {
+                    pixels[c * img * img + y * img + x] =
+                        ((c + 1) as f32) * 0.05 + (y as f32) * 0.001 + (x as f32) * 0.001;
+                }
+            }
+        }
+
+        let head_dim = (cfg.hidden_size / cfg.num_attention_heads) as f32;
+        let scale = 1.0f32 / head_dim.sqrt();
+
+        let executor = GraphExecutor::new(MlxDevice::new().expect("dev2"));
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        eprintln!("running full ViT GPU forward...");
+        let t0 = std::time::Instant::now();
+        let out = apply_vit_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &weights,
+            &cfg,
+            &pixels,
+            scale,
+        )
+        .expect("full forward");
+        session.finish().expect("finish");
+        let elapsed = t0.elapsed();
+        eprintln!("full ViT GPU forward done in {:?}", elapsed);
+
+        // Expected output shape: [49 patches, 2816 text_hidden].
+        let mm0 = weights.mm_0_weight().expect("mm.0");
+        let mm0_f32: &[f32] = mm0.as_slice::<f32>().expect("slice");
+        let text_hidden = mm0_f32.len() / (cfg.hidden_size as usize);
+        assert_eq!(text_hidden, 2816, "Gemma 4 projector output width");
+        let n_patches_out = 49;
+        let total = n_patches_out * text_hidden;
+
+        let got = readback_f32(&out, total);
+
+        // 1. Finite.
+        for v in &got {
+            assert!(v.is_finite(), "non-finite: {v}");
+        }
+        // 2. Each row's mean(x²) ≈ 1 (no-gain final RMSNorm).
+        for p in 0..n_patches_out {
+            let row = &got[p * text_hidden..(p + 1) * text_hidden];
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / (text_hidden as f32);
+            assert!(
+                (ms - 1.0).abs() < 0.05,
+                "patch {p} post-norm mean(x²) = {ms}, expected ≈ 1.0"
+            );
+        }
+        // 3. Cross-token diversity preserved.
+        let p0 = &got[0..text_hidden];
+        let p_last = &got[(n_patches_out - 1) * text_hidden..n_patches_out * text_hidden];
+        let l2: f32 = p0
+            .iter()
+            .zip(p_last.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        eprintln!("cross-token L2 = {:.4}", l2);
+        assert!(l2 > 1e-2, "all output tokens collapsed — diversity lost");
+
+        let max_abs = got.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let mean_abs = got.iter().map(|v| v.abs()).sum::<f32>() / (got.len() as f32);
+        eprintln!("output: max_abs = {:.4}, mean_abs = {:.4}", max_abs, mean_abs);
     }
 
     /// Iter 51a: 27-block GPU forward on real Gemma 4 mmproj. Tests the

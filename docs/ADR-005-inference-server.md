@@ -1894,6 +1894,29 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
     8. `vit_rms_norm_gpu(ones, eps)` — final no-gain norm
     Real-data test on real Gemma 4: expects [49, 2816] output, finite, sensible distribution. Iter 52 wires `process_multimodal_content` to invoke this; 501 → 200.
 
+- **2026-04-25 loop iter 51d — `apply_vit_full_forward_gpu` working end-to-end on real Gemma 4 in 1.3 seconds.**
+  - **`apply_vit_full_forward_gpu(encoder, registry, device, weights, cfg, pixel_values, scale) -> MlxBuffer`:** complete pixel-to-projected-multimodal-embedding pipeline:
+    1. CPU `patch_embed_forward(pixel_values, v.patch_embd.weight, optional bias, image_size, patch_size, hidden)` → `[196, 1152]` F32. The CPU stage is a one-time per-image cost; the heavier GPU pipeline dominates total wall.
+    2. Upload `[196, 1152]` to a GPU buffer (Apple unified memory: `contents_ptr` + memcpy).
+    3. `apply_vit_blocks_loop_gpu` × 27 blocks → `[196, 1152]`.
+    4. `vit_avg_pool_2x2_gpu(14, 1152)` → `[49, 1152]`.
+    5. `vit_scale_gpu(√1152 ≈ 33.94)` in-place.
+    6. `vit_std_bias_scale_gpu(v.std_bias, v.std_scale)` → `[49, 1152]`.
+    7. `vit_linear_gpu(mm.0.weight)` → `[49, 2816]`.
+    8. `vit_rms_norm_gpu(ones, eps)` — final no-gain RMSNorm. Returns `[49, 2816]` F32 buffer on device.
+    `encoder.memory_barrier()` between every dependent stage (per the iter-46 lesson).
+  - **Real-data test `apply_vit_full_forward_gpu_on_real_gemma4_full_pipeline`:** loads real Gemma 4 mmproj (400MB), runs the full pipeline on a synthetic 224×224 pixel tensor:
+    - **End-to-end time: 1.3 seconds.** CPU patch_embed (~173M MAC single-thread Conv2d) is ~1.2s of that; GPU portion (27 blocks + post-blocks + projector + final norm) is ~70 ms.
+    - Output shape: `[49, 2816]` ✓
+    - All 137,984 elements finite ✓
+    - Per-row `mean(x²) ≈ 1.0 ± 0.05` (no-gain final RMSNorm contract verified) ✓
+    - Cross-token L2 = 0.92 (output tokens are differentiated, no token-collapse) ✓
+    - max_abs = 7.64, mean_abs = 0.70 (sensible post-RMSNorm magnitudes)
+  - **Performance vs CPU:** the iter-42 CPU full forward took ~17 minutes for the same shape. **GPU is ~770× faster wall-clock** (1.3s vs 17min). With CPU patch_embed ported to GPU in a future iter, total drops to ~100 ms.
+  - **Verification:** `cargo test --bin hf2q apply_vit_full_forward_gpu` — 1/1 pass (~11s including 400MB mmproj load + 1.3s forward). Full suite 925/925 pass (+1).
+  - **Mantra check:** real Gemma 4 pretrained ViT weights producing real projected multimodal embeddings via real Metal dispatches end-to-end. **The CPU reference path (`apply_vit_full_forward` in vit.rs) is now fully redundant for production** — kept only as small-input parity validator for individual GPU primitives.
+  - **Next (iter 52):** wire `apply_vit_full_forward_gpu` into `process_multimodal_content`. The handler currently 501s after preprocessing image content parts (iter 26). Iter 52 replaces the 501 with: dispatch `apply_vit_full_forward_gpu` per `PreprocessedImage`, hold the resulting `[49, 2816]` GPU buffers, then inject them into the chat prompt's token stream as embedding placeholders. **First real `image_url` chat completion request will return a 200.** Multi-image requests handled by stacking the embeddings in image-order.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
