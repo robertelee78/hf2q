@@ -600,17 +600,26 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
                 // ADR-012 Decision 13 no-fallback guard:
                 // If the model is qwen35 or qwen35moe, we MUST have an ActivationCapture
-                // implementation from the inference session.  At present (pre-ADR-013 real
-                // impl), we error clearly rather than silently running weight-space DWQ.
-                // When ADR-013 P12 real ActivationCapture lands, this block is replaced by
-                // the real capture injection.
+                // implementation injected during DWQ calibration. As of commit 28df83c the
+                // real `impl ActivationCapture for Qwen35Model` is shipped (closing
+                // ADR-013 P12's deferred deliverable). The remaining piece — building a
+                // Qwen35Model at convert-time from the HF safetensors *without* having
+                // already emitted an intermediate GGUF — is P9b: convert-pipeline two-
+                // pass integration. Until P9b lands, we still error rather than silently
+                // dropping into weight-space fallback (per `feedback_never_ship_fallback_
+                // without_rootcause.md`). The error message reflects the now-accurate
+                // remaining blocker so the next step is unambiguous.
                 if dwq_arch.requires_activation_capture() {
-                    // No real ActivationCapture impl available yet — error clearly.
-                    // Per ADR-012 Decision 13 / no-fallback mantra: fix the blocker upstream,
-                    // do not route around it with weight-space fallback.
                     return Err(AppError::Conversion(anyhow::anyhow!(
-                        "{}",
-                        quantize::dwq::DwqError::NoActivationCapture
+                        "ADR-012 P9b: convert-pipeline activation-capture wire-up pending. \
+                         The real impl ActivationCapture for Qwen35Model is shipped \
+                         (src/inference/models/qwen35/activation_capture_real.rs), but \
+                         capture requires loading the model — Qwen35Model::load_from_gguf \
+                         expects a GGUF path while convert-time only has HF safetensors. \
+                         Two paths to closure: (a) two-pass conversion (emit intermediate \
+                         F16 GGUF, capture, re-quant to dwq46/dwq48), or (b) add \
+                         Qwen35Model::from_safetensors. No weight-space fallback per \
+                         ADR-012 Decision 13."
                     )));
                 }
 
