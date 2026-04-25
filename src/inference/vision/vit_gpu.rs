@@ -29,7 +29,8 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
-use mlx_native::ops::elementwise::scalar_mul_f32;
+use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
+use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_bf16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -646,6 +647,123 @@ pub fn vit_attention_gpu(
     Ok(attn_seq_major)
 }
 
+/// GPU residual add: `out[i] = a[i] + b[i]`. F32 elementwise.
+///
+/// Wraps `mlx_native::ops::elementwise::elementwise_add`. Allocates a
+/// fresh F32 output. (mlx-native's elementwise_add takes a separate
+/// output buffer; if a true in-place residual is needed for memory,
+/// a future iter can substitute the in-place variant when one exists.)
+///
+/// # Errors
+///
+/// - `n_elements == 0`
+/// - propagated from mlx-native dispatch
+pub fn vit_residual_add_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    n_elements: u32,
+) -> Result<MlxBuffer> {
+    if n_elements == 0 {
+        return Err(anyhow!("vit_residual_add_gpu: n_elements must be > 0"));
+    }
+    let out = device
+        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .map_err(|e| anyhow!("alloc residual add output: {e}"))?;
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        a,
+        b,
+        &out,
+        n_elements as usize,
+        DType::F32,
+    )
+    .context("vit_residual_add_gpu: elementwise_add")?;
+    Ok(out)
+}
+
+/// GPU SwiGLU gating: `out = silu(gate) * up = gate * sigmoid(gate) * up`.
+///
+/// Composed as two dispatches:
+///   1. `dispatch_sigmoid_mul(x=gate, gate=gate)` → `silu(gate)`
+///      (i.e. `gate * sigmoid(gate)`).
+///   2. `elementwise_mul(silu_out, up)` → final output.
+///
+/// All buffers are F32 with `n_elements` elements. Caller must register
+/// sigmoid_mul shader sources before dispatch:
+/// `mlx_native::ops::sigmoid_mul::register(&mut registry)`.
+///
+/// `encoder.memory_barrier()` is inserted between the two dispatches
+/// per the iter-46 concurrent-dispatch lesson.
+///
+/// # Errors
+///
+/// - `n_elements == 0`
+/// - propagated from mlx-native dispatches
+pub fn vit_silu_mul_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    gate: &MlxBuffer,
+    up: &MlxBuffer,
+    n_elements: u32,
+) -> Result<MlxBuffer> {
+    if n_elements == 0 {
+        return Err(anyhow!("vit_silu_mul_gpu: n_elements must be > 0"));
+    }
+    let metal_dev = device.metal_device();
+
+    // Step 1: silu(gate) via sigmoid_mul(gate, gate).
+    let silu_out = device
+        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .map_err(|e| anyhow!("alloc silu_out: {e}"))?;
+    // sigmoid_mul takes a params_buf with the count (u32 cast as f32 element).
+    let params_buf = device
+        .alloc_buffer(4, DType::F32, vec![1])
+        .map_err(|e| anyhow!("alloc sigmoid_mul params: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer.
+        let s: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut u32, 1)
+        };
+        s[0] = n_elements;
+    }
+    dispatch_sigmoid_mul(
+        encoder,
+        registry,
+        metal_dev,
+        gate,
+        gate,
+        &silu_out,
+        &params_buf,
+        n_elements,
+    )
+    .context("vit_silu_mul_gpu: sigmoid_mul (silu step)")?;
+    encoder.memory_barrier();
+
+    // Step 2: out = silu_out * up.
+    let out = device
+        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .map_err(|e| anyhow!("alloc final out: {e}"))?;
+    elementwise_mul(
+        encoder,
+        registry,
+        metal_dev,
+        &silu_out,
+        up,
+        &out,
+        n_elements as usize,
+        DType::F32,
+    )
+    .context("vit_silu_mul_gpu: elementwise_mul")?;
+
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -654,10 +772,10 @@ pub fn vit_attention_gpu(
 mod tests {
     use super::*;
     use crate::inference::vision::vit::{
-        linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
-        rms_norm_forward as rms_norm_cpu,
-        scaled_dot_product_attention as attention_cpu,
-        softmax_last_dim as softmax_cpu,
+        elementwise_mul_in_place, linear_forward as linear_cpu,
+        per_head_rms_norm_forward as per_head_rms_cpu, residual_add as residual_add_cpu,
+        rms_norm_forward as rms_norm_cpu, scaled_dot_product_attention as attention_cpu,
+        silu_in_place, softmax_last_dim as softmax_cpu,
     };
     use crate::inference::vision::mmproj::MmprojConfig;
     use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
@@ -1467,6 +1585,116 @@ mod tests {
             "{}/{} elements ({:.3}%) exceeded 1e-2, max_diff = {}",
             fail_count, total, frac * 100.0, max_diff
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_residual_add_gpu (iter 48)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_residual_add_gpu_matches_cpu_reference() {
+        let n = 32usize;
+        let a_cpu: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.1).collect();
+        let b_cpu: Vec<f32> = (0..n).map(|i| -0.3 + (i as f32) * 0.05).collect();
+
+        let mut expected = a_cpu.clone();
+        residual_add_cpu(&mut expected, &b_cpu).expect("cpu");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let a_buf = upload_f32(executor.device(), &a_cpu, vec![n]);
+        let b_buf = upload_f32(executor.device(), &b_cpu, vec![n]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_residual_add_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &a_buf,
+            &b_buf,
+            n as u32,
+        )
+        .expect("residual_add");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, n);
+
+        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        assert!(max_diff < 1e-6, "residual_add max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_residual_add_gpu_rejects_zero_n() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let a = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
+        let b = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("b");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_residual_add_gpu(session.encoder_mut(), &mut registry, device, &a, &b, 0)
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_silu_mul_gpu (iter 48)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_silu_mul_gpu_matches_cpu_swiglu_gate() {
+        // CPU reference: silu(gate) * up. silu(x) = x * sigmoid(x).
+        let n = 64usize;
+        let gate_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).sin()).collect();
+        let up_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).cos()).collect();
+
+        let mut silu_gate = gate_cpu.clone();
+        silu_in_place(&mut silu_gate);
+        let mut expected = silu_gate;
+        elementwise_mul_in_place(&mut expected, &up_cpu).expect("cpu");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let gate_buf = upload_f32(executor.device(), &gate_cpu, vec![n]);
+        let up_buf = upload_f32(executor.device(), &up_cpu, vec![n]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        // sigmoid_mul shader sources need explicit registration.
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_silu_mul_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &gate_buf,
+            &up_buf,
+            n as u32,
+        )
+        .expect("silu_mul");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, n);
+
+        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        // F32 throughout — tight tolerance.
+        assert!(max_diff < 1e-5, "silu_mul max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_silu_mul_gpu_rejects_zero_n() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let g = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("g");
+        let u = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("u");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_silu_mul_gpu(session.encoder_mut(), &mut registry, device, &g, &u, 0)
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
     }
 
     #[test]

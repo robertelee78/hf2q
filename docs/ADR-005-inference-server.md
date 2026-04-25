@@ -1783,6 +1783,28 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Mantra check:** real GPU attention end-to-end. Full bidirectional self-attention (no mask, ViT convention) producing CPU-reference-matching output within BF16 tolerance. The CPU `scaled_dot_product_attention` from iter 37 reduces to a tiny-input parity reference; production goes through `vit_attention_gpu`.
   - **Next (iter 48):** GPU equivalents for the remaining ViT primitives — `vit_residual_add_gpu` (uses `mlx_native::ops::elementwise::elementwise_add` or in-place add), `vit_silu_mul_gpu` (uses `mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul` — fused silu+gate). Then iter 49 composes `apply_vit_block_forward_gpu` from `vit_linear_gpu`/`vit_rms_norm_gpu`/`vit_per_head_rms_norm_gpu`/`vit_attention_gpu`/`vit_silu_mul_gpu`/`vit_residual_add_gpu` — one full transformer block on GPU, real-data tested against the CPU `apply_vit_block_forward` reference. Iter 50 chains 27 blocks + post-blocks pipeline + projector. Iter 51 wires into `process_multimodal_content` handler — 501 → 200.
 
+- **2026-04-24 loop iter 48 — `vit_residual_add_gpu` + `vit_silu_mul_gpu` (last building blocks for the full block).** 7 GPU primitives now exist; iter 49 composes them into a full transformer block.
+  - **`vit_residual_add_gpu(encoder, registry, device, a, b, n) -> MlxBuffer`:** `out[i] = a[i] + b[i]` F32, fresh output buffer. Wraps `mlx_native::ops::elementwise::elementwise_add` with DType::F32.
+  - **`vit_silu_mul_gpu(encoder, registry, device, gate, up, n) -> MlxBuffer`:** SwiGLU gating `silu(gate) * up` composed as 2 dispatches:
+    1. `dispatch_sigmoid_mul(x=gate, gate=gate)` → `gate * sigmoid(gate) = silu(gate)` (the sigmoid_mul kernel with x=gate=gate parameters reduces to the SiLU formula directly).
+    2. `elementwise_mul(silu_out, up)` → final output.
+    Explicit `encoder.memory_barrier()` between the two per the iter-46 lesson. Caller registers `mlx_native::ops::sigmoid_mul::register(&mut registry)` before dispatch.
+  - **Tests (4 new, all passing):**
+    - `vit_residual_add_gpu_matches_cpu_reference` — synthetic 32-element f32 vs CPU `residual_add` max_diff < 1e-6.
+    - `vit_residual_add_gpu_rejects_zero_n`.
+    - `vit_silu_mul_gpu_matches_cpu_swiglu_gate` — synthetic 64-element gate/up vs CPU `silu_in_place + elementwise_mul_in_place` max_diff < 1e-5 (F32 throughout — no BF16 round-trip).
+    - `vit_silu_mul_gpu_rejects_zero_n`.
+  - **Verification:** `cargo test --bin hf2q vit_residual` — 2/2 pass. `cargo test --bin hf2q vit_silu` — 2/2 pass. Full suite — 912/912 pass (+4 from iter 47's 908).
+  - **GPU primitive surface complete.** All 7 ops needed for a full transformer block + post-blocks pipeline are now on Metal:
+    - `vit_linear_gpu` (linear projections — Q/K/V/output, FFN gate/up/down, mm.0)
+    - `vit_rms_norm_gpu` (ln1, ln2, post_ffw_norm, final norm)
+    - `vit_per_head_rms_norm_gpu` (attn_q_norm, attn_k_norm)
+    - `vit_softmax_last_dim_gpu` (attention softmax)
+    - `vit_attention_gpu` (full SDPA composing softmax + 2 GEMMs + V transpose)
+    - `vit_residual_add_gpu` (post-attn + post-FFN residuals)
+    - `vit_silu_mul_gpu` (SwiGLU gating)
+  - **Next (iter 49):** `apply_vit_block_forward_gpu` — composes all 7 GPU primitives into one full transformer block. Real-data tested by feeding real Gemma 4 block-0 weights + a synthetic input through the GPU pipeline, comparing against the CPU `apply_vit_block_forward` reference. Should reduce a per-block CPU run from ~38s to <100ms.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
