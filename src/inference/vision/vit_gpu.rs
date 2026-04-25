@@ -1021,6 +1021,42 @@ pub fn apply_vit_block_forward_gpu(
     Ok(block_out)
 }
 
+/// In-place GPU scalar multiply: `buf[i] *= scalar` across every element.
+///
+/// Wraps `mlx_native::ops::elementwise::scalar_mul_f32` with input ==
+/// output, exploiting the kernel's per-thread read-then-write pattern
+/// (no aliasing issue — each thread touches one element).
+///
+/// Used by the post-blocks pipeline's `scale_in_place(√n_embd)` step
+/// (`ggml_scale(cur, sqrtf(n_embd))` in llama.cpp's gemma4v graph).
+///
+/// # Errors
+///
+/// - `n_elements == 0`
+/// - propagated from `scalar_mul_f32`
+pub fn vit_scale_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    buf: &MlxBuffer,
+    n_elements: u32,
+    scalar: f32,
+) -> Result<()> {
+    if n_elements == 0 {
+        return Err(anyhow!("vit_scale_gpu: n_elements must be > 0"));
+    }
+    scalar_mul_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        buf,
+        buf,
+        n_elements as usize,
+        scalar,
+    )
+    .context("vit_scale_gpu: scalar_mul_f32")
+}
+
 /// Chain `apply_vit_block_forward_gpu` across all `cfg.num_hidden_layers`
 /// blocks. Input + output shape: F32 `[batch, hidden]` on device.
 ///
@@ -2253,6 +2289,67 @@ mod tests {
         let (md_attn_f, l2_attn_f) = l2(&attn_f_back, &ref_attn);
         eprintln!("STAGE F (full chain through attention): max_diff = {:.6}, l2 = {:.6}", md_attn_f, l2_attn_f);
     }
+    // -----------------------------------------------------------------------
+    // vit_scale_gpu (iter 51b)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_scale_gpu_multiplies_every_element_in_place() {
+        let n = 64usize;
+        let scalar = 0.25f32;
+        let cpu_in: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
+        let expected: Vec<f32> = cpu_in.iter().map(|x| x * scalar).collect();
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let buf = upload_f32(executor.device(), &cpu_in, vec![n]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, n as u32, scalar)
+            .expect("scale");
+        session.finish().expect("finish");
+        let got = readback_f32(&buf, n);
+
+        let max_diff = got.iter().zip(expected.iter()).map(|(g, e)| (g - e).abs()).fold(0f32, f32::max);
+        assert!(max_diff < 1e-6, "scale GPU max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_scale_gpu_by_unit_is_identity() {
+        let n = 16usize;
+        let cpu_in: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 1.0).collect();
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let buf = upload_f32(executor.device(), &cpu_in, vec![n]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, n as u32, 1.0)
+            .expect("scale");
+        session.finish().expect("finish");
+        let got = readback_f32(&buf, n);
+        for (g, c) in got.iter().zip(cpu_in.iter()) {
+            assert!((g - c).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn vit_scale_gpu_rejects_zero_n() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, 0, 1.0)
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
+    }
+
     /// Iter 51a: 27-block GPU forward on real Gemma 4 mmproj. Tests the
     /// distributional output of the chained block loop — finite,
     /// magnitudes O(1) after blocks (residual stream stays bounded

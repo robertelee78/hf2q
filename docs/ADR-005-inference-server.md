@@ -1850,6 +1850,15 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Mantra check:** real production-shape compute on real pretrained weights running at GPU speed. Output ready to feed into the post-blocks pipeline once that lands.
   - **Next (iter 51b):** add the missing GPU primitives — `vit_avg_pool_2x2_gpu` (custom Metal kernel or compose-via-elementwise; mlx-native has no avg_pool currently), `vit_scale_gpu` (thin wrap around `scalar_mul_f32`), `vit_std_bias_scale_gpu` (custom kernel: `(x - bias) × scale` per-channel). Then `apply_vit_full_forward_gpu` chains: blocks_loop → avg_pool(14, 1152) → scale(√1152) → std_bias_scale → linear(mm.0) → rms_norm(no-gain) → `[49, 2816]` final output. Iter 52 wires `process_multimodal_content` to invoke the GPU full forward, 501 → 200.
 
+- **2026-04-25 loop iter 51b — `vit_scale_gpu` in-place scalar multiply.** Trivial wrap of `mlx_native::ops::elementwise::scalar_mul_f32` exploiting the kernel's per-thread read-then-write pattern (input == output buffer). Used by the post-blocks `scale_in_place(√n_embd)` step.
+  - **`vit_scale_gpu(encoder, registry, device, buf, n_elements, scalar)`:** in-place; 1 dispatch.
+  - **Tests (3 new, all passing):** elementwise correctness against CPU (max_diff < 1e-6), unit-scalar identity, zero-n rejection.
+  - **Verification:** `cargo test --bin hf2q vit_scale_gpu` — 3/3 pass. Full suite 918/918 pass (+3 from iter 51a's 915).
+  - **Next (iter 51c):** custom Metal kernels for `vit_avg_pool_2x2_gpu` and `vit_std_bias_scale_gpu` registered inline via `KernelRegistry::register_source` with `&'static str` shader sources. Both are simple elementwise+gather ops:
+    - avg_pool_2x2: `out[oy, ox, h] = (in[2oy, 2ox, h] + in[2oy, 2ox+1, h] + in[2oy+1, 2ox, h] + in[2oy+1, 2ox+1, h]) * 0.25`
+    - std_bias_scale: `out[b, h] = (in[b, h] - bias[h]) * scale[h]` (per-channel broadcast)
+  - Then iter 51d composes `apply_vit_full_forward_gpu` from blocks_loop + avg_pool + scale + std_bias_scale + mm.0 linear + final rms_norm → `[49, 2816]`. Iter 52 wires the handler.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).
