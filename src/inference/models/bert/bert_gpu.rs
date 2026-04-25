@@ -37,6 +37,8 @@ use mlx_native::metal::MTLSize;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, elementwise_add, CastDirection};
 use mlx_native::ops::encode_helpers::KernelArg;
+use mlx_native::ops::gather::dispatch_gather_f32;
+use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 // ---------------------------------------------------------------------------
@@ -146,6 +148,33 @@ kernel void bert_bias_add_f32(
     uint idx = r * params.cols + c;
     output[idx] = input[idx] + bias[c];
 }
+
+struct PoolMeanParams {
+    uint seq_len;
+    uint hidden;
+};
+
+// Mean-pool across the sequence dim:
+//   out[h] = (1/seq_len) * sum_{s=0}^{seq_len-1} input[s * hidden + h]
+//
+// Input shape `[seq_len, hidden]` row-major; output shape `[hidden]`.
+// One thread per column of `hidden`; the loop iterates over seq_len.
+// For seq_len up to a few thousand, this is fully bandwidth-bound and a
+// fancier reduction (parallel sum) would not help on M5 Max. Keeping
+// the kernel scalar-per-thread also makes correctness obvious.
+kernel void bert_pool_mean_f32(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant PoolMeanParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.hidden) return;
+    float acc = 0.0;
+    for (uint s = 0; s < params.seq_len; ++s) {
+        acc += input[s * params.hidden + gid];
+    }
+    output[gid] = acc / float(params.seq_len);
+}
 "#;
 
 #[repr(C)]
@@ -161,6 +190,13 @@ struct LayerNormGpuParams {
 struct BiasAddGpuParams {
     rows: u32,
     cols: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PoolMeanGpuParams {
+    seq_len: u32,
+    hidden: u32,
 }
 
 /// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
@@ -183,14 +219,17 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
 pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("bert_layer_norm_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_bias_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("bert_pool_mean_f32", BERT_CUSTOM_SHADERS_SOURCE);
     // mlx-native's per-op kernel sources are needed for the attention
-    // chain (delegated to `vit_attention_gpu`) plus the GeLU activation.
-    // Only modules that expose a top-level `register` are listed —
+    // chain (delegated to `vit_attention_gpu`), GeLU, embedding gather,
+    // and L2 normalization. Modules listed here expose a `register` fn;
     // `transpose`, `elementwise`, `dense_mm_bf16`, and `cast` self-
     // register their sources on first dispatch via internal lookups.
     mlx_native::ops::gelu::register(registry);
     mlx_native::ops::softmax::register(registry);
     mlx_native::ops::sigmoid_mul::register(registry);
+    mlx_native::ops::gather::register(registry);
+    mlx_native::ops::l2_norm::register(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +944,369 @@ pub fn apply_bert_encoder_block_gpu(
         hidden,
     )
     .context("encoder block: post-FFN LayerNorm")
+}
+
+// ---------------------------------------------------------------------------
+// Embedding gather — F32 row lookup
+// ---------------------------------------------------------------------------
+
+/// GPU embedding gather: for each `i in 0..n_ids`, copy `table[ids[i]]`
+/// (a row of `hidden` F32 values) into `output[i]`. Wraps mlx-native's
+/// `dispatch_gather_f32`.
+///
+/// Inputs:
+/// - `table`  F32 `[vocab, hidden]`
+/// - `ids`    U32 `[n_ids]`
+///
+/// Returns F32 `[n_ids, hidden]`.
+///
+/// # Errors
+/// - `vocab`, `hidden`, or `n_ids` is zero
+/// - propagated from gather kernel dispatch
+pub fn bert_embed_gather_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    table: &MlxBuffer,
+    ids: &MlxBuffer,
+    vocab: u32,
+    hidden: u32,
+    n_ids: u32,
+) -> Result<MlxBuffer> {
+    if vocab == 0 || hidden == 0 || n_ids == 0 {
+        return Err(anyhow!(
+            "bert_embed_gather_gpu: vocab/hidden/n_ids must all be > 0 (got {} / {} / {})",
+            vocab,
+            hidden,
+            n_ids
+        ));
+    }
+    let total = (n_ids as usize) * (hidden as usize);
+    let output = device
+        .alloc_buffer(total * 4, DType::F32, vec![n_ids as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc embed_gather output: {e}"))?;
+    dispatch_gather_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        table,
+        ids,
+        &output,
+        vocab,
+        hidden,
+        n_ids,
+    )
+    .map_err(|e| anyhow!("bert_embed_gather_gpu: dispatch_gather_f32: {e}"))?;
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings layer (token + position + token_types → sum → LayerNorm)
+// ---------------------------------------------------------------------------
+
+/// Build a U32 buffer holding `[0, 1, 2, ..., seq_len - 1]` for the
+/// position-embed gather. Allocated on `device`'s unified memory and
+/// populated via the CPU pointer view (Apple Silicon: same bytes the
+/// GPU sees).
+fn alloc_position_ids(device: &MlxDevice, seq_len: u32) -> Result<MlxBuffer> {
+    let n = seq_len as usize;
+    let buf = device
+        .alloc_buffer(n * 4, DType::U32, vec![n])
+        .map_err(|e| anyhow!("alloc position_ids: {e}"))?;
+    // SAFETY: just-allocated u32 buffer; exclusive access.
+    let slice: &mut [u32] =
+        unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, n) };
+    for (i, slot) in slice.iter_mut().enumerate() {
+        *slot = i as u32;
+    }
+    Ok(buf)
+}
+
+/// Full BERT embeddings layer:
+/// `out = LayerNorm(token_embd[input_ids] + position_embd[0..seq] + maybe token_types[type_ids])`
+///
+/// Inputs:
+/// - `input_ids`           U32 `[seq_len]`
+/// - `type_ids_opt`        U32 `[seq_len]` — optional (None for single-segment)
+/// - `token_embd`          F32 `[vocab, hidden]`
+/// - `position_embd`       F32 `[max_pos, hidden]`
+/// - `token_types_opt`     F32 `[type_vocab, hidden]` — must accompany
+///                          `type_ids_opt` (one None implies the other None)
+/// - `embed_norm_gamma`,
+///   `embed_norm_beta`     F32 `[hidden]`
+///
+/// Returns F32 `[seq_len, hidden]`.
+///
+/// `seq_len` must be ≤ `max_pos` (caller's responsibility — silent
+/// out-of-bounds reads in the gather kernel otherwise).
+///
+/// `vocab`, `max_pos`, `type_vocab` are passed explicitly so the gather
+/// kernel can validate index range. Real BERT GGUFs encode these in
+/// `BertConfig.{vocab_size, max_position_embeddings, type_vocab_size}`.
+///
+/// # Errors
+/// - any zero dimension
+/// - `type_ids_opt.is_some() != token_types_opt.is_some()` (must match)
+/// - propagated from sub-dispatches
+#[allow(clippy::too_many_arguments)]
+pub fn bert_embeddings_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_ids: &MlxBuffer,
+    type_ids_opt: Option<&MlxBuffer>,
+    token_embd: &MlxBuffer,
+    position_embd: &MlxBuffer,
+    token_types_opt: Option<&MlxBuffer>,
+    embed_norm_gamma: &MlxBuffer,
+    embed_norm_beta: &MlxBuffer,
+    eps: f32,
+    seq_len: u32,
+    hidden: u32,
+    vocab: u32,
+    max_pos: u32,
+    type_vocab: u32,
+) -> Result<MlxBuffer> {
+    if seq_len == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "bert_embeddings_gpu: seq_len ({}) and hidden ({}) must be > 0",
+            seq_len,
+            hidden
+        ));
+    }
+    if seq_len > max_pos {
+        return Err(anyhow!(
+            "bert_embeddings_gpu: seq_len ({}) exceeds max_pos ({})",
+            seq_len,
+            max_pos
+        ));
+    }
+    match (type_ids_opt.is_some(), token_types_opt.is_some()) {
+        (true, true) | (false, false) => {}
+        (a, b) => {
+            return Err(anyhow!(
+                "bert_embeddings_gpu: type_ids and token_types must both be Some or both None (got {} / {})",
+                a, b
+            ));
+        }
+    }
+
+    let n_hidden = (seq_len as usize) * (hidden as usize);
+
+    // Token gather.
+    let tok = bert_embed_gather_gpu(
+        encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len,
+    )
+    .context("embeddings: token gather")?;
+    encoder.memory_barrier();
+
+    // Position gather. Position ids are constructed as 0..seq.
+    let pos_ids = alloc_position_ids(device, seq_len)?;
+    let pos = bert_embed_gather_gpu(
+        encoder,
+        registry,
+        device,
+        position_embd,
+        &pos_ids,
+        max_pos,
+        hidden,
+        seq_len,
+    )
+    .context("embeddings: position gather")?;
+    encoder.memory_barrier();
+
+    // First sum: token + position.
+    let tok_pos = bert_residual_add_gpu(encoder, registry, device, &tok, &pos, n_hidden as u32)
+        .context("embeddings: token + position add")?;
+    encoder.memory_barrier();
+
+    // Second sum (optional): + token_types.
+    let summed = if let (Some(type_ids), Some(token_types)) = (type_ids_opt, token_types_opt) {
+        let typ = bert_embed_gather_gpu(
+            encoder,
+            registry,
+            device,
+            token_types,
+            type_ids,
+            type_vocab,
+            hidden,
+            seq_len,
+        )
+        .context("embeddings: type gather")?;
+        encoder.memory_barrier();
+        let s = bert_residual_add_gpu(
+            encoder,
+            registry,
+            device,
+            &tok_pos,
+            &typ,
+            n_hidden as u32,
+        )
+        .context("embeddings: + token_types add")?;
+        encoder.memory_barrier();
+        s
+    } else {
+        tok_pos
+    };
+
+    // LayerNorm finalize.
+    bert_layer_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &summed,
+        embed_norm_gamma,
+        embed_norm_beta,
+        eps,
+        seq_len,
+        hidden,
+    )
+    .context("embeddings: post-sum LayerNorm")
+}
+
+// ---------------------------------------------------------------------------
+// Pooling — Mean / CLS / Last
+// ---------------------------------------------------------------------------
+
+/// Pooling reduction kind used by `bert_pool_gpu`. Mirrors the runtime
+/// choice from `BertConfig.pooling_type` minus the variants
+/// `/v1/embeddings` cannot return (`None`/`Rank`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BertPoolKind {
+    /// Average across the sequence dimension.
+    Mean,
+    /// Take row 0 (CLS token).
+    Cls,
+    /// Take row `seq_len - 1` (last token).
+    Last,
+}
+
+/// GPU pool: reduce a `[seq_len, hidden]` row-major matrix to a single
+/// `[hidden]` row per `kind`. Returns a fresh F32 `[hidden]` buffer.
+///
+/// # Errors
+/// - `seq_len == 0` or `hidden == 0`
+/// - propagated from kernel dispatch
+pub fn bert_pool_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    kind: BertPoolKind,
+    seq_len: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if seq_len == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "bert_pool_gpu: seq_len ({}) and hidden ({}) must be > 0",
+            seq_len,
+            hidden
+        ));
+    }
+    match kind {
+        BertPoolKind::Mean => {
+            let output = device
+                .alloc_buffer((hidden as usize) * 4, DType::F32, vec![hidden as usize])
+                .map_err(|e| anyhow!("alloc pool_mean output: {e}"))?;
+            let pipeline = registry
+                .get_pipeline("bert_pool_mean_f32", device.metal_device())
+                .map_err(|e| anyhow!("bert_pool_gpu: get_pipeline: {e}"))?;
+            let params = PoolMeanGpuParams { seq_len, hidden };
+            let bytes = pod_as_bytes(&params);
+            let grid = MTLSize::new(hidden as u64, 1, 1);
+            let tg_x = std::cmp::min(64, hidden as u64);
+            let tg = MTLSize::new(tg_x, 1, 1);
+            encoder.encode_with_args(
+                pipeline,
+                &[
+                    (0, KernelArg::Buffer(input)),
+                    (1, KernelArg::Buffer(&output)),
+                    (2, KernelArg::Bytes(bytes)),
+                ],
+                grid,
+                tg,
+            );
+            Ok(output)
+        }
+        BertPoolKind::Cls | BertPoolKind::Last => {
+            // Implement as a 1-element gather: row index = 0 (CLS) or
+            // seq_len - 1 (Last). The gather kernel handles the F32
+            // row copy directly without needing a custom shader.
+            let idx_val: u32 = match kind {
+                BertPoolKind::Cls => 0,
+                BertPoolKind::Last => seq_len - 1,
+                BertPoolKind::Mean => unreachable!(),
+            };
+            let idx_buf = device
+                .alloc_buffer(4, DType::U32, vec![1])
+                .map_err(|e| anyhow!("alloc pool index buffer: {e}"))?;
+            // SAFETY: just-allocated u32 buffer of length 1.
+            let s: &mut [u32] =
+                unsafe { std::slice::from_raw_parts_mut(idx_buf.contents_ptr() as *mut u32, 1) };
+            s[0] = idx_val;
+            bert_embed_gather_gpu(encoder, registry, device, input, &idx_buf, seq_len, hidden, 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L2 normalize
+// ---------------------------------------------------------------------------
+
+/// GPU L2 normalize per row: `out[r, i] = in[r, i] / sqrt(sum_i in[r,i]² + eps)`.
+/// Wraps `mlx_native::ops::l2_norm::dispatch_l2_norm`. Allocates a fresh
+/// F32 output buffer.
+///
+/// For pooled embeddings (a single row), pass `rows = 1`. For
+/// per-token output (no pooling), pass `rows = seq_len`.
+///
+/// # Errors
+/// - `rows == 0` or `dim == 0`
+/// - propagated from dispatch
+pub fn bert_l2_normalize_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    eps: f32,
+    rows: u32,
+    dim: u32,
+) -> Result<MlxBuffer> {
+    if rows == 0 || dim == 0 {
+        return Err(anyhow!(
+            "bert_l2_normalize_gpu: rows ({}) and dim ({}) must be > 0",
+            rows,
+            dim
+        ));
+    }
+    let total = (rows as usize) * (dim as usize);
+    let output = device
+        .alloc_buffer(total * 4, DType::F32, vec![rows as usize, dim as usize])
+        .map_err(|e| anyhow!("alloc l2_norm output: {e}"))?;
+    // dispatch_l2_norm wants a 2-element F32 params buf [eps, dim].
+    let params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc l2_norm params: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2)
+        };
+        s[0] = eps;
+        s[1] = dim as f32;
+    }
+    dispatch_l2_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        &params_buf,
+        rows,
+        dim,
+    )
+    .map_err(|e| anyhow!("bert_l2_normalize_gpu: dispatch_l2_norm: {e}"))?;
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -2011,6 +2413,497 @@ mod tests {
             gpu_out[argmax],
             cpu_out[argmax]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // bert_embed_gather_gpu — F32 row lookup
+    // -----------------------------------------------------------------
+
+    fn upload_u32(device: &MlxDevice, data: &[u32], shape: Vec<usize>) -> MlxBuffer {
+        let bytes = data.len() * 4;
+        let buf = device.alloc_buffer(bytes, DType::U32, shape).unwrap();
+        // SAFETY: just-allocated u32 buffer; exclusive access.
+        let slice: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
+        };
+        slice.copy_from_slice(data);
+        buf
+    }
+
+    #[test]
+    fn embed_gather_gpu_picks_correct_rows() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let vocab = 5usize;
+        let hidden = 8usize;
+        // table[i, h] = i * 100 + h
+        let table: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i / hidden) * 100 + (i % hidden)) as f32)
+            .collect();
+        let ids: Vec<u32> = vec![3, 0, 4, 1, 2];
+
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        // SAFETY: executor outlives session.
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let table_buf = upload_f32(device, &table, vec![vocab, hidden]);
+        let ids_buf = upload_u32(device, &ids, vec![ids.len()]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_embed_gather_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &table_buf,
+            &ids_buf,
+            vocab as u32,
+            hidden as u32,
+            ids.len() as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, ids.len() * hidden);
+        for (i, &id) in ids.iter().enumerate() {
+            for h in 0..hidden {
+                let expected = (id as usize * 100 + h) as f32;
+                let actual = got[i * hidden + h];
+                assert!(
+                    (expected - actual).abs() < 1e-6,
+                    "row {} h {}: got {}, want {}",
+                    i,
+                    h,
+                    actual,
+                    expected
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // bert_embeddings_gpu — full token+pos+type+LN composition
+    // -----------------------------------------------------------------
+
+    /// CPU reference for the embeddings layer. Independent recomposition
+    /// of the same primitives so a regression in any sub-step surfaces.
+    fn embeddings_cpu_ref(
+        input_ids: &[u32],
+        type_ids: Option<&[u32]>,
+        token_embd: &[f32],
+        position_embd: &[f32],
+        token_types: Option<&[f32]>,
+        embed_gamma: &[f32],
+        embed_beta: &[f32],
+        eps: f32,
+        seq_len: usize,
+        hidden: usize,
+    ) -> Vec<f32> {
+        let mut summed = vec![0.0f32; seq_len * hidden];
+        for s in 0..seq_len {
+            let tid = input_ids[s] as usize;
+            for h in 0..hidden {
+                let v = token_embd[tid * hidden + h] + position_embd[s * hidden + h];
+                let v = if let (Some(tids), Some(tt)) = (type_ids, token_types) {
+                    let typ = tids[s] as usize;
+                    v + tt[typ * hidden + h]
+                } else {
+                    v
+                };
+                summed[s * hidden + h] = v;
+            }
+        }
+        bert_layer_norm_cpu_ref(&summed, embed_gamma, embed_beta, eps, seq_len, hidden)
+    }
+
+    #[test]
+    fn embeddings_gpu_matches_cpu_with_token_types() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 32usize; // satisfies LN reduction; below max_pos
+        let hidden = 64usize;
+        let vocab = 100usize;
+        let max_pos = 128usize;
+        let type_vocab = 2usize;
+        let eps = 1e-12f32;
+
+        let prand_f32 = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2654435761usize).wrapping_add(seed) % 1000) as f32) * 0.001
+                        - 0.5
+                })
+                .collect()
+        };
+        let token_embd = prand_f32(1, vocab * hidden);
+        let position_embd = prand_f32(2, max_pos * hidden);
+        let token_types = prand_f32(3, type_vocab * hidden);
+        let embed_gamma = prand_f32(4, hidden);
+        let embed_beta = prand_f32(5, hidden);
+        let input_ids: Vec<u32> = (0..seq).map(|i| (i.wrapping_mul(7) % vocab) as u32).collect();
+        let type_ids: Vec<u32> = (0..seq).map(|i| (i & 1) as u32).collect();
+
+        let cpu = embeddings_cpu_ref(
+            &input_ids,
+            Some(&type_ids),
+            &token_embd,
+            &position_embd,
+            Some(&token_types),
+            &embed_gamma,
+            &embed_beta,
+            eps,
+            seq,
+            hidden,
+        );
+
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let token_embd_b = upload_f32(device, &token_embd, vec![vocab, hidden]);
+        let position_embd_b = upload_f32(device, &position_embd, vec![max_pos, hidden]);
+        let token_types_b = upload_f32(device, &token_types, vec![type_vocab, hidden]);
+        let embed_gamma_b = upload_f32(device, &embed_gamma, vec![hidden]);
+        let embed_beta_b = upload_f32(device, &embed_beta, vec![hidden]);
+        let input_ids_b = upload_u32(device, &input_ids, vec![seq]);
+        let type_ids_b = upload_u32(device, &type_ids, vec![seq]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_embeddings_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_ids_b,
+            Some(&type_ids_b),
+            &token_embd_b,
+            &position_embd_b,
+            Some(&token_types_b),
+            &embed_gamma_b,
+            &embed_beta_b,
+            eps,
+            seq as u32,
+            hidden as u32,
+            vocab as u32,
+            max_pos as u32,
+            type_vocab as u32,
+        )
+        .expect("embeddings dispatch");
+        session.finish().expect("finish");
+        let gpu = readback_f32(&out, seq * hidden);
+
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        // Embeddings is gather + add + LayerNorm — all F32, no BF16
+        // cast. Tolerance tight at 1e-4 (LN reduction order is the
+        // only divergence source).
+        assert!(max_diff < 1e-4, "embeddings max_diff: {max_diff}");
+    }
+
+    #[test]
+    fn embeddings_gpu_without_token_types_path_works() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 32usize;
+        let hidden = 64usize;
+        let vocab = 50usize;
+        let max_pos = 64usize;
+        let eps = 1e-12f32;
+
+        let token_embd: Vec<f32> = (0..vocab * hidden).map(|i| (i as f32) * 0.001).collect();
+        let position_embd: Vec<f32> = (0..max_pos * hidden).map(|i| (i as f32) * 0.0005).collect();
+        let embed_gamma = vec![1.0f32; hidden];
+        let embed_beta = vec![0.0f32; hidden];
+        let input_ids: Vec<u32> = (0..seq).map(|i| (i % vocab) as u32).collect();
+
+        let cpu = embeddings_cpu_ref(
+            &input_ids,
+            None,
+            &token_embd,
+            &position_embd,
+            None,
+            &embed_gamma,
+            &embed_beta,
+            eps,
+            seq,
+            hidden,
+        );
+
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let token_embd_b = upload_f32(device, &token_embd, vec![vocab, hidden]);
+        let position_embd_b = upload_f32(device, &position_embd, vec![max_pos, hidden]);
+        let embed_gamma_b = upload_f32(device, &embed_gamma, vec![hidden]);
+        let embed_beta_b = upload_f32(device, &embed_beta, vec![hidden]);
+        let input_ids_b = upload_u32(device, &input_ids, vec![seq]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_embeddings_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_ids_b,
+            None,
+            &token_embd_b,
+            &position_embd_b,
+            None,
+            &embed_gamma_b,
+            &embed_beta_b,
+            eps,
+            seq as u32,
+            hidden as u32,
+            vocab as u32,
+            max_pos as u32,
+            0,
+        )
+        .expect("embeddings dispatch (no token_types)");
+        session.finish().expect("finish");
+        let gpu = readback_f32(&out, seq * hidden);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu.iter().zip(cpu.iter()) {
+            max_diff = max_diff.max((g - c).abs());
+        }
+        assert!(max_diff < 1e-4, "embeddings (no types) max_diff: {max_diff}");
+    }
+
+    #[test]
+    fn embeddings_rejects_inconsistent_token_types_args() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let buf = upload_f32(device, &[0.0; 64], vec![64]);
+        let id_buf = upload_u32(device, &[0; 32], vec![32]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = bert_embeddings_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &id_buf,
+            Some(&id_buf), // type_ids supplied
+            &buf,
+            &buf,
+            None, // but token_types not — must reject
+            &buf,
+            &buf,
+            1e-12,
+            32,
+            1,
+            10,
+            64,
+            2,
+        );
+        assert!(err.is_err(), "type_ids without token_types must error");
+        drop(session);
+    }
+
+    // -----------------------------------------------------------------
+    // bert_pool_gpu — Mean / CLS / Last
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pool_mean_gpu_matches_cpu_average() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 5usize;
+        let hidden = 8usize;
+        // input[s, h] = s + h * 0.1
+        let input: Vec<f32> = (0..seq * hidden)
+            .map(|i| (i / hidden) as f32 + (i % hidden) as f32 * 0.1)
+            .collect();
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Mean,
+            seq as u32,
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        for h in 0..hidden {
+            let mut expected = 0.0f32;
+            for s in 0..seq {
+                expected += s as f32 + h as f32 * 0.1;
+            }
+            expected /= seq as f32;
+            assert!(
+                (got[h] - expected).abs() < 1e-5,
+                "h={}: got {}, want {}",
+                h,
+                got[h],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pool_cls_gpu_returns_first_row() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 5usize;
+        let hidden = 8usize;
+        let input: Vec<f32> = (0..seq * hidden).map(|i| i as f32).collect();
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Cls,
+            seq as u32,
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        for h in 0..hidden {
+            assert!(
+                (got[h] - h as f32).abs() < 1e-6,
+                "CLS h={}: got {}, want {}",
+                h,
+                got[h],
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn pool_last_gpu_returns_last_row() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq = 5usize;
+        let hidden = 8usize;
+        let input: Vec<f32> = (0..seq * hidden).map(|i| i as f32).collect();
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Last,
+            seq as u32,
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        for h in 0..hidden {
+            let expected = ((seq - 1) * hidden + h) as f32;
+            assert!(
+                (got[h] - expected).abs() < 1e-6,
+                "Last h={}: got {}, want {}",
+                h,
+                got[h],
+                expected
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // bert_l2_normalize_gpu — unit L2 norm
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn l2_normalize_gpu_produces_unit_norm() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let rows = 1usize;
+        let dim = 384usize; // bge-small hidden
+        let input: Vec<f32> = (0..rows * dim).map(|i| (i as f32) * 0.01 - 1.0).collect();
+
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let in_buf = upload_f32(device, &input, vec![rows, dim]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_l2_normalize_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            1e-12,
+            rows as u32,
+            dim as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, rows * dim);
+
+        // Each row should have L2 norm 1.
+        for r in 0..rows {
+            let mut sum_sq = 0.0f64;
+            for d in 0..dim {
+                let v = got[r * dim + d] as f64;
+                sum_sq += v * v;
+            }
+            let norm = sum_sq.sqrt() as f32;
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "row {} norm {} != 1.0",
+                r,
+                norm
+            );
+        }
     }
 
     #[test]

@@ -1930,6 +1930,31 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 60 — Phase 2b BERT embeddings + pooling + L2 normalize — every primitive needed for the full forward pass now lands on GPU.**
+  - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
+    - `bert_embed_gather_gpu(table, ids, vocab, hidden, n_ids)` — F32 row gather wrapping `mlx_native::ops::gather::dispatch_gather_f32`. Output `[n_ids, hidden]`.
+    - `bert_embeddings_gpu(input_ids, type_ids_opt, token_embd, position_embd, token_types_opt, gamma, beta, eps, seq_len, hidden, vocab, max_pos, type_vocab)` — full embeddings layer: token gather + position gather (positions auto-built `0..seq_len`) + optional token-type gather + sum + LayerNorm. Memory barriers between every gather/add. Validates `type_ids_opt.is_some() == token_types_opt.is_some()` (must agree).
+    - `BertPoolKind { Mean, Cls, Last }` + `bert_pool_gpu(input, kind, seq_len, hidden)` — three pooling reductions:
+      - **Mean**: inline custom Metal kernel `bert_pool_mean_f32` (one thread per column; loop over `seq_len`).
+      - **CLS**: 1-element gather at index 0 (reuses the gather kernel — no extra shader).
+      - **Last**: 1-element gather at index `seq_len - 1`.
+    - `bert_l2_normalize_gpu(input, eps, rows, dim)` — wraps `mlx_native::ops::l2_norm::dispatch_l2_norm`. Allocates the `[eps, dim]` params buffer the kernel expects.
+    - `register_bert_custom_shaders` extended to register `bert_pool_mean_f32`, plus `gather::register` and `l2_norm::register` from mlx-native.
+    - `alloc_position_ids` helper builds `[0, 1, ..., seq_len-1]` in unified memory via direct CPU pointer write (Apple Silicon: same bytes the GPU sees).
+  - **Tests (8 new, all pass; full suite 965/965 +8):**
+    - `embed_gather_gpu_picks_correct_rows` — table[i, h] = i*100+h, ids=[3,0,4,1,2] → expected output rows match exactly within 1e-6.
+    - `embeddings_gpu_matches_cpu_with_token_types` — seq=32, hidden=64, vocab=100, max_pos=128, type_vocab=2. Deterministic pseudo-random tensors, type_ids alternating 0/1. Tolerance 1e-4 (no BF16 cast in this path; LN reduction order is the only divergence source).
+    - `embeddings_gpu_without_token_types_path_works` — same shapes, `None` for type_ids/token_types → asserts the optional-skip branch matches CPU at 1e-4.
+    - `embeddings_rejects_inconsistent_token_types_args` — `type_ids = Some(...)` with `token_types = None` → `Err`.
+    - `pool_mean_gpu_matches_cpu_average` — input[s, h] = s + h*0.1 → mean[h] computed analytically; tolerance 1e-5.
+    - `pool_cls_gpu_returns_first_row` — input[i] = i → out[h] = h, exact within 1e-6.
+    - `pool_last_gpu_returns_last_row` — input[i] = i → out[h] = (seq-1)*hidden + h, exact within 1e-6.
+    - `l2_normalize_gpu_produces_unit_norm` — bge-small dim=384 row, asserts the post-normalize L2 norm is 1.0 within 1e-4.
+  - **Why the embeddings path stays at 1e-4 tolerance vs the encoder block's 0.50.** No BF16 cast anywhere in the embedding path — gather is F32→F32, sum is F32 add, LayerNorm is F32 throughout. The block is loose because of the 4 cumulative BF16-cast linear projections + BF16 attention. This per-op tolerance discipline lets a future regression in any one step show up sharply.
+  - **Verification.** `cargo test --bin hf2q inference::models::bert` — 30/30 pass (was 22 + 8 new). Full suite **965/965 pass** (+8 from iter 59's 957), 8 ignored. `cargo check --bin hf2q --tests` clean.
+  - **Lane discipline observed.** All edits in `src/inference/models/bert/bert_gpu.rs`. No mlx-native fork, no edits to other lanes.
+  - **Next (iter 61):** `apply_bert_full_forward_gpu(input_ids, type_ids_opt, weights, cfg)` — chains `bert_embeddings_gpu` → N × `apply_bert_encoder_block_gpu` (pulling per-layer tensors via `LoadedBertWeights::block_required` / `block_optional`) → `bert_pool_gpu` (kind from `cfg.pooling_type`) → `bert_l2_normalize_gpu`. Then the `/v1/embeddings` handler wiring + `--embedding-model` CLI flag. After that, Phase 2b's accuracy gate (parity vs llama.cpp on a real BERT GGUF) is the closure step.
+
 - **2026-04-26 loop iter 59 — Phase 2b BERT encoder block forward pass composed end-to-end on GPU, parity-validated vs CPU oracle.**
   - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
     - `bert_residual_add_gpu(a, b, n)` — F32 residual elementwise-add wrapping `mlx_native::ops::elementwise::elementwise_add`. Used internally by the block composer; exposed `pub` for the iter-60 embedding sum.
