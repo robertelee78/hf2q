@@ -173,6 +173,44 @@ same host produce byte-identical transcripts.
 requirements). `tests/smoke_conformance.rs` exercises every preflight exit
 code via `assert_cmd` + `env_remove` — zero disk / HF / token dependency.
 
+### Smoke against an already-converted GGUF (skip the convert step)
+
+If you already have a converted `.gguf` on disk (e.g. produced by an earlier
+`hf2q convert` run), you can skip the convert step entirely and only validate
+the inference + transcript half of the pipeline:
+
+```bash
+# 1. Symlink the canonical filename smoke expects (`{arch}-{quant}.gguf`).
+ln -sf qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf \
+       /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen35moe-q4_0.gguf
+
+# 2. Run smoke with --skip-convert + --convert-output-dir pointing at the
+#    same dir as --local-dir.
+./target/release/hf2q smoke \
+    --arch qwen35moe \
+    --skip-convert \
+    --local-dir /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex \
+    --convert-output-dir /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex
+```
+
+`--local-dir` skips the HF_TOKEN preflight (exit code 2), and `--skip-convert`
+skips the convert subprocess. Disk floor is still checked; preflight exit
+code 3 fires if free space < `disk_floor_gb + 10 GB` even though no convert
+is actually run.
+
+This unblocks P8's "real-model close" deliverable — committing a real
+`tests/fixtures/smoke-transcripts/{arch}-{quant}.txt` — without needing
+HF_TOKEN or re-downloading safetensors. Useful when you already converted
+the model on a prior session or via a different tool.
+
+**Wall-clock budget on M5 Max** (apex MoE Q4_0, ~25 GB GGUF): expect
+~5–10 minutes for the inference step alone. llama-cli (homebrew build)
+defaults to single-threaded CPU inference on this size class — adding
+`-t 18` or building llama-cli with Metal offload would speed it up
+considerably, but the smoke transcript is intentionally deterministic
+across systems (`--seed 42 --temp 0 --no-warmup`) so changing thread
+count would invalidate prior committed transcripts.
+
 ---
 
 ## How P11 catches MTP regressions (manual bisection)
