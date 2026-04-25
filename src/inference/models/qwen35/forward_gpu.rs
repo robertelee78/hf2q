@@ -267,7 +267,10 @@ fn apply_output_head_gpu(
             hidden_size,
         )
         .context("dispatch_rms_norm output")?;
-        enc.commit_and_wait().context("commit output norm")?;
+        // commit() without wait: lm_head encoder reads `out` immediately after
+        // on the same Metal serial queue; GPU ordering guarantees output_norm
+        // completes before lm_head executes.
+        enc.commit();
         out
     };
 
