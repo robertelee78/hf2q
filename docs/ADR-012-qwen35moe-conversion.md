@@ -1072,6 +1072,25 @@ Both fallbacks keep path (a) intact; neither requires path (b).
 
 **Acceptance (P9b close):** all 7 sub-tasks shipped; new integration test green on synthetic qwen35-dense + qwen35-moe; old P9b-pending guard message removed from `src/main.rs`; intermediate GGUF cleanup verified by test on both happy-path and panic-path (Drop runs).
 
+#### P9 first real-model DWQ GGUF SHIPPED 2026-04-25
+
+`models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf` produced via the
+two-pass pipeline. End-to-end on Qwen/Qwen3.6-27B safetensors:
+- Input: 51.75 GB safetensors (BF16)
+- Output: 16.54 GB DWQ GGUF (3.1× compression)
+- Wall-clock: 20m 09s on M5 Max (HF download + transforms + intermediate F16 emit + CPU activation capture over 1024-token forward pass + DWQ scale calibration + final write)
+- GGUF magic + version 3 verified (`4747 5546 0300 0000` at file head)
+
+Three real-world bugs surfaced and fixed during this run (each was a synthetic-test gap that real safetensors uncovered):
+
+| Commit | Fix |
+|---|---|
+| `9ef3068` | A_log negation accepts BF16/F16 source data (real Qwen3.6 ships A_log as BF16, not F32 — synthetic fixtures had F32) |
+| `8e6282d` | linear_attn family wired into `hf_name_to_gguf` layer_map for both qwen35 + qwen35moe arches (was missing entirely; canonical mapping existed in `src/models/qwen35/dense.rs::map_linear_attn_suffix` but never wired into the GGUF backend) |
+| `b35aa9f` | qwen35 `load_from_gguf` accepts physically-padded vocab (token_embd 248320 rows vs metadata logical 248044; fix overrides cfg.vocab_size from tensor shape, matching llama.cpp's internal handling) |
+
+The remaining three GGUFs in Task #16 (qwen35 dwq48, qwen35moe × dwq46/dwq48) reuse the same cleared paths.
+
 #### P9b cost-model & optimization candidates (2026-04-25 audit)
 
 Captured here so future profiling has a concrete baseline. All numbers are theoretical from layout + dtype reasoning; the real-model run on apex MoE (Task #16) will validate or correct them.
