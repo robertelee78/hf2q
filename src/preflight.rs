@@ -272,17 +272,21 @@ fn validate_input_dir(input_dir: &Path) -> Result<(), PreflightError> {
 /// A model with *only* linear_attention layers is not a valid hybrid; KV state
 /// anchoring requires at least one full_attention layer.
 /// Models without any linear_attention layers (Gemma4, LLaMA, etc.) pass trivially.
+///
+/// Uses `resolved_layer_types()` per Decision 2's "P2+ MUST call
+/// resolved_layer_types(), not the legacy layer_types Vec" contract — so a
+/// Qwen3.5 config that supplies `full_attention_interval` only (without an
+/// explicit per-layer enumeration) is correctly diagnosed. The raw
+/// `layer_types` field would not contain "linear_attention" in that case
+/// (the parser populates it as `["attention"; N]` when no explicit array
+/// is present), making the validator a no-op for the most common
+/// real-world Qwen3.5 config shape.
 fn validate_linear_attention_hybrid(metadata: &ModelMetadata) -> Result<(), PreflightError> {
-    let has_linear = metadata
-        .layer_types
-        .iter()
-        .any(|t| t == "linear_attention");
+    let resolved = metadata.resolved_layer_types();
+    let has_linear = resolved.iter().any(|t| t == "linear_attention");
 
     if has_linear {
-        let has_full = metadata
-            .layer_types
-            .iter()
-            .any(|t| t == "full_attention");
+        let has_full = resolved.iter().any(|t| t == "full_attention");
 
         if !has_full {
             return Err(PreflightError::LinearAttentionWithoutFullAttention);
@@ -852,6 +856,70 @@ mod tests {
             validate_linear_attention_hybrid(&metadata).is_ok(),
             "valid hybrid (linear+full) must pass"
         );
+    }
+
+    /// Decision 2 contract: P2+ MUST call `resolved_layer_types()`. The
+    /// hybrid-validator was previously walking the raw `layer_types` field,
+    /// which the parser populates as `["attention"; N]` when no explicit
+    /// per-layer enumeration is in JSON. A Qwen3.5 config that supplied
+    /// `full_attention_interval` only would therefore *bypass* the
+    /// validator silently — has_linear=false on the raw field.
+    ///
+    /// This test seeds a synthetic Qwen3.5 config with derived layers
+    /// (full_attention_interval=4, num_layers=8 → 6 linear + 2 full) and
+    /// verifies the validator now sees the resolved per-layer types.
+    #[test]
+    fn preflight_uses_resolved_layer_types_for_qwen35_derived_config() {
+        // Raw `layer_types` is the parser's "attention" placeholder for
+        // a config without explicit per-layer enumeration. resolved_layer_types()
+        // derives from full_attention_interval=4 with num_layers=8, giving
+        // 6 linear + 2 full at positions 3 and 7.
+        let mut metadata = make_test_metadata(
+            8,
+            vec!["attention".to_string(); 8],
+        );
+        metadata.full_attention_interval = Some(4);
+
+        // Sanity: raw layer_types shows nothing about linear-attn.
+        assert!(
+            !metadata.layer_types.iter().any(|t| t == "linear_attention"),
+            "raw layer_types must NOT contain linear_attention (validator bypass risk)"
+        );
+        // resolved_layer_types() correctly derives the hybrid pattern.
+        let resolved = metadata.resolved_layer_types();
+        assert_eq!(resolved.iter().filter(|t| *t == "full_attention").count(), 2);
+        assert_eq!(resolved.iter().filter(|t| *t == "linear_attention").count(), 6);
+
+        // Hybrid is valid (has both kinds) — must pass.
+        assert!(
+            validate_linear_attention_hybrid(&metadata).is_ok(),
+            "Qwen3.5 derived hybrid (interval=4) must pass via resolved_layer_types"
+        );
+    }
+
+    /// Same as above but with a degenerate `full_attention_interval` (>num_layers)
+    /// so the resolved pattern is 100% linear_attention. Decision 3 must reject.
+    /// Pre-fix this would have passed because raw `layer_types` is `["attention"; N]`
+    /// and `has_linear=false` on the raw field.
+    #[test]
+    fn preflight_rejects_qwen35_all_linear_via_resolved_types() {
+        let mut metadata = make_test_metadata(
+            4,
+            vec!["attention".to_string(); 4],
+        );
+        // interval > num_layers (or any value where `(i+1) % interval != 0`
+        // for all i in 0..num_layers) makes the resolved pattern 100% linear.
+        metadata.full_attention_interval = Some(99);
+
+        let resolved = metadata.resolved_layer_types();
+        assert!(
+            resolved.iter().all(|t| t == "linear_attention"),
+            "interval=99 with num_layers=4 should derive 100% linear"
+        );
+
+        let err = validate_linear_attention_hybrid(&metadata)
+            .expect_err("100% linear (derived) must fail Decision 3 hybrid check");
+        assert!(matches!(err, PreflightError::LinearAttentionWithoutFullAttention));
     }
 
     /// Models with no linear_attention (Gemma4, LLaMA) pass trivially.
