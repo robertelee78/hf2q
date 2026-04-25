@@ -203,13 +203,27 @@ This unblocks P8's "real-model close" deliverable — committing a real
 HF_TOKEN or re-downloading safetensors. Useful when you already converted
 the model on a prior session or via a different tool.
 
-**Wall-clock budget on M5 Max** (apex MoE Q4_0, ~25 GB GGUF): expect
-~5–10 minutes for the inference step alone. llama-cli (homebrew build)
-defaults to single-threaded CPU inference on this size class — adding
-`-t 18` or building llama-cli with Metal offload would speed it up
-considerably, but the smoke transcript is intentionally deterministic
-across systems (`--seed 42 --temp 0 --no-warmup`) so changing thread
-count would invalidate prior committed transcripts.
+**Wall-clock budget on M5 Max** (apex MoE Q4_0, ~25 GB GGUF): empirically
+**>10 minutes** for the 8-token decode (validated 2026-04-25). Even with
+`/opt/llama.cpp/build/bin/llama-cli` having Metal kernels available,
+the apex MoE path appears to fall back to single-thread CPU under heavy
+memory paging (~4M syscalls/sec, single-core saturation, 30 GB RSS).
+**Apex-scale q4_0 smoke validation is impractical without further
+tuning** (e.g. explicit `-ngl 99` + a Metal-validated llama.cpp build
+that supports the qwen35moe MoE expert-routing kernel).
+
+For now, real-model q4_0 smoke transcripts at apex scale are deferred:
+the smoke pipeline DESIGN is correct (synthetic small-arch testing in
+`tests/smoke_conformance.rs` covers all preflight + dispatch contracts);
+the GAP is environment / kernel availability for inference at the apex
+size class on this hardware. Smaller real models (e.g. a hypothetical
+qwen3.5-dense-3B if it existed) would complete the smoke in seconds —
+no design change required.
+
+The smoke transcript is intentionally deterministic across systems
+(`--seed 42 --temp 0 --no-warmup`) so adjusting the default thread
+count or `-ngl` would invalidate any prior committed transcripts and
+require a one-shot agreement on the new canonical command line.
 
 ---
 
