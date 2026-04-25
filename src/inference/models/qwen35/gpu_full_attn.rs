@@ -971,8 +971,20 @@ pub fn build_gated_attn_layer(
             seq_len, n_kv_heads, head_dim, rotary_dim, freq_base, mrope_section,
         )?;
 
-        // Single commit for the entire pre-SDPA chain.
-        enc.commit_and_wait().context("commit ops1-4")?;
+        // Decode fast path (seq=1, head_dim%32==0): commit() without wait.
+        // Metal serial queue guarantees ops1-4 completes before SDPA starts.
+        // The SDPA encode path (apply_sdpa_with_kv_cache seq=1 branch) never
+        // calls download_f32 so no CPU buffer access races.
+        //
+        // Prefill path (seq>1) or non-standard head_dim: commit_and_wait()
+        // because apply_sdpa_with_kv_cache's prefill branch calls download_f32
+        // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
+        // GPU must have finished writing those buffers before we return.
+        if seq_len == 1 && head_dim % 32 == 0 {
+            enc.commit();
+        } else {
+            enc.commit_and_wait().context("commit ops1-4 prefill")?;
+        }
         (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope)
     };
     // Suppress unused variable warnings for intermediate buffers that were
