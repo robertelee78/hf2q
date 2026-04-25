@@ -436,4 +436,135 @@ mod tests {
         );
         assert_eq!(extract_layer_index("model.embed_tokens.weight"), None);
     }
+
+    /// **End-to-end validation (2026-04-25)** — drive the calibrator with
+    /// a real `Qwen35Model` (zero-weighted, in-memory via `empty_from_cfg`)
+    /// wrapped in `RealActivationCapture::from_model`, not the
+    /// `MockActivationCapture` used by the other tests. This proves the
+    /// CPU forward pass on a live qwen35 hybrid model (1 linear-attn +
+    /// 1 full-attn layer) flows through `run_calibration_prompt` →
+    /// `LayerActivations` → `compute_layer_sensitivity` →
+    /// `allocate_bits_by_sensitivity` → `MixedBitQuantizer` →
+    /// `QuantizedModel` end-to-end.
+    ///
+    /// On a zero-weighted model every layer's residual stream is also
+    /// zero, so all sensitivities tie. `allocate_bits_by_sensitivity`
+    /// returns the midpoint bit count for uniform sensitivity (per its
+    /// own contract: see `sensitivity::tests::test_allocate_bits_uniform_sensitivity`).
+    /// We assert exactly that — it's a load-bearing contract: a
+    /// degenerate (all-zero) input must not crash the calibrator and
+    /// must produce a well-defined output that's sensible for the
+    /// activation distribution.
+    #[test]
+    fn activation_calibration_with_real_model_wrapper_succeeds() {
+        use crate::inference::models::qwen35::activation_capture_real::RealActivationCapture;
+        use crate::inference::models::qwen35::model::Qwen35Model;
+        use crate::inference::models::qwen35::{
+            Qwen35Config, Qwen35LayerKind, Qwen35Variant,
+        };
+
+        // Tiny hybrid qwen35 dense config, identical shape to
+        // activation_capture_real::tests::tiny_dense_cfg() so the
+        // forward path is exercised against the same surface that's
+        // already pinned by 9 unit tests in that module.
+        let cfg = Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            vocab_size: 16,
+            hidden_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: Some(16),
+            rope_theta: 10_000.0,
+            rotary_dim: 4,
+            mrope_section: [1, 1, 1, 1],
+            mrope_interleaved: true,
+            partial_rotary_factor: 1.0,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 64,
+            attn_output_gate: true,
+            layer_types: vec![
+                Qwen35LayerKind::LinearAttention,
+                Qwen35LayerKind::FullAttention,
+            ],
+            full_attention_interval: 2,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            moe: None,
+            mtp_num_hidden_layers: 0,
+        };
+        let num_layers = cfg.num_hidden_layers;
+        let hidden_size = cfg.hidden_size;
+
+        let model_vocab_size: u64 = 16; // matches cfg.vocab_size above (cast to u64 for ModelMetadata)
+        let model = Qwen35Model::empty_from_cfg(cfg);
+        let mut capture = RealActivationCapture::from_model(model);
+
+        // Tensor_map is independent of the model — it's the conversion-
+        // side data feeding the downstream quantizer. Match num_layers,
+        // hidden_size, AND vocab_size so the calibration token generator
+        // (which samples up to metadata.vocab_size) doesn't emit token
+        // ids above the model's embedding table.
+        let mut metadata = tiny_metadata(num_layers, hidden_size);
+        metadata.vocab_size = model_vocab_size;
+        let tensor_map = tiny_tensor_map(num_layers, hidden_size);
+
+        let progress = ProgressReporter::new();
+        let config = DwqConfig {
+            // 2 calibration samples is enough — we just need the forward
+            // pass to execute and capture residuals.
+            calibration_samples: 2,
+            base_bits: 4,
+            sensitive_bits: 6,
+            arch: DwqArch::Other,
+            ..DwqConfig::default()
+        };
+
+        let model_out = run_dwq_activation_calibration(
+            &tensor_map,
+            &metadata,
+            &config,
+            &mut capture,
+            &progress,
+        )
+        .expect(
+            "real-Qwen35Model-wrapped activation calibration must succeed \
+             on a zero-weighted hybrid model",
+        );
+
+        // Method tag reflects the configured bit pair.
+        assert_eq!(model_out.quant_method, "dwq-mixed-4-6");
+
+        // Output preserves all input tensors.
+        assert!(
+            model_out.tensors.len() >= tensor_map.tensors.len(),
+            "output tensor count ({}) must cover input ({})",
+            model_out.tensors.len(),
+            tensor_map.tensors.len()
+        );
+
+        // For zero-weighted model: all layer residuals are zero, so
+        // sensitivities are uniform → `allocate_bits_by_sensitivity`
+        // returns the midpoint (4+6)/2 = 5 for every layer (per its
+        // documented contract). With midpoint = 5.0, our `> midpoint`
+        // filter yields zero sensitive layers, so every weight gets
+        // base_bits = 4. Anchor that contract here.
+        let layer0_q = "model.layers.0.self_attn.q_proj.weight";
+        let layer1_q = "model.layers.1.self_attn.q_proj.weight";
+        for name in [layer0_q, layer1_q] {
+            let qt = model_out
+                .tensors
+                .get(name)
+                .unwrap_or_else(|| panic!("expected tensor {name} in output"));
+            assert_eq!(
+                qt.quant_info.bits, 4,
+                "{name}: zero-weight model produces uniform sensitivity → \
+                 every layer gets base_bits=4 (no sensitive promotion)"
+            );
+        }
+    }
 }
