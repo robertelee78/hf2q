@@ -1122,6 +1122,28 @@ pub async fn embeddings(
             .into_response();
         }
     };
+
+    // OpenAI's `dimensions` parameter is only supported on Matryoshka-
+    // trained models (text-embedding-3 family). bge/mxbai are not
+    // trained for arbitrary-prefix truncation; honoring `dimensions`
+    // by returning the first N dims would silently degrade quality.
+    // Per OpenAI's published behavior, models without Matryoshka
+    // support reject the parameter with 400. We do the same: accept
+    // `dimensions == em.config.hidden_size` (no-op), reject anything
+    // else.
+    if let Some(d) = req.dimensions {
+        if d != em.config.hidden_size {
+            return ApiError::invalid_request(
+                format!(
+                    "model '{}' does not support custom output dimensions (native dim is {}; \
+                     only the text-embedding-3 family supports `dimensions`)",
+                    em.model_id, em.config.hidden_size
+                ),
+                Some("dimensions".into()),
+            )
+            .into_response();
+        }
+    }
     let inputs = req.input.into_vec();
     if inputs.is_empty() {
         return ApiError::invalid_request(
