@@ -605,6 +605,38 @@ fn smoke_bad_transcript_mock_returns_assertion_failed_exit() {
     );
 }
 
+/// `hf2q smoke --arch qwen35` (no --quant override) must use the
+/// default "q4_0" — and that default must round-trip through the
+/// dry-run diagnostic and through the eventual convert subprocess
+/// (which accepts `q4_0` as an alias for Q4 since commit 382d474).
+/// Without this anchor, a regression that changed the SmokeArgs
+/// default from "q4_0" → "q4" or removed the QuantMethod alias
+/// would silently flip the default-no-flag behaviour.
+#[test]
+fn smoke_default_quant_is_q4_0_in_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("qwen35-default-quant");
+    write_tiny_qwen35_local_dir(&local);
+    let out = hf2q()
+        .args([
+            "smoke",
+            "--arch",
+            "qwen35",
+            "--dry-run",
+            "--local-dir",
+            local.to_str().unwrap(),
+            // NOTE: no --quant — exercising the default.
+        ])
+        .env_remove("HF_TOKEN")
+        .output()
+        .expect("exec hf2q");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("quant:             q4_0"),
+        "default --quant must be q4_0 in dry-run report; got: {stdout}"
+    );
+}
+
 #[test]
 fn smoke_dry_run_prints_arch_entry_report_with_quality_thresholds() {
     // --dry-run prints the ArchEntry diagnostic report before preflight
