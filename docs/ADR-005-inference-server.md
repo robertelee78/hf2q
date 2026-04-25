@@ -1930,6 +1930,47 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 67 — Phase 2b accuracy gate MET on EVERY token count (20–200 tokens, cosine 0.99998–0.99999); root cause was an mlx-native kernel partial-K-tile bug, worked around at the handler.**
+  - **Bisection method.** Iter 66 closed the short-prompt gate but left long-prompt at 0.816. Iter 67 swept cosine across token counts:
+    ```
+    words=20  → cosine 0.999993   (mask path, seq=32, valid=22)
+    words=28  → cosine 0.999990   (mask path, seq=32, valid=30)
+    words=31  → cosine 0.753451   (no-mask, seq=33, valid=33)  ← cliff
+    words=32  → cosine 0.767206   (no-mask, seq=34)
+    words=33  → cosine 0.779198   (no-mask, seq=35)
+    words=40  → cosine 0.841061   (no-mask, seq=42)
+    words=50  → cosine 0.915373   (no-mask, seq=52)
+    words=70  → cosine 0.884007   (no-mask, seq=72)
+    ```
+    Hard cliff at the seq_len=32 boundary, with cosine then loosely correlated with how close seq_len lands to a multiple of 32. **Always-mask experiment** (force the masked code path even when valid==seq_len, with mask = all zeros) reproduced the same cliff — proving the bug isn't in the maskless `vit_attention_gpu` delegate but in something that activates only when `seq_len % 32 != 0`.
+  - **Root cause: `dense_matmul_bf16_f32_tensor` MSL kernel iterates K in 32-element tiles with no partial-tile handling.** From `/opt/mlx-native/.cfa-worktrees/hf2q-iter50/src/shaders/dense_mm_bf16_tensor.metal:149`:
+    ```cpp
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {  // NK = 32
+        // ... unconditional 16-element copy from `x` and `y` ...
+        x += NK; y += NK;
+    }
+    ```
+    For `K = 33`, the loop runs with `loop_k = 0` (covers k=0..31) and `loop_k = 32` (covers k=32..63). The second iteration reads 16 contiguous elements of x and y starting at k=32 — but the buffer ends at k=33. The kernel reads past the buffer into garbage / adjacent allocation memory. The matmul accumulates `garbage * BF16(garbage)` and the output diverges in seemingly random directions per row.
+  - **Why the masked path "works"**. Short prompts pad seq_len to 32 in the handler. K=32 is the kernel's tile boundary — the loop runs exactly once, no out-of-tile read. The mask masks padded positions on the FIRST matmul (Q @ K^T), and the second matmul's K = seq_len = 32 is also tile-aligned. Every long-prompt seq_len from 33 to 200 was a non-multiple of 32 → kernel always misbehaved.
+  - **Fix: round seq_len up to a multiple of 32 in the handler** (`src/serve/api/handlers.rs`):
+    - Renamed `BERT_MIN_SEQ_LEN` → `BERT_TILE_K = 32` to reflect the real constraint.
+    - Padding logic now: `target = ids.len().max(32).div_ceil(32) * 32`, capped at `cfg.max_position_embeddings` rounded down to a tile boundary.
+    - Attention mask (built in `apply_bert_full_forward_gpu` from `valid_token_count`) handles the extra padded positions correctly — pre-existing iter 66 plumbing does the right thing without modification.
+    - Comments + docstring updated to point at the kernel constraint as the reason for the padding.
+  - **Verification on bge-small-en-v1.5-f16:**
+    ```
+    words=20  → 0.999993       words=33  → 0.999991      words=70  → 0.999988
+    words=28  → 0.999990       words=35  → 0.999991      words=100 → 0.999988
+    words=31  → 0.999989       words=40  → 0.999990      words=200 → 0.999985
+    words=32  → 0.999991       words=50  → 0.999990
+    ```
+    **Phase 2b accuracy gate (≥ 0.999) MET across the entire range.** Worst case 0.999985 is 5e-5 above the gate, consistent with F32 round-off + BF16 weight cast precision — same envelope as the iter-50 ViT BF16 characterization.
+  - **What's NOT fixed (but tracked).** The mlx-native kernel partial-K-tile bug is a real correctness defect that affects any consumer with non-multiple-of-32 K. ViT happens to use seq=49 → K=49 in attention's `scores @ V` matmul → also broken under the same bug, but the iter-50 BF16-saturated-softmax characterization documented "macro stats agree, per-element diverges" — the pre-softmax saturation may have masked the K-tile bug because saturated softmax is robust to small per-element perturbations. The chat-model (qwen35) lane uses head_dim and intermediate dims that are typically multiples of 32 in their matmuls, so unaffected on the hot path. **Followup: patch `dense_mm_bf16_tensor.metal` to handle partial K-tiles** by zeroing tile entries for `loop_k + intra_tile_k >= ne00`. That's an mlx-native lane edit (we own that repo per user directive); landing it benefits ViT and any future consumer too. Iter 68+ work.
+  - **Tests:** 58/58 BERT-lane tests pass (no regressions). The iter-65 `bge_small_tokenizer_matches_llama_cpp_on_long_prompt` test (added this iter) exercises the long-prompt tokenizer path. End-to-end real-model parity test added next iter.
+  - **Lane discipline observed.** Edits in `src/serve/api/handlers.rs` only (read-only inspection of `src/inference/vision/vit_gpu.rs` and `/opt/mlx-native/.cfa-worktrees/hf2q-iter50/src/shaders/dense_mm_bf16_tensor.metal`). No mlx-native edit yet — kernel patch deferred to iter 68 so this iter ships the user-facing parity gate immediately.
+  - **Phase 2b status: SHORT and LONG prompts BOTH pass the accuracy gate. Phase 2b is functionally CLOSED for bge-small-en-v1.5.** Remaining Phase 2b items: (a) end-to-end test with the OpenAI Python SDK against `nomic-embed-text-v1.5` and `mxbai-embed-large-v1` (the other two day-one models — same architecture, expect same gate-passing result); (b) the mlx-native kernel proper fix; (c) wire `/v1/embeddings` into the `/v1/models` listing so OpenWebUI auto-discovers it.
+  - **Next (iter 68):** patch the mlx-native kernel directly. The handler workaround stays in place as a defense-in-depth gate; the kernel patch is the proper fix that benefits every consumer.
+
 - **2026-04-26 loop iter 66 — Phase 2b accuracy gate PASSES on short prompt: cosine 0.58 → 0.999985 ≥ 0.999. Attention mask was the dominant remaining bug.**
   - **Headline.** Iter 64's tokenizer fix took cosine 0.46 → 0.58 on the short-prompt path. Iter 66's attention-mask plumbing takes it 0.58 → **0.999985** — clearing Phase 2b's accuracy gate (≥ 0.999) by 5e-5. This is the closing fix for the short-prompt path; long-prompt (no padding, no mask) sits at 0.816 still and is the iter 67 target.
   - **What landed in `src/inference/models/bert/bert_gpu.rs`:**

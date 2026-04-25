@@ -608,6 +608,42 @@ mod tests {
     /// without the artifact skips cleanly. Expected ids derived from
     /// `llama-embedding -m ... --verbose-prompt`:
     ///   "hello world"  →  [101, 7592, 2088, 102]   (CLS hello world SEP)
+    /// Iter 67 diagnostic: tokenize the long prompt that gives cosine
+    /// 0.816 and compare ID-by-ID against llama.cpp's
+    /// `--verbose-prompt` output. Expected from llama.cpp (43 tokens):
+    ///   [101, 1999, 1996, 13950, 2989, 3655, 1997, 1996, 2715, 2088,
+    ///    1996, 4610, 9041, 2006, 1996, 8313, 1997, 3404, 2090, 6818,
+    ///    2040, 3863, 5350, 2578, 1998, 2592, 2408, 6565, 6125, 7987,
+    ///    3593, 4726, 17846, 1998, 5026, 12358, 2046, 13318, 5792, 3679,
+    ///    2408, 6645, 102]
+    #[test]
+    fn bge_small_tokenizer_matches_llama_cpp_on_long_prompt() {
+        let path = std::path::Path::new(
+            "/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf",
+        );
+        if !path.exists() {
+            eprintln!("skipping: bge GGUF not on disk");
+            return;
+        }
+        let gguf = mlx_native::gguf::GgufFile::open(path).expect("open");
+        let vocab = BertVocab::from_gguf(&gguf).expect("vocab");
+        let tokenizer = BertWpmTokenizer::new(&vocab);
+        let input = "In the bustling cities of the modern world the economy depends on the fabric of trust between participants who exchange goods services and information across vast networks bridging continents and bringing strangers into productive collaboration daily across borders";
+        let ids = tokenizer.encode(input, true);
+        let expected: Vec<u32> = vec![
+            101, 1999, 1996, 13950, 2989, 3655, 1997, 1996, 2715, 2088, 1996, 4610, 9041, 2006,
+            1996, 8313, 1997, 3404, 2090, 6818, 2040, 3863, 5350, 2578, 1998, 2592, 2408, 6565,
+            6125, 7987, 3593, 4726, 17846, 1998, 5026, 12358, 2046, 13318, 5792, 3679, 2408, 6645,
+            102,
+        ];
+        assert_eq!(
+            ids, expected,
+            "long-prompt tokenization mismatch ({} hf2q vs {} llama tokens)",
+            ids.len(),
+            expected.len(),
+        );
+    }
+
     #[test]
     fn bge_small_tokenizer_matches_llama_cpp_on_hello_world() {
         let path = std::path::Path::new(

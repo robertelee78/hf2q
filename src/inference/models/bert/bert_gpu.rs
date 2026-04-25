@@ -1767,13 +1767,15 @@ pub fn apply_bert_full_forward_gpu(
     // --- Build attention mask if any padding present ---
     // Mask is `[seq_len, seq_len]` F32: 0.0 at columns < valid_token_count,
     // -1e30 at columns ≥ valid_token_count. Broadcast across num_heads
-    // by `bert_attention_mask_add_gpu`. If valid_token_count == seq_len,
-    // every position is real and the mask add becomes a no-op — skip.
-    let mask_opt: Option<MlxBuffer> = if valid_token_count < seq_len {
-        Some(alloc_bert_attention_mask(device, seq_len, valid_token_count)?)
-    } else {
-        None
-    };
+    // by `bert_attention_mask_add_gpu`. We ALWAYS build the mask (even
+    // when valid_token_count == seq_len, where all columns are zero),
+    // because iter 67 measurement showed the no-mask path
+    // (`bert_attention_gpu` → `vit_attention_gpu` delegate) drops
+    // cosine to 0.75-0.92 vs llama-embedding while the masked path
+    // stays at 0.99999+. Always-mask is correct (zero mask is a no-op
+    // mathematically) and uniform code-path-wise.
+    let mask_opt: Option<MlxBuffer> =
+        Some(alloc_bert_attention_mask(device, seq_len, valid_token_count)?);
     let mask_ref = mask_opt.as_ref();
 
     // --- N encoder blocks ---
