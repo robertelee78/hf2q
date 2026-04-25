@@ -57,6 +57,7 @@ use super::gpu_full_attn::{
 use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::rms_norm;
 
 // ================================================================
@@ -326,6 +327,7 @@ fn residual_add_gpu(
     enc.commit_and_wait().context("commit residual_add")?;
     Ok(out)
 }
+
 
 // ================================================================
 // Qwen35Model::forward_gpu
@@ -605,60 +607,65 @@ impl Qwen35Model {
                 }
             }
 
-            // --- Residual after attention ---
-            let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            hidden = residual_add_gpu(&hidden, &attn_out, &device, &mut registry)
-                .with_context(|| format!("residual attn layer {layer_idx}"))?;
-            if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
-
-            // --- Post-attention RMSNorm ---
-            let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            // The normed value is the FFN *input* only.  The FFN output is added
-            // back to `ffn_residual` (the pre-norm value), matching llama.cpp:
+            // --- Fused residual + post-attention RMSNorm (1 encoder, 1 commit) ---
+            // Replaces: residual_add_gpu (1 commit) + dispatch_rms_norm (1 commit)
+            // with a single fused_residual_norm_f32 kernel (1 commit).
+            // Saves 1 GPU sync per layer (80 total = ~24ms).
+            //
+            // The fused kernel computes:
+            //   ffn_residual = hidden + attn_out          (write_sum=true path)
+            //   ffn_input    = rms_norm(ffn_residual, w)  (normed_output)
+            //
+            // Matches llama.cpp:
             //   ffn_residual = cur;                // after attn residual, BEFORE norm
             //   attn_post_norm = build_norm(cur);  // norm for FFN input only
             //   cur = build_layer_ffn(attn_post_norm);
             //   cur = ggml_add(cur, ffn_residual); // FFN residual is pre-norm
-            let ffn_residual = hidden.clone();  // save pre-norm for later residual
-            let ffn_input = {
+            let t_res_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let t_norm_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+            let (ffn_residual, ffn_input) = {
                 let post_norm_w = match layer_gpu {
                     LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
                     LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
                 };
-                let out = device
+                // Allocate both outputs up-front (they live past the encoder).
+                let ffn_input_buf = device
                     .alloc_buffer(
                         (seq_len * h) as usize * 4,
                         DType::F32,
                         vec![seq_len as usize, h as usize],
                     )
-                    .map_err(|e| anyhow!("alloc post_attn_norm output layer {layer_idx}: {e}"))?;
-                let mut params = device
-                    .alloc_buffer(8, DType::F32, vec![2])
-                    .map_err(|e| anyhow!("alloc post_attn_norm params: {e}"))?;
-                {
-                    let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
-                    s[0] = eps;
-                    s[1] = h as f32;
-                }
+                    .map_err(|e| anyhow!("alloc ffn_input layer {layer_idx}: {e}"))?;
+                let ffn_residual_buf = device
+                    .alloc_buffer(
+                        (seq_len * h) as usize * 4,
+                        DType::F32,
+                        vec![seq_len as usize, h as usize],
+                    )
+                    .map_err(|e| anyhow!("alloc ffn_residual layer {layer_idx}: {e}"))?;
                 let mut enc = device.command_encoder()
-                    .with_context(|| format!("enc post_attn_norm layer {layer_idx}"))?;
-                rms_norm::dispatch_rms_norm(
+                    .with_context(|| format!("enc fused_res_norm layer {layer_idx}"))?;
+                dispatch_fused_residual_norm_f32(
                     &mut enc,
                     &mut registry,
                     device.metal_device(),
-                    &hidden,
-                    post_norm_w,
-                    &out,
-                    &params,
+                    &hidden,        // residual
+                    &attn_out,      // input (to add)
+                    post_norm_w,    // weight
+                    &ffn_input_buf, // normed_output = rms_norm(hidden + attn_out)
+                    Some(&ffn_residual_buf), // sum_output = hidden + attn_out
                     seq_len,
                     h,
+                    eps,
                 )
-                .with_context(|| format!("dispatch_rms_norm post_attn layer {layer_idx}"))?;
+                .with_context(|| format!("dispatch_fused_residual_norm_f32 layer {layer_idx}"))?;
                 enc.commit_and_wait()
-                    .with_context(|| format!("commit post_attn_norm layer {layer_idx}"))?;
-                out
+                    .with_context(|| format!("commit fused_res_norm layer {layer_idx}"))?;
+                (ffn_residual_buf, ffn_input_buf)
             };
-
+            // Update hidden to the post-residual value (= ffn_residual = hidden + attn_out).
+            hidden = ffn_residual.clone();
+            if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
             if let Some(t) = t_norm_start { total_norm_us += t.elapsed().as_micros() as u64; }
 
             // --- FFN (takes normed ffn_input, not the pre-norm residual) ---

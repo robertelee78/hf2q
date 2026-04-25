@@ -826,8 +826,19 @@ pub fn build_delta_net_layer(
         s[1] = seq_len;
     }
 
-    let (_q_normed, _k_normed, attn_out, new_recurrent_state) = {
-        let mut enc = device.command_encoder().context("enc ops5q+5k+6+7")?;
+    // Pre-allocate op8-9 buffers before the combined encoder so they remain alive.
+    let rows_op8 = seq_len * n_v_heads;
+    let gated_elems = (rows_op8 * d_v) as usize;
+    let gated_buf = device
+        .alloc_buffer(gated_elems * 4, DType::F32, vec![gated_elems])
+        .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
+    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
+        .map_err(|e| anyhow!("op8 params: {e}"))?;
+
+    // ---- Ops 5+6+7+8+9: all GPU, no CPU work between them — single encoder ----
+    // Saves 1 commit per delta-net layer (previously 2 commits for ops5-7 and op8-9).
+    let (new_recurrent_state, output) = {
+        let mut enc = device.command_encoder().context("enc ops5-9")?;
         // These 4 ops are independent (different inputs, different outputs) — run concurrently.
         let q_l2 = apply_l2_norm_per_head(
             &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
@@ -880,47 +891,25 @@ pub fn build_delta_net_layer(
             &g_buf, &beta_buf, state_in,
             &attn_out_buf, &state_out_buf, &gdn_params_buf, gdn_params,
         ).context("dispatch_gated_delta_net")?;
-        enc.commit_and_wait().context("commit ops5+6+7")?;
-        (q_scaled, k_normed, attn_out_buf, state_out_buf)
+        // Barrier: op8 reads attn_out written by GDN above.
+        enc.memory_barrier();
+        // ---- Op 8: per-head RMSNorm + SiLU gate ----
+        dispatch_ssm_norm_gate(
+            &mut enc, registry, device.metal_device(),
+            &attn_out_buf, &weights.ssm_norm, &z,
+            &gated_buf, &op8_params,
+            rows_op8, d_v,
+        ).context("dispatch_ssm_norm_gate")?;
+        // Barrier: op9 reads gated written by op8.
+        enc.memory_barrier();
+        // ---- Op 9: output projection ----
+        let output = apply_proj(
+            &mut enc, registry, device, &gated_buf,
+            &weights.ssm_out, seq_len, z_channels, hidden_size,
+        )?;
+        enc.commit_and_wait().context("commit ops5-9")?;
+        (state_out_buf, output)
     };
-    // attn_out from kernel is [d_v * n_v_heads * n_tokens * n_seqs] but with layout
-    // [n_tokens, n_v_heads, d_v] (same as our v_gpu layout). The kernel's output
-    // buffer is just a flat allocation; the CPU ref's step 8 re-reads it as
-    // [seq, nv, dv] = token-major. We confirm via the layout table in gdn.rs:
-    // output is [D_v, n_v_heads, n_tokens, n_seqs] col-major = [n_tokens, n_v_heads, d_v]
-    // for n_seqs=1 when d_v is innermost. This matches our attn_out allocation shape.
-
-    // ---- Op 8: per-head RMSNorm + SiLU gate (GPU kernel — no CPU bridge) ----
-    // ssm_norm_gate_f32 computes:
-    //   normed[row, d] = attn_out[row, d] * rms_inv(attn_out[row, :]) * ssm_norm_w[d]
-    //   output[row, d] = normed[row, d] * silu(z[row, d])
-    // where row = (t, vh) and d indexes d_v.  Both attn_out and z are [seq, nv, d_v]
-    // contiguous = [rows, d_v] with rows = seq * n_v_heads.
-    // This replaces 2 GPU→CPU downloads + CPU compute + 1 CPU→GPU upload.
-    let rows_op8 = seq_len * n_v_heads;
-    let gated_elems = (rows_op8 * d_v) as usize;
-    let gated_buf = device
-        .alloc_buffer(gated_elems * 4, DType::F32, vec![gated_elems])
-        .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
-    let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
-        .map_err(|e| anyhow!("op8 params: {e}"))?;
-
-    let mut enc = device.command_encoder().context("enc op8-9")?;
-    dispatch_ssm_norm_gate(
-        &mut enc, registry, device.metal_device(),
-        &attn_out, &weights.ssm_norm, &z,
-        &gated_buf, &op8_params,
-        rows_op8, d_v,
-    ).context("dispatch_ssm_norm_gate")?;
-    // Barrier: op9 matmul reads gated written by op8.
-    enc.memory_barrier();
-
-    // ---- Op 9: output projection ----
-    let output = apply_proj(
-        &mut enc, registry, device, &gated_buf,
-        &weights.ssm_out, seq_len, z_channels, hidden_size,
-    )?;
-    enc.commit_and_wait().context("commit op8-9")?;
 
     Ok((output, new_conv_state, new_recurrent_state))
 }

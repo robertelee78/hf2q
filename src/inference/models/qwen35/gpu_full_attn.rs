@@ -79,19 +79,66 @@ pub struct FullAttnWeightsGpu {
 
 impl FullAttnWeightsGpu {
     /// Upload a [`FullAttnLayerWeights`] (pure-Rust f32) to Metal buffers.
+    ///
+    /// Large projection weights (wq, wk, wv, w_gate, wo) are pre-cast to BF16
+    /// at load time to avoid the per-inference F32→BF16 cast in
+    /// `apply_linear_projection_f32` (previously 33MB+ cast per Q/gate weight
+    /// per decode step, accounting for ~20ms of the full_attn budget).
     pub fn from_cpu(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
         Ok(Self {
             attn_norm: upload_f32(&weights.attn_norm, device)?,
             post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
-            wq: upload_f32(&weights.wq, device)?,
-            wk: upload_f32(&weights.wk, device)?,
-            wv: upload_f32(&weights.wv, device)?,
-            w_gate: upload_f32(&weights.w_gate, device)?,
+            wq: upload_bf16_from_f32(&weights.wq, device)?,
+            wk: upload_bf16_from_f32(&weights.wk, device)?,
+            wv: upload_bf16_from_f32(&weights.wv, device)?,
+            w_gate: upload_bf16_from_f32(&weights.w_gate, device)?,
             attn_q_norm: upload_f32(&weights.attn_q_norm, device)?,
             attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
-            wo: upload_f32(&weights.wo, device)?,
+            wo: upload_bf16_from_f32(&weights.wo, device)?,
         })
     }
+}
+
+/// Convert a single f32 to bf16 using round-to-nearest-even (RNE).
+///
+/// Matches Metal hardware BF16 rounding used in the GPU cast kernel, ensuring
+/// numerically identical results to the per-inference GPU F32→BF16 cast.
+///
+/// Algorithm: add rounding bias (0x7FFF + LSB of bit-16 for ties-to-even),
+/// then take the upper 16 bits.
+#[inline(always)]
+fn f32_to_bf16_rne(v: f32) -> u16 {
+    let bits = v.to_bits();
+    // Handle NaN: propagate a quiet NaN.
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) | 0x0040) as u16; // quiet NaN
+    }
+    // Round-to-nearest-even: add 0x7FFF + (bit 16 of mantissa) as tie-break.
+    let rounding_bias = 0x7FFF_u32 + ((bits >> 16) & 1);
+    ((bits + rounding_bias) >> 16) as u16
+}
+
+/// Helper: convert f32 → bf16 CPU-side and upload as a BF16 MlxBuffer.
+///
+/// Used for large weight tensors (wq, wk, wv, w_gate, wo) so the GPU path
+/// can skip the per-inference F32→BF16 cast in `apply_linear_projection_f32`.
+/// One-time cost at model load vs repeated ~33MB cast per decode step.
+/// Uses round-to-nearest-even to match Metal hardware BF16 rounding.
+pub fn upload_bf16_from_f32(data: &[f32], device: &MlxDevice) -> Result<MlxBuffer> {
+    let n = data.len();
+    let byte_len = n * 2; // 2 bytes per bf16
+    let mut buf = device
+        .alloc_buffer(byte_len, DType::BF16, vec![n])
+        .map_err(|e| anyhow!("alloc bf16 buffer len={n}: {e}"))?;
+    {
+        let slice = buf
+            .as_mut_slice::<u16>()
+            .map_err(|e| anyhow!("mut_slice bf16: {e}"))?;
+        for (i, &v) in data.iter().enumerate() {
+            slice[i] = f32_to_bf16_rne(v);
+        }
+    }
+    Ok(buf)
 }
 
 /// Helper: copy an f32 `Vec` into a freshly-allocated `MlxBuffer` with shape
@@ -378,13 +425,25 @@ pub fn apply_linear_projection_f32(
     in_features: u32,
     out_features: u32,
 ) -> Result<MlxBuffer> {
-    // Cast weight F32 → BF16 for the tensor-core path.
+    // If weight is already BF16 (pre-cast at load time), use it directly.
+    // Otherwise cast F32 → BF16 inline (slower hot-path for weights not pre-cast).
     let n_w = (out_features * in_features) as usize;
-    let weight_bf16 = device
-        .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
-        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-    cast(encoder, registry, device.metal_device(), weight, &weight_bf16, n_w, CastDirection::F32ToBF16)
-        .context("cast weight F32→BF16")?;
+    let weight_bf16_owned: Option<MlxBuffer>;
+    let weight_bf16: &MlxBuffer;
+    if weight.dtype() == DType::BF16 {
+        // Pre-cast: skip the per-inference cast — use the weight buffer directly.
+        weight_bf16_owned = None;
+        weight_bf16 = weight;
+    } else {
+        // Legacy F32 path: cast inline (per-inference cost).
+        let buf = device
+            .alloc_buffer(n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+            .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+        cast(encoder, registry, device.metal_device(), weight, &buf, n_w, CastDirection::F32ToBF16)
+            .context("cast weight F32→BF16")?;
+        weight_bf16_owned = Some(buf);
+        weight_bf16 = weight_bf16_owned.as_ref().unwrap();
+    }
 
     // Allocate output buffer.
     let out_bytes = (seq_len * out_features) as usize * 4;
@@ -402,7 +461,7 @@ pub fn apply_linear_projection_f32(
         src0_batch: 1,
         src1_batch: 1,
     };
-    dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
+    dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
         .context("dense_matmul_bf16_f32_tensor")?;
 
     Ok(dst)
