@@ -1056,21 +1056,18 @@ fn chrono_seconds() -> i64 {
 // POST /v1/embeddings  (Phase 2b — BERT-family embedding model)
 // ---------------------------------------------------------------------------
 
-/// BERT attention path tile granularity.
+/// Minimum sequence length for the BERT forward path. The BF16 tensor-
+/// core matmul kernel rejects K < 32; the post-softmax `scores @ V`
+/// matmul has K = seq_len, so seq_len must be ≥ 32. Tokenized inputs
+/// shorter than this are right-padded with `[PAD]`, and the attention
+/// mask (built from `valid_token_count` in `apply_bert_full_forward_gpu`)
+/// keeps the padded positions from contaminating the embedding.
 ///
-/// `dense_matmul_bf16_f32_tensor` (the BF16 tensor-core matmul) iterates
-/// the K dimension in 32-element tiles and **does not** handle a
-/// partial trailing tile — when K is not a multiple of 32, the last
-/// iteration reads off the end of the buffer (see iter 67 bisection
-/// notes in ADR-005). The post-softmax `scores @ V` matmul has K =
-/// seq_len, so we round seq_len up to a multiple of 32 and use the
-/// attention mask (iter 66) to mask the extra padded positions.
-///
-/// Empirically: any seq_len that is a multiple of 32 produces cosine
-/// 0.99999+ vs llama-embedding; non-multiples produced 0.75–0.92 in
-/// iter 67 measurements. Until the mlx-native kernel grows partial-K-
-/// tile support, this padding is the correctness gate.
-const BERT_TILE_K: usize = 32;
+/// Note: an earlier `dense_mm_bf16_tensor.metal` bug required padding
+/// seq_len up to a multiple of 32, but mlx-native iter 68 fixed the
+/// kernel to handle partial K-tiles correctly. The handler now pads
+/// only to the minimum and trusts the kernel.
+const BERT_MIN_SEQ_LEN: usize = 32;
 
 /// Handler for `POST /v1/embeddings`. Tokenizes each input string,
 /// runs the full BERT forward pass on GPU, and returns OpenAI-shaped
@@ -1162,25 +1159,17 @@ pub async fn embeddings(
             let raw_ids: Vec<u32> = tokenizer.encode(input.as_str(), true);
             total_tokens += raw_ids.len();
 
-            // Pad / truncate to satisfy the BF16 tensor matmul K-tile
-            // alignment (must be a multiple of `BERT_TILE_K = 32`) and
-            // the model's max position embedding cap. Always round up.
+            // Pad short inputs up to the kernel's K floor (32) so the
+            // post-softmax `scores @ V` matmul is dispatchable. The
+            // attention mask (built from valid_token_count in
+            // apply_bert_full_forward_gpu) keeps the padded positions
+            // from contaminating the embedding.
             let mut ids: Vec<u32> = raw_ids.to_vec();
-            // First clip to max_pos so we don't pad past the cap.
+            if ids.len() < BERT_MIN_SEQ_LEN {
+                ids.resize(BERT_MIN_SEQ_LEN, 0u32);
+            }
             if ids.len() > cfg.max_position_embeddings {
                 ids.truncate(cfg.max_position_embeddings);
-            }
-            // Round up to the next multiple of 32, but never below 32.
-            let target = ids.len().max(BERT_TILE_K).div_ceil(BERT_TILE_K) * BERT_TILE_K;
-            // Cap at max_pos rounded down to a tile boundary; if ids was
-            // truncated above, target may exceed max_pos — clamp.
-            let max_aligned =
-                cfg.max_position_embeddings - (cfg.max_position_embeddings % BERT_TILE_K);
-            let target = target.min(max_aligned).max(BERT_TILE_K);
-            if ids.len() < target {
-                ids.resize(target, 0u32);
-            } else if ids.len() > target {
-                ids.truncate(target);
             }
             let seq_len = ids.len() as u32;
 

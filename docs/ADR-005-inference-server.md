@@ -1930,6 +1930,31 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 68 — Proper kernel fix in mlx-native v0.4.2 + handler workaround removed. Phase 2b's accuracy gate met by the kernel alone, no defense-in-depth, no local patches.**
+  - **What this iter did right.** The user called out iter 67's hack: shipping a handler-side seq_len-rounding workaround instead of fixing the kernel. Iter 68 corrects that — the kernel is the truth; the handler trusts it.
+  - **Kernel fix in `/opt/mlx-native/src/shaders/dense_mm_bf16_tensor.metal`** (commit a50d1a2). Added a `full_tile = (loop_k + NK <= args.ne00)` branch around the K-loop body. Full-tile fast path is unchanged (common case; tensor-core throughput preserved). Partial-tile slow path per-element-gates the loads against `loop_k + intra_k < args.ne00`, writing `bfloat(0)` into shmem for out-of-tile positions — mathematically a no-op contribution to the matmul.
+  - **Kernel-level tests in `/opt/mlx-native/tests/test_dense_mm_bf16.rs`** (commit c3edfc2). Added `partial_k_tile_k_eq_{33, 47, 63, 72, 100}`. Pre-existing tests covered K ∈ {32, 64, 128, 256} — all multiples of 32, so the bug was latent. New tests catch any regression of the partial-K-tile path. All 5 pass against the patched kernel.
+  - **mlx-native v0.4.2 published to crates.io** (the user pushed it during this iter). hf2q's `Cargo.toml` updated to `mlx-native = "0.4.2"` — production builds resolve from crates.io directly. The local `.cargo/config.toml` patch is now INACTIVE (commented out) — no local override needed.
+  - **Handler reverted to the iter-66 shape** (`src/serve/api/handlers.rs`):
+    - `BERT_MIN_SEQ_LEN = 32` (the documented kernel K-floor; this is a real constraint, not a hack — the kernel rejects K < 32).
+    - Padding logic: pad to 32 minimum if shorter; truncate at `cfg.max_position_embeddings` if longer.
+    - Iter-67's "round seq_len up to a multiple of 32" workaround removed entirely. The kernel handles arbitrary K ≥ 32 correctly now.
+  - **Verification — kernel fix in isolation, no handler workaround:** cosine on bge-small-en-v1.5-f16 vs llama-embedding:
+    ```
+    words=5    → 0.999992      words=33   → 0.999991      words=100  → 0.999988
+    words=10   → 0.999990      words=35   → 0.999991      words=200  → 0.999985
+    words=20   → 0.999993      words=40   → 0.999990
+    words=28   → 0.999990      words=50   → 0.999990
+    words=31   → 0.999989      words=70   → 0.999988
+    words=32   → 0.999991
+    ```
+    Phase 2b accuracy gate (≥ 0.999) **MET at every measured seq_len from 5 to 200**, including the previously-broken 31, 33, 35, 40, 50, 70, 100, 200.
+  - **Why this is the best outcome.** No fallbacks. No local patches in production. No `if (this_seq_len) workaround else broken` branches. The kernel is correct; the handler trusts it; consumers see a clean dependency line `mlx-native = "0.4.2"` from crates.io. ViT and chat-model lanes that use the same matmul on non-multiple-of-32 K dimensions automatically benefit (the iter-50 BF16-saturated-softmax characterization for ViT may improve as a side effect, since the iter-50 measurement was done against the buggy kernel).
+  - **Tests post-fix.** hf2q: `cargo test inference::models::bert` 58/58 pass; `cargo test inference::vision` 186/186 pass. mlx-native: full `dense_mm_bf16` test suite 10/10 pass (the prior 5 + the 5 new partial-K-tile cases). Pre-existing 3 failures in `test_quantized_matmul_id_ggml` (q4_0 path) are unrelated and pre-date iter 68.
+  - **Lane discipline observed.** Cross-repo commits: 4 commits in `/opt/mlx-native` (kernel fix, version bump, lockfile sync, kernel tests). 3 files modified in hf2q (`Cargo.toml`, `Cargo.lock`, `src/serve/api/handlers.rs`). User's directive ("we own this repo and `/opt/mlx-native`") explicitly authorized cross-repo edits when the right fix lives upstream.
+  - **Phase 2b status: CLOSED for the bge-small-en-v1.5 path.** Pipeline, kernel, handler, accuracy gate all clean. Remaining Phase 2b work (per Decision #4 / line 870-878 of this ADR): validate `nomic-embed-text-v1.5` and `mxbai-embed-large-v1` (the other two day-one models — same architecture, expect same gate-passing result with no further code changes).
+  - **Next (iter 69):** download `nomic-embed-text-v1.5` (~268 MB F16) and `mxbai-embed-large-v1` (~670 MB F16), boot hf2q against each, measure cosine vs llama-embedding. If both clear 0.999, Phase 2b is fully closed and the iter-13 task can flip to `completed`. If either fails, bisect.
+
 - **2026-04-26 loop iter 67 — Phase 2b accuracy gate MET on EVERY token count (20–200 tokens, cosine 0.99998–0.99999); root cause was an mlx-native kernel partial-K-tile bug, worked around at the handler.**
   - **Bisection method.** Iter 66 closed the short-prompt gate but left long-prompt at 0.816. Iter 67 swept cosine across token counts:
     ```
