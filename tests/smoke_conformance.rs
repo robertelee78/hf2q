@@ -633,6 +633,27 @@ fn smoke_dry_run_prints_arch_entry_report_with_quality_thresholds() {
         stdout.contains("transcript_path:"),
         "report must show transcript path"
     );
+    // Decision 1 alias coverage (commit `57d4bcc`): the dry-run report
+    // must show BOTH ForCausalLM and ForConditionalGeneration aliases
+    // for qwen35 — multimodal Qwen3.5 checkpoints ship with the
+    // ConditionalGeneration form. If a future edit drops either alias
+    // from src/arch/entries/qwen35.rs::hf_architectures, this assertion
+    // fires.
+    assert!(
+        stdout.contains("Qwen3_5ForCausalLM"),
+        "report must list Qwen3_5ForCausalLM in hf_architectures"
+    );
+    assert!(
+        stdout.contains("Qwen3_5ForConditionalGeneration"),
+        "report must list Qwen3_5ForConditionalGeneration in hf_architectures \
+         (multimodal alias added in commit 57d4bcc)"
+    );
+    // Decision 14 / 16 (commit `d37daa4`): hf_repos must include the
+    // canonical 27B target.
+    assert!(
+        stdout.contains("Qwen/Qwen3.6-27B"),
+        "report must list the canonical hf_repos target"
+    );
 }
 
 #[test]
