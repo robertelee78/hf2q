@@ -65,6 +65,7 @@ use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
+use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,

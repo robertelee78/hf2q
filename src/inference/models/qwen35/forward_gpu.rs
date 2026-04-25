@@ -691,8 +691,11 @@ impl Qwen35Model {
                     eps,
                 )
                 .with_context(|| format!("dispatch_fused_residual_norm_f32 layer {layer_idx}"))?;
-                enc.commit_and_wait()
-                    .with_context(|| format!("commit fused_res_norm layer {layer_idx}"))?;
+                // commit() without wait: GPU executes this command buffer and then
+                // automatically pipelines into the next (FFN) command buffer.
+                // Metal serial queue guarantees ordering; the FFN commit_and_wait()
+                // provides the eventual CPU sync.  Saves 40 CPU wait points per token.
+                enc.commit();
                 (ffn_residual_buf, ffn_input_buf)
             };
             // Update hidden to the post-residual value (= ffn_residual = hidden + attn_out).
