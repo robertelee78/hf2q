@@ -372,30 +372,7 @@ fn run_q4_0_pipeline(
     if !args.skip_convert {
         let hf2q_exe = std::env::current_exe()
             .map_err(|e| format!("locate hf2q binary: {}", e))?;
-        // Decision 16 §CLI lists `[--with-vision]` as the smoke flag
-        // that exercises the P10 mmproj emitter path. When set AND the
-        // arch advertises `has_vision`, pass `--emit-vision-tower` to
-        // the convert subprocess. The convert side already handles the
-        // case where vision_config is absent from the model config —
-        // it silent-skips per Decision 18 (commit 18cbaaa). So passing
-        // the flag is safe even when the actual checkpoint has no
-        // vision tower.
-        let mut convert_args: Vec<String> = vec![
-            "convert".into(),
-            "--input".into(),
-            input_dir.to_str().ok_or("input_dir not UTF-8")?.into(),
-            "--format".into(),
-            "gguf".into(),
-            "--quant".into(),
-            args.quant.clone(),
-            "--output".into(),
-            gguf_path.to_str().ok_or("gguf_path not UTF-8")?.into(),
-            "--yes".into(),
-            "--skip-quality".into(),
-        ];
-        if args.with_vision && entry.has_vision {
-            convert_args.push("--emit-vision-tower".into());
-        }
+        let convert_args = build_convert_args(args, entry, &input_dir, &gguf_path)?;
         let convert_out = Command::new(&hf2q_exe)
             .args(&convert_args)
             .output()
@@ -492,6 +469,40 @@ fn run_q4_0_pipeline(
     std::fs::write(&transcript_path, transcript_body)
         .map_err(|e| format!("write transcript {:?}: {}", transcript_path, e))?;
     Ok(transcript_path)
+}
+
+/// Build the convert subprocess args. Pure function — extracted so
+/// the `--with-vision` → `--emit-vision-tower` wiring (Decision 16
+/// §CLI flag) can be unit-tested without spawning a subprocess.
+///
+/// Three guards combine before --emit-vision-tower is appended:
+/// 1. `args.with_vision` — user opt-in.
+/// 2. `entry.has_vision` — arch advertises a vision-tower path.
+/// 3. (Convert-side) silent-skip if config.json has no vision_config
+///    per Decision 18 / commit 18cbaaa.
+fn build_convert_args(
+    args: &SmokeArgs,
+    entry: &ArchEntry,
+    input_dir: &Path,
+    gguf_path: &Path,
+) -> Result<Vec<String>, String> {
+    let mut convert_args: Vec<String> = vec![
+        "convert".into(),
+        "--input".into(),
+        input_dir.to_str().ok_or("input_dir not UTF-8")?.into(),
+        "--format".into(),
+        "gguf".into(),
+        "--quant".into(),
+        args.quant.clone(),
+        "--output".into(),
+        gguf_path.to_str().ok_or("gguf_path not UTF-8")?.into(),
+        "--yes".into(),
+        "--skip-quality".into(),
+    ];
+    if args.with_vision && entry.has_vision {
+        convert_args.push("--emit-vision-tower".into());
+    }
+    Ok(convert_args)
 }
 
 /// Replace decimal-number sequences (`X.YZ`) with `<X.XX>` so the
@@ -945,6 +956,78 @@ mod tests {
             sanitize_timestamps(stderr_a),
             sanitize_timestamps(stderr_b),
             "sanitized transcripts must be byte-identical"
+        );
+    }
+
+    /// `--with-vision` + `entry.has_vision` ⇒ `--emit-vision-tower`
+    /// is in the convert args. Locks Decision 16 §CLI's documented
+    /// `[--with-vision]` flag wiring.
+    #[test]
+    fn build_convert_args_with_vision_appends_emit_vision_tower() {
+        let mut args = args_for("qwen35", "q4_0");
+        args.with_vision = true;
+        let entry = ArchRegistry::global().get("qwen35").unwrap();
+        let convert_args = build_convert_args(
+            &args,
+            entry,
+            Path::new("/in"),
+            Path::new("/out.gguf"),
+        )
+        .unwrap();
+        assert!(
+            convert_args.iter().any(|a| a == "--emit-vision-tower"),
+            "must include --emit-vision-tower; got {:?}",
+            convert_args
+        );
+    }
+
+    /// `--with-vision` is FALSE ⇒ no `--emit-vision-tower` in convert
+    /// args. The default-off path stays untouched.
+    #[test]
+    fn build_convert_args_without_with_vision_omits_emit_vision_tower() {
+        let args = args_for("qwen35", "q4_0");
+        // with_vision defaults false in args_for.
+        assert!(!args.with_vision);
+        let entry = ArchRegistry::global().get("qwen35").unwrap();
+        let convert_args = build_convert_args(
+            &args,
+            entry,
+            Path::new("/in"),
+            Path::new("/out.gguf"),
+        )
+        .unwrap();
+        assert!(
+            !convert_args.iter().any(|a| a == "--emit-vision-tower"),
+            "must NOT include --emit-vision-tower when with_vision=false; got {:?}",
+            convert_args
+        );
+    }
+
+    /// `--with-vision` set BUT arch has `has_vision=false` ⇒ flag is
+    /// suppressed. Catches a future mistake where the smoke harness
+    /// passes --emit-vision-tower against an arch (e.g. qwen35moe)
+    /// whose checkpoints don't ship a vision_config — Decision 16
+    /// §CLI: the `--with-vision` flag is honored only when the arch
+    /// actually has a vision-tower path.
+    #[test]
+    fn build_convert_args_arch_without_vision_suppresses_flag_even_if_user_asked() {
+        let mut args = args_for("qwen35moe", "q4_0");
+        args.with_vision = true;
+        let entry = ArchRegistry::global().get("qwen35moe").unwrap();
+        // qwen35moe's entry has has_vision=false (Robert's MoE target
+        // dropped vision_config — see qwen35moe.rs:226).
+        assert!(!entry.has_vision);
+        let convert_args = build_convert_args(
+            &args,
+            entry,
+            Path::new("/in"),
+            Path::new("/out.gguf"),
+        )
+        .unwrap();
+        assert!(
+            !convert_args.iter().any(|a| a == "--emit-vision-tower"),
+            "qwen35moe must NOT request --emit-vision-tower even when user passes --with-vision; got {:?}",
+            convert_args
         );
     }
 
