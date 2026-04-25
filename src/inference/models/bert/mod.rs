@@ -36,6 +36,7 @@
 
 pub mod config;
 pub mod tokenizer;
+pub mod weights;
 #[allow(unused_imports)]
 pub use config::{
     bert_layer_tensor, BertConfig, PoolingType, TENSOR_EMBED_NORM_BIAS, TENSOR_EMBED_NORM_WEIGHT,
@@ -44,6 +45,11 @@ pub use config::{
 #[allow(unused_imports)]
 pub use tokenizer::{
     build_token_to_id_map, build_wordpiece_tokenizer, BertSpecialTokens, BertVocab,
+};
+#[allow(unused_imports)]
+pub use weights::{
+    validate_tensor_set, LoadedBertWeights, BERT_BLOCK_OPTIONAL_SUFFIXES,
+    BERT_BLOCK_REQUIRED_SUFFIXES,
 };
 
 /// GGUF architecture identifier for the BERT family.
