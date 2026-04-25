@@ -460,7 +460,20 @@ pub fn build_dense_ffn_layer_gpu(
         down_out
     };
 
-    enc.commit_and_wait().context("commit dense swiglu")?;
+    // Decode fast path (seq=1): commit() without wait.
+    // The caller (forward_gpu) sets `hidden = ffn_out` then immediately feeds
+    // `hidden` into the next layer's fused_residual_norm encoder on the same
+    // Metal serial queue.  GPU ordering guarantees the dense FFN completes
+    // before fused_residual_norm executes.
+    //
+    // Prefill (seq>1): commit_and_wait() for correctness (fused_residual_norm
+    // is a separate code path in forward_gpu that relies on ffn_out being ready,
+    // and dump_hidden_stats may do a CPU read of hidden).
+    if seq_len == 1 {
+        enc.commit();
+    } else {
+        enc.commit_and_wait().context("commit dense swiglu")?;
+    }
     Ok(result)
 }
 
@@ -976,7 +989,18 @@ pub fn build_moe_ffn_layer_gpu_q(
             add_residual.is_some(),
         ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
 
-        enc.commit_and_wait().context("commit moe_ffn_q")?;
+        // Decode fast path (seq=1): commit() without wait.
+        // The caller (forward_gpu) sets `hidden = out_buf` then immediately
+        // feeds `hidden` into the next layer's fused_residual_norm encoder on
+        // the same Metal serial queue.  GPU ordering guarantees the MoE FFN
+        // completes before fused_residual_norm executes.
+        //
+        // Prefill (seq>1): commit_and_wait() for correctness.
+        if seq_len == 1 {
+            enc.commit();
+        } else {
+            enc.commit_and_wait().context("commit moe_ffn_q")?;
+        }
     }
 
     Ok(out_buf)
