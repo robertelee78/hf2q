@@ -1859,6 +1859,41 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
     - std_bias_scale: `out[b, h] = (in[b, h] - bias[h]) * scale[h]` (per-channel broadcast)
   - Then iter 51d composes `apply_vit_full_forward_gpu` from blocks_loop + avg_pool + scale + std_bias_scale + mm.0 linear + final rms_norm → `[49, 2816]`. Iter 52 wires the handler.
 
+- **2026-04-25 loop iter 51c — custom Metal shaders for `vit_avg_pool_2x2_gpu` + `vit_std_bias_scale_gpu`. All 10 GPU primitives now ship.**
+  - **`VIT_CUSTOM_SHADERS_SOURCE`** — single inline `&'static str` containing two Metal kernels (`vit_avg_pool_2x2_f32` and `vit_std_bias_scale_f32`). Registered via `register_vit_custom_shaders(&mut registry)` (idempotent — `KernelRegistry::register_source` overwrites). Compiled lazily by mlx-native's pipeline cache on first dispatch.
+  - **`vit_avg_pool_2x2_gpu(encoder, registry, device, input, n_side, hidden) -> MlxBuffer`:** spatial 2×2 average pool on `[N_side, N_side, hidden]` row-major → `[(N_side/2)², hidden]`. Output `out[oy, ox, h] = mean(input[2*oy..2*oy+1, 2*ox..2*ox+1, h])`. For Gemma 4: `[14, 14, 1152] → [49, 1152]`. Grid: `(hidden, out_side, out_side)` — one thread per output element.
+  - **`vit_std_bias_scale_gpu(encoder, registry, device, input, bias, scale, batch, hidden) -> MlxBuffer`:** per-channel `(x - bias) * scale`. Bias and scale are `[hidden]` shared across batch rows; one thread per `(batch, hidden)` element.
+  - **POD param helper:** since hf2q doesn't depend on `bytemuck`, used a tiny `pod_as_bytes<T: Copy>(p: &T) -> &[u8]` helper to view `#[repr(C)]` params as raw bytes for `KernelArg::Bytes(&[u8])`. Safe for the u32-only structs used here.
+  - **Tests (6 new, all passing):**
+    - `vit_avg_pool_2x2_gpu_matches_cpu_reference` — 4×4×2 hand-decodable test mirrors CPU `avg_pool_2x2_spatial`. max_diff < 1e-6.
+    - `vit_avg_pool_2x2_gpu_gemma4_production_shape` — `[14, 14, 1152] → [49, 1152]` on uniform input, asserts uniform output preserved.
+    - `vit_avg_pool_2x2_gpu_rejects_odd_n_side`.
+    - `vit_std_bias_scale_gpu_matches_cpu_reference` — 2×3 hand-decodable case (CPU `std_bias_scale_in_place` reference) max_diff < 1e-5.
+    - `vit_std_bias_scale_gpu_zero_bias_unit_scale_is_identity`.
+    - `vit_std_bias_scale_gpu_rejects_zero_dims`.
+  - **Verification:** `cargo test --bin hf2q vit_avg_pool` — 3/3 pass. `vit_std_bias_scale` — 3/3 pass. Full suite 924/924 pass (+6 from iter 51b's 918).
+  - **All 10 GPU primitives now exist:**
+    1. `vit_linear_gpu` — linear projections (Q/K/V/output, FFN, mm.0)
+    2. `vit_rms_norm_gpu` — ln1, ln2, post_ffw_norm, final norm
+    3. `vit_per_head_rms_norm_gpu` — attn_q_norm, attn_k_norm
+    4. `vit_softmax_last_dim_gpu` — attention softmax
+    5. `vit_attention_gpu` — full SDPA
+    6. `vit_residual_add_gpu` — residual connections
+    7. `vit_silu_mul_gpu` — SwiGLU gating
+    8. `vit_scale_gpu` — in-place scalar multiply
+    9. `vit_avg_pool_2x2_gpu` — post-blocks pooler [NEW]
+    10. `vit_std_bias_scale_gpu` — pre-projector normalization [NEW]
+  - **Next (iter 51d):** compose `apply_vit_full_forward_gpu(pixel_values, weights, cfg) -> MlxBuffer`. Pipeline:
+    1. patch_embed (CPU helper — patch_embed is one-time per image, not in the hot loop; GPU port eventually)
+    2. upload to GPU
+    3. `apply_vit_blocks_loop_gpu(input, weights, cfg, batch=196, scale)` — 27 blocks
+    4. `vit_avg_pool_2x2_gpu` → [49, 1152]
+    5. `vit_scale_gpu(by √n_embd = √1152)`
+    6. `vit_std_bias_scale_gpu(v.std_bias, v.std_scale)`
+    7. `vit_linear_gpu(mm.0.weight)` → [49, 2816]
+    8. `vit_rms_norm_gpu(ones, eps)` — final no-gain norm
+    Real-data test on real Gemma 4: expects [49, 2816] output, finite, sensible distribution. Iter 52 wires `process_multimodal_content` to invoke this; 501 → 200.
+
   - **Roadmap reset — iter 44+ ships GPU primitives to match every CPU op:**
     - iter 44: `vit_rms_norm_gpu` (wrapping `mlx_native::ops::rms_norm::dispatch_rms_norm`), `vit_per_head_rms_norm_gpu`.
     - iter 45: `vit_attention_gpu` (wrapping `mlx_native::ops::flash_attn_prefill_bf16_d256` or the matching variant for head_dim=72 — TBD).

@@ -26,6 +26,8 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
+use mlx_native::metal::MTLSize;
+use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
@@ -1019,6 +1021,229 @@ pub fn apply_vit_block_forward_gpu(
     )?;
 
     Ok(block_out)
+}
+
+/// Metal shader source for the iter-51c custom kernels:
+///   - `vit_avg_pool_2x2_f32`: spatial 2×2 avg-pool on `[N_side, N_side, hidden]`.
+///   - `vit_std_bias_scale_f32`: per-channel `(x - bias) * scale` on `[batch, hidden]`.
+///
+/// Registered with the `KernelRegistry` on first use via
+/// `register_vit_custom_shaders`. Lives as a `&'static str` since the
+/// registry stores sources as `&'static str`.
+const VIT_CUSTOM_SHADERS_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct AvgPool2x2Params {
+    uint n_side;
+    uint hidden;
+};
+
+kernel void vit_avg_pool_2x2_f32(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant AvgPool2x2Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint h  = gid.x;
+    uint ox = gid.y;
+    uint oy = gid.z;
+    uint out_side = params.n_side / 2;
+    if (h >= params.hidden || ox >= out_side || oy >= out_side) return;
+    uint iy = oy * 2u;
+    uint ix = ox * 2u;
+    uint h_stride = params.hidden;
+    uint row_stride = params.n_side * h_stride;
+    float a = input[iy * row_stride + ix * h_stride + h];
+    float b = input[iy * row_stride + (ix + 1u) * h_stride + h];
+    float c = input[(iy + 1u) * row_stride + ix * h_stride + h];
+    float d = input[(iy + 1u) * row_stride + (ix + 1u) * h_stride + h];
+    output[oy * out_side * h_stride + ox * h_stride + h] = (a + b + c + d) * 0.25;
+}
+
+struct StdBiasScaleParams {
+    uint hidden;
+    uint batch;
+};
+
+kernel void vit_std_bias_scale_f32(
+    device const float* input  [[buffer(0)]],
+    device const float* bias   [[buffer(1)]],
+    device const float* scale  [[buffer(2)]],
+    device       float* output [[buffer(3)]],
+    constant StdBiasScaleParams& params [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint h = gid.x;
+    uint b = gid.y;
+    if (h >= params.hidden || b >= params.batch) return;
+    uint idx = b * params.hidden + h;
+    output[idx] = (input[idx] - bias[h]) * scale[h];
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvgPool2x2GpuParams {
+    n_side: u32,
+    hidden: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StdBiasScaleGpuParams {
+    hidden: u32,
+    batch: u32,
+}
+
+/// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
+/// structs containing only primitive fields; the byte representation
+/// is stable and exactly `size_of::<T>()` bytes.
+fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
+    // SAFETY: `T: Copy + repr(C)` with primitive fields means the in-memory
+    // representation is a contiguous block of `size_of::<T>()` bytes with
+    // no uninitialized padding (we use only u32 fields packed naturally).
+    unsafe {
+        std::slice::from_raw_parts(p as *const T as *const u8, std::mem::size_of::<T>())
+    }
+}
+
+/// Register the iter-51c custom shaders with the kernel registry.
+/// Idempotent — `register_source` overwrites any previous registration
+/// for the same name. Caller invokes once per `KernelRegistry`.
+pub fn register_vit_custom_shaders(registry: &mut KernelRegistry) {
+    registry.register_source("vit_avg_pool_2x2_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_std_bias_scale_f32", VIT_CUSTOM_SHADERS_SOURCE);
+}
+
+/// GPU 2×2 spatial avg-pool on a `[N_side, N_side, hidden]` row-major
+/// tensor. Output shape `[(N_side/2)², hidden]`.
+///
+/// For Gemma 4 ViT: `[14, 14, 1152]` → `[49, 1152]` post-blocks pooler.
+///
+/// Caller registers `register_vit_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+///
+/// - `n_side == 0` or `n_side % 2 != 0`
+/// - `hidden == 0`
+/// - propagated from kernel pipeline compile failures
+pub fn vit_avg_pool_2x2_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    n_side: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if n_side == 0 || n_side % 2 != 0 {
+        return Err(anyhow!(
+            "vit_avg_pool_2x2_gpu: n_side ({}) must be positive and even",
+            n_side
+        ));
+    }
+    if hidden == 0 {
+        return Err(anyhow!("vit_avg_pool_2x2_gpu: hidden must be > 0"));
+    }
+    let out_side = n_side / 2;
+    let out_n_patches = (out_side as usize) * (out_side as usize);
+    let out_bytes = out_n_patches * (hidden as usize) * 4;
+    let output = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![out_side as usize, out_side as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc avg_pool output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("vit_avg_pool_2x2_f32", device.metal_device())
+        .map_err(|e| anyhow!("vit_avg_pool_2x2_gpu: get_pipeline: {e}"))?;
+
+    let params = AvgPool2x2GpuParams {
+        n_side,
+        hidden,
+    };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(hidden as u64, out_side as u64, out_side as u64);
+    // Threadgroup sized to fit the inner-most (hidden) dim into reasonable
+    // chunks; clamp components to 1 in axes not needing parallelism.
+    let tg_x = std::cmp::min(64, hidden as u64);
+    let tg = MTLSize::new(tg_x, 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(&output)),
+            (2, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
+}
+
+/// GPU per-channel std-normalization: `out[b, h] = (in[b, h] - bias[h]) * scale[h]`.
+///
+/// `input` shape `[batch, hidden]` F32, `bias`/`scale` each `[hidden]` F32.
+/// Returns a fresh F32 `[batch, hidden]` output buffer.
+///
+/// Used by Gemma 4 ViT's `(cur - std_bias) * std_scale` pre-projector
+/// step. `std_bias` and `std_scale` are loaded from `v.std_bias`,
+/// `v.std_scale` mmproj tensors.
+///
+/// Caller registers `register_vit_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+///
+/// - `batch == 0` or `hidden == 0`
+/// - propagated from kernel pipeline compile failures
+pub fn vit_std_bias_scale_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    bias: &MlxBuffer,
+    scale: &MlxBuffer,
+    batch: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "vit_std_bias_scale_gpu: batch ({}) and hidden ({}) must be > 0",
+            batch,
+            hidden
+        ));
+    }
+    let total = (batch as usize) * (hidden as usize);
+    let output = device
+        .alloc_buffer(total * 4, DType::F32, vec![batch as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc std_bias_scale output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("vit_std_bias_scale_f32", device.metal_device())
+        .map_err(|e| anyhow!("vit_std_bias_scale_gpu: get_pipeline: {e}"))?;
+
+    let params = StdBiasScaleGpuParams {
+        hidden,
+        batch,
+    };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(hidden as u64, batch as u64, 1);
+    let tg = MTLSize::new(std::cmp::min(64, hidden as u64), 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(bias)),
+            (2, KernelArg::Buffer(scale)),
+            (3, KernelArg::Buffer(&output)),
+            (4, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
 }
 
 /// In-place GPU scalar multiply: `buf[i] *= scalar` across every element.
@@ -2289,6 +2514,190 @@ mod tests {
         let (md_attn_f, l2_attn_f) = l2(&attn_f_back, &ref_attn);
         eprintln!("STAGE F (full chain through attention): max_diff = {:.6}, l2 = {:.6}", md_attn_f, l2_attn_f);
     }
+    // -----------------------------------------------------------------------
+    // vit_avg_pool_2x2_gpu + vit_std_bias_scale_gpu (iter 51c)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_avg_pool_2x2_gpu_matches_cpu_reference() {
+        // 4×4 grid × 2 hidden → 2×2 output. Same hand-decodable test
+        // as vit::tests::avg_pool_2x2_averages_each_2x2_block.
+        use crate::inference::vision::vit::avg_pool_2x2_spatial as avg_pool_cpu;
+        let n_side = 4usize;
+        let hidden = 2usize;
+        let mut input_cpu = vec![0f32; n_side * n_side * hidden];
+        for y in 0..n_side {
+            for x in 0..n_side {
+                let patch = y * n_side + x;
+                input_cpu[patch * hidden + 0] = patch as f32;
+                input_cpu[patch * hidden + 1] = (patch as f32) * 10.0;
+            }
+        }
+        let expected = avg_pool_cpu(&input_cpu, n_side, hidden).unwrap();
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![n_side, n_side, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_avg_pool_2x2_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_side as u32,
+            hidden as u32,
+        )
+        .expect("avg_pool");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, 4 * hidden);
+
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(g, e)| (g - e).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-6, "avg_pool max_diff = {max_diff}");
+    }
+
+    #[test]
+    fn vit_avg_pool_2x2_gpu_gemma4_production_shape() {
+        // [14, 14, 1152] → [49, 1152]. Uniform input → uniform output.
+        let n_side = 14usize;
+        let hidden = 1152usize;
+        let total = n_side * n_side * hidden;
+        let input_cpu: Vec<f32> = vec![1.5f32; total];
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![n_side, n_side, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_avg_pool_2x2_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            n_side as u32,
+            hidden as u32,
+        )
+        .expect("avg_pool");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, 49 * hidden);
+        for v in &got {
+            assert!((*v - 1.5).abs() < 1e-6, "expected 1.5, got {v}");
+        }
+    }
+
+    #[test]
+    fn vit_avg_pool_2x2_gpu_rejects_odd_n_side() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = executor.device().alloc_buffer(27 * 4, DType::F32, vec![3, 3, 3]).expect("a");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_avg_pool_2x2_gpu(session.encoder_mut(), &mut registry, device, &in_buf, 3, 3)
+            .unwrap_err();
+        assert!(format!("{err}").contains("positive and even"));
+    }
+
+    #[test]
+    fn vit_std_bias_scale_gpu_matches_cpu_reference() {
+        // batch=2, hidden=3. bias=[1, 2, 3], scale=[10, 20, 30]. Same
+        // hand-decodable test as vit::tests::std_bias_scale_subtracts_and_scales_per_channel.
+        let batch = 2usize;
+        let hidden = 3usize;
+        let input_cpu = vec![5.0f32, 10.0, 15.0, 10.0, 20.0, 30.0];
+        let bias_cpu = vec![1.0f32, 2.0, 3.0];
+        let scale_cpu = vec![10.0f32, 20.0, 30.0];
+        let expected = vec![40.0f32, 160.0, 360.0, 90.0, 360.0, 810.0];
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![batch, hidden]);
+        let bias_buf = upload_f32(executor.device(), &bias_cpu, vec![hidden]);
+        let scale_buf = upload_f32(executor.device(), &scale_cpu, vec![hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_std_bias_scale_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            &bias_buf,
+            &scale_buf,
+            batch as u32,
+            hidden as u32,
+        )
+        .expect("std_bias_scale");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, batch * hidden);
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!((g - e).abs() < 1e-5, "got {g} want {e}");
+        }
+    }
+
+    #[test]
+    fn vit_std_bias_scale_gpu_zero_bias_unit_scale_is_identity() {
+        let batch = 4usize;
+        let hidden = 8usize;
+        let input_cpu: Vec<f32> = (0..batch * hidden).map(|i| (i as f32) * 0.1).collect();
+        let bias_cpu = vec![0.0f32; hidden];
+        let scale_cpu = vec![1.0f32; hidden];
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![batch, hidden]);
+        let bias_buf = upload_f32(executor.device(), &bias_cpu, vec![hidden]);
+        let scale_buf = upload_f32(executor.device(), &scale_cpu, vec![hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_std_bias_scale_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            &bias_buf,
+            &scale_buf,
+            batch as u32,
+            hidden as u32,
+        )
+        .expect("std_bias_scale");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, batch * hidden);
+        for (g, c) in got.iter().zip(input_cpu.iter()) {
+            assert!((g - c).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn vit_std_bias_scale_gpu_rejects_zero_dims() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_std_bias_scale_gpu(session.encoder_mut(), &mut registry, device, &buf, &buf, &buf, 0, 4)
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be > 0"));
+    }
+
     // -----------------------------------------------------------------------
     // vit_scale_gpu (iter 51b)
     // -----------------------------------------------------------------------
