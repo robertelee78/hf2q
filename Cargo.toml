@@ -117,3 +117,11 @@ harness = false
 
 # ADR-008: vendored candle patches removed (candle no longer used for inference).
 
+# Pin mlx-native to a specific upstream rev until v0.4.3 ships to
+# crates.io. The fix at fed406d (encoder.rs:166 + :397, KernelArg::Buffer
+# now propagates MlxBuffer::byte_offset) is load-bearing for nomic-bert
+# cosine parity (ADR-005 iter 80). Local development can override this
+# via .cargo/config.toml.
+[patch.crates-io]
+mlx-native = { git = "https://github.com/robertelee78/mlx-native.git", rev = "fed406d" }
+
