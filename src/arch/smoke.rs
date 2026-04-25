@@ -328,6 +328,25 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
                 ),
             };
         }
+        // Basic HF-model-dir shape check: config.json must be present.
+        // Without this, the convert subprocess fails later with
+        // "No config.json found in <dir>. Is this a HuggingFace model
+        // directory?" — which is clear enough but adds an extra layer
+        // of indirection. Catching it at the smoke pre-flight gives the
+        // user a faster pre-run signal (especially on --dry-run, where
+        // the convert subprocess never runs and the user would otherwise
+        // see "smoke: pass" against an obviously-wrong directory).
+        if !local.join("config.json").is_file() {
+            return SmokeOutcome::PreflightFailed {
+                exit_code: EXIT_SMOKE_ASSERTION_FAILED,
+                reason: format!(
+                    "--local-dir {:?} has no config.json (expected a HuggingFace \
+                     model directory). If this is a fresh download in progress, \
+                     wait for it to finish; otherwise pass the correct path.",
+                    local
+                ),
+            };
+        }
     }
 
     if args.dry_run {
@@ -816,6 +835,34 @@ mod tests {
             other => panic!(
                 "expected PreflightFailed with EXIT_SMOKE_ASSERTION_FAILED, got: {other:?}"
             ),
+        }
+    }
+
+    /// `--local-dir <path>` pointing at a directory that exists but
+    /// has no `config.json` must fail at the dispatch layer. Without
+    /// this, the convert subprocess fails with "No config.json found
+    /// in <dir>. Is this a HuggingFace model directory?" — clear but
+    /// extra-indirection. Catching it at the smoke pre-flight gives
+    /// the user a faster pre-run signal, especially on --dry-run
+    /// where the convert subprocess never runs.
+    #[test]
+    fn local_dir_without_config_json_returns_preflight_failure() {
+        let env = MockEnv::default();
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty tempdir — no config.json.
+        let mut args = args_for("qwen35", "q4_0");
+        args.local_dir = Some(tmp.path().to_path_buf());
+        args.dry_run = true;
+        let outcome = dispatch(&args, &env);
+        match outcome {
+            SmokeOutcome::PreflightFailed { exit_code, reason } => {
+                assert_eq!(exit_code, EXIT_SMOKE_ASSERTION_FAILED);
+                assert!(
+                    reason.contains("config.json"),
+                    "error must name `config.json`, got: {reason}"
+                );
+            }
+            other => panic!("expected PreflightFailed, got: {other:?}"),
         }
     }
 
