@@ -292,6 +292,31 @@ pub fn dispatch(args: &SmokeArgs, env: &dyn SmokeEnv) -> SmokeOutcome {
         };
     }
 
+    // Step 1b: --local-dir existence check. Earlier this fired only at
+    // run_q4_0_pipeline (post-dry-run), so a user running
+    //   hf2q smoke --arch qwen35 --dry-run --local-dir /path/typo
+    // would see "pass" and exit 0 — misleading because the same command
+    // without --dry-run would fail at convert. Catch it here so dry-run
+    // is a faithful pre-flight check.
+    if let Some(local) = &args.local_dir {
+        if !local.exists() {
+            return SmokeOutcome::PreflightFailed {
+                // Reuse EXIT_SMOKE_ASSERTION_FAILED (8) for parity with the
+                // post-preflight `run_q4_0_pipeline` local-dir check; both
+                // paths now emit the same code so scripts can't distinguish
+                // "caught by preflight" vs "caught by pipeline" — only that
+                // it failed and the message names the missing path.
+                exit_code: EXIT_SMOKE_ASSERTION_FAILED,
+                reason: format!(
+                    "--local-dir {:?} does not exist (no input safetensors directory \
+                     to convert from). Pass a valid path or omit --local-dir to use \
+                     the HF download path.",
+                    local
+                ),
+            };
+        }
+    }
+
     if args.dry_run {
         let path = resolve_transcript_path(args, entry);
         return SmokeOutcome::Pass {
@@ -741,6 +766,43 @@ mod tests {
             local_dir: None,
             convert_output_dir: None,
             llama_cli_override: None,
+        }
+    }
+
+    /// `--local-dir <path>` with a non-existent path must fail at the
+    /// dispatch layer (NOT defer to run_q4_0_pipeline). Without this
+    /// pre-pipeline check, `hf2q smoke ... --dry-run --local-dir /typo`
+    /// returned exit 0 — misleading because the same command without
+    /// --dry-run would fail at convert. Now both --dry-run and full
+    /// runs reject the missing path at the same gate.
+    #[test]
+    fn local_dir_missing_path_returns_preflight_failure_in_dry_run() {
+        let env = MockEnv::default();
+        let mut args = args_for("qwen35", "q4_0");
+        args.local_dir = Some(PathBuf::from(
+            "/this/path/definitely/does/not/exist/qwen35-input",
+        ));
+        args.dry_run = true;
+        let outcome = dispatch(&args, &env);
+        match outcome {
+            SmokeOutcome::PreflightFailed { exit_code, reason } => {
+                assert_eq!(
+                    exit_code, EXIT_SMOKE_ASSERTION_FAILED,
+                    "missing --local-dir path must trip exit 8 (parity with \
+                     run_q4_0_pipeline's post-preflight check)"
+                );
+                assert!(
+                    reason.contains("--local-dir"),
+                    "error must name the offending flag, got: {reason}"
+                );
+                assert!(
+                    reason.contains("does not exist"),
+                    "error must explain the missing-dir condition, got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected PreflightFailed with EXIT_SMOKE_ASSERTION_FAILED, got: {other:?}"
+            ),
         }
     }
 
