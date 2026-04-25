@@ -241,14 +241,24 @@ impl BertSpecialTokens {
     /// Read special-token IDs from GGUF metadata. Uses llama.cpp's
     /// `tokenizer.ggml.*_token_id` convention. `mask` falls back to `unk`
     /// when absent (not every BERT GGUF includes it).
+    ///
+    /// BERT-family compatibility: when `cls_token_id` / `sep_token_id`
+    /// are absent (nomic-bert GGUFs ship only `bos_token_id` /
+    /// `eos_token_id`), fall back to those — the universal BERT-family
+    /// convention is BOS=`[CLS]`=101 and EOS=`[SEP]`=102 in the standard
+    /// `bert-base-uncased` vocab. Per llama.cpp's
+    /// `src/llama-vocab.cpp::llama_vocab::impl::load_with_default_special_tokens`,
+    /// this fallback is how the C++ side handles the same nomic GGUFs.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let read = |key: &str| -> Result<u32> {
             gguf.metadata_u32(key)
                 .ok_or_else(|| anyhow!("GGUF missing u32 metadata '{}'", key))
         };
-        let cls = read("tokenizer.ggml.cls_token_id")?;
+        let cls = read("tokenizer.ggml.cls_token_id")
+            .or_else(|_| read("tokenizer.ggml.bos_token_id"))?;
         let sep = read("tokenizer.ggml.seperator_token_id")
-            .or_else(|_| read("tokenizer.ggml.separator_token_id"))?;
+            .or_else(|_| read("tokenizer.ggml.separator_token_id"))
+            .or_else(|_| read("tokenizer.ggml.eos_token_id"))?;
         let pad = read("tokenizer.ggml.padding_token_id")?;
         let unk = read("tokenizer.ggml.unknown_token_id")?;
         let mask = read("tokenizer.ggml.mask_token_id").unwrap_or(unk);
