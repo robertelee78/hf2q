@@ -64,6 +64,8 @@
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::moe_softmax_topk::dispatch_moe_softmax_topk;
+use mlx_native::ops::moe_weighted_reduce::dispatch_moe_weighted_reduce;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
 use mlx_native::ops::quantized_matmul_id_ggml::{quantized_matmul_id_ggml, GgmlQuantizedMatmulIdParams};
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
@@ -766,7 +768,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
-    let ne = shape.num_experts as usize;
+    let _ne = shape.num_experts as usize;
     let topk = shape.num_experts_per_tok as usize;
     let m_moe = shape.moe_intermediate_size as usize;
     let seq_len = (x.element_count() / h) as u32;
@@ -777,36 +779,33 @@ pub fn build_moe_ffn_layer_gpu_q(
     let m_moe32 = shape.moe_intermediate_size;
     let m_sh32 = shape.shared_intermediate_size;
 
-    // ---- Steps 1+4+6+7: router + shared expert projections — all read from x ----
-    // Batch all four projections into one encoder + one commit.
-    // CPU step 2 (softmax + top-k) and step 5 (sigmoid) proceed after download.
-    let (logits_buf, sh_logit_buf, a_s_buf, b_s_buf) = {
-        let mut enc = device.command_encoder().context("enc router+shared")?;
-        let logits_buf    = proj(&mut enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
-        let sh_logit_buf  = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-        let a_s_buf       = proj(&mut enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
-        let b_s_buf       = proj(&mut enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
-        enc.commit_and_wait().context("commit router+shared")?;
-        (logits_buf, sh_logit_buf, a_s_buf, b_s_buf)
-    };
-
-    // ---- Step 2: softmax + top-k + renorm  [CPU] ----
-    let logits_cpu = download_f32(&logits_buf).context("download router logits")?;
-    let (topk_idx, topk_w) = softmax_topk_renorm_cpu(&logits_cpu, seq, ne, topk);
-
-    // Build ids buffer: [seq * topk] u32 — flat expert-id table.
-    // softmax_topk_renorm_cpu emits token-major ordering: for token t,
-    // topk_idx[t*topk .. (t+1)*topk] are the selected expert ids.
-    // This matches the layout expected by quantized_matmul_id_ggml.
+    // ADR-013 P13.3 perf: entire MoE FFN in ONE command buffer.
+    // By fusing all projections + routing + expert matmuls + weighted combine into a
+    // single encoder (single commit_and_wait per MoE layer), we eliminate the second
+    // commit_and_wait that previously separated the router projection from the expert
+    // matmuls.  40 MoE layers × 1 eliminated commit = 40 fewer GPU sync barriers
+    // per decode token.
+    //
+    // Dispatch order (all ops in one command buffer, barriers between RAW hazards):
+    //   A. proj(router) + proj(sh_logit) + proj(a_s) + proj(b_s)   — concurrent
+    //   BARRIER
+    //   B. softmax_topk(logits → ids, w) + silu_mul(a_s,b_s → h_s) — concurrent
+    //   BARRIER
+    //   C. gate_all + up_all + shared_down(h_s → y_s)              — concurrent
+    //   BARRIER
+    //   D. silu_mul(gate_all,up_all → h_all)
+    //   BARRIER
+    //   E. expert_down(h_all → y_all)
+    //   BARRIER
+    //   F. moe_weighted_reduce(w,y_all,sh_logit,y_s → out [+residual])
+    //   commit_and_wait() — single GPU sync per MoE layer
     let total_rows = seq * topk;
-    let ids_buf = upload_u32(&topk_idx, device).context("upload ids")?;
-
-    // ---- Steps 3a-3d + 8+9: one encoder — expert matmuls + shared SwiGLU ----
-    // Steps 3a-3d: gate+up+silu+down (sequential, barrier-gated)
-    // Steps 8+9:   shared silu_mul + shared_down (both depend on a_s_buf/b_s_buf
-    //              written by commit 1, independent of expert matmuls)
-    // Merging 3a-3d and 8+9 into a single encoder saves 1 commit_and_wait per
-    // MoE layer × 40 layers = 40 fewer GPU syncs per decode token.
+    let ids_buf = device
+        .alloc_buffer(total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
+        .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
+    let weights_buf = device
+        .alloc_buffer(total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
+        .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
     let gate_all_bytes = total_rows * m_moe * 4;
     let mut gate_all_buf = device
         .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
@@ -828,6 +827,10 @@ pub fn build_moe_ffn_layer_gpu_q(
     let h_s_buf = device
         .alloc_buffer(n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
         .map_err(|e| anyhow!("alloc h_s: {e}"))?;
+    let out_bytes = seq * h * 4;
+    let mut out_buf = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+        .map_err(|e| anyhow!("alloc output: {e}"))?;
     // params_buf for silu_mul (holds n as u32, must outlive the encoder)
     let mut silu_params_buf = device
         .alloc_buffer(4, DType::U32, vec![1])
@@ -837,9 +840,47 @@ pub fn build_moe_ffn_layer_gpu_q(
         .alloc_buffer(4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
     silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
-    let y_s_buf = {
-        let mut enc = device.command_encoder().context("enc expert+shared")?;
-        // Steps 3a+3b: gate_all + up_all (concurrent — both read from x, write different bufs)
+
+    // Dummy residual buffer (1 f32) used when add_residual=false; dispatch_moe_weighted_reduce
+    // requires a valid buffer reference even if the add_residual flag is 0.
+    let dummy_residual_buf;
+    let residual_ref: &MlxBuffer = match add_residual {
+        Some(buf) => buf,
+        None => {
+            dummy_residual_buf = device
+                .alloc_buffer(4, DType::F32, vec![1])
+                .map_err(|e| anyhow!("alloc dummy residual: {e}"))?;
+            &dummy_residual_buf
+        }
+    };
+
+    {
+        let mut enc = device.command_encoder().context("enc moe_ffn_q")?;
+
+        // ---- Phase A: router + shared expert projections (all read from x, concurrent) ----
+        let logits_buf   = proj(&mut enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
+        let sh_logit_buf = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf      = proj(&mut enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
+        let b_s_buf      = proj(&mut enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
+
+        // Barrier A→B: softmax_topk reads logits_buf; silu_mul reads a_s/b_s.
+        enc.memory_barrier();
+
+        // ---- Phase B: GPU softmax+topk + shared silu_mul (concurrent) ----
+        dispatch_moe_softmax_topk(
+            &mut enc, registry, device,
+            &logits_buf, &ids_buf, &weights_buf,
+            seq_len, ne32, shape.num_experts_per_tok,
+        ).map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
+        dispatch_silu_mul(
+            &mut enc, registry, device.metal_device(),
+            &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
+        ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
+
+        // Barrier B→C: gate/up matmuls need ids_buf; shared_down needs h_s.
+        enc.memory_barrier();
+
+        // ---- Phase C: expert gate+up matmuls + shared down proj (concurrent) ----
         quantized_matmul_id_ggml(
             &mut enc, registry, device,
             x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
@@ -866,25 +907,21 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_gate_up,
             },
         ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
-        // Step 8 (shared): h_s = silu(a_s) * b_s
-        // Reads a_s_buf/b_s_buf (from commit 1, already committed) — independent
-        // of gate_all/up_all, so it can run concurrently with steps 3a+3b.
-        dispatch_silu_mul(
-            &mut enc, registry, device.metal_device(),
-            &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
-        ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
-        // Barrier: silu_mul (step 3c) reads gate_all/up_all; shared_down reads h_s.
+        let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
+
+        // Barrier C→D: silu_mul reads gate_all/up_all.
         enc.memory_barrier();
-        // Step 3c: h_all = silu(gate_all) * up_all
+
+        // ---- Phase D: h_all = silu(gate_all) * up_all ----
         dispatch_silu_mul(
             &mut enc, registry, device.metal_device(),
             &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
         ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
-        // Step 9: y_s = shared_down_proj(h_s) — reads h_s written by step 8.
-        let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
-        // Barrier: step 3d (y_all = expert_down(h_all)) reads h_all.
+
+        // Barrier D→E: expert_down reads h_all.
         enc.memory_barrier();
-        // Step 3d: y_all = expert_down(h_all)
+
+        // ---- Phase E: y_all = expert_down(h_all) ----
         quantized_matmul_id_ggml(
             &mut enc, registry, device,
             &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
@@ -898,52 +935,29 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_down,
             },
         ).map_err(|e| anyhow!("y_all qmatmul_id: {e}"))?;
-        enc.commit_and_wait().context("commit expert+shared")?;
-        y_s_buf
-    };
 
-    // ---- Step 3e: weighted accumulate moe_out [CPU] ----
-    // y_all and y_s are both available now (single commit above).
-    let y_all_cpu = download_f32(&y_all_buf).context("download y_all")?;
-    let mut moe_out_cpu = vec![0.0f32; seq * h];
-    for (slot, (&w, row)) in topk_w.iter().zip(y_all_cpu.chunks(h)).enumerate() {
-        let t = slot / topk;
-        let out_row = &mut moe_out_cpu[t * h..(t + 1) * h];
-        for i in 0..h {
-            out_row[i] += w * row[i];
-        }
+        // Barrier E→F: moe_weighted_reduce reads y_all, y_s_buf, sh_logit_buf.
+        enc.memory_barrier();
+
+        // ---- Phase F: fused weighted accumulate + sigmoid(sh_logit)*y_s + residual ----
+        dispatch_moe_weighted_reduce(
+            &mut enc, registry, device,
+            &weights_buf,
+            &y_all_buf,
+            &sh_logit_buf,
+            &y_s_buf,
+            residual_ref,
+            &mut out_buf,
+            seq_len,
+            shape.num_experts_per_tok,
+            h32,
+            add_residual.is_some(),
+        ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
+
+        enc.commit_and_wait().context("commit moe_ffn_q")?;
     }
 
-    // ---- Step 5: sh_gate_val = sigmoid(sh_logit) [CPU — only seq scalars] ----
-    let sh_logit_cpu = download_f32(&sh_logit_buf).context("download sh_logit")?;
-    let sh_gate_vals: Vec<f32> = sh_logit_cpu
-        .iter()
-        .map(|&v| 1.0 / (1.0 + (-v).exp()))
-        .collect();
-
-    // ---- Step 10: output = moe_out + sh_gate * y_s [+ optional residual] [CPU combine] ----
-    let y_s_cpu = download_f32(&y_s_buf).context("download y_s")?;
-    // Optionally fold the residual into the CPU accumulation to save a GPU commit.
-    // On unified memory, download_f32 is zero-copy (returns a slice into Metal buffer).
-    let residual_cpu: Option<Vec<f32>> = match add_residual {
-        Some(buf) => Some(download_f32(buf).context("download add_residual")?),
-        None => None,
-    };
-    let mut out_cpu = moe_out_cpu;
-    for t in 0..seq {
-        let sg = sh_gate_vals[t];
-        let y_row = &y_s_cpu[t * h..(t + 1) * h];
-        let o_row = &mut out_cpu[t * h..(t + 1) * h];
-        for i in 0..h {
-            let mut v = o_row[i] + sg * y_row[i];
-            if let Some(ref r) = residual_cpu {
-                v += r[t * h + i];
-            }
-            o_row[i] = v;
-        }
-    }
-
-    upload_f32(&out_cpu, device).context("upload final moe_q out")
+    Ok(out_buf)
 }
 
 // ================================================================
@@ -1517,7 +1531,7 @@ mod tests {
 
         let x_buf = upload_f32(&x_cpu, &device).expect("upload x");
         let gpu_buf = build_moe_ffn_layer_gpu_q(
-            &device, &mut registry, &x_buf, &weights_q, shape,
+            &device, &mut registry, &x_buf, &weights_q, shape, None,
         ).expect("build_moe_ffn_layer_gpu_q");
 
         let gpu_out = download_f32(&gpu_buf).expect("download gpu out");
