@@ -1930,6 +1930,31 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 65 — Phase 2b two more root causes localized: padding contaminates CLS attention (0.58 → 0.82 wedge), compute drift remains ~0.18.**
+  - **Method.** With tokenizer fixed in iter 64 (cosine 0.58), the next bisection split was: is the residual gap from padding or from compute? Cheapest experiment: send a long prompt that tokenizes to ≥ 32 tokens naturally so no padding is needed. **Result: cosine 0.82 on the long prompt.** That isolates 0.24 of the gap to padding-related effects (between the 0.58 short-prompt and 0.82 long-prompt cases) and the remaining 0.18 (between 0.82 and the 1.0 gate) to compute drift.
+  - **Root cause #2 — no attention mask.** Confirmed by reading `/opt/candle/candle-transformers/src/models/bert.rs::BertSelfAttention::forward` lines 256-258:
+    ```rust
+    let attention_scores = query_layer.matmul(&key_layer.t()?)?;
+    let attention_scores = (attention_scores / sqrt_head_dim)?;
+    let attention_scores = attention_scores.broadcast_add(attention_mask)?;  // ← MISSING IN HF2Q
+    ```
+    Real BERT's `attention_mask` has `-inf` (or `-10000`) at padded positions, zero at real positions; broadcast-added to scores before softmax so padded positions get zero softmax weight. hf2q's `bert_attention_gpu` (which delegates to `vit_attention_gpu`) has no mask path because ViT inputs aren't padded — every patch is a real patch. **Even though bge uses CLS pool (only position 0 of the output is returned), CLS at position 0 attends across the entire sequence — its representation at the output of layer 1 already includes information from PAD positions, and that contamination compounds across 12 layers.**
+  - **Root cause #3 — compute drift, ~0.18 remaining.** On the long-prompt case (seq=37, no padding), cosine is 0.82 — leaves ~0.18 of unaccounted drift. Likely sources, in priority order:
+    1. BF16 weight cast in every linear projection × 4 linears/layer × 12 layers = 48 cast points compounding round-off.
+    2. LayerNorm reduction-order divergence — hf2q two-pass mean+variance vs llama.cpp's potentially fused one-pass.
+    3. Pooling mismatch hiding in plain sight — bge declares CLS pool (`bert.pooling_type = 2`) but `apply_bert_full_forward_gpu` reads `cfg.pooling_type` and dispatches accordingly; the long-prompt cosine was measured with both sides in their declared pool, so this isn't the cause for the 0.18 — but worth re-checking.
+    4. Attention scale: hf2q uses `1/sqrt(head_dim)`. bge head_dim = 32 → scale = 0.1768. Standard. Should match.
+  - **Why this iter doesn't ship the mask.** The mask kernel is a real chunk of work — needs (a) a custom Metal shader that computes mask from input_ids OR a CPU upload of a `[seq, seq]` F32 mask broadcast to `[num_heads, seq, seq]`, (b) modifying the attention dispatch chain to inject the mask between scores and softmax, (c) wiring the input_ids through the full forward composer. The right shape: iter 65 documents the localization (so future-me knows what's left); iter 66 ships the masked path with parity tests at the kernel level; iter 67 likely closes the compute-drift remainder.
+  - **Phase 2b status: still not closed (0.58 / 0.82 cosine, gate is 0.999).** The pipeline is correct in topology but loose in two known ways. Both have clear fix paths.
+  - **Verification.** `cargo test --bin hf2q` 972/972 pass — no regressions from iter 64. Long-prompt cosine confirmed at 0.82 on `bge-small-en-v1.5-f16.gguf`.
+  - **Lane discipline observed.** This iter is documentation-only — no code changes. Read-only references to `/opt/candle/candle-transformers/src/models/bert.rs` (per user's iter-64 directive: candle is reference, llama.cpp is reference). The mask implementation in iter 66 will edit `src/inference/models/bert/bert_gpu.rs` only.
+  - **Next (iter 66):** ship attention masking.
+    - Step 1: new inline Metal kernel `bert_attention_mask_add_f32` — broadcast-adds a `[seq, seq]` F32 mask to a `[num_heads, seq, seq]` scores tensor. Mask values: 0.0 at valid positions, -INF at padded.
+    - Step 2: new function `bert_attention_with_mask_gpu(...)` that composes `vit_attention_scores_gpu` → mask add → `vit_softmax_last_dim_gpu` → V transforms → V matmul → permute. Doesn't replace `bert_attention_gpu` — a future iter will deprecate the maskless path once the masked one is parity-validated.
+    - Step 3: pass the valid-token-count down from the handler through `apply_bert_full_forward_gpu` so it can build the mask buffer on CPU and dispatch.
+    - Step 4: re-measure cosine on bge-small for both short and long prompts; expected: short jumps from 0.58 to ~0.82+ (matches long), long stays ~0.82 (mask is a no-op when there's no padding).
+    - Step 5: commit + iter 67 attacks the remaining 0.18 compute drift via per-layer checksums.
+
 - **2026-04-26 loop iter 64 — Phase 2b cosine 0.46 → 0.58 — root-cause #1 (broken WordPiece tokenizer) found and fixed; ported llama.cpp's BERT-WPM tokenizer to Rust.**
   - **Root cause localized.** Iter 63 surfaced a cosine 0.46 against llama-embedding. Iter 64 step 1 was the cheapest bisection: dump tokenized ids and compare. Result on `"hello world"`:
     - llama.cpp → `[101, 7592, 2088, 102]` (`[CLS]`, `▁hello`, `▁world`, `[SEP]`)
