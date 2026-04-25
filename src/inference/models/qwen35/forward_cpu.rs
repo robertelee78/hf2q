@@ -88,7 +88,7 @@ impl Qwen35Model {
             ));
         }
 
-        let seq = tokens.len();
+        let _seq = tokens.len();
         let h = self.cfg.hidden_size as usize;
         let eps = self.cfg.rms_norm_eps;
 

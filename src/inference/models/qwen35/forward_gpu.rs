@@ -812,8 +812,9 @@ impl Qwen35Model {
                 enc.commit();
                 (ffn_residual_buf, ffn_input_buf)
             };
-            // Update hidden to the post-residual value (= ffn_residual = hidden + attn_out).
-            hidden = ffn_residual.clone();
+            // ffn_residual = hidden + attn_out. We don't update `hidden` here —
+            // it is overwritten unconditionally below after the FFN, and
+            // `ffn_residual` is consumed directly by the residual-add path.
             if let Some(t) = t_res_start { total_residual_us += t.elapsed().as_micros() as u64; }
             if let Some(t) = t_norm_start { total_norm_us += t.elapsed().as_micros() as u64; }
 
@@ -1284,7 +1285,8 @@ impl Qwen35Model {
                 enc.commit();
                 (ffn_residual_buf.clone(), ffn_input_buf.clone())
             };
-            hidden = ffn_residual.clone();
+            // hidden is overwritten unconditionally below after the FFN; the
+            // residual is consumed via `ffn_residual` directly.
 
             // --- FFN ---
             let ffn_weights_gpu = match layer_gpu {
@@ -1454,7 +1456,7 @@ impl Qwen35Model {
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::{
-        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
+        default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant,
     };
     use crate::inference::models::qwen35::forward_cpu::text_positions;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;

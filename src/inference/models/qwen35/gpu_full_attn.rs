@@ -917,8 +917,10 @@ pub fn apply_sdpa_with_kv_cache(
                 v_cache_cpu[dst_base..dst_base + d].copy_from_slice(&v_cpu_new[src_base..src_base + d]);
             }
         }
-        drop(k_cache_cpu);
-        drop(v_cache_cpu);
+        // k_cache_cpu / v_cache_cpu are &mut [f32] borrowed from slot.k / slot.v;
+        // NLL releases them at their last use (the loop above), so the immutable
+        // re-borrow at sdpa(&slot.k, &slot.v, ...) below is sound without an
+        // explicit drop. (drop() on a reference is a no-op anyway.)
 
         let q_cpu = download_f32(q_seq_major)?;
         let q_hm = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, seq, nh, d);

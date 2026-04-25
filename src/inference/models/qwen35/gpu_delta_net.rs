@@ -65,7 +65,6 @@ use mlx_native::ops::elementwise::{cast, scalar_mul_f32, CastDirection};
 use mlx_native::ops::gated_delta_net::{
     build_gated_delta_net_params, dispatch_gated_delta_net, GatedDeltaNetParams,
 };
-use mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32;
 use mlx_native::ops::l2_norm::dispatch_l2_norm;
 use mlx_native::ops::quantized_matmul_ggml::{
     quantized_matmul_ggml, GgmlQuantizedMatmulParams, GgmlType,
@@ -76,7 +75,7 @@ use mlx_native::ops::ssm_norm_gate::{build_ssm_norm_gate_params, dispatch_ssm_no
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
-use super::gpu_full_attn::{download_f32, upload_bf16_from_f32, upload_f32, upload_q4_0_from_f32};
+use super::gpu_full_attn::{download_f32, upload_f32, upload_q4_0_from_f32};
 
 // ================================================================
 // GPU weight container
@@ -1065,9 +1064,9 @@ mod tests {
 
     fn synthetic_weights(shape: DeltaNetLayerShape, seed_init: u32) -> DeltaNetLayerWeights {
         let h = shape.hidden_size as usize;
-        let nk = shape.n_k_heads as usize;
+        let _nk = shape.n_k_heads as usize;
         let nv = shape.n_v_heads as usize;
-        let dk = shape.d_k as usize;
+        let _dk = shape.d_k as usize;
         let dv = shape.d_v as usize;
         let k_width = shape.conv_kernel as usize;
         let qkv_channels = shape.qkv_channels() as usize;

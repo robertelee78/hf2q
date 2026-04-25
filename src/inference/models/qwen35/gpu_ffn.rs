@@ -304,12 +304,13 @@ fn proj(
     let n_w = (out_features * in_features) as usize;
 
     // If the weight is already BF16 (pre-cast at load time), use it directly;
-    // otherwise cast inline and barrier before the matmul.
-    let weight_bf16_owned: Option<MlxBuffer>;
-    let weight_bf16: &MlxBuffer;
-    if weight.dtype() == DType::BF16 {
-        weight_bf16_owned = None;
-        weight_bf16 = weight;
+    // otherwise cast inline and barrier before the matmul. weight_bf16_owned
+    // holds the cast buffer alive for the function scope when we cast; in
+    // the BF16-already branch it's never assigned (and never read past the
+    // if-else, so Rust accepts the partial initialization).
+    let weight_bf16_owned: MlxBuffer;
+    let weight_bf16: &MlxBuffer = if weight.dtype() == DType::BF16 {
+        weight
     } else {
         let buf = device
             .alloc_buffer(
@@ -330,9 +331,9 @@ fn proj(
         .context("cast weight F32→BF16")?;
         // Barrier: matmul reads weight_bf16 written by the cast above.
         encoder.memory_barrier();
-        weight_bf16_owned = Some(buf);
-        weight_bf16 = weight_bf16_owned.as_ref().unwrap();
-    }
+        weight_bf16_owned = buf;
+        &weight_bf16_owned
+    };
 
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
@@ -1556,7 +1557,7 @@ mod tests {
         let gate_stride = ((m * h / qk) * block_bytes) as u64;
         let down_stride = ((h * m / qk) * block_bytes) as u64;
 
-        let mut make_buf = |data: &[u8]| -> MlxBuffer {
+        let make_buf = |data: &[u8]| -> MlxBuffer {
             let mut buf = device.alloc_buffer(data.len(), DType::U8, vec![data.len()])
                 .expect("alloc q-buf");
             buf.as_mut_slice::<u8>().expect("q-buf slice").copy_from_slice(data);
