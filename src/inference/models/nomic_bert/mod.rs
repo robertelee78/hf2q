@@ -41,11 +41,17 @@
 #![allow(dead_code)] // forward pass + handler wiring lands in later iters
 
 pub mod config;
+pub mod forward;
 pub mod tokenizer;
 pub mod weights;
 
 #[allow(unused_imports)]
 pub use config::{nomic_bert_layer_tensor, NomicBertConfig, NOMIC_BERT_TENSOR_TOKEN_EMBD};
+#[allow(unused_imports)]
+pub use forward::{
+    apply_nomic_bert_encoder_block_gpu, apply_nomic_bert_full_forward_gpu,
+    nomic_bert_embeddings_gpu, register_nomic_bert_kernels, NomicBertEncoderBlockTensors,
+};
 #[allow(unused_imports)]
 pub use tokenizer::build_nomic_wordpiece_tokenizer;
 #[allow(unused_imports)]
