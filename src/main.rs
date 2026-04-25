@@ -645,48 +645,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     dwq_quantizer.name()
                 );
 
-                // Activation-based calibration path (non-qwen35 archs with tokenizer).
-                // For qwen35/qwen35moe the guard above has already returned an error,
-                // so this branch is unreachable for those archs.
-                if dwq_config.use_activations {
-                    tracing::info!("Tokenizer found, using activation-based DWQ calibration");
-                    match quantize::dwq_activation::run_dwq_activation_calibration(
-                        &tensor_map,
-                        &metadata,
-                        &dwq_config,
-                        &config.input_dir,
-                        &progress,
-                    ) {
-                        Ok(model) => model,
-                        Err(e) => {
-                            // ADR-012 Decision 13: the weight-space fallback below is ONLY
-                            // reachable for non-qwen35 archs (guard above enforces this).
-                            // For qwen35/qwen35moe we never reach here.
-                            warn!(
-                                "Activation-based DWQ failed ({}), falling back to weight-space calibration",
-                                e
-                            );
-                            quantize::dwq::run_dwq_calibration(
-                                &tensor_map,
-                                &metadata,
-                                &dwq_config,
-                                &progress,
-                            )
-                            .context("DWQ weight-space calibration failed")
-                            .map_err(AppError::Conversion)?
-                        }
-                    }
-                } else {
-                    tracing::info!("No tokenizer found, using weight-space DWQ calibration");
-                    quantize::dwq::run_dwq_calibration(
-                        &tensor_map,
-                        &metadata,
-                        &dwq_config,
-                        &progress,
-                    )
-                    .context("DWQ calibration failed")
-                    .map_err(AppError::Conversion)?
-                }
+                // ADR-012 P9b.3a: activation-based calibration now requires an
+                // `&mut dyn ActivationCapture` — which is not yet plumbed through
+                // the convert pipeline (P9b.2/3b will land that as part of the
+                // qwen35 two-pass branch). For non-qwen35 archs the historical
+                // path was the ADR-008 stub returning an error and falling back
+                // to weight-space; we now skip the stub call entirely and go
+                // directly to weight-space, which matches the realised behaviour.
+                //
+                // For qwen35 / qwen35moe the P9b guard above already returned an
+                // error before reaching this branch, so DwqArch::requires_
+                // activation_capture() == true never falls through here.
+                let _ = dwq_config.use_activations; // field preserved for P9b.3b wire-up
+                tracing::info!("Using DWQ weight-space calibration (activation path requires capture plumbing — P9b.2/3b)");
+                quantize::dwq::run_dwq_calibration(
+                    &tensor_map,
+                    &metadata,
+                    &dwq_config,
+                    &progress,
+                )
+                .context("DWQ calibration failed")
+                .map_err(AppError::Conversion)?
             }
             cli::QuantMethod::Apex => {
                 let apex_config = quantize::apex::ApexConfig {

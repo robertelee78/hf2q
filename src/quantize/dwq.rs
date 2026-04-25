@@ -221,7 +221,23 @@ pub fn run_dwq_calibration(
     if config.arch.requires_activation_capture() {
         return Err(DwqError::NoActivationCapture);
     }
+    run_dwq_calibration_internal(tensor_map, metadata, config, progress)
+}
 
+/// Internal calibration entry — same body as [`run_dwq_calibration`] but
+/// without the no-fallback arch guard. Callers that have legitimately
+/// satisfied the activation-capture contract (i.e.
+/// [`run_dwq_activation_calibration`] in `dwq_activation.rs`) call this
+/// directly with an activation-derived `DwqConfig.sensitive_layers`.
+///
+/// Not intended as a general-purpose entry point. The guard in
+/// `run_dwq_calibration` is the primary defence and is preserved.
+pub(crate) fn run_dwq_calibration_internal(
+    tensor_map: &TensorMap,
+    metadata: &ModelMetadata,
+    config: &DwqConfig,
+    progress: &ProgressReporter,
+) -> Result<QuantizedModel, DwqError> {
     let num_layers = metadata.num_layers as usize;
     let _hidden_size = metadata.hidden_size as usize;
     let total_steps = 2 + (num_layers as u64) * (1 + config.max_iterations as u64) + 1;
@@ -361,7 +377,7 @@ pub fn run_dwq_calibration(
 ///
 /// Produces a deterministic sequence of token IDs for calibration.
 /// In a production system, these would come from a real text dataset.
-fn generate_calibration_tokens(sample_count: u32, vocab_size: u32) -> Vec<u32> {
+pub(crate) fn generate_calibration_tokens(sample_count: u32, vocab_size: u32) -> Vec<u32> {
     let seq_len = 64.min(sample_count as usize);
     let safe_vocab = vocab_size.max(1);
 
