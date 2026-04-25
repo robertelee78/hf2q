@@ -1483,6 +1483,44 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
 /// `ffn_norm.weight` for LLaMA-family models (where it is the only post-attention
 /// norm and acts as the FFN pre-norm), but to `post_attention_norm.weight` for
 /// Gemma4 (which has a separate `pre_feedforward_layernorm` for the FFN pre-norm).
+/// Qwen3.5-family linear-attention (Gated DeltaNet) layer-map entries.
+///
+/// Shared between the qwen35 (dense) and qwen35moe (MoE) arches because the
+/// hybrid 3:1 DeltaNet:Full attention pattern is identical between variants
+/// (only the FFN differs). Citations transcribed from llama-arch.cpp via
+/// `src/models/qwen35/dense.rs::map_linear_attn_suffix`.
+fn qwen35_linear_attn_layer_map() -> &'static [(&'static str, &'static str)] {
+    &[
+        // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
+        ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+        // llama-arch.cpp:382 LLM_TENSOR_ATTN_QKV → "blk.%d.attn_qkv"
+        // (in_proj_qkvz is split → in_proj_qkv + in_proj_z by Phase 1.7)
+        ("linear_attn.in_proj_qkv.weight", "attn_qkv.weight"),
+        // llama-arch.cpp:370 LLM_TENSOR_ATTN_GATE → "blk.%d.attn_gate"
+        ("linear_attn.in_proj_z.weight", "attn_gate.weight"),
+        // llama-arch.cpp:400 LLM_TENSOR_SSM_ALPHA → "blk.%d.ssm_alpha"
+        ("linear_attn.in_proj_a.weight", "ssm_alpha.weight"),
+        // llama-arch.cpp:416 LLM_TENSOR_SSM_BETA → "blk.%d.ssm_beta"
+        ("linear_attn.in_proj_b.weight", "ssm_beta.weight"),
+        // llama-arch.cpp:402 LLM_TENSOR_SSM_OUT → "blk.%d.ssm_out"
+        ("linear_attn.out_proj.weight", "ssm_out.weight"),
+        // llama-arch.cpp:395 LLM_TENSOR_SSM_A_NOSCAN → "blk.%d.ssm_a"
+        // (no .weight suffix — the ssm_a tensor is just `blk.N.ssm_a`)
+        ("linear_attn.A_log", "ssm_a"),
+        // llama-arch.cpp:397 LLM_TENSOR_SSM_DT → "blk.%d.ssm_dt"
+        // py:4791 renames .dt_bias → .dt_proj.bias before mapping; we accept
+        // either form so the convert pipeline stays robust to that rename.
+        ("linear_attn.dt_bias", "ssm_dt.bias"),
+        ("linear_attn.dt_proj.bias", "ssm_dt.bias"),
+        ("linear_attn.dt_proj.weight", "ssm_dt.weight"),
+        // llama-arch.cpp:396 LLM_TENSOR_SSM_CONV1D → "blk.%d.ssm_conv1d"
+        ("linear_attn.conv1d.weight", "ssm_conv1d.weight"),
+        ("linear_attn.conv1d.bias", "ssm_conv1d.bias"),
+        // llama-arch.cpp:401 LLM_TENSOR_SSM_NORM → "blk.%d.ssm_norm"
+        ("linear_attn.norm.weight", "ssm_norm.weight"),
+    ]
+}
+
 fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
     // Shared entries — identical across all architectures
     let shared: &[(&str, &str)] = &[
@@ -1529,10 +1567,17 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm" (llama-arch.cpp:367).
         // There is NO separate ffn_norm tensor — the post-attn norm gates the FFN.
         // ADR-012 Decision 8: post_attention_layernorm verdict.
+        //
+        // Plus the qwen35-specific linear-attention (Gated DeltaNet) tensor
+        // family. Mappings transcribed from src/models/qwen35/dense.rs::
+        // map_linear_attn_suffix (which had the canonical citations to
+        // llama-arch.cpp but was never wired into the GGUF backend's
+        // layer_map). Each entry cites the matching llama-arch.cpp line.
+        // Note: `in_proj_qkvz.weight` is split into `in_proj_qkv` +
+        // `in_proj_z` upstream by `transform_in_proj_qkvz` in Phase 1.7,
+        // so the layer-map only sees the post-split names.
         "qwen35" => {
-            map.extend_from_slice(&[
-                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
-            ]);
+            map.extend_from_slice(&qwen35_linear_attn_layer_map());
         }
         // ADR-012 Decision 11 + P5: qwen35moe adds the MoE-specific surface:
         // router (mlp.gate), per-expert merged stacks (mlp.experts.* post-merge
@@ -1543,10 +1588,14 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // silently passing MoE tensors through as `blk.N.mlp.*.weight`
         // (wrong GGUF names; llama.cpp loader would reject the file).
         // P11 round-trip gate caught it — fix lands here.
+        //
+        // qwen35moe ALSO has the qwen35 linear-attention family (the hybrid
+        // 3:1 DeltaNet:Full pattern is identical between dense + MoE
+        // variants); only the FFN differs. Same mapping table is reused
+        // for both arches.
         "qwen35moe" => {
+            map.extend_from_slice(&qwen35_linear_attn_layer_map());
             map.extend_from_slice(&[
-                // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM
-                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
                 // llama-arch.cpp:393 LLM_TENSOR_FFN_GATE_INP → "blk.%d.ffn_gate_inp"
                 // src/models/qwen35/moe.rs:83 — MoE router.
                 ("mlp.gate.weight", "ffn_gate_inp.weight"),

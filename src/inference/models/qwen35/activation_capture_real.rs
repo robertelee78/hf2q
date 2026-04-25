@@ -314,9 +314,11 @@ impl RealActivationCapture {
             }
         })?;
         let model = Qwen35Model::load_from_gguf(&gguf).map_err(|e| {
+            // `{e:#}` displays the anyhow context chain on one line so the
+            // inner cause (e.g. specific tensor name + shape) is visible.
             RealActivationCaptureError::Load {
                 path: model_gguf.display().to_string(),
-                reason: format!("Qwen35Model::load_from_gguf: {e}"),
+                reason: format!("Qwen35Model::load_from_gguf: {e:#}"),
             }
         })?;
         Ok(Self {
