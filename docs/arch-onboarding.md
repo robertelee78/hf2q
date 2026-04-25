@@ -116,7 +116,13 @@ const CATALOG: TensorCatalog = TensorCatalog {
 
 pub const ENTRY: ArchEntry = ArchEntry {
     arch: "<arch>",
-    hf_architectures: &["<Arch>ForCausalLM"],
+    // List EVERY HF architecture alias that maps to this arch. Multimodal
+    // checkpoints typically ship `*ForConditionalGeneration` while text-
+    // only ones ship `*ForCausalLM`; both must resolve to the same
+    // ArchEntry or `get_by_hf_architecture` diverges from `arch_gguf_name`.
+    // See ADR-012 fix `57d4bcc` for the qwen35 / qwen35moe alias divergence
+    // bug that motivates listing both.
+    hf_architectures: &["<Arch>ForCausalLM", "<Arch>ForConditionalGeneration"],
     tensor_catalog: &CATALOG,
     has_mtp: false,
     has_vision: false,
@@ -204,6 +210,9 @@ shipped products.
 | Shared build dir swarm parallelism | Disjoint file claims are insufficient. Two agents compiling against the same `target/` racing `cargo build` will corrupt the output. Sequence workers when they share a Cargo workspace. |
 | Smoke harness in bash | Decision 16 acceptance §"Ownership" rejects bash — the harness is a Rust binary subcommand. Testable, single-entry, dispatched via `ArchRegistry::get(arch)`. |
 | External mmproj oracle / llama-cpp output as correctness reference | Sovereignty violation. Correctness = hand-authored expected values + spec-driven synthetic tests + round-trip through our own loader. |
+| Reading `metadata.layer_types` directly when you need to know whether a layer is full / linear attention | Decision 2 contract violation: the parser populates raw `layer_types` as `["attention"; N]` for any config without an explicit per-layer enumeration, so a Qwen3.5-style config that supplies only `full_attention_interval` silently bypasses anything reading the raw field. Use `metadata.resolved_layer_types()` — verified against this trap by ADR-012 fixes `83b6618` (preflight hybrid validator) and `ae3a9cf` (format_info diagnostic). |
+| Listing only `*ForCausalLM` in `hf_architectures` | Multimodal checkpoints ship `*ForConditionalGeneration`. Registry-side `get_by_hf_architecture` will diverge from GGUF-side `arch_gguf_name` if you list only one alias. List EVERY known alias for the arch — see ADR-012 fix `57d4bcc`. |
+| Duplicating the arch-string string-set check in multiple call sites | Drift across copies silently corrupts the convert pipeline (e.g. one site applies V-head reorder for an alias but another site skips expert merge). Centralize via a `pub(crate) fn is_<arch>_architecture(arch, model_type) -> bool` and call it from every gate site. See `is_qwen35_family_architecture` / `is_qwen35moe_architecture` in `src/models/qwen35/mod.rs` (commit `d37daa4`). |
 
 ---
 
