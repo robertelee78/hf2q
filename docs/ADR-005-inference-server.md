@@ -1930,6 +1930,60 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 81 — Task #16 CLOSED. Handler integration shipped: `EmbeddingArch` enum drives arch dispatch through `/v1/embeddings`. End-to-end smoke against real `nomic-embed-text-v1.5-f16.gguf` produces dim=768, ||y||₂=1.000000, first4 bit-identical to the cosine-parity test output.**
+  - **What landed.** `EmbeddingModel` refactored from BERT-only to arch-agnostic via a new `EmbeddingArch` enum:
+    ```rust
+    pub enum EmbeddingArch {
+        Bert      { config: BertConfig,      weights: Arc<LoadedBertWeights> },
+        NomicBert { config: NomicBertConfig, weights: Arc<LoadedNomicBertWeights> },
+    }
+    ```
+    Common properties (hidden_size, max_position_embeddings, pooling_type, arch_name) exposed via accessors so the handler shares validation logic.
+  - **`cmd_serve` arch sniff.** Reads `general.architecture` from the GGUF metadata, dispatches to:
+    - `"bert"` → `BertConfig::from_gguf` + `LoadedBertWeights::load` → `EmbeddingArch::Bert {..}` (bge / mxbai path).
+    - `"nomic-bert"` → `NomicBertConfig::from_gguf` + `LoadedNomicBertWeights::load` → `EmbeddingArch::NomicBert {..}` (nomic-embed-text-v1.5 path).
+    - Anything else → bail with a clear error naming both supported archs and the offending file path.
+    Validator + tracing emitted with the arch name in the log line, so operators see `arch="nomic-bert"` (and `rope_freq_base=1000.0` for nomic) rather than only `hidden=…, layers=…`.
+  - **`embeddings` handler dispatch.** Replaces direct `em.config.hidden_size` / `em.weights` field access with `em.arch.hidden_size()` / a match on `&arch`:
+    ```rust
+    let out = match &arch {
+        EmbeddingArch::Bert { config, weights } => {
+            register_bert_custom_shaders(&mut registry);
+            apply_bert_full_forward_gpu(..., weights, config, seq_len, valid_token_count)?
+        }
+        EmbeddingArch::NomicBert { config, weights } => {
+            register_nomic_bert_kernels(&mut registry);
+            apply_nomic_bert_full_forward_gpu(..., weights, config, seq_len, valid_token_count)?
+        }
+    };
+    ```
+    Same per-input loop, same valid_token_count semantics, same encoding_format / dimensions / base64 surface. Only the forward dispatch + kernel registration differ per arch.
+  - **`/v1/models` integration.** `context_length` field now sourced from `em.arch.as_ref().map(|a| a.max_position_embeddings())` instead of the deleted `em.config` field — single source of truth across both archs.
+  - **End-to-end smoke (real GGUF).**
+    ```
+    GET /v1/models →
+      { id: "nomic-embed-text-v1.5-f16", context_length: 2048,
+        backend: "mlx-native", loaded: true }
+
+    POST /v1/embeddings { model: "nomic-embed-text-v1.5-f16",
+                          input: "hello world", encoding_format: "float" } →
+      dim=768, ||y||₂=1.000000,
+      first4=[-0.006707659, -0.001192305, -0.17185518, 0.00815715],
+      usage={prompt_tokens: 4, total_tokens: 4}
+    ```
+    `first4` matches the iter-79 cosine-parity test output bit-for-bit. The HTTP path adds zero numerical drift on top of the forward; cosine ≥ 0.999962 vs llama-embedding holds end-to-end.
+  - **Verification.**
+    - 325/325 BERT + nomic_bert + serve::api lane tests pass.
+    - mlx-native v0.4.4 from crates.io (no `[patch.crates-io]` needed).
+    - 5 pre-existing qwen35 test failures (kv_cache, gpu_full_attn, gpu_delta_net) verified to exist on prior commit `02fdaac` BEFORE any iter-81 changes — unrelated to this refactor; logged for the qwen35 maintainer per ADR-013 P12 closure note.
+  - **Lane discipline.** Edits in `src/serve/api/state.rs` (EmbeddingArch enum + EmbeddingModel refactor) + `src/serve/api/handlers.rs` (arch dispatch in `embeddings` + `/v1/models`) + `src/serve/mod.rs::cmd_serve` (arch sniff + per-arch loader). Zero changes to bert_gpu, nomic_bert/forward, mlx-native.
+  - **Phase 2b Task #16 status: CLOSED.** All four phases shipped:
+    - Phase 1 (iter 75): module skeleton + GGUF config + tokenizer.
+    - Phase 2 (iter 76): forward composer; (iter 77) production-scale smoke.
+    - Phase 3 (iter 78–80): cosine-parity gate, bisection to mlx-native bug, upstream fix, workaround removal. Final cosine 0.999962.
+    - Phase 4 (iter 81): handler integration; e2e smoke green through `/v1/embeddings`.
+  - **Next (iter 82):** measure decode wall-time vs llama-embedding on the same prompt with the SAME nomic GGUF. Per the user directive — "as fast as or faster than llama.cpp." Iter 82 generates the speed comparison: hf2q `/v1/embeddings` request latency vs `llama-embedding -m … -p "hello world"` total time. If hf2q is slower, iter 83 profiles the dispatch chain and optimizes (e.g., persistent KernelRegistry across requests, pre-allocated weight-cast bf16 buffers, dispatch batching).
+
 - **2026-04-26 loop iter 80 — mlx-native fix landed upstream (v0.4.3); hf2q workaround removed. Cosine parity stays GREEN with the clean `slice_view` path: bge 0.999985, nomic-bert 0.999962. No more 84 MB-per-request copy overhead.**
   - **Upstream fix (`/opt/mlx-native` commit `fed406d`).** Two binding paths in `encoder.rs` now propagate `MlxBuffer::byte_offset` for `KernelArg::Buffer`:
     1. `apply_bindings` (line 166) — direct dispatch. `set_buffer(..., 0)` → `set_buffer(..., buf.byte_offset())`.

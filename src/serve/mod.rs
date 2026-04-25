@@ -920,13 +920,22 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
         let gguf = mlx_native::gguf::GgufFile::open(emb_path)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF header parse failed: {e}"))?;
-        let emb_config = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
-            .map_err(|e| anyhow::anyhow!("Embedding GGUF config parse failed: {e}"))?;
-        // Extract vocab + build llama.cpp-compatible WPM tokenizer.
-        // The HF `tokenizers` crate's WordPiece path is incompatible with
-        // the bge / nomic / mxbai GGUF vocab format (▁-prefixed word
-        // starters); iter 64 ported llama.cpp's `llm_tokenizer_wpm`
-        // directly to Rust.
+
+        // Sniff the architecture so we dispatch the correct loader +
+        // forward path. Per ADR-005 Phase 2b: bge/mxbai are arch="bert"
+        // (separate Q/K/V, position_embd, GeLU MLP, optionally CLS pool);
+        // nomic-embed-text-v1.5 is arch="nomic-bert" (fused QKV, RoPE,
+        // SwiGLU, Mean pool — see `inference::models::nomic_bert`).
+        let arch_str = gguf
+            .metadata_string("general.architecture")
+            .ok_or_else(|| anyhow::anyhow!("Embedding GGUF missing general.architecture"))?
+            .to_string();
+
+        // Vocab + tokenizer are shared across the BERT family — both
+        // archs serialize their WPM vocab the same way per llama.cpp's
+        // `llm_tokenizer_wpm_session::tokenize`. Iter-79 cross-lane
+        // edit added bos→cls / eos→sep fallbacks so nomic GGUFs parse
+        // through the BertVocab path unchanged.
         let vocab = crate::inference::models::bert::BertVocab::from_gguf(&gguf)
             .map_err(|e| anyhow::anyhow!("Embedding GGUF vocab parse failed: {e}"))?;
         let tokenizer = crate::inference::models::bert::BertWpmTokenizer::new(&vocab);
@@ -934,32 +943,78 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "embedding-model".into());
-        // Validate the tensor manifest before the multi-MB load so the
-        // operator gets a specific missing-tensor list rather than a
-        // generic mid-load failure.
-        crate::inference::models::bert::weights::validate_tensor_set(&gguf, &emb_config)
-            .map_err(|e| anyhow::anyhow!("Embedding GGUF tensor validation: {e}"))?;
+
         let device = mlx_native::MlxDevice::new()
             .map_err(|e| anyhow::anyhow!("create MlxDevice for embedding load: {e}"))?;
-        let weights =
-            crate::inference::models::bert::weights::LoadedBertWeights::load(&gguf, &emb_config, device)
-                .map_err(|e| anyhow::anyhow!("Embedding weights load failed: {e}"))?;
-        tracing::info!(
-            path = %emb_path.display(),
-            hidden = emb_config.hidden_size,
-            layers = emb_config.num_hidden_layers,
-            pooling = ?emb_config.pooling_type,
-            vocab_size = vocab.len(),
-            tensor_count = weights.len(),
-            "Validated embedding GGUF + loaded weights onto device"
-        );
+
+        let arch = match arch_str.as_str() {
+            "bert" => {
+                let cfg = crate::inference::models::bert::BertConfig::from_gguf(&gguf)
+                    .map_err(|e| anyhow::anyhow!("BERT GGUF config parse failed: {e}"))?;
+                crate::inference::models::bert::weights::validate_tensor_set(&gguf, &cfg)
+                    .map_err(|e| anyhow::anyhow!("BERT GGUF tensor validation: {e}"))?;
+                let weights =
+                    crate::inference::models::bert::weights::LoadedBertWeights::load(
+                        &gguf, &cfg, device,
+                    )
+                    .map_err(|e| anyhow::anyhow!("BERT weights load failed: {e}"))?;
+                tracing::info!(
+                    path = %emb_path.display(),
+                    arch = "bert",
+                    hidden = cfg.hidden_size,
+                    layers = cfg.num_hidden_layers,
+                    pooling = ?cfg.pooling_type,
+                    vocab_size = vocab.len(),
+                    tensor_count = weights.len(),
+                    "Validated embedding GGUF + loaded weights onto device"
+                );
+                api::state::EmbeddingArch::Bert {
+                    config: cfg,
+                    weights: std::sync::Arc::new(weights),
+                }
+            }
+            "nomic-bert" => {
+                let cfg = crate::inference::models::nomic_bert::NomicBertConfig::from_gguf(&gguf)
+                    .map_err(|e| anyhow::anyhow!("nomic-bert GGUF config parse failed: {e}"))?;
+                crate::inference::models::nomic_bert::validate_tensor_set(&gguf, &cfg)
+                    .map_err(|e| anyhow::anyhow!("nomic-bert GGUF tensor validation: {e}"))?;
+                let weights =
+                    crate::inference::models::nomic_bert::LoadedNomicBertWeights::load(
+                        &gguf, &cfg, device,
+                    )
+                    .map_err(|e| anyhow::anyhow!("nomic-bert weights load failed: {e}"))?;
+                tracing::info!(
+                    path = %emb_path.display(),
+                    arch = "nomic-bert",
+                    hidden = cfg.hidden_size,
+                    layers = cfg.num_hidden_layers,
+                    pooling = ?cfg.pooling_type,
+                    rope_freq_base = cfg.rope_freq_base,
+                    vocab_size = vocab.len(),
+                    tensor_count = weights.len(),
+                    "Validated embedding GGUF + loaded weights onto device"
+                );
+                api::state::EmbeddingArch::NomicBert {
+                    config: cfg,
+                    weights: std::sync::Arc::new(weights),
+                }
+            }
+            other => {
+                anyhow::bail!(
+                    "embedding GGUF general.architecture='{other}' is not supported. \
+                     Phase 2b day-one models: 'bert' (bge / mxbai) and 'nomic-bert' \
+                     (nomic-embed-text-v1.5). File: {}",
+                    emb_path.display()
+                );
+            }
+        };
+
         Some(api::state::EmbeddingModel {
             gguf_path: emb_path.clone(),
-            config: emb_config,
             vocab: std::sync::Arc::new(vocab),
             tokenizer: std::sync::Arc::new(tokenizer),
             model_id,
-            weights: Some(std::sync::Arc::new(weights)),
+            arch: Some(arch),
         })
     } else {
         None

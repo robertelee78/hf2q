@@ -1524,8 +1524,8 @@ pub async fn embeddings(
     if req.model != em.model_id {
         return ApiError::model_not_loaded(&req.model).into_response();
     }
-    let weights = match em.weights.as_ref() {
-        Some(w) => w.clone(),
+    let arch = match em.arch.as_ref() {
+        Some(a) => a.clone(),
         None => {
             return ApiError::generation_error(
                 "embedding model has no loaded weights (server startup did not eagerly load)"
@@ -1534,6 +1534,8 @@ pub async fn embeddings(
             .into_response();
         }
     };
+    let hidden_size_native = arch.hidden_size();
+    let max_pos = arch.max_position_embeddings();
 
     // --- Validate request format ---
     // OpenAI accepts {"float", "base64"}. The Python SDK defaults to
@@ -1560,12 +1562,12 @@ pub async fn embeddings(
     // `dimensions == em.config.hidden_size` (no-op), reject anything
     // else.
     if let Some(d) = req.dimensions {
-        if d != em.config.hidden_size {
+        if d != hidden_size_native {
             return ApiError::invalid_request(
                 format!(
                     "model '{}' does not support custom output dimensions (native dim is {}; \
                      only the text-embedding-3 family supports `dimensions`)",
-                    em.model_id, em.config.hidden_size
+                    em.model_id, hidden_size_native
                 ),
                 Some("dimensions".into()),
             )
@@ -1586,7 +1588,6 @@ pub async fn embeddings(
     // runtime is not held up while the per-input forward (~ms-scale)
     // executes. Each input gets its own GraphSession + KernelRegistry —
     // amortizing kernel-compile across requests is iter-63's perf work.
-    let cfg = em.config.clone();
     let model_id = em.model_id.clone();
     let tokenizer = em.tokenizer.clone();
 
@@ -1594,6 +1595,10 @@ pub async fn embeddings(
         use crate::inference::models::bert::bert_gpu::{
             apply_bert_full_forward_gpu, register_bert_custom_shaders,
         };
+        use crate::inference::models::nomic_bert::{
+            apply_nomic_bert_full_forward_gpu, register_nomic_bert_kernels,
+        };
+        use crate::serve::api::state::EmbeddingArch;
         use mlx_native::{GraphExecutor, KernelRegistry, MlxDevice};
 
         // Per-call device handle. The underlying Metal device is shared
@@ -1616,15 +1621,15 @@ pub async fn embeddings(
 
             // Pad short inputs up to the kernel's K floor (32) so the
             // post-softmax `scores @ V` matmul is dispatchable. The
-            // attention mask (built from valid_token_count in
-            // apply_bert_full_forward_gpu) keeps the padded positions
-            // from contaminating the embedding.
+            // attention mask (built from valid_token_count in the
+            // forward) keeps padded positions from contaminating the
+            // embedding output.
             let mut ids: Vec<u32> = raw_ids.to_vec();
             if ids.len() < BERT_MIN_SEQ_LEN {
                 ids.resize(BERT_MIN_SEQ_LEN, 0u32);
             }
-            if ids.len() > cfg.max_position_embeddings {
-                ids.truncate(cfg.max_position_embeddings);
+            if ids.len() > max_pos {
+                ids.truncate(max_pos);
             }
             let seq_len = ids.len() as u32;
 
@@ -1645,27 +1650,46 @@ pub async fn embeddings(
             };
             s.copy_from_slice(&ids);
 
-            // Dispatch the forward pass.
+            // Dispatch the forward pass — arch-aware.
             let mut session = executor
                 .begin()
                 .map_err(|e| anyhow::anyhow!("begin session: {e}"))?;
             let mut registry = KernelRegistry::new();
-            register_bert_custom_shaders(&mut registry);
             // valid_token_count = the count BEFORE [PAD] padding. The
             // forward pass uses this to build the attention mask so
             // padded positions don't contaminate the embedding.
             let valid_token_count = raw_ids.len().min(ids.len()) as u32;
-            let out = apply_bert_full_forward_gpu(
-                session.encoder_mut(),
-                &mut registry,
-                device,
-                &ids_buf,
-                None, // type_ids: single-segment input
-                &weights,
-                &cfg,
-                seq_len,
-                valid_token_count,
-            )?;
+
+            let out = match &arch {
+                EmbeddingArch::Bert { config, weights } => {
+                    register_bert_custom_shaders(&mut registry);
+                    apply_bert_full_forward_gpu(
+                        session.encoder_mut(),
+                        &mut registry,
+                        device,
+                        &ids_buf,
+                        None, // type_ids: single-segment input
+                        weights,
+                        config,
+                        seq_len,
+                        valid_token_count,
+                    )?
+                }
+                EmbeddingArch::NomicBert { config, weights } => {
+                    register_nomic_bert_kernels(&mut registry);
+                    apply_nomic_bert_full_forward_gpu(
+                        session.encoder_mut(),
+                        &mut registry,
+                        device,
+                        &ids_buf,
+                        None, // type_ids: single-segment input
+                        weights,
+                        config,
+                        seq_len,
+                        valid_token_count,
+                    )?
+                }
+            };
             session
                 .finish()
                 .map_err(|e| anyhow::anyhow!("session finish: {e}"))?;
@@ -1930,7 +1954,7 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                     object: "model",
                     created: chrono_seconds(),
                     owned_by: "hf2q",
-                    context_length: Some(em.config.max_position_embeddings),
+                    context_length: em.arch.as_ref().map(|a| a.max_position_embeddings()),
                     // Embedding GGUFs are typically F16/F32 — we don't
                     // run infer_quant_type for them because they're
                     // identified via the --embedding-model flag, not the

@@ -21,7 +21,10 @@ use std::time::Instant;
 
 use super::engine::Engine;
 use super::schema::OverflowPolicy;
+use crate::inference::models::bert::config::PoolingType;
 use crate::inference::models::bert::BertConfig;
+use crate::inference::models::bert::weights::LoadedBertWeights;
+use crate::inference::models::nomic_bert::{LoadedNomicBertWeights, NomicBertConfig};
 use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
 
@@ -195,33 +198,87 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct EmbeddingModel {
     pub gguf_path: PathBuf,
-    pub config: BertConfig,
     pub vocab: Arc<crate::inference::models::bert::BertVocab>,
     /// llama.cpp-compatible WordPiece tokenizer (uses ▁-prefix word
     /// starters, matches the bge / nomic / mxbai GGUF format byte-for-
-    /// byte). Replaces the prior HF `tokenizers::Tokenizer` because
-    /// the HF crate's WordPiece hardcodes the `##`-continuation
-    /// convention which is incompatible with how llama.cpp serializes
-    /// BERT vocabularies into GGUF.
+    /// byte). Shared across BERT-family architectures because all of
+    /// them use the same WPM vocab convention in GGUF (per
+    /// `llm_tokenizer_wpm_session::tokenize` in llama.cpp).
     pub tokenizer: Arc<crate::inference::models::bert::BertWpmTokenizer>,
     /// Model id (file stem) — surfaced via `/v1/models`.
     pub model_id: String,
-    /// All BERT tensors loaded onto a Metal device as F32. `Arc` so each
-    /// `/v1/embeddings` request clones a cheap reference and dispatches
-    /// the forward pass against the same on-device buffers. Loaded
-    /// eagerly at server startup so first-request latency excludes the
-    /// load cost. `None` when the eager-load path was skipped (test
-    /// scaffolding only — the production path always populates this).
-    pub weights: Option<
-        Arc<crate::inference::models::bert::weights::LoadedBertWeights>,
-    >,
+    /// Architecture variant. Carries the per-arch config + weights so
+    /// the handler dispatches the correct forward pass. Optional only
+    /// in the test-scaffolding path that bypasses real weight loading;
+    /// production always populates this via `cmd_serve`.
+    pub arch: Option<EmbeddingArch>,
+}
+
+/// Per-arch config + weights bundle. The handler matches on this enum
+/// to dispatch the correct forward pass:
+///   - `Bert` → `apply_bert_full_forward_gpu` (separate Q/K/V, GeLU MLP,
+///     position_embd lookup, CLS/Mean pool per `bert.pooling_type`).
+///   - `NomicBert` → `apply_nomic_bert_full_forward_gpu` (fused QKV,
+///     SwiGLU MLP, RoPE on Q/K, Mean pool per `nomic-bert.pooling_type`).
+///
+/// Common properties (hidden_size, max_position_embeddings, pooling_type,
+/// layer count) are exposed via accessor methods so the handler can
+/// share validation logic across both variants.
+#[derive(Debug, Clone)]
+pub enum EmbeddingArch {
+    Bert {
+        config: BertConfig,
+        weights: Arc<LoadedBertWeights>,
+    },
+    NomicBert {
+        config: NomicBertConfig,
+        weights: Arc<LoadedNomicBertWeights>,
+    },
+}
+
+impl EmbeddingArch {
+    /// Output embedding dimension (a.k.a. `hidden_size` in HF / GGUF).
+    /// Used for the `dimensions` parameter validation in `/v1/embeddings`.
+    pub fn hidden_size(&self) -> usize {
+        match self {
+            Self::Bert { config, .. } => config.hidden_size,
+            Self::NomicBert { config, .. } => config.hidden_size,
+        }
+    }
+
+    /// Maximum sequence length the model was trained for. Used to
+    /// truncate over-long inputs before the forward pass.
+    pub fn max_position_embeddings(&self) -> usize {
+        match self {
+            Self::Bert { config, .. } => config.max_position_embeddings,
+            Self::NomicBert { config, .. } => config.max_position_embeddings,
+        }
+    }
+
+    /// Pooling reduction (Mean / CLS / Last) read from the GGUF
+    /// metadata. Surfaced via `/v1/models` extension fields.
+    pub fn pooling_type(&self) -> PoolingType {
+        match self {
+            Self::Bert { config, .. } => config.pooling_type,
+            Self::NomicBert { config, .. } => config.pooling_type,
+        }
+    }
+
+    /// Architecture name as it appears in GGUF `general.architecture`.
+    pub fn arch_name(&self) -> &'static str {
+        match self {
+            Self::Bert { .. } => "bert",
+            Self::NomicBert { .. } => "nomic-bert",
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbeddingModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingModel")
             .field("gguf_path", &self.gguf_path)
-            .field("config", &self.config)
+            .field("arch", &self.arch.as_ref().map(|a| a.arch_name()))
+            .field("hidden", &self.arch.as_ref().map(|a| a.hidden_size()))
             .field("vocab_len", &self.vocab.len())
             .field("model_id", &self.model_id)
             .finish()
@@ -410,23 +467,10 @@ mod tests {
         let tokenizer = build_wordpiece_tokenizer(&vocab).expect("build");
         let em = EmbeddingModel {
             gguf_path: "/tmp/synthetic.gguf".into(),
-            config: BertConfig {
-                hidden_size: 384,
-                num_attention_heads: 12,
-                num_hidden_layers: 12,
-                intermediate_size: 1536,
-                max_position_embeddings: 512,
-                vocab_size: 6,
-                type_vocab_size: 2,
-                layer_norm_eps: 1e-12,
-                hidden_act: "gelu".into(),
-                pooling_type: PoolingType::Mean,
-                causal_attention: false,
-            },
             vocab: Arc::new(vocab.clone()),
             tokenizer: Arc::new(crate::inference::models::bert::BertWpmTokenizer::new(&vocab)),
             model_id: "synthetic-embed".into(),
-            weights: None,
+            arch: None,
         };
         let _ = tokenizer; // legacy HF tokenizer no longer used; kept for shape only
         let ids = em.encode("hello world", false);
