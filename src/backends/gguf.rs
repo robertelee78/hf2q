@@ -285,7 +285,7 @@ impl OutputBackend for GgufBackend {
             let gguf_name = hf_name_to_gguf(
                 name,
                 &resolved_arch_for_tensors,
-                model.metadata.num_layers as u32,
+                model.metadata.num_layers,
             );
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
@@ -677,7 +677,7 @@ fn write_mmproj_gguf(
         let gguf_name = hf_name_to_gguf(
             name,
             &model.metadata.model_type,
-            model.metadata.num_layers as u32,
+            model.metadata.num_layers,
         );
         let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
