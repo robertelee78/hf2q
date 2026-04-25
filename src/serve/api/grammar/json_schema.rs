@@ -399,11 +399,12 @@ impl Converter {
         // order.
         //
         // NOTE: this is stricter than llama.cpp which allows arbitrary order
-        // via recursive alternation. For iter 8 we require properties to
+        // via recursive alternation. For iter 8 we required properties to
         // appear in alphabetical order in the output JSON — a deliberate
-        // simplification documented here. A later iter can emit the
-        // alternating-order grammar when a user requests it.
-        let mut prop_rules: Vec<String> = Vec::with_capacity(properties.len());
+        // simplification. Iter 74 keeps that simplification but fixes the
+        // required/optional bookkeeping below.
+        let mut required_entries: Vec<String> = Vec::new();
+        let mut optional_entries: Vec<String> = Vec::new();
         let mut keys: Vec<&String> = properties.keys().collect();
         keys.sort();
         for k in keys {
@@ -414,40 +415,56 @@ impl Converter {
             // schemas with the same property name don't collide.
             let rule_name = format!("{}-{}", path_slug(path), prop_rule_name);
             self.rules.insert(rule_name.clone(), vbody);
-            let is_required = required_list.contains(k);
             let quoted_key = format_literal(&format!("\"{}\"", k));
             let entry = format!("{} \":\" space {}", quoted_key, rule_name);
-            if is_required {
-                prop_rules.push(entry);
+            if required_list.contains(k) {
+                required_entries.push(entry);
             } else {
-                // Non-required — wrap in optional.
-                prop_rules.push(format!("({})?", entry));
+                optional_entries.push(entry);
             }
         }
 
-        // Join with ", space" separators. Non-required entries are each
-        // optional, so this grammar accepts e.g. `{ "a": 1 }` even when only
-        // `a` is emitted; it rejects missing required fields.
+        // Iter 74 fix: required fields are emitted FIRST, joined with
+        // mandatory `","` separators (each one is non-optional, so all
+        // required keys must appear). Optional fields follow, each wrapped
+        // in its own `("," space entry)?` so the separator is inside the
+        // optional — `a (",", b)?` accepts `a` alone or `a,b`.
         //
-        // Because non-required entries are `(...)?` and the separator `,` is
-        // inside the required-or-not wrapper, the concatenation needs care —
-        // a grammar like `a? , b` would require the comma even if `a` is
-        // absent. To keep it honest we wrap separators with each optional
-        // entry: `a (',' space b)?`. For the first iteration we enforce
-        // **required-first, alphabetical, comma-separated**, which is a
-        // valid (strict) JSON schema interpretation and avoids the full
-        // combinatorial alternation.
-        //
-        // Produce: prop_rule_0 ("," space prop_rule_1)? ("," space prop_rule_2)? ...
-        // (first required, others required-or-optional preserving order).
-        if prop_rules.is_empty() {
+        // Bug from prior iter: the old code did `prop_rules.remove(0)` then
+        // wrapped EVERY remaining entry in `(",", x)?` regardless of
+        // required/optional bookkeeping. With 2 required fields the second
+        // was emitted as optional, falsely accepting `{first: ...}` alone.
+        // Surfaced by iter-74 function-call-with-nested-object test.
+        if required_entries.is_empty() && optional_entries.is_empty() {
             return Ok(r#""{" space "}" space"#.into());
         }
-        let first = prop_rules.remove(0);
-        let mut body = first;
-        for entry in prop_rules {
-            body.push_str(&format!(" (\",\" space {})?", entry));
+
+        let mut body = String::new();
+        let mut first_emitted = false;
+
+        // Required block: mandatory commas between consecutive required.
+        for r in &required_entries {
+            if !first_emitted {
+                body.push_str(r);
+                first_emitted = true;
+            } else {
+                body.push_str(&format!(" \",\" space {}", r));
+            }
         }
+
+        // Optional block: each one's own (",", entry)? wrapper.
+        for o in &optional_entries {
+            if !first_emitted {
+                // No required preceding — the very first entry is optional.
+                // Wrap as `(entry)?`. Produces `(a)? (",", b)? (",", c)?`
+                // which accepts `{}`, `{a}`, `{a,b}`, `{a,b,c}` (in order).
+                body.push_str(&format!("({})?", o));
+                first_emitted = true;
+            } else {
+                body.push_str(&format!(" (\",\" space {})?", o));
+            }
+        }
+
         Ok(format!(r#""{{" space {} "}}" space"#, body))
     }
 
@@ -744,5 +761,170 @@ mod tests {
     fn compiled_grammar_has_root_rule() {
         let out = compile(r#"{"type":"boolean"}"#);
         assert!(out.starts_with("root ::="), "output:\n{}", out);
+    }
+
+    // -----------------------------------------------------------------
+    // OpenAI function-calling schemas — realistic production shapes
+    //
+    // The OpenAI Chat Completions tools API serializes a function call
+    // as `{name: string, arguments: <stringified-JSON-of-args>}`.
+    // structured_outputs / response_format=json_schema accepts ANY
+    // OpenAI JSON Schema. Below cases mirror three distinct production
+    // workloads we need to support:
+    //   1. Single string argument (e.g. weather query)
+    //   2. Nested object argument with multiple required fields
+    //   3. Enum-constrained string argument
+    // Each test compiles the schema, parses the GBNF, then exercises
+    // the runtime against a sample OpenAI-shape function-call output.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn function_call_with_single_string_argument() {
+        // Mirrors: tools=[{type:"function", function:{name:"get_weather",
+        // parameters:{type:"object", properties:{city:{type:"string"}},
+        // required:["city"]}}}]
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"}
+            },
+            "required": ["city"],
+            "additionalProperties": false
+        }"#;
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"city":"London"}"#),
+            "rejected valid function-call payload"
+        );
+        assert!(rt.is_accepted(), "runtime not accepted at end");
+
+        // Reject if required field is missing.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{}"#);
+        assert!(!(ok && rt.is_accepted()), "accepted empty object missing required city");
+    }
+
+    #[test]
+    fn function_call_with_nested_object_argument() {
+        // Realistic: a search() tool that takes {query: str, filters:
+        // {min_price: number, max_price: number}}. This is the most
+        // common production shape — one level of nesting with mixed
+        // required fields.
+        //
+        // Iter 74 fixed the "second-required-becomes-optional" bug; the
+        // grammar emits ALL required fields as mandatory. The
+        // alphabetical-key-order constraint is a separate documented
+        // simplification — both required keys must appear, but in the
+        // alphabetical order the grammar enforces (filters < query).
+        // Models trained on OpenAI's API typically respect schema-
+        // declared order; accept-any-permutation grammar is iter 75+
+        // work.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "filters": {
+                    "type": "object",
+                    "properties": {
+                        "min_price": {"type": "number"},
+                        "max_price": {"type": "number"}
+                    },
+                    "required": ["min_price", "max_price"]
+                }
+            },
+            "required": ["query", "filters"]
+        }"#;
+        // Alphabetical order: filters before query; max_price before min_price.
+        let mut rt = runtime(schema);
+        let payload =
+            br#"{"filters":{"max_price":2000,"min_price":500},"query":"laptops"}"#;
+        assert!(rt.accept_bytes(payload), "rejected valid nested function-call");
+        assert!(rt.is_accepted(), "runtime not accepted at end");
+
+        // Critical bug-fix anchor: missing the SECOND required field
+        // (query) must be REJECTED. Pre-iter-74 this was falsely
+        // accepted because the grammar emitted query as optional.
+        let mut rt = runtime(schema);
+        let missing_required =
+            br#"{"filters":{"max_price":2000,"min_price":500}}"#;
+        let ok = rt.accept_bytes(missing_required);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'query' (iter 74 regression)"
+        );
+    }
+
+    #[test]
+    fn function_call_with_enum_argument() {
+        // Tool with a constrained enum field (e.g. unit selector for a
+        // weather function: celsius/fahrenheit). The structured-output
+        // grammar must reject any value that isn't in the enum.
+        // Alphabetical: city before unit (matches input).
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            },
+            "required": ["city", "unit"]
+        }"#;
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"city":"London","unit":"celsius"}"#),
+            "rejected valid enum value"
+        );
+        assert!(rt.is_accepted());
+
+        // Out-of-enum unit value must be rejected.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"city":"London","unit":"kelvin"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted enum value 'kelvin' that's not in [celsius, fahrenheit]"
+        );
+
+        // Missing required 'unit' rejected.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"city":"London"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'unit'"
+        );
+    }
+
+    #[test]
+    fn function_call_with_array_arguments_field() {
+        // A tool that takes an array of strings (e.g. tags for a
+        // bookmark create). Common production shape. Alphabetical key
+        // order: tags before url.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            "required": ["url", "tags"]
+        }"#;
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(
+            br#"{"tags":["news","tech"],"url":"https://example.com"}"#
+        ));
+        assert!(rt.is_accepted());
+
+        // Empty tags array allowed.
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"tags":[],"url":"https://example.com"}"#));
+        assert!(rt.is_accepted());
+
+        // Missing 'tags' rejected (iter 74 bug-fix anchor).
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"url":"https://example.com"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted object missing required 'tags'"
+        );
     }
 }
