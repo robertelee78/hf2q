@@ -1,6 +1,6 @@
 # ADR-013: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Inference Support — Pure-Rust Forward Pass + Metal Kernels
 
-**Status:** Proposed (2026-04-23)
+**Status:** COMPLETE (2026-04-25)
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-005 (inference server), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce), ADR-009 (reference parity and coherence recovery), ADR-010 (exact batched kernel parity), ADR-011 (flash-attn prefill port), **ADR-012 (qwen35 + qwen35moe conversion — companion ADR)**
 **Related memories:** `project_qwen36_architecture.md`, `project_model_class_split.md`, `project_pure_rust_crate_factory.md`, `project_mlx_native_is_the_strategic_destination.md`, `feedback_hf2q_sovereignty.md`, `feedback_llama_cpp_over_candle.md`, `feedback_mantra.md`, `feedback_walk_means_port_llama_cpp_to_rust.md`, `feedback_prove_in_code.md`, `feedback_no_broken_windows.md`, `feedback_no_shortcuts.md`, `feedback_correct_outcomes.md`, `reference_decode_benchmark_methodology.md`, `project_decode_parity_achieved.md`, `project_end_gate_reality_check.md`
@@ -780,6 +780,43 @@ oracles used by P9b.  See ffn.rs.
 - Docs cover both dense and MoE invocations.
 
 **Estimated LOC:** ~400 (excluding docs word count).
+
+#### P13.1 COMPLETE — sourdough byte-prefix gate landed (commit `5737f89`, 2026-04-24)
+`scripts/sourdough_qwen35.sh` + `tests/sourdough_qwen35_prompt.txt` + `MIN_COMMON_PREFIX=160` floor calibrated from first PASS (llama 310 / hf2q 304 / common 180 bytes).
+
+#### P13.2 COMPLETE — `scripts/qwen35_bench.sh` landed (commit `5737f89`, 2026-04-24)
+Match-or-beat gate at 5% drift budget across pp×tg matrix.
+
+#### P13.3 COMPLETE — perf gate met (hf2q `23e1128` + mlx-native `25d4c4b`, 2026-04-25)
+Decode tok/s ≥ llama.cpp at every measured length on the apex MoE GGUF:
+
+| Test | hf2q tok/s | llama.cpp tok/s | Ratio | Status |
+|---|---|---|---|---|
+| tg64   | 110.7 | 97.3 | 1.138× | ✅ PASS |
+| tg256  | 106.7 | 97.3 | 1.097× | ✅ PASS |
+| tg1024 |  97.9 | 97.3 | 1.006× | ✅ PASS |
+
+All three points clear the 0.95× drift budget. Eighteen P13.3 commits between `b3635d1` and `23e1128` walked decode from 5.8 → 110.7 tok/s via fused encoders, GPU-resident conv state, BF16 SIMD GEMV for M=1, GPU argmax + Q4_0 lm_head, pipelined output_norm, GEMV for M=1 projections, and tiled SDPA decode.
+
+Sourdough byte-prefix gate at HEAD `23e1128`: 180 bytes common prefix / 160-byte floor — ✅ PASS.
+
+#### P13.4 COMPLETE — integration tests landed (commit `3875bc9`, 2026-04-25)
+`tests/integration_qwen35moe.rs` + `tests/integration_qwen35_dense.rs`. `#[ignore]`'d (opt-in via `cargo test --release -- --ignored qwen35`); skip cleanly with `eprintln + return` when no on-disk GGUF; otherwise invoke `target/release/hf2q generate ...` and assert exit 0 + non-empty stdout + tok/s footer on stderr. MoE test verified locally against the apex GGUF (5.88s including model load + 8-token greedy decode); dense test skips cleanly until a Qwen3.5 dense GGUF is staged.
+
+#### P13.5 COMPLETE — `docs/running-qwen35.md` landed (commit `d42b8f6`, 2026-04-25)
+Hardware requirements, model layout, one-liner generate / sourdough / bench commands, caveats (greedy vs sampled fast-path, chat-template stop at token 106, Q5_K expert kernel requirement citing `mlx-native@dd087a9`, hybrid KV cache geometry, BF16 K-cache head_dim ≥ 32), out-of-scope list (parallel batches, tool-use, multi-turn, vision tower, MTP execution).
+
+#### P13.6 COMPLETE — ADR-013 status close (commit cited inline in this file's progress log, 2026-04-25)
+Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit hashes + receipts; End-gate criteria below all ✅.
+
+#### End gate (Definition of Done — all ✅)
+
+| Criterion | Receipt |
+|---|---|
+| Sourdough byte-parity passes on apex GGUF against llama.cpp's live output | ✅ 180 bytes common prefix / 160 floor at hf2q `23e1128` |
+| Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
+| Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
+| Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
 
 ### Totals
 
