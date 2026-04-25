@@ -53,6 +53,7 @@ use mlx_native::ops::rope_multi::{
     build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
 };
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
+use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
@@ -704,24 +705,41 @@ pub fn apply_sdpa_with_kv_cache(
     }
 
     // --- SDPA over full KV cache ---
+    // For seq=1 (decode) with head_dim divisible by 32, use sdpa_decode:
+    //   - SIMD-vectorized F32 Q/K/V (no half-precision quantization)
+    //   - 32 threads cooperate on each QK dot product via simd_sum
+    //   - Avoids the scalar inner loop of the generic sdpa kernel
+    //
+    // Falls back to sdpa for seq > 1 (prefill) or non-standard head_dim.
     let out_buf = device
         .alloc_buffer(nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
         .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
 
-    let params = SdpaParams {
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        seq_len,
-        kv_seq_len,
-        scale: 1.0 / (d as f32).sqrt(),
-        kv_capacity: max_seq_len,
-    };
-
-    // K/V Metal buffers are already head-major in the cache.
     let mut enc = device.command_encoder().context("enc sdpa kv-cache")?;
-    sdpa(&mut enc, registry, device, q_ref, &slot.k, &slot.v, &out_buf, &params, 1)
-        .context("sdpa with kv cache")?;
+    if seq == 1 && head_dim % 32 == 0 {
+        // Decode fast path: vectorized F32 SDPA with simd_sum QK dot products.
+        // Q layout for seq=1: [n_heads, head_dim] = same in both seq-major and head-major.
+        dispatch_sdpa_decode(
+            &mut enc, registry, device,
+            q_ref, &slot.k, &slot.v, &out_buf,
+            n_heads, n_kv_heads, head_dim,
+            kv_seq_len, max_seq_len,
+            1.0 / (d as f32).sqrt(),
+        ).context("sdpa_decode kv-cache")?;
+    } else {
+        // Prefill path or non-standard head_dim: generic SDPA.
+        let params = SdpaParams {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            seq_len,
+            kv_seq_len,
+            scale: 1.0 / (d as f32).sqrt(),
+            kv_capacity: max_seq_len,
+        };
+        sdpa(&mut enc, registry, device, q_ref, &slot.k, &slot.v, &out_buf, &params, 1)
+            .context("sdpa with kv cache")?;
+    }
     enc.commit_and_wait().context("commit sdpa kv-cache")?;
     drop(q_permuted);
 
@@ -804,13 +822,14 @@ pub fn build_gated_attn_layer(
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
-    // ---- Ops 1–4: norm, Q/K/V/G projections, Q/K head-norm, IMROPE Q+K ----
-    // All ops in this chain write to new output buffers and read from buffers
-    // written by earlier dispatches in the same encoder.  A memory_barrier()
-    // between dependent stages ensures the GPU sees the preceding output before
-    // the next dispatch reads it (same pattern as llama.cpp's single command
-    // buffer with memoryBarrierWithScope:MTLBarrierScopeBuffers).
-    // Collapse into a single encoder + one commit_and_wait.
+    // ---- PREFILL / STATELESS PATH (all cases) ----
+    //
+    // For decode (seq=1) with a KV cache slot, the GPU-fused single-encoder
+    // approach was measured slower (8 tok/s vs 11 tok/s) because Metal can
+    // pipeline multiple small command buffers better than one large one for
+    // short per-layer workloads. Keep the original 3-encoder path.
+    //
+    // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
     let (x_norm, q_flat, k_flat, v_flat, gate_flat, q_normed, k_normed, q_rope, k_rope) = {
         let mut enc = device.command_encoder().context("enc ops1-4")?;
 
@@ -873,15 +892,6 @@ pub fn build_gated_attn_layer(
     let _ = (x_norm, q_flat, k_flat, q_normed, k_normed);
 
     // ---- Op 5: SDPA (causal, GQA) with optional KV-cache threading ----
-    //
-    // Two code paths:
-    //   - With kv_cache_slot: decode/prefill uses the persistent HybridKvCache
-    //     slot. apply_sdpa_with_kv_cache writes current K/V into the slot at
-    //     position slot.current_len[0], runs SDPA over [0..current_len+seq_len],
-    //     and increments current_len. This is the correct behavior: every
-    //     decode step attends to ALL prior tokens.
-    //   - Without (None): legacy stateless SDPA for synthetic unit tests that
-    //     don't construct a full HybridKvCache.
     let attn_out = match kv_cache_slot {
         Some(slot) => apply_sdpa_with_kv_cache(
             device, registry,
@@ -900,8 +910,6 @@ pub fn build_gated_attn_layer(
     // attn_out is now [seq * n_heads, head_dim] seq-major.
 
     // ---- Ops 6–7: sigmoid-gate multiply + output projection ----
-    // gate_flat is already on GPU; attn_out returned by SDPA is on GPU.
-    // Collapse into one encoder + one commit.
     let out = {
         let n_elem = seq_len * q_total;
         let mut enc = device.command_encoder().context("enc ops6-7")?;
