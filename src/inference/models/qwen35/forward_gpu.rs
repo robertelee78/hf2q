@@ -718,18 +718,30 @@ impl Qwen35Model {
                         moe_intermediate_size: moe.moe_intermediate_size,
                         shared_intermediate_size: moe.shared_expert_intermediate_size,
                     };
-                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape)
+                    // Pass ffn_residual so the MoE FFN can fold the post-FFN
+                    // residual add into its CPU combine step, saving 1 GPU commit.
+                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape,
+                        Some(&ffn_residual))
                         .with_context(|| format!("moe_ffn_q layer {layer_idx}"))?
                 }
             };
 
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
 
-            // --- Residual after FFN: add to pre-norm ffn_residual, not normed ---
-            // Matches llama.cpp: `cur = ggml_add(cur, ffn_residual)`.
+            // --- Residual after FFN ---
+            // For MoeQ: residual is already folded into the FFN output (ffn_out = ffn + residual).
+            // For Dense and F32-MoE: still need a separate GPU add.
             let t_res2_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            hidden = residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
-                .with_context(|| format!("residual ffn layer {layer_idx}"))?;
+            // Keep a clone for the optional layer dump below; only paid when dump is active.
+            let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
+            hidden = match ffn_weights_gpu {
+                FfnWeightsGpu::MoeQ(_) => {
+                    // Residual already folded in build_moe_ffn_layer_gpu_q.
+                    ffn_out
+                }
+                _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
+                    .with_context(|| format!("residual ffn layer {layer_idx}"))?,
+            };
             if let Some(t) = t_res2_start { total_residual_us += t.elapsed().as_micros() as u64; }
 
             // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---
@@ -740,7 +752,9 @@ impl Qwen35Model {
                 if layer_idx == dump_n {
                     // Also dump attn_out and ffn_out for the target layer.
                     dump_hidden_stats(&format!("layer{layer_idx}_attn_out"), &attn_out, seq_len, h);
-                    dump_hidden_stats(&format!("layer{layer_idx}_ffn_out"), &ffn_out, seq_len, h);
+                    if let Some(ref fo) = ffn_out_for_dump {
+                        dump_hidden_stats(&format!("layer{layer_idx}_ffn_out"), fo, seq_len, h);
+                    }
                 }
             }
 

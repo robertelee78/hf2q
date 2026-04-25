@@ -408,28 +408,35 @@ pub fn build_dense_ffn_layer_gpu(
     let h = shape.hidden_size;
     let m = shape.intermediate_size;
     let seq_len = (x.element_count() / h as usize) as u32;
+    let n_h = (seq_len * m) as u32;
 
-    // ---- Op 1: gate = gate_proj(x) ----
-    let mut enc = device.command_encoder().context("enc dense gate")?;
+    // Pre-allocate intermediate buffers (must outlive the encoder).
+    let hidden_buf = device
+        .alloc_buffer(n_h as usize * 4, DType::F32, vec![seq_len as usize, m as usize])
+        .map_err(|e| anyhow!("alloc dense silu hidden: {e}"))?;
+    let mut silu_params = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc dense silu params: {e}"))?;
+    silu_params.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h;
+
+    // Single encoder: gate+up projs (concurrent) → silu_mul → down proj.
+    // Saves 2 commit_and_wait calls vs the previous 3-encoder approach.
+    let mut enc = device.command_encoder().context("enc dense swiglu")?;
+    // Ops 1+2: gate and up projections — concurrent (both read from x)
     let gate_buf = proj(&mut enc, registry, device, x, &weights_gpu.gate, seq_len, h, m)?;
-    enc.commit_and_wait().context("commit dense gate")?;
-
-    // ---- Op 2: up = up_proj(x) ----
-    let mut enc = device.command_encoder().context("enc dense up")?;
-    let up_buf = proj(&mut enc, registry, device, x, &weights_gpu.up, seq_len, h, m)?;
-    enc.commit_and_wait().context("commit dense up")?;
-
-    // ---- Op 3: hidden = silu(gate) * up  [CPU bridge] ----
-    let gate_cpu = download_f32(&gate_buf).context("download gate")?;
-    let up_cpu = download_f32(&up_buf).context("download up")?;
-    let hidden_cpu = silu_mul_cpu(&gate_cpu, &up_cpu);
-    let hidden_buf = upload_f32(&hidden_cpu, device).context("upload hidden")?;
-
-    // ---- Op 4: out = down_proj(hidden) ----
-    let mut enc = device.command_encoder().context("enc dense down")?;
+    let up_buf   = proj(&mut enc, registry, device, x, &weights_gpu.up,   seq_len, h, m)?;
+    // Barrier: silu_mul reads gate_buf/up_buf written above.
+    enc.memory_barrier();
+    // Op 3: silu(gate) * up → hidden
+    dispatch_silu_mul(
+        &mut enc, registry, device.metal_device(),
+        &gate_buf, &up_buf, &hidden_buf, &silu_params, n_h,
+    ).context("dispatch silu_mul dense")?;
+    // Barrier: down proj reads hidden written above.
+    enc.memory_barrier();
+    // Op 4: out = down_proj(hidden)
     let out = proj(&mut enc, registry, device, &hidden_buf, &weights_gpu.down, seq_len, m, h)?;
-    enc.commit_and_wait().context("commit dense down")?;
-
+    enc.commit_and_wait().context("commit dense swiglu")?;
     Ok(out)
 }
 
@@ -743,6 +750,12 @@ fn upload_u32(data: &[u32], device: &MlxDevice) -> Result<MlxBuffer> {
 ///
 /// Compared to a CPU F32 reference, Q6_K dequant noise is ≤ 2e-2 per element.
 /// The parity test for this path uses tolerance 2e-2.
+/// Compute the MoE FFN layer and optionally add a residual on CPU before
+/// the final GPU upload, eliminating a separate `residual_add_gpu` commit.
+///
+/// When `add_residual` is `Some(buf)`, `buf` must be `[seq_len * hidden_size]`
+/// F32. It is downloaded once (unified memory: zero-copy read) and folded
+/// into the CPU accumulation step before the final upload.
 #[allow(clippy::too_many_arguments)]
 pub fn build_moe_ffn_layer_gpu_q(
     device: &MlxDevice,
@@ -750,6 +763,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     x: &MlxBuffer,
     weights: &MoeFfnWeightsGpuQ,
     shape: MoeFfnShape,
+    add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let ne = shape.num_experts as usize;
@@ -907,15 +921,25 @@ pub fn build_moe_ffn_layer_gpu_q(
         .map(|&v| 1.0 / (1.0 + (-v).exp()))
         .collect();
 
-    // ---- Step 10: output = moe_out + sh_gate * y_s  [CPU combine] ----
+    // ---- Step 10: output = moe_out + sh_gate * y_s [+ optional residual] [CPU combine] ----
     let y_s_cpu = download_f32(&y_s_buf).context("download y_s")?;
+    // Optionally fold the residual into the CPU accumulation to save a GPU commit.
+    // On unified memory, download_f32 is zero-copy (returns a slice into Metal buffer).
+    let residual_cpu: Option<Vec<f32>> = match add_residual {
+        Some(buf) => Some(download_f32(buf).context("download add_residual")?),
+        None => None,
+    };
     let mut out_cpu = moe_out_cpu;
     for t in 0..seq {
         let sg = sh_gate_vals[t];
         let y_row = &y_s_cpu[t * h..(t + 1) * h];
         let o_row = &mut out_cpu[t * h..(t + 1) * h];
         for i in 0..h {
-            o_row[i] += sg * y_row[i];
+            let mut v = o_row[i] + sg * y_row[i];
+            if let Some(ref r) = residual_cpu {
+                v += r[t * h + i];
+            }
+            o_row[i] = v;
         }
     }
 
