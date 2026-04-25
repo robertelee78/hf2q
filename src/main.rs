@@ -68,6 +68,13 @@ enum AppError {
     QualityExceeded(anyhow::Error),
     #[allow(dead_code)]
     Interrupted,
+    /// Smoke-subcommand exit codes per ADR-012 Decision 16 §preflight (2-8).
+    /// Carries the smoke-specific code so the process exits with the
+    /// documented value rather than the generic `EXIT_CONVERSION_ERROR=1`
+    /// AppError default. Without this variant, every distinct smoke
+    /// failure mode collapses to exit 1 — defeating Decision 16's
+    /// "distinct non-zero code" contract at the OS-process level.
+    Smoke { code: u8, msg: anyhow::Error },
 }
 
 impl AppError {
@@ -77,6 +84,7 @@ impl AppError {
             AppError::Conversion(_) => EXIT_CONVERSION_ERROR,
             AppError::QualityExceeded(_) => EXIT_QUALITY_EXCEEDED,
             AppError::Interrupted => EXIT_CONVERSION_ERROR,
+            AppError::Smoke { code, .. } => *code,
         }
     }
 }
@@ -88,6 +96,7 @@ impl std::fmt::Display for AppError {
             AppError::Conversion(e) => write!(f, "{:#}", e),
             AppError::QualityExceeded(e) => write!(f, "{:#}", e),
             AppError::Interrupted => write!(f, "Conversion interrupted by user"),
+            AppError::Smoke { msg, .. } => write!(f, "{:#}", msg),
         }
     }
 }
@@ -204,13 +213,16 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
         println!("{}", rendered);
         Ok(())
     } else {
-        // Preflight / unknown-arch — non-zero exit with the documented code.
+        // Preflight / unknown-arch — propagate the smoke-specific exit
+        // code (Decision 16 §preflight: 2-8 distinct non-zero codes)
+        // rather than collapsing to AppError::Conversion's exit 1.
+        // Without `AppError::Smoke`, the documented exit codes were
+        // shadowed at the process boundary — fixed in this commit.
         eprintln!("{}", rendered);
-        if code == arch::conformance::EXIT_UNKNOWN_ARCH {
-            Err(AppError::Input(anyhow::anyhow!("{}", rendered)))
-        } else {
-            Err(AppError::Conversion(anyhow::anyhow!("{}", rendered)))
-        }
+        Err(AppError::Smoke {
+            code,
+            msg: anyhow::anyhow!("{}", rendered),
+        })
     }
 }
 
