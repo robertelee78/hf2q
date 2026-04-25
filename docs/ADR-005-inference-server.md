@@ -1930,6 +1930,29 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 61 — Phase 2b BERT full forward composer (`apply_bert_full_forward_gpu`) — embed → N×encoder block → pool → L2 normalize, end-to-end on GPU.**
+  - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
+    - `apply_bert_full_forward_gpu(input_ids, type_ids_opt, weights: &LoadedBertWeights, cfg: &BertConfig, seq_len)` — single-call BERT inference. Composes:
+      ```
+      hidden = bert_embeddings_gpu(input_ids, type_ids_opt, ...)
+      for layer in 0..cfg.num_hidden_layers:
+          hidden = apply_bert_encoder_block_gpu(hidden, BertEncoderBlockTensors {...}, ...)
+      pooled = bert_pool_gpu(hidden, kind_from_cfg, seq_len, hidden)
+      return bert_l2_normalize_gpu(pooled, eps, 1, hidden)
+      ```
+    - Maps `cfg.pooling_type` to `BertPoolKind` — `Mean → Mean`, `Cls → Cls`, `Last → Last`. `None`/`Rank` return `Err` with a clear message (no embedding output for those — `None` means raw hidden states, `Rank` is reranker-only).
+    - Validates `seq_len ≥ 32` (post-softmax matmul K floor) and `seq_len ≤ cfg.max_position_embeddings`. Both checked before any dispatch fires.
+    - Per-layer tensors pulled via `LoadedBertWeights::block_required` (errors loudly with name) / `block_optional` (None for bias-free variants). Single source of truth for the BERT GGUF tensor naming convention; producer/loader changes can't drift independently.
+    - Memory barriers between every dispatch boundary (block→pool, pool→L2). Internal block barriers were already in iter 59.
+  - **`LoadedBertWeights::from_tensors_for_test(tensors, device)`** — `#[cfg(test)] pub(crate)` escape hatch in `src/inference/models/bert/weights.rs`. Lets the iter-61 full-forward parity test build a synthetic weight bundle without writing a synthetic GGUF to disk. Production code still flows through `load`/`load_from_path`.
+  - **Tests (3 new, all pass; full suite 968/968 +3):**
+    - `full_forward_gpu_produces_unit_norm_output_at_minimal_config` — minimal cfg (seq=32, hidden=64, num_heads=2, intermediate=128, num_hidden_layers=2, vocab=100, max_pos=64, type_vocab=2, pooling=Mean). Builds 30 synthetic tensors covering every stem + per-layer slot, runs the full forward, and asserts: (1) every output element is finite (no NaN/Inf from the chain); (2) the output is L2-normalized at 1.0 within 1e-4. **Catches catastrophic regressions in any of the 11 + 8 stages of the full pipeline** (embed gather, position gather, type gather, sum, sum, embed-LN, then per layer: 4× linear + attention + LN + GeLU + linear + LN, plus pool + L2 normalize). Tighter parity arrives via an llama.cpp accuracy gate once a real BERT GGUF is on disk.
+    - `full_forward_rejects_pooling_type_none` — `cfg.pooling_type = None` → `Err` whose message names `pooling_type=None`.
+    - `full_forward_rejects_seq_len_below_floor` — `seq_len = 16` → `Err` (matmul K floor).
+  - **Verification.** `cargo test --bin hf2q full_forward` — 3/3 pass. Full suite **968/968 pass** (+3 from iter 60's 965), 8 ignored.
+  - **Lane discipline observed.** All edits in `src/inference/models/bert/{bert_gpu,weights}.rs`. No mlx-native fork, no edits to other lanes.
+  - **Next (iter 62):** the `/v1/embeddings` handler. Extends `EmbeddingModel` (in `src/serve/api/state.rs`) with a `weights: Arc<LoadedBertWeights>` field loaded eagerly at startup; adds the `/v1/embeddings` POST route to `router.rs`; implements the handler in `handlers.rs` — accept OpenAI-shaped `{model, input, encoding_format?, dimensions?}`, tokenize each input through `EmbeddingModel::encode`, run `apply_bert_full_forward_gpu`, return `{object: "list", data: [{object: "embedding", embedding: [...], index: i}], model, usage: {prompt_tokens, total_tokens}}`. Then download a real BERT GGUF (bge-small-en-v1.5 is the smallest at ~30MB) and run the Phase 2b accuracy gate against `llama-embedding`.
+
 - **2026-04-26 loop iter 60 — Phase 2b BERT embeddings + pooling + L2 normalize — every primitive needed for the full forward pass now lands on GPU.**
   - **What landed.** `src/inference/models/bert/bert_gpu.rs`:
     - `bert_embed_gather_gpu(table, ids, vocab, hidden, n_ids)` — F32 row gather wrapping `mlx_native::ops::gather::dispatch_gather_f32`. Output `[n_ids, hidden]`.

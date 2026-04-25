@@ -1310,6 +1310,152 @@ pub fn bert_l2_normalize_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Full forward pass — embed → N×block → pool → L2 normalize
+// ---------------------------------------------------------------------------
+
+/// One BERT-family forward pass on GPU, end-to-end:
+/// `out = L2norm(Pool(EncoderBlocks×N(Embed(input_ids, type_ids))))`
+///
+/// Inputs:
+/// - `input_ids`        U32 `[seq_len]`
+/// - `type_ids_opt`     U32 `[seq_len]` (None → no segment embedding)
+/// - `weights`          parsed BERT GGUF tensors (F32 on device)
+/// - `cfg`              architecture config (drives layer count, hidden
+///                      sizes, pooling kind, eps)
+///
+/// Returns F32 `[hidden]` — a single L2-normalized embedding vector.
+/// `cfg.pooling_type` decides which pooling reduction to apply.
+///
+/// `seq_len` must be ≥ 32 (post-softmax matmul K floor) and ≤
+/// `cfg.max_position_embeddings` (silent OOB read otherwise).
+///
+/// Caller registers `register_bert_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+/// - `cfg.pooling_type` is `None` or `Rank` (no embedding output for those)
+/// - `seq_len < 32` or `seq_len > cfg.max_position_embeddings`
+/// - missing tensor (propagated from `LoadedBertWeights` accessors)
+/// - propagated from any sub-dispatch
+pub fn apply_bert_full_forward_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input_ids: &MlxBuffer,
+    type_ids_opt: Option<&MlxBuffer>,
+    weights: &super::weights::LoadedBertWeights,
+    cfg: &super::config::BertConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    use super::config::PoolingType;
+
+    let pool_kind = match cfg.pooling_type {
+        PoolingType::Mean => BertPoolKind::Mean,
+        PoolingType::Cls => BertPoolKind::Cls,
+        PoolingType::Last => BertPoolKind::Last,
+        PoolingType::None => {
+            return Err(anyhow!(
+                "apply_bert_full_forward_gpu: pooling_type=None is not a single-vector embedding output"
+            ));
+        }
+        PoolingType::Rank => {
+            return Err(anyhow!(
+                "apply_bert_full_forward_gpu: pooling_type=Rank is reranker-only (out of scope for /v1/embeddings)"
+            ));
+        }
+    };
+
+    let hidden = cfg.hidden_size as u32;
+    let num_heads = cfg.num_attention_heads as u32;
+    let intermediate = cfg.intermediate_size as u32;
+    let vocab = cfg.vocab_size as u32;
+    let max_pos = cfg.max_position_embeddings as u32;
+    let type_vocab = cfg.type_vocab_size as u32;
+    let eps = cfg.layer_norm_eps;
+
+    if seq_len < 32 {
+        return Err(anyhow!(
+            "apply_bert_full_forward_gpu: seq_len ({}) must be >= 32 (post-softmax matmul K floor)",
+            seq_len
+        ));
+    }
+    if seq_len > max_pos {
+        return Err(anyhow!(
+            "apply_bert_full_forward_gpu: seq_len ({}) > max_position_embeddings ({})",
+            seq_len,
+            max_pos
+        ));
+    }
+
+    // --- Embeddings ---
+    let mut hidden_states = bert_embeddings_gpu(
+        encoder,
+        registry,
+        device,
+        input_ids,
+        type_ids_opt,
+        weights.token_embd_weight()?,
+        weights.position_embd_weight()?,
+        weights.token_types_weight(),
+        weights.embed_norm_weight()?,
+        weights.embed_norm_bias()?,
+        eps,
+        seq_len,
+        hidden,
+        vocab,
+        max_pos,
+        type_vocab,
+    )
+    .context("full forward: embeddings")?;
+    encoder.memory_barrier();
+
+    // --- N encoder blocks ---
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let tensors = BertEncoderBlockTensors {
+            q_w: weights.block_required(layer_idx, "attn_q.weight")?,
+            q_b: weights.block_optional(layer_idx, "attn_q.bias"),
+            k_w: weights.block_required(layer_idx, "attn_k.weight")?,
+            k_b: weights.block_optional(layer_idx, "attn_k.bias"),
+            v_w: weights.block_required(layer_idx, "attn_v.weight")?,
+            v_b: weights.block_optional(layer_idx, "attn_v.bias"),
+            o_w: weights.block_required(layer_idx, "attn_output.weight")?,
+            o_b: weights.block_optional(layer_idx, "attn_output.bias"),
+            attn_norm_gamma: weights.block_required(layer_idx, "attn_output_norm.weight")?,
+            attn_norm_beta: weights.block_required(layer_idx, "attn_output_norm.bias")?,
+            up_w: weights.block_required(layer_idx, "ffn_up.weight")?,
+            up_b: weights.block_optional(layer_idx, "ffn_up.bias"),
+            down_w: weights.block_required(layer_idx, "ffn_down.weight")?,
+            down_b: weights.block_optional(layer_idx, "ffn_down.bias"),
+            ffn_norm_gamma: weights.block_required(layer_idx, "layer_output_norm.weight")?,
+            ffn_norm_beta: weights.block_required(layer_idx, "layer_output_norm.bias")?,
+        };
+        hidden_states = apply_bert_encoder_block_gpu(
+            encoder,
+            registry,
+            device,
+            &hidden_states,
+            &tensors,
+            seq_len,
+            hidden,
+            num_heads,
+            intermediate,
+            eps,
+        )
+        .with_context(|| format!("full forward: encoder block {}", layer_idx))?;
+        encoder.memory_barrier();
+    }
+
+    // --- Pool ---
+    let pooled =
+        bert_pool_gpu(encoder, registry, device, &hidden_states, pool_kind, seq_len, hidden)
+            .context("full forward: pool")?;
+    encoder.memory_barrier();
+
+    // --- L2 normalize ---
+    bert_l2_normalize_gpu(encoder, registry, device, &pooled, eps, 1, hidden)
+        .context("full forward: l2 normalize")
+}
+
+// ---------------------------------------------------------------------------
 // CPU reference (parity oracle for tests)
 // ---------------------------------------------------------------------------
 
@@ -2904,6 +3050,338 @@ mod tests {
                 norm
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // apply_bert_full_forward_gpu — end-to-end on synthetic weights
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn full_forward_gpu_produces_unit_norm_output_at_minimal_config() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // Minimal config that satisfies all kernel constraints:
+        //   seq_len             = 32 (post-softmax matmul K floor)
+        //   hidden              = 64, num_heads = 2 → head_dim = 32
+        //   intermediate        = 128
+        //   vocab               = 100
+        //   max_pos             = 64 (≥ seq_len)
+        //   type_vocab          = 2
+        //   num_hidden_layers   = 2
+        //   pooling             = Mean
+        let seq = 32usize;
+        let hidden = 64usize;
+        let num_heads = 2usize;
+        let intermediate = 128usize;
+        let vocab = 100usize;
+        let max_pos = 64usize;
+        let type_vocab = 2usize;
+        let num_layers = 2usize;
+        let cfg = super::super::config::BertConfig {
+            hidden_size: hidden,
+            num_attention_heads: num_heads,
+            num_hidden_layers: num_layers,
+            intermediate_size: intermediate,
+            max_position_embeddings: max_pos,
+            vocab_size: vocab,
+            type_vocab_size: type_vocab,
+            layer_norm_eps: 1e-12,
+            hidden_act: "gelu".into(),
+            pooling_type: super::super::config::PoolingType::Mean,
+            causal_attention: false,
+        };
+
+        let prand = |seed: usize, n: usize, scale: f32, offset: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2654435761usize).wrapping_add(seed) % 1000) as f32) * scale
+                        + offset
+                })
+                .collect()
+        };
+
+        // Build LoadedBertWeights from synthetic tensors. Each weight
+        // / bias is uploaded to device once so it lives across the
+        // full-forward dispatch.
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        // SAFETY: executor outlives session below.
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let mut tensors: std::collections::HashMap<String, MlxBuffer> =
+            std::collections::HashMap::new();
+
+        // Stem.
+        tensors.insert(
+            super::super::TENSOR_TOKEN_EMBD.into(),
+            upload_f32(
+                device,
+                &prand(1, vocab * hidden, 0.001, -0.5),
+                vec![vocab, hidden],
+            ),
+        );
+        tensors.insert(
+            super::super::TENSOR_POS_EMBD.into(),
+            upload_f32(
+                device,
+                &prand(2, max_pos * hidden, 0.001, -0.5),
+                vec![max_pos, hidden],
+            ),
+        );
+        tensors.insert(
+            super::super::TENSOR_TOKEN_TYPES.into(),
+            upload_f32(
+                device,
+                &prand(3, type_vocab * hidden, 0.001, -0.5),
+                vec![type_vocab, hidden],
+            ),
+        );
+        tensors.insert(
+            super::super::TENSOR_EMBED_NORM_WEIGHT.into(),
+            upload_f32(device, &prand(4, hidden, 0.0001, 1.0), vec![hidden]),
+        );
+        tensors.insert(
+            super::super::TENSOR_EMBED_NORM_BIAS.into(),
+            upload_f32(device, &prand(5, hidden, 0.001, -0.5), vec![hidden]),
+        );
+
+        // Per-layer.
+        for layer in 0..num_layers {
+            let key =
+                |s: &str| -> String { super::super::config::bert_layer_tensor(layer, s) };
+            // Q/K/V/O linear layers — `[hidden, hidden]` weights + `[hidden]` biases.
+            let qkvo_seed_base = 100 + layer * 100;
+            for (i, name) in [
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            ]
+            .iter()
+            .enumerate()
+            {
+                tensors.insert(
+                    key(name),
+                    upload_f32(
+                        device,
+                        &prand(qkvo_seed_base + i * 10, hidden * hidden, 0.0005, -0.15),
+                        vec![hidden, hidden],
+                    ),
+                );
+            }
+            for (i, name) in [
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+            ]
+            .iter()
+            .enumerate()
+            {
+                tensors.insert(
+                    key(name),
+                    upload_f32(
+                        device,
+                        &prand(qkvo_seed_base + 50 + i * 10, hidden, 0.001, -0.05),
+                        vec![hidden],
+                    ),
+                );
+            }
+            // Post-attn LN.
+            tensors.insert(
+                key("attn_output_norm.weight"),
+                upload_f32(device, &prand(qkvo_seed_base + 60, hidden, 0.0001, 1.0), vec![hidden]),
+            );
+            tensors.insert(
+                key("attn_output_norm.bias"),
+                upload_f32(device, &prand(qkvo_seed_base + 61, hidden, 0.001, -0.5), vec![hidden]),
+            );
+            // FFN up/down.
+            tensors.insert(
+                key("ffn_up.weight"),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 70, intermediate * hidden, 0.0005, -0.15),
+                    vec![intermediate, hidden],
+                ),
+            );
+            tensors.insert(
+                key("ffn_up.bias"),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 71, intermediate, 0.001, -0.5),
+                    vec![intermediate],
+                ),
+            );
+            tensors.insert(
+                key("ffn_down.weight"),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 72, hidden * intermediate, 0.0005, -0.15),
+                    vec![hidden, intermediate],
+                ),
+            );
+            tensors.insert(
+                key("ffn_down.bias"),
+                upload_f32(
+                    device,
+                    &prand(qkvo_seed_base + 73, hidden, 0.001, -0.5),
+                    vec![hidden],
+                ),
+            );
+            // Post-FFN LN.
+            tensors.insert(
+                key("layer_output_norm.weight"),
+                upload_f32(device, &prand(qkvo_seed_base + 80, hidden, 0.0001, 1.0), vec![hidden]),
+            );
+            tensors.insert(
+                key("layer_output_norm.bias"),
+                upload_f32(device, &prand(qkvo_seed_base + 81, hidden, 0.001, -0.5), vec![hidden]),
+            );
+        }
+
+        let weights = super::super::weights::LoadedBertWeights::from_tensors_for_test(
+            tensors,
+            MlxDevice::new().unwrap(),
+        );
+
+        // Synthetic input: arbitrary token ids modulo vocab.
+        let input_ids: Vec<u32> = (0..seq).map(|i| (i.wrapping_mul(7) % vocab) as u32).collect();
+        let type_ids: Vec<u32> = (0..seq).map(|i| (i & 1) as u32).collect();
+        let input_ids_b = upload_u32(device, &input_ids, vec![seq]);
+        let type_ids_b = upload_u32(device, &type_ids, vec![seq]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = apply_bert_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_ids_b,
+            Some(&type_ids_b),
+            &weights,
+            &cfg,
+            seq as u32,
+        )
+        .expect("full forward dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+
+        // Two invariants the full forward must satisfy:
+        // (1) every output element is finite (no NaN/Inf from the
+        //     attention or LayerNorm chain).
+        // (2) the output is L2-normalized (||y||₂ = 1 within F32 tol).
+        for (i, &v) in got.iter().enumerate() {
+            assert!(v.is_finite(), "output[{i}] not finite: {v}");
+        }
+        let mut sum_sq = 0.0f64;
+        for &v in &got {
+            sum_sq += (v as f64) * (v as f64);
+        }
+        let norm = sum_sq.sqrt() as f32;
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "full-forward output not unit L2 norm: {} (expected 1.0)",
+            norm
+        );
+    }
+
+    #[test]
+    fn full_forward_rejects_pooling_type_none() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        // Minimal cfg with pooling_type = None — must error.
+        let cfg = super::super::config::BertConfig {
+            hidden_size: 64,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            intermediate_size: 128,
+            max_position_embeddings: 64,
+            vocab_size: 100,
+            type_vocab_size: 2,
+            layer_norm_eps: 1e-12,
+            hidden_act: "gelu".into(),
+            pooling_type: super::super::config::PoolingType::None,
+            causal_attention: false,
+        };
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let weights = super::super::weights::LoadedBertWeights::empty(
+            MlxDevice::new().unwrap(),
+        );
+        let input_ids = upload_u32(device, &[0u32; 32], vec![32]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = apply_bert_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_ids,
+            None,
+            &weights,
+            &cfg,
+            32,
+        );
+        assert!(err.is_err(), "pooling_type=None must error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("pooling_type=None"),
+            "error must name pooling_type=None: {msg}"
+        );
+        drop(session);
+    }
+
+    #[test]
+    fn full_forward_rejects_seq_len_below_floor() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let cfg = super::super::config::BertConfig {
+            hidden_size: 64,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            intermediate_size: 128,
+            max_position_embeddings: 64,
+            vocab_size: 100,
+            type_vocab_size: 2,
+            layer_norm_eps: 1e-12,
+            hidden_act: "gelu".into(),
+            pooling_type: super::super::config::PoolingType::Mean,
+            causal_attention: false,
+        };
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let weights = super::super::weights::LoadedBertWeights::empty(
+            MlxDevice::new().unwrap(),
+        );
+        let input_ids = upload_u32(device, &[0u32; 16], vec![16]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let err = apply_bert_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &input_ids,
+            None,
+            &weights,
+            &cfg,
+            16, // < 32 floor
+        );
+        assert!(err.is_err(), "seq_len < 32 must error");
+        drop(session);
     }
 
     #[test]

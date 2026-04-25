@@ -212,6 +212,23 @@ impl LoadedBertWeights {
         }
     }
 
+    /// Build a `LoadedBertWeights` from a name→buffer map. Test-only
+    /// escape hatch for the full-forward parity test (iter 61) — the
+    /// production code path is `load`/`load_from_path`. The function
+    /// is `pub(crate)` so it can be invoked from sibling test modules
+    /// (e.g. `bert_gpu`'s `apply_bert_full_forward_gpu` test) without
+    /// constructing a synthetic GGUF on disk.
+    #[cfg(test)]
+    pub(crate) fn from_tensors_for_test(
+        tensors: HashMap<String, MlxBuffer>,
+        device: MlxDevice,
+    ) -> Self {
+        Self {
+            tensors,
+            _device: device,
+        }
+    }
+
     /// Total tensor count.
     pub fn len(&self) -> usize {
         self.tensors.len()
