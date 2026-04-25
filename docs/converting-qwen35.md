@@ -75,6 +75,15 @@ same for all model classes (Gemma, Qwen3.5-MoE, Qwen3.5 dense).
 
 ## Converting Qwen3.6-35B-A3B (MoE variant)
 
+> **Pre-P12 status (as of 2026-04-24):** DWQ on `qwen35` / `qwen35moe`
+> requires real forward-pass activations from ADR-013 P12's
+> `RealActivationCapture` impl. Until P12 ships, the command below
+> **fails fast** with the structured `NoActivationCapture` error
+> (see `feedback_never_ship_fallback_without_rootcause.md`). For the
+> shipping path today, use `--quant q4_0` — see the smoke section
+> below — and switch to DWQ once ADR-013 P12 lands. There is no
+> weight-space fallback.
+
 ```bash
 hf2q convert \
   --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated \
