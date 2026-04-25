@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# Self-relaunch under Bash 4+ if invoked under macOS-shipped Bash 3.2 —
+# this script uses associative arrays (`declare -A`).
+if (( BASH_VERSINFO[0] < 4 )); then
+  for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [[ -x "$candidate" ]]; then
+      exec "$candidate" "$0" "$@"
+    fi
+  done
+  echo "qwen35_bench.sh requires Bash 4+ (uses associative arrays). Install via 'brew install bash'." >&2
+  exit 127
+fi
 # qwen35_bench.sh — ADR-013 Phase P13 match-or-beat benchmark gate for
 # Qwen3.5 / Qwen3.6 inference vs llama.cpp on the same GGUF.
 #
@@ -111,8 +122,9 @@ if [[ $SKIP_LLAMA -eq 0 ]]; then
   echo "--- llama-bench pass ---"
   PP_CSV="$(IFS=,; echo "${PP_LIST[*]}")"
   TG_CSV="$(IFS=,; echo "${DECODE_LIST[*]}")"
+  # llama-bench's --progress is a boolean flag (no value); drop the "0".
   if ! "$LLAMA_BIN" -m "$GGUF_PATH" -p "$PP_CSV" -n "$TG_CSV" -o csv \
-        --progress 0 > "$OUT_DIR/llama.csv" 2>"$LOG_LLAMA"; then
+        > "$OUT_DIR/llama.csv" 2>"$LOG_LLAMA"; then
     echo "llama-bench failed. See $LOG_LLAMA" >&2; exit 3
   fi
   # llama-bench CSV: model,size,params,backend,threads,test,t/s,...
