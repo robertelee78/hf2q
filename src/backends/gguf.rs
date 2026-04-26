@@ -102,19 +102,27 @@ pub fn emit_gguf_from_tensor_map(
     output_path: &Path,
     progress: &ProgressReporter,
 ) -> Result<OutputManifest, BackendError> {
-    use crate::quantize::{quantize_model, static_quant::StaticQuantizer};
+    use crate::quantize::{
+        intermediate_moe_q8::IntermediateMoeQ8Quantizer, quantize_model,
+    };
 
-    let quantizer = StaticQuantizer::new("f16").map_err(|e| BackendError::WriteFailed {
-        reason: format!("StaticQuantizer init for intermediate F16 emit: {e}"),
-    })?;
+    // ADR-012 P9b apex MoE OOM fix (2026-04-25): MoE expert tensors emit
+    // at Q8_0 instead of F16. Routing rationale: when the convert pipeline
+    // reloads this intermediate as a `Qwen35Model` for activation capture,
+    // F16 expert dtype triggers `weight_loader::load_moe_ffn`'s F32-expand
+    // path (~128 GB peak — kills 128 GB systems via swap thrash).
+    // Q8_0 keeps the loader on `load_moe_ffn_quantized` (MoeQ, ~33 GB),
+    // and is near-lossless for the calibration forward (final DWQ output
+    // is unaffected — DWQ re-quantizes from the original tensor_map, not
+    // from the intermediate). Non-MoE tensors stay F16, byte-identical to
+    // the previous intermediate format. See `quantize/intermediate_moe_q8.rs`.
+    let quantizer = IntermediateMoeQ8Quantizer::new();
 
-    // bits=16 / group_size=32 are required by the quantizer signature but
-    // the f16 path treats every weight as `convert_to_f16` (no grouping)
-    // and every preserved tensor as `preserve_tensor`. See
-    // `static_quant.rs::Quantizer::quantize_tensor`.
+    // bits=16 / group_size=32 are the F16 default; the Q8 route inside
+    // IntermediateMoeQ8Quantizer overrides to bits=8/group_size=32 per-tensor.
     let quantized = quantize_model(tensor_map, metadata, &quantizer, 16, 32, progress)
         .map_err(|e| BackendError::WriteFailed {
-            reason: format!("F16 intermediate quantize step: {e}"),
+            reason: format!("Intermediate F16+MoE-Q8 quantize step: {e}"),
         })?;
 
     let backend = GgufBackend::new();
