@@ -123,21 +123,19 @@ fn residual_add(dst: &mut [f32], src: &[f32]) {
 // GPU capture path (ADR-012 P9b — mantra-aligned production wire-up)
 // ================================================================
 
-/// True iff any layer FFN is a MoE variant (either F32-expanded `Moe` or
-/// native ggml-quantized `MoeQ`). Both paths benefit from GPU forward:
-///   * `MoeQ` — calibration on apex (256 experts) is impossible on CPU
-///     without F32 expansion → ~128 GB OOM. GPU runs `quantized_matmul_ggml`
-///     directly on native blocks.
-///   * `Moe` — F16-loaded intermediate already pays the F32-expansion cost,
-///     but CPU forward is ~30-60 minutes per calibration prompt at apex
-///     scale. GPU forward is ~30 seconds. No correctness compromise.
-fn has_moe_layer(model: &Qwen35Model) -> bool {
-    model.layers.iter().any(|l| {
-        matches!(
-            l.ffn(),
-            Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_)
-        )
-    })
+/// Detect whether `model` was built with production-shape weights the GPU
+/// forward can consume. The GPU lm_head Q4_0 packing
+/// (`encode_q4_0_blocks` in `gpu_full_attn.rs`) requires `hidden_size`
+/// divisible by 32; synthetic `empty_from_cfg` test models with
+/// `hidden_size=8` fail that assertion. Real Qwen3.5/3.6 hidden sizes are
+/// 5120 (27B Dense / 35B MoE) — comfortably above the bar. Mantra: no CPU
+/// fallback at production scale; CPU is parity-test only.
+fn has_production_weights(model: &Qwen35Model) -> bool {
+    let h = model.cfg.hidden_size;
+    !model.token_embd.is_empty()
+        && h >= 32
+        && h % 32 == 0
+        && model.cfg.num_hidden_layers > 0
 }
 
 /// Run a calibration prompt through the GPU forward and capture per-layer
@@ -416,19 +414,20 @@ impl ActivationCapture for RealActivationCapture {
         match &mut self.inner {
             RealCaptureBackend::Loaded(model) => {
                 // Mantra-aligned dispatch (ADR-012 P9b):
-                //   * Any MoE FFN (Moe or MoeQ) → GPU forward via
-                //     `forward_gpu_with_capture`, which calls
-                //     `mlx-native::quantized_matmul_ggml` for native blocks
-                //     and `mul_mm_id` for F32-expanded experts. CPU
-                //     forward on 256-expert apex is ~30-60 min/prompt;
-                //     GPU is ~30 sec. MoeQ on CPU would OOM (~128 GB).
-                //   * Dense → CPU path stays as the byte-identical reference
-                //     (small synthetic models in tests; pre-quant Dense
-                //     weights at convert time fit comfortably on CPU).
-                //   * HF2Q_FORCE_CPU_CAPTURE=1 escapes for parity debugging.
+                //   * Production weights (Dense, F16-Moe, MoeQ) → GPU
+                //     forward via `forward_gpu_with_capture`. Dispatches
+                //     `mlx-native::quantized_matmul_ggml` for native MoeQ
+                //     blocks, `mul_mm_id` for F32-expanded experts, and
+                //     dense GEMM kernels for Dense FFN. No CPU fallback —
+                //     CPU forward at production scale is unshippable
+                //     (per `feedback_gpu_everything`, `feedback_tests_on_gpu_not_cpu`).
+                //   * Synthetic empty_from_cfg test models → CPU parity
+                //     reference (those buffers have no real weights and
+                //     would fail the GPU upload).
+                //   * HF2Q_FORCE_CPU_CAPTURE=1 escapes only for debugging.
                 let force_cpu =
                     std::env::var("HF2Q_FORCE_CPU_CAPTURE").is_ok();
-                if !force_cpu && has_moe_layer(model) {
+                if !force_cpu && has_production_weights(model) {
                     run_calibration_prompt_gpu(model, tokens)
                 } else {
                     model.run_calibration_prompt(tokens)
