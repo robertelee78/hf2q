@@ -102,8 +102,10 @@ pub struct SamplingParams {
     pub min_p: f32,
 
     // --- Tier 4 (power-user) ---
-    /// Per-token-id logit bias map. Applied before softmax once the
-    /// forward-decode refactor exposes logits.
+    /// Per-token-id logit bias map. Additive bias applied to the
+    /// live logits before `sampler_pure::sample_token` (wired in
+    /// iter-94; OpenAI semantics — non-finite bias on a token vetoes
+    /// it, finite bias shifts its logit).
     pub logit_bias: std::collections::HashMap<u32, f32>,
     /// If `true`, include top-k logprobs in the response. Tier 4.
     pub logprobs: bool,
