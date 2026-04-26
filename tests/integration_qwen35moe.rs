@@ -33,6 +33,10 @@ fn qwen35moe_apex_generate_smoke() {
         );
         return;
     }
+    if let Err(e) = mlx_native::MlxDevice::new() {
+        eprintln!("skip: no Metal device available for qwen35moe generate smoke: {e}");
+        return;
+    }
 
     let bin = hf2q_release_bin();
     if !bin.exists() {

@@ -705,19 +705,21 @@ fn cmd_generate_qwen35(
     let prompt_len = prompt_tokens.len();
     tracing::info!("Qwen3.5: {} prompt tokens", prompt_len);
 
-    // ---- Allocate HybridKvCache ----
-    let device = MlxDevice::new()
-        .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
     let max_seq = (prompt_len + args.max_tokens + 64)
         .max(128)
         .min(model.cfg.max_position_embeddings as usize);
-    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
-        .context("HybridKvCache::new")?;
-    tracing::info!(
-        "Qwen3.5 KV cache allocated: max_seq={}, {} MB",
-        max_seq,
-        kv_cache.total_bytes() / (1024 * 1024)
-    );
+    let spec_env = std::env::var("HF2Q_SPEC_DECODE").ok();
+    let mut use_spec_decode = match spec_env.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => args.speculative || model.mtp.is_some(),
+    };
+    if use_spec_decode && model.mtp.is_none() {
+        tracing::warn!(
+            "Speculative decoding requested but this GGUF has no MTP weights; using greedy decode"
+        );
+        use_spec_decode = false;
+    }
 
     // ---- Build header info ----
     let backend_chip = {
@@ -753,6 +755,87 @@ fn cmd_generate_qwen35(
     let mut stdout = std::io::stdout();
     header::print_header_top(&mut stdout, &header_top, stdout_is_tty)
         .context("print header top")?;
+
+    if use_spec_decode {
+        use crate::inference::models::qwen35::spec_decode::SpecDecode;
+        tracing::info!("Qwen3.5 speculative decode enabled");
+        let result = SpecDecode::run_with_eos(
+            &model,
+            &prompt_tokens,
+            args.max_tokens,
+            Some(eos_token_id),
+            max_seq as u32,
+        )
+        .context("Qwen3.5 SpecDecode::run_with_eos")?;
+
+        let prefill_tok_s = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
+            prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        header::print_header_prefill(
+            &mut stdout,
+            &header::HeaderInfoPrefill {
+                prefill_n: prompt_len,
+                prefill_ms: result.stats.prefill_elapsed.as_secs_f64() * 1000.0,
+                prefill_tok_s,
+            },
+            stdout_is_tty,
+        )
+        .context("print header prefill")?;
+
+        let decoded = tokenizer.decode(&result.tokens, false).unwrap_or_default();
+        print!("{}", decoded);
+        stdout.flush()?;
+
+        let generated = result.tokens.len();
+        let tok_per_sec = if result.stats.decode_elapsed.as_secs_f64() > 0.0 {
+            generated as f64 / result.stats.decode_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        let (td, tr) = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            ("\x1b[2m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        eprintln!(
+            "\n\n{td}--- mlx-native (Qwen3.5 spec): {} tokens in {:.2}s ({:.1} tok/s, accept {:.1}%) ---{tr}",
+            generated,
+            result.stats.decode_elapsed.as_secs_f64(),
+            tok_per_sec,
+            result.stats.acceptance_rate_pct(),
+        );
+
+        if args.benchmark {
+            let (chip, mem_gb) = detect_hardware_info();
+            let model_filename = model_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!();
+            println!("=== Benchmark Results ===");
+            println!("Hardware: {}, {} GB", chip, mem_gb);
+            println!("Model: {}", model_filename);
+            println!("Prompt tokens: {}", prompt_len);
+            println!("Generated tokens: {}", generated);
+            println!("Prefill tok/s: {:.1}", prefill_tok_s);
+            println!("Decode tok/s: {:.1}", tok_per_sec);
+            println!("Spec accept %: {:.1}", result.stats.acceptance_rate_pct());
+        }
+        return Ok(());
+    }
+
+    // ---- Allocate HybridKvCache ----
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new: {e}"))?;
+    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
+        .context("HybridKvCache::new")?;
+    tracing::info!(
+        "Qwen3.5 KV cache allocated: max_seq={}, {} MB",
+        max_seq,
+        kv_cache.total_bytes() / (1024 * 1024)
+    );
 
     // ---- Prefill ----
     // Build flat positions [4 * prompt_len]: axis-major, all axes = token index.
@@ -1480,6 +1563,7 @@ fn cmd_parity_check(
         chat_template: None,
         chat_template_file: None,
         benchmark: false,
+        speculative: false,
     }, &prompt_text)?;
 
     let encoding = tokenizer.encode(rendered.as_str(), false)
@@ -1635,6 +1719,7 @@ fn cmd_parity_capture(
             chat_template: None,
             chat_template_file: None,
             benchmark: false,
+            speculative: false,
         }, &prompt_text)?;
 
         let encoding = tokenizer.encode(rendered.as_str(), false)

@@ -300,6 +300,11 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "1.0")]
     pub repetition_penalty: f64,
 
+    /// Enable Qwen3.5 MTP speculative decoding when MTP weights are present.
+    /// Also enabled by HF2Q_SPEC_DECODE=1; Qwen3.5 GGUFs with MTP default on.
+    #[arg(long)]
+    pub speculative: bool,
+
     /// Override chat template with a Jinja2 string
     ///
     /// Priority order (per ADR-005 Phase 1): this flag > --chat-template-file >
