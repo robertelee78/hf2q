@@ -629,6 +629,214 @@ impl ModelCache {
         Ok(())
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Invalidation surface (ADR-005 Phase 3 iter-205, AC line 5351)
+    //
+    // `hf2q cache clear` is the operator workflow that drives these
+    // entry points.  Three granularities:
+    //
+    // - [`invalidate`]          single (repo, quant) entry
+    // - [`invalidate_repo`]     all quants for one repo (and the model dir)
+    // - [`purge`]               every entry in the cache
+    //
+    // Plus [`iter_entries`] for the read-only `cache list` surface.
+    //
+    // # Concurrency
+    //
+    // `invalidate` holds the per-(repo, quant) advisory lock for the
+    // duration of the destructive operation; `invalidate_repo`
+    // acquires *every* per-quant lock for the repo (in deterministic
+    // BTreeMap-iteration order — same `quantizations` traversal we
+    // use everywhere else — so two parallel `invalidate_repo` calls
+    // for the same repo can't deadlock).  `purge` does NOT acquire
+    // locks because the caller (the CLI handler) is the gate that
+    // promised global exclusivity via `--yes`; purging while a serve
+    // is loading from cache would have already lost the race against
+    // any of the per-quant entry-points anyway.
+    //
+    // # Atomicity
+    //
+    // The order is `remove on-disk bytes → mutate in-memory manifest
+    // → atomic flush`.  If we crash between steps the manifest still
+    // points at a now-missing GGUF; `verify_quantized` then returns
+    // `gguf_missing` on the next serve attempt, which the operator
+    // resolves by re-running `hf2q cache clear` (idempotent: the
+    // second pass finds the manifest entry, attempts to remove an
+    // already-gone file via `fs::remove_dir_all` which is silent on
+    // ENOENT for missing children, and flushes a clean manifest).
+    //
+    // Bytes-freed accounting walks the on-disk dir BEFORE removal so
+    // the number reported is what the operator actually freed (the
+    // `QuantEntry::bytes` manifest field is `model.gguf` only and
+    // misses the optional `mmproj.gguf` plus the per-quant companion
+    // `manifest.json`).
+    // ────────────────────────────────────────────────────────────────
+
+    /// Remove a single `(repo_id, quant)` entry: deletes the on-disk
+    /// `quantized/<quant>/` directory tree (covering `model.gguf`, the
+    /// optional `mmproj.gguf`, and the companion per-quant manifest)
+    /// and drops the `QuantEntry` from `ModelEntry::quantizations`.
+    /// Holds the per-(repo, quant) advisory lock for the duration so
+    /// concurrent serve invocations cannot observe a half-deleted
+    /// state.  Flushes the global manifest atomically before the
+    /// lock releases.
+    ///
+    /// Returns the total bytes freed (sum of file sizes under the
+    /// removed dir as observed *before* the removal).  A `0` return
+    /// is legal (e.g. the gguf was already deleted out-of-band but
+    /// the manifest entry remained — `verify_quantized` would have
+    /// flagged that case at serve-time).
+    ///
+    /// Errors:
+    /// - `unknown_repo`  if `repo_id` has no model entry.
+    /// - `unknown_quant` if the model entry has no `quant` quantization.
+    pub fn invalidate(&mut self, repo_id: &str, quant: QuantType) -> Result<u64> {
+        let _lock = self.lock_quant(repo_id, quant)?;
+        let model = self
+            .manifest
+            .models
+            .get(repo_id)
+            .ok_or_else(|| anyhow!(
+                "invalidate: unknown_repo: no manifest entry for {}",
+                repo_id
+            ))?;
+        if !model.quantizations.contains_key(quant.as_str()) {
+            return Err(anyhow!(
+                "invalidate: unknown_quant: {} has no {} quantization cached",
+                repo_id,
+                quant.as_str()
+            ));
+        }
+
+        // Compute bytes freed from disk before we remove anything.
+        let slug = slug_repo_id(repo_id)?;
+        let quant_dir = self
+            .root
+            .join("models")
+            .join(&slug)
+            .join("quantized")
+            .join(quant.as_str());
+        let freed = dir_total_bytes(&quant_dir);
+
+        // Remove the on-disk tree first; if this fails we leave the
+        // manifest entry intact so the operator can retry.
+        if quant_dir.exists() {
+            fs::remove_dir_all(&quant_dir)
+                .with_context(|| format!("remove quant dir: {}", quant_dir.display()))?;
+        }
+
+        // Drop the manifest entry and persist atomically.
+        if let Some(m) = self.manifest.models.get_mut(repo_id) {
+            m.quantizations.remove(quant.as_str());
+        }
+        self.flush()?;
+        Ok(freed)
+    }
+
+    /// Remove every quantization for `repo_id` and the entire
+    /// `models/<slug>/` directory tree (covers `repo_meta.json`,
+    /// `source/`, and every `quantized/<quant>/`).  Acquires all
+    /// per-quant advisory locks for the repo (so a concurrent serve
+    /// resolving any of them blocks until this returns).
+    ///
+    /// Returns the total bytes freed.
+    ///
+    /// Errors:
+    /// - `unknown_repo` if `repo_id` has no manifest entry.
+    pub fn invalidate_repo(&mut self, repo_id: &str) -> Result<u64> {
+        let model = self
+            .manifest
+            .models
+            .get(repo_id)
+            .ok_or_else(|| anyhow!(
+                "invalidate_repo: unknown_repo: no manifest entry for {}",
+                repo_id
+            ))?;
+
+        // Collect every quant string up front (deterministic
+        // BTreeMap-iteration order) so the lock-acquisition order is
+        // stable across processes — prevents AB/BA deadlocks.
+        let quant_strs: Vec<String> = model
+            .quantizations
+            .keys()
+            .cloned()
+            .collect();
+
+        // Acquire every per-quant lock.  We hold these across the
+        // remove + flush so concurrent serve sees a coherent before
+        // /after.
+        let mut locks: Vec<CacheLock> = Vec::with_capacity(quant_strs.len());
+        for q in &quant_strs {
+            let lock_path = self
+                .root
+                .join("locks")
+                .join(format!("{}__{}.lock", slug_repo_id(repo_id)?, q));
+            locks.push(CacheLock::acquire(&lock_path)?);
+        }
+
+        let slug = slug_repo_id(repo_id)?;
+        let model_dir = self.root.join("models").join(&slug);
+        let freed = dir_total_bytes(&model_dir);
+
+        if model_dir.exists() {
+            fs::remove_dir_all(&model_dir)
+                .with_context(|| format!("remove model dir: {}", model_dir.display()))?;
+        }
+
+        self.manifest.models.remove(repo_id);
+        self.flush()?;
+
+        // `locks` drops here, releasing every per-quant flock.
+        drop(locks);
+        Ok(freed)
+    }
+
+    /// Remove every entry from the cache.  Walks `<root>/models/` to
+    /// compute bytes freed, removes the entire models tree, and resets
+    /// the manifest to an empty default.  Locks are NOT acquired —
+    /// the caller (the CLI handler) is responsible for external
+    /// coordination (`hf2q cache clear --all --yes`).
+    ///
+    /// Returns the total bytes freed.  Idempotent: running twice
+    /// returns `0` on the second call.
+    pub fn purge(&mut self) -> Result<u64> {
+        let models_dir = self.root.join("models");
+        let freed = dir_total_bytes(&models_dir);
+
+        if models_dir.exists() {
+            fs::remove_dir_all(&models_dir)
+                .with_context(|| format!("remove models tree: {}", models_dir.display()))?;
+        }
+        // Recreate the empty `models/` so the layout invariant
+        // (`open_at` expects `models/` to exist) holds for the very
+        // next `record_source` without a re-open.
+        fs::create_dir_all(&models_dir)
+            .with_context(|| format!("recreate models tree: {}", models_dir.display()))?;
+
+        self.manifest = CacheManifest::default();
+        self.flush()?;
+        Ok(freed)
+    }
+
+    /// Iterate over every cached model entry as a lightweight view
+    /// `(repo_id, model_entry)`.  Read-only; cheap given the manifest
+    /// already lives in memory.  Used by `hf2q cache list` and
+    /// `hf2q cache size`.
+    pub fn iter_entries(&self) -> impl Iterator<Item = CacheEntryView<'_>> {
+        self.manifest
+            .models
+            .iter()
+            .map(|(repo_id, model)| CacheEntryView { repo_id, model })
+    }
+
+    /// Sum the on-disk byte size of every cached `model.gguf` +
+    /// `mmproj.gguf`.  Walks `<root>/models/` once.  Used by
+    /// `hf2q cache size`.
+    pub fn total_bytes_on_disk(&self) -> u64 {
+        let models_dir = self.root.join("models");
+        dir_total_bytes(&models_dir)
+    }
+
     /// Atomically persist the manifest to `<root>/manifest.json`.
     pub fn flush(&self) -> Result<()> {
         let path = self.root.join("manifest.json");
@@ -709,6 +917,19 @@ impl ModelCache {
 pub struct HfHubSnapshot {
     pub path: PathBuf,
     pub revision: String,
+}
+
+/// Lightweight read-only view yielded by [`ModelCache::iter_entries`].
+/// Borrows from the underlying manifest; no ownership transfer or
+/// allocation per entry.  Used by `hf2q cache list` to render rows
+/// and by `hf2q cache size` to sum bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheEntryView<'a> {
+    /// The HF repo_id key for this entry (`org/repo`).
+    pub repo_id: &'a str,
+    /// The full model entry (revision, source, quantizations,
+    /// last_accessed_secs, source_shards).
+    pub model: &'a ModelEntry,
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -823,6 +1044,46 @@ fn resolve_hf_hub_root() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Sum the total byte size of every regular file under `dir`,
+/// recursively.  Returns `0` if `dir` does not exist or is unreadable
+/// (silent — caller already separately validated the path).  Used by
+/// the invalidation surface (iter-205) to compute "bytes freed" before
+/// removing a tree, and by [`ModelCache::total_bytes_on_disk`] to
+/// answer `hf2q cache size`.
+///
+/// Symlinks are not followed (matches the test-side `walk_total`
+/// helper, and avoids pathological cycles); `read_dir` errors are
+/// swallowed silently because the function is observability — a
+/// broken FS subtree should not crash the CLI handler.
+fn dir_total_bytes(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let ty = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ty.is_symlink() {
+            continue;
+        }
+        if ty.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                total = total.saturating_add(meta.len());
+            }
+        } else if ty.is_dir() {
+            total = total.saturating_add(dir_total_bytes(&entry.path()));
+        }
+    }
+    total
 }
 
 /// SHA-256 of a file as lowercase hex.  Used by [`QuantEntry`] writers.

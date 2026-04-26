@@ -66,6 +66,27 @@ impl QuantType {
             Self::Q3_K_M => "Q3_K_M",
         }
     }
+
+    /// Parse the canonical GGML name back into a `QuantType`.  Case-
+    /// insensitive on input (e.g. `q4_k_m` is accepted) so `hf2q
+    /// cache clear --quant q4_k_m` matches what an operator types
+    /// from muscle memory.  Returns `Err` with a message naming all
+    /// supported variants when the input is unrecognized.
+    ///
+    /// Pair-wise inverse of [`Self::as_str`]:
+    ///   `QuantType::from_canonical_str(qt.as_str()).unwrap() == qt`
+    /// for every variant.
+    pub fn from_canonical_str(name: &str) -> std::result::Result<Self, String> {
+        match name.to_ascii_uppercase().as_str() {
+            "Q8_0" => Ok(Self::Q8_0),
+            "Q6_K" => Ok(Self::Q6_K),
+            "Q4_K_M" => Ok(Self::Q4_K_M),
+            "Q3_K_M" => Ok(Self::Q3_K_M),
+            other => Err(format!(
+                "unknown quant type {other:?}: supported = Q8_0, Q6_K, Q4_K_M, Q3_K_M"
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for QuantType {
