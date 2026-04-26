@@ -84,8 +84,19 @@ base64 = "0.22"
 regex = "1"
 
 # Jinja2 chat template rendering (pure Rust; matches llama.cpp's vendored
-# common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
+# common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681).
+#
+# `minijinja-contrib`'s `pycompat` feature is the canonical adapter for
+# chat templates authored against Python's Jinja2 (which transparently
+# exposes Python-string methods like `.split()`, `.strip()`, `.lstrip()`,
+# `.lower()` on strings). Without it, real-world templates that call
+# e.g. `text.split('<channel|>')` — present in the Gemma 4 chat
+# template's `strip_thinking` macro — fail at the second turn of any
+# multi-turn chat with `UnknownMethod: string has no method named split`.
+# Surfaced and fixed during ADR-005 Phase 2a iter-133 Iter A while
+# closing the Open WebUI multi-turn AC 2509 harness.
 minijinja = "2"
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 
 # tempfile is used at runtime by the convert pipeline (ADR-012 P9b two-pass
 # intermediate GGUF for qwen35 / qwen35moe activation capture) AND by tests.

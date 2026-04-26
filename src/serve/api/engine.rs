@@ -1847,6 +1847,19 @@ pub fn render_chat_prompt(
     }
 
     let mut env = minijinja::Environment::new();
+    // ADR-005 Phase 2a iter-133 Iter A side-fix: register
+    // `minijinja-contrib`'s pycompat callback so chat templates authored
+    // against Python's Jinja2 (which transparently exposes Python-string
+    // methods like `.split()`, `.strip()`, `.lstrip()`, `.lower()`) render
+    // without `UnknownMethod` errors. The Gemma 4 chat template's
+    // `strip_thinking` macro calls `text.split('<channel|>')` on every
+    // assistant content; without pycompat, every multi-turn chat fails
+    // HTTP 400 at the second user turn (the first model message hits the
+    // macro). Discovered during the iter-133 Open WebUI multi-turn E2E
+    // test harness; pycompat is purely additive (consulted only when
+    // minijinja can't find a method natively), so existing single-turn
+    // and non-Python-style templates are unaffected.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
     let tmpl = env
@@ -2049,6 +2062,64 @@ assistant:
         }];
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         assert!(out.contains("assistant:hello"));
+    }
+
+    #[test]
+    fn render_chat_prompt_handles_pythonic_string_methods_via_pycompat() {
+        // ADR-005 Phase 2a iter-133 Iter A regression test for the
+        // pycompat side-fix in `render_chat_prompt`. Real-world chat
+        // templates (Gemma 4's `strip_thinking` macro is the surfaced
+        // case) call Python-string methods like `.split()` directly on
+        // string values; minijinja's vanilla Environment doesn't expose
+        // those, so a multi-turn render that exercises the macro fails
+        // with `UnknownMethod: string has no method named split` at the
+        // second user turn.
+        //
+        // This template is a minimal stand-in: a `{%- macro -%}` that
+        // calls `text.split('|')` (Python-style), invoked once per
+        // assistant message inside a `for messages` loop. Without the
+        // pycompat callback this `render_chat_prompt` call panics on
+        // unwrap; with the callback it renders cleanly.
+        let tmpl = "<|turn>model\n\
+                    {%- macro splitter(text) -%}\
+                    {%- for part in text.split('|') -%}{{ part }}+{% endfor -%}\
+                    {%- endmacro -%}\
+                    {% for m in messages %}\
+                    {%- if m.role == 'model' -%}M:{{ splitter(m.content) }}\n\
+                    {%- else -%}{{ m.role }}:{{ m.content }}\n{% endif -%}\
+                    {% endfor %}";
+        let msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("hi".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("a|b|c".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("again".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+        let out = render_chat_prompt(tmpl, &msgs).unwrap();
+        assert!(out.contains("user:hi"), "out={out}");
+        // assistant remapped to model (gemma marker present), then split('|')
+        // produced ["a", "b", "c"], each with a trailing '+'.
+        assert!(out.contains("M:a+b+c+"), "out={out}");
+        assert!(out.contains("user:again"), "out={out}");
     }
 
     #[test]
