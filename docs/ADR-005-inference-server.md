@@ -1428,6 +1428,96 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2a iter-133 Iter B-2 + Iter C — engine ToolCallSplitter lands (Bug 3 root-caused as 2a, fixed); reasoning-panel test infra (Scenario 3) lands but live-blocked by qwen3.6 serve-load bug; AC 2509 still `[ ]` — iter D blocker = qwen3.6-27b GGUF load failure in src/serve/forward_mlx.rs (2026-04-26, W66, hf2q commits `64e6515` + `6ac78e4` + `e1d7e09` + `ff8b5af` + `9356e1e` + `<adr-entry>`)
+
+**Why this iter exists.** W65 closed iter B (Scenario 2 tool-call round-trip lands; two production fix-forwards: `tools` threaded into chat-template render at commit 5cd410e; `tool_choice="none"` honored at commit 153cfbd) but explicitly DEFERRED two items: (1) iter B-2 — engine `ToolCallSplitter` to convert raw `<|tool_call>...<tool_call|>` text in `delta.content` into structured `delta.tool_calls[*].function.{name,arguments}` chunks per the OpenAI streaming spec; (2) iter C — Scenario 3 reasoning-panel test for `delta.reasoning_content`. Both gate AC 2509 closure.
+
+**Phase 1 — Chesterton's-fence read.** Verified the W65 directive's Bug-3 verdict was `2a` (genuinely missing splitter), not `2b` (existing splitter with edge case) or `2c` (mislabel). Evidence:
+
+* `src/serve/api/sse.rs:208-247` — `GenerationEvent::ToolCallDelta` SSE encoder variant plumbed + unit-tested by `tool_call_delta_round_trips_through_sse`. Encoder ready; no producer.
+* `src/serve/api/engine.rs::generate_stream_once:1443-1453` — `ReasoningSplitter` wired; no sibling tool splitter; the variable name `splitter` is overloaded to mean "reasoning splitter" (singular).
+* `src/serve/api/registry.rs:92-100` — `GEMMA4` registration declared `tool_open: "<tool_call>"` / `tool_close: "</tool_call>"` (the Qwen convention).
+* `models/gemma4/chat_template.jinja:189-203` — actual emission is `<|tool_call>call:NAME{...}<tool_call|>` (asymmetric pipe placement).
+* `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt` (W65 fixture) — captured the bug verbatim: 195 chunks of `<|tool_call>` raw text in `delta.content`, zero structured `delta.tool_calls`.
+
+Two distinct production bugs identified:
+
+  1. **Marker-mismatch** — even if a splitter had existed, the registry declared the wrong literals. Pre-fix the splitter would have detected nothing.
+  2. **No producer-side splitter** — exactly as W65's Bug-3-deferred note claimed.
+
+**Iter B-2 fix-forward (commit `64e6515`).** Three additions to `src/serve/api/registry.rs` + `src/serve/api/engine.rs`:
+
+* `ToolCallSplitter` — sibling to `ReasoningSplitter`, identical boundary-marker + tail-buffer pattern. Output enum `ToolCallEvent::{Content, ToolCallOpen, ToolCallText, ToolCallClose}` so the engine can buffer body text between Open/Close and emit structured deltas at Close.
+* `parse_tool_call_body(reg, body)` — per-family parser. Day-one supports Gemma 4's `call:NAME{key1:<|"|>val<|"|>,...}` syntax (with `<|"|>`-quoted strings, top-level-comma split that respects quote spans, JSON-literal fallback for numbers/bools) AND Qwen 3.5/3.6's `<function=NAME>\n<parameter=k>v</parameter></function>` syntax. Returns `ParsedToolCall { name, arguments_json }` ready for the SSE encoder.
+* GEMMA4 registration corrected: `tool_open: "<|tool_call>"`, `tool_close: "<tool_call|>"`. Locked in by new unit test `gemma4_tool_call_markers_match_chat_template_emission`.
+
+`generate_stream_once` composition: ReasoningSplitter first (reasoning never appears inside a tool call); the `Content`-classified output stream flows into ToolCallSplitter; on `ToolCallClose` the body is parsed and emitted as **two-chunk** OpenAI-spec ToolCallDelta (id+type+name first, full `arguments_json` second). `finish_reason` overrides to `"tool_calls"` per OpenAI spec when ≥1 structured delta was emitted.
+
+17 new unit tests in `registry.rs`: splitter (marker spans fragment boundary, qwen vs gemma marker distinctness, mid-call EOS, no-registration null) + parser (Gemma 4 string/numeric/bool args, quoted-comma in `<|"|>`-strings, empty args, malformed; Qwen function/parameter blocks with JSON or string-fallback values).
+
+**Iter B-2 live verification (gemma-4-26B-A4B-it-ara-abliterated-dwq, T=0).** `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_tools` PASS:
+
+```
+turn1_finish="tool_calls"  // override fired
+turn1_tool_calls=[AccumulatedToolCall {
+    id: Some("call_hf2q_18a9fee676769760"),
+    call_type: Some("function"),
+    name: Some("get_current_weather"),
+    arguments: "{\"location\":\"Paris\"}"
+}]
+turn2_text="The current weather in Paris is 18°C and partly cloudy."
+determinism PASS
+```
+
+Re-recorded fixture `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt` (commits `6ac78e4` retired pre-fix, `9356e1e` re-recorded post-fix) captures the structured wire shape. `normalize_chunk_for_replay` extended to also normalize per-tool-call wall-clock `id` (`call_hf2q_<UNIX_EPOCH-ns>`) so byte-replay matches across runs.
+
+Negative-path companion (`tool_choice="none"`) live-PASS: zero markers in `delta.content`, zero structured `delta.tool_calls`.
+
+**Iter C — Scenario 3 reasoning-panel test (commit `e1d7e09` + `ff8b5af`).** Lands `tests/openwebui_reasoning.rs` (282 LOC) + `tests/openwebui_helpers/mod.rs` extension (`ReasoningStreamCapture` struct + `streaming_chat_extract_reasoning` async helper).
+
+Test asserts seven invariants: SSE protocol (200 + role chunk + `[DONE]`); both `delta.reasoning_content` and `delta.content` non-empty; reasoning observed BEFORE content (Decision #21 ordering for the Open WebUI panel UX); raw markers (`<think>`, `</think>`, `<|think|>`, `</think|>`) MUST NOT leak into either slot; `finish_reason == "stop"|"length"`; T=0 determinism (byte-identical reasoning + content + finish on re-run).
+
+Test default model: `qwen3.6-27b-dwq46` (Qwen 3.5/3.6's `<think>` / `</think>` markers exactly match QWEN35 registry declaration). Override via `HF2Q_REASONING_TEST_MODEL=<path>`.
+
+**Iter C live-run BLOCKED.** Two distinct hf2q-serve panics on qwen3.6-27b GGUF load:
+
+  1. Default LMHEAD_Q8 path — `range end index 1269990400 out of range for slice of length 1269985280` at `src/serve/forward_mlx.rs:803`. `5120 = qwen3.6 hidden dim`, suggesting the lm_head Q8 quantize block is off-by-one-row in the embed_f32 slice. Likely vocab-pad / un-pad mismatch.
+  2. `HF2Q_LMHEAD_Q8=0` workaround path — `tensor 'blk.0.attn_q.weight' not found in GGUF`. Per `project_qwen36_architecture.md`, the qwen3.6 hybrid arch (3:1 Gated DeltaNet → Gated Attention) uses different tensor names than qwen3.5; the serve forward path expects qwen3.5 names.
+
+Iter C test commit `ff8b5af` bounds the load-probe to 30s so iter C skips cleanly with a clear iter-D-blocker message rather than burning the full 600s `wait_for_readyz` budget on connection-refused reads.
+
+**Honest closure of AC 2509 (line 2878).**
+
+| Concern              | Iter           | Status                                                                  |
+|----------------------|----------------|-------------------------------------------------------------------------|
+| streaming            | A (W64)        | exercised + recorded fixture (T=0 determinism PASS)                     |
+| tool use — request   | B (W65)        | exercised + real model invokes tool                                     |
+| tool use — none path | B (W65)        | exercised + tool_choice=none honored                                    |
+| tool use — SSE shape | **B-2 (W66)**  | **exercised — structured delta.tool_calls; finish_reason="tool_calls"** |
+| reasoning panel      | **C (W66)**    | **infra LANDED + skip-mode PASS; live BLOCKED by qwen3.6 load bug**     |
+
+AC 2509 stays `[ ]`. The split is honest: 4 of 5 legs are now exercised live against a real model at T=0; the 5th leg (reasoning panel) has its test infrastructure ready and exits cleanly via skip when the qwen3.6 load bug fires. Per the iter directive: *"If iter C cannot run (no reasoning-capable model cached locally), DO NOT flip the AC. Document the model-blocker explicitly and recommend iter D = re-run after qwen3.6 download lands."* The model IS cached; the load-path is broken. Same outcome.
+
+**Iter-133 Iter D plan.** Fix `src/serve/forward_mlx.rs:803` lm_head Q8 vocab-pad slice OOB OR fix the qwen3.6 hybrid-arch tensor-name registry on the serve forward path. Estimated 1-2 iters (the qwen3.6 work in `project_qwen36_architecture.md` already lays the groundwork; commit `fc85681` confirms `qwen35 GGUF now LOADS` for the GENERATE path — the SERVE path lags). After iter D, re-run `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_reasoning -- --test-threads=1 --nocapture` and AC 2509 candidate-flips if scenario 3 PASS.
+
+**Phase 4 cargo verify (W66 final).**
+
+* `cargo check --release` → 0
+* `cargo build --release --bin hf2q` → 0
+* `cargo test --release --test openwebui_multiturn` (skip mode) → 1/1 PASS
+* `cargo test --release --test openwebui_tools` (skip mode) → 2/2 PASS
+* `cargo test --release --test openwebui_reasoning` (skip mode) → 1/1 PASS
+* `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_multiturn -- --test-threads=1` → 1/1 PASS (Scenario 1 regression PASS)
+* `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_tools -- --test-threads=1` → 2/2 PASS (Scenario 2 + tool_choice=none, with structured-delta assertions firing PASS)
+* `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_reasoning -- --test-threads=1` → 1/1 PASS (skips with iter-D blocker message in 30.44s)
+* `cargo test --release --bin hf2q -- vision::` → 241/241 PASS (no vision regression)
+
+**Iter B-2 unit-test deltas:**
+* `serve::api::registry::tests` — 32/32 PASS (15 pre-existing + 17 new in iter B-2)
+* `serve::api::sse::tests` — 8/8 PASS (no SSE-encoder regression)
+
+---
+
 #### Phase 2a iter-133 Iter B — Open WebUI tool-call E2E test (Scenario 2 tool_choice=auto + tool_choice=none companion) lands; surfaced + fixed two production tool-call blockers in src/serve/api/{engine,handlers}.rs; real model output validates fix-forward end-to-end (gemma-4 invokes `get_current_weather` → tool result → "The current weather in Paris is 18°C and partly cloudy."); AC 2509 still `[ ]` — `delta.tool_calls` SSE-shape extractor deferred to iter B-2 alongside iter C reasoning panel (2026-04-26, W65, hf2q commits `5cd410e` + `7625220` + `153cfbd` + `<adr-entry>`)
 
 **Why this iter exists.** W64 iter-133 Iter A landed Scenario 1 (text-stream multi-turn) plus the minijinja-contrib pycompat side-fix that any gemma4 multi-turn chat needed. Iter A's exit-state directive was: *"Scenario 2 tool-call round-trip. Send a chat with `tools: [{...}]`, assert the grammar-driven tool-call delta sequence ... AC 2509 candidate flip if iters A+B together cover 'streaming, tool use'."* Iter B is that work. Per iter-A's discovery pattern (the minijinja blocker was found by Chesterton's-fence reading + first live run), iter B repeated the protocol with the chat-completions tool-call surface.
