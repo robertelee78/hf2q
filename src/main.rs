@@ -516,51 +516,58 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // Phase 1.42: ADR-012 Decision 19 — MTP tensor handling.
+    // Phase 1.42: ADR-013 P14 — MTP tensor handling.
     //
-    // HF Qwen3.5 emits 15 `mtp.*` tensors that the original P11 work
-    // (commit `0a1a7b7`) did not handle:
-    //   - 11 inner-transformer-block tensors at
-    //     mtp.layers.0.{self_attn,mlp,*norm}.*
-    //   - 4 wrapper tensors:
-    //     mtp.{fc, norm, pre_fc_norm_embedding, pre_fc_norm_hidden}.weight
+    // Emit Qwen3.5 MTP tensors by default. HF names use `mtp.*`; the helper
+    // rewrites them into `model.layers.{num_hidden_layers + mtp_idx}.*` so the
+    // GGUF mapper emits:
+    //   - inner transformer-block tensors at `blk.{N}.*`
+    //   - wrapper NextN tensors at `blk.{N}.nextn.*`
     //
-    // llama.cpp rejected every emitted GGUF with
-    //   done_getting_tensors: wrong number of tensors; expected N, got N-15
+    // Temporary escape hatch:
+    //   HF2Q_QWEN35_DROP_MTP=1
     //
-    // because those 15 names passed through `hf_name_to_gguf` unrenamed.
-    //
-    // **Decision (2026-04-25):** llama.cpp's qwen35 / qwen35moe loaders do
-    // NOT read LLM_KV_NEXTN_PREDICT_LAYERS and have no per-layer slots
-    // allocated for an MTP block.  Renaming `mtp.*` to `blk.{n_layer}.*`
-    // therefore causes a "missing tensor" rejection on the very first
-    // ssm_conv1d that the recurrent-layer pattern expects.  Until
-    // llama.cpp gains qwen35 MTP support, the only loadable choice is to
-    // **drop all mtp.* tensors** from the convert output.  ADR-013's
-    // mtp.rs::load_mtp_weights_if_present treats absence as expected
-    // (returns Ok(None)), so this drop is observable but non-fatal on
-    // the inference side.
-    //
-    // When llama.cpp gains qwen35 MTP loading (and starts reading
-    // NEXTN_PREDICT_LAYERS into hparams.nextn_predict_layers), this phase
-    // flips to actually emit the MTP block by uncommenting
-    // `rename_mtp_tensors_to_layer_form` + bumping block_count in
-    // `gguf.rs::build_metadata` to include nextn_predict_layers.
+    // REMOVE when llama.cpp adds qwen35 MTP loading OR by 2026-Q4 if upstream
+    // lags. The default must remain emit-by-default so hf2q-produced GGUFs
+    // carry the complete MTP block for native speculative decoding.
     {
-        let mtp_keys: Vec<String> = tensor_map
-            .tensors
-            .keys()
-            .filter(|n| n.starts_with("mtp."))
-            .cloned()
-            .collect();
-        if !mtp_keys.is_empty() {
-            tracing::info!(
-                dropped = mtp_keys.len(),
-                "Phase 1.42: dropping {} mtp.* tensors (llama.cpp qwen35/qwen35moe loader has no MTP slots; ADR-012 Decision 19 follow-up 2026-04-25)",
-                mtp_keys.len()
-            );
-            for key in mtp_keys {
-                tensor_map.tensors.remove(&key);
+        let qwen35_family = models::qwen35::is_qwen35_family_architecture(
+            &metadata.architecture,
+            &metadata.model_type,
+        );
+        let drop_mtp = qwen35_family
+            && std::env::var("HF2Q_QWEN35_DROP_MTP")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+        if drop_mtp {
+            let mtp_keys: Vec<String> = tensor_map
+                .tensors
+                .keys()
+                .filter(|n| n.starts_with("mtp."))
+                .cloned()
+                .collect();
+            if !mtp_keys.is_empty() {
+                tracing::warn!(
+                    dropped = mtp_keys.len(),
+                    "HF2Q_QWEN35_DROP_MTP=1: dropping {} mtp.* tensors; escape hatch expires when llama.cpp adds qwen35 MTP loading OR by 2026-Q4 if upstream lags",
+                    mtp_keys.len()
+                );
+                for key in mtp_keys {
+                    tensor_map.tensors.remove(&key);
+                }
+            }
+        } else {
+            let renamed =
+                models::qwen35::rename_mtp_tensors_to_layer_form(&mut tensor_map, &metadata)
+                    .context("qwen35 MTP tensor rename failed")
+                    .map_err(AppError::Conversion)?;
+            if renamed > 0 {
+                tracing::info!(
+                    renamed,
+                    "Phase 1.42: emitting {} qwen35 MTP tensors by default",
+                    renamed
+                );
             }
         }
     }
