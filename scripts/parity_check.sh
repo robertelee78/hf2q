@@ -52,6 +52,16 @@ FAIL=0
 # Encodes Gate F (N≥3 determinism): a single flaky run fails the gate.
 # When EXTRA_ARGS is non-empty they're forwarded to `hf2q parity check`
 # (used to plumb --self-baseline for Gate D).
+#
+# ADR-007 post-close 2026-04-24 (commit 7a4d354): byte-exact gates require
+# DENSE decode. TQ is the default decode path post-correction; argmax
+# divergence is ~0.8% by physical design (Lloyd-Max codebook is lossy).
+# Force HF2Q_USE_DENSE=1 explicitly here so the gate keeps asserting
+# "hf2q dense == llama.cpp" byte-identity. Mirrors the precedent in
+# scripts/sourdough_gate.sh:120-123. The `env -u` clears any inherited
+# layer-policy / codebook-bits override that would re-activate TQ.
+# Iter-107 reconciliation: this script previously had zero HF2Q_USE_DENSE
+# references — that was the half-done migration the iter finishes.
 run_parity_n_times() {
   local prompt="$1"
   local min_prefix="$2"
@@ -63,7 +73,8 @@ run_parity_n_times() {
   local run_fail=0
   for run in $(seq 1 "$N_RUNS"); do
     # shellcheck disable=SC2086
-    if $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt "$prompt" \
+    if env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS HF2Q_USE_DENSE=1 \
+        $HF2Q_BIN parity check --model "$GGUF_PATH" --prompt "$prompt" \
         --min-prefix "$min_prefix" $extra_args 2>/dev/null >/dev/null; then
       run_pass=$((run_pass + 1))
     else

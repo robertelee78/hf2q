@@ -98,6 +98,19 @@ echo "min decode tps:  $MIN_DECODE_TPS"
 echo "perf max-tokens: $MAX_TOKENS"
 echo
 
+# ADR-007 post-close 2026-04-24 (commit 7a4d354): every byte-exact / decode-
+# perf gate below runs under the DENSE regime via HF2Q_USE_DENSE=1. TQ-8-bit
+# became the default decode path that day; argmax divergence is ~0.8% by
+# physical design (Lloyd-Max codebook is lossy), so byte-exact gates against
+# llama.cpp / the frozen self-baseline must force dense to stay valid.
+# Precedent: scripts/sourdough_gate.sh:120-123. Iter-107 reconciliation
+# (W11) finished the half-done migration: this script previously had zero
+# HF2Q_USE_DENSE references. The `env -u` prefix clears any inherited
+# HF2Q_LAYER_POLICY / HF2Q_TQ_CODEBOOK_BITS that would re-activate TQ from
+# the user's shell. Gate B perf-sanity uses dense too because the published
+# floor (102.9-103.4 tok/s on M5 Max) was measured under dense; mixing
+# regimes would compare apples to oranges.
+
 # --- Gate 1: parity suite (Gates C/E + F) ---
 echo "--- Gate 1/4: parity suite ---"
 if ! "$SCRIPT_DIR/parity_check.sh" "$GGUF_PATH"; then
@@ -116,7 +129,8 @@ echo
 echo "--- Gate 2/4: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
 PERF_SAMPLES=()
 for run in 1 2 3; do
-  if ! "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PERF_PROMPT" \
+  if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS HF2Q_USE_DENSE=1 \
+        "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt "$PERF_PROMPT" \
         --max-tokens "$MAX_TOKENS" --temperature 0 \
         >/dev/null 2>"$PERF_LOG"; then
     echo "perf sanity run $run crashed; see $PERF_LOG" >&2
@@ -169,7 +183,8 @@ if [[ -f "$PREFILL_2048_PROMPT" ]]; then
   echo
   echo "--- Gate 3/4: prefill perf on ≥2048-token prompt (batched) ---"
   PREFILL_LOG="/tmp/release_check_prefill.log"
-  if ! HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1 \
+  if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
+        HF2Q_USE_DENSE=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1 \
       "$HF2Q_BIN" generate --model "$GGUF_PATH" --prompt-file "$PREFILL_2048_PROMPT" \
         --max-tokens 1 --temperature 0 \
         >/dev/null 2>"$PREFILL_LOG"; then
@@ -218,7 +233,8 @@ echo
 echo "--- Gate 4/4: mlx-native counter thresholds (Gate G) ---"
 COUNTER_LOG="/tmp/release_check_counters.log"
 COUNTER_PROMPT="Complrehensive instructions for making sourdough bread."
-if ! HF2Q_DUMP_COUNTERS=1 "$HF2Q_BIN" generate \
+if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
+      HF2Q_USE_DENSE=1 HF2Q_DUMP_COUNTERS=1 "$HF2Q_BIN" generate \
     --model "$GGUF_PATH" --prompt "$COUNTER_PROMPT" \
     --max-tokens 128 --temperature 0 \
     >/dev/null 2>"$COUNTER_LOG"; then
