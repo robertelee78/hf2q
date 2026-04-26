@@ -1072,6 +1072,19 @@ Both fallbacks keep path (a) intact; neither requires path (b).
 
 **Acceptance (P9b close):** all 7 sub-tasks shipped; new integration test green on synthetic qwen35-dense + qwen35-moe; old P9b-pending guard message removed from `src/main.rs`; intermediate GGUF cleanup verified by test on both happy-path and panic-path (Drop runs).
 
+#### Apex MoE activation capture: architectural OOM blocker (2026-04-25 finding)
+
+The two-pass conversion pipeline works end-to-end for **qwen35 dense** (27B) — both dwq46 and dwq48 GGUFs shipped this session. For **qwen35moe** (apex 35B-A3B), the pipeline gets to step 5 (RealActivationCapture::new → Qwen35Model::load_from_gguf on the intermediate F16 GGUF) and hits a memory wall:
+
+- Intermediate F16 GGUF emit succeeds: 66 GB on disk, all 6 P9b real-model fixes (a) language_model strip, (b) gate_up split, (c) pre-merged detect, (d) vocab pad, (e) A_log dtype, (f) linear_attn name map applied cleanly.
+- `load_moe_ffn_quantized` rejects F16 expert dtype (expects native GGML block quant Q4_0/Q8_0/Q5_K/Q6_K).
+- Routing to the F32-expanded `Qwen35FfnWeights::Moe` variant would expand 32.2 B MoE-expert params × 4 bytes ≈ 128 GB, plus tensor_map ~70 GB held = ~198 GB total. **System RAM is 128 GB.** Even with tensor_map dropped pre-capture (the cost-model OOM-mitigation candidate #3), the F32-expanded model alone is at the system limit with no slack.
+- `MoeQ` (production native-quant) path returns `RealActivationCaptureError::ForwardPass` per the existing architectural decision (the CPU forward kernel doesn't have a `quantized_matmul_ggml` for the F32 codepath).
+
+**Practical conclusion:** activation-aware DWQ for apex 35B-A3B requires the capture forward pass to run on the **GPU** via mlx-native's existing `quantized_matmul_ggml` kernel, not the CPU `forward_cpu` path. That's a real ADR-013 follow-up: extend `RealActivationCapture::run_calibration_prompt` to dispatch to the GPU forward when the model is `MoeQ`. Out of scope for P9b — would require coupling the convert-time activation capture to the runtime GPU forward path.
+
+For this session's Task #16 close: **qwen35 dense × dwq46/dwq48 shipped (2/4)**; apex MoE × dwq46/dwq48 deferred to the GPU-capture follow-up.
+
 #### P9 first real-model DWQ GGUF SHIPPED 2026-04-25
 
 `models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf` produced via the
