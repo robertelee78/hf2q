@@ -203,29 +203,30 @@ impl Qwen35Model {
             }
         }
 
-        // ADR-012 P9b real-model finding (apex MoE convert v6, 2026-04-25):
-        // detect whether the MoE expert tensors are stored quantized
-        // (Q4_0/Q5_K/Q6_K — production GGUF) or unquantized (F16/F32 —
-        // intermediate F16 GGUF emitted by emit_gguf_from_tensor_map).
-        // Routes to the matching loader: MoeQ for native quant, Moe (F32-
-        // expanded) for unquantized. The F32-expand path is what enables
-        // activation calibration on apex MoE — peak ~128 GB MoE params at
-        // F32, recovered to ~90 GB after macOS memory compression (per
-        // 27B dense empirical, ~30% compression ratio). Caller must drop
-        // tensor_map before this load to fit in 128 GB system RAM.
+        // ADR-012 item-2 architectural fix (2026-04-25): MoE experts MUST
+        // be loaded as native ggml-quantized blocks (`MoeQ`). The previous
+        // F16-detection / F32-expand fallback ("Moe" variant via
+        // `weight_loader::load_moe_ffn`) was peer-misaligned — peers
+        // (mlx-lm, llama.cpp, AutoAWQ) never F32-expand MoE experts at load
+        // time. Apex 35B-A3B at F32 is ~128 GB which doesn't fit on a
+        // 128 GB system; the convert pipeline now emits MoE experts at
+        // Q8_0 in the intermediate (see `quantize::intermediate_moe_q8`)
+        // so this branch is unreachable for production inputs. If a caller
+        // ever supplies F16/F32 experts (e.g. legacy GGUFs), we fail loud
+        // at load time rather than silently expanding.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-        let moe_experts_unquantized = if cfg.variant == Qwen35Variant::Moe {
-            gguf.tensor_info("blk.0.ffn_gate_exps.weight")
-                .map(|info| matches!(info.ggml_type, GgmlType::F16 | GgmlType::F32))
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        if moe_experts_unquantized {
-            tracing::info!(
-                "qwen35moe load: detected F16/F32 MoE experts (intermediate F16 GGUF \
-                 path); routing to F32-expanded Moe variant for activation calibration"
-            );
+        if cfg.variant == Qwen35Variant::Moe {
+            if let Some(info) = gguf.tensor_info("blk.0.ffn_gate_exps.weight") {
+                if matches!(info.ggml_type, GgmlType::F16 | GgmlType::F32) {
+                    return Err(anyhow!(
+                        "qwen35moe load: MoE expert tensor 'blk.0.ffn_gate_exps.weight' \
+                         is dtype {:?}; native ggml-block quantization (Q4_0, Q5_K, Q6_K, Q8_0) \
+                         is required. Re-emit the GGUF with quantized MoE experts — no \
+                         F32-expansion fallback per ADR-012 item-2 (peer alignment).",
+                        info.ggml_type
+                    ));
+                }
+            }
         }
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
@@ -237,14 +238,9 @@ impl Qwen35Model {
                         .get(i as usize)
                         .copied()
                         .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
-                    let ffn_weights = if moe_experts_unquantized {
-                        // F16/F32 experts — F32-expand via load_moe_ffn.
-                        let ffn = weight_loader::load_moe_ffn(gguf, i, &device)
-                            .with_context(|| format!("load_moe_ffn layer {i} (F32-expanded path)"))?;
-                        Qwen35FfnWeights::Moe(ffn)
-                    } else {
-                        // Production quantized experts (Q4_0/Q5_K/Q6_K) —
-                        // keep native blocks on Metal; no F32 expansion.
+                    // Production quantized experts (Q4_0/Q5_K/Q6_K/Q8_0) —
+                    // keep native blocks on Metal; no F32 expansion.
+                    let ffn_weights = {
                         let ffn = weight_loader::load_moe_ffn_quantized(gguf, i, &device)
                             .with_context(|| format!("load_moe_ffn_quantized layer {i}"))?;
                         Qwen35FfnWeights::MoeQ(ffn)
