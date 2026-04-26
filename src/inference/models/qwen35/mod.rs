@@ -529,11 +529,15 @@ mod tests {
         let gguf = match GgufFile::open(&path) {
             Ok(g) => g,
             Err(e) => {
-                // Apex GGUF contains Q5_K tensors; mlx-native's GGUF loader
-                // only supports F32/F16/Q4_0/Q8_0/Q4_K/Q6_K as of 2026-04-23.
-                // Q5_K + I16 support lands in P5 (ADR-013 Decision 12).
-                // Until then, this test cannot open the full apex file; skip.
-                eprintln!("skipping: apex GGUF open failed ({e}) — waiting on P5 Q5_K/I16 loader support");
+                // mlx-native's GGUF loader supports F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/
+                // Q6_K/I16 (verified at /opt/mlx-native/src/gguf/mod.rs:300-313
+                // and dequant table :755-765, as of 2026-04-25).  Q5_K mv_id +
+                // dequant are wired (see weight_loader.rs:405-411 and
+                // /opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:65-70);
+                // only the Q5_K mm_id kernel (large-batch prefill > 8 tokens)
+                // is not yet ported.  If GGUF open fails here it's almost
+                // certainly an unrelated parse/IO issue, not a Q5_K limitation.
+                eprintln!("skipping: apex GGUF open failed ({e})");
                 return;
             }
         };
