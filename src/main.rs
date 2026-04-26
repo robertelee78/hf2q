@@ -10,6 +10,7 @@
 
 #[allow(dead_code)]
 mod arch;
+mod calibrate;
 #[allow(dead_code)]
 mod backends;
 mod cli;
