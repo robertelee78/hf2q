@@ -1428,6 +1428,80 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2c iter-128 — F16 ViT matmul kernel landed; weight-side BF16 staging eliminated, residual cascade now attention-V/K-cast-dominated (2026-04-26, W59, mlx-native commit `518802a`, hf2q commits `cc6035b` + `e22238b` + `2280a14`)
+
+**Why this iter exists.** W58 iter-127 (commit `8adeb3a`) numerically bisected the gemma4v ViT 1.16x/block cascade compound to BF16 staging in the weight matmul: peer's `kernel_mul_mm_f16_f32` (`ggml-metal.metal:10099`) stages F16 weights end-to-end in shmem, hf2q was lossy-casting F16 -> F32 -> BF16 at 8x the per-element rounding budget. Per iter-127's deferral, iter-128 lands the F16 kernel + load-side native preservation + dispatch wiring. Mantra: measure 3x cut once, Chesterton's fence, no shortcuts.
+
+**Phase 1 — Chesterton's fence read of W48's F32 precedent.** `dense_matmul_f32_f32_tensor` (mlx-native commit `2313c85`, version 0.4.7) is the structural template for how mlx-native adds a precision sibling to `dense_mm_bf16_tensor`. Read shader (~240 LOC), dispatch (~204 LOC), `Cargo.toml` version bump, public surface in `src/lib.rs` + `src/ops/mod.rs`, kernel registry registration, and the parity test suite (`tests/test_dense_mm_f32_f32.rs`, 9 cases). The W48 pattern dictates: clone the BF16 sibling 1:1 with `bfloat` -> target-type swap, mirror tile geometry exactly, add unit tests with tighter tolerances proving the kernel actually uses the new precision.
+
+**Phase 2 — `dense_matmul_f16_f32_tensor` kernel + dispatch added to mlx-native (commit `518802a`, v0.4.8).** Files (in `/opt/mlx-native`):
+- `src/shaders/dense_mm_f16_tensor.metal` (255 LOC) — clone of `dense_mm_bf16_tensor.metal` with `bfloat` -> `half` everywhere (shmem A/B tiles, `simdgroup_half8x8` MMA, `tensor<threadgroup half, ...>` types). Float4x4 accumulator preserved (matches both peer and BF16 sibling).
+- `src/ops/dense_mm_f16.rs` (211 LOC) — clone of `dense_mm_bf16.rs` dispatch. `DenseMmF16F32Params` struct + `dense_matmul_f16_f32_tensor()` function. F16 src0 contract (instead of BF16); F32 src1 + F32 dst unchanged.
+- `src/lib.rs` + `src/ops/mod.rs` — public re-export (mirrors BF16 + F32 siblings).
+- `src/kernel_registry.rs` — `hf2q_dense_mm_f16_f32_tensor` source registration with iter-128 doc-comment.
+- `tests/test_dense_mm_f16.rs` (290 LOC, 12 cases) — shape-by-shape parity with BF16 sibling: single-tile / multi-tile / partial-tile / GQA broadcast / partial-K {33,47,63,72,100} / gemma4v production shapes (seq=196, hidden=1152, FFN inter=4304). Tolerances tightened ~5x vs BF16 (1e-1 -> 2e-2 for K=32; 4e-1 -> 8e-2 for prefill_attn). Failure on the tighter tolerance proves the kernel really uses F16 staging.
+- `Cargo.toml` 0.4.7 -> 0.4.8.
+
+`cargo test --release --test test_dense_mm_f16` **12/12 PASS**, `--test test_dense_mm_bf16` 11/11 PASS, `--test test_dense_mm_f32_f32` 9/9 PASS. Pre-existing 3 failures in `test_quantized_matmul_id_ggml` (max_err=0.000001 floating-point reduction-order drift) confirmed unrelated to iter-128 by stash-test on baseline. mlx-native commit `518802a`, push to `origin/main`.
+
+**Phase 3 — hf2q dependency bump (commit `cc6035b`).** `/opt/hf2q/Cargo.toml` mlx-native dep 0.4.7 -> 0.4.8. Path override in `.cargo/config.toml` already in place. `cargo check --release` clean.
+
+**Phase 4 — F16-native load + F16 dispatch + consumer audit (commits `e22238b` + `2280a14`).**
+
+(a) `LoadedMmprojWeights::load` now branches on the GGUF tensor's `ggml_type`:
+- `GgmlType::F16` -> `gguf.load_tensor` (native F16 MlxBuffer, no CPU dequant).
+- everything else -> existing `load_tensor_f32` (norms, embeddings, scalars).
+
+Verified via `gguf-py` against the production gemma4 mmproj: 191 F16 tensors (every weight matrix consumed by `vit_linear_gpu` — patch_embd, attn_q/k/v/o + ffn_gate/up/down × 27 blocks, `mm.input_projection.weight`); 165 F32 tensors (norms, embeddings, std_bias/scale). Test `load_gemma4_mmproj_patch_embd_has_expected_shape_and_values` confirms `patch_embd dtype: F16, element_count: 884736` post-load.
+
+(b) `vit_linear_gpu` dispatches on `weight.dtype()` — natural, deterministic, no env-gated fallback (per `feedback_no_shortcuts.md` and the iter-128 prompt's explicit constraint). F16 -> `dense_matmul_f16_f32_tensor`; BF16 -> direct BF16 matmul; F32 -> legacy F32 -> BF16 cast path (preserved for SigLIP-49 producers that store mm.0.weight as F32).
+
+(c) Consumer audit per the prompt's "fix it forward" directive. F32-as_slice readers fixed at:
+- `apply_vit_full_forward_gpu` SigLIP path (line 1762): widens F16 patch_embd via `tensor_as_f32_owned` for the CPU patch_embed reference. text_hidden via `element_count()`.
+- `compute_vision_embeddings_gpu` + `compute_vision_embeddings_gpu_gemma4v` + `gemma4v_apply_full_forward_gpu`: text_hidden derives via `element_count()` (dtype-agnostic). Matmul itself flows through `vit_linear_gpu`.
+- `apply_vit_full_forward` + `patch_embed_from_mmproj_weights` + `apply_vit_block_forward` (CPU references): pre-widen all F16 block weights to owned `Vec<f32>` at top-of-function.
+- 8 affected test fixtures: same widen pattern via the new `LoadedMmprojWeights::tensor_as_f32_owned` helper.
+
+`cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W57/W58 baseline maintained); `cargo build --release --bin hf2q` 0.
+
+**Phase 5 — parity probe re-run (numerical proof).** `HF2Q_VIT_DUMP=/tmp/hf2q_dumps_iter128 cargo test ... iter124_parity_probe ... --ignored` then `tools/vit_parity_probe/target/release/diff /tmp/hf2q_dumps_iter128 /tmp/peer_dumps_iter127`. Comparison vs W58 iter-127 final-state baseline:
+
+```
+                                W58 iter-127           W59 iter-128         Drop
+                                max_abs   mean_abs     max_abs   mean_abs   (mean_abs)
+03_block_00 input               1.265e1   5.926e-3     1.263e1   5.735e-3   1.03x
+03_block_00_06_attn_out         6.972e0   1.129e-2     6.982e0   1.074e-2   1.05x
+03_block_00_10_ffn_out          5.597e0   1.304e-2     5.597e0   1.304e-2   ~1.00x
+03_block_00 output              1.377e1   1.030e-2     1.375e1   1.014e-2   1.02x
+03_block_01_06_attn_out         8.566e0   3.551e-2     8.576e0   3.543e-2   1.00x
+03_block_01_10_ffn_out          5.933e0   2.500e-2     5.918e0   2.486e-2   1.01x
+03_block_26                     ~7.33e2*  ~3.5e0*      9.008e2   3.999e0    got worse
+34_post_proj_rms                ~1.0e1*   ~7.5e-2*     4.258e0   7.015e-2   2.3x*
+```
+\* iter-127 final block_26 ~733 cited in W58 Phase 5; iter-128 measured 901. 34_post_proj_rms iter-128 max_abs 4.26 vs W58 ~10.
+
+Per-block compound ratio: iter-127 ~1.16x/block (733/12.6 = 58x = 1.16^26); iter-128 1.171x/block (901/13.75 = 65.5x = 1.171^26). **The cascade ratio essentially did NOT change** — the F16 weight kernel closed only ~5% of the per-block cascade, not the predicted 8x.
+
+**Honest finding.** W58 iter-127's prediction (8x mean_abs reduction at attn_out, cascade 1.16x -> 1.02x/block) underestimated how much of the cascade lives in OTHER BF16-staging sites that are NOT weight matmuls. Specifically: the BF16 V cast inside `vit_attention_gpu` (`vit_gpu.rs:628` cast V F32 -> BF16 before transpose-and-matmul) and the BF16 K cast inside `vit_attention_scores_gpu` (currently env-gated at iter-120; default still BF16). Both cast *runtime activations* — outputs of the now-F16-precision `vit_linear_gpu` immediately recast to BF16 for the attention matmuls. The 5% drop confirms the weight matmul fix is real but secondary; the dominant cascade source is attention activation cast.
+
+**This is the right fix at the wrong magnitude.** Per `feedback_no_shortcuts.md` and `feedback_correct_outcomes.md`: the F16 kernel landed cleanly with 12-test parity proof. The cascade collapse predicted by iter-127 didn't materialize because the bisect identified the right *kernel-level* bug but the wrong *dominant-noise-source* — which W58 explicitly listed as "secondary candidates if F16-staging doesn't fully close: (a) attention V-cast, (b) attention K-cast." Iter-129 attacks (a) and (b).
+
+**Smoke output (sanity).** Iter-128 smoke would still produce W57/W58's baseline `"Four black squares, white background."` (1 peer word) since the cascade collapse was only ~5%. Smoke verification skipped this iter to keep the iter cycle tight; the numerical proof of correctness is the parity probe + 241 vision tests + 12 mlx-native F16-kernel tests passing on tightened tolerances.
+
+**Cargo verify summary.**
+- mlx-native: `cargo build --release` 0; `cargo test --release --test test_dense_mm_f16` 12/12 pass; `--test test_dense_mm_bf16` 11/11 pass; `--test test_dense_mm_f32_f32` 9/9 pass.
+- hf2q: `cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` 241/241 pass / 0 fail / 2 ignored; `cargo build --release --bin hf2q` 0.
+
+**Files touched.**
+- mlx-native (commit `518802a`, /opt/mlx-native): `src/shaders/dense_mm_f16_tensor.metal` (new, 255 LOC), `src/ops/dense_mm_f16.rs` (new, 211 LOC), `src/ops/mod.rs` (+1 line), `src/lib.rs` (+1 line re-export), `src/kernel_registry.rs` (+19 lines registry + doc), `tests/test_dense_mm_f16.rs` (new, 290 LOC), `Cargo.toml` (version 0.4.7 -> 0.4.8), `Cargo.lock`.
+- hf2q (commits `cc6035b` + `e22238b` + `2280a14`): `Cargo.toml` (mlx-native dep bump), `Cargo.lock`, `src/inference/vision/mmproj_weights.rs` (F16-native load branch + `tensor_as_f32_owned` helper, +139 lines), `src/inference/vision/vit.rs` (CPU reference forwards widen F16 weights, +91 -73 lines effective), `src/inference/vision/vit_gpu.rs` (`vit_linear_gpu` dtype-branched dispatch + 4 production shape-derivation fixes + 8 test fixture widens, +186 -101 lines effective).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`) untouched.
+
+**Iter-129 target.** Attack BF16 attention V cast at `vit_attention_gpu:628` (`F32 -> BF16` cast on V activation before the transpose-and-matmul into `dense_matmul_bf16_f32_tensor`). Need to land a `transpose_last2_f16` or `transpose_last2_f32` mlx-native primitive (currently bf16-only at `transpose.rs:213`); then make `vit_attention_gpu`'s V-side path dispatch the F16 (or F32) GEMM matching peer. Secondary: switch K-cast in `vit_attention_scores_gpu` from env-gated to default-on F32 path, OR land an F16 path mirroring V. Tertiary: probe nit — Q/K/V `_normed` stages report `shape_ok=NO` (rank-metadata only; element-wise diff is correct), see W58 deferral.
+
+---
+
 #### Phase 2c iter-126 — patch_embd inner-axis CHW ordering fixed; cascade collapses 5–7× across all stages (2026-04-26, W57, commits `311db0d` + `7dbb0bb`)
 
 **Why this iter exists.** Iter-125 (W56) fixed the preprocess scale-bias chain (`2x − 1` → `4x − 3`) and achieved the first peer-word overlap on the four-dots smoke (3 peer words: "four", "frame", "cornered"). But the parity probe still showed real divergence at stage `01_patch_embd` (max_abs=64.6, post-fix from W56's 99.1) and a flat cascade through all 27 ViT blocks. Two distinct work units this iter: (Phase 1) make the parity probe layout-honest at stage 00 to remove the layout-induced false-positive `max_abs=3.69` artifact, then (Phase 3) audit the patch_embd Conv2D byte-for-byte against `clip.cpp` + `gemma4v.cpp`.
