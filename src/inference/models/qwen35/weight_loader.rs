@@ -69,6 +69,38 @@ pub struct MoeFfnWeightsQ {
     pub shared_down: Vec<f32>,
 }
 
+// ============================================================================
+// Quantized Dense FFN weight container
+// ============================================================================
+
+/// Per-layer dense SwiGLU FFN weights kept in their native GGML quantization.
+///
+/// This mirrors [`MoeFfnWeightsQ`] for the dense path: the three projection
+/// buffers (`gate`, `up`, `down`) are raw GGML blocks (DType::U8 on Metal),
+/// exactly as they came off disk.  The Metal `quantized_matmul_ggml` kernel
+/// dequantizes on-the-fly during the matmul, so no F32 expansion occurs.
+///
+/// For a 27B dense GGUF (hidden=5120, intermediate=17408, Q4_K weights):
+///   F32 expansion: 17408×5120×2×4 bytes ≈ 714 MB per layer × 64 layers ≈ 46 GB
+///   Q4_K on-disk:  ≈ 7 GB per layer (4 bits/weight × 1.06× overhead)
+///   Total savings: ~39 GB Metal working set, eliminating the 129 GB OOM.
+pub struct DenseFfnWeightsQ {
+    /// Gate projection raw GGML blocks: `[intermediate_size, hidden_size]`.
+    pub gate_q: MlxBuffer,
+    /// Up projection raw GGML blocks: `[intermediate_size, hidden_size]`.
+    pub up_q: MlxBuffer,
+    /// Down projection raw GGML blocks: `[hidden_size, intermediate_size]`.
+    pub down_q: MlxBuffer,
+    /// GGML quantization type for gate/up (must be same — they share k=hidden_size).
+    pub ggml_type_gate_up: GgmlType,
+    /// GGML quantization type for down (may differ from gate/up in mixed-quant GGUFs).
+    pub ggml_type_down: GgmlType,
+    /// Dense FFN intermediate dimension (number of rows in gate/up weight).
+    pub intermediate_size: u32,
+    /// Model hidden dimension (number of columns in gate/up weight).
+    pub hidden_size: u32,
+}
+
 /// Load a tensor from the GGUF, dequantize to f32, and download into
 /// a `Vec<f32>`.
 pub fn load_f32_tensor(
@@ -451,6 +483,85 @@ pub fn load_dense_ffn(
     Ok(DenseFfnWeights { gate, up, down })
 }
 
+/// Load a dense FFN layer's weights, keeping projections in their native GGML
+/// quantization (e.g. Q4_K, Q6_K) — the production path for 27B dense GGUFs.
+///
+/// Gate/up/down projection buffers are loaded via `GgufFile::load_tensor` (raw
+/// GGML blocks, DType::U8 on Metal) rather than `load_tensor_f32`.  This
+/// eliminates the Q4_0→F32 round-trip that expands a 27B model from ~14 GB
+/// on-disk to ~129 GB in RAM, causing an OOM hang on M5 Max 128 GB.
+///
+/// Returns `Err` if any weight tensor has an unsupported quantization type
+/// (F32 and F16 are explicitly rejected; the caller's `load_layer` falls back
+/// to `load_dense_ffn` for synthetic/tiny models that use float weights).
+pub fn load_dense_ffn_quantized(
+    gguf: &GgufFile,
+    layer_idx: u32,
+    cfg: &Qwen35Config,
+    device: &MlxDevice,
+) -> Result<DenseFfnWeightsQ> {
+    let p = format!("blk.{}", layer_idx);
+
+    // Read quantization types from GGUF tensor metadata BEFORE loading buffers,
+    // so we can reject unsupported types cheaply without touching the tensor data.
+    let gate_info = gguf.tensor_info(&format!("{p}.ffn_gate.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate.weight not found in GGUF"))?;
+    let ggml_type_gate_up = gate_info.ggml_type;
+
+    let down_info = gguf.tensor_info(&format!("{p}.ffn_down.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down.weight not found in GGUF"))?;
+    let ggml_type_down = down_info.ggml_type;
+
+    // Reject float types — callers must use `load_dense_ffn` for those.
+    let supported = |t: GgmlType| matches!(
+        t,
+        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q6_K
+    );
+    if !supported(ggml_type_gate_up) {
+        return Err(anyhow!(
+            "layer {layer_idx}: gate/up dense weights have unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q4_K, or Q6_K for the quantized dense path; \
+             use load_dense_ffn for F32/F16 weights)",
+            ggml_type_gate_up
+        ));
+    }
+    if !supported(ggml_type_down) {
+        return Err(anyhow!(
+            "layer {layer_idx}: down dense weight has unsupported quant type {:?} \
+             (expected Q4_0, Q8_0, Q4_K, or Q6_K for the quantized dense path; \
+             use load_dense_ffn for F32/F16 weights)",
+            ggml_type_down
+        ));
+    }
+
+    // Load raw GGML blocks — DType::U8 on Metal, no F32 expansion.
+    let gate_q = gguf
+        .load_tensor(&format!("{p}.ffn_gate.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_gate.weight (quantized)"))?;
+    let up_q = gguf
+        .load_tensor(&format!("{p}.ffn_up.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_up.weight (quantized)"))?;
+    let down_q = gguf
+        .load_tensor(&format!("{p}.ffn_down.weight"), device)
+        .with_context(|| format!("layer {layer_idx} ffn_down.weight (quantized)"))?;
+
+    // Use config values as authoritative (already validated against GGUF metadata
+    // by Qwen35Config::from_gguf).
+    let hidden_size = cfg.hidden_size;
+    let intermediate_size = cfg.intermediate_size
+        .ok_or_else(|| anyhow!("layer {layer_idx}: dense FFN but cfg.intermediate_size is None"))?;
+
+    Ok(DenseFfnWeightsQ {
+        gate_q,
+        up_q,
+        down_q,
+        ggml_type_gate_up,
+        ggml_type_down,
+        intermediate_size,
+        hidden_size,
+    })
+}
+
 /// Load a complete layer (attention + FFN) per its `Qwen35LayerKind` and
 /// the model's FFN variant.
 pub fn load_layer(
@@ -465,16 +576,29 @@ pub fn load_layer(
         .copied()
         .ok_or_else(|| anyhow!("layer_idx {layer_idx} out of range"))?;
 
-    // MoE variant: route to the quantized Q path — MoeFfnWeightsQ preserves
-    // the GGUF's native Q6_K/Q8_0 expert tensor layout and avoids the 128 GB
-    // F32 expansion that OOMs on the real 35B-A3B model (256 experts × 40
-    // layers × 3 tensors × 2048×512 × 4 bytes exceeds Metal's 112 GB working
-    // set cap). The F32 `load_moe_ffn` / `Qwen35FfnWeights::Moe` variant is
-    // preserved for synthetic-weight unit tests that deliberately use F32
-    // inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
+    // Dense variant: prefer the quantized Q path (DenseQ) to avoid the
+    // Q4_0→F32 round-trip that causes the 129 GB OOM on 27B dense GGUFs.
+    // Fall back to F32 `load_dense_ffn` when the GGUF uses float weights
+    // (F32/F16), which covers synthetic test models and future architectures.
+    //
+    // MoE variant: always uses quantized MoeFfnWeightsQ (see comment in the
+    // MoeQ branch below for rationale).
     let ffn = match cfg.variant {
-        Qwen35Variant::Dense => Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?),
+        Qwen35Variant::Dense => {
+            // Try quantized path first; fall back to F32 for float-weight GGUFs
+            // (e.g. synthetic-weight unit tests that use F32 projections).
+            match load_dense_ffn_quantized(gguf, layer_idx, cfg, device) {
+                Ok(w) => Qwen35FfnWeights::DenseQ(w),
+                Err(_) => Qwen35FfnWeights::Dense(load_dense_ffn(gguf, layer_idx, device)?),
+            }
+        }
         Qwen35Variant::Moe => {
+            // MoeFfnWeightsQ preserves the GGUF's native Q6_K/Q8_0 expert tensor layout
+            // and avoids the 128 GB F32 expansion that OOMs on the real 35B-A3B model
+            // (256 experts × 40 layers × 3 tensors × 2048×512 × 4 bytes exceeds Metal's
+            // 112 GB working set cap). The F32 `load_moe_ffn` / `Qwen35FfnWeights::Moe`
+            // variant is preserved for synthetic-weight unit tests that deliberately use
+            // F32 inputs (see gpu_ffn.rs::build_moe_ffn_layer_gpu).
             Qwen35FfnWeights::MoeQ(load_moe_ffn_quantized(gguf, layer_idx, device)?)
         }
     };

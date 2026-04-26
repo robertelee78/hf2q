@@ -174,9 +174,15 @@ impl Qwen35Model {
                     };
                     moe_ffn_cpu_ref(&ffn_input, w, shape)
                 }
-                // MoeQ is a GGUF-loaded quantized variant; forward_cpu does not
-                // support it (expert weights are Metal buffers, not f32 vecs).
-                // CPU-only inference is not needed for the production path.
+                // DenseQ and MoeQ are GGUF-loaded quantized variants; forward_cpu
+                // does not support them (projection weights are Metal buffers, not
+                // f32 vecs). CPU-only inference is not needed for the production path.
+                Qwen35FfnWeights::DenseQ(_) => {
+                    return Err(anyhow!(
+                        "forward_cpu does not support DenseQ (quantized dense FFN weights \
+                         loaded from GGUF); use forward_gpu instead"
+                    ));
+                }
                 Qwen35FfnWeights::MoeQ(_) => {
                     return Err(anyhow!(
                         "forward_cpu does not support MoeQ (quantized expert weights \

@@ -48,8 +48,9 @@ use super::full_attn::FullAttnShape;
 use super::activation_capture::LayerActivations;
 use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q,
-    DenseFfnWeightsGpu, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q, build_moe_ffn_layer_gpu,
+    build_moe_ffn_layer_gpu_q, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
+    MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_linear_projection_f32, apply_linear_projection_f32_into, build_gated_attn_layer,
@@ -220,6 +221,8 @@ enum LayerWeightsGpu {
 
 enum FfnWeightsGpu {
     Dense(DenseFfnWeightsGpu),
+    /// Quantized dense SwiGLU (production GGUF load path for 27B dense — no OOM).
+    DenseQ(DenseFfnWeightsGpuQ),
     /// F32 MoE (unit-test / synthetic model path).
     Moe(MoeFfnWeightsGpu),
     /// Quantized MoE (production GGUF load path — no OOM).
@@ -905,6 +908,14 @@ impl Qwen35Model {
                         Some(&ffn_residual))
                         .with_context(|| format!("dense_ffn layer {layer_idx}"))?
                 }
+                FfnWeightsGpu::DenseQ(w) => {
+                    // Quantized dense path (production 27B DWQ GGUFs): weights stay as
+                    // GGML blocks; quantized_matmul_ggml dequantizes on-the-fly.
+                    // Residual folded in, same as Dense path.
+                    build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
+                        Some(&ffn_residual))
+                        .with_context(|| format!("dense_ffn_q layer {layer_idx}"))?
+                }
                 FfnWeightsGpu::Moe(w_gpu) => {
                     let moe = cfg.moe.as_ref().ok_or_else(|| {
                         anyhow!("MoE FFN missing moe config (layer {layer_idx})")
@@ -948,15 +959,16 @@ impl Qwen35Model {
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
 
             // --- Residual after FFN ---
-            // For MoeQ: residual is already folded into the FFN output (ffn_out = ffn + residual).
-            // For Dense and F32-MoE: still need a separate GPU add.
+            // For MoeQ / DenseQ / Dense: residual is already folded into the FFN output.
+            // For F32-MoE: still need a separate GPU add.
             let t_res2_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
             // Keep a clone for the optional layer dump below; only paid when dump is active.
             let ffn_out_for_dump = if dump_layer_n().is_some() { Some(ffn_out.clone()) } else { None };
             hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) => {
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => {
                     // Residual already folded in build_moe_ffn_layer_gpu_q /
-                    // build_dense_ffn_layer_gpu (with add_residual=Some).
+                    // build_dense_ffn_layer_gpu / build_dense_ffn_layer_gpu_q
+                    // (all called with add_residual=Some).
                     ffn_out
                 }
                 _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
@@ -1391,6 +1403,12 @@ impl Qwen35Model {
                         Some(&ffn_residual))
                         .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
                 }
+                FfnWeightsGpu::DenseQ(w) => {
+                    // Quantized dense path (production 27B DWQ GGUFs).
+                    build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
+                        Some(&ffn_residual))
+                        .with_context(|| format!("dense_ffn_q greedy layer {layer_idx}"))?
+                }
                 FfnWeightsGpu::Moe(w_gpu) => {
                     let moe = cfg.moe.as_ref().ok_or_else(|| {
                         anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
@@ -1431,8 +1449,10 @@ impl Qwen35Model {
             if let Some(t) = t_ffn_start { total_ffn_us += t.elapsed().as_micros() as u64; }
 
             // --- Residual after FFN ---
+            // DenseQ / Dense / MoeQ: residual already folded in (add_residual=Some).
+            // F32-MoE: separate GPU add still required.
             hidden = match ffn_weights_gpu {
-                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) => ffn_out,
+                FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => ffn_out,
                 _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
             };
@@ -1483,6 +1503,10 @@ impl Qwen35Model {
                     DenseFfnWeightsGpu::from_cpu(w, device)
                         .with_context(|| format!("upload dense_ffn layer {i}"))?,
                 ),
+                Qwen35FfnWeights::DenseQ(w) => {
+                    // Projection buffers already on Metal device (ARC retain, no data copy).
+                    FfnWeightsGpu::DenseQ(DenseFfnWeightsGpuQ::from_quantized(w))
+                }
                 Qwen35FfnWeights::Moe(w) => FfnWeightsGpu::Moe(
                     MoeFfnWeightsGpu::from_cpu(w, device)
                         .with_context(|| format!("upload moe_ffn layer {i}"))?,
@@ -1644,6 +1668,11 @@ mod tests {
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
                         }
+                        // DenseQ cannot be mutated in tests (Metal buffers are immutable);
+                        // test models always use Dense (F32) weights via empty_from_cfg.
+                        Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected DenseQ in test fixture — use Dense variant");
+                        }
                         Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");
                         }
@@ -1677,6 +1706,9 @@ mod tests {
                             w.gate = mk_rand(&mut seed, m_size * h, 0.02);
                             w.up = mk_rand(&mut seed, m_size * h, 0.02);
                             w.down = mk_rand(&mut seed, h * m_size, 0.02);
+                        }
+                        Qwen35FfnWeights::DenseQ(_) => {
+                            panic!("unexpected DenseQ in test fixture — use Dense variant");
                         }
                         Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_) => {
                             panic!("unexpected MoE in dense cfg");

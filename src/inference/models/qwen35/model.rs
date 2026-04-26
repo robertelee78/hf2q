@@ -15,7 +15,7 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
 use super::mtp::{load_mtp_weights_if_present, MtpWeights};
-use super::weight_loader::MoeFfnWeightsQ;
+use super::weight_loader::{DenseFfnWeightsQ, MoeFfnWeightsQ};
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 
 use mlx_native::gguf::GgufFile;
@@ -30,6 +30,10 @@ use mlx_native::MlxDevice;
 /// expert. Exactly one variant is populated per layer per model.
 pub enum Qwen35FfnWeights {
     Dense(DenseFfnWeights),
+    /// Quantized dense SwiGLU weights loaded directly from GGUF (production path).
+    /// Gate/up/down tensors stay in GGML block format on the Metal device;
+    /// no F32 expansion occurs during load. Used for 27B dense DWQ GGUFs.
+    DenseQ(DenseFfnWeightsQ),
     /// F32-dequantized MoE weights (unit tests / synthetic models only).
     Moe(MoeFfnWeights),
     /// Quantized MoE weights loaded directly from GGUF (production path).
@@ -42,6 +46,7 @@ impl Qwen35FfnWeights {
     pub fn variant(&self) -> &'static str {
         match self {
             Qwen35FfnWeights::Dense(_) => "dense",
+            Qwen35FfnWeights::DenseQ(_) => "dense-q",
             Qwen35FfnWeights::Moe(_) => "moe",
             Qwen35FfnWeights::MoeQ(_) => "moe-q",
         }
