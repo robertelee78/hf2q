@@ -1276,6 +1276,49 @@ There was no `encoder.memory_barrier()` between (1) and (2). mlx-native uses `MT
 
 ---
 
+#### Phase 2c iter-118 BF16 arm — `HF2Q_VIT_F32_ATTENTION` audit + Phase 7 blocker: F32×F32 GEMM kernel does not exist in mlx-native (2026-04-25, W47)
+
+**Dispatch context.** W47 in /loop /cfa wave 42, parallel arm of iter-118. iter-118 (W28) closed vision tests fully green via kernel-registration fix; this BF16 arm tests W46 iter-117's top remaining soft-token-divergence suspect: the `vit_attention_gpu` BF16 K/V cast at gemma4v scale=1.0. Pi-brain `project_vit_attention_bf16_softmax_drift.md` documents that BF16-cast K perturbs logits by ~0.68 and flips saturated-softmax winners on SigLIP-49; gemma4v compounds this differently across 27 layers.
+
+**Phase 1 — BF16 cast inventory (audit complete).** The vision attention path emits FIVE F32→BF16 casts per gemma4v block × 27 blocks = 135 BF16 casts total per image. Cited verbatim from `src/inference/vision/vit_gpu.rs`:
+
+1. **`vit_linear_gpu:88-104` — Q projection weight.** `cast(weight_f32 → weight_bf16)` then `dense_matmul_bf16_f32_tensor(weight_bf16, input_f32, …)`. Called from `gemma4v_block_forward_gpu` for `attn_q.weight`, `attn_k.weight`, `attn_v.weight`, `attn_out.weight`, plus `gate_proj`/`up_proj`/`down_proj` (3 MLP) — 7 BF16 weight casts per block.
+2. **`vit_attention_scores_gpu:407-424` — K activation cast.** After per-head RMS norm + 2D RoPE, K_perm F32 → K_bf16, then `dense_matmul_bf16_f32_tensor(k_bf16, q_perm_f32, …)` produces F32 scores. The Q activation stays F32; only K crosses BF16. **Per pi-brain memory: this is the iter-50 finding for SigLIP, ~0.68 logit perturbation.**
+3. **`vit_attention_gpu:560-578` — V activation cast.** After softmax(scores), V_perm F32 → V_bf16 to satisfy `transpose_last2`'s BF16-only contract and `dense_matmul_bf16_f32_tensor`'s src0=BF16 contract. Then matmul produces F32 attention output.
+
+The BF16 casts at sites 2 & 3 are Q/K/V *activations* — they are functions of the input image and per-block residual stream, not weights — so they re-quantize on every forward pass. Sites at #1 are weights (cast once per layer, but still lossy). Casts #2 + #3 are the targets of W46 iter-118's hypothesis.
+
+**Phase 2 — `HF2Q_VIT_F32_ATTENTION=1` env-gate implementation: BLOCKED at Phase 7.** mlx-native ships no F32×F32 GEMM with M>1. Inventory (`/opt/mlx-native/src/ops/dense_gemm.rs`):
+- `dispatch_dense_gemm_f16` — F16 weight, F32 i/o. Tile-based (M>1).
+- `dispatch_dense_matvec_f16w_f32io` — M=1 only (decode).
+- `dispatch_dense_matvec_bf16w_f32io` — M=1 only.
+- `dispatch_dense_matvec_f32` — M=1 only (`"M must be 1 (decode only)"`).
+- `dense_matmul_bf16_f32_tensor` (`/opt/mlx-native/src/ops/dense_mm_bf16.rs:77`) — tile-based, **src0=BF16, src1=F32, dst=F32; src0 BF16 dtype is hardware tensor-core contract, not a knob**.
+
+ViT attention at gemma4v scale runs at batch (=seq_len) = 256 (16×16 patch grid for 896×896 input, post-3×3 pool). Both attention matmuls — scores=Q@K^T and attn=scores@V — operate at M=256, so all available F32-i/o kernels (matvec) are unsuitable. The only tile-based GEMMs are F16-weight (also lossy) and BF16-weight (the very cast we want to bypass).
+
+**Workarounds considered + rejected.**
+- *Loop `dense_matvec_f32` over 256 rows × 16 heads × 2 matmuls × 27 layers ≈ 220K dispatches per image.* Metal command-buffer typically caps near 64K commands; this would require encoder-flush plumbing that doesn't exist. Even if plumbed it is a perf-pathological diagnostic, not a credible A/B vehicle. Rejected per `feedback_no_broken_windows.md` + `feedback_gpu_everything.md`.
+- *Reuse `dense_gemm_f16` (F16 weight, F32 i/o).* F16 is also lossy; replaces one quantization (BF16, ~3 mantissa bits + larger exponent) with another (F16, more mantissa, smaller exponent). Doesn't isolate the cast hypothesis.
+- *Pass F32 buffer to BF16-typed `src0` arg.* Crashes at the kernel layer (dtype mismatch in MlxBuffer alloc + tile loads); not a viable diagnostic.
+- *CPU readback / scalar fallback.* Violates "tests exercise GPU/NPU not CPU" (`feedback_tests_on_gpu_not_cpu.md`); test path runs Metal, CPU functions are tiny-input parity refs only.
+
+**Phase 7 blocker per dispatch authorization.** The dispatch's Phase 7 explicitly states: *"If implementing F32 attention requires a new mlx-native kernel: Phase 7 blocker, defer to iter-119."* This is exactly that case. Honest deferral over half-built env-gate scaffold that errors at runtime (which would itself be the broken-window per `feedback_no_broken_windows.md`).
+
+**iter-119 next-action.** Two viable kernel-port routes for the F32×F32 tile-based GEMM mlx-native needs:
+1. **Port mlx-lm's GEMM-F32.** `mlx-lm` ViT path computes attention in F32 throughout; its underlying mlx core ships an F32 tile GEMM. Port pattern follows `dense_mm_bf16_tensor.metal` (src `/opt/mlx-native/src/shaders/`) — swap `bfloat`→`float`, retain SIMD-group MMA tiling. Estimated 200 LOC kernel + 100 LOC dispatcher.
+2. **Port llama.cpp's `mul_mat_f32_f32` Metal kernel.** llama.cpp's `clip.cpp` ViT path uses `ggml_mul_mat` with F32 inputs end-to-end (no BF16 intermediate). Source at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:kernel_mul_mm_f32_f32`. Per `feedback_llama_cpp_over_candle.md`, llama.cpp is the preferred porting reference. Estimated similar size.
+
+After kernel lands in mlx-native, Phase 2 of this dispatch becomes ~80 LOC: gated `vit_attention_gpu_f32` path that skips both the K and V BF16 casts and dispatches the new kernel; gate threaded only through `gemma4v_block_forward_gpu` (per-arch isolation, SigLIP-49 path untouched). Phase 4 A/B run unblocks.
+
+**What this iter banks.** Phase 1's 5-site cast inventory (above) — the audit answers W46 iter-117's "additional BF16 casts" question concretely. The 7 weight casts per block via `vit_linear_gpu` are a NEW finding (W46 iter-117 only flagged the K/V activation casts at sites 2 + 3). This widens the iter-119 (or iter-120) hypothesis space: even if F32 attention shows no soft-token delta, the 7-per-block weight casts via `vit_linear_gpu` × 27 blocks = 189 weight quantizations remain candidates. The ordering for iter-119+: K/V activation casts FIRST (W46's hypothesis, smallest scope), then weight casts (broader, would also need F32×F32 GEMM since the weight cast feeds the same matmul).
+
+**Verification banked.** This is a doc-only iter; no code changes. Production default unchanged (BF16 attention via `dense_matmul_bf16_f32_tensor`, exactly as `5afc3e9` left it). Per dispatch constraint *"Don't change the BF16 production default unless Case 1 confirms it's the bug"* — which we cannot verify without the F32 kernel — production stays put.
+
+**Files NOT touched (per dispatch constraints):** `docs/ADR-014-streaming-convert-pipeline.md` (untracked), chat GGUF, frozen baselines, `sourdough_tq_quality.json`. Existing W47 host-quiet check (0 hf2q PIDs at dispatch); no model-load run attempted.
+
+---
+
 #### Phase 2c iter-118 — vision tests fully green; W25 kernel-registration omission closed (2026-04-25, W28)
 
 W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off by iter-117. **vision:: 233/233 PASS** (was 230/233); **gemma4v family 34/34 PASS**.
