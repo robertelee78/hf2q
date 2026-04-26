@@ -1428,6 +1428,118 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2a iter-133 Iter B — Open WebUI tool-call E2E test (Scenario 2 tool_choice=auto + tool_choice=none companion) lands; surfaced + fixed two production tool-call blockers in src/serve/api/{engine,handlers}.rs; real model output validates fix-forward end-to-end (gemma-4 invokes `get_current_weather` → tool result → "The current weather in Paris is 18°C and partly cloudy."); AC 2509 still `[ ]` — `delta.tool_calls` SSE-shape extractor deferred to iter B-2 alongside iter C reasoning panel (2026-04-26, W65, hf2q commits `5cd410e` + `7625220` + `153cfbd` + `<adr-entry>`)
+
+**Why this iter exists.** W64 iter-133 Iter A landed Scenario 1 (text-stream multi-turn) plus the minijinja-contrib pycompat side-fix that any gemma4 multi-turn chat needed. Iter A's exit-state directive was: *"Scenario 2 tool-call round-trip. Send a chat with `tools: [{...}]`, assert the grammar-driven tool-call delta sequence ... AC 2509 candidate flip if iters A+B together cover 'streaming, tool use'."* Iter B is that work. Per iter-A's discovery pattern (the minijinja blocker was found by Chesterton's-fence reading + first live run), iter B repeated the protocol with the chat-completions tool-call surface.
+
+**Phase 1 — Chesterton's-fence read of existing tool-call infra.**
+
+Audited `src/serve/api/{schema,handlers,engine,sse,registry,grammar/}.rs` end-to-end. Findings:
+
+- **Schema layer is complete** — `ChatCompletionRequest` carries `tools`, `tool_choice`, `parallel_tool_calls`. `ChatMessage` carries `tool_calls` (assistant) + `tool_call_id` (tool role). Streaming `ChunkDelta.tool_calls: Vec<ToolCallDelta>` with `index/id/type/function.{name,arguments}` is fully serde-defined.
+- **SSE encoder is complete** — `src/serve/api/sse.rs::GenerationEvent::ToolCallDelta` is the producer-side variant the encoder consumes; per-chunk emission yields the OpenAI streaming-arguments shape; final `finish_reason: "tool_calls"` path exists. Unit test `tool_call_delta_round_trips_through_sse` (lines 592-639) proves the encoder side correct in isolation.
+- **Handler / engine producer is NOT wired (production bug #1)** — `chat_completions` reads `req.tools` via serde but `render_chat_prompt` (the chat-template Jinja env) never received `tools` as a context variable. Every tool-aware chat template (gemma4, qwen3.5/3.6, llama3.x) gates its `<|tool>` declaration block on `{%- if tools -%}`, which evaluated to `false` because `tools` was simply not in scope. Result: the model never saw the operator's tool definitions, so it had no opportunity to invoke a tool — even when the schema accepted them and the SSE encoder was ready to emit the events. **AC 2509's tool-use leg was silently broken in production for every model.**
+- **`tool_choice="none"` is silently ignored (production bug #2)** — even after threading `tools` through, the chat template renders the tool defs into the system block regardless. With `tool_choice="none"`, OpenAI semantics require the model NOT invoke a tool this turn — Open WebUI uses this when the user toggles tools off. hf2q's surface accepted the field, parsed it via `ToolChoiceValue::parse`, but never propagated the negative case to render-time gating.
+- **`delta.tool_calls` extractor (the engine-streaming-side state machine that classifies model output text into tool-call deltas vs content deltas) is also missing.** This is the deeper bug; closing it requires extending `src/serve/api/registry.rs::ReasoningSplitter` with a `ToolCallSplitter` sibling and wiring it into `src/serve/api/engine.rs::generate_stream_once` alongside the existing reasoning splitter — the same boundary-marker pattern, routing tool-call markers through the `GenerationEvent::ToolCallDelta` event variant. Per iter-A's "fix-forward what's small, document what isn't" discipline, this third bug is **deferred to iter B-2**.
+
+The first two bugs are the iter-B production fix-forward (parallel to iter A's minijinja side-fix). The third bug is honestly named and tracked in the test's module-level doc + the iter-B-2 target below.
+
+**Phase 2 — Production fix-forward (commit `5cd410e`).**
+
+`src/serve/api/engine.rs::render_chat_prompt_with_tools(template_str, messages, tools)`:
+
+- Threads `tools` as a top-level Jinja variable (verbatim OpenAI tool-defs as `serde_json::Value`).
+- Per-message `tool_calls` (assistant): each `ChatMessage.tool_calls` entry serializes as `{id, type, function: {name, arguments}}` with `arguments` kept as the raw OpenAI string (gemma4 template handles both string + mapping shapes; preserving the string form is closest to what the model emitted the first time).
+- Per-message `tool_responses` (synthesized from `role: "tool"` history messages): OpenAI represents tool results as `{role: "tool", tool_call_id, content}` siblings; gemma4 + qwen3.5 templates expect a per-message `tool_responses: [{name, response}]` field on the SAME message. We do a single-pass scan over `messages` to build `id_to_name: HashMap<tool_call_id, function_name>` from prior assistant `tool_calls`, then synthesize `tool_responses` on every `role: "tool"` message via the lookup. The role string is left verbatim — the template decides whether to wrap with `<|turn>tool` or similar.
+- `render_chat_prompt(...)` now delegates to the with-tools variant with `tools = None`, byte-identical for legacy callers (`cmd_generate`, the summarizer's internal pass).
+- Caller plumbing: `req.tools.as_deref()` flows through `apply_overflow_policy` → `render_and_tokenize_for_overflow` → `apply_truncate_left` / `apply_summarize`. Summarizer's INTERNAL forward pass passes `None` (its private 2-message conversation has no business carrying the user's tool defs).
+
+Two new unit tests cover the fix-forward at engine level (commit `5cd410e`):
+
+- `render_chat_prompt_with_tools_threads_tools_into_jinja_context` — minimal template gates on `{%- if tools -%}`; asserts the block fires when `tools` is `Some(non-empty)`, does NOT fire when `None` or empty, and that the legacy `render_chat_prompt` entry-point is byte-identical to the empty/None path.
+- `render_chat_prompt_with_tools_threads_per_message_tool_calls_and_responses` — minimal template iterates messages and emits per-message `tool_calls` + synthesized `tool_responses`; asserts the `id_to_name` lookup populates `tool_responses[*].name` correctly from prior assistant tool_calls.
+
+**Phase 3 — Production fix-forward (commit `<TBD bug-2>`).**
+
+`src/serve/api/handlers.rs::prepare_chat_generation`:
+
+```rust
+let tool_choice = super::schema::ToolChoiceValue::parse(req.tool_choice.as_ref());
+let req_tools: Option<&[super::schema::Tool]> = match tool_choice {
+    super::schema::ToolChoiceValue::None => None,
+    _ => req.tools.as_deref(),
+};
+```
+
+`tool_choice="none"` is honored by suppressing tools at the chat-template render — the model never sees the tool defs and so cannot legitimately emit a tool-call marker. This is the safer semantics than letting the model see tools and hoping it ignores them: under T=0 with the gemma-4 abliterated DWQ, the observed live behavior was the model invoked the tool anyway because the chat-template's system-block tool declaration unconditionally lists every declared tool. `tool_choice="auto"` / `"required"` / forced-function still pass tools through; the per-call-shape grammar enforcement (Decision #6) is the deferred work.
+
+**Phase 4 — Test infrastructure (commit `7625220`).**
+
+`tests/openwebui_tools.rs` (613 LOC, separate from `tests/openwebui_multiturn.rs` because it tests a DIFFERENT scenario). Re-uses `tests/openwebui_helpers/mod.rs` verbatim (server-spawn, `/readyz` poll, fixture record/replay, canonical model-id lookup). A locally-defined `streaming_chat_with_tools` extends the shared `streaming_chat` with `tools` + `tool_choice` + a longer `max_tokens` budget; if iter C's reasoning-panel test needs the same shape it lifts to the helper module then.
+
+`scenario_2`: tool-aware streaming chat-completions request (`get_current_weather` schema, `tool_choice="auto"`). Asserts standard SSE protocol invariants (200 + content-type + non-empty content + `finish_reason` ∈ {stop, length, tool_calls, error} + `[DONE]` terminator). SOFT-asserts the model emitted the per-model `<|tool_call>` literal in `delta.content` — confirming end-to-end the iter-B fix-forward actually threads `tools` into the chat prompt. When the marker is present, exercises a turn-2 round-trip where the assistant's tool_calls history + a `role: "tool"` synthetic weather result are injected and the model's natural-language follow-up is asserted to reference the returned data (case-insensitive match on `[18|paris|celsius|cloudy]`). Determinism check (T=0 byte-identical accumulated content + finish_reason) mirrors Scenario 1.
+
+`tool_choice_none_companion`: tools defined, `tool_choice="none"`, request 200 OK, content non-empty, and CRITICALLY no per-model `<|tool_call>` marker appears. **The first live run of this companion FAILED — caught production bug #2 (tool_choice="none" silently ignored) — that's the iter-A's-minijinja-equivalent surface bug for iter B.** Fix landed in commit `153cfbd`.
+
+**Phase 5 — Live E2E real-model validation (gemma-4-26B-A4B-it-ara-abliterated-dwq, T=0).**
+
+Cold model load + warmup: `/readyz=200 after 4s` (warm cache). All test runs `--test-threads=1`.
+
+Turn 1 (`tool_choice="auto"`):
+- `finish_reason="length"` (model did not naturally stop within `max_tokens=256` after the tool-call marker; inline tool-call extractor + early-stop on `<tool_call|>` is the deferred extractor work).
+- `turn1_text = "<|tool_call>call:get_current_weather{location:<|\"|>Paris<|\"|>}<tool_call|>` ... [degenerate `<|tool_response>`-spam continuation because no extractor surrounds the well-formed call to terminate cleanly]
+- **Iter B fix-forward CONFIRMED end-to-end** — without the chat-template tools-threading, the model never could have emitted `call:get_current_weather` because it had no idea the function existed.
+
+Determinism PASS: turn1 re-run at T=0 produced byte-identical `accumulated_content` + `finish_reason`.
+
+Turn 2 (synthetic tool result injection — `assistant.tool_calls[]` + `role: "tool"`-result message):
+- `finish_reason="stop"` (clean stop — the tool result resolved the conversation).
+- `turn2_text = "The current weather in Paris is 18°C and partly cloudy."` — the model used the synthetic tool result naturally; case-insensitive substring match against `[18|paris|celsius|cloudy]` ALL satisfied.
+
+Companion (`tool_choice="none"`) post-fix: confirmed 200 OK, no `<|tool_call>` marker emitted (full pass — see Phase 6 cargo verify below for log).
+
+Recorded fixture: `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt` (217 chunks / 51181 bytes; truncated at the helper module's 50 KB cap — the per-token chunk granularity at `max_tokens=256` exceeds the cap. Replay path uses prefix-match for truncated fixtures, so this is correct by design — the fixture pins the wire-shape of the first 217 SSE chunks at T=0). The fixture replay layer normalizes per-request `id` and `created` fields (matches the iter-A normalization).
+
+**Phase 6 — Cargo verify (5 steps).**
+
+| # | Command | Result |
+|---|---------|--------|
+| 1 | `cargo check --release` | 0 errors / 11 warnings (all pre-existing) |
+| 2 | `cargo build --release --bin hf2q` | 0 errors |
+| 3 | `cargo test --release --test openwebui_tools` (skip mode, no env) | `2 passed / 0 failed` (both tests skip cleanly per ENV_GATE) |
+| 4 | `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_tools -- --test-threads=1` | `2 passed / 0 failed` (post-bug-2 fix; pre-fix had `1 passed / 1 failed` on companion) |
+| 5 | `cargo test --release --bin hf2q -- vision::` | matches iter-132 baseline (no vision regression) |
+
+Iter A's `openwebui_multiturn_streaming_chat_scenario_1` continues to PASS (skip mode), with no regression from the chat-template signature change (the legacy `render_chat_prompt(...)` entry-point is byte-identical to the new `..._with_tools(template_str, messages, None)` path).
+
+**Honest closure of AC 2509 (line 2509).**
+
+| Concern | Iter | Status |
+|---------|------|--------|
+| streaming | A | exercised + recorded fixture (`turn1_chunks.txt`) |
+| tool use — request side (`tools` reach the model + history echo-back works) | B | exercised + real model invokes `get_current_weather` |
+| tool use — `tool_choice="none"` negative path | B | exercised + production bug #2 fixed forward |
+| tool use — `delta.tool_calls` SSE-shape (streaming-arguments per OpenAI spec) | iter B-2 | **deferred** — engine `ToolCallSplitter` not yet wired |
+| reasoning panel | C | not yet exercised |
+
+AC 2509 stays `[ ]`. The AC text demands four concerns; iters A + B together cover ~2.5 of them. Iter B-2 closes the SSE-shape leg; iter C closes the reasoning-panel leg; AC 2509 candidate-flip is when both land.
+
+**Files touched.**
+
+- `src/serve/api/engine.rs` (commit `5cd410e`: `render_chat_prompt_with_tools` + 2 unit tests).
+- `src/serve/api/handlers.rs` (commit `5cd410e`: `tools` plumbing through overflow / truncate / summarize. Commit `153cfbd`: `tool_choice="none"` honored at render time).
+- `tests/openwebui_tools.rs` (commit `7625220`: 613 LOC test driver — Scenario 2 + tool_choice=none companion).
+- `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt` (commit `7625220`: 217 chunks / 51181 bytes recorded fixture, truncated at helper FIXTURE_MAX_BYTES cap).
+- `docs/ADR-005-inference-server.md` (this entry).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `forward_gpu` upload paths, `src/inference/models/qwen35/{forward_gpu, gpu_delta_net, gpu_ffn, gpu_full_attn, mod, decode_pool}.rs`) untouched. No mlx-native changes. No fences crossed (the parallel qwen35 session and ADR-014 streaming session committed mid-iter; rebase clean).
+
+**Iter-133 Iter B-2 target.** Engine `ToolCallSplitter` sibling to `ReasoningSplitter`. Per-model registration in `src/serve/api/registry.rs` already declares `tool_open` + `tool_close` fields on `ModelRegistration` (gemma4: `<tool_call>`/`</tool_call>`, qwen35: `<tool_call>`/`</tool_call>` — but the actual gemma4 chat template emits the *literal* markers `<|tool_call>...<tool_call|>`, so the registration markers may need updating to match what the model emits). Wire the splitter into `generate_stream_once` alongside the reasoning splitter; route tool-marker text through `GenerationEvent::ToolCallDelta` (already plumbed in `sse.rs`); parse the gemma-format `call:NAME{kv-list}<tool_call|>` into `name` + JSON `arguments` incrementally for the streaming-arguments OpenAI shape; emit `finish_reason: "tool_calls"` on first `<tool_call|>` close. Estimated 1 iter (boundary-marker pattern already proven by `ReasoningSplitter`); AC 2509 candidate flip if iter B-2 + iter C land cleanly.
+
+**Iter-133 Iter C target.** Scenario 3 reasoning-panel display via `HF2Q_REASONING_TEST_MODEL` env var (default to qwen3.6 once the GGUF is cached locally). Send a chat that triggers reasoning output; assert `delta.reasoning_content` chunks are streamed separately from `delta.content` per Decision #21. Will also reuse `tests/openwebui_helpers/mod.rs` directly. Estimated 1 iter.
+
+---
+
 #### Phase 2a iter-133 Iter A — Open WebUI multi-turn streaming chat E2E test (Scenario 1 text-stream) lands; surfaced + side-fixed minijinja-pycompat blocker for any gemma4 multi-turn render; AC 2509 partially exercised — tool use + reasoning panel deferred to iter-133 B/C (2026-04-26, W64, hf2q commits `763a1f1` + `aebbe97` + `18617b4` + `38b9917`)
 
 **Why this iter exists.** W63 iter-132 closed the Phase 2c vision-coherence chain at peer-precision-parity (F16 budget) and pivoted the iter-133 plan to the highest-priority closeable item: Phase 2a AC line 2509 ("Open WebUI on separate host: multi-turn chat works (streaming, tool use, reasoning-panel display). Image input required at 2c, not 2a."). The W4 research at line 3264 had already scoped this as 3 scenarios × 3 iters (Iter A text-stream, Iter B tool-call, Iter C reasoning-panel). Iter A lands the harness + Scenario 1 + recorded fixture so iters B/C have a working test base to extend.
