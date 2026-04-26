@@ -129,6 +129,21 @@ impl LoadedMmprojWeights {
         }
     }
 
+    /// Test-only: build a `LoadedMmprojWeights` from a pre-populated
+    /// tensor map. Used by parity tests that synthesize block weights
+    /// in-process rather than load a real GGUF (which would require a
+    /// fixture file on disk and the full 400 MB dequant cost).
+    #[cfg(test)]
+    pub fn from_tensors_for_test(
+        tensors: HashMap<String, MlxBuffer>,
+        device: MlxDevice,
+    ) -> Self {
+        Self {
+            tensors,
+            _device: device,
+        }
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()

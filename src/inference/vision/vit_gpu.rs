@@ -1912,6 +1912,647 @@ pub fn gemma4v_apply_position_embed_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Gemma4V per-block forward (GPU dispatch)
+// ---------------------------------------------------------------------------
+//
+// Sibling to `apply_vit_block_forward_gpu` (the SigLIP-49 path). Wires
+// up:
+//   - 4 Gemma-style RMSNorms ((weight + 1) gain) instead of 2.
+//   - GQA: K and V are projected to `num_kv_heads * head_dim`, then
+//     `repeat_kv`-expanded after RoPE.
+//   - V-norm: pure RMS (no learned gain) using mlx-native's
+//     `dispatch_rms_norm_no_scale_f32`.
+//   - 2-D NeoX RoPE on Q and K via mlx-native's `dispatch_vision_2d_rope`.
+//   - GELU(pytorch_tanh) on the gate proj instead of SiLU.
+//   - Attention scale = 1.0 (Q is RMS-normalized).
+//
+// All shapes/weights flow through the existing `LoadedMmprojWeights` /
+// `block_tensor(idx, suffix)` API — the loader is name-agnostic. The
+// caller provides the gemma4v-specific config (`Gemma4VisionBlockShape`)
+// and per-patch position arrays.
+
+use mlx_native::ops::elementwise::elementwise_mul as mlx_elementwise_mul;
+use mlx_native::ops::gelu::dispatch_gelu;
+use mlx_native::ops::rms_norm::dispatch_rms_norm_no_scale_f32;
+use mlx_native::ops::vision_2d_rope::{
+    build_vision_2d_rope_params, dispatch_vision_2d_rope,
+};
+
+/// Gemma-style RMSNorm on GPU: `y = x * rsqrt(mean(x²) + eps) * (weight + 1)`.
+///
+/// Builds a transient `weight + 1` buffer per call by adding a unit-vector
+/// constant to the loaded gain — the mlx-native RMSNorm kernel multiplies
+/// by the gain as-is, so the "+1" lives outside the kernel. Allocations:
+/// one `[dim]` ones-buffer (cheap) + one `[dim]` `weight + 1` buffer +
+/// one `[rows, dim]` output buffer.
+///
+/// # Why a sibling instead of changing `vit_rms_norm_gpu`
+///
+/// The SigLIP-49 path uses raw `weight` (no `+1`) and is correct for
+/// that arch. Adding `+1` unconditionally would silently change the
+/// SigLIP forward. Sibling primitive keeps both paths byte-stable.
+///
+/// # Errors
+///
+/// - any zero dim
+/// - propagated from underlying mlx-native dispatches
+#[allow(clippy::too_many_arguments)]
+pub fn vit_gemma_rms_norm_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gain_f32: &MlxBuffer,
+    rows: u32,
+    dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if rows == 0 || dim == 0 {
+        return Err(anyhow!(
+            "vit_gemma_rms_norm_gpu: rows ({rows}) and dim ({dim}) must be > 0"
+        ));
+    }
+    // Build a [dim] ones buffer (CPU-fill on unified-memory backed shared buffer).
+    let ones = device
+        .alloc_buffer(dim as usize * 4, DType::F32, vec![dim as usize])
+        .map_err(|e| anyhow!("vit_gemma_rms_norm_gpu: alloc ones: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; no aliasing.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(ones.contents_ptr() as *mut f32, dim as usize)
+        };
+        for v in s.iter_mut() {
+            *v = 1.0;
+        }
+    }
+    // gain_plus_one = gain + 1
+    let gain_plus_one = device
+        .alloc_buffer(dim as usize * 4, DType::F32, vec![dim as usize])
+        .map_err(|e| anyhow!("vit_gemma_rms_norm_gpu: alloc gain+1: {e}"))?;
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        gain_f32,
+        &ones,
+        &gain_plus_one,
+        dim as usize,
+        DType::F32,
+    )
+    .context("vit_gemma_rms_norm_gpu: gain + 1")?;
+    encoder.memory_barrier();
+
+    vit_rms_norm_gpu(encoder, registry, device, input, &gain_plus_one, rows, dim, eps)
+        .context("vit_gemma_rms_norm_gpu: rms_norm_gpu")
+}
+
+/// Gemma-style per-head RMSNorm on GPU: row-major `[batch, num_heads,
+/// head_dim]` is byte-identical to `[batch * num_heads, head_dim]`, so
+/// dispatch the 2-D variant with `rows = batch * num_heads`.
+#[allow(clippy::too_many_arguments)]
+pub fn vit_gemma_per_head_rms_norm_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    gain_f32: &MlxBuffer,
+    batch: u32,
+    num_heads: u32,
+    head_dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "vit_gemma_per_head_rms_norm_gpu: batch ({batch}), num_heads ({num_heads}), \
+             head_dim ({head_dim}) must all be > 0"
+        ));
+    }
+    let rows = batch
+        .checked_mul(num_heads)
+        .ok_or_else(|| anyhow!("vit_gemma_per_head_rms_norm_gpu: batch*num_heads overflow"))?;
+    vit_gemma_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, head_dim, eps)
+}
+
+/// V-norm (no learned gain) on GPU. Wraps mlx-native's
+/// `dispatch_rms_norm_no_scale_f32`. Dispatches per-head normalization
+/// (`rows = batch * num_kv_heads`, `dim = head_dim`).
+pub fn vit_v_norm_no_scale_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    batch: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    eps: f32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "vit_v_norm_no_scale_gpu: batch/num_kv_heads/head_dim must all be > 0"
+        ));
+    }
+    let rows = batch
+        .checked_mul(num_kv_heads)
+        .ok_or_else(|| anyhow!("vit_v_norm_no_scale_gpu: batch*num_kv_heads overflow"))?;
+    let n_elem = (rows as usize) * (head_dim as usize);
+    let output = device
+        .alloc_buffer(n_elem * 4, DType::F32, vec![rows as usize, head_dim as usize])
+        .map_err(|e| anyhow!("vit_v_norm_no_scale_gpu: alloc output: {e}"))?;
+    // Params: [eps, dim] (matches the rms_norm shader convention).
+    let params_buf = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("vit_v_norm_no_scale_gpu: alloc params: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; no aliasing.
+        let s: &mut [f32] =
+            unsafe { std::slice::from_raw_parts_mut(params_buf.contents_ptr() as *mut f32, 2) };
+        s[0] = eps;
+        s[1] = head_dim as f32;
+    }
+    dispatch_rms_norm_no_scale_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        &params_buf,
+        rows,
+        head_dim,
+    )
+    .context("vit_v_norm_no_scale_gpu: dispatch_rms_norm_no_scale_f32")?;
+    Ok(output)
+}
+
+/// 2-D NeoX RoPE on GPU. Wraps mlx-native's `dispatch_vision_2d_rope`.
+/// Allocates a fresh output buffer matching `input` (F32, `[batch *
+/// num_heads, head_dim]`).
+#[allow(clippy::too_many_arguments)]
+pub fn vit_vision_2d_rope_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    pos_x: &MlxBuffer,
+    pos_y: &MlxBuffer,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<MlxBuffer> {
+    if seq_len == 0 || n_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "vit_vision_2d_rope_gpu: seq_len/n_heads/head_dim must all be > 0"
+        ));
+    }
+    let n_rows = (seq_len as usize) * (n_heads as usize);
+    let n_elem = n_rows * (head_dim as usize);
+    let output = device
+        .alloc_buffer(n_elem * 4, DType::F32, vec![n_rows, head_dim as usize])
+        .map_err(|e| anyhow!("vit_vision_2d_rope_gpu: alloc output: {e}"))?;
+    let params = build_vision_2d_rope_params(device, theta, head_dim, n_heads)
+        .map_err(|e| anyhow!("vit_vision_2d_rope_gpu: build params: {e}"))?;
+    dispatch_vision_2d_rope(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &output,
+        &params,
+        pos_x,
+        pos_y,
+        seq_len,
+        n_heads,
+        head_dim,
+    )
+    .context("vit_vision_2d_rope_gpu: dispatch_vision_2d_rope")?;
+    Ok(output)
+}
+
+/// Repeat-kv on GPU: `[batch, num_kv_heads, head_dim]` →
+/// `[batch, num_kv_heads * num_kv_groups, head_dim]` by replicating each
+/// kv-head `num_kv_groups` times.
+///
+/// Implemented as a host-side gather table + a single `dispatch_gather_f32`
+/// over the output rows. For every output row `r`, the source row is
+/// `(b, k)` where `r = b * num_heads + h`, `k = h / num_kv_groups`,
+/// `src_row = b * num_kv_heads + k`. We build the src-index buffer on
+/// the host once per call, then gather.
+pub fn vit_repeat_kv_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    batch: u32,
+    num_kv_heads: u32,
+    num_kv_groups: u32,
+    head_dim: u32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || num_kv_heads == 0 || num_kv_groups == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "vit_repeat_kv_gpu: batch/num_kv_heads/num_kv_groups/head_dim must all be > 0"
+        ));
+    }
+    let num_heads = num_kv_heads
+        .checked_mul(num_kv_groups)
+        .ok_or_else(|| anyhow!("vit_repeat_kv_gpu: num_kv_heads*num_kv_groups overflow"))?;
+    let n_out_rows = batch
+        .checked_mul(num_heads)
+        .ok_or_else(|| anyhow!("vit_repeat_kv_gpu: batch*num_heads overflow"))?;
+    let n_in_rows = batch
+        .checked_mul(num_kv_heads)
+        .ok_or_else(|| anyhow!("vit_repeat_kv_gpu: batch*num_kv_heads overflow"))?;
+
+    // Build the gather index table on the host: out_row r = b * num_heads + h
+    //   → src_row = b * num_kv_heads + (h / num_kv_groups).
+    let idx_buf = device
+        .alloc_buffer(n_out_rows as usize * 4, DType::U32, vec![n_out_rows as usize])
+        .map_err(|e| anyhow!("vit_repeat_kv_gpu: alloc idx: {e}"))?;
+    {
+        // SAFETY: just-allocated u32 buffer.
+        let s: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                idx_buf.contents_ptr() as *mut u32,
+                n_out_rows as usize,
+            )
+        };
+        for b in 0..batch {
+            for h in 0..num_heads {
+                let kv_h = h / num_kv_groups;
+                s[(b * num_heads + h) as usize] = b * num_kv_heads + kv_h;
+            }
+        }
+    }
+
+    let n_out_elem = (n_out_rows as usize) * (head_dim as usize);
+    let output = device
+        .alloc_buffer(n_out_elem * 4, DType::F32, vec![n_out_rows as usize, head_dim as usize])
+        .map_err(|e| anyhow!("vit_repeat_kv_gpu: alloc output: {e}"))?;
+    dispatch_gather_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        &idx_buf,
+        &output,
+        n_in_rows,
+        head_dim,
+        n_out_rows,
+    )
+    .context("vit_repeat_kv_gpu: dispatch_gather_f32")?;
+    Ok(output)
+}
+
+/// Shape parameters for `gemma4v_block_forward_gpu` (mirrors the CPU
+/// `Gemma4VisionBlockShape`).
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4VisionBlockShapeGpu {
+    pub hidden: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub intermediate: u32,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+}
+
+/// GELU(pytorch_tanh) on GPU. Wraps mlx-native's `dispatch_gelu` and
+/// allocates a fresh F32 output buffer.
+pub fn vit_gelu_pytorch_tanh_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    n_elements: u32,
+) -> Result<MlxBuffer> {
+    if n_elements == 0 {
+        return Err(anyhow!("vit_gelu_pytorch_tanh_gpu: n_elements must be > 0"));
+    }
+    let output = device
+        .alloc_buffer(
+            (n_elements as usize) * 4,
+            DType::F32,
+            vec![n_elements as usize],
+        )
+        .map_err(|e| anyhow!("vit_gelu_pytorch_tanh_gpu: alloc output: {e}"))?;
+    dispatch_gelu(encoder, registry, device.metal_device(), input, &output)
+        .context("vit_gelu_pytorch_tanh_gpu: dispatch_gelu")?;
+    Ok(output)
+}
+
+/// Gemma 4 Vision per-block forward (GPU dispatch).
+///
+/// Pipeline (matches `gemma4v_block_forward` CPU reference):
+///
+/// ```text
+///   x_in    — input residual
+///   cur     = gemma_rms_norm(x_in, ln1.weight)
+///   q       = linear(cur, attn_q.weight)         → [B, num_heads*head_dim]
+///   k       = linear(cur, attn_k.weight)         → [B, num_kv_heads*head_dim]
+///   v       = linear(cur, attn_v.weight)         → [B, num_kv_heads*head_dim]
+///   q       = gemma_per_head_rms(q, attn_q_norm.weight)
+///   k       = gemma_per_head_rms(k, attn_k_norm.weight)
+///   v       = v_norm_no_scale(v)                 # no learned gain, no tensor
+///   q       = vision_2d_rope(q, pos_x, pos_y, theta)
+///   k       = vision_2d_rope(k, pos_x, pos_y, theta)
+///   k_full  = repeat_kv(k, num_kv_groups)
+///   v_full  = repeat_kv(v, num_kv_groups)
+///   attn    = vit_attention(q, k_full, v_full, scale=1.0)
+///   out     = linear(attn, attn_output.weight)
+///   out     = gemma_rms_norm(out, ln2.weight)    # post_attention_layernorm
+///   x_mid   = x_in + out
+///
+///   cur     = gemma_rms_norm(x_mid, ffn_norm.weight)
+///   gate    = linear(cur, ffn_gate.weight)
+///   up      = linear(cur, ffn_up.weight)
+///   gate    = gelu_pytorch_tanh(gate)
+///   activated = gate * up
+///   down    = linear(activated, ffn_down.weight)
+///   down    = gemma_rms_norm(down, post_ffw_norm.weight)
+///   x_out   = x_mid + down
+/// ```
+///
+/// `pos_x_idx` / `pos_y_idx` are u32 buffers of length `batch` (= num_patches).
+///
+/// # Errors
+///
+/// Propagated from any sub-primitive — primarily missing tensors or
+/// shape mismatches against `shape`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_block_forward_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    shape: &Gemma4VisionBlockShapeGpu,
+    block_idx: usize,
+    input: &MlxBuffer,
+    pos_x_idx: &MlxBuffer,
+    pos_y_idx: &MlxBuffer,
+    batch: u32,
+) -> Result<MlxBuffer> {
+    let hidden = shape.hidden;
+    let num_heads = shape.num_heads;
+    let num_kv_heads = shape.num_kv_heads;
+    let head_dim = shape.head_dim;
+    let intermediate = shape.intermediate;
+    let eps = shape.rms_norm_eps;
+    let theta = shape.rope_theta;
+
+    if hidden == 0
+        || num_heads == 0
+        || num_kv_heads == 0
+        || head_dim == 0
+        || intermediate == 0
+        || batch == 0
+    {
+        return Err(anyhow!(
+            "gemma4v_block_forward_gpu: zero dim in shape ({shape:?}) or batch ({batch})"
+        ));
+    }
+    if num_heads % num_kv_heads != 0 {
+        return Err(anyhow!(
+            "gemma4v_block_forward_gpu: num_heads ({num_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+        ));
+    }
+    let num_kv_groups = num_heads / num_kv_heads;
+    let q_dim = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: num_heads*head_dim overflow"))?;
+    let kv_dim = num_kv_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: num_kv_heads*head_dim overflow"))?;
+    if q_dim != hidden {
+        return Err(anyhow!(
+            "gemma4v_block_forward_gpu: q_dim ({q_dim}) != hidden ({hidden})"
+        ));
+    }
+
+    let block = |suffix: &str| -> Result<&MlxBuffer> {
+        weights
+            .block_tensor(block_idx, suffix)
+            .map_err(|e| anyhow!("block {} {}: {e}", block_idx, suffix))
+    };
+    let n_hidden = batch
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: batch*hidden overflow"))?;
+
+    // ---------- Attention half ----------
+    let cur = vit_gemma_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        input,
+        block("ln1.weight")?,
+        batch,
+        hidden,
+        eps,
+    )?;
+    encoder.memory_barrier();
+
+    let q = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &cur,
+        block("attn_q.weight")?,
+        batch,
+        hidden,
+        q_dim,
+    )?;
+    encoder.memory_barrier();
+    let k = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &cur,
+        block("attn_k.weight")?,
+        batch,
+        hidden,
+        kv_dim,
+    )?;
+    encoder.memory_barrier();
+    let v = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &cur,
+        block("attn_v.weight")?,
+        batch,
+        hidden,
+        kv_dim,
+    )?;
+    encoder.memory_barrier();
+
+    let q = vit_gemma_per_head_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &q,
+        block("attn_q_norm.weight")?,
+        batch,
+        num_heads,
+        head_dim,
+        eps,
+    )?;
+    encoder.memory_barrier();
+    let k = vit_gemma_per_head_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &k,
+        block("attn_k_norm.weight")?,
+        batch,
+        num_kv_heads,
+        head_dim,
+        eps,
+    )?;
+    encoder.memory_barrier();
+    let v = vit_v_norm_no_scale_gpu(
+        encoder, registry, device, &v, batch, num_kv_heads, head_dim, eps,
+    )?;
+    encoder.memory_barrier();
+
+    // 2-D RoPE on Q and K.
+    let q = vit_vision_2d_rope_gpu(
+        encoder, registry, device, &q, pos_x_idx, pos_y_idx, batch, num_heads, head_dim, theta,
+    )?;
+    encoder.memory_barrier();
+    let k = vit_vision_2d_rope_gpu(
+        encoder, registry, device, &k, pos_x_idx, pos_y_idx, batch, num_kv_heads, head_dim, theta,
+    )?;
+    encoder.memory_barrier();
+
+    // GQA: expand K and V to match Q's head count.
+    let k_full = vit_repeat_kv_gpu(
+        encoder, registry, device, &k, batch, num_kv_heads, num_kv_groups, head_dim,
+    )?;
+    encoder.memory_barrier();
+    let v_full = vit_repeat_kv_gpu(
+        encoder, registry, device, &v, batch, num_kv_heads, num_kv_groups, head_dim,
+    )?;
+    encoder.memory_barrier();
+
+    // Attention with scale = 1.0 (gemma4v: Q is RMS-normalized).
+    let attn = vit_attention_gpu(
+        encoder, registry, device, &q, &k_full, &v_full, batch, num_heads, head_dim, 1.0,
+    )?;
+    encoder.memory_barrier();
+
+    let attn_proj = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &attn,
+        block("attn_output.weight")?,
+        batch,
+        hidden,
+        hidden,
+    )?;
+    encoder.memory_barrier();
+
+    let attn_out = vit_gemma_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &attn_proj,
+        block("ln2.weight")?,
+        batch,
+        hidden,
+        eps,
+    )?;
+    encoder.memory_barrier();
+
+    let x_mid = vit_residual_add_gpu(encoder, registry, device, input, &attn_out, n_hidden)?;
+    encoder.memory_barrier();
+
+    // ---------- MLP half ----------
+    let cur = vit_gemma_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &x_mid,
+        block("ffn_norm.weight")?,
+        batch,
+        hidden,
+        eps,
+    )?;
+    encoder.memory_barrier();
+
+    let gate = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &cur,
+        block("ffn_gate.weight")?,
+        batch,
+        hidden,
+        intermediate,
+    )?;
+    encoder.memory_barrier();
+    let up = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &cur,
+        block("ffn_up.weight")?,
+        batch,
+        hidden,
+        intermediate,
+    )?;
+    encoder.memory_barrier();
+
+    let n_inter = batch
+        .checked_mul(intermediate)
+        .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: batch*intermediate overflow"))?;
+    let gated = vit_gelu_pytorch_tanh_gpu(encoder, registry, device, &gate, n_inter)?;
+    encoder.memory_barrier();
+
+    // activated = gated * up
+    let activated = device
+        .alloc_buffer((n_inter as usize) * 4, DType::F32, vec![n_inter as usize])
+        .map_err(|e| anyhow!("gemma4v_block_forward_gpu: alloc activated: {e}"))?;
+    mlx_elementwise_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        &gated,
+        &up,
+        &activated,
+        n_inter as usize,
+        DType::F32,
+    )
+    .context("gemma4v_block_forward_gpu: gate * up")?;
+    encoder.memory_barrier();
+
+    let down = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        &activated,
+        block("ffn_down.weight")?,
+        batch,
+        intermediate,
+        hidden,
+    )?;
+    encoder.memory_barrier();
+
+    let down = vit_gemma_rms_norm_gpu(
+        encoder,
+        registry,
+        device,
+        &down,
+        block("post_ffw_norm.weight")?,
+        batch,
+        hidden,
+        eps,
+    )?;
+    encoder.memory_barrier();
+
+    let x_out = vit_residual_add_gpu(encoder, registry, device, &x_mid, &down, n_hidden)?;
+    Ok(x_out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1920,6 +2561,7 @@ mod tests {
     use super::*;
     use crate::inference::vision::vit::{
         apply_vit_block_forward as apply_vit_block_forward_cpu, elementwise_mul_in_place,
+        gemma4v_block_forward as gemma4v_block_forward_cpu,
         gemma4v_patch_embed_forward as gemma4v_patch_embed_cpu,
         gemma4v_position_embed_lookup as gemma4v_pos_embed_cpu,
         linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
@@ -4159,5 +4801,336 @@ mod tests {
                 "apply_pos parity at {i}: gpu={g} cpu={e}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // gemma4v_block_forward — CPU+GPU parity + dimension + 4-RMSNorm tests
+    // -------------------------------------------------------------------
+
+    use crate::inference::vision::vit::{
+        Gemma4VisionBlockShape, Gemma4VisionBlockWeights,
+    };
+
+    /// Synthesize a small gemma4v block fixture: weights + shape +
+    /// positions. Sizes are chosen so the BF16 cast inside `vit_linear_gpu`
+    /// (`in_features >= 32`) is satisfied for every projection while the
+    /// numeric domain stays small enough for f32 parity comparisons.
+    fn synth_gemma4v_block_fixture()
+        -> (
+            Gemma4VisionBlockShape,
+            usize,                  // batch (== num_patches == seq_len)
+            Vec<f32>,               // input_layernorm.weight  [hidden]
+            Vec<f32>,               // post_attention_layernorm [hidden]
+            Vec<f32>,               // pre_feedforward_layernorm [hidden]
+            Vec<f32>,               // post_feedforward_layernorm [hidden]
+            Vec<f32>,               // q_proj [num_heads*head_dim, hidden]
+            Vec<f32>,               // k_proj [num_kv_heads*head_dim, hidden]
+            Vec<f32>,               // v_proj [num_kv_heads*head_dim, hidden]
+            Vec<f32>,               // o_proj [hidden, num_heads*head_dim]
+            Vec<f32>,               // q_norm [head_dim]
+            Vec<f32>,               // k_norm [head_dim]
+            Vec<f32>,               // gate_proj [intermediate, hidden]
+            Vec<f32>,               // up_proj   [intermediate, hidden]
+            Vec<f32>,               // down_proj [hidden, intermediate]
+            Vec<u32>,               // pos_x
+            Vec<u32>,               // pos_y
+            Vec<f32>,               // input [batch, hidden]
+        ) {
+        // 4 heads × 32 head_dim = hidden 128. KV groups = 2 → num_kv_heads = 2.
+        // Intermediate = 64. Batch = 32 patches (matches `vit_attention_gpu`'s
+        // tensor-core tile constraint K=batch >= 32 for the scores @ V matmul).
+        let hidden = 128usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let head_dim = 32usize;
+        let intermediate = 64usize;
+        let batch = 32usize;
+        let shape = Gemma4VisionBlockShape {
+            hidden: hidden as u32,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            intermediate: intermediate as u32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 100.0,
+        };
+        // Use deterministic small magnitudes so projections stay in a
+        // domain where f32 sums don't accumulate large absolute error.
+        let mk = |seed: f32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32) * seed + 0.13).sin() * 0.05).collect()
+        };
+        let input_ln    = mk(0.011, hidden);
+        let post_attn_ln = mk(0.013, hidden);
+        let pre_ff_ln    = mk(0.017, hidden);
+        let post_ff_ln   = mk(0.019, hidden);
+        let q_w  = mk(0.021, num_heads * head_dim * hidden);
+        let k_w  = mk(0.023, num_kv_heads * head_dim * hidden);
+        let v_w  = mk(0.025, num_kv_heads * head_dim * hidden);
+        let o_w  = mk(0.027, hidden * num_heads * head_dim);
+        let q_n  = mk(0.031, head_dim);
+        let k_n  = mk(0.033, head_dim);
+        let g_w  = mk(0.041, intermediate * hidden);
+        let u_w  = mk(0.043, intermediate * hidden);
+        let d_w  = mk(0.045, hidden * intermediate);
+        let pos_x: Vec<u32> = (0..batch as u32).collect();
+        let pos_y: Vec<u32> = (0..batch as u32).rev().collect();
+        let input: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.04)
+            .collect();
+        (
+            shape, batch,
+            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
+            q_w, k_w, v_w, o_w, q_n, k_n,
+            g_w, u_w, d_w,
+            pos_x, pos_y,
+            input,
+        )
+    }
+
+    /// Test 1: 4-RMSNorm dispatch count (architecture sanity).
+    ///
+    /// The CPU forward calls `gemma_rms_norm_forward` exactly 4 times per
+    /// block (input_ln + post_attn_ln + pre_ff_ln + post_ff_ln) and
+    /// `gemma_per_head_rms_norm_forward` exactly 2 times (q_norm, k_norm),
+    /// plus 1 `v_norm_no_scale_forward`. We assert this by structuring the
+    /// fixture so a wrong-arch shortcut would corrupt the output.
+    /// In practice the 4-RMSNorm count is implied by the function calling
+    /// each helper distinctly with 4 different gain tensors — if any pair
+    /// were accidentally aliased the parity test below would fail.
+    #[test]
+    fn gemma4v_block_forward_4_rmsnorm_count_is_exactly_four() {
+        // Synthesize fixture and execute the CPU forward; assert that
+        // each of the 4 gain tensors actually influences the output by
+        // perturbing one and observing a delta.
+        let (
+            shape, batch,
+            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
+            q_w, k_w, v_w, o_w, q_n, k_n,
+            g_w, u_w, d_w,
+            pos_x, pos_y,
+            input,
+        ) = synth_gemma4v_block_fixture();
+
+        let baseline = gemma4v_block_forward_cpu(
+            input.clone(),
+            &Gemma4VisionBlockWeights {
+                input_layernorm: &input_ln,
+                post_attention_layernorm: &post_attn_ln,
+                pre_feedforward_layernorm: &pre_ff_ln,
+                post_feedforward_layernorm: &post_ff_ln,
+                q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
+                q_norm: &q_n, k_norm: &k_n,
+                gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+            },
+            &shape, &pos_x, &pos_y,
+        ).expect("baseline");
+        assert_eq!(baseline.len(), batch * shape.hidden as usize);
+
+        // Perturb each of the 4 norm-gain tensors INDIVIDUALLY and confirm
+        // the output changes. This proves all 4 are wired in (none are
+        // accidentally bypassed) — a 4-RMSNorm count probe.
+        for which in 0..4usize {
+            let mut iln = input_ln.clone();
+            let mut pal = post_attn_ln.clone();
+            let mut pre = pre_ff_ln.clone();
+            let mut post = post_ff_ln.clone();
+            match which {
+                0 => iln[0] += 0.5,
+                1 => pal[0] += 0.5,
+                2 => pre[0] += 0.5,
+                _ => post[0] += 0.5,
+            }
+            let perturbed_out = gemma4v_block_forward_cpu(
+                input.clone(),
+                &Gemma4VisionBlockWeights {
+                    input_layernorm: &iln,
+                    post_attention_layernorm: &pal,
+                    pre_feedforward_layernorm: &pre,
+                    post_feedforward_layernorm: &post,
+                    q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
+                    q_norm: &q_n, k_norm: &k_n,
+                    gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+                },
+                &shape, &pos_x, &pos_y,
+            ).expect("perturbed");
+            let max_d = baseline.iter().zip(perturbed_out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_d > 1e-6,
+                "norm gain index {which} did not affect output (4-RMSNorm not wired correctly): max|delta| = {max_d}"
+            );
+        }
+    }
+
+    /// Test 2: GQA dimensions — Q has [B, num_heads, head_dim] and K/V
+    /// have [B, num_kv_heads, head_dim] before repeat-kv, then K_full /
+    /// V_full match Q's head count after repeat-kv. We test repeat_kv_cpu
+    /// directly since it's the GQA bridge.
+    #[test]
+    fn gemma4v_block_forward_gqa_dimensions() {
+        use crate::inference::vision::vit::repeat_kv_cpu;
+        let batch = 3usize;
+        let num_kv_heads = 2usize;
+        let num_kv_groups = 3usize;
+        let head_dim = 4usize;
+        let n_in = batch * num_kv_heads * head_dim;
+        let input: Vec<f32> = (0..n_in).map(|i| i as f32).collect();
+        let out = repeat_kv_cpu(&input, batch, num_kv_heads, num_kv_groups, head_dim).unwrap();
+        let num_heads = num_kv_heads * num_kv_groups; // = 6
+        assert_eq!(out.len(), batch * num_heads * head_dim);
+        // For each batch, kv_head k → expanded heads [k*g .. k*g + g - 1]
+        // share the SAME [head_dim] slice from the input.
+        for b in 0..batch {
+            for k in 0..num_kv_heads {
+                let in_base = (b * num_kv_heads + k) * head_dim;
+                let in_slice = &input[in_base..in_base + head_dim];
+                for g in 0..num_kv_groups {
+                    let h = k * num_kv_groups + g;
+                    let out_base = (b * num_heads + h) * head_dim;
+                    let out_slice = &out[out_base..out_base + head_dim];
+                    assert_eq!(
+                        in_slice, out_slice,
+                        "repeat_kv at batch={b} kv_head={k} group={g} (out head={h})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test 3: CPU↔GPU parity for the full per-block forward with
+    /// synthetic weights. Validates the pipeline wiring end-to-end.
+    #[test]
+    fn gemma4v_block_forward_cpu_gpu_parity() {
+        let (
+            shape, batch,
+            input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
+            q_w, k_w, v_w, o_w, q_n, k_n,
+            g_w, u_w, d_w,
+            pos_x, pos_y,
+            input,
+        ) = synth_gemma4v_block_fixture();
+        let hidden = shape.hidden as usize;
+        let num_heads = shape.num_heads as usize;
+        let num_kv_heads = shape.num_kv_heads as usize;
+        let head_dim = shape.head_dim as usize;
+        let intermediate = shape.intermediate as usize;
+
+        // ---- CPU reference ----
+        let bw_cpu = Gemma4VisionBlockWeights {
+            input_layernorm: &input_ln,
+            post_attention_layernorm: &post_attn_ln,
+            pre_feedforward_layernorm: &pre_ff_ln,
+            post_feedforward_layernorm: &post_ff_ln,
+            q_proj: &q_w, k_proj: &k_w, v_proj: &v_w, o_proj: &o_w,
+            q_norm: &q_n, k_norm: &k_n,
+            gate_proj: &g_w, up_proj: &u_w, down_proj: &d_w,
+        };
+        let cpu_out = gemma4v_block_forward_cpu(
+            input.clone(), &bw_cpu, &shape, &pos_x, &pos_y,
+        ).expect("cpu forward");
+
+        // ---- GPU forward via synthetic LoadedMmprojWeights ----
+        let device = MlxDevice::new().expect("device");
+
+        // Build a tensor map under the gemma4v block-suffix names.
+        let mut tensors: std::collections::HashMap<String, MlxBuffer> = std::collections::HashMap::new();
+        let put = |tensors: &mut std::collections::HashMap<String, MlxBuffer>, dev: &MlxDevice, key: String, data: &[f32], shape: Vec<usize>| {
+            let bytes = data.len() * 4;
+            let buf = dev.alloc_buffer(bytes, DType::F32, shape).expect("alloc tensor");
+            let slice: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, data.len())
+            };
+            slice.copy_from_slice(data);
+            tensors.insert(key, buf);
+        };
+        // Layer index = 0.
+        let block_key = |suffix: &str| format!("v.blk.0.{}", suffix);
+        put(&mut tensors, &device, block_key("ln1.weight"), &input_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("ln2.weight"), &post_attn_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("ffn_norm.weight"), &pre_ff_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("post_ffw_norm.weight"), &post_ff_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("attn_q.weight"), &q_w,
+            vec![num_heads * head_dim, hidden]);
+        put(&mut tensors, &device, block_key("attn_k.weight"), &k_w,
+            vec![num_kv_heads * head_dim, hidden]);
+        put(&mut tensors, &device, block_key("attn_v.weight"), &v_w,
+            vec![num_kv_heads * head_dim, hidden]);
+        put(&mut tensors, &device, block_key("attn_output.weight"), &o_w,
+            vec![hidden, num_heads * head_dim]);
+        put(&mut tensors, &device, block_key("attn_q_norm.weight"), &q_n, vec![head_dim]);
+        put(&mut tensors, &device, block_key("attn_k_norm.weight"), &k_n, vec![head_dim]);
+        put(&mut tensors, &device, block_key("ffn_gate.weight"), &g_w,
+            vec![intermediate, hidden]);
+        put(&mut tensors, &device, block_key("ffn_up.weight"), &u_w,
+            vec![intermediate, hidden]);
+        put(&mut tensors, &device, block_key("ffn_down.weight"), &d_w,
+            vec![hidden, intermediate]);
+
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+
+        // Now run the GPU forward.
+        let device = MlxDevice::new().expect("device2");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input, vec![batch, hidden]);
+        // Upload positions as DType::U32 (vision_2d_rope dispatch validates dtype).
+        let upload_u32_typed = |dev: &MlxDevice, data: &[u32]| -> MlxBuffer {
+            let buf = dev.alloc_buffer(data.len() * 4, DType::U32, vec![data.len()])
+                .expect("alloc u32 typed");
+            let slice: &mut [u32] = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
+            };
+            slice.copy_from_slice(data);
+            buf
+        };
+        let px_buf = upload_u32_typed(executor.device(), &pos_x);
+        let py_buf = upload_u32_typed(executor.device(), &pos_y);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        // Required shaders: vit_silu_mul (sigmoid_mul) + softmax + 2D rope + gelu + rms_norm_no_scale + gather.
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::vision_2d_rope::register(&mut registry);
+        mlx_native::ops::gelu::register(&mut registry);
+        mlx_native::ops::gather::register(&mut registry);
+
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let shape_gpu = Gemma4VisionBlockShapeGpu {
+            hidden: shape.hidden, num_heads: shape.num_heads,
+            num_kv_heads: shape.num_kv_heads, head_dim: shape.head_dim,
+            intermediate: shape.intermediate,
+            rms_norm_eps: shape.rms_norm_eps, rope_theta: shape.rope_theta,
+        };
+        let out = gemma4v_block_forward_gpu(
+            session.encoder_mut(), &mut registry, device,
+            &weights, &shape_gpu, 0, &in_buf,
+            &px_buf, &py_buf, batch as u32,
+        ).expect("gpu block forward");
+        session.finish().expect("finish");
+        let gpu_out = readback_f32(&out, batch * hidden);
+
+        // BF16 cast inside `vit_linear_gpu` introduces ~1e-3 relative
+        // noise per matmul. With 4 matmuls (q/k/v/o) + gate/up/down +
+        // 4 RMS norms + 2 RoPE rotations the cumulative absolute drift
+        // can reach a few units of the input magnitude scale (~0.05).
+        // Cosine similarity is the discipline-correct metric for
+        // pipeline-cumulative tolerance.
+        let dot: f32 = cpu_out.iter().zip(gpu_out.iter()).map(|(a, b)| a * b).sum();
+        let na: f32 = cpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = gpu_out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let cos = dot / (na * nb).max(1e-30);
+        let max_abs = cpu_out.iter().zip(gpu_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "gemma4v_block parity: cos={cos:.6}, max|abs|={max_abs:.6}, |cpu|={na:.4}, |gpu|={nb:.4}"
+        );
+        assert!(
+            cos > 0.999,
+            "gemma4v_block_forward CPU↔GPU cosine = {cos} < 0.999 (max|abs| = {max_abs})"
+        );
     }
 }

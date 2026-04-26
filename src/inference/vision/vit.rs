@@ -1370,6 +1370,613 @@ pub fn gemma4v_position_embed_add(
 }
 
 // ---------------------------------------------------------------------------
+// Gemma4V per-block forward (4-RMSNorm + GQA + 2D RoPE + V-norm)
+// ---------------------------------------------------------------------------
+//
+// Sibling to the SigLIP-49 `apply_vit_block_forward` (above). Differences
+// from the SigLIP path:
+//
+//   1. Four RMSNorms per block (input_layernorm / post_attention_layernorm /
+//      pre_feedforward_layernorm / post_feedforward_layernorm) vs SigLIP's
+//      two (ln1 / post_ffw_norm).
+//   2. RMSNorms use the Gemma "weight + 1" convention (centered-at-zero
+//      learned gain). SigLIP uses raw `weight`.
+//   3. Q-norm and K-norm also use the "weight + 1" convention.
+//   4. V is RMS-normalized too — but with NO learned gain (pure
+//      `x / rms(x)` per-head). No `attn_v_norm.weight` tensor.
+//   5. GQA: `num_kv_heads` may be < `num_attention_heads`. K and V are
+//      "repeat_kv"-expanded to match Q heads before attention.
+//   6. Q/K rotated with 2D NeoX RoPE driven by `(pos_x, pos_y)` per
+//      patch (not the standard 1-D RoPE).
+//   7. Activation is GELU(pytorch_tanh) on the gate proj (not SiLU).
+//   8. Attention scale is 1.0 (Q is RMS-normalized).
+//
+// All four refs:
+//   - `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:46-99`
+//   - `/opt/candle/.../gemma4/vision.rs:202-365`
+//   - `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (gemma4v hparams)
+//   - `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp` (NeoX rope semantics)
+
+/// Gemma-style RMSNorm: `y = x * rsqrt(mean(x²) + eps) * (weight + 1)`.
+///
+/// Same math as `rms_norm_forward` plus a `+1` on the gain — matches
+/// `/opt/candle/.../gemma4/vision.rs:39` (`(&self.weight + 1.0)`). The
+/// SigLIP path's `rms_norm_forward` does NOT add 1; this helper exists
+/// so the gemma4v block forward stays a true peer to that path without
+/// changing it.
+pub fn gemma_rms_norm_forward(
+    input: &mut [f32],
+    weight: &[f32],
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("gemma_rms_norm_forward: hidden must be > 0"));
+    }
+    if input.len() % hidden != 0 {
+        return Err(anyhow!(
+            "gemma_rms_norm_forward: input len {} not divisible by hidden {}",
+            input.len(),
+            hidden
+        ));
+    }
+    if weight.len() != hidden {
+        return Err(anyhow!(
+            "gemma_rms_norm_forward: weight len {} != hidden {}",
+            weight.len(),
+            hidden
+        ));
+    }
+    let inv_h = 1.0_f32 / hidden as f32;
+    let n_rows = input.len() / hidden;
+    for row in 0..n_rows {
+        let off = row * hidden;
+        let slice = &mut input[off..off + hidden];
+        let mut sq = 0.0_f32;
+        for &v in slice.iter() {
+            sq += v * v;
+        }
+        let inv_rms = 1.0_f32 / (sq * inv_h + eps).sqrt();
+        for (i, v) in slice.iter_mut().enumerate() {
+            *v = (*v * inv_rms) * (weight[i] + 1.0);
+        }
+    }
+    Ok(())
+}
+
+/// Per-head Gemma-style RMSNorm: `[batch, num_heads, head_dim]` →
+/// `[batch * num_heads, head_dim]` with `(weight + 1)` gain shared across
+/// heads. Used for `q_norm` and `k_norm` in the gemma4v ViT block.
+pub fn gemma_per_head_rms_norm_forward(
+    input: &mut [f32],
+    weight: &[f32],
+    batch: usize,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<()> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "gemma_per_head_rms_norm_forward: batch ({batch}), num_heads ({num_heads}), \
+             head_dim ({head_dim}) must all be > 0"
+        ));
+    }
+    let expected = batch * num_heads * head_dim;
+    if input.len() != expected {
+        return Err(anyhow!(
+            "gemma_per_head_rms_norm_forward: input len {} != batch*num_heads*head_dim = {}",
+            input.len(),
+            expected
+        ));
+    }
+    if weight.len() != head_dim {
+        return Err(anyhow!(
+            "gemma_per_head_rms_norm_forward: weight len {} != head_dim {}",
+            weight.len(),
+            head_dim
+        ));
+    }
+    gemma_rms_norm_forward(input, weight, head_dim, eps)
+}
+
+/// Pure RMS normalization with NO learned gain: `y = x * rsqrt(mean(x²) + eps)`.
+///
+/// Used for V-norm in gemma4v (per `/opt/candle/.../gemma4/vision.rs:43-50`).
+/// Internally f32 — even when called with an f32 input, this stays
+/// numerically equivalent to the candle reference's `to_dtype(F32)` cast.
+pub fn v_norm_no_scale_forward(
+    input: &mut [f32],
+    hidden: usize,
+    eps: f32,
+) -> Result<()> {
+    if hidden == 0 {
+        return Err(anyhow!("v_norm_no_scale_forward: hidden must be > 0"));
+    }
+    if input.len() % hidden != 0 {
+        return Err(anyhow!(
+            "v_norm_no_scale_forward: input len {} not divisible by hidden {}",
+            input.len(),
+            hidden
+        ));
+    }
+    let inv_h = 1.0_f32 / hidden as f32;
+    let n_rows = input.len() / hidden;
+    for row in 0..n_rows {
+        let off = row * hidden;
+        let slice = &mut input[off..off + hidden];
+        let mut sq = 0.0_f32;
+        for &v in slice.iter() {
+            sq += v * v;
+        }
+        let inv_rms = 1.0_f32 / (sq * inv_h + eps).sqrt();
+        for v in slice.iter_mut() {
+            *v *= inv_rms;
+        }
+    }
+    Ok(())
+}
+
+/// 2-D NeoX RoPE for ViT (CPU reference for `dispatch_vision_2d_rope`).
+///
+/// Layout: `[seq_len * n_heads, head_dim]` row-major.
+/// First half rotates by `pos_x[seq]`, second half by `pos_y[seq]`,
+/// each NeoX-style with pair `(d[i], d[i + d_quarter])` for
+/// `i ∈ [0, d_quarter = head_dim / 4)` and theta denominator `d_half`.
+///
+/// `head_dim` MUST be divisible by 4 (clean dual NeoX split).
+pub fn vision_2d_rope_forward_cpu(
+    input: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    pos_x: &[u32],
+    pos_y: &[u32],
+    theta: f32,
+) -> Result<Vec<f32>> {
+    if head_dim == 0 || seq_len == 0 || n_heads == 0 {
+        return Err(anyhow!(
+            "vision_2d_rope_forward_cpu: head_dim ({head_dim}), seq_len ({seq_len}), \
+             n_heads ({n_heads}) must all be > 0"
+        ));
+    }
+    if head_dim % 4 != 0 {
+        return Err(anyhow!(
+            "vision_2d_rope_forward_cpu: head_dim ({head_dim}) must be divisible by 4"
+        ));
+    }
+    if pos_x.len() != seq_len {
+        return Err(anyhow!(
+            "vision_2d_rope_forward_cpu: pos_x len {} != seq_len {seq_len}",
+            pos_x.len()
+        ));
+    }
+    if pos_y.len() != seq_len {
+        return Err(anyhow!(
+            "vision_2d_rope_forward_cpu: pos_y len {} != seq_len {seq_len}",
+            pos_y.len()
+        ));
+    }
+    let n_rows = seq_len * n_heads;
+    let n_elem = n_rows * head_dim;
+    if input.len() != n_elem {
+        return Err(anyhow!(
+            "vision_2d_rope_forward_cpu: input len {} != seq_len*n_heads*head_dim = {n_elem}",
+            input.len()
+        ));
+    }
+    let d_half = head_dim / 2;
+    let d_quarter = d_half / 2;
+    let mut out = vec![0_f32; n_elem];
+    out.copy_from_slice(input);
+
+    for row in 0..n_rows {
+        let seq_idx = row / n_heads;
+        let p_x = pos_x[seq_idx] as f32;
+        let p_y = pos_y[seq_idx] as f32;
+        let base = row * head_dim;
+        for i in 0..d_quarter {
+            let dim_ratio = (2 * i) as f32 / d_half as f32;
+            let freq = 1.0_f32 / theta.powf(dim_ratio);
+            let ax = p_x * freq;
+            let ay = p_y * freq;
+            let cx = ax.cos();
+            let sx = ax.sin();
+            let cy = ay.cos();
+            let sy = ay.sin();
+            // First half pair (i, i + d_quarter)
+            let x0 = input[base + i];
+            let x1 = input[base + i + d_quarter];
+            out[base + i] = x0 * cx - x1 * sx;
+            out[base + i + d_quarter] = x0 * sx + x1 * cx;
+            // Second half pair (d_half + i, d_half + i + d_quarter)
+            let y0 = input[base + d_half + i];
+            let y1 = input[base + d_half + i + d_quarter];
+            out[base + d_half + i] = y0 * cy - y1 * sy;
+            out[base + d_half + i + d_quarter] = y0 * sy + y1 * cy;
+        }
+    }
+    Ok(out)
+}
+
+/// GELU pytorch_tanh, in-place.
+///
+/// `y = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))`.
+/// Matches both `torch.nn.functional.gelu(approximate="tanh")` and
+/// mlx-native's `gelu_f32` kernel. Used for the gate-proj activation in
+/// the gemma4v MLP.
+pub fn gelu_pytorch_tanh_in_place(input: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56_f32;
+    const COEFF: f32 = 0.044_715_f32;
+    for v in input.iter_mut() {
+        let x = *v;
+        let inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
+        *v = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
+/// CPU repeat-kv: replicate K (or V) heads to match Q's `num_heads`.
+///
+/// Input shape: `[batch, num_kv_heads, head_dim]` (== `[batch, num_kv_heads * head_dim]`
+/// in row-major); each KV head is repeated `num_kv_groups = num_heads / num_kv_heads`
+/// times, producing `[batch, num_heads, head_dim]`. The repetition order
+/// matches PyTorch's `repeat_kv`: kv_head k → expanded heads
+/// `[k * num_kv_groups, k * num_kv_groups + 1, ..., (k+1) * num_kv_groups - 1]`.
+pub fn repeat_kv_cpu(
+    input: &[f32],
+    batch: usize,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || num_kv_heads == 0 || num_kv_groups == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "repeat_kv_cpu: batch, num_kv_heads, num_kv_groups, head_dim must all be > 0"
+        ));
+    }
+    let expected_in = batch * num_kv_heads * head_dim;
+    if input.len() != expected_in {
+        return Err(anyhow!(
+            "repeat_kv_cpu: input len {} != batch*num_kv_heads*head_dim = {expected_in}",
+            input.len()
+        ));
+    }
+    let num_heads = num_kv_heads * num_kv_groups;
+    let mut out = vec![0_f32; batch * num_heads * head_dim];
+    for b in 0..batch {
+        for k in 0..num_kv_heads {
+            let in_base = (b * num_kv_heads + k) * head_dim;
+            for g in 0..num_kv_groups {
+                let h_idx = k * num_kv_groups + g;
+                let out_base = (b * num_heads + h_idx) * head_dim;
+                out[out_base..out_base + head_dim]
+                    .copy_from_slice(&input[in_base..in_base + head_dim]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Gemma 4 Vision per-block forward (CPU reference).
+///
+/// Mirrors `/opt/candle/.../gemma4/vision.rs:353-365` exactly:
+///
+/// ```text
+///   x = x + post_attention_layernorm(self_attention(input_layernorm(x)))
+///   x = x + post_feedforward_layernorm(mlp(pre_feedforward_layernorm(x)))
+/// ```
+///
+/// Where `self_attention` does:
+///
+/// ```text
+///   q = q_proj(in)              [batch, num_heads * head_dim]
+///   k = k_proj(in)              [batch, num_kv_heads * head_dim]
+///   v = v_proj(in)              [batch, num_kv_heads * head_dim]
+///   q = gemma_rms(q, q_norm)
+///   k = gemma_rms(k, k_norm)
+///   v = v_norm(v)               # no learned gain
+///   q = vision_2d_rope(q, pos_x, pos_y, theta)
+///   k = vision_2d_rope(k, pos_x, pos_y, theta)
+///   k = repeat_kv(k, num_kv_groups)
+///   v = repeat_kv(v, num_kv_groups)
+///   out = scaled_dot_product_attention(q, k, v, scale=1.0)
+///   out = o_proj(out)
+/// ```
+///
+/// And `mlp`:
+///
+/// ```text
+///   gate = gate_proj(in); gate = gelu_pytorch_tanh(gate)
+///   up   = up_proj(in)
+///   down = down_proj(gate * up)
+/// ```
+///
+/// # Arguments
+///
+/// * `hidden_states` — `[batch, hidden]` row-major (consumed; replaced
+///   by next block's input).
+/// * `weights[*]`    — block-local tensors, layout matches the GGUF
+///   loader's `block_tensor(idx, suffix)` outputs.
+/// * `pos_x`, `pos_y` — per-patch (batch == seq_len == num_patches)
+///   positions for 2-D RoPE.
+/// * shape parameters — see [`Gemma4VisionBlockShape`].
+///
+/// # Errors
+///
+/// Any shape mismatch in the supplied weights (validated row-by-row) or
+/// any propagated error from the per-stage helpers.
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_block_forward(
+    hidden_states: Vec<f32>,
+    block_weights: &Gemma4VisionBlockWeights<'_>,
+    shape: &Gemma4VisionBlockShape,
+    pos_x: &[u32],
+    pos_y: &[u32],
+) -> Result<Vec<f32>> {
+    let hidden = shape.hidden as usize;
+    let num_heads = shape.num_heads as usize;
+    let num_kv_heads = shape.num_kv_heads as usize;
+    let head_dim = shape.head_dim as usize;
+    let intermediate = shape.intermediate as usize;
+    let eps = shape.rms_norm_eps;
+    let theta = shape.rope_theta;
+
+    if hidden == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || intermediate == 0 {
+        return Err(anyhow!(
+            "gemma4v_block_forward: zero dim in shape: {shape:?}"
+        ));
+    }
+    if num_heads % num_kv_heads != 0 {
+        return Err(anyhow!(
+            "gemma4v_block_forward: num_heads ({num_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+        ));
+    }
+    if hidden_states.len() % hidden != 0 {
+        return Err(anyhow!(
+            "gemma4v_block_forward: hidden_states len {} not divisible by hidden {hidden}",
+            hidden_states.len()
+        ));
+    }
+    let batch = hidden_states.len() / hidden;
+    if pos_x.len() != batch || pos_y.len() != batch {
+        return Err(anyhow!(
+            "gemma4v_block_forward: pos_x ({}) / pos_y ({}) lengths must equal batch ({batch})",
+            pos_x.len(),
+            pos_y.len()
+        ));
+    }
+    let num_kv_groups = num_heads / num_kv_heads;
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    if q_dim != hidden {
+        return Err(anyhow!(
+            "gemma4v_block_forward: num_heads*head_dim ({q_dim}) must equal hidden ({hidden})"
+        ));
+    }
+
+    // ----- Attention half -----
+    let mut residual = hidden_states;
+
+    // input_layernorm (gemma RMS, weight+1)
+    let mut cur = residual.clone();
+    gemma_rms_norm_forward(&mut cur, block_weights.input_layernorm, hidden, eps)?;
+
+    // QKV projections
+    let mut q = linear_forward(
+        &cur,
+        block_weights.q_proj,
+        None,
+        batch,
+        hidden,
+        q_dim,
+    )?;
+    let mut k = linear_forward(
+        &cur,
+        block_weights.k_proj,
+        None,
+        batch,
+        hidden,
+        kv_dim,
+    )?;
+    let mut v = linear_forward(
+        &cur,
+        block_weights.v_proj,
+        None,
+        batch,
+        hidden,
+        kv_dim,
+    )?;
+
+    // q_norm / k_norm (gemma per-head RMS, weight+1) and v_norm (no gain)
+    gemma_per_head_rms_norm_forward(&mut q, block_weights.q_norm, batch, num_heads, head_dim, eps)?;
+    gemma_per_head_rms_norm_forward(
+        &mut k,
+        block_weights.k_norm,
+        batch,
+        num_kv_heads,
+        head_dim,
+        eps,
+    )?;
+    v_norm_no_scale_forward(&mut v, head_dim, eps)?;
+
+    // 2-D RoPE on Q and K (separate denominators for num_heads vs num_kv_heads)
+    let q = vision_2d_rope_forward_cpu(&q, batch, num_heads, head_dim, pos_x, pos_y, theta)?;
+    let k = vision_2d_rope_forward_cpu(&k, batch, num_kv_heads, head_dim, pos_x, pos_y, theta)?;
+
+    // GQA: repeat K / V to match Q's head count.
+    let k_full = repeat_kv_cpu(&k, batch, num_kv_heads, num_kv_groups, head_dim)?;
+    let v_full = repeat_kv_cpu(&v, batch, num_kv_heads, num_kv_groups, head_dim)?;
+
+    // Scaled-dot-product attention (gemma4v scale = 1.0 because Q is RMS-normalized).
+    // Existing helper applies the standard 1/sqrt(head_dim) scale internally; for
+    // gemma4v we want NO scale, so pre-multiply Q by sqrt(head_dim) to undo it.
+    // The cleanest approach is to inline the math here so we don't smuggle the
+    // arch-specific scale into the SigLIP helper.
+    let attn = gemma4v_attention_unit_scale(&q, &k_full, &v_full, batch, num_heads, head_dim)?;
+
+    // o_proj
+    let attn_proj = linear_forward(
+        &attn,
+        block_weights.o_proj,
+        None,
+        batch,
+        hidden,
+        hidden,
+    )?;
+
+    // post_attention_layernorm (applied to the attention OUTPUT before the residual add).
+    let mut attn_out = attn_proj;
+    gemma_rms_norm_forward(
+        &mut attn_out,
+        block_weights.post_attention_layernorm,
+        hidden,
+        eps,
+    )?;
+    residual_add(&mut residual, &attn_out)?;
+
+    // ----- MLP half -----
+    let mut cur = residual.clone();
+    gemma_rms_norm_forward(
+        &mut cur,
+        block_weights.pre_feedforward_layernorm,
+        hidden,
+        eps,
+    )?;
+
+    let mut gate = linear_forward(
+        &cur,
+        block_weights.gate_proj,
+        None,
+        batch,
+        hidden,
+        intermediate,
+    )?;
+    let up = linear_forward(
+        &cur,
+        block_weights.up_proj,
+        None,
+        batch,
+        hidden,
+        intermediate,
+    )?;
+    gelu_pytorch_tanh_in_place(&mut gate);
+    elementwise_mul_in_place(&mut gate, &up)?;
+    let mut down = linear_forward(
+        &gate,
+        block_weights.down_proj,
+        None,
+        batch,
+        intermediate,
+        hidden,
+    )?;
+    gemma_rms_norm_forward(
+        &mut down,
+        block_weights.post_feedforward_layernorm,
+        hidden,
+        eps,
+    )?;
+    residual_add(&mut residual, &down)?;
+
+    Ok(residual)
+}
+
+/// Local helper: scaled-dot-product attention with `scale = 1.0` for gemma4v.
+///
+/// Same algorithm as `scaled_dot_product_attention` but with no implicit
+/// `1/sqrt(head_dim)` scaling — gemma4v doesn't divide because Q has
+/// already been RMS-normalized. Inputs are `[batch, num_heads, head_dim]`
+/// (Q, K, V); output is `[batch, num_heads * head_dim]`.
+fn gemma4v_attention_unit_scale(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || num_heads == 0 || head_dim == 0 {
+        return Err(anyhow!(
+            "gemma4v_attention_unit_scale: zero dim batch={batch} heads={num_heads} d={head_dim}"
+        ));
+    }
+    let expected = batch * num_heads * head_dim;
+    if q.len() != expected || k.len() != expected || v.len() != expected {
+        return Err(anyhow!(
+            "gemma4v_attention_unit_scale: shape mismatch q={} k={} v={} expected {expected}",
+            q.len(),
+            k.len(),
+            v.len()
+        ));
+    }
+    // Compute scores[h, i, j] = sum_d Q[i, h, d] * K[j, h, d] for batch_q=batch_k=batch.
+    // No sqrt scaling.
+    let mut scores = vec![0_f32; num_heads * batch * batch];
+    for h in 0..num_heads {
+        for i in 0..batch {
+            for j in 0..batch {
+                let mut acc = 0_f32;
+                let q_base = i * num_heads * head_dim + h * head_dim;
+                let k_base = j * num_heads * head_dim + h * head_dim;
+                for d in 0..head_dim {
+                    acc += q[q_base + d] * k[k_base + d];
+                }
+                scores[h * batch * batch + i * batch + j] = acc;
+            }
+        }
+    }
+    // Softmax along last (j) axis per (h, i).
+    softmax_last_dim(&mut scores, batch)?;
+    // attn[i, h, d] = sum_j scores[h, i, j] * V[j, h, d]
+    let mut attn = vec![0_f32; batch * num_heads * head_dim];
+    for h in 0..num_heads {
+        for i in 0..batch {
+            for d in 0..head_dim {
+                let mut acc = 0_f32;
+                for j in 0..batch {
+                    let v_idx = j * num_heads * head_dim + h * head_dim + d;
+                    let s_idx = h * batch * batch + i * batch + j;
+                    acc += scores[s_idx] * v[v_idx];
+                }
+                attn[i * num_heads * head_dim + h * head_dim + d] = acc;
+            }
+        }
+    }
+    Ok(attn)
+}
+
+/// Shape parameters for `gemma4v_block_forward`. Built by the caller from
+/// the model config + the loaded block tensors.
+#[derive(Debug, Clone, Copy)]
+pub struct Gemma4VisionBlockShape {
+    pub hidden: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub intermediate: u32,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+}
+
+/// Borrowed view of a single block's weights for the CPU forward.
+/// Each field is `[out, in]` row-major (PyTorch nn.Linear convention)
+/// for projection weights, and `[head_dim]` (or `[hidden]`) for norms.
+#[derive(Debug)]
+pub struct Gemma4VisionBlockWeights<'a> {
+    pub input_layernorm: &'a [f32],            // ln1.weight,        [hidden]
+    pub post_attention_layernorm: &'a [f32],    // ln2.weight,        [hidden]
+    pub pre_feedforward_layernorm: &'a [f32],   // ffn_norm.weight,   [hidden]
+    pub post_feedforward_layernorm: &'a [f32],  // post_ffw_norm,     [hidden]
+    pub q_proj: &'a [f32],                      // attn_q.weight,     [num_heads*head_dim, hidden]
+    pub k_proj: &'a [f32],                      // attn_k.weight,     [num_kv_heads*head_dim, hidden]
+    pub v_proj: &'a [f32],                      // attn_v.weight,     [num_kv_heads*head_dim, hidden]
+    pub o_proj: &'a [f32],                      // attn_output.weight,[hidden, num_heads*head_dim]
+    pub q_norm: &'a [f32],                      // attn_q_norm.weight,[head_dim]
+    pub k_norm: &'a [f32],                      // attn_k_norm.weight,[head_dim]
+    pub gate_proj: &'a [f32],                   // ffn_gate.weight,   [intermediate, hidden]
+    pub up_proj: &'a [f32],                     // ffn_up.weight,     [intermediate, hidden]
+    pub down_proj: &'a [f32],                   // ffn_down.weight,   [hidden, intermediate]
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
