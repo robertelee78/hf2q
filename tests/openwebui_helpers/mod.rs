@@ -231,13 +231,26 @@ pub fn user_msg_with_image_url(text: &str, image_url: &str) -> serde_json::Value
     })
 }
 
-/// GET `/v1/models` → canonical loaded model id.
+/// GET `/v1/models` → canonical loaded **chat** model id.
 ///
 /// The loaded model id is `general.name` from GGUF metadata, falling
 /// back to the file stem (see `src/serve/api/engine.rs:511-520`).
 /// A request body with the wrong `model` field returns HTTP 400
 /// `model_not_loaded`; we read /v1/models so the test never depends
 /// on the GGUF's `general.name` string.
+///
+/// W79 iter-211 fix: when the server is started with `--mmproj <path>`
+/// the mmproj is prepended to `/v1/models` (handlers.rs:2978-2994) for
+/// operational visibility — but it is NOT a chat-completions-eligible
+/// model. Picking `data[0].id` blindly returns the mmproj id and the
+/// next /v1/chat/completions request 400s with `model_not_loaded`.
+///
+/// We mirror the discovery pattern from
+/// `tests/mmproj_llama_cpp_compat.rs:543-561`: the chat entry is
+/// the one carrying a non-null `context_length`; the mmproj entry's
+/// `context_length` is `null`. Filter on that to pick the
+/// chat-completions target deterministically across `--mmproj` and
+/// no-`--mmproj` server configurations.
 pub async fn fetch_canonical_model_id() -> String {
     // Async client only — adding `reqwest`'s `blocking` feature for
     // a single one-shot GET would pull in extra dependencies for no
@@ -258,6 +271,28 @@ pub async fn fetch_canonical_model_id() -> String {
         resp.status()
     );
     let v: serde_json::Value = resp.json().await.expect("parse /v1/models JSON");
+    let data = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .unwrap_or_else(|| panic!("/v1/models response missing data array: {v}"));
+    // Pick the first entry with a non-null `context_length`. mmproj entries
+    // carry `null` here; chat entries carry the integer context window.
+    let chat_id = data
+        .iter()
+        .find(|m| {
+            m.get("context_length")
+                .map(|cl| !cl.is_null())
+                .unwrap_or(false)
+        })
+        .and_then(|m| m.get("id"))
+        .and_then(|s| s.as_str());
+    if let Some(id) = chat_id {
+        return id.to_string();
+    }
+    // Pre-iter-209 single-slot servers (and embedding-only configurations)
+    // may have no chat entry; fall back to the first entry rather than
+    // hard-fail so a future zero-chat configuration surfaces as a model
+    // resolution error, not a helper panic.
     v["data"][0]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("/v1/models response missing data[0].id: {v}"))
