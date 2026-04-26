@@ -1338,6 +1338,74 @@ Bit-identical reproduction across two cold-process runs at T=0.0, max_tokens=16.
 
 ---
 
+#### Phase 2c iter-126 — patch_embd inner-axis CHW ordering fixed; cascade collapses 5–7× across all stages (2026-04-26, W57, commits `311db0d` + `7dbb0bb`)
+
+**Why this iter exists.** Iter-125 (W56) fixed the preprocess scale-bias chain (`2x − 1` → `4x − 3`) and achieved the first peer-word overlap on the four-dots smoke (3 peer words: "four", "frame", "cornered"). But the parity probe still showed real divergence at stage `01_patch_embd` (max_abs=64.6, post-fix from W56's 99.1) and a flat cascade through all 27 ViT blocks. Two distinct work units this iter: (Phase 1) make the parity probe layout-honest at stage 00 to remove the layout-induced false-positive `max_abs=3.69` artifact, then (Phase 3) audit the patch_embd Conv2D byte-for-byte against `clip.cpp` + `gemma4v.cpp`.
+
+**Phase 1 — parity probe layout-honest stage 00 (commit `311db0d`).** W56's probe dumped hf2q's `00_preprocess` as `[2304, 768]` (post-patchify HWC-flattened) but peer dumped `inp_raw_scaled` as `[3, 768, 768]` (pre-patchify CHW planar). The diff harness compares element-wise by linear index, so identical data in different layouts yielded a `max_abs=3.69` false-positive that masked the true numerical identity established by W56's stats analysis (min=−2.7647, max=+0.9216, mean diff=3.4e-4, all bilinear-resize noise).
+
+Renamed the existing `00_preprocess` stage to `00_post_patchify` (hf2q-native HWC, no peer counterpart — useful for self-consistency checks across iters) and added a new `00_pre_patchify` stage that emits a planar `[3, n_y·P, n_x·P]` CHW tensor reconstructed from the patchified row-major data via a pure index permutation (no FP arithmetic, byte-exact). This matches peer's `inp_raw_scaled` ggml ne ordering `(W, H, C)` ne[0..2] → on-disk shape `[C, H, W]`. Peer dumper updated to map `inp_raw_scaled` → `00_pre_patchify`.
+
+Diff result on layout-honest dumps:
+
+```
+stage              shape          max_abs        mean_abs    shape_ok  notes
+00_pre_patchify    [3, 768, 768]  9.882e-1       3.560e-3    yes       bilinear-resize noise (mean 0.36%)
+01_patch_embd      [2304, 1152]   6.460e1        3.694e-2    yes       real divergence — Phase 3 target
+```
+
+Stage `00_pre_patchify` worst_idx=553680 (hf2q=−1.337, peer=−2.325) decodes to `(R-channel, y=720, x=720)` near image bottom-right corner — corresponds to bilinear-resize sampling drift between hf2q's `image-rs` resampler and llama.cpp's hand-rolled `resize_bilinear_pad_llama_cpp` at edge pixels; the iter-121 (W52) port matched the algorithm structure but inherent uint8-cast-truncation differences yield ~1.0 max diff at edges with mean 0.36% across the image. **Production-correct** — Phase 1 confirmed by element-wise diff that stage 00 is now image-aligned across both pipelines and the W56 max_abs=3.7 was 100% layout artifact.
+
+Discovered side-effect: hf2q's `02_pos_embd` dump shape reports `[2654208]` (1-D from buffer's flat allocation) where peer reports `[2304, 1152]`. Same total elements; comparator pairs them correctly element-wise but `shape_ok=NO`. iter-127 cleanup (one-line in `vit_dump.rs::write_dump_inner` to honour buffer's stored shape).
+
+**Phase 3 — patch_embd byte-for-byte audit.** Read `gemma4v.cpp:12` (`ggml_conv_2d(model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1)`), `clip.cpp:518` (`build_inp_raw` returns `ggml_new_tensor_3d(ctx0, F32, img.nx, img.ny, channels)` — ne ordering `(W, H, C)`, planar CHW memory), `clip.cpp:3202-3215` (input fill: peer reads `imgs.entries[b]->buf` interleaved HWC and writes planar CHW to `inp_raw`), `ggml-cpu/ops.cpp:6391` (im2col output last-dim layout = `iic*(KH*KW) + ikh*KW + ikw` = CHW per row), and `convert_hf_to_gguf.py:7873-7877` (HF source weight `[n_embd, hwc]` HWC → reshape `(n_embd, h, w, c)` → `permute(0, 3, 1, 2)` → `[n_embd, c, h, w]` PyTorch CHW).
+
+Hf2q's `transpose_patch_embd_hwc_to_chw` (`gguf.rs:995-1019`) applies the SAME permute at convert time, so the GGUF-stored tensor has rows in CHW per-output-row order. The reader returns it as 2-D `[hidden, p²·c]` flat — and `vit_linear_gpu` does `out[n][o] = Σ_k weight[o][k] · patches[n][k]`, requiring both sides of the matmul to agree on what `(c, dy, dx)` triplet `k` refers to.
+
+But hf2q's `preprocess_gemma4v` patchify (`preprocess.rs:362-367`, pre-this-iter) emitted patch rows in HWC `(dy, dx, c)` order — copying candle's `permute(0,2,4,3,5,1)` (`/opt/candle/.../gemma4/vision.rs:146`). Candle works because it reads the HF safetensors weight DIRECTLY without permute — HWC patches dot HWC weight rows, self-consistent. Hf2q reads the writer-permuted CHW weight, so HWC patches against CHW weight is a per-channel ordering mismatch.
+
+**Signature confirmed by parity probe:** all 2196 grayscale-uniform patches (the four_dots fixture is RGB-equal) had stage 01 diff at the BF16-noise floor (0.026 — `vit_linear_gpu` casts F32 weight to BF16 before matmul; ~0.026 = 768-element accumulated 7-bit-mantissa noise), but the 64 non-uniform patches (containing the four black square corners) had output diff up to 64.6. Uniform inputs `R(y,x) = G(y,x) = B(y,x)` collapse the per-channel sum across orderings; non-uniform inputs do not.
+
+**Fix (commit `7dbb0bb`).** One-line index permutation in the patchify loop: `patches[row_base + (dy*P + dx)*3 + c] = …` → `patches[row_base + c*P² + dy*P + dx] = …`. The `Gemma4vPreprocessed::patches` doc-comment updated to declare CHW ordering and call out why hf2q's path differs from candle's. The de-patchify dump in `vit_gpu.rs::gemma4v_apply_full_forward_gpu` updated to consume the new CHW-rowed patches. One existing test (`gemma4v_preprocess_first_pixel_is_corner`) had a hardcoded HWC index `last_patch[765]` ((dy=15, dx=15, c=0) → `(15·16 + 15)·3 + 0`); updated to CHW `last_patch[255]` ((c=0, dy=15, dx=15) → `0·256 + 15·16 + 15`).
+
+**Cascade collapse (max_abs at each stage):**
+
+```
+stage              W56 (iter-125)   iter-126 P1 (layout)   iter-126 P3 (CHW fix)   total drop
+00_pre_patchify    n/a              9.882e-1               9.882e-1                 reference
+01_patch_embd      9.914e1          6.460e1                1.265e1                  −87.2%
+02_pos_embd        9.914e1          6.460e1                1.265e1                  −87.2%
+03_block_00        9.953e1          (same)                 1.377e1                  −86.2%
+03_block_05        n/a              1.252e2                1.576e1                  −87.4%
+03_block_15        n/a              4.033e2                4.090e1                  −89.9%
+03_block_26        1.417e3          (same)                 7.334e2                  −48.2%
+30_final_pool      2.376e4          (same)                 6.152e3                  −74.1%
+32_std_bias_scale  9.176e0          (same)                 1.976e0                  −78.5%
+33_projector       1.401e1          (same)                 3.395e0                  −75.8%
+34_post_proj_rms   1.024e1          (same)                 2.442e0                  −76.2%
+```
+
+Per-patch correlation analysis on stage 01 post-fix: 0.91 between input-diff and output-diff; 2196 uniform patches diff to BF16 noise floor; 64 non-uniform patches show output/input ratio 13.2× (consistent with conv's amplification of bilinear-resize input perturbations). The patch_embd is now byte-faithful modulo upstream preprocess noise.
+
+**Smoke output progression (T=0 cold, four_dots_in_corners_128x128.png, two cold runs deterministic):**
+
+```
+Peer truth:                  An image of a square frame made of four
+W55 (iter-124 baseline):     Minimalist geometric pattern, white background.
+W56 (iter-125):              Four cornered frame, mostly white.       (3 peer words)
+W57 (iter-126 patch_embd):   Four black squares, white background.    (1 peer word)
+```
+
+Bit-identical reproduction across two cold runs. **Peer-word count went from 3 → 1**, but the underlying scene perception is more accurate: the four_dots fixture IS literally four black squares on white background. The W56 output described the geometry "frame/cornered" peer used; W57's output describes the literal pixel content correctly. This is the patch_embd fix surfacing — the model now sees the dots as discrete black squares (lower-level features) rather than aggregating them into a "cornered frame" via downstream feature compounding that was being driven by the per-channel ordering mismatch's signed-error pattern. The cascade still has 733 max_abs at block_26 which iter-127 will narrow.
+
+**Cargo verify.** `cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W56 baseline 241); `cargo build --release --bin hf2q` 0; `cmake --build cpp/build` 0; `cargo build --release` inside `tools/vit_parity_probe` 0.
+
+**Files touched.** `src/inference/vision/preprocess.rs` (1-line patchify reorder + doc-string + 1 test index update), `src/inference/vision/vit_dump.rs` (taxonomy comment), `src/inference/vision/vit_gpu.rs` (rename `00_preprocess` → `00_post_patchify` + add `00_pre_patchify` de-patchify dump), `tools/vit_parity_probe/cpp/peer_dumper.cpp` (name_map: `inp_raw_scaled` → `00_pre_patchify`). Fenced files clean.
+
+**Iter-127 target.** Cascade still compounds from 12.6 at stage 01 to 733 at block_26 (58× growth across 27 blocks ≈ 1.16× per-block) — well-controlled by ViT block standards (each block adds attention residuals + MLP residuals + 7 BF16 weight casts). Candidates ordered by likelihood: (a) `02_pos_embd` shape NO is a probe cleanup, but the underlying numerical identity needs a dedicated audit — even though stage 02 max_abs is identical to stage 01's (12.6), the position-embed lookup is a non-trivial op that could drift if the dual-table indexing or row-stride is off; (b) the BF16 K cast inside attention (`vit_attention_gpu`) per `project_vit_attention_bf16_softmax_drift.md` — iter-120 (W49) showed it perturbs by ~0.68 logits; with stage 01 noise now 5× smaller it may dominate; (c) per-block residual-stream sign convention or attention head splitting/concatenation; (d) projector mm.0 matmul orientation. Probe still runs; element-wise diff still works; lower the tolerance to `1e-2` to start narrowing in iter-127.
+
+---
+
 #### Phase 2c iter-125 — preprocess scale-bias chain fixed (`4x − 3`); peer-word overlap on four-dots smoke achieved for the first time (2026-04-26, W56, commit `b649d9f`)
 
 **Iter-124 numerical target executed.** W55's parity probe pinpointed the first divergence at stage `00_preprocess`: hf2q's `preprocess_gemma4v` (`src/inference/vision/preprocess.rs:344-350`) applied only the FIRST step of llama.cpp's two-step scale-bias chain. The bug: `mtmd-image.cpp:11-21` `img_u8_to_f32` with mean=std=[0.5,0.5,0.5] produces `2x − 1` (range `[−1, +1]`), and `gemma4v.cpp:9` `ggml_scale_bias(2.0, −1.0)` then applies a SECOND `2y − 1` on top, yielding `4x − 3` (range `[−3, +1]`). hf2q stopped at the first step, producing exactly `(peer + 1) / 2`.
