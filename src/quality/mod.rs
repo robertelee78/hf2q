@@ -14,7 +14,7 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::ir::{DType, ModelMetadata, QuantizedModel, TensorMap, TensorRef};
+use crate::ir::{DType, ModelMetadata, QuantizedModel, QuantizedTensor, TensorMap, TensorRef};
 use crate::progress::ProgressReporter;
 
 /// Errors from quality measurement.
@@ -233,95 +233,212 @@ fn tensor_ref_to_f32(tensor: &TensorRef) -> Vec<f32> {
     }
 }
 
+/// Dequantize a single QuantizedTensor back to a TensorRef for comparison.
+///
+/// Preserved/f16 tensors are returned as-is (data clone). Quantized tensors
+/// are unpacked and dequantized using their stored scales back to f16.
+///
+/// This is the per-tensor primitive used by both [`dequantize_to_tensor_map`]
+/// (the legacy whole-model variant kept for tests) and
+/// [`measure_quality_streaming`] (the bounded-memory variant used in
+/// Phase 4.5).
+pub fn dequantize_single_tensor(name: &str, qt: &QuantizedTensor) -> TensorRef {
+    if qt.quant_info.preserved {
+        let dtype = match qt.quant_info.bits {
+            32 => DType::F32,
+            _ => DType::F16,
+        };
+        return TensorRef {
+            name: name.to_string(),
+            shape: qt.shape.clone(),
+            dtype,
+            data: qt.data.clone(),
+        };
+    }
+
+    if qt.quant_info.method == "f16" {
+        return TensorRef {
+            name: name.to_string(),
+            shape: qt.shape.clone(),
+            dtype: DType::F16,
+            data: qt.data.clone(),
+        };
+    }
+
+    let numel: usize = qt.shape.iter().product();
+    let bits = qt.quant_info.bits;
+    let group_size = qt.quant_info.group_size;
+
+    let scales: Vec<f32> = match &qt.quant_info.scales {
+        Some(s) => s
+            .chunks_exact(2)
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                half::f16::from_bits(bits).to_f32()
+            })
+            .collect(),
+        None => {
+            warn!("No scales for tensor '{}', treating as passthrough", name);
+            let data: Vec<u8> = vec![0u8; numel * 2];
+            return TensorRef {
+                name: name.to_string(),
+                shape: qt.shape.clone(),
+                dtype: DType::F16,
+                data,
+            };
+        }
+    };
+
+    let quantized_values = unpack_quantized(&qt.data, numel, bits);
+    let effective_group_size = if numel < group_size {
+        numel
+    } else {
+        group_size
+    };
+
+    let mut f16_data = Vec::with_capacity(numel * 2);
+    for (i, &q_val) in quantized_values.iter().enumerate() {
+        let group_idx = i / effective_group_size;
+        let scale = if group_idx < scales.len() {
+            scales[group_idx]
+        } else {
+            0.0
+        };
+        let dequantized = q_val as f32 * scale;
+        let f16_val = half::f16::from_f32(dequantized);
+        f16_data.extend_from_slice(&f16_val.to_le_bytes());
+    }
+
+    TensorRef {
+        name: name.to_string(),
+        shape: qt.shape.clone(),
+        dtype: DType::F16,
+        data: f16_data,
+    }
+}
+
 /// Dequantize a QuantizedModel back into a TensorMap for forward pass comparison.
 ///
 /// Preserved (passthrough) tensors are returned as-is. Quantized tensors are
 /// unpacked and dequantized using their stored scales back to f16.
+///
+/// **Memory characteristic:** holds the entire dequantized model in RAM. For
+/// 27B+ DWQ models this peaks near `whole_model × 2` (alongside the original
+/// `tensor_map`) which OOMs on a 128 GB M5 Max — see Task #13 / ADR-012.  Use
+/// [`measure_quality_streaming`] for production conversion of large models;
+/// this variant is retained for tests and small-model paths.
 pub fn dequantize_to_tensor_map(model: &QuantizedModel) -> TensorMap {
     let mut tensor_map = TensorMap::new();
-
     for (name, qt) in &model.tensors {
-        let tensor_ref = if qt.quant_info.preserved {
-            // Preserved tensor: data is already in original format (f16 or f32)
-            let dtype = match qt.quant_info.bits {
-                32 => DType::F32,
-                _ => DType::F16,
-            };
-            TensorRef {
-                name: name.clone(),
-                shape: qt.shape.clone(),
-                dtype,
-                data: qt.data.clone(),
-            }
-        } else if qt.quant_info.method == "f16" {
-            TensorRef {
-                name: name.clone(),
-                shape: qt.shape.clone(),
-                dtype: DType::F16,
-                data: qt.data.clone(),
-            }
-        } else {
-            // Dequantize: unpack values, multiply by scales, produce f16 output
-            let numel: usize = qt.shape.iter().product();
-            let bits = qt.quant_info.bits;
-            let group_size = qt.quant_info.group_size;
+        tensor_map.insert(dequantize_single_tensor(name, qt));
+    }
+    tensor_map
+}
 
-            let quantized_values = unpack_quantized(&qt.data, numel, bits);
+/// Streaming weight-cosine quality measurement.
+///
+/// Iterates the quantized model tensor-by-tensor, dequantizing each weight
+/// just-in-time and dropping the F32 buffers before the next iteration.
+/// Bounds peak memory to roughly `max_tensor_F32 × 2` instead of the
+/// `whole_model × 2` footprint of [`measure_quality`] +
+/// [`dequantize_to_tensor_map`].
+///
+/// This is the path used by Phase 4.5 of the convert pipeline (main.rs)
+/// for real-model DWQ conversions where the dense path otherwise OOMs at
+/// ~170 GB peak on a 128 GB M5 Max — see Task #13 / ADR-012.
+///
+/// Returns the same shape of [`QualityReport`] as the legacy variant
+/// (per-layer cosine, average, min, min layer index), so downstream
+/// consumers ([`print_quality_summary`], [`check_thresholds`]) work
+/// unchanged.
+pub fn measure_quality_streaming(
+    original_tensors: &TensorMap,
+    quantized: &QuantizedModel,
+    _metadata: &ModelMetadata,
+    _model_dir: &Path,
+    progress: &ProgressReporter,
+) -> Result<QualityReport, QualityError> {
+    let mut weight_names: Vec<&String> = quantized
+        .tensors
+        .keys()
+        .filter(|name| {
+            original_tensors
+                .tensors
+                .get(*name)
+                .map(|t| t.is_weight())
+                .unwrap_or(false)
+        })
+        .collect();
+    weight_names.sort();
 
-            let scales: Vec<f32> = match &qt.quant_info.scales {
-                Some(s) => s
-                    .chunks_exact(2)
-                    .map(|c| {
-                        let bits = u16::from_le_bytes([c[0], c[1]]);
-                        half::f16::from_bits(bits).to_f32()
-                    })
-                    .collect(),
-                None => {
-                    // No scales: assume passthrough
-                    warn!("No scales for tensor '{}', treating as passthrough", name);
-                    let data: Vec<u8> = vec![0u8; numel * 2]; // zeros as f16
-                    tensor_map.insert(TensorRef {
-                        name: name.clone(),
-                        shape: qt.shape.clone(),
-                        dtype: DType::F16,
-                        data,
-                    });
-                    continue;
-                }
-            };
+    let pb = progress.bar(weight_names.len() as u64, "Quality measurement (streaming)");
 
-            let effective_group_size = if numel < group_size {
-                numel
-            } else {
-                group_size
-            };
+    let mut report = QualityReport::empty();
+    let mut per_layer: Vec<f64> = Vec::with_capacity(weight_names.len());
+    let mut min_val: f64 = 1.0;
+    let mut min_idx: usize = 0;
 
-            // Dequantize: value * scale -> f16
-            let mut f16_data = Vec::with_capacity(numel * 2);
-            for (i, &q_val) in quantized_values.iter().enumerate() {
-                let group_idx = i / effective_group_size;
-                let scale = if group_idx < scales.len() {
-                    scales[group_idx]
-                } else {
-                    0.0
-                };
-                let dequantized = q_val as f32 * scale;
-                let f16_val = half::f16::from_f32(dequantized);
-                f16_data.extend_from_slice(&f16_val.to_le_bytes());
-            }
+    for (idx, name) in weight_names.iter().enumerate() {
+        let orig_tensor = &original_tensors.tensors[*name];
+        // SAFETY: weight_names was filtered against quantized.tensors above.
+        let qt = &quantized.tensors[*name];
 
-            TensorRef {
-                name: name.clone(),
-                shape: qt.shape.clone(),
-                dtype: DType::F16,
-                data: f16_data,
+        // Dequantize one tensor at a time; drop after the cosine pair is computed.
+        let dequant_ref = dequantize_single_tensor(name, qt);
+
+        let orig_f32 = tensor_ref_to_f32(orig_tensor);
+        let dequant_f32 = tensor_ref_to_f32(&dequant_ref);
+        // Drop the dequant TensorRef byte buffer as soon as we have F32.
+        drop(dequant_ref);
+
+        if orig_f32.is_empty() || dequant_f32.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        let len = orig_f32.len().min(dequant_f32.len());
+        let sim = match cosine_sim::cosine_similarity(&orig_f32[..len], &dequant_f32[..len]) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Cosine similarity failed for tensor '{}': {}", name, e);
+                pb.inc(1);
+                continue;
             }
         };
 
-        tensor_map.insert(tensor_ref);
+        if sim < min_val {
+            min_val = sim;
+            min_idx = idx;
+        }
+        per_layer.push(sim);
+        // Explicit drops to free F32 staging before the next tensor.
+        drop(orig_f32);
+        drop(dequant_f32);
+        pb.inc(1);
     }
 
-    tensor_map
+    pb.finish_with_message("Quality measurement complete");
+
+    if !per_layer.is_empty() {
+        let average = per_layer.iter().sum::<f64>() / per_layer.len() as f64;
+        report.cosine_sim_average = Some(average);
+        report.cosine_sim_min = Some(min_val);
+        report.cosine_sim_min_layer = Some(min_idx);
+        report.per_layer_cosine_sim = Some(per_layer);
+    } else {
+        warn!("No matching weight tensors found for streaming quality measurement");
+    }
+
+    info!(
+        weight_pairs = report
+            .per_layer_cosine_sim
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0),
+        "Streaming weight-level quality measurement complete"
+    );
+
+    Ok(report)
 }
 
 /// Unpack bit-packed quantized values back to i8.
@@ -642,5 +759,254 @@ mod tests {
         assert!((vals[0] - 1.0).abs() < 0.01);
         assert!((vals[1] + 2.0).abs() < 0.01);
         assert!((vals[2] - 3.5).abs() < 0.01);
+    }
+
+    /// Build a small QuantizedModel + matching original TensorMap that has
+    /// a passthrough weight (identical orig/quant) and a quantized weight
+    /// (identical orig/quant within float roundtrip).  Returns
+    /// (orig_tensor_map, quantized_model, expected_min_layer_name).
+    fn build_streaming_test_model() -> (TensorMap, QuantizedModel) {
+        use std::collections::HashMap;
+
+        // Need shape with row_dim (last dim) ≥ 32 for is_weight() to return
+        // true (per ADR-012 P9b: Q4_0/Q5_0/Q8_0 require row_dim divisible
+        // by 32).  Use 1×32 tensors.
+        const ROW: usize = 32;
+
+        // Quantized "ffn_up.weight": 32 elements at 8-bit, group_size=32.
+        // Lossless dequant when scale = 1.0 and values are in [-128, 127].
+        let orig_q_vals: Vec<f32> = (0..ROW as i32)
+            .map(|i| (i - 16) as f32) // -16..15
+            .collect();
+        let q_data: Vec<u8> = orig_q_vals.iter().map(|&v| v as i8 as u8).collect();
+        let scale_f16 = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let q_scales: Vec<u8> = scale_f16.to_vec();
+        let orig_q_f16: Vec<u8> = orig_q_vals
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        // Preserved tensor: 1×32 of varying values.
+        let preserved_vals: Vec<f32> = (0..ROW as i32).map(|i| (i + 1) as f32 * 0.5).collect();
+        let preserved_f16: Vec<u8> = preserved_vals
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        let mut orig_map = TensorMap::new();
+        orig_map.insert(TensorRef {
+            name: "blk.0.ffn_up.weight".to_string(),
+            shape: vec![1, ROW],
+            dtype: DType::F16,
+            data: orig_q_f16,
+        });
+        orig_map.insert(TensorRef {
+            name: "blk.0.ffn_down.weight".to_string(),
+            shape: vec![1, ROW],
+            dtype: DType::F16,
+            data: preserved_f16.clone(),
+        });
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "blk.0.ffn_up.weight".to_string(),
+            crate::ir::QuantizedTensor {
+                name: "blk.0.ffn_up.weight".to_string(),
+                shape: vec![1, ROW],
+                original_dtype: DType::F16,
+                data: q_data,
+                quant_info: crate::ir::TensorQuantInfo {
+                    method: "q8".to_string(),
+                    bits: 8,
+                    group_size: 32,
+                    preserved: false,
+                    scales: Some(q_scales),
+                    biases: None,
+                    ggml_type: None,
+                },
+            },
+        );
+        tensors.insert(
+            "blk.0.ffn_down.weight".to_string(),
+            crate::ir::QuantizedTensor {
+                name: "blk.0.ffn_down.weight".to_string(),
+                shape: vec![1, ROW],
+                original_dtype: DType::F16,
+                data: preserved_f16,
+                quant_info: crate::ir::TensorQuantInfo {
+                    method: "passthrough".to_string(),
+                    bits: 16,
+                    group_size: 0,
+                    preserved: true,
+                    scales: None,
+                    biases: None,
+                    ggml_type: None,
+                },
+            },
+        );
+
+        let metadata = ModelMetadata {
+            architecture: "test".to_string(),
+            model_type: "test".to_string(),
+            param_count: 64,
+            hidden_size: 32,
+            num_layers: 1,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: None,
+            vocab_size: 32000,
+            dtype: "float16".to_string(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: None,
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        let model = QuantizedModel {
+            metadata,
+            tensors,
+            quant_method: "q8".to_string(),
+            group_size: 8,
+            bits: 8,
+        };
+
+        (orig_map, model)
+    }
+
+    #[test]
+    fn measure_quality_streaming_matches_legacy_for_lossless_dequant() {
+        // Lossless q8 + passthrough → both paths must report cosine ≈ 1.0
+        // for every weight.  Streaming and legacy must agree on the per-layer
+        // vector length, average, min, and min_layer_idx.
+        let (orig, model) = build_streaming_test_model();
+        let progress = ProgressReporter::new();
+        let metadata = model.metadata.clone();
+        let tmp = std::path::PathBuf::from("/tmp");
+
+        let streaming = measure_quality_streaming(&orig, &model, &metadata, &tmp, &progress)
+            .expect("streaming quality should succeed");
+
+        let legacy_dequant = dequantize_to_tensor_map(&model);
+        let legacy = measure_quality(&orig, &legacy_dequant, &metadata, &tmp, &progress)
+            .expect("legacy quality should succeed");
+
+        // Both must produce the same number of per-layer entries.
+        assert_eq!(
+            streaming.per_layer_cosine_sim.as_ref().map(|v| v.len()),
+            legacy.per_layer_cosine_sim.as_ref().map(|v| v.len()),
+            "streaming and legacy must report the same number of weight tensors",
+        );
+
+        // Average and min must agree within float tolerance.
+        let s_avg = streaming.cosine_sim_average.expect("streaming avg");
+        let l_avg = legacy.cosine_sim_average.expect("legacy avg");
+        assert!(
+            (s_avg - l_avg).abs() < 1e-9,
+            "streaming avg {} must match legacy avg {} within 1e-9",
+            s_avg,
+            l_avg,
+        );
+
+        let s_min = streaming.cosine_sim_min.expect("streaming min");
+        let l_min = legacy.cosine_sim_min.expect("legacy min");
+        assert!(
+            (s_min - l_min).abs() < 1e-9,
+            "streaming min {} must match legacy min {} within 1e-9",
+            s_min,
+            l_min,
+        );
+
+        // For lossless q8 + passthrough, every cosine should be ~1.0.
+        for (i, &v) in streaming
+            .per_layer_cosine_sim
+            .as_ref()
+            .expect("per-layer")
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                (v - 1.0).abs() < 1e-3,
+                "layer {} streaming cosine {} should be ~1.0 for lossless dequant",
+                i,
+                v,
+            );
+        }
+    }
+
+    #[test]
+    fn measure_quality_streaming_handles_empty_quantized_model() {
+        // Empty tensor map → empty per_layer + None metrics, no panic.
+        let progress = ProgressReporter::new();
+        let metadata = ModelMetadata {
+            architecture: "test".to_string(),
+            model_type: "test".to_string(),
+            param_count: 0,
+            hidden_size: 0,
+            num_layers: 0,
+            layer_types: vec![],
+            num_attention_heads: 0,
+            num_kv_heads: None,
+            vocab_size: 0,
+            dtype: "float16".to_string(),
+            shard_count: 0,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: None,
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+        let model = QuantizedModel {
+            metadata: metadata.clone(),
+            tensors: std::collections::HashMap::new(),
+            quant_method: "q8".to_string(),
+            group_size: 8,
+            bits: 8,
+        };
+        let report = measure_quality_streaming(
+            &TensorMap::new(),
+            &model,
+            &metadata,
+            std::path::Path::new("/tmp"),
+            &progress,
+        )
+        .expect("empty model streaming quality should succeed");
+        assert!(report.cosine_sim_average.is_none());
+        assert!(report.per_layer_cosine_sim.is_none());
     }
 }

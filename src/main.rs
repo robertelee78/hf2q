@@ -1121,16 +1121,20 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // Phase 4.5: Quality measurement (before write, while quantized_model is available)
+    // Phase 4.5: Quality measurement (before write, while quantized_model is available).
+    //
+    // ADR-012 / Task #13: use the streaming variant which dequantizes and compares
+    // one tensor at a time, bounding peak memory to ~max_tensor_F32 × 2 instead of
+    // whole_model × 2.  The pre-Task-#13 path held both the original `tensor_map`
+    // (~108 GB F32 for 27B) and a fully-dequantized clone (~108 GB F16) at once,
+    // peaking near 170 GB on a 128 GB M5 Max and OOM-killing the convert process.
     let quality_report = if config.skip_quality {
         tracing::info!("Quality measurement skipped (--skip-quality)");
         quality::QualityReport::empty()
     } else if let Some(ref qm) = quantized_model {
-        // Build a dequantized TensorMap from the quantized output for comparison
-        let quantized_tensor_map = quality::dequantize_to_tensor_map(qm);
-        match quality::measure_quality(
+        match quality::measure_quality_streaming(
             &tensor_map,
-            &quantized_tensor_map,
+            qm,
             &metadata,
             &config.input_dir,
             &progress,
