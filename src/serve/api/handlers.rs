@@ -25,7 +25,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::engine::{self, SamplingParams};
+use std::sync::Arc;
+
+use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
 use super::schema::{
     ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
@@ -34,6 +36,166 @@ use super::schema::{
     ReadyzResponse, ResponseFormat, UsageStats,
 };
 use super::state::AppState;
+use crate::serve::auto_pipeline;
+use crate::serve::multi_model::{EngineConfig, LoadedEngine};
+use crate::serve::quant_select::QuantType;
+
+// ---------------------------------------------------------------------------
+// Pool-routing helper (ADR-005 Phase 4 iter-209 — Decision #26 auto-swap)
+// ---------------------------------------------------------------------------
+
+/// Resolve `req.model` (or `state.default_model` as fallback) through the
+/// auto-pipeline + the in-memory `HotSwapManager` pool.  On hit: returns
+/// the existing pooled engine without invoking the loader.  On miss:
+/// resolves through cache + auto_pipeline (which may download / quantize),
+/// admits via `pool.load_or_get` (which may evict LRU entries), and
+/// returns the freshly-pooled engine.
+///
+/// **Decision #26 mapping (ADR-005 line 5366).**  Pre-iter-209 the
+/// generation handlers returned `400 model_not_loaded` whenever
+/// `state.engine.is_none()`.  Iter-209 replaces that single contract
+/// surface with auto-swap: the same 400 fires only when the
+/// auto-pipeline cannot resolve the requested name (empty / not on disk
+/// / not a valid HF repo-id), preserving the OpenAI client-facing
+/// contract.  Successfully-resolvable models auto-load transparently.
+///
+/// **Error mapping.**
+///
+/// - Empty / unresolvable `req.model` → 400 `model_not_loaded`.
+/// - Cache lock poisoned → 503 (a previous handler panicked under the
+///   cache mutex; surface a retryable error rather than panic-propagate).
+/// - Auto-pipeline failure (download / quantize / verify mismatch) →
+///   503 `not_ready` with the auto-pipeline's chained context.
+/// - Pool refused (oversized handle, zero capacity) → 503 `not_ready`.
+/// - Loader failed (GGUF parse / weights load / tokenizer / warmup) →
+///   500 `generation_error`.
+/// - GGUF metadata read failed → 500 `generation_error`.
+async fn resolve_engine_for_request(
+    state: &AppState,
+    requested_model: &str,
+) -> std::result::Result<Arc<LoadedEngine<Engine>>, Response> {
+    // 1. Resolve the lookup key.  Empty / whitespace req.model falls
+    //    back to `state.default_model`; if both are empty / unset,
+    //    that's a Decision #26 400.
+    let trimmed = requested_model.trim();
+    let model_arg: String = if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else if let Some(d) = state.default_model.as_deref() {
+        d.to_string()
+    } else {
+        return Err(ApiError::model_not_loaded(requested_model).into_response());
+    };
+
+    // 2. **Engine-id fast path (pre-iter-209 contract preserved)**.
+    //    Pre-iter-209: `req.model` was matched against `engine.model_id()`
+    //    (the loaded GGUF's `general.name` or file stem).  Iter-209
+    //    preserves that surface: if `req.model` matches the model_id of
+    //    an already-pooled engine, route to it directly without running
+    //    the auto-pipeline.  This is what Open WebUI / OpenAI clients
+    //    do when they re-send `req.model` from a prior `/v1/models`
+    //    response.  Without this fast path the GGUF-name string
+    //    `"Gemma4ForConditionalGeneration"` would fall through to
+    //    auto_pipeline (which classifies it as "neither path nor HF
+    //    repo-id" and 400s) — see iter-209 LIVE openwebui_multiturn
+    //    regression bisect.
+    if let Ok(pool_guard) = state.pool.read() {
+        for le in pool_guard.snapshot_engines() {
+            if le.engine.model_id() == model_arg {
+                drop(pool_guard);
+                return Ok(le);
+            }
+        }
+        // Drop guard before touching auto-pipeline (which acquires
+        // the cache mutex).
+        drop(pool_guard);
+    }
+
+    // 3. Run auto-pipeline resolution under the cache lock.  This is the
+    //    same code path cmd_serve's startup pre-warm dispatched against;
+    //    cache-hit + integrity-pass (or hf2q-origin short-circuit) is
+    //    near-zero-latency, cache-miss may take seconds (download +
+    //    quantize).  Run on the spawn_blocking pool so we don't stall
+    //    the tokio runtime on a long resolution.
+    let cache_arc = state.cache.clone();
+    let hardware = state.hardware.clone();
+    let no_integrity = state.no_integrity;
+    let model_arg_for_resolve = model_arg.clone();
+    let resolve_outcome = tokio::task::spawn_blocking(move || {
+        let mut cache_guard = cache_arc
+            .lock()
+            .map_err(|e| anyhow::anyhow!("cache mutex poisoned: {e}"))?;
+        auto_pipeline::resolve_or_prepare_model(
+            &model_arg_for_resolve,
+            &mut cache_guard,
+            hardware.as_ref(),
+            no_integrity,
+        )
+    })
+    .await;
+    let resolved = match resolve_outcome {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            // The auto-pipeline rejected the input.  Most common cause:
+            // unresolvable name (not a path, not an HF repo-id).  Map to
+            // Decision #26's 400 `model_not_loaded` so the OpenAI
+            // client-facing contract is preserved.
+            tracing::debug!(model = %model_arg, error = %e, "auto-pipeline rejected request model");
+            return Err(ApiError::model_not_loaded(&model_arg).into_response());
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "auto-pipeline blocking task panicked");
+            return Err(ApiError::internal_error().into_response());
+        }
+    };
+
+    let pool_repo = resolved
+        .repo_id
+        .clone()
+        .unwrap_or_else(|| crate::serve::pool_key_for_path(&resolved.gguf_path));
+    let pool_quant = resolved.quant.unwrap_or(QuantType::Q4_K_M);
+
+    // 4. Slow path: load through the manager.  `load_or_get` is
+    //    mutating + serializes on the write-lock.  Concurrent requests
+    //    for the SAME (repo, quant) will see one winner that runs the
+    //    loader; the other winner will hit the fast path on its retry
+    //    (NB: this implementation is "winner-loads, others-block" by
+    //    virtue of the write-lock — simpler than per-key in-flight
+    //    deduplication and acceptable for the request-rate workload).
+    let engine_config = EngineConfig {
+        tokenizer_path: None,
+        config_path: None,
+        queue_capacity: state.engine_queue_capacity,
+        warmup_synchronously: true,
+    };
+    let pool_arc = state.pool.clone();
+    let pool_repo_blocking = pool_repo.clone();
+    let gguf_path = resolved.gguf_path.clone();
+    let load_outcome = tokio::task::spawn_blocking(move || {
+        let mut w = pool_arc
+            .write()
+            .map_err(|e| anyhow::anyhow!("pool rwlock poisoned: {e}"))?;
+        w.load_or_get(&pool_repo_blocking, pool_quant, &gguf_path, &engine_config)
+            .map_err(|e| anyhow::anyhow!("hot-swap: {e}"))
+    })
+    .await;
+    match load_outcome {
+        Ok(Ok(arc)) => Ok(arc),
+        Ok(Err(e)) => {
+            tracing::error!(model = %model_arg, error = %e, "hot-swap load failed");
+            Err(ApiError::generation_error(format!("model load failed: {e}")).into_response())
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "hot-swap blocking task panicked");
+            Err(ApiError::internal_error().into_response())
+        }
+    }
+}
+
+// (HotSwapError → ApiError mapping is done inline inside the
+// spawn_blocking branch above; the manager's anyhow-wrapping is the
+// single error envelope today.  When iter-210 lands sharper
+// per-variant mapping — e.g. PoolRefused → 503 with Retry-After —
+// it will go here as a dedicated helper.)
 
 // ---------------------------------------------------------------------------
 // POST /v1/chat/completions (non-streaming)
@@ -82,7 +244,7 @@ pub async fn chat_completions(
     }
 
     let PreparedChatContext {
-        engine: _engine_ref,
+        loaded_engine,
         prompt_tokens,
         params,
         summarized_messages,
@@ -92,7 +254,7 @@ pub async fn chat_completions(
         vit_images,
         vit_soft_tokens_total,
     } = prepared;
-    let engine = state.engine.as_ref().expect("engine gate above ensures Some");
+    let engine: &Engine = &loaded_engine.engine;
 
     // --- Generate (non-streaming) ---
     // Snapshot mlx-native process-global GPU counters pre-generation so we
@@ -260,10 +422,11 @@ fn apply_transparency_headers(
 /// Everything the non-streaming + streaming paths both need to start the
 /// generation on the worker thread.
 struct PreparedChatContext {
-    /// Kept for symmetry; the actual engine ref is re-fetched from `state`
-    /// at the call site because the async streaming body needs to take a
-    /// `'static` clone of the handle.
-    engine: (),
+    /// Pool-resolved engine handle (iter-209).  The non-streaming +
+    /// streaming dispatch paths both consume this; refcount semantics
+    /// keep the engine alive through the handler's lifetime even if
+    /// the pool evicts it concurrently.
+    loaded_engine: Arc<LoadedEngine<Engine>>,
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
     /// Decision #23 transparency counters. `Some` only when the
@@ -301,15 +464,16 @@ async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> std::result::Result<PreparedChatContext, Response> {
-    // --- Engine gate ---
-    let Some(engine) = state.engine.as_ref() else {
-        return Err(ApiError::model_not_loaded(&req.model).into_response());
-    };
+    // --- Pool-routed engine resolution (iter-209) ---
+    // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
+    // `state.engine.is_none()`.  Iter-209 routes `req.model` through
+    // the `HotSwapManager` pool: cache hit → reused engine; cache miss
+    // → auto-pipeline + admit + return.  Decision #26's 400 fires only
+    // when the auto-pipeline cannot resolve the requested name.
+    let loaded_engine = resolve_engine_for_request(state, &req.model).await?;
+    let engine: &Engine = &loaded_engine.engine;
     if !state.is_ready_for_gen() {
         return Err(ApiError::not_ready().into_response());
-    }
-    if req.model != engine.model_id() {
-        return Err(ApiError::model_not_loaded(&req.model).into_response());
     }
     if req.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -567,7 +731,7 @@ async fn prepare_chat_generation(
         Some(soft_tokens.iter().map(|s| s.range.len()).sum())
     };
     Ok(PreparedChatContext {
-        engine: (),
+        loaded_engine,
         prompt_tokens: final_prompt_tokens,
         params,
         summarized_messages,
@@ -590,10 +754,12 @@ async fn chat_completions_stream(
 ) -> Response {
     use super::sse::{generation_events_to_sse, SseStreamOptions};
 
-    let engine = match state.engine.as_ref() {
-        Some(e) => e.clone(),
-        None => return ApiError::model_not_loaded(&req.model).into_response(),
-    };
+    // Iter-209: stream path uses the resolved engine from
+    // `prepared.loaded_engine` — the pool resolution already ran in
+    // `prepare_chat_generation`.  Cloning `Engine` is cheap (an Arc clone
+    // of the inner state); the resulting handle is `'static` so the SSE
+    // encoder body can move it.
+    let engine: Engine = prepared.loaded_engine.engine.clone();
 
     // Vision streaming is not supported in this iter — the soft-token
     // path runs through `Engine::generate_with_soft_tokens` (non-
@@ -2086,13 +2252,17 @@ pub async fn embeddings(
     // chat-model path is the fallback for users who only loaded a chat
     // model.
     if state.embedding_config.is_none() {
-        if let Some(engine) = state.engine.as_ref() {
-            if req.model == engine.model_id() {
-                return chat_model_embeddings(engine.clone(), req).await;
-            }
-            return ApiError::model_not_loaded(&req.model).into_response();
-        }
-        return ApiError::model_not_loaded(&req.model).into_response();
+        // Iter-209: pool-routed chat-model embeddings.  Resolve the
+        // requested model through the same auto-swap surface chat
+        // completions uses; on success, route through Engine::embed
+        // (Last pooling on the chat model's last-layer hidden state).
+        // Resolution failures map to 400 model_not_loaded just as
+        // pre-iter-209's no-engine branch did.
+        let loaded = match resolve_engine_for_request(&state, &req.model).await {
+            Ok(arc) => arc,
+            Err(resp) => return resp,
+        };
+        return chat_model_embeddings(loaded.engine.clone(), req).await;
     }
 
     // --- Dedicated embedding model path (--embedding-model) ---
@@ -2548,7 +2718,17 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering;
     let m = &state.metrics;
     let ready = if state.is_ready_for_gen() { 1 } else { 0 };
-    let model_loaded = if state.engine.is_some() { 1 } else { 0 };
+    // Iter-209: gauge reflects the pool's loaded_count (0 = HTTP-only
+    // backbone; ≥1 = at least one model resident in the pool).  Per
+    // ADR-005 line 5404, future iters will surface
+    // `hf2q_pool_loaded_models` + `hf2q_pool_resident_bytes` as
+    // dedicated pool-state gauges; for the iter-209 closure window
+    // `hf2q_model_loaded` keeps its single-bit semantics.
+    let pool_stats_for_metrics = state.pool.read().ok().map(|m| m.pool_stats());
+    let model_loaded = match pool_stats_for_metrics {
+        Some(stats) if stats.loaded_count > 0 => 1,
+        _ => 0,
+    };
     let body = format!(
         "\
 # HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
@@ -2619,8 +2799,22 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .metrics
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (model, context_length) = match state.engine.as_ref() {
-        Some(e) => (Some(e.model_id().to_string()), e.context_length()),
+    // Iter-209: report the MRU pool entry's model_id + context_length.
+    // The pool's iteration order is LRU → MRU; the last entry is what
+    // a single-model server will display (matches pre-iter-209
+    // behaviour).  Empty pool ⇒ same `None` as pre-iter-209 with no
+    // engine.
+    let snapshot: Vec<_> = state
+        .pool
+        .read()
+        .ok()
+        .map(|m| m.snapshot_engines())
+        .unwrap_or_default();
+    let (model, context_length) = match snapshot.last() {
+        Some(le) => (
+            Some(le.engine.model_id().to_string()),
+            le.engine.context_length(),
+        ),
         None => (None, None),
     };
     let resp = HealthResponse {
@@ -2697,11 +2891,20 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                 return ApiError::internal_error().into_response();
             }
         };
-    // Mark the currently-loaded model as loaded=true. If the loaded model
-    // isn't in the cache catalog (e.g. loaded from a path outside
-    // ~/.cache/hf2q/), prepend it.
-    if let Some(engine) = state.engine.as_ref() {
-        let loaded_id = engine.model_id().to_string();
+    // Iter-209: enumerate every pooled engine and mark its catalog entry
+    // (or prepend a synthetic one if the loaded model lives outside the
+    // cache directory).  Pre-iter-209 single-slot semantics are a
+    // strict subset (one entry, max).  The OpenAI `loaded` boolean
+    // extension reflects pool residency: any model present in
+    // `pool.snapshot_engines()` reports `loaded: true`.
+    let pool_snapshot: Vec<_> = state
+        .pool
+        .read()
+        .ok()
+        .map(|m| m.snapshot_engines())
+        .unwrap_or_default();
+    for le in pool_snapshot.iter() {
+        let loaded_id = le.engine.model_id().to_string();
         match models.iter_mut().find(|m| m.id == loaded_id) {
             Some(m) => m.loaded = true,
             None => {
@@ -2712,8 +2915,8 @@ pub async fn list_models(State(state): State<AppState>) -> Response {
                         object: "model",
                         created: chrono_seconds(),
                         owned_by: "hf2q",
-                        context_length: engine.context_length(),
-                        quant_type: engine.quant_type().map(|s| s.to_string()),
+                        context_length: le.engine.context_length(),
+                        quant_type: le.engine.quant_type().map(|s| s.to_string()),
                         backend: Some("mlx-native"),
                         loaded: true,
                     },

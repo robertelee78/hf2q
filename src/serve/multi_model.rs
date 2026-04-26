@@ -587,6 +587,18 @@ pub struct PoolStats {
     pub memory_budget_bytes: u64,
 }
 
+/// Per-loaded-handle summary for `/v1/models` extension fields.
+/// `pool_key` is the manager-internal `format!("{repo}@{quant}")` form;
+/// `quant` is the canonical GGML name string (matches
+/// [`QuantType::as_str`] output).  Bytes-resident is the on-GPU
+/// allocation accounted against the pool's memory budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedSummary {
+    pub pool_key: String,
+    pub quant: String,
+    pub bytes_resident: u64,
+}
+
 /// Errors returned by [`HotSwapManager`] operations.
 #[derive(Debug)]
 pub enum HotSwapError {
@@ -707,6 +719,28 @@ impl<E> HotSwapManager<E> {
     pub fn try_get(&self, repo: &str, quant: QuantType) -> Option<Arc<LoadedEngine<E>>> {
         let k = pool_key(repo, quant);
         self.engines.get(&k).cloned()
+    }
+
+    /// Snapshot every currently-pooled `Arc<LoadedEngine<E>>`.  Used by
+    /// `cmd_serve`'s graceful-shutdown path (iter-209) to enumerate the
+    /// worker handles and join them in parallel.  Cheap-clones every
+    /// Arc; does NOT touch the LRU order, does NOT trigger a load.
+    /// LRU → MRU iteration order (matches [`LoadedPool::iter`]).
+    pub fn snapshot_engines(&self) -> Vec<Arc<LoadedEngine<E>>> {
+        self.pool
+            .iter()
+            .filter_map(|h| self.engines.get(&h.repo_id).cloned())
+            .collect()
+    }
+
+    /// Iterate the pool's `(pool_key, repo, quant_str, bytes_resident, loaded)` tuples
+    /// for `/v1/models` extension fields.  LRU → MRU order.  Read-only.
+    pub fn iter_loaded(&self) -> impl Iterator<Item = LoadedSummary> + '_ {
+        self.pool.iter().map(|h| LoadedSummary {
+            pool_key: h.repo_id.clone(),
+            quant: h.quant.clone(),
+            bytes_resident: h.bytes_resident,
+        })
     }
 
     /// Force-drop the entry for `(repo, quant)` — symmetric to

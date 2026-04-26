@@ -1,18 +1,19 @@
 //! Shared application state (`AppState`) for the hf2q HTTP API server.
 //!
-//! The axum router threads a single `AppState` through every handler. This
-//! type is deliberately thin: it holds immutable per-server config, the
-//! startup timestamp (for `/health` uptime), a warmup-ready atomic (for
-//! `/readyz`), and a monotonic request counter (for request-id generation
-//! and `/metrics`).
+//! The axum router threads a single `AppState` through every handler.  In
+//! ADR-005 Phase 4 iter-209 (W77) the single-slot `engine: Option<Engine>`
+//! field was replaced with `pool: Arc<RwLock<HotSwapManager<Engine>>>`:
+//! request-time auto-swap (Decision #26) routes the OpenAI `model:` field
+//! through the pool, evicting LRU entries under capacity / memory-budget
+//! pressure (W74 `LoadedPool` + W76 `HotSwapManager`).  The pool starts
+//! empty when `--model` is not supplied; the first request specifying a
+//! model triggers an auto-load via [`crate::serve::auto_pipeline`].
 //!
-//! In this iteration the inference engine itself is NOT part of `AppState` —
-//! the engine + model load + warmup pipeline lands in the next iteration
-//! alongside `/v1/chat/completions` and `/v1/embeddings`. The `ready_for_gen`
-//! flag is currently always `true` because no generation endpoint is routed
-//! yet; when the engine is introduced, the flag will start `false`, flip to
-//! `true` after warmup completes, and the chat/embedding handlers will gate
-//! on it per ADR-005 Decision #16 (`503 + Retry-After` during warmup).
+//! Decision #26 surface stays compatible: `400 model_not_loaded` is
+//! returned when a request names a model that auto_pipeline cannot
+//! resolve (not on disk + not a valid HF repo-id) — i.e., a genuinely
+//! un-loadable input — while previously-cached or repo-id models
+//! auto-swap transparently.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +28,11 @@ use crate::inference::models::bert::weights::LoadedBertWeights;
 use crate::inference::models::nomic_bert::{LoadedNomicBertWeights, NomicBertConfig};
 use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
+use crate::intelligence::hardware::HardwareProfile;
+use crate::serve::cache::ModelCache;
+use crate::serve::multi_model::{
+    DefaultModelLoader, HotSwapManager, LoadedPool,
+};
 
 /// Server-level configuration, captured at startup from CLI flags + defaults.
 ///
@@ -112,6 +118,22 @@ pub fn default_cache_dir() -> Option<PathBuf> {
         .map(|h| h.join(".cache").join("hf2q"))
 }
 
+/// Construct a unique-per-process tempdir cache root for the test path
+/// (`AppState::new`).  Each `AppState::new` call yields a fresh root so
+/// concurrent test threads never share manifest state.  The directory
+/// is left on disk after the test — `std::env::temp_dir()` is platform-
+/// specific and the OS reaps it; tests that care set their own root
+/// via [`AppState::new_for_serve`] / `cli::ServeArgs.cache_dir`.
+fn synthetic_cache_root() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let mut p = std::env::temp_dir();
+    p.push(format!("hf2q-test-cache-{pid}-{id}"));
+    p
+}
+
 /// Process-wide metric counters surfaced via `/metrics` in Prometheus text
 /// format (Decision #11). Cheap atomics; handler code bumps them inline.
 ///
@@ -154,22 +176,55 @@ impl ServerMetrics {
 /// Shared runtime state threaded through axum handlers.
 ///
 /// Cheap to clone (every field is behind `Arc` or is a plain atomic wrapper).
+///
+/// ADR-005 Phase 4 iter-209 (W77) replaced the single-slot
+/// `engine: Option<Engine>` field with a [`HotSwapManager<Engine>`] pool
+/// behind `Arc<RwLock<...>>`.  `load_or_get` is mutating (LRU touch + insert)
+/// so request handlers acquire the write-lock briefly to admit a new model
+/// or promote a cached one; `try_get` is non-mutating and could be served
+/// under a read-lock for diagnostic / metrics endpoints.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub started_at: Arc<Instant>,
-    /// `true` once the server is ready to serve generation. When `engine` is
-    /// `None`, generation endpoints return 400 `model_not_loaded`. When
-    /// `engine` is `Some` but `ready_for_gen` is `false`, they return 503
-    /// `not_ready` + `Retry-After: 1` (Decision #16, warmup-in-progress).
+    /// `true` once the server is ready to serve generation.  After Phase 4
+    /// iter-209 the pool is empty at process start when `--model` is not
+    /// supplied; the flag still gates the first request through warmup
+    /// (and ADR-005 Decision #16 applies on auto-swap reloads — the
+    /// re-load path runs synchronous warmup before returning).
     pub ready_for_gen: Arc<AtomicBool>,
     /// Monotonic counter for request-id generation + metrics.
     pub request_counter: Arc<AtomicU64>,
-    /// Inference engine. `None` means no `--model` was supplied at startup
-    /// (the HTTP backbone still serves `/health`, `/readyz`, `/v1/models`).
-    /// `Some(engine)` means a model is loaded and the worker thread is up;
-    /// generation endpoints gate on `ready_for_gen` for warmup status.
-    pub engine: Option<Engine>,
+    /// Multi-model engine pool.  Replaces the pre-Phase-4 `Option<Engine>`.
+    /// Empty pool + no [`Self::default_model`] means the server is HTTP-only
+    /// (every generation request returns 400 `model_not_loaded` — the
+    /// auto-pipeline cannot resolve an empty / unspecified `req.model`).
+    pub pool: Arc<std::sync::RwLock<HotSwapManager<Engine>>>,
+    /// On-disk cache (`~/.cache/hf2q/`).  Held behind `Arc<Mutex<_>>` so
+    /// concurrent handlers that resolve a `req.model` through the
+    /// auto-pipeline (which may mutate the manifest on download /
+    /// quantize / touch) serialize on the same cache instance.
+    pub cache: Arc<std::sync::Mutex<ModelCache>>,
+    /// Hardware profile detected once at startup.  Used by the
+    /// auto-pipeline's quant selector + the pool's memory-budget
+    /// adapter; immutable for the lifetime of the process.
+    pub hardware: Arc<HardwareProfile>,
+    /// `--no-integrity` operator opt-out (off by default).  When `true`,
+    /// the cache integrity re-check on every load is skipped (with a
+    /// stern warning logged at request time).  Mirrors the
+    /// `cli::ServeArgs.no_integrity` field.
+    pub no_integrity: bool,
+    /// FIFO queue capacity for newly-loaded engines.  Mirrors
+    /// `cli::ServeArgs.queue_capacity` (Decision #19 surface).  Captured
+    /// at startup and threaded into every `EngineConfig` the loader
+    /// dispatches with.
+    pub engine_queue_capacity: usize,
+    /// `--model` argument from CLI startup, if any.  Used as the fallback
+    /// "default model" when a request omits the OpenAI `model:` field
+    /// (or sends an empty string).  Stored as the original argument
+    /// string so the auto-pipeline classifies it the same way the
+    /// startup pre-warm did.
+    pub default_model: Option<String>,
     /// BERT embedding model config (from `--embedding-model <path>`).
     /// `None` when no embedding model was supplied. Validated at startup
     /// via `BertConfig::from_gguf` — the forward pass that consumes this
@@ -322,17 +377,92 @@ pub struct LoadedMmproj {
 }
 
 impl AppState {
-    /// Construct `AppState` without an engine. Only `/health`, `/readyz`,
-    /// `/v1/models` will serve real data; generation endpoints return
-    /// `model_not_loaded`. Used by the iter-2 backbone path and by tests.
+    /// Construct `AppState` for production use — opens (or creates) the
+    /// on-disk cache, detects hardware once, and constructs an empty
+    /// [`HotSwapManager`] sized off the unified-memory budget per
+    /// ADR-005 line 929 (80% default).  `cmd_serve` calls this then
+    /// optionally pre-warms the pool with the `--model` argument before
+    /// passing to the router.
+    ///
+    /// Errors propagate from `ModelCache::open` (filesystem permissions
+    /// on `~/.cache/hf2q/`) and `HardwareProfiler::detect` (sysinfo
+    /// unavailable).  Tests use [`Self::new`] (synthetic-fixture path)
+    /// to avoid real filesystem + sysinfo dependencies.
+    pub fn new_for_serve(
+        config: ServerConfig,
+        no_integrity: bool,
+        engine_queue_capacity: usize,
+        default_model: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let hardware = crate::intelligence::hardware::HardwareProfiler::detect()
+            .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
+        let cache = ModelCache::open()?;
+        let pool = LoadedPool::from_hardware(&hardware);
+        let manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        Ok(Self {
+            config: Arc::new(config),
+            started_at: Arc::new(Instant::now()),
+            // ready_for_gen starts true: the pool is the gating surface for
+            // generation; warmup is per-load (synchronous) inside the
+            // loader.  /readyz reports server liveness, not a per-model
+            // warmup status (which is now an auto-swap concept).
+            ready_for_gen: Arc::new(AtomicBool::new(true)),
+            request_counter: Arc::new(AtomicU64::new(0)),
+            pool: Arc::new(std::sync::RwLock::new(manager)),
+            cache: Arc::new(std::sync::Mutex::new(cache)),
+            hardware: Arc::new(hardware),
+            no_integrity,
+            engine_queue_capacity,
+            default_model,
+            embedding_config: None,
+            embedding_registry: None,
+            mmproj: None,
+            metrics: Arc::new(ServerMetrics::default()),
+        })
+    }
+
+    /// Construct `AppState` for tests / router unit tests — uses a
+    /// synthetic empty pool with a 1 GiB memory budget and a tempdir
+    /// cache so no real filesystem/sysinfo work runs.
+    ///
+    /// The pool starts empty; without `default_model` set, every
+    /// generation request will return 400 `model_not_loaded` (the
+    /// auto-pipeline cannot resolve a missing model name).  Tests
+    /// asserting that 400-shape behaviour use this constructor.
     pub fn new(config: ServerConfig) -> Self {
+        // Synthetic 1 GiB budget — tests never load a real engine; the
+        // budget exists only so PoolError::ZeroCapacity / OversizedHandle
+        // paths can be exercised under unit tests.
+        let pool = LoadedPool::with_capacity_and_budget(3, 1u64 << 30);
+        let manager = HotSwapManager::new(pool, Arc::new(DefaultModelLoader));
+        // Synthetic cache root in a per-process tempdir.  Tests that need
+        // a specific cache state should construct via `new_for_serve` or
+        // hand-build an `AppState` (every field is `pub`).
+        let cache = ModelCache::open_at(synthetic_cache_root())
+            .expect("open synthetic cache for AppState::new (test path)");
+        // Synthetic hardware (16 GiB) — tests don't depend on the value;
+        // the auto-pipeline path is mocked out at the caller in test
+        // contexts.
+        let hardware = HardwareProfile {
+            chip_model: "Synthetic-Test".into(),
+            total_memory_bytes: 16u64 << 30,
+            available_memory_bytes: 16u64 << 30,
+            performance_cores: 8,
+            efficiency_cores: 4,
+            total_cores: 12,
+            memory_bandwidth_gbs: 400.0,
+        };
         Self {
             config: Arc::new(config),
             started_at: Arc::new(Instant::now()),
-            // No engine → no warmup needed → ready.
             ready_for_gen: Arc::new(AtomicBool::new(true)),
             request_counter: Arc::new(AtomicU64::new(0)),
-            engine: None,
+            pool: Arc::new(std::sync::RwLock::new(manager)),
+            cache: Arc::new(std::sync::Mutex::new(cache)),
+            hardware: Arc::new(hardware),
+            no_integrity: false,
+            engine_queue_capacity: 32,
+            default_model: None,
             embedding_config: None,
             embedding_registry: None,
             mmproj: None,
@@ -340,21 +470,11 @@ impl AppState {
         }
     }
 
-    /// Construct `AppState` with an engine. The engine worker thread is
-    /// already running at this point; `ready_for_gen` starts `false` until
-    /// the warmup task flips it.
-    pub fn with_engine(config: ServerConfig, engine: Engine) -> Self {
-        Self {
-            config: Arc::new(config),
-            started_at: Arc::new(Instant::now()),
-            ready_for_gen: Arc::new(AtomicBool::new(false)),
-            request_counter: Arc::new(AtomicU64::new(0)),
-            engine: Some(engine),
-            embedding_config: None,
-            embedding_registry: None,
-            mmproj: None,
-            metrics: Arc::new(ServerMetrics::default()),
-        }
+    /// Set the default model lookup key (the original `--model` CLI
+    /// argument).  Returned by-value for builder chaining.
+    pub fn with_default_model(mut self, default_model: Option<String>) -> Self {
+        self.default_model = default_model;
+        self
     }
 
     /// Attach a BERT embedding model config. Cheap (clones internal

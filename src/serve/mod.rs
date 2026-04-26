@@ -1027,6 +1027,21 @@ fn cmd_generate_qwen35(
 /// chat-template resolution, or warmup — every failure is fatal to the
 /// load attempt.  Caller decides how to surface it (cmd_serve aborts the
 /// boot; HotSwapManager will return the error to the request handler).
+/// Derive a stable pool key for a filesystem-path passthrough — used
+/// when `auto_pipeline::resolve_or_prepare_model` returns
+/// `repo_id: None` (the operator passed `--model /path/to.gguf`
+/// instead of an HF repo-id).  The file stem matches what the engine
+/// itself uses for `model_id()` when GGUF metadata lacks `general.name`,
+/// so the pool key matches the surface every other code path sees.
+///
+/// Deterministic per identical input: two requests resolving to the
+/// same on-disk file yield the same key, the pool reuses the engine.
+pub fn pool_key_for_path(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 pub fn load_engine(
     path: &Path,
     config: &multi_model::EngineConfig,
@@ -1149,28 +1164,54 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
     }
 
-    // --- ADR-005 Phase 3 item 4/4 (iter-204): auto-pipeline resolution ---
-    // When `--model` is a HuggingFace repo-id (e.g. `google/gemma-4-27b-it`),
-    // chain quant_select (W51) + cache (W70) + integrity (W71) to produce a
-    // ready-to-load GGUF path before the existing model-load logic runs.
-    // Filesystem paths pass through unchanged (existing behavior preserved).
+    // --- AppState construction (iter-209) ---
+    // Build the pool-backed AppState before any model resolution: opens
+    // the on-disk cache once + detects hardware once + constructs an
+    // empty `HotSwapManager<Engine>` sized off the unified-memory budget
+    // per ADR-005 line 929 (80% default).  The same `cache` + `hardware`
+    // are shared with request-time auto_pipeline resolution.
+    let default_model_arg = args
+        .model
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let mut state = api::AppState::new_for_serve(
+        config.clone(),
+        args.no_integrity,
+        config.queue_capacity,
+        default_model_arg.clone(),
+    )?;
+
+    // --- Optional pre-warm (--model supplied) ---
+    // ADR-005 Phase 4 iter-208 (W76): the load path flows through the
+    // shared `load_engine` callable via `HotSwapManager::load_or_get`,
+    // which dispatches against `DefaultModelLoader`.  iter-209 unifies
+    // the startup path with the request-time auto-swap path: both call
+    // `pool.load_or_get(...)` against the same manager.  Pre-warming at
+    // startup keeps Decision #15 (fail-fast on bad weights) intact and
+    // guarantees /readyz returns 200 with a usable pooled engine.
     //
-    // The resolution mutates the cache manifest (records source on download,
-    // records quantized on emit, touches LRU on hit) — held in a local
-    // scope so the `&mut ModelCache` reference doesn't outlive the resolve.
-    let resolved_model_path: Option<std::path::PathBuf> = if let Some(model_arg) = args.model.as_ref() {
-        let arg_str = model_arg.to_string_lossy().into_owned();
-        let hw = crate::intelligence::hardware::HardwareProfiler::detect()
-            .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
-        let mut cache = cache::ModelCache::open()
-            .context("open model cache for auto-pipeline")?;
+    // Filesystem-path passthrough uses the file stem as the pool's
+    // `repo` key + a synthetic `Q4_K_M` quant (the on-disk quant is
+    // baked into the file; the pool key just needs determinism per
+    // identical input).
+    if let Some(model_arg) = default_model_arg.as_ref() {
+        let mut cache_guard = state
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("cache mutex poisoned at startup: {e}"))?;
         let resolved = auto_pipeline::resolve_or_prepare_model(
-            &arg_str,
-            &mut cache,
-            &hw,
-            args.no_integrity,
+            model_arg,
+            &mut cache_guard,
+            state.hardware.as_ref(),
+            state.no_integrity,
         )
         .context("auto-pipeline: resolve --model into a GGUF path")?;
+        // Drop the cache lock before the long-running engine load so
+        // request-time resolutions can proceed concurrently if they
+        // somehow arrive (test paths) — production startup is
+        // single-threaded but the lock-discipline is right anyway.
+        drop(cache_guard);
+
         if let Some(repo) = resolved.repo_id.as_deref() {
             let quant_str: &str = resolved
                 .quant
@@ -1184,36 +1225,34 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 "auto-pipeline: --model resolved"
             );
         }
-        Some(resolved.gguf_path)
-    } else {
-        None
-    };
 
-    // --- Optionally load the model + spawn the engine ---
-    // When --model is supplied, we eagerly load (Decision #15 fail-fast) and
-    // spawn the serialized-FIFO worker thread.  Warmup runs synchronously
-    // BEFORE any other Metal device activity (iter-103 fix — see
-    // [`load_engine`] doc).  Once `load_engine` returns the engine is fully
-    // primed; `ready_for_gen` is flipped after the listener binds so
-    // `/readyz` reports the server status, not the load status.
-    //
-    // ADR-005 Phase 4 iter-208 (W76): the load path now flows through the
-    // shared [`load_engine`] callable so the [`multi_model::HotSwapManager`]
-    // (iter-209) can dispatch the same load logic for second-model swaps
-    // without re-implementing it.  This is a pure refactor — the existing
-    // single-model startup behaviour is byte-identical.
-    let engine_opt = if let Some(model_path) = resolved_model_path.as_ref() {
+        let pool_repo = resolved
+            .repo_id
+            .clone()
+            .unwrap_or_else(|| pool_key_for_path(&resolved.gguf_path));
+        let pool_quant = resolved
+            .quant
+            .unwrap_or(quant_select::QuantType::Q4_K_M);
         let engine_config = multi_model::EngineConfig {
             tokenizer_path: args.tokenizer.clone(),
             config_path: args.config.clone(),
             queue_capacity: config.queue_capacity,
             warmup_synchronously: true,
         };
-        let engine = load_engine(model_path, &engine_config)?;
-        Some(engine)
-    } else {
-        None
-    };
+        let mut pool_guard = state
+            .pool
+            .write()
+            .map_err(|e| anyhow::anyhow!("pool rwlock poisoned at startup: {e}"))?;
+        pool_guard
+            .load_or_get(&pool_repo, pool_quant, &resolved.gguf_path, &engine_config)
+            .map_err(|e| anyhow::anyhow!("startup pre-warm: {e}"))?;
+        drop(pool_guard);
+        tracing::info!(
+            repo = %pool_repo,
+            quant = %pool_quant.as_str(),
+            "hf2q startup pre-warm: model admitted to pool"
+        );
+    }
 
     // --- Optionally validate + load the BERT embedding model config ---
     // Decision: load config only (header parse), NOT weights. Per
@@ -1446,10 +1485,10 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     };
 
     // --- Build router ---
-    let mut state = match engine_opt {
-        Some(engine) => api::AppState::with_engine(config.clone(), engine),
-        None => api::AppState::new(config.clone()),
-    };
+    // `state` was constructed above (iter-209) with the cache + hardware
+    // + empty pool; pre-warm has already admitted the `--model` engine
+    // (when supplied).  Here we attach the embedding model + mmproj
+    // descriptors before the router takes ownership.
     if let Some(em) = embedding_model {
         // Pre-warm a persistent kernel registry: register all kernels
         // the arch needs + run one warmup forward against the loaded
@@ -1487,22 +1526,31 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
         eprintln!("hf2q serving on http://{}", bind);
 
-        // Engine warmup ran SYNCHRONOUSLY before mmproj load (iter-103
-        // fix — see the warmup_rt block above).  Just flip
-        // ready_for_gen so /readyz returns 200 immediately upon
-        // serving.  The previous design ran warmup in a tokio::spawn
-        // here so /v1/models could serve while warmup ran, but
-        // (a) warmup is fast enough (~10–60 s on M5 Max) that no
-        //     orchestrator times out waiting, and
-        // (b) running warmup AFTER mmproj load triggered the
-        //     iter-103 NaN-logits bug.
-        if state_for_warmup.engine.is_some() {
-            state_for_warmup
-                .ready_for_gen
-                .store(true, std::sync::atomic::Ordering::Release);
-            tracing::info!(
-                "hf2q engine ready_for_gen=true (warmup ran synchronously pre-mmproj)"
-            );
+        // Iter-209: warmup ran SYNCHRONOUSLY at pre-warm time (when
+        // `--model` was supplied) inside `pool.load_or_get` →
+        // `DefaultModelLoader::load` → `load_engine` (warmup_synchronously
+        // = true).  ready_for_gen is already initialized to `true` by
+        // `AppState::new_for_serve`; this block remains as a no-op
+        // observability anchor — the previous engine.is_some() guard is
+        // replaced with a pool-state log so operators see the boot
+        // ordering signal in the logs.  The iter-103 ordering invariant
+        // (chat warmup BEFORE mmproj load) is preserved by the call
+        // ordering above (pre-warm runs before mmproj load).
+        {
+            let pool_state_log = state_for_warmup
+                .pool
+                .read()
+                .ok()
+                .map(|m| m.pool_stats());
+            if let Some(stats) = pool_state_log {
+                tracing::info!(
+                    loaded = stats.loaded_count,
+                    capacity = stats.capacity_models,
+                    bytes_resident = stats.total_resident_bytes,
+                    bytes_budget = stats.memory_budget_bytes,
+                    "hf2q ready (pool-backed; pre-warm complete if --model supplied)"
+                );
+            }
         }
 
         axum::serve(listener, router)
@@ -1512,18 +1560,31 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
 
         // Axum has stopped accepting + drained in-flight HTTP responses.
         // Each in-flight handler that called `engine.generate*` has already
-        // received its reply. Now send the Shutdown sentinel (FIFO behind any
-        // generations that were dispatched but whose HTTP response had
-        // already returned — e.g. SSE streams that wrote their last frame
-        // before SIGTERM) and join the worker thread.
+        // received its reply.  Iter-209: with the pool replacing the
+        // single-slot Option<Engine>, we shut down EVERY pooled engine in
+        // parallel (each owns a separate worker thread + its own GPU
+        // resources).  Without this, the tokio runtime drops at the
+        // bottom of `block_on` and the `mpsc::Sender` to each worker is
+        // closed implicitly; the worker exits its loop on the next
+        // `blocking_recv`, but a mid-decode generation gets cut off
+        // rather than running to its natural finish_reason.
         //
-        // Without this, the tokio runtime drops at the bottom of `block_on`
-        // and the `mpsc::Sender` to the worker is closed implicitly; the
-        // worker exits its loop on the next `blocking_recv`, but a
-        // mid-decode generation gets cut off rather than running to its
-        // natural finish_reason. Joining here gives the worker a chance to
-        // complete in-flight compute cleanly before the runtime tears down.
-        if let Some(engine) = state_for_warmup.engine.clone() {
+        // We snapshot the engine handles under the read lock, then drop
+        // the lock before awaiting (await-while-holding-RwLock would
+        // deadlock if any handler held it).  The pool itself is then
+        // cleared so refcounts drop deterministically.
+        let shutdown_engines: Vec<_> = state_for_warmup
+            .pool
+            .read()
+            .ok()
+            .map(|mgr| {
+                mgr.snapshot_engines()
+                    .into_iter()
+                    .map(|le| le.engine.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for engine in shutdown_engines {
             match engine.shutdown().await {
                 Ok(()) => tracing::info!("hf2q-engine worker joined"),
                 Err(e) => tracing::warn!(error = %e, "hf2q-engine worker join failed"),
