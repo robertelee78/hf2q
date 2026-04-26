@@ -1428,6 +1428,79 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2c iter-130 — comprehensive dtype audit lands; runtime probe falsifies all four W60 candidates (FFN BF16 / softmax precision / per-head RMS / residual BF16); cascade compound stays at 1.175x but the noise source is provably NOT precision-cast-dominated; smoke unchanged at 1 peer word — deeper-falsification iter (2026-04-26, W61, hf2q commit `404af7d`)
+
+**Why this iter exists.** W60 iter-129 closed the attention V/K BF16-cast hypothesis but left cascade compound at 1.175x/block (essentially identical to iter-128's 1.171x). W60's iter-130 plan listed four candidates — FFN BF16 staging, softmax precision, per-head RMS precision, residual BF16 — and prescribed a measurement-first iter rather than another guess-and-fix. Mantra: measure 3x cut once, no shortcuts.
+
+**Phase 1 — static dtype audit of `gemma4v_block_forward_gpu` end-to-end.** Walked every `MlxBuffer` allocation in `vit_gpu.rs` lines 3050-3411 and every helper it calls (`vit_linear_gpu`, `vit_gemma_rms_norm_gpu`, `vit_gemma_per_head_rms_norm_gpu`, `vit_v_norm_no_scale_gpu`, `vit_vision_2d_rope_gpu`, `vit_repeat_kv_gpu`, `vit_attention_gpu`, `vit_attention_scores_gpu`, `vit_residual_add_gpu`, `vit_gelu_pytorch_tanh_gpu`, `mlx_elementwise_mul`). Cross-referenced the underlying mlx-native shaders (`rms_norm.metal`, `softmax.metal`, `vision_2d_rope.metal`, `gelu.metal`, `elementwise.metal`, `dense_mm_f16_tensor.metal`).
+
+Static finding: every named intermediate buffer in the block is allocated F32; the only F16 staging (`k_f16`, `v_f16`, `v_t_f16`) is internal to `vit_attention_gpu`. Every shader's internal accumulator is `float` (verified by reading `partial_sum_sq` / `local_max` / `cT = mm.get_destination_cooperative_tensor<..., float>()` in the respective metal files).
+
+**Phase 1 (cont) — GGUF storage audit.** Ran `gguf-py.GGUFReader` on `gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf`: counts F16=191, F32=165. Every weight tensor that consumes activations (Q/K/V/O attention projections AND ffn_gate/ffn_up/ffn_down across all 27 layers = 189 tensors) is F16-stored. Norms (ln1, ln2, attn_post_norm, ffn_post_norm, attn_q_norm, attn_k_norm) and stem F32-storage tensors are F32. **`LoadedMmprojWeights::load` (mmproj_weights.rs:135-138)** routes F16 GGUF → native F16 MlxBuffer, F32 GGUF → F32 dequant. Therefore every weight matmul in the block forward path hits the **F16 branch of `vit_linear_gpu`** (`dense_matmul_f16_f32_tensor`, mlx-native 0.4.8+). This falsifies W60 candidate (a) FFN BF16 staging at the static layer.
+
+**Phase 2 — runtime dtype audit instrumentation (commit `404af7d`).** Added `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` env var that, when set alongside `HF2Q_VIT_DUMP=<dir>`, records `(name, dtype, shape)` per intermediate `MlxBuffer` in `gemma4v_block_forward_gpu` into a thread-local audit collector and writes a single `_dtype_audit.json` sidecar per image after the forward completes. INSTRUMENTATION ONLY — no production behaviour change; no-op when env unset (single LazyLock read returns false at every site). 24 audit points × 27 blocks = 648 entries on the fast block path; weight-storage entries push the total to 945.
+
+Files (1 commit, hf2q only — no mlx-native changes):
+- `src/inference/vision/vit_dump.rs` (+~100 LOC) — `dtype_audit_env()` + `is_dtype_audit_armed()` + `AuditEntry` + `AUDIT_COLLECTOR` thread-local + `record_audit` + `drain_audit_entries` + `write_dtype_audit`.
+- `src/inference/vision/vit_gpu.rs` (+~140 LOC) — `audit_intra` flag + 24 `record_audit` call sites in `gemma4v_block_forward_gpu` + audit drain + JSON write hook in `compute_vision_embeddings_gpu_gemma4v`.
+
+**Phase 3 — runtime audit run on production smoke** (`HF2Q_VIT_DUMP=/tmp/iter130_audit_dump HF2Q_VIT_DUMP_DTYPE_AUDIT=1`, four_dots fixture, T=0):
+
+```
+Total entries:                  945     (35/block × 27 blocks)
+Dtype distribution:
+  F32:                          756     (28/block × 27 — every active intermediate)
+  F16:                          189     (7/block × 27 — Q/K/V/O + ffn_gate/up/down weight storage only)
+  BF16:                         0       ← key finding
+  Other (I32/I16/etc):          0
+```
+
+**HYPOTHESIS FALSIFIED — all four W60 iter-130 candidates ruled out at the runtime layer:**
+
+| W60 candidate | Falsification source |
+|---|---|
+| (a) FFN BF16 staging | Runtime audit shows `ffn_gate_proj`, `ffn_up_proj`, `ffn_down_proj` outputs all F32; `ffn_gate_weight_storage`, `ffn_up_weight_storage`, `ffn_down_weight_storage` all F16 (× 27 blocks). FFN matmuls hit the same `dense_matmul_f16_f32_tensor` path as Q/K/V/O. |
+| (b) Softmax precision | Per-shader read confirms F32 input → F32 internal accumulator (`local_max`, `local_sum`) → F32 output (softmax.metal:35,54). Peer's `flash_attn_ext` with `GGML_PREC_F32` is exactly the same precision contract. |
+| (c) Per-head RMS precision | Runtime audit shows `attn_q_normed`, `attn_k_normed`, `attn_v_normed_no_scale` all F32; norm-weight storage tags (`attn_q_norm_weight_storage`, `attn_k_norm_weight_storage`) F32. `dispatch_rms_norm` selects `rms_norm_f32` kernel (F32 internal `partial_sum_sq` reduction, F32 weight, F32 output). |
+| (d) Residual stream BF16 | Runtime audit shows `ffn_inp_residual` and `layer_out_residual` both F32; `vit_residual_add_gpu` allocates F32 + dispatches `elementwise_add` with `DType::F32` (line 871-883). No BF16 round-trip. |
+
+**Phase 4 — pivot. The cascade noise source is NOT precision-cast-dominated.** Cascade compound carries through unchanged at 1.175x/block geomean across the 26 inter-block ratios. Per-block ratios are heterogeneous (range 0.94x–1.46x for blocks 1-25); **block_25→block_26 ratio is 4.08x — a >3-sigma outlier vs the average 1.13x**, indicating a non-uniform amplification mechanism rather than pure rounding-noise compounding.
+
+The runtime audit + the static dtype contract (F32 throughout) leave the residual cascade owned by one or more of:
+
+(i) **Mathematically-identical-but-numerically-different op factoring vs peer.** Peer's `ggml_flash_attn_ext` runs softmax INSIDE the FA kernel (single fused F32-accumulator pass); hf2q runs Q@K^T → softmax → scores@V as three separate dispatches (each with F32 intermediates committed to global memory and re-read). The READ/WRITE round-trips are F32-clean per dispatch but the global-memory commit may surface an order-of-summation difference vs the FA fused single-pass softmax.
+
+(ii) **Per-block weight realisation drift.** F16-stored weights have 10-bit mantissa per element. Each weight read is bitwise identical to peer (peer uses the same F16 weight bits via its `kernel_mul_mm_f16_f32`), so this should NOT contribute. Worth confirming on iter-131 by dumping a weight buffer's underlying u16 bits and comparing to peer's GGUF tensor data block.
+
+(iii) **block_26 anomalous 4.08x jump** specifically. The non-uniform compound at block_26 suggests a layer-specific attribute (maybe the FFN scale or the post-block norm has a feature that triggers above some magnitude threshold). This is the most actionable iter-131 lead — if block_26 alone explains the 909 / 222 ≈ 4x final-block excursion, then the cascade BEFORE block_26 is closer to 1.13x/block (still imperfect, but ~30% closer to peer parity than the geomean suggests).
+
+(iv) **Position-embed indexing / RoPE freq-table rounding.** Already audited in iter-126 (W57 patch_embd CHW fix) — the cascade STARTS at 12.6 max_abs at stage 01_patch_embd, so the per-patch position component is in-budget. But per-block RoPE re-application may have a non-trivial freq-table f32 rounding contribution. The audit confirms `attn_q_rope`, `attn_k_rope` are F32; the freq-table itself is built per-call via `build_vision_2d_rope_params` and may differ from peer's `rope_freqs` precomputation by a deterministic but nonzero amount.
+
+**Smoke output (T=0 cold, four_dots_in_corners_128x128.png, two cold runs deterministic).** Verbatim:
+
+```
+Run 1: Four black squares, white background.
+Run 2: Four black squares, white background.
+```
+
+Identical to W57/W58/W59/W60 baseline. Peer truth: `An image of a square frame made of four`. **Peer-word overlap: 1 ("square").** No improvement; expected — this iter is measurement-only with no production-path math change.
+
+**Cargo verify.**
+- `cargo check --release` 0 (4 pre-existing warnings unchanged)
+- `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W60 baseline maintained)
+- `cargo build --release --bin hf2q` 0
+
+**Files touched.**
+- hf2q (commit `404af7d`): `src/inference/vision/vit_dump.rs` (+~100 LOC audit infrastructure), `src/inference/vision/vit_gpu.rs` (+~140 LOC audit recording call sites + drain hook).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `forward_gpu` upload paths, `docs/ADR-014-*.md`) untouched. mlx-native untouched (no kernel work this iter).
+
+**Iter-131 target.** Bisect block_25→block_26 (4.08x ratio anomaly): is block_26 special structurally (different config), or is it the magnitude saturation threshold where some F32 op starts losing precision (e.g. gelu's `tanh` past x≈3.5 saturates)? Run: extend the dump probe to record block_25 and block_26 separately for `01_pre_attn_norm`, `06_attn_out`, `08_ffn_inp`, `09_ffn_inp_normed`, `10_ffn_out`, `11_ffn_post_normed` (currently capped at blocks 0/1). Compare hf2q vs peer at block_25→block_26 transition; identify the specific sub-stage where the 4x jump is localized. Secondary: dump a single weight tensor's underlying u16 bits and assert byte-identical to peer's GGUF tensor block (validates that F16 storage isn't the source). Tertiary: A/B `dense_matmul_f32_f32_tensor` (mlx-native 0.4.7) on JUST the FFN matmuls to test whether op-order/factoring differences with peer's softmax-fused FA are the dominant residual.
+
+**Why this iter is correct work even though the smoke didn't move.** This iter is a deeper-falsification iter — the runtime audit is the source of truth on dtype contracts, and it conclusively rules out the four most likely precision-cast residuals. Iter-131 starts from the right anchor (block_25→block_26 anomaly + op-factoring residuals) instead of guessing more BF16 candidates. Per pi-brain `feedback_no_shortcuts.md` and `feedback_correct_outcomes.md`: don't pivot on a guess; falsify with measurement first.
+
+---
+
 #### Phase 2c iter-129 — F16 attention V/K casts + transpose_last2_f16 land; per-block cascade compound essentially flat (1.171x → 1.175x), smoke unchanged at 1 peer word — falsifies the "attention-cast is dominant noise" hypothesis (2026-04-26, W60, mlx-native commit `14b4a37`, hf2q commits `05950bd` + `4ac4d0c` + `ebe7383`)
 
 **Why this iter exists.** W59 iter-128 closed the weight-matmul BF16-staging side of the gemma4v ViT cascade but the per-block compound only dropped from 1.16x to 1.171x (essentially flat). W59's hypothesis: the residual is dominated by attention activation casts — `vit_attention_gpu` casts V F32→BF16 before transpose, `vit_attention_scores_gpu` casts K F32→BF16 before the score matmul. Both immediately re-quantize the F16-precision outputs of `vit_linear_gpu` back to BF16 for the attention GEMMs. Iter-129 lands F16 transpose + F16 V cast + F16 K cast (peer parity) and measures whether the cascade collapses.
