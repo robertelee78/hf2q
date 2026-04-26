@@ -45,6 +45,7 @@ use std::sync::OnceLock;
 use super::delta_net::DeltaNetLayerShape;
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::full_attn::FullAttnShape;
+use super::activation_capture::LayerActivations;
 use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu, build_moe_ffn_layer_gpu_q,
@@ -484,6 +485,38 @@ impl Qwen35Model {
         positions_flat: &[i32], // [4 * seq_len] axis-major
         kv_cache: &mut HybridKvCache,
     ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl(tokens, positions_flat, kv_cache, None)
+    }
+
+    /// GPU forward + per-layer activation capture for ADR-012 P9b
+    /// activation-aware DWQ. Mirrors `forward_gpu` exactly but downloads
+    /// the residual stream `hidden` to F32 CPU memory at the START
+    /// (layer_inputs) and END (layer_outputs) of each layer iteration.
+    /// Returns the same `[seq_len * vocab_size]` logits as forward_gpu;
+    /// writes per-layer captures into `out_activations`.
+    ///
+    /// This is the no-fallback GPU path — runs at production GPU
+    /// `quantized_matmul_ggml` speeds (~50–100× the CPU forward) so
+    /// activation calibration on apex MoE no longer requires F32-
+    /// expanding the experts (~128 GB) into RAM. Mantra-aligned: pure
+    /// excellence, no shortcuts, no F32-MoE hack.
+    pub fn forward_gpu_with_capture(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        out_activations: &mut LayerActivations,
+    ) -> Result<Vec<f32>> {
+        self.forward_gpu_impl(tokens, positions_flat, kv_cache, Some(out_activations))
+    }
+
+    fn forward_gpu_impl(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        mut capture: Option<&mut LayerActivations>,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
@@ -624,6 +657,15 @@ impl Qwen35Model {
         let mut total_full_attn_us = 0u64;
         for (layer_idx, layer_gpu) in layer_weights_gpu.iter().enumerate() {
             let layer_cpu = &self.layers[layer_idx];
+
+            // ADR-012 P9b GPU capture path: download residual entering this
+            // layer to CPU F32 if a capture target is bound. Cost: ~20 MB
+            // download per layer (seq_len × hidden × 4 bytes), single
+            // GPU→CPU transfer; well-amortized over the per-layer compute.
+            if let Some(ref mut acts) = capture {
+                let f32_data = download_f32(&hidden).context("capture layer_input download")?;
+                acts.layer_inputs.push(f32_data);
+            }
 
             // --- Attention ---
             let t_attn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
@@ -899,6 +941,14 @@ impl Qwen35Model {
             };
             if let Some(t) = t_res2_start { total_residual_us += t.elapsed().as_micros() as u64; }
 
+            // ADR-012 P9b GPU capture path: download residual leaving this
+            // layer to CPU F32 if a capture target is bound. Pairs with the
+            // layer_input download at the start of the loop.
+            if let Some(ref mut acts) = capture {
+                let f32_data = download_f32(&hidden).context("capture layer_output download")?;
+                acts.layer_outputs.push(f32_data);
+            }
+
             // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---
             if let Some(dump_n) = dump_layer_n() {
                 if layer_idx <= dump_n {
@@ -932,6 +982,13 @@ impl Qwen35Model {
                 total_residual_us as f64 / 1000.0,
                 total_us as f64 / 1000.0,
             );
+        }
+
+        // Stamp shape metadata onto the activation capture (ADR-012 P9b).
+        if let Some(ref mut acts) = capture {
+            acts.num_layers = self.layers.len() as u32;
+            acts.seq_len = seq_len;
+            acts.hidden_size = h as u32;
         }
 
         // ---- Step 3: final output head → logits ----

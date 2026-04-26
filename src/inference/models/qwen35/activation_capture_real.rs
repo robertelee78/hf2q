@@ -50,7 +50,8 @@
 //! synthetic activations. Callers must handle this rather than silently
 //! routing around it.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use mlx_native::MlxDevice;
 use thiserror::Error;
 
 use super::activation_capture::{ActivationCapture, LayerActivations};
@@ -60,6 +61,7 @@ use super::ffn::{
 };
 use super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
 use super::io_heads::embed_tokens;
+use super::kv_cache::HybridKvCache;
 use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 
 // ================================================================
@@ -115,6 +117,73 @@ fn residual_add(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d += s;
     }
+}
+
+// ================================================================
+// GPU capture path (ADR-012 P9b — mantra-aligned production wire-up)
+// ================================================================
+
+/// True iff any layer FFN is the native ggml block-quantized MoeQ variant.
+/// MoeQ cannot be F32-expanded into the CPU forward without OOM (~128 GB
+/// for 256-expert apex), so calibration MUST go through the GPU forward.
+fn has_moeq_layer(model: &Qwen35Model) -> bool {
+    model
+        .layers
+        .iter()
+        .any(|l| matches!(l.ffn(), Qwen35FfnWeights::MoeQ(_)))
+}
+
+/// Run a calibration prompt through the GPU forward and capture per-layer
+/// residual streams. Uses `Qwen35Model::forward_gpu_with_capture`, which
+/// dispatches `mlx-native` `quantized_matmul_ggml` for native MoeQ experts
+/// — no F32 expansion, no OOM, runs at production decode speed.
+///
+/// Allocates a fresh `HybridKvCache` sized to `tokens.len()` for the
+/// calibration pass; the cache is dropped on return so subsequent inference
+/// sessions are unaffected.
+pub fn run_calibration_prompt_gpu(
+    model: &Qwen35Model,
+    tokens: &[u32],
+) -> Result<LayerActivations> {
+    if tokens.is_empty() {
+        anyhow::bail!("run_calibration_prompt_gpu: tokens must be non-empty");
+    }
+
+    let seq_len = tokens.len() as u32;
+    // Text-only positions: one axis per token, replicated across all 4 MROPE
+    // sectors. Matches `text_positions` in `forward_cpu`.
+    let mut positions_flat: Vec<i32> = Vec::with_capacity((4 * seq_len) as usize);
+    for s in 0..4 {
+        let _ = s;
+        for i in 0..seq_len as i32 {
+            positions_flat.push(i);
+        }
+    }
+    debug_assert_eq!(positions_flat.len(), (4 * seq_len) as usize);
+
+    let device = MlxDevice::new()
+        .context("run_calibration_prompt_gpu: MlxDevice::new")?;
+
+    let mut kv_cache = HybridKvCache::new(&model.cfg, &device, seq_len.max(1), 1)
+        .context("run_calibration_prompt_gpu: HybridKvCache::new")?;
+
+    let num_layers = model.cfg.num_hidden_layers as usize;
+    let mut acts = LayerActivations {
+        layer_inputs: Vec::with_capacity(num_layers),
+        layer_outputs: Vec::with_capacity(num_layers),
+        num_layers: model.cfg.num_hidden_layers,
+        seq_len,
+        hidden_size: model.cfg.hidden_size,
+    };
+
+    let _logits = model
+        .forward_gpu_with_capture(tokens, &positions_flat, &mut kv_cache, &mut acts)
+        .context("run_calibration_prompt_gpu: forward_gpu_with_capture")?;
+
+    acts.validate()
+        .context("run_calibration_prompt_gpu: captured activations failed validate()")?;
+
+    Ok(acts)
 }
 
 // ================================================================
@@ -338,7 +407,25 @@ impl RealActivationCapture {
 impl ActivationCapture for RealActivationCapture {
     fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations> {
         match &mut self.inner {
-            RealCaptureBackend::Loaded(model) => model.run_calibration_prompt(tokens),
+            RealCaptureBackend::Loaded(model) => {
+                // Mantra-aligned dispatch (ADR-012 P9b):
+                //   * MoeQ (native ggml-block experts) → GPU forward via
+                //     `forward_gpu_with_capture`, which calls
+                //     `mlx-native::quantized_matmul_ggml` directly. No F32
+                //     expansion, no OOM, production decode speeds (~50–100×
+                //     CPU). HF2Q_FORCE_CPU_CAPTURE=1 escapes only for parity
+                //     debugging.
+                //   * Dense / F32-Moe → CPU path stays as the byte-identical
+                //     reference (small synthetic models in tests, and
+                //     pre-quant Dense weights at convert time).
+                let force_cpu =
+                    std::env::var("HF2Q_FORCE_CPU_CAPTURE").is_ok();
+                if !force_cpu && has_moeq_layer(model) {
+                    run_calibration_prompt_gpu(model, tokens)
+                } else {
+                    model.run_calibration_prompt(tokens)
+                }
+            }
             RealCaptureBackend::NotReady => {
                 Err(anyhow::anyhow!(RealActivationCaptureError::NotReady))
             }
