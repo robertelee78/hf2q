@@ -263,8 +263,13 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     );
 
     // Phase 0: Read model metadata for preflight
+    //
+    // `metadata` is `mut` so Phase 1.8 (vocab-pad de-pad, ADR-012) can
+    // overwrite `metadata.vocab_size` with the de-padded count derived from
+    // tokenizer.json — keeps the downstream metadata emission consistent
+    // with the truncated embedding tensors.
     let config_path = config.input_dir.join("config.json");
-    let metadata = if config_path.exists() {
+    let mut metadata = if config_path.exists() {
         input::config_parser::parse_config(&config_path)
             .context("Failed to parse model config")
             .map_err(AppError::Input)?
@@ -579,6 +584,39 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     )
     .context("qwen35 linear-attention transforms failed")
     .map_err(AppError::Conversion)?;
+
+    // Phase 1.8: ADR-012 vocab-pad de-pad — surfaced 2026-04-25 by
+    // `hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snap>`.
+    //
+    // HF safetensors pads `model.embed_tokens.weight` and `lm_head.weight` to
+    // an aligned vocab dimension (Qwen3.6-27B emits 248320 rows even though
+    // the tokenizer owns 248044 unique ids).  llama.cpp's loader compares the
+    // tensor shape against the emitted `tokenizer.ggml.tokens` array length
+    // and rejects a mismatch with
+    //   tensor 'token_embd.weight' has wrong shape; expected H, T, got H, P
+    // where T is de-padded and P is padded.
+    //
+    // This phase truncates both embedding tensors to the de-padded count
+    // computed from `tokenizer.json` (the same ground truth that drives
+    // tokenizer.ggml.tokens emission downstream).  No-op when the model has
+    // no `tokenizer.json`, when no padding is present, or when the embed
+    // tensor doesn't match the original metadata.vocab_size.  Updates
+    // `metadata.vocab_size` to the de-padded value so downstream metadata
+    // emission is consistent.
+    if let Some(true_vocab) =
+        input::detect_padded_vocab(&config.input_dir, &metadata)
+            .context("vocab-pad detection failed")
+            .map_err(AppError::Conversion)?
+    {
+        let truncated = input::truncate_padded_vocab(&mut tensor_map, &mut metadata, true_vocab);
+        if truncated > 0 {
+            tracing::info!(
+                truncated_tensors = truncated,
+                de_padded_vocab = true_vocab,
+                "ADR-012 Phase 1.8: vocab-pad fix applied"
+            );
+        }
+    }
 
     check_interrupted()?;
 
