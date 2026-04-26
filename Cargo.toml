@@ -92,15 +92,18 @@ minijinja = "2"
 # Promoted from dev-dep to runtime dep when P9b.2 / P9b.3b shipped.
 tempfile = "3"
 
+# ADR-007 Gate H (W21 iter-108b): parity_quality fixture writer hashes the
+# GGUF + records git_head; sha2 + hex were previously dev-deps for ADR-012 P9
+# corpus drift assertions, promoted to runtime deps here.
+sha2 = "0.10"
+hex = "0.4"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 criterion = "0.5"
 regex = "1"
 tower = { version = "0.4", features = ["util"] }
-# ADR-012 P9: corpus drift + disjointness assertions.
-sha2 = "0.10"
-hex = "0.4"
 
 [[bin]]
 name = "iter23_audit"

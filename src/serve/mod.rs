@@ -9,6 +9,7 @@ pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;
 pub mod header;
+pub mod parity_quality;
 #[allow(dead_code)]
 pub mod sampler_pure;
 
@@ -1473,11 +1474,79 @@ pub fn cmd_parity(args: cli::ParityArgs) -> Result<()> {
     use cli::ParityCommand;
 
     match args.command {
-        ParityCommand::Check { model, prompt, min_prefix, max_tokens, self_baseline } => {
-            cmd_parity_check(&model, &prompt, min_prefix, max_tokens, self_baseline)
+        ParityCommand::Check {
+            model,
+            prompt,
+            min_prefix,
+            max_tokens,
+            self_baseline,
+            tq_quality,
+            fixture,
+            cosine_mean_floor,
+            cosine_p1_floor,
+            argmax_max,
+            ppl_delta_max,
+        } => {
+            if tq_quality {
+                // ADR-007 §853-866 Gate H — TQ-active envelope check.
+                // The fixture is required: Gate H is a comparison gate
+                // (cosine / argmax / PPL Δ vs the frozen
+                // <prompt>_tq_quality.json), not absolute.  Erroring
+                // early without --fixture beats running a 1000-token
+                // two-regime decode and then discovering nothing to
+                // compare against.
+                if self_baseline {
+                    anyhow::bail!(
+                        "parity check --tq-quality is incompatible with \
+                         --self-baseline (Gate D vs Gate H — different gates)"
+                    );
+                }
+                let fixture = fixture.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "parity check --tq-quality requires --fixture \
+                         <path/to/<prompt>_tq_quality.json>.\n\
+                         Hint: the fixture is produced by `hf2q parity \
+                         capture --tq-quality --model <gguf> --prompt \
+                         {prompt}` (iter-112)."
+                    )
+                })?;
+                parity_quality::cmd_parity_check_tq_quality(
+                    &model,
+                    &prompt,
+                    &fixture,
+                    cosine_mean_floor,
+                    cosine_p1_floor,
+                    argmax_max,
+                    ppl_delta_max,
+                    max_tokens,
+                )
+            } else {
+                // Suppress unused-warnings for the Gate H args on the
+                // byte-prefix path.
+                let _ = (
+                    fixture,
+                    cosine_mean_floor,
+                    cosine_p1_floor,
+                    argmax_max,
+                    ppl_delta_max,
+                );
+                cmd_parity_check(&model, &prompt, min_prefix, max_tokens, self_baseline)
+            }
         }
-        ParityCommand::Capture { model, output, prompt, max_tokens } => {
-            cmd_parity_capture(&model, &output, &prompt, max_tokens)
+        ParityCommand::Capture {
+            model,
+            output,
+            prompt,
+            max_tokens,
+            tq_quality,
+        } => {
+            if tq_quality {
+                parity_quality::cmd_parity_capture_tq_quality(
+                    &model, &output, &prompt, max_tokens,
+                )
+            } else {
+                cmd_parity_capture(&model, &output, &prompt, max_tokens)
+            }
         }
     }
 }

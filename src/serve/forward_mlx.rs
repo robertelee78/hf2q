@@ -563,6 +563,28 @@ pub struct MlxModelWeights {
     /// per-layer loop and the per-token tail, so the entire
     /// instrumentation block becomes dead code under `if !gate_h_inactive`.
     pub gate_h_inactive: bool,
+    /// ADR-007 Gate H per-instance replay-token override (W21 iter-108b).
+    ///
+    /// When non-empty, takes precedence over
+    /// [`InvestigationEnv::decode_input_tokens`] in the post-argmax tail
+    /// of [`Self::forward_decode`].  This is the in-process replay surface
+    /// used by `cmd_parity_check_tq_quality` / `cmd_parity_capture_tq_quality`:
+    /// pass 1 (dense) records the picked tokens directly via
+    /// `forward_decode`'s return value, then pass 2 (TQ) sets this field
+    /// before the decode loop so each TQ-step's logits are scored against
+    /// the same token sequence dense produced (the ADR-007 §853-866 PPL
+    /// input shape).  See [`Self::set_replay_tokens`].
+    ///
+    /// `LazyLock` makes [`InvestigationEnv::decode_input_tokens`] frozen
+    /// at first access, so the env-var path can't switch mid-process —
+    /// hence the per-instance override.  Empty by default; emit/NLL/decode-
+    /// step bookkeeping in `forward_decode` continues to gate on
+    /// [`Self::gate_h_inactive`], which is set to `false` by
+    /// [`Self::set_replay_tokens`] whenever the replay vector is non-empty.
+    ///
+    /// (Wired by iter-108b's `parity_quality::run_two_regime_decode`;
+    /// no in-tree caller as of iter-108a.)
+    pub replay_tokens: Vec<u32>,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -1075,7 +1097,13 @@ impl MlxModelWeights {
                     && env.decode_input_tokens.is_empty()
                 // decode_regime is Default at construction, so the regime
                 // arm is true here without an extra read.
+                // replay_tokens is empty at construction (default Vec::new()),
+                // so it does not flip gate_h_inactive here either.
             },
+            // W21 iter-108b: per-instance replay vector for the in-process
+            // two-regime Gate H run.  Empty by default → no behavior change
+            // from iter-108a; populated only via [`set_replay_tokens`].
+            replay_tokens: Vec::new(),
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1137,7 +1165,40 @@ impl MlxModelWeights {
         self.gate_h_inactive = matches!(regime, DecodeRegime::Default)
             && !env.emit_nll
             && !env.decode_emit_tokens
-            && env.decode_input_tokens.is_empty();
+            && env.decode_input_tokens.is_empty()
+            && self.replay_tokens.is_empty();
+    }
+
+    /// Set the per-instance replay vector for the next decode trajectory
+    /// (ADR-007 Gate H, W21 iter-108b two-regime in-process harness).
+    ///
+    /// When non-empty, the post-argmax tail of [`Self::forward_decode`]
+    /// substitutes `replay[step]` for the model's argmax pick — same
+    /// contract as `HF2Q_DECODE_INPUT_TOKENS` but bypassing the
+    /// `INVESTIGATION_ENV` `LazyLock` (which is frozen at first access
+    /// and so cannot be flipped between the dense and TQ passes of a
+    /// single Gate H run).  After the replay buffer is exhausted, the
+    /// loop falls through to the live argmax pick — identical fall-back
+    /// to the env-var path.
+    ///
+    /// Pass an empty `Vec` to clear the override.  Also resets
+    /// [`Self::decode_step`] (matching `set_decode_regime` semantics) so
+    /// each replay run's `step` counter starts at 0, and refreshes
+    /// [`Self::gate_h_inactive`] so the per-token instrumentation block
+    /// runs whenever a replay is active even when env hooks are silent.
+    ///
+    /// (Wired by iter-108b's `parity_quality::run_two_regime_decode`;
+    /// no other in-tree caller.)
+    #[allow(dead_code)]
+    pub fn set_replay_tokens(&mut self, replay: Vec<u32>) {
+        self.replay_tokens = replay;
+        self.decode_step = 0;
+        let env = &*INVESTIGATION_ENV;
+        self.gate_h_inactive = matches!(self.decode_regime, DecodeRegime::Default)
+            && !env.emit_nll
+            && !env.decode_emit_tokens
+            && env.decode_input_tokens.is_empty()
+            && self.replay_tokens.is_empty();
     }
 
     /// Run one decode step through mlx-native's GraphExecutor.
@@ -3380,7 +3441,14 @@ impl MlxModelWeights {
             // Replay first — substitute picked token before NLL/emit so both
             // downstream observers see the SAME token id (otherwise a replay
             // run would emit replay tokens but NLL the original argmax pick).
-            let final_token = if !env.decode_input_tokens.is_empty()
+            // W21 iter-108b: per-instance `replay_tokens` takes precedence
+            // over the frozen env-var vector so the in-process two-regime
+            // Gate H harness can switch replay sources between passes.
+            let final_token = if !self.replay_tokens.is_empty()
+                && (step as usize) < self.replay_tokens.len()
+            {
+                self.replay_tokens[step as usize]
+            } else if !env.decode_input_tokens.is_empty()
                 && (step as usize) < env.decode_input_tokens.len()
             {
                 env.decode_input_tokens[step as usize]

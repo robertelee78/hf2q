@@ -411,7 +411,13 @@ pub enum OverflowPolicyArg {
 
 #[derive(Subcommand, Debug)]
 pub enum ParityCommand {
-    /// Check hf2q output against locked reference fixtures
+    /// Check hf2q output against locked reference fixtures.
+    ///
+    /// Default mode: byte-prefix comparison vs `*_llama.txt` (or vs the
+    /// frozen hf2q self-baseline when `--self-baseline` is set).  Pass
+    /// `--tq-quality` to switch to the ADR-007 §853-866 Gate H envelope
+    /// check instead (cosine / argmax / PPL Δ vs a frozen
+    /// `<prompt>_tq_quality.json` fixture).
     Check {
         /// Path to GGUF model file
         #[arg(long)]
@@ -437,9 +443,52 @@ pub enum ParityCommand {
         /// min-prefix floor).
         #[arg(long)]
         self_baseline: bool,
+
+        /// ADR-007 Gate H — switch this invocation to the TQ-active
+        /// quality envelope check (cosine on SDPA outputs + argmax flip
+        /// rate + PPL Δ vs the frozen `<prompt>_tq_quality.json`
+        /// fixture). Requires `--fixture` to point at a fixture produced
+        /// by `parity capture --tq-quality`.  All other flags below
+        /// (`--cosine-mean-floor`, etc.) only take effect when this is
+        /// set.
+        #[arg(long)]
+        tq_quality: bool,
+
+        /// Path to the frozen `<prompt>_tq_quality.json` fixture (Gate H
+        /// only). Required when `--tq-quality` is set; the comparison
+        /// is meaningless without a frozen reference, so `parity check
+        /// --tq-quality` errors clearly when this is absent.
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+
+        /// Cosine-similarity mean floor for Gate H (industry std 0.999;
+        /// day-of-close envelope measured 0.9998).  ADR-007 §853.
+        #[arg(long, default_value_t = 0.999)]
+        cosine_mean_floor: f32,
+
+        /// Cosine-similarity p1 floor for Gate H (industry std 0.99; day-
+        /// of-close envelope measured 0.9986).  ADR-007 §853.
+        #[arg(long, default_value_t = 0.99)]
+        cosine_p1_floor: f32,
+
+        /// Argmax-flip-rate ceiling for Gate H (W12 1.5%; day-of-close
+        /// envelope measured 0.8% — variance baked in).  ADR-007 §853.
+        #[arg(long, default_value_t = 0.015)]
+        argmax_max: f32,
+
+        /// PPL-delta ceiling for Gate H expressed as a fraction (W12
+        /// 0.02 = 2.0%; day-of-close envelope measured 1.24% — variance
+        /// baked in).  ADR-007 §866.
+        #[arg(long, default_value_t = 0.02)]
+        ppl_delta_max: f32,
     },
 
-    /// Capture fresh reference outputs (requires model)
+    /// Capture fresh reference outputs (requires model).
+    ///
+    /// Default mode: writes the byte-prefix anchor (`<prompt>_hf2q.txt`)
+    /// for Gates C/D/E/F.  Pass `--tq-quality` to instead capture the
+    /// frozen Gate H envelope fixture (`<prompt>_tq_quality.json`)
+    /// described in ADR-007 §853-866.
     Capture {
         /// Path to GGUF model file
         #[arg(long)]
@@ -456,6 +505,15 @@ pub enum ParityCommand {
         /// Maximum tokens to generate
         #[arg(long)]
         max_tokens: Option<usize>,
+
+        /// ADR-007 Gate H — capture the frozen `<prompt>_tq_quality.json`
+        /// fixture instead of the byte-prefix anchor.  Single prompt only
+        /// (`all` is rejected); the in-process two-regime decode loop
+        /// runs dense pass 1 + TQ pass 2 on one model load and emits the
+        /// dense token stream + dense per-step NLL + the day-of-capture
+        /// envelope (cosine / argmax / PPL Δ) into the fixture JSON.
+        #[arg(long)]
+        tq_quality: bool,
     },
 }
 
