@@ -264,6 +264,66 @@ impl LoadedMmprojWeights {
             .get(super::mmproj::TENSOR_MM_2_WEIGHT)
             .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_MM_2_WEIGHT))
     }
+
+    // -----------------------------------------------------------------------
+    // Gemma4ClippableLinear scalar bounds for `mm.0.weight`.
+    //
+    // Per `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`, gemma4v emits
+    // four optional scalar f32 tensors as siblings of `mm.0.weight`:
+    //   - `mm.0.input_min`, `mm.0.input_max` (clamps applied BEFORE matmul)
+    //   - `mm.0.output_min`, `mm.0.output_max` (clamps applied AFTER matmul)
+    //
+    // Each is a 1-element f32 tensor (the converter `unsqueeze(0)`s the
+    // 0-D scalar so GGUF round-trips it as a 1-D `[1]` tensor; see
+    // `/opt/llama.cpp/convert_hf_to_gguf.py:7851-7853`).
+    //
+    // Returns `Some(value)` when the tensor is present and decodes to
+    // exactly one f32, else `None`. Callers compose the four into a
+    // `Gemma4ClippableLinearBounds` via `mm_0_bounds()`.
+    // -----------------------------------------------------------------------
+
+    fn read_scalar_f32(&self, name: &str) -> Option<f32> {
+        let buf = self.tensors.get(name)?;
+        let slice = buf.as_slice::<f32>().ok()?;
+        // Defensive: clamp scalars are 1-element. If we ever load a
+        // mis-shaped sibling (e.g. converter wrote a vector), reject
+        // cleanly rather than silently picking element 0.
+        if slice.len() != 1 {
+            return None;
+        }
+        Some(slice[0])
+    }
+
+    /// Read the `mm.0.input_min` scalar bound (clamp BEFORE matmul).
+    /// `None` when absent OR mis-shaped — caller treats absence as
+    /// `f32::NEG_INFINITY` (no-op) per llama.cpp's default.
+    pub fn mm_0_input_min(&self) -> Option<f32> {
+        self.read_scalar_f32("mm.0.input_min")
+    }
+    /// Read the `mm.0.input_max` scalar bound. See `mm_0_input_min`.
+    pub fn mm_0_input_max(&self) -> Option<f32> {
+        self.read_scalar_f32("mm.0.input_max")
+    }
+    /// Read the `mm.0.output_min` scalar bound (clamp AFTER matmul).
+    pub fn mm_0_output_min(&self) -> Option<f32> {
+        self.read_scalar_f32("mm.0.output_min")
+    }
+    /// Read the `mm.0.output_max` scalar bound. See `mm_0_output_min`.
+    pub fn mm_0_output_max(&self) -> Option<f32> {
+        self.read_scalar_f32("mm.0.output_max")
+    }
+
+    /// Compose the four clamp scalars into a single
+    /// `Gemma4ClippableLinearBounds`. All-`None` result means the
+    /// projector is byte-equivalent to a plain Linear (no clamps).
+    pub fn mm_0_bounds(&self) -> super::vit::Gemma4ClippableLinearBounds {
+        super::vit::Gemma4ClippableLinearBounds {
+            input_min: self.mm_0_input_min(),
+            input_max: self.mm_0_input_max(),
+            output_min: self.mm_0_output_min(),
+            output_max: self.mm_0_output_max(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,5 +556,59 @@ mod tests {
         assert!(weights.mm_0_weight().is_err());
         assert!(weights.mm_2_weight().is_err());
         assert!(weights.block_tensor(0, "attn_q.weight").is_err());
+    }
+
+    /// iter-115: mm.0 Gemma4ClippableLinear scalar bounds accessors.
+    /// Build a synthetic `LoadedMmprojWeights` carrying only the four
+    /// 1-element clamp-scalar tensors and assert each accessor returns
+    /// the expected scalar.
+    #[test]
+    fn mm_0_clamp_scalar_accessors_round_trip_single_element_tensors() {
+        use mlx_native::DType;
+        let device = MlxDevice::new().expect("device");
+        let put = |tensors: &mut HashMap<String, MlxBuffer>,
+                   dev: &MlxDevice,
+                   name: &str,
+                   value: f32| {
+            // 1-element f32 tensor with shape [1] — matches what
+            // convert_hf_to_gguf.py emits for the unsqueeze(0)'d scalar.
+            let buf = dev.alloc_buffer(4, DType::F32, vec![1]).expect("alloc scalar");
+            let s: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, 1)
+            };
+            s[0] = value;
+            tensors.insert(name.to_string(), buf);
+        };
+        let mut tensors: HashMap<String, MlxBuffer> = HashMap::new();
+        put(&mut tensors, &device, "mm.0.input_min", -2.5);
+        put(&mut tensors, &device, "mm.0.input_max", 2.5);
+        put(&mut tensors, &device, "mm.0.output_min", -10.0);
+        put(&mut tensors, &device, "mm.0.output_max", 10.0);
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+
+        assert_eq!(weights.mm_0_input_min(), Some(-2.5));
+        assert_eq!(weights.mm_0_input_max(), Some(2.5));
+        assert_eq!(weights.mm_0_output_min(), Some(-10.0));
+        assert_eq!(weights.mm_0_output_max(), Some(10.0));
+
+        let bounds = weights.mm_0_bounds();
+        assert!(bounds.any());
+        assert_eq!(bounds.input_min, Some(-2.5));
+        assert_eq!(bounds.output_max, Some(10.0));
+    }
+
+    /// Absence of any clamp-scalar tensor → all accessors return None,
+    /// `mm_0_bounds().any()` is false (the projector degrades to a
+    /// plain Linear, byte-equivalent to the no-clamp path).
+    #[test]
+    fn mm_0_clamp_scalar_accessors_return_none_when_absent() {
+        let device = MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::empty(device);
+        assert_eq!(weights.mm_0_input_min(), None);
+        assert_eq!(weights.mm_0_input_max(), None);
+        assert_eq!(weights.mm_0_output_min(), None);
+        assert_eq!(weights.mm_0_output_max(), None);
+        let bounds = weights.mm_0_bounds();
+        assert!(!bounds.any());
     }
 }

@@ -1784,6 +1784,16 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
         ("model.vision_tower.std_bias", "v.std_bias"),
         ("model.vision_tower.std_scale", "v.std_scale"),
         ("model.embed_vision.embedding_projection.weight", "mm.0.weight"),
+        // Gemma4ClippableLinear scalar bounds for the multimodal projection.
+        // Each is a single-f32 tensor in HF (PyTorch 0-D scalar); the
+        // llama.cpp converter `unsqueeze(0)`s them to GGUF 1-D `[1]`
+        // tensors. Loaded as `Option<f32>` by `mmproj_weights::mm_0_bounds`
+        // and consumed by `gemma4v_clippable_linear_{forward,gpu}`.
+        // Reference: `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
+        ("model.embed_vision.embedding_projection.input_min", "mm.0.input_min"),
+        ("model.embed_vision.embedding_projection.input_max", "mm.0.input_max"),
+        ("model.embed_vision.embedding_projection.output_min", "mm.0.output_min"),
+        ("model.embed_vision.embedding_projection.output_max", "mm.0.output_max"),
     ];
 
     for &(hf, gguf) in static_map {
@@ -3851,6 +3861,40 @@ mod tests {
             "token_embd.weight",
         ] {
             assert_eq!(resolve_mtp_block_index(unaffected, 40), *unaffected);
+        }
+    }
+
+    /// iter-115: gemma4v Gemma4ClippableLinear scalar bounds map to GGUF
+    /// `mm.0.{input_min, input_max, output_min, output_max}`. Reference:
+    /// `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
+    #[test]
+    fn test_gemma4v_clippable_linear_scalar_bounds_mapping() {
+        for arch in &["gemma4", "gemma4_multimodal", "llama"] {
+            assert_eq!(
+                hf_name_to_gguf("model.embed_vision.embedding_projection.input_min", arch, 0),
+                "mm.0.input_min",
+                "[{arch}] input_min mapping"
+            );
+            assert_eq!(
+                hf_name_to_gguf("model.embed_vision.embedding_projection.input_max", arch, 0),
+                "mm.0.input_max",
+                "[{arch}] input_max mapping"
+            );
+            assert_eq!(
+                hf_name_to_gguf("model.embed_vision.embedding_projection.output_min", arch, 0),
+                "mm.0.output_min",
+                "[{arch}] output_min mapping"
+            );
+            assert_eq!(
+                hf_name_to_gguf("model.embed_vision.embedding_projection.output_max", arch, 0),
+                "mm.0.output_max",
+                "[{arch}] output_max mapping"
+            );
+            // Sanity: weight still maps the same way.
+            assert_eq!(
+                hf_name_to_gguf("model.embed_vision.embedding_projection.weight", arch, 0),
+                "mm.0.weight"
+            );
         }
     }
 }

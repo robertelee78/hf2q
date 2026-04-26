@@ -1024,9 +1024,15 @@ pub fn apply_vit_block_forward_gpu(
     Ok(block_out)
 }
 
-/// Metal shader source for the iter-51c custom kernels:
+/// Metal shader source for the iter-51c + iter-115 custom kernels:
 ///   - `vit_avg_pool_2x2_f32`: spatial 2×2 avg-pool on `[N_side, N_side, hidden]`.
+///     SigLIP-49 path; preserved byte-identical for that arch.
+///   - `vit_avg_pool_kxk_f32`: parameterized k×k avg-pool on a rectangular
+///     `[n_y, n_x, hidden]` grid. Generalizes the 2×2 case to gemma4v's
+///     k=3 + variable n_x/n_y. (iter 115)
 ///   - `vit_std_bias_scale_f32`: per-channel `(x - bias) * scale` on `[batch, hidden]`.
+///   - `vit_clip_inplace_f32`: elementwise scalar clamp with optional
+///     min/max. (iter 115)
 ///
 /// Registered with the `KernelRegistry` on first use via
 /// `register_vit_custom_shaders`. Lives as a `&'static str` since the
@@ -1062,6 +1068,56 @@ kernel void vit_avg_pool_2x2_f32(
     output[oy * out_side * h_stride + ox * h_stride + h] = (a + b + c + d) * 0.25;
 }
 
+// Parameterized k×k spatial avg-pool on a rectangular [n_y, n_x, hidden]
+// grid. Output shape is [n_y/k, n_x/k, hidden]. Generalizes
+// vit_avg_pool_2x2_f32 (which is the n_x=n_y=n_side, k=2 case).
+//
+// gemma4v call: n_x = n_patches_x, n_y = n_patches_y, k = n_merge = 3
+// (per /opt/llama.cpp/tools/mtmd/clip.cpp:1337).
+//
+// Layout assumption: input is row-major with rows iterating Y first
+// (so row stride = n_x * hidden), matching the
+// [n_y, n_x, hidden] reshape in the gemma4v post-blocks pipeline.
+struct AvgPoolKxKParams {
+    uint n_x;     // input width  in patches
+    uint n_y;     // input height in patches
+    uint k;       // pool kernel edge (= stride; non-overlapping)
+    uint hidden;  // channel dim
+};
+
+kernel void vit_avg_pool_kxk_f32(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant AvgPoolKxKParams& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint h  = gid.x;
+    uint ox = gid.y;
+    uint oy = gid.z;
+    uint out_x = params.n_x / params.k;
+    uint out_y = params.n_y / params.k;
+    if (h >= params.hidden || ox >= out_x || oy >= out_y) return;
+    uint iy0 = oy * params.k;
+    uint ix0 = ox * params.k;
+    uint h_stride = params.hidden;
+    uint row_stride = params.n_x * h_stride;
+    float acc = 0.0f;
+    // Sum over the k×k input block. k is small (== 3 for gemma4v) so
+    // the inner double-loop is a handful of ops; the compiler will
+    // unroll once k becomes a constant via specialization. We keep it
+    // dynamic so the same kernel handles k=2 (SigLIP path), k=3
+    // (gemma4v), and any future arch's pool factor.
+    for (uint dy = 0u; dy < params.k; ++dy) {
+        for (uint dx = 0u; dx < params.k; ++dx) {
+            uint ix = ix0 + dx;
+            uint iy = iy0 + dy;
+            acc += input[iy * row_stride + ix * h_stride + h];
+        }
+    }
+    float k2 = float(params.k * params.k);
+    output[oy * out_x * h_stride + ox * h_stride + h] = acc / k2;
+}
+
 struct StdBiasScaleParams {
     uint hidden;
     uint batch;
@@ -1081,6 +1137,37 @@ kernel void vit_std_bias_scale_f32(
     uint idx = b * params.hidden + h;
     output[idx] = (input[idx] - bias[h]) * scale[h];
 }
+
+// Elementwise in-place scalar clamp. Both min and max are scalar f32
+// values supplied via a 2-element params buffer. The convention:
+//   out[i] = clamp(in[i], min, max)
+// Setting min = -FLT_MAX or max = FLT_MAX makes that side a no-op,
+// matching llama.cpp's get_scalar default for the gemma4v
+// Gemma4ClippableLinear (`tools/mtmd/clip.cpp:1953-1956`).
+//
+// Caller dispatches once per clamp (input or output side); we don't
+// fuse the matmul-and-clamps because the Gemma4ClippableLinear
+// composes from existing primitives (clip + matmul + clip) and the
+// clamp itself is bandwidth-bound (one pass through the output).
+struct ClipInplaceParams {
+    float min_val;
+    float max_val;
+    uint  n_elements;
+    uint  _pad; // align to 16 bytes for Metal
+};
+
+kernel void vit_clip_inplace_f32(
+    device const float* input  [[buffer(0)]],
+    device       float* output [[buffer(1)]],
+    constant ClipInplaceParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n_elements) return;
+    float x = input[gid];
+    x = max(x, params.min_val);
+    x = min(x, params.max_val);
+    output[gid] = x;
+}
 "#;
 
 #[repr(C)]
@@ -1092,9 +1179,27 @@ struct AvgPool2x2GpuParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct AvgPoolKxKGpuParams {
+    n_x: u32,
+    n_y: u32,
+    k: u32,
+    hidden: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct StdBiasScaleGpuParams {
     hidden: u32,
     batch: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ClipInplaceGpuParams {
+    min_val: f32,
+    max_val: f32,
+    n_elements: u32,
+    _pad: u32,
 }
 
 /// View any `Copy + repr(C)` POD as a byte slice. SAFE for `repr(C)`
@@ -1114,7 +1219,9 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
 /// for the same name. Caller invokes once per `KernelRegistry`.
 pub fn register_vit_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("vit_avg_pool_2x2_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_avg_pool_kxk_f32", VIT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("vit_std_bias_scale_f32", VIT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("vit_clip_inplace_f32", VIT_CUSTOM_SHADERS_SOURCE);
 }
 
 /// GPU 2×2 spatial avg-pool on a `[N_side, N_side, hidden]` row-major
@@ -1170,6 +1277,188 @@ pub fn vit_avg_pool_2x2_gpu(
     // Threadgroup sized to fit the inner-most (hidden) dim into reasonable
     // chunks; clamp components to 1 in axes not needing parallelism.
     let tg_x = std::cmp::min(64, hidden as u64);
+    let tg = MTLSize::new(tg_x, 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(&output)),
+            (2, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
+}
+
+/// GPU parameterized k×k spatial avg-pool on a rectangular
+/// `[n_y, n_x, hidden]` row-major tensor. Output shape:
+/// `[n_y/k, n_x/k, hidden]`.
+///
+/// Generalizes `vit_avg_pool_2x2_gpu` to:
+///   - rectangular grids (`n_x` ≠ `n_y`),
+///   - arbitrary kernel size `k` (must divide both `n_x` and `n_y`).
+///
+/// gemma4v call: pass `(n_x = n_patches_x, n_y = n_patches_y, k =
+/// n_merge = 3)` per `/opt/llama.cpp/tools/mtmd/clip.cpp:1337,1334`.
+///
+/// # Byte-stable wrt the 2×2 path
+///
+/// For `(n_x = n_y = N, k = 2)` the kxk shader's accumulate-and-divide
+/// path produces values byte-identical to the dedicated 2×2 shader's
+/// `(a + b + c + d) * 0.25` (4 floats summed in the same order, divided
+/// by 4.0). The SigLIP-49 path keeps using `vit_avg_pool_2x2_gpu` so
+/// no regression risk; the kxk path is opt-in for gemma4v + future archs.
+///
+/// Caller registers `register_vit_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+///
+/// - `n_x == 0` or `n_y == 0` or `k == 0`
+/// - `n_x % k != 0` or `n_y % k != 0` (input must be exactly tileable;
+///   llama.cpp's `ggml_pool_2d` with stride==kernel and pad==0 has the
+///   same tiling assumption — fractional-tile output isn't well-defined)
+/// - `hidden == 0`
+/// - propagated from kernel pipeline compile failures
+#[allow(clippy::too_many_arguments)]
+pub fn vit_avg_pool_kxk_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    n_x: u32,
+    n_y: u32,
+    k: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if n_x == 0 || n_y == 0 || k == 0 {
+        return Err(anyhow!(
+            "vit_avg_pool_kxk_gpu: n_x ({n_x}), n_y ({n_y}), k ({k}) must all be > 0"
+        ));
+    }
+    if hidden == 0 {
+        return Err(anyhow!("vit_avg_pool_kxk_gpu: hidden must be > 0"));
+    }
+    if n_x % k != 0 || n_y % k != 0 {
+        return Err(anyhow!(
+            "vit_avg_pool_kxk_gpu: n_x ({n_x}) and n_y ({n_y}) must both be multiples of k ({k})"
+        ));
+    }
+    let out_x = n_x / k;
+    let out_y = n_y / k;
+    let out_n = (out_x as usize) * (out_y as usize);
+    let out_bytes = out_n * (hidden as usize) * 4;
+    let output = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![out_y as usize, out_x as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc avg_pool_kxk output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("vit_avg_pool_kxk_f32", device.metal_device())
+        .map_err(|e| anyhow!("vit_avg_pool_kxk_gpu: get_pipeline: {e}"))?;
+
+    let params = AvgPoolKxKGpuParams { n_x, n_y, k, hidden };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(hidden as u64, out_x as u64, out_y as u64);
+    let tg_x = std::cmp::min(64, hidden as u64);
+    let tg = MTLSize::new(tg_x, 1, 1);
+    encoder.encode_with_args(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(&output)),
+            (2, KernelArg::Bytes(bytes)),
+        ],
+        grid,
+        tg,
+    );
+    Ok(output)
+}
+
+/// GPU thin wrapper for the gemma4v 3×3 avg-pool. Routes through
+/// `vit_avg_pool_kxk_gpu` with `k = 3` per the gemma4v `n_merge`
+/// reference (`/opt/llama.cpp/tools/mtmd/clip.cpp:1337`).
+///
+/// `n_x` / `n_y` come from `Gemma4vPreprocessed.n_x` / `.n_y` — the
+/// variable patch grid produced by `preprocess_gemma4v`. Both must be
+/// multiples of 3 (callers reading the preprocessor output already
+/// satisfy this; the inner check is for symmetry with the 2×2 wrapper).
+pub fn gemma4v_avg_pool_3x3_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    n_x: u32,
+    n_y: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    vit_avg_pool_kxk_gpu(encoder, registry, device, input, n_x, n_y, 3, hidden)
+}
+
+/// GPU elementwise scalar clamp: `out[i] = clamp(in[i], min_val, max_val)`.
+///
+/// Building block for Gemma4ClippableLinear (`gemma4v.cpp:138-151`).
+/// Pass `min_val = f32::NEG_INFINITY` (or `f32::MIN`) for "no min" and
+/// `max_val = f32::INFINITY` (or `f32::MAX`) for "no max" to match
+/// llama.cpp's `get_scalar(name, FLT_MAX/-FLT_MAX)` defaults.
+///
+/// Allocates a fresh `[n_elements]` output buffer; the input is
+/// untouched (despite the name "_inplace" in the Metal kernel — the
+/// kernel reads from `input` and writes to `output`, which can be the
+/// same buffer if the caller wants in-place behavior, but our Rust
+/// dispatch always allocates a fresh output for clarity).
+///
+/// Caller registers `register_vit_custom_shaders(&mut registry)` first.
+///
+/// # Errors
+///
+/// - `n_elements == 0`
+/// - `min_val > max_val` (would produce undefined output)
+/// - propagated from kernel pipeline compile failures
+pub fn vit_clip_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    n_elements: u32,
+    min_val: f32,
+    max_val: f32,
+) -> Result<MlxBuffer> {
+    if n_elements == 0 {
+        return Err(anyhow!("vit_clip_gpu: n_elements must be > 0"));
+    }
+    if min_val.is_nan() || max_val.is_nan() {
+        return Err(anyhow!(
+            "vit_clip_gpu: NaN clamp bounds (min={min_val}, max={max_val}) — \
+             would silently corrupt all elements"
+        ));
+    }
+    if min_val > max_val {
+        return Err(anyhow!(
+            "vit_clip_gpu: min_val ({min_val}) > max_val ({max_val}) is undefined"
+        ));
+    }
+    let out_bytes = (n_elements as usize) * 4;
+    let output = device
+        .alloc_buffer(out_bytes, DType::F32, vec![n_elements as usize])
+        .map_err(|e| anyhow!("alloc clip output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("vit_clip_inplace_f32", device.metal_device())
+        .map_err(|e| anyhow!("vit_clip_gpu: get_pipeline: {e}"))?;
+
+    let params = ClipInplaceGpuParams {
+        min_val,
+        max_val,
+        n_elements,
+        _pad: 0,
+    };
+    let bytes = pod_as_bytes(&params);
+    let grid = MTLSize::new(n_elements as u64, 1, 1);
+    let tg_x = std::cmp::min(256, n_elements as u64);
     let tg = MTLSize::new(tg_x, 1, 1);
     encoder.encode_with_args(
         pipeline,
@@ -1692,6 +1981,219 @@ pub fn compute_vision_embeddings_gpu(
         out.push(slice.to_vec());
     }
     Ok(out)
+}
+
+/// Variable-resolution gemma4v preprocessed image carrier.
+///
+/// Sibling to `PreprocessedImage` (which is square-fixed-size for the
+/// SigLIP-49 path). This struct carries the patch tensor + per-patch
+/// position arrays produced by `preprocess_gemma4v`, plus a debug
+/// label for tracing. The `compute_vision_embeddings_gpu_gemma4v`
+/// entry point consumes a slice of these.
+///
+/// `n_x` / `n_y` MUST satisfy `n_x % 3 == 0 && n_y % 3 == 0`
+/// (`gemma4v_apply_full_forward_gpu` enforces this; the preprocessor
+/// already produces multiple-of-3 grids).
+#[derive(Debug, Clone)]
+pub struct Gemma4vPreprocessedImage {
+    pub patches: Vec<f32>,
+    pub pos_x: Vec<u32>,
+    pub pos_y: Vec<u32>,
+    pub n_x: u32,
+    pub n_y: u32,
+    pub source_label: String,
+}
+
+/// Variable-resolution gemma4v end-to-end GPU forward over a slice of
+/// preprocessed images. Sibling to `compute_vision_embeddings_gpu` for
+/// the SigLIP-49 path.
+///
+/// Returns one `Vec<f32>` per image, each `[N_post_pool * text_hidden]`
+/// row-major. `N_post_pool = (n_x/3) * (n_y/3)` so the output length
+/// varies per image (252-280 input patches → 28-31 post-pool tokens).
+///
+/// Internally uses the same per-image fresh-session pattern as the
+/// SigLIP-49 path (one `GraphSession::finish()` per image).
+///
+/// # Errors
+///
+/// Propagated from `gemma4v_apply_full_forward_gpu` (shape mismatch,
+/// missing tensors).
+pub fn compute_vision_embeddings_gpu_gemma4v(
+    images: &[Gemma4vPreprocessedImage],
+    mmproj_weights: &super::mmproj_weights::LoadedMmprojWeights,
+    mmproj_cfg: &super::mmproj::MmprojConfig,
+) -> Result<Vec<Vec<f32>>> {
+    use mlx_native::{GraphExecutor, MlxDevice};
+
+    let mut out = Vec::with_capacity(images.len());
+    for (idx, img) in images.iter().enumerate() {
+        let executor = GraphExecutor::new(
+            MlxDevice::new().map_err(|e| {
+                anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: device: {e}", idx)
+            })?,
+        );
+        let mut session = executor.begin().map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: begin: {e}", idx)
+        })?;
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        // SAFETY: executor outlives session via the loop scope.
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let buf = gemma4v_apply_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            mmproj_weights,
+            mmproj_cfg,
+            &img.patches,
+            &img.pos_x,
+            &img.pos_y,
+            img.n_x,
+            img.n_y,
+        )
+        .map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
+        })?;
+        session.finish().map_err(|e| {
+            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: finish: {e}", idx)
+        })?;
+
+        let pooled_n = ((img.n_x / 3) as usize) * ((img.n_y / 3) as usize);
+        let mm0 = mmproj_weights
+            .mm_0_weight()
+            .map_err(|e| anyhow!("mm.0: {e}"))?;
+        let text_hidden = mm0
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("mm.0 slice: {e}"))?
+            .len()
+            / (mmproj_cfg.hidden_size as usize);
+        let total = pooled_n * text_hidden;
+        let slice: &[f32] = buf
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("readback: {e}"))?;
+        if slice.len() != total {
+            return Err(anyhow!(
+                "compute_vision_embeddings_gpu_gemma4v image {}: readback len {} != expected {} \
+                 (pooled_n={}, text_hidden={})",
+                idx,
+                slice.len(),
+                total,
+                pooled_n,
+                text_hidden
+            ));
+        }
+        out.push(slice.to_vec());
+    }
+    Ok(out)
+}
+
+/// Per-image input variant for `compute_vision_embeddings_gpu_dispatch`.
+///
+/// `Siglip49(PreprocessedImage)` — square fixed-size pixels for the
+/// SigLIP-49 / classic-CLIP path. `Gemma4v(Gemma4vPreprocessedImage)` —
+/// variable-resolution patches + 2D pos for gemma4v.
+///
+/// The handler chooses the variant based on the loaded mmproj's
+/// `ArchProfile` at preprocess time (one branch in
+/// `process_multimodal_content`); the dispatch function below routes
+/// accordingly.
+#[derive(Debug, Clone)]
+pub enum VisionInput {
+    Siglip49(super::PreprocessedImage),
+    Gemma4v(Gemma4vPreprocessedImage),
+}
+
+/// Arch-profile dispatch over a heterogeneous slice of images.
+///
+/// Currently splits into two homogeneous batches (all-Siglip49 vs
+/// all-Gemma4v) since the underlying GPU paths are distinct compute
+/// kernels with different per-image setup. `arch` is the
+/// `ArchProfile` detected at mmproj load time and supplied by the
+/// caller — we fail loud on a mismatch (e.g. `Gemma4v` input with
+/// `ArchProfile::ClipClassic` mmproj) rather than silently routing to
+/// the wrong forward.
+///
+/// Output ordering matches input ordering. `scale` is the SigLIP-49
+/// attention scale (ignored for the gemma4v branch which uses
+/// scale=1.0 internally per gemma4v.cpp:93).
+///
+/// # Errors
+///
+/// - `arch == Unknown`
+/// - `arch` doesn't match the variant of any input element
+/// - propagated from the underlying compute call
+pub fn compute_vision_embeddings_gpu_dispatch(
+    inputs: &[VisionInput],
+    arch: super::mmproj::ArchProfile,
+    mmproj_weights: &super::mmproj_weights::LoadedMmprojWeights,
+    mmproj_cfg: &super::mmproj::MmprojConfig,
+    scale: f32,
+) -> Result<Vec<Vec<f32>>> {
+    if !arch.is_supported() {
+        return Err(anyhow!(
+            "compute_vision_embeddings_gpu_dispatch: arch profile is Unknown — \
+             cannot dispatch a vision forward"
+        ));
+    }
+    // Validate every input matches `arch` before running anything.
+    for (idx, input) in inputs.iter().enumerate() {
+        match (&arch, input) {
+            (super::mmproj::ArchProfile::Gemma4Siglip, VisionInput::Gemma4v(_))
+            | (super::mmproj::ArchProfile::Gemma4Siglip, VisionInput::Siglip49(_))
+            | (super::mmproj::ArchProfile::ClipClassic, VisionInput::Siglip49(_)) => {}
+            (super::mmproj::ArchProfile::ClipClassic, VisionInput::Gemma4v(_)) => {
+                return Err(anyhow!(
+                    "compute_vision_embeddings_gpu_dispatch: input {idx} is Gemma4v \
+                     but arch is ClipClassic — preprocessing/arch mismatch"
+                ));
+            }
+            (super::mmproj::ArchProfile::Unknown, _) => unreachable!("guarded above"),
+        }
+    }
+
+    // Partition inputs by variant while preserving original index so we
+    // can re-merge at the end.
+    let mut siglip_idx: Vec<usize> = Vec::new();
+    let mut siglip_imgs: Vec<super::PreprocessedImage> = Vec::new();
+    let mut gemma_idx: Vec<usize> = Vec::new();
+    let mut gemma_imgs: Vec<Gemma4vPreprocessedImage> = Vec::new();
+    for (idx, input) in inputs.iter().enumerate() {
+        match input {
+            VisionInput::Siglip49(p) => {
+                siglip_idx.push(idx);
+                siglip_imgs.push(p.clone());
+            }
+            VisionInput::Gemma4v(g) => {
+                gemma_idx.push(idx);
+                gemma_imgs.push(g.clone());
+            }
+        }
+    }
+
+    let mut out: Vec<Option<Vec<f32>>> = (0..inputs.len()).map(|_| None).collect();
+    if !siglip_imgs.is_empty() {
+        let r = compute_vision_embeddings_gpu(&siglip_imgs, mmproj_weights, mmproj_cfg, scale)?;
+        for (i, e) in siglip_idx.into_iter().zip(r.into_iter()) {
+            out[i] = Some(e);
+        }
+    }
+    if !gemma_imgs.is_empty() {
+        let r = compute_vision_embeddings_gpu_gemma4v(&gemma_imgs, mmproj_weights, mmproj_cfg)?;
+        for (i, e) in gemma_idx.into_iter().zip(r.into_iter()) {
+            out[i] = Some(e);
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.ok_or_else(|| anyhow!("compute_vision_embeddings_gpu_dispatch: slot {i} unfilled"))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2550,6 +3052,392 @@ pub fn gemma4v_block_forward_gpu(
 
     let x_out = vit_residual_add_gpu(encoder, registry, device, &x_mid, &down, n_hidden)?;
     Ok(x_out)
+}
+
+// ---------------------------------------------------------------------------
+// Gemma4ClippableLinear (GPU dispatch)
+// ---------------------------------------------------------------------------
+
+/// GPU sibling of `vit::gemma4v_clippable_linear_forward`.
+///
+/// Pipeline:
+///   1. (optional) `vit_clip_gpu(input, input_min, input_max)`
+///   2. `vit_linear_gpu(clamped_input, weight)` (no bias)
+///   3. (optional) `vit_clip_gpu(output, output_min, output_max)`
+///
+/// `bounds.any() == false` short-circuits to a plain `vit_linear_gpu`
+/// call — no extra dispatches, no extra allocations. This is the common
+/// case for any non-gemma4v projector and for the gemma4v projector
+/// when the GGUF was written by an older converter that didn't emit the
+/// clamp scalars.
+///
+/// Inserts a memory barrier between each clamp and the matmul (clamp's
+/// output is matmul's input → RAW), and between matmul and the output
+/// clamp.
+///
+/// # Errors
+///
+/// Propagated from `vit_clip_gpu` and `vit_linear_gpu`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_clippable_linear_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight_f32: &MlxBuffer,
+    bounds: &super::vit::Gemma4ClippableLinearBounds,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    // --- Stage 1: optional input clamp ---
+    let input_for_matmul: MlxBuffer;
+    let input_ref: &MlxBuffer = if bounds.input_min.is_some() || bounds.input_max.is_some() {
+        let (mn, mx) = bounds.resolved_input();
+        let n = (seq_len as u64).saturating_mul(in_features as u64);
+        if n > u32::MAX as u64 {
+            return Err(anyhow!(
+                "gemma4v_clippable_linear_gpu: input element count ({n}) exceeds u32::MAX"
+            ));
+        }
+        input_for_matmul = vit_clip_gpu(encoder, registry, device, input, n as u32, mn, mx)
+            .context("gemma4v_clippable_linear_gpu: input clamp")?;
+        encoder.memory_barrier();
+        &input_for_matmul
+    } else {
+        input
+    };
+
+    // --- Stage 2: linear ---
+    let projected = vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        input_ref,
+        weight_f32,
+        seq_len,
+        in_features,
+        out_features,
+    )
+    .context("gemma4v_clippable_linear_gpu: vit_linear_gpu")?;
+
+    // --- Stage 3: optional output clamp ---
+    if bounds.output_min.is_some() || bounds.output_max.is_some() {
+        encoder.memory_barrier();
+        let (mn, mx) = bounds.resolved_output();
+        let n = (seq_len as u64).saturating_mul(out_features as u64);
+        if n > u32::MAX as u64 {
+            return Err(anyhow!(
+                "gemma4v_clippable_linear_gpu: output element count ({n}) exceeds u32::MAX"
+            ));
+        }
+        return vit_clip_gpu(encoder, registry, device, &projected, n as u32, mn, mx)
+            .context("gemma4v_clippable_linear_gpu: output clamp");
+    }
+
+    Ok(projected)
+}
+
+// ---------------------------------------------------------------------------
+// gemma4v full-forward composition + arch-profile dispatch
+// ---------------------------------------------------------------------------
+
+/// Full GPU gemma4v ViT forward: pre-processed image → projected
+/// multimodal embeddings.
+///
+/// Pipeline (matches `clip_graph_gemma4v::build`,
+/// `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`):
+///
+///   1. Upload patches `[N, p²·3]` + position-index arrays
+///      (`pos_x[N]`, `pos_y[N]`) to GPU.
+///   2. `gemma4v_patch_embed_gpu`: `[N, p²·3] @ W` → `[N, hidden]`.
+///   3. `gemma4v_apply_position_embed_gpu`: residual-add the dual-table
+///      gather (X-table + Y-table) into the patch embeddings.
+///   4. `gemma4v_block_forward_gpu` × `num_hidden_layers` (27 for the
+///      Gemma 4 26B mmproj). Each block runs 4-RMSNorm + GQA attn +
+///      2D NeoX RoPE on Q/K + GELU(tanh) MLP.
+///   5. Reshape `[N, hidden]` → `[n_y, n_x, hidden]` (no copy; the
+///      pool kernel reads the same buffer with the rectangular layout)
+///      and `gemma4v_avg_pool_3x3_gpu` → `[n_y/3, n_x/3, hidden]`.
+///   6. `vit_scale_gpu(sqrt(hidden))` — gemma4v.cpp:115.
+///   7. `vit_std_bias_scale_gpu(std_bias, std_scale)` — gemma4v.cpp:121-122.
+///   8. `gemma4v_clippable_linear_gpu(mm.0.weight, bounds)` —
+///      gemma4v.cpp:127, build_mm at 138-151.
+///   9. `vit_rms_norm_gpu(ones, eps)` — gemma4v.cpp:131
+///      (`embedding_post_projection_norm`, no learned gain).
+///
+/// Returns the final `[N_post_pool, text_hidden]` F32 buffer on device.
+/// `N_post_pool = (n_x/3) * (n_y/3)`.
+///
+/// `n_x` / `n_y` come from `Gemma4vPreprocessed` and MUST both be
+/// multiples of 3 (the gemma4v pool kernel size). The
+/// `preprocess_gemma4v` pipeline already enforces this — it rounds the
+/// resized image dims to multiples of `patch_size * n_merge = 16 * 3
+/// = 48` so the post-pool grid is exact.
+///
+/// Caller registers shaders before dispatch (see
+/// `compute_vision_embeddings_gpu` for the canonical setup):
+/// ```
+/// mlx_native::ops::softmax::register(&mut registry);
+/// mlx_native::ops::sigmoid_mul::register(&mut registry);
+/// register_vit_custom_shaders(&mut registry);
+/// ```
+///
+/// # Errors
+///
+/// - `n_x` or `n_y` not a multiple of 3 (caller bug; preprocess rounds)
+/// - any required tensor missing (`v.patch_embd.weight`, `v.position_
+///   embd.weight`, `v.std_bias`, `v.std_scale`, `mm.0.weight`)
+/// - propagated from any sub-stage
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_apply_full_forward_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    weights: &super::mmproj_weights::LoadedMmprojWeights,
+    cfg: &super::mmproj::MmprojConfig,
+    patches: &[f32],
+    pos_x: &[u32],
+    pos_y: &[u32],
+    n_x: u32,
+    n_y: u32,
+) -> Result<MlxBuffer> {
+    if n_x == 0 || n_y == 0 {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: n_x ({n_x}) and n_y ({n_y}) must be > 0"
+        ));
+    }
+    if n_x % 3 != 0 || n_y % 3 != 0 {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: n_x ({n_x}) and n_y ({n_y}) must both \
+             be multiples of 3 (gemma4v pool kernel size)"
+        ));
+    }
+    let n_patches = (n_x as u64).saturating_mul(n_y as u64);
+    if n_patches == 0 || n_patches > u32::MAX as u64 {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: n_patches ({n_patches}) overflow u32"
+        ));
+    }
+    let n_patches = n_patches as u32;
+
+    let hidden = cfg.hidden_size;
+    let patch_size = cfg.patch_size;
+    let inner = patch_size
+        .checked_mul(patch_size)
+        .and_then(|s| s.checked_mul(3))
+        .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: inner overflow"))?;
+
+    let expected_patches = (n_patches as usize).saturating_mul(inner as usize);
+    if patches.len() != expected_patches {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: patches len {} != n_patches*inner = {}*{} = {}",
+            patches.len(),
+            n_patches,
+            inner,
+            expected_patches
+        ));
+    }
+    if pos_x.len() != n_patches as usize || pos_y.len() != n_patches as usize {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: pos_x ({}) / pos_y ({}) length must equal n_patches ({})",
+            pos_x.len(),
+            pos_y.len(),
+            n_patches
+        ));
+    }
+
+    // --- Stage 1: upload patches + pos_x + pos_y to GPU ---
+    let patches_buf = device
+        .alloc_buffer(
+            expected_patches * 4,
+            DType::F32,
+            vec![n_patches as usize, inner as usize],
+        )
+        .map_err(|e| anyhow!("alloc patches: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer; copy-in is exclusive.
+        let dst: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                patches_buf.contents_ptr() as *mut f32,
+                expected_patches,
+            )
+        };
+        dst.copy_from_slice(patches);
+    }
+    let pos_x_buf = device
+        .alloc_buffer((n_patches as usize) * 4, DType::U32, vec![n_patches as usize])
+        .map_err(|e| anyhow!("alloc pos_x: {e}"))?;
+    {
+        // SAFETY: just-allocated U32 buffer; copy-in is exclusive.
+        let dst: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                pos_x_buf.contents_ptr() as *mut u32,
+                n_patches as usize,
+            )
+        };
+        dst.copy_from_slice(pos_x);
+    }
+    let pos_y_buf = device
+        .alloc_buffer((n_patches as usize) * 4, DType::U32, vec![n_patches as usize])
+        .map_err(|e| anyhow!("alloc pos_y: {e}"))?;
+    {
+        // SAFETY: just-allocated U32 buffer.
+        let dst: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                pos_y_buf.contents_ptr() as *mut u32,
+                n_patches as usize,
+            )
+        };
+        dst.copy_from_slice(pos_y);
+    }
+
+    // --- Stage 2: patch-embed (Linear, no bias) ---
+    let patch_w = weights
+        .patch_embd_weight()
+        .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: {e}"))?;
+    let patch_embeds = gemma4v_patch_embed_gpu(
+        encoder, registry, device, &patches_buf, patch_w, n_patches, inner, hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 3: dual-table position-embed lookup + add ---
+    let (pe_table, pos_size, pe_hidden) = weights
+        .position_embd_table_3d()
+        .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: {e}"))?;
+    if pe_hidden != hidden {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: position_embd hidden ({pe_hidden}) != cfg.hidden_size ({hidden})"
+        ));
+    }
+    let after_pos = gemma4v_apply_position_embed_gpu(
+        encoder, registry, device, &patch_embeds, pe_table, &pos_x_buf, &pos_y_buf,
+        n_patches, pos_size, hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 4: 27-block transformer loop ---
+    // Build the gemma4v block shape from cfg. head_dim = hidden / num_heads.
+    let head_dim = hidden / cfg.num_attention_heads;
+    // gemma4v's GQA ratio: num_kv_heads = num_attention_heads / 4 in the
+    // production 26B config (4 KV groups). Read from cfg if/when the
+    // mmproj parser exposes a kv_head field; until then we infer from
+    // the loaded `attn_k.weight` shape — its row count = num_kv_heads
+    // * head_dim. This matches W24's per-block test approach.
+    let attn_k0 = weights
+        .block_tensor(0, "attn_k.weight")
+        .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: probe num_kv_heads: {e}"))?;
+    let attn_k0_rows = attn_k0.shape().first().copied().unwrap_or(0) as u32;
+    if attn_k0_rows == 0 || attn_k0_rows % head_dim != 0 {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: cannot infer num_kv_heads from attn_k.weight \
+             row count ({attn_k0_rows}); head_dim = {head_dim}"
+        ));
+    }
+    let num_kv_heads = attn_k0_rows / head_dim;
+    let shape = Gemma4VisionBlockShapeGpu {
+        hidden,
+        num_heads: cfg.num_attention_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate: cfg.intermediate_size,
+        rms_norm_eps: cfg.layer_norm_eps,
+        // gemma4v rope_theta is fixed at 100.0 per clip.cpp:1336
+        // (`hparams.rope_theta = 100.0f` for PROJECTOR_TYPE_GEMMA4V).
+        rope_theta: 100.0f32,
+    };
+
+    let mut hidden_states = gemma4v_block_forward_gpu(
+        encoder, registry, device, weights, &shape, 0, &after_pos,
+        &pos_x_buf, &pos_y_buf, n_patches,
+    )?;
+    encoder.memory_barrier();
+    for block_idx in 1..(cfg.num_hidden_layers as usize) {
+        hidden_states = gemma4v_block_forward_gpu(
+            encoder, registry, device, weights, &shape, block_idx, &hidden_states,
+            &pos_x_buf, &pos_y_buf, n_patches,
+        )?;
+        encoder.memory_barrier();
+    }
+
+    // --- Stage 5: 3×3 spatial avg-pool ---
+    // The block output is `[n_patches, hidden]` row-major with patches
+    // iterating row-major in (y, x) order (matching pos_y * n_x + pos_x
+    // as set by `preprocess_gemma4v`). The pool kernel interprets this
+    // as a `[n_y, n_x, hidden]` 3-D tensor — same backing buffer, just a
+    // different shape view, no copy needed.
+    let pooled = gemma4v_avg_pool_3x3_gpu(
+        encoder, registry, device, &hidden_states, n_x, n_y, hidden,
+    )?;
+    encoder.memory_barrier();
+
+    let pooled_n = ((n_x / 3) as usize) * ((n_y / 3) as usize);
+    let pooled_total = pooled_n * (hidden as usize);
+
+    // --- Stage 6: scale by sqrt(hidden) ---
+    vit_scale_gpu(
+        encoder, registry, device, &pooled, pooled_total as u32,
+        (hidden as f32).sqrt(),
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 7: std_bias / std_scale normalize ---
+    let std_bias = weights
+        .get("v.std_bias")
+        .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: missing v.std_bias"))?;
+    let std_scale = weights
+        .get("v.std_scale")
+        .ok_or_else(|| anyhow!("gemma4v_apply_full_forward_gpu: missing v.std_scale"))?;
+    let normed = vit_std_bias_scale_gpu(
+        encoder, registry, device, &pooled, std_bias, std_scale,
+        pooled_n as u32, hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 8: Gemma4ClippableLinear projection ---
+    let mm0 = weights
+        .mm_0_weight()
+        .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: mm.0.weight: {e}"))?;
+    let mm0_slice: &[f32] = mm0
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("mm.0.weight as_slice: {e}"))?;
+    let text_hidden = (mm0_slice.len() / (hidden as usize)) as u32;
+    if text_hidden == 0 {
+        return Err(anyhow!(
+            "gemma4v_apply_full_forward_gpu: text_hidden derived from mm.0.weight is 0"
+        ));
+    }
+    let bounds = weights.mm_0_bounds();
+    let projected = gemma4v_clippable_linear_gpu(
+        encoder, registry, device, &normed, mm0, &bounds,
+        pooled_n as u32, hidden, text_hidden,
+    )?;
+    encoder.memory_barrier();
+
+    // --- Stage 9: final no-gain RMSNorm (embedding_post_projection_norm) ---
+    let ones = device
+        .alloc_buffer(
+            (text_hidden as usize) * 4,
+            DType::F32,
+            vec![text_hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc ones: {e}"))?;
+    {
+        // SAFETY: just-allocated f32 buffer.
+        let s: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(
+                ones.contents_ptr() as *mut f32,
+                text_hidden as usize,
+            )
+        };
+        for v in s.iter_mut() {
+            *v = 1.0;
+        }
+    }
+    vit_rms_norm_gpu(
+        encoder, registry, device, &projected, &ones,
+        pooled_n as u32, text_hidden, cfg.layer_norm_eps,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3838,6 +4726,350 @@ mod tests {
         let err = vit_avg_pool_2x2_gpu(session.encoder_mut(), &mut registry, device, &in_buf, 3, 3)
             .unwrap_err();
         assert!(format!("{err}").contains("positive and even"));
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_avg_pool_kxk_gpu (iter 115)
+    // -----------------------------------------------------------------------
+
+    /// Regression guard: kxk with k=2 + square n_x=n_y must produce
+    /// byte-identical output to the dedicated 2x2 path. Locks in the
+    /// SigLIP-49 invariant — if this ever drifts, the kxk shader's
+    /// accumulate-and-divide differs from `(a + b + c + d) * 0.25`,
+    /// which is a real numeric regression worth investigating.
+    #[test]
+    fn vit_avg_pool_kxk_k2_byte_identical_to_2x2_path() {
+        let n_side = 4usize;
+        let hidden = 2usize;
+        let mut input_cpu = vec![0f32; n_side * n_side * hidden];
+        for y in 0..n_side {
+            for x in 0..n_side {
+                let patch = y * n_side + x;
+                input_cpu[patch * hidden + 0] = patch as f32;
+                input_cpu[patch * hidden + 1] = (patch as f32) * 10.0;
+            }
+        }
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![n_side, n_side, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+
+        let out_2x2 = vit_avg_pool_2x2_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf,
+            n_side as u32, hidden as u32,
+        )
+        .expect("2x2");
+        let out_kxk = vit_avg_pool_kxk_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf,
+            n_side as u32, n_side as u32, 2, hidden as u32,
+        )
+        .expect("kxk");
+        session.finish().expect("finish");
+
+        let r_2x2 = readback_f32(&out_2x2, 4 * hidden);
+        let r_kxk = readback_f32(&out_kxk, 4 * hidden);
+        assert_eq!(r_2x2.len(), r_kxk.len());
+        let max_diff = r_2x2
+            .iter()
+            .zip(r_kxk.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "kxk(k=2) drifted from 2x2 path: max_diff = {max_diff}"
+        );
+    }
+
+    /// gemma4v's 3x3 case on a tiny synthetic input — verify the
+    /// shader actually averages over the 3×3 block. n_x = n_y = 6, k = 3
+    /// → 2×2 output of hidden=2 channels.
+    #[test]
+    fn vit_avg_pool_kxk_k3_correctness() {
+        let n_x = 6usize;
+        let n_y = 6usize;
+        let k = 3usize;
+        let hidden = 2usize;
+        // Each input element = patch_idx (over n_x * n_y patches), with
+        // the second hidden dim being patch_idx + 100 to keep channels
+        // distinguishable.
+        let mut input_cpu = vec![0f32; n_x * n_y * hidden];
+        for y in 0..n_y {
+            for x in 0..n_x {
+                let patch = y * n_x + x;
+                input_cpu[patch * hidden + 0] = patch as f32;
+                input_cpu[patch * hidden + 1] = patch as f32 + 100.0;
+            }
+        }
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![n_y, n_x, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_avg_pool_kxk_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf,
+            n_x as u32, n_y as u32, k as u32, hidden as u32,
+        )
+        .expect("kxk k=3");
+        session.finish().expect("finish");
+        let out_x = n_x / k;
+        let out_y = n_y / k;
+        let got = readback_f32(&out_buf, out_x * out_y * hidden);
+
+        // Compute expected on CPU. For each output (oy, ox), sum the
+        // 3×3 block of input patches and divide by 9.
+        let mut expected = vec![0f32; out_x * out_y * hidden];
+        for oy in 0..out_y {
+            for ox in 0..out_x {
+                for h in 0..hidden {
+                    let mut acc = 0f32;
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            let iy = oy * k + dy;
+                            let ix = ox * k + dx;
+                            let patch = iy * n_x + ix;
+                            acc += input_cpu[patch * hidden + h];
+                        }
+                    }
+                    let out_idx = (oy * out_x + ox) * hidden + h;
+                    expected[out_idx] = acc / ((k * k) as f32);
+                }
+            }
+        }
+        let max_diff = got
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max_diff < 1e-4, "k=3 max_diff = {max_diff}");
+    }
+
+    /// Output dimensions on a rectangular grid (n_x ≠ n_y) — verifies
+    /// the shader's row-stride calculations are correct independent of
+    /// per-axis tile counts.
+    #[test]
+    fn vit_avg_pool_kxk_dimensions_rectangular() {
+        let n_x = 12u32;
+        let n_y = 9u32;
+        let k = 3u32;
+        let hidden = 4u32;
+        let total = (n_x * n_y * hidden) as usize;
+        let input_cpu = vec![2.0f32; total];
+
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(
+            executor.device(),
+            &input_cpu,
+            vec![n_y as usize, n_x as usize, hidden as usize],
+        );
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_avg_pool_kxk_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf, n_x, n_y, k, hidden,
+        )
+        .expect("kxk rect");
+        session.finish().expect("finish");
+        let out_x = (n_x / k) as usize;
+        let out_y = (n_y / k) as usize;
+        let got = readback_f32(&out_buf, out_x * out_y * hidden as usize);
+        // Uniform input → uniform output of same value.
+        for v in &got {
+            assert!((v - 2.0).abs() < 1e-6, "expected 2.0, got {v}");
+        }
+        assert_eq!(out_x, 4);
+        assert_eq!(out_y, 3);
+    }
+
+    #[test]
+    fn vit_avg_pool_kxk_rejects_non_divisible_n() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = executor
+            .device()
+            .alloc_buffer(7 * 9 * 4 * 4, DType::F32, vec![7, 9, 4])
+            .expect("a");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        // n_x=9, n_y=7, k=3 — 7 is not a multiple of 3.
+        let err = vit_avg_pool_kxk_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf, 9, 7, 3, 4,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("multiples of k"));
+    }
+
+    // -----------------------------------------------------------------------
+    // vit_clip_gpu (iter 115)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vit_clip_gpu_clamps_to_min_max() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let input_cpu: Vec<f32> = vec![-5.0, -1.0, 0.0, 1.0, 5.0, 100.0];
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![input_cpu.len()]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_clip_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf,
+            input_cpu.len() as u32, -2.0, 3.0,
+        )
+        .expect("clip");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, input_cpu.len());
+        let expected: Vec<f32> = input_cpu.iter().map(|v| v.clamp(-2.0, 3.0)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn vit_clip_gpu_no_op_on_neg_inf_pos_inf() {
+        // Default sentinels (no clamp on either side) → identity.
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let input_cpu: Vec<f32> = vec![-5.0, -1.0, 0.0, 1.0, 5.0];
+        let in_buf = upload_f32(executor.device(), &input_cpu, vec![input_cpu.len()]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out_buf = vit_clip_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf,
+            input_cpu.len() as u32, f32::NEG_INFINITY, f32::INFINITY,
+        )
+        .expect("clip");
+        session.finish().expect("finish");
+        let got = readback_f32(&out_buf, input_cpu.len());
+        assert_eq!(got, input_cpu);
+    }
+
+    #[test]
+    fn vit_clip_gpu_rejects_min_greater_than_max() {
+        let device = MlxDevice::new().expect("dev");
+        let executor = GraphExecutor::new(device);
+        let in_buf = upload_f32(executor.device(), &[1.0, 2.0, 3.0], vec![3]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = vit_clip_gpu(
+            session.encoder_mut(), &mut registry, device, &in_buf, 3, 5.0, 1.0,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("min_val") || format!("{err}").contains("> max_val"));
+    }
+
+    // -----------------------------------------------------------------------
+    // gemma4v_clippable_linear (CPU + GPU, iter 115)
+    // -----------------------------------------------------------------------
+
+    /// Three-case parity: (no clamp, input only, both clamps) — the GPU
+    /// path matches the CPU reference within bf16 round-trip tolerance
+    /// (`vit_linear_gpu` casts weight F32→BF16 internally, so the
+    /// expected diff for the linear stage alone is ≤ 1e-3).
+    #[test]
+    fn gemma4v_clippable_linear_with_and_without_clamp() {
+        use crate::inference::vision::vit::{
+            gemma4v_clippable_linear_forward as cpu_clip_linear,
+            Gemma4ClippableLinearBounds,
+        };
+        let batch = 4usize;
+        let in_features = 64usize;
+        let out_features = 32usize;
+        let input: Vec<f32> = (0..batch * in_features)
+            .map(|i| ((i as f32) * 0.013).sin() * 2.0)
+            .collect();
+        let weight: Vec<f32> = (0..out_features * in_features)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.05)
+            .collect();
+
+        // Three bounds variants.
+        let bounds_none = Gemma4ClippableLinearBounds::default();
+        let bounds_input_only = Gemma4ClippableLinearBounds {
+            input_min: Some(-0.5),
+            input_max: Some(0.5),
+            ..Default::default()
+        };
+        let bounds_both = Gemma4ClippableLinearBounds {
+            input_min: Some(-1.0),
+            input_max: Some(1.0),
+            output_min: Some(-0.05),
+            output_max: Some(0.05),
+        };
+
+        for (label, bounds) in &[
+            ("none", &bounds_none),
+            ("input_only", &bounds_input_only),
+            ("both", &bounds_both),
+        ] {
+            // CPU reference.
+            let cpu_out = cpu_clip_linear(
+                &input, &weight, bounds, batch, in_features, out_features,
+            )
+            .expect("cpu clip linear");
+
+            // GPU dispatch.
+            let device = MlxDevice::new().expect("dev");
+            let executor = GraphExecutor::new(device);
+            let in_buf = upload_f32(executor.device(), &input, vec![batch, in_features]);
+            let w_buf = upload_f32(executor.device(), &weight, vec![out_features, in_features]);
+            let mut session = executor.begin().expect("begin");
+            let mut registry = KernelRegistry::new();
+            register_vit_custom_shaders(&mut registry);
+            let device_ref: *const MlxDevice = executor.device() as *const _;
+            let device: &MlxDevice = unsafe { &*device_ref };
+            let out_buf = gemma4v_clippable_linear_gpu(
+                session.encoder_mut(), &mut registry, device, &in_buf, &w_buf, bounds,
+                batch as u32, in_features as u32, out_features as u32,
+            )
+            .expect("gpu clip linear");
+            session.finish().expect("finish");
+            let gpu_out = readback_f32(&out_buf, batch * out_features);
+
+            assert_eq!(gpu_out.len(), cpu_out.len(), "[{label}] length mismatch");
+            // BF16 weight round-trip in vit_linear_gpu: tolerance 5e-3
+            // (per existing vit_linear_gpu_matches_cpu_reference test).
+            let max_diff = gpu_out
+                .iter()
+                .zip(cpu_out.iter())
+                .map(|(g, c)| (g - c).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_diff < 5e-3,
+                "[{label}] gpu/cpu max_diff = {max_diff}"
+            );
+            // Verify clamps actually fired when bounds were set: every
+            // GPU output element must respect the output clamp.
+            if let Some(mn) = bounds.output_min {
+                for v in &gpu_out {
+                    assert!(*v >= mn - 1e-4, "[{label}] {v} < output_min {mn}");
+                }
+            }
+            if let Some(mx) = bounds.output_max {
+                for v in &gpu_out {
+                    assert!(*v <= mx + 1e-4, "[{label}] {v} > output_max {mx}");
+                }
+            }
+            // Also: outputs are finite.
+            for v in &gpu_out {
+                assert!(v.is_finite(), "[{label}] non-finite: {v}");
+            }
+        }
     }
 
     #[test]
@@ -5132,5 +6364,431 @@ mod tests {
             cos > 0.999,
             "gemma4v_block_forward CPU↔GPU cosine = {cos} < 0.999 (max|abs| = {max_abs})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // gemma4v_apply_full_forward_gpu — synthetic-fixture smoke tests (iter 115)
+    // -----------------------------------------------------------------------
+
+    /// Build a tiny synthetic gemma4v fixture sized to the
+    /// `vit_attention_gpu` K-tile floor (K = batch >= 32) for the
+    /// 27-block path. Unused-but-needed weights (std_bias, std_scale,
+    /// mm.0.weight, position_embd dual table, patch_embd) are
+    /// stamped into a `LoadedMmprojWeights`.
+    ///
+    /// Returns `(weights, cfg, patches, pos_x, pos_y, n_x, n_y)`. The
+    /// returned `cfg.num_hidden_layers` is small (2) so the test runs
+    /// fast without sacrificing the dispatch coverage.
+    #[allow(clippy::too_many_arguments)]
+    fn synth_gemma4v_full_fixture(
+        n_x: u32,
+        n_y: u32,
+    ) -> (
+        LoadedMmprojWeights,
+        MmprojConfig,
+        Vec<f32>,
+        Vec<u32>,
+        Vec<u32>,
+    ) {
+        // Smallest legal sizes that satisfy:
+        //   - hidden % num_attention_heads == 0 (head_dim positive)
+        //   - head_dim >= 32 (vit_attention_gpu floor)
+        //   - num_attention_heads % num_kv_heads == 0 (GQA)
+        //   - inner = patch_size² * 3 >= 32 (vit_linear_gpu floor)
+        // Keep 2 layers so the loop exercises multi-block dispatch.
+        let hidden: u32 = 128;
+        let num_heads: u32 = 4;
+        let num_kv_heads: u32 = 2;
+        let head_dim: u32 = hidden / num_heads; // 32
+        let intermediate: u32 = 64;
+        let patch_size: u32 = 4;                 // inner = 4*4*3 = 48 >= 32
+        let inner: u32 = patch_size * patch_size * 3;
+        let num_layers: u32 = 2;
+        // text_hidden — projector output; pick any > 0.
+        let text_hidden: u32 = 64;
+        // Position-embed table size — must be >= max(n_x, n_y) so
+        // index lookups don't clamp. gemma4v's actual pos_size in the
+        // GGUF is the number of unique X (or Y) coordinates the
+        // preprocessor can emit; for this fixture we set it to a
+        // safe upper bound.
+        let pos_size: u32 = (n_x.max(n_y)).max(64);
+        let n_patches = n_x * n_y;
+
+        let mk = |seed: f32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32) * seed + 0.13).sin() * 0.05).collect()
+        };
+
+        let device = MlxDevice::new().expect("synth dev");
+        let put = |tensors: &mut std::collections::HashMap<String, MlxBuffer>,
+                   dev: &MlxDevice,
+                   key: String,
+                   data: &[f32],
+                   shape: Vec<usize>| {
+            let bytes = data.len() * 4;
+            let buf = dev
+                .alloc_buffer(bytes, DType::F32, shape)
+                .expect("alloc tensor");
+            let slice: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut f32, data.len())
+            };
+            slice.copy_from_slice(data);
+            tensors.insert(key, buf);
+        };
+
+        let mut tensors: std::collections::HashMap<String, MlxBuffer> =
+            std::collections::HashMap::new();
+
+        // Stem tensors.
+        let patch_w = mk(0.011, (hidden * inner) as usize);
+        put(
+            &mut tensors,
+            &device,
+            "v.patch_embd.weight".to_string(),
+            &patch_w,
+            vec![hidden as usize, inner as usize],
+        );
+        // Dual position-embed table [2, pos_size, hidden].
+        let pe_table = mk(0.013, (2 * pos_size * hidden) as usize);
+        put(
+            &mut tensors,
+            &device,
+            "v.position_embd.weight".to_string(),
+            &pe_table,
+            vec![2usize, pos_size as usize, hidden as usize],
+        );
+        // std_bias / std_scale [hidden].
+        let std_bias = mk(0.014, hidden as usize);
+        put(
+            &mut tensors,
+            &device,
+            "v.std_bias".to_string(),
+            &std_bias,
+            vec![hidden as usize],
+        );
+        // std_scale: keep magnitudes near 1.0 so the post-pool path
+        // doesn't blow up f32 range.
+        let std_scale: Vec<f32> = (0..hidden).map(|_| 1.0).collect();
+        put(
+            &mut tensors,
+            &device,
+            "v.std_scale".to_string(),
+            &std_scale,
+            vec![hidden as usize],
+        );
+        // mm.0.weight [text_hidden, hidden].
+        let mm0 = mk(0.017, (text_hidden * hidden) as usize);
+        put(
+            &mut tensors,
+            &device,
+            "mm.0.weight".to_string(),
+            &mm0,
+            vec![text_hidden as usize, hidden as usize],
+        );
+
+        // Per-block tensors × num_layers.
+        for layer_idx in 0..num_layers {
+            let prefix = format!("v.blk.{}.", layer_idx);
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ln1.weight"),
+                &mk(0.021 + layer_idx as f32 * 0.001, hidden as usize),
+                vec![hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ln2.weight"),
+                &mk(0.022 + layer_idx as f32 * 0.001, hidden as usize),
+                vec![hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ffn_norm.weight"),
+                &mk(0.023 + layer_idx as f32 * 0.001, hidden as usize),
+                vec![hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}post_ffw_norm.weight"),
+                &mk(0.024 + layer_idx as f32 * 0.001, hidden as usize),
+                vec![hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_q.weight"),
+                &mk(0.031 + layer_idx as f32 * 0.001, (num_heads * head_dim * hidden) as usize),
+                vec![(num_heads * head_dim) as usize, hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_k.weight"),
+                &mk(0.033 + layer_idx as f32 * 0.001, (num_kv_heads * head_dim * hidden) as usize),
+                vec![(num_kv_heads * head_dim) as usize, hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_v.weight"),
+                &mk(0.035 + layer_idx as f32 * 0.001, (num_kv_heads * head_dim * hidden) as usize),
+                vec![(num_kv_heads * head_dim) as usize, hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_output.weight"),
+                &mk(0.037 + layer_idx as f32 * 0.001, (hidden * num_heads * head_dim) as usize),
+                vec![hidden as usize, (num_heads * head_dim) as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_q_norm.weight"),
+                &mk(0.041 + layer_idx as f32 * 0.001, head_dim as usize),
+                vec![head_dim as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}attn_k_norm.weight"),
+                &mk(0.043 + layer_idx as f32 * 0.001, head_dim as usize),
+                vec![head_dim as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ffn_gate.weight"),
+                &mk(0.051 + layer_idx as f32 * 0.001, (intermediate * hidden) as usize),
+                vec![intermediate as usize, hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ffn_up.weight"),
+                &mk(0.053 + layer_idx as f32 * 0.001, (intermediate * hidden) as usize),
+                vec![intermediate as usize, hidden as usize],
+            );
+            put(
+                &mut tensors,
+                &device,
+                format!("{prefix}ffn_down.weight"),
+                &mk(0.055 + layer_idx as f32 * 0.001, (hidden * intermediate) as usize),
+                vec![hidden as usize, intermediate as usize],
+            );
+        }
+
+        let weights = LoadedMmprojWeights::from_tensors_for_test(tensors, device);
+
+        // Synth patches + per-patch positions.
+        let patches: Vec<f32> = (0..(n_patches * inner) as usize)
+            .map(|i| ((i as f32) * 0.07).cos() * 0.04)
+            .collect();
+        let mut pos_x: Vec<u32> = Vec::with_capacity(n_patches as usize);
+        let mut pos_y: Vec<u32> = Vec::with_capacity(n_patches as usize);
+        for y in 0..n_y {
+            for x in 0..n_x {
+                pos_x.push(x);
+                pos_y.push(y);
+            }
+        }
+
+        let cfg = MmprojConfig {
+            image_size: 0, // unused on gemma4v variable-resolution path
+            patch_size,
+            num_patches_side: 0, // unused
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            num_attention_heads: num_heads,
+            num_hidden_layers: num_layers,
+            layer_norm_eps: 1e-6,
+            projector: crate::inference::vision::mmproj::ProjectorType::Mlp,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+        };
+        (weights, cfg, patches, pos_x, pos_y)
+    }
+
+    /// Variable-resolution sanity: run the full gemma4v forward at
+    /// (n_x=6, n_y=6) → 36 patches, batch=36 (≥32 K-tile floor),
+    /// post-pool 2×2 = 4 tokens. Asserts the output is finite and has
+    /// the correct shape.
+    #[test]
+    fn gemma4v_apply_full_forward_gpu_synthetic_n_36() {
+        let n_x: u32 = 6;
+        let n_y: u32 = 6;
+        let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device_ref: &MlxDevice = unsafe { &*device_ref };
+
+        let buf = gemma4v_apply_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device_ref,
+            &weights,
+            &cfg,
+            &patches,
+            &pos_x,
+            &pos_y,
+            n_x,
+            n_y,
+        )
+        .expect("full forward synthetic");
+        session.finish().expect("finish");
+
+        // Expected output shape: [(n_x/3)*(n_y/3), text_hidden = 64].
+        let pooled_n = ((n_x / 3) * (n_y / 3)) as usize; // 4
+        let text_hidden = 64usize;
+        let expected_len = pooled_n * text_hidden;
+        let slice: &[f32] = buf.as_slice::<f32>().expect("readback");
+        assert_eq!(slice.len(), expected_len, "output len mismatch");
+        for v in slice {
+            assert!(v.is_finite(), "non-finite output: {v}");
+        }
+    }
+
+    /// Same fixture, larger N. (n_x=9, n_y=6) → 54 patches, post-pool
+    /// 3×2 = 6 tokens. Verifies the rectangular path works at sizes
+    /// that more closely approximate gemma4v production (~270 patches).
+    #[test]
+    fn gemma4v_apply_full_forward_gpu_synthetic_rectangular_n_54() {
+        let n_x: u32 = 9;
+        let n_y: u32 = 6;
+        let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::softmax::register(&mut registry);
+        mlx_native::ops::sigmoid_mul::register(&mut registry);
+        register_vit_custom_shaders(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device_ref: &MlxDevice = unsafe { &*device_ref };
+
+        let buf = gemma4v_apply_full_forward_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device_ref,
+            &weights,
+            &cfg,
+            &patches,
+            &pos_x,
+            &pos_y,
+            n_x,
+            n_y,
+        )
+        .expect("full forward synthetic rect");
+        session.finish().expect("finish");
+
+        let pooled_n = ((n_x / 3) * (n_y / 3)) as usize; // 6
+        let text_hidden = 64usize;
+        let expected_len = pooled_n * text_hidden;
+        let slice: &[f32] = buf.as_slice::<f32>().expect("readback");
+        assert_eq!(slice.len(), expected_len, "rect output len mismatch");
+        for v in slice {
+            assert!(v.is_finite(), "non-finite rect output: {v}");
+        }
+    }
+
+    /// Arch-profile dispatch: routes a Gemma4v input through the
+    /// gemma4v full-forward when arch == Gemma4Siglip. Because the
+    /// synthetic fixture only stamps gemma4v-shaped tensors, we can't
+    /// validate the SigLIP branch here without a separate fixture —
+    /// the arch dispatch over a homogeneous `Gemma4v` input batch is
+    /// what we exercise.
+    #[test]
+    fn compute_vision_embeddings_gpu_dispatch_gemma4v_routes_correctly() {
+        use crate::inference::vision::mmproj::ArchProfile;
+        let n_x: u32 = 6;
+        let n_y: u32 = 6;
+        let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
+        let img = Gemma4vPreprocessedImage {
+            patches,
+            pos_x,
+            pos_y,
+            n_x,
+            n_y,
+            source_label: "synthetic".to_string(),
+        };
+        let inputs = vec![VisionInput::Gemma4v(img)];
+        let result = compute_vision_embeddings_gpu_dispatch(
+            &inputs,
+            ArchProfile::Gemma4Siglip,
+            &weights,
+            &cfg,
+            1.0,
+        )
+        .expect("dispatch");
+        assert_eq!(result.len(), 1);
+        let pooled_n = ((n_x / 3) * (n_y / 3)) as usize;
+        let text_hidden = 64usize;
+        assert_eq!(result[0].len(), pooled_n * text_hidden);
+        for v in &result[0] {
+            assert!(v.is_finite());
+        }
+    }
+
+    /// Arch-mismatch guard: a Gemma4v input under ArchProfile::ClipClassic
+    /// must error rather than silently routing to the wrong forward.
+    #[test]
+    fn compute_vision_embeddings_gpu_dispatch_rejects_arch_mismatch() {
+        use crate::inference::vision::mmproj::ArchProfile;
+        let n_x: u32 = 6;
+        let n_y: u32 = 6;
+        let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
+        let img = Gemma4vPreprocessedImage {
+            patches,
+            pos_x,
+            pos_y,
+            n_x,
+            n_y,
+            source_label: "synthetic".to_string(),
+        };
+        let inputs = vec![VisionInput::Gemma4v(img)];
+        let err = compute_vision_embeddings_gpu_dispatch(
+            &inputs,
+            ArchProfile::ClipClassic,
+            &weights,
+            &cfg,
+            1.0,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Gemma4v") && msg.contains("ClipClassic"),
+            "expected arch-mismatch error message, got: {msg}"
+        );
+    }
+
+    /// Empty input slice: must succeed with an empty output (a
+    /// no-images-in-request shouldn't crash).
+    #[test]
+    fn compute_vision_embeddings_gpu_dispatch_empty_inputs_ok() {
+        use crate::inference::vision::mmproj::ArchProfile;
+        let n_x: u32 = 6;
+        let n_y: u32 = 6;
+        let (weights, cfg, _, _, _) = synth_gemma4v_full_fixture(n_x, n_y);
+        let inputs: Vec<VisionInput> = Vec::new();
+        let result = compute_vision_embeddings_gpu_dispatch(
+            &inputs,
+            ArchProfile::Gemma4Siglip,
+            &weights,
+            &cfg,
+            1.0,
+        )
+        .expect("empty dispatch");
+        assert!(result.is_empty());
     }
 }

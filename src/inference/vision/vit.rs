@@ -1516,6 +1516,123 @@ pub fn v_norm_no_scale_forward(
     Ok(())
 }
 
+/// Optional pair of `[input_min, input_max]` and `[output_min, output_max]`
+/// scalar bounds for `gemma4v_clippable_linear_forward`. Each bound is
+/// represented as an `Option<f32>`; `None` collapses to `f32::NEG_INFINITY`
+/// (for min) or `f32::INFINITY` (for max), making that side a no-op.
+///
+/// Mirrors llama.cpp's `clamp_info` struct (`tools/mtmd/clip.cpp:1952-1957`)
+/// which carries the four scalars as plain f32 with `+/- FLT_MAX` defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gemma4ClippableLinearBounds {
+    pub input_min: Option<f32>,
+    pub input_max: Option<f32>,
+    pub output_min: Option<f32>,
+    pub output_max: Option<f32>,
+}
+
+impl Gemma4ClippableLinearBounds {
+    /// `true` when at least one of the four scalars is present. A
+    /// clippable linear with no bounds is byte-identical to a plain
+    /// `linear_forward(_, weight, None, ...)` — callers can short-circuit.
+    pub fn any(&self) -> bool {
+        self.input_min.is_some()
+            || self.input_max.is_some()
+            || self.output_min.is_some()
+            || self.output_max.is_some()
+    }
+
+    /// Resolve `(input_min, input_max)` with default sentinels. Use
+    /// `f32::NEG_INFINITY` for missing min and `f32::INFINITY` for
+    /// missing max so a kernel-level clamp degenerates to a no-op for
+    /// any finite input.
+    pub fn resolved_input(&self) -> (f32, f32) {
+        (
+            self.input_min.unwrap_or(f32::NEG_INFINITY),
+            self.input_max.unwrap_or(f32::INFINITY),
+        )
+    }
+
+    /// Resolve `(output_min, output_max)` with default sentinels.
+    pub fn resolved_output(&self) -> (f32, f32) {
+        (
+            self.output_min.unwrap_or(f32::NEG_INFINITY),
+            self.output_max.unwrap_or(f32::INFINITY),
+        )
+    }
+}
+
+/// CPU reference for the `Gemma4ClippableLinear` projector primitive
+/// (`/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:138-151`).
+///
+/// Pipeline:
+///   1. (optional) clamp `input` to `[input_min, input_max]`
+///   2. `y = matmul(input, weight)` (single Linear, no bias — gemma4v
+///      uses `linear_no_bias` per `/opt/candle/.../gemma4/multimodal_
+///      embedding.rs:46`)
+///   3. (optional) clamp `y` to `[output_min, output_max]`
+///
+/// `bounds.any() == false` is byte-equivalent to
+/// `linear_forward(input, weight, None, batch, in_features, out_features)`
+/// — we still go through the function so the call-site reads as the
+/// gemma4v graph step. The GPU sibling `gemma4v_clippable_linear_gpu`
+/// matches this exact ordering.
+///
+/// # Errors
+///
+/// - any zero shape arg
+/// - input or weight length mismatch (delegated to `linear_forward`)
+pub fn gemma4v_clippable_linear_forward(
+    input: &[f32],
+    weight: &[f32],
+    bounds: &Gemma4ClippableLinearBounds,
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    if batch == 0 || in_features == 0 || out_features == 0 {
+        return Err(anyhow!(
+            "gemma4v_clippable_linear_forward: batch ({batch}), in_features \
+             ({in_features}), out_features ({out_features}) must all be > 0"
+        ));
+    }
+    // --- Stage 1: input clamp (only if bounds present) ---
+    let clamped_input_owned: Option<Vec<f32>> =
+        if bounds.input_min.is_some() || bounds.input_max.is_some() {
+            let (mn, mx) = bounds.resolved_input();
+            if mn > mx {
+                return Err(anyhow!(
+                    "gemma4v_clippable_linear_forward: input_min ({mn}) > input_max ({mx})"
+                ));
+            }
+            let mut v = input.to_vec();
+            for x in v.iter_mut() {
+                *x = x.clamp(mn, mx);
+            }
+            Some(v)
+        } else {
+            None
+        };
+    let input_view: &[f32] = clamped_input_owned.as_deref().unwrap_or(input);
+
+    // --- Stage 2: linear ---
+    let mut y = linear_forward(input_view, weight, None, batch, in_features, out_features)?;
+
+    // --- Stage 3: output clamp (only if bounds present) ---
+    if bounds.output_min.is_some() || bounds.output_max.is_some() {
+        let (mn, mx) = bounds.resolved_output();
+        if mn > mx {
+            return Err(anyhow!(
+                "gemma4v_clippable_linear_forward: output_min ({mn}) > output_max ({mx})"
+            ));
+        }
+        for v in y.iter_mut() {
+            *v = v.clamp(mn, mx);
+        }
+    }
+    Ok(y)
+}
+
 /// 2-D NeoX RoPE for ViT (CPU reference for `dispatch_vision_2d_rope`).
 ///
 /// Layout: `[seq_len * n_heads, head_dim]` row-major.
@@ -4508,5 +4625,105 @@ mod tests {
         assert_eq!(&patch_embeds[0..4], &[15.0, 17.0, 19.0, 21.0]);
         // patch 1: 1 + (5+9, 6+10, 7+11, 8+12) = [15, 17, 19, 21]
         assert_eq!(&patch_embeds[4..8], &[15.0, 17.0, 19.0, 21.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // gemma4v_clippable_linear_forward (iter 115)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gemma4v_clippable_linear_forward_no_bounds_matches_plain_linear() {
+        // bounds.any() == false → byte-equivalent to linear_forward(_, None).
+        let batch = 3usize;
+        let in_features = 4usize;
+        let out_features = 2usize;
+        let input: Vec<f32> = vec![
+            -1.0, 2.0, 3.0, 4.0,
+             5.0, -6.0, 7.0, 8.0,
+            -9.0, 10.0, -11.0, 12.0,
+        ];
+        let weight: Vec<f32> = vec![
+            0.1, 0.2, 0.3, 0.4,
+            0.5, 0.6, 0.7, 0.8,
+        ];
+        let bounds = Gemma4ClippableLinearBounds::default();
+        assert!(!bounds.any());
+
+        let plain =
+            linear_forward(&input, &weight, None, batch, in_features, out_features).unwrap();
+        let clipped = gemma4v_clippable_linear_forward(
+            &input, &weight, &bounds, batch, in_features, out_features,
+        )
+        .unwrap();
+        assert_eq!(plain, clipped, "no-bounds clippable_linear must match plain linear");
+    }
+
+    #[test]
+    fn gemma4v_clippable_linear_forward_input_clamp_only() {
+        // Input element -100 should be clamped to -1.0 BEFORE the matmul.
+        let batch = 1usize;
+        let in_features = 4usize;
+        let out_features = 1usize;
+        let input: Vec<f32> = vec![-100.0, 1.0, 1.0, 1.0];
+        let weight: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+        let bounds = Gemma4ClippableLinearBounds {
+            input_min: Some(-1.0),
+            input_max: Some(1.0),
+            output_min: None,
+            output_max: None,
+        };
+        let out = gemma4v_clippable_linear_forward(
+            &input, &weight, &bounds, batch, in_features, out_features,
+        )
+        .unwrap();
+        // Expected: clamp(-100, -1, 1) = -1, then dot([- 1, 1, 1, 1], [1, 1, 1, 1]) = 2.
+        assert_eq!(out, vec![2.0]);
+    }
+
+    #[test]
+    fn gemma4v_clippable_linear_forward_both_clamps() {
+        // Input pre-clamps to [-2, 2]; output post-clamps to [-3, 3].
+        let batch = 1usize;
+        let in_features = 4usize;
+        let out_features = 1usize;
+        let input: Vec<f32> = vec![100.0, 100.0, 100.0, 100.0];
+        let weight: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+        let bounds = Gemma4ClippableLinearBounds {
+            input_min: Some(-2.0),
+            input_max: Some(2.0),
+            output_min: Some(-3.0),
+            output_max: Some(3.0),
+        };
+        let out = gemma4v_clippable_linear_forward(
+            &input, &weight, &bounds, batch, in_features, out_features,
+        )
+        .unwrap();
+        // After input clamp: [2, 2, 2, 2]. dot = 8. Output clamped to 3.
+        assert_eq!(out, vec![3.0]);
+    }
+
+    #[test]
+    fn gemma4v_clippable_linear_bounds_resolve_default_to_neg_pos_inf() {
+        let bounds = Gemma4ClippableLinearBounds::default();
+        let (mn_in, mx_in) = bounds.resolved_input();
+        let (mn_out, mx_out) = bounds.resolved_output();
+        assert_eq!(mn_in, f32::NEG_INFINITY);
+        assert_eq!(mx_in, f32::INFINITY);
+        assert_eq!(mn_out, f32::NEG_INFINITY);
+        assert_eq!(mx_out, f32::INFINITY);
+        assert!(!bounds.any());
+    }
+
+    #[test]
+    fn gemma4v_clippable_linear_forward_rejects_min_gt_max() {
+        let input: Vec<f32> = vec![0.0; 4];
+        let weight: Vec<f32> = vec![0.0; 4];
+        let bounds = Gemma4ClippableLinearBounds {
+            input_min: Some(5.0),
+            input_max: Some(1.0),
+            ..Default::default()
+        };
+        let err = gemma4v_clippable_linear_forward(&input, &weight, &bounds, 1, 4, 1).unwrap_err();
+        assert!(format!("{err}").contains("input_min"));
     }
 }

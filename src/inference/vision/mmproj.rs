@@ -256,7 +256,7 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
 ///   - `ClipClassic`  — per-block has `attn_norm.weight` (llama.cpp's
 ///     default CLIP-style writer).
 ///   - `Unknown`      — neither pattern found. Forward pass not supported.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchProfile {
     Gemma4Siglip,
     ClipClassic,
