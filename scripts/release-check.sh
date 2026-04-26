@@ -4,16 +4,19 @@
 # Runs the merge-gating checks defined in the ADR and in docs/shipping-
 # contract.md in sequence, exiting non-zero on first fail:
 #
-#   1. parity suite (Gates C/E + F) — short_hello / sourdough / sliding_wrap
-#      each run 3× at T=0; every run must pass its min-prefix threshold.
+#   1. parity suite (Gates C/D/E + F) — short_hello / sourdough / sliding_wrap
+#      each run 3× at T=0 against the llama.cpp reference (C/E) AND the
+#      committed hf2q self-baseline (D), via scripts/parity_check.sh's
+#      --self-baseline branch. F is the "every run byte-identical" wrapper.
 #   2. perf sanity (Gate B) — median-of-3 decode tok/s on sourdough ≥ floor.
 #   3. prefill perf (Gate A) — batched prefill tok/s on a ≥2048-token prompt
 #      ≥ floor. Requires prefill_2048.txt fixture (skipped if absent).
 #   4. mlx-native counter thresholds (Gate G) — dispatches/decode_tok and
 #      total syncs within thresholds; uses HF2Q_DUMP_COUNTERS=1 hook.
 #
-# Gates not yet wired here: D (frozen hf2q self-baseline). Needs a
-# committed token-id fixture; follow-up.
+# All seven gates A-G wired. Gate D's frozen hf2q self-baseline lives in
+# tests/evals/reference/{short_hello,sourdough,sliding_wrap}_hf2q.txt with
+# MANIFEST.json recording the source commit + GGUF SHA.
 #
 # Parity suite wraps `hf2q parity check` via scripts/parity_check.sh.
 # Perf gates parse tok/s from stderr of `hf2q generate`.
