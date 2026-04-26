@@ -15,6 +15,8 @@ pub mod gpu;
 pub mod header;
 pub mod parity_quality;
 #[allow(dead_code)]
+pub mod multi_model;
+#[allow(dead_code)]
 pub mod quant_select;
 #[allow(dead_code)]
 pub mod sampler_pure;
