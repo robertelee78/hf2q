@@ -921,6 +921,406 @@ pub fn quantize_row_q4_k(row: &[f32], blocks: &mut [BlockQ4K]) -> Result<(), KQu
     Ok(())
 }
 
+/// Quantize `row` (length `n_blocks × QK_K`) to a sequence of
+/// `BlockQ5K` super-blocks. Pure-Rust port of `quantize_row_q5_K_ref`
+/// (`ggml-quants.c:1582`).
+///
+/// Structurally parallel to [`quantize_row_q4_k`] with the following
+/// differences:
+/// - `make_qkx2_quants` is called with `nmax=31` (5-bit), `rmin=-0.5`,
+///   `rdelta=0.1`, `nstep=15` (vs `nmax=15, rmin=-1.0, nstep=20` for Q4_K).
+/// - Re-derived per-element `L` is clamped to `[0, 31]` (5-bit).
+/// - Pack: `L > 15` triggers the high-bit pack into `qh[32]`; the
+///   per-pair mask shifters `(m1, m2)` start at `(1, 2)` and shift left
+///   by 2 per 64-element pair (mirrors the dequantize-side `(u1, u2)`).
+pub fn quantize_row_q5_k(row: &[f32], blocks: &mut [BlockQ5K]) -> Result<(), KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q5_K_SIZE,
+        });
+    }
+
+    let mut l_buf = [0u8; QK_K];
+    let mut laux = [0u8; 32];
+    let mut weights_buf = [0.0f32; 32];
+    let mut mins = [0.0f32; QK_K / 32];
+    let mut scales = [0.0f32; QK_K / 32];
+
+    for i in 0..nb {
+        let x = &row[i * QK_K..(i + 1) * QK_K];
+        let mut max_scale = 0.0f32;
+        let mut max_min = 0.0f32;
+
+        // Per-sub-block: codebook search at nmax=31.
+        for j in 0..(QK_K / 32) {
+            let xj = &x[32 * j..32 * j + 32];
+            let mut sum_x2 = 0.0f32;
+            for &v in xj.iter() {
+                sum_x2 += v * v;
+            }
+            let av_x = (sum_x2 / 32.0).sqrt();
+            for (l, &v) in weights_buf.iter_mut().zip(xj.iter()) {
+                *l = av_x + v.abs();
+            }
+            let (scale, the_min) = make_qkx2_quants(
+                32,
+                31,
+                xj,
+                &weights_buf,
+                &mut l_buf[32 * j..32 * j + 32],
+                &mut laux,
+                -0.5,
+                0.1,
+                15,
+                false,
+            );
+            scales[j] = scale;
+            mins[j] = the_min;
+            if scale > max_scale {
+                max_scale = scale;
+            }
+            if the_min > max_min {
+                max_min = the_min;
+            }
+        }
+
+        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+        let mut packed_scales = [0u8; 12];
+
+        for j in 0..(QK_K / 32) {
+            let ls = nearest_int(inv_scale * scales[j]).max(0).min(63) as u8;
+            let lm = nearest_int(inv_min * mins[j]).max(0).min(63) as u8;
+            if j < 4 {
+                packed_scales[j] = ls;
+                packed_scales[j + 4] = lm;
+            } else {
+                packed_scales[j + 4] = (ls & 0x0F) | ((lm & 0x0F) << 4);
+                packed_scales[j - 4] |= (ls >> 4) << 6;
+                packed_scales[j] |= (lm >> 4) << 6;
+            }
+        }
+
+        let d_f = max_scale / 63.0;
+        let dmin_f = max_min / 63.0;
+        let d_bits = half::f16::from_f32(d_f).to_bits();
+        let dmin_bits = half::f16::from_f32(dmin_f).to_bits();
+        let d = half::f16::from_bits(d_bits).to_f32();
+        let dmin = half::f16::from_bits(dmin_bits).to_f32();
+
+        // Re-quantize L using final (d, dmin, sc, m) — clamp to 5-bit [0,31].
+        for j in 0..(QK_K / 32) {
+            let (sc, m) = get_scale_min_k4(j, &packed_scales);
+            let d_eff = d * (sc as f32);
+            if d_eff == 0.0 {
+                continue;
+            }
+            let dm = dmin * (m as f32);
+            for ii in 0..32 {
+                let lq = nearest_int((x[32 * j + ii] + dm) / d_eff)
+                    .max(0)
+                    .min(31);
+                l_buf[32 * j + ii] = lq as u8;
+            }
+        }
+
+        // Pack 5-bit quants: low 4 bits in qs, high bit in qh.
+        let mut qs = [0u8; QK_K / 2];
+        let mut qh = [0u8; QK_K / 8];
+        let mut m1: u8 = 1;
+        let mut m2: u8 = 2;
+        let mut ql_off = 0usize;
+        for j_pair in 0..(QK_K / 64) {
+            let n = j_pair * 64;
+            for jj in 0..32 {
+                let mut l1 = l_buf[n + jj] as i32;
+                if l1 > 15 {
+                    l1 -= 16;
+                    qh[jj] |= m1;
+                }
+                let mut l2 = l_buf[n + jj + 32] as i32;
+                if l2 > 15 {
+                    l2 -= 16;
+                    qh[jj] |= m2;
+                }
+                qs[ql_off + jj] = (l1 as u8) | ((l2 as u8) << 4);
+            }
+            m1 <<= 2;
+            m2 <<= 2;
+            ql_off += 32;
+        }
+
+        blocks[i] = BlockQ5K {
+            d_bits,
+            dmin_bits,
+            scales: packed_scales,
+            qh,
+            qs,
+        };
+    }
+    Ok(())
+}
+
+/// Threshold below which `make_qx_quants` treats the entire group as
+/// zero. Mirrors `GROUP_MAX_EPS` in `ggml-quants.c:16` (1e-15).
+const GROUP_MAX_EPS: f32 = 1e-15;
+
+/// Symmetric codebook quantizer for Q6_K (and Q3_K, IQ ranges).
+/// Pure-Rust port of `make_qx_quants` (`ggml-quants.c:566`).
+///
+/// Unlike [`make_qkx2_quants`] (which subtracts a per-sub-block min
+/// before quantizing — `q ∈ [0, nmax]`), this one is **symmetric**:
+/// quants live in `[-nmax, nmax-1]` and are stored at offset `+nmax`
+/// in `L[i] ∈ [0, 2*nmax-1]`. Used by Q6_K (and Q3_K) where there's
+/// no per-sub-block min.
+///
+/// Algorithm:
+/// 1. Find `max = x[argmax_abs]`. Early-return zero if `|max| < eps`.
+/// 2. Initial guess `iscale = -nmax / max`.
+/// 3. If `rmse_type == 0`: write quants and return `1/iscale`.
+/// 4. Else: refine with weighted moments. The weight is selected by
+///    `rmse_type`:
+///    - `1`: `w = x²` (importance ≈ value magnitude squared)
+///    - `2`: `w = 1` (uniform)
+///    - `3`: `w = |x|`
+///    - other: `w = sqrt(|x|)`
+///    Custom weights via `qw` override the rmse_type-derived weights.
+///    Iterate `is ∈ [-9, 9] \ {0}` shifting `iscale` by `0.1*is`.
+///    Pick the `is` with maximum `sumlx² / suml2` ratio.
+/// 5. Return final `scale = sumlx / suml2`.
+///
+/// `rmse_type < 0` means "return early after the initial weighted
+/// scale" — used by Q3_K's quick path. Not currently exercised by Q6_K.
+pub fn make_qx_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    l: &mut [i8],
+    rmse_type: i32,
+    qw: Option<&[f32]>,
+) -> f32 {
+    debug_assert_eq!(x.len(), n);
+    debug_assert!(l.len() >= n);
+
+    let mut amax = 0.0f32;
+    let mut max = 0.0f32;
+    for &v in x.iter().take(n) {
+        let ax = v.abs();
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        for slot in l.iter_mut().take(n) {
+            *slot = 0;
+        }
+        return 0.0;
+    }
+
+    let mut iscale = -(nmax as f32) / max;
+    if rmse_type == 0 {
+        for i in 0..n {
+            let lq = nearest_int(iscale * x[i]);
+            l[i] = (nmax + lq.max(-nmax).min(nmax - 1)) as i8;
+        }
+        return 1.0 / iscale;
+    }
+
+    let mut return_early = false;
+    let mut rmse = rmse_type;
+    if rmse < 0 {
+        rmse = -rmse;
+        return_early = true;
+    }
+
+    let weight_at = |i: usize| -> f32 {
+        if let Some(qw) = qw {
+            qw[i]
+        } else if rmse == 1 {
+            x[i] * x[i]
+        } else if rmse == 2 {
+            1.0
+        } else if rmse == 3 {
+            x[i].abs()
+        } else {
+            x[i].abs().sqrt()
+        }
+    };
+
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let lq = nearest_int(iscale * x[i]).max(-nmax).min(nmax - 1);
+        l[i] = (lq + nmax) as i8;
+        let w = weight_at(i);
+        sumlx += w * x[i] * (lq as f32);
+        suml2 += w * (lq as f32) * (lq as f32);
+    }
+    let mut scale = if suml2 > 0.0 { sumlx / suml2 } else { 0.0 };
+    if return_early {
+        return if suml2 > 0.0 {
+            0.5 * (scale + 1.0 / iscale)
+        } else {
+            1.0 / iscale
+        };
+    }
+    let mut best = scale * sumlx;
+    for is in -9i32..=9 {
+        if is == 0 {
+            continue;
+        }
+        iscale = -((nmax as f32) + 0.1 * (is as f32)) / max;
+        sumlx = 0.0;
+        suml2 = 0.0;
+        for i in 0..n {
+            let lq = nearest_int(iscale * x[i]).max(-nmax).min(nmax - 1);
+            let w = weight_at(i);
+            sumlx += w * x[i] * (lq as f32);
+            suml2 += w * (lq as f32) * (lq as f32);
+        }
+        if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
+            for i in 0..n {
+                let lq = nearest_int(iscale * x[i]).max(-nmax).min(nmax - 1);
+                l[i] = (lq + nmax) as i8;
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    scale
+}
+
+/// Quantize `row` (length `n_blocks × QK_K`) to a sequence of
+/// `BlockQ6K` super-blocks. Pure-Rust port of `quantize_row_q6_K_ref`
+/// (`ggml-quants.c:1807`).
+///
+/// Per super-block (16 sub-blocks of 16 elements each, **not** 8×32):
+/// 1. Run [`make_qx_quants`] per sub-block with `nmax=32, rmse_type=1`
+///    to get F32 `scales[16]`. Track the `max_scale` (signed) at the
+///    `argmax_abs(scale)` over sub-blocks.
+/// 2. If `|max_scale| < GROUP_MAX_EPS`: emit a zeroed block (matches
+///    the C `memset` early-return).
+/// 3. Else: super-block scale `iscale = -128 / max_scale`. Per
+///    sub-block, store `scales[ib] = MIN(127, round(iscale * scales[ib]))`.
+///    Note the i8 scales accept negative values — Q6_K is the only
+///    k-quant with **signed** sub-block scales.
+/// 4. Re-derive `L[256]` per sub-block from `(d, scale[ib])`:
+///    `l = round(x / d).clamp(-32, 31); L = l + 32`.
+/// 5. Pack: `ql[128]` holds the lower 4 bits, `qh[64]` the upper
+///    2 bits. The pack groups four 32-element strides per
+///    128-element half: `q1, q2, q3, q4` from `L[l], L[l+32],
+///    L[l+64], L[l+96]`. Lower nibbles pack `(q1, q3) → ql[l]` and
+///    `(q2, q4) → ql[l+32]`. Upper-2-bits pack `((L>>4) & 3)` for
+///    each of the four strides into `qh[l]` shifted by `(0, 2, 4, 6)`.
+pub fn quantize_row_q6_k(row: &[f32], blocks: &mut [BlockQ6K]) -> Result<(), KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q6_K_SIZE,
+        });
+    }
+
+    let mut l_buf = [0i8; QK_K];
+    let mut scales = [0.0f32; QK_K / 16];
+
+    for i in 0..nb {
+        let x = &row[i * QK_K..(i + 1) * QK_K];
+
+        // Per-sub-block: run symmetric quantizer at nmax=32, rmse_type=1.
+        let mut max_scale = 0.0f32;
+        let mut max_abs_scale = 0.0f32;
+        for ib in 0..(QK_K / 16) {
+            let xib = &x[16 * ib..16 * ib + 16];
+            let scale = make_qx_quants(16, 32, xib, &mut l_buf[16 * ib..16 * ib + 16], 1, None);
+            scales[ib] = scale;
+            let abs_scale = scale.abs();
+            if abs_scale > max_abs_scale {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+        }
+
+        // Early-return zero block.
+        if max_abs_scale < GROUP_MAX_EPS {
+            blocks[i] = BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: half::f16::from_f32(0.0).to_bits(),
+            };
+            continue;
+        }
+
+        let iscale = -128.0 / max_scale;
+        let d_f = 1.0 / iscale;
+        let d_bits = half::f16::from_f32(d_f).to_bits();
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        let mut block_scales = [0i8; QK_K / 16];
+        for ib in 0..(QK_K / 16) {
+            // i8 range: nearest_int output then min(127, x); the i8 cast
+            // saturates negative side naturally since scales are typically negative
+            // (max_scale < 0 case → iscale > 0 → most products go positive;
+            //  max_scale > 0 case → iscale < 0 → products go negative).
+            let lq = nearest_int(iscale * scales[ib]).min(127);
+            block_scales[ib] = lq as i8;
+        }
+
+        // Re-derive 6-bit quants from final (d, scales[ib]) per sub-block.
+        for j in 0..(QK_K / 16) {
+            let d_eff = d * (block_scales[j] as f32);
+            if d_eff == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let lq = nearest_int(x[16 * j + ii] / d_eff).max(-32).min(31);
+                l_buf[16 * j + ii] = (lq + 32) as i8;
+            }
+        }
+
+        // Pack 6-bit quants: ql holds low 4 bits, qh holds upper 2 bits.
+        let mut ql = [0u8; QK_K / 2];
+        let mut qh = [0u8; QK_K / 4];
+        for half in 0..(QK_K / 128) {
+            let l_off = half * 128;
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            for l in 0..32 {
+                let q1 = (l_buf[l_off + l] as u8) & 0x0F;
+                let q2 = (l_buf[l_off + l + 32] as u8) & 0x0F;
+                let q3 = (l_buf[l_off + l + 64] as u8) & 0x0F;
+                let q4 = (l_buf[l_off + l + 96] as u8) & 0x0F;
+                ql[ql_off + l] = q1 | (q3 << 4);
+                ql[ql_off + l + 32] = q2 | (q4 << 4);
+                qh[qh_off + l] = ((l_buf[l_off + l] as u8) >> 4)
+                    | (((l_buf[l_off + l + 32] as u8) >> 4) << 2)
+                    | (((l_buf[l_off + l + 64] as u8) >> 4) << 4)
+                    | (((l_buf[l_off + l + 96] as u8) >> 4) << 6);
+            }
+        }
+
+        blocks[i] = BlockQ6K {
+            ql,
+            qh,
+            scales: block_scales,
+            d_bits,
+        };
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,6 +2068,401 @@ mod tests {
                 assert_eq!(n_blocks, 2);
             }
             _ => panic!("expected BlockSizeMismatch"),
+        }
+    }
+
+    // ─────────────────── quantize_row_q5_k tests ───────────────────
+
+    /// Q5_K all-zero input → blocks all zero; dequantize back to zeros.
+    #[test]
+    fn quantize_q5_k_zero_input() {
+        let row = vec![0.0_f32; QK_K];
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0xFFFF,
+                dmin_bits: 0xFFFF,
+                scales: [0xFFu8; 12],
+                qh: [0xFFu8; QK_K / 8],
+                qs: [0xFFu8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q5_k(&row, &mut blocks).unwrap();
+        assert_eq!(blocks[0].d_bits, 0);
+        assert_eq!(blocks[0].dmin_bits, 0);
+        assert_eq!(blocks[0].scales, [0u8; 12]);
+        // qh re-zeroed even though we pre-filled.
+        for &b in blocks[0].qh.iter() {
+            assert_eq!(b, 0);
+        }
+        for &b in blocks[0].qs.iter() {
+            assert_eq!(b, 0);
+        }
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q5_k(&blocks, &mut decoded).unwrap();
+        for &v in decoded.iter() {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// Q5_K round-trip RMSE bound on a smooth ramp [-2, 2]. Q5_K's
+    /// 5.5-bpw codebook should yield RMSE ≤ 0.025 — about half of
+    /// the Q4_K bound, because we double the codebook density.
+    #[test]
+    fn quantize_q5_k_round_trip_synthetic() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q5_k(&row, &mut blocks).unwrap();
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q5_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.025,
+            "Q5_K round-trip RMSE {rmse} > 0.025 threshold for smooth ramp"
+        );
+    }
+
+    /// Q5_K vs Q4_K: on the same input, Q5_K must produce strictly
+    /// lower RMSE than Q4_K (more bits → lower error). Verifies the
+    /// 5-bit codebook isn't accidentally degraded.
+    #[test]
+    fn quantize_q5_k_lower_rmse_than_q4_k() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -3.0 + 6.0 * t
+            })
+            .collect();
+
+        let mut q4 = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let mut q5 = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q4_k(&row, &mut q4).unwrap();
+        quantize_row_q5_k(&row, &mut q5).unwrap();
+
+        let mut q4_decoded = vec![0.0_f32; QK_K];
+        let mut q5_decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k(&q4, &mut q4_decoded).unwrap();
+        dequantize_row_q5_k(&q5, &mut q5_decoded).unwrap();
+
+        let rmse = |a: &[f32], b: &[f32]| -> f64 {
+            let mut sse = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = (*x as f64) - (*y as f64);
+                sse += d * d;
+            }
+            (sse / a.len() as f64).sqrt()
+        };
+        let r4 = rmse(&row, &q4_decoded);
+        let r5 = rmse(&row, &q5_decoded);
+        assert!(
+            r5 < r4,
+            "Q5_K RMSE {r5} should be < Q4_K RMSE {r4} (more bits → less error)"
+        );
+    }
+
+    /// Q5_K with input that needs the high bit to be set (values that
+    /// quantize above 15). Verifies the qh[] packing actually fires.
+    #[test]
+    fn quantize_q5_k_high_bit_packed() {
+        // Use a wide-range input so quants exceed 15 in some sub-blocks.
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| if i < QK_K / 2 { 0.0 } else { 10.0 })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q5_k(&row, &mut blocks).unwrap();
+
+        // qh must have at least one bit set (high-bit pack triggered).
+        let any_qh_set = blocks[0].qh.iter().any(|&b| b != 0);
+        assert!(
+            any_qh_set,
+            "qh has no bits set — Q5_K high-bit pack missing"
+        );
+    }
+
+    // ─────────────────── make_qx_quants tests ───────────────────
+
+    /// `make_qx_quants` on all-zero input early-returns scale=0, L=[0; n].
+    #[test]
+    fn make_qx_quants_all_zero_input() {
+        let n = 16;
+        let x = vec![0.0_f32; n];
+        let mut l = vec![0i8; n];
+        let scale = make_qx_quants(n, 32, &x, &mut l, 1, None);
+        assert_eq!(scale, 0.0);
+        for &q in l.iter() {
+            assert_eq!(q, 0);
+        }
+    }
+
+    /// `make_qx_quants` on a symmetric ramp [-1, 1] with rmse_type=1
+    /// returns a finite scale and L values in [0, 2*nmax-1].
+    #[test]
+    fn make_qx_quants_symmetric_ramp() {
+        let n = 16;
+        let x: Vec<f32> = (0..n)
+            .map(|i| -1.0 + 2.0 * (i as f32) / ((n - 1) as f32))
+            .collect();
+        let mut l = vec![0i8; n];
+        let scale = make_qx_quants(n, 32, &x, &mut l, 1, None);
+        assert!(scale.is_finite());
+        // L stored at offset +32, so L ∈ [0, 63]. Verify all in range.
+        for &q in l.iter() {
+            assert!(q >= 0, "L[i] negative: {q}");
+            assert!(q <= 63, "L[i] > 2*nmax-1: {q}");
+        }
+    }
+
+    /// `make_qx_quants` with `rmse_type == 0` skips refinement and
+    /// returns the initial scale `1/iscale = -max/nmax`.
+    #[test]
+    fn make_qx_quants_no_refinement() {
+        let n = 16;
+        // Single non-zero value → max = 1.0; iscale = -32/1 = -32; scale = -1/32.
+        let mut x = vec![0.0_f32; n];
+        x[5] = 1.0;
+        let mut l = vec![0i8; n];
+        let scale = make_qx_quants(n, 32, &x, &mut l, 0, None);
+        assert!(
+            (scale - (-1.0 / 32.0)).abs() < 1e-5,
+            "scale = {scale}, expected -1/32"
+        );
+    }
+
+    // ─────────────────── quantize_row_q6_k tests ───────────────────
+
+    /// Q6_K all-zero input → blocks all zero.
+    #[test]
+    fn quantize_q6_k_zero_input() {
+        let row = vec![0.0_f32; QK_K];
+        let mut blocks = vec![
+            BlockQ6K {
+                ql: [0xFFu8; QK_K / 2],
+                qh: [0xFFu8; QK_K / 4],
+                scales: [127i8; QK_K / 16],
+                d_bits: 0xFFFF,
+            };
+            1
+        ];
+        quantize_row_q6_k(&row, &mut blocks).unwrap();
+        assert_eq!(blocks[0].d_bits, 0);
+        for &s in blocks[0].scales.iter() {
+            assert_eq!(s, 0);
+        }
+        for &b in blocks[0].ql.iter() {
+            assert_eq!(b, 0);
+        }
+        for &b in blocks[0].qh.iter() {
+            assert_eq!(b, 0);
+        }
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q6_k(&blocks, &mut decoded).unwrap();
+        for &v in decoded.iter() {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// Q6_K round-trip RMSE bound on a smooth ramp [-2, 2]. Q6_K's
+    /// 6.5625-bpw codebook should yield RMSE ≤ 0.012 — about half
+    /// of Q5_K's bound.
+    #[test]
+    fn quantize_q6_k_round_trip_synthetic() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: 0,
+            };
+            1
+        ];
+        quantize_row_q6_k(&row, &mut blocks).unwrap();
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q6_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.012,
+            "Q6_K round-trip RMSE {rmse} > 0.012 threshold for smooth ramp"
+        );
+    }
+
+    /// Q6_K vs Q5_K vs Q4_K on **zero-mean symmetric** input: each
+    /// should produce strictly lower RMSE than the previous. Note:
+    /// for shifted-mean per-sub-block distributions (like a linear
+    /// ramp), Q6_K's symmetric codebook can waste precision and lose
+    /// to Q5_K_M's min-term advantage. A sine wave keeps each
+    /// 16-element sub-block roughly zero-mean, which is where Q6_K's
+    /// extra bit pays off.
+    #[test]
+    fn quantize_q6_k_lowest_rmse() {
+        // Sine wave amplitude 2 over QK_K elements covering 4 cycles.
+        // Each 16-element sub-block sees ~half a cycle → near-zero mean.
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let theta = 8.0 * std::f32::consts::PI * (i as f32) / (QK_K as f32);
+                2.0 * theta.sin()
+            })
+            .collect();
+
+        let mut q4 = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let mut q5 = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let mut q6 = vec![
+            BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: 0,
+            };
+            1
+        ];
+        quantize_row_q4_k(&row, &mut q4).unwrap();
+        quantize_row_q5_k(&row, &mut q5).unwrap();
+        quantize_row_q6_k(&row, &mut q6).unwrap();
+
+        let mut q4_decoded = vec![0.0_f32; QK_K];
+        let mut q5_decoded = vec![0.0_f32; QK_K];
+        let mut q6_decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k(&q4, &mut q4_decoded).unwrap();
+        dequantize_row_q5_k(&q5, &mut q5_decoded).unwrap();
+        dequantize_row_q6_k(&q6, &mut q6_decoded).unwrap();
+
+        let rmse = |a: &[f32], b: &[f32]| -> f64 {
+            let mut sse = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = (*x as f64) - (*y as f64);
+                sse += d * d;
+            }
+            (sse / a.len() as f64).sqrt()
+        };
+        let r4 = rmse(&row, &q4_decoded);
+        let r5 = rmse(&row, &q5_decoded);
+        let r6 = rmse(&row, &q6_decoded);
+        assert!(r5 < r4, "Q5_K RMSE {r5} should be < Q4_K RMSE {r4}");
+        assert!(r6 < r5, "Q6_K RMSE {r6} should be < Q5_K RMSE {r5}");
+    }
+
+    /// Q6_K rejects misaligned input.
+    #[test]
+    fn quantize_q6_k_rejects_misaligned() {
+        let row = vec![0.0_f32; QK_K + 1];
+        let mut blocks = vec![
+            BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: 0,
+            };
+            1
+        ];
+        let err = quantize_row_q6_k(&row, &mut blocks).unwrap_err();
+        match err {
+            KQuantError::NotBlockAligned { actual } => {
+                assert_eq!(actual, QK_K + 1);
+            }
+            _ => panic!("expected NotBlockAligned"),
+        }
+    }
+
+    /// `quantize_row_q5_k` rejects misaligned input.
+    #[test]
+    fn quantize_q5_k_rejects_misaligned() {
+        let row = vec![0.0_f32; QK_K + 3];
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let err = quantize_row_q5_k(&row, &mut blocks).unwrap_err();
+        match err {
+            KQuantError::NotBlockAligned { actual } => {
+                assert_eq!(actual, QK_K + 3);
+            }
+            _ => panic!("expected NotBlockAligned"),
         }
     }
 
