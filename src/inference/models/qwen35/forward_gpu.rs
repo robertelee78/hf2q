@@ -49,8 +49,8 @@ use super::activation_capture::LayerActivations;
 use super::gpu_delta_net::{build_delta_net_layer, DeltaNetWeightsGpu};
 use super::gpu_ffn::{
     build_dense_ffn_layer_gpu, build_dense_ffn_layer_gpu_q, build_moe_ffn_layer_gpu,
-    build_moe_ffn_layer_gpu_q, DenseFfnWeightsGpu, DenseFfnWeightsGpuQ, MoeFfnWeightsGpu,
-    MoeFfnWeightsGpuQ,
+    build_moe_ffn_layer_gpu_q, build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu,
+    DenseFfnWeightsGpuQ, MoeFfnWeightsGpu, MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_linear_projection_f32, apply_linear_projection_f32_into, build_gated_attn_layer,
@@ -1262,6 +1262,8 @@ impl Qwen35Model {
 
         // ---- Per-layer forward pass (identical to forward_gpu) ----
         let decode_profile = std::env::var("HF2Q_DECODE_PROFILE").is_ok();
+        let cb_start = if decode_profile { mlx_native::cmd_buf_count() } else { 0 };
+        let disp_start = if decode_profile { mlx_native::dispatch_count() } else { 0 };
         let mut total_linear_attn_us = 0u64;
         let mut total_full_attn_us = 0u64;
         let mut total_ffn_us = 0u64;
@@ -1377,18 +1379,44 @@ impl Qwen35Model {
                 }
             }
 
-            // --- Fused residual + post-attention RMSNorm ---
-            // Use pre-allocated per-layer scratch buffers (avoids 2 Metal
-            // newBuffer calls per layer × 40 layers = 80 allocs per token).
-            let (ffn_residual, ffn_input) = {
-                let post_norm_w = match layer_gpu {
-                    LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
-                    LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
+            // --- Fused residual + post-attention RMSNorm + FFN (single command buffer) ---
+            //
+            // ADR-012 §Optimize / Task #15 follow-up: the pre-fusion path issued 2
+            // separate command buffers per MoE layer (1 for fused_residual_norm, 1 for
+            // build_moe_ffn_layer_gpu_q).  Fusing them into one encoder saves 40
+            // command buffers per decode token (40 layers × 1 cb saved each), reducing
+            // hf2q's command-buffer count from 140 toward llama.cpp's 1-2 per decode.
+            //
+            // For dense FFN paths (DenseQ / Dense / Moe-unquantized) we keep the
+            // legacy 2-encoder path because their dispatchers have not been
+            // converted to the `_into` API yet.  Production 27B GGUFs use DenseQ;
+            // the MoE-q (35B-A3B) path is the priority for the dwq46 parity gap.
+            let post_norm_w = match layer_gpu {
+                LayerWeightsGpu::FullAttn { attn, .. } => &attn.post_attn_norm,
+                LayerWeightsGpu::LinearAttn { attn, .. } => &attn.post_attn_norm,
+            };
+            let (ffn_input_buf_ref, ffn_residual_buf_ref) = &decode_bufs.layer_scratch[layer_idx];
+
+            let ffn_weights_gpu = match layer_gpu {
+                LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
+                LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
+            };
+            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
+
+            let ffn_out = if let FfnWeightsGpu::MoeQ(w_gpu) = ffn_weights_gpu {
+                // Fused MoE-Q path: one command buffer for fused_res_norm + entire MoE FFN.
+                let moe = cfg.moe.as_ref().ok_or_else(|| {
+                    anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                })?;
+                let shape = MoeFfnShape {
+                    hidden_size: h,
+                    num_experts: moe.num_experts,
+                    num_experts_per_tok: moe.num_experts_per_tok,
+                    moe_intermediate_size: moe.moe_intermediate_size,
+                    shared_intermediate_size: moe.shared_expert_intermediate_size,
                 };
-                // layer_scratch[layer_idx] = (ffn_input_buf, ffn_residual_buf)
-                let (ffn_input_buf, ffn_residual_buf) = &decode_bufs.layer_scratch[layer_idx];
                 let mut enc = device.command_encoder()
-                    .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
+                    .with_context(|| format!("enc fused_res_norm+moeq greedy layer {layer_idx}"))?;
                 dispatch_fused_residual_norm_f32(
                     &mut enc,
                     &mut registry,
@@ -1396,78 +1424,87 @@ impl Qwen35Model {
                     &hidden,
                     &attn_out,
                     post_norm_w,
-                    ffn_input_buf,
-                    Some(ffn_residual_buf),
+                    ffn_input_buf_ref,
+                    Some(ffn_residual_buf_ref),
                     seq_len,
                     h,
                     eps,
                 )
-                .with_context(|| format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}"))?;
-                enc.commit();
-                (ffn_residual_buf.clone(), ffn_input_buf.clone())
-            };
-            // hidden is overwritten unconditionally below after the FFN; the
-            // residual is consumed via `ffn_residual` directly.
-
-            // --- FFN ---
-            let ffn_weights_gpu = match layer_gpu {
-                LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
-                LayerWeightsGpu::LinearAttn { ffn, .. } => ffn,
-            };
-            let t_ffn_start = if decode_profile { Some(std::time::Instant::now()) } else { None };
-            let ffn_out = match ffn_weights_gpu {
-                FfnWeightsGpu::Dense(w) => {
-                    let m = cfg.intermediate_size.ok_or_else(|| {
-                        anyhow!("dense FFN missing intermediate_size greedy (layer {layer_idx})")
-                    })?;
-                    let shape = DenseFfnShape {
-                        hidden_size: h,
-                        intermediate_size: m,
-                    };
-                    build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
-                        Some(&ffn_residual))
-                        .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
+                .with_context(|| format!("dispatch_fused_residual_norm_f32 fused-MoeQ greedy layer {layer_idx}"))?;
+                enc.memory_barrier();
+                let out = build_moe_ffn_layer_gpu_q_into(
+                    &mut enc, &device, &mut registry, ffn_input_buf_ref, w_gpu, shape,
+                    Some(ffn_residual_buf_ref),
+                )
+                .with_context(|| format!("moe_ffn_q_into fused greedy layer {layer_idx}"))?;
+                if seq_len == 1 {
+                    enc.commit();
+                } else {
+                    enc.commit_and_wait().with_context(|| format!("commit fused-MoeQ greedy layer {layer_idx}"))?;
                 }
-                FfnWeightsGpu::DenseQ(w) => {
-                    // Quantized dense path (production 27B DWQ GGUFs).
-                    build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
-                        Some(&ffn_residual))
-                        .with_context(|| format!("dense_ffn_q greedy layer {layer_idx}"))?
+                out
+            } else {
+                // Legacy 2-encoder path for DenseQ / Dense / Moe-unquantized.
+                {
+                    let mut enc = device.command_encoder()
+                        .with_context(|| format!("enc fused_res_norm greedy layer {layer_idx}"))?;
+                    dispatch_fused_residual_norm_f32(
+                        &mut enc,
+                        &mut registry,
+                        device.metal_device(),
+                        &hidden,
+                        &attn_out,
+                        post_norm_w,
+                        ffn_input_buf_ref,
+                        Some(ffn_residual_buf_ref),
+                        seq_len,
+                        h,
+                        eps,
+                    )
+                    .with_context(|| format!("dispatch_fused_residual_norm_f32 greedy layer {layer_idx}"))?;
+                    enc.commit();
                 }
-                FfnWeightsGpu::Moe(w_gpu) => {
-                    let moe = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
-                    })?;
-                    let shape = MoeFfnShape {
-                        hidden_size: h,
-                        num_experts: moe.num_experts,
-                        num_experts_per_tok: moe.num_experts_per_tok,
-                        moe_intermediate_size: moe.moe_intermediate_size,
-                        shared_intermediate_size: moe.shared_expert_intermediate_size,
-                    };
-                    let w_cpu = match &layer_cpu.ffn() {
-                        Qwen35FfnWeights::Moe(w) => w,
-                        _ => return Err(anyhow!(
-                            "layer {layer_idx} config says F32-MoE but weights are different"
-                        )),
-                    };
-                    build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
-                        .with_context(|| format!("moe_ffn greedy layer {layer_idx}"))?
-                }
-                FfnWeightsGpu::MoeQ(w_gpu) => {
-                    let moe = cfg.moe.as_ref().ok_or_else(|| {
-                        anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
-                    })?;
-                    let shape = MoeFfnShape {
-                        hidden_size: h,
-                        num_experts: moe.num_experts,
-                        num_experts_per_tok: moe.num_experts_per_tok,
-                        moe_intermediate_size: moe.moe_intermediate_size,
-                        shared_intermediate_size: moe.shared_expert_intermediate_size,
-                    };
-                    build_moe_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w_gpu, shape,
-                        Some(&ffn_residual))
-                        .with_context(|| format!("moe_ffn_q greedy layer {layer_idx}"))?
+                let ffn_input = ffn_input_buf_ref.clone();
+                let ffn_residual = ffn_residual_buf_ref.clone();
+                match ffn_weights_gpu {
+                    FfnWeightsGpu::Dense(w) => {
+                        let m = cfg.intermediate_size.ok_or_else(|| {
+                            anyhow!("dense FFN missing intermediate_size greedy (layer {layer_idx})")
+                        })?;
+                        let shape = DenseFfnShape {
+                            hidden_size: h,
+                            intermediate_size: m,
+                        };
+                        build_dense_ffn_layer_gpu(&device, &mut registry, &ffn_input, w, shape,
+                            Some(&ffn_residual))
+                            .with_context(|| format!("dense_ffn greedy layer {layer_idx}"))?
+                    }
+                    FfnWeightsGpu::DenseQ(w) => {
+                        build_dense_ffn_layer_gpu_q(&device, &mut registry, &ffn_input, w,
+                            Some(&ffn_residual))
+                            .with_context(|| format!("dense_ffn_q greedy layer {layer_idx}"))?
+                    }
+                    FfnWeightsGpu::Moe(w_gpu) => {
+                        let moe = cfg.moe.as_ref().ok_or_else(|| {
+                            anyhow!("MoE FFN missing moe config greedy (layer {layer_idx})")
+                        })?;
+                        let shape = MoeFfnShape {
+                            hidden_size: h,
+                            num_experts: moe.num_experts,
+                            num_experts_per_tok: moe.num_experts_per_tok,
+                            moe_intermediate_size: moe.moe_intermediate_size,
+                            shared_intermediate_size: moe.shared_expert_intermediate_size,
+                        };
+                        let w_cpu = match &layer_cpu.ffn() {
+                            Qwen35FfnWeights::Moe(w) => w,
+                            _ => return Err(anyhow!(
+                                "layer {layer_idx} config says F32-MoE but weights are different"
+                            )),
+                        };
+                        build_moe_ffn_layer_gpu(&device, &mut registry, &ffn_input, w_gpu, w_cpu, shape)
+                            .with_context(|| format!("moe_ffn greedy layer {layer_idx}"))?
+                    }
+                    FfnWeightsGpu::MoeQ(_) => unreachable!("MoeQ handled in fused path above"),
                 }
             };
 
@@ -1478,19 +1515,23 @@ impl Qwen35Model {
             // F32-MoE: separate GPU add still required.
             hidden = match ffn_weights_gpu {
                 FfnWeightsGpu::MoeQ(_) | FfnWeightsGpu::Dense(_) | FfnWeightsGpu::DenseQ(_) => ffn_out,
-                _ => residual_add_gpu(&ffn_residual, &ffn_out, &device, &mut registry)
+                _ => residual_add_gpu(ffn_residual_buf_ref, &ffn_out, &device, &mut registry)
                     .with_context(|| format!("residual ffn greedy layer {layer_idx}"))?,
             };
         }
 
         if decode_profile {
             let total_layers_us = total_linear_attn_us + total_full_attn_us + total_ffn_us;
+            let cb_count = mlx_native::cmd_buf_count() - cb_start;
+            let disp_count = mlx_native::dispatch_count() - disp_start;
             eprintln!(
-                "[GREEDY_PROFILE] linear_attn={:.1}ms full_attn={:.1}ms ffn={:.1}ms total_layers={:.1}ms",
+                "[GREEDY_PROFILE] linear_attn={:.1}ms full_attn={:.1}ms ffn={:.1}ms total_layers={:.1}ms cmd_bufs={} dispatches={}",
                 total_linear_attn_us as f64 / 1000.0,
                 total_full_attn_us as f64 / 1000.0,
                 total_ffn_us as f64 / 1000.0,
                 total_layers_us as f64 / 1000.0,
+                cb_count,
+                disp_count,
             );
         }
 

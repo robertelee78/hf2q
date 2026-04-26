@@ -993,6 +993,66 @@ pub fn build_moe_ffn_layer_gpu_q(
     shape: MoeFfnShape,
     add_residual: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
+    // Backwards-compatible variant: create our own encoder, dispatch, commit.
+    let mut enc = device.command_encoder().context("enc moe_ffn_q")?;
+    let out = build_moe_ffn_layer_gpu_q_into(&mut enc, device, registry, x, weights, shape, add_residual)?;
+    let seq_len = (x.element_count() / shape.hidden_size as usize) as u32;
+    if seq_len == 1 {
+        enc.commit();
+    } else {
+        enc.commit_and_wait().context("commit moe_ffn_q")?;
+    }
+    Ok(out)
+}
+
+/// External-encoder variant of [`build_moe_ffn_layer_gpu_q`].
+///
+/// Encodes the entire MoE FFN forward pass (router + shared expert + gated
+/// expert projections + softmax_topk + silu_mul + weighted reduce + optional
+/// residual add) into the caller-supplied [`mlx_native::CommandEncoder`].
+/// Does NOT commit — the caller is responsible for committing the encoder.
+///
+/// # Why this exists
+///
+/// Closes the per-layer command-buffer overhead component of the ADR-012
+/// §Optimize / Task #15 MoE dwq46 0.91× decode parity gap.  The
+/// pre-fusion path issued 2 separate command buffers per MoE layer:
+///
+/// 1. `dispatch_fused_residual_norm_f32` — produces `ffn_input` from
+///    `(hidden, attn_out, post_norm_w)` + writes `ffn_residual` for the
+///    later add.
+/// 2. `build_moe_ffn_layer_gpu_q` — its own encoder for the MoE
+///    forward + residual add at the end.
+///
+/// With this variant, the caller can fuse step 1 + step 2 into a single
+/// command buffer per MoE layer (40 fewer command buffers per decode
+/// token on Qwen3.6-35B-A3B).  For comparison, llama.cpp's Metal compute
+/// path issues 1-2 command buffers per decode token total
+/// (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:458` —
+/// "optimal values for n_cb are 1 or 2"); hf2q pre-fusion issues 140.
+///
+/// # Caller contract
+///
+/// * The caller must provide the encoder.  The encoder must NOT have been
+///   committed.
+/// * The caller MUST commit the encoder after this function returns; the
+///   GPU work is queued but not yet submitted.
+/// * The output `MlxBuffer` is allocated from the per-decode-token arena
+///   pool; it must NOT be downloaded to CPU via `as_slice` /
+///   `download_f32` (the pool's bucket rounding inflates `byte_len`).
+///   Decode-path consumers (next layer's fused_residual_norm + lm_head
+///   `apply_output_head_gpu_greedy`) read via shape-respecting kernels —
+///   safe.
+#[allow(clippy::too_many_arguments)]
+pub fn build_moe_ffn_layer_gpu_q_into(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    x: &MlxBuffer,
+    weights: &MoeFfnWeightsGpuQ,
+    shape: MoeFfnShape,
+    add_residual: Option<&MlxBuffer>,
+) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let _ne = shape.num_experts as usize;
     let topk = shape.num_experts_per_tok as usize;
@@ -1082,25 +1142,23 @@ pub fn build_moe_ffn_layer_gpu_q(
     };
 
     {
-        let mut enc = device.command_encoder().context("enc moe_ffn_q")?;
-
         // ---- Phase A: router + shared expert projections (all read from x, concurrent) ----
-        let logits_buf   = proj(&mut enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
-        let sh_logit_buf = proj(&mut enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-        let a_s_buf      = proj(&mut enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
-        let b_s_buf      = proj(&mut enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
+        let logits_buf   = proj(enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
+        let sh_logit_buf = proj(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf      = proj(enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
+        let b_s_buf      = proj(enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
 
         // Barrier A→B: softmax_topk reads logits_buf; silu_mul reads a_s/b_s.
         enc.memory_barrier();
 
         // ---- Phase B: GPU softmax+topk + shared silu_mul (concurrent) ----
         dispatch_moe_softmax_topk(
-            &mut enc, registry, device,
+            enc, registry, device,
             &logits_buf, &ids_buf, &weights_buf,
             seq_len, ne32, shape.num_experts_per_tok,
         ).map_err(|e| anyhow!("moe_softmax_topk: {e}"))?;
         dispatch_silu_mul(
-            &mut enc, registry, device.metal_device(),
+            enc, registry, device.metal_device(),
             &a_s_buf, &b_s_buf, &h_s_buf, &silu_sh_params_buf, n_h_s,
         ).map_err(|e| anyhow!("silu_mul sh: {e}"))?;
 
@@ -1109,7 +1167,7 @@ pub fn build_moe_ffn_layer_gpu_q(
 
         // ---- Phase C: expert gate+up matmuls + shared down proj (concurrent) ----
         quantized_matmul_id_ggml(
-            &mut enc, registry, device,
+            enc, registry, device,
             x, &weights.expert_gate_q, &ids_buf, &mut gate_all_buf,
             &GgmlQuantizedMatmulIdParams {
                 n_tokens: seq_len,
@@ -1122,7 +1180,7 @@ pub fn build_moe_ffn_layer_gpu_q(
             },
         ).map_err(|e| anyhow!("gate_all qmatmul_id: {e}"))?;
         quantized_matmul_id_ggml(
-            &mut enc, registry, device,
+            enc, registry, device,
             x, &weights.expert_up_q, &ids_buf, &mut up_all_buf,
             &GgmlQuantizedMatmulIdParams {
                 n_tokens: seq_len,
@@ -1134,14 +1192,14 @@ pub fn build_moe_ffn_layer_gpu_q(
                 ggml_type: weights.ggml_type_gate_up,
             },
         ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
-        let y_s_buf = proj(&mut enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
+        let y_s_buf = proj(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
 
         // Barrier C→D: silu_mul reads gate_all/up_all.
         enc.memory_barrier();
 
         // ---- Phase D: h_all = silu(gate_all) * up_all ----
         dispatch_silu_mul(
-            &mut enc, registry, device.metal_device(),
+            enc, registry, device.metal_device(),
             &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
         ).map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
 
@@ -1150,7 +1208,7 @@ pub fn build_moe_ffn_layer_gpu_q(
 
         // ---- Phase E: y_all = expert_down(h_all) ----
         quantized_matmul_id_ggml(
-            &mut enc, registry, device,
+            enc, registry, device,
             &h_all_buf, &weights.expert_down_q, &ids_buf, &mut y_all_buf,
             &GgmlQuantizedMatmulIdParams {
                 n_tokens: total_rows as u32,
@@ -1168,7 +1226,7 @@ pub fn build_moe_ffn_layer_gpu_q(
 
         // ---- Phase F: fused weighted accumulate + sigmoid(sh_logit)*y_s + residual ----
         dispatch_moe_weighted_reduce(
-            &mut enc, registry, device,
+            enc, registry, device,
             &weights_buf,
             &y_all_buf,
             &sh_logit_buf,
@@ -1181,18 +1239,9 @@ pub fn build_moe_ffn_layer_gpu_q(
             add_residual.is_some(),
         ).map_err(|e| anyhow!("moe_weighted_reduce: {e}"))?;
 
-        // Decode fast path (seq=1): commit() without wait.
-        // The caller (forward_gpu) sets `hidden = out_buf` then immediately
-        // feeds `hidden` into the next layer's fused_residual_norm encoder on
-        // the same Metal serial queue.  GPU ordering guarantees the MoE FFN
-        // completes before fused_residual_norm executes.
-        //
-        // Prefill (seq>1): commit_and_wait() for correctness.
-        if seq_len == 1 {
-            enc.commit();
-        } else {
-            enc.commit_and_wait().context("commit moe_ffn_q")?;
-        }
+        // NOTE: this `_into` variant does NOT commit.  The caller is
+        // responsible for committing the encoder, allowing fusion with
+        // upstream dispatches (e.g. `dispatch_fused_residual_norm_f32`).
     }
 
     Ok(out_buf)
