@@ -27,12 +27,16 @@
 //!      tiles. Compute `(n_x, n_y)` such that `n_x * n_y` lies in
 //!      `[token_min, token_max]` (typically `[252, 280]`); downscale
 //!      preserving aspect ratio when the native grid exceeds the cap.
-//!   2. Each pixel is mapped `[0, 1] → [-1, 1]` via `2x − 1`. This is
-//!      mathematically equivalent to mean=std=[0.5, 0.5, 0.5] (the
-//!      `(x − 0.5)/0.5 = 2x − 1` identity), so the SigLIP-49 fixed-res
-//!      path's `GEMMA4_VISION_CONFIG` produces byte-identical normalized
-//!      values for the same pixel — the gemma4v path just stores them
-//!      flattened per-patch instead of CHW.
+//!   2. Each pixel is mapped `[0, 1] → [-3, +1]` via `4x − 3`. This is
+//!      the algebraic collapse of llama.cpp's two-step scale-bias chain:
+//!      `img_u8_to_f32` with mean=std=[0.5, 0.5, 0.5] yields `2x − 1`
+//!      (`mtmd-image.cpp:11-21`), and `ggml_scale_bias(2.0, -1.0)` then
+//!      applies `2y − 1` on top of that (`gemma4v.cpp:9`), composing to
+//!      `4x − 3`. The SigLIP-49 fixed-res path's `GEMMA4_VISION_CONFIG`
+//!      stops at the `2x − 1` step (no scale-bias follow-up) and is
+//!      therefore NOT byte-identical to the gemma4v variable-res path
+//!      — they target different model graphs (ADR-005 Phase 2c iter-125,
+//!      W56).
 //!   3. Returns a `[N_patches, patch_size² × 3]` flat patch buffer plus
 //!      per-patch `pos_x` and `pos_y` index arrays so the dual
 //!      position-embed lookup (`tools/mtmd/models/gemma4v.cpp:18-42`)
@@ -244,11 +248,13 @@ impl Gemma4vPreprocessed {
 ///   - Patchify into `[N_patches, patch_size² × 3]` with pixel layout
 ///     `(dy, dx, c)` per patch (matches candle's reshape, see
 ///     `Gemma4vPreprocessed::patches` doc).
-///   - Pixel-scale `2x − 1` so the per-patch values are in `[-1, 1]`.
-///     llama.cpp does this as the first GPU op (`gemma4v.cpp:9`); we
-///     fold it into the CPU pre-step because the math is identical
-///     to mean=std=[0.5,0.5,0.5] and the existing SigLIP-49 path
-///     already runs the equivalent in preprocess.
+///   - Pixel-scale `4x − 3` so the per-patch values are in `[-3, +1]`.
+///     This is the algebraic collapse of llama.cpp's two-step chain:
+///     `mtmd-image.cpp:11-21` `img_u8_to_f32` with mean=std=[0.5,0.5,0.5]
+///     gives `2x − 1` (range `[-1, +1]`), and `gemma4v.cpp:9`
+///     `ggml_scale_bias(2.0, -1.0)` then applies `2y − 1` on top, yielding
+///     `4x − 3`. Folded here into a single CPU pass so the GPU patch-embd
+///     conv sees byte-faithful inputs (ADR-005 Phase 2c iter-125, W56).
 ///
 /// # Errors
 ///
@@ -341,13 +347,24 @@ pub fn preprocess_gemma4v(
                     let img_y = py * p + dy;
                     let pix = rgb.get_pixel(img_x, img_y);
                     let inner_base = ((dy as usize) * p_us + (dx as usize)) * 3;
-                    // 2x − 1 maps [0, 1] → [-1, 1].
+                    // ADR-005 Phase 2c iter-125 (W56): byte-faithful match
+                    // against llama.cpp's two-step scale-bias chain.
+                    // Step 1 — `mtmd-image.cpp:11-21` `img_u8_to_f32` with
+                    // mean=std=[0.5,0.5,0.5]:
+                    //     y = (pix/255 - 0.5)/0.5  = 2*pix/255 - 1   ∈ [-1, +1]
+                    // Step 2 — `gemma4v.cpp:9` `ggml_scale_bias(2.0, -1.0)`:
+                    //     z = 2*y + (-1)           = 2*(2*pix/255 - 1) - 1
+                    //                              = 4*pix/255 - 3    ∈ [-3, +1]
+                    // Folded into a single CPU expression: `4x − 3`. Iter-124
+                    // parity probe (W55, 625f94a) showed hf2q was one full
+                    // `2x − 1` step short, producing the algebraic identity
+                    // hf2q = (peer + 1) / 2; i.e. peer = 2*hf2q + 1.
                     patches[row_base + inner_base + 0] =
-                        (pix[0] as f32 / 255.0) * 2.0 - 1.0;
+                        (pix[0] as f32 / 255.0) * 4.0 - 3.0;
                     patches[row_base + inner_base + 1] =
-                        (pix[1] as f32 / 255.0) * 2.0 - 1.0;
+                        (pix[1] as f32 / 255.0) * 4.0 - 3.0;
                     patches[row_base + inner_base + 2] =
-                        (pix[2] as f32 / 255.0) * 2.0 - 1.0;
+                        (pix[2] as f32 / 255.0) * 4.0 - 3.0;
                 }
             }
         }
@@ -847,11 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn gemma4v_preprocess_pixel_scaling_2x_minus_1() {
-        // Solid black should land at -1.0 (0 → -1), solid white at +1.0.
-        // Solid mid-gray (128) should land at ~0.0 (128/255 ≈ 0.502 → 0.004).
+    fn gemma4v_preprocess_pixel_scaling_4x_minus_3() {
+        // ADR-005 Phase 2c iter-125 (W56): expected values updated from the
+        // old single-step `2x − 1` algebra (which produced range [-1, +1])
+        // to the byte-faithful llama.cpp two-step chain folded as `4x − 3`
+        // (range [-3, +1]). Solid black (0) → 4*0 - 3 = -3.0. Solid white
+        // (255) → 4*1 - 3 = +1.0. Mid-gray (128) → 4*(128/255) - 3 ≈ -0.992.
         for (rgb, expect) in [
-            ([0u8, 0, 0], -1.0_f32),
+            ([0u8, 0, 0], -3.0_f32),
             ([255, 255, 255], 1.0),
         ] {
             let png = encode_solid_png(256, 256, rgb);
@@ -868,18 +888,25 @@ mod tests {
                 );
             }
         }
-        // Mid-gray center
+        // Mid-gray center: 4 * (128/255) - 3 = 0.5098... - 2.0 - ... actually
+        // 128/255 ≈ 0.50196, *4 = 2.00784, -3 = -0.99216.
         let png_mid = encode_solid_png(256, 256, [128, 128, 128]);
         let out_mid = preprocess_gemma4v(&png_mid, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
         let v = out_mid.patches[0];
-        // 128/255*2 - 1 ≈ 0.0039
-        assert!(v.abs() < 0.01, "mid-gray got {v}, expected ~0.004");
+        let expect_mid = (128.0_f32 / 255.0) * 4.0 - 3.0; // ≈ -0.99216
+        assert!(
+            (v - expect_mid).abs() < 1e-3,
+            "mid-gray got {v}, expected ≈ {expect_mid}"
+        );
     }
 
     #[test]
-    fn gemma4v_preprocess_pixel_range_in_minus_one_one() {
-        // Random-style image (gradient) — every pixel must end up in
-        // [-1, 1].
+    fn gemma4v_preprocess_pixel_range_in_minus_three_plus_one() {
+        // ADR-005 Phase 2c iter-125 (W56): expected range updated from
+        // [-1, +1] (old one-step `2x − 1`) to [-3, +1] (byte-faithful
+        // two-step chain `4x − 3`, llama.cpp `gemma4v.cpp:9` +
+        // `mtmd-image.cpp:11-21`). Random-style gradient image — every
+        // pixel must end up in [-3, +1].
         let img: RgbImage = ImageBuffer::from_fn(128, 128, |x, y| {
             Rgb([
                 (x as u8).wrapping_mul(2),
@@ -894,7 +921,7 @@ mod tests {
         let max_v = out.patches.iter().cloned().fold(f32::MIN, f32::max);
         let min_v = out.patches.iter().cloned().fold(f32::MAX, f32::min);
         assert!(
-            min_v >= -1.0 - 1e-6 && max_v <= 1.0 + 1e-6,
+            min_v >= -3.0 - 1e-6 && max_v <= 1.0 + 1e-6,
             "range out of bounds: [{min_v}, {max_v}]"
         );
     }
@@ -1050,8 +1077,10 @@ mod tests {
         let out = preprocess_gemma4v(&buf, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
 
         // First patch (top-left corner). At least one pixel in the patch
-        // must be > 0 (specifically pixel (0,0) of the resized image
-        // is exactly src(0,0) = white = +1.0 after 2x-1 normalization).
+        // must be > 0 (specifically pixel (0,0) of the resized image is
+        // exactly src(0,0) = white = +1.0 after the `4x − 3` byte-faithful
+        // normalization: 4*1.0 - 3 = +1.0; iter-125 W56 confirmed white
+        // is invariant under the algebra change).
         let inner = (16 * 16 * 3) as usize;
         let first_patch = &out.patches[0..inner];
         // (dy=0, dx=0, c=0) → index 0 in patch row.
