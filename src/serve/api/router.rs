@@ -607,4 +607,200 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 iter-209 (W77) — pool-routed AppState
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // Tests below exercise the `HotSwapManager`-backed `AppState`
+    // surface introduced by iter-209.  The default test state
+    // (`AppState::new`) ships an EMPTY pool with a 1 GiB synthetic
+    // memory budget (no real engine load), so every chat-completion
+    // request must fail through the auto-pipeline → Decision #26
+    // `400 model_not_loaded` path.  The new tests document the
+    // post-refactor invariants:
+    //
+    //   1. Empty pool + unresolvable req.model → 400 model_not_loaded
+    //      (the auto-pipeline rejects the input; the handler maps to
+    //      Decision #26's contract surface, preserving the OpenAI-
+    //      facing error shape pre-iter-209 callers depended on).
+    //   2. /v1/models with empty pool reports zero loaded entries.
+    //   3. Concurrent unresolvable requests serialize cleanly through
+    //      the cache mutex without poisoning state.
+    //   4. /metrics gauge `hf2q_model_loaded` is 0 when the pool is
+    //      empty (matches pre-iter-209 single-slot semantics for the
+    //      empty case).
+
+    #[tokio::test]
+    async fn iter209_chat_with_empty_pool_returns_model_not_loaded_for_unresolvable_name() {
+        // Empty pool + req.model="not-a-repo-or-path" → auto-pipeline
+        // rejects ("not on disk + not a valid HF repo-id") → handler
+        // maps to 400 `model_not_loaded` (Decision #26 contract).
+        let app = build_router(state_default());
+        let body = r#"{"model":"not-a-repo-or-path","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not-a-repo-or-path"),
+            "error message should name the unresolvable model: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn iter209_v1_models_empty_pool_reports_no_loaded_entries() {
+        // Empty pool + cache_dir = None → /v1/models returns an empty
+        // data array.  Pre-iter-209 same shape; post-iter-209 the
+        // `loaded` boolean is sourced from `pool.snapshot_engines()`
+        // (empty pool ⇒ no entries get marked loaded).
+        let cfg = ServerConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
+        let state = AppState::new(cfg);
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let data = v["data"].as_array().expect("data is array");
+        // No entries marked `loaded: true` when the pool is empty.
+        for entry in data {
+            let loaded = entry["loaded"].as_bool().unwrap_or(false);
+            assert!(
+                !loaded,
+                "no entry should be loaded with empty pool; got {entry}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn iter209_metrics_model_loaded_zero_with_empty_pool() {
+        // Pre-iter-209: hf2q_model_loaded gauge was `1` iff
+        // `state.engine.is_some()`.  Iter-209: gauge is `1` iff
+        // `pool.read().pool_stats().loaded_count > 0`.  Empty pool ⇒ 0.
+        let app = build_router(state_default());
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp).await;
+        // `hf2q_model_loaded 0` must appear on its own line.
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_model_loaded 0"),
+            "expected `hf2q_model_loaded 0` line; body:\n{}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn iter209_two_concurrent_unresolvable_requests_both_400() {
+        // Concurrent requests for the same unresolvable model — both
+        // serialize through the cache mutex inside `spawn_blocking`,
+        // both return 400 model_not_loaded; neither poisons the
+        // mutex (which would surface as a 500 on the third request).
+        let state = state_default();
+        let app1 = build_router(state.clone());
+        let app2 = build_router(state.clone());
+        let body = r#"{"model":"unresolvable-name","messages":[{"role":"user","content":"hi"}]}"#;
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (resp1, resp2) = tokio::join!(app1.oneshot(req1), app2.oneshot(req2));
+        let resp1 = resp1.unwrap();
+        let resp2 = resp2.unwrap();
+        assert_eq!(resp1.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        let v1: serde_json::Value = serde_json::from_str(&body_string(resp1).await).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&body_string(resp2).await).unwrap();
+        assert_eq!(v1["error"]["code"], "model_not_loaded");
+        assert_eq!(v2["error"]["code"], "model_not_loaded");
+
+        // Third request after both — proves the cache mutex was not
+        // poisoned (a poisoned mutex would surface as 500 on the third).
+        let app3 = build_router(state);
+        let req3 = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+        let v3: serde_json::Value = serde_json::from_str(&body_string(resp3).await).unwrap();
+        assert_eq!(v3["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn iter209_default_model_fallback_when_req_model_empty() {
+        // When req.model is empty and no default_model is set, handler
+        // maps to 400 model_not_loaded (no model name to resolve).
+        let app = build_router(state_default());
+        let body = r#"{"model":"","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+    }
+
+    #[tokio::test]
+    async fn iter209_default_model_fallback_uses_default_when_req_model_empty() {
+        // When req.model is empty BUT default_model is set, the
+        // handler routes through default_model.  Since "still-not-resolvable"
+        // is not a valid path or repo-id, this still maps to
+        // 400 model_not_loaded — but proves the fallback was consulted
+        // (otherwise we'd see an empty-string error message).
+        let cfg = ServerConfig::default();
+        let state = AppState::new(cfg).with_default_model(Some("still-not-resolvable".into()));
+        let app = build_router(state);
+        let body = r#"{"model":"","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // The error message should name the default-model fallback,
+        // proving the handler consulted it (not the empty req.model).
+        assert_eq!(v["error"]["code"], "model_not_loaded");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("still-not-resolvable"),
+            "expected default_model name in error: {v}"
+        );
+    }
 }
