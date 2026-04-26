@@ -429,16 +429,22 @@ pub fn apply_nomic_bert_encoder_block_gpu(
             (2 * weight_bytes_per_block_bf16) as u64,
             weight_elems_per_block,
         );
+        // Iter-87 perf: Q/K/V matmuls all read `input` and write to
+        // disjoint output buffers (q_proj, k_proj, v_proj). No RAW
+        // hazard between them — Metal's MTLDispatchType::Concurrent
+        // can overlap their execution. The single barrier AFTER V is
+        // sufficient: it gates the RoPE/attention reads of all three
+        // outputs that follow. Removing the inter-QKV barriers lets
+        // the GPU schedule the three matmuls concurrently when
+        // hardware resources allow.
         let q = bert_linear_bf16_gpu(
             encoder, registry, device, input, &q_w_bf16, q_b_ref, seq_len, hidden, hidden,
         )
         .context("nomic block: q_proj bf16 linear")?;
-        encoder.memory_barrier();
         let k = bert_linear_bf16_gpu(
             encoder, registry, device, input, &k_w_bf16, k_b_ref, seq_len, hidden, hidden,
         )
         .context("nomic block: k_proj bf16 linear")?;
-        encoder.memory_barrier();
         let v = bert_linear_bf16_gpu(
             encoder, registry, device, input, &v_w_bf16, v_b_ref, seq_len, hidden, hidden,
         )
@@ -450,12 +456,10 @@ pub fn apply_nomic_bert_encoder_block_gpu(
             encoder, registry, device, input, &q_w, q_b_ref, seq_len, hidden, hidden,
         )
         .context("nomic block: q_proj linear (f32 fallback)")?;
-        encoder.memory_barrier();
         let k = bert_linear_gpu(
             encoder, registry, device, input, &k_w, k_b_ref, seq_len, hidden, hidden,
         )
         .context("nomic block: k_proj linear (f32 fallback)")?;
-        encoder.memory_barrier();
         let v = bert_linear_gpu(
             encoder, registry, device, input, &v_w, v_b_ref, seq_len, hidden, hidden,
         )
@@ -580,6 +584,11 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     // `ops/silu_mul.rs:25-26`.
     let n_ffn = (seq_len as usize) * (intermediate as usize);
 
+    // Iter-87 perf: ffn_up and ffn_gate matmuls both read
+    // after_attn_norm and write to disjoint outputs (up_proj,
+    // gate_proj). No RAW between them — Metal can overlap the two
+    // matmuls. Single barrier AFTER both gates the silu_mul read of
+    // both outputs that follows.
     let up_proj = if let Some(up_w_bf16) = tensors.up_w_bf16 {
         bert_linear_bf16_gpu(
             encoder, registry, device, &after_attn_norm, up_w_bf16, tensors.up_b, seq_len, hidden,
@@ -593,7 +602,6 @@ pub fn apply_nomic_bert_encoder_block_gpu(
         )
         .context("nomic block: ffn_up linear (f32 fallback)")?
     };
-    encoder.memory_barrier();
 
     let gate_proj = if let Some(gate_w_bf16) = tensors.gate_w_bf16 {
         bert_linear_bf16_gpu(
