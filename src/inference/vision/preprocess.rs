@@ -135,18 +135,36 @@ pub fn preprocess_rgb_chw(bytes: &[u8], config: &PreprocessConfig) -> Result<Vec
 /// Knobs for the gemma4v patchifier. Defaults to llama.cpp's
 /// `PROJECTOR_TYPE_GEMMA4V` settings:
 ///   - `patch_size = 16`
-///   - `token_min = 252`, `token_max = 280`
-///     (`tools/mtmd/clip.cpp:1341` `set_limit_image_tokens(252, 280)`)
+///   - `n_merge = 3` (pool kernel size; pre-pool patch grid axes must
+///     be multiples of `n_merge` so the n_merge×n_merge avg-pool
+///     produces an exact integer post-pool grid)
+///   - `token_min = 252`, `token_max = 280` — **post-pool** token
+///     bounds per `tools/mtmd/clip.cpp:1341`
+///     `set_limit_image_tokens(252, 280)`. The `set_limit_image_tokens`
+///     helper at `tools/mtmd/clip-model.h:112-118` converts these to
+///     pixel bounds:
+///       `image_min_pixels = 252 * patch_size² * n_merge² = 580608`
+///       `image_max_pixels = 280 * patch_size² * n_merge² = 645120`.
+///     These pixel bounds are what `calc_size_preserved_ratio` actually
+///     consumes when picking the resized image dims; the resulting
+///     pre-pool patch grid `(n_x, n_y)` is therefore aligned to
+///     `align_size = patch_size * n_merge = 48` pixels — i.e. each
+///     axis is automatically a multiple of `n_merge`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4vPreprocessConfig {
     /// Patch edge length (square; pixel count per patch is `patch_size²`).
     pub patch_size: u32,
-    /// Lower bound on `N_patches = n_x * n_y` (inclusive). Small images
-    /// are upscaled until they meet this floor — llama.cpp does the same
+    /// Pool kernel size (n_merge × n_merge avg-pool after the ViT).
+    /// Pre-pool patch grid axes are constrained to be multiples of this.
+    pub n_merge: u32,
+    /// Lower bound on the **post-pool** token count, i.e.
+    /// `(n_x / n_merge) * (n_y / n_merge)` (inclusive). Small images
+    /// are upscaled to meet this floor — llama.cpp does the same
     /// (the `@ngxson` rationale: small inputs degrade quality without it).
     pub token_min: u32,
-    /// Upper bound on `N_patches` (inclusive). Large images are
-    /// downscaled (preserving aspect ratio) until the patch grid fits.
+    /// Upper bound on the **post-pool** token count (inclusive). Large
+    /// images are downscaled (preserving aspect ratio) until the
+    /// post-pool grid fits.
     pub token_max: u32,
 }
 
@@ -154,6 +172,7 @@ pub struct Gemma4vPreprocessConfig {
 /// the hf2q output matches the GGUF tower's expected token budget.
 pub const GEMMA4V_PREPROCESS_DEFAULT: Gemma4vPreprocessConfig = Gemma4vPreprocessConfig {
     patch_size: 16,
+    n_merge: 3,
     token_min: 252,
     token_max: 280,
 };
@@ -227,6 +246,9 @@ pub fn preprocess_gemma4v(
     if cfg.patch_size == 0 {
         return Err(anyhow!("gemma4v: patch_size must be > 0"));
     }
+    if cfg.n_merge == 0 {
+        return Err(anyhow!("gemma4v: n_merge must be > 0"));
+    }
     if cfg.token_max == 0 {
         return Err(anyhow!("gemma4v: token_max must be > 0"));
     }
@@ -255,7 +277,14 @@ pub fn preprocess_gemma4v(
     }
 
     let p = cfg.patch_size;
-    let (n_x, n_y) = compute_gemma4v_patch_grid(orig_w, orig_h, p, cfg.token_min, cfg.token_max)?;
+    let (n_x, n_y) = compute_gemma4v_patch_grid(
+        orig_w,
+        orig_h,
+        p,
+        cfg.n_merge,
+        cfg.token_min,
+        cfg.token_max,
+    )?;
     let target_w = n_x * p;
     let target_h = n_y * p;
 
@@ -304,108 +333,111 @@ pub fn preprocess_gemma4v(
     })
 }
 
-/// Compute `(n_x, n_y)` for a `(orig_w, orig_h)` image given a patch
-/// edge `p` and `[token_min, token_max]` total-patch bounds.
+/// Compute `(n_x, n_y)` — the pre-pool patch grid — for a
+/// `(orig_w, orig_h)` image given a patch edge `p`, pool kernel size
+/// `n_merge`, and `[token_min, token_max]` **post-pool** token bounds.
 ///
-/// Algorithm (matches the spirit of llama.cpp's
-/// `set_limit_image_tokens(252, 280)` at `clip.cpp:1341` — a single
-/// uniform-scale factor `s` is applied to both axes so aspect ratio is
-/// preserved, then each axis is rounded down to a multiple of `p`):
+/// This is a byte-faithful port of llama.cpp's
+/// `img_tool::calc_size_preserved_ratio(inp, align_size,
+/// min_pixels, max_pixels)`
+/// (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:144-168`), called by
+/// `mtmd_image_preprocessor_dyn_size::preprocess` at
+/// `/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:864-873` for
+/// `PROJECTOR_TYPE_GEMMA4V`. The pixel bounds come from
+/// `set_limit_image_tokens` at `clip-model.h:112-118` which converts
+/// the post-pool token bounds via
+///   `image_min_pixels = token_min * patch_size² * n_merge²`
+///   `image_max_pixels = token_max * patch_size² * n_merge²`.
 ///
-///   1. Start from `(orig_w / p, orig_h / p)` rounded down.
-///   2. If `n_x * n_y > token_max`, shrink: pick the largest scalar
-///      `s ≤ 1` such that `floor(s*orig_w / p) * floor(s*orig_h / p)
-///      ≤ token_max` via binary search.
-///   3. If `n_x * n_y < token_min`, grow: pick the smallest `s ≥ 1`
-///      such that `floor(s*orig_w / p) * floor(s*orig_h / p) ≥ token_min`.
-///      (We never let the resized image escape `[1, 64]` × original
-///      to bound the work; 64× is enough to inflate any 32-pixel
-///      thumbnail to ≥ 252 patches at p=16.)
-///   4. Each axis is clamped to `≥ 1` so we never emit a zero grid.
+/// Algorithm (this is "smart_resize" from the HF transformers code):
+///   - `align_size = p * n_merge` (= 48 for gemma4v defaults).
+///   - "Always align up first": `h_bar = max(align, round_by(h))`,
+///     `w_bar = max(align, round_by(w))`, where `round_by(x)` =
+///     `round(x/align)*align`.
+///   - If `h_bar*w_bar > max_pixels`: `beta = sqrt(h*w / max_pixels)`;
+///     `h_bar = max(align, floor_by(h/beta))`,
+///     `w_bar = max(align, floor_by(w/beta))`.
+///   - Else if `h_bar*w_bar < min_pixels`:
+///     `beta = sqrt(min_pixels / (h*w))`;
+///     `h_bar = ceil_by(h*beta)`, `w_bar = ceil_by(w*beta)`.
 ///
-/// Per-axis rounding uses floor() to never overshoot `token_max`. If
-/// the floor sweep can't satisfy `token_min` from above (e.g. a 1×N
-/// strip that can never be square), we accept the closest grid and
-/// let the caller decide (current callers don't care: the dual
-/// position-embed table is large enough to cover any small grid).
+/// Returned `(n_x, n_y) = (w_bar/p, h_bar/p)` — both are multiples of
+/// `n_merge` by construction, matching the gemma4v pool kernel's
+/// invariant. Post-pool token count = `(n_x/n_merge) * (n_y/n_merge)`.
 fn compute_gemma4v_patch_grid(
     orig_w: u32,
     orig_h: u32,
     p: u32,
+    n_merge: u32,
     token_min: u32,
     token_max: u32,
 ) -> Result<(u32, u32)> {
-    if orig_w < p || orig_h < p {
-        // Sub-patch input — emit a single patch via upscaling. Caller
-        // sees `n_x = n_y = 1` (so 1 patch); fail-fast below if we
-        // can't satisfy `token_min` either.
-        let n_x = (orig_w as f64 / p as f64).max(1.0).round() as u32;
-        let n_y = (orig_h as f64 / p as f64).max(1.0).round() as u32;
-        return Ok((n_x.max(1), n_y.max(1)));
+    let align_size: u64 = (p as u64) * (n_merge as u64);
+    if align_size == 0 {
+        return Err(anyhow!(
+            "gemma4v patch grid: align_size = patch_size ({p}) * n_merge ({n_merge}) is zero"
+        ));
     }
+    // Pixel-area bounds, mirroring `set_limit_image_tokens`
+    // (clip-model.h:112-118): patch_area = p² * n_merge².
+    let patch_area: u64 = (p as u64) * (p as u64) * (n_merge as u64) * (n_merge as u64);
+    let min_pixels: u64 = (token_min as u64) * patch_area;
+    let max_pixels: u64 = (token_max as u64) * patch_area;
 
-    // Helper: for a uniform scale s, compute (n_x, n_y) and total.
-    let grid_for_scale = |s: f64| -> (u32, u32, u64) {
-        let nx = ((orig_w as f64 * s) / p as f64).floor() as u32;
-        let ny = ((orig_h as f64 * s) / p as f64).floor() as u32;
-        let nx = nx.max(1);
-        let ny = ny.max(1);
-        (nx, ny, nx as u64 * ny as u64)
+    // Helpers: round / ceil / floor `x` to a multiple of `align_size`.
+    let round_by = |x: f64| -> u64 {
+        ((x / align_size as f64).round() as i64).max(0) as u64 * align_size
+    };
+    let ceil_by = |x: f64| -> u64 {
+        ((x / align_size as f64).ceil() as i64).max(0) as u64 * align_size
+    };
+    let floor_by = |x: f64| -> u64 {
+        ((x / align_size as f64).floor() as i64).max(0) as u64 * align_size
     };
 
-    let (mut nx, mut ny, mut total) = grid_for_scale(1.0);
+    let width = orig_w as u64;
+    let height = orig_h as u64;
 
-    if total > token_max as u64 {
-        // Binary search for largest s ≤ 1 with total ≤ token_max.
-        let mut lo: f64 = 1e-4;
-        let mut hi: f64 = 1.0;
-        for _ in 0..50 {
-            let mid = 0.5 * (lo + hi);
-            let (_, _, t) = grid_for_scale(mid);
-            if t > token_max as u64 {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        let (a, b, t) = grid_for_scale(lo);
-        nx = a;
-        ny = b;
-        total = t;
-    } else if total < token_min as u64 {
-        // Binary search for smallest s ≥ 1 with total ≥ token_min.
-        let mut lo: f64 = 1.0;
-        let mut hi: f64 = 64.0;
-        for _ in 0..50 {
-            let mid = 0.5 * (lo + hi);
-            let (_, _, t) = grid_for_scale(mid);
-            if t >= token_min as u64 {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        let (a, b, t) = grid_for_scale(hi);
-        nx = a;
-        ny = b;
-        total = t;
+    // "Always align up first" — clip-model.h:153-155.
+    let mut h_bar: u64 = align_size.max(round_by(height as f64));
+    let mut w_bar: u64 = align_size.max(round_by(width as f64));
+
+    if h_bar * w_bar > max_pixels {
+        // Shrink toward max_pixels.
+        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+        h_bar = align_size.max(floor_by(height as f64 / beta));
+        w_bar = align_size.max(floor_by(width as f64 / beta));
+    } else if h_bar * w_bar < min_pixels {
+        // Grow toward min_pixels.
+        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        h_bar = ceil_by(height as f64 * beta);
+        w_bar = ceil_by(width as f64 * beta);
     }
 
-    // After scaling, total may still exceed token_max if the binary
-    // search converged on a boundary where the floor() makes one more
-    // patch fit — re-clamp by shaving one row/col off the longer axis.
-    while total > token_max as u64 {
-        if nx >= ny && nx > 1 {
-            nx -= 1;
-        } else if ny > 1 {
-            ny -= 1;
-        } else {
-            break;
-        }
-        total = nx as u64 * ny as u64;
+    let n_x_u64 = w_bar / (p as u64);
+    let n_y_u64 = h_bar / (p as u64);
+    if n_x_u64 == 0 || n_y_u64 == 0 || n_x_u64 > u32::MAX as u64 || n_y_u64 > u32::MAX as u64 {
+        return Err(anyhow!(
+            "gemma4v patch grid: degenerate output ({} x {}) for input ({} x {})",
+            n_x_u64,
+            n_y_u64,
+            orig_w,
+            orig_h
+        ));
     }
+    let n_x = n_x_u64 as u32;
+    let n_y = n_y_u64 as u32;
 
-    Ok((nx, ny))
+    // Defensive: post-condition. Both axes must be multiples of n_merge
+    // (the gemma4v pool kernel invariant). With align_size = p*n_merge
+    // and `_bar` computed via *_by_factor on align_size, this is
+    // guaranteed mathematically; assert for paranoia.
+    debug_assert!(
+        n_x % n_merge == 0 && n_y % n_merge == 0,
+        "gemma4v patch grid: ({n_x},{n_y}) not aligned to n_merge={n_merge}"
+    );
+
+    Ok((n_x, n_y))
 }
 
 // ---------------------------------------------------------------------------
@@ -599,24 +631,36 @@ mod tests {
         // Locks the llama.cpp `set_limit_image_tokens(252, 280)` and
         // `n_merge=3`/`patch_size=16` reference values.
         assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.patch_size, 16);
+        assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.n_merge, 3);
         assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.token_min, 252);
         assert_eq!(GEMMA4V_PREPROCESS_DEFAULT.token_max, 280);
     }
 
     #[test]
-    fn gemma4v_preprocess_token_budget() {
+    fn gemma4v_preprocess_token_budget_post_pool() {
         // Three sizes spanning the budget regimes (small, on-target,
-        // large). All should land in [252, 280] after the patcher
-        // resizes.
+        // large). The post-pool token count `(n_x/n_merge) * (n_y/n_merge)`
+        // must land in `[token_min, token_max]` = `[252, 280]`. The
+        // pre-pool patch grid axes must each be multiples of
+        // `n_merge = 3` so the avg-pool kernel sees an exact integer
+        // grid (matches llama.cpp's
+        // `mtmd_image_preprocessor_dyn_size::preprocess` resize via
+        // `calc_size_preserved_ratio` with align_size = patch * n_merge).
+        let n_merge = GEMMA4V_PREPROCESS_DEFAULT.n_merge;
         for (w, h) in [(64u32, 64), (256, 256), (1024, 1024)] {
             let png = encode_solid_png(w, h, [128, 128, 128]);
             let out = preprocess_gemma4v(&png, &GEMMA4V_PREPROCESS_DEFAULT)
                 .unwrap_or_else(|e| panic!("({w},{h}): {e}"));
-            let n = out.n_patches();
+            assert_eq!(out.n_x % n_merge, 0, "({w},{h}) n_x={} not mul of {n_merge}", out.n_x);
+            assert_eq!(out.n_y % n_merge, 0, "({w},{h}) n_y={} not mul of {n_merge}", out.n_y);
+            let post_pool = (out.n_x / n_merge) * (out.n_y / n_merge);
             assert!(
-                (252..=280).contains(&n),
-                "({w},{h}) → {n} patches, expected [252, 280]"
+                (252..=280).contains(&post_pool),
+                "({w},{h}) → pre-pool ({},{}) → post-pool {post_pool} tokens, expected [252, 280]",
+                out.n_x,
+                out.n_y
             );
+            let n = out.n_patches();
             assert_eq!(out.patches.len(), (n as usize) * 16 * 16 * 3);
             assert_eq!(out.pos_x.len(), n as usize);
             assert_eq!(out.pos_y.len(), n as usize);
@@ -717,6 +761,7 @@ mod tests {
         let png = encode_solid_png(64, 64, [0, 0, 0]);
         let cfg = Gemma4vPreprocessConfig {
             patch_size: 16,
+            n_merge: 3,
             token_min: 300,
             token_max: 100,
         };
