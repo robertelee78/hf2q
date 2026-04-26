@@ -1316,6 +1316,28 @@ Verbatim outputs:
 
 ---
 
+#### Phase 2c iter-121 — gemma4v image preprocessor byte-faithful to mtmd-image.cpp (2026-04-26, W52, commit `f5d9748`)
+
+Ported the corner-aligned bilinear + truncation + pad-color flow from `/opt/llama.cpp/tools/mtmd/mtmd-image.cpp` into `src/inference/vision/preprocess.rs`. 24 preprocess + 238 vision tests PASS. Smoke vs four-dots fixture stayed image-blind ("Repeating text in five words." — no peer-overlap with llama-mtmd-cli's "An image of a square frame made of four"), so the preprocessor was a real fix but NOT the dominant cause; encoder is touched (output direction changed) but spatial differentiation isn't reaching the LM. Iter-122 hypothesis: ViT layernorm gain convention.
+
+---
+
+#### Phase 2c iter-122 — gemma4v ViT RMSNorm convention: drop spurious `(weight + 1)` gain (2026-04-26, W53, commit `8825ec3`)
+
+**Root cause.** hf2q's `gemma_rms_norm_forward` (CPU) and `vit_gemma_rms_norm_gpu` (GPU) applied `(weight + 1)` at all six gemma4v ViT block norm sites (input_layernorm, q_norm, k_norm, post_attention_layernorm, pre_feedforward_layernorm, post_feedforward_layernorm). That convention was copied from `/opt/candle/.../gemma4/vision.rs:39` `(&self.weight + 1.0)`. Audit against the HF transformers reference `models/gemma4/modeling_gemma4.py::Gemma4RMSNorm::forward` (lines 171-175) shows Gemma4 deliberately broke from Gemma3's `(1+weight)` convention and uses the literal weight (initialized to ones). llama.cpp's converter `Gemma4VisionAudioModel` (convert_hf_to_gguf.py:7805-7879) does NOT apply `+1` to any vision tensor — explicitly contrasted in the Gemma3VisionModel comment "the other norm values are part of SigLIP model, and they are already correct". Runtime `clip.cpp::clip_graph::build_norm` (lines 524-547) is plain `ggml_mul(cur, mw)`. Across 27 ViT blocks the unwarranted `+1` inflated gains by ~weight_mean and collapsed spatial differentiation.
+
+**Fix.** Made `gemma_rms_norm_forward` delegate to the existing `rms_norm_forward` and `vit_gemma_rms_norm_gpu` delegate to `vit_rms_norm_gpu`. The six call-sites in `gemma4v_block_forward` (CPU) and `gemma4v_block_forward_gpu` (GPU) are unchanged — only the inner math flipped. Side benefit: drops 2 buffer allocs + 1 `elementwise_add` dispatch + 1 `memory_barrier` per GPU norm call (× 6 sites × 27 layers per forward).
+
+**Smoke vs four-dots fixture (peer: "An image of a square frame made of four").**
+  - iter-121 hf2q: "Repeating text in five words." (image-blind)
+  - iter-122 hf2q: "Minimalist geometric pattern, white background." (image-aware — describes 4 dots on white BG)
+
+Bit-identical reproduction across two cold-process runs at T=0.0, max_tokens=16. No literal-word overlap with peer yet, but the encoder is now visibly producing usable image signal. Tests: `cargo test --release --bin hf2q -- vision::` 238/238 PASS. Build: `cargo build --release` PASS, 3 pre-existing warnings only.
+
+**Files touched.** `src/inference/vision/vit.rs`, `src/inference/vision/vit_gpu.rs`. Fenced files clean.
+
+---
+
 #### Phase 2c iter-118 BF16 arm — `HF2Q_VIT_F32_ATTENTION` audit + Phase 7 blocker: F32×F32 GEMM kernel does not exist in mlx-native (2026-04-25, W47)
 
 **Dispatch context.** W47 in /loop /cfa wave 42, parallel arm of iter-118. iter-118 (W28) closed vision tests fully green via kernel-registration fix; this BF16 arm tests W46 iter-117's top remaining soft-token-divergence suspect: the `vit_attention_gpu` BF16 K/V cast at gemma4v scale=1.0. Pi-brain `project_vit_attention_bf16_softmax_drift.md` documents that BF16-cast K perturbs logits by ~0.68 and flips saturated-softmax winners on SigLIP-49; gemma4v compounds this differently across 27 layers.
