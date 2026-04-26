@@ -235,23 +235,78 @@ fn mmproj_llama_cpp_load_gate_gemma4v() {
     phase_d_parity_proxy_t0_n16();
 }
 
-/// Phase C placeholder — iter-116b lands the actual `Command::spawn` of
-/// `llama-mtmd-cli -m <chat-gguf> --mmproj <mmproj-gguf> --image
-/// <fixture> -p "<prompt>" -n 16 --temperature 0 -no-cnv`,
-/// captures stderr, and asserts the absence of:
+/// Phase C — spawn `llama-mtmd-cli` against the hf2q-emitted mmproj +
+/// chat GGUF pair, capture stderr, and gate against the four CLIP
+/// loader regression substrings:
 ///
-///   - `clip.cpp:` error lines
-///   - `unsupported projector` substring
-///   - `tensor not found` substring
+///   - `clip.cpp:` (any error line emitted from the vendored clip loader)
+///   - `unsupported projector` (projector_type metadata mismatch)
+///   - `tensor not found` (writer dropped a tensor we still reference)
+///   - `error: ` (catch-all for any generic error: line)
 ///
-/// Captured stderr is logged to stdout via `eprintln!` for forensic
-/// review when the gate fires.
-#[allow(dead_code)]
+/// We force `LLAMA_ARG_MMPROJ_OFFLOAD=0` so the CLIP encoder runs on
+/// CPU (avoids fighting hf2q's Metal context for VRAM under a quiet
+/// host). T=0 + n=16 keeps the smoke fast (~30 s decode after the
+/// ~5 min model load).
+///
+/// The full stderr/stdout byte counts are logged via `eprintln!` for
+/// forensic review when the gate fires; the verbatim stderr is
+/// inlined in the assertion failure message.
 fn phase_c_llama_mtmd_stderr_smoke() {
-    panic!(
-        "[Phase C] llama-mtmd-cli spawn not implemented in iter-116a. \
-         Lands in iter-116b. See {} for run instructions.",
-        file!()
+    let output = std::process::Command::new(LLAMA_MTMD_BIN)
+        .args([
+            "-m", CHAT_GGUF_PATH,
+            "--mmproj", MMPROJ_PATH,
+            "--image", FIXTURE_IMAGE,
+            "-p", "Describe this image in 5 words.",
+            "-n", "16",
+            "--temperature", "0",
+            "-no-cnv",
+        ])
+        .env("LLAMA_ARG_MMPROJ_OFFLOAD", "0")
+        .output()
+        .expect("[Phase C] llama-mtmd-cli spawn failed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stderr.contains("clip.cpp:"),
+        "[Phase C] llama-mtmd-cli reported clip.cpp errors:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("unsupported projector"),
+        "[Phase C] llama-mtmd-cli reported unsupported projector:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("tensor not found"),
+        "[Phase C] llama-mtmd-cli reported missing tensor:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("error: "),
+        "[Phase C] llama-mtmd-cli reported a generic error:\n{}",
+        stderr
+    );
+
+    assert!(
+        output.status.success(),
+        "[Phase C] llama-mtmd-cli exited non-zero: {:?}\nstderr:\n{}",
+        output.status,
+        stderr
+    );
+    assert!(
+        !stdout.is_empty(),
+        "[Phase C] llama-mtmd-cli produced no stdout"
+    );
+
+    eprintln!(
+        "[mmproj-llama-cpp-compat] Phase C llama-mtmd-cli load gate PASS — \
+         stdout={} bytes, stderr={} bytes",
+        stdout.len(),
+        stderr.len()
     );
 }
 
