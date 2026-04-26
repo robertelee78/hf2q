@@ -3181,11 +3181,15 @@ mod multimodal_tests {
         assert_eq!(got.len(), 1);
         match &got[0] {
             VisionInput::Gemma4v(g) => {
-                // 256×256 input @ patch_size=16 → 16×16=256 patches; this
-                // sits inside the [252, 280] budget so the patcher
-                // accepts it without rescale.
-                assert_eq!(g.n_x, 16);
-                assert_eq!(g.n_y, 16);
+                // W44 iter-116k: post iter-116j n_merge rounding, the
+                // 256×256 fixture is upscaled to align with
+                // `align_size = patch_size * n_merge = 48px`; the
+                // smallest multiple of 48 in [580608, 645120] pixel
+                // budget is 768×768 → 48×48 = 2304 pre-pool patches
+                // (post-pool: (48/3)² = 256 tokens, inside the
+                // [252, 280] post-pool token budget).
+                assert_eq!(g.n_x, 48);
+                assert_eq!(g.n_y, 48);
                 let n = (g.n_x as usize) * (g.n_y as usize);
                 assert_eq!(g.patches.len(), n * 16 * 16 * 3);
                 assert_eq!(g.pos_x.len(), n);

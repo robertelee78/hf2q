@@ -2766,19 +2766,34 @@ pub fn vit_gelu_pytorch_tanh_gpu(
 ///   k_full  = repeat_kv(k, num_kv_groups)
 ///   v_full  = repeat_kv(v, num_kv_groups)
 ///   attn    = vit_attention(q, k_full, v_full, scale=1.0)
-///   out     = linear(attn, attn_output.weight)
-///   out     = gemma_rms_norm(out, ln2.weight)    # post_attention_layernorm
+///   out     = linear(attn, attn_out.weight)
+///   out     = gemma_rms_norm(out, attn_post_norm.weight)  # post_attention_layernorm
 ///   x_mid   = x_in + out
 ///
-///   cur     = gemma_rms_norm(x_mid, ffn_norm.weight)
+///   cur     = gemma_rms_norm(x_mid, ln2.weight)           # pre_feedforward_layernorm
 ///   gate    = linear(cur, ffn_gate.weight)
 ///   up      = linear(cur, ffn_up.weight)
 ///   gate    = gelu_pytorch_tanh(gate)
 ///   activated = gate * up
 ///   down    = linear(activated, ffn_down.weight)
-///   down    = gemma_rms_norm(down, post_ffw_norm.weight)
+///   down    = gemma_rms_norm(down, ffn_post_norm.weight)  # post_feedforward_layernorm
 ///   x_out   = x_mid + down
 /// ```
+///
+/// # Tensor name lineage (W44 iter-116k)
+///
+/// Gemma4v vision-namespace short forms per
+/// `/opt/llama.cpp/tools/mtmd/clip-impl.h`:
+///   - `attn_out.weight`        — TN_ATTN_OUTPUT (l.82, W34 iter-116e)
+///   - `attn_post_norm.weight`  — TN_ATTN_POST_NORM (l.94, post-attention norm)
+///   - `ln2.weight`             — TN_LN_2 (l.90, pre-FFN norm — W36 iter-116f
+///                                renamed `pre_feedforward_layernorm` → `ln2`)
+///   - `ffn_post_norm.weight`   — TN_FFN_POST_NORM (l.95, post-FFN norm —
+///                                W36 iter-116f renamed
+///                                `post_feedforward_layernorm` → `ffn_post_norm`)
+/// `block_tensor` accepts the legacy `attn_output` / `post_ffw_norm`
+/// aliases bidirectionally; the ln1/ln2/attn_post_norm/ffn_post_norm
+/// reads here use the canonical short forms emitted by W36+ writers.
 ///
 /// `pos_x_idx` / `pos_y_idx` are u32 buffers of length `batch` (= num_patches).
 ///
@@ -2952,7 +2967,12 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &attn,
-        block("attn_output.weight")?,
+        // W44 iter-116k: TN_ATTN_OUTPUT short form `attn_out` per
+        // /opt/llama.cpp/tools/mtmd/clip-impl.h:82 (W34 iter-116e
+        // writer rename). `block_tensor`'s legacy alias still
+        // accepts `attn_output.weight`, but this site uses the
+        // canonical name to match the writer's emit.
+        block("attn_out.weight")?,
         batch,
         hidden,
         hidden,
@@ -2964,7 +2984,14 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &attn_proj,
-        block("ln2.weight")?,
+        // W44 iter-116k: post-attention norm is `attn_post_norm`
+        // (TN_ATTN_POST_NORM, clip-impl.h:94), NOT `ln2`. W36
+        // iter-116f writer maps HF `post_attention_layernorm` →
+        // `attn_post_norm.weight` per
+        // /opt/llama.cpp/gguf-py/gguf/constants.py:1218
+        // (V_ENC_ATTN_POST_NORM). Build_vit consumes via
+        // `layer.attn_post_norm_w` (clip.cpp:439-441).
+        block("attn_post_norm.weight")?,
         batch,
         hidden,
         eps,
@@ -2980,7 +3007,13 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &x_mid,
-        block("ffn_norm.weight")?,
+        // W44 iter-116k: pre-FFN norm is `ln2` (TN_LN_2,
+        // clip-impl.h:90), NOT `ffn_norm`. W36 iter-116f writer
+        // maps HF `pre_feedforward_layernorm` → `ln2.weight` per
+        // /opt/llama.cpp/gguf-py/gguf/constants.py:1214
+        // (V_ENC_POST_ATTN_NORM = "v.blk.{bid}.ln2"). Build_vit
+        // consumes via `layer.ln_2_w` (clip.cpp:452).
+        block("ln2.weight")?,
         batch,
         hidden,
         eps,
@@ -3050,7 +3083,15 @@ pub fn gemma4v_block_forward_gpu(
         registry,
         device,
         &down,
-        block("post_ffw_norm.weight")?,
+        // W44 iter-116k: post-FFN norm is `ffn_post_norm`
+        // (TN_FFN_POST_NORM, clip-impl.h:95). W36 iter-116f writer
+        // maps HF `post_feedforward_layernorm` →
+        // `ffn_post_norm.weight` per
+        // /opt/llama.cpp/gguf-py/gguf/constants.py:1219
+        // (V_ENC_FFN_POST_NORM). `block_tensor`'s legacy alias
+        // still accepts `post_ffw_norm.weight`, but this site
+        // uses the canonical name to match the writer's emit.
+        block("ffn_post_norm.weight")?,
         batch,
         hidden,
         eps,
@@ -6300,17 +6341,25 @@ mod tests {
         };
         // Layer index = 0.
         let block_key = |suffix: &str| format!("v.blk.0.{}", suffix);
+        // W44 iter-116k: emit-name semantics aligned with W36 iter-116f
+        // writer renames; canonical short forms per
+        // /opt/llama.cpp/tools/mtmd/clip-impl.h.
+        //   - ln1            = pre-attention norm                     (l.89)
+        //   - attn_post_norm = post-attention norm   (was: ln2)        (l.94)
+        //   - ln2            = pre-FFN norm          (was: ffn_norm)   (l.90)
+        //   - ffn_post_norm  = post-FFN norm         (was: post_ffw)   (l.95)
+        //   - attn_out       = attn output projection (was: attn_output) (l.82)
         put(&mut tensors, &device, block_key("ln1.weight"), &input_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("ln2.weight"), &post_attn_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("ffn_norm.weight"), &pre_ff_ln, vec![hidden]);
-        put(&mut tensors, &device, block_key("post_ffw_norm.weight"), &post_ff_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("attn_post_norm.weight"), &post_attn_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("ln2.weight"), &pre_ff_ln, vec![hidden]);
+        put(&mut tensors, &device, block_key("ffn_post_norm.weight"), &post_ff_ln, vec![hidden]);
         put(&mut tensors, &device, block_key("attn_q.weight"), &q_w,
             vec![num_heads * head_dim, hidden]);
         put(&mut tensors, &device, block_key("attn_k.weight"), &k_w,
             vec![num_kv_heads * head_dim, hidden]);
         put(&mut tensors, &device, block_key("attn_v.weight"), &v_w,
             vec![num_kv_heads * head_dim, hidden]);
-        put(&mut tensors, &device, block_key("attn_output.weight"), &o_w,
+        put(&mut tensors, &device, block_key("attn_out.weight"), &o_w,
             vec![hidden, num_heads * head_dim]);
         put(&mut tensors, &device, block_key("attn_q_norm.weight"), &q_n, vec![head_dim]);
         put(&mut tensors, &device, block_key("attn_k_norm.weight"), &k_n, vec![head_dim]);
@@ -6508,6 +6557,14 @@ mod tests {
         );
 
         // Per-block tensors × num_layers.
+        // W44 iter-116k: emit-name semantics aligned with W36 iter-116f
+        // writer renames. Canonical short forms per
+        // /opt/llama.cpp/tools/mtmd/clip-impl.h:
+        //   - ln1            (l.89) — pre-attention norm
+        //   - attn_post_norm (l.94) — post-attention norm   (was: ln2)
+        //   - ln2            (l.90) — pre-FFN norm          (was: ffn_norm)
+        //   - ffn_post_norm  (l.95) — post-FFN norm         (was: post_ffw_norm)
+        //   - attn_out       (l.82) — attn output proj      (was: attn_output)
         for layer_idx in 0..num_layers {
             let prefix = format!("v.blk.{}.", layer_idx);
             put(
@@ -6520,21 +6577,21 @@ mod tests {
             put(
                 &mut tensors,
                 &device,
-                format!("{prefix}ln2.weight"),
+                format!("{prefix}attn_post_norm.weight"),
                 &mk(0.022 + layer_idx as f32 * 0.001, hidden as usize),
                 vec![hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
-                format!("{prefix}ffn_norm.weight"),
+                format!("{prefix}ln2.weight"),
                 &mk(0.023 + layer_idx as f32 * 0.001, hidden as usize),
                 vec![hidden as usize],
             );
             put(
                 &mut tensors,
                 &device,
-                format!("{prefix}post_ffw_norm.weight"),
+                format!("{prefix}ffn_post_norm.weight"),
                 &mk(0.024 + layer_idx as f32 * 0.001, hidden as usize),
                 vec![hidden as usize],
             );
@@ -6562,7 +6619,7 @@ mod tests {
             put(
                 &mut tensors,
                 &device,
-                format!("{prefix}attn_output.weight"),
+                format!("{prefix}attn_out.weight"),
                 &mk(0.037 + layer_idx as f32 * 0.001, (hidden * num_heads * head_dim) as usize),
                 vec![hidden as usize, (num_heads * head_dim) as usize],
             );
