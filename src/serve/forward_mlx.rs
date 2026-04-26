@@ -546,6 +546,23 @@ pub struct MlxModelWeights {
     /// so each regime's stderr `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]` lines
     /// start at `step=0`.
     pub decode_regime: DecodeRegime,
+    /// Cached startup-time flag: true iff none of the iter-108a Gate H
+    /// runtime hooks are active. When true, the decode hot path skips
+    /// per-token NLL emit, decode-emit, decode-replay, the `decode_step`
+    /// counter mutation, AND the per-layer `decode_regime` enum match —
+    /// keeping pre-iter-108a per-token cost bit-for-bit (W14b 5.6%
+    /// regression: 95.0 → 100.6 tok/s baseline, 2026-04-25).
+    ///
+    /// Computed at construction from `INVESTIGATION_ENV` (a `LazyLock`
+    /// that is populated exactly once per process via `from_env`) and
+    /// the `decode_regime` field.  Re-evaluated only inside
+    /// [`MlxModelWeights::set_decode_regime`] (since a non-Default
+    /// regime requires the per-layer SDPA-gate match path to run).
+    /// Never read or written on the per-token hot path beyond the
+    /// initial single load — LLVM hoists the bool check above the
+    /// per-layer loop and the per-token tail, so the entire
+    /// instrumentation block becomes dead code under `if !gate_h_inactive`.
+    pub gate_h_inactive: bool,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -1045,6 +1062,20 @@ impl MlxModelWeights {
             // Default == today's env-var-only path; setter flips it for two-
             // regime-one-process release-check runs.
             decode_regime: DecodeRegime::Default,
+            // iter-108a-fix (W15, 2026-04-25): cache the "Gate H inactive"
+            // predicate so the decode hot path can elide the per-token
+            // NLL/emit/replay block AND the per-layer regime-match site
+            // when no Gate H hooks are armed. INVESTIGATION_ENV is a
+            // process-lifetime LazyLock so this snapshot stays valid
+            // until set_decode_regime is called (which refreshes it).
+            gate_h_inactive: {
+                let env = &*INVESTIGATION_ENV;
+                !env.emit_nll
+                    && !env.decode_emit_tokens
+                    && env.decode_input_tokens.is_empty()
+                // decode_regime is Default at construction, so the regime
+                // arm is true here without an extra read.
+            },
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1097,6 +1128,16 @@ impl MlxModelWeights {
     pub fn set_decode_regime(&mut self, regime: DecodeRegime) {
         self.decode_regime = regime;
         self.decode_step = 0;
+        // iter-108a-fix (W15): re-evaluate the Gate H elision flag.
+        // Non-Default regime forces the per-layer SDPA-gate match path,
+        // so we can't elide it; the env-var hooks could still be off,
+        // but we only treat the path as "inactive" when ALL Gate H
+        // surfaces are quiet (env hooks unset AND regime is Default).
+        let env = &*INVESTIGATION_ENV;
+        self.gate_h_inactive = matches!(regime, DecodeRegime::Default)
+            && !env.emit_nll
+            && !env.decode_emit_tokens
+            && env.decode_input_tokens.is_empty();
     }
 
     /// Run one decode step through mlx-native's GraphExecutor.
@@ -1995,8 +2036,36 @@ impl MlxModelWeights {
                 // bits gates remain env-driven because the codebook width is a
                 // representation choice consistent across both regimes.  See
                 // `MlxModelWeights::set_decode_regime` for the contract.
+                // iter-108a-fix (W15, 2026-04-25): when `gate_h_inactive` is true
+                // (the default — no Gate H env hooks armed and regime is Default),
+                // skip the regime-match arm entirely and use the pre-iter-108a
+                // env-var-only path verbatim. This restores the byte-identical
+                // hot-path branch sequence to the iter-108a base commit
+                // (`1bcf172`). When Gate H is active, the regime override is
+                // consulted as before. Per-layer = ~30× per token; the saved
+                // enum-field load + match across the layer loop is the bulk of
+                // the W14b 5.6% regression.
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
+                } else if self.gate_h_inactive {
+                    // Pre-iter-108a path: env-var-only. Bit-identical to base.
+                    if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
+                        true
+                    } else {
+                        match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
+                            Ok("dense_all") => true,
+                            Ok("tq_all") | Err(_) => false,
+                            Ok("tq_slide_dense_global") => !kv_is_sliding,
+                            Ok("dense_slide_tq_global") => kv_is_sliding,
+                            Ok(other) => {
+                                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
+                                }
+                                false
+                            }
+                        }
+                    }
                 } else {
                     match self.decode_regime {
                         DecodeRegime::ForceDense => true,
@@ -3295,46 +3364,62 @@ impl MlxModelWeights {
         // production decode path.  iter-108b will replace the audit
         // binaries with a release-check.sh-driven Gate 5; for that to
         // work, the production binary itself must honor the contract.
+        //
+        // iter-108a-fix (W15, 2026-04-25): the entire block below is gated
+        // behind `self.gate_h_inactive` so that pre-iter-108a per-token
+        // cost is restored when no Gate H hooks are armed (W14b regression
+        // 95.0 → 100.6 tok/s baseline). The flag is computed once at
+        // construction (`from_gguf_with_options`) and refreshed only by
+        // `set_decode_regime`; reading it here is a single field load + a
+        // single branch, which LLVM/the M-series CPU hoists out of any
+        // surrounding loop and skips entirely on the false branch.
         // -----------------------------------------------------------------
-        let env = &*INVESTIGATION_ENV;
-        let step = self.decode_step;
-        // Replay first — substitute picked token before NLL/emit so both
-        // downstream observers see the SAME token id (otherwise a replay
-        // run would emit replay tokens but NLL the original argmax pick).
-        let final_token = if !env.decode_input_tokens.is_empty()
-            && (step as usize) < env.decode_input_tokens.len()
-        {
-            env.decode_input_tokens[step as usize]
-        } else {
-            token_id
-        };
-        if env.emit_nll {
-            // token_nll_from_logits asserts token_id < vocab_size; replay
-            // tokens come from the user, so guard against an out-of-vocab
-            // entry rather than panicking the whole decode loop.
-            if (final_token as usize) < self.vocab_size {
-                match self.token_nll_from_logits(final_token) {
-                    Ok(nll) => eprintln!(
-                        "[HF2Q_NLL] step={step} token={final_token} nll={nll:.6}"
-                    ),
-                    Err(e) => eprintln!(
-                        "[HF2Q_NLL] step={step} token={final_token} error={e}"
-                    ),
-                }
+        if !self.gate_h_inactive {
+            let env = &*INVESTIGATION_ENV;
+            let step = self.decode_step;
+            // Replay first — substitute picked token before NLL/emit so both
+            // downstream observers see the SAME token id (otherwise a replay
+            // run would emit replay tokens but NLL the original argmax pick).
+            let final_token = if !env.decode_input_tokens.is_empty()
+                && (step as usize) < env.decode_input_tokens.len()
+            {
+                env.decode_input_tokens[step as usize]
             } else {
-                eprintln!(
-                    "[HF2Q_NLL] step={step} token={final_token} \
-                     error=token_id_out_of_vocab vocab_size={}",
-                    self.vocab_size
-                );
+                token_id
+            };
+            if env.emit_nll {
+                // token_nll_from_logits asserts token_id < vocab_size; replay
+                // tokens come from the user, so guard against an out-of-vocab
+                // entry rather than panicking the whole decode loop.
+                if (final_token as usize) < self.vocab_size {
+                    match self.token_nll_from_logits(final_token) {
+                        Ok(nll) => eprintln!(
+                            "[HF2Q_NLL] step={step} token={final_token} nll={nll:.6}"
+                        ),
+                        Err(e) => eprintln!(
+                            "[HF2Q_NLL] step={step} token={final_token} error={e}"
+                        ),
+                    }
+                } else {
+                    eprintln!(
+                        "[HF2Q_NLL] step={step} token={final_token} \
+                         error=token_id_out_of_vocab vocab_size={}",
+                        self.vocab_size
+                    );
+                }
             }
+            if env.decode_emit_tokens {
+                eprintln!("[HF2Q_DECODE_EMIT] step={step} token={final_token}");
+            }
+            // Only mutate decode_step when Gate H is active — pre-iter-108a
+            // the field did not exist, and writing to it every token even
+            // when no observer reads it is a per-token RMW that defeats
+            // the rest of the elision.
+            self.decode_step = self.decode_step.saturating_add(1);
+            return Ok(final_token);
         }
-        if env.decode_emit_tokens {
-            eprintln!("[HF2Q_DECODE_EMIT] step={step} token={final_token}");
-        }
-        self.decode_step = self.decode_step.saturating_add(1);
 
-        Ok(final_token)
+        Ok(token_id)
     }
 
     // forward_prefill() is defined in forward_prefill.rs (ADR-009 Track 1).
