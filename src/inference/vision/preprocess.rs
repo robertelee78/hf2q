@@ -41,9 +41,27 @@
 //!      mapping.
 //!
 //! The existing `preprocess_rgb_chw` is unchanged.
+//!
+//! # ADR-005 Phase 2c iter-121 (W52) — peer-parity resize
+//!
+//! Earlier iters used `image::imageops::FilterType::Triangle` for the
+//! gemma4v resize step. That's a separable triangle filter with
+//! pixel-center sampling and round-to-nearest output — which does NOT
+//! match llama.cpp's `mtmd_image_preprocessor_dyn_size` reference. The
+//! peer's algorithm is corner-aligned bilinear interpolation followed
+//! by truncation-to-uint8 (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:200-236`,
+//! `static_cast<uint8_t>(lerp(...))`). For sparse-signal fixtures
+//! (e.g. four corner dots on white), the difference between
+//! corner-aligned + truncation and center-aligned + round-to-nearest
+//! is large enough to flip patch-level pixel values and produce a
+//! qualitatively different ViT input — exactly what was observed in
+//! iter-117 through iter-120 (hf2q text "image-blind" vs llama-mtmd-cli
+//! "square frame made of four"). This iter ports the byte-faithful
+//! algorithm into hf2q so the variable-resolution patch tensor matches
+//! `llama-mtmd-cli`'s for the same input bytes.
 
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, GenericImageView, ImageFormat};
+use image::{imageops::FilterType, GenericImageView, ImageBuffer, ImageFormat, Rgb, RgbImage};
 
 /// Preprocessing knobs for a specific ViT model family.
 #[derive(Debug, Clone, PartialEq)]
@@ -288,8 +306,19 @@ pub fn preprocess_gemma4v(
     let target_w = n_x * p;
     let target_h = n_y * p;
 
-    let resized = img.resize_exact(target_w, target_h, FilterType::Triangle);
-    let rgb = resized.to_rgb8();
+    // ADR-005 Phase 2c iter-121 (W52): byte-faithful match against
+    // `llama-mtmd-cli`'s `mtmd_image_preprocessor_dyn_size::preprocess`
+    // (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:859-878`). The peer's
+    // `img_tool::resize` is called with `image_resize_pad = true`
+    // (default in `clip-model.h:54` — gemma4v's projector init at
+    // `clip.cpp:1334-1343` does not override it), so we replicate the
+    // padded-resize branch with a black `pad_color` (`clip-model.h:55`,
+    // `image_pad_color = {0,0,0}`). Bilinear sampling is corner-aligned
+    // with truncation-to-uint8, NOT the image crate's
+    // `FilterType::Triangle` (center-aligned, round-to-nearest); see
+    // `mtmd-image.cpp:200-236`.
+    let src_rgb = img.to_rgb8();
+    let rgb = resize_bilinear_pad_llama_cpp(&src_rgb, target_w, target_h, [0, 0, 0]);
 
     let n_patches = (n_x as usize) * (n_y as usize);
     let p_us = p as usize;
@@ -438,6 +467,156 @@ fn compute_gemma4v_patch_grid(
     );
 
     Ok((n_x, n_y))
+}
+
+// ---------------------------------------------------------------------------
+// Byte-faithful llama.cpp bilinear resize (ADR-005 Phase 2c iter-121, W52)
+// ---------------------------------------------------------------------------
+
+/// Corner-aligned bilinear resize matching llama.cpp's
+/// `img_tool::resize_bilinear` byte-for-byte (`/opt/llama.cpp/tools/mtmd/
+/// mtmd-image.cpp:200-236`).
+///
+/// Differences vs `image::imageops::FilterType::Triangle`:
+///   - **Sampling alignment**: uses `x_ratio = (src_w-1)/(target_w-1)`
+///     (vertex/corner-aligned — corners coincide), NOT center-aligned
+///     `(src_w/target_w)` with half-pixel offsets.
+///   - **Bounds clamping**: when integer truncation puts `x0` at the last
+///     column, `x1 = min(x0+1, src_w-1)` clamps to the last column, so
+///     edge pixels are weighted-blended with themselves (degenerate lerp).
+///   - **No antialiasing**: even when downscaling, no kernel widening —
+///     this is a 2×2 nearest-neighbor lerp regardless of scale ratio.
+///   - **u8 cast**: `static_cast<uint8_t>(lerp(top, bottom, yf))` — C++
+///     truncation-toward-zero of a non-negative float is `floor`, NOT
+///     round-to-nearest.
+fn resize_bilinear_llama_cpp(src: &RgbImage, target_w: u32, target_h: u32) -> RgbImage {
+    let src_w = src.width();
+    let src_h = src.height();
+    if target_w == 0 || target_h == 0 || src_w == 0 || src_h == 0 {
+        return ImageBuffer::new(target_w.max(1), target_h.max(1));
+    }
+    if src_w == target_w && src_h == target_h {
+        return src.clone();
+    }
+
+    // Match `mtmd-image.cpp:209-210` exactly (vertex-aligned ratio).
+    let x_ratio = if target_w > 1 {
+        (src_w as f32 - 1.0) / (target_w as f32 - 1.0)
+    } else {
+        0.0
+    };
+    let y_ratio = if target_h > 1 {
+        (src_h as f32 - 1.0) / (target_h as f32 - 1.0)
+    } else {
+        0.0
+    };
+
+    let mut dst: RgbImage = ImageBuffer::new(target_w, target_h);
+    let src_w_i = src_w as i32;
+    let src_h_i = src_h as i32;
+
+    for y in 0..target_h {
+        for x in 0..target_w {
+            let px = x as f32 * x_ratio;
+            let py = y as f32 * y_ratio;
+
+            // `std::min(static_cast<int>(px), src.nx - 1)` —
+            // C++ int-cast of non-negative float is truncation = floor.
+            let x0 = (px as i32).min(src_w_i - 1).max(0);
+            let y0 = (py as i32).min(src_h_i - 1).max(0);
+            let x1 = (x0 + 1).min(src_w_i - 1);
+            let y1 = (y0 + 1).min(src_h_i - 1);
+
+            let xf = px - (x0 as f32);
+            let yf = py - (y0 as f32);
+
+            let p00 = src.get_pixel(x0 as u32, y0 as u32).0;
+            let p10 = src.get_pixel(x1 as u32, y0 as u32).0;
+            let p01 = src.get_pixel(x0 as u32, y1 as u32).0;
+            let p11 = src.get_pixel(x1 as u32, y1 as u32).0;
+
+            let mut out = [0u8; 3];
+            for c in 0..3 {
+                // lerp(s, e, t) = s + (e - s) * t  (mtmd-image.cpp:558-560)
+                let top = (p00[c] as f32) + ((p10[c] as f32) - (p00[c] as f32)) * xf;
+                let bottom = (p01[c] as f32) + ((p11[c] as f32) - (p01[c] as f32)) * xf;
+                let v = top + (bottom - top) * yf;
+                // C++ `static_cast<uint8_t>(positive_float)` = truncation = floor.
+                // Clamp to [0, 255] for paranoia (lerp of u8s in [0, 255]
+                // with t ∈ [0, 1] is already in-range, but defensive).
+                out[c] = v.clamp(0.0, 255.0) as u8;
+            }
+            dst.put_pixel(x, y, Rgb(out));
+        }
+    }
+    dst
+}
+
+/// Resize-with-padding match for `img_tool::resize` with
+/// `add_padding = true` (`/opt/llama.cpp/tools/mtmd/mtmd-image.cpp:68-98`).
+///
+///   - Compute `scale = min(target_w/src.nx, target_h/src.ny)` —
+///     fit-inside, aspect-ratio preserving.
+///   - `new_w = min(ceil(src.nx * scale), target_w)`,
+///     `new_h = min(ceil(src.ny * scale), target_h)`.
+///   - Bilinear-resize to `(new_w, new_h)` via
+///     `resize_bilinear_llama_cpp`.
+///   - Allocate `target_w × target_h` filled with `pad_color`, composite
+///     resized image at `((target_w - new_w)/2, (target_h - new_h)/2)`
+///     (center).
+///
+/// For square inputs where target is square (the common gemma4v case
+/// after `calc_size_preserved_ratio`), `new_w == target_w` and
+/// `new_h == target_h`, so the padding is a no-op and behavior reduces
+/// to plain bilinear. For non-square inputs the center-pad is what
+/// llama.cpp emits, and we match it.
+fn resize_bilinear_pad_llama_cpp(
+    src: &RgbImage,
+    target_w: u32,
+    target_h: u32,
+    pad_color: [u8; 3],
+) -> RgbImage {
+    let src_w = src.width();
+    let src_h = src.height();
+    if src_w == target_w && src_h == target_h {
+        return src.clone();
+    }
+    if target_w == 0 || target_h == 0 || src_w == 0 || src_h == 0 {
+        return ImageBuffer::new(target_w.max(1), target_h.max(1));
+    }
+
+    // `mtmd-image.cpp:71-75`.
+    let scale_w = (target_w as f32) / (src_w as f32);
+    let scale_h = (target_h as f32) / (src_h as f32);
+    let scale = scale_w.min(scale_h);
+
+    let new_w_f = (src_w as f32) * scale;
+    let new_h_f = (src_h as f32) * scale;
+    // `std::ceil` then min-clamp to target.
+    let new_w = (new_w_f.ceil() as i64).min(target_w as i64).max(1) as u32;
+    let new_h = (new_h_f.ceil() as i64).min(target_h as i64).max(1) as u32;
+
+    let resized = resize_bilinear_llama_cpp(src, new_w, new_h);
+
+    // Fill dst with pad_color (`mtmd-image.cpp:92` + `fill` lambda
+    // `mtmd-image.cpp:189-196`).
+    let mut dst: RgbImage = ImageBuffer::from_pixel(target_w, target_h, Rgb(pad_color));
+
+    // Composite at center (`mtmd-image.cpp:94-97`).
+    let offset_x = ((target_w - new_w) / 2) as i32;
+    let offset_y = ((target_h - new_h) / 2) as i32;
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let dx = (x as i32) + offset_x;
+            let dy = (y as i32) + offset_y;
+            if dx < 0 || dy < 0 || dx >= target_w as i32 || dy >= target_h as i32 {
+                continue;
+            }
+            let p = *resized.get_pixel(x, y);
+            dst.put_pixel(dx as u32, dy as u32, p);
+        }
+    }
+    dst
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +933,144 @@ mod tests {
         };
         let err = preprocess_gemma4v(&png, &cfg).unwrap_err();
         assert!(format!("{err}").contains("patch_size"));
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-005 Phase 2c iter-121 (W52) — byte-faithful llama.cpp resize
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resize_bilinear_llama_cpp_corner_aligned_identity_2x2_to_3x3() {
+        // 2×2 input with each pixel a unique value; resize to 3×3.
+        // Corner-aligned bilinear with x_ratio = (2-1)/(3-1) = 0.5 means
+        // output position (0,0) samples src(0,0), (2,2) samples src(1,1)
+        // (corners are exact). Center (1,1) bilinear-blends all four src.
+        // This locks "vertex-aligned" sampling; image::Triangle would
+        // produce a different center pixel.
+        let mut src: RgbImage = ImageBuffer::new(2, 2);
+        src.put_pixel(0, 0, Rgb([0, 0, 0]));     // top-left = 0
+        src.put_pixel(1, 0, Rgb([100, 100, 100])); // top-right = 100
+        src.put_pixel(0, 1, Rgb([200, 200, 200])); // bot-left = 200
+        src.put_pixel(1, 1, Rgb([255, 255, 255])); // bot-right = 255
+
+        let dst = resize_bilinear_llama_cpp(&src, 3, 3);
+        // Corner (0,0) must be exactly src(0,0) = 0 (not blended).
+        assert_eq!(dst.get_pixel(0, 0).0[0], 0, "corner (0,0)");
+        // Corner (2,2) must be exactly src(1,1) = 255 (not blended).
+        assert_eq!(dst.get_pixel(2, 2).0[0], 255, "corner (2,2)");
+        // Corner (2,0) must be exactly src(1,0) = 100.
+        assert_eq!(dst.get_pixel(2, 0).0[0], 100, "corner (2,0)");
+        // Corner (0,2) must be exactly src(0,1) = 200.
+        assert_eq!(dst.get_pixel(0, 2).0[0], 200, "corner (0,2)");
+        // Center (1,1) at px=py=0.5 → x0=y0=0, xf=yf=0.5.
+        // top    = lerp(0, 100, 0.5) = 50
+        // bottom = lerp(200, 255, 0.5) = 227.5
+        // out    = lerp(50, 227.5, 0.5) = 138.75 → trunc → 138
+        assert_eq!(dst.get_pixel(1, 1).0[0], 138, "center (1,1)");
+    }
+
+    #[test]
+    fn resize_bilinear_llama_cpp_truncates_not_rounds() {
+        // 1×2 source [0, 1] → resize to 1×3. With x_ratio = (2-1)/(3-1) = 0.5,
+        // middle output samples px=0.5 → top=0.5, bottom=0.5, out=0.5.
+        // Truncation: 0.5 → 0 (NOT 1 like round-to-nearest).
+        let mut src: RgbImage = ImageBuffer::new(1, 2);
+        src.put_pixel(0, 0, Rgb([0, 0, 0]));
+        src.put_pixel(0, 1, Rgb([1, 1, 1]));
+        let dst = resize_bilinear_llama_cpp(&src, 1, 3);
+        assert_eq!(dst.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(dst.get_pixel(0, 1).0, [0, 0, 0], "trunc(0.5)=0");
+        assert_eq!(dst.get_pixel(0, 2).0, [1, 1, 1]);
+    }
+
+    #[test]
+    fn resize_bilinear_pad_llama_cpp_no_pad_for_square_input() {
+        // Square input → square target: padding branch must reduce to
+        // plain bilinear (new_w/new_h hit target exactly). Verifies
+        // gemma4v's common case (square fixtures) works the same as
+        // direct resize.
+        let src: RgbImage = ImageBuffer::from_fn(4, 4, |x, _y| Rgb([(x * 50) as u8; 3]));
+        let padded = resize_bilinear_pad_llama_cpp(&src, 8, 8, [0, 0, 0]);
+        let plain = resize_bilinear_llama_cpp(&src, 8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    padded.get_pixel(x, y).0,
+                    plain.get_pixel(x, y).0,
+                    "({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_bilinear_pad_llama_cpp_pads_non_square_input() {
+        // 4×2 source → 4×4 target. scale = min(4/4, 4/2) = 1.0.
+        // new_w = ceil(4*1.0) = 4, new_h = ceil(2*1.0) = 2.
+        // Padding adds 1 row of black above and 1 row below the resized
+        // image (offset_y = (4-2)/2 = 1).
+        let src: RgbImage = ImageBuffer::from_fn(4, 2, |_x, _y| Rgb([200, 100, 50]));
+        let dst = resize_bilinear_pad_llama_cpp(&src, 4, 4, [0, 0, 0]);
+        // Top row must be black pad.
+        for x in 0..4 {
+            assert_eq!(dst.get_pixel(x, 0).0, [0, 0, 0], "pad top ({x},0)");
+        }
+        // Middle two rows = resized source = original color (1:1 scale).
+        for x in 0..4 {
+            assert_eq!(dst.get_pixel(x, 1).0, [200, 100, 50]);
+            assert_eq!(dst.get_pixel(x, 2).0, [200, 100, 50]);
+        }
+        // Bottom row = black pad.
+        for x in 0..4 {
+            assert_eq!(dst.get_pixel(x, 3).0, [0, 0, 0], "pad bot ({x},3)");
+        }
+    }
+
+    #[test]
+    fn gemma4v_preprocess_uses_llama_cpp_resize_for_four_corner_dots() {
+        // 8×8 image with four corner pixels = white, rest = black.
+        // After llama.cpp's corner-aligned bilinear resize to a much
+        // larger target (e.g. 768×768 from the gemma4v patch grid),
+        // the resulting CORNER patches must contain non-zero pixel values
+        // (white seeped into the corner via the lerp from the 1-pixel
+        // dot). With a center-aligned + antialiased filter the same
+        // 1-pixel dot can be smoothed away or shifted, so this test
+        // both pins our new resize and is a regression guard against
+        // accidentally re-introducing `FilterType::Triangle`.
+        let img: RgbImage = ImageBuffer::from_fn(8, 8, |x, y| {
+            if (x == 0 || x == 7) && (y == 0 || y == 7) {
+                Rgb([255u8, 255, 255])
+            } else {
+                Rgb([0, 0, 0])
+            }
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .expect("encode png");
+        let out = preprocess_gemma4v(&buf, &GEMMA4V_PREPROCESS_DEFAULT).unwrap();
+
+        // First patch (top-left corner). At least one pixel in the patch
+        // must be > 0 (specifically pixel (0,0) of the resized image
+        // is exactly src(0,0) = white = +1.0 after 2x-1 normalization).
+        let inner = (16 * 16 * 3) as usize;
+        let first_patch = &out.patches[0..inner];
+        // (dy=0, dx=0, c=0) → index 0 in patch row.
+        assert!(
+            (first_patch[0] - 1.0).abs() < 1e-3,
+            "first patch (0,0,R) should be +1.0 (corner-aligned exact src), got {}",
+            first_patch[0]
+        );
+
+        // Last patch's bottom-right pixel must also be exactly +1.0
+        // (corner of resized image == corner of src).
+        let n_patches = out.n_patches() as usize;
+        let last_patch = &out.patches[(n_patches - 1) * inner..n_patches * inner];
+        // (dy=15, dx=15, c=0) → ((15*16) + 15) * 3 = 765.
+        assert!(
+            (last_patch[765] - 1.0).abs() < 1e-3,
+            "last patch (15,15,R) should be +1.0, got {}",
+            last_patch[765]
+        );
     }
 
     #[test]
