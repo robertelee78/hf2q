@@ -756,11 +756,25 @@ oracles used by P9b.  See ffn.rs.
 
 **Scope:** Decision 16. Cross-ADR coordination.
 
-**Deliverables:** `Qwen35Model` implements `ActivationCapture`. Hooks into P11 forward to capture per-layer activations. Unblocks ADR-012 P6.
+**Deliverables:** `RealActivationCapture` (in `activation_capture_real`) implements `ActivationCapture` and drives `Qwen35Model::forward_gpu_with_capture` to capture per-layer activations. Unblocks ADR-012 P6.
 
 **Acceptance:** Mock-friendly interface; synthetic-weight test produces expected-shape `LayerActivations`; documented coordination with ADR-012 engineer.
 
 **Estimated LOC:** ~250.
+
+#### P12.a COMPLETE — trait + mock landed at ADR-013 close (commit `c1b5a30`, 2026-04-25)
+`activation_capture.rs` defines the `ActivationCapture` trait and `LayerActivations` shape, plus `MockActivationCapture` for ADR-012-side calibration tests.
+
+#### P12.b COMPLETE — real impl, GPU-only (2026-04-25)
+`src/inference/models/qwen35/activation_capture_real.rs` finishes Decision 16 with a single GPU execution path:
+- `run_calibration_prompt_gpu(model, tokens)` allocates a fresh `HybridKvCache`, builds the 4×seq_len MROPE-replicated positions vector, and drives `Qwen35Model::forward_gpu_with_capture` (added in `forward_gpu.rs`). The GPU forward downloads the residual stream to F32 at the start and end of each layer iteration and dispatches `mlx-native::quantized_matmul_ggml` for native MoeQ experts — no F32 expansion of the 256-expert MoE, no OOM, runs at production decode speed.
+- `RealActivationCapture` is the convenience wrapper for the DWQ pipeline (loads via `Qwen35Model::load_from_gguf`, holds the model, implements `ActivationCapture` by calling `run_calibration_prompt_gpu` unconditionally).
+
+Per `feedback_gpu_everything.md` ("All ops on Metal GPU, no CPU fallbacks") and `feedback_tests_on_gpu_not_cpu.md` ("Test-path runs on Metal GPU"), there is **no CPU path**. Unit tests build production-shaped synthetic models (`hidden_size = 64`, divisible by 32 to satisfy the Q4_0 lm_head packing constraint) so the same `forward_gpu_with_capture` code path is exercised end-to-end. No `HF2Q_FORCE_CPU_CAPTURE` escape hatch, no dispatch predicate, no parallel CPU reference impl on `Qwen35Model`.
+
+Variant coverage (all GPU): Dense (GEMM), MoE F32 (`mul_mm_id`), MoE GGUF-loaded (`quantized_matmul_ggml`).
+
+Tests: 9 unit tests in `activation_capture_real::tests` + 1 end-to-end test in `quantize::dwq_activation::tests::activation_calibration_with_real_model_wrapper_succeeds` — all passing through the GPU path. Stale "P11 follow-up" notes elsewhere in the inference module retired.
 
 ### P14 — MTP speculative-decoding execution (planned; blocked on ADR-012 P11)
 

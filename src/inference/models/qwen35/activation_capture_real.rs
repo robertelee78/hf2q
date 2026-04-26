@@ -1,68 +1,69 @@
-//! Real (non-mock) `ActivationCapture` for `Qwen35Model`.
+//! Real (non-mock) `ActivationCapture` for `Qwen35Model` — GPU-only.
 //!
 //! ADR-012 P9 / ADR-013 Decision 16. Lands on top of the ADR-013 merge
 //! (`236abb8` — full Qwen3.5/3.6 forward) which closed P12 with trait+mock
 //! only and explicitly deferred the real impl. This file finishes that
 //! deferred contract.
 //!
-//! Two surfaces are exposed:
+//! # Path: GPU only
 //!
-//! 1. [`Qwen35Model`] directly implements [`ActivationCapture`]. Power callers
-//!    that already hold a `Qwen35Model` (e.g. an existing inference session)
-//!    can capture activations without re-loading.
-//! 2. [`RealActivationCapture`] is the convenience wrapper for the DWQ
-//!    calibration pipeline: it loads a `Qwen35Model` from a GGUF on the fly
-//!    and delegates `run_calibration_prompt` to the model. The
-//!    `not_ready()` constructor remains for callers that explicitly want to
-//!    surface a structured "deferred" error (used in unit tests of the
-//!    no-fallback guard).
+//! Per `feedback_gpu_everything.md` ("All ops on Metal GPU, no CPU
+//! fallbacks. CPU inference == poop.") and
+//! `feedback_tests_on_gpu_not_cpu.md` ("Test-path runs on Metal GPU"),
+//! activation capture has exactly one execution path: `forward_gpu_with_capture`
+//! → `mlx-native::quantized_matmul_ggml` for native MoeQ experts,
+//! `mul_mm_id` for F32-expanded experts, dense GEMM kernels for Dense
+//! FFN. Unit tests build production-shaped synthetic models (`hidden_size`
+//! divisible by 32 to satisfy the Q4_0 lm_head packing constraint) so they
+//! run through the same code path as production calibration.
+//!
+//! # Surfaces
+//!
+//! * [`run_calibration_prompt_gpu`] — free function that takes a
+//!   `&Qwen35Model` and a token list, allocates a fresh `HybridKvCache`,
+//!   drives `forward_gpu_with_capture`, and returns a populated
+//!   `LayerActivations`. Power callers that already hold a model use this.
+//! * [`RealActivationCapture`] — convenience wrapper for the DWQ
+//!   calibration pipeline: it loads a `Qwen35Model` from a GGUF on the fly
+//!   and delegates `run_calibration_prompt` to the GPU path. The
+//!   `not_ready()` constructor remains for unit tests that pin the
+//!   no-fallback guard surface.
 //!
 //! # Capture semantics
 //!
 //! For each transformer block `l` (`0 ≤ l < num_hidden_layers`):
 //!
-//! * `layer_inputs[l]` — residual stream entering layer `l`.
-//!     - `l == 0`: the embedding output.
-//!     - `l > 0`:  `layer_outputs[l-1]`.
+//! * `layer_inputs[l]` — residual stream entering layer `l`. For `l == 0`
+//!   this is the embedding output; for `l > 0` this is `layer_outputs[l-1]`.
 //! * `layer_outputs[l]` — residual stream leaving layer `l` after FFN
 //!   residual add (matches the per-block `ffn_residual + ffn_out` shape
-//!   in [`super::forward_cpu`]).
+//!   in `forward_gpu`).
 //!
 //! Each captured tensor is row-major `[seq_len, hidden_size]` flattened
-//! to `Vec<f32>` per the `LayerActivations` contract.
+//! to `Vec<f32>` per the `LayerActivations` contract. Capture is performed
+//! by `forward_gpu_with_capture` via a `download_f32` round-trip at the
+//! start and end of each layer iteration.
 //!
 //! # Variants supported
 //!
-//! * **Dense Qwen3.5** (`qwen35`, `Qwen35Variant::Dense`): full CPU capture
-//!   path works on F32-loaded weights.
-//! * **MoE Qwen3.5** (`qwen35moe`, `Qwen35Variant::Moe`): GGUF-loaded
-//!   experts are stored in their native ggml block-quantization
-//!   (`Qwen35FfnWeights::MoeQ`); `forward_cpu` returns an error rather
-//!   than F32-expanding 256 experts (would OOM the 64 GB working set).
-//!   Capture for MoE therefore returns
-//!   [`RealActivationCaptureError::ForwardPass`] with a clear message;
-//!   the GPU-backed capture path (uses `forward_gpu`) is a follow-up.
+//! All Qwen3.5/3.6 weight variants — Dense, F32-expanded MoE, native
+//! GGML-block-quantized MoeQ — go through the same GPU path. No F32
+//! expansion of 256-expert MoE; no fallback.
 //!
 //! # No fallback
 //!
-//! Per `feedback_never_ship_fallback_without_rootcause.md`: if the forward
-//! errors out (e.g. on MoE-quantized FFN) we return a typed error, not
-//! synthetic activations. Callers must handle this rather than silently
-//! routing around it.
+//! Per `feedback_never_ship_fallback_without_rootcause.md`: if the GPU
+//! forward errors out (OOM, kernel failure, malformed weights) we return
+//! a typed error, not synthetic activations. Callers must handle this
+//! rather than silently routing around it.
 
 use anyhow::{Context, Result};
 use mlx_native::MlxDevice;
 use thiserror::Error;
 
 use super::activation_capture::{ActivationCapture, LayerActivations};
-use super::delta_net::{delta_net_layer_cpu_ref, DeltaNetLayerShape};
-use super::ffn::{
-    dense_swiglu_cpu_ref, moe_ffn_cpu_ref, DenseFfnShape, MoeFfnShape,
-};
-use super::full_attn::{gated_full_attention_cpu_ref, FullAttnShape};
-use super::io_heads::embed_tokens;
 use super::kv_cache::HybridKvCache;
-use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use super::model::Qwen35Model;
 
 // ================================================================
 // Error type
@@ -71,7 +72,7 @@ use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
 /// Errors returned by the real ActivationCapture path. `NotReady` is
 /// retained for the `not_ready()` factory used in dependency-blocked
 /// unit tests; `ForwardPass` is the production error variant naming the
-/// specific layer / reason.
+/// specific layer / reason; `Load` covers GGUF open / parse failures.
 #[derive(Debug, Error)]
 pub enum RealActivationCaptureError {
     /// Constructor was called via [`RealActivationCapture::not_ready`].
@@ -96,56 +97,17 @@ pub enum RealActivationCaptureError {
 }
 
 // ================================================================
-// RMSNorm helper (mirrors forward_cpu::rms_norm_rows; private there)
+// GPU capture path (ADR-012 P9b — sole execution path)
 // ================================================================
-
-fn rms_norm_rows(x: &mut [f32], weight: &[f32], hidden: usize, eps: f32) {
-    debug_assert_eq!(weight.len(), hidden);
-    let seq = x.len() / hidden;
-    for t in 0..seq {
-        let row = &mut x[t * hidden..(t + 1) * hidden];
-        let sum_sq: f32 = row.iter().map(|v| v * v).sum();
-        let inv = ((sum_sq / (hidden as f32)) + eps).sqrt().recip();
-        for (j, v) in row.iter_mut().enumerate() {
-            *v = *v * inv * weight[j];
-        }
-    }
-}
-
-fn residual_add(dst: &mut [f32], src: &[f32]) {
-    debug_assert_eq!(dst.len(), src.len());
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += s;
-    }
-}
-
-// ================================================================
-// GPU capture path (ADR-012 P9b — mantra-aligned production wire-up)
-// ================================================================
-
-/// Detect whether `model` was built with production-shape weights the GPU
-/// forward can consume. The GPU lm_head Q4_0 packing
-/// (`encode_q4_0_blocks` in `gpu_full_attn.rs`) requires `hidden_size`
-/// divisible by 32; synthetic `empty_from_cfg` test models with
-/// `hidden_size=8` fail that assertion. Real Qwen3.5/3.6 hidden sizes are
-/// 5120 (27B Dense / 35B MoE) — comfortably above the bar. Mantra: no CPU
-/// fallback at production scale; CPU is parity-test only.
-fn has_production_weights(model: &Qwen35Model) -> bool {
-    let h = model.cfg.hidden_size;
-    !model.token_embd.is_empty()
-        && h >= 32
-        && h % 32 == 0
-        && model.cfg.num_hidden_layers > 0
-}
 
 /// Run a calibration prompt through the GPU forward and capture per-layer
-/// residual streams. Uses `Qwen35Model::forward_gpu_with_capture`, which
-/// dispatches `mlx-native` `quantized_matmul_ggml` for native MoeQ experts
-/// — no F32 expansion, no OOM, runs at production decode speed.
+/// residual streams. Drives [`Qwen35Model::forward_gpu_with_capture`],
+/// which dispatches `mlx-native::quantized_matmul_ggml` for native MoeQ
+/// experts — no F32 expansion, no OOM, runs at production decode speed.
 ///
 /// Allocates a fresh `HybridKvCache` sized to `tokens.len()` for the
-/// calibration pass; the cache is dropped on return so subsequent inference
-/// sessions are unaffected.
+/// calibration pass; the cache is dropped on return so subsequent
+/// inference sessions are unaffected.
 pub fn run_calibration_prompt_gpu(
     model: &Qwen35Model,
     tokens: &[u32],
@@ -156,10 +118,9 @@ pub fn run_calibration_prompt_gpu(
 
     let seq_len = tokens.len() as u32;
     // Text-only positions: one axis per token, replicated across all 4 MROPE
-    // sectors. Matches `text_positions` in `forward_cpu`.
+    // sectors. Matches `text_positions` in the GPU forward.
     let mut positions_flat: Vec<i32> = Vec::with_capacity((4 * seq_len) as usize);
-    for s in 0..4 {
-        let _ = s;
+    for _ in 0..4 {
         for i in 0..seq_len as i32 {
             positions_flat.push(i);
         }
@@ -192,151 +153,11 @@ pub fn run_calibration_prompt_gpu(
 }
 
 // ================================================================
-// Primary impl: ActivationCapture for Qwen35Model
-// ================================================================
-
-impl ActivationCapture for Qwen35Model {
-    fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations> {
-        if tokens.is_empty() {
-            anyhow::bail!("Qwen35Model::run_calibration_prompt: tokens must be non-empty");
-        }
-
-        let h = self.cfg.hidden_size as usize;
-        let eps = self.cfg.rms_norm_eps;
-        let num_layers = self.cfg.num_hidden_layers;
-        let seq_len = tokens.len();
-
-        // Text-only positions (one axis per token, replicated across the 4
-        // MROPE sectors). Matches forward_cpu's text_positions helper.
-        let positions: Vec<[i32; 4]> = (0..seq_len as i32).map(|i| [i, i, i, i]).collect();
-
-        // 1. Embedding lookup.
-        let mut hidden = embed_tokens(
-            tokens,
-            &self.token_embd,
-            self.cfg.vocab_size,
-            self.cfg.hidden_size,
-        );
-
-        let mut layer_inputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers as usize);
-        let mut layer_outputs: Vec<Vec<f32>> = Vec::with_capacity(num_layers as usize);
-
-        // 2. Per-layer forward + capture. Mirrors `forward_cpu` exactly so
-        // the captured residual stream is byte-identical to a forward
-        // call's intermediate state.
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // Capture residual stream entering this layer.
-            layer_inputs.push(hidden.clone());
-
-            // Attention.
-            let attn_out = match layer {
-                Qwen35LayerWeights::FullAttn { attn, .. } => {
-                    let shape = FullAttnShape::from_config(&self.cfg);
-                    gated_full_attention_cpu_ref(&hidden, &positions, attn, shape)
-                }
-                Qwen35LayerWeights::LinearAttn { attn, .. } => {
-                    let shape = DeltaNetLayerShape::from_config(&self.cfg);
-                    let state_in = vec![
-                        0.0f32;
-                        (self.cfg.linear_key_head_dim
-                            * self.cfg.linear_value_head_dim
-                            * self.cfg.linear_num_value_heads)
-                            as usize
-                    ];
-                    let km1 = (self.cfg.linear_conv_kernel_dim - 1) as usize;
-                    let qkv_channels = (2 * self.cfg.linear_num_key_heads
-                        * self.cfg.linear_key_head_dim
-                        + self.cfg.linear_num_value_heads
-                            * self.cfg.linear_value_head_dim)
-                        as usize;
-                    let conv_state = vec![0.0f32; km1 * qkv_channels];
-                    let (out, _new_state, _new_conv) =
-                        delta_net_layer_cpu_ref(&hidden, attn, shape, &state_in, &conv_state);
-                    out
-                }
-            };
-
-            // Residual after attention.
-            residual_add(&mut hidden, &attn_out);
-
-            // Post-attention norm + FFN (matches forward_cpu's
-            // ffn_residual / attn_post_norm structure).
-            let ffn_residual = hidden.clone();
-            let mut ffn_input = hidden.clone();
-            let post_norm_w = match layer {
-                Qwen35LayerWeights::FullAttn { attn, .. } => &attn.post_attn_norm,
-                Qwen35LayerWeights::LinearAttn { attn, .. } => &attn.post_attn_norm,
-            };
-            rms_norm_rows(&mut ffn_input, post_norm_w, h, eps);
-
-            let ffn_out = match layer.ffn() {
-                Qwen35FfnWeights::Dense(w) => {
-                    let m = self.cfg.intermediate_size.ok_or_else(|| {
-                        RealActivationCaptureError::ForwardPass {
-                            layer: layer_idx as u32,
-                            reason: "dense variant missing intermediate_size".into(),
-                        }
-                    })?;
-                    let shape = DenseFfnShape {
-                        hidden_size: self.cfg.hidden_size,
-                        intermediate_size: m,
-                    };
-                    dense_swiglu_cpu_ref(&ffn_input, w, shape)
-                }
-                Qwen35FfnWeights::Moe(w) => {
-                    let moe = self.cfg.moe.as_ref().ok_or_else(|| {
-                        RealActivationCaptureError::ForwardPass {
-                            layer: layer_idx as u32,
-                            reason: "moe variant missing moe config".into(),
-                        }
-                    })?;
-                    let shape = MoeFfnShape {
-                        hidden_size: self.cfg.hidden_size,
-                        num_experts: moe.num_experts,
-                        num_experts_per_tok: moe.num_experts_per_tok,
-                        moe_intermediate_size: moe.moe_intermediate_size,
-                        shared_intermediate_size: moe.shared_expert_intermediate_size,
-                    };
-                    moe_ffn_cpu_ref(&ffn_input, w, shape)
-                }
-                Qwen35FfnWeights::MoeQ(_) => {
-                    return Err(anyhow::anyhow!(
-                        RealActivationCaptureError::ForwardPass {
-                            layer: layer_idx as u32,
-                            reason:
-                                "MoE variant loaded with native GGML block quantization \
-                                 (MoeQ); CPU activation capture path does not F32-expand \
-                                 256 experts. GPU-backed capture is the follow-up. \
-                                 No weight-space fallback per ADR-012 D13.".into(),
-                        }
-                    ));
-                }
-            };
-
-            // Residual after FFN: pre-norm value (ffn_residual) + ffn_out.
-            hidden = ffn_residual;
-            residual_add(&mut hidden, &ffn_out);
-
-            // Capture residual stream leaving this layer.
-            layer_outputs.push(hidden.clone());
-        }
-
-        Ok(LayerActivations {
-            layer_inputs,
-            layer_outputs,
-            num_layers,
-            seq_len: seq_len as u32,
-            hidden_size: self.cfg.hidden_size,
-        })
-    }
-}
-
-// ================================================================
 // Convenience wrapper — RealActivationCapture
 // ================================================================
 
 /// Production wrapper that owns a `Qwen35Model` loaded from disk and
-/// delegates capture to its `ActivationCapture` impl.
+/// drives the GPU activation capture path.
 pub struct RealActivationCapture {
     inner: RealCaptureBackend,
 }
@@ -411,28 +232,8 @@ impl RealActivationCapture {
 
 impl ActivationCapture for RealActivationCapture {
     fn run_calibration_prompt(&mut self, tokens: &[u32]) -> Result<LayerActivations> {
-        match &mut self.inner {
-            RealCaptureBackend::Loaded(model) => {
-                // Mantra-aligned dispatch (ADR-012 P9b):
-                //   * Production weights (Dense, F16-Moe, MoeQ) → GPU
-                //     forward via `forward_gpu_with_capture`. Dispatches
-                //     `mlx-native::quantized_matmul_ggml` for native MoeQ
-                //     blocks, `mul_mm_id` for F32-expanded experts, and
-                //     dense GEMM kernels for Dense FFN. No CPU fallback —
-                //     CPU forward at production scale is unshippable
-                //     (per `feedback_gpu_everything`, `feedback_tests_on_gpu_not_cpu`).
-                //   * Synthetic empty_from_cfg test models → CPU parity
-                //     reference (those buffers have no real weights and
-                //     would fail the GPU upload).
-                //   * HF2Q_FORCE_CPU_CAPTURE=1 escapes only for debugging.
-                let force_cpu =
-                    std::env::var("HF2Q_FORCE_CPU_CAPTURE").is_ok();
-                if !force_cpu && has_production_weights(model) {
-                    run_calibration_prompt_gpu(model, tokens)
-                } else {
-                    model.run_calibration_prompt(tokens)
-                }
-            }
+        match &self.inner {
+            RealCaptureBackend::Loaded(model) => run_calibration_prompt_gpu(model, tokens),
             RealCaptureBackend::NotReady => {
                 Err(anyhow::anyhow!(RealActivationCaptureError::NotReady))
             }
@@ -441,49 +242,48 @@ impl ActivationCapture for RealActivationCapture {
 }
 
 // ================================================================
-// Tests
+// Tests — all run through the GPU path via run_calibration_prompt_gpu
 // ================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{
-        Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
-    };
+    use super::super::{Qwen35Config, Qwen35MoeConfig, Qwen35Variant};
 
-    /// Minimal hybrid Qwen3.5 dense config: 1 linear-attn + 1 full-attn
-    /// layer, tiny dims. Sufficient to exercise both branches of the
-    /// capture loop.
+    /// GPU-eligible tiny hybrid Qwen3.5 dense config (mirrors
+    /// `forward_gpu::tests::tiny_hybrid_cfg`): `hidden_size = 64`
+    /// (divisible by 32 to satisfy the Q4_0 lm_head packing constraint),
+    /// `head_dim = 32`, 4 layers (one full-attn at index 3, the rest
+    /// linear-attn). Sufficient to exercise both attention branches and
+    /// the FFN through `forward_gpu_with_capture`.
     fn tiny_dense_cfg() -> Qwen35Config {
+        let layer_types = super::super::default_layer_types(4, 4);
         Qwen35Config {
             variant: Qwen35Variant::Dense,
-            vocab_size: 16,
-            hidden_size: 8,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 4,
-            intermediate_size: Some(16),
-            rope_theta: 10_000.0,
-            rotary_dim: 4,
-            mrope_section: [1, 1, 1, 1],
-            mrope_interleaved: true,
-            partial_rotary_factor: 1.0,
-            rms_norm_eps: 1e-6,
-            max_position_embeddings: 64,
-            attn_output_gate: true,
-            layer_types: vec![
-                Qwen35LayerKind::LinearAttention,
-                Qwen35LayerKind::FullAttention,
-            ],
-            full_attention_interval: 2,
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
             linear_conv_kernel_dim: 4,
-            moe: None,
+            full_attention_interval: 4,
+            layer_types,
+            partial_rotary_factor: 0.5,
+            rope_theta: 10_000.0,
+            rotary_dim: 16,
+            mrope_section: [4, 4, 0, 0],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 128,
+            vocab_size: 128,
+            attn_output_gate: true,
             mtp_num_hidden_layers: 0,
+            intermediate_size: Some(64),
+            moe: None,
         }
     }
 
@@ -494,8 +294,8 @@ mod tests {
         c.moe = Some(Qwen35MoeConfig {
             num_experts: 2,
             num_experts_per_tok: 1,
-            moe_intermediate_size: 4,
-            shared_expert_intermediate_size: 4,
+            moe_intermediate_size: 32,
+            shared_expert_intermediate_size: 32,
         });
         c
     }
@@ -503,10 +303,10 @@ mod tests {
     #[test]
     fn dense_capture_returns_correct_shape() {
         let cfg = tiny_dense_cfg();
-        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
-        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let tokens: Vec<u32> = vec![0, 1, 2];
 
-        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
+        let acts = run_calibration_prompt_gpu(&model, &tokens).expect("capture ok");
         acts.validate().expect("validate ok");
 
         assert_eq!(acts.num_layers, cfg.num_hidden_layers);
@@ -524,24 +324,39 @@ mod tests {
 
     #[test]
     fn dense_layer_input_zero_equals_post_embedding() {
-        // For an empty (zero-weighted) model with zero token_embd, layer_inputs[0]
-        // should be all zeros (= the embedding output for any token).
+        // Zero-weight model with zero `token_embd`: the residual stream
+        // entering layer 0 is the embedding output, which is all zeros for
+        // any token. The GPU forward downloads `hidden` to F32 at the start
+        // of each layer iteration so this captures the embedding output
+        // verbatim.
         let cfg = tiny_dense_cfg();
-        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let model = Qwen35Model::empty_from_cfg(cfg);
         let tokens: Vec<u32> = vec![0, 0, 0];
 
-        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
+        let acts = run_calibration_prompt_gpu(&model, &tokens).expect("capture ok");
         for v in &acts.layer_inputs[0] {
             assert_eq!(*v, 0.0, "zero-weight model should produce zero residual");
         }
     }
 
     #[test]
+    fn moe_unquantized_capture_returns_correct_shape() {
+        let cfg = tiny_moe_cfg();
+        let model = Qwen35Model::empty_from_cfg(cfg.clone());
+        let tokens: Vec<u32> = vec![0, 1];
+
+        let acts = run_calibration_prompt_gpu(&model, &tokens).expect("capture ok");
+        acts.validate().expect("validate ok");
+        assert_eq!(acts.num_layers, cfg.num_hidden_layers);
+        assert_eq!(acts.layer_outputs.len(), cfg.num_hidden_layers as usize);
+    }
+
+    #[test]
     fn moe_quantized_returns_typed_forward_pass_error() {
-        // empty_from_cfg for MoE variant constructs Qwen35FfnWeights::Moe (the
-        // F32 path), not MoeQ. To exercise the MoeQ error branch we'd need a
-        // real GGUF — covered by the production guard. This test pins the
-        // ForwardPass error display format instead.
+        // empty_from_cfg for MoE constructs Qwen35FfnWeights::Moe (the
+        // F32-expanded path). Exercising the MoeQ branch requires a real
+        // GGUF — covered by integration-level tests gated on the apex
+        // file. This test pins the ForwardPass error display format.
         let err = RealActivationCaptureError::ForwardPass {
             layer: 5,
             reason: "MoeQ requires GPU capture path".into(),
@@ -552,27 +367,15 @@ mod tests {
     }
 
     #[test]
-    fn moe_unquantized_capture_returns_correct_shape() {
-        let cfg = tiny_moe_cfg();
-        let mut model = Qwen35Model::empty_from_cfg(cfg.clone());
-        let tokens: Vec<u32> = vec![0, 1];
-
-        let acts = model.run_calibration_prompt(&tokens).expect("capture ok");
-        acts.validate().expect("validate ok");
-        assert_eq!(acts.num_layers, cfg.num_hidden_layers);
-        assert_eq!(acts.layer_outputs.len(), cfg.num_hidden_layers as usize);
-    }
-
-    #[test]
     fn empty_tokens_returns_error() {
         let cfg = tiny_dense_cfg();
-        let mut model = Qwen35Model::empty_from_cfg(cfg);
-        let err = model.run_calibration_prompt(&[]).unwrap_err();
+        let model = Qwen35Model::empty_from_cfg(cfg);
+        let err = run_calibration_prompt_gpu(&model, &[]).unwrap_err();
         assert!(format!("{err}").contains("non-empty"));
     }
 
     #[test]
-    fn real_activation_capture_wrapper_delegates_to_model() {
+    fn real_activation_capture_wrapper_delegates_to_gpu() {
         let cfg = tiny_dense_cfg();
         let model = Qwen35Model::empty_from_cfg(cfg.clone());
         let mut wrapper = RealActivationCapture::from_model(model);

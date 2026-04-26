@@ -492,11 +492,11 @@ mod tests {
     /// a real `Qwen35Model` (zero-weighted, in-memory via `empty_from_cfg`)
     /// wrapped in `RealActivationCapture::from_model`, not the
     /// `MockActivationCapture` used by the other tests. This proves the
-    /// CPU forward pass on a live qwen35 hybrid model (1 linear-attn +
-    /// 1 full-attn layer) flows through `run_calibration_prompt` →
-    /// `LayerActivations` → `compute_layer_sensitivity` →
-    /// `allocate_bits_by_sensitivity` → `MixedBitQuantizer` →
-    /// `QuantizedModel` end-to-end.
+    /// GPU forward pass (`forward_gpu_with_capture`) on a live qwen35
+    /// hybrid model (3 linear-attn + 1 full-attn layer) flows through
+    /// `run_calibration_prompt` → `LayerActivations` →
+    /// `compute_layer_sensitivity` → `allocate_bits_by_sensitivity` →
+    /// `MixedBitQuantizer` → `QuantizedModel` end-to-end.
     ///
     /// On a zero-weighted model every layer's residual stream is also
     /// zero, so all sensitivities tie. `allocate_bits_by_sensitivity`
@@ -510,40 +510,36 @@ mod tests {
     fn activation_calibration_with_real_model_wrapper_succeeds() {
         use crate::inference::models::qwen35::activation_capture_real::RealActivationCapture;
         use crate::inference::models::qwen35::model::Qwen35Model;
-        use crate::inference::models::qwen35::{
-            Qwen35Config, Qwen35LayerKind, Qwen35Variant,
-        };
+        use crate::inference::models::qwen35::{default_layer_types, Qwen35Config, Qwen35Variant};
 
-        // Tiny hybrid qwen35 dense config, identical shape to
-        // activation_capture_real::tests::tiny_dense_cfg() so the
-        // forward path is exercised against the same surface that's
-        // already pinned by 9 unit tests in that module.
+        // GPU-eligible tiny hybrid qwen35 dense config (mirrors
+        // activation_capture_real::tests::tiny_dense_cfg and
+        // forward_gpu::tests::tiny_hybrid_cfg). hidden_size=64 is divisible
+        // by 32 to satisfy the Q4_0 lm_head packing constraint, so the
+        // GPU forward path runs end-to-end.
         let cfg = Qwen35Config {
             variant: Qwen35Variant::Dense,
-            vocab_size: 16,
-            hidden_size: 8,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 4,
-            intermediate_size: Some(16),
+            vocab_size: 128,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            intermediate_size: Some(64),
             rope_theta: 10_000.0,
-            rotary_dim: 4,
-            mrope_section: [1, 1, 1, 1],
+            rotary_dim: 16,
+            mrope_section: [4, 4, 0, 0],
             mrope_interleaved: true,
-            partial_rotary_factor: 1.0,
+            partial_rotary_factor: 0.5,
             rms_norm_eps: 1e-6,
-            max_position_embeddings: 64,
+            max_position_embeddings: 128,
             attn_output_gate: true,
-            layer_types: vec![
-                Qwen35LayerKind::LinearAttention,
-                Qwen35LayerKind::FullAttention,
-            ],
-            full_attention_interval: 2,
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
+            layer_types: default_layer_types(4, 4),
+            full_attention_interval: 4,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
             linear_conv_kernel_dim: 4,
             moe: None,
             mtp_num_hidden_layers: 0,
@@ -551,7 +547,7 @@ mod tests {
         let num_layers = cfg.num_hidden_layers;
         let hidden_size = cfg.hidden_size;
 
-        let model_vocab_size: u64 = 16; // matches cfg.vocab_size above (cast to u64 for ModelMetadata)
+        let model_vocab_size: u64 = cfg.vocab_size as u64; // for ModelMetadata sampling bound
         let model = Qwen35Model::empty_from_cfg(cfg);
         let mut capture = RealActivationCapture::from_model(model);
 
