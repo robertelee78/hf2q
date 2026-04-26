@@ -22,4 +22,5 @@
 //! algorithm lives here and the eager DWQ path stays in
 //! `src/quantize/`.
 
+pub mod cache;
 pub mod imatrix;
