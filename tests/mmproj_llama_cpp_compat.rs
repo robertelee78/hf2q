@@ -393,22 +393,496 @@ fn phase_c_llama_mtmd_stderr_smoke() {
     );
 }
 
-/// Phase D placeholder — iter-116b lands the parity proxy: same
-/// fixture image + prompt at T=0/max-tokens=16 through both hf2q's
-/// `/v1/chat/completions` and `llama-mtmd-cli`, then compares output
-/// token sequences. Soft equality (greedy decode shouldn't drift but
-/// the BF16 attention saturation in hf2q's vit_gpu can perturb
-/// logits — see `project_vit_attention_bf16_softmax_drift.md`); a
-/// strict byte-equal proxy is too strict.
+/// Phase D parity proxy — iter-116i (W41) lands the body that W40
+/// drafted + reverted in iter-116h (the `is_supported()` gate
+/// rejected the gemma4v projector at serve startup before the body
+/// could exercise the runtime forward path; W41 iter-116i unblocks
+/// the runtime path via `ProjectorType::Gemma4v` extension).
 ///
-/// Iter-116b's proxy: assert N_image_tokens matches between the two
-/// (hf2q's `X-HF2Q-Soft-Tokens-Total` header vs llama-mtmd-cli's
-/// stderr image-token report). Output text need not match — the
-/// soft-token contract is what we're gating on.
+/// Run hf2q `serve` and `llama-mtmd-cli` against the same
+/// fixture image + prompt at T=0 / max-tokens=16 and compare:
+///
+///   1. Soft-token count parity — `X-HF2Q-Soft-Tokens-Total` HTTP
+///      header from hf2q vs llama-mtmd-cli stderr's
+///      `n_tokens_per_image` line. The soft-token contract is what
+///      hf2q's prefill embed-bypass assumes; a delta here means
+///      the two stacks see the image token-count differently and
+///      the prefill rewrites won't line up.
+///   2. Common-prefix > 0 on the produced text — greedy decode at
+///      T=0 over identical token-streams should agree on the first
+///      token. BF16 attention saturation drift
+///      (`project_vit_attention_bf16_softmax_drift.md`) means
+///      strict byte-equal is too strict, but a 0-byte common prefix
+///      = catastrophic divergence (e.g. a tokenizer mismatch or a
+///      complete projector misbehavior).
+///
+/// `LLAMA_ARG_MMPROJ_OFFLOAD=0` keeps llama-mtmd-cli's CLIP encoder
+/// on CPU so it doesn't fight hf2q's Metal context for VRAM under
+/// the OOM-prevention rule (`feedback_oom_prevention.md`).
+///
+/// Spawned hf2q server uses `--port 0` is not supported by clap,
+/// so the proxy uses a fixed high-numbered random port to avoid
+/// collisions.  /readyz polls every 2s up to 600s (10 min) — first
+/// model load on a 17 GB chat GGUF + 1.07 GB mmproj is ~5 min cold.
+///
+/// All HTTP I/O uses raw `TcpStream` + manual HTTP/1.1 to avoid
+/// adding `reqwest`/`ureq` to the workspace just for this gate.
 #[allow(dead_code)]
 fn phase_d_parity_proxy_t0_n16() {
-    panic!(
-        "[Phase D] parity proxy not implemented in iter-116a. \
-         Lands in iter-116b."
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // ----- pick a port + spawn hf2q serve -----
+    //
+    // Port choice: a value high enough to avoid common dev ports yet
+    // distinct from peer workers' fixtures. iter-116i uses 52226 (W40's
+    // value in /tmp/w40_phase_abcd.log) since that worker's run
+    // proved port-clean under the wave's quiet host.
+    let host = "127.0.0.1";
+    let port: u16 = 52226;
+    let prompt = "Describe this image in 5 words.";
+    let max_tokens: u32 = 16;
+    eprintln!(
+        "[Phase D] start: host={host} port={port} prompt={prompt:?} \
+         max_tokens={max_tokens}"
     );
+
+    // hf2q serve binary lives where cargo just compiled it.
+    // CARGO_BIN_EXE_hf2q is the cargo-test-injected path.
+    let hf2q_bin = env!("CARGO_BIN_EXE_hf2q");
+    let child: Child = Command::new(hf2q_bin)
+        .args([
+            "serve",
+            "--model", CHAT_GGUF_PATH,
+            "--mmproj", MMPROJ_PATH,
+            "--host", host,
+            "--port", &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("[Phase D] hf2q serve spawn failed");
+    let pid = child.id();
+    eprintln!("[Phase D] spawned hf2q serve pid={pid}");
+
+    // RAII guard: kill the child on every exit path so a panic mid-test
+    // never strands a 17 GB-resident server in the background.
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    // Move ownership into the guard.
+    // (We still need its stderr handle below — drain it post-kill via
+    // wait_with_output if needed for forensic logging.)
+    let guard = Guard(child);
+
+    // ----- /readyz poll up to 600s -----
+    let readyz_deadline = Instant::now() + Duration::from_secs(600);
+    let mut readyz_ok = false;
+    let mut last_err: Option<String> = None;
+    while Instant::now() < readyz_deadline {
+        match http_get_status(host, port, "/readyz") {
+            Ok(200) => {
+                readyz_ok = true;
+                break;
+            }
+            Ok(code) => last_err = Some(format!("status={code}")),
+            Err(e) => last_err = Some(format!("transport: {e}")),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(
+        readyz_ok,
+        "[Phase D] /readyz did not reach 200 within 600s; \
+         last_err={}",
+        last_err.unwrap_or_else(|| "<none>".into())
+    );
+    eprintln!("[Phase D] /readyz=200 at {:?}", Instant::now());
+
+    // ----- POST /v1/chat/completions with image_url -----
+    //
+    // Use a `data:image/png;base64,...` URL so the request is
+    // self-contained; reading the fixture once into base64 is cheaper
+    // than the file:// path (which would need the server to share the
+    // test's working dir).
+    let img_bytes = std::fs::read(FIXTURE_IMAGE)
+        .expect("[Phase D] read fixture image failed");
+    let img_b64 = base64_encode(&img_bytes);
+    // W42 iter-116i: the loaded model's `id` (per `/v1/models`) is
+    // `general.name` from GGUF metadata when present, falling back
+    // to the file stem (`src/serve/api/engine.rs:511-520`). For the
+    // gemma4 chat GGUF, `general.name = "Gemma4ForConditionalGeneration"`,
+    // not the file stem — so the file-stem guess returns HTTP 400
+    // `model_not_loaded`. Query `/v1/models` to read the actual id.
+    let models_resp = http_get(host, port, "/v1/models")
+        .expect("[Phase D] GET /v1/models failed");
+    assert_eq!(
+        models_resp.0, 200,
+        "[Phase D] /v1/models status={}, body=\n{}",
+        models_resp.0, models_resp.1
+    );
+    let models_v: serde_json::Value = serde_json::from_str(&models_resp.1)
+        .unwrap_or_else(|e| panic!("[Phase D] parse /v1/models: {e}\n{}", models_resp.1));
+    // /v1/models lists BOTH the chat model and the mmproj as separate
+    // entries (`src/serve/mod.rs:1152-1226` for chat, `:1292-1343` for
+    // mmproj). The chat entry is the one carrying `context_length`
+    // (the mmproj entry omits it). Filter on that to grab the
+    // chat-completions-eligible id.
+    let data = models_v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .unwrap_or_else(|| panic!(
+            "[Phase D] /v1/models missing data array; body=\n{}",
+            models_resp.1
+        ));
+    // Both entries serialize the `context_length` key (it's a struct
+    // field), but mmproj's value is `null` (Option::None → JSON null).
+    // The chat entry's value is the actual integer context window.
+    // Filter on non-null to pick the chat engine deterministically.
+    let model_id = data
+        .iter()
+        .find(|m| {
+            m.get("context_length")
+                .map(|v| !v.is_null())
+                .unwrap_or(false)
+        })
+        .and_then(|m| m.get("id"))
+        .and_then(|s| s.as_str())
+        .unwrap_or_else(|| panic!(
+            "[Phase D] /v1/models has no entry with non-null \
+             `context_length` (chat model); body=\n{}",
+            models_resp.1
+        ))
+        .to_string();
+    eprintln!("[Phase D] resolved loaded chat-model id from /v1/models: {model_id}");
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text",      "text": prompt },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:image/png;base64,{img_b64}"),
+                        },
+                    },
+                ],
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "stream": false,
+    })
+    .to_string();
+
+    let (status, headers, body_text) =
+        http_post_json(host, port, "/v1/chat/completions", &body)
+            .expect("[Phase D] POST /v1/chat/completions failed");
+    assert_eq!(
+        status, 200,
+        "[Phase D] hf2q chat completions status={status}, body=\n{body_text}"
+    );
+    let soft_tokens_hf2q = headers
+        .iter()
+        .find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("x-hf2q-soft-tokens-total") {
+                v.trim().parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "[Phase D] hf2q response missing X-HF2Q-Soft-Tokens-Total \
+                 header; headers=\n{}",
+                headers_to_string(&headers)
+            )
+        });
+    let hf2q_text = extract_chat_text(&body_text)
+        .unwrap_or_else(|e| panic!("[Phase D] parse hf2q chat body: {e}\n{body_text}"));
+    eprintln!(
+        "[Phase D] hf2q response: soft_tokens={soft_tokens_hf2q}, text={:?}",
+        hf2q_text
+    );
+
+    // Drop the guard now to free GPU memory before launching
+    // llama-mtmd-cli (OOM rule: one model-loading inference at a time).
+    drop(guard);
+
+    // ----- run llama-mtmd-cli -----
+    let llama_out = Command::new(LLAMA_MTMD_BIN)
+        .args([
+            "-m", CHAT_GGUF_PATH,
+            "--mmproj", MMPROJ_PATH,
+            "--image", FIXTURE_IMAGE,
+            "-p", prompt,
+            "-n", &max_tokens.to_string(),
+            "--temperature", "0",
+            "--jinja",
+        ])
+        .env("LLAMA_ARG_MMPROJ_OFFLOAD", "0")
+        .output()
+        .expect("[Phase D] llama-mtmd-cli spawn failed");
+    let llama_stdout = String::from_utf8_lossy(&llama_out.stdout).to_string();
+    let llama_stderr = String::from_utf8_lossy(&llama_out.stderr).to_string();
+    assert!(
+        llama_out.status.success(),
+        "[Phase D] llama-mtmd-cli exited non-zero: status={:?}\nstderr=\n{llama_stderr}",
+        llama_out.status
+    );
+
+    // Soft-token count: llama-mtmd-cli logs lines like
+    //   "encoding image batch idx 0, n_tokens_batch = 280"
+    // (per /opt/llama.cpp/tools/mtmd/mtmd.cpp). Parse the first such
+    // line and treat the integer as the reference soft-token count.
+    let soft_tokens_llama: u32 = parse_n_tokens_batch(&llama_stderr).unwrap_or_else(|| {
+        panic!(
+            "[Phase D] llama-mtmd-cli stderr does not report n_tokens_batch:\n\
+             {llama_stderr}"
+        )
+    });
+    let llama_text = llama_stdout.trim().to_string();
+    eprintln!(
+        "[Phase D] llama-mtmd-cli response: soft_tokens={soft_tokens_llama}, \
+         stdout_bytes={}",
+        llama_text.len()
+    );
+
+    // ----- compare -----
+    eprintln!("[Phase D] hf2q_text  = {:?}", hf2q_text);
+    eprintln!("[Phase D] llama_text = {:?}", llama_text);
+    let common_prefix = byte_common_prefix(hf2q_text.as_bytes(), llama_text.as_bytes());
+    eprintln!(
+        "[Phase D] common_prefix={} bytes; soft_tokens hf2q={} llama={}",
+        common_prefix, soft_tokens_hf2q, soft_tokens_llama
+    );
+    assert_eq!(
+        soft_tokens_hf2q, soft_tokens_llama,
+        "[Phase D] soft-token count mismatch — hf2q sees {} image tokens \
+         per image, llama-mtmd-cli sees {}; prefill embed-bypass contract \
+         is broken",
+        soft_tokens_hf2q, soft_tokens_llama
+    );
+    assert!(
+        common_prefix > 0,
+        "[Phase D] common-prefix = 0 — catastrophic divergence at T=0:\n\
+         hf2q:  {:?}\nllama: {:?}\n\
+         (BF16 attention saturation drift would still leave at least \
+         the first token; 0-prefix means tokenizer mismatch or projector \
+         misbehavior)",
+        hf2q_text,
+        llama_text
+    );
+    eprintln!("[Phase D] PASS — soft_tokens parity + common_prefix>0");
+
+    // ----- helpers -----
+    return;
+
+    fn http_get_status(host: &str, port: u16, path: &str) -> std::io::Result<u16> {
+        let mut s = TcpStream::connect((host, port))?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes())?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf)?;
+        let resp = String::from_utf8_lossy(&buf);
+        let first = resp.lines().next().unwrap_or("");
+        // "HTTP/1.1 200 OK"
+        let mut it = first.split_whitespace();
+        let _proto = it.next();
+        let code = it
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| std::io::Error::other(format!("bad status line: {first:?}")))?;
+        Ok(code)
+    }
+
+    /// GET that returns (status, body_text). Used by Phase D to read
+    /// `/v1/models` so the request body's `model` field matches the
+    /// server-side `id` (which is GGUF `general.name` first, file-stem
+    /// fallback — see `src/serve/api/engine.rs:511-520`).
+    fn http_get(host: &str, port: u16, path: &str) -> std::io::Result<(u16, String)> {
+        let mut s = TcpStream::connect((host, port))?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        s.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes())?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf)?;
+        let split_at = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| std::io::Error::other("no header/body split"))?;
+        let head = std::str::from_utf8(&buf[..split_at])
+            .map_err(|e| std::io::Error::other(format!("non-utf8 headers: {e}")))?;
+        let body_bytes = &buf[split_at + 4..];
+        let status_line = head.lines().next().unwrap_or("");
+        let mut it = status_line.split_whitespace();
+        let _proto = it.next();
+        let code = it
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| std::io::Error::other(format!("bad status: {status_line:?}")))?;
+        let body_text = String::from_utf8_lossy(body_bytes).to_string();
+        Ok((code, body_text))
+    }
+
+    /// Returns (status_code, headers, body_text). Headers preserved as
+    /// (name, value) pairs in receipt order.
+    fn http_post_json(
+        host: &str,
+        port: u16,
+        path: &str,
+        body: &str,
+    ) -> std::io::Result<(u16, Vec<(String, String)>, String)> {
+        let mut s = TcpStream::connect((host, port))?;
+        // Generous timeouts: vit forward + decode of 16 tokens on a
+        // 17 GB model can take ~30 s on the M5 Max.
+        s.set_read_timeout(Some(Duration::from_secs(120)))?;
+        s.set_write_timeout(Some(Duration::from_secs(60)))?;
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        s.write_all(req.as_bytes())?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf)?;
+
+        // Split header/body on the first \r\n\r\n.
+        let split_at = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| std::io::Error::other("no header/body split"))?;
+        let head = std::str::from_utf8(&buf[..split_at])
+            .map_err(|e| std::io::Error::other(format!("non-utf8 headers: {e}")))?;
+        let body_bytes = &buf[split_at + 4..];
+
+        let mut lines = head.lines();
+        let status_line = lines.next().unwrap_or("");
+        let mut sit = status_line.split_whitespace();
+        let _proto = sit.next();
+        let code = sit
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| std::io::Error::other(format!("bad status: {status_line:?}")))?;
+        let mut headers = Vec::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        // axum's default response is non-chunked + Connection: close, so
+        // body is the raw remainder. (If a future server config flips to
+        // chunked encoding, this proxy will need an unchunker; assert
+        // here to fail loud rather than silently get a malformed body.)
+        if headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding")
+                && v.eq_ignore_ascii_case("chunked"))
+        {
+            return Err(std::io::Error::other(
+                "chunked transfer-encoding not handled by Phase D proxy; \
+                 add an unchunker if hf2q starts emitting it",
+            ));
+        }
+        let body_text = String::from_utf8_lossy(body_bytes).to_string();
+        Ok((code, headers, body_text))
+    }
+
+    fn headers_to_string(headers: &[(String, String)]) -> String {
+        headers
+            .iter()
+            .map(|(k, v)| format!("  {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn extract_chat_text(body: &str) -> Result<String, String> {
+        let v: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| format!("json parse: {e}"))?;
+        let txt = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c0| c0.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| "missing .choices[0].message.content".to_string())?;
+        Ok(txt.to_string())
+    }
+
+    fn parse_n_tokens_batch(stderr: &str) -> Option<u32> {
+        // Match e.g. "n_tokens_batch = 280" or "n_tokens_per_image = 280".
+        for line in stderr.lines() {
+            for needle in ["n_tokens_batch", "n_tokens_per_image"] {
+                if let Some(idx) = line.find(needle) {
+                    let tail = &line[idx + needle.len()..];
+                    // Skip past " = " or whitespace + digits.
+                    let digits: String = tail
+                        .chars()
+                        .skip_while(|c| !c.is_ascii_digit())
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if let Ok(n) = digits.parse::<u32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn byte_common_prefix(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    }
+
+    /// Minimal RFC 4648 base64 encoder so the test doesn't depend on
+    /// a third-party base64 crate (hf2q's only base64 dep is in
+    /// production code, not dev-deps).
+    fn base64_encode(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+        let mut i = 0;
+        while i + 3 <= input.len() {
+            let n = ((input[i] as u32) << 16)
+                | ((input[i + 1] as u32) << 8)
+                | (input[i + 2] as u32);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+            i += 3;
+        }
+        let rem = input.len() - i;
+        if rem == 1 {
+            let n = (input[i] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        } else if rem == 2 {
+            let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        out
+    }
 }
