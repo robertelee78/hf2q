@@ -42,6 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::serve::config::Gemma4Config;
 use crate::serve::forward_mlx::{MlxModelWeights, ProfileAccumulator};
+use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
 use crate::serve::sampler_pure::{
@@ -162,6 +163,21 @@ impl Default for SamplingParams {
             token_bytes: None,
         }
     }
+}
+
+/// Owned soft-token override sent through the worker channel.
+///
+/// Identical contract to [`SoftTokenInjection`] but owns the
+/// `MlxBuffer` (channel-friendly: needs `Send`).  The worker thread
+/// rebuilds borrowed `SoftTokenInjection<'_>` slices from a
+/// `&[SoftTokenData]` for the prefill call.  Phase 2c Task #17 / iter-98.
+#[derive(Debug, Clone)]
+pub struct SoftTokenData {
+    /// Half-open position range within the prompt: `[start, end)`.
+    pub range: std::ops::Range<usize>,
+    /// Replacement embeddings, shape `[range.len(), hidden_size]` F32,
+    /// row-major.  Cheap-clone (Arc-shared underlying Metal buffer).
+    pub embeddings: mlx_native::MlxBuffer,
 }
 
 /// Result of a non-streaming chat generation.
@@ -286,6 +302,14 @@ enum Request {
     Embed {
         prompt_tokens: Vec<u32>,
         reply: oneshot::Sender<Result<Vec<f32>>>,
+    },
+    /// Vision-aware chat generation (Phase 2c Task #17 / iter-98).
+    /// See `Engine::generate_with_soft_tokens` doc.
+    GenerateWithSoftTokens {
+        prompt_tokens: Vec<u32>,
+        soft_tokens: Vec<SoftTokenData>,
+        params: SamplingParams,
+        reply: oneshot::Sender<Result<GenerationResult>>,
     },
     /// Graceful-shutdown sentinel.
     Shutdown,
@@ -798,6 +822,40 @@ impl Engine {
         reply_rx.await.context("embedding reply dropped")?
     }
 
+    /// Vision-aware non-streaming generation (Phase 2c Task #17 / iter-98).
+    ///
+    /// Same as `generate` but passes per-position embedding overrides
+    /// that the worker plugs into the prefill via
+    /// `MlxModelWeights::forward_prefill_with_soft_tokens`.  Used by
+    /// the chat handler when an `image_url` content part is present
+    /// in the request: the projected vision embeddings for each image
+    /// flow through this API as `SoftTokenData` covering the
+    /// placeholder-token positions in the prompt.
+    pub async fn generate_with_soft_tokens(
+        &self,
+        prompt_tokens: Vec<u32>,
+        soft_tokens: Vec<SoftTokenData>,
+        params: SamplingParams,
+    ) -> Result<GenerationResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::GenerateWithSoftTokens {
+            prompt_tokens,
+            soft_tokens,
+            params,
+            reply: reply_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                anyhow::bail!("queue_full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone");
+            }
+        }
+        reply_rx.await.context("vision generation reply dropped")?
+    }
+
     /// Request a clean shutdown of the worker. Drains in-flight + queued work
     /// (FIFO ordering means the `Shutdown` sentinel runs after every request
     /// already enqueued) and then joins the worker thread.
@@ -906,6 +964,33 @@ fn worker_run(
                     .forward_embed_last(&prompt_tokens, &mut loaded.ctx);
                 let _ = reply.send(result);
             }
+            Request::GenerateWithSoftTokens {
+                prompt_tokens,
+                soft_tokens,
+                params,
+                reply,
+            } => {
+                // Vision-aware generate (Phase 2c Task #17 / iter-98).
+                // Build borrowed `SoftTokenInjection<'_>` slices from the
+                // owned `SoftTokenData` we received over the channel; the
+                // borrow lifetime is bounded by this match arm so it
+                // can't outlive the underlying buffers.
+                let injections: Vec<SoftTokenInjection<'_>> = soft_tokens
+                    .iter()
+                    .map(|d| SoftTokenInjection {
+                        range: d.range.clone(),
+                        embeddings: &d.embeddings,
+                    })
+                    .collect();
+                let result = generate_once_with_soft_tokens(
+                    &mut loaded,
+                    &prompt_tokens,
+                    &injections,
+                    &params,
+                    registration.as_ref(),
+                );
+                let _ = reply.send(result);
+            }
             Request::Shutdown => {
                 tracing::info!("hf2q-engine worker received Shutdown; exiting");
                 break;
@@ -952,6 +1037,22 @@ fn warmup_once(loaded: &mut LoadedModel) -> Result<()> {
 fn generate_once(
     loaded: &mut LoadedModel,
     prompt_tokens: &[u32],
+    params: &SamplingParams,
+    registration: Option<&super::registry::ModelRegistration>,
+) -> Result<GenerationResult> {
+    generate_once_with_soft_tokens(loaded, prompt_tokens, &[], params, registration)
+}
+
+/// Vision-aware variant — same as `generate_once` except the prefill
+/// goes through `forward_prefill_with_soft_tokens` so per-position
+/// embedding overrides apply.  Phase 2c Task #17 / iter-98.
+///
+/// When `soft_tokens` is empty, behaviour is byte-identical to
+/// `generate_once`.
+fn generate_once_with_soft_tokens(
+    loaded: &mut LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[SoftTokenInjection<'_>],
     params: &SamplingParams,
     registration: Option<&super::registry::ModelRegistration>,
 ) -> Result<GenerationResult> {
@@ -1071,10 +1172,13 @@ fn generate_once(
         };
 
     // --- Prefill ---
+    // Iter-98: route through forward_prefill_with_soft_tokens. Empty
+    // soft_tokens slice is the no-op identity over forward_prefill —
+    // text-only requests pay zero overhead.
     let prefill_start = Instant::now();
     let prefill_argmax = loaded
         .weights
-        .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx)?;
+        .forward_prefill_with_soft_tokens(prompt_tokens, soft_tokens, max_tokens, &mut loaded.ctx)?;
     let prefill_duration = prefill_start.elapsed();
 
     // First decode token: greedy fast-path uses prefill's on-GPU argmax;

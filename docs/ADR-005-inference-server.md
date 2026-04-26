@@ -1930,6 +1930,23 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 98 — Phase 2c Task #17 engine layer: `Engine::generate_with_soft_tokens` + worker channel `GenerateWithSoftTokens` variant + `generate_once_with_soft_tokens` helper. Engine API now accepts per-position embedding overrides end-to-end — handlers can call `engine.generate_with_soft_tokens(prompt_tokens, soft_tokens, params).await` and the worker thread plugs the overrides into `forward_prefill_with_soft_tokens` at the right positions. Iter-99 wires the chat handler (drop the 501) to actually populate `soft_tokens` with the projected ViT embeddings.**
+  - **What landed.**
+    - **`SoftTokenData`** struct (engine.rs): owned variant of `SoftTokenInjection` (the borrowed lifetime `<'a>` form lives in `forward_prefill.rs`).  Owns the `MlxBuffer` so the channel can move it across thread boundaries (`MlxBuffer: Send + Sync` per the Apple Silicon shared-memory contract).  Cheap-clone (Arc-shared underlying Metal buffer).
+    - **`Request::GenerateWithSoftTokens`** worker channel variant: `{ prompt_tokens: Vec<u32>, soft_tokens: Vec<SoftTokenData>, params: SamplingParams, reply: oneshot::Sender<...> }`.
+    - **`Engine::generate_with_soft_tokens(prompt_tokens, soft_tokens, params).await`** public API: same FIFO queue / `queue_full → 429 + Retry-After` semantics as `generate`.
+    - **Worker arm**: builds borrowed `Vec<SoftTokenInjection<'_>>` from the owned `SoftTokenData` slice (lifetime bounded by the match arm) and calls `generate_once_with_soft_tokens`.
+    - **`generate_once_with_soft_tokens`** helper: same body as `generate_once` except the prefill call routes through `forward_prefill_with_soft_tokens(prompt_tokens, soft_tokens, max_tokens, &mut loaded.ctx)`.  `generate_once` is now a thin wrapper that delegates with `&[]` — text-only requests pay zero overhead.
+  - **Verification.** `cargo test --release --bin hf2q -- nomic_bert bert_gpu grammar --test-threads=1` → **139/139 pass**.  Build clean.
+  - **Iter-99 plan: wire chat handler + drop the 501.**
+    1. After `process_multimodal_content` produces `Vec<PreprocessedImage>`, run `compute_vision_embeddings_gpu` (already done) → `Vec<Vec<f32>>` of projected embeddings, `[N_image_tokens × hidden_size]` per image.
+    2. Convert each `Vec<f32>` → `MlxBuffer` via `MlxDevice::alloc_buffer` + CPU-side memcpy through `as_mut_slice` (Apple Silicon unified memory).
+    3. Render chat template with `<|image|>` placeholder text per image.  Tokenize → find `IMG_TOKEN_ID = 258880` positions.
+    4. EXPAND each placeholder: replace position `p` with `N_image_tokens` consecutive `IMG_TOKEN_ID`s so the prompt has 49 image-token positions per image.
+    5. Build `Vec<SoftTokenData>` covering each expanded range.
+    6. Call `engine.generate_with_soft_tokens(prompt_tokens, soft_tokens, params).await` instead of returning the 501.
+    7. Acceptance: hf2q vision output matches mlx-lm Gemma 4 vision on 5 standard prompts × 5 images (token-match for the first 50 generated tokens at T=0).
+
 - **2026-04-25 loop iter 97 — Phase 2c Task #17 foundation: `MlxModelWeights::forward_prefill_with_soft_tokens` ships the per-position embedding-override hook that the multimodal soft-token path will plug vision embeddings into. Existing `forward_prefill` becomes a thin wrapper over the new method (`soft_tokens=&[]`). Iter-98 wires it through Engine + chat handler to close Task #17 end-to-end.**
   - **What landed.**
     - **`SoftTokenInjection<'a>` struct** (forward_prefill.rs): `{ range: Range<usize>, embeddings: &'a MlxBuffer }`. Range is half-open `[start, end)` over prompt positions; embeddings is `[range.len(), hidden_size]` F32 row-major.
