@@ -1,8 +1,8 @@
 # ADR-008: Full Candle Divorce — Port to Pure mlx-native
 
-**Status:** Proposed  
-**Date:** 2026-04-15  
-**Decision Makers:** Robert, Claude  
+**Status:** Accepted. Implemented 2026-04-14 in commit 9e23b7d ("feat(ADR-008): full candle divorce — pure mlx-native inference"); ~47k lines of candle-derived code deleted, hf2q's forward path runs entirely on mlx-native.
+**Date:** 2026-04-15 (Proposed) → 2026-04-14 (Implemented in 9e23b7d, recorded post-hoc)
+**Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native GPU backend), ADR-007 (TurboQuant KV cache), ADR-005 (inference server)
 
 ---
