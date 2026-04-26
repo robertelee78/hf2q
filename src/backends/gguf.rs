@@ -1528,6 +1528,38 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
 /// Gemma4 (which has a separate `pre_feedforward_layernorm` for the FFN pre-norm).
 /// Qwen3.5-family linear-attention (Gated DeltaNet) layer-map entries.
 ///
+/// MTP wrapper-tensor mappings for qwen35 / qwen35moe.
+///
+/// After `models::qwen35::rename_mtp_tensors_to_layer_form` rewrites HF
+/// `mtp.fc.weight` etc. to `model.layers.{n_layer}.eh_proj.weight` etc.,
+/// the standard layer mapper sees them and translates to the
+/// `blk.{N}.nextn.<suffix>` form llama-arch.cpp:447-450 expects.
+///
+/// Each entry cites the corresponding `LLM_TENSOR_NEXTN_*` line.
+fn qwen35_nextn_wrapper_layer_map() -> &'static [(&'static str, &'static str)] {
+    &[
+        // llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ → "blk.%d.nextn.eh_proj"
+        // (rename source: mtp.fc.weight per convert_hf_to_gguf.py:10536)
+        ("eh_proj.weight", "nextn.eh_proj.weight"),
+        // llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM → "blk.%d.nextn.enorm"
+        // (rename source: mtp.pre_fc_norm_embedding.weight per :10537)
+        ("enorm.weight", "nextn.enorm.weight"),
+        // llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM → "blk.%d.nextn.hnorm"
+        // (rename source: mtp.pre_fc_norm_hidden.weight per :10538)
+        ("hnorm.weight", "nextn.hnorm.weight"),
+        // llama-arch.cpp:452 LLM_TENSOR_NEXTN_SHARED_HEAD_NORM → "blk.%d.nextn.shared_head_norm"
+        // (rename source: mtp.norm.weight per :10539; py uses "shared_head.norm")
+        ("shared_head.norm.weight", "nextn.shared_head_norm.weight"),
+        ("shared_head_norm.weight", "nextn.shared_head_norm.weight"),
+        // llama-arch.cpp:451 LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD → "blk.%d.nextn.shared_head_head"
+        // (no Qwen3.5 HF source observed yet; mapped for forward compatibility)
+        ("shared_head.head.weight", "nextn.shared_head_head.weight"),
+        // llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS → "blk.%d.nextn.embed_tokens"
+        // (some HF variants ship the wrapper-level embed_tokens at mtp.embed_tokens.weight)
+        ("embed_tokens.weight", "nextn.embed_tokens.weight"),
+    ]
+}
+
 /// Shared between the qwen35 (dense) and qwen35moe (MoE) arches because the
 /// hybrid 3:1 DeltaNet:Full attention pattern is identical between variants
 /// (only the FFN differs). Citations transcribed from llama-arch.cpp via
@@ -1621,6 +1653,7 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // so the layer-map only sees the post-split names.
         "qwen35" => {
             map.extend_from_slice(&qwen35_linear_attn_layer_map());
+            map.extend_from_slice(qwen35_nextn_wrapper_layer_map());
         }
         // ADR-012 Decision 11 + P5: qwen35moe adds the MoE-specific surface:
         // router (mlp.gate), per-expert merged stacks (mlp.experts.* post-merge
@@ -1638,6 +1671,7 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // for both arches.
         "qwen35moe" => {
             map.extend_from_slice(&qwen35_linear_attn_layer_map());
+            map.extend_from_slice(qwen35_nextn_wrapper_layer_map());
             map.extend_from_slice(&[
                 // llama-arch.cpp:393 LLM_TENSOR_FFN_GATE_INP → "blk.%d.ffn_gate_inp"
                 // src/models/qwen35/moe.rs:83 — MoE router.
@@ -2273,6 +2307,16 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         "general.quantization_version".into(),
         MetaValue::Uint32(2),
     ));
+    // ADR-012 Decision 19 (2026-04-25 follow-up): for qwen35 / qwen35moe,
+    // llama.cpp's load_hparams does NOT read LLM_KV_NEXTN_PREDICT_LAYERS
+    // (only GLM4 + DeepseekV3 do, see llama-model.cpp:2073/2107/2154/2329).
+    // Its create_tensor loop is `for (int i = 0; i < n_layer; ++i)` and
+    // expects exactly that many per-layer slots.  So `block_count` is the
+    // raw `num_hidden_layers` (no MTP); MTP tensors must NOT be emitted as
+    // blk.{n_layer}.* slots — they have no loader-side allocation and the
+    // file is rejected.  When llama.cpp gains qwen35 MTP support, this
+    // expression becomes `meta.num_layers + meta.mtp_num_hidden_layers...`
+    // (mirrors convert_hf_to_gguf.py:10042 for arches that do).
     kv.push((
         format!("{}.block_count", arch),
         MetaValue::Uint32(meta.num_layers),

@@ -1307,6 +1307,124 @@ pub fn apply_qwen35_linear_attn_transforms_in_tensor_map(
     Ok(())
 }
 
+/// Rename HF MTP (`mtp.*`) tensors into the standard `model.layers.{N}.*`
+/// form so the downstream `gguf::hf_name_to_gguf` mapper produces the
+/// `blk.{N}.*` and `blk.{N}.nextn.*` names llama.cpp expects (ADR-012
+/// Decision 19, full implementation).
+///
+/// # Background — Bug 2 in the 2026-04-25 cron-iter end-gate sweep
+///
+/// The original ADR-012 P11 (commit `0a1a7b7`) only handled four wrapper
+/// suffixes (`enorm`, `hnorm`, `embed_tokens`, `eh_proj`) — and used the
+/// **wrong** HF source names.  The actual Qwen3.6-27B HF schema emits 15
+/// `mtp.*` tensors that pass through `hf_name_to_gguf` unrenamed:
+///
+/// * 11 inner-transformer-block tensors:
+///   `mtp.layers.0.{self_attn.{q,k,v,o,q_norm,k_norm}_proj,mlp.{gate,up,down}_proj}.weight`
+///   + `mtp.layers.0.input_layernorm.weight`
+///   + `mtp.layers.0.post_attention_layernorm.weight`
+///
+/// * 4 wrapper tensors:
+///   `mtp.fc.weight` (eh_proj equivalent),
+///   `mtp.norm.weight` (shared_head.norm),
+///   `mtp.pre_fc_norm_embedding.weight` (enorm),
+///   `mtp.pre_fc_norm_hidden.weight` (hnorm)
+///
+/// llama.cpp rejects every GGUF that emits these as raw `mtp.*` strings:
+///   > done_getting_tensors: wrong number of tensors; expected N, got N-15
+///
+/// # Mapping (mirrors `convert_hf_to_gguf.py:10529-10540`)
+///
+/// For `mtp.layers.{idx}.{rest}` — append `idx` to `num_hidden_layers` and
+/// rewrite to `model.layers.{N + idx}.{rest}` (then the standard layer
+/// mapper takes over: `model.layers.K.input_layernorm.weight` → `blk.K.attn_norm.weight`,
+/// etc.).
+///
+/// For the four wrapper tensors — rewrite to
+/// `model.layers.{N}.{eh_proj|enorm|hnorm|shared_head.norm}.weight` and
+/// add the matching layer-map entries downstream.
+///
+/// # Arch gate
+///
+/// No-op for non-Qwen3.5 family arches.  No `mtp.*` tensors exist outside
+/// the qwen35 / qwen35moe pipelines — but the explicit gate keeps the
+/// transform free of false positives if a future arch happens to use a
+/// similar prefix.
+pub fn rename_mtp_tensors_to_layer_form(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<usize, ConvertError> {
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(0);
+    }
+    let n_layer = metadata.num_layers as usize;
+
+    // Collect first to avoid mutate-during-iterate.
+    let mtp_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| n.starts_with("mtp."))
+        .cloned()
+        .collect();
+
+    let mut renamed = 0usize;
+
+    for old_name in mtp_keys {
+        let new_name = match map_mtp_tensor_name(&old_name, n_layer) {
+            Some(n) => n,
+            None => continue,
+        };
+        let Some(mut tensor) = tensor_map.tensors.remove(&old_name) else {
+            continue;
+        };
+        tensor.name = new_name.clone();
+        tensor_map.tensors.insert(new_name, tensor);
+        renamed += 1;
+    }
+
+    Ok(renamed)
+}
+
+/// Map a single HF MTP tensor name to its `model.layers.{N}.*` equivalent.
+///
+/// Returns `None` for tensors that don't match a known MTP pattern (caller
+/// leaves them untouched — the unrecognized-tensor path in
+/// `gguf::hf_name_to_gguf` will surface them with a clear error if any
+/// future variant emits a name we don't know yet).
+pub fn map_mtp_tensor_name(name: &str, n_layer: usize) -> Option<String> {
+    // Strip "mtp." prefix.
+    let rest = name.strip_prefix("mtp.")?;
+
+    // Case A: mtp.layers.{idx}.{rest}
+    if let Some(layer_part) = rest.strip_prefix("layers.") {
+        let dot = layer_part.find('.')?;
+        let idx_str = &layer_part[..dot];
+        let suffix = &layer_part[dot + 1..];
+        let idx: usize = idx_str.parse().ok()?;
+        return Some(format!("model.layers.{}.{}", n_layer + idx, suffix));
+    }
+
+    // Case B: wrapper tensors → model.layers.{n_layer}.<canonical>
+    // Mapping from convert_hf_to_gguf.py:10536-10540.  The downstream
+    // gguf layer mapper translates each canonical name to the
+    // `blk.{N}.nextn.<suffix>` form llama-arch.cpp:447-450 expects.
+    let canonical = match rest {
+        "fc.weight" => "eh_proj.weight",
+        "pre_fc_norm_embedding.weight" => "enorm.weight",
+        "pre_fc_norm_hidden.weight" => "hnorm.weight",
+        "norm.weight" => "shared_head.norm.weight",
+        // Some HF variants ship the embed_tokens at the wrapper level
+        // (rather than under layers.0).  Route it through the same
+        // wrapper canonicalization so it lands at blk.{N}.nextn.embed_tokens.
+        "embed_tokens.weight" => "embed_tokens.weight",
+        // Unknown wrapper — leave to caller to surface a clear error
+        // rather than guessing.  This is the no-stub path: silent
+        // pass-through would be a fallback.
+        _ => return None,
+    };
+    Some(format!("model.layers.{}.{}", n_layer, canonical))
+}
+
 pub fn apply_rms_norm_plus_one_in_tensor_map(
     tensor_map: &mut crate::ir::TensorMap,
     metadata: &crate::ir::ModelMetadata,
