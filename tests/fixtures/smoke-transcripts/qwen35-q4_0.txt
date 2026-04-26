@@ -1,0 +1,68 @@
+# hf2q smoke transcript
+# arch:  qwen35
+# quant: q4_0
+# prompt: "The quick brown fox"
+# (timestamps stripped; byte-stable across runs)
+
+---stdout---
+--no-conversation is not supported by llama-cli
+please use llama-completion instead
+
+Loading model... 
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b8680-15f786e65
+model      : qwen35-q4_0.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> The quick brown fox
+
+[Start thinking]
+The user has provided a partial sentence:
+
+[ Prompt:<X.XX> t/s | Generation:<X.XX> t/s ]
+
+Exiting...
+
+---stderr---
+load_backend: loaded BLAS backend from /opt/homebrew/Cellar/ggml/<X.XX>.11/libexec/libggml-blas.so
+ggml_metal_device_init: testing tensor API for f16 support
+ggml_metal_device_init: testing tensor API for bfloat support
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in<X.XX> sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple10  (1010)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = true
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  =<X.XX> MB
+load_backend: loaded MTL backend from /opt/homebrew/Cellar/ggml/<X.XX>.11/libexec/libggml-metal.so
+load_backend: loaded CPU backend from /opt/homebrew/Cellar/ggml/<X.XX>.11/libexec/libggml-cpu-apple_m4.so
+llama_memory_breakdown_print: | memory breakdown [MiB]  |  total    free     self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - MTL0 (Apple M5 Max) | 110100 = 76555 + (33543 = 16176 +   16533 +     834) +           0 |
+llama_memory_breakdown_print: |   - Host                |                    2954 =  2422 +       0 +     532                |
+ggml_metal_free: deallocating
+

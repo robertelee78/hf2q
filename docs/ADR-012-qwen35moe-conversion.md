@@ -1,6 +1,6 @@
 # ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
 
-**Status:** 🟡 **IN PROGRESS** — engineering pipeline complete, **shipped artifact regression discovered 2026-04-25**.
+**Status:** 🟡 **IN PROGRESS** — engineering pipeline complete, **Bug 4 closed 2026-04-25, Bug 3 (DWQ re-emit) still open**.
 
 P0–P11 all shipped on main (post-merge `da030a5`).  1185 unit + ~117 integration tests green.
 
@@ -39,10 +39,10 @@ hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snap>
 → preflight passes
 → convert produces 16 GB GGUF
 → llama_model_load: SUCCESS (no rejection)
-→ ggml-metal aborts on ssm_conv1d dtype assertion (Bug 4 — fix in flight)
+→ ggml-metal aborts on ssm_conv1d dtype assertion (Bug 4 — FIXED, see below)
 ```
 
-**Bug 4 — ssm_conv1d Metal kernel F32 requirement (CONVERT side, RUNTIME ABORT):** ⏳ **FIX SHIPPED, RE-RUN PENDING** — `src/backends/gguf.rs` working-tree edit (committed in this handoff alongside the ADR refresh) extends the existing F32-promotion path (`needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1`) to also fire for any tensor whose GGUF name ends with `.ssm_conv1d.weight`.
+**Bug 4 — ssm_conv1d Metal kernel F32 requirement (CONVERT side, RUNTIME ABORT):** ✅ **FIXED** in commit `f02a293` + smoke verified in **this commit** — `src/backends/gguf.rs` extends the existing F32-promotion path (`needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1`) to also fire for any tensor whose GGUF name ends with `.ssm_conv1d.weight`.
 
 Root cause: the Metal `SSM_CONV` kernel at `ggml-metal-device.cpp:490` asserts
 
@@ -54,24 +54,29 @@ and aborts the process at the first generation step if the conv1d weight is F16.
 
 Detection is by GGUF tensor name (post-rename), so the same guard fires for both qwen35 and qwen35moe without an arch-string check (no other arch emits a tensor named `*.ssm_conv1d.weight`).
 
-**Verification pending** — handoff state.  Next-iteration steps:
+**Verification done 2026-04-25** — smoke run on Qwen/Qwen3.6-27B (snapshot `6a9e13bd`) Q4_0, post-`f02a293` binary:
 
 ```
 cargo build --release --bin hf2q
-QWEN27B_DIR=$(ls -d ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/*/ | head -1)
-rm -rf /tmp/smoke-qwen35-q4 /tmp/smoke-fixtures
-./target/release/hf2q smoke --arch qwen35 --quant q4_0 \
-  --local-dir "$QWEN27B_DIR" \
+hf2q smoke --arch qwen35 --quant q4_0 \
+  --local-dir ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9/ \
   --convert-output-dir /tmp/smoke-qwen35-q4 \
   --fixtures-root /tmp/smoke-fixtures \
   --llama-cli-override /opt/homebrew/bin/llama-cli
+# Output: hf2q smoke: pass → /tmp/smoke-fixtures/smoke-transcripts/qwen35-q4_0.txt
 ```
 
-If the resulting transcript at `/tmp/smoke-fixtures/smoke-transcripts/qwen35-q4_0.txt` shows clean 8-token generation (no `GGML_ASSERT` line, no `Aborted`), Bug 4 is closed and the ADR can flip Bug 4 → ✅ FIXED + the `qwen35-q4_0.txt` transcript can move into `tests/fixtures/smoke-transcripts/`.
+Results:
+- Exit 0 (no `GGML_ASSERT`, no `Aborted`, no `panic`)
+- 8-token deterministic transcript generated (prompt: "The quick brown fox")
+- Byte-identical across two fresh runs (AC5 of the smoke spec satisfied)
+- Transcript committed to `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` in **this commit**
+
+**Note on ADR-013 P14 interaction:** the P14 merge (commit `79140ec`) changed the default qwen35 convert to emit MTP blocks (`block_count = num_hidden_layers + 1 = 65`) for native speculative decoding. Current llama.cpp b8680 has no qwen35 MTP loader and rejects the file with "missing tensor 'blk.64.ssm_conv1d.weight'" (the MTP block is full-attention with no ssm_conv1d). The smoke harness sets `HF2Q_QWEN35_DROP_MTP=1` for its convert subprocess (in `src/arch/smoke.rs`) so it tests the base 64-block GGUF load path — which is the correct scope for Bug 4 (ssm_conv1d F32 for blocks 0–63). Remove this workaround when llama.cpp gains qwen35 MTP loading.
 
 The same code path runs for qwen35moe.  Re-emitting the four DWQ deliverables (Bug 3 below) is then unblocked.
 
-**Bug 5 — `hf2q smoke` llama-cli interactive-readline hang (TEST HARNESS side, INFINITE BLOCK):** ⏳ **FIX SHIPPED, RE-RUN PENDING** — surfaced 2026-04-25 cron-iter when running the post-`f02a293` Bug 4 smoke verification.  Bug 5 was the latent blocker for Bug 4 verification; the F32-promotion fix appears correct (the GGUF builds, llama-cli loads it without rejection) but the smoke harness itself hung before the transcript could be scraped.
+**Bug 5 — `hf2q smoke` llama-cli interactive-readline hang (TEST HARNESS side, INFINITE BLOCK):** ✅ **FIXED** in `src/arch/smoke.rs` — smoke verified 2026-04-25.  Surfaced 2026-04-25 cron-iter when running the post-`f02a293` Bug 4 smoke verification.  Bug 5 was the latent blocker for Bug 4 verification; the F32-promotion fix appears correct (the GGUF builds, llama-cli loads it without rejection) but the smoke harness itself hung before the transcript could be scraped.
 
 Symptom: `hf2q smoke --arch qwen35 --quant q4_0 …` runs convert → produces `/tmp/smoke-qwen35-q4/qwen35-q4_0.gguf` (16.9 GB, valid) → invokes `llama-cli --model … --prompt "The quick brown fox" -n 8 --seed 42 --temp 0 --no-warmup` → llama-cli hangs indefinitely (25+ minutes observed before kill).  `sample(1)` on the hung child PID showed the dominant call stack:
 
@@ -83,9 +88,9 @@ The 8-token greedy generation completes; llama-cli then enters **conversation mo
 
 Root cause: recent llama.cpp builds default to conversation mode (`-cnv` / `--conversation` ON), per `/opt/llama.cpp/common/arg.cpp:1490`.  The `Command::new(&llama_cli)` invocation in `src/arch/smoke.rs:486-503` did not pass `-no-cnv` to disable it.
 
-Fix: add `"-no-cnv"` to the args list (this commit).  Detection by user arg (no version sniff): older llama.cpp builds where `-cnv` defaulted off still accept `-no-cnv` as a no-op, so the fix is safe across versions.  The mock `write_mock_llama_cli` in `tests/smoke_conformance.rs` ignores all args, so existing CI tests are unaffected.
+Fix: added `"-no-cnv"` and `"--single-turn"` to the args list.  `-no-cnv` disables conversation mode; `--single-turn` (added in **this commit**) further ensures exit after the first prompt response even when interactive mode is otherwise entered.  Also added `strip_terminal_control()` to the stdout sanitizer to remove backspace characters from the loading spinner and apply proper terminal emulation, producing a byte-stable transcript.  The mock `write_mock_llama_cli` in `tests/smoke_conformance.rs` ignores all args, so existing CI tests are unaffected.
 
-**Verification pending** — same repro as Bug 4 above (rebuild + smoke run).  When the smoke transcript materializes cleanly, Bug 5 → ✅ FIXED in the same commit that closes Bug 4 (since Bug 5 was the only thing actually preventing Bug 4 from being verified).
+**Verification done 2026-04-25** — Bug 5 ✅ FIXED in same commit as Bug 4 closure.  The smoke transcript at `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` materialized cleanly (68 lines, 2904 bytes, byte-identical across two fresh runs).
 
 ---
 

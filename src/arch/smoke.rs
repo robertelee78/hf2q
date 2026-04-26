@@ -455,6 +455,28 @@ fn run_q4_0_pipeline(
         let convert_args = build_convert_args(args, entry, &input_dir, &gguf_path)?;
         let convert_out = Command::new(&hf2q_exe)
             .args(&convert_args)
+            // ADR-012 Bug 4 smoke / ADR-013 P14 interaction (2026-04-25):
+            // The P14 merge flipped qwen35 / qwen35moe to emit MTP blocks
+            // by default (block_count = num_hidden_layers + 1 = 65) so that
+            // hf2q-produced GGUFs carry the complete MTP block for native
+            // speculative decoding in the inference engine.
+            //
+            // However, llama.cpp b8680 (current stable) has no qwen35 MTP
+            // loader: its create_tensor loop expects exactly num_hidden_layers
+            // blocks all with the same linear-attn slot layout, and rejects
+            // the file with "missing tensor 'blk.64.ssm_conv1d.weight'" when
+            // the MTP full-attention block (which has no ssm_conv1d) appears
+            // as blk.64.
+            //
+            // The smoke harness tests the LOAD path (Bug 4: ssm_conv1d F32
+            // requirement, blocks 0–63).  Verifying MTP emission is ADR-013's
+            // mandate, not this smoke gate.  Activate the escape hatch so the
+            // convert subprocess strips MTP and emits a 64-block GGUF that the
+            // installed llama.cpp can load.
+            //
+            // REMOVE when llama.cpp gains qwen35 MTP loading support (then
+            // the smoke can verify MTP loading too).
+            .env("HF2Q_QWEN35_DROP_MTP", "1")
             .output()
             .map_err(|e| format!("run hf2q convert: {}", e))?;
         if !convert_out.status.success() {
@@ -678,28 +700,66 @@ fn sanitize_timestamps(s: &str) -> String {
     out
 }
 
-/// Strip ASCII terminal control characters (0x00–0x1F) except `\n` (0x0A)
-/// and `\t` (0x09) from a string slice, returning a new `String`.
+/// Emulate terminal control sequences in a string, producing a clean
+/// representation of what a terminal would display after processing the
+/// raw byte stream from `llama-cli` stdout.
 ///
-/// This removes:
-/// - `\x08` (BS / backspace) — used by the llama-cli loading spinner
-///   (`|/-\` animation) which produces multi-GB stdout when captured
-///   via `.output()`.
-/// - `\r` (CR, 0x0D) — carriage-return sequences from terminal
-///   overwrite patterns.
-/// - Other control chars (0x00–0x08, 0x0B–0x0C, 0x0E–0x1F) for
-///   robustness; real llama-cli output does not rely on them.
+/// Handles:
+/// - `\x08` (BS / backspace, 0x08) — simulated as terminal backspace:
+///   removes the last non-newline character on the current line (if any).
+///   The llama-cli loading spinner emits `|`, `\x08`, `-`, `\x08`, `\`, …
+///   which a terminal renders as a single animated character; after
+///   processing we retain only the final character of each overwrite
+///   sequence, making the spinner deterministic (it resolves to one char).
+/// - `\r` (CR, 0x0D) — carriage-return: clears the rest of the current
+///   line (moves the write position back to column 0 for the next
+///   character, discarding what was written). We implement this by
+///   truncating the current line back to zero.
+/// - Other C0 controls (0x00–0x08, 0x0B–0x0C, 0x0E–0x1F) are dropped.
 ///
 /// Non-ASCII bytes (multibyte UTF-8) pass through unchanged.
+/// `\n` (0x0A) and `\t` (0x09) pass through as-is.
 fn strip_terminal_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // We collect the output line-by-line (split on \n), and within each
+    // line we apply \x08 (BS) and \r (CR) emulation via a small char-
+    // level buffer.
+    let mut out = String::with_capacity(s.len() / 4);
+    // `line_buf` accumulates the current line's characters.
+    let mut line_buf: Vec<char> = Vec::with_capacity(256);
+
     for ch in s.chars() {
         let b = ch as u32;
-        // Keep \n (0x0A) and \t (0x09); strip all other C0 controls.
-        if b < 0x20 && b != 0x0A && b != 0x09 {
-            continue;
+        match b {
+            0x08 => {
+                // Backspace: remove last char on current line (if any).
+                line_buf.pop();
+            }
+            0x0D => {
+                // Carriage return: discard current line content (overwrite).
+                line_buf.clear();
+            }
+            0x0A => {
+                // Newline: flush current line to output.
+                for c in line_buf.drain(..) {
+                    out.push(c);
+                }
+                out.push('\n');
+            }
+            0x09 => {
+                // Tab: pass through.
+                line_buf.push(ch);
+            }
+            b if b < 0x20 => {
+                // Other C0 controls: drop.
+            }
+            _ => {
+                line_buf.push(ch);
+            }
         }
-        out.push(ch);
+    }
+    // Flush any remaining content (no trailing newline).
+    for c in line_buf.drain(..) {
+        out.push(c);
     }
     out
 }
