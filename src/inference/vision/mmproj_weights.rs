@@ -44,6 +44,31 @@ use anyhow::{anyhow, Result};
 use mlx_native::{MlxBuffer, MlxDevice};
 use mlx_native::gguf::GgufFile;
 
+// W59 ADR-005 Phase 2c iter-128: route F16-stored mmproj tensors through
+// `gguf.load_tensor` (native dtype-preserving) instead of
+// `gguf.load_tensor_f32` (CPU-dequant to F32). Every Gemma 4 ViT weight
+// is GGML F16 in storage; pre-iter-128 the load path dequantized to F32
+// at upload, then `vit_linear_gpu` re-cast F32→BF16 inside the matmul,
+// costing 8x the per-element rounding budget vs peer's F16 staging
+// (W58 iter-127 numerical bisect, ADR-005 iter-127 entry).
+//
+// This module uses `mlx_native::gguf::tensor_info(name).ggml_type` to
+// gate the load branch — F16 tensors keep their native `DType::F16`
+// MlxBuffer, every other type still dequants to F32 (norms, embeddings,
+// scalars, and any non-F16 weight a future producer might emit).
+//
+// `vit_linear_gpu` reads the resulting buffer's `dtype()` and dispatches
+// the matching tensor-core kernel:
+//   - DType::F16  -> mlx_native::dense_matmul_f16_f32_tensor (NEW, 0.4.8)
+//   - DType::BF16 -> existing dense_matmul_bf16_f32_tensor
+//   - DType::F32  -> existing F32->BF16 cast + BF16 matmul (legacy path,
+//                    kept for non-F16-stored weight types).
+//
+// Dispatch is determined by the buffer's storage dtype — natural,
+// deterministic, no env-gated fallback (per the iter-128 prompt
+// constraint and `feedback_no_shortcuts.md`).
+use mlx_native::GgmlType;
+
 use super::mmproj::{vit_layer_tensor, MmprojConfig};
 
 /// Collection of mmproj tensors loaded onto a Metal device as F32.
@@ -89,9 +114,32 @@ impl LoadedMmprojWeights {
         let names = gguf.tensor_names();
         let mut tensors = HashMap::with_capacity(names.len());
         for name in &names {
-            let buf = gguf
-                .load_tensor_f32(*name, &device)
-                .map_err(|e| anyhow!("mmproj load_tensor_f32('{}'): {e}", name))?;
+            // W59 ADR-005 Phase 2c iter-128: route F16-stored tensors
+            // through `load_tensor` (native F16 MlxBuffer, no CPU
+            // dequant) so the downstream matmul can dispatch the
+            // matching mlx-native 0.4.8 F16 tensor-core kernel without
+            // a lossy F16 -> F32 -> BF16 round-trip. Every other ggml
+            // type (F32, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, I16) keeps the
+            // legacy F32-dequant path — those are non-weight tensors
+            // (norms, embeddings, scalars) where F32 is the right
+            // intermediate, OR weight types this loader doesn't yet
+            // wire to a non-BF16 kernel.
+            //
+            // GGUF tensor_info() returns None only when the lookup name
+            // doesn't exist — but we're iterating gguf.tensor_names() so
+            // every name is guaranteed present. The else-branch on
+            // tensor_info absence is defensive only; falls back to the
+            // F32 dequant path so a future GGUF format change can't
+            // silently break the loader.
+            let info = gguf.tensor_info(*name);
+            let is_f16 = info.map(|i| i.ggml_type == GgmlType::F16).unwrap_or(false);
+            let buf = if is_f16 {
+                gguf.load_tensor(*name, &device)
+                    .map_err(|e| anyhow!("mmproj load_tensor (F16-native) '{}': {e}", name))?
+            } else {
+                gguf.load_tensor_f32(*name, &device)
+                    .map_err(|e| anyhow!("mmproj load_tensor_f32 '{}': {e}", name))?
+            };
             tensors.insert((*name).to_string(), buf);
         }
         Ok(Self {
@@ -116,6 +164,53 @@ impl LoadedMmprojWeights {
     /// `Some`).
     pub fn get(&self, name: &str) -> Option<&MlxBuffer> {
         self.tensors.get(name)
+    }
+
+    /// Read a tensor's contents as an owned `Vec<f32>`, regardless of
+    /// the storage dtype. Use ONLY for CPU consumers — the production
+    /// matmul path dispatches the dtype-matching tensor-core kernel
+    /// directly via `vit_linear_gpu`.
+    ///
+    /// W59 ADR-005 Phase 2c iter-128: with `LoadedMmprojWeights::load`
+    /// keeping F16 GGUF tensors as native F16 MlxBuffers, callers that
+    /// need an `&[f32]` view (CPU patch_embed reference, test parity
+    /// L2 distance, etc.) must explicitly convert. This helper performs
+    /// the float-narrowing only when needed; for an F32 buffer it
+    /// allocates and copies, for an F16 buffer it widens via `half::f16`.
+    /// Returns `Err` for non-{F32,F16} dtypes (caller must handle
+    /// quant/U8 storage, which currently doesn't appear on the mmproj
+    /// load path).
+    ///
+    /// Cost: O(N) heap alloc + per-element widen. The Gemma 4 mmproj's
+    /// largest single tensor is `v.patch_embd.weight` at 884,736 f16
+    /// elements ≈ 3.5 MB allocation; the SigLIP CPU patch_embed call
+    /// site does this once per image. Acceptable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when (a) the tensor's `as_slice::<…>` fails for
+    /// the underlying buffer's dtype, or (b) the dtype is anything
+    /// other than F32 or F16.
+    pub fn tensor_as_f32_owned(&self, buf: &MlxBuffer) -> Result<Vec<f32>> {
+        use mlx_native::DType;
+        match buf.dtype() {
+            DType::F32 => buf
+                .as_slice::<f32>()
+                .map(|s| s.to_vec())
+                .map_err(|e| anyhow!("tensor_as_f32_owned (F32): {e}")),
+            DType::F16 => {
+                let raw = buf
+                    .as_slice::<u16>()
+                    .map_err(|e| anyhow!("tensor_as_f32_owned (F16 u16 view): {e}"))?;
+                Ok(raw
+                    .iter()
+                    .map(|&u| half::f16::from_bits(u).to_f32())
+                    .collect())
+            }
+            other => Err(anyhow!(
+                "tensor_as_f32_owned: unsupported dtype {other:?} (only F32/F16)"
+            )),
+        }
     }
 
     /// Build an empty `LoadedMmprojWeights` with no tensors. Useful for
@@ -468,9 +563,18 @@ mod tests {
     #[test]
     fn load_gemma4_mmproj_patch_embd_has_expected_shape_and_values() {
         // `v.patch_embd.weight` in Gemma 4 is a 2D tensor [hidden,
-        // 3*patch*patch] = [1152, 768] = 884,736 f32 elements. This is
-        // the flattened Conv2d kernel ready for a matmul against the
-        // flattened patch pixels.
+        // 3*patch*patch] = [1152, 768] = 884,736 elements. The GGUF
+        // stores it as F16 (per W58 iter-127 audit + gguf_dump.py
+        // verification); pre-iter-128 the loader dequantized to F32 at
+        // upload, post-iter-128 the loader keeps F16 native so the
+        // matmul can dispatch the mlx-native 0.4.8 F16 tensor-core
+        // kernel (8x tighter per-element rounding than BF16 staging,
+        // closes the 1.16x/block ViT cascade compound).
+        //
+        // This test asserts shape (element count) AND non-trivial
+        // content (non-zero patch weights) without depending on the
+        // storage dtype — works whether the loader keeps F16 native or
+        // dequantizes to F32.
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
@@ -485,13 +589,36 @@ mod tests {
             * 3
             * (cfg.patch_size as usize)
             * (cfg.patch_size as usize);
-        let data: &[f32] = patch.as_slice().expect("as_slice f32");
-        assert_eq!(data.len(), expected_elems, "patch_embd element count");
-        // Sanity: loaded f32 dequant output is non-trivial.
-        let sum_abs: f32 = data.iter().take(1024).map(|v| v.abs()).sum();
+        // Element-count check is dtype-agnostic via element_count(); it
+        // matches expected_elems regardless of F16/F32 storage.
+        assert_eq!(
+            patch.element_count(),
+            expected_elems,
+            "patch_embd element count"
+        );
+        // Non-zero sanity: read the underlying bytes (works for both
+        // F16 and F32). For F16 storage, every f16 has ≥1 nonzero bit
+        // when its value is nonzero; for F32 the same holds. A patch
+        // weight tensor with the first 1024 elements all zero would be
+        // a load bug — assert that fewer than 95% of the first 2048
+        // bytes (= 1024 f16 OR 512 f32) are zero.
+        let raw: &[u8] = patch.as_slice().expect("as_slice raw bytes");
+        let scan = raw.len().min(2048);
+        let nonzero = raw[..scan].iter().filter(|&&b| b != 0).count();
         assert!(
-            sum_abs > 0.0,
-            "first 1024 elements all zero — probable load bug"
+            nonzero > scan * 5 / 100,
+            "patch_embd loads to mostly-zero bytes (probable load bug): \
+             {nonzero}/{scan} nonzero in first {scan} bytes"
+        );
+        // Dtype-specific spot-check: the gemma4v patch_embd is F16 in
+        // storage; if the iter-128 path is wired correctly the buffer
+        // dtype reflects that. (For SigLIP / classic CLIP producers
+        // the tensor may be F32 instead — both paths are valid here;
+        // we just print so the test record shows which one was loaded.)
+        eprintln!(
+            "patch_embd dtype: {:?}, element_count: {}",
+            patch.dtype(),
+            patch.element_count()
         );
     }
 
