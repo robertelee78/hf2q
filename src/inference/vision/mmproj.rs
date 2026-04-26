@@ -43,13 +43,24 @@ pub const ARCH_CLIP: &str = "clip";
 /// the ViT hidden → text-embed transform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectorType {
-    /// Dense 2-layer MLP (Gemma 4 default).
+    /// Dense 2-layer MLP (CLIP-classic / SigLIP-49 default).
     Mlp,
     /// Perceiver-style resampler (uncommon; present in some VLMs).
     Resampler,
-    /// Other / unknown. Forward pass can only handle MLP today; this
-    /// variant exists so probes/`/v1/models` don't fail on unfamiliar
-    /// mmproj files — they can be listed but not served.
+    /// Gemma-4 vision projector — single `Gemma4ClippableLinear` head
+    /// (clamp-then-linear-then-clamp; see
+    /// `/opt/llama.cpp/tools/mtmd/clip-impl.h:323` ↦ "gemma4v").
+    /// hf2q runtime path lives in
+    /// `vit_gpu::gemma4v_apply_full_forward_gpu` (W25 iter-115 +
+    /// W26 iter-116a + iter-117/118 kernel fixes); the
+    /// arch-profile dispatch in
+    /// `compute_vision_embeddings_gpu_dispatch` routes here when the
+    /// loaded mmproj is `ArchProfile::Gemma4Siglip`.
+    Gemma4v,
+    /// Other / unknown projector shape — forward pass cannot run.
+    /// Listable via `/v1/models` but rejected by `validate_tensor_set`
+    /// at serve startup so the server never advertises a forward path
+    /// it can't back.
     Other(String),
 }
 
@@ -58,6 +69,11 @@ impl ProjectorType {
         match s {
             "mlp" => ProjectorType::Mlp,
             "resampler" => ProjectorType::Resampler,
+            // llama.cpp's `PROJECTOR_TYPE_GEMMA4V` writes the literal
+            // string "gemma4v" via PROJECTOR_TYPE_NAMES (clip-impl.h:323).
+            // hf2q's writer matches via `build_mmproj_metadata`
+            // (`backends/gguf.rs:606-610`).
+            "gemma4v" => ProjectorType::Gemma4v,
             other => ProjectorType::Other(other.to_string()),
         }
     }
@@ -65,11 +81,27 @@ impl ProjectorType {
         match self {
             ProjectorType::Mlp => "mlp",
             ProjectorType::Resampler => "resampler",
+            ProjectorType::Gemma4v => "gemma4v",
             ProjectorType::Other(s) => s.as_str(),
         }
     }
+    /// Whether hf2q has a runtime forward path for this projector.
+    ///
+    /// `Mlp` — yes (SigLIP-49 / classic-CLIP path; production since
+    /// Phase 2c iter-50s).
+    ///
+    /// `Gemma4v` — yes (W25 iter-115 +  W26 iter-116a runtime
+    /// dispatch; W41 iter-116i wires the writer ↔ runtime
+    /// `is_supported()` gate so `hf2q serve --mmproj` accepts the
+    /// hf2q-emitted gemma4v fixture). The arch-profile dispatch
+    /// in `compute_vision_embeddings_gpu_dispatch` routes Gemma4v
+    /// inputs through `gemma4v_apply_full_forward_gpu`; the
+    /// projector head `Gemma4ClippableLinear` is in
+    /// `vit_gpu.rs::gemma4v_apply_full_forward_gpu` (Stage 8).
+    ///
+    /// `Resampler` / `Other(_)` — no (no kernel path).
     pub fn is_supported(&self) -> bool {
-        matches!(self, ProjectorType::Mlp)
+        matches!(self, ProjectorType::Mlp | ProjectorType::Gemma4v)
     }
 }
 
@@ -215,7 +247,8 @@ impl MmprojConfig {
 //   - v.blk.{N}.attn_q.{weight,bias}
 //   - v.blk.{N}.attn_k.{weight,bias}
 //   - v.blk.{N}.attn_v.{weight,bias}
-//   - v.blk.{N}.attn_output.{weight,bias}
+//   - v.blk.{N}.attn_out.{weight,bias}    (TN_ATTN_OUTPUT short form,
+//                                           clip-impl.h:82)
 //   - v.blk.{N}.attn_norm.{weight,bias}
 //   - v.blk.{N}.ffn_up.{weight,bias}
 //   - v.blk.{N}.ffn_down.{weight,bias}
@@ -239,6 +272,12 @@ pub const TENSOR_MM_0_BIAS: &str = "mm.0.bias";
 /// MLP projector second linear.
 pub const TENSOR_MM_2_WEIGHT: &str = "mm.2.weight";
 pub const TENSOR_MM_2_BIAS: &str = "mm.2.bias";
+/// gemma4v projector head — `TN_MM_INP_PROJ` at
+/// `/opt/llama.cpp/tools/mtmd/clip-impl.h:110`. Distinct base name
+/// from the CLIP-classic `mm.0.weight` because gemma4v's projector is
+/// a `Gemma4ClippableLinear`, not an MLP. clip.cpp:1937 hard-requires
+/// this exact name when `proj_type == PROJECTOR_TYPE_GEMMA4V`.
+pub const TENSOR_MM_INPUT_PROJECTION_WEIGHT: &str = "mm.input_projection.weight";
 
 /// Per-layer tensor name helper.
 pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
@@ -252,7 +291,8 @@ pub fn vit_layer_tensor(layer_idx: usize, suffix: &str) -> String {
 ///
 /// Detection rule (order matters — first match wins):
 ///   - `Gemma4Siglip` — per-block has `ln1.weight`, `ln2.weight`, and
-///     `post_ffw_norm.weight` (Gemma 4's dual-LN SigLIP variant).
+///     `ffn_post_norm.weight` (Gemma 4's dual-LN SigLIP variant —
+///     llama.cpp's `TN_FFN_POST_NORM` short form, clip-impl.h:95).
 ///   - `ClipClassic`  — per-block has `attn_norm.weight` (llama.cpp's
 ///     default CLIP-style writer).
 ///   - `Unknown`      — neither pattern found. Forward pass not supported.
@@ -282,12 +322,21 @@ impl ArchProfile {
 /// This is cheap: a ~10-element probe over the block-0 tensor set.
 /// Returns `Unknown` when the file has neither marker, which the
 /// validator maps to a 400 `no_mmproj_loaded`-style error at request time.
+///
+/// W41 iter-116i: gemma4 marker tightened to llama.cpp's actual
+/// `TN_FFN_POST_NORM = "%s.blk.%d.ffn_post_norm.%s"`
+/// (`/opt/llama.cpp/tools/mtmd/clip-impl.h:95`); the prior
+/// `post_ffw_norm.weight` literal predates that header convention
+/// and never appeared in real llama.cpp-emitted gemma4 mmproj files.
+/// The legacy spelling is still accepted as a fallback so any older
+/// fixtures don't regress.
 pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
     let set: std::collections::HashSet<&str> = actual_names.iter().copied().collect();
-    if set.contains("v.blk.0.ln1.weight")
-        && set.contains("v.blk.0.ln2.weight")
-        && set.contains("v.blk.0.post_ffw_norm.weight")
-    {
+    let has_ln_pair = set.contains("v.blk.0.ln1.weight")
+        && set.contains("v.blk.0.ln2.weight");
+    let has_gemma4_post_norm = set.contains("v.blk.0.ffn_post_norm.weight")
+        || set.contains("v.blk.0.post_ffw_norm.weight");
+    if has_ln_pair && has_gemma4_post_norm {
         return ArchProfile::Gemma4Siglip;
     }
     if set.contains("v.blk.0.attn_norm.weight") {
@@ -303,7 +352,10 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
 ///   - `v.patch_embd.weight` (pixel → patch-embedding)
 ///   - `v.position_embd.weight` (learned position encoding)
 ///   - `v.blk.0.attn_q.weight` + `attn_k.weight` + `attn_v.weight` +
-///     `attn_output.weight` (block 0's QKV + output projection)
+///     `attn_out.weight` (block 0's QKV + output projection — the
+///     vision-namespace short form per llama.cpp's
+///     `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`,
+///     `/opt/llama.cpp/tools/mtmd/clip-impl.h:82`).
 ///   - at least one of `mm.0.weight` / `mm.2.weight` (the projector head)
 ///   - per `MmprojConfig.num_hidden_layers`, the same QKV+output set for
 ///     every block (catches truncated files)
@@ -318,12 +370,18 @@ pub fn detect_arch_profile(actual_names: &[&str]) -> ArchProfile {
 ///
 /// Missing tensors batched into one error listing up to 10 names so a
 /// producer bug doesn't become one-at-a-time whack-a-mole on restart.
+///
+/// W41 iter-116i note: pre-iter-116i this validator required
+/// `attn_output.weight` (the text-decoder name).  W34 iter-116e
+/// fixed the writer to emit the vision-namespace `attn_out.weight`
+/// short form per `TN_ATTN_OUTPUT`, but the validator was missed —
+/// causing `hf2q serve --mmproj <gemma4v>` to bail with "missing 28
+/// required tensor(s)" once the projector-type guard was unblocked.
 pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<()> {
     if !cfg.projector.is_supported() {
         return Err(anyhow!(
             "mmproj projector type '{}' is not yet supported by hf2q's ViT \
-             forward pass (only 'mlp' is). No forward path will succeed for \
-             this file.",
+             forward pass. No forward path will succeed for this file.",
             cfg.projector.as_str()
         ));
     }
@@ -336,8 +394,12 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
         TENSOR_POS_EMBD.to_string(),
     ];
     // Per-block QKV + output (present in both CLIP + Gemma 4).
+    // The output projection's vision-namespace short-form is `attn_out`
+    // per `TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"`
+    // (`/opt/llama.cpp/tools/mtmd/clip-impl.h:82`); this is distinct
+    // from the text-decoder `attn_output.weight` long-form.
     for layer_idx in 0..cfg.num_hidden_layers as usize {
-        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"] {
+        for suffix in ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_out.weight"] {
             required.push(vit_layer_tensor(layer_idx, suffix));
         }
     }
@@ -348,12 +410,23 @@ pub fn validate_tensor_set(cfg: &MmprojConfig, actual_names: &[&str]) -> Result<
         .cloned()
         .collect();
 
-    // Projector: accept EITHER mm.0.weight alone (Gemma 4 single-linear)
-    // OR the CLIP 2-layer MLP pair. Absence of both is a missing projector.
-    if !actual_set.contains(TENSOR_MM_0_WEIGHT) && !actual_set.contains(TENSOR_MM_2_WEIGHT) {
+    // Projector head: accept any of three names depending on projector
+    // family:
+    //   - `mm.0.weight`              — CLIP-classic MLP layer 0
+    //   - `mm.2.weight`              — CLIP-classic MLP layer 2 (some
+    //                                   producers ship only the 2nd layer)
+    //   - `mm.input_projection.weight` — gemma4v's `Gemma4ClippableLinear`
+    //                                   (TN_MM_INP_PROJ; clip-impl.h:110)
+    // Absence of all three = no projector head.
+    if !actual_set.contains(TENSOR_MM_0_WEIGHT)
+        && !actual_set.contains(TENSOR_MM_2_WEIGHT)
+        && !actual_set.contains(TENSOR_MM_INPUT_PROJECTION_WEIGHT)
+    {
         missing.push(format!(
-            "{} (or {})",
-            TENSOR_MM_0_WEIGHT, TENSOR_MM_2_WEIGHT
+            "{} (or {}, or gemma4v's {})",
+            TENSOR_MM_0_WEIGHT,
+            TENSOR_MM_2_WEIGHT,
+            TENSOR_MM_INPUT_PROJECTION_WEIGHT,
         ));
     }
 
@@ -391,6 +464,13 @@ mod tests {
             ProjectorType::from_str_gguf("resampler"),
             ProjectorType::Resampler
         );
+        // W41 iter-116i: gemma4v parses to its own variant (was
+        // `Other("gemma4v")`, which made `is_supported() = false`
+        // and blocked `hf2q serve --mmproj <gemma4v>`).
+        assert_eq!(
+            ProjectorType::from_str_gguf("gemma4v"),
+            ProjectorType::Gemma4v
+        );
         match ProjectorType::from_str_gguf("q-former") {
             ProjectorType::Other(s) => assert_eq!(s, "q-former"),
             other => panic!("expected Other, got {:?}", other),
@@ -398,8 +478,12 @@ mod tests {
     }
 
     #[test]
-    fn projector_supported_only_for_mlp() {
+    fn projector_supported_for_mlp_and_gemma4v() {
+        // Both projector heads have a runtime forward path:
+        //   - Mlp     → compute_vision_embeddings_gpu (SigLIP-49)
+        //   - Gemma4v → gemma4v_apply_full_forward_gpu via dispatch
         assert!(ProjectorType::Mlp.is_supported());
+        assert!(ProjectorType::Gemma4v.is_supported());
         assert!(!ProjectorType::Resampler.is_supported());
         assert!(!ProjectorType::Other("x".into()).is_supported());
     }
@@ -408,6 +492,7 @@ mod tests {
     fn projector_as_str_matches_input() {
         assert_eq!(ProjectorType::Mlp.as_str(), "mlp");
         assert_eq!(ProjectorType::Resampler.as_str(), "resampler");
+        assert_eq!(ProjectorType::Gemma4v.as_str(), "gemma4v");
         assert_eq!(
             ProjectorType::Other("q-former".into()).as_str(),
             "q-former"
@@ -510,7 +595,10 @@ mod tests {
                 "attn_q.weight",
                 "attn_k.weight",
                 "attn_v.weight",
-                "attn_output.weight",
+                // W41 iter-116i: vision-namespace short form per
+                // TN_ATTN_OUTPUT (clip-impl.h:82); not the
+                // text-decoder `attn_output.weight`.
+                "attn_out.weight",
             ] {
                 names.push(vit_layer_tensor(layer_idx, suffix));
             }
@@ -596,7 +684,7 @@ mod tests {
         let actual: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let err = validate_tensor_set(&cfg, &actual).expect_err("should fail");
         let msg = format!("{err}");
-        // 4 missing: v.blk.1.{attn_q, attn_k, attn_v, attn_output}.weight
+        // 4 missing: v.blk.1.{attn_q, attn_k, attn_v, attn_out}.weight
         assert!(msg.contains("missing 4 required tensor"), "got: {msg}");
         assert!(msg.contains("v.blk.1.attn_q.weight"), "got: {msg}");
     }
