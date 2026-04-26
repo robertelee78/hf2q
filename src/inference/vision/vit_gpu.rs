@@ -738,8 +738,25 @@ pub fn vit_residual_add_gpu(
     if n_elements == 0 {
         return Err(anyhow!("vit_residual_add_gpu: n_elements must be > 0"));
     }
+    // ADR-005 iter 127 (W58): residual add preserves shape. Propagate the
+    // first input's shape (`a`) onto the output so downstream consumers
+    // (parity-probe dumps, inspectors) see the layout-honest 2-D shape
+    // that matches peer's `[n_patches, hidden]` ne ordering instead of a
+    // flat `[n_elements]` collapse. Math is unchanged — `elementwise_add`
+    // operates on a flat byte stream regardless of stored shape.
+    //
+    // When `a.element_count() != n_elements` (caller violates contract by
+    // passing a mismatched count), we fall back to `[n_elements]` so the
+    // output's element_count() stays correct. Production code never
+    // tickles this path — every call site computes `n_elements` from the
+    // shape product — but the guard keeps the helper robust.
+    let out_shape: Vec<usize> = if a.element_count() == n_elements as usize {
+        a.shape().to_vec()
+    } else {
+        vec![n_elements as usize]
+    };
     let out = device
-        .alloc_buffer((n_elements as usize) * 4, DType::F32, vec![n_elements as usize])
+        .alloc_buffer((n_elements as usize) * 4, DType::F32, out_shape)
         .map_err(|e| anyhow!("alloc residual add output: {e}"))?;
     elementwise_add(
         encoder,
@@ -2959,6 +2976,21 @@ pub fn gemma4v_block_forward_gpu(
         .checked_mul(hidden)
         .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: batch*hidden overflow"))?;
 
+    // ADR-005 iter 127 (W58): intra-block parity probe.
+    //
+    // When the dump collector is armed AND this is one of the early
+    // blocks (0 or 1) we sub-localize the per-block ~1.16× error
+    // compound by recording each named ggml-equivalent intermediate so
+    // the diff harness can pair them against peer_dumper's per-layer
+    // captures.
+    //
+    // We restrict to blocks 0 and 1 to keep dump-disk cost bounded: the
+    // 16% compound is per-op, not per-block-position, so two blocks are
+    // sufficient to identify the offending sub-op (a JUMP that is
+    // reproducible at both block 0 and block 1).
+    let dump_intra = super::vit_dump::is_armed() && block_idx <= 1;
+    let intra_name = |suffix: &str| format!("03_block_{:02}_{}", block_idx, suffix);
+
     // ---------- Attention half ----------
     let cur = vit_gemma_rms_norm_gpu(
         encoder,
@@ -2971,6 +3003,9 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        super::vit_dump::record(&intra_name("01_pre_attn_norm"), &cur);
+    }
 
     let q = vit_linear_gpu(
         encoder,
@@ -3044,6 +3079,15 @@ pub fn gemma4v_block_forward_gpu(
         encoder, registry, device, &k, pos_x_idx, pos_y_idx, batch, num_kv_heads, head_dim, theta,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterparts: Qcur_pos-NN, Kcur_pos-NN, Vcur_normed-NN.
+        // Q is post-(per-head-RMS + 2-D NeoX RoPE); K likewise. V is
+        // post-RMS (no scale) and pre-attn — peer's `Vcur_normed` is
+        // captured at the same spot before `build_attn` permutes.
+        super::vit_dump::record(&intra_name("02_q_pos"), &q);
+        super::vit_dump::record(&intra_name("03_k_pos"), &k);
+        super::vit_dump::record(&intra_name("04_v_normed"), &v);
+    }
 
     // GQA: expand K and V to match Q's head count.
     let k_full = vit_repeat_kv_gpu(
@@ -3060,6 +3104,13 @@ pub fn gemma4v_block_forward_gpu(
         encoder, registry, device, &q, &k_full, &v_full, batch, num_heads, head_dim, 1.0,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: kqv_out-NN. hf2q's vit_attention_gpu output
+        // is `[batch, num_heads*head_dim] = [batch, hidden]` row-major
+        // — same row-major as peer's `cur` after the cont_2d at the end
+        // of build_attn's non-flash branch (clip.cpp:683).
+        super::vit_dump::record(&intra_name("05_kqv_out"), &attn);
+    }
 
     let attn_proj = vit_linear_gpu(
         encoder,
@@ -3077,6 +3128,10 @@ pub fn gemma4v_block_forward_gpu(
         hidden,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: attn_out-NN (post-O-proj).
+        super::vit_dump::record(&intra_name("06_attn_out"), &attn_proj);
+    }
 
     let attn_out = vit_gemma_rms_norm_gpu(
         encoder,
@@ -3096,9 +3151,20 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: attn_post_normed-NN.
+        super::vit_dump::record(&intra_name("07_attn_post_normed"), &attn_out);
+    }
 
     let x_mid = vit_residual_add_gpu(encoder, registry, device, input, &attn_out, n_hidden)?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: ffn_inp-NN (input to FFN half = post first
+        // residual add). Note clip.cpp:445-449 calls this `cur` then
+        // names the residual `ffn_inp` AFTER the add (line 449), so this
+        // matches the post-add tensor.
+        super::vit_dump::record(&intra_name("08_ffn_inp"), &x_mid);
+    }
 
     // ---------- MLP half ----------
     let cur = vit_gemma_rms_norm_gpu(
@@ -3118,6 +3184,10 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: ffn_inp_normed-NN (post-ln2).
+        super::vit_dump::record(&intra_name("09_ffn_inp_normed"), &cur);
+    }
 
     let gate = vit_linear_gpu(
         encoder,
@@ -3176,6 +3246,12 @@ pub fn gemma4v_block_forward_gpu(
         hidden,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: ffn_out-NN (post-down-proj, BEFORE
+        // ffn_post_norm). build_ffn returns this via `cur` and clip.cpp:
+        // 462 names it `ffn_out` before the optional ff_post_norm_w.
+        super::vit_dump::record(&intra_name("10_ffn_out"), &down);
+    }
 
     let down = vit_gemma_rms_norm_gpu(
         encoder,
@@ -3196,6 +3272,10 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if dump_intra {
+        // Peer counterpart: ffn_post_normed-NN.
+        super::vit_dump::record(&intra_name("11_ffn_post_normed"), &down);
+    }
 
     let x_out = vit_residual_add_gpu(encoder, registry, device, &x_mid, &down, n_hidden)?;
     Ok(x_out)

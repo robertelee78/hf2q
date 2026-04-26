@@ -250,6 +250,32 @@ static void write_dump(const fs::path & dir, const std::string & stage_name,
             ne_string(t).c_str(), ggml_type_name(t->type), data.size());
 }
 
+// ADR-005 iter 127 (W58): intra-block parity probe — peer counterparts
+// for hf2q's `03_block_{NN}_{step}_{name}` sub-stages. We restrict
+// capture to layers 0 and 1 (the bug is per-op, not per-layer-position;
+// two layers are sufficient and bound dump-disk cost).
+//
+// Mapping (peer ggml tensor name → hf2q stage suffix), step indices
+// match `vit_gpu.rs::gemma4v_block_forward_gpu` zero-padded ordering.
+struct intra_step {
+    const char * peer_prefix;
+    const char * hf2q_suffix;
+};
+static constexpr intra_step kIntraSteps[] = {
+    { "layer_inp_normed-",      "01_pre_attn_norm"       },
+    { "Qcur_pos-",              "02_q_pos"               },
+    { "Kcur_pos-",              "03_k_pos"               },
+    { "Vcur_normed-",           "04_v_normed"            },
+    { "kqv_out-",               "05_kqv_out"             },
+    { "attn_out-",              "06_attn_out"            },
+    { "attn_post_normed-",      "07_attn_post_normed"    },
+    { "ffn_inp-",               "08_ffn_inp"             },
+    { "ffn_inp_normed-",        "09_ffn_inp_normed"      },
+    { "ffn_out-",               "10_ffn_out"             },
+    { "ffn_post_normed-",       "11_ffn_post_normed"     },
+};
+static constexpr int kIntraMaxLayer = 1;
+
 // Match ggml tensor name to a hf2q stage name. Returns "" when not in
 // the parity-stage allowlist.
 static std::string map_to_stage(const std::string & ggml_name,
@@ -269,6 +295,20 @@ static std::string map_to_stage(const std::string & ggml_name,
             int idx = std::atoi(idx_str.c_str());
             std::snprintf(buf, sizeof(buf), "03_block_%02d", idx);
             return std::string(buf);
+        }
+    }
+    // Intra-block stages (layers 0 and 1 only).
+    for (const auto & step : kIntraSteps) {
+        const size_t plen = std::strlen(step.peer_prefix);
+        if (ggml_name.rfind(step.peer_prefix, 0) == 0 && ggml_name.size() > plen) {
+            const std::string idx_str = ggml_name.substr(plen);
+            const int idx = std::atoi(idx_str.c_str());
+            if (idx >= 0 && idx <= kIntraMaxLayer) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "03_block_%02d_%s",
+                              idx, step.hf2q_suffix);
+                return std::string(buf);
+            }
         }
     }
     return {};
