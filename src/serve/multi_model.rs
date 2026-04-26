@@ -494,6 +494,326 @@ impl LoadedPool {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// HotSwapManager — pool-backed engine cache with LRU eviction.
+//
+// ADR-005 Phase 4 spec item 3/5 (W76 iter-208).  Composes the pure
+// [`LoadedPool`] data primitive (W74 iter-206) with a pluggable
+// [`ModelLoader`] trait so tests can substitute a synthetic engine
+// fixture and production wires the [`DefaultModelLoader`] that delegates
+// to [`crate::serve::load_engine`].
+//
+// **Generic over the engine type.**  The production wire-up uses
+// `E = crate::serve::api::engine::Engine` ([`HotSwapManager::default`] +
+// [`DefaultModelLoader`]).  Unit tests substitute `E = ()`-equivalent
+// synthetic fixture types so the manager's eviction + accounting +
+// in-flight-Arc-safety logic can be exercised without a real Metal
+// device or GGUF on disk.  The shape `Engine` ships with — worker
+// thread, GPU buffers, tokenizer, etc. — has no synthetic constructor;
+// the trait approach keeps the production type free of test-only
+// scaffolding.
+// ─────────────────────────────────────────────────────────────────────
+
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::serve::api::engine::Engine;
+use crate::serve::quant_select::QuantType;
+
+/// A loaded engine + the metadata the pool tracks for eviction.  The
+/// `HotSwapManager` hands out `Arc<LoadedEngine<E>>` clones; in-flight
+/// requests that hold an Arc keep the engine alive past eviction (the
+/// pool slot drops the manager's Arc; the engine itself drops when the
+/// last handler releases — refcount semantics).
+///
+/// Generic over the engine type so tests can substitute a synthetic `E`
+/// (the production type [`Engine`] requires a real Metal device + GGUF).
+#[derive(Debug)]
+pub struct LoadedEngine<E> {
+    /// The actual engine handle.  In production this is
+    /// [`crate::serve::api::engine::Engine`] (owns the worker thread,
+    /// model weights, KV caches).
+    pub engine: E,
+    /// HuggingFace repo id (or path stem) — same key the pool uses.
+    pub repo: String,
+    /// Quantization variant resident on this engine.
+    pub quant: QuantType,
+    /// On-GPU resident-bytes estimate (typically GGUF file size; the
+    /// pool sums these to enforce the memory budget).  Set at admission
+    /// time and never updated.
+    pub bytes_resident: u64,
+    /// Wall-clock when the engine finished loading.
+    pub loaded_at: SystemTime,
+}
+
+/// Trait for loading a GGUF into a live engine of type `E`.
+///
+/// The production implementation ([`DefaultModelLoader`]) delegates to
+/// [`crate::serve::load_engine`], which performs the full mlx-native load
+/// (header parse + weights mmap → GPU + tokenizer + chat-template +
+/// synchronous warmup).  Tests substitute a `MockLoader` that returns a
+/// synthetic engine fixture without touching disk or Metal.
+///
+/// `Send + Sync` because the manager is held inside an
+/// `Arc<RwLock<HotSwapManager>>` (iter-209) and concurrent handlers may
+/// call `load_or_get` from multiple tokio tasks.
+pub trait ModelLoader<E>: Send + Sync {
+    /// Load a GGUF at `path` using `config` and return the live engine.
+    /// May take seconds (full GPU weights upload + warmup).
+    ///
+    /// Errors propagate from header parse, weights load, tokenizer parse,
+    /// chat-template resolution, or warmup; the manager treats any error
+    /// as a load-failure and does NOT admit a partial entry.
+    fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<E>;
+}
+
+/// Production [`ModelLoader`] — delegates to
+/// [`crate::serve::load_engine`].  Stateless; cheap to clone.
+#[derive(Debug, Clone, Default)]
+pub struct DefaultModelLoader;
+
+impl ModelLoader<Engine> for DefaultModelLoader {
+    fn load(&self, path: &Path, config: &EngineConfig) -> anyhow::Result<Engine> {
+        crate::serve::load_engine(path, config)
+    }
+}
+
+/// Pool diagnostics — bytes used, count, capacity — surfaced for
+/// `/v1/models` extension fields and `/metrics` Prometheus output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    pub loaded_count: usize,
+    pub capacity_models: usize,
+    pub total_resident_bytes: u64,
+    pub memory_budget_bytes: u64,
+}
+
+/// Errors returned by [`HotSwapManager`] operations.
+#[derive(Debug)]
+pub enum HotSwapError {
+    /// The pool refused the new entry — wraps a [`PoolError`].  Common
+    /// when the requested model exceeds the entire budget even after
+    /// evicting every existing entry, or the pool is configured at
+    /// zero capacity.
+    PoolRefused(PoolError),
+    /// The configured loader returned an error (GGUF parse failure,
+    /// tokenizer missing, warmup error, etc.).  The manager does not
+    /// admit the entry on loader failure.
+    LoaderFailed(anyhow::Error),
+    /// Filesystem error reading the GGUF file size for budget accounting.
+    /// Surfaced as a load-failure rather than swallowed because a
+    /// missing or unreadable GGUF is a load-time defect.
+    FileSize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for HotSwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PoolRefused(e) => write!(f, "hot-swap pool refused entry: {e}"),
+            Self::LoaderFailed(e) => write!(f, "hot-swap loader failed: {e}"),
+            Self::FileSize { path, source } => write!(
+                f,
+                "hot-swap failed to read GGUF file size for {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HotSwapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PoolRefused(e) => Some(e),
+            Self::LoaderFailed(e) => Some(e.as_ref()),
+            Self::FileSize { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Compose a pool key from `(repo, quant)`.  Two distinct quant variants
+/// of the same repo may coexist; the pool keys on `repo_id` so we
+/// disambiguate by appending the canonical quant name.
+fn pool_key(repo: &str, quant: QuantType) -> String {
+    format!("{repo}@{}", quant.as_str())
+}
+
+/// Pool-backed engine cache with LRU eviction.
+///
+/// Composes [`LoadedPool`] (eviction policy, byte accounting) with a
+/// [`ModelLoader`] (load path) and a parallel `HashMap<key,
+/// Arc<LoadedEngine<E>>>` (the actual engine handles, keyed identically
+/// to the pool).
+///
+/// **Generic over `E`.**  Production wires `E = Engine`; tests use a
+/// synthetic stand-in.  The pool eviction + byte accounting logic is
+/// engine-agnostic.
+///
+/// **In-flight request safety.**  Eviction drops the manager's
+/// `Arc<LoadedEngine<E>>` from the engines map.  If an axum handler is
+/// mid-`generate` and holds its own Arc clone, the engine itself does
+/// NOT drop until the handler releases — refcount semantics.  The pool
+/// slot becomes available immediately so the new model can admit; the
+/// freed bytes don't materialize until the last in-flight request
+/// completes.  This is acceptable for a request-rate eviction policy:
+/// briefly exceeding the budget while a long generation drains is
+/// preferable to either (a) interrupting in-flight work or (b) blocking
+/// the new load on an arbitrary in-flight latency.
+///
+/// **Concurrency.**  The manager itself is not internally synchronized;
+/// callers wrap it in `Arc<RwLock<...>>` (iter-209's AppState
+/// integration).  `load_or_get` is mutating (LRU touch + insert), so
+/// concurrent calls serialize on the write-lock; `try_get` is
+/// non-mutating and could be called under the read-lock if the wrapper
+/// adds that path.
+pub struct HotSwapManager<E> {
+    pool: LoadedPool,
+    loader: Arc<dyn ModelLoader<E>>,
+    /// Parallel map keyed identically to the pool — holds the actual
+    /// engine handles.  Invariant: `engines.contains_key(k) ==
+    /// pool.get(k).is_some()` for every `k` after every `load_or_get` /
+    /// `evict` call returns.
+    engines: HashMap<String, Arc<LoadedEngine<E>>>,
+}
+
+impl<E> HotSwapManager<E> {
+    /// Construct a new manager from a pool + a loader.  Production
+    /// passes [`LoadedPool::from_hardware`] (or a fixed-budget pool
+    /// for tests) and [`DefaultModelLoader`].  The manager starts
+    /// empty; the first `load_or_get` admits the first engine.
+    pub fn new(pool: LoadedPool, loader: Arc<dyn ModelLoader<E>>) -> Self {
+        Self {
+            pool,
+            loader,
+            engines: HashMap::new(),
+        }
+    }
+
+    /// Loaded count + capacity + memory budget — surfaced for diagnostics.
+    pub fn pool_stats(&self) -> PoolStats {
+        PoolStats {
+            loaded_count: self.pool.len(),
+            capacity_models: self.pool.capacity_models(),
+            total_resident_bytes: self.pool.total_resident_bytes(),
+            memory_budget_bytes: self.pool.memory_budget_bytes(),
+        }
+    }
+
+    /// Read-only borrow — does NOT touch the LRU order, does NOT trigger
+    /// a load.  Returns `None` when the requested `(repo, quant)` is not
+    /// resident in the pool.  Used by routing-only / metrics paths that
+    /// need to observe the cache state without mutating it.
+    pub fn try_get(&self, repo: &str, quant: QuantType) -> Option<Arc<LoadedEngine<E>>> {
+        let k = pool_key(repo, quant);
+        self.engines.get(&k).cloned()
+    }
+
+    /// Force-drop the entry for `(repo, quant)` — symmetric to
+    /// [`LoadedPool::remove`].  Returns the bytes freed (0 if the entry
+    /// was not in the pool — idempotent).  In-flight requests holding
+    /// their own Arc clones keep the engine alive until they release;
+    /// the pool slot becomes available immediately.
+    pub fn evict(&mut self, repo: &str, quant: QuantType) -> u64 {
+        let k = pool_key(repo, quant);
+        let removed = self.pool.remove(&k);
+        // Drop the engines map entry symmetrically.  If the pool didn't
+        // know about the key (already-evicted from a prior call), the
+        // engines map shouldn't have it either by the invariant — but
+        // we remove unconditionally to be defensive.
+        self.engines.remove(&k);
+        removed.map(|h| h.bytes_resident).unwrap_or(0)
+    }
+
+    /// Return the engine for `(repo, quant)`, loading + admitting if
+    /// not already pooled.  On a hit: promotes to MRU and returns the
+    /// existing `Arc<LoadedEngine<E>>` clone.  On a miss: invokes the
+    /// loader (may take seconds), reads the GGUF file size for byte
+    /// accounting, admits the new entry to the pool (which may evict
+    /// LRU entries), inserts into the engines map, and returns the
+    /// fresh Arc.
+    ///
+    /// **Errors.**
+    ///
+    /// - [`HotSwapError::FileSize`] when the GGUF cannot be `metadata`'d.
+    /// - [`HotSwapError::LoaderFailed`] when the loader returns an
+    ///   error.  Pool + engines map are untouched on loader failure.
+    /// - [`HotSwapError::PoolRefused`] when the pool refuses admission
+    ///   (oversized handle, zero capacity).  Loader still ran; the
+    ///   engine produced is dropped immediately to free GPU buffers.
+    pub fn load_or_get(
+        &mut self,
+        repo: &str,
+        quant: QuantType,
+        gguf_path: &Path,
+        config: &EngineConfig,
+    ) -> Result<Arc<LoadedEngine<E>>, HotSwapError> {
+        let k = pool_key(repo, quant);
+
+        // Fast path: already loaded.  Touch the LRU and clone the Arc.
+        if let Some(existing) = self.engines.get(&k).cloned() {
+            self.pool.touch(&k);
+            return Ok(existing);
+        }
+
+        // Slow path: load.  Read the file size FIRST so a missing GGUF
+        // fails fast without driving the loader (which would itself
+        // bail at header-open time, but a clean upfront error is
+        // better tracing).
+        let bytes_resident = std::fs::metadata(gguf_path)
+            .map_err(|source| HotSwapError::FileSize {
+                path: gguf_path.to_path_buf(),
+                source,
+            })?
+            .len();
+
+        let engine = self
+            .loader
+            .load(gguf_path, config)
+            .map_err(HotSwapError::LoaderFailed)?;
+
+        let loaded_engine = Arc::new(LoadedEngine {
+            engine,
+            repo: repo.to_string(),
+            quant,
+            bytes_resident,
+            loaded_at: SystemTime::now(),
+        });
+
+        // Admit to the pool.  May evict LRU entries; we drop the
+        // corresponding engine map entries here so the freed Arcs
+        // release.
+        let handle = LoadedHandle {
+            repo_id: k.clone(),
+            quant: quant.as_str().to_string(),
+            loaded_at: loaded_engine.loaded_at,
+            bytes_resident,
+        };
+
+        let evicted = match self.pool.insert(handle) {
+            Ok(evicted) => evicted,
+            Err(e) => {
+                // Pool refused — drop the freshly-loaded engine
+                // immediately to free its GPU buffers.  No state
+                // mutation visible to the caller.
+                drop(loaded_engine);
+                return Err(HotSwapError::PoolRefused(e));
+            }
+        };
+
+        for victim in evicted {
+            // Drop the manager's Arc — in-flight requests holding their
+            // own clones keep the engine alive until they release; the
+            // pool slot is already free.
+            self.engines.remove(&victim.repo_id);
+        }
+
+        self.engines.insert(k, Arc::clone(&loaded_engine));
+        Ok(loaded_engine)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Tests — synthetic fixtures, no engine load, no GPU.
 // ─────────────────────────────────────────────────────────────────────
 
