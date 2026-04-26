@@ -1107,6 +1107,30 @@ W25 closed the gemma4v end-to-end CPU+GPU forward path. Five deliverables, all s
 
 ---
 
+#### Phase 2c iter-117 — `gemma4v_block_forward` CPU↔GPU parity restored — `vit_linear_gpu` RAW barrier (2026-04-25, W27)
+
+W27 root-caused and fixed a non-deterministic regression in `gemma4v_block_forward_cpu_gpu_parity` that surfaced after W24's iter-114 landing. The test reported cos=0.994976 / max|abs|=0.4628 (FAIL) on one run and cos=0.999771 / max|abs|=0.1362 (PASS) on the next, with CPU output constant and GPU output varying run-to-run.
+
+**Bisect:** the regression is NOT in W25 (`3971878`) or W26 (`d65d42d`/`f5afbe4`/`d2afc6f`). The race condition has lived in `vit_linear_gpu` (src/inference/vision/vit_gpu.rs:60-138) since iter-43 (commit `2b48063`). Earlier call sites only chained at most 2 `vit_linear_gpu` invocations per encoder — Metal's command queue happened to serialize them deterministically. W24's `gemma4v_block_forward_gpu` is the first call site to chain 7 back-to-back `vit_linear_gpu` invocations (q/k/v/o + gate/up/down) inside one encoder, exposing the latent hazard.
+
+**Root cause.** `vit_linear_gpu` issues two dispatches into the same `CommandEncoder`:
+1. `cast(weight_f32 → weight_bf16)` writes the bf16 weight buffer.
+2. `dense_matmul_bf16_f32_tensor(weight_bf16, …)` reads the bf16 weight buffer.
+
+There was no `encoder.memory_barrier()` between (1) and (2). mlx-native uses `MTLDispatchType::Concurrent`, so without an explicit barrier the matmul can observe partially-written `weight_bf16`. Pi-brain documents this exactly: "All dispatches in one encoder run concurrently; explicit `encoder.memory_barrier()` needed between RAW/WAR/WAW. Bug presents as GPU returning 0." — the gemma4v block forward chains so many of these that the partial-write race becomes detectable as drift, not zeros.
+
+**Fix.** Insert `encoder.memory_barrier()` between the cast and matmul inside `vit_linear_gpu`. Single line, no API change, no scope expansion. mlx-native untouched (the contract is "caller emits barriers"; the caller — `vit_linear_gpu` — was the bug).
+
+**Verification (release build, 10 cold-process runs):**
+- `gemma4v_block parity: cos=0.999771, max|abs|=0.136246, |cpu|=66.7876, |gpu|=66.8099` — bit-for-bit identical across all 10 runs (was non-deterministic before).
+- `gemma4v_block` filter: 3 pass / 0 fail (`gqa_dimensions`, `4_rmsnorm_count_is_exactly_four`, `cpu_gpu_parity`).
+- `vision::` filter: 230 pass / 3 fail / 1 ignored. The 3 failures (`gemma4v_apply_full_forward_gpu_synthetic_n_36`, `_synthetic_rectangular_n_54`, `compute_vision_embeddings_gpu_dispatch_gemma4v_routes_correctly`) all panic with `"Kernel not found: vision_2d_rope_f32"` — they pre-exist on `d2afc6f` and are out of scope for iter-117.
+- `cargo build --release --bin hf2q` clean.
+
+**Outstanding for iter-118 (W28):** kernel-registration omission inside `gemma4v_apply_full_forward_gpu` (the 3 vision_2d_rope_f32-not-found failures above) + cross-compat smoke (the original iter-116 deferred items).
+
+---
+
 #### Phase 2c iter-114 — 2D RoPE + per-block forward landed (2026-04-25, W24)
 
 W24 implemented the 2-D NeoX RoPE Metal kernel (in `mlx-native`) and the gemma4v per-block forward (in `hf2q`) per W22's iter-114 scope. All work is **sibling-only** — every existing SigLIP-49 function (`apply_vit_block_forward[_gpu]`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`) is unchanged.
