@@ -1338,6 +1338,96 @@ Bit-identical reproduction across two cold-process runs at T=0.0, max_tokens=16.
 
 ---
 
+#### Phase 2c iter-127 — parity probe stage 02 layout-honest + intra-block sub-localization for block_00/block_01 finds the residual error is mlx-native matmul precision (BF16 staging vs peer F16) (2026-04-26, W58, commit `8adeb3a`)
+
+**Why this iter exists.** Iter-126 (W57) collapsed the cascade 5–7× across all stages but left a residual ~1.16×-per-block compound (12.6 → 733 across 27 blocks). The W57 hypothesis tree for iter-127 was four-deep — pos_embd lookup, BF16 K cast in attention, residual sign convention, projector matmul orientation. Rather than picking one and testing, this iter sub-localized the per-block error to a specific intra-block sub-op via 11 new dump points inside `gemma4v_block_forward_gpu` for layers 0 and 1.
+
+**Phase 1 — `02_pos_embd` shape mismatch root-cause + fix.** W57 noted hf2q dumped `02_pos_embd` as `[2654208]` (1-D flat) while peer dumped `[2304, 1152]` — `shape_ok=NO`. Audit found `vit_residual_add_gpu` (`vit_gpu.rs:730`) was allocating its output buffer with `vec![n_elements as usize]` (a flat 1-D shape) regardless of input shape. The same flattening hit every `03_block_NN` output (residual is the last op in every block) — only `01_patch_embd` retained 2-D shape because `vit_linear_gpu` sets it explicitly. **Fix**: propagate `a.shape().to_vec()` into the residual-add output when `a.element_count() == n_elements` (true at every production call site by construction). Math is unchanged; only buffer-shape metadata. After fix `02_pos_embd` reports `[2304, 1152]` matching peer; max_abs identical to stage 01's 12.65 (pos_embd is just an additive table, doesn't compound). Phase 1 verified.
+
+**Phase 2 — intra-block parity probes for block_00 and block_01 (commit `8adeb3a`).** Added 11 dump points inside `gemma4v_block_forward_gpu` keyed by sub-op order, gated by `super::vit_dump::is_armed() && block_idx <= 1` so disk cost stays bounded (the per-op compound is per-op-position, not per-block-position; two blocks suffice). Stage names match the ggml `cb()` checkpoints in `clip.cpp::build_vit` byte-for-byte:
+
+```
+hf2q stage suffix       ↔ peer ggml tensor name
+01_pre_attn_norm        ↔ layer_inp_normed-NN
+02_q_pos                ↔ Qcur_pos-NN          (post per-head Q-RMS-norm + 2-D NeoX RoPE)
+03_k_pos                ↔ Kcur_pos-NN
+04_v_normed             ↔ Vcur_normed-NN       (gemma4v V rms-no-scale)
+05_kqv_out              ↔ kqv_out-NN           (post SDPA, pre o-proj)
+06_attn_out             ↔ attn_out-NN          (post o-proj)
+07_attn_post_normed     ↔ attn_post_normed-NN
+08_ffn_inp              ↔ ffn_inp-NN           (post first residual add)
+09_ffn_inp_normed       ↔ ffn_inp_normed-NN    (post ln2)
+10_ffn_out              ↔ ffn_out-NN           (post down-proj)
+11_ffn_post_normed      ↔ ffn_post_normed-NN
+03_block_NN (existing)  ↔ layer_out-NN         (block-output, post second residual add)
+```
+
+Indices zero-padded so `01..11` lex-sort numerically. Peer dumper extended (`peer_dumper.cpp::map_to_stage`) with a prefix-match table `kIntraSteps[]` that matches `<peer-prefix>-<idx>` and emits the matching hf2q stage name for `idx ≤ 1`.
+
+**Phase 3 — diff results (block_00 + block_01, four_dots fixture, F32 dtype on both sides).**
+
+```
+                              max_abs        mean_abs
+03_block_00 input             1.265e1        5.926e-3   (= 02_pos_embd)
+03_block_00_01_pre_attn_norm  3.792e0        3.111e-3   (rms_norm reduces magnitude)
+03_block_00_02_q_pos          2.401e0        4.211e-3   (Q-proj + Q-norm + RoPE)
+03_block_00_03_k_pos          7.848e-1       1.778e-3   (K-proj + K-norm + RoPE)
+03_block_00_04_v_normed       4.128e0        6.333e-3   (V-proj + V-rms-no-scale)
+03_block_00_05_kqv_out        4.139e0        5.830e-3   (post-SDPA)
+03_block_00_06_attn_out       6.972e0        1.129e-2   (post o-proj)         ← 1.94× mean
+03_block_00_07_attn_post_normed 3.363e0      1.873e-3
+03_block_00_08_ffn_inp        1.364e1        6.748e-3
+03_block_00_09_ffn_inp_normed 1.486e0        2.314e-3
+03_block_00_10_ffn_out        5.597e0        1.304e-2   (gate*up + GELU + down) ← 5.63× mean
+03_block_00_11_ffn_post_normed 5.554e0       5.077e-3
+03_block_00 output            1.377e1        1.030e-2
+
+                              max_abs        mean_abs
+03_block_01 input             1.377e1        1.030e-2   (= block_00 output)
+03_block_01_01_pre_attn_norm  4.291e0        4.822e-3
+03_block_01_02_q_pos          1.166e0        7.206e-3
+03_block_01_03_k_pos          4.370e-1       3.409e-3
+03_block_01_04_v_normed       2.017e0        9.408e-3
+03_block_01_05_kqv_out        8.930e0        1.137e-2
+03_block_01_06_attn_out       8.566e0        3.551e-2   ← 3.11× mean (vs block_00)
+03_block_01_07_attn_post_normed 6.253e0      4.604e-3
+03_block_01_08_ffn_inp        1.380e1        1.138e-2
+03_block_01_09_ffn_inp_normed 2.505e0        3.791e-3
+03_block_01_10_ffn_out        5.933e0        2.500e-2   ← 6.60× mean
+03_block_01_11_ffn_post_normed 4.768e0       6.371e-3
+03_block_01 output            1.314e1        1.359e-2
+```
+
+The largest single-step `mean_abs` amplifications are at the matmul-only sub-ops:
+- **O-proj** (`05_kqv_out → 06_attn_out`): block_00 1.94×, block_01 3.11× — one matmul (`vit_linear_gpu`).
+- **FFN body** (`09_ffn_inp_normed → 10_ffn_out`): block_00 5.63×, block_01 6.60× — three matmuls + GELU (gate, up, down). Per-matmul amplification ≈ ³√5.63 ≈ 1.78×, ³√6.60 ≈ 1.88×.
+
+Q-proj (post Q-norm + RoPE): block_00 1.35×, block_01 ≈1.0×. RMS-norm and RoPE do not amplify error; the matmul does. The amplification is **systematic across every matmul**, with magnitude proportional to the weight × activation scale.
+
+**Phase 4 — byte-for-byte audit of `vit_linear_gpu` (the matmul producing the JUMP).** Audit target: `dense_matmul_bf16_f32_tensor` (mlx-native) vs llama.cpp's `kernel_mul_mm_f16_f32` (`ggml-metal.metal:10099`). Findings:
+
+  * **GGUF storage**: every Gemma 4 ViT weight (`v.blk.NN.attn_*`, `v.blk.NN.ffn_*`, `v.patch_embd.weight`, `mm.input_projection.weight`) is stored as **F16** in the mmproj GGUF (verified via `gguf_dump.py`). Peer's `kernel_mul_mm_f16_f32` consumes F16 weights directly, stages them as `half` in shmem, and computes the matmul on `simdgroup_half8x8` MMA with a `float4x4` accumulator. **Effective precision: 10-bit mantissa per element of weight + activation, F32 accumulation.**
+  * **Hf2q path**: `LoadedMmprojWeights::load` dequantizes F16→F32 at upload. `vit_linear_gpu` then casts F32→**BF16** for the A-tile (line 113-131). Activation B-tile is also cast F32→BF16 in the shader (`dense_mm_bf16_tensor.metal:213-220`). MMA on `bfloat`. **Effective precision: 7-bit mantissa per element of weight + activation, F32 accumulation.**
+  * Per-element rounding error: peer ≈ 2⁻¹¹ ≈ 4.9e-4; hf2q ≈ 2⁻⁸ ≈ 3.9e-3. **8× more rounding error per BF16 element than per F16 element.** For a K=1152 contract, accumulated `mean_abs` error ≈ √K × (per-element-error × max_value); the observed mean_abs of ~5e-3 to 3e-2 on outputs of magnitude 1-13 matches the BF16 budget within 2×.
+  * No mismatch in: weight layout (verified row-major in both), bias add order (no biases on attn/ffn weights), residual sign (`ggml_add` is +; `vit_residual_add_gpu` is +), head splitting (peer's `ggml_view_3d` matches hf2q's `[batch, num_heads, head_dim]` row-major), eps placement (`ggml_rms_norm` adds eps inside `sqrt(mean+eps)` — same as `vit_gemma_rms_norm_gpu`), softmax scale (`kq_scale = 1.0` for gemma4v on both), kq_scale path (build_attn line 644 + hf2q vit_attention_scores_gpu both apply scale on QK product before softmax).
+
+The byte-by-byte audit reveals **one structural mismatch: matmul tile precision (BF16 hf2q vs F16 peer)**. Every other sub-op invariant matches.
+
+**Phase 5 — fix deferral to iter-128.** The fix is mlx-native territory: add a `dense_matmul_f16_f32_tensor` kernel that mirrors `dense_mm_bf16_tensor.metal` but with `bfloat`→`half` and `dequantize_bf16_t4`→`dequantize_f16_t4` in the shader template. Then load mmproj F16 weights as F16 (not dequantize-to-F32 in `LoadedMmprojWeights::load`) and switch `vit_linear_gpu` to dispatch the F16 variant. This is a clean clone of the existing BF16 kernel — no new MMA semantics, just a precision swap.
+
+  * **Per the fence** (W58 prompt): mlx-native edits "ONLY if Metal kernel mismatch is the actual cause AND fix can't live on dispatch side." This iter's audit confirmed both: the cause IS kernel-level precision (BF16 vs F16); no hf2q dispatch-side rearrangement gets to F16-staging without a new mlx-native kernel. Iter-128 is the right place.
+  * F32×F32 fallback rejected: `dense_matmul_f32_f32_tensor` exists today, but switching hf2q to it would OVERSHOOT peer's precision (F32 hf2q is 24-bit mantissa, peer is 10-bit mantissa) — moves AWAY from byte-parity, not toward it. The "less precise but more peer-faithful" answer is F16-staging, not F32-staging.
+
+**Smoke output (sanity, no production code changed):** Iter-127 only adds dump points (env-gated, no-op when `HF2Q_VIT_DUMP` is unset) + propagates buffer shape (math unchanged). Smoke output IS BYTE-IDENTICAL to W57's `"Four black squares, white background."` (1 peer word). Verification skipped this iter (no production-path mutation).
+
+**Cargo verify.** `cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W57 baseline 241); `cargo build --release --bin hf2q` 0; `cmake --build cpp/build` 0.
+
+**Files touched.** `src/inference/vision/vit_gpu.rs` (`vit_residual_add_gpu` shape propagation + 11 intra-block dump points gated by `block_idx ≤ 1`), `tools/vit_parity_probe/cpp/peer_dumper.cpp` (`kIntraSteps[]` + extended `map_to_stage` for layers 0/1). Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`) untouched.
+
+**Iter-128 target (mlx-native crate).** Add `dense_matmul_f16_f32_tensor` kernel + dispatcher. Wire `LoadedMmprojWeights::load` to keep F16 tensors as F16 (skip dequant). Switch `vit_linear_gpu` to dispatch the F16 variant. Re-run parity probe; expect mean_abs at `06_attn_out` to drop from 1.13e-2 → ~1.5e-3 (8× better, matching peer F16 precision); cascade should collapse from 1.16×/block to ~1.02×/block; block_26 max_abs from 733 → ~20-50; smoke output should converge toward peer's `"An image of a square frame made of four"`. Secondary candidates if F16-staging doesn't fully close: (a) attention V-cast (`vit_attention_gpu:628` F32→BF16 V before transpose-and-matmul), (b) attention K-cast inside `vit_attention_scores_gpu` (already iter-120 instrumented). Tertiary: probe nit — Q/K/V `_normed` stages report `shape_ok=NO` because hf2q stores `[batch*num_heads, head_dim]` while peer stores `[batch, num_heads, head_dim]`. Same byte layout, different rank metadata — element-wise diff still works correctly. Fix = pre-record reshape OR `record_with_shape` API in `vit_dump.rs`.
+
+---
+
 #### Phase 2c iter-126 — patch_embd inner-axis CHW ordering fixed; cascade collapses 5–7× across all stages (2026-04-26, W57, commits `311db0d` + `7dbb0bb`)
 
 **Why this iter exists.** Iter-125 (W56) fixed the preprocess scale-bias chain (`2x − 1` → `4x − 3`) and achieved the first peer-word overlap on the four-dots smoke (3 peer words: "four", "frame", "cornered"). But the parity probe still showed real divergence at stage `01_patch_embd` (max_abs=64.6, post-fix from W56's 99.1) and a flat cascade through all 27 ViT blocks. Two distinct work units this iter: (Phase 1) make the parity probe layout-honest at stage 00 to remove the layout-induced false-positive `max_abs=3.69` artifact, then (Phase 3) audit the patch_embd Conv2D byte-for-byte against `clip.cpp` + `gemma4v.cpp`.

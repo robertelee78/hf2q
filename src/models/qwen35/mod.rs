@@ -1567,6 +1567,64 @@ pub(crate) fn dtype_elem_size(dtype: DType) -> usize {
 // regression against its eager counterpart in the test module below.
 // ---------------------------------------------------------------------------
 
+/// ADR-014 P1: lazy variant of [`apply_rms_norm_plus_one_in_tensor_map`].
+///
+/// Phase 1.6 — Qwen3.5 family RMS-norm `gamma + 1` convention. Walks
+/// every `*norm.weight` tensor (excluding `linear_attn.norm.weight`,
+/// per `convert_hf_to_gguf.py:4794`'s arch-scoped exclusion), wraps
+/// each with a `.map()` closure that adds `1.0` per element at
+/// materialise time.
+///
+/// Shape and dtype preserved — RMS-norm weights keep their declared
+/// `[hidden_size]` shape and BF16/F16/F32 dtype unchanged. The `.map()`
+/// composes onto the underlying `Arc<Mmap>+offset+len` closure (when
+/// the input came from `read_tensors_lazy`) or onto the in-memory
+/// closure from a previous Phase 1.x lift; either way, no bytes are
+/// touched until the streaming quantize loop (ADR-014 P2) consumes the
+/// tensor.
+///
+/// Same arch gate (Qwen3.5 family only) and same per-element math
+/// dispatcher ([`apply_rms_norm_plus_one`]) as the eager variant.
+/// `linear_attn.norm.weight` excluded — flowing through unchanged.
+pub fn apply_rms_norm_plus_one_in_lazy_map(
+    lazy_map: &mut crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    use crate::ir::lazy::MaterializeError;
+
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    let qualifying: Vec<String> = lazy_map
+        .names()
+        .filter(|n| n.ends_with("norm.weight") && !n.ends_with("linear_attn.norm.weight"))
+        .cloned()
+        .collect();
+
+    for name in qualifying {
+        let Some(old_lazy) = lazy_map.remove(&name) else {
+            continue;
+        };
+        // `.map()` preserves shape + dtype — RMS-norm transform is
+        // per-element add-1.0 with no layout change. The underlying
+        // closure stays deferred; bytes only materialise at quantize
+        // time. `name_for_err` cloned into the closure so error
+        // reporting can name the failed tensor without borrowing the
+        // for-loop variable.
+        let name_for_err = name.clone();
+        let transformed = old_lazy.map(move |tref| {
+            apply_rms_norm_plus_one(tref).map_err(|e| MaterializeError::Transform {
+                name: name_for_err.clone(),
+                reason: format!("rms_norm_plus_one: {e}"),
+            })
+        });
+        lazy_map.insert(transformed);
+    }
+
+    Ok(())
+}
+
 /// ADR-014 P1: lazy variant of [`rename_mtp_tensors_to_layer_form`].
 ///
 /// Operates on a [`crate::ir::lazy::LazyTensorMap`] without
@@ -1679,6 +1737,135 @@ mod tests {
                 "({arch:?}, {mt:?}) must NOT be accepted as Qwen3.5 family"
             );
         }
+    }
+
+    /// ADR-014 P1 byte-identity regression:
+    /// `apply_rms_norm_plus_one_in_lazy_map` produces a tensor map whose
+    /// post-transform bytes are byte-equal to the eager
+    /// `apply_rms_norm_plus_one_in_tensor_map` on the same fixture.
+    /// The transform applies +1.0 per-element to every `*norm.weight`
+    /// (excluding `linear_attn.norm.weight`); shape and dtype preserved.
+    #[test]
+    fn apply_rms_norm_plus_one_in_lazy_map_byte_identical_to_eager() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            model_type: "qwen3_5".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        // Mix of dtypes + a `linear_attn.norm.weight` that must NOT
+        // get +1 added — exclusion path coverage.
+        let make_f16_payload = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len / 2)
+                .flat_map(|i| half::f16::from_f32(seed as f32 + i as f32 * 0.01).to_le_bytes())
+                .collect()
+        };
+        let make_bf16_payload = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len / 2)
+                .flat_map(|i| half::bf16::from_f32(seed as f32 + i as f32 * 0.01).to_le_bytes())
+                .collect()
+        };
+
+        let fixtures: Vec<(&str, Vec<usize>, DType, Vec<u8>)> = vec![
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![4],
+                DType::F16,
+                make_f16_payload(1, 8),
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![4],
+                DType::BF16,
+                make_bf16_payload(2, 8),
+            ),
+            (
+                "model.norm.weight",
+                vec![4],
+                DType::F16,
+                make_f16_payload(3, 8),
+            ),
+            // Excluded: linear_attn.norm.weight does NOT get +1 (py:4794).
+            (
+                "model.layers.0.linear_attn.norm.weight",
+                vec![4],
+                DType::F16,
+                make_f16_payload(4, 8),
+            ),
+        ];
+
+        let mut eager = TensorMap::new();
+        let mut lazy = LazyTensorMap::new();
+        for (name, shape, dtype, data) in &fixtures {
+            eager.insert(TensorRef {
+                name: name.to_string(),
+                shape: shape.clone(),
+                dtype: *dtype,
+                data: data.clone(),
+            });
+            lazy.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), shape.clone(), *dtype),
+                data.clone(),
+            ));
+        }
+
+        apply_rms_norm_plus_one_in_tensor_map(&mut eager, &metadata).unwrap();
+        apply_rms_norm_plus_one_in_lazy_map(&mut lazy, &metadata).unwrap();
+        let lazy_eager = lazy.materialize_all().unwrap();
+
+        // Same key set + per-key bytes byte-equal (including the
+        // exclusion-path tensor whose bytes must NOT have changed).
+        for (name, _shape, _dtype, _data) in &fixtures {
+            let e = eager.get(name).unwrap();
+            let l = lazy_eager.get(name).unwrap();
+            assert_eq!(e.shape, l.shape, "{name} shape");
+            assert_eq!(e.dtype, l.dtype, "{name} dtype");
+            assert_eq!(e.data, l.data, "{name} bytes");
+            assert_eq!(l.name, *name, "{name} carried-name field");
+        }
+
+        // Exclusion-path tensor: bytes unchanged (still equal to input).
+        let original_excluded = &fixtures[3].3;
+        let excluded_after = lazy_eager
+            .get("model.layers.0.linear_attn.norm.weight")
+            .unwrap();
+        assert_eq!(
+            &excluded_after.data, original_excluded,
+            "linear_attn.norm.weight must NOT have +1 applied"
+        );
     }
 
     /// ADR-014 P1 byte-identity regression:

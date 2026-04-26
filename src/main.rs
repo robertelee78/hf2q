@@ -644,17 +644,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("qwen35moe expert merge (lazy) failed")
         .map_err(AppError::Conversion)?;
 
-    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.6 / 1.7 /
-    // 1.8) are still eager — they take `&mut TensorMap` and operate on
-    // materialised bytes. Bridge through `materialize_all` here. Each
-    // Phase 1.x lifted in subsequent P1 iters moves this bridge later;
-    // once the streaming quantize loop (P2) lands the bridge becomes
-    // test-only.
-    let mut tensor_map = lazy_map
-        .materialize_all()
-        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
-        .map_err(AppError::Conversion)?;
-
     // Phase 1.6: ADR-012 P3 Decision 6 — RMS norm +1 bias (Qwen3.5 family
     // `gamma + 1` convention, py:4794-4795). Baked into the stored weights
     // at convert time. Silent wire-up gap caught by spec-source audit
@@ -662,8 +651,22 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // it; before this fix, converted Qwen3.5 GGUFs shipped RMS norm
     // weights WITHOUT the +1 bias, producing silent logit skew at
     // inference. No-op for non-Qwen3.5 arches (Gemma4, LLaMA).
-    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(&mut tensor_map, &metadata)
-        .context("qwen35 RMS norm +1 bias application failed")
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap. Per-tensor `.map()` —
+    // closure adds 1.0 to each F32/F16/BF16 RMS-norm weight at
+    // materialise time. Shape and dtype preserved.
+    models::qwen35::apply_rms_norm_plus_one_in_lazy_map(&mut lazy_map, &metadata)
+        .context("qwen35 RMS norm +1 bias application (lazy) failed")
+        .map_err(AppError::Conversion)?;
+
+    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.7 / 1.8)
+    // are still eager. Bridge through `materialize_all` here. Each
+    // Phase 1.x lifted in subsequent P1 iters moves this bridge later;
+    // once the streaming quantize loop (P2) lands the bridge becomes
+    // test-only.
+    let mut tensor_map = lazy_map
+        .materialize_all()
+        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
         .map_err(AppError::Conversion)?;
 
     // Phase 1.7: ADR-012 P2/P3 Decision 5 + R2 — linear-attention transforms.
