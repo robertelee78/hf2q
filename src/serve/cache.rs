@@ -1983,4 +1983,358 @@ mod tests {
         assert_eq!(s.is_lfs, integ.is_lfs);
         assert!(s.verified_at_secs > 0);
     }
+
+    // ── ADR-005 Phase 3 iter-205 — invalidate / invalidate_repo / purge ─
+
+    /// Drop two quants of one repo onto disk with a real manifest
+    /// entry per quant; returns (cache, gguf paths).
+    fn fab_two_quants(tmp: &Path, repo: &str) -> (ModelCache, PathBuf, PathBuf) {
+        let mut cache = ModelCache::open_at(tmp).unwrap();
+        cache
+            .record_source(
+                repo,
+                "rev",
+                SourcePointer::Local {
+                    path: PathBuf::from("/p"),
+                    sha256: "0".repeat(64),
+                },
+            )
+            .unwrap();
+
+        let g4 = cache_model_path(tmp, repo, QuantType::Q4_K_M).unwrap();
+        fs::create_dir_all(g4.parent().unwrap()).unwrap();
+        fs::write(&g4, b"Q4_K_M_BYTES_FOR_TEST").unwrap();
+        cache
+            .record_quantized(
+                repo,
+                QuantEntry {
+                    quant_type: QuantType::Q4_K_M.as_str().to_string(),
+                    gguf_path: g4.clone(),
+                    mmproj_path: None,
+                    bytes: 21,
+                    sha256: sha256_file(&g4).unwrap(),
+                    quantized_at_secs: secs_since_epoch(),
+                    quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            )
+            .unwrap();
+
+        let g8 = cache_model_path(tmp, repo, QuantType::Q8_0).unwrap();
+        fs::create_dir_all(g8.parent().unwrap()).unwrap();
+        fs::write(&g8, b"Q8_0_BYTES_FOR_TEST_LARGER").unwrap();
+        cache
+            .record_quantized(
+                repo,
+                QuantEntry {
+                    quant_type: QuantType::Q8_0.as_str().to_string(),
+                    gguf_path: g8.clone(),
+                    mmproj_path: None,
+                    bytes: 26,
+                    sha256: sha256_file(&g8).unwrap(),
+                    quantized_at_secs: secs_since_epoch(),
+                    quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            )
+            .unwrap();
+        (cache, g4, g8)
+    }
+
+    #[test]
+    fn invalidate_removes_quant_entry_and_files() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, g4, g8) = fab_two_quants(tmp.path(), "org/m");
+
+        assert!(g4.is_file(), "Q4_K_M GGUF must be on disk pre-invalidate");
+        assert!(g8.is_file(), "Q8_0 GGUF must be on disk pre-invalidate");
+        assert!(cache.lookup("org/m", QuantType::Q4_K_M).is_some());
+        assert!(cache.lookup("org/m", QuantType::Q8_0).is_some());
+
+        let _freed = cache.invalidate("org/m", QuantType::Q4_K_M).unwrap();
+
+        // Q4_K_M is gone from disk + manifest; Q8_0 untouched.
+        assert!(!g4.exists(), "Q4_K_M GGUF must be removed");
+        assert!(!g4.parent().unwrap().exists(), "Q4_K_M dir must be removed");
+        assert!(g8.is_file(), "Q8_0 GGUF must survive");
+        assert!(cache.lookup("org/m", QuantType::Q4_K_M).is_none());
+        assert!(cache.lookup("org/m", QuantType::Q8_0).is_some());
+    }
+
+    #[test]
+    fn invalidate_returns_bytes_freed_matching_disk_walk() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+
+        // Pre-walk the dir so the test's expectation is the truth on disk
+        // (covers gguf + companion manifest.json), independent of the
+        // QuantEntry::bytes field which only tracks the GGUF.
+        let pre = dir_total_bytes(g4.parent().unwrap());
+        assert!(pre > 0, "pre-bytes must be non-zero");
+
+        let freed = cache.invalidate("org/m", QuantType::Q4_K_M).unwrap();
+        assert_eq!(freed, pre, "freed bytes must match the pre-removal walk");
+    }
+
+    #[test]
+    fn invalidate_unknown_repo_errors_named() {
+        let tmp = TempDir::new().unwrap();
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        let err = cache
+            .invalidate("ghost/repo", QuantType::Q4_K_M)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown_repo"), "msg: {msg}");
+        assert!(msg.contains("ghost/repo"), "msg: {msg}");
+    }
+
+    #[test]
+    fn invalidate_unknown_quant_errors_named() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+        let err = cache
+            .invalidate("org/m", QuantType::Q3_K_M)  // not cached
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown_quant"), "msg: {msg}");
+        assert!(msg.contains("Q3_K_M"), "msg: {msg}");
+    }
+
+    #[test]
+    fn invalidate_persists_across_reopen() {
+        // After invalidate, reopening from cold disk must not rediscover
+        // the removed entry (the manifest must have been atomically
+        // flushed).
+        let tmp = TempDir::new().unwrap();
+        {
+            let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+            cache.invalidate("org/m", QuantType::Q4_K_M).unwrap();
+        }
+        let cache = ModelCache::open_at(tmp.path()).unwrap();
+        assert!(cache.lookup("org/m", QuantType::Q4_K_M).is_none());
+        assert!(cache.lookup("org/m", QuantType::Q8_0).is_some());
+    }
+
+    #[test]
+    fn invalidate_holds_per_quant_lock_during_op() {
+        // The lock taken inside `invalidate` must observably hold the
+        // (repo, quant) lock — concurrent `try_lock_quant` from the
+        // SAME process for the same key returns None until invalidate
+        // releases.  We can't probe mid-call (no callbacks), but the
+        // post-condition (lock released after return) is provable.
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+        cache.invalidate("org/m", QuantType::Q4_K_M).unwrap();
+        // Lock must be released — try_lock returns Some.
+        let l = cache
+            .try_lock_quant("org/m", QuantType::Q4_K_M)
+            .unwrap();
+        assert!(
+            l.is_some(),
+            "post-invalidate lock must be released (RAII Drop fires before flush returns)"
+        );
+    }
+
+    #[test]
+    fn invalidate_repo_removes_all_quants_and_model_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, g4, g8) = fab_two_quants(tmp.path(), "org/m");
+
+        let model_dir = tmp
+            .path()
+            .join("models")
+            .join(slug_repo_id("org/m").unwrap());
+        assert!(model_dir.is_dir());
+
+        let freed = cache.invalidate_repo("org/m").unwrap();
+        assert!(freed > 0, "freed must be non-zero with two real quants");
+
+        assert!(!model_dir.exists(), "model dir must be removed");
+        assert!(!g4.exists());
+        assert!(!g8.exists());
+        assert!(cache.lookup_model("org/m").is_none());
+    }
+
+    #[test]
+    fn invalidate_repo_unknown_errors_named() {
+        let tmp = TempDir::new().unwrap();
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        let err = cache.invalidate_repo("ghost/repo").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown_repo"), "msg: {msg}");
+        assert!(msg.contains("ghost/repo"), "msg: {msg}");
+    }
+
+    #[test]
+    fn invalidate_repo_handles_repo_with_no_quants() {
+        // A `record_source` without any `record_quantized` (i.e. an
+        // in-flight or failed quantize) must still be removable.
+        let tmp = TempDir::new().unwrap();
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        cache
+            .record_source(
+                "org/m",
+                "rev",
+                SourcePointer::Local {
+                    path: PathBuf::from("/p"),
+                    sha256: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        cache.invalidate_repo("org/m").unwrap();
+        assert!(cache.lookup_model("org/m").is_none());
+    }
+
+    #[test]
+    fn purge_removes_everything_and_resets_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/a");
+        // Add a second model so we can prove purge nukes more than one.
+        cache
+            .record_source(
+                "org/b",
+                "rev",
+                SourcePointer::Local {
+                    path: PathBuf::from("/p"),
+                    sha256: "1".repeat(64),
+                },
+            )
+            .unwrap();
+
+        let freed = cache.purge().unwrap();
+        assert!(freed > 0);
+        assert!(cache.manifest().models.is_empty());
+        assert!(cache.lookup_model("org/a").is_none());
+        assert!(cache.lookup_model("org/b").is_none());
+
+        // models/ dir must still exist (layout invariant) — empty.
+        let models = tmp.path().join("models");
+        assert!(models.is_dir(), "models/ must be re-created post-purge");
+        let count = fs::read_dir(&models).unwrap().count();
+        assert_eq!(count, 0, "models/ must be empty post-purge");
+    }
+
+    #[test]
+    fn purge_preserves_schema_version_v2_on_reopen() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/a");
+            cache.purge().unwrap();
+        }
+        // Reopen from cold disk.
+        let cache = ModelCache::open_at(tmp.path()).unwrap();
+        assert_eq!(
+            cache.manifest().schema_version,
+            MANIFEST_SCHEMA_VERSION,
+            "purge must not regress schema version"
+        );
+        assert!(cache.manifest().models.is_empty());
+    }
+
+    #[test]
+    fn purge_idempotent_second_call_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+        let _first = cache.purge().unwrap();
+        let second = cache.purge().unwrap();
+        assert_eq!(second, 0, "second purge must report 0 bytes freed");
+    }
+
+    #[test]
+    fn iter_entries_lists_all_repos_and_quants() {
+        let tmp = TempDir::new().unwrap();
+        let (mut cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/a");
+        // Second repo, single Q8_0 quant.
+        let g_b = cache_model_path(tmp.path(), "org/b", QuantType::Q8_0).unwrap();
+        cache
+            .record_source(
+                "org/b",
+                "rev",
+                SourcePointer::Local {
+                    path: PathBuf::from("/p"),
+                    sha256: "2".repeat(64),
+                },
+            )
+            .unwrap();
+        fs::create_dir_all(g_b.parent().unwrap()).unwrap();
+        fs::write(&g_b, b"Q8_0").unwrap();
+        cache
+            .record_quantized(
+                "org/b",
+                QuantEntry {
+                    quant_type: QuantType::Q8_0.as_str().to_string(),
+                    gguf_path: g_b.clone(),
+                    mmproj_path: None,
+                    bytes: 4,
+                    sha256: sha256_file(&g_b).unwrap(),
+                    quantized_at_secs: secs_since_epoch(),
+                    quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+            )
+            .unwrap();
+
+        let entries: Vec<_> = cache.iter_entries().collect();
+        assert_eq!(entries.len(), 2, "two distinct repos");
+        // BTreeMap iteration is alphabetical → org/a before org/b.
+        assert_eq!(entries[0].repo_id, "org/a");
+        assert_eq!(entries[0].model.quantizations.len(), 2); // Q4_K_M + Q8_0
+        assert_eq!(entries[1].repo_id, "org/b");
+        assert_eq!(entries[1].model.quantizations.len(), 1);
+    }
+
+    #[test]
+    fn total_bytes_on_disk_matches_walk() {
+        let tmp = TempDir::new().unwrap();
+        let (cache, _g4, _g8) = fab_two_quants(tmp.path(), "org/m");
+        let direct = dir_total_bytes(&tmp.path().join("models"));
+        assert_eq!(cache.total_bytes_on_disk(), direct);
+        assert!(cache.total_bytes_on_disk() > 0);
+    }
+
+    #[test]
+    fn dir_total_bytes_returns_zero_for_missing_path() {
+        // Helper-level guard: the silent-on-missing semantics are
+        // load-bearing for `total_bytes_on_disk` against a freshly
+        // opened cache.
+        let tmp = TempDir::new().unwrap();
+        let phantom = tmp.path().join("does/not/exist");
+        assert_eq!(dir_total_bytes(&phantom), 0);
+    }
+
+    // ── QuantType::from_canonical_str ──────────────────────────────────
+
+    #[test]
+    fn quant_type_round_trip_via_from_canonical_str() {
+        for q in [
+            QuantType::Q8_0,
+            QuantType::Q6_K,
+            QuantType::Q4_K_M,
+            QuantType::Q3_K_M,
+        ] {
+            let parsed = QuantType::from_canonical_str(q.as_str()).unwrap();
+            assert_eq!(parsed, q, "round-trip for {}", q.as_str());
+        }
+    }
+
+    #[test]
+    fn quant_type_case_insensitive() {
+        assert_eq!(
+            QuantType::from_canonical_str("q4_k_m").unwrap(),
+            QuantType::Q4_K_M
+        );
+        assert_eq!(
+            QuantType::from_canonical_str("Q4_k_M").unwrap(),
+            QuantType::Q4_K_M
+        );
+    }
+
+    #[test]
+    fn quant_type_unknown_errors_lists_supported() {
+        let err = QuantType::from_canonical_str("Q5_K_S").unwrap_err();
+        // Error message names every supported variant so the operator
+        // can self-correct without consulting docs.
+        assert!(err.contains("Q8_0"), "err: {err}");
+        assert!(err.contains("Q6_K"), "err: {err}");
+        assert!(err.contains("Q4_K_M"), "err: {err}");
+        assert!(err.contains("Q3_K_M"), "err: {err}");
+        assert!(err.contains("Q5_K_S"), "err: {err}");
+    }
 }
