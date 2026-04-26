@@ -776,23 +776,52 @@ Variant coverage (all GPU): Dense (GEMM), MoE F32 (`mul_mm_id`), MoE GGUF-loaded
 
 Tests: 9 unit tests in `activation_capture_real::tests` + 1 end-to-end test in `quantize::dwq_activation::tests::activation_calibration_with_real_model_wrapper_succeeds` — all passing through the GPU path. Stale "P11 follow-up" notes elsewhere in the inference module retired.
 
-### P14 — MTP speculative-decoding execution (planned; blocked on ADR-012 P11)
+### P14 — MTP speculative-decoding execution (IN PROGRESS — convert-side flipped; forward_draft pending parity-test GGUF)
 
-**Status:** ⏳ **planned** — new phase added 2026-04-24 alongside ADR-012 Decision 19's conversion-side MTP tensor round-trip gate.
+**Status:** 🟡 **IN PROGRESS** — convert-side opt-in landed 2026-04-26 (commits `c33e33a`, `6ece6d5`, `d4e17f3` on branch `cfa/p14/claude`); forward_draft GPU implementation deferred pending a successful KEEP_MTP convert against a Qwen3.5 dense GGUF (the M5 Max OOM-killed the 27B Q4 attempt mid-iteration).
 
 **Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
 
-**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate). If P11 is not green, P14 is not started — the cross-link exists precisely so a "we'll do the inference side later" stub cannot silently accumulate on this side of the boundary.
+**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate). Landed 2026-04-24.
 
-**Deliverables (provisional, to be refined when P14 opens):**
-- `src/inference/models/qwen35/mtp.rs` — load-only scaffold is promoted to a full forward implementation. The `MtpWeights` bag-of-tensors structure gains a `forward_draft` entry point.
-- Rejection sampling loop in `src/inference/models/qwen35/model.rs` (both dense + MoE variants).
-- Unit tests for the rejection sampler against a hand-authored log-prob fixture.
-- Acceptance: speculative decoding does not change output logits vs. greedy single-token decode at temperature 0. Throughput improvement measured on a small-fixture generate; must be positive (≥ 10%) on at least one prompt set.
+#### P14.A COMPLETE — convert-side opt-in MTP emit (commit `c33e33a`, 2026-04-26)
 
-**Cross-link:** ADR-012 P11 landed 2026-04-24. That commit is the precondition for this phase. When P14 opens, both ADRs update their phase tables together.
+Replaced the unconditional MTP-drop policy from ADR-012 fc85681 with an opt-in `HF2Q_QWEN35_KEEP_MTP=1` env flag (the *inverse* of P14's original spec — analysis showed default-emit would default-break the sourdough oracle because llama.cpp's qwen35/qwen35moe loader has no per-layer slots for `nextn.*`).
 
-**Estimated LOC:** ~500 (MTP forward + rejection sampling + tests).
+- `src/main.rs` Phase 1.42 — keep `mtp.*` tensors when flag set; drop otherwise.  Default behaviour (drop) preserved so sourdough oracle keeps working.
+- `src/backends/gguf.rs` `build_metadata` — `block_count` bumped by `mtp_num_hidden_layers` only when the flag is set AND arch is qwen35 / qwen35moe (Gemma / dense LLaMA paths untouched).
+- Sourdough invariant verified post-change: 242 bytes common prefix / 160-byte floor on apex GGUF (vs 180-byte baseline at HEAD `23e1128` — the 60-byte improvement is the apex GGUF's intrinsic stability, NOT a regression).
+- Exit condition: REMOVE the flag (and make emit the default) when EITHER llama.cpp gains qwen35 MTP loading AND its loader accepts MTP-emitting GGUFs, OR by 2026-Q4. Documented inline at both touch sites per `feedback_never_ship_fallback_without_rootcause.md`.
+
+#### P14.B groundwork COMPLETE — MtpFullWeights eager loader (commit `6ece6d5`, 2026-04-26)
+
+Promoted `mtp.rs` from metadata-only `MtpWeights` to a full `MtpFullWeights` struct + `load_mtp_weights_full` function that loads tensor data for all 15 MTP block tensors as F32 row-major `Vec<f32>`:
+
+| Family | Location | Tensors |
+|---|---|---|
+| Inner full-attention | `blk.{n_layer}.*` | `attn_norm`, `post_attention_norm`, `attn_q` (fused Q+gate; split here), `attn_k`, `attn_v`, `attn_q_norm`, `attn_k_norm`, `attn_output` |
+| Inner dense SwiGLU FFN | `blk.{n_layer}.*` | `ffn_gate`, `ffn_up`, `ffn_down` |
+| Wrapper (MTP-only) | `blk.{n_layer}.nextn.*` | `enorm`, `hnorm`, `eh_proj`, `shared_head_norm` |
+
+- Probe tensor: `blk.{n_layer}.nextn.eh_proj.weight`. Absent → `Ok(None)`. Present + any other expected tensor missing → `Err` (loud rather than zero-fill).
+- Shape sanity for every tensor; fused Q+gate split mirrors `weight_loader::load_full_attn_layer`'s interleaved-head de-interleave.
+- Tests (3 new, all GREEN): `full_loader_absent_returns_none`, `full_loader_present_populates_all_fields` (synthetic 15-tensor GGUF, byte-identity verified), `full_loader_partial_presence_errors`.
+
+#### P14.B/C scaffold COMPLETE — Qwen35Model.mtp_full + SpecDecode (commit `d4e17f3`, 2026-04-26)
+
+- `Qwen35Model.mtp_full: Option<MtpFullWeights>` populated in `load_from_gguf` (Dense variant only — MoE MTP block layout not yet characterized; gated explicitly with debug log per `feedback_no_shortcuts.md`).
+- New module `src/inference/models/qwen35/spec_decode.rs` (~180 LOC) with `SpecDecode<'a>` wrapper, `has_mtp()` probe, and `run()` entry point documenting the 7-step rejection-sampler contract.
+- `run()` currently returns explicit `anyhow::Error` with a clear pointer to either the KEEP_MTP convert flag or the `forward_gpu_greedy` fallback. Per `feedback_no_shortcuts.md`, an explicit unimplemented error is strictly better than a stub returning wrong output.
+- 2 new tests (GREEN): `has_mtp_false_on_empty_model`, `run_errors_when_mtp_absent` (verifies the error message guides the caller correctly).
+- Stale doc comments retired in both `mtp.rs` (lines 9–25) and `model.rs` (lines 13–16).
+
+#### P14.B forward_draft — DEFERRED (blocked on KEEP_MTP-emitted GGUF)
+
+Phase B's GPU-resident `forward_draft` requires a real Qwen3.5 GGUF emitted with `HF2Q_QWEN35_KEEP_MTP=1` to parity-test against. Attempt 2026-04-26 to convert the 27B HF snapshot at Q4_0 was SIGKILL-9 OOM-killed on the M5 Max (52 GB HF source + Q4 quantization peak working set exceeds the available budget per `feedback_oom_prevention.md`). Loader, sampler scaffold, and integration point are all ready; the moment a KEEP_MTP-emitted GGUF materialises (via re-convert on a higher-RAM box, or via a smaller dense Qwen3.5 reference, or via convert-pipeline OOM-mitigation), the forward_draft + rejection-sampler loop can land in a single follow-on commit.
+
+**Cross-link:** ADR-012 P11 landed 2026-04-24. That commit is the precondition for this phase, and is met.
+
+**Remaining LOC estimate:** ~700 (Metal-encoded MTP block forward, mirroring `gpu_full_attn::build_gated_attn_layer` + `gpu_ffn::build_dense_ffn_layer_gpu` + the 4 wrapper-tensor ops, plus HybridKvCache MTP-slot extension, plus rejection-sampler integration with `cmd_generate_qwen35`).
 
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 
@@ -841,14 +870,19 @@ Hardware requirements, model layout, one-liner generate / sourdough / bench comm
 #### P13.6 COMPLETE — ADR-013 status close (commit cited inline in this file's progress log, 2026-04-25)
 Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit hashes + receipts; End-gate criteria below all ✅.
 
-#### End gate (Definition of Done — all ✅)
+#### End gate (Definition of Done — P13 all ✅; P14 partial)
 
 | Criterion | Receipt |
 |---|---|
-| Sourdough byte-parity passes on apex GGUF against llama.cpp's live output | ✅ 180 bytes common prefix / 160 floor at hf2q `23e1128` |
+| Sourdough byte-parity passes on apex GGUF against llama.cpp's live output | ✅ 180 bytes common prefix / 160 floor at hf2q `23e1128`; re-verified 242 bytes at hf2q `d4e17f3` post-P14.A |
 | Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
 | Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
 | Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
+| P14 convert-side opt-in MTP emit | ✅ `HF2Q_QWEN35_KEEP_MTP=1` flag at hf2q `c33e33a` |
+| P14 MTP weight loader + sampler scaffold | ✅ `MtpFullWeights` + `load_mtp_weights_full` at hf2q `6ece6d5`; `SpecDecode` at hf2q `d4e17f3` |
+| P14 forward_draft GPU implementation | ⏳ blocked on KEEP_MTP-emitted GGUF (27B Q4 convert OOM-killed 2026-04-26; awaiting re-attempt on higher-RAM host or smaller dense reference) |
+| P14 rejection-sampler integration with `--speculative` CLI flag | ⏳ blocked on forward_draft |
+| P14 throughput improvement ≥ 10% on small-fixture generate | ⏳ blocked on forward_draft |
 
 ### Totals
 
