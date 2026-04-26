@@ -2005,10 +2005,22 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         MetaValue::Bool(false),
     ));
 
-    // Pre-tokenizer type — used by llama.cpp to select the right pre-tokenizer
+    // Pre-tokenizer type — used by llama.cpp to select the right pre-tokenizer.
+    //
+    // ADR-012 P9b real-model finding (2026-04-25): we previously emitted
+    // `tokenizer.ggml.pre = tokenizer.ggml.model` (e.g. "gpt2"), which
+    // llama.cpp's vocab loader rejects:
+    //   "unknown pre-tokenizer type: 'gpt2'"
+    // The two keys serve different purposes:
+    //   tokenizer.ggml.model = BPE/SP family (llama, gpt2, gemma4, ...)
+    //   tokenizer.ggml.pre   = pre-tokenizer regex bucket
+    //                          (qwen35, qwen2, llama-bpe, gemma4, ...)
+    // The `pre` field is enumerated in /opt/llama.cpp/src/llama-vocab.cpp
+    // around line 1948-2061. Here we map by GGUF arch.
+    let pre_tokenizer = determine_pre_tokenizer_type(arch);
     kv.push((
         "tokenizer.ggml.pre".into(),
-        MetaValue::String(tokenizer_model_name.clone()),
+        MetaValue::String(pre_tokenizer),
     ));
 
     // Chat template — read from chat_template.jinja or tokenizer_config.json
@@ -2058,6 +2070,31 @@ fn is_byte_token(token: &str) -> bool {
         && bytes[3].is_ascii_hexdigit()
         && bytes[4].is_ascii_hexdigit()
         && bytes[5] == b'>'
+}
+
+/// Determine the GGUF `tokenizer.ggml.pre` (pre-tokenizer type) per arch.
+///
+/// Enumeration source: `/opt/llama.cpp/src/llama-vocab.cpp` around line
+/// 1948-2061. The `pre` field selects the regex-bucket pre-tokenizer that
+/// llama.cpp uses to split text before BPE encoding. Different model
+/// families use different regex rules.
+///
+/// ADR-012 P9b real-model finding 2026-04-25 — bug #10: previously we
+/// emitted the BPE-family tag (e.g. "gpt2") here, which llama.cpp
+/// rejects with "unknown pre-tokenizer type: 'gpt2'".
+fn determine_pre_tokenizer_type(arch: &str) -> String {
+    match arch {
+        // llama-vocab.cpp:2029 — Qwen3.5 / Qwen3.6 family.
+        "qwen35" | "qwen35moe" => "qwen35".into(),
+        // llama-vocab.cpp:2022 — Qwen2 family.
+        "qwen2" | "qwen3" => "qwen2".into(),
+        // llama-vocab.cpp:2005 — Gemma4.
+        "gemma4" | "gemma3" => "gemma4".into(),
+        // llama-vocab.cpp:1951-1959 — LLaMA3 BPE family.
+        "llama" | "mistral" => "llama-bpe".into(),
+        // Fallback for unknown arch — "default" (LLAMA_VOCAB_PRE_TYPE_DEFAULT).
+        _ => "default".into(),
+    }
 }
 
 /// Determine the GGUF tokenizer model name based on tokenizer.json contents and arch.
