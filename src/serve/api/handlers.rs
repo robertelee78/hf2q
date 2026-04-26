@@ -435,7 +435,25 @@ async fn prepare_chat_generation(
     // definitions (Iter B production fix-forward — see
     // `render_chat_prompt_with_tools`). `None` ⇒ legacy text-only
     // behavior unchanged.
-    let req_tools: Option<&[super::schema::Tool]> = req.tools.as_deref();
+    //
+    // `tool_choice == "none"` semantics (OpenAI spec): the operator
+    // declares tools but instructs the model NOT to invoke them this
+    // turn. Open WebUI sends this when the user toggles tools off
+    // mid-conversation. Honor it by suppressing tools at the chat-
+    // template render — the model never sees the tool defs and so
+    // cannot legitimately emit a tool-call marker. This is the safer
+    // semantics than letting the model see tools and hoping it
+    // ignores them: under T=0 with the gemma-4 abliterated DWQ, the
+    // observed behavior was that the model invoked the tool anyway,
+    // because the chat-template renders the tool defs into the
+    // system block regardless. tool_choice="auto" / "required" /
+    // forced-function still pass tools through; the per-call-shape
+    // grammar enforcement (Decision #6) is the deferred work.
+    let tool_choice = super::schema::ToolChoiceValue::parse(req.tool_choice.as_ref());
+    let req_tools: Option<&[super::schema::Tool]> = match tool_choice {
+        super::schema::ToolChoiceValue::None => None,
+        _ => req.tools.as_deref(),
+    };
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
         match apply_overflow_policy(engine, &messages_for_render, policy, req_tools).await {
             Ok(r) => r,
