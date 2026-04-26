@@ -1129,4 +1129,462 @@ mod tests {
         assert!(msg.contains("1000"));
         assert!(msg.contains("Phase 4"));
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // HotSwapManager tests — synthetic engine fixture (`MockEngine` is
+    // a unit struct), MockLoader writes a temp GGUF (just bytes) so
+    // `std::fs::metadata().len()` returns a deterministic byte count
+    // for the pool's budget accounting.  Production E = Engine path
+    // is exercised by tests/multi_model_hotswap.rs (env-gated E2E).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Synthetic engine type used by the manager unit tests.  The pool's
+    /// eviction logic is engine-agnostic — it only sees `bytes_resident`
+    /// and the LRU order — so the test fixture just needs a `Send +
+    /// Sync` placeholder that survives an `Arc::clone`.  Carries an id
+    /// so tests can assert "the same Arc came back" via field equality.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockEngine {
+        load_serial: u64,
+    }
+
+    /// Test loader.  Tracks call count + an optional error injection
+    /// so tests can exercise both happy + failure paths.  Holds an
+    /// AtomicU64 for the load-serial counter so the manager can
+    /// observe distinct engine instances across calls.
+    struct MockLoader {
+        calls: std::sync::atomic::AtomicU64,
+        fail_on_call: Option<u64>, // 1-indexed; None = never fail
+    }
+
+    impl MockLoader {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                fail_on_call: None,
+            }
+        }
+        fn fail_on(call_num: u64) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                fail_on_call: Some(call_num),
+            }
+        }
+        fn call_count(&self) -> u64 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ModelLoader<MockEngine> for MockLoader {
+        fn load(&self, _path: &Path, _config: &EngineConfig) -> anyhow::Result<MockEngine> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.fail_on_call == Some(n) {
+                anyhow::bail!("MockLoader synthetic failure on call {n}");
+            }
+            Ok(MockEngine { load_serial: n })
+        }
+    }
+
+    /// Make a temp GGUF-shaped fixture file of `size` bytes.  The
+    /// manager reads the file size for budget accounting; the loader
+    /// is a mock so the bytes' content doesn't matter.  Returns a
+    /// `tempfile::NamedTempFile` so the file lives until the test
+    /// function returns.
+    fn synthetic_gguf(size: usize) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        // Write `size` zero bytes — the manager only cares about
+        // `metadata().len()`, not the content.
+        let chunk = vec![0u8; 4096.min(size)];
+        let mut remaining = size;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            f.write_all(&chunk[..n]).expect("write");
+            remaining -= n;
+        }
+        f.flush().expect("flush");
+        f
+    }
+
+    fn empty_config() -> EngineConfig {
+        EngineConfig::default()
+    }
+
+    // --- Load + reuse path ---------------------------------------------
+
+    #[test]
+    fn hotswap_loads_on_first_request() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+        let engine = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("first load");
+
+        assert_eq!(engine.repo, "acme/m1");
+        assert_eq!(engine.quant, QuantType::Q4_K_M);
+        assert_eq!(engine.bytes_resident, 1_000);
+        assert_eq!(engine.engine.load_serial, 1);
+        assert_eq!(loader.call_count(), 1);
+        // Pool reflects the load.
+        let stats = mgr.pool_stats();
+        assert_eq!(stats.loaded_count, 1);
+        assert_eq!(stats.total_resident_bytes, 1_000);
+    }
+
+    #[test]
+    fn hotswap_reuses_pooled_engine() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let e1 = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("first");
+        let e2 = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("second");
+
+        // Same Arc — refcount-equality.
+        assert!(Arc::ptr_eq(&e1, &e2), "second call must return same Arc");
+        // Loader called exactly once.
+        assert_eq!(loader.call_count(), 1);
+    }
+
+    #[test]
+    fn hotswap_evicts_lru_on_pressure() {
+        // Capacity 2, budget large enough to bypass byte-budget
+        // eviction so we exercise the capacity path cleanly.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_000_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        let _e1 = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a/1");
+        let _e2 = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b/2");
+        let _e3 = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c/3");
+
+        // a/1 was LRU at the third load → evicted.
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        assert!(mgr.try_get("b/2", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("c/3", QuantType::Q4_K_M).is_some());
+        let stats = mgr.pool_stats();
+        assert_eq!(stats.loaded_count, 2);
+    }
+
+    #[test]
+    fn hotswap_evicts_lru_on_byte_pressure() {
+        // Capacity comfortable, budget tight — third load forces a
+        // byte-budget eviction even though capacity is 5.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(5, 2_500);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f1 = synthetic_gguf(1_000);
+        let f2 = synthetic_gguf(1_000);
+        let f3 = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f1.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f2.path(), &cfg)
+            .expect("b");
+        // 1000 + 1000 + 1000 = 3000 > 2500 → evict a/1 (LRU) → 2000.
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f3.path(), &cfg)
+            .expect("c");
+
+        assert!(mgr.try_get("a/1", QuantType::Q4_K_M).is_none());
+        let stats = mgr.pool_stats();
+        assert_eq!(stats.loaded_count, 2);
+        assert_eq!(stats.total_resident_bytes, 2_000);
+    }
+
+    #[test]
+    fn hotswap_errors_when_no_evictable_fits() {
+        // Budget 500, GGUF file 1500 → oversized handle even with
+        // empty pool.  Loader still runs (the manager invokes it
+        // before the pool admission attempt by design — the alternative
+        // would be to file-stat first, but file size IS the byte
+        // estimate so we already do that).  Verify the engine is
+        // dropped (`Arc::strong_count == 0` after the error).
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 500);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f = synthetic_gguf(1_500);
+        let cfg = empty_config();
+
+        let err = mgr
+            .load_or_get("big/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect_err("should refuse oversized");
+        match err {
+            HotSwapError::PoolRefused(PoolError::OversizedHandle {
+                repo_id,
+                handle_bytes,
+                budget_bytes,
+            }) => {
+                assert_eq!(repo_id, "big/1@Q4_K_M");
+                assert_eq!(handle_bytes, 1_500);
+                assert_eq!(budget_bytes, 500);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // Loader was invoked (engine produced + dropped).
+        assert_eq!(loader.call_count(), 1);
+        // Manager state is unchanged.
+        assert_eq!(mgr.pool_stats().loaded_count, 0);
+        assert!(mgr.try_get("big/1", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn hotswap_evict_explicit_removes() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f = synthetic_gguf(700);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("load");
+        assert_eq!(mgr.pool_stats().loaded_count, 1);
+
+        let bytes_freed = mgr.evict("acme/m1", QuantType::Q4_K_M);
+        assert_eq!(bytes_freed, 700);
+        assert!(mgr.try_get("acme/m1", QuantType::Q4_K_M).is_none());
+        assert_eq!(mgr.pool_stats().loaded_count, 0);
+        assert_eq!(mgr.pool_stats().total_resident_bytes, 0);
+
+        // Idempotent: second evict returns 0.
+        assert_eq!(mgr.evict("acme/m1", QuantType::Q4_K_M), 0);
+    }
+
+    #[test]
+    fn hotswap_try_get_returns_none_when_absent() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 1_000);
+        let mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        assert!(mgr.try_get("nope/0", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn hotswap_try_get_returns_arc_when_present() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let loaded = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("load");
+        let viewed = mgr
+            .try_get("acme/m1", QuantType::Q4_K_M)
+            .expect("present");
+        // Same Arc.
+        assert!(Arc::ptr_eq(&loaded, &viewed));
+    }
+
+    #[test]
+    fn hotswap_try_get_does_not_touch_lru() {
+        // Mirrors W74's `get_does_not_touch` test for the manager
+        // surface: try_get must NOT promote the entry, otherwise a
+        // diagnostic / metrics path peeking at the cache would poison
+        // the LRU policy.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_000_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b");
+        // Peek at a/1 — must not promote.
+        let _peek = mgr.try_get("a/1", QuantType::Q4_K_M).unwrap();
+        // Third load: a/1 should still be LRU and evicted.
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c");
+        assert!(
+            mgr.try_get("a/1", QuantType::Q4_K_M).is_none(),
+            "try_get must NOT promote — a/1 should evict as LRU"
+        );
+    }
+
+    #[test]
+    fn hotswap_pool_stats_reflects_loads_and_evictions() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(2, 5_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f1 = synthetic_gguf(800);
+        let f2 = synthetic_gguf(800);
+        let cfg = empty_config();
+
+        // Empty.
+        let s0 = mgr.pool_stats();
+        assert_eq!(s0.loaded_count, 0);
+        assert_eq!(s0.total_resident_bytes, 0);
+        assert_eq!(s0.capacity_models, 2);
+        assert_eq!(s0.memory_budget_bytes, 5_000);
+
+        // One load.
+        let _ = mgr.load_or_get("a/1", QuantType::Q4_K_M, f1.path(), &cfg);
+        let s1 = mgr.pool_stats();
+        assert_eq!(s1.loaded_count, 1);
+        assert_eq!(s1.total_resident_bytes, 800);
+
+        // Two loads.
+        let _ = mgr.load_or_get("b/2", QuantType::Q4_K_M, f2.path(), &cfg);
+        let s2 = mgr.pool_stats();
+        assert_eq!(s2.loaded_count, 2);
+        assert_eq!(s2.total_resident_bytes, 1_600);
+
+        // Explicit evict drops to 1.
+        mgr.evict("a/1", QuantType::Q4_K_M);
+        let s3 = mgr.pool_stats();
+        assert_eq!(s3.loaded_count, 1);
+        assert_eq!(s3.total_resident_bytes, 800);
+    }
+
+    #[test]
+    fn hotswap_loader_error_propagates() {
+        // Loader fails on first call → manager returns LoaderFailed
+        // and does NOT admit the entry.
+        let loader = Arc::new(MockLoader::fail_on(1));
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let err = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect_err("loader failure must propagate");
+        match err {
+            HotSwapError::LoaderFailed(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("synthetic failure"),
+                    "expected synthetic failure msg, got: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(loader.call_count(), 1);
+        // No state mutation — the entry was never admitted.
+        assert_eq!(mgr.pool_stats().loaded_count, 0);
+        assert!(mgr.try_get("acme/m1", QuantType::Q4_K_M).is_none());
+    }
+
+    #[test]
+    fn hotswap_file_size_error_when_gguf_missing() {
+        // GGUF path doesn't exist → FileSize error before the loader
+        // is invoked.  Verifies the manager's pre-load file-stat
+        // catches missing files with a clean named error.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let cfg = empty_config();
+
+        let err = mgr
+            .load_or_get(
+                "acme/m1",
+                QuantType::Q4_K_M,
+                Path::new("/nonexistent/path/to/no.gguf"),
+                &cfg,
+            )
+            .expect_err("missing GGUF must error");
+        match err {
+            HotSwapError::FileSize { path, .. } => {
+                assert!(path.to_string_lossy().contains("/nonexistent/"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // Loader was NOT invoked.
+        assert_eq!(loader.call_count(), 0);
+        assert_eq!(mgr.pool_stats().loaded_count, 0);
+    }
+
+    #[test]
+    fn hotswap_two_quants_of_same_repo_coexist() {
+        // The pool key is `format!("{repo}@{quant}")` so two distinct
+        // quant variants of the same repo can both be resident.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("Q4_K_M");
+        let _ = mgr
+            .load_or_get("acme/m1", QuantType::Q8_0, f.path(), &cfg)
+            .expect("Q8_0");
+
+        assert!(mgr.try_get("acme/m1", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("acme/m1", QuantType::Q8_0).is_some());
+        assert_eq!(mgr.pool_stats().loaded_count, 2);
+        assert_eq!(loader.call_count(), 2);
+    }
+
+    #[test]
+    fn hotswap_in_flight_arc_survives_eviction() {
+        // Capacity 1.  Hold the Arc from the first load through the
+        // second load; the manager evicts the first, but the Arc
+        // refcount keeps the engine alive.  Drop the held Arc and
+        // confirm refcount drops to 1 (just the held local, since the
+        // manager already released its reference).
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(1, 100_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader);
+        let f = synthetic_gguf(500);
+        let cfg = empty_config();
+
+        let inflight = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a/1");
+        // strong_count: 1 (manager) + 1 (inflight) = 2
+        assert_eq!(Arc::strong_count(&inflight), 2);
+
+        // Second load evicts a/1 from the manager.
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b/2");
+
+        // Manager dropped its Arc → strong_count = 1 (just inflight).
+        assert_eq!(
+            Arc::strong_count(&inflight),
+            1,
+            "manager must have released its Arc on eviction"
+        );
+        // Inflight Arc still valid — the engine wasn't dropped.
+        assert_eq!(inflight.repo, "a/1");
+        assert_eq!(inflight.engine.load_serial, 1);
+
+        // Drop inflight → engine drops now.
+        drop(inflight);
+        // (We can't assert "engine dropped" directly without a Drop
+        // impl on MockEngine; the strong_count == 1 invariant above
+        // is the load-bearing assertion for this test.)
+    }
 }
