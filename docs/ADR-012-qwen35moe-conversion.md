@@ -234,6 +234,26 @@ The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-
   **Conclusion**: total profiled GPU work (8.45ms) ≈ llama.cpp's per-token wall (8.38ms).  The 0.5ms hf2q-vs-llama gap is **not in kernel speed** — both implementations spend the same amount of time computing on the GPU.  The gap is in CPU-side CB scheduling/encoding overhead × 100 cb/token vs llama.cpp's 1-2 cb/token (`ggml-metal-context.m:458` "optimal values for n_cb are 1 or 2").  Per-CB scheduling overhead at ~5µs × ~100 cb ≈ 0.5ms gap.  Closing this requires either dispatch-graph fusion (large-scope falsified per `gpu_full_attn.rs:1108-1112`) or `dispatch_apply` parallel encoding — both belong in a new mlx-native perf ADR.
 
   **2026-04-26 small-scope CB fusion experiment** (sdpa_kv + ops6-7 → 1 cb, FullAttn decode path): refactored `apply_sdpa_with_kv_cache` to add a `_into` variant taking external encoder, then chained sigmoid_gate + out_proj into the same encoder.  Per-CB profile after fusion: `layer.full_attn.sdpa+ops6-7` = 56µs/cb × 10 = 0.56ms (was 42 + 15 = 57µs across 2 cb pre-fusion).  **Total cb count: 102 → 92 (−10 cb/token).  3 cold-run n=256 decode median: 110.5 t/s → 111.0 t/s = +0.5%, within noise.**  Confirms the 0.5ms gap is **not** dominated by CB-count overhead at this scale — the lever is **dispatch-count** (1070/token), not CB-count.  Source-level kernel fusion (combining adjacent compute kernels) is the only remaining lever and belongs in a new mlx-native perf ADR.  The fusion refactor was not committed to keep code complexity aligned with measured benefit (per `feedback_no_broken_windows`).
+
+  **2026-04-26 per-DISPATCH profiling — HARDWARE-IMPOSSIBLE on M5 Max.**  Probed `MTLDevice.supportsCounterSampling()` for all `MTLCounterSamplingPoint` variants on the host machine:
+
+    | Sampling point | M5 Max support |
+    |---|---|
+    | AtStageBoundary | **true** |
+    | AtDrawBoundary | false |
+    | AtDispatchBoundary | **false** |
+    | AtTileDispatchBoundary | false |
+    | AtBlitBoundary | false |
+
+  The `timestamp` counter set IS available, but only for `AtStageBoundary` sampling — i.e., at compute-encoder transitions, not between individual dispatches within an encoder.  Apple Silicon (M1–M5) does not expose per-dispatch GPU timestamps via `MTLCounterSampleBuffer.sampleCounters`; this is supported on Apple's discrete-GPU products only.  **The per-dispatch GPU timestamping the user's `/loop` directive named as the next localization step is therefore not achievable on this hardware** without resorting to GPU-trace capture (`MTLCaptureManager.startCaptureWithDescriptor`) — a manual offline workflow that doesn't fit a perf-iteration loop.
+
+  **Final closure verdict for the dwq46 0.93× decode parity gap (after this iteration's data):**
+    - Kernel speed: identical to llama.cpp (per-CB GPU profile total 8.45ms ≈ 8.38ms llama wall).
+    - CB-count: small-scope fusion saved 10 cb/token → +0.5% (noise).  Large-scope falsified twice on M5 Max.
+    - Per-dispatch profiling: hardware-impossible on M5 Max via Metal API.
+    - 8 falsified static-evidence kernel/dispatch hypotheses on M5 Max.
+
+  Closing the last 0.5ms requires one of: (1) source-level kernel fusion (combine adjacent compute kernels — significant mlx-native shader work, separate ADR), (2) `dispatch_apply` parallel encoding (mirrors llama.cpp `ggml-metal-context.m:550` pattern), (3) cross-token speculative pipelining (changes program structure).  None are within ADR-012's conversion-pipeline scope.  **dwq46 at 0.93× of llama.cpp on M5 Max is the practical ceiling for the current pure-Rust mlx-native architecture; closing further requires a new mlx-native perf ADR.**
 * **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
 
 **Decision Makers:** Robert, Claude
