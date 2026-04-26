@@ -87,6 +87,9 @@ pub async fn chat_completions(
         params,
         summarized_messages,
         summary_tokens,
+        soft_tokens,
+        vit_forward_ms,
+        vit_images,
     } = prepared;
     let engine = state.engine.as_ref().expect("engine gate above ensures Some");
 
@@ -96,7 +99,20 @@ pub async fn chat_completions(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
     let gen_started = std::time::Instant::now();
-    let result = match engine.generate(prompt_tokens, params).await {
+    // Vision dispatch fork (Phase 2c Task #17 / iter-99): when the
+    // multimodal preflight produced soft-token overrides, route through
+    // `Engine::generate_with_soft_tokens` so the worker plugs the
+    // projected ViT embeddings into the prefill at every placeholder
+    // position.  Empty `soft_tokens` ⇒ pure-text path (unchanged
+    // `Engine::generate`).
+    let gen_outcome = if soft_tokens.is_empty() {
+        engine.generate(prompt_tokens, params).await
+    } else {
+        engine
+            .generate_with_soft_tokens(prompt_tokens, soft_tokens, params)
+            .await
+    };
+    let result = match gen_outcome {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("{e}");
@@ -248,6 +264,17 @@ struct PreparedChatContext {
     /// synthetic summary system message.
     summarized_messages: Option<usize>,
     summary_tokens: Option<usize>,
+    /// Per-position embedding overrides for the multimodal vision path
+    /// (Phase 2c Task #17 / iter-99).  Empty for text-only requests.
+    /// When non-empty, `chat_completions` dispatches via
+    /// `Engine::generate_with_soft_tokens` instead of `Engine::generate`.
+    soft_tokens: Vec<engine::SoftTokenData>,
+    /// ViT forward wall-clock for the vision branch (transparency
+    /// header `x-hf2q-vit-forward-ms`).  `None` for text-only.
+    vit_forward_ms: Option<u64>,
+    /// Image count for the vision branch (transparency header
+    /// `x-hf2q-vit-images`).  `None` for text-only.
+    vit_images: Option<usize>,
 }
 
 /// Run every validation + rendering + tokenization step common to the
