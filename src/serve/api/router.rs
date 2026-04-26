@@ -708,6 +708,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iter210_metrics_emits_pool_gauges() {
+        // ADR-005 Phase 4 iter-210 (W78): /metrics surfaces three new
+        // pool-state gauges sourced from `HotSwapManager::pool_stats()`.
+        // With an empty default pool we expect:
+        //   - hf2q_pool_loaded_models 0
+        //   - hf2q_pool_resident_bytes 0
+        //   - hf2q_pool_memory_budget_bytes <budget>  (synthetic 1 GiB
+        //     test budget set by AppState::new — see
+        //     `src/serve/api/state.rs::with_capacity_and_budget`).
+        // The HELP/TYPE preamble for each gauge is asserted so the
+        // Prometheus exposition format stays parseable; downstream
+        // dashboards rely on it for type-aware aggregation.
+        let app = build_router(state_default());
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+
+        // Gauge 1: loaded_models — empty pool ⇒ 0.
+        assert!(
+            body.contains("# HELP hf2q_pool_loaded_models"),
+            "missing HELP line for hf2q_pool_loaded_models; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_loaded_models gauge"),
+            "missing TYPE line for hf2q_pool_loaded_models; body:\n{body}"
+        );
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_pool_loaded_models 0"),
+            "expected `hf2q_pool_loaded_models 0` line; body:\n{body}"
+        );
+
+        // Gauge 2: resident_bytes — empty pool ⇒ 0.
+        assert!(
+            body.contains("# HELP hf2q_pool_resident_bytes"),
+            "missing HELP line for hf2q_pool_resident_bytes; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_resident_bytes gauge"),
+            "missing TYPE line for hf2q_pool_resident_bytes; body:\n{body}"
+        );
+        assert!(
+            body.lines().any(|l| l.trim() == "hf2q_pool_resident_bytes 0"),
+            "expected `hf2q_pool_resident_bytes 0` line; body:\n{body}"
+        );
+
+        // Gauge 3: memory_budget_bytes — value comes from `state_default()`'s
+        // synthetic pool budget (set in AppState::new for tests).  We
+        // assert the prefix + a non-empty value to avoid coupling to the
+        // exact byte count, which is intentionally synthetic in tests.
+        assert!(
+            body.contains("# HELP hf2q_pool_memory_budget_bytes"),
+            "missing HELP line for hf2q_pool_memory_budget_bytes; body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE hf2q_pool_memory_budget_bytes gauge"),
+            "missing TYPE line for hf2q_pool_memory_budget_bytes; body:\n{body}"
+        );
+        let budget_line = body
+            .lines()
+            .find(|l| l.starts_with("hf2q_pool_memory_budget_bytes "))
+            .unwrap_or_else(|| panic!("expected hf2q_pool_memory_budget_bytes line; body:\n{body}"));
+        let budget_val: u64 = budget_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("could not parse u64 from {budget_line:?}; body:\n{body}")
+            });
+        // The synthetic test budget is non-zero; production reads
+        // `from_hardware` (80% of unified RAM).  Either way, > 0 here
+        // proves the gauge wired through `pool_stats()` correctly.
+        assert!(
+            budget_val > 0,
+            "expected positive memory_budget_bytes, got {budget_val}; body:\n{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn iter209_two_concurrent_unresolvable_requests_both_400() {
         // Concurrent requests for the same unresolvable model — both
         // serialize through the cache mutex inside `spawn_blocking`,

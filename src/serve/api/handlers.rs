@@ -2703,32 +2703,41 @@ async fn chat_model_embeddings(
 /// output is plain-text key/value with `# HELP` and `# TYPE` annotations.
 ///
 /// Counters / gauges surfaced:
-///   - `hf2q_uptime_seconds`          (gauge)
-///   - `hf2q_ready`                   (gauge — 0/1)
-///   - `hf2q_model_loaded`            (gauge — 0/1)
-///   - `hf2q_requests_total`          (counter)
-///   - `hf2q_requests_rejected_total` (counter)
-///   - `hf2q_chat_completions_started`   (counter)
-///   - `hf2q_chat_completions_completed` (counter)
-///   - `hf2q_chat_completions_queue_full`(counter)
-///   - `hf2q_sse_cancellations`       (counter)
-///   - `hf2q_decode_tokens_total`     (counter)
-///   - `hf2q_prompt_tokens_total`     (counter)
+///   - `hf2q_uptime_seconds`              (gauge)
+///   - `hf2q_ready`                       (gauge — 0/1)
+///   - `hf2q_model_loaded`                (gauge — 0/1)
+///   - `hf2q_pool_loaded_models`          (gauge — count of pooled engines)
+///   - `hf2q_pool_resident_bytes`         (gauge — sum of GGUF bytes resident)
+///   - `hf2q_pool_memory_budget_bytes`    (gauge — 80% of unified RAM by default)
+///   - `hf2q_requests_total`              (counter)
+///   - `hf2q_requests_rejected_total`     (counter)
+///   - `hf2q_chat_completions_started`    (counter)
+///   - `hf2q_chat_completions_completed`  (counter)
+///   - `hf2q_chat_completions_queue_full` (counter)
+///   - `hf2q_sse_cancellations`           (counter)
+///   - `hf2q_decode_tokens_total`         (counter)
+///   - `hf2q_prompt_tokens_total`         (counter)
 pub async fn metrics(State(state): State<AppState>) -> Response {
     use std::sync::atomic::Ordering;
     let m = &state.metrics;
     let ready = if state.is_ready_for_gen() { 1 } else { 0 };
-    // Iter-209: gauge reflects the pool's loaded_count (0 = HTTP-only
-    // backbone; ≥1 = at least one model resident in the pool).  Per
-    // ADR-005 line 5404, future iters will surface
-    // `hf2q_pool_loaded_models` + `hf2q_pool_resident_bytes` as
-    // dedicated pool-state gauges; for the iter-209 closure window
-    // `hf2q_model_loaded` keeps its single-bit semantics.
+    // Iter-210 (W78): pool-state gauges sourced from `pool_stats()`
+    // (ADR-005 Phase 4, AC 5466 + AC 5467).  Empty / poisoned pool
+    // → all three pool gauges report 0 so the surface stays parseable;
+    // `hf2q_model_loaded` keeps its pre-iter-210 single-bit semantics
+    // for backward compatibility with operator dashboards built on the
+    // iter-209 surface.
     let pool_stats_for_metrics = state.pool.read().ok().map(|m| m.pool_stats());
-    let model_loaded = match pool_stats_for_metrics {
-        Some(stats) if stats.loaded_count > 0 => 1,
-        _ => 0,
-    };
+    let (model_loaded, pool_loaded_models, pool_resident_bytes, pool_memory_budget_bytes) =
+        match pool_stats_for_metrics {
+            Some(stats) => (
+                if stats.loaded_count > 0 { 1 } else { 0 },
+                stats.loaded_count as u64,
+                stats.total_resident_bytes,
+                stats.memory_budget_bytes,
+            ),
+            None => (0, 0, 0, 0),
+        };
     let body = format!(
         "\
 # HELP hf2q_uptime_seconds Process uptime in seconds since bind.\n\
@@ -2740,6 +2749,15 @@ hf2q_ready {ready}\n\
 # HELP hf2q_model_loaded 1 if a model is loaded, 0 if HTTP-only backbone.\n\
 # TYPE hf2q_model_loaded gauge\n\
 hf2q_model_loaded {model}\n\
+# HELP hf2q_pool_loaded_models Number of models currently resident in HotSwapManager.\n\
+# TYPE hf2q_pool_loaded_models gauge\n\
+hf2q_pool_loaded_models {pool_loaded}\n\
+# HELP hf2q_pool_resident_bytes Total bytes of GGUF data resident in HotSwapManager.\n\
+# TYPE hf2q_pool_resident_bytes gauge\n\
+hf2q_pool_resident_bytes {pool_resident}\n\
+# HELP hf2q_pool_memory_budget_bytes Memory budget for HotSwapManager (80% of unified RAM by default).\n\
+# TYPE hf2q_pool_memory_budget_bytes gauge\n\
+hf2q_pool_memory_budget_bytes {pool_budget}\n\
 # HELP hf2q_requests_total Total HTTP requests reaching a handler (post-auth).\n\
 # TYPE hf2q_requests_total counter\n\
 hf2q_requests_total {req_total}\n\
@@ -2768,6 +2786,9 @@ hf2q_prompt_tokens_total {prompt_tok}\n\
         uptime = state.uptime_seconds(),
         ready = ready,
         model = model_loaded,
+        pool_loaded = pool_loaded_models,
+        pool_resident = pool_resident_bytes,
+        pool_budget = pool_memory_budget_bytes,
         req_total = m.requests_total.load(Ordering::Relaxed),
         req_rej = m.requests_rejected_total.load(Ordering::Relaxed),
         chat_start = m.chat_completions_started.load(Ordering::Relaxed),
