@@ -516,37 +516,41 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // Phase 1.42: ADR-012 Decision 19 — MTP tensor handling.
+    // Phase 1.42: ADR-013 P14 — MTP tensor handling (opt-in emit).
     //
-    // HF Qwen3.5 emits 15 `mtp.*` tensors that the original P11 work
-    // (commit `0a1a7b7`) did not handle:
+    // HF Qwen3.5 emits 15 `mtp.*` tensors:
     //   - 11 inner-transformer-block tensors at
     //     mtp.layers.0.{self_attn,mlp,*norm}.*
     //   - 4 wrapper tensors:
     //     mtp.{fc, norm, pre_fc_norm_embedding, pre_fc_norm_hidden}.weight
     //
-    // llama.cpp rejected every emitted GGUF with
-    //   done_getting_tensors: wrong number of tensors; expected N, got N-15
+    // **Default behaviour (DROP):** llama.cpp's qwen35 / qwen35moe loaders
+    // do NOT read LLM_KV_NEXTN_PREDICT_LAYERS into a per-layer slot
+    // allocation. Emitting MTP tensors makes llama-cli reject every GGUF
+    // with `done_getting_tensors: wrong number of tensors; expected N,
+    // got N+15`, which would break the ADR-013 sourdough byte-parity
+    // gate (whose oracle IS llama-cli on the same GGUF). For that
+    // reason the default convert output drops `mtp.*` tensors. This is
+    // the opposite of what was originally planned in P14's spec — the
+    // analysis in commit fc85681 (2026-04-25) showed default-emit is
+    // ship-blocked on llama.cpp parity.
     //
-    // because those 15 names passed through `hf_name_to_gguf` unrenamed.
+    // **Opt-in path (KEEP):** Set `HF2Q_QWEN35_KEEP_MTP=1` to emit the
+    // MTP block. The resulting GGUF will NOT load in stock llama.cpp
+    // but WILL load in hf2q (ADR-013 P14 forward_draft consumes the
+    // emitted `blk.{num_hidden_layers}.nextn.*` tensors for speculative
+    // decoding). When llama.cpp gains qwen35 MTP loading, flip the
+    // default by inverting the env-var sense.
     //
-    // **Decision (2026-04-25):** llama.cpp's qwen35 / qwen35moe loaders do
-    // NOT read LLM_KV_NEXTN_PREDICT_LAYERS and have no per-layer slots
-    // allocated for an MTP block.  Renaming `mtp.*` to `blk.{n_layer}.*`
-    // therefore causes a "missing tensor" rejection on the very first
-    // ssm_conv1d that the recurrent-layer pattern expects.  Until
-    // llama.cpp gains qwen35 MTP support, the only loadable choice is to
-    // **drop all mtp.* tensors** from the convert output.  ADR-013's
-    // mtp.rs::load_mtp_weights_if_present treats absence as expected
-    // (returns Ok(None)), so this drop is observable but non-fatal on
-    // the inference side.
-    //
-    // When llama.cpp gains qwen35 MTP loading (and starts reading
-    // NEXTN_PREDICT_LAYERS into hparams.nextn_predict_layers), this phase
-    // flips to actually emit the MTP block by uncommenting
-    // `rename_mtp_tensors_to_layer_form` + bumping block_count in
-    // `gguf.rs::build_metadata` to include nextn_predict_layers.
+    // **Exit condition:** REMOVE this env flag (and make emit the default)
+    // when EITHER llama.cpp gains qwen35 MTP loading AND the sourdough
+    // oracle accepts MTP-emitting GGUFs, OR by 2026-Q4 — whichever
+    // comes first. This is the dated escape hatch demanded by
+    // feedback_never_ship_fallback_without_rootcause.
     {
+        let keep_mtp = std::env::var("HF2Q_QWEN35_KEEP_MTP")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let mtp_keys: Vec<String> = tensor_map
             .tensors
             .keys()
@@ -554,13 +558,27 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .cloned()
             .collect();
         if !mtp_keys.is_empty() {
-            tracing::info!(
-                dropped = mtp_keys.len(),
-                "Phase 1.42: dropping {} mtp.* tensors (llama.cpp qwen35/qwen35moe loader has no MTP slots; ADR-012 Decision 19 follow-up 2026-04-25)",
-                mtp_keys.len()
-            );
-            for key in mtp_keys {
-                tensor_map.tensors.remove(&key);
+            if keep_mtp {
+                tracing::info!(
+                    kept = mtp_keys.len(),
+                    "Phase 1.42 (P14 opt-in): keeping {} mtp.* tensors via HF2Q_QWEN35_KEEP_MTP=1; downstream rename_mtp_tensors_to_layer_form will rewrite to blk.{{n_layer+idx}}.* form",
+                    mtp_keys.len()
+                );
+                // No drop — leave mtp.* in the map; the qwen35 transform
+                // pipeline (rename_mtp_tensors_to_layer_form, called below)
+                // will translate them into model.layers.{n_layer+idx}.* form,
+                // and the standard layer-map / hf_name_to_gguf pair plus
+                // qwen35_nextn_wrapper_layer_map will produce the final
+                // blk.{N}.nextn.* names ADR-013 P14 expects.
+            } else {
+                tracing::info!(
+                    dropped = mtp_keys.len(),
+                    "Phase 1.42: dropping {} mtp.* tensors (llama.cpp qwen35/qwen35moe loader has no MTP slots; set HF2Q_QWEN35_KEEP_MTP=1 to opt into ADR-013 P14 speculative-decoding output)",
+                    mtp_keys.len()
+                );
+                for key in mtp_keys {
+                    tensor_map.tensors.remove(&key);
+                }
             }
         }
     }

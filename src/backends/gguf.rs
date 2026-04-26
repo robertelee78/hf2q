@@ -2326,19 +2326,40 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         "general.quantization_version".into(),
         MetaValue::Uint32(2),
     ));
-    // ADR-012 Decision 19 (2026-04-25 follow-up): for qwen35 / qwen35moe,
-    // llama.cpp's load_hparams does NOT read LLM_KV_NEXTN_PREDICT_LAYERS
-    // (only GLM4 + DeepseekV3 do, see llama-model.cpp:2073/2107/2154/2329).
-    // Its create_tensor loop is `for (int i = 0; i < n_layer; ++i)` and
-    // expects exactly that many per-layer slots.  So `block_count` is the
-    // raw `num_hidden_layers` (no MTP); MTP tensors must NOT be emitted as
-    // blk.{n_layer}.* slots — they have no loader-side allocation and the
-    // file is rejected.  When llama.cpp gains qwen35 MTP support, this
-    // expression becomes `meta.num_layers + meta.mtp_num_hidden_layers...`
-    // (mirrors convert_hf_to_gguf.py:10042 for arches that do).
+    // ADR-012 Decision 19 (2026-04-25 follow-up) + ADR-013 P14 (2026-04-26):
+    // for qwen35 / qwen35moe, llama.cpp's load_hparams does NOT read
+    // LLM_KV_NEXTN_PREDICT_LAYERS (only GLM4 + DeepseekV3 do, see
+    // llama-model.cpp:2073/2107/2154/2329). Its create_tensor loop is
+    // `for (int i = 0; i < n_layer; ++i)` and expects exactly that many
+    // per-layer slots. So in the **default** (drop-MTP) convert path,
+    // `block_count` is the raw `num_hidden_layers` and MTP tensors are
+    // dropped upstream (src/main.rs Phase 1.42).
+    //
+    // In the **opt-in** path (`HF2Q_QWEN35_KEEP_MTP=1`), the convert
+    // pipeline emits `mtp_num_hidden_layers` extra blocks at
+    // `blk.{num_hidden_layers..num_hidden_layers + mtp_num_hidden_layers}.nextn.*`
+    // and bumps `block_count` to match — the resulting GGUF won't load in
+    // stock llama.cpp (no nextn slots) but WILL load in hf2q (ADR-013 P14
+    // mtp.rs::forward_draft consumes those slots for speculative decoding).
+    //
+    // Scope-gate: only apply the bump for qwen35 / qwen35moe arches; never
+    // touch Gemma / dense LLaMA paths whose mtp_num_hidden_layers is
+    // either None or not exercised.
+    let block_count = {
+        let keep_mtp = std::env::var("HF2Q_QWEN35_KEEP_MTP")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let is_qwen35_family = arch == "qwen35" || arch == "qwen35moe";
+        if keep_mtp && is_qwen35_family {
+            let extra = meta.mtp_num_hidden_layers.unwrap_or(0);
+            meta.num_layers.saturating_add(extra)
+        } else {
+            meta.num_layers
+        }
+    };
     kv.push((
         format!("{}.block_count", arch),
-        MetaValue::Uint32(meta.num_layers),
+        MetaValue::Uint32(block_count),
     ));
     kv.push((
         format!("{}.embedding_length", arch),
