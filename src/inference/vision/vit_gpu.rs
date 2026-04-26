@@ -6996,4 +6996,83 @@ mod tests {
         .expect("empty dispatch");
         assert!(result.is_empty());
     }
+
+    /// ADR-005 phase 2c iter 124 (W55) — parity probe runner.
+    ///
+    /// Loads the four-dots fixture, runs the real gemma4v preprocessor +
+    /// GPU ViT forward, and (when `HF2Q_VIT_DUMP=<dir>` is set) writes
+    /// stage tensors via the production dump path in
+    /// `gemma4v_apply_full_forward_gpu`. Skipped by default — the test
+    /// is `#[ignore]`d AND additionally short-circuits when the env var
+    /// is unset, so a stray `cargo test -- --ignored` on a host without
+    /// HF2Q_VIT_DUMP doesn't burn 30+ s of GPU time.
+    ///
+    /// Run:
+    ///   HF2Q_VIT_DUMP=/tmp/hf2q_dumps \
+    ///     cargo test --release --bin hf2q -- \
+    ///       inference::vision::vit_gpu::tests::iter124_parity_probe \
+    ///       --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn iter124_parity_probe_dump_four_dots_real_gemma4() {
+        if super::super::vit_dump::resolve_dump_dir()
+            .expect("resolve dump dir")
+            .is_none()
+        {
+            eprintln!("skip: HF2Q_VIT_DUMP unset (parity probe runner is opt-in)");
+            return;
+        }
+        let mmproj_path = Path::new(GEMMA4_MMPROJ_PATH);
+        if !mmproj_path.exists() {
+            eprintln!("skip: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
+            return;
+        }
+        let img_path = Path::new(
+            "/opt/hf2q/tests/fixtures/vision/four_dots_in_corners_128x128.png",
+        );
+        let img_bytes = std::fs::read(img_path).expect("read four-dots fixture");
+
+        let pre = crate::inference::vision::preprocess::preprocess_gemma4v(
+            &img_bytes,
+            &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT,
+        )
+        .expect("preprocess");
+
+        let gguf = GgufFile::open(mmproj_path).expect("open mmproj");
+        let cfg = MmprojConfig::from_gguf(&gguf).expect("cfg");
+        let device = MlxDevice::new().expect("device");
+        let weights =
+            LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load mmproj");
+
+        let img = Gemma4vPreprocessedImage {
+            patches: pre.patches,
+            pos_x: pre.pos_x,
+            pos_y: pre.pos_y,
+            n_x: pre.n_x,
+            n_y: pre.n_y,
+            source_label: "four_dots_in_corners_128x128.png".to_string(),
+        };
+
+        let out = compute_vision_embeddings_gpu_gemma4v(
+            std::slice::from_ref(&img),
+            &weights,
+            &cfg,
+        )
+        .expect("forward");
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].is_empty());
+
+        // The dump directory is now populated by
+        // compute_vision_embeddings_gpu_gemma4v. Surface the resolved
+        // path so the runner script can pick it up via stdout.
+        let dir = super::super::vit_dump::resolve_dump_dir()
+            .expect("resolve dump dir")
+            .expect("dump dir set");
+        eprintln!(
+            "iter124 parity probe: dumps written to {} (n_x={}, n_y={})",
+            dir.display(),
+            img.n_x,
+            img.n_y
+        );
+    }
 }

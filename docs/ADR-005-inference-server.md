@@ -1338,6 +1338,82 @@ Bit-identical reproduction across two cold-process runs at T=0.0, max_tokens=16.
 
 ---
 
+#### Phase 2c iter-124 — ViT parity probe lands; first divergence at stage `00_preprocess` traces to a missing second `2x − 1` (2026-04-26, W55, commits `fdb415e` + `1b53625`)
+
+**Why this iter exists.** Iter-122 fixed the `(weight + 1)` RMSNorm bug. Iter-123 (W54, no commits) audited four high-likelihood candidates from W54's hypothesis tree (2D-RoPE table layout, scale-bias pre-conv, pooler `sqrt(n_embd)`, soft-token geometry) byte-for-byte against `clip.cpp` + `gemma4v.cpp`; **all four matched** — the hypothesis tree was exhausted. Smoke vs four-dots fixture still diverged from peer ("An image of a square frame made of four") to hf2q's "Minimalist geometric pattern, white background." (image-aware but no peer-word overlap).
+
+W54 recommendation #5: stop guessing, start measuring. Build a numerical parity probe.
+
+**Reference choice — A (llama.cpp) via Homebrew libmtmd.** Candle (B) and HF transformers (C) both implement Gemma-style RmsNorm with `(weight + 1)` (`/opt/candle/.../gemma4/vision.rs:39`, HF `Gemma3RMSNorm`) — using either as a numerical reference would re-bake the exact bug iter-122 just corrected. /opt/llama.cpp itself is read-only-reference per project policy; the peer dumper instead links against `/opt/homebrew/lib/libmtmd.dylib` (Homebrew package, distinct from the source tree at /opt/llama.cpp), which exposes the public `mtmd_context_params::cb_eval` callback.
+
+**Probe components.**
+
+  * `src/inference/vision/vit_dump.rs` (commit `fdb415e`) — env-gated thread-local `MlxBuffer` collector wired into `gemma4v_apply_full_forward_gpu` at 9 named pipeline stages: `00_preprocess`, `01_patch_embd`, `02_pos_embd`, `03_block_00..03_block_NN`, `30_final_pool`, `31_pool_sqrt_scale`, `32_std_bias_scale`, `33_projector`, `34_post_proj_rms`. Trigger: `HF2Q_VIT_DUMP=<dir>`. Default unset → zero overhead, single `RefCell::borrow` per forward, no allocations. On-disk format: raw F32 LE `<stage>.bin` + JSON sidecar `<stage>.json` listing shape and dtype.
+  * `tools/vit_parity_probe/cpp/peer_dumper.cpp` (commit `1b53625`) — C++17 binary linking libmtmd / libllama / libggml from Homebrew. Sets a `ggml_backend_sched_eval_callback`, captures every named graph node whose name is in the parity-stage allowlist, dequantises to F32, writes the SAME on-disk format as hf2q. Maps llama.cpp tensor names (`inp_raw_scaled`, `inp`, `pos_embd`, `layer_out-NN`, `pooled`, `std_scaled`, `projected`, `projected_normed`) → hf2q stages.
+  * `tools/vit_parity_probe/src/bin/diff.rs` (commit `1b53625`) — pure-Rust binary that reads two dump dirs, pairs by stage name, computes max-abs / mean-abs / max-rel-err per stage, reports first divergence at a configurable tolerance (default `1e-4`). Exit 0 = parity within tol; 1 = divergence; 2 = I/O / shape error.
+
+**Probe runner.** `iter124_parity_probe_dump_four_dots_real_gemma4` in `vit_gpu.rs::tests` (`#[ignore]`-by-default + env-var double-gate) loads the four-dots fixture, runs `preprocess_gemma4v` + `compute_vision_embeddings_gpu_gemma4v`, and the production dump path writes the stages.
+
+**Run procedure.**
+
+```bash
+# hf2q side
+HF2Q_VIT_DUMP=/tmp/hf2q_dumps cargo test --release --bin hf2q -- \
+  inference::vision::vit_gpu::tests::iter124_parity_probe \
+  --ignored --nocapture
+
+# llama.cpp side
+tools/vit_parity_probe/cpp/build/peer_dumper \
+  -m models/gemma-4-26B-A4B-it-ara-abliterated-dwq/...gguf \
+  --mmproj models/gemma-4-26B-A4B-it-ara-abliterated-dwq/...mmproj.gguf \
+  --image tests/fixtures/vision/four_dots_in_corners_128x128.png \
+  --dump-dir /tmp/peer_dumps
+
+# Diff
+tools/vit_parity_probe/target/release/diff /tmp/hf2q_dumps /tmp/peer_dumps
+```
+
+**First divergence: stage `00_preprocess`.**
+
+```
+stage              n          max_abs        mean_abs      shape_ok
+00_preprocess      1769472    3.725e0        2.326e-1      NO  (hf2q=[2304,768], peer=[3,768,768])
+01_patch_embd      2654208    9.914e1        7.050e-2      yes
+02_pos_embd        2654208    9.914e1        7.050e-2      NO
+03_block_00        2654208    9.953e1        9.054e-2      NO
+03_block_26        2654208    1.506e3        3.387e1       NO
+34_post_proj_rms   720896     9.571e0        6.921e-1      NO
+```
+
+Shape disagreement at `00_preprocess` is layout, not data: hf2q dumps the post-patchify `[N_patches=2304, patch_size²×3=768]` row-major tensor (the input to the patch_embd Linear); peer dumps llama.cpp's `inp_raw_scaled` which is the pre-conv `[C=3, H=768, W=768]` raw image. Both representations cover the same 1769472 floats.
+
+**Numerical signature is the diagnosis.** Element-wise stats at stage 00:
+
+  * peer: min=−2.764706, max=+0.921569, mean=+0.789837, std=0.664680 — range ≈ [−3, +1].
+  * hf2q: min=−0.882353, max=+0.960784, mean=+0.895088, std=0.331832 — range ≈ [−1, +1].
+
+`hf2q.std == peer.std / 2` and `(peer.mean + 1) / 2 == 0.895 == hf2q.mean` to numerical precision. **hf2q is exactly `(peer + 1) / 2`** — i.e., hf2q is missing one full `2x − 1` step.
+
+**Root-cause walk through llama.cpp.**
+
+  1. `mtmd_image_preprocessor::img_u8_to_f32` (`mtmd-image.cpp:11-21`) applies `(p/255 − mean)/std` with `mean = std = [0.5, 0.5, 0.5]` (read from `clip.vision.image_mean` / `..._std` in the mmproj GGUF — confirmed `0x3f000000 = 0.5` for both). This produces values in `[−1, +1]`.
+  2. `clip_image_batch_encode` (`clip.cpp:3213`) feeds those `[−1, +1]` values directly into the input tensor `inp_raw`.
+  3. `clip_graph_gemma4v::build` (`gemma4v.cpp:9`) THEN applies `ggml_scale_bias(inp_raw, 2.0f, −1.0f)` → values in `[−3, +1]`. Comment on line 7-8 explicitly: `// patches = 2 * (patches - 0.5) … equivalent to: patches * 2 - 1`. This is a SECOND scale-bias step on top of the already-normalized `[−1, +1]` input.
+
+hf2q's `preprocess_gemma4v` (`preprocess.rs:344-350`) only applies the FIRST step (`(p/255) * 2 − 1`, range `[−1, +1]`). The doc string on lines 30-35 explicitly conflated "mean=std=[0.5, 0.5, 0.5]" with the gemma4v graph's extra scale-bias and concluded the SigLIP-49 preprocessor was byte-identical for gemma4v — that conclusion is wrong.
+
+**Iter-125 numerical target.** `src/inference/vision/preprocess.rs::preprocess_gemma4v` lines 344-350: change the per-channel write from `(p/255) * 2 − 1` to `(p/255) * 4 − 3` (collapsing the two scale-bias steps `[(p/255 − 0.5)/0.5] * 2 − 1`). After the fix, `00_preprocess.bin` byte-identity must hold against peer (modulo the `[2304, 768]` patchify-layout vs `[3, 768, 768]` raw-image-layout reshape — those represent the same data and need a layout-aware comparator OR a separate post-patchify peer dump).
+
+Once stage 00 matches, `01_patch_embd` should drop from max_abs ≈ 99.1 down to within BF16 tolerance, and the cascade through the 27 blocks should follow. If it doesn't, the next divergent stage is the iter-126 numerical target.
+
+**Cargo verify (this iter).** `cargo check --release` 0; `cargo test --release --bin hf2q -- vision::` **241 PASS** / 0 fail / 2 ignored (W54 baseline 238); `cargo build --release --bin hf2q` 0; `cargo build --release` inside `tools/vit_parity_probe` 0; `cmake --build cpp/build` 0; `cargo test --release` inside `tools/vit_parity_probe` 3/3 PASS.
+
+**Files touched.** `src/inference/vision/mod.rs`, `src/inference/vision/vit_dump.rs` (new), `src/inference/vision/vit_gpu.rs`, `tools/vit_parity_probe/` (new). Fenced files: stashed `src/input/mod.rs` + `src/models/qwen35/mod.rs` ADR-014 work-in-progress that appeared mid-iter; restored after commit C lands.
+
+**Why peer was the right reference (Chesterton's fence).** Both candle and HF transformers carry the `(weight + 1)` RmsNorm convention iter-122 already proved is wrong for gemma4v. Falsifying a probe's reference invalidates every downstream divergence we'd report. llama.cpp gemma4v.cpp + clip.cpp is the only reference whose every line has already been audited line-by-line in iters 117-123 and confirmed self-consistent. The Homebrew libmtmd path runs that exact code without any modification to /opt/llama.cpp.
+
+---
+
 #### Phase 2c iter-118 BF16 arm — `HF2Q_VIT_F32_ATTENTION` audit + Phase 7 blocker: F32×F32 GEMM kernel does not exist in mlx-native (2026-04-25, W47)
 
 **Dispatch context.** W47 in /loop /cfa wave 42, parallel arm of iter-118. iter-118 (W28) closed vision tests fully green via kernel-registration fix; this BF16 arm tests W46 iter-117's top remaining soft-token-divergence suspect: the `vit_attention_gpu` BF16 K/V cast at gemma4v scale=1.0. Pi-brain `project_vit_attention_bf16_softmax_drift.md` documents that BF16-cast K perturbs logits by ~0.68 and flips saturated-softmax winners on SigLIP-49; gemma4v compounds this differently across 27 layers.

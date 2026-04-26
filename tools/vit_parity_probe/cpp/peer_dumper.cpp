@@ -314,6 +314,13 @@ int main(int argc, char ** argv) {
     // ── Load the text model so libmtmd can probe vocab/template etc.
     // We never decode any text — we only need a valid llama_model
     // handle for `mtmd_init_from_file`.
+    //
+    // ggml_backend_load_all() registers the Metal / BLAS / CPU
+    // backends; without it llama_model_load_from_file aborts with
+    // "no backends are loaded" on macOS. The static
+    // llama_backend_init() alone is insufficient with the dynamic
+    // backend loader that ships in modern ggml.
+    ggml_backend_load_all();
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
