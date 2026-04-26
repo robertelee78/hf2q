@@ -1072,6 +1072,41 @@ W23 implemented the preprocess + patch-embed sibling layer per W22's iter-113-pr
 
 ---
 
+#### Phase 2c iter-115 — kxk pool + Gemma4ClippableLinear + arch dispatch — gemma4v full forward composed (2026-04-25, W25)
+
+W25 closed the gemma4v end-to-end CPU+GPU forward path. Five deliverables, all sibling to the SigLIP-49 path (every existing function and shader unchanged).
+
+| Repo | Files | LOC (`git diff --stat`) | Surface area |
+|---|---|---|---|
+| hf2q | `src/inference/vision/vit_gpu.rs` | +1714 | `vit_avg_pool_kxk_f32` shader + `vit_avg_pool_kxk_gpu` Rust dispatch + `gemma4v_avg_pool_3x3_gpu` thin wrapper; `vit_clip_inplace_f32` shader + `vit_clip_gpu` dispatch; `gemma4v_clippable_linear_gpu` (composes clip + linear + clip); `gemma4v_apply_full_forward_gpu` (full pipeline composition); `Gemma4vPreprocessedImage` carrier; `compute_vision_embeddings_gpu_gemma4v` + `VisionInput` enum + `compute_vision_embeddings_gpu_dispatch`; 8 new tests (k=2 byte-identity, k=3 correctness, rectangular dims, error path, clip 3 cases, clippable_linear 3-case parity, full_forward synth N=36 + N=54, dispatch routing + arch-mismatch + empty inputs) |
+| hf2q | `src/inference/vision/vit.rs` | +217 | `Gemma4ClippableLinearBounds` struct + `gemma4v_clippable_linear_forward` CPU reference + 5 parity tests |
+| hf2q | `src/inference/vision/mmproj_weights.rs` | +114 | `read_scalar_f32` helper + `mm_0_{input,output}_{min,max}` accessors + `mm_0_bounds()` composer + 2 round-trip tests |
+| hf2q | `src/backends/gguf.rs` | +44 | Static map extended with 4 clamp scalar suffixes (`mm.0.input_min`, `input_max`, `output_min`, `output_max`) per `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959` + 1 mapping test |
+| hf2q | `src/inference/vision/mmproj.rs` | +1 | `ArchProfile` gained `Copy` so the dispatch validation loop doesn't move out of `&arch` |
+| mlx-native | (none) | 0 | All new kernels co-located in `vit_gpu.rs::VIT_CUSTOM_SHADERS_SOURCE` per the existing pattern; mlx-native version unchanged |
+
+**Phase 1 findings (Chesterton's fence):**
+- The existing `vit_avg_pool_2x2_f32` shader lives **inline in `/opt/hf2q/src/inference/vision/vit_gpu.rs`** as part of `VIT_CUSTOM_SHADERS_SOURCE`, NOT in mlx-native. mlx-native has zero pool ops. The right-shaped extension is therefore an in-place generalization of the existing inline shader (no mlx-native version bump) — keeping ViT-specific shaders co-located is the pre-existing convention.
+- mlx-native has no `clamp`/`clip` op. Trivial elementwise kernel; added inline alongside the existing custom shaders.
+- `gemma4v.cpp:138-151` `build_mm` is the authoritative projector reference. Candle's `gemma4/multimodal_embedding.rs` does NOT yet implement Gemma4ClippableLinear (just bare RMSNorm + Linear). llama.cpp source of truth.
+- `vit_attention_gpu` K-tile constraint (`K=batch >= 32` for the scores @ V tensor-core matmul, plus `head_dim >= 32`). Gemma4v production has `N_patches in [252, 280]` so the K constraint is satisfied at all real sizes; **Phase 7 blocker NOT fired**.
+- `LoadedMmprojWeights::load` is arch-agnostic (walks `gguf.tensor_names()`), so clamp scalars auto-load once the GGUF carries them. Only the converter-side static map needs the 4 new entries.
+- `GgufFile::load_tensor_f32` round-trips 1-element `[1]` tensors correctly (W22 blocker #5 confirmed non-issue).
+- `MmprojConfig` has no `arch_profile` field; `LoadedMmproj` (server state) does. Dispatch threads `arch: ArchProfile` through `compute_vision_embeddings_gpu_dispatch` (handler reads it from state).
+
+**Verification (cargo-check only this iter, per task constraint):**
+- `cd /opt/hf2q && cargo check --release` — clean (3 pre-existing `EXIT_SMOKE_*` dead-code warnings in main.rs, unrelated).
+- `cd /opt/hf2q && cargo check --release --tests` — clean (1 additional pre-existing unused-import warning in serve/api/state.rs, unrelated).
+- mlx-native untouched (no diff).
+- No model load triggered; concurrent `hf2q convert` host activity not blocked.
+
+**Outstanding for iter-116** (GGUF emit + cross-compat smoke):
+1. **Handler wiring.** `process_multimodal_content` currently calls `preprocess_rgb_chw` (square-fixed) and packs into `PreprocessedImage`. Must branch on `mmproj.arch == Gemma4Siglip` to call `preprocess_gemma4v` and produce `Gemma4vPreprocessedImage` instead. Then call `compute_vision_embeddings_gpu_dispatch` with the arch threaded through.
+2. **GGUF emit (convert side).** `src/backends/gguf.rs` `write_*` paths must emit the 4 clamp scalars when present in HF source. Each is a `[1]`-shaped F32 tensor (NOT a metadata key — it's a tensor blob in the file). Reference: `/opt/llama.cpp/convert_hf_to_gguf.py:7851-7879`.
+3. **Cross-compat smoke.** `tests/mmproj_llama_cpp_compat.rs` (default-off via `HF2Q_LLAMA_MMPROJ_COMPAT=1`) — produce a gemma4v mmproj GGUF with hf2q's converter, load via `llama-mtmd-cli`, verify text-equivalence at T=0 / max-tokens=16 against a reference image. Builds on W6's projector_type fix.
+
+---
+
 #### Phase 2c iter-114 — 2D RoPE + per-block forward landed (2026-04-25, W24)
 
 W24 implemented the 2-D NeoX RoPE Metal kernel (in `mlx-native`) and the gemma4v per-block forward (in `hf2q`) per W22's iter-114 scope. All work is **sibling-only** — every existing SigLIP-49 function (`apply_vit_block_forward[_gpu]`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`) is unchanged.
