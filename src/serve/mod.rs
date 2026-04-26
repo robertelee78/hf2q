@@ -17,6 +17,8 @@ pub mod parity_quality;
 #[allow(dead_code)]
 pub mod multi_model;
 #[allow(dead_code)]
+pub mod provenance;
+#[allow(dead_code)]
 pub mod quant_select;
 #[allow(dead_code)]
 pub mod sampler_pure;
