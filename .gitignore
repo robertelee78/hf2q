@@ -50,3 +50,10 @@ scripts/dump_layer_states
 scripts/dump_layer_states
 .cargo/
 iter*_audit.json
+
+# ADR-005 Phase 2c iter-101 vision E2E harness:
+# fixture PNGs are auto-regenerated on every test run via
+# materialize_fixture_images() in tests/vision_e2e_vs_mlx_vlm.rs;
+# the matrix report is per-run output.
+tests/fixtures/vision/*.png
+tests/fixtures/vision/last_e2e_report.json
