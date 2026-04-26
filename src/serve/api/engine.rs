@@ -1808,8 +1808,8 @@ fn strip_trailing_stop(text: &mut String, stops: &[String]) {
 /// Render a Jinja2 chat template over an OpenAI-shaped message list.
 ///
 /// The minijinja environment mirrors the one the one-shot `cmd_generate`
-/// path uses: `messages`, `add_generation_prompt`, `bos_token`, `eos_token`
-/// are in scope. Content handling:
+/// path uses: `messages`, `add_generation_prompt`, `bos_token`, `eos_token`,
+/// and (when supplied) `tools` are in scope. Content handling:
 ///
 ///   - `content: "plain string"` → the template sees `content = "..."`.
 ///   - `content: [{type:"text", text:"..."}, ...]` → text parts are
@@ -1819,13 +1819,70 @@ fn strip_trailing_stop(text: &mut String, stops: &[String]) {
 ///   - OpenAI `assistant` role is remapped to `model` if the GGUF template
 ///     is Gemma 4 (detected by presence of `<|turn>model` in the template).
 ///     Otherwise roles are passed through verbatim.
+///   - Per-message `tool_calls` (assistant-emitted) and synthetic
+///     `tool_responses` (synthesized from OpenAI `role: "tool"` history
+///     messages, see [`render_chat_prompt_with_tools`]) are exposed to the
+///     template as message fields so tool-aware templates (e.g. Gemma 4's
+///     `<|tool_call>` / `<|tool_response>` markers) render correctly.
+///
+/// Use [`render_chat_prompt_with_tools`] to supply tool definitions; the
+/// thin entry-point `render_chat_prompt` is kept for legacy callers (one-shot
+/// `cmd_generate`, the chat-template overflow path) that don't carry tools.
 pub fn render_chat_prompt(
     template_str: &str,
     messages: &[super::schema::ChatMessage],
 ) -> Result<String> {
+    render_chat_prompt_with_tools(template_str, messages, None)
+}
+
+/// Render the chat template with optional tool-definition exposure.
+///
+/// ADR-005 Phase 2a iter-133 Iter B production fix-forward: prior to this
+/// iter, `tools` and per-message `tool_calls` / `tool_call_id` carried by
+/// the request schema were silently dropped before render — every tool-aware
+/// chat template (Gemma 4, Qwen 3.5/3.6, Llama 3.x) saw an empty `tools`
+/// variable and emitted no tool-call definitions to the model. As a result,
+/// the model never had a chance to invoke a tool even when the operator
+/// declared one. This function threads them through:
+///
+///   1. `tools` (top-level Jinja variable): the raw OpenAI tool definitions,
+///      serialized as JSON values. Templates check `{%- if tools -%}` before
+///      iterating, so `None`/empty leaves existing behavior unchanged.
+///   2. Per-message `tool_calls` (on assistant messages): each assistant
+///      message in `messages` gets its `tool_calls` array exposed as a
+///      Jinja-visible field. The template iterates and emits per-model markers
+///      (e.g. Gemma 4's `<|tool_call>call:NAME{...}<tool_call|>`).
+///   3. Synthetic `tool_responses` (on `role: "tool"` messages): OpenAI
+///      represents tool results as `{role: "tool", tool_call_id, content}`
+///      sibling messages. Most chat templates (Gemma 4 included) instead
+///      expect a per-message `tool_responses: [{name, response}]` field.
+///      We synthesize that field on each `role: "tool"` message by looking up
+///      the function name from the prior assistant `tool_calls` keyed by
+///      `tool_call_id`. The role itself is left verbatim — the template
+///      decides whether to wrap with `<|turn>tool` or similar.
+pub fn render_chat_prompt_with_tools(
+    template_str: &str,
+    messages: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
+) -> Result<String> {
     use super::schema::MessageContent;
 
     let remap_assistant_to_model = template_str.contains("<|turn>model");
+
+    // Build a lookup table tool_call_id → function-name for synthesizing
+    // `tool_responses` on subsequent role:"tool" messages. This is a
+    // single-pass scan; assistant messages with tool_calls populate the
+    // map, role:"tool" messages consume it.
+    let mut id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if let Some(tcs) = msg.tool_calls.as_ref() {
+            for tc in tcs {
+                id_to_name.insert(tc.id.clone(), tc.function.name.clone());
+            }
+        }
+    }
+
     let mut out_msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
     for msg in messages {
         let mut role = msg.role.clone();
@@ -1840,11 +1897,70 @@ pub fn render_chat_prompt(
                 MessageContent::Parts(_) => c.text(),
             })
             .unwrap_or_default();
-        out_msgs.push(serde_json::json!({
-            "role": role,
-            "content": content_text,
-        }));
+        let mut obj = serde_json::Map::new();
+        obj.insert("role".into(), serde_json::Value::String(role));
+        obj.insert("content".into(), serde_json::Value::String(content_text));
+
+        // Assistant tool_calls: serialize each as
+        // `{id, type, function: {name, arguments}}`. `arguments` is kept as
+        // the raw OpenAI string (Gemma 4's template handles both string and
+        // mapping shapes; preserving the string form is closest to how the
+        // model emitted it the first time).
+        if let Some(tcs) = msg.tool_calls.as_ref() {
+            let arr: Vec<serde_json::Value> = tcs
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": tc.call_type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    })
+                })
+                .collect();
+            obj.insert("tool_calls".into(), serde_json::Value::Array(arr));
+        }
+
+        // role:"tool" messages → synthesize `tool_responses` field. The
+        // OpenAI shape is `{tool_call_id, content}`; we look up the tool
+        // name from id_to_name and pass the content string verbatim.
+        // Templates (Gemma 4) accept either string or mapping for the
+        // `response` field; the string path is the safer default.
+        if msg.role == "tool" {
+            if let Some(tcid) = msg.tool_call_id.as_ref() {
+                let name = id_to_name
+                    .get(tcid)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into());
+                let response_str = msg
+                    .content
+                    .as_ref()
+                    .map(|c| match c {
+                        MessageContent::Text(s) => s.clone(),
+                        MessageContent::Parts(_) => c.text(),
+                    })
+                    .unwrap_or_default();
+                obj.insert(
+                    "tool_responses".into(),
+                    serde_json::json!([{"name": name, "response": response_str}]),
+                );
+            }
+        }
+
+        out_msgs.push(serde_json::Value::Object(obj));
     }
+
+    // Tools serialize verbatim. Each Tool is `{type, function: {name,
+    // description, parameters}}`; serde_json::to_value mirrors the wire
+    // shape. Skipping the threading entirely when `None` keeps the existing
+    // legacy callers (one-shot generate, overflow tokenize) byte-identical.
+    let tools_json: serde_json::Value = match tools {
+        None => serde_json::Value::Null,
+        Some(t) if t.is_empty() => serde_json::Value::Null,
+        Some(t) => serde_json::to_value(t).unwrap_or(serde_json::Value::Null),
+    };
 
     let mut env = minijinja::Environment::new();
     // ADR-005 Phase 2a iter-133 Iter A side-fix: register
@@ -1868,6 +1984,7 @@ pub fn render_chat_prompt(
     let rendered = tmpl
         .render(minijinja::context! {
             messages => out_msgs,
+            tools => tools_json,
             add_generation_prompt => true,
             bos_token => "<bos>",
             eos_token => "<eos>",
@@ -2120,6 +2237,134 @@ assistant:
         // produced ["a", "b", "c"], each with a trailing '+'.
         assert!(out.contains("M:a+b+c+"), "out={out}");
         assert!(out.contains("user:again"), "out={out}");
+    }
+
+    #[test]
+    fn render_chat_prompt_with_tools_threads_tools_into_jinja_context() {
+        // ADR-005 Phase 2a iter-133 Iter B fix-forward: prior to this iter,
+        // `tools` declared on a chat-completions request were silently
+        // dropped before render — every tool-aware chat template (Gemma 4,
+        // Qwen 3.5/3.6, Llama 3.x) saw an empty `tools` variable and emitted
+        // no tool definitions to the model. Regression test: a minimal
+        // template that just emits "TOOLS:<count>\n" + tool names
+        // round-trips correctly.
+        let tmpl = "{%- if tools -%}TOOLS:{{ tools | length }}\n\
+                    {%- for t in tools -%}{{ t.function.name }};{%- endfor -%}\n\
+                    {%- endif -%}\
+                    {%- for m in messages -%}{{ m.role }}:{{ m.content }}\n{%- endfor -%}";
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("weather?".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = vec![
+            super::super::schema::Tool {
+                tool_type: "function".into(),
+                function: super::super::schema::ToolFunction {
+                    name: "get_current_weather".into(),
+                    description: Some("Look up the weather".into()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        },
+                        "required": ["location"]
+                    })),
+                },
+            },
+            super::super::schema::Tool {
+                tool_type: "function".into(),
+                function: super::super::schema::ToolFunction {
+                    name: "get_news".into(),
+                    description: None,
+                    parameters: None,
+                },
+            },
+        ];
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, Some(&tools)).unwrap();
+        assert!(out.contains("TOOLS:2"), "out={out}");
+        assert!(out.contains("get_current_weather;"), "out={out}");
+        assert!(out.contains("get_news;"), "out={out}");
+        assert!(out.contains("user:weather?"), "out={out}");
+
+        // None / empty path → tools block must NOT fire.
+        let out_none = render_chat_prompt_with_tools(tmpl, &msgs, None).unwrap();
+        assert!(!out_none.contains("TOOLS:"), "out_none={out_none}");
+        let out_empty = render_chat_prompt_with_tools(tmpl, &msgs, Some(&[])).unwrap();
+        assert!(!out_empty.contains("TOOLS:"), "out_empty={out_empty}");
+
+        // Legacy entry-point `render_chat_prompt` (no tools param) should be
+        // byte-identical to the empty/None path.
+        let out_legacy = render_chat_prompt(tmpl, &msgs).unwrap();
+        assert_eq!(out_legacy, out_none);
+    }
+
+    #[test]
+    fn render_chat_prompt_with_tools_threads_per_message_tool_calls_and_responses() {
+        // Verify the per-message threading of `tool_calls` (assistant) and
+        // synthesized `tool_responses` (from role:"tool" messages, looked up
+        // by tool_call_id). A minimal template iterates messages and emits
+        // tool_calls + tool_responses verbatim.
+        let tmpl = "{%- for m in messages -%}\
+                    [{{ m.role }}]\
+                    {%- if m.tool_calls -%}\
+                    {%- for tc in m.tool_calls -%}TC:{{ tc.function.name }}({{ tc.function.arguments }});{%- endfor -%}\
+                    {%- endif -%}\
+                    {%- if m.tool_responses -%}\
+                    {%- for tr in m.tool_responses -%}TR:{{ tr.name }}={{ tr.response }};{%- endfor -%}\
+                    {%- endif -%}\
+                    {%- if m.content -%}{{ m.content }}{%- endif -%}\n\
+                    {%- endfor -%}";
+        let msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("Paris weather?".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![super::super::schema::ToolCall {
+                    id: "call_abc".into(),
+                    call_type: "function".into(),
+                    function: super::super::schema::ToolCallFunction {
+                        name: "get_current_weather".into(),
+                        arguments: "{\"location\":\"Paris\"}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(MessageContent::Text(
+                    "{\"temperature\": 18}".into(),
+                )),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("call_abc".into()),
+                name: None,
+            },
+        ];
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, None).unwrap();
+        assert!(out.contains("[user]Paris weather?"), "out={out}");
+        // Assistant message: tool_calls visible verbatim (string-arguments).
+        assert!(
+            out.contains("[assistant]TC:get_current_weather({\"location\":\"Paris\"});"),
+            "out={out}"
+        );
+        // Tool message: tool_responses synthesized via id_to_name lookup.
+        assert!(
+            out.contains("[tool]TR:get_current_weather={\"temperature\": 18};"),
+            "out={out}"
+        );
     }
 
     #[test]

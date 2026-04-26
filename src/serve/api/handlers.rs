@@ -431,8 +431,13 @@ async fn prepare_chat_generation(
     let policy = req
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
+    // Pass-through `req.tools` so the chat template gets the tool
+    // definitions (Iter B production fix-forward — see
+    // `render_chat_prompt_with_tools`). `None` ⇒ legacy text-only
+    // behavior unchanged.
+    let req_tools: Option<&[super::schema::Tool]> = req.tools.as_deref();
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
-        match apply_overflow_policy(engine, &messages_for_render, policy).await {
+        match apply_overflow_policy(engine, &messages_for_render, policy, req_tools).await {
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
@@ -843,10 +848,11 @@ async fn apply_overflow_policy(
     engine: &engine::Engine,
     messages: &[super::schema::ChatMessage],
     policy: super::schema::OverflowPolicy,
+    tools: Option<&[super::schema::Tool]>,
 ) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
-    let (tokens, n) = render_and_tokenize_for_overflow(engine, messages)?;
+    let (tokens, n) = render_and_tokenize_for_overflow(engine, messages, tools)?;
     let ctx_len = match engine.context_length() {
         Some(c) => c,
         None => return Ok((tokens, n, None, None)), // no advertised ctx → trust the caller
@@ -861,21 +867,31 @@ async fn apply_overflow_policy(
             Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
         }
         OverflowPolicy::TruncateLeft => {
-            let (t, n) = apply_truncate_left(engine, messages, ctx_len, tokens, n)?;
+            let (t, n) = apply_truncate_left(engine, messages, ctx_len, tokens, n, tools)?;
             Ok((t, n, None, None))
         }
-        OverflowPolicy::Summarize => apply_summarize(engine, messages, ctx_len).await,
+        OverflowPolicy::Summarize => apply_summarize(engine, messages, ctx_len, tools).await,
     }
 }
 
 /// Render the chat template + tokenize. Returns `(tokens, n_tokens)` or
 /// the response to bail with on failure. Pulled out of
 /// `apply_overflow_policy` so the summarize path can reuse it.
+///
+/// `tools` (Iter B fix-forward): when `Some(non_empty)`, the chat template
+/// receives the tool definitions in scope so it can emit per-model tool
+/// declaration markers. `None` keeps legacy behavior verbatim (no tools
+/// in scope; templates that gate on `{%- if tools -%}` skip the block).
 fn render_and_tokenize_for_overflow(
     engine: &engine::Engine,
     msgs: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
 ) -> Result<(Vec<u32>, usize), Response> {
-    let rendered = match engine::render_chat_prompt(engine.chat_template(), msgs) {
+    let rendered = match engine::render_chat_prompt_with_tools(
+        engine.chat_template(),
+        msgs,
+        tools,
+    ) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "chat template render failed");
@@ -907,15 +923,18 @@ fn apply_truncate_left(
     ctx_len: usize,
     initial_tokens: Vec<u32>,
     initial_n: usize,
+    tools: Option<&[super::schema::Tool]>,
 ) -> Result<(Vec<u32>, usize), Response> {
     let outcome = truncate_left(messages, ctx_len, |msgs| {
-        render_and_tokenize_for_overflow(engine, msgs)
+        render_and_tokenize_for_overflow(engine, msgs, tools)
             .map(|(_, n)| n)
             .map_err(|r| r)
     });
     match outcome {
         TruncateOutcome::Fits(_, _) => Ok((initial_tokens, initial_n)),
-        TruncateOutcome::Truncated(shrunk, _, _) => render_and_tokenize_for_overflow(engine, &shrunk),
+        TruncateOutcome::Truncated(shrunk, _, _) => {
+            render_and_tokenize_for_overflow(engine, &shrunk, tools)
+        }
         TruncateOutcome::CannotShrink { ctx_len, actual } => {
             Err(ApiError::context_length_exceeded(ctx_len, actual).into_response())
         }
@@ -938,13 +957,16 @@ async fn apply_summarize(
     engine: &engine::Engine,
     messages: &[super::schema::ChatMessage],
     ctx_len: usize,
+    tools: Option<&[super::schema::Tool]>,
 ) -> Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     let split = split_for_summarize(messages, SUMMARIZE_KEEP_RECENT_MSGS);
     if split.summary_window.is_empty() {
         // Nothing to summarize — fall through to truncate_left without
         // populating the summarize-specific transparency counters.
-        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(engine, messages)?;
-        let (t, n) = apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+        let (initial_tokens, initial_n) =
+            render_and_tokenize_for_overflow(engine, messages, tools)?;
+        let (t, n) =
+            apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n, tools)?;
         return Ok((t, n, None, None));
     }
 
@@ -977,16 +999,21 @@ async fn apply_summarize(
     ];
 
     // Tokenize the summary request through the engine's chat template.
+    // The internal summarization pass is NOT user-facing — pass `None` for
+    // tools so the summarizer's own tiny conversation doesn't get any
+    // tool-declaration overhead.
     let (summary_prompt_tokens, summary_prompt_n) =
-        render_and_tokenize_for_overflow(engine, &summary_request_msgs)?;
+        render_and_tokenize_for_overflow(engine, &summary_request_msgs, None)?;
 
     // Sanity: the summary prompt + completion budget must itself fit.
     // If not, the summary window is too long for a one-shot summary
     // (e.g. a single 50k-token user dump) — fall back to truncate_left
     // on the original message list.
     if summary_prompt_n + SUMMARIZE_MAX_TOKENS >= ctx_len {
-        let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(engine, messages)?;
-        let (t, n) = apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+        let (initial_tokens, initial_n) =
+            render_and_tokenize_for_overflow(engine, messages, tools)?;
+        let (t, n) =
+            apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n, tools)?;
         return Ok((t, n, None, None));
     }
 
@@ -1002,9 +1029,15 @@ async fn apply_summarize(
             if text.is_empty() {
                 tracing::warn!("summarize produced empty text; falling back to truncate_left");
                 let (initial_tokens, initial_n) =
-                    render_and_tokenize_for_overflow(engine, messages)?;
-                let (t, n) =
-                    apply_truncate_left(engine, messages, ctx_len, initial_tokens, initial_n)?;
+                    render_and_tokenize_for_overflow(engine, messages, tools)?;
+                let (t, n) = apply_truncate_left(
+                    engine,
+                    messages,
+                    ctx_len,
+                    initial_tokens,
+                    initial_n,
+                    tools,
+                )?;
                 return Ok((t, n, None, None));
             }
             (text, result.completion_tokens)
@@ -1032,7 +1065,7 @@ async fn apply_summarize(
 
     let summarized_count = split.summary_window.len();
 
-    let (new_tokens, new_n) = render_and_tokenize_for_overflow(engine, &new_messages)?;
+    let (new_tokens, new_n) = render_and_tokenize_for_overflow(engine, &new_messages, tools)?;
     if new_n < ctx_len {
         return Ok((
             new_tokens,
@@ -1047,7 +1080,7 @@ async fn apply_summarize(
     // end. Keep the summarize-counters populated so the operator can
     // see in transparency headers what the policy attempted.
     let outcome = truncate_left(&new_messages, ctx_len, |msgs| {
-        render_and_tokenize_for_overflow(engine, msgs)
+        render_and_tokenize_for_overflow(engine, msgs, tools)
             .map(|(_, n)| n)
             .map_err(|r| r)
     });
@@ -1059,7 +1092,7 @@ async fn apply_summarize(
             Some(summary_completion_tokens),
         )),
         TruncateOutcome::Truncated(shrunk, _, _) => {
-            let (t, n) = render_and_tokenize_for_overflow(engine, &shrunk)?;
+            let (t, n) = render_and_tokenize_for_overflow(engine, &shrunk, tools)?;
             Ok((
                 t,
                 n,
