@@ -1397,13 +1397,33 @@ pub fn gemma4v_position_embed_add(
 //   - `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (gemma4v hparams)
 //   - `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp` (NeoX rope semantics)
 
-/// Gemma-style RMSNorm: `y = x * rsqrt(mean(x²) + eps) * (weight + 1)`.
+/// Gemma4 ViT RMSNorm: `y = x * rsqrt(mean(x²) + eps) * weight` (literal gain).
 ///
-/// Same math as `rms_norm_forward` plus a `+1` on the gain — matches
-/// `/opt/candle/.../gemma4/vision.rs:39` (`(&self.weight + 1.0)`). The
-/// SigLIP path's `rms_norm_forward` does NOT add 1; this helper exists
-/// so the gemma4v block forward stays a true peer to that path without
-/// changing it.
+/// Spec: `transformers/models/gemma4/modeling_gemma4.py::Gemma4RMSNorm::forward`
+/// (lines 171-175) — applies the literal weight, with `weight` initialized to
+/// `torch.ones(dim)` (line 164). This is **OPPOSITE** to Gemma3's RMSNorm
+/// (`output * (1.0 + weight)`); Gemma4 deliberately changed the convention.
+///
+/// llama.cpp peer reference:
+///   - converter (`convert_hf_to_gguf.py::Gemma4VisionAudioModel`, lines
+///     7805-7879) does NOT shift weights; vision tensors pass through verbatim
+///     (in contrast to `Gemma3VisionModel` which adds +1 to `soft_emb_norm`).
+///   - runtime (`tools/mtmd/clip.cpp::clip_graph::build_norm`, lines 524-547)
+///     applies `ggml_mul(cur, mw)` — literal weight.
+///
+/// Bug-history (iter-122, 2026-04-26): hf2q originally copied candle's
+/// `(&self.weight + 1.0)` from `/opt/candle/.../gemma4/vision.rs:39` — but
+/// candle is wrong for Gemma4 (likely a Gemma3 copy-paste). The `+1` produced
+/// image-blind output: encoder magnitudes inflated by ~weight_mean ≈ 1, which
+/// across 27 ViT blocks compounds multiplicatively and collapses spatial
+/// differentiation in the soft-token output. Removing the `+1` restores
+/// peer parity with llama-mtmd-cli on the four-dots fixture.
+///
+/// The naming `gemma_rms_norm_forward` is preserved for blame/log continuity;
+/// the math is now byte-identical to `rms_norm_forward`. We keep the helper
+/// (rather than inlining `rms_norm_forward` at every callsite) so the
+/// "this is the GEMMA4 convention" annotation stays attached to each
+/// gemma4v_block_forward LN call.
 pub fn gemma_rms_norm_forward(
     input: &mut [f32],
     weight: &[f32],
@@ -1427,26 +1447,16 @@ pub fn gemma_rms_norm_forward(
             hidden
         ));
     }
-    let inv_h = 1.0_f32 / hidden as f32;
-    let n_rows = input.len() / hidden;
-    for row in 0..n_rows {
-        let off = row * hidden;
-        let slice = &mut input[off..off + hidden];
-        let mut sq = 0.0_f32;
-        for &v in slice.iter() {
-            sq += v * v;
-        }
-        let inv_rms = 1.0_f32 / (sq * inv_h + eps).sqrt();
-        for (i, v) in slice.iter_mut().enumerate() {
-            *v = (*v * inv_rms) * (weight[i] + 1.0);
-        }
-    }
-    Ok(())
+    // Delegate to the literal-gain `rms_norm_forward` — peer-identical to
+    // llama.cpp `clip_graph::build_norm` for the gemma4v ViT path.
+    rms_norm_forward(input, weight, hidden, eps)
 }
 
-/// Per-head Gemma-style RMSNorm: `[batch, num_heads, head_dim]` →
-/// `[batch * num_heads, head_dim]` with `(weight + 1)` gain shared across
-/// heads. Used for `q_norm` and `k_norm` in the gemma4v ViT block.
+/// Per-head Gemma4 ViT RMSNorm: `[batch, num_heads, head_dim]` →
+/// `[batch * num_heads, head_dim]` with literal-`weight` gain shared across
+/// heads. Used for `q_norm` and `k_norm` in the gemma4v ViT block. See
+/// `gemma_rms_norm_forward` for the full convention rationale and the
+/// iter-122 bug-history note.
 pub fn gemma_per_head_rms_norm_forward(
     input: &mut [f32],
     weight: &[f32],
@@ -1873,7 +1883,8 @@ pub fn gemma4v_block_forward(
     // ----- Attention half -----
     let mut residual = hidden_states;
 
-    // input_layernorm (gemma RMS, weight+1)
+    // input_layernorm (Gemma4 RMSNorm — literal weight gain; see
+    // `gemma_rms_norm_forward` for the iter-122 convention note).
     let mut cur = residual.clone();
     gemma_rms_norm_forward(&mut cur, block_weights.input_layernorm, hidden, eps)?;
 
@@ -1903,7 +1914,8 @@ pub fn gemma4v_block_forward(
         kv_dim,
     )?;
 
-    // q_norm / k_norm (gemma per-head RMS, weight+1) and v_norm (no gain)
+    // q_norm / k_norm (Gemma4 per-head RMSNorm — literal weight gain) and
+    // v_norm (no learned gain — `with_scale=False` in HF Gemma4VisionAttention).
     gemma_per_head_rms_norm_forward(&mut q, block_weights.q_norm, batch, num_heads, head_dim, eps)?;
     gemma_per_head_rms_norm_forward(
         &mut k,

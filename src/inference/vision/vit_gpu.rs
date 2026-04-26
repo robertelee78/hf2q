@@ -2485,7 +2485,8 @@ pub fn gemma4v_apply_position_embed_gpu(
 //
 // Sibling to `apply_vit_block_forward_gpu` (the SigLIP-49 path). Wires
 // up:
-//   - 4 Gemma-style RMSNorms ((weight + 1) gain) instead of 2.
+//   - 4 Gemma4 RMSNorms (literal `weight` gain — see HF
+//     `Gemma4RMSNorm.forward`) instead of SigLIP-49's 2.
 //   - GQA: K and V are projected to `num_kv_heads * head_dim`, then
 //     `repeat_kv`-expanded after RoPE.
 //   - V-norm: pure RMS (no learned gain) using mlx-native's
@@ -2506,24 +2507,32 @@ use mlx_native::ops::vision_2d_rope::{
     build_vision_2d_rope_params, dispatch_vision_2d_rope,
 };
 
-/// Gemma-style RMSNorm on GPU: `y = x * rsqrt(mean(x²) + eps) * (weight + 1)`.
+/// Gemma4 ViT RMSNorm on GPU: `y = x * rsqrt(mean(x²) + eps) * weight`
+/// (literal gain).
 ///
-/// Builds a transient `weight + 1` buffer per call by adding a unit-vector
-/// constant to the loaded gain — the mlx-native RMSNorm kernel multiplies
-/// by the gain as-is, so the "+1" lives outside the kernel. Allocations:
-/// one `[dim]` ones-buffer (cheap) + one `[dim]` `weight + 1` buffer +
-/// one `[rows, dim]` output buffer.
+/// Spec: `transformers/models/gemma4/modeling_gemma4.py::Gemma4RMSNorm::forward`
+/// — applies the literal weight (initialized to `torch.ones(dim)`). Peer
+/// reference: llama.cpp `tools/mtmd/clip.cpp::clip_graph::build_norm`
+/// (lines 524-547) — `ggml_mul(cur, mw)` literal.
 ///
-/// # Why a sibling instead of changing `vit_rms_norm_gpu`
+/// Bug-history (iter-122, 2026-04-26): originally this helper allocated a
+/// transient `weight + 1` buffer to apply the candle convention from
+/// `/opt/candle/.../gemma4/vision.rs:39`. That convention is wrong for
+/// Gemma4 (it's a Gemma3 copy-paste); the `+1` collapsed spatial
+/// differentiation across 27 ViT blocks and produced image-blind soft
+/// tokens. Removing the `+1` makes the GPU path peer-identical to
+/// llama-mtmd-cli on the four-dots fixture. As a side benefit, this drops
+/// 2 buffer allocs + 1 elementwise_add dispatch + 1 memory_barrier per
+/// call (× 6 call-sites × 27 layers per forward).
 ///
-/// The SigLIP-49 path uses raw `weight` (no `+1`) and is correct for
-/// that arch. Adding `+1` unconditionally would silently change the
-/// SigLIP forward. Sibling primitive keeps both paths byte-stable.
+/// The function name and the call-sites are preserved so blame/log
+/// continuity stays intact and the "this is the GEMMA4 convention"
+/// annotation stays attached to each gemma4v_block_forward LN dispatch.
 ///
 /// # Errors
 ///
 /// - any zero dim
-/// - propagated from underlying mlx-native dispatches
+/// - propagated from `vit_rms_norm_gpu`
 #[allow(clippy::too_many_arguments)]
 pub fn vit_gemma_rms_norm_gpu(
     encoder: &mut CommandEncoder,
@@ -2540,37 +2549,9 @@ pub fn vit_gemma_rms_norm_gpu(
             "vit_gemma_rms_norm_gpu: rows ({rows}) and dim ({dim}) must be > 0"
         ));
     }
-    // Build a [dim] ones buffer (CPU-fill on unified-memory backed shared buffer).
-    let ones = device
-        .alloc_buffer(dim as usize * 4, DType::F32, vec![dim as usize])
-        .map_err(|e| anyhow!("vit_gemma_rms_norm_gpu: alloc ones: {e}"))?;
-    {
-        // SAFETY: just-allocated f32 buffer; no aliasing.
-        let s: &mut [f32] = unsafe {
-            std::slice::from_raw_parts_mut(ones.contents_ptr() as *mut f32, dim as usize)
-        };
-        for v in s.iter_mut() {
-            *v = 1.0;
-        }
-    }
-    // gain_plus_one = gain + 1
-    let gain_plus_one = device
-        .alloc_buffer(dim as usize * 4, DType::F32, vec![dim as usize])
-        .map_err(|e| anyhow!("vit_gemma_rms_norm_gpu: alloc gain+1: {e}"))?;
-    elementwise_add(
-        encoder,
-        registry,
-        device.metal_device(),
-        gain_f32,
-        &ones,
-        &gain_plus_one,
-        dim as usize,
-        DType::F32,
-    )
-    .context("vit_gemma_rms_norm_gpu: gain + 1")?;
-    encoder.memory_barrier();
-
-    vit_rms_norm_gpu(encoder, registry, device, input, &gain_plus_one, rows, dim, eps)
+    // Delegate to the literal-gain primitive — peer-identical to
+    // llama.cpp `clip_graph::build_norm` for the gemma4v ViT path.
+    vit_rms_norm_gpu(encoder, registry, device, input, gain_f32, rows, dim, eps)
         .context("vit_gemma_rms_norm_gpu: rms_norm_gpu")
 }
 
