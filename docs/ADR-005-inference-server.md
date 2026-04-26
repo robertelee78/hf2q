@@ -1047,6 +1047,30 @@ W21 landed the Rust + script edits for the ADR-007 §853-866 TQ-active companion
 
 ---
 
+#### Phase 2c iter-116g — cross-compat smoke FULLY GREEN — Task #14 AC CLOSES (2026-04-26, W37)
+
+**Phase A + B + C all PASS** end-to-end. `llama-mtmd-cli` loaded the hf2q-emitted mmproj GGUF and produced 71 bytes of decoded text via the gemma4v CLIP graph. Test exit 0; chat GGUF SHA `ae19574d…f8e6f` preserved. Commit `8af50d4` (single fix) closes the writer-side audit campaign that ran iters 116a-g.
+
+**Five-iter writer-fix lineage** (all in `src/backends/gguf.rs`):
+
+| Iter | Fix | Citation |
+|---|---|---|
+| 116a (W26) | clamp scalar `[]→[1]` shape + F32 dtype force | clip.cpp:1941-1959 |
+| 116d (W6 ←) | `clip.vision.projector_type` → `clip.projector_type` (un-namespaced) | clip-impl.h:23 KEY_PROJ_TYPE |
+| 116e (W34) | `v.blk.{N}.attn_output.weight` → `v.blk.{N}.attn_out.weight` (short form) | clip-impl.h:82 TN_ATTN_OUTPUT |
+| 116f (W36) | `mm.0.weight` → `mm.input_projection.weight` + 4 clamp scalar renames + 3 layernorm renames (`post_attention → attn_post_norm`, `pre_feedforward → ln2`, `post_feedforward → ffn_post_norm`) | clip-impl.h:110-111 + constants.py:1218-1219 + tensor_mapping.py:1575 |
+| 116g (W37) | `v.patch_embd.weight` 2-D `[1152, 768]` → 4-D `[1152, 3, 16, 16]` (HWC→CHW permute) + F32 promotion for norms / position_embed / 1-D tensors | convert_hf_to_gguf.py:7873-7877 + :7841 |
+
+**Phase 2c port progress: 6/7 iters complete.** Remaining: iter-119 fixture re-capture against canonical Gemma 4 vision repo (HF auth + repo discovery — W22's only hard-external blocker). Phase D parity proxy (`HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1`) queued for iter-116h.
+
+**Discovery dossier** (W32+W36 second-order findings, separate next-actions):
+1. `hf2q::quality::measure_quality` jetsam OOM on 26B+ param models — `--skip-quality` is the operational workaround; refactor candidates: streaming KL, sampled cache, or KL-without-cache.
+2. P10 vit emitter (`src/models/vit/`) authored for Qwen3.6 namespace; falls through to legacy `write_mmproj_gguf` on gemma4v due to missing `image_size` parse. Both paths now route through legacy + W37's fix; consolidation is iter-116h+ scope.
+
+The fixture at `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf` is iter-116g's emit (1.19 GB; 47 MB larger than pre-fix from F32 promotions). The chat GGUF at the same dir is unmodified (Gate D self-baseline).
+
+---
+
 #### Phase 2c iter-113 — preprocess + patch-embed primitives landed (2026-04-26, W23+W23-verify)
 
 W23 implemented the preprocess + patch-embed sibling layer per W22's iter-113-prep scope (no existing SigLIP-49 function modified). Commit `8a845d4` added 1373 lines across 4 files, sibling-only:
