@@ -8,7 +8,7 @@
 
 | Phase | Status | Commit | Notes |
 | ----- | ------ | ------ | ----- |
-| P0 — Lazy tensor primitive + lazy safetensors reader | ⏳ pending | — | Foundation. Blocks every subsequent phase. |
+| P0 — Lazy tensor primitive + lazy safetensors reader | 🟢 code-green; on-day apex-MoE iter spike pending | `c707a2c` (lazy primitive), `038f2ab` (lazy reader + bridge), `<spike-commit>` (apex-MoE iter spike) | LazyTensor + LazyTensorMap + lazy safetensors reader land; 13 unit + 4 reader + 1296 full-bin tests pass; eager bridge byte-identical to pre-ADR-014. Decision 6 gate value locked at **36.3 GB** (33 GB ADR-012 P9b inherited + 10% headroom) per `docs/peer-parity-baselines-2026-04-26.md`. Decision 2 `≤ 8 GB` LazyTensorMap-iter spike on apex MoE pending (next iter). |
 | P1 — Lift Phase 1.4–1.7 transforms to lazy | ⏳ pending | — | Depends on P0. |
 | P2 — Streaming quantize loop (per-tensor write-and-drop) | ⏳ pending | — | Depends on P1. |
 | P3 — Rayon parallelism in quantize loop | ⏳ pending | — | Depends on P2. |
@@ -328,7 +328,7 @@ Tensors quantise in parallel; writes are serialised in deterministic order (BTre
 **Tests:**
 - `test_p9b_dance_eliminated` — assert `intermediate_moe_q8.rs` is removed; assert `cmd_convert` never writes a tempfile when `dwq_arch.requires_activation_capture()`.
 - `test_activation_capture_from_lazy` — synthetic 4-layer qwen35 + 4-expert qwen35moe; `RealActivationCapture::from_lazy_tensor_map` produces sensitivity JSON byte-identical to the previous `from_intermediate_gguf` path on the same model.
-- `test_apex_moe_capture_peak_rss` — apex MoE activation capture peak resident `≤ <derived>`. **The numeric ceiling is derived from the P0 measurement spike**, not chosen at proposal time. The spike runs apex MoE activation capture on the existing pipeline once, records peak RSS during the forward-pass-with-capture step (counting both weights resident on Metal **and** F32 activation tensors emitted at every SDPA / router / expert-matmul boundary), and the gate value is `measured + 10% headroom`. Loosely upper-bounded by ADR-012 P9b's measured ~33 GB intermediate-Q8 path. The committed value lands in `docs/peer-parity-baselines-<date>.md` as part of the P0 closing commit, then is inlined here.
+- `test_apex_moe_capture_peak_rss` — apex MoE activation capture peak resident **≤ 36.3 GB** (33 GB measured on the existing intermediate-Q8 pipeline per ADR-012 P9b's real-model close + 10% headroom; locked 2026-04-26 in `docs/peer-parity-baselines-2026-04-26.md`). The number reflects the existing pipeline; **P4 re-measures on the new lazy-weight-loader path it lands** (Decision 6 + 8 deletions remove the IntermediateMoeQ8Quantizer and the F32 round-trip), and replaces this gate value with `<P4-measured> + 10%`. The dated exit condition lives in the baselines file; the gate in this body refreshes with each P4 iteration.
 
 **Estimated LOC:** −39 net, but ~700 lines touched (delete + add).
 
