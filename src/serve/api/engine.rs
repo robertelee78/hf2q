@@ -2113,7 +2113,7 @@ pub fn render_chat_prompt(
     template_str: &str,
     messages: &[super::schema::ChatMessage],
 ) -> Result<String> {
-    render_chat_prompt_with_tools(template_str, messages, None)
+    render_chat_prompt_with_tools(template_str, messages, None, false)
 }
 
 /// Render the chat template with optional tool-definition exposure.
@@ -2145,6 +2145,7 @@ pub fn render_chat_prompt_with_tools(
     template_str: &str,
     messages: &[super::schema::ChatMessage],
     tools: Option<&[super::schema::Tool]>,
+    enable_thinking: bool,
 ) -> Result<String> {
     use super::schema::MessageContent;
 
@@ -2266,6 +2267,20 @@ pub fn render_chat_prompt_with_tools(
         .render(minijinja::context! {
             messages => out_msgs,
             tools => tools_json,
+            // ADR-005 Phase 2a iter-133 Iter D (W67): expose
+            // `enable_thinking` to the chat template so reasoning-capable
+            // models can be told to actually emit a thinking trace. Gemma 4's
+            // template (chat_template.jinja:161-163) emits a `<|think|>`
+            // system-block hint when this is true; lines 263-265 also
+            // skip the closed-channel seed (`<|channel>thought\n<channel|>`)
+            // so the model is free to emit its own
+            // `<|channel>thought\n…<channel|>` block during decode. Qwen 3.5/3.6
+            // templates accept the same kwarg per HF convention. Templates
+            // that don't reference `enable_thinking` ignore the variable
+            // (Jinja default behavior — undefined-or-default(false) gates
+            // are unchanged), so the legacy non-reasoning path stays
+            // byte-identical.
+            enable_thinking => enable_thinking,
             add_generation_prompt => true,
             bos_token => "<bos>",
             eos_token => "<eos>",
@@ -2565,16 +2580,16 @@ assistant:
                 },
             },
         ];
-        let out = render_chat_prompt_with_tools(tmpl, &msgs, Some(&tools)).unwrap();
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, Some(&tools), false).unwrap();
         assert!(out.contains("TOOLS:2"), "out={out}");
         assert!(out.contains("get_current_weather;"), "out={out}");
         assert!(out.contains("get_news;"), "out={out}");
         assert!(out.contains("user:weather?"), "out={out}");
 
         // None / empty path → tools block must NOT fire.
-        let out_none = render_chat_prompt_with_tools(tmpl, &msgs, None).unwrap();
+        let out_none = render_chat_prompt_with_tools(tmpl, &msgs, None, false).unwrap();
         assert!(!out_none.contains("TOOLS:"), "out_none={out_none}");
-        let out_empty = render_chat_prompt_with_tools(tmpl, &msgs, Some(&[])).unwrap();
+        let out_empty = render_chat_prompt_with_tools(tmpl, &msgs, Some(&[]), false).unwrap();
         assert!(!out_empty.contains("TOOLS:"), "out_empty={out_empty}");
 
         // Legacy entry-point `render_chat_prompt` (no tools param) should be
@@ -2634,7 +2649,7 @@ assistant:
                 name: None,
             },
         ];
-        let out = render_chat_prompt_with_tools(tmpl, &msgs, None).unwrap();
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, None, false).unwrap();
         assert!(out.contains("[user]Paris weather?"), "out={out}");
         // Assistant message: tool_calls visible verbatim (string-arguments).
         assert!(

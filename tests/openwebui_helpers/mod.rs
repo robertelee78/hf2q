@@ -253,6 +253,13 @@ pub async fn streaming_chat_extract_reasoning(
         "stream": true,
         "max_tokens": max_tokens,
         "temperature": 0,
+        // ADR-005 Phase 2a iter-133 Iter D (W67): explicitly enable
+        // reasoning mode so the chat template (Gemma 4 / Qwen 3.5/3.6)
+        // emits the thinking-mode hint and the model is free to produce
+        // a `<|channel>thought\n…<channel|>` (Gemma 4) or `<think>…</think>`
+        // (Qwen) block. Without this the test asserts the splitter is
+        // wired but never exercises the actual reasoning routing path.
+        "hf2q_enable_thinking": true,
     });
 
     let client = reqwest::Client::builder()

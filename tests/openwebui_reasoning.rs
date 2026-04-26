@@ -213,7 +213,13 @@ fn openwebui_reasoning_streaming_scenario_3() {
         serde_json::json!({"role": "user", "content": "What is 73 × 47? Show your reasoning."}),
     ];
 
-    let cap = rt.block_on(streaming_chat_extract_reasoning(&model_id, &messages, 256));
+    // 1024 tokens chosen to comfortably cover BOTH a Gemma-4-style
+    // multi-method reasoning trace (~250 tokens observed) AND the
+    // post-`<channel|>` answer. iter D W67 first probe at 256 caught
+    // Gemma 4 mid-reasoning with empty content (failed invariant b);
+    // bumping to 1024 lets the model finish the channel block + emit
+    // the final answer in delta.content.
+    let cap = rt.block_on(streaming_chat_extract_reasoning(&model_id, &messages, 2048));
 
     // -----------------------------------------------------------------
     // (a) SSE protocol invariants
@@ -361,8 +367,31 @@ fn openwebui_reasoning_streaming_scenario_3() {
     // deterministic over deterministic input.
     // -----------------------------------------------------------------
     let rerun: ReasoningStreamCapture = rt.block_on(streaming_chat_extract_reasoning(
-        &model_id, &messages, 256,
+        &model_id, &messages, 2048,
     ));
+    eprintln!(
+        "openwebui_reasoning: rerun reasoning len={} chars, content len={} chars, frames={}, finish_reason={:?}",
+        rerun.accumulated_reasoning.chars().count(),
+        rerun.accumulated_content.chars().count(),
+        rerun.frames.len(),
+        rerun.finish_reason,
+    );
+    if rerun.accumulated_content.is_empty() {
+        eprintln!(
+            "openwebui_reasoning: rerun first 5 frames: {:?}",
+            rerun.frames.iter().take(5).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "openwebui_reasoning: rerun last 5 frames: {:?}",
+            rerun
+                .frames
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .collect::<Vec<_>>()
+        );
+    }
     assert_eq!(
         cap.accumulated_content, rerun.accumulated_content,
         "scenario3 content determinism violation at T=0:\n  first: {:?}\n  rerun: {:?}",

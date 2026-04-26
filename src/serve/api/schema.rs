@@ -591,6 +591,21 @@ pub struct ChatCompletionRequest {
     /// Per-request overflow policy override (Decision #23).
     #[serde(default)]
     pub hf2q_overflow_policy: Option<OverflowPolicy>,
+
+    /// Per-request reasoning-mode override (ADR-005 Phase 2a iter-133
+    /// Iter D, W67). When `Some(true)`, the chat-template render passes
+    /// `enable_thinking=true` so reasoning-capable models actually emit a
+    /// thinking trace (e.g. Gemma 4 emits `<|channel>thought\n…<channel|>`,
+    /// Qwen 3.5/3.6 emits `<think>…</think>`). When `None` (default) or
+    /// `Some(false)`, reasoning mode is OFF — Gemma 4's template seeds an
+    /// empty channel block (`<|channel>thought\n<channel|>`) and the model
+    /// proceeds straight to answer; Qwen's template skips the
+    /// `<think>` enable hint. Open WebUI clients that target the panel UX
+    /// should set this to `true` when the user toggles thinking on; the
+    /// default-off keeps every legacy + non-thinking-aware caller's
+    /// rendered prompt byte-identical.
+    #[serde(default)]
+    pub hf2q_enable_thinking: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
