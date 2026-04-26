@@ -3999,3 +3999,45 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - Qwen 3.6 integration in parallel session: Phase 2's model-agnostic design (grammar constraints + per-model registration + Jinja chat templates + boundary-marker registration) absorbs Qwen 3.6 without Phase 2 scope change.
 
   Full session transcript in the `adr_005_phase_2` party-mode conversation; this ADR's body + AC sections reflect the decisions.
+
+#### Phase 2c iter-116h — Phase D parity proxy BLOCKED on missing `gemma4v` projector forward path (2026-04-25, W40)
+
+W40 (CFA wave-35) implemented the Phase D parity proxy body in `tests/mmproj_llama_cpp_compat.rs::phase_d_parity_proxy_t0_n16` per the iter-104 scope (W22 / W26 docstring contract): spawn `hf2q serve` with the iter-116g mmproj GGUF, POST `/v1/chat/completions` with the four-dots fixture image at T=0/max_tokens=16, then sequentially run `llama-mtmd-cli` on the same chat GGUF + mmproj + image, then compare the two outputs for at least one common leading byte. Implementation comprised ~330 LOC in the test (TCP-based `wait_for_readyz`, base64 data-URI, `serde_json` request build, `X-HF2Q-Soft-Tokens-Total` header capture, RAII `ServeGuard`, llama-stdout text scrape), all of which compiled cleanly (`cargo check --release --tests`).
+
+**Phase A + B + C all PASS at HEAD `2ccffda`** under `HF2Q_LLAMA_MMPROJ_COMPAT=1 HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1 HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1`:
+
+```
+[mmproj-llama-cpp-compat] Phase A+B PASS: 356 tensors, arch='clip'
+[mmproj-llama-cpp-compat] Phase C llama-mtmd-cli load gate PASS — stdout=71 bytes, stderr=15633 bytes
+```
+
+**Phase D failed at the `/readyz` step**: hf2q serve exited within ~5 seconds of spawn, never binding the test port. Manual reproduction at the shell with the same `--model` + `--mmproj` arguments produced the verbatim startup error:
+
+```
+ERROR hf2q: mmproj GGUF tensor-set validation: mmproj projector type 'gemma4v' is not yet supported
+by hf2q's ViT forward pass (only 'mlp' is). No forward path will succeed for this file.
+Error: mmproj GGUF tensor-set validation: mmproj projector type 'gemma4v' is not yet supported
+by hf2q's ViT forward pass (only 'mlp' is). No forward path will succeed for this file.
+```
+
+The blocker is a **preexisting hf2q runtime gap**, not a Phase D test bug, and not a regression introduced by iter-116g's writer fixes. `src/inference/vision/mmproj.rs::validate_tensor_set` (line ~321-329) hard-rejects any projector whose `Projector::is_supported()` returns false, and `Projector::Gemma4v` is currently unsupported on the hf2q forward side even though the iter-116a→g writer chain emits it correctly (Phase B clamp scalars + tensor names + metadata all round-trip clean, and llama.cpp's CLIP loader accepts the file end-to-end in Phase C).
+
+**State:**
+
+| Item | State |
+|------|-------|
+| Phase A (fixtures-on-disk) | PASS |
+| Phase B (metadata + tensor-name parse) | PASS — 356 tensors, arch=clip |
+| Phase C (llama-mtmd-cli stderr smoke) | PASS — stdout=71 B, stderr=15633 B, exit=0 |
+| Phase D body (test code) | IMPLEMENTED + cargo-check clean — held back from commit |
+| Phase D first-run (parity proxy) | BLOCKED — hf2q serve exits at boot on `gemma4v` projector |
+
+**Why this blocks the iter-116h commit (and not iter-117).** The iter-116h dispatch's hard constraint is *"DON'T modify hf2q source code (verified clean as of iter-116g)"*. The required fix is in `src/inference/vision/mmproj.rs::Projector::is_supported` + a new `gemma4v` ViT forward path under `src/inference/vision/` — both source-side, both squarely in the next iteration's scope.
+
+**Next-action for iter-116i (or a fresh iter-117).** Land the `gemma4v` projector forward path on the hf2q side. Concretely:
+
+1. Flip `Projector::Gemma4v` to `is_supported() == true` in `src/inference/vision/mmproj.rs`.
+2. Implement the gemma4v projector head in the ViT forward pass — the 4-clamp-scalar `Gemma4ClippableLinear` shape `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` documents (clamp branch is optional when scalars absent — see Phase B's source-driven note at iter-116c).
+3. Re-run iter-116h's Phase D body (currently held in W40's working tree but reverted from this commit per the dispatch's "ADR-only commit" blocker protocol). The body is correct as-implemented and lands the moment hf2q serve can boot with the iter-116g mmproj.
+
+**Why the Phase D body itself was reverted from this commit, not landed alongside the blocker.** Per the iter-116h dispatch's Phase 6 protocol: *"If Phase D fails for any reason: capture verbatim, write blocker, ADR-only commit. Don't widen scope."* Landing the implementation against a known-failing runtime would either (a) leave a panicking gate behind in CI when CFA wave-36 picks it up, or (b) require a `#[ignore]` band-aid that obscures the real blocker. Both are anti-patterns vs. `feedback_no_broken_windows.md`. iter-116i's first commit re-applies the full ~330 LOC Phase D body the moment the hf2q-side blocker clears.
