@@ -1047,6 +1047,40 @@ W21 landed the Rust + script edits for the ADR-007 §853-866 TQ-active companion
 
 ---
 
+#### Phase 2c iter-113-prep — gemma4_vision ViT-arch port scope (2026-04-26, W22)
+
+W22 mapped the port from current SigLIP-49 (49 tokens, pool=2×2) to gemma4_vision (≤280 tokens, pool=3×3, GQA, 2D NeoX RoPE, dual position-embed table, Gemma4ClippableLinear projector, GELU(pytorch_tanh) activation). All four reference implementations are LOCAL on disk: `/opt/candle/candle-transformers/src/models/gemma4/vision.rs` (552 lines), `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` (151 lines), `/opt/llama.cpp/convert_hf_to_gguf.py:7804-7879`, `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (rope_theta=100, n_merge=3, image-token-limit 252-280).
+
+**Total scope**: ~3500 src + ~1400 test LOC across ~7 worker iterations. **Reusable from current SigLIP path**: `vit_linear_gpu`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`, `vit_attention_gpu` (scale=1.0 supported), `vit_residual_add_gpu`, `vit_scale_gpu`, `vit_std_bias_scale_gpu`, ArchProfile detection (already recognises `Gemma4Siglip` markers at `mmproj.rs:285-297`), W6's projector_type fix (writer + loader aligned with `clip.projector_type` per `/opt/llama.cpp/tools/mtmd/clip-impl.h:23`).
+
+**Net new kernels (all in `/opt/mlx-native` per `project_mlx_native_is_the_strategic_destination.md`):** `vision_2d_rope.metal` (NEW; first-half by pos_x, second-half by pos_y, NeoX-pair indexing, theta=100); `vit_avg_pool_kxk.metal` (generalize current 2×2-hardcoded shader to parameterized k); `vit_clip_inplace.metal` (NEW; for Gemma4ClippableLinear input/output clamps); possibly `vit_gelu_tanh.metal` (verify mlx-native's existing `gelu.rs`/`gelu.metal` is the tanh approximation; if so, reuse).
+
+**Iter-by-iter plan (W22 estimate):**
+
+| Iter | Scope | LOC |
+|---|---|---|
+| 113 | Preprocess + patch-embed (CPU + GPU; `2x-1` scaling, no-bias linear, dual position-embed lookup) | ~600 src + 250 test |
+| 114 | 2D RoPE kernel (Metal + Rust dispatch) + per-block forward (4-RMSNorm pattern: input_layernorm → attn → post_attention_layernorm → residual → pre_ff_layernorm → mlp → post_ff_layernorm → residual) | ~700 + 350 |
+| 115 | GELU(pytorch_tanh) kernel + parameterized `vit_avg_pool_kxk_f32` + GQA repeat-kv inside vit_attention | ~350 + 200 |
+| 116 | Gemma4ClippableLinear (clamp → matmul → clamp) + clamp-scalar plumbing through `LoadedMmprojWeights` + final post-projection norm wiring | ~400 + 250 |
+| 117 | GGUF emit changes (extra metadata keys: `clip.vision.projector.scale_factor=3`, `clip.vision.use_gelu=true`; clamp-scalar tensors `<tensor>.input_min`/`.input_max`/`.output_min`/`.output_max`; `mm.0.norm.weight` post-projection norm tensor) + cross-compat smoke against `llama-mtmd-cli` | ~250 + 200 |
+| 118 | Wire `apply_gemma4v_full_forward_gpu` into `compute_vision_embeddings_gpu` (vit_gpu.rs:1628) with arch-profile dispatch (`Gemma4Siglip` → gemma4v graph) | ~200 + 150 |
+| 119 | Fixture re-capture against real mlx-vlm gemma4 vision repo (HF_TOKEN + repo discovery) + Gate H verify on the 5×5 matrix; ticks AC line ~1215 | ~100 + fixture bytes |
+
+**Numbered blockers (only #1 is hard-external):**
+1. **HF auth + mlx-vlm repo discovery (HARD, iter-119)**: harness defaults to `mlx-community/gemma-4-vision-26b-A4B-it-bf16` which 404s. Need real public repo OR locally-converted `google/gemma-4-it` (HF-gated; needs `HF_TOKEN`).
+2. Parameterized avg-pool: existing shader (`vit_gpu.rs:1042`) hardcodes k=2; mechanical generalization, not a blocker.
+3. 2D RoPE: not in mlx-native; net-new kernel.
+4. GELU(pytorch_tanh) GPU op: verify `/opt/mlx-native/src/ops/gelu.rs` is the tanh approximation; if so, reuse.
+5. Gemma4ClippableLinear clamp scalars in GGUF: convert_hf_to_gguf.py `unsqueeze(0)` → 1-D scalar tensors; verify `mlx_native::gguf::GgufFile` round-trips 1-element tensors.
+6. GQA in `vit_attention_gpu`: current path assumes `num_heads==num_kv_heads`; needs explicit repeat-kv. Mechanical.
+7. **llama.cpp clip.cpp DOES support gemma4v** at `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` — Task #14 cross-compat is unblocked at the C++ side.
+8. Mmproj round-trip parity tests need extension for the `[2, pos_size, hidden]` 3-D position table + scalar clamp tensors.
+
+**iter-112 (Gate H fixture capture + verify) parked**: a concurrent `hf2q convert` of Qwen3.6-27B is running at ~60% mem (~80 GB resident) under a 4-hour timeout, blocking the model lock per `feedback_oom_prevention.md`. Fixture capture + verify run dispatched on next quiet-host window.
+
+---
+
 #### Phase 1b CLOSED — 2026-04-25 (iter-110 W20)
 
 `scripts/release-check.sh PASS` on all seven gates A–G end-to-end at HEAD `24b4029` (Gemma 4 26B-A4B-it-ara-abliterated-dwq GGUF, M5 Max, cold SoC). Per-gate measurements:
