@@ -5,9 +5,12 @@
 //! - `config_parser`: HF config.json -> ModelMetadata
 //! - `safetensors`: Streaming mmap shard reader -> TensorMap
 //! - `hf_download`: HF Hub download (Epic 3)
+//! - `integrity`: Per-shard SHA-256 verification against HF's `x-linked-etag`
+//!   (ADR-005 Phase 3 item 3/4)
 
 pub mod config_parser;
 pub mod hf_download;
+pub mod integrity;
 pub mod safetensors;
 
 use std::path::Path;
