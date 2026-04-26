@@ -201,6 +201,7 @@ pub async fn chat_completions(
     };
     let mut response = (StatusCode::OK, Json(resp)).into_response();
     apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
+    apply_vit_transparency_headers(&mut response, vit_forward_ms, vit_images);
     response
 }
 
@@ -407,7 +408,7 @@ async fn prepare_chat_generation(
         .hf2q_overflow_policy
         .unwrap_or(state.config.default_overflow_policy);
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
-        match apply_overflow_policy(engine, &req.messages, policy).await {
+        match apply_overflow_policy(engine, &messages_for_render, policy).await {
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
@@ -462,19 +463,50 @@ async fn prepare_chat_generation(
         grammar: response_grammar,
         token_bytes: grammar_token_bytes,
     };
+    // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
+    // the multimodal preflight produced ViT embeddings, locate the
+    // single `<|image|>` placeholder token per image in the rendered
+    // prompt and EXPAND each into a contiguous run of `N_image_tokens`
+    // copies so the prefill iterates one model-side step per image
+    // patch position.  `forward_prefill_with_soft_tokens` then bypasses
+    // the embed-table gather at those positions and copies the
+    // projected vision embeddings into the hidden state instead.
+    //
+    // Empty `vision_embeddings` ⇒ pure-text path: skip everything,
+    // return `Vec::new()` for `soft_tokens`.
+    let (final_prompt_tokens, soft_tokens) = if vision_embeddings.is_empty() {
+        (prompt_tokens, Vec::<engine::SoftTokenData>::new())
+    } else {
+        match expand_image_placeholders(engine, &prompt_tokens, &vision_embeddings) {
+            Ok(pair) => pair,
+            Err(resp) => return Err(resp),
+        }
+    };
+    // Post-expansion context-budget guard.  The pre-expansion overflow
+    // policy ran on the un-expanded prompt (which carries one
+    // placeholder token per image, not `N_image_tokens` per image), so
+    // the expanded prompt may push past `context_length` even when the
+    // un-expanded prompt fit.  Fail clean with the standard 400 envelope
+    // when that happens; richer image-aware overflow handling is a
+    // follow-up iter (would need to drop *images*, which is a content
+    // decision, not a tokenization concern).
+    if let Some(ctx_len) = engine.context_length() {
+        if final_prompt_tokens.len() >= ctx_len {
+            return Err(
+                ApiError::context_length_exceeded(ctx_len, final_prompt_tokens.len())
+                    .into_response(),
+            );
+        }
+    }
     Ok(PreparedChatContext {
         engine: (),
-        prompt_tokens,
+        prompt_tokens: final_prompt_tokens,
         params,
         summarized_messages,
         summary_tokens,
-        // ADR-005 phase 2c iter-99: vision-soft-token wiring lands when
-        // the multimodal preflight + ViT forward returns embeddings instead
-        // of the 501 above.  Until then, the text-only path produces empty
-        // overrides and `chat_completions` falls through to `Engine::generate`.
-        soft_tokens: Vec::new(),
-        vit_forward_ms: None,
-        vit_images: None,
+        soft_tokens,
+        vit_forward_ms: vit_forward_ms_v,
+        vit_images: vit_images_v,
     })
 }
 
@@ -493,6 +525,23 @@ async fn chat_completions_stream(
         Some(e) => e.clone(),
         None => return ApiError::model_not_loaded(&req.model).into_response(),
     };
+
+    // Vision streaming is not supported in this iter — the soft-token
+    // path runs through `Engine::generate_with_soft_tokens` (non-
+    // streaming).  When the streaming variant lands, this gate reverts
+    // to the standard `generate_stream` call but with the soft tokens
+    // attached.  Until then a vision request with `stream: true`
+    // returns a clean 400 instead of silently dropping the image
+    // embeddings.
+    if !prepared.soft_tokens.is_empty() {
+        return ApiError::invalid_request(
+            "stream: true with image content parts is not yet supported. \
+             Send the same request with stream: false to exercise the \
+             vision soft-token path.",
+            Some("stream".into()),
+        )
+        .into_response();
+    }
 
     // Decision #23: capture transparency counters BEFORE we move
     // `prepared` into `engine.generate_stream`. They flow into the
@@ -2904,5 +2953,151 @@ mod multimodal_tests {
     fn vit_forward_pending_response_is_501_with_messages_param() {
         let resp = vit_forward_pending_response(2);
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-005 Phase 2c iter-99: vision soft-token wiring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rewrite_messages_for_vision_placeholders_passthrough_text() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Text("hello".into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders(&msgs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, msgs[0].content);
+    }
+
+    #[test]
+    fn rewrite_messages_for_vision_placeholders_pure_text_parts() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "hello".into() },
+                ContentPart::Text { text: " world".into() },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders(&msgs);
+        match out[0].content.as_ref().expect("content") {
+            MessageContent::Parts(parts) => assert_eq!(parts.len(), 2),
+            other => panic!("expected Parts, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_messages_for_vision_placeholders_one_image() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "see this:".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,XXX".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders(&msgs);
+        match out[0].content.as_ref().expect("content") {
+            MessageContent::Text(t) => {
+                assert!(t.contains("<|image|>"), "got: {t}");
+                assert!(t.starts_with("see this:"));
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_messages_for_vision_placeholders_two_images_two_placeholders() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Text { text: "a:".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,A".into(),
+                        detail: None,
+                    },
+                },
+                ContentPart::Text { text: " b:".into() },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,B".into(),
+                        detail: None,
+                    },
+                },
+            ])),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let out = rewrite_messages_for_vision_placeholders(&msgs);
+        match out[0].content.as_ref().expect("content") {
+            MessageContent::Text(t) => {
+                let n_marks = t.matches("<|image|>").count();
+                assert_eq!(n_marks, 2, "expected 2 placeholders, got {n_marks} in {t:?}");
+                assert!(t.starts_with("a:"));
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_messages_for_vision_placeholders_only_touches_image_messages() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some(MessageContent::Text("be helpful".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,X".into(),
+                        detail: None,
+                    },
+                }])),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("ack".into())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+        let out = rewrite_messages_for_vision_placeholders(&msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].content, msgs[0].content);
+        assert_eq!(out[2].content, msgs[2].content);
+        match out[1].content.as_ref().expect("content") {
+            MessageContent::Text(t) => assert_eq!(t, "<|image|>"),
+            other => panic!("expected Text, got {:?}", other),
+        }
     }
 }
