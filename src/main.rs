@@ -501,6 +501,24 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
+    // Phase 1.45: ADR-012 P9b real-model finding (jenerallee78 abliterated apex):
+    // some qwen35moe checkpoints ship a FUSED gate+up tensor named
+    //   model.layers.N.mlp.experts.gate_up_proj   (shape [N_exp, 2*moe_inter, hidden])
+    // plus
+    //   model.layers.N.mlp.experts.down_proj      (shape [N_exp, hidden, moe_inter])
+    // — both WITHOUT the `.weight` suffix llama.cpp / hf_name_to_gguf
+    // expect. Split the fused gate_up along axis 1 into separate
+    // gate_proj/up_proj and add `.weight` to all three. After this phase
+    // the tensors are in the canonical pre-merged form expected by
+    // `merge_moe_experts_in_tensor_map`'s pre-merged-skip path
+    // (commit 9045d04).
+    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
+        &mut tensor_map,
+        &metadata,
+    )
+    .context("qwen35moe fused gate_up split + .weight rename failed")
+    .map_err(AppError::Conversion)?;
+
     // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
     //
     // Must run BEFORE quantization: `merge_moe_experts_in_tensor_map`

@@ -402,6 +402,163 @@ pub fn merge_expert_tensors(
 /// Callers run this immediately after `input::read_model` and before
 /// the quantizer dispatch. Gemma and other non-MoE arches hit the
 /// early-return guard and incur no cost.
+/// ADR-012 P9b real-model finding (jenerallee78 abliterated apex 2026-04-25):
+/// split the fused `mlp.experts.gate_up_proj` tensor into separate
+/// `gate_proj.weight` + `up_proj.weight`, and add the missing `.weight`
+/// suffix to `down_proj`.
+///
+/// # Input
+///
+///   model.layers.N.mlp.experts.gate_up_proj  shape [n_experts, 2*moe_inter, hidden] BF16/F16
+///   model.layers.N.mlp.experts.down_proj     shape [n_experts, hidden, moe_inter]    BF16/F16
+///
+/// # Output
+///
+///   model.layers.N.mlp.experts.gate_proj.weight  shape [n_experts, moe_inter, hidden]
+///   model.layers.N.mlp.experts.up_proj.weight    shape [n_experts, moe_inter, hidden]
+///   model.layers.N.mlp.experts.down_proj.weight  shape [n_experts, hidden, moe_inter]
+///
+/// The split takes the fused `[2 * moe_inter, hidden]` per-expert sub-tensor
+/// and emits gate as the first `moe_inter` rows, up as the second
+/// `moe_inter` rows. This matches the convention used by HF's
+/// `Qwen3MoeMLP`-style fusion (gate is first half by output channel) and
+/// reproduces what `convert_hf_to_gguf.py` would emit if it processed the
+/// per-expert form.
+///
+/// No-op for non-qwen35moe arches.
+pub fn split_and_rename_fused_gate_up_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    // Collect input tensor keys to mutate (can't iterate while modifying).
+    let gate_up_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.layers.")
+                && n.ends_with(".mlp.experts.gate_up_proj")
+        })
+        .cloned()
+        .collect();
+
+    let down_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.layers.")
+                && n.ends_with(".mlp.experts.down_proj")
+        })
+        .cloned()
+        .collect();
+
+    if gate_up_keys.is_empty() && down_keys.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        gate_up_count = gate_up_keys.len(),
+        down_count = down_keys.len(),
+        "qwen35moe fused gate_up split + rename: processing {} gate_up_proj + {} down_proj tensors",
+        gate_up_keys.len(),
+        down_keys.len()
+    );
+
+    // Split each gate_up_proj.
+    for key in gate_up_keys {
+        let Some(tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        // Shape contract: [n_experts, 2 * moe_inter, hidden].
+        if tensor.shape.len() != 3 {
+            return Err(ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj expected 3-D [n_experts, 2*moe_inter, hidden], got shape {:?}",
+                    tensor.shape
+                ),
+            });
+        }
+        let n_experts = tensor.shape[0];
+        let two_inter = tensor.shape[1];
+        let hidden = tensor.shape[2];
+        if two_inter % 2 != 0 {
+            return Err(ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj middle dim {} must be even (2 * moe_intermediate_size)",
+                    two_inter
+                ),
+            });
+        }
+        let moe_inter = two_inter / 2;
+        let elem_size = tensor.dtype.element_size();
+        let per_expert_bytes = two_inter * hidden * elem_size;
+        let half_bytes = moe_inter * hidden * elem_size;
+
+        let mut gate_data = Vec::with_capacity(n_experts * half_bytes);
+        let mut up_data = Vec::with_capacity(n_experts * half_bytes);
+
+        for e in 0..n_experts {
+            let base = e * per_expert_bytes;
+            // Gate: first moe_inter rows of the [2*moe_inter, hidden] block.
+            gate_data.extend_from_slice(&tensor.data[base..base + half_bytes]);
+            // Up: second moe_inter rows.
+            up_data.extend_from_slice(
+                &tensor.data[base + half_bytes..base + per_expert_bytes],
+            );
+        }
+
+        let split_shape = vec![n_experts, moe_inter, hidden];
+        // Construct new names by replacing the fused suffix.
+        let gate_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.gate_proj.weight",
+        );
+        let up_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.up_proj.weight",
+        );
+
+        tensor_map.tensors.insert(
+            gate_name.clone(),
+            crate::ir::TensorRef {
+                name: gate_name,
+                shape: split_shape.clone(),
+                dtype: tensor.dtype,
+                data: gate_data,
+            },
+        );
+        tensor_map.tensors.insert(
+            up_name.clone(),
+            crate::ir::TensorRef {
+                name: up_name,
+                shape: split_shape,
+                dtype: tensor.dtype,
+                data: up_data,
+            },
+        );
+    }
+
+    // Rename down_proj → down_proj.weight (no data changes).
+    for key in down_keys {
+        let Some(mut tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let new_name = key.replace(
+            ".mlp.experts.down_proj",
+            ".mlp.experts.down_proj.weight",
+        );
+        tensor.name = new_name.clone();
+        tensor_map.tensors.insert(new_name, tensor);
+    }
+
+    Ok(())
+}
+
 pub fn merge_moe_experts_in_tensor_map(
     tensor_map: &mut crate::ir::TensorMap,
     metadata: &crate::ir::ModelMetadata,
@@ -459,6 +616,20 @@ pub fn merge_moe_experts_in_tensor_map(
             count = pre_merged_count,
             "qwen35moe expert merge: detected {} pre-merged expert tensors; skipping merge for those (input is already in canonical form)",
             pre_merged_count
+        );
+    } else {
+        // Diagnostic: dump up to 20 names containing `mlp.experts.` so we
+        // can see what the actual naming form is for this model.
+        let mut sample: Vec<&String> = tensor_map
+            .tensors
+            .keys()
+            .filter(|n| n.contains("mlp.experts."))
+            .take(20)
+            .collect();
+        sample.sort();
+        tracing::warn!(
+            sample = ?sample,
+            "qwen35moe expert merge: no pre-merged form detected; first 20 mlp.experts. tensor names dumped"
         );
     }
 
