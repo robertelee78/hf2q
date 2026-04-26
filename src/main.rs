@@ -462,9 +462,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     })
     .ok();
 
-    // Phase 1: Read model tensors
-    let (_, mut tensor_map) = input::read_model(&config.input_dir, &progress)
-        .context("Failed to read model")
+    // Phase 1: Read model tensors (ADR-014 P0/P1 lazy entry).
+    //
+    // `read_tensors_lazy` returns a LazyTensorMap whose entries each
+    // carry an Arc<Mmap> + closure. Tensor bytes do not materialise
+    // until each Phase 1.x transform / quantize consumer invokes
+    // `LazyTensor::materialize`. Phase 1.4 + 1.42 are pure-metadata
+    // key rewrites and run on the LazyTensorMap directly; Phase 1.45+
+    // are not yet lifted (later P1 iters), so the lazy map is bridged
+    // back to an eager TensorMap via `materialize_all` immediately
+    // before Phase 1.45 — see the bridge call below.
+    let mut lazy_map = input::safetensors::read_tensors_lazy(&config.input_dir, &progress)
+        .context("Failed to index model tensors lazily")
         .map_err(AppError::Conversion)?;
 
     check_interrupted()?;
@@ -494,10 +503,12 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // root-level non-language_model paths are unaffected (the strip is a
     // simple `.replace` and only fires on tensors that actually contain
     // the literal `language_model.` segment).
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap. Pure metadata operation; no
+    // tensor bytes touched.
     {
-        let renames: Vec<(String, String)> = tensor_map
-            .tensors
-            .keys()
+        let renames: Vec<(String, String)> = lazy_map
+            .names()
             .filter(|n| n.contains("language_model."))
             .map(|n| (n.clone(), n.replace("language_model.", "")))
             .collect();
@@ -508,9 +519,18 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 renames.len()
             );
             for (old_name, new_name) in renames {
-                if let Some(mut tensor) = tensor_map.tensors.remove(&old_name) {
-                    tensor.name = new_name.clone();
-                    tensor_map.tensors.insert(new_name, tensor);
+                if let Some(old_lazy) = lazy_map.remove(&old_name) {
+                    let new_meta = crate::ir::lazy::LazyMeta::new(
+                        new_name.clone(),
+                        old_lazy.shape().to_vec(),
+                        old_lazy.dtype(),
+                    );
+                    let new_name_for_closure = new_name.clone();
+                    let renamed_lazy = old_lazy.map_with_meta(new_meta, move |mut tref| {
+                        tref.name = new_name_for_closure.clone();
+                        Ok(tref)
+                    });
+                    lazy_map.insert(renamed_lazy);
                 }
             }
         }
@@ -530,6 +550,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // REMOVE when llama.cpp adds qwen35 MTP loading OR by 2026-Q4 if upstream
     // lags. The default must remain emit-by-default so hf2q-produced GGUFs
     // carry the complete MTP block for native speculative decoding.
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap via `_lazy` variant. Pure
+    // metadata key rewrite; no tensor bytes touched.
     {
         let qwen35_family = models::qwen35::is_qwen35_family_architecture(
             &metadata.architecture,
@@ -541,9 +564,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 .unwrap_or(false);
 
         if drop_mtp {
-            let mtp_keys: Vec<String> = tensor_map
-                .tensors
-                .keys()
+            let mtp_keys: Vec<String> = lazy_map
+                .names()
                 .filter(|n| n.starts_with("mtp."))
                 .cloned()
                 .collect();
@@ -554,14 +576,16 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     mtp_keys.len()
                 );
                 for key in mtp_keys {
-                    tensor_map.tensors.remove(&key);
+                    lazy_map.remove(&key);
                 }
             }
         } else {
-            let renamed =
-                models::qwen35::rename_mtp_tensors_to_layer_form(&mut tensor_map, &metadata)
-                    .context("qwen35 MTP tensor rename failed")
-                    .map_err(AppError::Conversion)?;
+            let renamed = models::qwen35::rename_mtp_tensors_to_layer_form_lazy(
+                &mut lazy_map,
+                &metadata,
+            )
+            .context("qwen35 MTP tensor rename failed")
+            .map_err(AppError::Conversion)?;
             if renamed > 0 {
                 tracing::info!(
                     renamed,
@@ -571,6 +595,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             }
         }
     }
+
+    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.45 / 1.5 /
+    // 1.6 / 1.7 / 1.8) are still eager — they take `&mut TensorMap` and
+    // operate on materialised bytes. Bridge through `materialize_all`
+    // here. Each Phase 1.x lifted in subsequent P1 iters moves this
+    // bridge later in the pipeline; once the streaming quantize loop
+    // (P2) lands the bridge becomes test-only.
+    let mut tensor_map = lazy_map
+        .materialize_all()
+        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
+        .map_err(AppError::Conversion)?;
 
     // Phase 1.45: ADR-012 P9b real-model finding (jenerallee78 abliterated apex):
     // some qwen35moe checkpoints ship a FUSED gate+up tensor named

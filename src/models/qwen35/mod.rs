@@ -1556,6 +1556,72 @@ pub(crate) fn dtype_elem_size(dtype: DType) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-014 P1 — Lazy variants of the Phase 1.x transform helpers.
+//
+// These mirror their eager counterparts above but operate on
+// [`crate::ir::lazy::LazyTensorMap`]. They are introduced alongside the
+// eager versions because the P9b intermediate-GGUF dance
+// (`main.rs::cmd_convert` second call site) still consumes the eager
+// `&mut TensorMap` API; ADR-014 P4 deletes the dance and the eager
+// helpers along with it. Each lazy variant has a pinned byte-identity
+// regression against its eager counterpart in the test module below.
+// ---------------------------------------------------------------------------
+
+/// ADR-014 P1: lazy variant of [`rename_mtp_tensors_to_layer_form`].
+///
+/// Operates on a [`crate::ir::lazy::LazyTensorMap`] without
+/// materialising tensor bytes. MTP rename is a pure-metadata operation
+/// (rewrite map keys, propagate the new name through the carried
+/// metadata), so the closures stay deferred — bytes remain on the
+/// underlying mmap until the streaming quantize loop (ADR-014 P2)
+/// consumes them.
+///
+/// Behaviour and tensor-name mapping are byte-identical to the eager
+/// variant: same `is_qwen35_family_architecture` arch gate, same
+/// [`map_mtp_tensor_name`] dispatcher, same canonical wrapper paths.
+/// Only the storage type changes.
+pub fn rename_mtp_tensors_to_layer_form_lazy(
+    lazy_map: &mut crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<usize, ConvertError> {
+    use crate::ir::lazy::LazyMeta;
+
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(0);
+    }
+    let n_layer = metadata.num_layers as usize;
+
+    let mtp_keys: Vec<String> = lazy_map
+        .names()
+        .filter(|n| n.starts_with("mtp."))
+        .cloned()
+        .collect();
+
+    let mut renamed = 0usize;
+
+    for old_name in mtp_keys {
+        let new_name = match map_mtp_tensor_name(&old_name, n_layer) {
+            Some(n) => n,
+            None => continue,
+        };
+        let Some(old_lazy) = lazy_map.remove(&old_name) else {
+            continue;
+        };
+        let new_meta =
+            LazyMeta::new(new_name.clone(), old_lazy.shape().to_vec(), old_lazy.dtype());
+        let new_name_for_closure = new_name.clone();
+        let renamed_tensor = old_lazy.map_with_meta(new_meta, move |mut tref| {
+            tref.name = new_name_for_closure.clone();
+            Ok(tref)
+        });
+        lazy_map.insert(renamed_tensor);
+        renamed += 1;
+    }
+
+    Ok(renamed)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1613,6 +1679,163 @@ mod tests {
                 "({arch:?}, {mt:?}) must NOT be accepted as Qwen3.5 family"
             );
         }
+    }
+
+    /// ADR-014 P1 byte-identity regression:
+    /// `rename_mtp_tensors_to_layer_form_lazy` produces a tensor map whose
+    /// post-rename names AND post-materialise bytes are byte-equal to
+    /// the eager `rename_mtp_tensors_to_layer_form` on the same fixture.
+    /// Pins the lazy variant against the eager one — any drift in either
+    /// fails the test.
+    #[test]
+    fn rename_mtp_tensors_to_layer_form_lazy_byte_identical_to_eager() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+
+        // Synthetic 2-layer Qwen3.5 metadata: one MTP layer at index 0
+        // (mtp.layers.0.*) plus the wrapper canonical names.
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5ForCausalLM".into(),
+            model_type: "qwen3_5".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec!["full_attention".into(), "linear_attention".into()],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        // Distinguishing payload per tensor — different bytes for each
+        // so a swap or drop would be detected.
+        let mtp_tensors: Vec<(&str, Vec<u8>)> = vec![
+            ("mtp.layers.0.input_layernorm.weight", vec![0xAA; 8]),
+            ("mtp.fc.weight", vec![0xBB; 8]),
+            ("mtp.pre_fc_norm_embedding.weight", vec![0xCC; 8]),
+            ("mtp.pre_fc_norm_hidden.weight", vec![0xDD; 8]),
+            ("mtp.norm.weight", vec![0xEE; 8]),
+        ];
+
+        // ---- Eager: build TensorMap, run eager rename ----
+        let mut eager = TensorMap::new();
+        for (name, data) in &mtp_tensors {
+            eager.insert(TensorRef {
+                name: name.to_string(),
+                shape: vec![4],
+                dtype: DType::F16,
+                data: data.clone(),
+            });
+        }
+        let eager_renamed = rename_mtp_tensors_to_layer_form(&mut eager, &metadata).unwrap();
+
+        // ---- Lazy: build LazyTensorMap, run lazy rename, materialise ----
+        let mut lazy = LazyTensorMap::new();
+        for (name, data) in &mtp_tensors {
+            let meta = LazyMeta::new(name.to_string(), vec![4], DType::F16);
+            lazy.insert(LazyTensor::from_bytes(meta, data.clone()));
+        }
+        let lazy_renamed =
+            rename_mtp_tensors_to_layer_form_lazy(&mut lazy, &metadata).unwrap();
+        let lazy_materialised = lazy.materialize_all().unwrap();
+
+        // Same number renamed.
+        assert_eq!(eager_renamed, lazy_renamed, "renamed counts must match");
+        assert!(eager_renamed >= mtp_tensors.len() - 1); // wrapper canonicals all match
+
+        // Same set of post-rename keys.
+        let mut eager_keys: Vec<&String> = eager.tensors.keys().collect();
+        eager_keys.sort();
+        let mut lazy_keys: Vec<&String> = lazy_materialised.tensors.keys().collect();
+        lazy_keys.sort();
+        assert_eq!(eager_keys, lazy_keys, "post-rename key sets must match");
+
+        // Per-key bytes byte-equal.
+        for key in eager_keys {
+            let eager_t = eager.get(key).unwrap();
+            let lazy_t = lazy_materialised.get(key).unwrap();
+            assert_eq!(eager_t.shape, lazy_t.shape, "{key} shape");
+            assert_eq!(eager_t.dtype, lazy_t.dtype, "{key} dtype");
+            assert_eq!(eager_t.data, lazy_t.data, "{key} bytes");
+            // The materialised TensorRef's name field must reflect the
+            // post-rename name, not the pre-rename mtp.* name.
+            assert_eq!(lazy_t.name, *key, "{key} carried-name field");
+        }
+    }
+
+    /// Non-qwen35 architectures must early-return Ok(0) on the lazy
+    /// variant — same arch-gate behaviour as the eager version.
+    #[test]
+    fn rename_mtp_tensors_to_layer_form_lazy_no_op_for_non_qwen35() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata};
+
+        let metadata = ModelMetadata {
+            architecture: "LlamaForCausalLM".into(),
+            model_type: "llama".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        let mut lazy = LazyTensorMap::new();
+        let meta = LazyMeta::new("mtp.fc.weight".into(), vec![4], DType::F16);
+        lazy.insert(LazyTensor::from_bytes(meta, vec![0u8; 8]));
+
+        let renamed = rename_mtp_tensors_to_layer_form_lazy(&mut lazy, &metadata).unwrap();
+        assert_eq!(renamed, 0, "non-qwen35 must early-return without renaming");
+        assert!(lazy.contains_key("mtp.fc.weight"));
     }
 
     /// `is_qwen35moe_architecture` accepts ONLY the MoE aliases (2 archs
