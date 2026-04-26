@@ -309,6 +309,17 @@ impl OutputBackend for GgufBackend {
             // When incompatible, use llama.cpp's standard fallback chain from
             // tensor_type_fallback() in llama-quant.cpp:362-408:
             //   Q6_K → Q8_0, Q5_K → Q5_1, Q4_K → Q5_0, Q3_K/Q2_K → Q4_0
+            //
+            // ADR-012 P9b real-model finding (2026-04-25): the original chain
+            // only handled K-quant types when row_dim wasn't divisible by 256.
+            // But Q4_0 / Q5_0 / Q8_0 (block_size = 32 = QK4_0) ALSO require
+            // row_dim divisible by their block size. Tensors with very small
+            // row_dim (e.g. ssm_conv1d.weight with K=4 conv kernel) aren't
+            // representable in any block-quant type — must fall back to F16.
+            // Without this fix, the GGUF emits with row_dim=4 Q4_0 which
+            // llama.cpp's loader rejects:
+            //   "blk.0.ssm_conv1d.weight of type 2 (q4_0) has 4 elements per
+            //    row, not a multiple of block size (32)"
             if !qt.shape.is_empty() {
                 let row_dim = *qt.shape.last().unwrap();
                 if row_dim % QK6_K != 0 {
@@ -335,6 +346,23 @@ impl OutputBackend for GgufBackend {
                             ggml_type = GGML_TYPE_F16;
                         }
                     }
+                }
+
+                // Independent of the K-quant chain above: any Q4_0 / Q5_0 /
+                // Q8_0 (block 32) tensor with row_dim < 32 OR row_dim not
+                // divisible by 32 → fall back to F16. Catches ssm_conv1d
+                // (K=4) and any other small-row-dim weight that slipped
+                // past the K-quant fallback.
+                let block_32_quant = matches!(
+                    ggml_type,
+                    GGML_TYPE_Q4_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q8_0
+                );
+                if block_32_quant && row_dim % QK4_0 != 0 {
+                    debug!(
+                        "Tensor '{}': ne[0]={} not block-32 aligned, {} → F16",
+                        gguf_name, row_dim, ggml_type_name(ggml_type)
+                    );
+                    ggml_type = GGML_TYPE_F16;
                 }
             }
 

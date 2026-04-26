@@ -154,6 +154,20 @@ impl TensorRef {
         if n.contains("embed_tokens") || n.contains("embedding_projection") {
             return false;
         }
+        // ADR-012 P9b real-model finding (2026-04-25): tensors with a small
+        // inner-dim (< 32 = Q4_0 block size) cannot be block-quantized at all
+        // — Q4_0/Q5_0/Q8_0 require row_dim divisible by 32, K-quants by 256.
+        // ssm_conv1d.weight (shape [channels, K=4]) and similar small-kernel
+        // tensors must be preserved at F16/F32. Without this gate the DWQ
+        // pipeline emits a Q4_0 ssm_conv1d which llama.cpp rejects with
+        //   "tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements
+        //    per row, not a multiple of block size (32)"
+        if self.shape.len() >= 2 {
+            let row_dim = *self.shape.last().unwrap();
+            if row_dim < 32 {
+                return false;
+            }
+        }
         // Multi-dimensional tensors with "weight" or "proj" in the name are quantizable
         if self.shape.len() >= 2 {
             return n.contains("weight") || n.contains("proj") || n.contains("experts.");
