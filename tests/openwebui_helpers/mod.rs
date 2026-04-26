@@ -40,7 +40,11 @@ use std::time::{Duration, Instant};
 
 pub const ENV_GATE: &str = "HF2Q_OPENWEBUI_E2E";
 pub const ENV_GGUF: &str = "HF2Q_OPENWEBUI_E2E_GGUF";
+pub const ENV_MMPROJ: &str = "HF2Q_OPENWEBUI_E2E_MMPROJ";
 pub const ENV_RECORD: &str = "HF2Q_OPENWEBUI_E2E_RECORD";
+/// Companion gate for tests that exercise live network paths
+/// (HTTPS image fetching). Default-off; default-skip with no flake.
+pub const ENV_NETWORK: &str = "HF2Q_NETWORK_TESTS";
 
 /// Default chat GGUF path — same fixture used by
 /// `tests/mmproj_llama_cpp_compat.rs` and `tests/vision_e2e_vs_mlx_vlm.rs`.
@@ -48,6 +52,14 @@ pub const ENV_RECORD: &str = "HF2Q_OPENWEBUI_E2E_RECORD";
 pub const DEFAULT_CHAT_GGUF: &str = concat!(
     "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/",
     "gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf"
+);
+
+/// Default Gemma 4 mmproj path — same fixture used by
+/// `tests/mmproj_llama_cpp_compat.rs` and `tests/vision_e2e_vs_mlx_vlm.rs`
+/// (W79 iter-211, Phase 2c residual ACs 3103 + 3106).
+pub const DEFAULT_MMPROJ_GGUF: &str = concat!(
+    "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/",
+    "gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf"
 );
 
 /// High-numbered fixed port distinct from `mmproj_llama_cpp_compat.rs`
@@ -87,6 +99,21 @@ pub struct ServerGuard(Child);
 
 impl ServerGuard {
     pub fn spawn(gguf: &str) -> std::io::Result<Self> {
+        Self::spawn_inner(gguf, None)
+    }
+
+    /// Spawn `hf2q serve` with `--mmproj <mmproj>` so the request handler's
+    /// multimodal pipeline can run end-to-end against `image_url` content
+    /// parts (W79 iter-211, Phase 2c residual ACs 3103 + 3106).
+    ///
+    /// Behaves identically to [`Self::spawn`] when `mmproj` is `None`; the
+    /// extra entry point exists so test bodies don't have to copy the
+    /// CARGO_BIN_EXE_hf2q lookup + Stdio setup just to vary one CLI flag.
+    pub fn spawn_with_mmproj(gguf: &str, mmproj: &str) -> std::io::Result<Self> {
+        Self::spawn_inner(gguf, Some(mmproj))
+    }
+
+    fn spawn_inner(gguf: &str, mmproj: Option<&str>) -> std::io::Result<Self> {
         let bin = std::env::var("CARGO_BIN_EXE_hf2q").unwrap_or_else(|_| {
             // Fallback when run outside cargo (e.g. cargo nextest). The env
             // var is the cargo-canonical lookup.
@@ -95,13 +122,17 @@ impl ServerGuard {
                 .to_string_lossy()
                 .into_owned()
         });
-        let child = Command::new(&bin)
-            .args([
-                "serve",
-                "--model", gguf,
-                "--host", HOST,
-                "--port", &PORT.to_string(),
-            ])
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "serve",
+            "--model", gguf,
+            "--host", HOST,
+            "--port", &PORT.to_string(),
+        ]);
+        if let Some(mp) = mmproj {
+            cmd.args(["--mmproj", mp]);
+        }
+        let child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -179,6 +210,25 @@ pub fn user_msg(text: &str) -> serde_json::Value {
 
 pub fn assistant_msg(text: &str) -> serde_json::Value {
     serde_json::json!({"role": "assistant", "content": text})
+}
+
+/// Build a user message whose `content` is the OpenAI multimodal parts
+/// array — `[{type:text,text:...}, {type:image_url,image_url:{url:...}}]`.
+/// This is the canonical Open WebUI shape for image upload (W79 iter-211).
+///
+/// `image_url` may be a `data:image/...;base64,...` data URI, a
+/// `file:///` URL, a bare absolute path, or `https://...`. Routing,
+/// scheme support, and per-scheme error taxonomy live in
+/// `src/inference/vision/mod.rs::parse_image_url` +
+/// `load_image_bytes` and `src/serve/api/handlers.rs::process_multimodal_content`.
+pub fn user_msg_with_image_url(text: &str, image_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+    })
 }
 
 /// GET `/v1/models` → canonical loaded model id.
@@ -452,6 +502,127 @@ pub async fn streaming_chat(
     // Stream ended without [DONE] — assertion harness will fail,
     // but return what we have for the diagnostic.
     (frames, accumulated_content)
+}
+
+/// Same wire-level transport as [`streaming_chat`] but parametric over
+/// `max_tokens` — needed when the test's image-aware response needs more
+/// than the 16-token cap baked into `streaming_chat` (W79 iter-211 vision
+/// scenario uses 32 tokens so the model has room to emit a peer-overlap
+/// word past the chat-template prefix).
+pub async fn streaming_chat_with_max_tokens(
+    model_id: &str,
+    messages: &[serde_json::Value],
+    max_tokens: u64,
+) -> (Vec<String>, String) {
+    use futures_util::StreamExt;
+
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": messages,
+        "stream": true,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SSE_READ_BUDGET_SECS))
+        .build()
+        .expect("build reqwest client");
+
+    let resp = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/chat/completions failed");
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into());
+        panic!(
+            "/v1/chat/completions stream status != 200: {status}; body={body_text}; \
+             request body sent={}",
+            serde_json::to_string(&body).unwrap_or_default()
+        );
+    }
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("text/event-stream"),
+        "Content-Type missing text/event-stream: {ct:?}"
+    );
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut frames: Vec<String> = Vec::new();
+    let mut accumulated_content = String::new();
+
+    while let Some(next) = stream.next().await {
+        let bytes = next.expect("SSE bytes_stream chunk error");
+        let s = std::str::from_utf8(&bytes).expect("SSE chunk not valid UTF-8");
+        buf.push_str(s);
+        loop {
+            let Some(end) = buf.find("\n\n") else { break };
+            let msg = buf[..end].to_string();
+            buf.drain(..end + 2);
+            for line in msg.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    frames.push(payload.to_string());
+                    if payload != "[DONE]" {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                            if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
+                                accumulated_content.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+            if frames.last().map(|s| s == "[DONE]").unwrap_or(false) {
+                return (frames, accumulated_content);
+            }
+        }
+    }
+
+    (frames, accumulated_content)
+}
+
+/// POST a chat-completions request and return `(http_status, parsed_json_body)`.
+/// Used to assert error-shape contracts (e.g. the `https://` and `image/webp`
+/// "intentionally unsupported" 400 responses for W79 iter-211's AC-3106
+/// scope companion tests).
+///
+/// Always sends `stream: false` since error bodies are JSON regardless of
+/// the request's stream flag — the handler short-circuits to ApiError
+/// before SSE setup.
+pub async fn nonstreaming_chat_status_and_body(
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SSE_READ_BUDGET_SECS))
+        .build()
+        .expect("build reqwest client");
+    let resp = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/chat/completions failed");
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "<unreadable body>".into());
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| {
+        serde_json::json!({"_unparsed_body": text})
+    });
+    (status, json)
 }
 
 pub async fn nonstreaming_chat(
