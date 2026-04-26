@@ -1930,6 +1930,30 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 102 — Phase 2c acceptance harness observability: `X-HF2Q-Soft-Tokens-Total` response header + `MatrixReport` extended with per-pair X-HF2Q-* header capture, hf2q stderr tail, mlx-vlm stderr tail, and HTTP status.  Plus `/readyz` polling timeout bumped 120 s → 600 s for cold-cache 26 B GGUF loads.  Without these, an "exact_match=false on every pair" outcome from the iter-101 matrix would be a coin-flip between "hf2q didn't see the image" and "hf2q saw the image but generated different tokens" — these fields turn divergence-triage into a seconds-long inspection of the JSON snapshot.**
+  - **What landed.**
+    - **`PreparedChatContext.vit_soft_tokens_total: Option<usize>`** — sum of `soft_tokens[i].range.len()` across all images.  Computed at the same point that `vit_forward_ms` / `vit_images` are populated.
+    - **`apply_vit_transparency_headers` extended** to emit `X-HF2Q-Soft-Tokens-Total` (no-op when `None`).  Now hf2q surfaces three vision-path triage headers on every successful chat completion: `X-HF2Q-ViT-Forward-Ms`, `X-HF2Q-ViT-Images`, `X-HF2Q-Soft-Tokens-Total`.  A divergence between hf2q's `Soft-Tokens-Total` and the reference `vision_soft_tokens_per_image × N_images` is the smoking gun for placeholder-text or N-tokens-per-image bugs.
+    - **`MatrixReport.hf2q_stderr_tail_8kb`** — last 8 KB of hf2q stderr captured via `Stdio::piped()` + `wait_with_output()` after the matrix completes.
+    - **`PairOutcome.hf2q_x_headers: BTreeMap<String, String>`** — every `X-HF2Q-*` response header from the per-pair POST.  Keyed lower-case for stable JSON ordering.
+    - **`PairOutcome.hf2q_http_status: String`** — "200 OK" / "400 Bad Request" / etc.  Non-200 surfaces in the report so a failed pair stands out.
+    - **`PairOutcome.mlx_vlm_stderr_tail_4kb: String`** — last 4 KB of `mlx_vlm.generate` stderr per pair.
+    - **Per-pair POST switched to `curl -i`** so headers + body land in stdout.  New helpers: `split_curl_response` (separates headers/body/status), `extract_x_hf2q_headers` (filters to the X-HF2Q-* prefix, case-insensitive, dropped malformed lines), `tail_bytes` (lossy UTF-8 conversion so any control bytes don't panic).
+    - **`/readyz` timeout 120 s → 600 s.**  Loading + warming up a 26 B-parameter Gemma 4 GGUF is on the multi-minute order on M5 Max (cold mmap fault-in + warmup pass through every kernel).
+  - **Tests added** (10 new in `vision_e2e_vs_mlx_vlm`, all GREEN):
+    - `split_curl_response_parses_well_formed_response` — happy path.
+    - `split_curl_response_falls_back_when_no_separator` — defensive on malformed.
+    - `split_curl_response_handles_400_status` — non-200 status line is preserved.
+    - `extract_x_hf2q_headers_filters_to_x_hf2q_prefix` — non-X-HF2Q headers excluded.
+    - `extract_x_hf2q_headers_case_insensitive_prefix_match` — uppercase / lowercase / mixed-case names all land.
+    - `extract_x_hf2q_headers_skips_malformed_lines` — lines without `:` are skipped.
+    - `tail_bytes_returns_last_n_bytes` — happy path.
+    - `tail_bytes_returns_full_buf_when_n_exceeds_len` — small buf.
+    - `tail_bytes_returns_empty_when_n_is_zero` — degenerate.
+    - `tail_bytes_handles_invalid_utf8_lossily` — control-byte safety.
+  - **Verification.** `cargo test --release --test vision_e2e_vs_mlx_vlm` → **19/19 PASS** (10 new + 9 existing).  `cargo test --release -- serve` → **284/284 PASS** (no regression on iter-99/100/101 vision soft-token path).  `cargo check` → clean.
+  - **Iter-103 plan.**  Run the gated matrix once now that the report carries enough fields to triage divergences in seconds: `HF2Q_VISION_E2E=1 cargo test --release --test vision_e2e_vs_mlx_vlm vision_e2e_matrix_against_mlx_vlm`.  Inspect `tests/fixtures/vision/last_e2e_report.json` — if exact-match < 25, the new `hf2q_x_headers` + `hf2q_stderr_tail_8kb` fields disambiguate the failure mode (missing image, wrong N tokens, ViT NaN, etc.).  Replace the iter-101 permissive `assert!(!report.pairs.is_empty(), …)` with `exact_matches >= K` calibrated against the captured baseline.
+
 - **2026-04-25 loop iter 101 — Phase 2c acceptance harness: `tests/vision_e2e_vs_mlx_vlm.rs` wires the iter-99 acceptance bar (hf2q vision output matches mlx-lm Gemma 4 vision on 5 prompts × 5 images at T=0) as an integration test gated behind `HF2Q_VISION_E2E=1`. Default `cargo test` runs no model — only the cheap path (4 mlx-vlm-output extractor tests + 3 fixture-array invariants + 1 fixture-PNG round-trip + 1 gated-test-skip-noop) fires.**
   - **What landed.**
     - **5 standard prompts** (color, caption, OCR, count-shapes, light-vs-dark) — short + closed-ended so token-level comparison against mlx-vlm is feasible.
