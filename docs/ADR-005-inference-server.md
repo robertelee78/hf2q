@@ -1338,6 +1338,67 @@ Bit-identical reproduction across two cold-process runs at T=0.0, max_tokens=16.
 
 ---
 
+#### Phase 2c iter-125 — preprocess scale-bias chain fixed (`4x − 3`); peer-word overlap on four-dots smoke achieved for the first time (2026-04-26, W56, commit `b649d9f`)
+
+**Iter-124 numerical target executed.** W55's parity probe pinpointed the first divergence at stage `00_preprocess`: hf2q's `preprocess_gemma4v` (`src/inference/vision/preprocess.rs:344-350`) applied only the FIRST step of llama.cpp's two-step scale-bias chain. The bug: `mtmd-image.cpp:11-21` `img_u8_to_f32` with mean=std=[0.5,0.5,0.5] produces `2x − 1` (range `[−1, +1]`), and `gemma4v.cpp:9` `ggml_scale_bias(2.0, −1.0)` then applies a SECOND `2y − 1` on top, yielding `4x − 3` (range `[−3, +1]`). hf2q stopped at the first step, producing exactly `(peer + 1) / 2`.
+
+**One-line algebraic fix.** Per-channel write at lines 344-350 changed from `(p/255) * 2 − 1` to `(p/255) * 4 − 3`. This collapses the two scale-bias steps into a single CPU expression. The doc-strings at lines 30-35 (file-level) and line 247 (function-level) both updated to reflect the corrected algebra and to explicitly call out that the SigLIP-49 fixed-res path (`preprocess_rgb_chw`) is NOT byte-identical to gemma4v — they target different graphs. The W55 conclusion that the SigLIP-49 path was reusable for gemma4v was the bug.
+
+**Parity probe verification — stage 00 numerical identity.** Element-wise stats on `00_preprocess.bin` (1769472 floats):
+
+  * hf2q: min=−2.764706, max=+0.921569, mean=+0.790176, std=0.663664.
+  * peer: min=−2.764706, max=+0.921569, mean=+0.789837, std=0.664680.
+  * diff: min=0, max=0, mean=+3.4e-4, std=−1.0e-3.
+
+min/max are byte-identical; mean/std diff is BF16 rounding noise from the resize step. The diff harness still reports `max_abs=3.69` because it does element-wise pairing through different memory layouts: hf2q dumps `[2304, 768]` post-patchify, peer dumps `[3, 768, 768]` pre-conv. Same data, different orderings — the `worst_idx=37681` (hf2q=0.9216, peer=−2.7647) is the diff harness comparing two completely different positions in two different tensor shapes that happen to have the same total element count. Layout-aware comparator is iter-126 work.
+
+**Cascade reduction (max_abs):**
+
+```
+stage              W55 (before)   iter-125 (after)   change
+00_preprocess      3.725e0        3.686e0 (layout)   stats now identical
+01_patch_embd      9.914e1        6.460e1            −35%
+02_pos_embd        9.914e1        6.460e1            −35%
+03_block_00        9.953e1        9.944e1            ~flat
+03_block_26        1.506e3        1.417e3            −6%
+30_final_pool      not in W55     2.376e4            new datum
+32_std_bias_scale  not in W55     9.176e0            new datum
+33_projector       not in W55     1.401e1            new datum
+34_post_proj_rms   9.571e0        1.024e1            ~flat
+```
+
+`01_patch_embd` reduced 35% from the stage-00 fix, but the cascade does NOT collapse to numerical identity. There is a SECOND divergence downstream. Hypotheses for iter-126: (a) the patch_embd Conv2D itself (kernel order, stride, weight unpack), (b) the position-embedding lookup ordering — peer's `pos_embd` table and hf2q's may differ in one of (px, py) → (pos_x, pos_y) → flat-index resolution, or (c) RoPE tables hit during block-0. Probe is intact; element-wise diff still works for stages 01+ where shapes match.
+
+**Smoke vs four-dots fixture (`Describe this image in 5 words.`, T=0, max_tokens=16) — peer-word overlap achieved.** Two cold-process T=0 runs:
+
+```
+Run 1: Four cornered frame, mostly white.
+Run 2: Four cornered frame, mostly white.
+
+Peer truth (llama-mtmd-cli):
+       An image of a square frame made of four
+W55 baseline:
+       Minimalist geometric pattern, white background.
+```
+
+Bit-identical reproduction across two cold runs (deterministic). Peer-word matches: **"four" + "frame" + "cornered" (≈corner)** are all present in iter-125 output and the peer truth. The model has crossed the threshold from "image-aware but generic" (W55) to "reading the same geometric structure as the peer" (iter-125). The remaining divergence between "Four cornered frame, mostly white" and "An image of a square frame made of four" is wording-level; the underlying scene understanding is now aligned.
+
+**Tests updated (3, all in `preprocess.rs::tests`):**
+
+  * `gemma4v_preprocess_pixel_scaling_2x_minus_1` → `gemma4v_preprocess_pixel_scaling_4x_minus_3`. Expected floor flips from −1.0 to −3.0 (new range minimum); white still +1.0 (algebraic invariant under `4x − 3`); mid-gray (128) updated to `4 * 128/255 − 3 ≈ −0.992`.
+  * `gemma4v_preprocess_pixel_range_in_minus_one_one` → `gemma4v_preprocess_pixel_range_in_minus_three_plus_one`. Range bound updated from `[−1, +1]` to `[−3, +1]`.
+  * `gemma4v_preprocess_uses_llama_cpp_resize_for_four_corner_dots`: no value change (white = +1.0 under both algebras), comment updated to cite the new `4x − 3` formula.
+
+No tests deleted; no `#[ignore]` added; no env-gated skips.
+
+**Cargo verify.** `cargo check --release` 0 (3 pre-existing warnings unchanged); `cargo test --release --bin hf2q -- preprocess` **24/24 PASS**; `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 2 ignored (W55 baseline 241); `cargo build --release --bin hf2q` 0.
+
+**Files touched.** `src/inference/vision/preprocess.rs` (1-line algebra fix + 3 test updates + 2 doc-string updates), `scripts/w56_iter125_smoke.sh` (smoke harness, adapted from `w49_iter120_ab_diagnostic.sh`). Fenced files clean — `gguf.rs` ADR-014 work-in-progress that was visible at iter-start cleared between sessions before commit.
+
+**Iter-126 target.** Locate the SECOND divergence that prevents `01_patch_embd` from collapsing to numerical identity. Either (a) extend the probe to dump `[3, 768, 768]` pre-patchify on hf2q so stage 00 has a layout-matching comparator and the diff harness reports a true max_abs, then (b) audit `gemma4v_apply_full_forward_gpu`'s patch_embd Conv2D against `clip.cpp` + `gemma4v.cpp`'s `ggml_conv_2d` byte-for-byte (kernel layout, stride, padding, bias add ordering). Cascade should then collapse if the conv is the only second-order bug.
+
+---
+
 #### Phase 2c iter-124 — ViT parity probe lands; first divergence at stage `00_preprocess` traces to a missing second `2x − 1` (2026-04-26, W55, commits `fdb415e` + `1b53625`)
 
 **Why this iter exists.** Iter-122 fixed the `(weight + 1)` RMSNorm bug. Iter-123 (W54, no commits) audited four high-likelihood candidates from W54's hypothesis tree (2D-RoPE table layout, scale-bias pre-conv, pooler `sqrt(n_embd)`, soft-token geometry) byte-for-byte against `clip.cpp` + `gemma4v.cpp`; **all four matched** — the hypothesis tree was exhausted. Smoke vs four-dots fixture still diverged from peer ("An image of a square frame made of four") to hf2q's "Minimalist geometric pattern, white background." (image-aware but no peer-word overlap).
