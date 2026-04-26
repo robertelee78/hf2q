@@ -61,7 +61,77 @@ pub fn hf_vit_name_to_gguf(hf_name: &str) -> Option<String> {
         }
     }
 
-    // -- Per-layer ViT encoder tensors -----------------------------------
+    // -- Qwen3.6 ViT family (PROJECTOR_TYPE_QWEN3VL) ---------------------
+    //
+    // Real Qwen3.6 multimodal models use a different namespace from
+    // Gemma's CLIP-style:
+    //   HF: model.visual.{blocks.{N}.{component}, patch_embed.*, pos_embed.*, merger.*}
+    //   GGUF: v.{blk.{N}.{...}, patch_embd.*, position_embd.*, mm.{0,2}.*}
+    //
+    // Tensor name conventions transcribed from
+    // /opt/llama.cpp/tools/mtmd/clip-impl.h:
+    //   TN_ATTN_QKV   = "%s.blk.%d.attn_qkv.%s"  (fused QKV — no split)
+    //   TN_ATTN_OUTPUT = "%s.blk.%d.attn_out.%s"
+    //   TN_FFN_UP     = "%s.blk.%d.ffn_up.%s"
+    //   TN_FFN_DOWN   = "%s.blk.%d.ffn_down.%s"
+    //   TN_LN_1/2     = "%s.blk.%d.ln{1,2}.%s"
+    //   TN_LLAVA_PROJ = "mm.%d.%s"  (Qwen3VL projector uses mm.0 + mm.2)
+    //   TN_MM_INP_NORM = "mm.input_norm.weight"
+    //   TN_PATCH_EMBD  = "v.patch_embd.weight"  (first temporal slice)
+    //   TN_PATCH_EMBD_1 = "v.patch_embd.weight.1"  (second temporal slice)
+    //   TN_PATCH_BIAS  = "v.patch_embd.bias"
+    //   TN_POS_EMBD    = "v.position_embd.weight"
+    //
+    // Note: patch_embed.proj.weight is 5-D `[out, in, temporal=2, H, W]`
+    // for Qwen3VL — caller must split along axis 2 into two 4-D tensors
+    // and emit both as `v.patch_embd.weight` + `v.patch_embd.weight.1`.
+    // This function returns the canonical "first slice" name when given
+    // the 5-D tensor; the splitting logic lives in the convert pipeline.
+    if let Some(rest) = hf_name.strip_prefix("model.visual.blocks.") {
+        let (layer_str, suffix) = rest.split_once('.')?;
+        let l: usize = layer_str.parse().ok()?;
+        let blk = format!("v.blk.{}", l);
+        let mapped = match suffix {
+            "attn.qkv.weight"     => Some(format!("{}.attn_qkv.weight", blk)),
+            "attn.qkv.bias"       => Some(format!("{}.attn_qkv.bias", blk)),
+            "attn.proj.weight"    => Some(format!("{}.attn_out.weight", blk)),
+            "attn.proj.bias"      => Some(format!("{}.attn_out.bias", blk)),
+            "mlp.linear_fc1.weight" => Some(format!("{}.ffn_up.weight", blk)),
+            "mlp.linear_fc1.bias"   => Some(format!("{}.ffn_up.bias", blk)),
+            "mlp.linear_fc2.weight" => Some(format!("{}.ffn_down.weight", blk)),
+            "mlp.linear_fc2.bias"   => Some(format!("{}.ffn_down.bias", blk)),
+            "norm1.weight"        => Some(format!("{}.ln1.weight", blk)),
+            "norm1.bias"          => Some(format!("{}.ln1.bias", blk)),
+            "norm2.weight"        => Some(format!("{}.ln2.weight", blk)),
+            "norm2.bias"          => Some(format!("{}.ln2.bias", blk)),
+            _ => None,
+        };
+        return mapped;
+    }
+    // Qwen3.6 globals: patch_embed, pos_embed, merger.
+    static QWEN36_GLOBAL_MAP: &[(&str, &str)] = &[
+        // patch_embed: 5-D [out, in, T=2, H, W] needs caller-side split
+        // along T. We return the canonical first-slice name; pipeline
+        // also emits the `.1` suffixed second slice.
+        ("model.visual.patch_embed.proj.weight", "v.patch_embd.weight"),
+        ("model.visual.patch_embed.proj.bias",   "v.patch_embd.bias"),
+        ("model.visual.pos_embed.weight",        "v.position_embd.weight"),
+        // PROJECTOR_TYPE_QWEN3VL uses mm.0 + mm.2 (linear_fc1, linear_fc2).
+        ("model.visual.merger.linear_fc1.weight", "mm.0.weight"),
+        ("model.visual.merger.linear_fc1.bias",   "mm.0.bias"),
+        ("model.visual.merger.linear_fc2.weight", "mm.2.weight"),
+        ("model.visual.merger.linear_fc2.bias",   "mm.2.bias"),
+        // Qwen3.6 ViT pre-merger norm — maps to TN_MM_INP_NORM family.
+        ("model.visual.merger.norm.weight", "mm.input_norm.weight"),
+        ("model.visual.merger.norm.bias",   "mm.input_norm.bias"),
+    ];
+    for (hf, gguf) in QWEN36_GLOBAL_MAP {
+        if hf_name == *hf {
+            return Some((*gguf).to_string());
+        }
+    }
+
+    // -- Per-layer ViT encoder tensors (Gemma CLIP-style) ----------------
     // HF: "model.vision_tower.encoder.layer.{L}.{component}.weight"
     // GGUF: "v.blk.{L}.{mapped}.{weight,bias}"
     if let Some(rest) = hf_name.strip_prefix("model.vision_tower.encoder.layer.") {
@@ -151,6 +221,34 @@ pub fn load_vision_tensors(
 
     let mut out: HashMap<String, VitTensor> = HashMap::new();
     for (name, tensor) in tensor_map.iter() {
+        // Special case: Qwen3.6 patch_embed.proj.weight is 5-D
+        // [out, in, T=2, H, W]. llama.cpp's qwen3vl clip graph
+        // expects two separate 4-D conv weights (one per temporal
+        // frame), named `v.patch_embd.weight` and
+        // `v.patch_embd.weight.1`. Split here.
+        if name == "model.visual.patch_embed.proj.weight" && tensor.shape.len() == 5 {
+            let (slice0, slice1) = split_qwen3vl_patch_embed_temporal(tensor)?;
+            out.insert(
+                "v.patch_embd.weight".to_string(),
+                VitTensor {
+                    gguf_name: "v.patch_embd.weight".to_string(),
+                    shape: slice0.0,
+                    dtype: DType::F16,
+                    data: slice0.1,
+                },
+            );
+            out.insert(
+                "v.patch_embd.weight.1".to_string(),
+                VitTensor {
+                    gguf_name: "v.patch_embd.weight.1".to_string(),
+                    shape: slice1.0,
+                    dtype: DType::F16,
+                    data: slice1.1,
+                },
+            );
+            continue;
+        }
+
         if let Some(gguf_name) = hf_vit_name_to_gguf(name) {
             let data = ensure_f16_bytes(tensor)?;
             out.insert(
@@ -165,6 +263,109 @@ pub fn load_vision_tensors(
         }
     }
     Ok(out)
+}
+
+/// Split Qwen3.6 ViT 5-D patch_embed weight `[out, in, T, H, W]` along
+/// the temporal dim into two 4-D tensors `[out, in, H, W]` and convert
+/// each to F16 bytes. Returns `((shape, bytes), (shape, bytes))` —
+/// first temporal slice and second.
+///
+/// Layout assumption (row-major contiguous, outer-first):
+///   src[o, i, t, h, w] at byte offset
+///     ((o * I + i) * T + t) * H * W * elem_size + (h * W + w) * elem_size
+/// where I = in_channels, T = 2 (temporal frames), H = W = patch_size.
+fn split_qwen3vl_patch_embed_temporal(
+    tensor: &TensorRef,
+) -> Result<(
+    (Vec<usize>, Vec<u8>),
+    (Vec<usize>, Vec<u8>),
+), VitConvertError> {
+    if tensor.shape.len() != 5 {
+        return Err(VitConvertError::Safetensors(
+            "patch_embed.proj.weight (expected 5-D)".to_string(),
+        ));
+    }
+    let out = tensor.shape[0];
+    let inp = tensor.shape[1];
+    let t = tensor.shape[2];
+    let h = tensor.shape[3];
+    let w = tensor.shape[4];
+    if t != 2 {
+        return Err(VitConvertError::Safetensors(format!(
+            "patch_embed.proj.weight: expected temporal=2, got {}",
+            t
+        )));
+    }
+    let elem_size = tensor.dtype.element_size();
+    // Source offset for src[o, i, t, h, w]:
+    //   ((o * inp + i) * t + t_idx) * h * w + (h_idx * w + w_idx)
+    // We only need the per-(o,i,t) row stride (h*w elements).
+    let hw_bytes = h * w * elem_size;
+
+    let mut s0_bytes = Vec::with_capacity(out * inp * h * w * elem_size);
+    let mut s1_bytes = Vec::with_capacity(out * inp * h * w * elem_size);
+
+    for o in 0..out {
+        for i in 0..inp {
+            // src offset for (o, i, 0, ...): ((o * inp + i) * 2 + 0) * h * w
+            let off0 = ((o * inp + i) * t + 0) * hw_bytes;
+            let off1 = ((o * inp + i) * t + 1) * hw_bytes;
+            s0_bytes.extend_from_slice(&tensor.data[off0..off0 + hw_bytes]);
+            s1_bytes.extend_from_slice(&tensor.data[off1..off1 + hw_bytes]);
+        }
+    }
+
+    // Cast to F16 if not already.
+    let s0_f16 = match tensor.dtype {
+        DType::F16 => s0_bytes,
+        DType::BF16 => bf16_bytes_to_f16(&s0_bytes),
+        DType::F32 => f32_bytes_to_f16(&s0_bytes),
+        _ => return Err(VitConvertError::Safetensors(format!(
+            "patch_embed.proj.weight: unsupported dtype {:?}",
+            tensor.dtype
+        ))),
+    };
+    let s1_f16 = match tensor.dtype {
+        DType::F16 => s1_bytes,
+        DType::BF16 => bf16_bytes_to_f16(&s1_bytes),
+        DType::F32 => f32_bytes_to_f16(&s1_bytes),
+        _ => unreachable!(), // covered above
+    };
+
+    let split_shape = vec![out, inp, h, w];
+    Ok((
+        (split_shape.clone(), s0_f16),
+        (split_shape, s1_f16),
+    ))
+}
+
+fn bf16_bytes_to_f16(input: &[u8]) -> Vec<u8> {
+    let n = input.len() / 2;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let bf = u16::from_le_bytes([input[i * 2], input[i * 2 + 1]]);
+        let f32_bits = (bf as u32) << 16;
+        let f = f32::from_bits(f32_bits);
+        let h = half::f16::from_f32(f);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out
+}
+
+fn f32_bytes_to_f16(input: &[u8]) -> Vec<u8> {
+    let n = input.len() / 4;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let f = f32::from_le_bytes([
+            input[i * 4],
+            input[i * 4 + 1],
+            input[i * 4 + 2],
+            input[i * 4 + 3],
+        ]);
+        let h = half::f16::from_f32(f);
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

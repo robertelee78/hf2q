@@ -211,9 +211,16 @@ impl OutputBackend for GgufBackend {
         // text model loader rejects the file with "wrong number of tensors".
         let mut tensor_names: Vec<&String> = model.tensors.keys()
             .filter(|name| {
-                // Skip vision/audio tensors — they belong in a separate mmproj GGUF
+                // Skip vision/audio tensors — they belong in a separate mmproj GGUF.
+                // Three namespace conventions seen in the wild:
+                //   - Gemma:    model.vision_tower.* + model.embed_vision.*
+                //   - Qwen3.6:  model.visual.*   (real-model finding 2026-04-25)
+                //   - Audio:    model.audio_tower.*
                 let n = name.as_str();
-                !(n.contains("vision_tower") || n.contains("embed_vision") || n.contains("audio_tower"))
+                !(n.contains("vision_tower")
+                    || n.contains("embed_vision")
+                    || n.contains("audio_tower")
+                    || n.contains("model.visual."))
             })
             .collect();
         tensor_names.sort();
