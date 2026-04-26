@@ -736,6 +736,22 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .context("ADR-012 P9b: intermediate F16 GGUF emission failed")
                     .map_err(AppError::Conversion)?;
 
+                    // ADR-012 P9b apex MoE OOM mitigation (cost-model
+                    // candidate #3, 2026-04-25): swap tensor_map out for an
+                    // empty placeholder across the capture call so the
+                    // F32-expanded Qwen35Model (~128 GB MoE params) doesn't
+                    // have to coexist with tensor_map (~70 GB BF16) on a
+                    // 128 GB system. Re-read the safetensors after capture
+                    // (~30s I/O cost) and re-apply Phases 1.4 + 1.45 + 1.6 +
+                    // 1.7 transforms (idempotent — same input produces same
+                    // tensor_map). The placeholder lets `tensor_map` stay
+                    // in-scope for the downstream Phase 4.x usage.
+                    let _drop_for_capture = std::mem::replace(
+                        &mut tensor_map,
+                        ir::TensorMap::new(),
+                    );
+                    drop(_drop_for_capture);
+
                     let mut capture =
                         inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
                             &intermediate_path,
@@ -748,20 +764,92 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                         })?;
 
                     tracing::info!(
-                        "ADR-012 P9b: running activation-aware DWQ calibration"
+                        "ADR-012 P9b: capturing activations from intermediate F16 GGUF"
                     );
-                    let model = quantize::dwq_activation::run_dwq_activation_calibration(
-                        &tensor_map,
+                    let derived_sensitive_ranges =
+                        quantize::dwq_activation::capture_activations_to_sensitive_ranges(
+                            &metadata,
+                            &dwq_config,
+                            &mut capture,
+                        )
+                        .context(
+                            "ADR-012 P9b: activation capture / sensitivity derivation failed",
+                        )
+                        .map_err(AppError::Conversion)?;
+
+                    drop(capture); // release Qwen35Model (~128 GB for apex MoE) ASAP
+                    drop(intermediate_dir); // RAII cleanup of tempdir
+
+                    // Re-read tensor_map from safetensors and re-apply the
+                    // qwen35 normalization + transform phases. All
+                    // transforms are idempotent (input safetensors haven't
+                    // changed), so the result is byte-equivalent to the
+                    // tensor_map we just dropped.
+                    tracing::info!(
+                        "ADR-012 P9b: re-reading tensor_map for DWQ pass after capture"
+                    );
+                    let (_, mut tensor_map_re) =
+                        input::read_model(&config.input_dir, &progress)
+                            .context("ADR-012 P9b: re-read of model after capture failed")
+                            .map_err(AppError::Conversion)?;
+
+                    // Re-apply the same qwen35 normalization the original
+                    // tensor_map went through (Phases 1.4 + 1.45 + 1.6 + 1.7).
+                    {
+                        let renames: Vec<(String, String)> = tensor_map_re
+                            .tensors
+                            .keys()
+                            .filter(|n| n.contains("language_model."))
+                            .map(|n| (n.clone(), n.replace("language_model.", "")))
+                            .collect();
+                        for (old_name, new_name) in renames {
+                            if let Some(mut tensor) = tensor_map_re.tensors.remove(&old_name) {
+                                tensor.name = new_name.clone();
+                                tensor_map_re.tensors.insert(new_name, tensor);
+                            }
+                        }
+                    }
+                    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
+                        &mut tensor_map_re,
                         &metadata,
-                        &dwq_config,
-                        &mut capture,
-                        &progress,
                     )
-                    .context("ADR-012 P9b: activation-aware DWQ calibration failed")
+                    .context("ADR-012 P9b: re-read fused gate_up split failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::moe::merge_moe_experts_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read MoE expert merge failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read RMS+1 transform failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read linear-attn transforms failed")
                     .map_err(AppError::Conversion)?;
 
-                    drop(capture); // release Qwen35Model (~30 GB for apex) ASAP
-                    drop(intermediate_dir); // RAII cleanup of tempdir
+                    tracing::info!(
+                        "ADR-012 P9b: running DWQ scale calibration with {} activation-derived sensitive layer ranges",
+                        derived_sensitive_ranges.len()
+                    );
+                    let model = quantize::dwq_activation::run_dwq_with_sensitive_ranges(
+                        &tensor_map_re,
+                        &metadata,
+                        &dwq_config,
+                        derived_sensitive_ranges,
+                        &progress,
+                    )
+                    .context("ADR-012 P9b: DWQ scale calibration failed")
+                    .map_err(AppError::Conversion)?;
+                    // Re-bind tensor_map to the re-read version for the
+                    // downstream Phase 4.x bit-overrides + write path.
+                    tensor_map = tensor_map_re;
                     model
                 } else {
                     tracing::info!(

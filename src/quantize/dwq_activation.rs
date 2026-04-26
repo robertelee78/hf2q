@@ -58,6 +58,13 @@ use super::sensitivity::{allocate_bits_by_sensitivity, compute_layer_sensitivity
 ///
 /// Wired through `src/main.rs` for qwen35/qwen35moe DWQ as of P9b.3b
 /// (commit landing this fn into the convert-pipeline two-pass branch).
+///
+/// Single-shot wrapper that captures activations + runs DWQ in one call.
+/// Convenient for unit tests; production main.rs uses the split helpers
+/// `capture_activations_to_sensitive_ranges` + `run_dwq_with_sensitive_ranges`
+/// to enable tensor_map drop+reread across the capture call (apex MoE
+/// OOM mitigation, cost-model candidate #3).
+#[allow(dead_code)]
 pub fn run_dwq_activation_calibration(
     tensor_map: &TensorMap,
     metadata: &ModelMetadata,
@@ -73,8 +80,44 @@ pub fn run_dwq_activation_calibration(
         "Activation-aware DWQ calibration starting"
     );
 
-    // Step 1: generate calibration tokens (deterministic — same path as
-    // weight-space calibration).
+    // Capture activations and derive sensitive ranges via the public
+    // helper (split for OOM-mitigation use cases — see
+    // `capture_activations_to_sensitive_ranges` doc).
+    let derived_sensitive_ranges =
+        capture_activations_to_sensitive_ranges(metadata, config, capture)?;
+
+    // Build derived DwqConfig + delegate to the internal calibration entry.
+    let derived_config = DwqConfig {
+        sensitive_layers: derived_sensitive_ranges,
+        ..config.clone()
+    };
+    return run_dwq_calibration_internal(tensor_map, metadata, &derived_config, progress);
+}
+
+/// **Capture activations and derive sensitive layer ranges** — the
+/// memory-heavy half of activation calibration, split out so that the
+/// caller can drop the tensor_map across the capture call (cost-model
+/// OOM-mitigation candidate #3, required for apex MoE which needs F32-
+/// expanded `Moe` variant ~128 GB plus tensor_map ~70 GB > 128 GB
+/// system RAM).
+///
+/// Use pattern (apex MoE):
+///   - emit_gguf_from_tensor_map(&tensor_map, …)   // hold tensor_map
+///   - drop(tensor_map);                          // free ~70 GB
+///   - let ranges = capture_activations_to_sensitive_ranges(…)?;
+///   - drop(capture);                             // free ~128 GB Qwen35Model
+///   - re-read tensor_map from safetensors + reapply qwen35 transforms
+///   - run_dwq_with_sensitive_ranges(&tensor_map, …, ranges, …)
+///
+/// Memory peak bounded by `tensor_map.len() + Qwen35Model.len()` only
+/// during the capture phase — never both simultaneously with the held
+/// tensor_map.
+pub fn capture_activations_to_sensitive_ranges(
+    metadata: &ModelMetadata,
+    config: &DwqConfig,
+    capture: &mut dyn ActivationCapture,
+) -> Result<Vec<std::ops::RangeInclusive<usize>>, DwqError> {
+    // Step 1: generate calibration tokens.
     let calibration_tokens =
         generate_calibration_tokens(config.calibration_samples, metadata.vocab_size as u32);
     if calibration_tokens.is_empty() {
@@ -144,19 +187,27 @@ pub fn run_dwq_activation_calibration(
         midpoint
     );
 
-    let derived_sensitive_ranges = indices_to_ranges(&sensitive_indices);
+    Ok(indices_to_ranges(&sensitive_indices))
+}
 
-    // Step 5: build a derived DwqConfig with the activation-derived
-    // sensitive layers. Everything else (group_size, bit pair, arch) is
-    // preserved.
+/// Run weight-space DWQ calibration **after** activation-derived
+/// sensitive ranges are already computed (paired with
+/// `capture_activations_to_sensitive_ranges`). Lets the caller drop the
+/// capture state (and tensor_map) before invoking the closed-form scale
+/// optimization step. Same downstream as `run_dwq_activation_calibration`'s
+/// trailing half — bypasses the Decision-13 no-fallback guard because
+/// the activation contract has been satisfied upstream.
+pub fn run_dwq_with_sensitive_ranges(
+    tensor_map: &TensorMap,
+    metadata: &ModelMetadata,
+    config: &DwqConfig,
+    sensitive_ranges: Vec<std::ops::RangeInclusive<usize>>,
+    progress: &ProgressReporter,
+) -> Result<QuantizedModel, DwqError> {
     let derived_config = DwqConfig {
-        sensitive_layers: derived_sensitive_ranges,
+        sensitive_layers: sensitive_ranges,
         ..config.clone()
     };
-
-    // Step 6: delegate to the internal calibration entry (bypasses the
-    // Decision-13 no-fallback guard because the contract has just been
-    // satisfied).
     run_dwq_calibration_internal(tensor_map, metadata, &derived_config, progress)
 }
 
