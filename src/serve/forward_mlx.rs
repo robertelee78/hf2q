@@ -532,9 +532,20 @@ pub struct MlxModelWeights {
     /// Increments on every successful `forward_decode`.  The audit-binary
     /// contract (`iter25_audit.rs::parse_nll_values`) sorts by `step=`,
     /// so a monotonic 0-based counter is the right shape.  Reset to 0
-    /// at construction; iter-108b's runtime regime toggle also resets
-    /// it between regimes.
+    /// at construction; [`MlxModelWeights::set_decode_regime`] also resets
+    /// it between regimes for Gate H two-regime-one-process runs.
     pub decode_step: u64,
+    /// ADR-007 Gate H per-call regime override (W12 iter-108a blocker #3).
+    ///
+    /// Default value [`DecodeRegime::Default`] preserves today's env-var-only
+    /// path bit-exactly — the SDPA-mode gate reads `HF2Q_USE_DENSE` and
+    /// `HF2Q_LAYER_POLICY` exactly as it does on the iter-108a base
+    /// commit.  Set via [`MlxModelWeights::set_decode_regime`] to flip
+    /// between TQ-active and dense-active SDPA within a single process
+    /// (Gate H two-regime run); the setter also resets [`Self::decode_step`]
+    /// so each regime's stderr `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]` lines
+    /// start at `step=0`.
+    pub decode_regime: DecodeRegime,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -566,6 +577,49 @@ pub struct DenseKvBuffers {
     pub capacity: usize,
     /// True if this is a sliding layer (ring-buffer semantics).
     pub is_sliding: bool,
+}
+
+/// Per-call decode regime override for ADR-007 Gate H two-regime-one-process
+/// runs (W12 iter-108a blocker #3).
+///
+/// Set on `MlxModelWeights` before each prefill+decode trajectory via
+/// [`MlxModelWeights::set_decode_regime`].  Consulted at the SDPA-mode
+/// gate inside `forward_decode` (the `use_dense_sdpa` check); the four
+/// codebook-bits gates (`forward_mlx.rs:1100/1234`, `forward_prefill.rs:330`)
+/// stay env-var-driven because the codebook width is a representation
+/// choice that is consistent across both regimes (both regimes read the
+/// same KV format).  The four-gate lockstep contract (W9's mapping) is
+/// preserved: when `regime == Default`, every gate reads env exactly as
+/// it did on the iter-108a base commit; when `regime != Default`, only
+/// the SDPA-mode gate flips.
+///
+/// - `Default` (the zero value): preserve today's env-var behavior.
+/// - `ForceTq`: ignore env, behave as if `HF2Q_USE_DENSE` were unset and
+///   `HF2Q_LAYER_POLICY=tq_all` — TQ-active SDPA on every layer.
+/// - `ForceDense`: ignore env, behave as if `HF2Q_USE_DENSE=1` were set —
+///   dense-active SDPA on every layer.
+///
+/// Gate H uses one [`MlxModelWeights`] instance and runs (a) `set_decode_regime
+/// (ForceDense)` -> fresh `forward_prefill` + decode loop -> capture tokens
+/// + per-token NLL + SDPA-output dumps; then (b) `set_decode_regime
+/// (ForceTq)` -> fresh `forward_prefill` + decode loop with the same prompt
+/// -> cosine the SDPA outputs against (a)'s dump and PPL the NLLs.  The
+/// per-instance step counter is reset by `set_decode_regime` so each
+/// regime's `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]` lines start at `step=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeRegime {
+    /// Honor `HF2Q_USE_DENSE` / `HF2Q_LAYER_POLICY` env vars (today's path).
+    #[default]
+    Default,
+    /// Force TQ-active SDPA regardless of env.
+    /// (Wired by iter-108b's release-check.sh Gate 5 harness; no in-tree
+    /// caller as of iter-108a.)
+    #[allow(dead_code)]
+    ForceTq,
+    /// Force dense-active SDPA regardless of env.
+    /// (Wired by iter-108b's release-check.sh Gate 5 harness.)
+    #[allow(dead_code)]
+    ForceDense,
 }
 
 impl MlxModelWeights {
@@ -987,6 +1041,10 @@ impl MlxModelWeights {
             // forward_decode call, used by the `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]`
             // stderr lines (W12 iter-108a blocker #1).
             decode_step: 0,
+            // ADR-007 Gate H per-call regime override (W12 iter-108a blocker #3).
+            // Default == today's env-var-only path; setter flips it for two-
+            // regime-one-process release-check runs.
+            decode_regime: DecodeRegime::Default,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1008,6 +1066,37 @@ impl MlxModelWeights {
         }
 
         result
+    }
+
+    /// Set the decode regime for the next prefill+decode trajectory.
+    ///
+    /// ADR-007 Gate H (W12 iter-108a blocker #3) — flips the SDPA-mode
+    /// gate at `forward_mlx.rs::forward_decode` between TQ-active and
+    /// dense-active without re-loading the model from GGUF.  The four
+    /// codebook-bits gates (`forward_mlx.rs:1100/1234`, `forward_prefill
+    /// .rs:330`) are *not* affected by this setter — the codebook width
+    /// is a representation choice that stays consistent across both
+    /// regimes (Gate H runs both regimes on the same KV format).  Only
+    /// the SDPA-reader (the `use_dense_sdpa` gate) consults the override.
+    ///
+    /// Calling this also resets the per-instance step counter so each
+    /// regime's stderr `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]` lines start
+    /// at `step=0`, matching the audit-binary contract (every audit
+    /// invocation is a fresh process today).
+    ///
+    /// Default-mode behavior (i.e. `regime == DecodeRegime::Default`)
+    /// is *byte-identical* to today's env-var-only path — see the
+    /// `forward_mlx.rs::forward_decode` use_dense_sdpa gate for the
+    /// invariant.  Non-Default regimes ignore `HF2Q_USE_DENSE` and
+    /// `HF2Q_LAYER_POLICY` for the duration of the next decode loop.
+    ///
+    /// (Wired by iter-108b's release-check.sh Gate 5 harness; no in-tree
+    /// caller as of iter-108a — the surface is designed for the
+    /// iter-108b two-regime release-check entry point.)
+    #[allow(dead_code)]
+    pub fn set_decode_regime(&mut self, regime: DecodeRegime) {
+        self.decode_regime = regime;
+        self.decode_step = 0;
     }
 
     /// Run one decode step through mlx-native's GraphExecutor.
@@ -1893,22 +1982,43 @@ impl MlxModelWeights {
                 //   "dense_slide_tq_global"   = dense for sliding, TQ for global
                 //
                 // HF2Q_USE_DENSE=1 forces dense_all (explicit opt-out for byte-exact gates).
+                //
+                // W12 iter-108a blocker #3 (ADR-007 Gate H): per-call regime override
+                // consulted BEFORE the env vars.  When the regime is `DecodeRegime::Default`
+                // (the default for every existing call site), this path is bit-identical
+                // to today's env-var-only logic.  When the regime is `ForceDense` /
+                // `ForceTq`, the env vars are skipped entirely so a single process
+                // can run both regimes against the same prompt without subprocess
+                // fork.  The four-gate lockstep contract (W9's mapping —
+                // forward_mlx.rs:1100/1234/<this gate>, forward_prefill.rs:330) is
+                // preserved: only this SDPA-reader gate is overridden; the codebook-
+                // bits gates remain env-driven because the codebook width is a
+                // representation choice consistent across both regimes.  See
+                // `MlxModelWeights::set_decode_regime` for the contract.
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
-                } else if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
-                    true
                 } else {
-                    match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
-                        Ok("dense_all") => true,
-                        Ok("tq_all") | Err(_) => false,
-                        Ok("tq_slide_dense_global") => !kv_is_sliding,
-                        Ok("dense_slide_tq_global") => kv_is_sliding,
-                        Ok(other) => {
-                            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
+                    match self.decode_regime {
+                        DecodeRegime::ForceDense => true,
+                        DecodeRegime::ForceTq => false,
+                        DecodeRegime::Default => {
+                            if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
+                                true
+                            } else {
+                                match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
+                                    Ok("dense_all") => true,
+                                    Ok("tq_all") | Err(_) => false,
+                                    Ok("tq_slide_dense_global") => !kv_is_sliding,
+                                    Ok("dense_slide_tq_global") => kv_is_sliding,
+                                    Ok(other) => {
+                                        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                            eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
+                                        }
+                                        false
+                                    }
+                                }
                             }
-                            false
                         }
                     }
                 };
