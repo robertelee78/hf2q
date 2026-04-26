@@ -1131,6 +1131,26 @@ There was no `encoder.memory_barrier()` between (1) and (2). mlx-native uses `MT
 
 ---
 
+#### Phase 2c iter-118 — vision tests fully green; W25 kernel-registration omission closed (2026-04-25, W28)
+
+W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off by iter-117. **vision:: 233/233 PASS** (was 230/233); **gemma4v family 34/34 PASS**.
+
+**Diagnosis (Chesterton's fence read).** mlx-native's `KernelRegistry::register_source(name, msl_src)` maps a kernel name to its MSL source string; `dispatch_*` lookups resolve by name and compile-on-first-use. Each ops module exposes a `register(&mut registry)` helper that wires all of its named entry points (e.g. `mlx_native::ops::vision_2d_rope::register` registers both `vision_2d_rope_f32` and `vision_2d_rope_bf16`). The working `gemma4v_block_forward_gpu` test setup (vit_gpu.rs:6333) registered vision_2d_rope + gelu + gather explicitly; the W25 iter-115 (`3971878`) full-forward test setups (6638 + 6683) and the production helper `compute_vision_embeddings_gpu_gemma4v` (2049) only registered the SigLIP-shared trio (softmax + sigmoid_mul + register_vit_custom_shaders). When the synthetic full-forward fixture (n_x=6, n_y=6) actually ran the per-block GQA Q/K rotation, `vit_vision_2d_rope_gpu` panicked at first dispatch with `"Kernel not found: vision_2d_rope_f32"`.
+
+**Fix.** Self-register the three gemma4v-specific kernels (vision_2d_rope, gelu, gather) at the top of `gemma4v_apply_full_forward_gpu`. `register_source` is idempotent (overwrites prior registrations) so re-calling is harmless when a caller already registered them, and a single registration site now propagates the fix to every production + test call-site of the gemma4v full-forward — including `compute_vision_embeddings_gpu_gemma4v` which feeds `compute_vision_embeddings_gpu_dispatch`. The SigLIP-shared shaders remain caller-registered (they're shared with `apply_vit_full_forward_gpu`'s SigLIP path, so they live at the caller layer). mlx-native untouched — the kernel was correctly there since W24, the omission was at the hf2q call-site.
+
+**Verification (release build):**
+- `gemma4v_apply_full_forward_gpu_synthetic_n_36` PASS.
+- `gemma4v_apply_full_forward_gpu_synthetic_rectangular_n_54` PASS.
+- `compute_vision_embeddings_gpu_dispatch_gemma4v_routes_correctly` PASS.
+- `vision::` filter: 233 pass / 0 fail / 1 ignored (was 230 pass / 3 fail / 1 ignored on `ec4316a`).
+- `gemma4v` filter: 34 pass / 0 fail.
+- `cargo build --release --bin hf2q` clean.
+
+**Outstanding for iter-119 (W29):** the original iter-116 cross-compat smoke (mmproj llama.cpp parity bench, default-off scaffold landed in `d2afc6f`) + Gate H fixture capture under quiet host. Vision green-unblocks both.
+
+---
+
 #### Phase 2c iter-114 — 2D RoPE + per-block forward landed (2026-04-25, W24)
 
 W24 implemented the 2-D NeoX RoPE Metal kernel (in `mlx-native`) and the gemma4v per-block forward (in `hf2q`) per W22's iter-114 scope. All work is **sibling-only** — every existing SigLIP-49 function (`apply_vit_block_forward[_gpu]`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`) is unchanged.
