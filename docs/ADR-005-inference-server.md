@@ -1930,6 +1930,36 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 91 — Phase 2b padding-invariance gates at production seq_lens (32/64/128/256/512). All three day-one models PROVABLY stable across the full seq_len range: bge **0.00e0 drift** (bit-exact), mxbai **1.19e-7**, nomic-bert (flash-attn) **1.19e-7**. 1× the rounding-noise floor. Phase 2b certified shippable at production scales.**
+  - **What landed.**
+    - `bge_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512` (`bert_gpu.rs`) — embeds "hello world" padded to seq_len ∈ {32, 64, 128, 256, 512}, verifies cosine vs the seq_len=32 baseline ≥ 0.99999 across all pairs.  Validates the pre-iter-90 `bert_attention_with_mask_gpu` 8-stage chain at production seq_lens.
+    - `mxbai_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512` — same contract for the 24-layer / hidden=1024 / 16-head BERT-lane stack.
+    - `full_forward_padding_invariance_at_seq_lens_32_64_128_256_512` (`nomic_bert/forward.rs`) — same contract for the iter-90 flash-attn-d64 SeqMajor path.  Catches mask-leak, flash-attn long-seq instability, and pooling-divisor bugs that the seq_len=32-only ground-truth tests can't surface.
+    - Pre-iter-90 synthetic-config tests updated to reflect iter-90's tightened `head_dim == 64` precondition: `synthetic_min_cfg` now produces `hidden_size=128 / heads=2 / head_dim=64` (was `hidden_size=64 / heads=2 / head_dim=32`).  The pre-iter-90 `full_forward_rejects_seq_len_below_floor` test (which validated the now-removed `seq_len ≥ 32` tile-K floor) is replaced by `full_forward_rejects_non_64_head_dim` (which validates the new `head_dim == 64` flash-attn instantiation contract).
+  - **Numbers.**
+    ```
+                                         drift (gate: 1e-5)
+    bge-small-en-v1.5    (BERT, CLS):    0.00e0    bit-exact across all 5 seq_lens
+    mxbai-embed-large-v1 (BERT, CLS):    1.19e-7   8e3× tighter than gate
+    nomic-embed-text-v1.5 (FA d=64, M):  1.19e-7   8e3× tighter than gate
+    ```
+    bge being bit-exact is expected: CLS pool reads row 0 only, and the BERT-lane attention's mask path correctly zeroes out padded contributions to row 0 at every seq_len.  The 1.19e-7 drift on mxbai/nomic-bert is exactly the IEEE-754 rounding floor for f32 dot products of 1024/768-element unit vectors — there is no recoverable signal below that.
+  - **What this certifies.**
+    1. Flash-attn `bf16_d64` SeqMajor (iter-90) is numerically stable across seq_lens 32 → 512 — no NaN propagation, no scale blowup of the running max/sum, no precision degradation as kL grows.
+    2. The BF16 `[seq_len, seq_len]` padding mask built by `alloc_nomic_attn_mask_bf16` (iter-90) and the F32 mask built by `alloc_bert_attention_mask` (BERT lane) both correctly broadcast to all heads and zero-out padded contributions at every seq_len.
+    3. Mean pooling divides by `valid_token_count` (4 for "hello world"), not `seq_len` — the pre-iter-72 bug where `seq_len` was used has stayed fixed.
+    4. The `bert_attention_with_mask_gpu` pre-iter-90 path remains correct at production seq_lens (the 1024-element matmul, `vit_softmax_last_dim_gpu`, and the V-permute/transpose chain are all stable).
+  - **Cosine parity (re-verified iter-91).** All three day-one ground-truth gates still pass:
+    ```
+    bge-small-en-v1.5     0.999985  (unchanged from iter-90)
+    mxbai-embed-large-v1  0.999988  (unchanged from iter-90)
+    nomic-embed-text-v1.5 0.999960  (unchanged from iter-90)
+    ```
+  - **Verification.** `cargo test --release --bin hf2q -- nomic_bert bert_gpu --test-threads=1` → **56/56 passed, 0 failed, 1 ignored** (the `forward_timing_10x_warm` perf test).  The 3 padding-invariance tests run in 0.75 s combined.
+  - **Lane discipline.** Edits in two test sections only: `bert_gpu.rs::tests` (+ 201 LOC, two new tests for bge / mxbai) and `nomic_bert/forward.rs::tests` (+ ~150 LOC: one new padding-invariance test + 2 updated tests for iter-90's tightened preconditions).  Zero non-test code changed.
+  - **Phase 2b status: SHIPPABLE.** All three day-one BERT-family models are correctness-validated at the seq_len=32 ground-truth gate AND padding-invariant across seq_lens 32-512.  Iter-90 perf delivered 1.34× HTTP ratio vs llama.cpp.  No known bugs.  The remaining "iter-92+ candidate" work (BF16-output matmul to drop Q/K/V casts, BERT-lane flash-attn port) are pure perf optimizations, not correctness blockers.
+  - **Next (iter 92):** pivot from Phase 2b perf into the Phase 2a unblockers.  The chat-model lane refactor (forward_embed hook + worker channel + handler dispatch) opens task #8 (chat-model pooled embeddings) — and the same forward_embed hook is also the first step toward task #15 / #17 (vision soft-token injection).  Lower-risk first move: add a pooled embedding path to `MlxModelWeights` that does not require the full engine-channel refactor (i.e. `forward_embed(prompt_tokens, &mut GpuContext) -> Result<Vec<f32>>` as a peer of `forward_prefill`), then expose via a separate `EmbeddingArch::ChatModel` variant in state.rs.
+
 - **2026-04-25 loop iter 90 — Flash Attention port for nomic-bert (head_dim=64). New mlx-native v0.4.5 dispatcher `flash_attn_prefill_bf16_d64` with `FlashAttnPrefillLayout::SeqMajor` consumes the BERT-family seq-major Q/K/V layout directly (no host-side transpose). Replaces the 8-stage `bert_attention_with_mask_gpu` chain with `cast_F32→BF16(Q,K,V) + flash_attn + cast_BF16→F32(O)` = 5 dispatches per layer (was 8). Cooled 3-run avg: HTTP `/v1/embeddings` mean **5.69 ms**, min **5.01 ms** vs llama.cpp `prompt_eval` 4.25 ms — ratio **1.34×** (was 1.45×). Cosine parity holds: bge 0.999985, mxbai 0.999988, nomic 0.999960.**
   - **What landed (mlx-native v0.4.5).**
     - `src/shaders/flash_attn_prefill.metal` — added 4 D=64 instantiations (`bf16/f16` × `additive/boolmask`) using the same BQ=32 / BK=16 / WM=4 / WN=1 geometry as D=256. Threadgroup memory at bf16 ≈ 7.7 KB (vs 32 KB cap), well under budget. Static asserts pass: `BQ ≥ kNWarps×kFragSize = 32`, `TQ = 1`, `TD = 64/8 = 8`, `TK = 16/8 = 2`.

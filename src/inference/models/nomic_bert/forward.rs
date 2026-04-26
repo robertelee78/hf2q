@@ -1042,14 +1042,18 @@ mod tests {
 
     use std::collections::HashMap;
 
-    /// Minimum-shape config that satisfies every kernel floor:
-    ///   seq_len >= 32, head_dim >= 32, even rope_dim.
+    /// Minimum-shape config that satisfies every kernel floor.
+    ///
+    /// Iter-90: `head_dim` must be exactly 64 (the only registered
+    /// `flash_attn_prefill_bf16_d64` instantiation).  Pre-iter-90 this was
+    /// `head_dim >= 32` with a separate seq_len ≥ 32 floor; flash-attn
+    /// removed both constraints in favor of a single fixed-D requirement.
     fn synthetic_min_cfg(num_layers: usize) -> NomicBertConfig {
         NomicBertConfig {
-            hidden_size: 64,            // 2 heads * 32 head_dim
+            hidden_size: 128,           // 2 heads * 64 head_dim — flash-attn d=64 contract
             num_attention_heads: 2,
             num_hidden_layers: num_layers,
-            intermediate_size: 128,
+            intermediate_size: 256,     // 2 * hidden, matches typical SwiGLU expansion
             max_position_embeddings: 128,
             vocab_size: 100,
             type_vocab_size: 2,
@@ -1237,22 +1241,42 @@ mod tests {
         }
     }
 
+    /// Iter-90: `head_dim` must be exactly 64 (only D=64 flash-attn
+    /// instantiation registered).  Verify the precondition rejects a
+    /// non-64 head_dim with a clear error before any GPU dispatch.
+    /// Replaces the pre-iter-90 `seq_len ≥ 32` floor test (that floor
+    /// was a tile-K limit of `bert_attention_with_mask_gpu`'s
+    /// post-softmax matmul, which flash-attn no longer goes through).
     #[test]
-    fn full_forward_rejects_seq_len_below_floor() {
-        let cfg = synthetic_min_cfg(1);
+    fn full_forward_rejects_non_64_head_dim() {
+        // Build a config with head_dim=32 (hidden=64 / heads=2) — was
+        // legal pre-iter-90, must now reject.
+        let cfg = NomicBertConfig {
+            hidden_size: 64, // 2 heads * 32 head_dim
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            intermediate_size: 128,
+            max_position_embeddings: 128,
+            vocab_size: 100,
+            type_vocab_size: 2,
+            layer_norm_eps: 1e-12,
+            pooling_type: PoolingType::Mean,
+            rope_freq_base: 1000.0,
+            causal_attention: false,
+        };
+
         let device = MlxDevice::new().expect("create device");
         let mut registry = KernelRegistry::new();
         register_nomic_bert_kernels(&mut registry);
 
+        // Weights still need to allocate for the (rejected) shape so the
+        // function can reach the head_dim check.  Use the same synthetic
+        // builder; it generates buffers sized to the cfg.
         let tensors = synthetic_weights(&device, &cfg).expect("build synthetic weights");
-        // MlxDevice doesn't impl Clone; create a separate handle. On Apple
-        // Silicon both `MlxDevice::new()` instances bind to the same shared
-        // Metal device — buffers allocated via `device` work in `weights`
-        // (loaded-weights only holds the device for RAII).
         let weights_device = MlxDevice::new().expect("create weights device");
         let weights = LoadedNomicBertWeights::from_tensors_for_test(tensors, weights_device);
 
-        let seq_len: u32 = 16; // below 32 floor
+        let seq_len: u32 = 32;
         let input_ids = device
             .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
             .expect("alloc input_ids");
@@ -1269,9 +1293,12 @@ mod tests {
             seq_len,
             seq_len,
         )
-        .expect_err("seq_len < 32 must reject");
+        .expect_err("head_dim != 64 must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("seq_len") && msg.contains("32"), "error: {msg}");
+        assert!(
+            msg.contains("head_dim") && msg.contains("64"),
+            "error message must reference head_dim and the required 64 constraint: {msg}"
+        );
     }
 
     /// llama-embedding ground-truth vector for "hello world" tokenized
@@ -1879,6 +1906,160 @@ mod tests {
         assert!(
             cosine >= 0.999,
             "cosine {cosine:.6} below 0.999 gate; hf2q diverges from llama-embedding",
+        );
+    }
+
+    /// Padding-invariance gate at production seq_lens (iter-91, ADR-005 Phase 2b).
+    ///
+    /// Embeds the same short input ("hello world", 4 real tokens after [CLS]/[SEP])
+    /// padded to seq_len ∈ {32, 64, 128, 256, 512} and verifies the resulting
+    /// pooled+L2-normalized embedding is invariant across padding lengths
+    /// (cosine ≥ 0.99999 between every pair vs the seq_len=32 baseline).
+    ///
+    /// **What it validates:**
+    /// 1. Flash-attention `bf16_d64` SeqMajor (iter-90) handles seq_lens
+    ///    32/64/128/256/512 without numerical blowup or NaN propagation.
+    /// 2. The BF16 `[seq_len, seq_len]` padding mask built by
+    ///    `alloc_nomic_attn_mask_bf16` correctly broadcasts across heads at
+    ///    every seq_len: `valid_token_count = 4` real tokens attend; the
+    ///    remaining `seq_len - 4` padded positions are masked to `-INFINITY`
+    ///    and contribute zero attention weight after softmax.
+    /// 3. Mean pooling (nomic's `pooling_type=1`) divides by
+    ///    `valid_token_count = 4` (not `seq_len`), so the pooled vector
+    ///    averages over real positions only.
+    ///
+    /// **Why ≥ 0.99999 (not 0.999) gate:** padding invariance is exact in
+    /// floating-point math: the masked positions contribute 0 to the
+    /// pooled output regardless of seq_len. Any drift > 1e-5 indicates
+    /// either a mask bug, a flash-attn numerical issue at long seq_len,
+    /// or a pooling-divisor bug — all are correctness regressions.
+    ///
+    /// **Failure mode this catches:** a flash-attn d=64 instantiation
+    /// that scales internal state (e.g. running max/sum) wrong at
+    /// long seq_len would surface as the cosine drifting from 1.0 as
+    /// padding grows.
+    ///
+    /// Skips when the GGUF fixture isn't on disk.
+    #[test]
+    fn full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        use mlx_native::gguf::GgufFile;
+        use std::path::Path;
+
+        use super::super::tokenizer::build_nomic_wordpiece_tokenizer;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!(
+                "skipping: nomic GGUF fixture not at {}",
+                model_path.display()
+            );
+            return;
+        }
+
+        let gguf = GgufFile::open(model_path).expect("open nomic GGUF");
+        let cfg = NomicBertConfig::from_gguf(&gguf).expect("parse nomic config");
+        let tok = build_nomic_wordpiece_tokenizer(model_path).expect("build tokenizer");
+
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count: u32 = real_ids.len() as u32;
+        let pad_id = tok.specials().pad;
+
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_nomic_bert_kernels(&mut registry);
+        let weights = LoadedNomicBertWeights::load_from_path(model_path, &cfg)
+            .expect("load real nomic weights");
+
+        // Embed at each seq_len; collect Vec<f32> outputs.
+        let seq_lens: &[u32] = &[32, 64, 128, 256, 512];
+        let mut outputs: Vec<(u32, Vec<f32>)> = Vec::with_capacity(seq_lens.len());
+
+        for &seq_len in seq_lens {
+            let mut padded_ids: Vec<u32> = real_ids.clone();
+            while padded_ids.len() < seq_len as usize {
+                padded_ids.push(pad_id);
+            }
+
+            let input_ids = device
+                .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
+                .expect("alloc input_ids");
+            {
+                let slice: &mut [u32] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        input_ids.contents_ptr() as *mut u32,
+                        seq_len as usize,
+                    )
+                };
+                slice.copy_from_slice(&padded_ids);
+            }
+
+            let mut encoder = device.command_encoder().expect("command_encoder");
+            let pooled = apply_nomic_bert_full_forward_gpu(
+                &mut encoder,
+                &mut registry,
+                &device,
+                &input_ids,
+                None,
+                &weights,
+                &cfg,
+                seq_len,
+                valid_token_count,
+            )
+            .unwrap_or_else(|e| panic!("forward at seq_len={seq_len}: {e}"));
+            encoder.commit_and_wait().expect("commit_and_wait");
+
+            let view: &[f32] = pooled.as_slice::<f32>().expect("read pooled f32");
+            assert_eq!(view.len(), 768, "seq_len={seq_len}: hidden_size mismatch");
+
+            // Self-norm sanity (every result should be l2-normalized).
+            let n: f32 = view.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!(
+                (n - 1.0).abs() < 1e-3,
+                "seq_len={seq_len}: ||y||₂ = {n}, expected ~1.0"
+            );
+            // No NaN/Inf.
+            for &v in view {
+                assert!(
+                    v.is_finite(),
+                    "seq_len={seq_len}: non-finite component encountered"
+                );
+            }
+
+            outputs.push((seq_len, view.to_vec()));
+        }
+
+        // ---- Pairwise cosine ≥ 0.99999 (padding invariance gate) ----
+        let baseline = &outputs[0]; // seq_len=32 reference (matches the existing
+                                    // ground-truth test's shape exactly)
+        let mut max_drift: f32 = 0.0;
+        for (sl, vec) in outputs.iter().skip(1) {
+            let dot: f32 = baseline.1.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+            // Both are unit-norm, so cosine = dot directly. We still
+            // divide by ||a|| * ||b|| (which should be exactly 1 ± 1e-5)
+            // to be robust to tiny post-pool drift on either side.
+            let na: f32 = baseline.1.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let cosine = dot / (na * nb);
+            let drift = (1.0 - cosine).abs();
+            if drift > max_drift {
+                max_drift = drift;
+            }
+            eprintln!(
+                "[pad-invariance] seq_len 32 vs {sl}: cosine={cosine:.7}, drift={drift:.2e}"
+            );
+            assert!(
+                cosine >= 0.99999,
+                "seq_len 32 vs {sl}: cosine {cosine:.7} below 0.99999 padding-invariance gate \
+                 (drift {drift:.2e}). Either the BF16 padding mask is leaking, flash-attn d=64 \
+                 is unstable at long seq_len, or mean pooling is dividing by seq_len instead \
+                 of valid_token_count."
+            );
+        }
+        eprintln!(
+            "[pad-invariance] PASS — max drift across {} seq_lens = {:.2e} (gate: 1e-5)",
+            seq_lens.len(),
+            max_drift
         );
     }
 }

@@ -4287,6 +4287,108 @@ mod tests {
         );
     }
 
+    /// **bge padding-invariance gate at production seq_lens** (iter-91).
+    ///
+    /// Embeds "hello world" padded to seq_len ∈ {32, 64, 128, 256, 512}
+    /// and verifies cosine ≥ 0.99999 across every pair vs the seq_len=32
+    /// baseline.  Validates the BERT-lane attention-with-mask path
+    /// (`bert_attention_with_mask_gpu` — pre-iter-90 8-stage chain) is
+    /// stable at production seq_lens.  CLS pool reads row 0 only, so the
+    /// only thing padding can change is whether attention to padded
+    /// positions leaks into row-0's hidden state.  Drift > 1e-5 = mask leak.
+    #[test]
+    fn bge_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        use std::path::Path;
+        use mlx_native::gguf::GgufFile;
+        use super::super::config::BertConfig;
+        use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
+        use super::super::weights::LoadedBertWeights;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: bge GGUF fixture not at {}", model_path.display());
+            return;
+        }
+
+        let gguf = GgufFile::open(model_path).expect("open bge GGUF");
+        let cfg = BertConfig::from_gguf(&gguf).expect("parse bge config");
+        let vocab = BertVocab::from_gguf(&gguf).expect("parse bge vocab");
+        let tok = BertWpmTokenizer::new(&vocab);
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count: u32 = real_ids.len() as u32;
+        let pad_id = tok.specials().pad;
+
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
+            .expect("load bge weights");
+
+        let seq_lens: &[u32] = &[32, 64, 128, 256, 512];
+        let mut outputs: Vec<(u32, Vec<f32>)> = Vec::with_capacity(seq_lens.len());
+
+        for &seq_len in seq_lens {
+            let mut padded_ids: Vec<u32> = real_ids.clone();
+            while padded_ids.len() < seq_len as usize {
+                padded_ids.push(pad_id);
+            }
+
+            let input_ids = device
+                .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
+                .expect("alloc input_ids");
+            {
+                let slice: &mut [u32] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        input_ids.contents_ptr() as *mut u32,
+                        seq_len as usize,
+                    )
+                };
+                slice.copy_from_slice(&padded_ids);
+            }
+
+            let mut encoder = device.command_encoder().expect("command_encoder");
+            let pooled = apply_bert_full_forward_gpu(
+                &mut encoder, &mut registry, &device, &input_ids, None,
+                &weights, &cfg, seq_len, valid_token_count,
+            )
+            .unwrap_or_else(|e| panic!("bge forward at seq_len={seq_len}: {e}"));
+            encoder.commit_and_wait().expect("commit_and_wait");
+
+            let view: &[f32] = pooled.as_slice::<f32>().expect("read pooled f32");
+            assert_eq!(view.len(), 384, "seq_len={seq_len}: hidden_size mismatch");
+            for &v in view {
+                assert!(v.is_finite(), "seq_len={seq_len}: non-finite component");
+            }
+            outputs.push((seq_len, view.to_vec()));
+        }
+
+        let baseline = &outputs[0];
+        let mut max_drift: f32 = 0.0;
+        for (sl, vec) in outputs.iter().skip(1) {
+            let dot: f32 = baseline.1.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+            let na: f32 = baseline.1.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let cosine = dot / (na * nb);
+            let drift = (1.0 - cosine).abs();
+            if drift > max_drift {
+                max_drift = drift;
+            }
+            eprintln!(
+                "[bge pad-invariance] seq_len 32 vs {sl}: cosine={cosine:.7}, drift={drift:.2e}"
+            );
+            assert!(
+                cosine >= 0.99999,
+                "bge: seq_len 32 vs {sl}: cosine {cosine:.7} below 0.99999 padding-invariance \
+                 gate (drift {drift:.2e}). Padding mask leak in bert_attention_with_mask_gpu."
+            );
+        }
+        eprintln!(
+            "[bge pad-invariance] PASS — max drift across {} seq_lens = {:.2e}",
+            seq_lens.len(), max_drift
+        );
+    }
+
     /// **mxbai-embed-large-v1 cosine-parity gate** (third Phase-2b
     /// day-one model, locks BERT lane at hidden=1024 / layers=24 /
     /// heads=16 / pooling=CLS). Generated 2026-04-26 via:
@@ -4656,6 +4758,105 @@ mod tests {
         assert!(
             cosine >= 0.999,
             "mxbai cosine {cosine:.6} below 0.999"
+        );
+    }
+
+    /// **mxbai padding-invariance gate at production seq_lens** (iter-91).
+    ///
+    /// Same contract as the bge variant — but exercises the BERT lane at
+    /// hidden=1024, layers=24, heads=16 (production scale), so the
+    /// drift budget catches mask-leak bugs that only surface with
+    /// deeper attention stacks.
+    #[test]
+    fn mxbai_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        use std::path::Path;
+        use mlx_native::gguf::GgufFile;
+        use super::super::config::BertConfig;
+        use super::super::tokenizer::{BertVocab, BertWpmTokenizer};
+        use super::super::weights::LoadedBertWeights;
+
+        let model_path =
+            Path::new("/opt/hf2q/models/bert-test/mxbai-embed-large-v1-f16.gguf");
+        if !model_path.exists() {
+            eprintln!("skipping: mxbai GGUF fixture not at {}", model_path.display());
+            return;
+        }
+
+        let gguf = GgufFile::open(model_path).expect("open mxbai GGUF");
+        let cfg = BertConfig::from_gguf(&gguf).expect("parse mxbai config");
+        let vocab = BertVocab::from_gguf(&gguf).expect("parse mxbai vocab");
+        let tok = BertWpmTokenizer::new(&vocab);
+        let real_ids = tok.encode("hello world", true);
+        let valid_token_count: u32 = real_ids.len() as u32;
+        let pad_id = tok.specials().pad;
+
+        let device = MlxDevice::new().expect("create device");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let weights = LoadedBertWeights::load_from_path(model_path, &cfg)
+            .expect("load mxbai weights");
+
+        let seq_lens: &[u32] = &[32, 64, 128, 256, 512];
+        let mut outputs: Vec<(u32, Vec<f32>)> = Vec::with_capacity(seq_lens.len());
+
+        for &seq_len in seq_lens {
+            let mut padded_ids: Vec<u32> = real_ids.clone();
+            while padded_ids.len() < seq_len as usize {
+                padded_ids.push(pad_id);
+            }
+
+            let input_ids = device
+                .alloc_buffer((seq_len as usize) * 4, DType::U32, vec![seq_len as usize])
+                .expect("alloc input_ids");
+            {
+                let slice: &mut [u32] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        input_ids.contents_ptr() as *mut u32,
+                        seq_len as usize,
+                    )
+                };
+                slice.copy_from_slice(&padded_ids);
+            }
+
+            let mut encoder = device.command_encoder().expect("command_encoder");
+            let pooled = apply_bert_full_forward_gpu(
+                &mut encoder, &mut registry, &device, &input_ids, None,
+                &weights, &cfg, seq_len, valid_token_count,
+            )
+            .unwrap_or_else(|e| panic!("mxbai forward at seq_len={seq_len}: {e}"));
+            encoder.commit_and_wait().expect("commit_and_wait");
+
+            let view: &[f32] = pooled.as_slice::<f32>().expect("read pooled f32");
+            assert_eq!(view.len(), 1024, "seq_len={seq_len}: hidden_size mismatch");
+            for &v in view {
+                assert!(v.is_finite(), "seq_len={seq_len}: non-finite component");
+            }
+            outputs.push((seq_len, view.to_vec()));
+        }
+
+        let baseline = &outputs[0];
+        let mut max_drift: f32 = 0.0;
+        for (sl, vec) in outputs.iter().skip(1) {
+            let dot: f32 = baseline.1.iter().zip(vec.iter()).map(|(a, b)| a * b).sum();
+            let na: f32 = baseline.1.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let cosine = dot / (na * nb);
+            let drift = (1.0 - cosine).abs();
+            if drift > max_drift {
+                max_drift = drift;
+            }
+            eprintln!(
+                "[mxbai pad-invariance] seq_len 32 vs {sl}: cosine={cosine:.7}, drift={drift:.2e}"
+            );
+            assert!(
+                cosine >= 0.99999,
+                "mxbai: seq_len 32 vs {sl}: cosine {cosine:.7} below 0.99999 padding-invariance \
+                 gate (drift {drift:.2e})."
+            );
+        }
+        eprintln!(
+            "[mxbai pad-invariance] PASS — max drift across {} seq_lens = {:.2e}",
+            seq_lens.len(), max_drift
         );
     }
 
