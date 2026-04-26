@@ -204,12 +204,22 @@ pub const GEMMA4V_PREPROCESS_DEFAULT: Gemma4vPreprocessConfig = Gemma4vPreproces
 /// embedding and 2D RoPE both consume.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gemma4vPreprocessed {
-    /// Flat `[N_patches, patch_size² × 3]` tensor in row-major order.
-    /// Within each row, the `patch_size² × 3` inner dim iterates as
-    /// `(dy, dx, c)` — pixel-major within a patch, channel-minor —
-    /// matching the candle reference's
-    /// `permute(0,2,4,3,5,1).reshape(b, ph*pw, ps*ps*c)`
-    /// (`/opt/candle/.../gemma4/vision.rs:146-150`).
+    /// Flat `[N_patches, 3 × patch_size²]` tensor in row-major order.
+    /// Within each row, the `3 × patch_size²` inner dim iterates as
+    /// `(c, dy, dx)` — channel-major, pixel-minor — matching the
+    /// CHW im2col layout that llama.cpp's `ggml_conv_2d` produces over
+    /// `inp_raw[ne0=W, ne1=H, ne2=C]` (`tools/mtmd/clip.cpp:518` +
+    /// `ggml/src/ggml-cpu/ops.cpp:6391` `iic*(KH*KW) + ikh*KW + ikw`).
+    /// The GGUF-stored `v.patch_embd.weight` is CHW per output row
+    /// (writer applies `permute(0, 3, 1, 2)` matching
+    /// `convert_hf_to_gguf.py:7873-7877`); the linear matmul `out[n][o]
+    /// = Σ_k weight[o][k] · patches[n][k]` requires both sides to share
+    /// the same `(c, dy, dx)` flat indexing for `k` to refer to the
+    /// same spatial-channel position. ADR-005 Phase 2c iter-126 (W57)
+    /// fixed the prior HWC `(dy, dx, c)` ordering — that ordering
+    /// matched candle's HWC reshape but candle reads HF source weight
+    /// directly without the CHW permute, so HWC↔HWC worked there. Hf2q
+    /// reads the CHW-permuted GGUF weight, so it requires CHW patches.
     pub patches: Vec<f32>,
     /// Per-patch X-axis position index, length `N_patches`. Patch
     /// `(px, py)` (column, row) at the post-resize grid maps to
@@ -333,8 +343,19 @@ pub fn preprocess_gemma4v(
     let mut pos_x = Vec::with_capacity(n_patches);
     let mut pos_y = Vec::with_capacity(n_patches);
 
-    // Patchify in (py, px, dy, dx, c) order — matches candle's
-    // `permute(0,2,4,3,5,1).reshape(b, ph*pw, ps*ps*c)`.
+    // Patchify in (py, px, c, dy, dx) order — channel-major within
+    // each patch row to match the CHW im2col layout consumed by
+    // llama.cpp's patch_embd conv (see `Gemma4vPreprocessed::patches`
+    // doc) and the CHW-permuted GGUF weight (`gguf.rs:995` +
+    // `convert_hf_to_gguf.py:7873-7877`). ADR-005 Phase 2c iter-126
+    // (W57): prior HWC `(dy, dx, c)` ordering was a mismatch against
+    // the GGUF weight's CHW per-output-row layout — uniform-channel
+    // patches still produced byte-identical output (Σ over channels
+    // collapses), but every non-grayscale patch diverged from peer
+    // (parity probe stage 01 max_abs=64.6 with correlation 0.967 even
+    // after iter-125's `4x − 3` fix). This fix is the index permutation
+    // patches[(c, dy, dx)] = (pix(dy, dx)[c]/255)*4 - 3.
+    let p2 = p_us * p_us; // patch_size² (pixels per channel-plane in one patch)
     for py in 0..n_y {
         for px in 0..n_x {
             let patch_idx = (py as usize) * (n_x as usize) + (px as usize);
@@ -346,7 +367,7 @@ pub fn preprocess_gemma4v(
                     let img_x = px * p + dx;
                     let img_y = py * p + dy;
                     let pix = rgb.get_pixel(img_x, img_y);
-                    let inner_base = ((dy as usize) * p_us + (dx as usize)) * 3;
+                    let pos_in_plane = (dy as usize) * p_us + (dx as usize);
                     // ADR-005 Phase 2c iter-125 (W56): byte-faithful match
                     // against llama.cpp's two-step scale-bias chain.
                     // Step 1 — `mtmd-image.cpp:11-21` `img_u8_to_f32` with
@@ -359,11 +380,11 @@ pub fn preprocess_gemma4v(
                     // parity probe (W55, 625f94a) showed hf2q was one full
                     // `2x − 1` step short, producing the algebraic identity
                     // hf2q = (peer + 1) / 2; i.e. peer = 2*hf2q + 1.
-                    patches[row_base + inner_base + 0] =
+                    patches[row_base + 0 * p2 + pos_in_plane] =
                         (pix[0] as f32 / 255.0) * 4.0 - 3.0;
-                    patches[row_base + inner_base + 1] =
+                    patches[row_base + 1 * p2 + pos_in_plane] =
                         (pix[1] as f32 / 255.0) * 4.0 - 3.0;
-                    patches[row_base + inner_base + 2] =
+                    patches[row_base + 2 * p2 + pos_in_plane] =
                         (pix[2] as f32 / 255.0) * 4.0 - 3.0;
                 }
             }
@@ -1083,22 +1104,26 @@ mod tests {
         // is invariant under the algebra change).
         let inner = (16 * 16 * 3) as usize;
         let first_patch = &out.patches[0..inner];
-        // (dy=0, dx=0, c=0) → index 0 in patch row.
+        // ADR-005 Phase 2c iter-126 (W57): inner-axis ordering switched
+        // from HWC `(dy, dx, c)` to CHW `(c, dy, dx)`. (c=0, dy=0, dx=0)
+        // → index 0*256 + 0*16 + 0 = 0 (still index 0 for the (R, 0, 0)
+        // pixel by coincidence — both orderings start at the R-channel
+        // top-left pixel).
         assert!(
             (first_patch[0] - 1.0).abs() < 1e-3,
-            "first patch (0,0,R) should be +1.0 (corner-aligned exact src), got {}",
+            "first patch (R, 0, 0) should be +1.0 (corner-aligned exact src), got {}",
             first_patch[0]
         );
 
         // Last patch's bottom-right pixel must also be exactly +1.0
-        // (corner of resized image == corner of src).
+        // (corner of resized image == corner of src). With CHW ordering,
+        // (c=0, dy=15, dx=15) → 0*256 + 15*16 + 15 = 255.
         let n_patches = out.n_patches() as usize;
         let last_patch = &out.patches[(n_patches - 1) * inner..n_patches * inner];
-        // (dy=15, dx=15, c=0) → ((15*16) + 15) * 3 = 765.
         assert!(
-            (last_patch[765] - 1.0).abs() < 1e-3,
-            "last patch (15,15,R) should be +1.0, got {}",
-            last_patch[765]
+            (last_patch[255] - 1.0).abs() < 1e-3,
+            "last patch (R, 15, 15) should be +1.0, got {}",
+            last_patch[255]
         );
     }
 

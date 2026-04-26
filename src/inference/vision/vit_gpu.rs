@@ -3478,10 +3478,12 @@ pub fn gemma4v_apply_full_forward_gpu(
             vec![n_patches as usize, inner as usize],
         );
         // De-patchify into planar [C, H, W] = [3, n_y*P, n_x*P].
-        // `patches` row `(py, px)` holds inner[(dy*P + dx)*3 + c]; we
-        // scatter to planar[c, py*P+dy, px*P+dx] = patches[…]. This is
-        // a pure index permutation (no FP arithmetic) so byte-exact.
+        // After iter-126 (W57) `patches` rows are CHW
+        // `(c, dy, dx)` so `patches[row_base + c*P² + dy*P + dx]` ↔
+        // planar[c, py*P+dy, px*P+dx]. This is a pure index permutation
+        // (no FP arithmetic) so byte-exact.
         let p = patch_size as usize;
+        let p2 = p * p;
         let h = (n_y as usize) * p;
         let w = (n_x as usize) * p;
         let mut planar = vec![0f32; 3 * h * w];
@@ -3491,12 +3493,12 @@ pub fn gemma4v_apply_full_forward_gpu(
                 let row_base = patch_idx * (inner as usize);
                 for dy in 0..p {
                     for dx in 0..p {
-                        let inner_base = (dy * p + dx) * 3;
+                        let pos_in_plane = dy * p + dx;
                         let yy = py * p + dy;
                         let xx = px * p + dx;
                         for c in 0..3 {
                             planar[c * h * w + yy * w + xx] =
-                                patches[row_base + inner_base + c];
+                                patches[row_base + c * p2 + pos_in_plane];
                         }
                     }
                 }
