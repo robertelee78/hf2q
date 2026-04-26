@@ -78,10 +78,39 @@ pub fn dump_f32(
     layer_idx: Option<usize>,
     seq_pos: usize,
 ) -> Result<()> {
+    dump_f32_to(buf, n_elems, name, layer_idx, seq_pos, None)
+}
+
+/// W39 iter-112b: explicit-directory variant of [`dump_f32`].  `dir_override =
+/// Some(_)` writes the file under that path instead of `INVESTIGATION_ENV
+/// .dump_dir`; `None` falls back to the LazyLock value (i.e. byte-identical
+/// to [`dump_f32`]).
+///
+/// Motivation: `INVESTIGATION_ENV` is populated by `LazyLock` at process
+/// start (`main.rs::main`) before `Cli::parse`, so a runtime `set_var`
+/// after `INVESTIGATION_ENV.activate()` is too late to reach the LazyLock.
+/// The Gate H two-regime in-process harness needs to redirect dumps at
+/// run time without restarting the process; this overload is the
+/// per-call escape hatch.
+pub fn dump_f32_to(
+    buf: &MlxBuffer,
+    n_elems: usize,
+    name: &str,
+    layer_idx: Option<usize>,
+    seq_pos: usize,
+    dir_override: Option<&std::path::Path>,
+) -> Result<()> {
     let data: &[f32] = buf
         .as_slice()
         .map_err(|e| anyhow::anyhow!("dump {name} read: {e}"))?;
-    let dump_dir = &INVESTIGATION_ENV.dump_dir;
+    let dump_dir_owned: String;
+    let dump_dir: &str = match dir_override {
+        Some(p) => {
+            dump_dir_owned = p.to_string_lossy().into_owned();
+            &dump_dir_owned
+        }
+        None => &INVESTIGATION_ENV.dump_dir,
+    };
     let path = match layer_idx {
         Some(l) => format!("{dump_dir}/hf2q_{name}_layer{l:02}_pos{seq_pos}.bin"),
         None => format!("{dump_dir}/hf2q_{name}_pos{seq_pos}.bin"),

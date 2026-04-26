@@ -585,6 +585,45 @@ pub struct MlxModelWeights {
     /// (Wired by iter-108b's `parity_quality::run_two_regime_decode`;
     /// no in-tree caller as of iter-108a.)
     pub replay_tokens: Vec<u32>,
+    /// ADR-007 Gate H per-instance dump-config override (W39 iter-112b).
+    ///
+    /// `INVESTIGATION_ENV.dump_dir` and `.dump_all_cache` are populated from
+    /// process-start env via a `LazyLock` triggered in `main.rs::main` *before*
+    /// `Cli::parse`, so the env vars W21's `parity_quality::run_two_regime_decode`
+    /// sets at run time (after the LazyLock has frozen) never reach the SDPA
+    /// dump gate at `forward_decode` lines 1268-1271 nor the dump-path
+    /// formatter inside `dumps::dump_f32`.  W39 splits the two readers so the
+    /// in-process Gate H harness can supply per-instance values instead:
+    ///   - `Some(dir)` overrides `INVESTIGATION_ENV.dump_dir` for SDPA-out
+    ///     dump file paths (consulted by the call site in `forward_decode`,
+    ///     which routes through a path that picks up the override).
+    ///   - `Some(true)` forces `dump_all_cache=true` for SDPA-out gating.
+    ///   - `None` falls back to `INVESTIGATION_ENV` (i.e. the default
+    ///     env-var-only path is byte-identical to pre-iter-112b).
+    ///
+    /// `set_dump_overrides` exposes the setter and is the only mutator.
+    /// Like `set_replay_tokens`, the gate-H instrumentation flag isn't
+    /// affected — these knobs are purely diagnostic plumbing for the
+    /// SDPA-out file gate, not for the per-token NLL/replay block.
+    ///
+    /// (Wired by iter-112b's `parity_quality::run_two_regime_decode`; no
+    /// other in-tree caller.)
+    pub dump_dir_override: Option<std::path::PathBuf>,
+    pub dump_all_cache_override: Option<bool>,
+    /// ADR-007 Gate H per-instance decode-step dump counter (W39 iter-112b).
+    ///
+    /// Replaces the process-static `AtomicUsize` previously declared inside
+    /// `forward_decode` at lines 1262-1267.  That static accumulated across
+    /// the dense and TQ passes of the same Gate H run — pass 1 left it at
+    /// `tokens`, so pass 2's `decode_step_for_dump < max_pos` was false at
+    /// every step.  Per-instance + reset-between-passes restores the
+    /// per-pass `[0, max_pos)` window.
+    ///
+    /// Reset to 0 by `set_decode_regime` and `set_replay_tokens` (matching
+    /// `decode_step` semantics) and by the explicit
+    /// `reset_decode_step_dump_counter` for the rare caller that wants to
+    /// reset without touching regime / replay state.
+    pub decode_step_dump_counter: usize,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -1104,6 +1143,17 @@ impl MlxModelWeights {
             // two-regime Gate H run.  Empty by default → no behavior change
             // from iter-108a; populated only via [`set_replay_tokens`].
             replay_tokens: Vec::new(),
+            // W39 iter-112b: per-instance dump-config overrides.  None by
+            // default → SDPA-out dump gate falls back to INVESTIGATION_ENV,
+            // bit-identical to pre-iter-112b.  parity_quality sets these
+            // before each Gate H pass so the dumps land in the per-pass
+            // dir even though INVESTIGATION_ENV's LazyLock is frozen.
+            dump_dir_override: None,
+            dump_all_cache_override: None,
+            // W39 iter-112b: per-instance decode-step dump counter.  Replaces
+            // the old process-static AtomicUsize so the SDPA dump gate's
+            // [0, max_pos) window resets at the start of each Gate H pass.
+            decode_step_dump_counter: 0,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -1156,6 +1206,11 @@ impl MlxModelWeights {
     pub fn set_decode_regime(&mut self, regime: DecodeRegime) {
         self.decode_regime = regime;
         self.decode_step = 0;
+        // W39 iter-112b: also reset the per-instance SDPA-dump step
+        // counter so each Gate H regime's [0, max_pos) dump window
+        // restarts at 0 (the old process-static AtomicUsize accumulated
+        // across passes and silently dropped pass 2's dumps).
+        self.decode_step_dump_counter = 0;
         // iter-108a-fix (W15): re-evaluate the Gate H elision flag.
         // Non-Default regime forces the per-layer SDPA-gate match path,
         // so we can't elide it; the env-var hooks could still be off,
@@ -1193,12 +1248,60 @@ impl MlxModelWeights {
     pub fn set_replay_tokens(&mut self, replay: Vec<u32>) {
         self.replay_tokens = replay;
         self.decode_step = 0;
+        // W39 iter-112b: see `set_decode_regime` — reset the SDPA-dump
+        // step counter for the upcoming pass.
+        self.decode_step_dump_counter = 0;
         let env = &*INVESTIGATION_ENV;
         self.gate_h_inactive = matches!(self.decode_regime, DecodeRegime::Default)
             && !env.emit_nll
             && !env.decode_emit_tokens
             && env.decode_input_tokens.is_empty()
             && self.replay_tokens.is_empty();
+    }
+
+    /// Set per-instance SDPA-dump overrides for the next decode trajectory
+    /// (ADR-007 Gate H, W39 iter-112b two-regime in-process harness).
+    ///
+    /// `INVESTIGATION_ENV` is a `LazyLock` populated by
+    /// `INVESTIGATION_ENV.activate()` at `main.rs::main` *before* `Cli::parse`.
+    /// W21's `parity_quality::run_two_regime_decode` sets `HF2Q_DUMP_DIR` and
+    /// `HF2Q_DUMP_ALL_CACHE` at run time, but those `set_var` calls reach
+    /// `std::env` *after* the LazyLock has frozen, so the SDPA-out dump gate
+    /// at `forward_decode` and the dump-path formatter inside `dumps::dump_f32`
+    /// keep reading the pre-launch (default) values — `dump_all_cache=false`
+    /// and `dump_dir=/tmp` — silently dropping every Gate H dump.
+    ///
+    /// This setter exposes the per-instance override surface.  Both
+    /// arguments are `Option`: `Some(_)` overrides the corresponding
+    /// `INVESTIGATION_ENV` field for SDPA-out gating + path formation;
+    /// `None` falls back to `INVESTIGATION_ENV` (i.e. the default
+    /// env-var-only path is bit-identical to pre-iter-112b).
+    ///
+    /// Also resets [`Self::decode_step_dump_counter`] so the upcoming pass's
+    /// `[0, max_pos)` dump window starts at step 0.
+    ///
+    /// (Wired by iter-112b's `parity_quality::run_two_regime_decode`; no
+    /// other in-tree caller.)
+    #[allow(dead_code)]
+    pub fn set_dump_overrides(
+        &mut self,
+        dir: Option<std::path::PathBuf>,
+        all_cache: Option<bool>,
+    ) {
+        self.dump_dir_override = dir;
+        self.dump_all_cache_override = all_cache;
+        self.decode_step_dump_counter = 0;
+    }
+
+    /// Reset the per-instance SDPA-dump step counter without touching
+    /// regime / replay / override state.  W39 iter-112b: most Gate H call
+    /// sites reset via `set_decode_regime` / `set_replay_tokens` /
+    /// `set_dump_overrides`; this is the explicit setter for callers that
+    /// only want to roll the counter back (e.g. between sub-passes within
+    /// the same regime).
+    #[allow(dead_code)]
+    pub fn reset_decode_step_dump_counter(&mut self) {
+        self.decode_step_dump_counter = 0;
     }
 
     /// Run one decode step through mlx-native's GraphExecutor.
@@ -1248,8 +1351,19 @@ impl MlxModelWeights {
         // iter-23: HF2Q_DUMP_SDPA_MAX_POS=N — when set along with HF2Q_DUMP_ALL_CACHE=1,
         // dump sdpa_out for all layers at every decode STEP < N (decode-step index, not
         // absolute seq_pos, so it is prompt-length independent).
-        // The atomic counter increments on each forward_decode call regardless of layer.
+        // The counter increments on each forward_decode call regardless of layer.
         // This enables the Gate A cosine-sim harness without requiring N separate hf2q runs.
+        //
+        // W39 iter-112b: HF2Q_DUMP_SDPA_MAX_POS still uses a process-static
+        // OnceLock (read once, never overridden — Gate H always wants the
+        // same `tokens` window across both passes), but the decode-step
+        // counter moved from a process-static `AtomicUsize` to per-instance
+        // `self.decode_step_dump_counter` so `set_decode_regime` /
+        // `set_replay_tokens` / `set_dump_overrides` can reset it between
+        // the dense and TQ passes of a single Gate H run.  The
+        // `dump_all_cache` read also consults the per-instance override
+        // first (W39 iter-112b: `INVESTIGATION_ENV` LazyLock is frozen at
+        // `main.rs::main` before parity_quality's runtime `set_var` lands).
         let dump_sdpa_max_pos: Option<usize> = {
             static MAX_POS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
             *MAX_POS.get_or_init(|| {
@@ -1258,16 +1372,14 @@ impl MlxModelWeights {
                     .and_then(|v| v.parse::<usize>().ok())
             })
         };
-        // Decode-step counter: counts forward_decode invocations (resets at process start).
-        let decode_step_for_dump: usize = {
-            static STEP: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-            // fetch_add returns OLD value; the returned value is this call's step index.
-            STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        };
+        let decode_step_for_dump: usize = self.decode_step_dump_counter;
+        self.decode_step_dump_counter = self.decode_step_dump_counter.saturating_add(1);
+        let dump_all_cache_eff: bool = self
+            .dump_all_cache_override
+            .unwrap_or(INVESTIGATION_ENV.dump_all_cache);
         let dump_layers: bool = INVESTIGATION_ENV.dump_layers == Some(seq_pos)
             || dump_sdpa_max_pos.map_or(false, |max| {
-                decode_step_for_dump < max && INVESTIGATION_ENV.dump_all_cache
+                decode_step_for_dump < max && dump_all_cache_eff
             });
 
         // --- Pre-session CPU work ---
@@ -2053,16 +2165,18 @@ impl MlxModelWeights {
 
                 // ADR-009 Phase 3A: dump Q,K,V before SDPA for the detail layer,
                 // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
-                let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
+                // W39 iter-112b: consult per-instance override first.
+                let dump_all_cache = dump_all_cache_eff;
                 if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump QKV finish L{layer_idx}: {e}"))?;
-                    dumps::dump_f32(&self.activations.attn_q_normed, nh * hd,
-                        "q_normed", Some(layer_idx), seq_pos)?;
-                    dumps::dump_f32(&self.activations.attn_k_normed, nkv * hd,
-                        "k_normed", Some(layer_idx), seq_pos)?;
-                    dumps::dump_f32(v_src, nkv * hd,
-                        "v_normed", Some(layer_idx), seq_pos)?;
+                    let dir_override = self.dump_dir_override.as_deref();
+                    dumps::dump_f32_to(&self.activations.attn_q_normed, nh * hd,
+                        "q_normed", Some(layer_idx), seq_pos, dir_override)?;
+                    dumps::dump_f32_to(&self.activations.attn_k_normed, nkv * hd,
+                        "k_normed", Some(layer_idx), seq_pos, dir_override)?;
+                    dumps::dump_f32_to(v_src, nkv * hd,
+                        "v_normed", Some(layer_idx), seq_pos, dir_override)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump QKV re-begin L{layer_idx}: {e}"))?;
                 }
@@ -2208,11 +2322,20 @@ impl MlxModelWeights {
 
                     // ADR-009 Phase 3A: dump full cached K/V for the detail layer,
                     // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
-                    let dump_all_cache = INVESTIGATION_ENV.dump_all_cache;
+                    // W39 iter-112b: consult per-instance override first.
+                    let dump_all_cache = dump_all_cache_eff;
                     if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("dump cache finish L{layer_idx}: {e}"))?;
-                        let dump_dir = &INVESTIGATION_ENV.dump_dir;
+                        // W39 iter-112b: per-instance dump dir override; falls back
+                        // to INVESTIGATION_ENV.dump_dir when unset.
+                        let dump_dir_override = self
+                            .dump_dir_override
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned());
+                        let dump_dir: &str = dump_dir_override
+                            .as_deref()
+                            .unwrap_or(&INVESTIGATION_ENV.dump_dir);
                         // Pack [nkv, kv_seq_len, hd] into a tight F32 buffer for comparison
                         let valid_len = kv_seq_len;
                         let mut k_valid = vec![0.0f32; nkv * valid_len * hd];
@@ -2637,12 +2760,16 @@ impl MlxModelWeights {
 
                 // ADR-009 Phase 3A: dump sdpa_out before O-proj for the detail layer,
                 // or ALL layers when HF2Q_DUMP_ALL_CACHE=1
+                // W39 iter-112b: route through dump_f32_to with the
+                // per-instance dir override so Gate H's in-process harness
+                // can redirect dumps after INVESTIGATION_ENV's LazyLock froze.
                 if dump_layers && (dump_detail_layer == Some(layer_idx) || dump_all_cache) {
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out finish L{layer_idx}: {e}"))?;
                     // [nh, 1, hd] flattened.
-                    dumps::dump_f32(&self.activations.sdpa_out, nh * hd,
-                        "sdpa_out", Some(layer_idx), seq_pos)?;
+                    let dir_override = self.dump_dir_override.as_deref();
+                    dumps::dump_f32_to(&self.activations.sdpa_out, nh * hd,
+                        "sdpa_out", Some(layer_idx), seq_pos, dir_override)?;
                     s = exec.begin()
                         .map_err(|e| anyhow::anyhow!("dump sdpa_out re-begin L{layer_idx}: {e}"))?;
                 }

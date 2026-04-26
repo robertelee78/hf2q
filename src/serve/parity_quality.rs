@@ -410,17 +410,26 @@ fn run_two_regime_decode(
     dense_dump_dir: &Path,
     tq_dump_dir: &Path,
 ) -> Result<(GateHEnvelope, PassCapture)> {
-    // STEP 1 — env-var setup.  Must happen before any code path triggers
-    // INVESTIGATION_ENV's LazyLock (model load reads it; so does the dump
-    // helper).  All three vars are READ-ONLY diagnostics; none affects
-    // forward-pass math.
+    // STEP 1 — env-var setup for the OnceLock-driven knob.
+    //
+    // W39 iter-112b: `INVESTIGATION_ENV` is a `LazyLock` populated by
+    // `INVESTIGATION_ENV.activate()` at `main.rs::main` *before* `Cli::parse`,
+    // so setting `HF2Q_DUMP_DIR` / `HF2Q_DUMP_ALL_CACHE` here is too late —
+    // those fields are already frozen at their pre-launch (default) values.
+    // The fix is to use the per-instance `MlxModelWeights::set_dump_overrides`
+    // setter (added in iter-112b) below; we no longer set those env vars.
+    //
+    // `HF2Q_DUMP_SDPA_MAX_POS` IS still env-driven because its read site uses
+    // a function-local `OnceLock` inside `forward_decode` that doesn't fire
+    // until the first decode call — i.e. AFTER this set_var lands.  Writing
+    // it once here covers both Gate H passes (the per-pass dump window is
+    // controlled by resetting the per-instance step counter, not by varying
+    // the cap).
     //
     // Safety: setting env vars from the calling process is sound when no
     // other thread is concurrently reading them; cmd_parity is a single-
     // threaded entry point, so there's no race here.
     unsafe {
-        std::env::set_var("HF2Q_DUMP_DIR", dump_root.as_os_str());
-        std::env::set_var("HF2Q_DUMP_ALL_CACHE", "1");
         std::env::set_var(
             "HF2Q_DUMP_SDPA_MAX_POS",
             tokens.to_string(),
@@ -480,8 +489,13 @@ fn run_two_regime_decode(
     // → step index when iterating later.
 
     // STEP 3 — Pass 1: dense.
+    // W39 iter-112b: per-instance dump override (LazyLock workaround) +
+    // per-instance step counter reset (set_decode_regime resets it).  The
+    // dump dir is `dump_root` for both passes; we move files into the
+    // per-pass dirs after each `run_one_pass` returns.
     eprintln!("[gate-h] Pass 1/2: dense forced regime ({} tokens)...", tokens);
     mlx_w.set_decode_regime(DecodeRegime::ForceDense);
+    mlx_w.set_dump_overrides(Some(dump_root.to_path_buf()), Some(true));
     let dense_capture = run_one_pass(
         &mut mlx_w,
         &mut ctx,
@@ -498,6 +512,11 @@ fn run_two_regime_decode(
     );
     mlx_w.set_decode_regime(DecodeRegime::ForceTq);
     mlx_w.set_replay_tokens(dense_capture.final_tokens.clone());
+    // W39 iter-112b: re-assert overrides for pass 2 (set_decode_regime /
+    // set_replay_tokens already reset the dump-step counter; this re-asserts
+    // the dir + all_cache override which is a no-op in steady state but
+    // makes the contract explicit).
+    mlx_w.set_dump_overrides(Some(dump_root.to_path_buf()), Some(true));
     let tq_capture = run_one_pass(
         &mut mlx_w,
         &mut ctx,
