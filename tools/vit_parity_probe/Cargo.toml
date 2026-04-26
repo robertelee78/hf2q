@@ -6,15 +6,27 @@
 #   * `diff` binary: stage-by-stage element-wise max-abs-error between a
 #     hf2q dump dir and an llama.cpp peer-reference dump dir.
 #
+#   * `weight_bytes` binary (iter-131, ADR-005 Phase 2c): F16 weight
+#     byte-identity probe — opens an mmproj GGUF and asserts that the
+#     bytes hf2q's `mlx_native::gguf::GgufFile::load_tensor` exposes via
+#     the loaded `MlxBuffer` are byte-identical to a direct file read of
+#     the same tensor block. Validates W61's iter-130 candidate #2
+#     (cheap-validation path): if hf2q's load is silently corrupting
+#     F16 weights, the cascade audit's downstream hypotheses are unsound.
+#
 # The C++ peer dumper lives at `cpp/peer_dumper.cpp` (built via cmake).
-# This crate stays pure-Rust per the hf2q sovereignty mandate; it links
-# only against std and the dump format (raw F32 LE + JSON sidecar).
+# This crate is mostly pure-Rust; the `weight_bytes` binary depends on
+# the path-pinned mlx-native to share the production load path.
 #
 # Build:
 #   cargo build --release --manifest-path tools/vit_parity_probe/Cargo.toml
 #
 # Run diff:
 #   target/release/diff /tmp/hf2q_dumps /tmp/peer_dumps
+#
+# Run weight byte-identity probe:
+#   target/release/weight_bytes \
+#       /opt/hf2q/models/.../mmproj.gguf v.blk.26.attn_q.weight
 
 [package]
 name = "vit_parity_probe"
@@ -26,14 +38,21 @@ publish = false
 name = "diff"
 path = "src/bin/diff.rs"
 
+[[bin]]
+name = "weight_bytes"
+path = "src/bin/weight_bytes.rs"
+
+# Iter-131: weight_bytes binary depends on mlx-native to drive the
+# production load path. The diff binary stays dep-free.
+[dependencies]
+mlx-native = { path = "/opt/mlx-native" }
+
 # Independent target dir so we don't share build state with the main
 # hf2q crate. Also keeps the artefact out of accidental `cargo install`s.
 [workspace]
 
 # The parent /opt/hf2q/.cargo/config.toml has a `[patch.crates-io]`
-# entry for `mlx-native` (path-pinned to /opt/mlx-native) that this
-# crate doesn't depend on. Cargo emits a "patch was not used" warning
-# unless we mirror the patch here. Mirror it to silence the noise; the
-# patch is a no-op for our dep-less crate.
+# entry for `mlx-native` (path-pinned to /opt/mlx-native) that we
+# mirror here so cargo's patch consistency check is happy.
 [patch.crates-io]
 mlx-native = { path = "/opt/mlx-native" }
