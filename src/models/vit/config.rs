@@ -118,12 +118,46 @@ impl VisionConfig {
                 .unwrap_or(default)
         };
 
+        // ADR-012 P9b real-model finding: Qwen3.6 vision_config uses
+        // different field names than the Gemma-style schema this parser
+        // was originally written for. Accept both forms via fallback:
+        //   Gemma            Qwen3.6
+        //   num_hidden_layers depth
+        //   num_attention_heads  num_heads
+        //   image_size       (derived from num_position_embeddings)
+        let u32_req_alt = |primary: &'static str, fallback: &'static str|
+            -> Result<u32, VisionConfigError>
+        {
+            if let Some(v) = vc.get(primary).and_then(|v| v.as_u64()) {
+                return Ok(v as u32);
+            }
+            if let Some(v) = vc.get(fallback).and_then(|v| v.as_u64()) {
+                return Ok(v as u32);
+            }
+            Err(VisionConfigError::MissingField {
+                field: primary,
+                expected_type: "u32",
+            })
+        };
+
         let hidden_size = u32_req("hidden_size")?;
-        let num_hidden_layers = u32_req("num_hidden_layers")?;
-        let num_attention_heads = u32_req("num_attention_heads")?;
+        let num_hidden_layers = u32_req_alt("num_hidden_layers", "depth")?;
+        let num_attention_heads = u32_req_alt("num_attention_heads", "num_heads")?;
         let patch_size = u32_req("patch_size")?;
-        let image_size = u32_req("image_size")?;
         let intermediate_size = u32_req("intermediate_size")?;
+        // image_size: prefer explicit; otherwise derive from
+        // num_position_embeddings = (image_size/patch_size)^2 for ViT.
+        let image_size = if let Some(v) = vc.get("image_size").and_then(|v| v.as_u64()) {
+            v as u32
+        } else if let Some(npe) = vc.get("num_position_embeddings").and_then(|v| v.as_u64()) {
+            let patches_per_side = (npe as f64).sqrt() as u32;
+            patches_per_side * patch_size
+        } else {
+            return Err(VisionConfigError::MissingField {
+                field: "image_size",
+                expected_type: "u32 (or num_position_embeddings to derive)",
+            });
+        };
 
         if patch_size == 0 {
             return Err(VisionConfigError::InvalidField {
