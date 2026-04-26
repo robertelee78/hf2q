@@ -1930,6 +1930,54 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 95 — Phase 2a Task #5 CLOSED: grammar-constrained decoding wired end-to-end. `response_format: {json_object}` + `json_schema` produce parseable JSON byte-for-byte through `/v1/chat/completions`. Adversarial prompts that try to coax prose preamble are forced to direct JSON output by the GBNF mask.**
+  - **What landed.**
+    - **`compile_response_format(rf) -> Result<Option<grammar::Grammar>, Response>`** (handlers.rs): refactored from the iter-9 `validate_response_format` (which discarded the parsed grammar). Now returns the compiled `Grammar` for `JsonObject` (built-in JSON grammar) and `JsonSchema` (via the iter-8 schema→GBNF translator). `Text` returns `Ok(None)`. Bad schemas / unparseable GBNF still 400 with `grammar_error` in <1ms.
+    - **`SamplingParams.grammar: Option<grammar::Grammar>`** + **`SamplingParams.token_bytes: Option<Arc<Vec<Vec<u8>>>>`**: the parsed grammar and the per-vocab byte-text table flow from the chat handler through the engine worker channel into the decode loop.
+    - **`Engine::token_bytes_table()`** (lazy + cached via `OnceLock`): builds the per-vocab UTF-8 byte table on first grammar request — `vocab × tokenizer.decode(&[id], false)` calls. Cost ~50-200 ms one-time on Gemma-4 26K vocab; every subsequent grammar request is a free Arc clone. Zero overhead for non-grammar workloads.
+    - **Sampling fork extension** (engine.rs `generate_once` + `generate_stream_once`): the iter-94 fork already routes `temperature`/`top_p`/`top_k`/`repetition_penalty`/`logit_bias` requests through `sampler_pure::sample_token` over live logits. Iter-95 adds: (a) `params.grammar.is_some()` flips `sample_logits = true` (grammar applies even at T=0); (b) inside the helper, after Tier 4 logit_bias and BEFORE `sample_token`, call `grammar::mask::mask_invalid_tokens(&runtime, &token_bytes, &mut logits)`; (c) after the chosen token is returned, feed its `token_bytes[id]` through the runtime via `accept_bytes` so the next step's mask is correctly narrowed.
+    - **Grammar-driven termination**: when the runtime reaches `is_dead()` (no in-flight stacks remain), set `finish_reason = "stop"` and break. Pop the trailing token + re-decode the surviving prefix so the out-of-grammar fallback (typically `<pad>` from the all-`-inf` softmax fallback path) doesn't pollute the response body. Streaming variant breaks but cannot pop (fragments already sent over SSE) — documented as iter-96+ "hold-back-last-fragment" candidate.
+  - **End-to-end smoke (Gemma-4 26B-A4B-it-ara-abliterated-dwq.gguf, M5 Max).**
+    ```
+    Test 1: json_object simple — "Reply with JSON {fruit, color}":
+      content: '{\n  "fruit": "Mango",\n  "color": "Yellow"\n} '
+      finish: stop  ✓
+      json.loads: {'fruit': 'Mango', 'color': 'Yellow'}  ✓ PARSES
+
+    Test 2: json_object adversarial — "Explain JSON in one sentence, then return JSON":
+      WITHOUT grammar (baseline):
+        'JSON is a lightweight data-interchange format ... \n\n```json\n{...'
+        ✗ prose preamble + markdown fence
+      WITH grammar:
+        '{"summary": "JSON is a lightweight, text-based data interchange format..."}'
+        ✓ pure JSON, no preamble — grammar suppressed prose
+
+    Test 3: json_schema strict {name:string, age:integer, role:string}:
+      content: '{\n  "age": 30,\n  "name": "Alice",\n  "role": "engineer"\n}\n\n...'
+      finish: stop  ✓
+      All 3 required fields present + correctly typed  ✓
+      json.loads → {'age':30, 'name':'Alice', 'role':'engineer'}  ✓ PARSES
+
+    Test 4: regression — no response_format → natural-language output:
+      content: 'Hello!'  ✓ unchanged
+    ```
+  - **Cost analysis.**
+    - **Greedy fast path (default, no grammar):** zero overhead — unchanged from iter-94.
+    - **Grammar slow path (per decode token):** one `grammar::mask::mask_invalid_tokens` call = `O(vocab × avg_token_bytes × avg_stack_depth)` clones+accept_bytes. For Gemma-4's 256K vocab × shallow JSON grammar (~5 stacks), this is ~5-15 ms/token CPU on M5 Max — comparable to the GPU layer forward at this model size. **Latency dominated by the per-token mask, not the GPU forward.** Iter-96+ candidate: precompute a per-(token, grammar-state) accept cache so most steps skip the full mask scan.
+    - **Token-bytes table:** ~50-200 ms one-time build per Engine lifetime. ~1-2 MB Arc-shared across all grammar requests.
+  - **Grammar infra inventory (now fully wired).**
+    ```
+    src/serve/api/grammar/parser.rs       (Phase 1, iter-5)  GBNF parser, 26 tests
+    src/serve/api/grammar/sampler.rs      (Phase 2, iter-6)  GrammarRuntime, 23 tests
+    src/serve/api/grammar/json_schema.rs  (Phase 3, iter-7)  schema → GBNF translator
+    src/serve/api/grammar/mask.rs         (Phase 4, iter-8)  logit-mask helper, 9 tests
+    src/serve/api/engine.rs::generate_once + generate_stream_once   (Phase 5, iter-95)  WIRING
+    ```
+    All 4 pure-compute lib layers now drive a real decode loop end-to-end. Pre-iter-95 the wiring was the missing piece (documented in iter-74 ADR text as "blocked on chat-model lane forward_decode_logits refactor"); iter-94's `logits_view()` hook + iter-95's mask + advance + termination calls close it.
+  - **Verification.** `cargo test --release --bin hf2q -- nomic_bert bert_gpu grammar --test-threads=1` → **139/139 pass, 0 fail, 1 ignored**. Includes: 26 GBNF parser tests, 23 sampler tests, 9 mask tests, 56 Phase 2b model tests, 25 grammar-error / schema-validation tests. Zero regressions.
+  - **Lane discipline.** Edits in 2 files: `src/serve/api/handlers.rs` (refactor `validate_response_format` → `compile_response_format`, attach grammar + token_bytes to SamplingParams) and `src/serve/api/engine.rs` (`Engine::token_bytes_table()` accessor, sampling-fork extensions in both `generate_once` and `generate_stream_once`). Zero changes outside the chat-engine lane.
+  - **Phase 2a status.** **Task #5 (grammar-constrained decoding) — CLOSED.** Remaining Phase 2a task: #7 (prompt cache — single-slot LCP-based prefix cache). The iter-92 `kv_caches` reset in `forward_prefill` is the inverse of what prompt cache needs — it'd need to selectively preserve the cached-prefix range instead of wholesale reset. Iter-96 candidate: implement an `Engine::reset_or_preserve(prefix_len)` that compares the new prompt against a cached prefix and either resets fully (no match) or preserves up to `prefix_len`.
+
 - **2026-04-25 loop iter 94 — Tier 2/3/4 sampling wired into chat decode loop. `temperature`, `top_p`, `top_k`, `repetition_penalty`, `logit_bias` all functional through OpenAI `/v1/chat/completions`. Builds the `forward_decode_logits` hook (read-only `logits_view()` over `self.activations.logits`) that grammar-constrained decoding (Task #5) and prompt cache (Task #7) will plug into.**
   - **What landed.**
     - **`MlxModelWeights::logits_view() -> Result<&[f32]>`** (forward_mlx.rs): borrowed slice into the live `[vocab_size]` logits buffer that `forward_decode` / `forward_prefill` populate as a side-effect of their lm_head + softcap dispatches. No extra GPU work, no copy. Replaces the implicit "read `self.activations.logits.as_slice()` directly" pattern with a typed accessor + length validation.

@@ -113,6 +113,27 @@ pub struct SamplingParams {
     /// `true` = allow multiple tool calls in the same turn. Tier 4. Plumbs
     /// through to the grammar-constrained decode path when it lands.
     pub parallel_tool_calls: bool,
+
+    // --- Grammar-constrained decoding (Decision #6, Task #5, iter-95) ---
+    /// Pre-compiled GBNF grammar to constrain decode-time token selection.
+    /// `None` ⇒ unconstrained (default sampling on raw logits).  When
+    /// `Some(g)`, the decode loop builds a fresh `GrammarRuntime`
+    /// (`mask::mask_invalid_tokens` clones it per-token), calls the
+    /// mask BEFORE `sampler_pure::sample_token`, and feeds the chosen
+    /// token's bytes through the runtime so the next step's mask is
+    /// correctly narrowed.
+    ///
+    /// Built by `handlers.rs::compile_response_format`.  `Grammar` is
+    /// `Clone` (cheap — just a `Vec<Vec<GretElement>>`); the chat
+    /// handler clones it into the per-request `SamplingParams`.
+    pub grammar: Option<super::grammar::Grammar>,
+    /// Per-vocab decoded UTF-8 byte table for grammar masking.  `None`
+    /// when `grammar` is also `None` (no grammar, no need for the
+    /// table).  When `grammar` is `Some`, this MUST be `Some(table)`
+    /// — the chat handler obtains it via `Engine::token_bytes_table()`
+    /// (lazily built + cached on the Engine).  Cheap to attach: an
+    /// Arc clone (no copy of the underlying vector).
+    pub token_bytes: Option<Arc<Vec<Vec<u8>>>>,
 }
 
 impl Default for SamplingParams {
@@ -135,6 +156,8 @@ impl Default for SamplingParams {
             logprobs: false,
             top_logprobs: 0,
             parallel_tool_calls: true,
+            grammar: None,
+            token_bytes: None,
         }
     }
 }
@@ -195,6 +218,9 @@ struct EngineInner {
     /// embedder (Phase 2a Task #8) — used to validate the OpenAI
     /// `dimensions` parameter and to size the response payload.
     hidden_size: usize,
+    /// Vocabulary size — needed to size the per-vocab token_bytes table
+    /// (built lazily on first grammar request).
+    vocab_size: usize,
     eos_token_ids: Vec<u32>,
     /// Tokenizer cloned per-request so handlers can tokenize without a lock.
     tokenizer: Arc<Tokenizer>,
@@ -204,6 +230,14 @@ struct EngineInner {
     /// Per-model registration — reasoning-boundary + tool-call markers
     /// (Decision #21). `None` when no family matches this model's id.
     registration: Option<super::registry::ModelRegistration>,
+    /// Per-vocab decoded UTF-8 byte table — `token_bytes[id]` is the
+    /// bytes the tokenizer emits when token `id` is sampled.  Built on
+    /// first grammar request via `Engine::token_bytes_table()` and
+    /// cached for the engine's lifetime (vocab × ~3-5 bytes ≈ 1 MB at
+    /// 256K vocab — trivial vs the model weights).  `OnceLock` so
+    /// concurrent first-callers race only on the build, not on reads.
+    /// Phase 2a Task #5 / iter-95.
+    token_bytes: std::sync::OnceLock<Arc<Vec<Vec<u8>>>>,
 }
 
 /// The request protocol the worker thread drains.
@@ -412,6 +446,7 @@ impl Engine {
         let context_length = loaded.context_length;
         let quant_type = loaded.quant_type.clone();
         let hidden_size = loaded.weights.hidden_size;
+        let vocab_size = loaded.weights.vocab_size;
         let eos_token_ids = loaded.eos_token_ids.clone();
         let tokenizer = Arc::new(loaded.tokenizer.clone());
         let chat_template = Arc::new(loaded.chat_template.clone());
@@ -445,12 +480,60 @@ impl Engine {
                 context_length,
                 quant_type,
                 hidden_size,
+                vocab_size,
                 eos_token_ids,
                 tokenizer,
                 chat_template,
                 registration,
+                token_bytes: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Lazily build + cache the per-vocab decoded UTF-8 byte table used
+    /// by the grammar mask (Phase 2a Task #5 / iter-95).
+    ///
+    /// `token_bytes[id]` is the bytes the tokenizer emits when token `id`
+    /// is sampled — exactly `tokenizer.decode(&[id], false)` lowered to
+    /// raw UTF-8 bytes.  Empty entries (special / unprintable tokens
+    /// like `<eos>` / `<turn|>`) are left blank; the mask treats them
+    /// as "do not constrain" — the decode loop's EOS/stop-string layer
+    /// owns those.
+    ///
+    /// Cost: vocab × one tokenizer.decode call.  At Gemma-4's vocab=256K
+    /// this is ~50-200 ms on first call (CPU work; not on hot path),
+    /// then ~free for every subsequent grammar request through this
+    /// Engine.  The build runs on the calling thread so the worker
+    /// thread is unaffected.
+    ///
+    /// Returned as `Arc<Vec<Vec<u8>>>` — the chat handler attaches it
+    /// to `SamplingParams.token_bytes` (cheap Arc clone) so the worker
+    /// thread can consume it without re-resolving on every request.
+    pub fn token_bytes_table(&self) -> Arc<Vec<Vec<u8>>> {
+        self.inner
+            .token_bytes
+            .get_or_init(|| {
+                let v = self.inner.vocab_size;
+                let tok = &self.inner.tokenizer;
+                let mut out: Vec<Vec<u8>> = Vec::with_capacity(v);
+                for id in 0..v as u32 {
+                    // `decode` returns the rendered text per token; for
+                    // BPE-byte-fallback vocabs the bytes round-trip via
+                    // UTF-8.  Failure (out-of-range id, unsupported
+                    // token) returns an empty string — emit empty bytes
+                    // so the mask treats it as a "special" / unprintable
+                    // token (left untouched).
+                    let s = tok.decode(&[id], false).unwrap_or_default();
+                    out.push(s.into_bytes());
+                }
+                tracing::info!(
+                    "Engine: built per-vocab token_bytes table ({} ids, ~{:.1} MB)",
+                    v,
+                    out.iter().map(|v| v.len()).sum::<usize>() as f64 / 1e6
+                );
+                Arc::new(out)
+            })
+            .clone()
     }
 
     pub fn model_id(&self) -> &str {
@@ -737,27 +820,32 @@ fn generate_once(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
-    // ── Sampler config — Tier 2/3/4 surface (iter-94) ──────────────────
+    // ── Sampler config — Tier 2/3/4 surface + grammar (iter-94 / iter-95) ──
     //
     // Pre-iter-94 the decode loop only consumed `forward_decode`'s
     // on-GPU greedy argmax — every `temperature` / `top_p` / `top_k` /
     // `repetition_penalty` / `logit_bias` request was silently downcast
     // to greedy.  Iter-94 forks on whether ANY field requests non-greedy
     // sampling and routes those through `sampler_pure::sample_token`
-    // over the live `self.activations.logits` slice (already populated
-    // as a side-effect of `forward_decode` / `forward_prefill`'s lm_head
-    // + softcap dispatch).
+    // over the live `self.activations.logits` slice.  Iter-95 adds the
+    // grammar branch: when `params.grammar.is_some()`, mask the live
+    // logits via `grammar::mask::mask_invalid_tokens` BEFORE handing
+    // them to `sampler_pure` (or to the greedy argmax for T=0).  The
+    // chosen token's bytes then advance the runtime so the next step's
+    // mask is correctly narrowed.
     //
-    // Greedy fast path (all fields at default) keeps the existing
-    // forward_decode return-value chain — no logits readback, no extra
-    // copy.  Sampling slow path discards the on-GPU argmax token
-    // (~20 µs of wasted GPU work, negligible vs the ~10-100ms layer
-    // forward) and re-derives the next token from the live logits.
+    // Greedy fast path (all fields at default + no grammar) keeps the
+    // existing forward_decode return-value chain — no logits readback,
+    // no extra copy.  Sampling/grammar slow path discards the on-GPU
+    // argmax token (~20 µs of wasted GPU work, negligible vs the
+    // ~10-100ms layer forward) and re-derives the next token from the
+    // mask + sample chain.
     let sample_logits = params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0
         || params.repetition_penalty != 1.0
-        || !params.logit_bias.is_empty();
+        || !params.logit_bias.is_empty()
+        || params.grammar.is_some();
     let sampler_params = if sample_logits {
         Some(SamplerParams {
             temperature: params.temperature as f64,
@@ -770,13 +858,37 @@ fn generate_once(
         None
     };
 
-    // Local helper — apply Tier 4 logit_bias and sample.  Captures
-    // params + sampler_params by reference; takes the running
-    // `generated_tokens` for repetition-penalty.
+    // Build the per-request grammar runtime (Phase 2a Task #5 / iter-95).
+    // `Grammar` is `Clone` (cheap ~Vec<Vec<GretElement>>); the runtime
+    // owns the clone + a small Vec<Stack> of in-flight positions.  We
+    // mutate in place across decode steps (advance via accept_bytes
+    // after each sampled token).
+    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
+        Some(g) => {
+            let start_rule_id = g
+                .rule_id("root")
+                .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+            let rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
+                .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
+            Some(rt)
+        }
+        None => None,
+    };
+    let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
+
+    // Local helper — apply grammar mask + Tier 4 logit_bias and sample.
+    // Mutably borrows the runtime so it can be advanced after sampling
+    // (caller does the advance to keep this closure side-effect-light).
+    // Returns the sampled token id; caller must feed
+    // `token_bytes[id]` through the runtime to keep it in sync.
     let sample_from_live_logits =
-        |weights: &mut MlxModelWeights, generated: &[u32]| -> Result<u32> {
+        |weights: &mut MlxModelWeights,
+         generated: &[u32],
+         runtime: Option<&super::grammar::GrammarRuntime>|
+         -> Result<u32> {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
             let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
+            // Tier 4 logit_bias FIRST: additive per OpenAI convention.
             if !params.logit_bias.is_empty() {
                 let v = logits.len();
                 for (&id, &bias) in &params.logit_bias {
@@ -785,6 +897,11 @@ fn generate_once(
                         logits[idx] += bias;
                     }
                 }
+            }
+            // Grammar mask: zero out tokens that would drive the runtime
+            // dead.  Skipped when no grammar (Option None).
+            if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
+                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
             }
             Ok(sampler_pure::sample_token(&mut logits, sp, generated))
         };
@@ -802,7 +919,19 @@ fn generate_once(
     // applies to the very first generated token, not just decode-loop
     // tokens 2..N.  The greedy-fast-path skips logits readback entirely.
     let mut next_token = if sample_logits {
-        sample_from_live_logits(&mut loaded.weights, &[])?
+        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
+        // Feed the chosen token's bytes through the grammar runtime so
+        // the next step's mask is correctly narrowed.  No-op when no
+        // grammar.  An empty token_bytes entry (special / unprintable)
+        // is also a no-op since accept_bytes on an empty slice returns
+        // true with no state change.
+        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !bytes.is_empty() {
+                rt.accept_bytes(bytes);
+            }
+        }
+        tok
     } else {
         prefill_argmax
     };
@@ -857,11 +986,21 @@ fn generate_once(
 
             next_token = if sample_logits {
                 // Sampling slow path: read logits, apply Tier 4 logit_bias,
-                // call sampler_pure for temperature/top_p/top_k/rep-penalty.
-                // OpenAI logit_bias is additive: `logit_bias[id] = bias`
-                // adds `bias` to `logits[id]` before softmax.  Out-of-range
-                // ids are silently ignored (matches OpenAI behaviour).
-                sample_from_live_logits(&mut loaded.weights, &generated_tokens)?
+                // grammar mask, then call sampler_pure for
+                // temperature/top_p/top_k/rep-penalty.
+                let tok = sample_from_live_logits(
+                    &mut loaded.weights,
+                    &generated_tokens,
+                    grammar_runtime.as_ref(),
+                )?;
+                // Advance the grammar runtime by the chosen token's bytes.
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if !bytes.is_empty() {
+                        rt.accept_bytes(bytes);
+                    }
+                }
+                tok
             } else {
                 // Greedy fast path — use forward_decode's on-GPU argmax.
                 greedy_token
@@ -890,6 +1029,38 @@ fn generate_once(
                 // convention per ADR-005 "Stop-sequence stripping from
                 // returned text").
                 strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                break;
+            }
+            // Grammar-driven termination (Phase 2a Task #5 / iter-95).
+            //
+            // After the grammar runtime tried to accept the chosen
+            // token, `is_dead()` becomes true if no in-flight stack
+            // can extend further.  Two ways this fires after a
+            // grammar-constrained decode step:
+            //
+            //   1. **Mask masked everything**: every printable token's
+            //      bytes failed the grammar, so `sampler_pure` softmaxed
+            //      all-`-inf` logits, summed to zero, and fell back to
+            //      `indexed[0]` (usually id=0 = `<pad>` for Gemma).
+            //      That token's bytes also fail the grammar (`<pad>`
+            //      decodes to literal `"<pad>"` text — `<` is not valid
+            //      JSON after `} ws`).  `accept_bytes` returned false
+            //      above ⇒ runtime is now dead.
+            //   2. **Grammar fully matched + last token was the final
+            //      legal one**: the runtime accepted the token but has
+            //      no remaining stacks — the parse is complete.
+            //
+            // Both cases collapse to "decoder should halt".  Pop the
+            // last pushed token + re-decode the surviving prefix so
+            // any out-of-grammar fragment (`<pad>`) doesn't appear in
+            // the response body.
+            if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
+                finish_reason = "stop";
+                generated_tokens.pop();
+                decoded_text = loaded
+                    .tokenizer
+                    .decode(&generated_tokens, false)
+                    .unwrap_or_default();
                 break;
             }
         }
@@ -1036,12 +1207,13 @@ fn generate_stream_once(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
 
-    // ── Sampler config — Tier 2/3/4 surface (iter-94, mirrors generate_once) ──
+    // ── Sampler config — Tier 2/3/4 + grammar (iter-94 / iter-95, mirrors generate_once) ──
     let sample_logits = params.temperature > 0.0
         || params.top_k > 0
         || params.top_p < 1.0
         || params.repetition_penalty != 1.0
-        || !params.logit_bias.is_empty();
+        || !params.logit_bias.is_empty()
+        || params.grammar.is_some();
     let sampler_params = if sample_logits {
         Some(SamplerParams {
             temperature: params.temperature as f64,
@@ -1053,6 +1225,26 @@ fn generate_stream_once(
     } else {
         None
     };
+    let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
+        Some(g) => {
+            let start_rule_id = match g.rule_id("root") {
+                Some(id) => id,
+                None => {
+                    send!(GenerationEvent::Error("grammar has no root rule".into()));
+                    return;
+                }
+            };
+            match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
+                Some(rt) => Some(rt),
+                None => {
+                    send!(GenerationEvent::Error("grammar runtime init failed".into()));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
     // --- Prefill ---
     let prefill_start = Instant::now();
@@ -1090,7 +1282,17 @@ fn generate_stream_once(
                 }
             }
         }
-        sampler_pure::sample_token(&mut logits, sp, &[])
+        if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+        }
+        let tok = sampler_pure::sample_token(&mut logits, sp, &[]);
+        if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+            let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !bytes.is_empty() {
+                rt.accept_bytes(bytes);
+            }
+        }
+        tok
     } else {
         prefill_argmax
     };
@@ -1166,7 +1368,17 @@ fn generate_stream_once(
                         }
                     }
                 }
-                sampler_pure::sample_token(&mut logits, sp, &generated_tokens)
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                }
+                let tok = sampler_pure::sample_token(&mut logits, sp, &generated_tokens);
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                    let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if !bytes.is_empty() {
+                        rt.accept_bytes(bytes);
+                    }
+                }
+                tok
             } else {
                 greedy_token
             };
@@ -1192,6 +1404,27 @@ fn generate_stream_once(
             if hit_stop_string(&accumulated_text, &params.stop_strings) {
                 finish_reason = "stop";
                 break;
+            }
+            // Grammar-driven termination — see generate_once for full doc.
+            // Streaming variant: we can't pop the trailing token cleanly
+            // because the fragment was already emitted to the SSE stream;
+            // accept the small wart.  Iter-96+ candidate: hold back the
+            // last fragment until next-step grammar state is known so it
+            // can be suppressed pre-emit.
+            if grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
+                finish_reason = "stop";
+                break;
+            }
+            if let Some(rt) = grammar_runtime.as_ref() {
+                if rt.is_accepted() {
+                    if let Some(tb) = token_bytes_ref {
+                        let bytes = tb.get(next_token as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                        if bytes.is_empty() {
+                            finish_reason = "stop";
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1573,10 +1806,12 @@ assistant:
                 context_length: None,
                 quant_type: None,
                 hidden_size: 0,
+                vocab_size: 0,
                 eos_token_ids: vec![],
                 tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
                 chat_template: Arc::new(String::new()),
                 registration: None,
+                token_bytes: std::sync::OnceLock::new(),
             }),
         }
     }

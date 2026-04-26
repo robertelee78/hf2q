@@ -330,17 +330,19 @@ async fn prepare_chat_generation(
         }
     }
 
-    // Pre-compile the response_format grammar (Decision #6). Fails fast on
-    // malformed JSON-Schema so the client sees a grammar_error before any
-    // generation starts — not after N tokens of model output. Note: the
-    // grammar is compiled but not yet wired into the decode-time sampler
-    // (that refactor needs a live model to validate byte-identical output);
-    // the pre-compile catches the most common class of bad requests.
-    if let Some(rf) = req.response_format.as_ref() {
-        if let Err(resp) = validate_response_format(rf) {
-            return Err(resp);
-        }
-    }
+    // Compile the response_format grammar (Decision #6).  Iter-95 wires
+    // the parsed grammar into `SamplingParams.grammar` so the decode loop
+    // can mask invalid tokens at every step.  Pre-iter-95 the grammar
+    // was discarded after parse-validation; bad requests still fail
+    // fast in <1 ms but valid grammars now constrain decoding instead
+    // of being silently ignored.
+    let response_grammar: Option<grammar::Grammar> = match req.response_format.as_ref() {
+        Some(rf) => match compile_response_format(rf) {
+            Ok(g) => g,
+            Err(resp) => return Err(resp),
+        },
+        None => None,
+    };
 
     // Render + tokenize + apply context-overflow policy (Decision #23).
     // `apply_overflow_policy` handles the three policies:
@@ -383,6 +385,18 @@ async fn prepare_chat_generation(
                 .collect()
         })
         .unwrap_or_default();
+    // When the request carries a grammar (response_format=json_object /
+    // json_schema), attach the per-vocab token-bytes table so the worker
+    // can mask invalid tokens at every decode step.  The table is
+    // lazily built + cached on the Engine — first grammar request pays
+    // ~50-200 ms (CPU work, off the worker thread); every subsequent
+    // request gets a free Arc clone.  No grammar ⇒ no table attachment ⇒
+    // zero extra cost.
+    let grammar_token_bytes: Option<std::sync::Arc<Vec<Vec<u8>>>> = if response_grammar.is_some() {
+        Some(engine.token_bytes_table())
+    } else {
+        None
+    };
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
@@ -398,6 +412,8 @@ async fn prepare_chat_generation(
         logprobs: req.logprobs.unwrap_or(false),
         top_logprobs: req.top_logprobs.unwrap_or(0),
         parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+        grammar: response_grammar,
+        token_bytes: grammar_token_bytes,
     };
     Ok(PreparedChatContext {
         engine: (),
@@ -1382,19 +1398,25 @@ fn vit_engine_integration_pending_response(n_images: usize, forward_ms: u64) -> 
     resp
 }
 
-/// Pre-compile the request's `response_format` to a GBNF grammar and parse
-/// it. Returns `Err(Response)` with the OpenAI-shaped 400 `grammar_error`
-/// envelope on failure. On success, the grammar is discarded (iter 9 scope)
-/// — a future iter plumbs the compiled `Grammar` into the engine so it
-/// actually constrains decoding. Pre-compile alone is still valuable:
-/// malformed schemas are rejected in <1ms instead of producing garbage
-/// after N tokens.
-fn validate_response_format(rf: &ResponseFormat) -> std::result::Result<(), Response> {
+/// Pre-compile the request's `response_format` to a parsed GBNF grammar.
+///
+/// Returns `Ok(None)` for `ResponseFormat::Text` (no constraint applies).
+/// Returns `Ok(Some(grammar))` for `JsonObject` / `JsonSchema` — caller
+/// attaches the parsed grammar to `SamplingParams` so the decode loop's
+/// mask step (iter-95+) can constrain token selection to grammar-valid
+/// completions.
+///
+/// Returns `Err(Response)` with the OpenAI-shaped 400 `grammar_error`
+/// envelope on a malformed JSON-Schema or unparseable GBNF — fails fast
+/// in <1ms instead of producing garbage after N tokens.
+fn compile_response_format(
+    rf: &ResponseFormat,
+) -> std::result::Result<Option<grammar::Grammar>, Response> {
     let gbnf = match rf {
-        ResponseFormat::Text => return Ok(()),
+        ResponseFormat::Text => return Ok(None),
         ResponseFormat::JsonObject => {
-            // Unconstrained JSON. Hardcoded grammar — no schema to compile.
-            // We still parse it to make sure the primitive rule set is wired.
+            // Unconstrained JSON object grammar — same shape as
+            // llama.cpp's built-in json_object.gbnf.
             static JSON_OBJECT_GRAMMAR: &str = r#"root   ::= object
 value  ::= object | array | string | number | ("true" | "false" | "null") ws
 object ::=
@@ -1431,13 +1453,11 @@ ws ::= | " " | "\n" [ \t]{0,20}
             }
         }
     };
-    // Sanity-parse: compile the GBNF. Catches bugs in the translator or in
-    // the hardcoded json_object grammar before they hit the sampler.
-    if let Err(e) = grammar::parser::parse(&gbnf) {
-        return Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e))
-            .into_response());
+    match grammar::parser::parse(&gbnf) {
+        Ok(g) => Ok(Some(g)),
+        Err(e) => Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e))
+            .into_response()),
     }
-    Ok(())
 }
 
 /// Build a 429 `queue_full` response with OpenAI-convention rate-limit
