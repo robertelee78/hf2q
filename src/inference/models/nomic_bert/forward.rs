@@ -59,8 +59,7 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::super::bert::bert_gpu::{
     alloc_bert_attention_mask, bert_attention_with_mask_gpu, bert_embed_gather_gpu,
     bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu, bert_linear_gpu,
-    bert_pool_gpu, bert_residual_add_gpu, bert_residual_layer_norm_gpu,
-    register_bert_custom_shaders, BertPoolKind,
+    bert_pool_gpu, bert_residual_layer_norm_gpu, register_bert_custom_shaders, BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
 use super::config::NomicBertConfig;
@@ -140,46 +139,64 @@ pub fn nomic_bert_embeddings_gpu(
         }
     }
 
-    let n_hidden = (seq_len as usize) * (hidden as usize);
+    let _ = seq_len; // n_hidden derivation kept for future callers
+    let _n_hidden = (seq_len as usize) * (hidden as usize);
 
-    // 1. Token embedding gather.
-    let tok =
-        bert_embed_gather_gpu(encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len)
-            .context("nomic embeddings: token gather")?;
-    encoder.memory_barrier();
+    // Iter-88 perf:
+    //   - Token gather and type gather are independent (different
+    //     lookup tables, different output buffers, different ids
+    //     buffers). Removed the inter-gather barrier.
+    //   - When both gathers run, fuse the (tok + typ) residual_add
+    //     into the LayerNorm via bert_residual_layer_norm_gpu (same
+    //     iter-86 fusion as the encoder block sites). Saves one
+    //     dispatch + the intermediate `summed` buffer alloc.
+    //
+    // Dispatch chain (with both type_ids + token_types present):
+    //   gather(tok)  ┐
+    //                ├── barrier ── fused_residual_layer_norm
+    //   gather(typ)  ┘
+    //
+    // Fall-back when no segment table: single gather + plain
+    // bert_layer_norm_gpu (still saves the residual_add it never had).
+    let tok = bert_embed_gather_gpu(
+        encoder, registry, device, token_embd, input_ids, vocab, hidden, seq_len,
+    )
+    .context("nomic embeddings: token gather")?;
 
-    // 2. Optional segment-type embedding gather + add. nomic-embed-text-v1.5
-    //    has type_vocab_size=2 and the loader synthesizes an all-zero
-    //    type_ids buffer when caller passes None (mirrors BERT's behavior
-    //    via apply_nomic_bert_full_forward_gpu).
-    let summed = if let (Some(type_ids), Some(token_types)) = (type_ids_opt, token_types_opt) {
+    if let (Some(type_ids), Some(token_types)) = (type_ids_opt, token_types_opt) {
         let typ = bert_embed_gather_gpu(
             encoder, registry, device, token_types, type_ids, type_vocab, hidden, seq_len,
         )
         .context("nomic embeddings: type gather")?;
         encoder.memory_barrier();
-        let s =
-            bert_residual_add_gpu(encoder, registry, device, &tok, &typ, n_hidden as u32)
-                .context("nomic embeddings: token + type add")?;
-        encoder.memory_barrier();
-        s
+        super::super::bert::bert_gpu::bert_residual_layer_norm_gpu(
+            encoder,
+            registry,
+            device,
+            &tok,
+            &typ,
+            embed_norm_gamma,
+            embed_norm_beta,
+            eps,
+            seq_len,
+            hidden,
+        )
+        .context("nomic embeddings: tok+typ residual+LayerNorm (fused)")
     } else {
-        tok
-    };
-
-    // 3. LayerNorm finalize.
-    bert_layer_norm_gpu(
-        encoder,
-        registry,
-        device,
-        &summed,
-        embed_norm_gamma,
-        embed_norm_beta,
-        eps,
-        seq_len,
-        hidden,
-    )
-    .context("nomic embeddings: post-sum LayerNorm")
+        encoder.memory_barrier();
+        bert_layer_norm_gpu(
+            encoder,
+            registry,
+            device,
+            &tok,
+            embed_norm_gamma,
+            embed_norm_beta,
+            eps,
+            seq_len,
+            hidden,
+        )
+        .context("nomic embeddings: post-tok LayerNorm")
+    }
 }
 
 // ---------------------------------------------------------------------------
