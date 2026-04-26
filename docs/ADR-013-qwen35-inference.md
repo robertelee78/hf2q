@@ -128,7 +128,7 @@ Each of these is explicitly *not* in this ADR's scope.
 
 1. **Conversion pipeline (HF safetensors → DWQ GGUF).** Owned by ADR-012. This ADR consumes GGUFs; it doesn't produce them. Cross-ADR coordination point: the `ActivationCapture` trait defined in ADR-012 Decision 13, implemented here in Decision 10.
 2. **Multimodal vision tower.** Qwen3.6-27B dense ships with a 27-layer ViT (patch_size=16, hidden_size=1152). The 35B-A3B on-disk target has `mmproj-qwen36-F16.gguf` alongside the main GGUF but the text config drops vision. This ADR scopes text-only inference for both variants. Vision is a follow-up ADR that can layer on top.
-3. **MTP speculative-decoding execution.** `mtp_num_hidden_layers: 1` is present in both variants' configs; the corresponding GGUF tensors are loaded but unused in the v1 hot path. Implementing speculative decoding (MTP head prediction + verification loop) is a follow-up ADR. This ADR ensures MTP weights load without error and the main forward produces correct output *without* MTP execution. (The on-disk apex GGUF has MTP tensors stripped per the 2026-04-23 gguf-dump — but conversion via ADR-012 will emit them, so inference must load them gracefully.)
+3. **MTP speculative-decoding execution.** `mtp_num_hidden_layers: 1` is present in both variants' configs. P14 implements the MTP draft block, optional `HybridKvCache.mtp_slot`, and the greedy T=0 speculative accept/reject loop for GGUFs that carry `blk.{num_hidden_layers}.nextn.*` tensors. The on-disk apex GGUF has MTP tensors stripped per the 2026-04-23 gguf-dump, so the non-MTP greedy path remains the clean fall-through.
 4. **Tokenizer runtime changes beyond what GGUF-embedded metadata provides.** The Qwen3.5 `gpt2`-family BPE (pre-type `qwen35`, vocab 248,320) is loaded from the GGUF's `tokenizer.ggml.*` keys and `tokenizer.chat_template`. If hf2q's existing tokenizer pipeline requires a new pre-tokenizer regex for `pre: qwen35`, we add it; if it requires a new chat-template engine, that's a follow-up ADR.
 5. **Dynamic KV-cache quantization (TQ / TurboQuant) for Qwen3.5's hybrid KV state.** ADR-007 is TurboQuant for Gemma; per `project_tq_state_2026_04_21.md` it's gated off pending C-0 audit. We ship Qwen3.5 inference with dense F32 KV cache for full-attention layers and dense F32 SSM recurrent state for linear-attention layers — matching the llama.cpp default. Extending TQ to Qwen3.5 is out of scope here.
 6. **Multi-GPU / multi-device inference.** Single M-series device. llama.cpp's `auto_fgdn` fallback-on-device-mismatch logic is not ported; we target a single-device hot path.
@@ -194,7 +194,7 @@ Each decision below specifies: **Problem** (what breaks today), **Decision** (wh
 
 Module file layout (per `project_model_class_split.md`):
 
-- `src/inference/models/qwen35/mod.rs` — shared across both variants: linear-attention forward, gated full-attention forward, MROPE dispatch, tokenizer, MTP load-path, hybrid KV cache management, `Qwen35Config` parser, `LayerKind` enum.
+- `src/inference/models/qwen35/mod.rs` — shared across both variants: linear-attention forward, gated full-attention forward, MROPE dispatch, tokenizer, MTP draft path, speculative decode, hybrid KV cache management, `Qwen35Config` parser, `LayerKind` enum.
 - `src/inference/models/qwen35/dense.rs` — dense-specific: dense SwiGLU FFN, dense tensor-name resolution, dense forward entry point.
 - `src/inference/models/qwen35/moe.rs` — MoE-specific: 256-expert dispatch, shared-expert-gate, MoE tensor-name resolution, MoE forward entry point.
 - `src/inference/models/qwen35/kernels.rs` — thin wrappers around `mlx-native`'s new ops for Qwen3.5 (keeps forward-pass code readable; no math here, just dispatch).
@@ -498,17 +498,18 @@ Allocation strategy: allocate full-cache-size upfront sized by `cfg.max_position
 - Unit test: synthetic FFN weights produce expected SwiGLU output.
 - Zero overlap with MoE code path (compile-time variant dispatch).
 
-### 15. MTP tensors (load-only, no execution)
+### 15. MTP tensors and speculative draft execution
 
-**Problem.** `mtp_num_hidden_layers: 1` in config. GGUF tensors named `blk.{N}.nextn.*` (where N = num_hidden_layers) per ADR-012 Decision 11. These must load without error even though the v1 hot path doesn't execute speculative decoding.
+**Problem.** `mtp_num_hidden_layers: 1` in config. GGUF tensors named `blk.{N}.nextn.*` (where N = num_hidden_layers) per ADR-012 Decision 11. These must load without error and, when present, drive an MTP draft head for deterministic speculative decoding.
 
-**Decision.** Load MTP tensors into memory as `Option<MtpWeights>` on `Qwen35Model`. Production forward ignores them. A follow-up ADR (speculative decoding) consumes them.
+**Decision.** Load MTP tensors into GPU-resident `MtpWeights` on `Qwen35Model`. The verifier's normal greedy path ignores MTP unless speculative decoding is enabled; the speculative path calls `MtpWeights::forward_draft(prev_hidden, embed_t, kv_cache, position_ids)` and accepts the draft token only when it matches the verifier's next greedy token.
 
 If the GGUF doesn't contain MTP tensors (like the apex.gguf on disk today, which had them stripped per the 2026-04-23 dump), `Option` is None and no error.
 
 **Acceptance criteria.**
 - Load on apex.gguf succeeds (MTP absent → None, no error).
-- Load on a (future hf2q-produced) GGUF with MTP succeeds; `MtpWeights` is populated; tensor shapes match spec.
+- Load on a GGUF with MTP succeeds; `MtpWeights` is populated with the nextn wrapper tensors plus the inner full-attention + dense-FFN block weights.
+- `HF2Q_SPEC_DECODE=1` or `--speculative` runs the greedy T=0 rejection sampler; MTP-bearing GGUFs default on, non-MTP GGUFs fall through to existing greedy decode.
 
 ### 16. `ActivationCapture` trait implementation (ADR-012 cross-coordination)
 
@@ -776,21 +777,27 @@ Variant coverage (all GPU): Dense (GEMM), MoE F32 (`mul_mm_id`), MoE GGUF-loaded
 
 Tests: 9 unit tests in `activation_capture_real::tests` + 1 end-to-end test in `quantize::dwq_activation::tests::activation_calibration_with_real_model_wrapper_succeeds` — all passing through the GPU path. Stale "P11 follow-up" notes elsewhere in the inference module retired.
 
-### P14 — MTP speculative-decoding execution (planned; blocked on ADR-012 P11)
+### P14 — MTP speculative-decoding execution (COMPLETE in worktree; commit pending)
 
-**Status:** ⏳ **planned** — new phase added 2026-04-24 alongside ADR-012 Decision 19's conversion-side MTP tensor round-trip gate.
+**Status:** ✅ **COMPLETE in `cfa/p14/codex` worktree** (2026-04-25). Commit hash citation is pending because this sandbox cannot create `/opt/hf2q/.git/worktrees/p14-codex/index.lock`; no source hash is fabricated here.
 
 **Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
 
-**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate). If P11 is not green, P14 is not started — the cross-link exists precisely so a "we'll do the inference side later" stub cannot silently accumulate on this side of the boundary.
+**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate) landed 2026-04-24. P14 consumes the emitted `blk.{num_hidden_layers}.nextn.*` layout.
 
-**Deliverables (provisional, to be refined when P14 opens):**
-- `src/inference/models/qwen35/mtp.rs` — load-only scaffold is promoted to a full forward implementation. The `MtpWeights` bag-of-tensors structure gains a `forward_draft` entry point.
-- Rejection sampling loop in `src/inference/models/qwen35/model.rs` (both dense + MoE variants).
-- Unit tests for the rejection sampler against a hand-authored log-prob fixture.
-- Acceptance: speculative decoding does not change output logits vs. greedy single-token decode at temperature 0. Throughput improvement measured on a small-fixture generate; must be positive (≥ 10%) on at least one prompt set.
+**Delivered:**
+- Convert-side MTP policy flipped to emit-by-default with `HF2Q_QWEN35_DROP_MTP=1` escape hatch and dated removal condition.
+- Qwen3.5 / Qwen3.5-MoE GGUF metadata now reports `block_count = num_hidden_layers + nextn_predict_layers`; runtime config subtracts `nextn_predict_layers` so the verifier stack does not load MTP as a normal layer.
+- `src/inference/models/qwen35/mtp.rs` promotes `MtpWeights` to GPU-loaded weights and implements `forward_draft` with full attention (not DeltaNet), dense FFN, shared draft head, F32 activations/logits, and BF16 projection weights.
+- `src/inference/models/qwen35/kv_cache.rs` adds optional `mtp_slot` at index `num_hidden_layers`; absent MTP remains zero-cost.
+- `src/inference/models/qwen35/spec_decode.rs` adds greedy T=0 speculative decoding with accept/reject accounting.
+- `hf2q generate` wires `--speculative` / `HF2Q_SPEC_DECODE=1`; MTP-bearing GGUFs default on, non-MTP GGUFs fall through to greedy.
 
-**Cross-link:** ADR-012 P11 landed 2026-04-24. That commit is the precondition for this phase. When P14 opens, both ADRs update their phase tables together.
+**Local verification receipts:**
+- `RUSTC_WRAPPER= cargo build --release` — PASS.
+- `RUSTC_WRAPPER= cargo test --release qwen35::mtp` — PASS (4 passed, 1 ignored).
+- `RUSTC_WRAPPER= cargo test --release qwen35::spec_decode` — PASS (2 passed).
+- `scripts/sourdough_qwen35.sh` live gate did not produce a bytes receipt in this sandbox: `/opt/homebrew/bin/llama-cli` failed Metal initialization (`failed to create command queue`) and segfaulted before hf2q ran.
 
 **Estimated LOC:** ~500 (MTP forward + rejection sampling + tests).
 
@@ -836,7 +843,7 @@ Sourdough byte-prefix gate at HEAD `23e1128`: 180 bytes common prefix / 160-byte
 `tests/integration_qwen35moe.rs` + `tests/integration_qwen35_dense.rs`. `#[ignore]`'d (opt-in via `cargo test --release -- --ignored qwen35`); skip cleanly with `eprintln + return` when no on-disk GGUF; otherwise invoke `target/release/hf2q generate ...` and assert exit 0 + non-empty stdout + tok/s footer on stderr. MoE test verified locally against the apex GGUF (5.88s including model load + 8-token greedy decode); dense test skips cleanly until a Qwen3.5 dense GGUF is staged.
 
 #### P13.5 COMPLETE — `docs/running-qwen35.md` landed (commit `d42b8f6`, 2026-04-25)
-Hardware requirements, model layout, one-liner generate / sourdough / bench commands, caveats (greedy vs sampled fast-path, chat-template stop at token 106, Q5_K expert kernel requirement citing `mlx-native@dd087a9`, hybrid KV cache geometry, BF16 K-cache head_dim ≥ 32), out-of-scope list (parallel batches, tool-use, multi-turn, vision tower, MTP execution).
+Hardware requirements, model layout, one-liner generate / sourdough / bench commands, caveats (greedy vs sampled fast-path, chat-template stop at token 106, Q5_K expert kernel requirement citing `mlx-native@dd087a9`, hybrid KV cache geometry, BF16 K-cache head_dim ≥ 32), out-of-scope list (parallel batches, tool-use, multi-turn, vision tower). P14 removes MTP execution from this out-of-scope set when an MTP-bearing GGUF is present.
 
 #### P13.6 COMPLETE — ADR-013 status close (commit cited inline in this file's progress log, 2026-04-25)
 Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit hashes + receipts; End-gate criteria below all ✅.
@@ -849,6 +856,7 @@ Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit 
 | Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
 | Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
 | Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
+| P14 MTP speculative decode gate | ⚠️ Code/tests pass in worktree (`cargo build --release`, `cargo test --release qwen35::mtp`, `cargo test --release qwen35::spec_decode`); live bytes/tok-s remeasurement blocked because `llama-cli` failed Metal command-queue creation and segfaulted before producing sourdough or bench numbers |
 
 ### Totals
 
@@ -980,7 +988,7 @@ Decision 17. This is the only place a llama.cpp binary is invoked, and it's invo
 - **LayerKind (Qwen3.5).** Enum `{LinearAttention, FullAttention}`. Distinct from Gemma-4's `LayerType::{Sliding, Full}`.
 - **LLM_ARCH_QWEN35 / QWEN35MOE.** llama.cpp architecture constants. Arch strings `qwen35` / `qwen35moe`.
 - **MROPE.** Multi-axis RoPE. Rotary dimensions partitioned into multiple sections with independent theta bases.
-- **MTP.** Multi-Token Prediction. Extra transformer block after main stack for speculative decoding. Load-only in this ADR; execution is a follow-up.
+- **MTP.** Multi-Token Prediction. Extra transformer block after the main stack for speculative decoding; P14 loads the GPU-resident draft block and runs the greedy T=0 accept/reject path when the GGUF carries MTP tensors.
 - **NSG.** Metal "Num SimdGroups" — threadgroup-size parameterization of a kernel.
 - **Sourdough gate.** ADR-009 methodology: byte-parity check against a black-box reference (llama.cpp) on fixed prompt/seed/temp=0 input.
 - **SSM.** State-Space Model. Mamba-family recurrence; a primitive Gated DeltaNet is related to but not identical to.

@@ -2329,19 +2329,25 @@ fn build_metadata(model: &QuantizedModel, input_dir: &Path) -> Vec<(String, Meta
         "general.quantization_version".into(),
         MetaValue::Uint32(2),
     ));
-    // ADR-012 Decision 19 (2026-04-25 follow-up): for qwen35 / qwen35moe,
-    // llama.cpp's load_hparams does NOT read LLM_KV_NEXTN_PREDICT_LAYERS
-    // (only GLM4 + DeepseekV3 do, see llama-model.cpp:2073/2107/2154/2329).
-    // Its create_tensor loop is `for (int i = 0; i < n_layer; ++i)` and
-    // expects exactly that many per-layer slots.  So `block_count` is the
-    // raw `num_hidden_layers` (no MTP); MTP tensors must NOT be emitted as
-    // blk.{n_layer}.* slots — they have no loader-side allocation and the
-    // file is rejected.  When llama.cpp gains qwen35 MTP support, this
-    // expression becomes `meta.num_layers + meta.mtp_num_hidden_layers...`
-    // (mirrors convert_hf_to_gguf.py:10042 for arches that do).
+    // ADR-013 P14: qwen35 / qwen35moe block_count includes appended MTP
+    // blocks when present. Other arches keep their historical layer count.
+    //
+    // Temporary escape hatch mirrors src/main.rs Phase 1.42:
+    //   HF2Q_QWEN35_DROP_MTP=1
+    //
+    // REMOVE when llama.cpp adds qwen35 MTP loading OR by 2026-Q4 if upstream
+    // lags. With the hatch enabled, block_count remains the raw layer count so
+    // a deliberately stripped file is internally consistent.
+    let drop_mtp_escape = std::env::var("HF2Q_QWEN35_DROP_MTP").as_deref() == Ok("1");
+    let block_count = match (arch.as_str(), drop_mtp_escape) {
+        ("qwen35" | "qwen35moe", false) => {
+            meta.num_layers + meta.mtp_num_hidden_layers.unwrap_or(0)
+        }
+        _ => meta.num_layers,
+    };
     kv.push((
         format!("{}.block_count", arch),
-        MetaValue::Uint32(meta.num_layers),
+        MetaValue::Uint32(block_count),
     ));
     kv.push((
         format!("{}.embedding_length", arch),
@@ -2678,9 +2684,12 @@ fn emit_qwen35_metadata(
 
     // nextn_predict_layers — llama-arch.cpp:194 LLM_KV_NEXTN_PREDICT_LAYERS
     // optional, default 0; MTP block count.  mtp_num_hidden_layers = 1 for the apex model.
-    if let Some(mtp) = meta.mtp_num_hidden_layers {
-        if mtp > 0 {
-            kv.push((format!("{}.nextn_predict_layers", arch), MetaValue::Uint32(mtp)));
+    // Suppressed only by the temporary HF2Q_QWEN35_DROP_MTP=1 conversion hatch.
+    if std::env::var("HF2Q_QWEN35_DROP_MTP").as_deref() != Ok("1") {
+        if let Some(mtp) = meta.mtp_num_hidden_layers {
+            if mtp > 0 {
+                kv.push((format!("{}.nextn_predict_layers", arch), MetaValue::Uint32(mtp)));
+            }
         }
     }
 
@@ -2909,6 +2918,30 @@ mod tests {
     fn model(tensors: Vec<(&str, u8, bool)>, bits: u8) -> QuantizedModel {
         let map = tensors.into_iter().map(|(n, b, p)| (n.into(), tensor(n, b, p))).collect();
         QuantizedModel { metadata: meta(), tensors: map, quant_method: format!("q{}", bits), group_size: 64, bits }
+    }
+
+    fn model_with_metadata(metadata: ModelMetadata) -> QuantizedModel {
+        QuantizedModel {
+            metadata,
+            tensors: Default::default(),
+            quant_method: "f16".into(),
+            group_size: 64,
+            bits: 16,
+        }
+    }
+
+    fn metadata_u32(kv: &[(String, MetaValue)], key: &str) -> Option<u32> {
+        kv.iter().find_map(|(k, v)| {
+            if k == key {
+                if let MetaValue::Uint32(n) = v {
+                    Some(*n)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
     }
 
     #[test]
@@ -3680,6 +3713,42 @@ mod tests {
     fn arch_routing_llama_unchanged() {
         let m = meta();
         assert_eq!(arch_gguf_name(&m), "llama");
+    }
+
+    #[test]
+    fn qwen35_block_count_includes_mtp_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let dense = model_with_metadata(meta_qwen35_dense());
+        let dense_kv = build_metadata(&dense, tmp.path());
+        assert_eq!(
+            metadata_u32(&dense_kv, "qwen35.block_count"),
+            Some(65),
+            "qwen35 block_count must include 64 main layers + 1 MTP layer"
+        );
+
+        let moe = model_with_metadata(meta_qwen35_moe());
+        let moe_kv = build_metadata(&moe, tmp.path());
+        assert_eq!(
+            metadata_u32(&moe_kv, "qwen35moe.block_count"),
+            Some(41),
+            "qwen35moe block_count must include 40 main layers + 1 MTP layer"
+        );
+    }
+
+    #[test]
+    fn non_qwen_block_count_does_not_include_mtp_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut metadata = meta();
+        metadata.mtp_num_hidden_layers = Some(1);
+
+        let model = model_with_metadata(metadata);
+        let kv = build_metadata(&model, tmp.path());
+        assert_eq!(
+            metadata_u32(&kv, "llama.block_count"),
+            Some(32),
+            "non-qwen arches must keep historical block_count semantics"
+        );
     }
 
     // ---------------------------------------------------------------------------

@@ -1365,7 +1365,13 @@ mod tests {
     #[test]
     #[ignore = "ADR-013 follow-up: chunked seq_len=1 dispatch returns zeros — pre-existing on origin/main, not an ADR-012 regression"]
     fn gpu_state_propagation_chunked_vs_monolithic() {
-        let device = MlxDevice::new().expect("device");
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
         let mut registry = KernelRegistry::new();
 
         let shape = small_shape();

@@ -485,7 +485,29 @@ impl Qwen35Model {
         positions_flat: &[i32], // [4 * seq_len] axis-major
         kv_cache: &mut HybridKvCache,
     ) -> Result<Vec<f32>> {
-        self.forward_gpu_impl(tokens, positions_flat, kv_cache, None)
+        self.forward_gpu_impl(tokens, positions_flat, kv_cache, None, None)
+    }
+
+    /// Forward pass that also returns the final residual-stream hidden buffer
+    /// before output RMSNorm. Used by MTP speculative decoding so the draft
+    /// block can consume verifier hidden state without a CPU readback.
+    pub fn forward_gpu_with_hidden(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<(Vec<f32>, MlxBuffer)> {
+        let mut hidden_out = None;
+        let logits = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            None,
+            Some(&mut hidden_out),
+        )?;
+        let hidden = hidden_out
+            .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
+        Ok((logits, hidden))
     }
 
     /// GPU forward + per-layer activation capture for ADR-012 P9b
@@ -507,7 +529,7 @@ impl Qwen35Model {
         kv_cache: &mut HybridKvCache,
         out_activations: &mut LayerActivations,
     ) -> Result<Vec<f32>> {
-        self.forward_gpu_impl(tokens, positions_flat, kv_cache, Some(out_activations))
+        self.forward_gpu_impl(tokens, positions_flat, kv_cache, Some(out_activations), None)
     }
 
     fn forward_gpu_impl(
@@ -516,6 +538,7 @@ impl Qwen35Model {
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
         mut capture: Option<&mut LayerActivations>,
+        mut hidden_out: Option<&mut Option<MlxBuffer>>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
@@ -989,6 +1012,10 @@ impl Qwen35Model {
             acts.num_layers = self.layers.len() as u32;
             acts.seq_len = seq_len;
             acts.hidden_size = h as u32;
+        }
+
+        if let Some(out) = hidden_out.as_mut() {
+            **out = Some(hidden.clone());
         }
 
         // ---- Step 3: final output head → logits ----

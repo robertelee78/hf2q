@@ -355,6 +355,16 @@ fn qwen35_mtp_roundtrip() {
 
     // Positive: every EXPECTED_MTP_SUFFIX is present at blk.4.* (num_hidden_layers=4).
     let num_hidden_layers = 4u32;
+    assert_eq!(
+        gguf.metadata_u32("qwen35.block_count"),
+        Some(num_hidden_layers + 1),
+        "qwen35 block_count must include the appended MTP layer"
+    );
+    assert_eq!(
+        gguf.metadata_u32("qwen35.nextn_predict_layers"),
+        Some(1),
+        "qwen35 nextn_predict_layers must preserve mtp_num_hidden_layers"
+    );
     for suffix in EXPECTED_MTP_SUFFIXES {
         let expected = format!("blk.{}.{}", num_hidden_layers, suffix);
         let found = names.iter().any(|n| *n == expected);
@@ -404,6 +414,16 @@ fn qwen35moe_mtp_roundtrip() {
     let names: Vec<&str> = gguf.tensor_names();
 
     let num_hidden_layers = 4u32;
+    assert_eq!(
+        gguf.metadata_u32("qwen35moe.block_count"),
+        Some(num_hidden_layers + 1),
+        "qwen35moe block_count must include the appended MTP layer"
+    );
+    assert_eq!(
+        gguf.metadata_u32("qwen35moe.nextn_predict_layers"),
+        Some(1),
+        "qwen35moe nextn_predict_layers must preserve mtp_num_hidden_layers"
+    );
     for suffix in EXPECTED_MTP_SUFFIXES {
         let expected = format!("blk.{}.{}", num_hidden_layers, suffix);
         assert!(
