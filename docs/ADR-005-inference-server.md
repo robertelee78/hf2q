@@ -1428,6 +1428,85 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2c iter-129 — F16 attention V/K casts + transpose_last2_f16 land; per-block cascade compound essentially flat (1.171x → 1.175x), smoke unchanged at 1 peer word — falsifies the "attention-cast is dominant noise" hypothesis (2026-04-26, W60, mlx-native commit `14b4a37`, hf2q commits `05950bd` + `4ac4d0c` + `ebe7383`)
+
+**Why this iter exists.** W59 iter-128 closed the weight-matmul BF16-staging side of the gemma4v ViT cascade but the per-block compound only dropped from 1.16x to 1.171x (essentially flat). W59's hypothesis: the residual is dominated by attention activation casts — `vit_attention_gpu` casts V F32→BF16 before transpose, `vit_attention_scores_gpu` casts K F32→BF16 before the score matmul. Both immediately re-quantize the F16-precision outputs of `vit_linear_gpu` back to BF16 for the attention GEMMs. Iter-129 lands F16 transpose + F16 V cast + F16 K cast (peer parity) and measures whether the cascade collapses.
+
+**Phase 1 — Chesterton's fence on llama.cpp's gemma4v ViT attention.** Read `tools/mtmd/clip.cpp::build_attn` (lines 637-697) and the warmup path (lines 2491-2528). `mtmd_context_params_default()` sets `flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO`; warmup upgrades AUTO → ENABLED whenever the Metal backend supports `flash_attn_ext` (which it does). Inside the FA branch (lines 660-669): `k = ggml_cast(ctx0, k, GGML_TYPE_F16)`, `v = ggml_cast(ctx0, v, GGML_TYPE_F16)`, then `ggml_flash_attn_ext(q_f32, k_f16, v_f16, ...)` with `GGML_PREC_F32` on the output. **Peer's gemma4v ViT therefore stages K and V at F16 (10-bit mantissa) with F32 accumulator** — exactly the precision iter-129's plan targets. The non-FA branch (lines 671-684) is dormant on Metal. Hf2q's `vit_attention_gpu` is already decomposed (separate score-matmul → softmax → V transpose → V matmul), so wiring F16 = use the existing `dense_matmul_f16_f32_tensor` (mlx-native 0.4.8) for both GEMMs — no new attention kernel required.
+
+**Phase 2 — `transpose_last2_f16` added to mlx-native (commit `14b4a37`, v0.4.9).** Files (in `/opt/mlx-native`):
+- `src/shaders/elementwise.metal::transpose_last2_f16` — clone of `transpose_last2_bf16` with `bfloat`→`half`. Pure typed-copy kernel, byte-identical dispatch geometry (bfloat and half both 16-bit storage). Same Permute021Params struct.
+- `src/ops/transpose.rs::transpose_last2_f16` — Rust dispatcher; mirrors BF16 sibling exactly modulo dtype validation.
+- `src/kernel_registry.rs` — registry entry alongside `transpose_last2_bf16`.
+- `tests/test_transpose_extended.rs` — 3 new F16 tests: bitwise-exact at [2,16,64] (gemma4v shape factor), 1×1×1, zero-dim error. Tolerance < 1e-10 (typed memcpy must be bitwise exact).
+- `Cargo.toml` 0.4.8 → 0.4.9.
+
+`cargo test --release --test test_transpose_extended` **6/6 PASS** (3 new F16 + 3 existing BF16). Scoped sweep `--test test_transpose_extended --test test_dense_mm_f16 --test test_dense_mm_bf16 --test test_elementwise --test test_bf16_kernels` all green. Pre-existing 3 `test_quantized_matmul_id_ggml` failures unchanged (confirmed unrelated by stash-test on baseline `518802a`). Pushed to `origin/main`.
+
+**Phase 3 — hf2q dependency bump + V-path + K-path (commits `05950bd`, `4ac4d0c`, `ebe7383`).**
+
+(a) `Cargo.toml` mlx-native dep `0.4.8` → `0.4.9`. Path override in `.cargo/config.toml` already in place.
+
+(b) `vit_attention_gpu` V path (commit `4ac4d0c`):
+- `cast(F32→F16)` replaces `cast(F32→BF16)` on V_perm.
+- `transpose_last2_f16` replaces `transpose_last2_bf16` on the F16 V buffer.
+- `dense_matmul_f16_f32_tensor` (with `DenseMmF16F32Params`) replaces `dense_matmul_bf16_f32_tensor` on the scores@V matmul.
+- `transpose_last2_bf16` import dropped (zero remaining call sites).
+
+(c) `vit_attention_scores_gpu` K path (commit `ebe7383`):
+- Production default switches from F32→BF16 K cast + `dense_matmul_bf16_f32_tensor` to F32→F16 K cast + `dense_matmul_f16_f32_tensor`.
+- `HF2Q_VIT_F32_ATTENTION=1` env var (W49 iter-120) repurposed: was a default-off F32 isolation gate against the BF16 default, now a development-only A/B override against the F16 default. **Not** a production fallback per `feedback_no_shortcuts.md` and `feedback_never_ship_fallback_without_rootcause.md`. Doc updated to reflect the iter-129 semantics.
+
+`cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W59 baseline maintained); `cargo build --release --bin hf2q` 0.
+
+**Phase 4 — parity probe (numerical proof). HYPOTHESIS FALSIFIED.**
+
+```
+                                W59 iter-128         W60 iter-129       Drop
+                                max_abs   mean_abs   max_abs   mean_abs (mean_abs)
+03_block_00 input               1.263e1   5.735e-3   1.263e1   5.735e-3 1.00x (identical)
+03_block_00_06_attn_out         6.982e0   1.074e-2   6.980e0   1.004e-2 1.07x
+03_block_00_10_ffn_out          5.597e0   1.304e-2   5.601e0   1.302e-2 ~1.00x
+03_block_00 output              1.375e1   1.014e-2   1.375e1   1.011e-2 ~1.00x
+03_block_01_06_attn_out         8.576e0   3.543e-2   8.569e0   3.549e-2 ~1.00x
+03_block_26                     9.008e2   3.999e0    9.094e2   3.925e0  ~1.00x
+34_post_proj_rms                4.258e0   7.015e-2   4.287e0   6.867e-2 ~1.00x
+```
+
+Per-block compound: iter-128 1.171x; iter-129 **1.175x** (computed as geometric mean of 26 inter-block ratios on iter-129 max_abs sequence). The cascade ratio essentially DID NOT change. block_26 went 901 → 909 (slightly worse). post_proj_rms 4.26 → 4.29 (essentially flat).
+
+**Honest finding — third BF16-staging source elsewhere.** F16 V/K attention casts are now peer-aligned, F16 weight matmul is peer-aligned (iter-128), preprocess + patch_embd CHW ordering is byte-faithful (iter-126). The 1.175x cascade compound persists — meaning the dominant noise source is NEITHER the weight matmul NOR the attention activation casts. Block_00 intra-cell breakdown shows attn_out max_abs 6.98 (large) and ffn_inp max_abs 13.62 (residual add of attn_out), then ffn_out max_abs 5.60, ffn_post_normed max_abs 5.51 — the FFN is producing per-block excursions of similar magnitude to the attention output. Candidates for the third source: (a) FFN intermediate gate/up/down BF16 staging inside `vit_linear_gpu` (but iter-128 already routed F16 weights through `dense_matmul_f16_f32_tensor`, so this should be peer-aligned unless a specific FFN tensor is loaded as BF16 not F16); (b) RMSNorm convention or per-head RMSNorm precision drift; (c) residual-stream layout or accumulation order across the 27 blocks; (d) softmax precision in `vit_softmax_last_dim_gpu` (peer's `flash_attn_ext` does softmax inside the FA primitive at F32; ours is a separate dispatch — verify dtype); (e) a non-attention activation cast we haven't identified.
+
+**Smoke output (T=0 cold, four_dots_in_corners_128x128.png, two cold runs deterministic).** Verbatim output for both runs: `Four black squares, white background.` Identical to W57 (iter-126), W58 (iter-127), W59-predicted (iter-128). Peer truth: `An image of a square frame made of four`.
+
+**Peer-word overlap progression.**
+```
+W55 (iter-124 baseline):     Minimalist geometric pattern, white background.       0 peer words
+W56 (iter-125):              Four cornered frame, mostly white.                    3 peer words
+W57 (iter-126 patch_embd):   Four black squares, white background.                 1 peer word
+W58 (iter-127):              [no smoke run; numerical bisect only]
+W59 (iter-128):              [skipped — predicted unchanged]
+W60 (iter-129):              Four black squares, white background.                 1 peer word
+```
+
+W60's smoke is **unchanged from W57** — consistent with the parity probe showing flat cascade. The model still sees four discrete black squares correctly but doesn't produce "frame" or "made of". This is the user-facing AC for ADR-005 Phase 2c shippability; it stays open.
+
+**Why this iter is correct work even though smoke didn't move.** Iter-128 closed weight-matmul BF16; iter-129 closed attention activation BF16. Both fixes are peer-aligned, pass cargo verify, pass 241/241 vision tests, and ship `dense_matmul_f16_f32_tensor` + `transpose_last2_f16` reusable mlx-native primitives. The cascade-collapse hypothesis (V/K cast is dominant) was numerically falsified — the right way to falsify it. Iter-130 needs a fresh sub-localization (in the spirit of W58's iter-127 intra-block bisect) targeting candidates (a)-(e) above; element-wise diff still works, dump points exist for `01_pre_attn_norm`, `06_attn_out`, `08_ffn_inp`, `09_ffn_inp_normed`, `10_ffn_out`, `11_ffn_post_normed`. Read order for iter-130: (1) confirm every FFN weight in mmproj is F16 in GGUF and that `vit_linear_gpu` routes to the F16 kernel for them (`grep -i ffn` in `LoadedMmprojWeights::load`); (2) compare hf2q's softmax dispatch dtype semantics against peer's `flash_attn_ext` internal softmax precision; (3) audit `vit_per_head_rms_norm_gpu` against `clip.cpp` Vcur_normed.
+
+**Cargo verify summary.**
+- mlx-native: `cargo build --release` 0; `cargo test --release --test test_transpose_extended` 6/6 pass (incl. 3 new F16); scoped test sweep `--test test_dense_mm_f16 --test test_dense_mm_bf16 --test test_elementwise --test test_bf16_kernels` all green. Pre-existing 3 Q4_0 ID failures in `test_quantized_matmul_id_ggml` confirmed unrelated by stash-test.
+- hf2q: `cargo check --release` 0 (3 pre-existing warnings); `cargo test --release --bin hf2q -- vision::` 241/241 pass / 0 fail / 2 ignored; `cargo build --release --bin hf2q` 0.
+
+**Files touched.**
+- mlx-native (commit `14b4a37`, /opt/mlx-native): `src/shaders/elementwise.metal` (+39 lines `transpose_last2_f16` kernel), `src/ops/transpose.rs` (+78 lines Rust dispatcher), `src/kernel_registry.rs` (+1 line registration), `tests/test_transpose_extended.rs` (+148 lines, 3 new F16 tests + cpu_transpose_last2 helper), `Cargo.toml` (version 0.4.8 → 0.4.9), `Cargo.lock`.
+- hf2q (commits `05950bd` + `4ac4d0c` + `ebe7383`): `Cargo.toml` (mlx-native dep bump), `Cargo.lock`, `src/inference/vision/vit_gpu.rs` (V path: cast F32→F16 + transpose_last2_f16 + dense_matmul_f16_f32_tensor on scores@V; K path: F32→F16 default + dense_matmul_f16_f32_tensor on Q@K^T; HF2Q_VIT_F32_ATTENTION repurposed as debug-only override; transpose_last2_bf16 import dropped; ~103 lines effective).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`) untouched.
+
+**Iter-130 target.** Sub-localize the residual cascade noise via a fresh intra-block bisect across FFN sub-stages (gate / up / down / silu / residual-add) on block_00 + block_01, and audit `vit_per_head_rms_norm_gpu` precision. Candidates per Phase 4 finding (a)-(e) above. The iter-128 + iter-129 BF16-staging eliminations are correct work; iter-130 needs a different bisect target rather than another BF16-cast hypothesis.
+
+---
+
 #### Phase 2c iter-128 — F16 ViT matmul kernel landed; weight-side BF16 staging eliminated, residual cascade now attention-V/K-cast-dominated (2026-04-26, W59, mlx-native commit `518802a`, hf2q commits `cc6035b` + `e22238b` + `2280a14`)
 
 **Why this iter exists.** W58 iter-127 (commit `8adeb3a`) numerically bisected the gemma4v ViT 1.16x/block cascade compound to BF16 staging in the weight matmul: peer's `kernel_mul_mm_f16_f32` (`ggml-metal.metal:10099`) stages F16 weights end-to-end in shmem, hf2q was lossy-casting F16 -> F32 -> BF16 at 8x the per-element rounding budget. Per iter-127's deferral, iter-128 lands the F16 kernel + load-side native preservation + dispatch wiring. Mantra: measure 3x cut once, Chesterton's fence, no shortcuts.
