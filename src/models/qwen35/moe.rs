@@ -912,11 +912,11 @@ pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError>
 // ---------------------------------------------------------------------------
 // ADR-014 P1 — Lazy variants of the qwen35moe Phase 1.45 / 1.5 helpers.
 //
-// Phase 1.45 (gate_up split + .weight rename) lifts here as
+// Phase 1.45 (gate_up split + .weight rename) lifts as
 // `split_and_rename_fused_gate_up_in_lazy_map`. Phase 1.5 (expert
-// merge — Decision 7 layer-streaming) lifts in a dedicated subsequent
-// P1 iter; the eager `merge_moe_experts_in_tensor_map` stays for the
-// P9b dance until P4 deletes both.
+// merge — Decision 7 layer-streaming) lifts as
+// `merge_moe_experts_in_lazy_map`. The eager variants stay for the
+// ADR-012 P9b intermediate-GGUF dance until ADR-014 P4 deletes both.
 // ---------------------------------------------------------------------------
 
 /// ADR-014 P1: lazy variant of [`split_and_rename_fused_gate_up_in_tensor_map`].
@@ -1081,6 +1081,215 @@ pub fn split_and_rename_fused_gate_up_in_lazy_map(
     Ok(())
 }
 
+/// ADR-014 P1 + Decision 7: lazy, layer-streaming variant of
+/// [`merge_moe_experts_in_tensor_map`].
+///
+/// Each (layer, projection) merge produces ONE [`LazyTensor`] whose
+/// closure performs the 256-expert stack at materialise time. The
+/// closure owns the per-expert [`LazyTensor`]s; they are removed from
+/// `lazy_map` at this phase but their bytes do not materialise until
+/// the streaming quantize loop (ADR-014 P2) consumes the merged
+/// tensor.
+///
+/// **Decision 7 layer-streaming benefit:** in the eager variant every
+/// merged `[N=256, hidden, moe_inter]` tensor stays in the map between
+/// Phase 1.5 close and quantize-write boundaries — for apex MoE that's
+/// ~80 GB across 40 layers × 3 projections at the same time. The lazy
+/// variant emits each merged tensor as a closure; at quantize-time the
+/// streaming loop materialises one merged tensor (~750 MB, 256 × hidden
+/// × moe_inter × 2 bytes for apex BF16), quantises it, writes it,
+/// drops it, then proceeds to the next. Peak resident bytes stay
+/// bounded by ~one merged tile, not the full ~80 GB stack.
+///
+/// The pre-merged-skip path (apex MoE checkpoints that already ship a
+/// pre-merged form per Phase 1.45's split) is preserved exactly: when
+/// `pre_merged_name` is already present in the map, the function
+/// leaves it as-is.
+///
+/// Validation invariants (shape consistency across experts, 2-D
+/// per-expert shape, byte_len === shape × dtype) are checked at
+/// closure-construction time so failures surface before the
+/// `LazyTensor` is created — never silently at materialise time.
+///
+/// No-op for non-qwen35moe arches and for dense (no `num_experts`).
+pub fn merge_moe_experts_in_lazy_map(
+    lazy_map: &mut crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), super::ConvertError> {
+    use crate::ir::lazy::{LazyMeta, LazyTensor, MaterializeError};
+
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+    let num_experts = match metadata.num_experts {
+        Some(n) => n as usize,
+        None => return Ok(()),
+    };
+
+    // Same MoE-layer scan as the eager helper — uses lazy_map.names()
+    // (deterministic BTreeMap iteration order) so downstream behaviour
+    // is bit-for-bit reproducible.
+    let mut moe_layers: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
+    for name in lazy_map.names() {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot].parse::<usize>() {
+                    if rest[dot + 1..].starts_with("mlp.experts.") {
+                        moe_layers.insert(layer_idx);
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!(
+        moe_layers_found = moe_layers.len(),
+        "qwen35moe expert merge (lazy): scanning {} tensor names, found {} MoE-bearing layers",
+        lazy_map.len(),
+        moe_layers.len()
+    );
+
+    // Pre-merged-skip detection — same as eager, just over lazy_map.
+    let pre_merged_count = lazy_map
+        .names()
+        .filter(|n| {
+            let s = n.as_str();
+            s.starts_with("model.layers.")
+                && (s.ends_with(".mlp.experts.gate_proj.weight")
+                    || s.ends_with(".mlp.experts.up_proj.weight")
+                    || s.ends_with(".mlp.experts.down_proj.weight"))
+        })
+        .count();
+    if pre_merged_count > 0 {
+        tracing::info!(
+            count = pre_merged_count,
+            "qwen35moe expert merge (lazy): detected {} pre-merged expert tensors; skipping merge for those (input is already in canonical form)",
+            pre_merged_count
+        );
+    }
+
+    for proj in &["gate_proj", "up_proj", "down_proj"] {
+        for &layer_idx in &moe_layers {
+            // Skip if the pre-merged form is already present.
+            let pre_merged_name =
+                format!("model.layers.{}.mlp.experts.{}.weight", layer_idx, proj);
+            if lazy_map.contains_key(&pre_merged_name) {
+                continue;
+            }
+
+            // Collect num_experts per-expert LazyTensors. We *remove*
+            // them up-front (FnOnce semantics — the closure that does
+            // the merge takes ownership). If we can't find all
+            // num_experts, restore the partial collection and skip
+            // this (layer, proj) — same silent-skip behaviour as the
+            // eager `continue;` path, but explicit about the partial-
+            // restore.
+            let mut collected: Vec<(String, LazyTensor)> = Vec::with_capacity(num_experts);
+            let mut all_found = true;
+            for e in 0..num_experts {
+                let hf = format!(
+                    "model.layers.{}.mlp.experts.{}.{}.weight",
+                    layer_idx, e, proj
+                );
+                let Some(lazy) = lazy_map.remove(&hf) else {
+                    all_found = false;
+                    break;
+                };
+                collected.push((hf, lazy));
+            }
+            if !all_found {
+                // Restore — LazyTensor knows its own name via meta.
+                for (_, lazy) in collected.into_iter() {
+                    lazy_map.insert(lazy);
+                }
+                continue;
+            }
+
+            // Validate shape + dtype consistency across experts BEFORE
+            // closure construction. Failures here surface inline; the
+            // closure body is reserved for the merge itself.
+            let first = &collected[0].1;
+            if first.shape().len() != 2 {
+                return Err(super::ConvertError::ExpertMergeShapeMismatch {
+                    expert_idx: 0,
+                    reason: format!(
+                        "expected 2-D tensor, got {} dims",
+                        first.shape().len()
+                    ),
+                });
+            }
+            let rows = first.shape()[0];
+            let cols = first.shape()[1];
+            let dtype = first.dtype();
+            let elem_size = dtype.element_size();
+            let bytes_per_expert = rows * cols * elem_size;
+            for (i, (_, l)) in collected.iter().enumerate().skip(1) {
+                if l.shape() != [rows, cols] {
+                    return Err(super::ConvertError::ExpertMergeShapeMismatch {
+                        expert_idx: i,
+                        reason: format!(
+                            "shape {:?} differs from expert 0 shape [{}, {}]",
+                            l.shape(),
+                            rows,
+                            cols
+                        ),
+                    });
+                }
+                if l.dtype() != dtype {
+                    return Err(super::ConvertError::ExpertMergeShapeMismatch {
+                        expert_idx: i,
+                        reason: format!(
+                            "dtype {:?} differs from expert 0 dtype {:?}",
+                            l.dtype(),
+                            dtype
+                        ),
+                    });
+                }
+            }
+
+            let merged_shape = vec![num_experts, rows, cols];
+            let merged_byte_len = num_experts * bytes_per_expert;
+            let merged_meta = LazyMeta::new(pre_merged_name.clone(), merged_shape, dtype);
+
+            // Move per-expert LazyTensors into the closure. The closure
+            // is FnOnce: at quantize time the streaming loop calls
+            // materialize() exactly once. Each per-expert is materialised
+            // and dropped in turn — peak resident is one expert's bytes
+            // plus the accumulating merged buffer.
+            let collected_lazies: Vec<LazyTensor> =
+                collected.into_iter().map(|(_, l)| l).collect();
+            let pre_merged_name_for_err = pre_merged_name.clone();
+            let merge_closure = move || -> Result<Vec<u8>, MaterializeError> {
+                let mut merged_data = Vec::with_capacity(merged_byte_len);
+                for (i, lazy) in collected_lazies.into_iter().enumerate() {
+                    let t = lazy.materialize().map_err(|e| MaterializeError::Transform {
+                        name: pre_merged_name_for_err.clone(),
+                        reason: format!("expert {} materialize: {}", i, e),
+                    })?;
+                    if t.data.len() != bytes_per_expert {
+                        return Err(MaterializeError::Transform {
+                            name: pre_merged_name_for_err.clone(),
+                            reason: format!(
+                                "expert {} bytes ({}) != expected ({})",
+                                i,
+                                t.data.len(),
+                                bytes_per_expert
+                            ),
+                        });
+                    }
+                    merged_data.extend_from_slice(&t.data);
+                    // t (TensorRef) drops here — expert bytes freed.
+                }
+                Ok(merged_data)
+            };
+
+            lazy_map.insert(LazyTensor::from_closure(merged_meta, merge_closure));
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1238,6 +1447,278 @@ mod tests {
             assert_eq!(e.data, l.data, "{key} bytes");
             assert_eq!(l.name, *key, "{key} carried-name field");
         }
+    }
+
+    /// ADR-014 P1 + Decision 7 layer-streaming byte-identity regression.
+    /// `merge_moe_experts_in_lazy_map` produces a tensor map whose
+    /// post-merge keys + shapes + materialised bytes are byte-equal to
+    /// the eager `merge_moe_experts_in_tensor_map` on the same fixture
+    /// (per-expert form, not pre-merged).
+    #[test]
+    fn merge_moe_experts_lazy_byte_identical_to_eager_per_expert_input() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+
+        // Synthetic 2-layer Qwen3.5-MoE with per-expert form
+        // (4 experts × 3 projections × 2 layers = 24 per-expert tensors).
+        // Per-expert shape: gate/up [moe_inter=2, hidden=4]; down [hidden=4, moe_inter=2].
+        // Distinguishing payloads so a swap or drop would be caught.
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".into(),
+            model_type: "qwen3_5_moe_text".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec!["full_attention".into(), "linear_attention".into()],
+            num_attention_heads: 4,
+            num_kv_heads: Some(2),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: Some(4),
+            top_k_experts: Some(2),
+            intermediate_size: Some(4),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: Some(2),
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        // Build per-expert payloads: each (layer, expert, proj) gets a
+        // distinguishing seed so byte-identity is meaningful.
+        let make_payload = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+        };
+
+        let proj_shapes = [
+            ("gate_proj", vec![2usize, 4]),
+            ("up_proj", vec![2usize, 4]),
+            ("down_proj", vec![4usize, 2]),
+        ];
+
+        // Build identical eager + lazy fixtures. Use a helper closure
+        // so we know both inputs are bit-equal at start.
+        let mut eager = TensorMap::new();
+        let mut lazy = LazyTensorMap::new();
+        for layer_idx in 0..2usize {
+            for &(proj, ref shape) in proj_shapes.iter() {
+                for e in 0..4usize {
+                    let name = format!(
+                        "model.layers.{}.mlp.experts.{}.{}.weight",
+                        layer_idx, e, proj
+                    );
+                    let byte_len = shape[0] * shape[1] * 2; // F16
+                    // Seed: layer * 64 + expert * 16 + proj_offset (gate=0, up=1, down=2).
+                    let proj_off: u8 = match proj {
+                        "gate_proj" => 0,
+                        "up_proj" => 1,
+                        "down_proj" => 2,
+                        _ => unreachable!(),
+                    };
+                    let seed = (layer_idx as u8 * 64) + (e as u8 * 16) + proj_off;
+                    let data = make_payload(seed, byte_len);
+
+                    eager.insert(TensorRef {
+                        name: name.clone(),
+                        shape: shape.clone(),
+                        dtype: DType::F16,
+                        data: data.clone(),
+                    });
+                    lazy.insert(LazyTensor::from_bytes(
+                        LazyMeta::new(name, shape.clone(), DType::F16),
+                        data,
+                    ));
+                }
+            }
+        }
+
+        // Run both merges.
+        merge_moe_experts_in_tensor_map(&mut eager, &metadata).unwrap();
+        merge_moe_experts_in_lazy_map(&mut lazy, &metadata).unwrap();
+        let lazy_eager = lazy.materialize_all().unwrap();
+
+        // Same key set — should be 6 merged tensors (2 layers × 3 projs).
+        let mut eager_keys: Vec<&String> = eager.tensors.keys().collect();
+        eager_keys.sort();
+        let mut lazy_keys: Vec<&String> = lazy_eager.tensors.keys().collect();
+        lazy_keys.sort();
+        assert_eq!(eager_keys, lazy_keys, "post-merge key sets must match");
+        assert_eq!(
+            eager_keys.len(),
+            6,
+            "expected 6 merged tensors (2 layers × 3 projs); per-expert form should be fully consumed"
+        );
+
+        // Per-key shape, dtype, bytes byte-equal.
+        for key in eager_keys {
+            let e = eager.get(key).unwrap();
+            let l = lazy_eager.get(key).unwrap();
+            assert_eq!(e.shape, l.shape, "{key} shape (merged should be 3-D)");
+            assert_eq!(e.dtype, l.dtype, "{key} dtype");
+            assert_eq!(e.data, l.data, "{key} bytes (256-expert stack)");
+            assert_eq!(l.name, *key, "{key} carried-name field");
+        }
+    }
+
+    /// Pre-merged tensors (apex MoE form post Phase 1.45 split) are
+    /// preserved as-is by `merge_moe_experts_in_lazy_map` — the
+    /// pre-merged-skip path produces identical output to the eager
+    /// variant.
+    #[test]
+    fn merge_moe_experts_lazy_skips_pre_merged_form() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".into(),
+            model_type: "qwen3_5_moe_text".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 1,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: Some(4),
+            top_k_experts: Some(2),
+            intermediate_size: Some(2),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: Some(2),
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        // Pre-merged form: shape [num_experts=4, rows, cols].
+        let pre_merged = vec![
+            (
+                "model.layers.0.mlp.experts.gate_proj.weight",
+                vec![4usize, 2, 4],
+                64usize, // 4*2*4 * 2 = 64 bytes
+                0xAAu8,
+            ),
+            (
+                "model.layers.0.mlp.experts.up_proj.weight",
+                vec![4usize, 2, 4],
+                64,
+                0xBBu8,
+            ),
+            (
+                "model.layers.0.mlp.experts.down_proj.weight",
+                vec![4usize, 4, 2],
+                64,
+                0xCCu8,
+            ),
+        ];
+        let mut eager = TensorMap::new();
+        let mut lazy = LazyTensorMap::new();
+        for (name, shape, byte_len, fill) in &pre_merged {
+            let data = vec![*fill; *byte_len];
+            eager.insert(TensorRef {
+                name: name.to_string(),
+                shape: shape.clone(),
+                dtype: DType::F16,
+                data: data.clone(),
+            });
+            lazy.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
+                data,
+            ));
+        }
+
+        merge_moe_experts_in_tensor_map(&mut eager, &metadata).unwrap();
+        merge_moe_experts_in_lazy_map(&mut lazy, &metadata).unwrap();
+        let lazy_eager = lazy.materialize_all().unwrap();
+
+        // Both should pass pre-merged tensors through unchanged.
+        for (name, shape, byte_len, fill) in &pre_merged {
+            let e = eager.get(name).unwrap();
+            let l = lazy_eager.get(name).unwrap();
+            assert_eq!(e.shape, *shape, "{name} eager shape unchanged");
+            assert_eq!(l.shape, *shape, "{name} lazy shape unchanged");
+            assert_eq!(e.data.len(), *byte_len);
+            assert_eq!(l.data.len(), *byte_len);
+            assert!(e.data.iter().all(|b| *b == *fill), "{name} eager bytes unchanged");
+            assert!(l.data.iter().all(|b| *b == *fill), "{name} lazy bytes unchanged");
+        }
+    }
+
+    /// Non-qwen35moe arches must early-return Ok(()) on the lazy
+    /// variant — same arch-gate behaviour as the eager version.
+    #[test]
+    fn merge_moe_experts_lazy_no_op_for_dense() {
+        use crate::ir::lazy::LazyTensorMap;
+        use crate::ir::ModelMetadata;
+
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5ForCausalLM".into(), // dense
+            model_type: "qwen3_5".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 1,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+        let mut lazy = LazyTensorMap::new();
+        merge_moe_experts_in_lazy_map(&mut lazy, &metadata).unwrap();
+        assert_eq!(lazy.len(), 0);
     }
 
     /// `split_and_rename_fused_gate_up_in_lazy_map` is a no-op for

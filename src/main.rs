@@ -621,33 +621,38 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     .context("qwen35moe fused gate_up split + .weight rename (lazy) failed")
     .map_err(AppError::Conversion)?;
 
-    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.5 / 1.6 /
-    // 1.7 / 1.8) are still eager — they take `&mut TensorMap` and
-    // operate on materialised bytes. Bridge through `materialize_all`
-    // here. Each Phase 1.x lifted in subsequent P1 iters moves this
-    // bridge later in the pipeline; once the streaming quantize loop
-    // (P2) lands the bridge becomes test-only.
+    // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
+    //
+    // Must run BEFORE quantization: the merge consumes pre-quantization
+    // F16/BF16 bytes where shape × dtype.size matches data.len().
+    // Without this call, qwen35moe GGUFs emit N_experts × 3 × N_layers
+    // separate per-expert tensors instead of 3 × N_layers merged ones,
+    // and llama.cpp's loader rejects the file.
+    //
+    // ADR-014 P1 + Decision 7 layer-streaming: lifted onto
+    // LazyTensorMap. Each merged (layer, projection) is one LazyTensor
+    // whose closure stacks 256 experts at materialise time — the
+    // streaming quantize loop (P2) materialises one merged tile,
+    // quantises it, writes it, drops it, then proceeds to the next.
+    // Peak resident bytes stay bounded by one merged tile (~750 MB
+    // apex BF16) instead of the eager-pipeline ~80 GB stack of all
+    // merged tiles at once.
+    //
+    // No-op for dense arches and pre-merged inputs (apex MoE post
+    // Phase 1.45's split is already pre-merged).
+    models::qwen35::moe::merge_moe_experts_in_lazy_map(&mut lazy_map, &metadata)
+        .context("qwen35moe expert merge (lazy) failed")
+        .map_err(AppError::Conversion)?;
+
+    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.6 / 1.7 /
+    // 1.8) are still eager — they take `&mut TensorMap` and operate on
+    // materialised bytes. Bridge through `materialize_all` here. Each
+    // Phase 1.x lifted in subsequent P1 iters moves this bridge later;
+    // once the streaming quantize loop (P2) lands the bridge becomes
+    // test-only.
     let mut tensor_map = lazy_map
         .materialize_all()
         .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
-        .map_err(AppError::Conversion)?;
-
-    // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
-    //
-    // Must run BEFORE quantization: `merge_moe_experts_in_tensor_map`
-    // consumes pre-quantization F16/BF16 bytes where shape × dtype.size
-    // matches data.len(). Running post-quant on Q4_0 bytes trips the
-    // expected-bytes check in `merge_expert_tensors`.
-    //
-    // Without this call, qwen35moe GGUFs emit N_experts × 3 × N_layers
-    // separate per-expert tensors instead of 3 × N_layers merged ones,
-    // and llama.cpp's loader rejects the file (silent P4→P5 wire-up
-    // gap caught by ADR-012 P11 round-trip test).
-    //
-    // No-op for dense arches (guarded by the arch string check inside
-    // the function itself).
-    models::qwen35::moe::merge_moe_experts_in_tensor_map(&mut tensor_map, &metadata)
-        .context("qwen35moe expert merge failed")
         .map_err(AppError::Conversion)?;
 
     // Phase 1.6: ADR-012 P3 Decision 6 — RMS norm +1 bias (Qwen3.5 family
