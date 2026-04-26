@@ -123,14 +123,21 @@ fn residual_add(dst: &mut [f32], src: &[f32]) {
 // GPU capture path (ADR-012 P9b — mantra-aligned production wire-up)
 // ================================================================
 
-/// True iff any layer FFN is the native ggml block-quantized MoeQ variant.
-/// MoeQ cannot be F32-expanded into the CPU forward without OOM (~128 GB
-/// for 256-expert apex), so calibration MUST go through the GPU forward.
-fn has_moeq_layer(model: &Qwen35Model) -> bool {
-    model
-        .layers
-        .iter()
-        .any(|l| matches!(l.ffn(), Qwen35FfnWeights::MoeQ(_)))
+/// True iff any layer FFN is a MoE variant (either F32-expanded `Moe` or
+/// native ggml-quantized `MoeQ`). Both paths benefit from GPU forward:
+///   * `MoeQ` — calibration on apex (256 experts) is impossible on CPU
+///     without F32 expansion → ~128 GB OOM. GPU runs `quantized_matmul_ggml`
+///     directly on native blocks.
+///   * `Moe` — F16-loaded intermediate already pays the F32-expansion cost,
+///     but CPU forward is ~30-60 minutes per calibration prompt at apex
+///     scale. GPU forward is ~30 seconds. No correctness compromise.
+fn has_moe_layer(model: &Qwen35Model) -> bool {
+    model.layers.iter().any(|l| {
+        matches!(
+            l.ffn(),
+            Qwen35FfnWeights::Moe(_) | Qwen35FfnWeights::MoeQ(_)
+        )
+    })
 }
 
 /// Run a calibration prompt through the GPU forward and capture per-layer
@@ -409,18 +416,19 @@ impl ActivationCapture for RealActivationCapture {
         match &mut self.inner {
             RealCaptureBackend::Loaded(model) => {
                 // Mantra-aligned dispatch (ADR-012 P9b):
-                //   * MoeQ (native ggml-block experts) → GPU forward via
+                //   * Any MoE FFN (Moe or MoeQ) → GPU forward via
                 //     `forward_gpu_with_capture`, which calls
-                //     `mlx-native::quantized_matmul_ggml` directly. No F32
-                //     expansion, no OOM, production decode speeds (~50–100×
-                //     CPU). HF2Q_FORCE_CPU_CAPTURE=1 escapes only for parity
-                //     debugging.
-                //   * Dense / F32-Moe → CPU path stays as the byte-identical
-                //     reference (small synthetic models in tests, and
-                //     pre-quant Dense weights at convert time).
+                //     `mlx-native::quantized_matmul_ggml` for native blocks
+                //     and `mul_mm_id` for F32-expanded experts. CPU
+                //     forward on 256-expert apex is ~30-60 min/prompt;
+                //     GPU is ~30 sec. MoeQ on CPU would OOM (~128 GB).
+                //   * Dense → CPU path stays as the byte-identical reference
+                //     (small synthetic models in tests; pre-quant Dense
+                //     weights at convert time fit comfortably on CPU).
+                //   * HF2Q_FORCE_CPU_CAPTURE=1 escapes for parity debugging.
                 let force_cpu =
                     std::env::var("HF2Q_FORCE_CPU_CAPTURE").is_ok();
-                if !force_cpu && has_moeq_layer(model) {
+                if !force_cpu && has_moe_layer(model) {
                     run_calibration_prompt_gpu(model, tokens)
                 } else {
                     model.run_calibration_prompt(tokens)
