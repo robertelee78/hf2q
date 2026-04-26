@@ -214,6 +214,130 @@ pub async fn fetch_canonical_model_id() -> String {
         .to_string()
 }
 
+/// Per-stream extracted reasoning + content slots (iter C W66). The
+/// "reasoning panel" UX in Open WebUI gates on `delta.reasoning_content`:
+/// chunks emitted in this slot stream into a collapsible thinking
+/// section while `delta.content` chunks stream into the main reply.
+///
+/// Returned by `streaming_chat_extract_reasoning`. Iter A's existing
+/// `streaming_chat` continues to expose the simpler
+/// `(chunks, accumulated_content)` shape; iter C's reasoning test needs
+/// both sides + the `finish_reason` and a record of which slot was
+/// observed first to assert the `reasoning_content` precedes
+/// `content` invariant per Decision #21.
+#[derive(Debug, Default, Clone)]
+pub struct ReasoningStreamCapture {
+    pub frames: Vec<String>,
+    pub accumulated_content: String,
+    pub accumulated_reasoning: String,
+    pub finish_reason: Option<String>,
+    /// Sequence of `(slot, len)` ticks per non-empty delta. Slot is
+    /// `"content"` or `"reasoning"`. Used to assert the reasoning-first
+    /// ordering Decision #21 requires for the Open WebUI panel UX.
+    pub slot_sequence: Vec<(&'static str, usize)>,
+}
+
+/// Streaming chat with explicit `reasoning_content` extraction. Same
+/// transport as `streaming_chat`; broader return shape so iter C's
+/// reasoning-panel test can assert both slots + ordering.
+pub async fn streaming_chat_extract_reasoning(
+    model_id: &str,
+    messages: &[serde_json::Value],
+    max_tokens: u64,
+) -> ReasoningStreamCapture {
+    use futures_util::StreamExt;
+
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": messages,
+        "stream": true,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SSE_READ_BUDGET_SECS))
+        .build()
+        .expect("build reqwest client");
+
+    let resp = client
+        .post(format!("{}/v1/chat/completions", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/chat/completions failed");
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body_text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into());
+        panic!(
+            "/v1/chat/completions reasoning-stream status != 200: {status}; body={body_text}; \
+             request body sent={}",
+            serde_json::to_string(&body).unwrap_or_default()
+        );
+    }
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.contains("text/event-stream"),
+        "Content-Type missing text/event-stream: {ct:?}"
+    );
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut cap = ReasoningStreamCapture::default();
+
+    while let Some(next) = stream.next().await {
+        let bytes = next.expect("SSE bytes_stream chunk error");
+        let s = std::str::from_utf8(&bytes).expect("SSE chunk not valid UTF-8");
+        buf.push_str(s);
+        loop {
+            let Some(end) = buf.find("\n\n") else { break };
+            let msg = buf[..end].to_string();
+            buf.drain(..end + 2);
+            for line in msg.lines() {
+                if let Some(payload) = line.strip_prefix("data: ") {
+                    cap.frames.push(payload.to_string());
+                    if payload != "[DONE]" {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                            let delta = &v["choices"][0]["delta"];
+                            if let Some(text) = delta["content"].as_str() {
+                                if !text.is_empty() {
+                                    cap.slot_sequence.push(("content", text.len()));
+                                }
+                                cap.accumulated_content.push_str(text);
+                            }
+                            if let Some(text) = delta["reasoning_content"].as_str() {
+                                if !text.is_empty() {
+                                    cap.slot_sequence.push(("reasoning", text.len()));
+                                }
+                                cap.accumulated_reasoning.push_str(text);
+                            }
+                            if let Some(fr) =
+                                v["choices"][0]["finish_reason"].as_str()
+                            {
+                                cap.finish_reason = Some(fr.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if cap.frames.last().map(|s| s == "[DONE]").unwrap_or(false) {
+                return cap;
+            }
+        }
+    }
+
+    cap
+}
+
 /// Drive a streaming chat-completions request and return:
 /// - the raw SSE chunk payloads (everything after `data: ` and before `\n\n`),
 ///   in order,
