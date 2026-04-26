@@ -1151,6 +1151,58 @@ W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off
 
 ---
 
+#### Phase 2c iter-116c+d — cross-compat smoke unblocked through CLIP load; Phase C reveals `attn_output → attn_out` writer mapping bug; W32 finds `quality::measure_quality` OOM on 26B+ models (2026-04-25, W31/W32/W33)
+
+**Background.** iter-116b (W30) closed Phase B FAIL on a stale on-disk mmproj predating W6's iter-104 writer fix. iter-116c (W31/W32) ran the re-emit; iter-116d (W33) adapted the test scaffold to the new fixture's shape and pushed Phase C to its real failure mode.
+
+**iter-116c re-emit (W31/W32, fresh mmproj at HEAD `8543a83`+).** `hf2q convert --emit-mmproj` on the `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated` source produced a 1.15 GB GGUF (`gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf`, mtime 2026-04-26 03:09) with `clip.projector_type='gemma4v'` (un-namespaced — W6's writer fix verified end-to-end). The chat GGUF SHA at `ae19574d…` was preserved (no chat-side regeneration needed). The convert ran with `--skip-quality` after a hard-jetsam silent kill on the quality stage — see "Future-iter" note below.
+
+**iter-116c Phase B finding (W32, source-driven invariant).** The first iter-116c smoke run hit a fresh Phase B failure: `[Phase B] mmproj missing clamp scalar 'mm.0.input_min' — hf2q writer regression in gguf.rs::write_mmproj_gguf`. Investigation: the source HF repo `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated` ships **only** `model.embed_vision.embedding_projection.weight` in its `model.safetensors.index.json` — none of `clip_min`/`clip_max`/`input_min`/`input_max`/`output_min`/`output_max` are published. The publisher stripped them. llama.cpp's `Gemma4ClippableLinear` (`/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:138-151`) treats the clamp branch as optional — when the input/output min/max scalars aren't present the linear skips clamping. So a clamp-scalar-less mmproj is structurally valid for both hf2q's `MmprojConfig::from_gguf` and llama.cpp's CLIP loader. **The hf2q writer is correct; the data invariant is publisher-stripped.**
+
+**iter-116d test fix (W33, source-driven Phase B assertion).** Replaced Phase B's verbatim `assert!(names.iter().any(...))` against the four `mm.0.*` clamp scalars with a log-only enumeration plus a writer-side sanity check (`assert!(clamp_present_count == 0 || clamp_present_count == 4)` — partial tuples would still indicate a writer regression). Net effect: the gate trips on writer regressions but tolerates source-driven clamp-scalar absence. iter-116d also committed W30's pending uncommitted scaffolding (the +24 LOC `ENV_GATE_PARITY` constant + Phase D gate block) so Phase D can be activated independently of Phase A+B+C once its body lands.
+
+**iter-116d Phase C scaffolding fixes (W33, llama-mtmd-cli flag drift).** Two mechanical fixes to the Phase C `Command::new("/opt/homebrew/bin/llama-mtmd-cli")` invocation, neither touching hf2q source:
+1. Removed `-no-cnv` — Homebrew build 8680 raises `error: invalid argument: -no-cnv` for it. Per `--help`, single-turn semantics now come from passing `--image` + `-p` together.
+2. Added `--jinja` — Gemma-4's tool-aware chat template trips the legacy `common_chat_templates_apply` parser with `this custom template is not supported, try using --jinja`; the Jinja engine path handles it correctly.
+
+**iter-116d Phase A+B+C run (HF2Q_LLAMA_MMPROJ_COMPAT=1 + HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1, fresh mmproj):**
+
+| Layer | Result | Detail |
+|---|---|---|
+| Host stability | CLEAR | `pgrep` count = 0 across all three smoke invocations |
+| Phase A (file-on-disk) | PASS | mmproj 1.15 GB + chat 15.8 GB both `Path::exists()` |
+| Phase B (metadata header) | PASS | 356 tensors, `general.architecture='clip'`, `clip.projector_type='gemma4v'`, all 8 `clip.vision.*` required keys present, clamp scalars `0/4` (source-driven log; partial-tuple invariant satisfied: 0 of 4 = the "or none" leg) |
+| Phase C (CLIP load) | **FAIL** at clip_init | hf2q-emitted GGUF passes `clip_model_loader` (parses all 356 tensors, all 15 KV pairs, hparams identical to source: `n_embd=1152`, `n_layer=27`, `image_size=224`, `patch_size=16`, `projector=gemma4v`); fails downstream at `clip_init: failed to load model: operator(): unable to find tensor v.blk.0.attn_out.weight` |
+
+**Phase C blocker root cause (writer-side tensor name mismatch — pending iter-116e).** llama.cpp's CLIP loader expects `v.blk.{N}.attn_out.weight`; hf2q's writer emits `v.blk.{N}.attn_output.weight`. Confirmed via `gguf-dump` on the fresh fixture (`v.blk.0.attn_output.weight, F16, [1152,1152]` at tensor index 11). The mapping originates in `src/backends/gguf.rs:1663` (and parallel entry at `:1850`): `("self_attn.o_proj.weight", "attn_output.weight")` — should emit `attn_out.weight` for the CLIP/vision sub-namespace specifically (text-side `blk.N.attn_output.weight` is the correct llama.cpp text convention; CLIP uses `attn_out`). This is a **single-string fix** in the hf_name_to_gguf map for the vision namespace — but it requires a re-emit of the mmproj GGUF, which is its own ~16 GB owner-quiet-host step.
+
+**Verification (release build, iter-116d):**
+- `cargo test --release --test mmproj_llama_cpp_compat --no-run` — clean.
+- `HF2Q_LLAMA_MMPROJ_COMPAT=1 HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1 cargo test --release --test mmproj_llama_cpp_compat -- --ignored --nocapture` — Phase A PASS, Phase B PASS, Phase C FAIL at the verbatim `unable to find tensor v.blk.0.attn_out.weight` line. Smoke log preserved at `/tmp/w33_phase_abc_run3.log` (18.3 KB).
+- mlx-native untouched. hf2q source untouched (W6/W17/W18/W26 writer paths verified clean; the next blocker lives in the hf_name_to_gguf vision-namespace map). Only `tests/mmproj_llama_cpp_compat.rs` and `docs/ADR-005-inference-server.md` modified.
+
+**Outstanding for iter-116e (next worker, ~10 LOC + re-emit):**
+1. **Patch the hf_name_to_gguf map** at `src/backends/gguf.rs:1663` (and the parallel `:1850` entry) to emit `attn_out.weight` (not `attn_output.weight`) under the **vision/CLIP namespace only**. Text-side `blk.N.attn_output.weight` is correct llama.cpp convention and must remain. The vision branch is what the gemma4v CLIP loader reads.
+2. **Re-emit mmproj** under a verified-quiet host (~16 GB load).
+3. **Re-run Phase A+B+C end-to-end.** Expected: all three green. Phase D parity proxy (the `panic!`-placeholder body, gated behind `HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1`) lands in iter-116f.
+
+#### Future-iter: `hf2q::quality::measure_quality` jetsam OOM on 26B+ param models (W32 finding, 2026-04-25)
+
+**Symptom.** `hf2q convert` on a 26B-param model exits silently mid-quality-stage with no stderr — the parent shell sees only "Killed: 9" (or no diagnostic when the parent is detached). Adding `--skip-quality` recovers the convert in 1m55s.
+
+**Root cause.** `src/quality/mod.rs:140 measure_quality` builds two `Vec<Vec<f32>>` collections holding every tensor dequantized to f32 — one for the source weights, one for the quantized recovery. For the 26B-param Gemma 4 model: 25.8B × 4 B/f32 × 2 = ~206 GB working set vs 128 GB physical RAM on M5 Max. macOS jetsam kills the process silently before stderr can be flushed.
+
+**Why this surfaces now.** Pre-iter-116c convert flows ran on smaller models (≤14B) where the doubled f32 working set still fit. The 26B Gemma 4 MoE is the first model in the project to exceed physical RAM in `measure_quality`. `--skip-quality` is a workable iter-116c+d workaround but is not a sustainable answer — quality measurement is the convert pipeline's only defense against silent quantization regressions.
+
+**Concrete next-action (iter-116e or a separate ADR ticket).** Refactor `src/quality/mod.rs:140` to streaming KL divergence — never materialize both full f32 tensor sets at once:
+- **Option A (per-tensor streaming).** Iterate (source_tensor, quantized_tensor) pairs once; compute KL for each pair against the source's softmax, accumulate the sum, drop the f32 buffers before the next pair. Peak working set: 2 × max(tensor_size_bytes) instead of 2 × sum(tensor_size_bytes).
+- **Option B (KL-without-cache).** Compute the divergence in-place via the dequant API (no intermediate f32 Vec) by streaming bytes directly into the divergence accumulator. Memory-bounded; CPU-bound only.
+- **Option C (sample-based proxy).** Sample N=1024 random tensor positions per layer and compute KL only over those; sub-percent statistical bias for a multi-orders-of-magnitude memory win. Acceptable if the convert pipeline only needs a regression signal, not a publication-quality bound.
+
+Option A is the smallest delta and preserves the exact KL semantics. Option C is the most memory-efficient and is sufficient as a regression gate. Pick under measurement once iter-116e clears the Phase C blocker.
+
+---
+
 #### Phase 2c iter-116b — cross-compat Phase C body landed; Phase B blocked on stale on-disk mmproj fixture (2026-04-25, W30)
 
 W30 (CFA wave-25) ran the iter-116b retry of the ADR-005 cross-compat smoke under a quiet host. **Phase C body landed** in `tests/mmproj_llama_cpp_compat.rs` (replaces W26's `iter-116a` placeholder-panic with a real `Command::new("/opt/homebrew/bin/llama-mtmd-cli")` spawn + stderr-substring gates + status-success + non-empty-stdout asserts; gated on `HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1` per the iter-116a contract). **Phase A+B FAILED** because the on-disk mmproj GGUF predates W6's iter-104 writer fix (`8543a83`, 2026-04-25 21:28).
