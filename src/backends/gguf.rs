@@ -645,7 +645,10 @@ fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
         ("general.type".into(), MetaValue::String("mmproj".into())),
         ("general.file_type".into(), MetaValue::Uint32(ggml_ftype_from_bits(model.bits))),
         ("clip.has_vision_encoder".into(), MetaValue::Bool(true)),
-        ("clip.vision.projector_type".into(), MetaValue::String(projector_type.into())),
+        // NOTE: projector_type is un-namespaced in llama.cpp — the only top-level `clip.*`
+        // key in this metadata block. See vendored clip-impl.h:23 (KEY_PROJ_TYPE).
+        // Loader counterpart: src/inference/vision/mmproj.rs:148.
+        ("clip.projector_type".into(), MetaValue::String(projector_type.into())),
         // Vision geometry.
         ("clip.vision.image_size".into(), MetaValue::Uint32(image_size)),
         ("clip.vision.patch_size".into(), MetaValue::Uint32(patch_size)),
