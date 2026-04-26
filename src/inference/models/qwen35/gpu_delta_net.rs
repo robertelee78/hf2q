@@ -160,6 +160,48 @@ impl DeltaNetWeightsGpu {
             ssm_out:   upload_q4_0_from_f32(&weights.ssm_out,   device)?,
         })
     }
+
+    /// Test-only upload variant: keeps **all** projection weights as raw F32
+    /// (no Q4_0 quantization).  Used by the GPU↔CPU kernel-pipeline parity
+    /// tests so quantization noise (~1e-2 per Q4_0 projection × 5 stacking)
+    /// does not mask kernel correctness regressions at the 2e-3 tolerance
+    /// the parity gate enforces.  Production decode always uses
+    /// [`Self::from_cpu`] (Q4_0).
+    ///
+    /// At projection time, `apply_proj` (→ `apply_linear_projection_f32`)
+    /// takes the F32 branch which casts weights to BF16 on the GPU and
+    /// dispatches the MMA tiled matmul — the original numeric path the
+    /// P11 parity gate was written against, before commit 554a351 +
+    /// fad4263 introduced pre-cast BF16 / Q4_0 storage.
+    #[cfg(test)]
+    pub fn from_cpu_f32(
+        weights: &DeltaNetLayerWeights,
+        device: &MlxDevice,
+        k_width: usize,
+        qkv_channels: usize,
+    ) -> Result<Self> {
+        let conv1d_t = transpose_k_channels_to_channels_k(
+            &weights.ssm_conv1d,
+            k_width,
+            qkv_channels,
+        );
+        Ok(Self {
+            attn_norm: upload_f32(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
+            ssm_conv1d: upload_f32(&conv1d_t, device)?,
+            ssm_dt_bias: upload_f32(&weights.ssm_dt_bias, device)?,
+            ssm_dt_bias_cpu: weights.ssm_dt_bias.clone(),
+            ssm_a: upload_f32(&weights.ssm_a, device)?,
+            ssm_a_cpu: weights.ssm_a.clone(),
+            ssm_norm: upload_f32(&weights.ssm_norm, device)?,
+            ssm_norm_cpu: weights.ssm_norm.clone(),
+            attn_qkv:  upload_f32(&weights.attn_qkv,  device)?,
+            attn_gate: upload_f32(&weights.attn_gate, device)?,
+            ssm_alpha: upload_f32(&weights.ssm_alpha, device)?,
+            ssm_beta:  upload_f32(&weights.ssm_beta,  device)?,
+            ssm_out:   upload_f32(&weights.ssm_out,   device)?,
+        })
+    }
 }
 
 // ================================================================
@@ -1143,13 +1185,19 @@ mod tests {
         assert_eq!(cpu_out.len(), seq * h);
 
         // GPU path.
-        let gpu_weights = DeltaNetWeightsGpu::from_cpu(
+        // Upload weights as raw F32 (test-only, see `from_cpu_f32`).  The
+        // production `from_cpu` quantizes 5 projections to Q4_0 (~1e-2 noise
+        // each, stacking to >2e-2 end-to-end) which would mask kernel
+        // correctness regressions at the 2e-3 BF16-cast tolerance this gate
+        // enforces.  Q4_0-vs-F32 numerical equivalence is covered separately
+        // by the sourdough end-to-end token gate.
+        let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
             &weights_cpu,
             &device,
             shape.conv_kernel as usize,
             qkv_channels,
         )
-        .expect("from_cpu");
+        .expect("from_cpu_f32");
 
         let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
         let state_in_gpu = upload_f32(&state_in, &device).expect("upload state_in");
@@ -1300,12 +1348,31 @@ mod tests {
         let state_zeros = vec![0.0f32; state_size];
         let conv_zeros = vec![0.0f32; km1 * qkv_channels];
 
-        let gpu_weights = DeltaNetWeightsGpu::from_cpu(
+        // Use F32 weights so test signal isn't masked by Q4_0 quantization
+        // noise (~1e-2 per projection; the ping-pong correctness check below
+        // tolerates only 1e-3).  See `from_cpu_f32` docstring.
+        let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
             &weights_cpu, &device, shape.conv_kernel as usize, qkv_channels,
         )
-        .expect("from_cpu");
+        .expect("from_cpu_f32");
 
-        // Monolithic: 2 tokens at once.
+        // Helper: drain the Metal command queue.  `build_delta_net_layer`'s
+        // decode path (seq_len == 1) issues `enc.commit()` without waiting
+        // (line ~923) so its caller can pipeline into the next layer.  In
+        // production that's safe because the next encoder commit-waits on
+        // the same FIFO command queue.  In this test we read GPU buffers
+        // *immediately* after the call, so we must explicitly flush —
+        // otherwise the read returns the buffer's pre-execution contents
+        // (zeros), producing the misleading "chunk=0.000000" diagnostic.
+        // An empty `commit_and_wait()` on a fresh encoder serializes after
+        // the just-committed buffer on the device's single command queue.
+        let flush = |device: &MlxDevice| {
+            let mut enc = device.command_encoder().expect("flush enc");
+            enc.commit_and_wait().expect("flush commit_and_wait");
+        };
+
+        // Monolithic: 2 tokens at once.  seq_len > 1 → prefill path already
+        // does its own commit_and_wait; flush is a no-op safety belt.
         let x_full_gpu = upload_f32(&x_full, &device).expect("upload");
         let state_zeros_gpu = upload_f32(&state_zeros, &device).expect("upload state_zeros mono");
         let state_scratch_mono = upload_f32(&state_zeros, &device).expect("state scratch mono");
@@ -1318,9 +1385,10 @@ mod tests {
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("mono");
+        flush(&device);
         let mono_out = download_f32(&mono_buf).expect("dl mono");
 
-        // Chunked: token 0 then token 1.
+        // Chunked: token 0 then token 1 — both decode-path (seq_len == 1).
         // Use ping-pong: after t0, conv_t0_out / state_t0_out hold the new
         // conv-state and recurrent-state; feed them in for t1.
         let x_t0 = x_full[0..h].to_vec();
@@ -1338,6 +1406,8 @@ mod tests {
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t0");
+        // Required: decode path commit() without wait — flush before reading.
+        flush(&device);
         let t0_out = download_f32(&t0_buf).expect("dl t0");
 
         // conv_t0_out / state_t0_out now hold post-t0 ping-pong state;
@@ -1352,6 +1422,7 @@ mod tests {
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
         ).expect("chunk t1");
+        flush(&device);
         let t1_out = download_f32(&t1_buf).expect("dl t1");
 
         // Token 0 outputs must match between mono and chunked.
