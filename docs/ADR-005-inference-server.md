@@ -1930,6 +1930,27 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 89 — iter-88 reverted (regression confirmed). Final cooled baseline: HTTP `/v1/embeddings` mean **6.46 ms** (3-run avg), min 6.00 ms, ratio 1.45× vs llama.cpp 4.44 ms. Iter-89 documents the stable post-revert state and queues Flash Attention as the next-iter work.**
+  - **Iter-88 regression: embed-stage fusion was net-slower.**
+    - Replaced (token_gather + type_gather + residual_add + layer_norm) with (concurrent token_gather + type_gather + fused_residual_layer_norm).
+    - Cooled 3-run avg with iter-88: HTTP mean 7.85 ms, min 7.46 ms, ratio 1.81×.
+    - Cooled 3-run avg without iter-88 (revert at 21a5124): HTTP mean 6.46 ms, min 6.00 ms, ratio 1.45×.
+    - **Why fusion hurt here.** The `bert_residual_layer_norm_f32` kernel reads `input + residual` THREE times per element (sum pass, var pass, final apply). The unfused pair does residual_add (read input + read residual + write tmp = 3 ops) followed by layer_norm (read tmp ×3 = 3 ops + 2 weight reads + 1 write). For a small intermediate (`summed` buffer at hidden=768, seq_len=32 = 96 KB — comfortably cache-resident on M5 Max's L2), the unfused path's intermediate reads are free; the fused path's extra residual-buffer reads cost. **Fusion helps when the eliminated intermediate is large enough to spill cache; hurts when both are cache-resident.**
+  - **Iter-86 fusion is still a win** because the encoder-block residual+norm sites operate on `[seq_len=32, hidden=768]` = 96 KB inputs but the eliminated `attn_residual` / `ffn_residual` intermediate buffer ALSO triggers a fresh `MlxBuffer` alloc per layer per request (~24 buffer allocs total per forward). The dispatch + alloc reduction outweighs the cache-thrash cost there. The embed stage runs ONCE per forward, so the per-forward alloc savings are tiny (~2 buffers).
+  - **Stable post-revert numbers (M5 Max, 2026-04-26, 30s cool-down between runs).**
+    ```
+    Run 1: mean 6.81 ms, min 6.08 ms, max 7.84 ms — ratio 1.53×
+    Run 2: mean 6.28 ms, min 6.03 ms, max 6.85 ms — ratio 1.38×
+    Run 3: mean 6.28 ms, min 6.00 ms, max 6.52 ms — ratio 1.44×
+    Avg:   mean 6.46 ms, min 6.04 ms             — ratio 1.45×
+    llama.cpp prompt_eval (mean across same runs): 4.44 ms
+    ```
+  - **Cosine parity (unchanged from iter-87).** bge 0.999985, mxbai 0.999988, nomic 0.999974.
+  - **Iter-90 plan: Flash Attention port.** mlx-native's `flash_attn_prefill_bf16_d256` is the closest existing kernel — already supports additive bf16 mask + non-causal. Two blockers to using it directly:
+    1. **head_dim mismatch.** Nomic-bert head_dim = 64; flash_attn_prefill is only instantiated at D=256 and D=512. Need to add `flash_attn_prefill_bf16_d64` (and `_boolmask`/`_f16` variants if useful) — single line in the shader template + Rust dispatch wrapper. Threadgroup memory budget at BD=64 is generous (~8 KB Q tile vs 32 KB cap).
+    2. **F32 → BF16 round-trip.** Our matmul outputs F32; flash_attn wants BF16 Q/K/V inputs and produces BF16 output. Adds 3 cast dispatches before + 1 cast dispatch after per layer. Net: replaces ~10 attention sub-dispatches with 1 flash_attn + 4 casts per layer = 5 dispatches → saves ~5 dispatches per layer × 12 layers = ~60 dispatches, ~1.2 ms.
+    Validation: cosine ≥ 0.999 must hold. Risk: BF16 attention may lose precision; might need `dense_kvs` style mixed-precision (KV in F32, scores in BF16).
+
 - **2026-04-26 loop iter 87 — barrier hygiene: remove redundant `memory_barrier()` between disjoint-write dispatches (Q/K/V matmuls; ffn_up/ffn_gate matmuls). In-process forward min **5.55 ms** (was 6.12 ms, −9%) — within **1.22×** of llama.cpp's `prompt_eval` 4.54 ms. Cosine parity unchanged.**
   - **What's a redundant barrier.** `mlx_native::CommandEncoder` uses `MTLDispatchType::Concurrent`. A `memory_barrier()` call between two encoded dispatches forces the second to wait for the first to fully retire. Required ONLY when there's a real RAW (read-after-write) hazard — i.e., dispatch B reads a buffer that dispatch A wrote. When two dispatches read the same input and write to disjoint output buffers (no aliasing), the GPU scheduler can overlap them.
   - **Fixed in this iter (nomic-bert encoder block).**
