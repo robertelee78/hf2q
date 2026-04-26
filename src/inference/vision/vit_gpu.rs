@@ -41,25 +41,29 @@ use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_f16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-/// ADR-005 Phase 2c iter-120 (W49) — F32-attention env-gate.
+/// ADR-005 Phase 2c iter-120 (W49), repurposed at iter-129 — F32-attention
+/// development override.
 ///
-/// When `HF2Q_VIT_F32_ATTENTION=1`, the production gemma4v ViT
-/// attention path skips the F32→BF16 K cast and dispatches the
-/// score matmul (`Q @ K^T`) on the F32×F32→F32 tensor-core GEMM
-/// added to mlx-native 0.4.7 (`dense_matmul_f32_f32_tensor`). All
-/// other ViT primitives, including the post-softmax `attn = softmaxed
-/// @ V` matmul, retain the BF16 fast path. This isolates the K cast,
-/// which the iter-118 audit (see
-/// `project_vit_attention_bf16_softmax_drift.md`) identified as the
-/// dominant ~0.68 logit perturbation that flips saturated-softmax
-/// winners over 27 layers at gemma4v's `scale = 1.0`.
+/// At iter-120 this gate isolated K precision from other variables by
+/// switching from the (then-default) BF16 K cast to an F32 dispatch.
+/// At iter-129 the production default became F16 K (peer parity with
+/// `flash_attn_ext` at clip.cpp:663); the env var now serves as a
+/// development-only A/B override against that F16 default — useful for
+/// investigators isolating K precision but never engaged in the
+/// shipping path.
+///
+/// When `HF2Q_VIT_F32_ATTENTION=1`, the gemma4v ViT score matmul
+/// (`Q @ K^T`) dispatches the F32×F32→F32 tensor-core GEMM
+/// (`dense_matmul_f32_f32_tensor`, mlx-native 0.4.7).  All other ViT
+/// primitives retain their iter-129 F16 paths (V cast / transpose /
+/// scores@V matmul).
 ///
 /// The env var is read exactly once per process; subsequent toggles
 /// do not take effect (matches the gate-h `INVESTIGATION_ENV` /
 /// `LazyLock` pattern in `forward_mlx.rs:556-565` so an A/B
 /// invocation must launch hf2q with the env explicitly set in the
-/// outer process).  Default (env unset / not "1") keeps the
-/// BF16-tensor production path byte-identical to iter-118.
+/// outer process).  Default (env unset / not "1") engages the
+/// production F16 path.
 pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("HF2Q_VIT_F32_ATTENTION")
         .map(|v| v == "1")
@@ -420,17 +424,24 @@ pub fn vit_softmax_last_dim_gpu(
 /// Input shape: `Q`, `K` each `[batch, num_heads, head_dim]` F32 row-major.
 /// Output shape: `[num_heads, batch_q, batch_k]` F32 (head-major scores).
 ///
-/// Pipeline:
+/// Pipeline (iter-129, peer parity):
 ///   1. Permute Q, K from seq-major `[batch, num_heads, head_dim]` to
 ///      head-major `[num_heads, batch, head_dim]` via `permute_021_f32`.
-///   2. Cast K_perm F32 → BF16 (tensor-core src0 contract).
-///   3. Dispatch `dense_matmul_bf16_f32_tensor` with src0=K_bf16,
-///      src1=Q_perm. Output: `[num_heads, batch_q, batch_k]` F32.
+///   2. Cast K_perm F32 → F16 (matches peer's `flash_attn_ext` K
+///      staging at clip.cpp:663; 10-bit mantissa per element).
+///   3. Dispatch `dense_matmul_f16_f32_tensor` with src0=K_f16,
+///      src1=Q_perm. Output: `[num_heads, batch_q, batch_k]` F32 with
+///      F32 accumulator (mirrors `kernel_mul_mm_f16_f32`'s
+///      `simdgroup_half8x8` MMA with float4x4 accumulator).
 ///   4. Apply `scale` via `scalar_mul_f32` in-place.
 ///
 /// `scale` for standard ViT = `1 / sqrt(head_dim)`. **For Gemma 4V the
 /// correct scale is 1.0** per llama.cpp `clip.cpp` — caller passes the
 /// arch-appropriate value. This function does no implicit scaling.
+///
+/// `HF2Q_VIT_F32_ATTENTION=1` is a development-only override that
+/// dispatches the F32×F32→F32 GEMM instead. Not a production fallback;
+/// retained for A/B isolation of K-cast precision from other variables.
 ///
 /// # Errors
 ///
@@ -507,15 +518,24 @@ pub fn vit_attention_scores_gpu(
     encoder.memory_barrier();
 
     // --- Step 2 + 3: scores = Q @ K^T per head batch ---
-    // Default (BF16): cast K F32→BF16, then dispatch the bf16-tensor
-    // matmul (src0=K_bf16, src1=Q_f32, dst=scores_f32).
     //
-    // ADR-005 iter-120 F32 path (`HF2Q_VIT_F32_ATTENTION=1`): skip the
-    // BF16 K cast entirely and dispatch the F32×F32→F32 tensor-core
-    // GEMM added in mlx-native 0.4.7. The two paths share the same
-    // mathematical contract (`output[h, m, n] = sum_k K[h, n, k] *
-    // Q[h, m, k]`), so the score buffer downstream is byte-shape-
-    // identical; only the K-side dtype precision differs.
+    // ADR-005 Phase 2c iter-129 (W60) — F16 K is the default, peer-aligned.
+    // Peer's gemma4v ViT runs `flash_attn_ext` on Metal (default AUTO
+    // upgrades to ENABLED at clip.cpp:2494-2528) and casts K to F16
+    // before the FA call (clip.cpp:663). We match that 10-bit-mantissa
+    // staging here using `dense_matmul_f16_f32_tensor` (mlx-native
+    // 0.4.8+), which mirrors `kernel_mul_mm_f16_f32`'s
+    // `simdgroup_half8x8` MMA with float4x4 accumulator. 8x tighter
+    // per-element rounding budget than the pre-iter-129 BF16 K cast,
+    // closing the residual cascade left by iter-128's weight-matmul
+    // F16 fix.
+    //
+    // Debug override: `HF2Q_VIT_F32_ATTENTION=1` keeps the iter-120
+    // F32×F32→F32 dispatch for development-only A/B comparisons. NOT a
+    // production fallback — F16 is now the production-correct path. The
+    // override exists only so investigators can isolate K precision
+    // from other variables; it is read once at process startup
+    // (LazyLock) and stays off by default.
     let n_scores = (num_heads as usize) * (batch as usize) * (batch as usize);
     let mut scores = device
         .alloc_buffer(
@@ -525,8 +545,9 @@ pub fn vit_attention_scores_gpu(
         )
         .map_err(|e| anyhow!("alloc scores: {e}"))?;
     if *VIT_F32_ATTENTION_ACTIVE {
-        // F32 path: K_perm is already F32 [num_heads, batch_k, head_dim].
-        // Pass it directly as src0 — the F32 GEMM interprets it as
+        // Debug-only F32 path: K_perm is already F32
+        // [num_heads, batch_k, head_dim].  Pass it directly as src0 —
+        // the F32 GEMM interprets it as
         // [src0_batch=num_heads, n=batch_k, k=head_dim].
         let params = DenseMmF32F32Params {
             m: batch,
@@ -544,48 +565,48 @@ pub fn vit_attention_scores_gpu(
             &mut scores,
             &params,
         )
-        .context("attention scores matmul (F32 path, iter-120)")?;
+        .context("attention scores matmul (F32 debug override, HF2Q_VIT_F32_ATTENTION=1)")?;
     } else {
-        // BF16 production path (unchanged).
-        let k_bf16 = device
+        // Default F16 path (peer parity, iter-129).
+        let k_f16 = device
             .alloc_buffer(
                 n_qk_elems * 2,
-                DType::BF16,
+                DType::F16,
                 vec![num_heads as usize, batch as usize, head_dim as usize],
             )
-            .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
+            .map_err(|e| anyhow!("alloc k_f16: {e}"))?;
         cast(
             encoder,
             registry,
             metal_dev,
             &k_perm,
-            &k_bf16,
+            &k_f16,
             n_qk_elems,
-            CastDirection::F32ToBF16,
+            CastDirection::F32ToF16,
         )
-        .context("cast K F32→BF16")?;
+        .context("cast K F32→F16")?;
         encoder.memory_barrier();
 
-        // Layout: src0=K_bf16 [num_heads, batch_k, head_dim] BF16,
+        // Layout: src0=K_f16 [num_heads, batch_k, head_dim] F16,
         //         src1=Q_perm [num_heads, batch_q, head_dim] F32.
         // output[h, m, n] = sum_k K[h, n, k] * Q[h, m, k] = (Q[h] @ K[h]^T)[m, n].
-        let params = DenseMmBf16F32Params {
+        let params = DenseMmF16F32Params {
             m: batch,
             n: batch,
             k: head_dim,
             src0_batch: num_heads,
             src1_batch: num_heads,
         };
-        dense_matmul_bf16_f32_tensor(
+        dense_matmul_f16_f32_tensor(
             encoder,
             registry,
             device,
-            &k_bf16,
+            &k_f16,
             &q_perm,
             &mut scores,
             &params,
         )
-        .context("attention scores matmul")?;
+        .context("attention scores matmul (F16, peer parity)")?;
     }
 
     // --- Step 4: apply scale (in-place via scalar_mul_f32) ---
