@@ -20,6 +20,31 @@ This is exactly the failure mode the **post-shipment** P9b commit `436b923` ("`i
 2. Each loads in `llama-cli --model <path>` without error, emits 8 deterministic tokens at `--seed 42 --temp 0`, and produces the committed transcript under `tests/fixtures/smoke-transcripts/`.
 3. The vocab-padding emit-side fix lands so the convert pipeline can emit a llama.cpp-loadable file from the canonical Qwen/Qwen3.6-27B safetensors snapshot in `~/.cache/huggingface/hub/`.
 
+### 2026-04-25 cron-iter end-gate sweep — bug ladder
+
+The `hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snapshot>` end-gate run surfaces a ladder of three concrete bugs.  Each fix unblocks the next layer:
+
+**Bug 1 — vocab-pad emit (CONVERT side):** ✅ **FIXED** in commit `85e488f` (Phase 1.8 in `cmd_convert`).  HF safetensors padded `model.embed_tokens.weight` to 248320 rows; llama.cpp's loader expects the de-padded count (248044, max base-vocab id + 1) to match the emitted `tokenizer.ggml.tokens` array length.  New `input::detect_padded_vocab` + `input::truncate_padded_vocab` truncate both `model.embed_tokens.weight` and `lm_head.weight` to the de-padded count and update `metadata.vocab_size`.  Seven new unit tests pin the math.
+
+**Bug 2 — MTP tensor naming (CONVERT side, EMITTING UNRECOGNIZED NAMES):** ⏳ **OPEN.**  Smoke surfaced "wrong number of tensors; expected 866, got 851" — the GGUF emits 866 total but llama.cpp only recognizes 851.  Root cause: 15 raw `mtp.*` HF tensor names pass through `hf_name_to_gguf` unrenamed.  ADR-012 P11's MTP rename only covered four wrapper suffixes (`enorm`, `hnorm`, `embed_tokens`, `eh_proj`) and even those used the wrong HF source names — Qwen3.6-27B's HF schema actually emits:
+  * `mtp.pre_fc_norm_embedding.weight` (not `mtp.layers.0.enorm.weight`)
+  * `mtp.pre_fc_norm_hidden.weight` (not `mtp.layers.0.hnorm.weight`)
+  * `mtp.embed_tokens.weight` (no `layers.0` infix on the wrapper)
+  * `mtp.fc.weight` (the eh_proj equivalent)
+  * `mtp.norm.weight` (the per-llama-arch.cpp `nextn.shared_head_norm` analog)
+  * **Plus** the inner transformer block at `mtp.layers.0.{self_attn,mlp}.*` + `input_layernorm.weight` + `post_attention_layernorm.weight` (11 tensors that map to a separate `blk.{n_layer}.*` block — same shape as a regular transformer layer; the `nextn` block is a single transformer layer prepended to the lm-head).
+
+  **Fix design (next iter):** extend `gguf.rs::hf_name_to_gguf` MTP branch to recognize all 15 `mtp.*` patterns and route them per `llama-arch.cpp:447-452` (the 6 `LLM_TENSOR_NEXTN_*` slots) plus the inner transformer block at `blk.{n_layer}.*`.  Cross-reference `/opt/llama.cpp/convert_hf_to_gguf.py` for the canonical HF→GGUF MTP mapping to avoid guesswork.  Update the ADR-012 P11 round-trip test to load all 15 (currently only verifies 4); ADR-013's `mtp.rs::load_mtp_weights_if_present` already scans the full `blk.{N}.nextn.*` prefix so it picks up whatever new mappings land.
+
+**Bug 3 — ssm_conv1d Q4_0 alignment (PRE-FIX SHIPPED ARTIFACTS):** ⏳ **OPEN.**  All four "shipped" DWQ GGUFs (`models/qwen3.6-27b-dwq{46,48}/`, `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq{46,48}/`) were produced before the post-shipment `is_weight()` guard (`436b923`) landed.  Every one fails to load:
+
+  ```
+  gguf_init_from_file_ptr: tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0)
+                           has 4 elements per row, not a multiple of block size (32)
+  ```
+
+  **Fix:** re-emit each of the four GGUFs through the post-fix pipeline once Bug 2 is closed.  The 27B-dwq46 GGUF appears to have been deleted from disk entirely; the other three are present but unloadable.  Each re-emit costs ~150 GB peak disk + ~2 h DWQ wall-clock per ADR-012 P9b's documented numbers.
+
 Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  This addendum reverts that claim with the verification evidence and names the remaining work explicitly.
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
