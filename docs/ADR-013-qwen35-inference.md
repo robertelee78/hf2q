@@ -855,7 +855,7 @@ Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit 
 | Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
 | Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
 | Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
-| P14 MTP speculative decode gate | ✅ Merged on `main` at `79140ec` (2026-04-25). Verified on M5 Max: build PASS; `qwen35::mtp` 4 passed/1 ignored (incl. real-Metal `mtp_forward_draft_returns_logits`); `qwen35::spec_decode` 2 passed; sourdough on apex Q4_0 MoE GGUF `222 / 160 floor` PASS. Live bench with `HF2Q_SPEC_DECODE=1` deferred — requires KEEP_MTP-emitted GGUF (existing apex shipped with MTP-stripped before the Phase A flip). |
+| P14 MTP speculative decode gate | ✅ Merged on `main` at `79140ec` (2026-04-25). Verified on M5 Max: build PASS; `qwen35::mtp` 4 passed/1 ignored (incl. real-Metal `mtp_forward_draft_returns_logits`); `qwen35::spec_decode` 2 passed; sourdough on apex Q4_0 MoE GGUF `222 / 160 floor` PASS. Fall-through smoke (`--speculative` on MTP-stripped apex): WARN-and-fall-through to greedy, decode 116.7 tok/s — no regression vs P13.3 baseline 110.7 tok/s tg64. Live bench with MTP throughput win deferred — all 5 Qwen3.6 GGUFs on disk (27b-dwq46/48, 35b-a3b-apex/dwq46/dwq48) were converted before today's Phase A flip and have `blk.N.nextn.*` tensors stripped (verified via `strings` scan); throughput-improvement measurement requires either re-converting one with the new emit-by-default Phase A path (currently OOM-prone for 35B Q4_0 on this host) or staging a smaller MTP-bearing model. |
 
 ### Totals
 
