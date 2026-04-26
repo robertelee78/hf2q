@@ -2092,6 +2092,12 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
 ) -> Result<Vec<Vec<f32>>> {
     use mlx_native::{GraphExecutor, MlxDevice};
 
+    // ADR-005 iter 124: the dump probe runs inside the per-image scope
+    // below. Resolve the dump dir once here so we fail loud (e.g. EACCES)
+    // BEFORE running the forward, not after spending GPU cycles. Returns
+    // `None` when `HF2Q_VIT_DUMP` is unset → zero overhead default path.
+    let dump_dir = super::vit_dump::resolve_dump_dir()?;
+
     let mut out = Vec::with_capacity(images.len());
     for (idx, img) in images.iter().enumerate() {
         let executor = GraphExecutor::new(
@@ -2110,24 +2116,76 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
         let device_ref: *const MlxDevice = executor.device() as *const _;
         let device: &MlxDevice = unsafe { &*device_ref };
 
-        let buf = gemma4v_apply_full_forward_gpu(
-            session.encoder_mut(),
-            &mut registry,
-            device,
-            mmproj_weights,
-            mmproj_cfg,
-            &img.patches,
-            &img.pos_x,
-            &img.pos_y,
-            img.n_x,
-            img.n_y,
-        )
-        .map_err(|e| {
-            anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
-        })?;
+        // ADR-005 iter 124: when the dump probe is armed, run the forward
+        // inside a `with_dump_collector` scope so intermediate buffers
+        // are stashed via thread-local. We cannot read GPU buffers
+        // mid-forward (encoder still recording); collection happens
+        // in-flight, write-out happens after `session.finish()`.
+        let (buf, collected) = if dump_dir.is_some() {
+            super::vit_dump::with_dump_collector(|| {
+                gemma4v_apply_full_forward_gpu(
+                    session.encoder_mut(),
+                    &mut registry,
+                    device,
+                    mmproj_weights,
+                    mmproj_cfg,
+                    &img.patches,
+                    &img.pos_x,
+                    &img.pos_y,
+                    img.n_x,
+                    img.n_y,
+                )
+                .map_err(|e| {
+                    anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
+                })
+            })?
+        } else {
+            let b = gemma4v_apply_full_forward_gpu(
+                session.encoder_mut(),
+                &mut registry,
+                device,
+                mmproj_weights,
+                mmproj_cfg,
+                &img.patches,
+                &img.pos_x,
+                &img.pos_y,
+                img.n_x,
+                img.n_y,
+            )
+            .map_err(|e| {
+                anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: forward: {e}", idx)
+            })?;
+            (b, Vec::new())
+        };
         session.finish().map_err(|e| {
             anyhow!("compute_vision_embeddings_gpu_gemma4v image {}: finish: {e}", idx)
         })?;
+
+        // After GPU finish: shared-memory buffers are safe to read on
+        // CPU. Write each collected stage to the dump dir. CPU mirrors
+        // (00_preprocess) are drained from a parallel thread-local.
+        if let Some(ref dir) = dump_dir {
+            let img_dir = if images.len() > 1 {
+                dir.join(format!("image_{}", idx))
+            } else {
+                dir.clone()
+            };
+            if !img_dir.exists() {
+                std::fs::create_dir_all(&img_dir).map_err(|e| {
+                    anyhow!("create dump subdir {}: {e}", img_dir.display())
+                })?;
+            }
+            for mirror in super::vit_dump::drain_cpu_mirrors() {
+                super::vit_dump::write_dump_cpu(&img_dir, &mirror).map_err(|e| {
+                    anyhow!("write CPU dump {}: {e}", mirror.name)
+                })?;
+            }
+            for (name, buffer) in &collected {
+                super::vit_dump::write_dump_gpu(&img_dir, name, buffer).map_err(|e| {
+                    anyhow!("write GPU dump {}: {e}", name)
+                })?;
+            }
+        }
 
         let pooled_n = ((img.n_x / 3) as usize) * ((img.n_y / 3) as usize);
         let mm0 = mmproj_weights
@@ -3395,6 +3453,17 @@ pub fn gemma4v_apply_full_forward_gpu(
         dst.copy_from_slice(pos_y);
     }
 
+    // ADR-005 iter 124 (W55): record the preprocessed CPU input as
+    // stage `00_preprocess`. The collector is a no-op when the
+    // `HF2Q_VIT_DUMP` env is unset — see `vit_dump.rs`.
+    if super::vit_dump::is_armed() {
+        super::vit_dump::record_f32(
+            "00_preprocess",
+            patches,
+            vec![n_patches as usize, inner as usize],
+        );
+    }
+
     // --- Stage 2: patch-embed (Linear, no bias) ---
     let patch_w = weights
         .patch_embd_weight()
@@ -3403,6 +3472,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         encoder, registry, device, &patches_buf, patch_w, n_patches, inner, hidden,
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("01_patch_embd", &patch_embeds);
 
     // --- Stage 3: dual-table position-embed lookup + add ---
     let (pe_table, pos_size, pe_hidden) = weights
@@ -3418,6 +3488,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         n_patches, pos_size, hidden,
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("02_pos_embd", &after_pos);
 
     // --- Stage 4: 27-block transformer loop ---
     // Build the gemma4v block shape from cfg. head_dim = hidden / num_heads.
@@ -3455,12 +3526,21 @@ pub fn gemma4v_apply_full_forward_gpu(
         &pos_x_buf, &pos_y_buf, n_patches,
     )?;
     encoder.memory_barrier();
+    if super::vit_dump::is_armed() {
+        super::vit_dump::record("03_block_00", &hidden_states);
+    }
     for block_idx in 1..(cfg.num_hidden_layers as usize) {
         hidden_states = gemma4v_block_forward_gpu(
             encoder, registry, device, weights, &shape, block_idx, &hidden_states,
             &pos_x_buf, &pos_y_buf, n_patches,
         )?;
         encoder.memory_barrier();
+        if super::vit_dump::is_armed() {
+            super::vit_dump::record(
+                &format!("03_block_{:02}", block_idx),
+                &hidden_states,
+            );
+        }
     }
 
     // --- Stage 5: 3×3 spatial avg-pool ---
@@ -3473,6 +3553,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         encoder, registry, device, &hidden_states, n_x, n_y, hidden,
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("30_final_pool", &pooled);
 
     let pooled_n = ((n_x / 3) as usize) * ((n_y / 3) as usize);
     let pooled_total = pooled_n * (hidden as usize);
@@ -3483,6 +3564,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         (hidden as f32).sqrt(),
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("31_pool_sqrt_scale", &pooled);
 
     // --- Stage 7: std_bias / std_scale normalize ---
     let std_bias = weights
@@ -3496,6 +3578,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         pooled_n as u32, hidden,
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("32_std_bias_scale", &normed);
 
     // --- Stage 8: Gemma4ClippableLinear projection ---
     let mm0 = weights
@@ -3516,6 +3599,7 @@ pub fn gemma4v_apply_full_forward_gpu(
         pooled_n as u32, hidden, text_hidden,
     )?;
     encoder.memory_barrier();
+    super::vit_dump::record("33_projector", &projected);
 
     // --- Stage 9: final no-gain RMSNorm (embedding_post_projection_norm) ---
     let ones = device
@@ -3537,10 +3621,12 @@ pub fn gemma4v_apply_full_forward_gpu(
             *v = 1.0;
         }
     }
-    vit_rms_norm_gpu(
+    let post_proj_rms = vit_rms_norm_gpu(
         encoder, registry, device, &projected, &ones,
         pooled_n as u32, text_hidden, cfg.layer_norm_eps,
-    )
+    )?;
+    super::vit_dump::record("34_post_proj_rms", &post_proj_rms);
+    Ok(post_proj_rms)
 }
 
 // ---------------------------------------------------------------------------

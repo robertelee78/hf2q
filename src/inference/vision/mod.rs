@@ -41,6 +41,7 @@ pub mod mmproj;
 pub mod mmproj_weights;
 pub mod preprocess;
 pub mod vit;
+pub mod vit_dump;
 pub mod vit_gpu;
 
 #[allow(unused_imports)]
