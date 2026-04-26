@@ -73,10 +73,13 @@ run_parity_n_times() {
   done
   if (( run_fail == 0 )); then
     echo "  $run_pass/$N_RUNS PASS"
-    ((PASS++))
+    # Pre-increment: under `set -e`, post-increment returns the *old* value;
+    # the 0→1 transition exits 1 and kills the suite mid-run. Surfaced by
+    # ADR-005 iter-104 W7 release-check pass.
+    ((++PASS))
   else
     echo "  $run_pass/$N_RUNS PASS, $run_fail/$N_RUNS FAIL (Gate F: determinism violated)"
-    ((FAIL++))
+    ((++FAIL))
   fi
   echo
 }
