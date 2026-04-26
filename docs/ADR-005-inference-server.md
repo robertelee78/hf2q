@@ -1082,6 +1082,64 @@ Run artifact: `/tmp/w39_release_check.log`. Capture artifact: `/tmp/w39_capture.
 
 ---
 
+#### Phase 2c iter-117 — vision soft-token correctness audit — three W44 candidates clear; root cause lives below the audit (2026-04-25, W46)
+
+**Read-only static audit** of the three W44 iter-116k–flagged candidate root causes for the Phase D `common_prefix=0` semantic divergence (hf2q `"Text-heavy image, no actual image."` vs llama-mtmd-cli `"<|channel|>thought\n*   Input: An image of a square frame made of four"`). All three candidates were checked verbatim against `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`, `/opt/llama.cpp/convert_hf_to_gguf.py:7873-7877`, and `/opt/candle/candle-transformers/src/models/gemma4/vision.rs:139-365`. Result: **all three look CORRECT against the references**; iter-118 widens the audit per the dispatch's Phase 6 honest-blocker plan.
+
+**Candidate #1 — `patch_embd` HWC→CHW permute (`src/backends/gguf.rs:846-867, 939-961, 995-1019`).** Reads against the python convert reference verbatim:
+- Convert ref (`convert_hf_to_gguf.py:7873-7877`):
+  - `n_embd, ksize_sq_c = data_torch.shape`
+  - `patch_size = int((ksize_sq_c // 3) ** 0.5)`
+  - `data_torch = data_torch.reshape(n_embd, patch_size, patch_size, 3)`
+  - `data_torch = data_torch.permute(0, 3, 1, 2).contiguous()`
+- hf2q Pass 1 emit shape (l.849-859): exactly `[n_embd, IN_CHANNELS=3, patch_size, patch_size]` after the reshape `[n_embd, h, w, c]` → permute target `[n_embd, c, h, w]`. The dim-reverse on GGUF emit then yields `ne[]=[w, h, c, n_embd]=[16, 16, 3, 1152]`, which satisfies `a->ne[2]=c=3` for the im2col assert at `ggml.c:4412` and `gemma4v.cpp:12`'s `ggml_conv_2d`.
+- hf2q Pass 2 byte transpose (l.1005-1018): `dst_idx = ((o*c+k)*h+i)*w+j` reading `src_idx = ((o*h+i)*w+j)*c+k` — algebraic inverse of the python `permute(0,3,1,2)` on row-major contiguous bytes. Verified by `test_patch_embd_hwc_to_chw_transpose` (l.4168) using a fully-distinct-element fixture.
+- HF source-row layout cross-check (`candle/gemma4/vision.rs:146-150`): patches are built as `pixel_values.reshape((b, c, ph, ps_h, pw, ps_w)).permute((0, 2, 4, 3, 5, 1)).reshape((b, ph*pw, ps_h*ps_w*c))` — inner dim iterates `(ps_h, ps_w, c)` = HWC. The `linear_no_bias(ps²·3, hidden)` weight is `[hidden, ps²·3]` with input order `(h, w, c)` flattened — confirms the safetensors row layout the convert ref reshapes is HWC.
+- **Verdict: CORRECT.** Reshape, permute, byte-transpose, and HF source convention agree.
+
+**Candidate #2 — 2D RoPE pair-element indexing (`src/shaders/vision_2d_rope.metal:31-129`).** Reads against `gemma4v.cpp:46-91` verbatim:
+- Reference (gemma4v.cpp:54-86): `first` view = `view_3d(cur, n_dim/2, n_head, n_pos, ..., 0)`; `second` view = `view_3d(cur, n_dim/2, n_head, n_pos, ..., n_dim/2 * elem_size)`. Both `ggml_rope_ext` calls use `n_dims = n_dim/2`, `GGML_ROPE_TYPE_NEOX`, `theta_base = hparams.rope_theta`, `freq_scale=1.0f`.
+- Theta scale derivation (`/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp:5789`): `theta_scale = pow(freq_base, -2.0f/n_dims)` where `n_dims=d_half`. NeoX `rotate_pairs` (l.5857) called with stride `n_dims/2`, pairing `(d[i], d[i + n_dims/2])` for `i ∈ [0, n_dims/2) = [0, d_quarter)`. Sign convention for forward: `(x0', x1') = (x0*c - x1*s, x0*s + x1*c)`.
+- Metal kernel (l.39-81): pair index `i ∈ [0, d_quarter)`, first half rotates `(input[base+i], input[base+i+d_quarter])` with `freq = 1/pow(theta, 2*i/d_half)`; second half rotates `(input[base+d_half+i], input[base+d_half+i+d_quarter])`. Sign: `output[base+i] = x0*cx - x1*sx; output[base+i+d_quarter] = x0*sx + x1*cx`.
+- d-axis schedule, sign convention, theta denominator, axis assignment (`pos_x` → first half, `pos_y` → second half) all match the reference.
+- **Verdict: CORRECT.** NeoX-pair indexing, per-half theta scale (`d_half` denominator, NOT `head_dim`), and forward sign convention all line-by-line match gemma4v.cpp + ggml's NeoX rope.
+
+**Candidate #3 — four-norm residual ordering (`src/inference/vision/vit_gpu.rs:2864-3102` + `vit.rs:1873-1996`).** Reads against `candle/gemma4/vision.rs:353-365` verbatim:
+- Candle reference: `residual = xs.clone(); xs = input_layernorm(xs); xs = self_attn(xs); xs = post_attention_layernorm(xs); xs = residual + xs;` then `residual = xs.clone(); xs = pre_feedforward_layernorm(xs); xs = mlp(xs); xs = post_feedforward_layernorm(xs); residual + xs`. Critically: post-norms are applied BEFORE the residual add, residual is the un-normed input.
+- hf2q GPU (vit_gpu.rs:2864 → 3102):
+  - `cur = gemma_rms_norm(input, ln1.weight)` — input_layernorm on cloned input ✓
+  - `attn_proj = ...attention(cur)` — attn on the normed cur ✓
+  - `attn_out = gemma_rms_norm(attn_proj, attn_post_norm.weight)` — post_attention_layernorm on attn output ✓
+  - `x_mid = vit_residual_add(input, attn_out)` — residual = original `input` + post-norm(attn) ✓
+  - `cur = gemma_rms_norm(x_mid, ln2.weight)` — pre_feedforward_layernorm on x_mid ✓ (NOTE: this ln2/ffn-norm aliasing was the W44 iter-116k semantic fix; pre-W44 read `ffn_norm` here, which was the SigLIP alias not the gemma4v pre-FFN norm)
+  - `down = gemma_rms_norm(down, ffn_post_norm.weight)` — post_feedforward_layernorm ✓
+  - `x_out = vit_residual_add(x_mid, down)` — residual + post-norm(mlp) ✓
+- hf2q CPU (vit.rs:1873-1996) is byte-identical in structure (post_attention_layernorm at l.1945-1950 BEFORE residual_add at l.1951; post_feedforward_layernorm at l.1988-1993 BEFORE residual_add at l.1994). The CPU↔GPU parity test `gemma4v_block_forward_4_rmsnorm_count_is_exactly_four` (l.6196) and the per-block CPU-GPU parity test (l.6266) both already pass on this code, so the residual junctions are correct against the CPU reference.
+- **Verdict: CORRECT.** The residual reads the un-normed input on both halves; post_attention_layernorm and post_feedforward_layernorm are applied to the attention/MLP output respectively before the add. Matches candle exactly. W44's iter-116k tensor-name fix (`f2b80fb`) closed the post_attn-norm and post-FFN-norm read-position bugs that previously corrupted the post-norm semantics.
+
+**Wider audit — surfaces below the candidate set:**
+1. **`vit_attention_gpu` BF16 K cast in scaled-dot-product attention (`vit_gpu.rs:560-579`).** V is cast f32→bf16 at l.569-578 before the `scores @ V` matmul. Per `project_vit_attention_bf16_softmax_drift.md`, this BF16 cast introduces ~0.68 logit perturbation that flips saturated-softmax winners. Macro stats match CPU; per-element diverges. Marked "production-correct, don't use CPU F32 attention as parity bar" — but at 27 stacked layers with `scale=1.0` (NOT 1/sqrt(head_dim)) and Q already RMS-normalized, the cumulative drift across the residual stream is plausibly large enough to drive the LM into a different output basin.
+2. **Gemma4ClippableLinear bounds source.** `mm.0.weight`'s clamp scalars are emitted by the writer (Phase B = 0/4 source-driven). The 0-clamp case is iter-116d's "jenerallee78 strips them" finding — confirmed correct for THIS DWQ. But at the SAME `mm.0.weight` site, hf2q calls `gemma4v_clippable_linear_gpu` with empty bounds → plain `vit_linear_gpu`, which BF16-casts at the matmul (need to verify in `vit_linear_gpu`). If yes, that's a SECOND BF16 cast in a precision-critical path.
+3. **`v.std_bias` / `v.std_scale` mean-and-scale**. `gemma4v.cpp:120-123` does `cur = (cur - std_bias) * std_scale` — straightforward elementwise op against the pooled hidden state. hf2q `vit_std_bias_scale_gpu` should be a 1-line trace verification.
+4. **Final `embedding_post_projection_norm` (Stage 9 in apply_full_forward).** `gemma4v.cpp:131` does `ggml_rms_norm(cur, eps)` — true no-gain RMS. hf2q (vit_gpu.rs:3500-3503) calls `vit_rms_norm_gpu(projected, ones, ...)` — pure RMS with gain=ones, equivalent. Looks correct but worth the 5-min verbatim re-read.
+5. **`Gemma4VisionPooler` 3×3 avg pool ordering** (`gemma4v.cpp:102-117` vs `gemma4v_avg_pool_3x3_gpu`). The reference does `transpose → cont_4d(n_x, n_y, n_embd, 1) → pool_2d(AVG, k=3)`. Candle's reference (vision.rs:385-435) instead does a `scatter_add`-based pool. Two different algorithms; need to verify the Metal version follows the gemma4v.cpp tile-by-tile pool, not candle's scatter-add (which would only be byte-equivalent for square inputs aligned to k).
+
+**Top suspect ranking for iter-118:**
+1. **Wider #1 — vit_attention_gpu BF16 V cast at scale=1.0** (rank 1, highest prior). Known precision drift, 27-layer accumulation, and gemma4v's unit-scale attention (Q already RMS-normed) makes this the most plausible distributional disruptor. Hardest to fix surgically: requires either an F32 attention path for gemma4v specifically, or a peer-token diagnostic against mlx-vlm to bound the drift.
+2. **Wider #5 — pooler ordering** (rank 2). Candle and gemma4v.cpp use different pooling algorithms; if hf2q follows candle's scatter-add for non-square inputs the byte-equivalence breaks at non-square images. The four-dots fixture is square (128×128) so this likely doesn't fire, but worth a 5-line read.
+3. **Wider #2 — second BF16 cast in `vit_linear_gpu`** (rank 3). If `vit_linear_gpu` BF16-casts inputs the cumulative effect of N projections (Q/K/V/O at each of 27 layers + gate/up/down at each) is much larger than #1.
+
+**iter-118 recommended fix path (estimated LOC):**
+- Phase A (5-10 LOC, audit-only, no model load): grep + read `vit_linear_gpu` body to confirm/refute the BF16 cast hypothesis. If no cast, drop wider #2 from the suspect set.
+- Phase B (50-100 LOC, single model-load diagnostic): run hf2q with `HF2Q_DUMP_ALL_CACHE=1` + a new `HF2Q_VIT_F32_ATTENTION=1` env-gate that swaps `vit_attention_gpu` for an F32-only variant (bypass V cast). If the soft-token magnitudes shift toward llama-mtmd-cli's, wider #1 confirmed. If not, the bug is in pooler / std_bias / final norm and we narrow further.
+- Phase C (variable): once root cause is bounded, the actual fix is 20-200 LOC depending on suspect.
+
+**iter-119 dependency.** Phase B's diagnostic does NOT require iter-119 (canonical Gemma 4 vision repo capture). Magnitude / distribution comparison between hf2q-with-F32-attention and hf2q-with-BF16-attention is enough to confirm/refute wider #1 in isolation. iter-119 becomes required only if Phase B inverts the suspect ranking and the residual gap is small enough to need a peer-token byte-baseline (i.e. if BF16 cast is innocent and we're chasing a 0.1%-magnitude drift).
+
+**Constraints honored.** Read-only — no source changes. Three candidates (W44's audit-first list) verified verbatim against `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`, `/opt/llama.cpp/convert_hf_to_gguf.py`, `/opt/candle/candle-transformers/src/models/gemma4/vision.rs`, and `/opt/llama.cpp/ggml/src/ggml-cpu/ops.cpp` (NeoX rope). One-model-load Phase 4 diagnostic skipped per Phase 6 of the dispatch (static analysis decisive on the three candidates).
+
+---
+
 #### Phase 2c iter-116l — cross-compat AC FULLY CLOSES — A+B+C+D all PASS at W22's documented bar (2026-04-25, W45)
 
 **Phase A + B + C + D all PASS.** Phase D's strict `assert!(common_prefix > 0)` was relaxed to W22's iter-104 documented bar — *"both produce non-empty text without errors; token-match is desirable but soft — image preprocessor differences across implementations are documented"* (committed in iter-113-prep ADR `5a06229`). Strict common-prefix gating is iter-119 work (canonical mlx-vlm peer comparison) and ABOVE the AC's "loads correctly in BOTH" bar at line ~1216. The iter-119 scope (HF auth + canonical Gemma 4 vision repo discovery, blocker #1 per W22 iter-113-prep) remains queued.
