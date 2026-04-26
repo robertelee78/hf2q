@@ -500,6 +500,23 @@ fn run_q4_0_pipeline(
             // be suppressed, leaving the transcript-assertion parsers
             // staring at empty stderr. See run_q4_0_pipeline doc comment.
             "--no-warmup",
+            // ADR-012 Bug 5 (2026-04-25 cron-iter): llama-cli enters
+            // conversation mode by default in recent llama.cpp builds and
+            // reopens /dev/tty for interactive readline AFTER finishing
+            // the requested -n tokens. Without -no-cnv the child blocks
+            // forever in `console::readline()` even with stdin redirected
+            // to null (interactive mode bypasses parent stdin). See
+            // /opt/llama.cpp/common/arg.cpp:1490 for the canonical flag.
+            "-no-cnv",
+            // ADR-012 Bug 5 follow-up (2026-04-25 smoke-verify): -no-cnv
+            // disables conversation mode but the process still enters
+            // interactive mode and loops printing "> " until stdin EOF is
+            // surfaced (takes ~27 min, produces >11 GB of stdout).
+            // --single-turn exits immediately after the first prompt
+            // response when --prompt is provided, per llama-cli help:
+            //   "will not be interactive if first turn is predefined
+            //    with --prompt"
+            "--single-turn",
         ])
         .output()
         .map_err(|e| format!("run llama-cli: {}", e))?;
@@ -512,7 +529,17 @@ fn run_q4_0_pipeline(
     // decimal numbers (the timestamps + rates) to placeholders before
     // writing — integer counts (n_runs, n_tokens) are preserved so
     // the structural assertion still has its scrape targets.
+    //
+    // Apply sanitization to both stdout and stderr:
+    // - sanitize_timestamps replaces decimal numbers (timing data) with
+    //   <X.XX> placeholders for byte-stable transcripts across runs.
+    // - strip_terminal_control removes ASCII control chars (0x00–0x1F)
+    //   except \n and \t; these include \x08 (BS, from the loading
+    //   spinner animation) and \r (CR) that appear in llama-cli stdout
+    //   and would otherwise create multi-GB transcripts when the spinner
+    //   emits backspace sequences for every frame.
     let sanitized_stderr = sanitize_timestamps(&combined_stderr);
+    let sanitized_stdout = sanitize_timestamps(&strip_terminal_control(&combined_stdout));
     let transcript_body = format!(
         "# hf2q smoke transcript\n\
          # arch:  {}\n\
@@ -521,7 +548,7 @@ fn run_q4_0_pipeline(
          # (timestamps stripped; byte-stable across runs)\n\n\
          ---stdout---\n{}\n\
          ---stderr---\n{}\n",
-        entry.arch, args.quant, prompt, combined_stdout, sanitized_stderr
+        entry.arch, args.quant, prompt, sanitized_stdout, sanitized_stderr
     );
 
     // Scan stderr for regression patterns per conformance helpers.
@@ -647,6 +674,32 @@ fn sanitize_timestamps(s: &str) -> String {
             }
             out.push_str(&s[ch_start..i]);
         }
+    }
+    out
+}
+
+/// Strip ASCII terminal control characters (0x00–0x1F) except `\n` (0x0A)
+/// and `\t` (0x09) from a string slice, returning a new `String`.
+///
+/// This removes:
+/// - `\x08` (BS / backspace) — used by the llama-cli loading spinner
+///   (`|/-\` animation) which produces multi-GB stdout when captured
+///   via `.output()`.
+/// - `\r` (CR, 0x0D) — carriage-return sequences from terminal
+///   overwrite patterns.
+/// - Other control chars (0x00–0x08, 0x0B–0x0C, 0x0E–0x1F) for
+///   robustness; real llama-cli output does not rely on them.
+///
+/// Non-ASCII bytes (multibyte UTF-8) pass through unchanged.
+fn strip_terminal_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let b = ch as u32;
+        // Keep \n (0x0A) and \t (0x09); strip all other C0 controls.
+        if b < 0x20 && b != 0x0A && b != 0x09 {
+            continue;
+        }
+        out.push(ch);
     }
     out
 }

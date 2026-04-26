@@ -71,6 +71,22 @@ If the resulting transcript at `/tmp/smoke-fixtures/smoke-transcripts/qwen35-q4_
 
 The same code path runs for qwen35moe.  Re-emitting the four DWQ deliverables (Bug 3 below) is then unblocked.
 
+**Bug 5 — `hf2q smoke` llama-cli interactive-readline hang (TEST HARNESS side, INFINITE BLOCK):** ⏳ **FIX SHIPPED, RE-RUN PENDING** — surfaced 2026-04-25 cron-iter when running the post-`f02a293` Bug 4 smoke verification.  Bug 5 was the latent blocker for Bug 4 verification; the F32-promotion fix appears correct (the GGUF builds, llama-cli loads it without rejection) but the smoke harness itself hung before the transcript could be scraped.
+
+Symptom: `hf2q smoke --arch qwen35 --quant q4_0 …` runs convert → produces `/tmp/smoke-qwen35-q4/qwen35-q4_0.gguf` (16.9 GB, valid) → invokes `llama-cli --model … --prompt "The quick brown fox" -n 8 --seed 42 --temp 0 --no-warmup` → llama-cli hangs indefinitely (25+ minutes observed before kill).  `sample(1)` on the hung child PID showed the dominant call stack:
+
+```
+main → console::readline() → fflush → __sflush → _swrite → __write_nocancel
+```
+
+The 8-token greedy generation completes; llama-cli then enters **conversation mode** and reopens `/dev/tty` for further input, ignoring stdin redirection from the parent process.  `Command::output()` in std defers to the child for stdin, and `output()`'s default stdin pipe close-on-spawn does not block `/dev/tty` reopens.
+
+Root cause: recent llama.cpp builds default to conversation mode (`-cnv` / `--conversation` ON), per `/opt/llama.cpp/common/arg.cpp:1490`.  The `Command::new(&llama_cli)` invocation in `src/arch/smoke.rs:486-503` did not pass `-no-cnv` to disable it.
+
+Fix: add `"-no-cnv"` to the args list (this commit).  Detection by user arg (no version sniff): older llama.cpp builds where `-cnv` defaulted off still accept `-no-cnv` as a no-op, so the fix is safe across versions.  The mock `write_mock_llama_cli` in `tests/smoke_conformance.rs` ignores all args, so existing CI tests are unaffected.
+
+**Verification pending** — same repro as Bug 4 above (rebuild + smoke run).  When the smoke transcript materializes cleanly, Bug 5 → ✅ FIXED in the same commit that closes Bug 4 (since Bug 5 was the only thing actually preventing Bug 4 from being verified).
+
 ---
 
 **Original Bug 2 surface (preserved for context):**
