@@ -4045,6 +4045,54 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Next (iter 19):** either (a) BERT WordPiece tokenizer loader from GGUF metadata (pure compute, needed for pooled embeddings integration when forward_embed hook lands); (b) PromptCache data structure + LCP algorithm as a standalone module (pure compute, deferred integration until KV-replay can be live-validated); (c) start a real mid-unit-test integration test — spin up the server with a fixture GGUF (small BERT for /v1/embeddings or a tiny synthetic chat path) to exercise the success path end-to-end.
 
 ### Phase 3: Auto Pipeline (renumbered from Phase 4 on 2026-04-23)
+
+#### Phase 3 audit + iter-by-iter plan (2026-04-25, W50)
+
+Read-only audit of `hf2q` HEAD (post `fc85681`) against the four Phase 3 spec bullets at lines 901–915 + the five acceptance checkboxes below. **Conclusion: this is a multi-iter campaign starting at iter-201; only the convert-leg (HF download + quantize) is in-tree today, and none of the four spec bullets are wired into a single `serve --model <repo>` flow.**
+
+**Existing-code inventory (file:line).**
+
+- `src/cli.rs:65-92` — `Command` enum: `Convert`, `Serve`, `Generate`, `Smoke`, etc. **No `Run` subcommand. No `Cache` subcommand.**
+- `src/cli.rs:140-210` (`ConvertArgs`) — `--input | --repo`, `--format`, `--quant auto|...`, `--output`. The HF→GGUF leg already accepts a repo string and auto-quantizes.
+- `src/cli.rs:324-401` (`ServeArgs`) — `--model: Option<PathBuf>` (path-only; **no repo string accepted**), `--cache-dir`, `--mmproj`, etc. `default_value = "127.0.0.1"` per Decision #7.
+- `src/serve/mod.rs:1009-1117` (`cmd_serve`) — validates GGUF header, eagerly loads model, spawns engine + sync warmup. **Pure path-loader; no download, no quantize, no cache-key resolve.**
+- `src/main.rs:240+` (`cmd_convert`) — orchestrates HF download → preflight → quantize → emit GGUF. Uses `HardwareProfiler::detect()` and `AutoResolver` to pick `--quant auto`.
+- `src/input/hf_download.rs` — 966 LOC; `download_model()`, hf-hub + hf-cli + huggingface-cli fallbacks, `resolve_hf_cache_dir()` honors `HF_HOME` / `XDG_CACHE_HOME` / `~/.cache/huggingface/hub`, `check_disk_preflight()`. **Caches under `~/.cache/huggingface/hub` (the HF cache, NOT `~/.cache/hf2q`).** No sha256 verifier; no fetch of HF safetensors-metadata hashes.
+- `src/serve/api/state.rs:106-113` — `default_cache_dir()` returns `$HOME/.cache/hf2q`. Only ever consumed by `cmd_serve` for `/v1/models` listing; nothing writes quantized GGUFs into it.
+- `src/intelligence/hardware.rs:178-220` — `HardwareProfiler::detect()` → `HardwareProfile { total_memory_bytes, available_memory_bytes, chip_model, memory_bandwidth_gbs, ... }`. Chip-tier table + bandwidth lookup. **No `GpuInfo` type; no static `(memory_gib → quant_type)` table.**
+- `src/intelligence/auto_quant.rs` — full auto-quant planner (per-tensor bit allocation, MoE-aware bandwidth model). **Different surface than Phase 3's static decision table** — produces a continuous `AutoQuantPlan`, not a discrete `Q8_0|Q6_K|Q4_K_M|Q3_K_M`.
+- `src/serve/quant_select.rs` — **DOES NOT EXIST.**
+- `src/serve/parity_quality.rs:841` (`sha256_file`) — file-level sha256 helper exists (used by Gate H fixtures); not wired to download integrity.
+- `~/.cache/hf2q/` on disk — `models/mlx-community/gemma-4-26b-a4b-it-4bit/` (one stray dir; appears unrelated to Phase 3 plumbing — not produced by current `cmd_convert`). **No `{model-id}/{quant-type}/{sha256}` layout in tree.**
+- No `cmd_cache_clear` / `Command::Cache` anywhere in `src/`.
+
+**Spec → implementation table.**
+
+| Spec item (lines 901–915) | Status | Where today / what's missing |
+|---|---|---|
+| `hf2q serve --model google/gemma-4-27b-it` → download + quantize + serve | **MISSING** | `ServeArgs.model: Option<PathBuf>` path-only; `cmd_serve:1057` requires `model_path.exists()`. The convert leg exists in `cmd_convert` but is not chained into `cmd_serve`. |
+| Hardware detection → static quant-selection table at `src/serve/quant_select.rs` | **MISSING** | `HardwareProfiler` exists; no `quant_select.rs`, no static `(GiB → Q8_0/Q6_K/Q4_K_M/Q3_K_M)` table, no `GpuInfo` fixtures, no boundary unit tests. The `auto_quant` planner is a different shape (continuous bit allocation, not the spec'd 4-row table). |
+| Cache policy `~/.cache/hf2q/{model-id}/{quant-type}/{sha256}` | **PARTIAL** | `default_cache_dir()` returns the right root; `/v1/models` scans it. **Key shape is wrong** (today: `models/<org>/<repo>/`; spec: `{model-id}/{quant-type}/{sha256}`). No writer ever lands a quantized GGUF at the spec'd path. No `hf2q cache clear` subcommand. |
+| Safetensors sha256 integrity check vs HF model-card hashes | **MISSING** | `sha256_file()` primitive exists (`parity_quality.rs:841`); `hf_download.rs` does not fetch the HF `/api/models/<repo>` JSON, does not compare per-shard hashes, does not refuse on mismatch. |
+
+Net status: **0/4 spec bullets COMPLETE, 1/4 PARTIAL, 3/4 MISSING.** All five Phase 3 acceptance checkboxes (below) remain `[ ]` and are blocked on the gaps above.
+
+**Iter-by-iter plan.**
+
+| Iter | Scope | LOC est. | Depends on |
+|---|---|---|---|
+| 201 | `src/serve/quant_select.rs` — `GpuInfo { unified_memory_bytes }` + `select_static_quant(&GpuInfo) -> StaticQuant` matching the 4-row table; refuse on `< 8 GB` with named minimum. Synthetic-fixture unit tests covering every threshold boundary (8, 16, 32, 64 GB and the inclusive/exclusive edges per spec). Adapter `from(&HardwareProfile)`. | ~120 src + ~80 test | — |
+| 202 | Cache-key normalization + writer. New `src/serve/cache_layout.rs` with `cache_path(model_id, quant, sha) -> PathBuf` rendering `~/.cache/hf2q/{model-id}/{quant-type}/{sha256}/model.gguf`. Migrate `cmd_convert` `--output` resolution when invoked via auto-pipeline so quantized GGUFs land at the spec'd key. Tests for slug-safety (slashes in `org/repo`), idempotent path render, and offline-mode `cache_lookup()`. | ~150 src + ~100 test | — |
+| 203 | Safetensors integrity check. Extend `hf_download.rs` to fetch `https://huggingface.co/api/models/<repo>` JSON (or `model.safetensors.index.json` shard metadata + per-shard `X-Linked-Etag`), record per-shard sha256, and post-download verify each shard. Refuse to quantize on mismatch with a clear error. Reuse `sha256_file()` from `parity_quality.rs`. Cover behind a `--no-integrity` escape hatch (off by default). Tests: synthetic shard with mismatched hash, offline-mode skip, network-failure soft-fail message. | ~180 src + ~120 test | hf_download fetch path |
+| 204 | `hf2q serve --model <repo-or-path>` end-to-end wiring. Detect "looks like an HF repo id" (regex `^[\w.-]+/[\w.-]+$`) vs path. On repo: call `quant_select::select_static_quant(detect()?)` → `cmd_convert`-equivalent download+quantize into `cache_layout::cache_path(...)` → fall through to existing `cmd_serve` path-loader. Wire `Command::Cache(Clear { model: String })` subcommand calling `cache_layout::invalidate(model)`. **No new convert primitives** — re-use the existing chain. | ~180 wiring + ~80 test | 201 + 202 + 203 |
+| 205 | End-to-end smoke. Reuse the fixture-Q4_0 path from `Smoke` to drive `serve --model <local-dir>` → quantize-into-cache → server starts → `/v1/models` lists the cached entry → `/v1/chat/completions` returns 200. Fail-fast on integrity mismatch by tampering one byte of a fixture shard. Use `--llama-cli-override` style fixtures so this stays under the OOM-prevention single-loader directive. | ~250 test | 204 |
+
+**Total Phase 3 estimate: ~870 LOC (~630 src + ~630 test, ~5 iters).**
+
+**Blockers — none external.** No new auth (HF token path already supported in `hf_download.rs:601-637`). No new infra. The integrity-check JSON fetch uses the same hf-hub client already in tree. The static quant table is committed by spec; the per-byte threshold edges are the only design call (decisions encoded as inclusive-lower / exclusive-upper to match the markdown ranges).
+
+**Phase 3 closeout posture.** Phase 3 is **not "mostly done"** — none of the four spec bullets are implemented in their spec'd form. The closely-adjacent surfaces (`HardwareProfiler`, `auto_quant`, `hf_download`, `default_cache_dir`, `sha256_file`) are pre-existing primitives that iter-201..205 can compose without new infra; that's the substrate that keeps the LOC estimate under ~900. Recommend opening iter-201 immediately after this audit lands.
+
 - [ ] `hf2q serve --model google/gemma-4-27b-it` on a fresh machine: downloads, auto-quantizes for detected hardware, starts serving — zero manual steps
 - [ ] Subsequent runs use `~/.cache/hf2q/` (offline mode works for previously cached models)
 - [ ] Hardware detection selects quant per the static table; unit tests cover every threshold boundary
