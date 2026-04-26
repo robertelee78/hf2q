@@ -44,6 +44,9 @@ use crate::serve::config::Gemma4Config;
 use crate::serve::forward_mlx::{MlxModelWeights, ProfileAccumulator};
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
+use crate::serve::sampler_pure::{
+    self, SamplingParams as SamplerParams,
+};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -715,12 +718,75 @@ fn generate_once(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
+    // ── Sampler config — Tier 2/3/4 surface (iter-94) ──────────────────
+    //
+    // Pre-iter-94 the decode loop only consumed `forward_decode`'s
+    // on-GPU greedy argmax — every `temperature` / `top_p` / `top_k` /
+    // `repetition_penalty` / `logit_bias` request was silently downcast
+    // to greedy.  Iter-94 forks on whether ANY field requests non-greedy
+    // sampling and routes those through `sampler_pure::sample_token`
+    // over the live `self.activations.logits` slice (already populated
+    // as a side-effect of `forward_decode` / `forward_prefill`'s lm_head
+    // + softcap dispatch).
+    //
+    // Greedy fast path (all fields at default) keeps the existing
+    // forward_decode return-value chain — no logits readback, no extra
+    // copy.  Sampling slow path discards the on-GPU argmax token
+    // (~20 µs of wasted GPU work, negligible vs the ~10-100ms layer
+    // forward) and re-derives the next token from the live logits.
+    let sample_logits = params.temperature > 0.0
+        || params.top_k > 0
+        || params.top_p < 1.0
+        || params.repetition_penalty != 1.0
+        || !params.logit_bias.is_empty();
+    let sampler_params = if sample_logits {
+        Some(SamplerParams {
+            temperature: params.temperature as f64,
+            top_p: params.top_p as f64,
+            top_k: params.top_k,
+            repetition_penalty: params.repetition_penalty as f64,
+            max_tokens: params.max_tokens,
+        })
+    } else {
+        None
+    };
+
+    // Local helper — apply Tier 4 logit_bias and sample.  Captures
+    // params + sampler_params by reference; takes the running
+    // `generated_tokens` for repetition-penalty.
+    let sample_from_live_logits =
+        |weights: &mut MlxModelWeights, generated: &[u32]| -> Result<u32> {
+            let sp = sampler_params.as_ref().expect("sample_logits gate");
+            let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
+            if !params.logit_bias.is_empty() {
+                let v = logits.len();
+                for (&id, &bias) in &params.logit_bias {
+                    let idx = id as usize;
+                    if idx < v {
+                        logits[idx] += bias;
+                    }
+                }
+            }
+            Ok(sampler_pure::sample_token(&mut logits, sp, generated))
+        };
+
     // --- Prefill ---
     let prefill_start = Instant::now();
-    let mut next_token = loaded
+    let prefill_argmax = loaded
         .weights
         .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx)?;
     let prefill_duration = prefill_start.elapsed();
+
+    // First decode token: greedy fast-path uses prefill's on-GPU argmax;
+    // sampling path re-derives from prefill's live logits buffer (last
+    // prompt-token's lm_head output) so the user-controlled temperature
+    // applies to the very first generated token, not just decode-loop
+    // tokens 2..N.  The greedy-fast-path skips logits readback entirely.
+    let mut next_token = if sample_logits {
+        sample_from_live_logits(&mut loaded.weights, &[])?
+    } else {
+        prefill_argmax
+    };
 
     // --- Reasoning splitter + counter (Decision #21) ---
     // Feed each decoded fragment through a local ReasoningSplitter; count
@@ -761,10 +827,26 @@ fn generate_once(
         for _ in 1..max_tokens {
             let pos = prompt_len + generated_tokens.len() - 1;
             let mut p = profiler.start_token();
-            next_token = loaded
+            // forward_decode populates self.activations.logits as a
+            // side-effect of its lm_head + softcap dispatch chain; the
+            // returned u32 is the on-GPU greedy argmax (only used on the
+            // greedy fast-path).
+            let greedy_token = loaded
                 .weights
                 .forward_decode(next_token, pos, &mut loaded.ctx, &mut p)?;
             profiler.finish_token(p);
+
+            next_token = if sample_logits {
+                // Sampling slow path: read logits, apply Tier 4 logit_bias,
+                // call sampler_pure for temperature/top_p/top_k/rep-penalty.
+                // OpenAI logit_bias is additive: `logit_bias[id] = bias`
+                // adds `bias` to `logits[id]` before softmax.  Out-of-range
+                // ids are silently ignored (matches OpenAI behaviour).
+                sample_from_live_logits(&mut loaded.weights, &generated_tokens)?
+            } else {
+                // Greedy fast path — use forward_decode's on-GPU argmax.
+                greedy_token
+            };
 
             if loaded.eos_token_ids.contains(&next_token) {
                 finish_reason = "stop";
@@ -935,6 +1017,24 @@ fn generate_stream_once(
     let pre_dispatches = mlx_native::dispatch_count();
     let pre_syncs = mlx_native::sync_count();
 
+    // ── Sampler config — Tier 2/3/4 surface (iter-94, mirrors generate_once) ──
+    let sample_logits = params.temperature > 0.0
+        || params.top_k > 0
+        || params.top_p < 1.0
+        || params.repetition_penalty != 1.0
+        || !params.logit_bias.is_empty();
+    let sampler_params = if sample_logits {
+        Some(SamplerParams {
+            temperature: params.temperature as f64,
+            top_p: params.top_p as f64,
+            top_k: params.top_k,
+            repetition_penalty: params.repetition_penalty as f64,
+            max_tokens: params.max_tokens,
+        })
+    } else {
+        None
+    };
+
     // --- Prefill ---
     let prefill_start = Instant::now();
     let next_token_result =
@@ -942,12 +1042,38 @@ fn generate_stream_once(
             .weights
             .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx);
     let prefill_duration = prefill_start.elapsed();
-    let mut next_token = match next_token_result {
+    let prefill_argmax = match next_token_result {
         Ok(t) => t,
         Err(e) => {
             send!(GenerationEvent::Error(format!("prefill failed: {e}")));
             return;
         }
+    };
+    // First decode token: greedy fast-path uses prefill's on-GPU argmax;
+    // sampling path re-derives from prefill's live logits (last
+    // prompt-token's lm_head output) so user-controlled temperature
+    // applies to the very first generated token.
+    let mut next_token = if let Some(sp) = sampler_params.as_ref() {
+        let logits_view = match loaded.weights.logits_view() {
+            Ok(v) => v.to_vec(),
+            Err(e) => {
+                send!(GenerationEvent::Error(format!("first-token logits read: {e}")));
+                return;
+            }
+        };
+        let mut logits = logits_view;
+        if !params.logit_bias.is_empty() {
+            let v = logits.len();
+            for (&id, &bias) in &params.logit_bias {
+                let idx = id as usize;
+                if idx < v {
+                    logits[idx] += bias;
+                }
+            }
+        }
+        sampler_pure::sample_token(&mut logits, sp, &[])
+    } else {
+        prefill_argmax
     };
 
     // --- Decode loop ---
@@ -957,6 +1083,12 @@ fn generate_stream_once(
     let mut reasoning_token_count = 0usize;
     let mut finish_reason: &'static str = "length";
     let mut profiler = ProfileAccumulator::new(0);
+    // Iter-94: streaming path needs the running token list for
+    // sampler_pure's repetition_penalty.  Pre-iter-94 only the
+    // accumulated_text was tracked (sufficient for stop-string scan),
+    // because the loop ran greedy-only.
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
 
     // Emit prefill-produced first token:
     let first_text = loaded
@@ -991,12 +1123,33 @@ fn generate_stream_once(
                     .weights
                     .forward_decode(next_token, pos, &mut loaded.ctx, &mut p);
             profiler.finish_token(p);
-            next_token = match dec_result {
+            let greedy_token = match dec_result {
                 Ok(t) => t,
                 Err(e) => {
                     send!(GenerationEvent::Error(format!("decode failed: {e}")));
                     return;
                 }
+            };
+            next_token = if let Some(sp) = sampler_params.as_ref() {
+                let mut logits: Vec<f32> = match loaded.weights.logits_view() {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => {
+                        send!(GenerationEvent::Error(format!("logits read: {e}")));
+                        return;
+                    }
+                };
+                if !params.logit_bias.is_empty() {
+                    let v = logits.len();
+                    for (&id, &bias) in &params.logit_bias {
+                        let idx = id as usize;
+                        if idx < v {
+                            logits[idx] += bias;
+                        }
+                    }
+                }
+                sampler_pure::sample_token(&mut logits, sp, &generated_tokens)
+            } else {
+                greedy_token
             };
 
             if loaded.eos_token_ids.contains(&next_token) {
@@ -1004,6 +1157,7 @@ fn generate_stream_once(
                 break;
             }
             completion_tokens += 1;
+            generated_tokens.push(next_token);
             let fragment = loaded
                 .tokenizer
                 .decode(&[next_token], false)

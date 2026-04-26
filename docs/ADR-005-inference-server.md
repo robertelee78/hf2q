@@ -1930,6 +1930,48 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 94 — Tier 2/3/4 sampling wired into chat decode loop. `temperature`, `top_p`, `top_k`, `repetition_penalty`, `logit_bias` all functional through OpenAI `/v1/chat/completions`. Builds the `forward_decode_logits` hook (read-only `logits_view()` over `self.activations.logits`) that grammar-constrained decoding (Task #5) and prompt cache (Task #7) will plug into.**
+  - **What landed.**
+    - **`MlxModelWeights::logits_view() -> Result<&[f32]>`** (forward_mlx.rs): borrowed slice into the live `[vocab_size]` logits buffer that `forward_decode` / `forward_prefill` populate as a side-effect of their lm_head + softcap dispatches. No extra GPU work, no copy. Replaces the implicit "read `self.activations.logits.as_slice()` directly" pattern with a typed accessor + length validation.
+    - **Sampling fork in `generate_once`** (engine.rs, non-streaming path):
+      ```rust
+      let sample_logits = params.temperature > 0.0
+          || params.top_k > 0
+          || params.top_p < 1.0
+          || params.repetition_penalty != 1.0
+          || !params.logit_bias.is_empty();
+      ```
+      When ANY non-default sampling field is requested: read live logits, apply Tier 4 `logit_bias` (additive per OpenAI convention), call `sampler_pure::sample_token(...)` for temperature / top_p / top_k / repetition_penalty.  When all defaults: keep the existing `forward_decode` on-GPU greedy argmax fast path (zero overhead).  First decode token (post-prefill) goes through the same fork so user-controlled temperature applies from token 1, not token 2.
+    - **Same fork in `generate_stream_once`** (streaming path) — mirrors the non-streaming logic, plus tracks a `generated_tokens: Vec<u32>` for repetition-penalty (the streaming path previously only tracked `accumulated_text` for stop-string scan, since it ran greedy-only).
+    - Removed the stale doc comment on `SamplingParams` that read "remaining fields … plumb through untouched until the forward-decode refactor exposes logits".
+  - **End-to-end smoke (Gemma-4 26B-A4B-it-ara-abliterated-dwq.gguf, M5 Max).**
+    ```
+    Greedy (T=0, all defaults) — should be deterministic:
+      run 1: 'apple, banana, orange'
+      run 2: 'apple, banana, orange'   ✓ identical
+    Sampling (T=1.0, top_p=0.95) — should vary:
+      run 1: 'Cats are graceful companions that bring warmth and wonder to every home.'
+      run 2: 'Cats are graceful hunters that bring joy to every home.'
+      run 3: 'Cats are graceful predators that bring comfort and charm to any home.'
+      ✓ different completions, all coherent and on-topic
+    Tier 4 logit_bias suppression (T=0, logit_bias["17641"]=-100  // 'apple'):
+      'banana, apple, mango'   ✓ apple no longer 1st; output composition shifted
+    Tier 4 logit_bias boost (T=0, logit_bias["30077"]=+50  // ' banana'):
+      ' banana banana banana banana banana banana ...'
+      ✓ boosted token wins at every step (no rep-penalty in this run)
+    ```
+  - **Cost analysis.**
+    - **Greedy fast path (the default for vast majority of agentic / tool-call / RAG workloads):** zero overhead.  `forward_decode`'s on-GPU argmax is consumed directly; logits are never read back.
+    - **Sampling slow path:** one `vocab_size`-sized `Vec<f32>` allocation + memcpy per decode token (~1 MB per step at 256K vocab), plus the CPU-side sampler work (sort for top-k/top-p — ~256K-element partial sort in worst case).  forward_decode's on-GPU argmax (~20 µs of GPU work) is wasted but negligible vs the layer forward (10-100 ms).  The lm_head dispatch is unchanged.
+    - **No GPU code changes.**  Iter-94 is a pure-Rust integration on top of the existing on-GPU lm_head + softcap dispatches.
+  - **What's NOT yet wired.**
+    1. **`response_format` → grammar mask** (Task #5).  The grammar parser, runtime sampler, mask kernel, and JSON-schema → GBNF translator are all done as pure compute.  Iter-95 plumbs them: chat handler compiles the grammar from `response_format.json_schema`, attaches it to SamplingParams, decode loop calls `mask::apply_grammar(&runtime, &mut logits)` BEFORE `sampler_pure::sample_token`.
+    2. **`logprobs` / `top_logprobs` response fields** (Task #5 sidecar).  Hook for these is the same `logits_view()`; need to compute log-softmax over the unmasked logits and report the top-K alongside the chosen token.
+    3. **`min_p`, `frequency_penalty`, `presence_penalty`, `seed`** — sampler_pure's struct doesn't expose these yet.  Lower priority; can land alongside grammar in iter-95.
+  - **Verification.** `cargo test --release --bin hf2q -- nomic_bert bert_gpu --test-threads=1` → **56/56 pass, 0 fail**.  Phase 2b unaffected.  `cargo build --release --bin hf2q` clean.
+  - **Lane discipline.** Edits in 2 files: `src/serve/forward_mlx.rs` (+ `logits_view` accessor ~20 LOC) and `src/serve/api/engine.rs` (+ sampling fork in `generate_once` and `generate_stream_once`, ~80 LOC each).  Zero changes to BERT lane, mlx-native, or any handler outside the engine module.
+  - **Phase 2a status.** **Tier 2/3/4 sampling — CLOSED** (was `partial — plumbed but ignored` since the spec layer landed).  Tasks #5 (grammar) + #7 (prompt cache) — still in_progress, but the engine-side hook they both queue against is now in place.  Iter-95 can land grammar masking as a single `apply_grammar(&runtime, &mut logits)` call between `logit_bias` and `sample_token` in the new fork.
+
 - **2026-04-25 loop iter 93 — Phase 2a Task #8 byte-for-byte parity gate MET: chat-model `/v1/embeddings` cosine vs `llama-embedding --pooling last` jumps from **0.700 → 0.999935** after fixing BOS-prepend in the embedding handler. Task #8 fully closed.**
   - **Root cause (iter-92 left this open).** `llama-embedding` prepends the model's BOS token (`<bos>` id=2 for Gemma 4) before tokenizing the input — that's the byte-for-byte sequence-prefix the model trained on.  hf2q's chat tokenizer (HuggingFace `tokenizers` crate) does NOT auto-add BOS for Gemma 4 even with `add_special_tokens=true`, because the Gemma `tokenizer.json` post-processor leaves bos handling to the chat-template render layer (which embeds `{{ bos_token }}` literally and the BPE tokenizes that to id 2).  Embedding mode skips the chat template, so no BOS got prepended.  Result: hf2q tokenized "hello world" to **2 tokens**, llama tokenized to **3 tokens** (`<bos>` + `hello` + ` world`).  With Last pooling the different terminal token produced a different embedding direction.
   - **Fix.** Added a BOS-probe + manual prepend in `chat_model_embeddings`:

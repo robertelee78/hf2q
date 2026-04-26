@@ -3930,6 +3930,43 @@ impl MlxModelWeights {
         eprintln!("      {} sessions/token vs 1 in production mode.", 8 * num_layers + 2);
     }
 
+    /// Read the `[vocab_size]` F32 logits buffer that was produced by the
+    /// most recent `forward_decode` (or `forward_prefill`) call.
+    ///
+    /// Returns a borrowed slice into `self.activations.logits` (no copy).
+    /// Caller holds the borrow until they drop the reference; no further
+    /// `self.activations` reads invalidate this slice (the underlying
+    /// `MlxBuffer` is reused across decode steps but writes only happen
+    /// inside the next `forward_decode` invocation).
+    ///
+    /// **Phase 2a Task #5 / #7 hook (iter-94).**  This is the logits-side
+    /// surface that the chat decode loop consults when any Tier 2/3/4
+    /// sampling field (`temperature`, `top_p`, `top_k`, `repetition_penalty`,
+    /// `logit_bias`) is non-default — it bypasses `forward_decode`'s on-GPU
+    /// greedy argmax and runs the pure-Rust `sampler_pure::sample_token`
+    /// over these logits instead.  When grammar lands (iter-95+), the same
+    /// hook supplies the logits to the GBNF mask before sampling.
+    ///
+    /// The logits include any post-softcap that the kernel applied
+    /// (`final_logit_softcapping` from the GGUF metadata) — sampling
+    /// operates on the same logits the on-GPU argmax would have seen.
+    ///
+    /// # Errors
+    /// Forwarded from `MlxBuffer::as_slice` — fails only if the buffer
+    /// is in an unreadable state (typically: never written by any
+    /// preceding forward call).
+    pub fn logits_view(&self) -> Result<&[f32]> {
+        let slice: &[f32] = self.activations.logits.as_slice()
+            .map_err(|e| anyhow::anyhow!("logits_view read: {e}"))?;
+        let v = self.vocab_size;
+        anyhow::ensure!(
+            slice.len() >= v,
+            "logits_view: buffer length {} < vocab_size {}",
+            slice.len(), v
+        );
+        Ok(&slice[..v])
+    }
+
     /// Compute NLL (negative log-likelihood) for `token_id` from the logits buffer
     /// that was produced by the most recent `forward_decode` call.
     ///
