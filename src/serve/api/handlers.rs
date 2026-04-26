@@ -450,6 +450,13 @@ async fn prepare_chat_generation(
         params,
         summarized_messages,
         summary_tokens,
+        // ADR-005 phase 2c iter-99: vision-soft-token wiring lands when
+        // the multimodal preflight + ViT forward returns embeddings instead
+        // of the 501 above.  Until then, the text-only path produces empty
+        // overrides and `chat_completions` falls through to `Engine::generate`.
+        soft_tokens: Vec::new(),
+        vit_forward_ms: None,
+        vit_images: None,
     })
 }
 
@@ -1393,38 +1400,200 @@ fn vit_forward_pending_response(n_images: usize) -> Response {
 /// the per-request vision-forward timing so clients can verify the
 /// path is real even though the engine doesn't yet consume the
 /// embeddings.
-fn vit_engine_integration_pending_response(n_images: usize, forward_ms: u64) -> Response {
-    let err = ApiError::invalid_request(
-        format!(
-            "Request carries {n} image(s); all parsed, preprocessed, \
-             and run through the ViT GPU forward in {ms}ms producing \
-             [49, 2816] projected multimodal embeddings per image. \
-             The chat-completion engine does not yet consume vision \
-             embeddings (ADR-005 Phase 2c iter 53 lands that). The \
-             multimodal pipeline up to and including the ViT projector \
-             is fully production-correct and exercised on every \
-             request — only the engine-side embedding-injection path \
-             is pending. Send a text-only message to exercise chat \
-             completions today.",
-            n = n_images,
-            ms = forward_ms
-        ),
-        Some("messages".into()),
-    );
-    let mut resp = err.into_response();
-    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    // Surface forward timing as a transparency header so clients can
-    // see the GPU forward really ran without parsing the error body.
+/// Vision-path transparency headers (Phase 2c Task #17 / iter-99).  Set
+/// on every successful chat-completion that routed through the soft-
+/// token path:
+///
+///   - `X-HF2Q-ViT-Forward-Ms` — wall-clock for the ViT GPU forward.
+///   - `X-HF2Q-ViT-Images`     — count of images consumed.
+///
+/// Lets clients see the per-request vision cost without parsing the
+/// body.  No-op when both fields are `None` (text-only request).
+fn apply_vit_transparency_headers(
+    resp: &mut Response,
+    forward_ms: Option<u64>,
+    n_images: Option<usize>,
+) {
     use axum::http::{header::HeaderName, HeaderValue};
-    if let Ok(v) = HeaderValue::from_str(&forward_ms.to_string()) {
-        resp.headers_mut()
-            .insert(HeaderName::from_static("x-hf2q-vit-forward-ms"), v);
+    let headers = resp.headers_mut();
+    if let Some(ms) = forward_ms {
+        if let Ok(v) = HeaderValue::from_str(&ms.to_string()) {
+            headers.insert(HeaderName::from_static("x-hf2q-vit-forward-ms"), v);
+        }
     }
-    if let Ok(v) = HeaderValue::from_str(&n_images.to_string()) {
-        resp.headers_mut()
-            .insert(HeaderName::from_static("x-hf2q-vit-images"), v);
+    if let Some(n) = n_images {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            headers.insert(HeaderName::from_static("x-hf2q-vit-images"), v);
+        }
     }
-    resp
+}
+
+/// Convert each `MessageContent::Parts` containing image content parts
+/// into a `MessageContent::Text` whose payload preserves the original
+/// part order, with each image part substituted by the literal token
+/// text `<|image|>` (Gemma family) — one placeholder per image.  Pure-
+/// text messages and pure-text Parts are passed through unchanged.
+///
+/// The chat template (rendered by `engine::render_chat_prompt`) wraps
+/// the message content in role-specific markers; the placeholder text
+/// flows through verbatim and the tokenizer maps each `<|image|>`
+/// sequence to its special-token id (Gemma 4: 258880).  At soft-token
+/// expansion time those single placeholder positions are replaced by
+/// `N_image_tokens` consecutive copies of the same id (the model never
+/// reads them — the embed step is short-circuited per
+/// `SoftTokenInjection`'s contract — but keeping them as literal image
+/// tokens means OpenAI usage shape and hf2q's own token-counting stay
+/// consistent).
+///
+/// Phase 2c Task #17 / iter-99.
+fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    use super::schema::ContentPart;
+    messages
+        .iter()
+        .map(|msg| {
+            let new_content = msg.content.as_ref().map(|c| match c {
+                MessageContent::Text(_) => c.clone(),
+                MessageContent::Parts(parts) => {
+                    let any_image = parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+                    if !any_image {
+                        c.clone()
+                    } else {
+                        let mut buf = String::new();
+                        for part in parts {
+                            match part {
+                                ContentPart::Text { text } => buf.push_str(text),
+                                ContentPart::ImageUrl { .. } => buf.push_str("<|image|>"),
+                            }
+                        }
+                        MessageContent::Text(buf)
+                    }
+                }
+            });
+            ChatMessage {
+                role: msg.role.clone(),
+                content: new_content,
+                reasoning_content: msg.reasoning_content.clone(),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+                name: msg.name.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Locate `<|image|>` placeholder positions in the rendered prompt
+/// tokens and EXPAND each into a contiguous run of `N_image_tokens`
+/// copies (where `N_image_tokens = embeddings[i].len() / hidden`).  For
+/// each expanded run, allocate an `MlxBuffer` shaped `[N_image_tokens,
+/// hidden]` F32 and copy the projected vision embedding row-major,
+/// then return `(prompt_tokens_expanded, soft_tokens)` where
+/// `soft_tokens[i].range` indexes the post-expansion vector.
+///
+/// Errors (each mapped to a 500 `generation_error`):
+///   * tokenizer has no `<|image|>` special-token id
+///   * placeholder count != image count (template emitted wrong number)
+///   * MlxDevice / buffer allocation failed
+///
+/// Phase 2c Task #17 / iter-99.
+fn expand_image_placeholders(
+    engine: &engine::Engine,
+    prompt_tokens: &[u32],
+    embeddings: &[Vec<f32>],
+) -> std::result::Result<(Vec<u32>, Vec<engine::SoftTokenData>), Response> {
+    let n_images = embeddings.len();
+    let hidden = engine.hidden_size();
+    let img_token_id: u32 = match engine.tokenizer().token_to_id("<|image|>") {
+        Some(id) => id,
+        None => {
+            return Err(ApiError::generation_error(
+                "tokenizer has no `<|image|>` special-token id; the loaded chat \
+                 model does not support vision input through hf2q's soft-token \
+                 path",
+            )
+            .into_response());
+        }
+    };
+    let placeholder_positions: Vec<usize> = prompt_tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(p, t)| if *t == img_token_id { Some(p) } else { None })
+        .collect();
+    if placeholder_positions.len() != n_images {
+        return Err(ApiError::generation_error(format!(
+            "rendered prompt has {} `<|image|>` placeholder(s) but request \
+             carries {} image(s); the chat template likely dropped or \
+             duplicated image markers — check `tokenizer_config.json` and \
+             the GGUF chat template",
+            placeholder_positions.len(),
+            n_images
+        ))
+        .into_response());
+    }
+    // Apple Silicon: MlxDevice::new() returns the singleton Metal
+    // device.  Buffers it allocates are usable by any other GpuContext
+    // / device handle in this process via shared-memory semantics, so
+    // the handler can alloc + populate the soft-token buffers off the
+    // worker thread.
+    let mlx_dev = match mlx_native::MlxDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(
+                ApiError::generation_error(format!("MlxDevice init failed: {e}")).into_response(),
+            );
+        }
+    };
+    let total_extra: usize = embeddings
+        .iter()
+        .map(|e| e.len() / hidden)
+        .sum::<usize>()
+        .saturating_sub(n_images); // each placeholder already counts once
+    let mut prompt_expanded: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + total_extra);
+    let mut soft_tokens: Vec<engine::SoftTokenData> = Vec::with_capacity(n_images);
+    let mut last_pos = 0usize;
+    for (i, &pos) in placeholder_positions.iter().enumerate() {
+        prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..pos]);
+        let n_image_tokens = embeddings[i].len() / hidden;
+        let start = prompt_expanded.len();
+        for _ in 0..n_image_tokens {
+            prompt_expanded.push(img_token_id);
+        }
+        let end = prompt_expanded.len();
+        let byte_len = n_image_tokens * hidden * std::mem::size_of::<f32>();
+        let mut buf = match mlx_dev.alloc_buffer(
+            byte_len,
+            mlx_native::DType::F32,
+            vec![n_image_tokens, hidden],
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(ApiError::generation_error(format!(
+                    "soft-token buffer alloc failed (image {i}): {e}"
+                ))
+                .into_response());
+            }
+        };
+        match buf.as_mut_slice::<f32>() {
+            Ok(dst) => {
+                debug_assert_eq!(dst.len(), embeddings[i].len());
+                dst.copy_from_slice(&embeddings[i]);
+            }
+            Err(e) => {
+                return Err(ApiError::generation_error(format!(
+                    "soft-token buffer mut slice failed (image {i}): {e}"
+                ))
+                .into_response());
+            }
+        }
+        soft_tokens.push(engine::SoftTokenData {
+            range: start..end,
+            embeddings: buf,
+        });
+        last_pos = pos + 1;
+    }
+    prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..]);
+    Ok((prompt_expanded, soft_tokens))
 }
 
 /// Pre-compile the request's `response_format` to a parsed GBNF grammar.
