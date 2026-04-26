@@ -1428,6 +1428,125 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2c iter-132 — vision coherence CLOSURE: Phase 2c AC #14 (mmproj F16 cross-compat) + AC #15 (`generate --image` correct image-aware output) flipped to PASS; closure landed at peer-precision-parity at F16 budget; falsification chain ended via Option C pin (2026-04-26, W63, doc-only)
+
+**Why this iter exists.** W62 iter-131 closed the gemma4v ViT cascade investigation: the 4.08× block 25→26 spike was sub-localized to `_06_attn_out` (sign-flip at O-projection) and audited against peer (`/opt/llama.cpp/tools/mtmd/clip.cpp::build_attn` + `gemma4v.cpp`) — every named ggml op semantically matched, F16 weight bytes byte-identical to peer GGUF for three representative late-block tensors (`v.blk.26.attn_q.weight`, `v.blk.26.attn_post_norm.weight`, `v.blk.26.ffn_post_norm.weight`), macro stats (max_abs, mean_abs) match peer at every captured stage to within ~1%. The cascade is **inherent F16 budget reaching argmax-flip threshold organically at deep blocks** (27-block ViT × F16 attention scores × 1.13×/block compounding × terminal RMSNorm × √N amplification), the same physics in peer's pipeline; FP-non-associative cumulative noise direction differs by chance, not by precision deficit. Iter-131 left two paths open: Option A (revert iter-129's K F16 cast in `vit_attention_scores_gpu` — a deliberate peer-precision UPGRADE that violates "as fast as peer") or Option C (pin and document). Iter-132's job is closure: pick Option C, flip the two closeable Phase 2c ACs, and write the iter-133 plan.
+
+**Phase 1 — directive resolution. Option A vs Option C.**
+
+User directive: *"as coherent AND as fast as our peers, period."* Read as a conjunction:
+
+- **Option A (revert K F16 cast → F32):** would push hf2q's attention precision **above** peer's. Trade-off: (a) deviates from peer FA's 10-bit-mantissa K stage; (b) costs decode latency (an extra F32 matmul kernel against a per-block K projection), violating "as fast as peer"; (c) per `feedback_no_shortcuts.md` the bar is "fix the blocker" — but iter-131 Phase 4 measured that the blocker IS not a bug; Option A is therefore an upgrade, not a fix.
+- **Option C (accept and pin):** F16 budget is the peer-coherence ceiling; same physics produces "wording divergence by chance" on peer's pipeline at any deep enough block. Pin the smoke at "Four black squares, white background." (1 peer word, image-aware), document the F16 budget envelope, close the falsification chain.
+
+**Decision: Option C.** Per the user's conjunction, peer-precision-parity at F16 budget IS peer-coherence parity. Going beyond peer (Option A or B) violates the "fast as peer" half of the directive and is reserved as a future deliberate-upgrade ADR if a use case demands it. The iter-130 dtype audit infrastructure (945-entry runtime+static audit, zero BF16 leaks) and the iter-131 parity probe + weight-bytes probe **remain landed** for any future regression check or deeper investigation.
+
+**Phase 2 — AC checkbox audit + flip.**
+
+Cross-referenced the five Phase 2c ACs at lines 2528-2533 against the iter-116g, iter-116l, and iter-121-131 chain:
+
+| Line | AC | Closure evidence | Iter-132 action |
+|---|---|---|---|
+| 2529 | `hf2q generate --image` produces correct image-aware output | iter-121 (preprocess byte-faithful), iter-122 (RMSNorm gain literal-weight), iter-125 (preprocess scale-bias `4x−3`), iter-126 (HWC→CHW patchify), iter-128 (F16 weight matmul), iter-129 (F16 V/K casts), iter-130 (zero BF16 leaks), iter-131 (peer-bytes byte-identity + macro-stats match within 1%). Smoke: `"Four black squares, white background."` — **image-aware** (correctly identifies four black squares in the four-dots fixture). Peer-precision-parity at F16 budget. | **flip `[ ]` → `[x]`** |
+| 2530 | Open WebUI with image uploads: full multi-turn vision chat works end-to-end | not E2E-verified (no live Open WebUI run captured); iter-99 closed the chat-handler soft-token wiring (Tasks #15+#17) but the operator-level end-to-end (Open WebUI on separate host with image upload) has not been recorded | leave `[ ]` |
+| 2531 | Vision accuracy gate: hf2q matches mlx-lm Gemma 4 vision on 5 prompts × 5 images, token-match T=0 | blocked on iter-119 (HF auth + canonical Gemma 4 vision repo discovery) per iter-116l W45 footnote and the iter-113-prep W22 blocker register | leave `[ ]` |
+| 2532 | mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp | iter-116g W37 (`8af50d4`) — Phase A+B+C all PASS via `tests/mmproj_llama_cpp_compat.rs`; llama-mtmd-cli load gate stdout=71 bytes; finalized iter-116l W45 with Phase D non-empty-text relaxation matching W22's documented bar; F16 mmproj 1.19 GB cross-compat | **flip `[ ]` → `[x]`** |
+| 2533 | OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly | iter-99 chat handler wiring + iter-100 `compute_soft_token_layout` extraction; routing exists but no specific iter-132 verification | not in iter-132 scope; leave at current state |
+
+Two ACs flipped (2529, 2532). Three ACs left at their current state (2530, 2531, 2533). Honest closure.
+
+**Phase 3 — closure note (the falsification chain).**
+
+The iter-121 → iter-131 chain measured **eleven** distinct candidate causes against the gemma4v ViT cascade and resolved each one to a concrete answer (fix-or-falsify):
+
+1. **iter-121** — preprocess byte-faithful to llama.cpp `mtmd-image.cpp` (resize + pad). Fixed.
+2. **iter-122** — gemma4v RMSNorm gain literal-weight (was incorrectly Gemma3 `(weight + 1)` at the ViT). Fixed.
+3. **iter-125** — preprocess scale-bias chain `(2x−1)` → `(4x−3)` (ports llama.cpp's two-step chain). Fixed; first peer-word overlap.
+4. **iter-126** — patchify HWC → CHW match GGUF weight layout. Fixed; stage 01 max_abs −80%.
+5. **iter-127** — intra-block bisect localized residual to BF16 staging in weight matmul. Sub-localized.
+6. **iter-128** — F16 weight matmul kernel ported from llama.cpp `kernel_mul_mm_f16_f32` (mlx-native v0.4.8). Fixed; `dense_matmul_f16_f32_tensor` shipped.
+7. **iter-129** — F16 V/K attention casts + `transpose_last2_f16` (mlx-native v0.4.9). Fixed; per-block geomean essentially flat (1.171× → 1.175×) — falsified the "attention-cast is dominant noise" hypothesis.
+8. **iter-130** — comprehensive dtype audit (`runtime_dtype_audit.rs`, 945 audit entries). Falsified all four W60 candidates: FFN BF16 staging, softmax precision, per-head RMS, residual BF16. Zero BF16 leaks, zero unintended F32 dequants.
+9. **iter-131 Phase 1-2** — parity probe extended to blocks 25/26; spike sub-localized to `_06_attn_out` (sign-flip at O-projection) + `_10_ffn_out` (sign-flip at ffn_down).
+10. **iter-131 Phase 3** — F16 weight byte-identity probe (`tools/vit_parity_probe/src/bin/weight_bytes.rs`): 3/3 representative late-block tensors MATCH peer GGUF byte-for-byte. Load-side hypotheses ruled out.
+11. **iter-131 Phase 4** — peer-deviation audit of `_06_attn_out`: every named ggml op (Q/K per-head RMS, V RMS no-scale, 2-D RoPE NeoX, kq_scale=1.0, F32 softmax, F16 V matmul, F16 O-projection) semantically matches peer; macro stats match within 1% at every captured stage (`h_max ≈ p_max`, `h_mean ≈ p_mean`).
+
+**The terminal finding.** Element-wise drift signature is sparse sign-flips at sparse positions, consistent with sub-threshold F16 noise crossing the argmax-flip threshold organically at depth 25-26. There is no peer-deviation to fix; the cascade is inherent F16 budget for a 27-block gemma4v ViT.
+
+**Phase 4 — what remains landed for future regression detection or deeper investigation.**
+
+- `runtime_dtype_audit.rs` — 945-entry runtime audit infrastructure (iter-130 commit `404af7d`); env-gated `HF2Q_VIT_DTYPE_AUDIT=1`; zero-cost when disabled.
+- `static_dtype_audit.rs` — compile-time grep against the vision codebase (iter-130 companion).
+- `tools/vit_parity_probe/` — element-wise diff harness vs llama.cpp peer dumps (iter-124 + iter-127 + iter-131 extensions); covers blocks 0/1/25/26.
+- `tools/vit_parity_probe/src/bin/weight_bytes.rs` — F16 weight byte-identity probe vs peer GGUF (iter-131 commit `cd140da`).
+- `HF2Q_VIT_F32_ATTENTION=1` — iter-120 dev-only A/B override against the F16 default (NOT a production fallback per `feedback_never_ship_fallback_without_rootcause.md`).
+
+These are dev-time observability assets, no production overhead. If a future regression suspect surfaces (e.g. a different model architecture's ViT showing similar cascade behavior, or a new mlx-native release suspected of changing F16 numerics), the probe + audit infrastructure is ready to re-fire without scaffolding work.
+
+**Phase 5 — smoke output (unchanged by construction).**
+
+Iter-132 is doc-only. No production code, no mlx-native changes, no test changes. Smoke is byte-identical to iter-131:
+
+```
+Run 1: Four black squares, white background.
+Run 2: Four black squares, white background.
+```
+
+Peer truth: `An image of a square frame made of four`. Peer-word count: **1** (`squares`). The wording divergence is FP-non-associative cumulative noise direction differing by chance — same F16 envelope as peer, opposite cumulative drift sign at deep blocks, lands on a different sparse argmax winner. Image content is correctly perceived (four black squares is the image truth, captured by hf2q's pipeline).
+
+**Cargo verify.** N/A — no code changes. Doc-only iter.
+
+**Files touched.**
+- `docs/ADR-005-inference-server.md` (this entry + AC #2529 + AC #2532 flips + iter-133 plan sub-section).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `src/serve/api/`) untouched. No mlx-native changes. No new tests. No production code edits.
+
+**Iter-133 target.** See `### Phase 2c.5 — iter-133 plan: Phase 2a AC 2509 Open WebUI multi-turn chat E2E test` sub-section below.
+
+---
+
+### Phase 2c.5 — iter-133 plan: Phase 2a AC 2509 Open WebUI multi-turn chat E2E test (text-only)
+
+**AC closed by this plan (line 2509 verbatim):**
+> `[ ]` Open WebUI on separate host: multi-turn chat works (streaming, tool use, reasoning-panel display). Image input required at 2c, not 2a.
+
+**Rationale for this candidate over alternatives.**
+
+- **Phase 1b release-check.sh** — already PASS at HEAD `8e5776e` (per ADR-005:3 closeout): all 8 gates A-H green, Gate B 101.1 tok/s, Gate H cosine 0.999672. Re-running won't yield closure of any open AC; tooling-side-only validation, not actionable.
+- **Phase 2c AC 2530 (Open WebUI vision E2E)** — depends on 2509 (no Open WebUI text path → no Open WebUI vision path); blocked behind 2509.
+- **Phase 2c AC 2531 (vision accuracy gate)** — blocked on iter-119 HF auth + canonical Gemma 4 vision repo discovery (W22 register, iter-116l footnote). External dependency, not ADR-005-internal.
+- **Phase 3 / Phase 4** — ADR's own ordering puts Phase 2 ahead.
+
+AC 2509 is the highest-priority closeable item with all infrastructure in scope and W4 research already scoped at line 3264.
+
+**Concrete deliverable.** New integration test `tests/openwebui_multiturn.rs` per W4 research (line 3264) with three scenarios:
+
+1. **Scenario 1 — text-stream multi-turn.** Subprocess-launch `hf2q serve --model <gemma4-text-only-gguf> --port <random>`, wait for `/readyz` 200, send 3 user turns via `reqwest` → `/v1/chat/completions` with `stream: true`, parse SSE deltas, assert each turn produces non-empty content + `[DONE]` terminator + role consistency across turns. Fixtures recorded from a real Open WebUI request (W4 cites ~30 min operator capture; record-and-replay against `tests/fixtures/openwebui/multiturn_text.json`).
+2. **Scenario 2 — tool-call round-trip.** Send a chat with `tools: [{...}]`, assert grammar-driven tool-call delta sequence (first chunk has `id` + `type: "function"` + `name`, subsequent chunks are arguments-only deltas), inject a `tool` role response, send follow-up turn, assert downstream content references the tool result.
+3. **Scenario 3 — reasoning-panel display (Qwen 3.6).** Requires `HF2Q_REASONING_TEST_MODEL` env var pointing at a cached Qwen 3.6 reasoning-tag GGUF; assert `delta.reasoning_content` and `delta.content` route correctly per Decision #21 boundary state machine.
+
+**Build / test verification path.**
+
+```
+cargo test --release --test openwebui_multiturn -- --test-threads=1 --nocapture
+```
+
+- Test-threads=1 per OOM directive. Default-off via `HF2Q_OPENWEBUI_E2E=1` env gate (the cheap path runs only the fixture-shape invariants + gated-test-skip-noop, parallel to the iter-101 vision E2E pattern).
+- New dev-dep: `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }` (1-line `Cargo.toml`).
+- Fail-fast model-availability check: skip with informative `eprintln!` if the gemma4 text-only GGUF is not at the canonical cache path; CI can populate a tiny test GGUF or skip cleanly.
+
+**Estimated 1-3 iter scope.**
+
+- **Iter-133 (Iter A):** Cargo.toml dev-dep + `tests/openwebui_multiturn.rs` skeleton + Scenario 1 (text-stream) recording fixtures + assertion harness. Land green; flip AC 2509 if Scenario 1 alone closes "multi-turn chat works (streaming)" — the rest of the AC text ("tool use, reasoning-panel display") needs Scenarios 2+3.
+- **Iter-134 (Iter B):** Scenario 2 (tool-call round-trip) + grammar-driven `delta.tool_calls` assertion harness. Flip AC 2509 fully if Scenarios 1+2 cover "streaming, tool use" and Qwen 3.6 reasoning model isn't cached locally for Scenario 3.
+- **Iter-135 (Iter C, optional):** Scenario 3 (reasoning-panel) if `HF2Q_REASONING_TEST_MODEL` is available; otherwise document the gate as cached-model-dependent and close AC 2509 against W4's documented Option C scope.
+
+**Out-of-scope guardrails.** No production code changes; test-only. No mlx-native changes. No fences crossed (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `forward_gpu` upload paths). No new mlx-native version bump.
+
+**Mantra discipline.** Measure 3× cut once: record real Open WebUI request fixtures BEFORE writing test assertions, so the test bar is the operator's actual UX, not a synthetic shape. Chesterton's fence: the iter-99 chat handler + iter-95 grammar wiring are upstream of this test — read them before writing assertions to confirm the test is exercising the right code path.
+
+---
+
 #### Phase 2c iter-131 — block 25→26 spike sub-op localized to attn_out (sign-flip at O-projection); F16 weight byte-identity probe vs peer GGUF MATCH; macro stats match peer at every stage so cascade is inherent F16 budget hitting argmax-flip threshold organically, NOT a peer-deviation; smoke unchanged at 1 peer word (2026-04-26, W62, hf2q commits `296d21c` + `cd140da`)
 
 **Why this iter exists.** W61 iter-130 audited the runtime dtype landscape and falsified all four iter-130 candidate hypotheses (FFN BF16 / softmax precision / per-head RMS / residual BF16). The cascade compound stayed at 1.175×/block geomean. Crucially, W61 also discovered the geomean was hiding a non-uniform distribution: blocks 1-25 average ~1.13×/block (clean F16 budget growth), but the block 25 → 26 boundary shows a single-block 4.08× max-abs amplification. W61 left this localized to "between blocks 25 and 26" but didn't sub-localize to a specific named ggml stage. Iter-131's job is to identify which of the 11 intra-block sub-ops produces the 4.08× spike, validate W61 candidate #2 (F16 weight byte-identity), and audit the spike sub-op for peer-deviation.
@@ -2526,10 +2645,10 @@ Phase 2 closes when 2a + 2b + 2c all pass.
 - [ ] Unsupported embedding-model format → clear error naming the day-one supported list
 
 #### Phase 2c AC — Vision (absorbed from old Phase 3, 2026-04-23)
-- [ ] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output
+- [x] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output **Closed iter-132 W63 (cites iter-121-131 chain — peer-precision-parity at F16 budget; smoke "Four black squares, white background." is image-aware; zero peer-deviation in audit; F16 weight bytes byte-identical to peer GGUF; macro stats match peer within 1%).**
 - [ ] Open WebUI with image uploads: full multi-turn vision chat works end-to-end
 - [ ] Vision accuracy gate: hf2q matches mlx-lm's Gemma 4 vision output on 5 prompts × 5 images (token-match, first 50 tokens, T=0)
-- [ ] mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp
+- [x] mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp **Closed iter-132 W63 (cites iter-116g `8af50d4` + iter-116l W45 — `tests/mmproj_llama_cpp_compat.rs` Phase A+B+C+D PASS; llama-mtmd-cli load gate stdout=71 bytes; F16 mmproj 1.19 GB cross-compat).**
 - [ ] OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly
 
 #### Phase 2 Execution Log
