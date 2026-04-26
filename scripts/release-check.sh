@@ -18,6 +18,12 @@
 # tests/evals/reference/{short_hello,sourdough,sliding_wrap}_hf2q.txt with
 # MANIFEST.json recording the source commit + GGUF SHA.
 #
+# W21 iter-108b adds Gate H (TQ-active quality envelope; ADR-007 §853-866):
+# in-process two-regime decode loop (dense pass 1 + TQ pass 2 with token
+# replay) on a frozen sourdough_tq_quality.json fixture. Skipped cleanly
+# when the fixture is absent — capture lands in iter-112 (W21's code-only
+# pass; capture + e2e verify is iter-112).
+#
 # Parity suite wraps `hf2q parity check` via scripts/parity_check.sh.
 # Perf gates parse tok/s from stderr of `hf2q generate`.
 # Counter gate parses `[MLX_COUNTERS] ...` stderr from a 128-decode-token
@@ -289,6 +295,66 @@ fi
 if (( FAIL_COUNTERS > 0 )); then
   exit 2
 fi
+
+# --- Gate 5/5 (Gate H): TQ-active quality envelope (ADR-007 §853-866) ---
+#
+# Companion to the byte-prefix Gates C/D/E/F (which run on dense via
+# HF2Q_USE_DENSE=1).  Gate H deliberately exercises BOTH regimes via the
+# in-process two-regime decode loop wired in `cmd_parity_check_tq_quality`
+# (W21 iter-108b): `set_decode_regime(ForceDense)` for pass 1, then
+# `set_decode_regime(ForceTq) + set_replay_tokens(dense_tokens)` for
+# pass 2.  Because the regime is set per-instance via the setters (NOT
+# via env vars), this gate runs WITHOUT the `HF2Q_USE_DENSE=1` prefix
+# the byte-prefix gates use — flipping env here would force both passes
+# through the same dense branch and defeat the gate.
+#
+# The `env -u` prefix still clears any inherited HF2Q_LAYER_POLICY /
+# HF2Q_TQ_CODEBOOK_BITS so the operator's shell can't accidentally
+# nudge the TQ pass off the default 8-bit codebook (which is what the
+# frozen fixture's envelope was captured under).
+#
+# Methodology (W12 thresholds, day-of-close envelope from ADR-007 close
+# §1093-1100 baked in with variance):
+#   cosine_mean >= 0.999    (envelope 0.9998)
+#   cosine_p1   >= 0.99     (envelope 0.9986)
+#   argmax      <= 1.5%     (envelope 0.8%)
+#   ppl_delta   <= 2.0%     (envelope 1.24%)
+#
+# Thermal-aware ordering note: Gate H is comparison-based (cosine /
+# argmax / PPL Δ across two passes WITHIN the same single process),
+# so SoC thermal state at run-start is mostly inert — both passes share
+# the same thermal envelope.  Placing it last (after parity + perf +
+# counters) is fine.  See feedback_perf_gate_thermal_methodology.md.
+#
+# Skips cleanly when the frozen fixture is absent: the fixture is
+# captured by `hf2q parity capture --tq-quality` in iter-112; until
+# that lands, this gate is a no-op so iter-108b's code-only landing
+# does not break release-check.
+echo
+echo "--- Gate 5/5 (Gate H): TQ-active quality envelope (cosine/argmax/PPL Δ) ---"
+GATE_H_FIXTURE="tests/evals/reference/sourdough_tq_quality.json"
+if [[ -f "$GATE_H_FIXTURE" ]]; then
+  GATE_H_LOG="/tmp/release_check_gate_h.log"
+  if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
+        "$HF2Q_BIN" parity check --tq-quality \
+          --model "$GGUF_PATH" \
+          --prompt sourdough \
+          --fixture "$GATE_H_FIXTURE" \
+          --cosine-mean-floor 0.999 \
+          --cosine-p1-floor 0.99 \
+          --argmax-max 0.015 \
+          --ppl-delta-max 0.02 \
+        > "$GATE_H_LOG" 2>&1; then
+    echo "FAIL: Gate H tripped. See $GATE_H_LOG" >&2
+    tail -40 "$GATE_H_LOG" >&2
+    exit 2
+  fi
+  # Show the envelope + PASS line so an operator skim sees the numbers.
+  grep -E '^(  cosine:|  argmax_flip_rate:|  PPL:|PASS:)' "$GATE_H_LOG" || true
+else
+  echo "(Gate H skipped: $GATE_H_FIXTURE not found — fixture lands in iter-112)" >&2
+fi
+
 
 echo
 echo "=== release-check PASS — all gates green ==="
