@@ -47,7 +47,7 @@ thiserror = "2"
 # development, override via a (gitignored) .cargo/config.toml:
 #   [patch.crates-io]
 #   mlx-native = { path = "/opt/mlx-native" }
-mlx-native = "0.4.5"
+mlx-native = "0.4.6"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
