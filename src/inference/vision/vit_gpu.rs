@@ -2330,6 +2330,17 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
                     anyhow!("write GPU dump {}: {e}", name)
                 })?;
             }
+            // ADR-005 iter 130 (W61) — drain the dtype-audit collector
+            // and write the metadata-only sidecar JSON. No-op when
+            // `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` is unset (drain returns
+            // empty Vec). One file per image, listing every audited
+            // intermediate's `(name, dtype, shape)`.
+            let audit_entries = super::vit_dump::drain_audit_entries();
+            if !audit_entries.is_empty() {
+                super::vit_dump::write_dtype_audit(&img_dir, &audit_entries).map_err(|e| {
+                    anyhow!("write dtype audit JSON: {e}")
+                })?;
+            }
         }
 
         let pooled_n = ((img.n_x / 3) as usize) * ((img.n_y / 3) as usize);
@@ -3120,6 +3131,20 @@ pub fn gemma4v_block_forward_gpu(
     let dump_intra = super::vit_dump::is_armed() && block_idx <= 1;
     let intra_name = |suffix: &str| format!("03_block_{:02}_{}", block_idx, suffix);
 
+    // ADR-005 iter 130 (W61) — comprehensive dtype audit instrumentation.
+    //
+    // When `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` is set alongside
+    // `HF2Q_VIT_DUMP=<dir>` the audit fires on EVERY block (not just
+    // blocks 0/1 like the binary dump): we want the `_dtype_audit.json`
+    // to surface any per-block layout drift across all 27 blocks if it
+    // exists. The audit recording is a `buffer.dtype() + buffer.shape()`
+    // read + Vec push (~1 µs/call), gated to no-op when the env var is
+    // unset, so no production overhead.
+    //
+    // INSTRUMENTATION ONLY — no production behaviour change.
+    let audit_intra = super::vit_dump::is_dtype_audit_armed()
+        && super::vit_dump::is_armed();
+
     // ---------- Attention half ----------
     let cur = vit_gemma_rms_norm_gpu(
         encoder,
@@ -3135,6 +3160,9 @@ pub fn gemma4v_block_forward_gpu(
     if dump_intra {
         super::vit_dump::record(&intra_name("01_pre_attn_norm"), &cur);
     }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("01_pre_attn_norm"), &cur);
+    }
 
     let q = vit_linear_gpu(
         encoder,
@@ -3147,6 +3175,13 @@ pub fn gemma4v_block_forward_gpu(
         q_dim,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_q_proj"), &q);
+        super::vit_dump::record_audit(
+            &intra_name("attn_q_weight_storage"),
+            block("attn_q.weight")?,
+        );
+    }
     let k = vit_linear_gpu(
         encoder,
         registry,
@@ -3158,6 +3193,13 @@ pub fn gemma4v_block_forward_gpu(
         kv_dim,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_k_proj"), &k);
+        super::vit_dump::record_audit(
+            &intra_name("attn_k_weight_storage"),
+            block("attn_k.weight")?,
+        );
+    }
     let v = vit_linear_gpu(
         encoder,
         registry,
@@ -3169,6 +3211,13 @@ pub fn gemma4v_block_forward_gpu(
         kv_dim,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_v_proj"), &v);
+        super::vit_dump::record_audit(
+            &intra_name("attn_v_weight_storage"),
+            block("attn_v.weight")?,
+        );
+    }
 
     let q = vit_gemma_per_head_rms_norm_gpu(
         encoder,
@@ -3182,6 +3231,13 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_q_normed"), &q);
+        super::vit_dump::record_audit(
+            &intra_name("attn_q_norm_weight_storage"),
+            block("attn_q_norm.weight")?,
+        );
+    }
     let k = vit_gemma_per_head_rms_norm_gpu(
         encoder,
         registry,
@@ -3194,20 +3250,36 @@ pub fn gemma4v_block_forward_gpu(
         eps,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_k_normed"), &k);
+        super::vit_dump::record_audit(
+            &intra_name("attn_k_norm_weight_storage"),
+            block("attn_k_norm.weight")?,
+        );
+    }
     let v = vit_v_norm_no_scale_gpu(
         encoder, registry, device, &v, batch, num_kv_heads, head_dim, eps,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_v_normed_no_scale"), &v);
+    }
 
     // 2-D RoPE on Q and K.
     let q = vit_vision_2d_rope_gpu(
         encoder, registry, device, &q, pos_x_idx, pos_y_idx, batch, num_heads, head_dim, theta,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_q_rope"), &q);
+    }
     let k = vit_vision_2d_rope_gpu(
         encoder, registry, device, &k, pos_x_idx, pos_y_idx, batch, num_kv_heads, head_dim, theta,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_k_rope"), &k);
+    }
     if dump_intra {
         // Peer counterparts: Qcur_pos-NN, Kcur_pos-NN, Vcur_normed-NN.
         // Q is post-(per-head-RMS + 2-D NeoX RoPE); K likewise. V is
@@ -3223,16 +3295,25 @@ pub fn gemma4v_block_forward_gpu(
         encoder, registry, device, &k, batch, num_kv_heads, num_kv_groups, head_dim,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_k_full_gqa"), &k_full);
+    }
     let v_full = vit_repeat_kv_gpu(
         encoder, registry, device, &v, batch, num_kv_heads, num_kv_groups, head_dim,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_v_full_gqa"), &v_full);
+    }
 
     // Attention with scale = 1.0 (gemma4v: Q is RMS-normalized).
     let attn = vit_attention_gpu(
         encoder, registry, device, &q, &k_full, &v_full, batch, num_heads, head_dim, 1.0,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_kqv_out"), &attn);
+    }
     if dump_intra {
         // Peer counterpart: kqv_out-NN. hf2q's vit_attention_gpu output
         // is `[batch, num_heads*head_dim] = [batch, hidden]` row-major
@@ -3261,6 +3342,13 @@ pub fn gemma4v_block_forward_gpu(
         // Peer counterpart: attn_out-NN (post-O-proj).
         super::vit_dump::record(&intra_name("06_attn_out"), &attn_proj);
     }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_out_proj"), &attn_proj);
+        super::vit_dump::record_audit(
+            &intra_name("attn_out_weight_storage"),
+            block("attn_out.weight")?,
+        );
+    }
 
     let attn_out = vit_gemma_rms_norm_gpu(
         encoder,
@@ -3284,6 +3372,13 @@ pub fn gemma4v_block_forward_gpu(
         // Peer counterpart: attn_post_normed-NN.
         super::vit_dump::record(&intra_name("07_attn_post_normed"), &attn_out);
     }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("attn_post_normed"), &attn_out);
+        super::vit_dump::record_audit(
+            &intra_name("attn_post_norm_weight_storage"),
+            block("attn_post_norm.weight")?,
+        );
+    }
 
     let x_mid = vit_residual_add_gpu(encoder, registry, device, input, &attn_out, n_hidden)?;
     encoder.memory_barrier();
@@ -3293,6 +3388,9 @@ pub fn gemma4v_block_forward_gpu(
         // names the residual `ffn_inp` AFTER the add (line 449), so this
         // matches the post-add tensor.
         super::vit_dump::record(&intra_name("08_ffn_inp"), &x_mid);
+    }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_inp_residual"), &x_mid);
     }
 
     // ---------- MLP half ----------
@@ -3317,6 +3415,13 @@ pub fn gemma4v_block_forward_gpu(
         // Peer counterpart: ffn_inp_normed-NN (post-ln2).
         super::vit_dump::record(&intra_name("09_ffn_inp_normed"), &cur);
     }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_inp_normed"), &cur);
+        super::vit_dump::record_audit(
+            &intra_name("ln2_weight_storage"),
+            block("ln2.weight")?,
+        );
+    }
 
     let gate = vit_linear_gpu(
         encoder,
@@ -3329,6 +3434,13 @@ pub fn gemma4v_block_forward_gpu(
         intermediate,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_gate_proj"), &gate);
+        super::vit_dump::record_audit(
+            &intra_name("ffn_gate_weight_storage"),
+            block("ffn_gate.weight")?,
+        );
+    }
     let up = vit_linear_gpu(
         encoder,
         registry,
@@ -3340,12 +3452,22 @@ pub fn gemma4v_block_forward_gpu(
         intermediate,
     )?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_up_proj"), &up);
+        super::vit_dump::record_audit(
+            &intra_name("ffn_up_weight_storage"),
+            block("ffn_up.weight")?,
+        );
+    }
 
     let n_inter = batch
         .checked_mul(intermediate)
         .ok_or_else(|| anyhow!("gemma4v_block_forward_gpu: batch*intermediate overflow"))?;
     let gated = vit_gelu_pytorch_tanh_gpu(encoder, registry, device, &gate, n_inter)?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_gated_gelu"), &gated);
+    }
 
     // activated = gated * up
     let activated = device
@@ -3363,6 +3485,9 @@ pub fn gemma4v_block_forward_gpu(
     )
     .context("gemma4v_block_forward_gpu: gate * up")?;
     encoder.memory_barrier();
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_activated"), &activated);
+    }
 
     let down = vit_linear_gpu(
         encoder,
@@ -3380,6 +3505,13 @@ pub fn gemma4v_block_forward_gpu(
         // ffn_post_norm). build_ffn returns this via `cur` and clip.cpp:
         // 462 names it `ffn_out` before the optional ff_post_norm_w.
         super::vit_dump::record(&intra_name("10_ffn_out"), &down);
+    }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_down_proj"), &down);
+        super::vit_dump::record_audit(
+            &intra_name("ffn_down_weight_storage"),
+            block("ffn_down.weight")?,
+        );
     }
 
     let down = vit_gemma_rms_norm_gpu(
@@ -3405,8 +3537,18 @@ pub fn gemma4v_block_forward_gpu(
         // Peer counterpart: ffn_post_normed-NN.
         super::vit_dump::record(&intra_name("11_ffn_post_normed"), &down);
     }
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("ffn_post_normed"), &down);
+        super::vit_dump::record_audit(
+            &intra_name("ffn_post_norm_weight_storage"),
+            block("ffn_post_norm.weight")?,
+        );
+    }
 
     let x_out = vit_residual_add_gpu(encoder, registry, device, &x_mid, &down, n_hidden)?;
+    if audit_intra {
+        super::vit_dump::record_audit(&intra_name("layer_out_residual"), &x_out);
+    }
     Ok(x_out)
 }
 

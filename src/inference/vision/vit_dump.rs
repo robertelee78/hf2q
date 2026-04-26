@@ -88,6 +88,30 @@ fn dump_dir_env() -> Option<PathBuf> {
     }
 }
 
+// ADR-005 Phase 2c iter 130 (W61) — comprehensive dtype audit instrumentation.
+//
+// `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` is a development-only env var that, when
+// armed alongside `HF2Q_VIT_DUMP=<dir>`, instructs the recording sites in
+// `gemma4v_block_forward_gpu` and the attention helpers to also append a
+// `(name, dtype, shape)` triple into a thread-local audit collector. After
+// the forward pass completes, the caller drains the audit collector and
+// writes a single `_dtype_audit.json` file listing every observed
+// intermediate. INSTRUMENTATION ONLY — no production behavior change.
+//
+// Why this is its own env var separate from `HF2Q_VIT_DUMP`: the audit
+// path hits buffers we don't otherwise dump as F32 binaries (e.g. the
+// internal F16 staging tiles `k_f16`, `v_f16`, `v_t_f16` inside
+// `vit_attention_gpu`). Those buffers can't be written as F32 raw binaries
+// without additional logic; the audit just reads `buffer.dtype()` and
+// `buffer.shape()` (both cheap accessors with no kernel work).
+//
+// Read once at first access (LazyLock); subsequent runtime mutations
+// not honoured. Matches the `HF2Q_VIT_F32_ATTENTION` and `HF2Q_VIT_DUMP`
+// patterns in this module.
+fn dtype_audit_env() -> bool {
+    matches!(std::env::var("HF2Q_VIT_DUMP_DTYPE_AUDIT").as_deref(), Ok("1"))
+}
+
 thread_local! {
     /// When `Some`, the active forward pass appends `(stage_name, MlxBuffer)`
     /// here for the caller to drain and write after `session.finish()`.
@@ -95,6 +119,24 @@ thread_local! {
     static COLLECTOR: RefCell<Option<Vec<(String, MlxBuffer)>>> = const {
         RefCell::new(None)
     };
+
+    /// ADR-005 iter 130 (W61) — dtype audit collector (separate from
+    /// `COLLECTOR`). Holds `(name, dtype_str, shape)` triples appended by
+    /// `record_audit` when both `HF2Q_VIT_DUMP=<dir>` AND
+    /// `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` are set. Drained by
+    /// `drain_audit_entries` after `with_dump_collector` exits.
+    static AUDIT_COLLECTOR: RefCell<Vec<AuditEntry>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+/// One entry of the dtype audit. Recorded per intermediate MlxBuffer in
+/// the gemma4v block forward path when audit instrumentation is armed.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<usize>,
 }
 
 /// Arm the thread-local collector for the duration of the closure, then
@@ -152,6 +194,113 @@ pub fn record(name: &str, buffer: &MlxBuffer) {
 pub fn is_armed() -> bool {
     COLLECTOR.with(|c| c.borrow().is_some())
 }
+
+/// Returns true if the dtype-audit instrumentation is enabled.
+///
+/// ADR-005 iter 130 (W61). One-shot env read of
+/// `HF2Q_VIT_DUMP_DTYPE_AUDIT=1` cached in a `LazyLock`; subsequent
+/// runtime mutations are NOT honoured (matches the
+/// `HF2Q_VIT_F32_ATTENTION` pattern in vit_gpu.rs).
+///
+/// Callers in `vit_gpu.rs::gemma4v_block_forward_gpu` /
+/// `vit_attention_gpu` / `vit_attention_scores_gpu` gate `record_audit`
+/// calls behind both this AND `is_armed()` so the audit only fires
+/// inside an `with_dump_collector` scope (the audit's drain path runs
+/// alongside the dump-buffer drain at scope exit).
+pub fn is_dtype_audit_armed() -> bool {
+    static AUDIT_ARMED: LazyLock<bool> = LazyLock::new(dtype_audit_env);
+    *AUDIT_ARMED
+}
+
+/// Append a `(name, dtype, shape)` triple to the dtype-audit collector.
+///
+/// No-op when `is_dtype_audit_armed()` is false OR when `is_armed()`
+/// (the GPU-buffer collector) is false. The audit collector is drained
+/// alongside the dump-buffer collector at `with_dump_collector` scope
+/// exit and written via `write_dtype_audit`.
+///
+/// # Cost
+///
+/// `buffer.dtype()` + `buffer.shape()` are constant-time accessors; the
+/// `Vec::push` is amortized O(1). Total cost per call: ~1 microsecond
+/// (string format dominates). Scaled across 27 blocks × ~33
+/// intermediates per block = ~890 calls per forward = <1 ms total.
+pub fn record_audit(name: &str, buffer: &MlxBuffer) {
+    if !is_dtype_audit_armed() {
+        return;
+    }
+    if !is_armed() {
+        return;
+    }
+    let dtype = format!("{:?}", buffer.dtype());
+    let shape = buffer.shape().to_vec();
+    AUDIT_COLLECTOR.with(|c| {
+        c.borrow_mut().push(AuditEntry {
+            name: name.to_string(),
+            dtype,
+            shape,
+        });
+    });
+}
+
+/// Drain the dtype-audit collector and return all accumulated entries.
+/// Caller (parity probe runner) writes the JSON via `write_dtype_audit`
+/// after `with_dump_collector` returns.
+pub fn drain_audit_entries() -> Vec<AuditEntry> {
+    AUDIT_COLLECTOR.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Write the dtype-audit JSON sidecar to `<dir>/_dtype_audit.json`.
+///
+/// Format (one JSON array of `{name, dtype, shape}` objects):
+///
+/// ```text
+/// [
+///   {"name":"03_block_00_01_pre_attn_norm","dtype":"F32","shape":[196,1152]},
+///   {"name":"03_block_00_attn_q_proj","dtype":"F32","shape":[196,1152]},
+///   ...
+/// ]
+/// ```
+///
+/// Hand-rolled JSON to avoid a new dependency (matches `write_dump_inner`
+/// pattern). One file per forward pass, overwritten if it already exists.
+///
+/// # Errors
+///
+/// I/O errors creating or writing the file.
+pub fn write_dtype_audit(dir: &Path, entries: &[AuditEntry]) -> Result<()> {
+    use std::io::Write;
+    let path = dir.join("_dtype_audit.json");
+    let mut f = std::fs::File::create(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(b"[\n")
+        .with_context(|| format!("write {}", path.display()))?;
+    for (i, e) in entries.iter().enumerate() {
+        let shape_str = e
+            .shape
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            "  {{\"name\":\"{}\",\"dtype\":\"{}\",\"shape\":[{}]}}",
+            e.name, e.dtype, shape_str
+        );
+        f.write_all(line.as_bytes())
+            .with_context(|| format!("write entry to {}", path.display()))?;
+        if i + 1 < entries.len() {
+            f.write_all(b",\n")
+                .with_context(|| format!("write {}", path.display()))?;
+        } else {
+            f.write_all(b"\n")
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+    }
+    f.write_all(b"]\n")
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 
 /// Record a CPU-side `&[f32]` slice as a synthetic stage. Used for the
 /// `00_pre_patchify` / `00_post_patchify` dumps (input tensors that are
