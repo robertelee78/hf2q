@@ -777,29 +777,28 @@ Variant coverage (all GPU): Dense (GEMM), MoE F32 (`mul_mm_id`), MoE GGUF-loaded
 
 Tests: 9 unit tests in `activation_capture_real::tests` + 1 end-to-end test in `quantize::dwq_activation::tests::activation_calibration_with_real_model_wrapper_succeeds` — all passing through the GPU path. Stale "P11 follow-up" notes elsewhere in the inference module retired.
 
-### P14 — MTP speculative-decoding execution (COMPLETE in worktree; commit pending)
+### P14 — MTP speculative-decoding execution (COMPLETE)
 
-**Status:** ✅ **COMPLETE in `cfa/p14/codex` worktree** (2026-04-25). Commit hash citation is pending because this sandbox cannot create `/opt/hf2q/.git/worktrees/p14-codex/index.lock`; no source hash is fabricated here.
+**Status:** ✅ **COMPLETE on `main`** at commit `79140ec` (2026-04-25 merge of `cfa/p14/codex`). CFA dual-mode session `cfa-20260425-adr013-p14`; queen-judged 337-253 over Claude scaffold branch (real Metal `forward_draft` + file-discipline + `--speculative` CLI + honest receipts decided it).
 
 **Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
 
 **Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate) landed 2026-04-24. P14 consumes the emitted `blk.{num_hidden_layers}.nextn.*` layout.
 
-**Delivered:**
-- Convert-side MTP policy flipped to emit-by-default with `HF2Q_QWEN35_DROP_MTP=1` escape hatch and dated removal condition.
-- Qwen3.5 / Qwen3.5-MoE GGUF metadata now reports `block_count = num_hidden_layers + nextn_predict_layers`; runtime config subtracts `nextn_predict_layers` so the verifier stack does not load MTP as a normal layer.
-- `src/inference/models/qwen35/mtp.rs` promotes `MtpWeights` to GPU-loaded weights and implements `forward_draft` with full attention (not DeltaNet), dense FFN, shared draft head, F32 activations/logits, and BF16 projection weights.
-- `src/inference/models/qwen35/kv_cache.rs` adds optional `mtp_slot` at index `num_hidden_layers`; absent MTP remains zero-cost.
-- `src/inference/models/qwen35/spec_decode.rs` adds greedy T=0 speculative decoding with accept/reject accounting.
-- `hf2q generate` wires `--speculative` / `HF2Q_SPEC_DECODE=1`; MTP-bearing GGUFs default on, non-MTP GGUFs fall through to greedy.
+**Commits (3 logical phases, all on `main`):**
+- `92afced` — Phase A: convert-side MTP emit-by-default + `HF2Q_QWEN35_DROP_MTP=1` escape hatch (dated 2026-Q4 exit) + qwen35/qwen35moe-scoped `block_count` bump.
+- `3296bc7` — Phase B: `MtpWeights::forward_draft` GPU full-attention + dense-FFN inner block (NOT DeltaNet); split `mtp.rs` (471) + `mtp_weights_load.rs` (243) + `mtp_tests.rs` (215); optional `HybridKvCache.mtp_slot` at index `num_hidden_layers`.
+- `7d5e3e6` — Phase C: greedy T=0 `spec_decode.rs` (302 LoC) with accept/reject accounting + `--speculative` / `HF2Q_SPEC_DECODE=1` wiring through `cli.rs` + `serve/mod.rs`.
 
-**Local verification receipts:**
-- `RUSTC_WRAPPER= cargo build --release` — PASS.
-- `RUSTC_WRAPPER= cargo test --release qwen35::mtp` — PASS (4 passed, 1 ignored).
-- `RUSTC_WRAPPER= cargo test --release qwen35::spec_decode` — PASS (2 passed).
-- `scripts/sourdough_qwen35.sh` live gate did not produce a bytes receipt in this sandbox: `/opt/homebrew/bin/llama-cli` failed Metal initialization (`failed to create command queue`) and segfaulted before hf2q ran.
+**Verification receipts (parent-Claude on M5 Max, 2026-04-25):**
+- `cargo build --release` — PASS.
+- `cargo test --release qwen35::mtp` — 4 passed, 1 ignored, 0 failed (incl. `mtp_loads_gpu_weights_from_synthetic_gguf` + `mtp_forward_draft_returns_logits` — real GPU dispatch).
+- `cargo test --release qwen35::spec_decode` — 2 passed, 0 failed.
+- `scripts/sourdough_qwen35.sh` against apex Q4_0 MoE GGUF — **PASS, common prefix 222 / floor 160 bytes** (62-byte tighter than the floor).
 
-**Estimated LOC:** ~500 (MTP forward + rejection sampling + tests).
+**Bench gate (`scripts/qwen35_bench.sh` with `HF2Q_SPEC_DECODE=1`):** deferred to a follow-up — depends on a KEEP_MTP-emitted GGUF being staged. The on-disk apex GGUF was converted before the Phase A flip and has MTP tensors stripped, so MTP-decode acceptance rate measurements require a re-converted Qwen3.5/3.6 GGUF first. The greedy fall-through path (when MTP weights absent) reuses the existing decode loop verified in P13.3.
+
+**Estimated LOC:** ~1,950 (mtp.rs 471 + mtp_weights_load.rs 243 + mtp_tests.rs 215 + spec_decode.rs 302 + diffs across 8 other files).
 
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 
@@ -856,7 +855,7 @@ Header flipped `Proposed` → `COMPLETE`; this phase plan annotated with commit 
 | Bench within 5% of llama.cpp on M5 Max | ✅ tg64 1.138×, tg256 1.097×, tg1024 1.006× — all > 0.95× at hf2q `23e1128` + mlx-native `25d4c4b` |
 | Integration tests green | ✅ `qwen35moe_apex_generate_smoke` and `qwen35_dense_generate_smoke` — commit `3875bc9` |
 | Docs cover both dense and MoE invocations | ✅ `docs/running-qwen35.md` — commit `d42b8f6` |
-| P14 MTP speculative decode gate | ⚠️ Code/tests pass in worktree (`cargo build --release`, `cargo test --release qwen35::mtp`, `cargo test --release qwen35::spec_decode`); live bytes/tok-s remeasurement blocked because `llama-cli` failed Metal command-queue creation and segfaulted before producing sourdough or bench numbers |
+| P14 MTP speculative decode gate | ✅ Merged on `main` at `79140ec` (2026-04-25). Verified on M5 Max: build PASS; `qwen35::mtp` 4 passed/1 ignored (incl. real-Metal `mtp_forward_draft_returns_logits`); `qwen35::spec_decode` 2 passed; sourdough on apex Q4_0 MoE GGUF `222 / 160 floor` PASS. Live bench with `HF2Q_SPEC_DECODE=1` deferred — requires KEEP_MTP-emitted GGUF (existing apex shipped with MTP-stripped before the Phase A flip). |
 
 ### Totals
 
