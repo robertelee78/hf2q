@@ -1965,6 +1965,163 @@ pub fn quantize_row_q6_k(row: &[f32], blocks: &mut [BlockQ6K]) -> Result<(), KQu
     Ok(())
 }
 
+// ────────────────── Flat-bytes wrappers (GGUF emission) ──────────────────
+
+/// Quantize a row of F32 to GGUF-format **`Q4_K`** block bytes (flat
+/// `Vec<u8>`, ready for the GGUF tensor data section). Convenience
+/// wrapper over [`quantize_row_q4_k`] + [`BlockQ4K::to_bytes`].
+///
+/// `row.len()` must be a multiple of `QK_K` (256). Output length is
+/// `(row.len() / QK_K) × BLOCK_Q4_K_SIZE` bytes.
+pub fn quantize_row_q4_k_to_bytes(row: &[f32]) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ4K {
+            d_bits: 0,
+            dmin_bits: 0,
+            scales: [0u8; 12],
+            qs: [0u8; QK_K / 2],
+        };
+        nb
+    ];
+    quantize_row_q4_k(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q4_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Imatrix-weighted variant of [`quantize_row_q4_k_to_bytes`]. Calls
+/// [`quantize_row_q4_k_imatrix`] with the supplied per-element weights.
+pub fn quantize_row_q4_k_imatrix_to_bytes(
+    row: &[f32],
+    quant_weights: &[f32],
+) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ4K {
+            d_bits: 0,
+            dmin_bits: 0,
+            scales: [0u8; 12],
+            qs: [0u8; QK_K / 2],
+        };
+        nb
+    ];
+    quantize_row_q4_k_imatrix(row, &mut blocks, quant_weights)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q4_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Quantize a row of F32 to GGUF-format **`Q5_K`** block bytes.
+pub fn quantize_row_q5_k_to_bytes(row: &[f32]) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ5K {
+            d_bits: 0,
+            dmin_bits: 0,
+            scales: [0u8; 12],
+            qh: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 2],
+        };
+        nb
+    ];
+    quantize_row_q5_k(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q5_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Imatrix-weighted variant of [`quantize_row_q5_k_to_bytes`].
+pub fn quantize_row_q5_k_imatrix_to_bytes(
+    row: &[f32],
+    quant_weights: &[f32],
+) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ5K {
+            d_bits: 0,
+            dmin_bits: 0,
+            scales: [0u8; 12],
+            qh: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 2],
+        };
+        nb
+    ];
+    quantize_row_q5_k_imatrix(row, &mut blocks, quant_weights)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q5_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Quantize a row of F32 to GGUF-format **`Q6_K`** block bytes.
+pub fn quantize_row_q6_k_to_bytes(row: &[f32]) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ6K {
+            ql: [0u8; QK_K / 2],
+            qh: [0u8; QK_K / 4],
+            scales: [0i8; QK_K / 16],
+            d_bits: 0,
+        };
+        nb
+    ];
+    quantize_row_q6_k(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q6_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Imatrix-weighted variant of [`quantize_row_q6_k_to_bytes`].
+pub fn quantize_row_q6_k_imatrix_to_bytes(
+    row: &[f32],
+    quant_weights: &[f32],
+) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ6K {
+            ql: [0u8; QK_K / 2],
+            qh: [0u8; QK_K / 4],
+            scales: [0i8; QK_K / 16],
+            d_bits: 0,
+        };
+        nb
+    ];
+    quantize_row_q6_k_imatrix(row, &mut blocks, quant_weights)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q6_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3471,6 +3628,135 @@ mod tests {
             KQuantError::BlockSizeMismatch { .. } => {}
             _ => panic!("expected BlockSizeMismatch"),
         }
+    }
+
+    // ─────────────── Flat-bytes wrapper tests (iter-3f) ───────────────
+
+    /// `quantize_row_q4_k_to_bytes` produces exactly `n_blocks ×
+    /// BLOCK_Q4_K_SIZE` bytes; round-trip via `dequantize_row_q4_k_bytes`
+    /// yields F32 within Q4_K's RMSE bound.
+    #[test]
+    fn quantize_q4_k_to_bytes_round_trip() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+        let bytes = quantize_row_q4_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), BLOCK_Q4_K_SIZE);
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k_bytes(&bytes, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.05, "Q4_K bytes round-trip RMSE {rmse} > 0.05");
+    }
+
+    /// `quantize_row_q4_k_to_bytes` for multi-block input produces
+    /// `nb × BLOCK_Q4_K_SIZE` bytes.
+    #[test]
+    fn quantize_q4_k_to_bytes_multi_block_size() {
+        let row = vec![0.5_f32; 4 * QK_K];
+        let bytes = quantize_row_q4_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), 4 * BLOCK_Q4_K_SIZE);
+    }
+
+    /// `quantize_row_q5_k_to_bytes` round-trip — bytes-side RMSE bound.
+    #[test]
+    fn quantize_q5_k_to_bytes_round_trip() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+        let bytes = quantize_row_q5_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), BLOCK_Q5_K_SIZE);
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q5_k_bytes(&bytes, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.025, "Q5_K bytes round-trip RMSE {rmse} > 0.025");
+    }
+
+    /// `quantize_row_q6_k_to_bytes` round-trip — bytes-side RMSE bound.
+    /// Uses the same smooth ramp as `quantize_q6_k_round_trip_synthetic`
+    /// since the bytes wrapper goes through the same quantize path; the
+    /// 0.012 bound is empirically validated for ramp inputs.
+    #[test]
+    fn quantize_q6_k_to_bytes_round_trip() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+        let bytes = quantize_row_q6_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), BLOCK_Q6_K_SIZE);
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q6_k_bytes(&bytes, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.012, "Q6_K bytes round-trip RMSE {rmse} > 0.012");
+    }
+
+    /// Imatrix flat-bytes wrappers all produce the same byte count
+    /// as the non-imatrix wrappers (same on-disk format).
+    #[test]
+    fn imatrix_to_bytes_size_matches_ref() {
+        let row = vec![0.0_f32; 2 * QK_K];
+        let weights = vec![1.0_f32; 2 * QK_K];
+
+        let q4_ref = quantize_row_q4_k_to_bytes(&row).unwrap();
+        let q4_im = quantize_row_q4_k_imatrix_to_bytes(&row, &weights).unwrap();
+        assert_eq!(q4_ref.len(), q4_im.len());
+        assert_eq!(q4_ref.len(), 2 * BLOCK_Q4_K_SIZE);
+
+        let q5_ref = quantize_row_q5_k_to_bytes(&row).unwrap();
+        let q5_im = quantize_row_q5_k_imatrix_to_bytes(&row, &weights).unwrap();
+        assert_eq!(q5_ref.len(), q5_im.len());
+        assert_eq!(q5_ref.len(), 2 * BLOCK_Q5_K_SIZE);
+
+        let q6_ref = quantize_row_q6_k_to_bytes(&row).unwrap();
+        let q6_im = quantize_row_q6_k_imatrix_to_bytes(&row, &weights).unwrap();
+        assert_eq!(q6_ref.len(), q6_im.len());
+        assert_eq!(q6_ref.len(), 2 * BLOCK_Q6_K_SIZE);
+    }
+
+    /// Flat-bytes wrappers reject misaligned input lengths.
+    #[test]
+    fn quantize_to_bytes_rejects_misaligned() {
+        let bad = vec![0.0_f32; QK_K - 1];
+        assert!(matches!(
+            quantize_row_q4_k_to_bytes(&bad).unwrap_err(),
+            KQuantError::NotBlockAligned { .. }
+        ));
+        assert!(matches!(
+            quantize_row_q5_k_to_bytes(&bad).unwrap_err(),
+            KQuantError::NotBlockAligned { .. }
+        ));
+        assert!(matches!(
+            quantize_row_q6_k_to_bytes(&bad).unwrap_err(),
+            KQuantError::NotBlockAligned { .. }
+        ));
     }
 
     /// Q6_K imatrix rejects mismatched weight length.
