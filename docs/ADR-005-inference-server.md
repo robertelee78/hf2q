@@ -1151,6 +1151,52 @@ W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off
 
 ---
 
+#### Phase 2c iter-116e — `attn_out` short form fixes attention layer load; Phase C surfaces NEXT blocker `mm.input_projection.weight` projector tensor name mismatch (2026-04-26, W34/W35)
+
+**Background.** iter-116d (W33) closed Phase C at `unable to find tensor v.blk.0.attn_out.weight`. iter-116e tested W34's 1-char vision-namespace fix (`attn_output` → `attn_out` in `vision_layer_map` at `src/backends/gguf.rs:1853`) by re-emitting mmproj and re-running smoke synchronously under a quiet host (W35).
+
+**iter-116e re-emit + swap (W34/W35, fresh mmproj at HEAD `d49560f` + W34's uncommitted writer fix).** W34 emitted `/tmp/iter116e-emit/gemma-4-throwaway-mmproj.gguf` (1.15 GB) via `hf2q convert --skip-quality --emit-vision-tower`; `strings | grep "v.blk.0.attn"` confirmed the short form `v.blk.0.attn_out.weight`. W35 swapped the canonical fixture in place, ran Phase A+B+C synchronously, then reverted to the W33 stale fixture (per "no commit without smoke green" discipline). Chat GGUF SHA `ae19574d…f8e6f` preserved across the swap+revert.
+
+**iter-116e Phase A+B+C run (HF2Q_LLAMA_MMPROJ_COMPAT=1 + HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1, fresh `attn_out` mmproj):**
+
+| Layer | Result | Detail |
+|---|---|---|
+| Host stability | CLEAR | `pgrep` count = 0 at re-check |
+| Phase A (file-on-disk) | PASS | mmproj 1.146 GB + chat 15.8 GB both `Path::exists()` |
+| Phase B (metadata header) | PASS | 356 tensors, `arch='clip'`, clamp scalars `0/4` (source-driven, partial-tuple invariant satisfied) |
+| Phase C (CLIP load) | **FAIL** at clip_init | hf2q-emitted GGUF passes `clip_model_loader` (parses all 356 tensors, all 15 KV pairs, all hparams identical to source: `n_embd=1152`, `n_layer=27`, `image_size=224`, `patch_size=16`, `projector=gemma4v`, `n_merge=3`, **all attention tensors load** — W34's `attn_out` fix VERIFIED-CORRECT against the CLIP loader); fails at `clip_init: failed to load model: operator(): unable to find tensor mm.input_projection.weight` |
+
+**W34's `attn_out` fix verified-correct (necessary but not sufficient).** Pre-W34, the iter-116d fixture failed at `unable to find tensor v.blk.0.attn_out.weight` — i.e., the CLIP loader rejected the GGUF at the first attention tensor lookup. With W34's fix landed, all 27 vision blocks' attention tensors loaded successfully and the CLIP loader proceeded all the way through hparams parsing and into the projector tensor lookup at clip.cpp:1937. The new failure mode is **strictly downstream** of the iter-116d failure mode — W34 unblocked attention layer load. Per the "no commit without smoke green" discipline, the writer fix is held in tree (uncommitted) until the projector tensor name mismatch (iter-116f, below) clears.
+
+**Phase C blocker root cause #2 (writer-side projector tensor name mismatch — pending iter-116f).** llama.cpp's gemma4v CLIP loader at `/opt/llama.cpp/tools/mtmd/clip.cpp:1932` calls `get_tensor(TN_MM_INP_PROJ)` and `get_tensor(TN_MM_SOFT_EMB_N)` where (per `clip-impl.h:110-111`):
+
+```c
+#define TN_MM_INP_PROJ     "mm.input_projection.weight" // gemma3
+#define TN_MM_SOFT_EMB_N   "mm.soft_emb_norm.weight"    // gemma3
+```
+
+(Per the comment, gemma4v reuses gemma3's projector convention.) hf2q's writer emits only `mm.0.weight` for the projector. Confirmed via `strings | grep "^mm\."` on the fresh fixture: only `mm.0.weight` is present; `mm.input_projection.weight` and `mm.soft_emb_norm.weight` are both absent. The hf_name_to_gguf map needs a vision-projector branch that emits `mm.input_projection.weight` for the projector linear and `mm.soft_emb_norm.weight` for the soft embedding RMS norm — currently the projector path appears to short-circuit through a generic `mm.0.weight` mapping.
+
+**Source HF artifact analysis (whether `mm.soft_emb_norm` is publisher-stripped).** Pending — needs `model.safetensors.index.json` enumeration on `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated`. If absent like the clamp scalars (iter-116c finding), llama.cpp's loader behavior on that absence determines whether the writer needs to emit-zero or whether the test gate tolerates absence. Worker for iter-116f to verify before patching.
+
+**Verification (release build, iter-116e):**
+- `cargo test --release --test mmproj_llama_cpp_compat --no-run` — clean (only existing dead-code warnings on `EXIT_SMOKE_*` constants, pre-existing).
+- `HF2Q_LLAMA_MMPROJ_COMPAT=1 HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1 cargo test --release --test mmproj_llama_cpp_compat -- --ignored --nocapture` — Phase A PASS, Phase B PASS, Phase C FAIL at verbatim `unable to find tensor mm.input_projection.weight`. Smoke log preserved at `/tmp/w35_phase_abc.log`.
+- mlx-native untouched. hf2q source unchanged from W34's iter-116e working tree (1-char `attn_out` fix in `vision_layer_map`, uncommitted, held pending iter-116f).
+- Canonical mmproj fixture reverted to W33 iter-116d stale state (`mtime 2026-04-26 03:09`); fresh `attn_out` fixture preserved at `/tmp/iter116e-emit/gemma-4-throwaway-mmproj.gguf.kept` for iter-116f reuse (avoids a second ~16 GB convert load).
+- Chat GGUF SHA `ae19574dab588e0a742a8cfa1282ccf358ed8a58c5a3483f2bf596020a4f8e6f` verified twice (pre-swap + post-revert); Gate D self-baseline intact.
+
+**Outstanding for iter-116f (next worker):**
+1. **Inventory the source repo's projector tensor names.** Read `model.safetensors.index.json` on `jenerallee78/gemma-4-26B-A4B-it-ara-abliterated`; identify the HF-side names that should map to `mm.input_projection.weight` + `mm.soft_emb_norm.weight`. Verify whether `soft_emb_norm` is published or publisher-stripped (parallels the clamp-scalar question from iter-116c).
+2. **Patch hf_name_to_gguf** projector-namespace mapping in `src/backends/gguf.rs` to emit `mm.input_projection.weight` and (if published) `mm.soft_emb_norm.weight`. Generic `mm.0.weight` likely needs to become arch-aware (gemma4v emits gemma3 names; other models may keep `mm.0.weight`).
+3. **Re-emit mmproj** under verified-quiet host using the saved `/tmp/iter116e-emit/gemma-4-throwaway-mmproj.gguf.kept` as the starting point — or re-run convert if the patch crosses the dequant boundary.
+4. **Commit W34's `attn_out` writer fix together with the iter-116f projector fix in one writer-side commit** once smoke goes green — both vision-namespace mapping bugs are part of the same "llama.cpp gemma4v CLIP convention" delta.
+5. **Re-run Phase A+B+C end-to-end.** Expected: all three green. Phase D parity proxy (the `panic!`-placeholder body, gated behind `HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1`) lands in iter-116g.
+
+**Why two iters not one.** iter-116e was scoped to verify W34's `attn_out` hypothesis under real smoke; the projector tensor name mismatch is structurally a separate writer-side mapping bug (different namespace, different llama.cpp loader call site, different source-side HF tensor names). The ladder reduces blame ambiguity if iter-116f surfaces a third blocker — each iter peels one mismatch at a time, with smoke proof each step.
+
+---
+
 #### Phase 2c iter-116c+d — cross-compat smoke unblocked through CLIP load; Phase C reveals `attn_output → attn_out` writer mapping bug; W32 finds `quality::measure_quality` OOM on 26B+ models (2026-04-25, W31/W32/W33)
 
 **Background.** iter-116b (W30) closed Phase B FAIL on a stale on-disk mmproj predating W6's iter-104 writer fix. iter-116c (W31/W32) ran the re-emit; iter-116d (W33) adapted the test scaffold to the new fixture's shape and pushed Phase C to its real failure mode.
