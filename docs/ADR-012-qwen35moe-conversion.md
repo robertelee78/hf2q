@@ -182,7 +182,7 @@ Measured on M5 Max + 128 GB unified RAM, llama.cpp build `b8680-15f786e65`, hf2q
 
 The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-012's scope is the conversion pipeline:
 
-* **Task #13** — Refactor Phase 4.5 quality measurement to streaming dequant.  Current `--skip-quality` is the closure-day workaround; full-quality re-emit would PPL/KL-gate the four DWQ GGUFs.  Bounded by ~max_tensor_F32 × 2 instead of whole-model × 2.
+* **Task #13** — ✅ CLOSED 2026-04-26 (commit `53037d2`).  Phase 4.5 now uses `measure_quality_streaming` which dequantizes + compares one tensor at a time, bounding peak memory to ~max_tensor_F32 × 2 instead of whole-model × 2.  `--skip-quality` is no longer required for 27B+ DWQ re-emits; can be removed from the dwq46/dwq48 manifests on the next re-emit cycle.
 * **Task #14** — ✅ CLOSED 2026-04-26 (commits `d975cb8` dense Q-path + `92604a2` special-token coverage).  hf2q dense 27B now decodes at 0.96–1.10× of llama.cpp.  Working set 129 GB → 17.3 GB.
 * **MoE dwq46 parity gap (0.91×)** — investigate Lloyd-Max codebook decode in the 4-bit majority layers per `project_tq_sdpa_perf_analysis.md`-class methodology; likely representation-level optimization, not kernel-level.
 * **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
