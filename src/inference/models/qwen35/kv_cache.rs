@@ -565,11 +565,22 @@ mod tests {
 
         // Full-attn: 10 × 2 × 256 × 2 × 32 × 1 × 4 bytes = 10 × 131072 = 1.3 MB
         let full_expected = 10 * 2 * (256 * 2 * 32 * 1) * 4;
-        // Linear-attn: 30 × (conv + rec)
-        //   conv: 3 × 8192 × 1 × 4 = 98304 bytes
-        //   rec:  128 × 128 × 32 × 1 × 4 = 2097152 bytes
-        //   each slot: 2195456 bytes × 30 = 65,863,680
-        let linear_expected = 30 * (3 * 8192 * 1 * 4 + 128 * 128 * 32 * 1 * 4);
+        // Linear-attn: 30 × (conv ping-pong + rec ping-pong).
+        //
+        // Each linear slot allocates *two* conv-state buffers (active +
+        // scratch, ping-pong) and *two* recurrent-state buffers (active +
+        // scratch, ping-pong) — see `LinearAttnStateSlot` and commits
+        // c858ec8 (GPU-resident conv state ping-pong) + fad016b (recurrent
+        // state ping-pong).  Each pair is identical in shape, so the slot
+        // footprint is 2× the single-buffer footprint.
+        //
+        //   conv (each):  3 × 8192 × 1 × 4 =      98_304 bytes
+        //   rec  (each):  128 × 128 × 32 × 1 × 4 = 2_097_152 bytes
+        //   slot:         2 × (conv + rec) =      4_390_912 bytes
+        //   30 slots:                             131_727_360 bytes
+        let conv_bytes = 3 * 8192 * 1 * 4;
+        let rec_bytes = 128 * 128 * 32 * 1 * 4;
+        let linear_expected = 30 * 2 * (conv_bytes + rec_bytes);
         let expected = full_expected + linear_expected;
         assert_eq!(cache.total_bytes(), expected);
     }
