@@ -251,9 +251,17 @@ static void write_dump(const fs::path & dir, const std::string & stage_name,
 }
 
 // ADR-005 iter 127 (W58): intra-block parity probe — peer counterparts
-// for hf2q's `03_block_{NN}_{step}_{name}` sub-stages. We restrict
-// capture to layers 0 and 1 (the bug is per-op, not per-layer-position;
-// two layers are sufficient and bound dump-disk cost).
+// for hf2q's `03_block_{NN}_{step}_{name}` sub-stages.
+//
+// ADR-005 iter 131 (W62): probe extended to layers 25 and 26 so the
+// diff harness can pair both endpoints of the 4.08× block_25 → 26
+// max-abs amplification W61 discovered (geomean 1.175×/block was hiding
+// a non-uniform distribution: blocks 1-25 average 1.13×/block, then a
+// single-block spike at the boundary). Capture restricted to {0, 1, 25,
+// 26}: bug is per-op-at-precision-threshold so four layers — both
+// endpoints of the clean regime AND both endpoints of the spike — are
+// sufficient to identify which sub-op amplifies, while bounding
+// dump-disk cost.
 //
 // Mapping (peer ggml tensor name → hf2q stage suffix), step indices
 // match `vit_gpu.rs::gemma4v_block_forward_gpu` zero-padded ordering.
@@ -274,7 +282,13 @@ static constexpr intra_step kIntraSteps[] = {
     { "ffn_out-",               "10_ffn_out"             },
     { "ffn_post_normed-",       "11_ffn_post_normed"     },
 };
-static constexpr int kIntraMaxLayer = 1;
+// ADR-005 iter 131: the probed-layer set must mirror the gate in
+// `vit_gpu.rs::gemma4v_block_forward_gpu` exactly. Any drift between
+// the two sides causes "only in hf2q" / "only in peer" stages in the
+// diff harness output.
+static inline bool intra_layer_probed(int idx) {
+    return idx == 0 || idx == 1 || idx == 25 || idx == 26;
+}
 
 // Match ggml tensor name to a hf2q stage name. Returns "" when not in
 // the parity-stage allowlist.
@@ -297,13 +311,13 @@ static std::string map_to_stage(const std::string & ggml_name,
             return std::string(buf);
         }
     }
-    // Intra-block stages (layers 0 and 1 only).
+    // Intra-block stages (layers 0, 1, 25, 26 — see intra_layer_probed).
     for (const auto & step : kIntraSteps) {
         const size_t plen = std::strlen(step.peer_prefix);
         if (ggml_name.rfind(step.peer_prefix, 0) == 0 && ggml_name.size() > plen) {
             const std::string idx_str = ggml_name.substr(plen);
             const int idx = std::atoi(idx_str.c_str());
-            if (idx >= 0 && idx <= kIntraMaxLayer) {
+            if (intra_layer_probed(idx)) {
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "03_block_%02d_%s",
                               idx, step.hf2q_suffix);

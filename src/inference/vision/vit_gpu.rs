@@ -3118,17 +3118,30 @@ pub fn gemma4v_block_forward_gpu(
 
     // ADR-005 iter 127 (W58): intra-block parity probe.
     //
-    // When the dump collector is armed AND this is one of the early
-    // blocks (0 or 1) we sub-localize the per-block ~1.16× error
+    // When the dump collector is armed AND this is one of the probed
+    // blocks (0, 1, 25, or 26) we sub-localize the per-block error
     // compound by recording each named ggml-equivalent intermediate so
     // the diff harness can pair them against peer_dumper's per-layer
     // captures.
     //
-    // We restrict to blocks 0 and 1 to keep dump-disk cost bounded: the
-    // 16% compound is per-op, not per-block-position, so two blocks are
-    // sufficient to identify the offending sub-op (a JUMP that is
-    // reproducible at both block 0 and block 1).
-    let dump_intra = super::vit_dump::is_armed() && block_idx <= 1;
+    // ADR-005 iter 127 (W58): blocks 0 and 1 — early-block probe used to
+    //   identify per-op sub-stage divergence at the F16 budget floor
+    //   (compound 1.13×/block in the clean regime).
+    //
+    // ADR-005 iter 131 (W62): blocks 25 and 26 — W61's per-block sweep
+    //   discovered a 4.08× single-block max-abs amplification at the
+    //   block 25 → 26 boundary (geomean 1.175× per block was hiding a
+    //   non-uniform distribution: blocks 1-25 average 1.13×/block,
+    //   block 25 → 26 spikes to 4.08×). Probing both endpoints of the
+    //   spike lets the diff harness identify which sub-op (attention
+    //   path vs FFN path vs residual) is the amplifier so the iter-131
+    //   audit can target a single ggml node for the byte-for-byte
+    //   peer-deviation review.
+    //
+    // Disk cost bound: 4 blocks × ~11 named stages × ~196 patches × 1152
+    //   hidden × 4 bytes ≈ 40 MB total — bounded, dev-only.
+    let dump_intra = super::vit_dump::is_armed()
+        && (block_idx <= 1 || block_idx == 25 || block_idx == 26);
     let intra_name = |suffix: &str| format!("03_block_{:02}_{}", block_idx, suffix);
 
     // ADR-005 iter 130 (W61) — comprehensive dtype audit instrumentation.

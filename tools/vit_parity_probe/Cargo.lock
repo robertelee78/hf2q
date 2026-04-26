@@ -8,4 +8,4 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "mlx-native"
-version = "0.4.7"
+version = "0.4.9"
