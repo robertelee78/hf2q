@@ -761,22 +761,15 @@ async fn chat_completions_stream(
     // encoder body can move it.
     let engine: Engine = prepared.loaded_engine.engine.clone();
 
-    // Vision streaming is not supported in this iter — the soft-token
-    // path runs through `Engine::generate_with_soft_tokens` (non-
-    // streaming).  When the streaming variant lands, this gate reverts
-    // to the standard `generate_stream` call but with the soft tokens
-    // attached.  Until then a vision request with `stream: true`
-    // returns a clean 400 instead of silently dropping the image
-    // embeddings.
-    if !prepared.soft_tokens.is_empty() {
-        return ApiError::invalid_request(
-            "stream: true with image content parts is not yet supported. \
-             Send the same request with stream: false to exercise the \
-             vision soft-token path.",
-            Some("stream".into()),
-        )
-        .into_response();
-    }
+    // Phase 2c iter-211 W79: vision streaming is supported. The
+    // `Request::GenerateStream` variant now carries `soft_tokens` and the
+    // worker routes them through `forward_prefill_with_soft_tokens`. Empty
+    // `soft_tokens` (text-only requests) is identity over the prior
+    // text-only prefill path. Pre-iter-211 the handler returned 400 for
+    // any `stream: true` + image_url content-part combination; that gate
+    // existed because `Request::GenerateStream` didn't carry the
+    // soft-token override field. Closes AC 3103 (Open WebUI vision
+    // multi-turn end-to-end).
 
     // Decision #23: capture transparency counters BEFORE we move
     // `prepared` into `engine.generate_stream`. They flow into the
@@ -796,6 +789,7 @@ async fn chat_completions_stream(
             prepared.params,
             events_tx,
             cancellation_counter,
+            prepared.soft_tokens,
         )
         .await
     {

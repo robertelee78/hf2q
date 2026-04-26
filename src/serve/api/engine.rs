@@ -290,6 +290,20 @@ enum Request {
         params: SamplingParams,
         events: mpsc::Sender<super::sse::GenerationEvent>,
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+        /// Per-position embedding overrides for the multimodal vision
+        /// path (Phase 2c iter-211 W79). Empty slice ⇒ identity over
+        /// the text-only `forward_prefill` path (the prefill function
+        /// is already a thin wrapper around
+        /// `forward_prefill_with_soft_tokens` with an empty slice —
+        /// see `src/serve/forward_prefill.rs:111-118`).
+        ///
+        /// Pre-iter-211 the streaming worker did not carry soft-token
+        /// data and the chat handler returned a 400 when an `image_url`
+        /// content part was present + `stream: true`. Iter-211 closes
+        /// AC 3103 by routing soft tokens through the streaming path
+        /// using the same forward-prefill API the non-streaming
+        /// `Request::GenerateWithSoftTokens` arm already uses.
+        soft_tokens: Vec<SoftTokenData>,
     },
     /// Pooled-embedding request (ADR-005 Phase 2a Task #8 / iter-92).
     ///
@@ -784,12 +798,14 @@ impl Engine {
         params: SamplingParams,
         events_tx: mpsc::Sender<super::sse::GenerationEvent>,
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+        soft_tokens: Vec<SoftTokenData>,
     ) -> Result<()> {
         let req = Request::GenerateStream {
             prompt_tokens,
             params,
             events: events_tx,
             cancellation_counter,
+            soft_tokens,
         };
         match self.inner.tx.try_send(req) {
             Ok(()) => Ok(()),
@@ -934,6 +950,7 @@ fn worker_run(
                 params,
                 events,
                 cancellation_counter,
+                soft_tokens,
             } => {
                 // The streaming path sends every event (Delta / Done / Error)
                 // via `events`. Errors stay inside the function — the
@@ -941,9 +958,25 @@ fn worker_run(
                 // receiver was dropped (client disconnect → early exit).
                 // When the early-exit path fires, we bump the cancellation
                 // counter if supplied (→ hf2q_sse_cancellations in /metrics).
+                //
+                // Phase 2c iter-211 W79: build borrowed `SoftTokenInjection<'_>`
+                // slices from the owned `SoftTokenData` (channel-friendly Send)
+                // mirroring the pattern used by `Request::GenerateWithSoftTokens`
+                // above. Empty `soft_tokens` ⇒ identity over the text-only
+                // prefill path (the prefill function is already a thin wrapper
+                // around `forward_prefill_with_soft_tokens` with an empty
+                // slice — see `src/serve/forward_prefill.rs:111-118`).
+                let injections: Vec<SoftTokenInjection<'_>> = soft_tokens
+                    .iter()
+                    .map(|d| SoftTokenInjection {
+                        range: d.range.clone(),
+                        embeddings: &d.embeddings,
+                    })
+                    .collect();
                 generate_stream_once(
                     &mut loaded,
                     &prompt_tokens,
+                    &injections,
                     &params,
                     &events,
                     registration.as_ref(),
@@ -1410,6 +1443,7 @@ fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<Strin
 fn generate_stream_once(
     loaded: &mut LoadedModel,
     prompt_tokens: &[u32],
+    soft_tokens: &[SoftTokenInjection<'_>],
     params: &SamplingParams,
     events: &mpsc::Sender<super::sse::GenerationEvent>,
     registration: Option<&super::registry::ModelRegistration>,
@@ -1705,11 +1739,16 @@ fn generate_stream_once(
     let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
     // --- Prefill ---
+    // Iter-211 W79: routed through `forward_prefill_with_soft_tokens` so
+    // vision content parts can stream. `soft_tokens` is empty for text-only
+    // requests; the prefill API treats an empty slice as identity over
+    // `forward_prefill` (`src/serve/forward_prefill.rs:117`), so the
+    // text-only path stays byte-identical.
     let prefill_start = Instant::now();
     let next_token_result =
         loaded
             .weights
-            .forward_prefill(prompt_tokens, max_tokens, &mut loaded.ctx);
+            .forward_prefill_with_soft_tokens(prompt_tokens, soft_tokens, max_tokens, &mut loaded.ctx);
     let prefill_duration = prefill_start.elapsed();
     let prefill_argmax = match next_token_result {
         Ok(t) => t,
