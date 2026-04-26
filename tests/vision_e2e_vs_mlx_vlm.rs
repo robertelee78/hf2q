@@ -320,6 +320,10 @@ struct MatrixReport {
     hf2q_gguf: String,
     hf2q_mmproj: String,
     mlx_repo: String,
+    /// Tail of hf2q's stderr captured AFTER the matrix completed.
+    /// Last 8 KB so a panic-style failure message lands in the report
+    /// even if the daemon emitted megabytes of trace logs.  iter-102.
+    hf2q_stderr_tail_8kb: String,
 }
 
 #[derive(serde::Serialize)]
@@ -332,6 +336,22 @@ struct PairOutcome {
     mlx_vlm_text: String,
     exact_match: bool,
     hf2q_starts_with_mlx_first_word: bool,
+    /// Captured `X-HF2Q-*` response headers from the per-pair POST.
+    /// Iter-102 added so the divergence-triage flow can immediately
+    /// see `x-hf2q-vit-forward-ms`, `x-hf2q-vit-images`,
+    /// `x-hf2q-soft-tokens-total`, plus any iter-future additions.
+    /// Critical when hf2q vs mlx-vlm token outputs diverge — the
+    /// header values disambiguate "hf2q didn't see the image" (zero
+    /// soft-tokens-total) from "hf2q saw the image but generated
+    /// different tokens" (nonzero soft-tokens-total + bad text).
+    hf2q_x_headers: std::collections::BTreeMap<String, String>,
+    /// Status code of the per-pair POST (200 on success).  Non-200
+    /// surfaces in the report so a failed pair stands out next to
+    /// successful ones in the same run.
+    hf2q_http_status: String,
+    /// Tail of mlx-vlm stderr from the per-pair invocation.  Last
+    /// 4 KB; mlx-vlm prints config + per-step timing on stderr.
+    mlx_vlm_stderr_tail_4kb: String,
 }
 
 fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
@@ -387,12 +407,18 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // Wait for /readyz with 120s timeout.
+    // Wait for /readyz with 600s timeout.  Loading + warming up
+    // a 26B-parameter Gemma 4 GGUF is on the multi-minute order on
+    // M5 Max (cold mmap fault-in + warmup pass through every
+    // kernel).  120s was iter-101's first cut and proved tight in
+    // practice; iter-102 raised it to 10 minutes so the test never
+    // false-fails on a cold-cache load.  The loop polls every 500ms
+    // so the tail latency is ≤500ms once `/readyz` flips.
     let base = format!("http://127.0.0.1:{port}");
     let ready_url = format!("{base}/readyz");
     let started = std::time::Instant::now();
     let mut ready = false;
-    while started.elapsed().as_secs() < 120 {
+    while started.elapsed().as_secs() < 600 {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let status = std::process::Command::new("curl")
             .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &ready_url])
@@ -406,7 +432,9 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
     }
     if !ready {
         let _ = hf2q.kill();
-        return Err(std::io::Error::other("hf2q /readyz did not return 200 within 120s"));
+        return Err(std::io::Error::other(
+            "hf2q /readyz did not return 200 within 600s",
+        ));
     }
 
     // ---- Step 2: 25-pair matrix via curl/JSON ----
@@ -433,18 +461,24 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
             });
             let body_path = std::env::temp_dir().join(format!("hf2q_e2e_body_{pi}_{ii}.json"));
             std::fs::write(&body_path, body.to_string())?;
+            // `-i` makes curl include response headers in stdout
+            // (followed by a CRLF-CRLF separator and the body).
+            // Iter-102 captures the headers so the X-HF2Q-* triage
+            // fields land in the report.
             let resp = std::process::Command::new("curl")
-                .args(["-s", "-X", "POST", &format!("{base}/v1/chat/completions")])
+                .args(["-s", "-i", "-X", "POST", &format!("{base}/v1/chat/completions")])
                 .args(["-H", "Content-Type: application/json"])
                 .args(["-d", &format!("@{}", body_path.display())])
                 .output()?;
             let raw = String::from_utf8_lossy(&resp.stdout).into_owned();
-            let parsed: serde_json::Value = serde_json::from_str(&raw)
-                .unwrap_or_else(|_| serde_json::json!({"_raw": raw}));
+            let (headers, body, status_line) = split_curl_response(&raw);
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|_| serde_json::json!({"_raw": body}));
             let hf2q_text = parsed["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let x_headers = extract_x_hf2q_headers(headers);
             pairs.push(PairOutcome {
                 prompt_idx: pi,
                 image_idx: ii,
@@ -454,14 +488,21 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
                 mlx_vlm_text: String::new(), // filled in step 3
                 exact_match: false,
                 hf2q_starts_with_mlx_first_word: false,
+                hf2q_x_headers: x_headers,
+                hf2q_http_status: status_line.to_string(),
+                mlx_vlm_stderr_tail_4kb: String::new(), // filled in step 3
             });
             let _ = std::fs::remove_file(&body_path);
         }
     }
 
-    // ---- Step 3: drain hf2q ----
+    // ---- Step 3: drain hf2q + capture stderr tail ----
     let _ = hf2q.kill();
-    let _ = hf2q.wait();
+    let hf2q_drain = hf2q.wait_with_output();
+    let hf2q_stderr_tail_8kb = match hf2q_drain {
+        Ok(out) => tail_bytes(&out.stderr, 8 * 1024),
+        Err(e) => format!("(stderr drain failed: {e})"),
+    };
 
     // ---- Step 4: 25-pair mlx-vlm reference ----
     for outcome in pairs.iter_mut() {
@@ -474,11 +515,9 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
             .args(["--max-tokens", "50"])
             .output()?;
         let stdout = String::from_utf8_lossy(&mlx_out.stdout).into_owned();
-        // mlx_vlm.generate prints config/usage info around the actual
-        // generated text.  Heuristic extraction: find the line after
-        // a "==========" or "Output:" marker; otherwise take stdout verbatim.
         let extracted = extract_mlx_vlm_output(&stdout);
         outcome.mlx_vlm_text = extracted.clone();
+        outcome.mlx_vlm_stderr_tail_4kb = tail_bytes(&mlx_out.stderr, 4 * 1024);
         outcome.exact_match = outcome.hf2q_text.trim() == extracted.trim();
         let mlx_first_word = extracted.split_whitespace().next().unwrap_or("");
         outcome.hf2q_starts_with_mlx_first_word =
@@ -492,7 +531,81 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
         hf2q_gguf: gguf,
         hf2q_mmproj: mmproj,
         mlx_repo,
+        hf2q_stderr_tail_8kb,
     })
+}
+
+// -----------------------------------------------------------------------------
+// curl-output parsing helpers (iter-102)
+// -----------------------------------------------------------------------------
+
+/// Split a `curl -i` response into `(headers, body, status_line)`.
+///
+/// The response shape is one HTTP status line ("HTTP/1.1 200 OK"),
+/// followed by CRLF-separated `Header: value` lines, a blank CRLF,
+/// then the body.  Returns the status line text (e.g. "200 OK"),
+/// the headers block (everything between the status line and the
+/// blank line, no trailing CRLF), and the body slice.
+///
+/// On a malformed response (no `\r\n\r\n` separator), returns
+/// empty headers + the entire raw input as the body, with status
+/// line `""` — keeps callers crash-free.
+pub(crate) fn split_curl_response(raw: &str) -> (&str, &str, &str) {
+    let sep = "\r\n\r\n";
+    let body_start = match raw.find(sep) {
+        Some(i) => i + sep.len(),
+        None => return ("", raw, ""),
+    };
+    let prelude = &raw[..body_start - sep.len()];
+    let body = &raw[body_start..];
+    // First line of prelude is the HTTP status line
+    // ("HTTP/1.1 200 OK").  Strip the "HTTP/1.x " prefix to leave
+    // just "200 OK" — matches the format clients usually log.
+    let (status_line, headers_block) = match prelude.find("\r\n") {
+        Some(i) => (&prelude[..i], &prelude[i + 2..]),
+        None => (prelude, ""),
+    };
+    let status_compact = status_line
+        .splitn(2, ' ')
+        .nth(1)
+        .unwrap_or(status_line);
+    (headers_block, body, status_compact)
+}
+
+/// Pull every `X-HF2Q-*` header (case-insensitive match on the
+/// `x-hf2q-` prefix) from the headers block of a `curl -i` response
+/// into a sorted `BTreeMap<String, String>` keyed by lowercased
+/// header name.  Headers without the prefix are silently dropped.
+pub(crate) fn extract_x_hf2q_headers(
+    headers_block: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in headers_block.split("\r\n") {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = match line.split_once(':') {
+            Some((n, v)) => (n.trim(), v.trim()),
+            None => continue,
+        };
+        let name_lower = name.to_ascii_lowercase();
+        if name_lower.starts_with("x-hf2q-") {
+            out.insert(name_lower, value.to_string());
+        }
+    }
+    out
+}
+
+/// Return the last `n_bytes` bytes of `buf` as a UTF-8 string,
+/// preserving the byte ordering at the tail (used to capture the
+/// "interesting" end of long stderr streams without serializing
+/// megabytes of trace logs into the report).  Lossy on invalid
+/// UTF-8.  Bytes are clamped from the LEFT so a panic message at
+/// the very end of stderr is always preserved.
+pub(crate) fn tail_bytes(buf: &[u8], n_bytes: usize) -> String {
+    let start = buf.len().saturating_sub(n_bytes);
+    String::from_utf8_lossy(&buf[start..]).into_owned()
 }
 
 /// Extract the mlx_vlm.generate output text from its stdout.  The CLI
@@ -545,4 +658,99 @@ fn extract_mlx_vlm_output_trims_surrounding_whitespace() {
     let stdout = "==========\n\n   padded   \n\n==========\n";
     let got = extract_mlx_vlm_output(stdout);
     assert_eq!(got, "padded");
+}
+
+// -----------------------------------------------------------------------------
+// curl-output parsing helper unit tests (iter-102)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn split_curl_response_parses_well_formed_response() {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-HF2Q-ViT-Images: 1\r\n\r\n{\"choices\":[]}";
+    let (headers, body, status) = split_curl_response(raw);
+    assert_eq!(status, "200 OK");
+    assert!(headers.contains("Content-Type"));
+    assert!(headers.contains("X-HF2Q-ViT-Images"));
+    assert_eq!(body, "{\"choices\":[]}");
+}
+
+#[test]
+fn split_curl_response_falls_back_when_no_separator() {
+    let raw = "totally malformed not even http";
+    let (headers, body, status) = split_curl_response(raw);
+    assert_eq!(headers, "");
+    assert_eq!(body, raw);
+    assert_eq!(status, "");
+}
+
+#[test]
+fn split_curl_response_handles_400_status() {
+    let raw = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\": \"x\"}";
+    let (_, body, status) = split_curl_response(raw);
+    assert_eq!(status, "400 Bad Request");
+    assert_eq!(body, "{\"error\": \"x\"}");
+}
+
+#[test]
+fn extract_x_hf2q_headers_filters_to_x_hf2q_prefix() {
+    let block = "Content-Type: application/json\r\nX-HF2Q-ViT-Forward-Ms: 12\r\nX-HF2Q-ViT-Images: 1\r\nX-HF2Q-Soft-Tokens-Total: 49\r\nX-Other-Header: ignored\r\n";
+    let headers = extract_x_hf2q_headers(block);
+    assert_eq!(headers.len(), 3);
+    assert_eq!(headers.get("x-hf2q-vit-forward-ms"), Some(&"12".to_string()));
+    assert_eq!(headers.get("x-hf2q-vit-images"), Some(&"1".to_string()));
+    assert_eq!(headers.get("x-hf2q-soft-tokens-total"), Some(&"49".to_string()));
+    assert!(!headers.contains_key("content-type"));
+    assert!(!headers.contains_key("x-other-header"));
+}
+
+#[test]
+fn extract_x_hf2q_headers_case_insensitive_prefix_match() {
+    let block = "x-hf2q-lower: a\r\nX-HF2Q-Mixed: b\r\nX-HF2Q-UPPER: c\r\n";
+    let headers = extract_x_hf2q_headers(block);
+    assert_eq!(headers.len(), 3);
+    // All keys land under their lower-case form regardless of the
+    // wire-format casing.
+    assert_eq!(headers.get("x-hf2q-lower"), Some(&"a".to_string()));
+    assert_eq!(headers.get("x-hf2q-mixed"), Some(&"b".to_string()));
+    assert_eq!(headers.get("x-hf2q-upper"), Some(&"c".to_string()));
+}
+
+#[test]
+fn extract_x_hf2q_headers_skips_malformed_lines() {
+    let block = "X-HF2Q-Good: value\r\nNotAHeaderLine\r\nX-HF2Q-Other: ok\r\n";
+    let headers = extract_x_hf2q_headers(block);
+    assert_eq!(headers.len(), 2);
+    assert!(headers.contains_key("x-hf2q-good"));
+    assert!(headers.contains_key("x-hf2q-other"));
+}
+
+#[test]
+fn tail_bytes_returns_last_n_bytes() {
+    let buf = b"abcdefghij";
+    let got = tail_bytes(buf, 3);
+    assert_eq!(got, "hij");
+}
+
+#[test]
+fn tail_bytes_returns_full_buf_when_n_exceeds_len() {
+    let buf = b"hi";
+    let got = tail_bytes(buf, 100);
+    assert_eq!(got, "hi");
+}
+
+#[test]
+fn tail_bytes_returns_empty_when_n_is_zero() {
+    let buf = b"abc";
+    let got = tail_bytes(buf, 0);
+    assert_eq!(got, "");
+}
+
+#[test]
+fn tail_bytes_handles_invalid_utf8_lossily() {
+    // 0xFF 0xFE is invalid UTF-8 prefix; tail_bytes uses lossy
+    // conversion so it must not panic and must return a valid String.
+    let buf = b"text\xFF\xFEmore";
+    let got = tail_bytes(buf, 100);
+    assert!(got.contains("text"));
+    assert!(got.contains("more"));
 }

@@ -90,6 +90,7 @@ pub async fn chat_completions(
         soft_tokens,
         vit_forward_ms,
         vit_images,
+        vit_soft_tokens_total,
     } = prepared;
     let engine = state.engine.as_ref().expect("engine gate above ensures Some");
 
@@ -201,7 +202,12 @@ pub async fn chat_completions(
     };
     let mut response = (StatusCode::OK, Json(resp)).into_response();
     apply_transparency_headers(&state, &req, &mut response, summarized_messages, summary_tokens);
-    apply_vit_transparency_headers(&mut response, vit_forward_ms, vit_images);
+    apply_vit_transparency_headers(
+        &mut response,
+        vit_forward_ms,
+        vit_images,
+        vit_soft_tokens_total,
+    );
     response
 }
 
@@ -276,6 +282,16 @@ struct PreparedChatContext {
     /// Image count for the vision branch (transparency header
     /// `x-hf2q-vit-images`).  `None` for text-only.
     vit_images: Option<usize>,
+    /// Sum of `soft_tokens[i].range.len()` across all images — i.e.,
+    /// the total number of placeholder positions the prefill bypasses
+    /// the embed-table at (Phase 2c Task #17 / iter-102).  Surfaced
+    /// as the `X-HF2Q-Soft-Tokens-Total` response header so clients
+    /// can verify hf2q's image-token-count matches the reference
+    /// implementation's expectation (e.g., Gemma 4 production
+    /// `vision_soft_tokens_per_image = 280` × N images).  Critical
+    /// for triaging the iter-101 acceptance harness when hf2q vs
+    /// mlx-vlm token counts diverge.  `None` for text-only.
+    vit_soft_tokens_total: Option<usize>,
 }
 
 /// Run every validation + rendering + tokenization step common to the
@@ -498,6 +514,11 @@ async fn prepare_chat_generation(
             );
         }
     }
+    let vit_soft_tokens_total: Option<usize> = if soft_tokens.is_empty() {
+        None
+    } else {
+        Some(soft_tokens.iter().map(|s| s.range.len()).sum())
+    };
     Ok(PreparedChatContext {
         engine: (),
         prompt_tokens: final_prompt_tokens,
@@ -507,6 +528,7 @@ async fn prepare_chat_generation(
         soft_tokens,
         vit_forward_ms: vit_forward_ms_v,
         vit_images: vit_images_v,
+        vit_soft_tokens_total,
     })
 }
 
@@ -1467,19 +1489,27 @@ fn vit_forward_pending_response(n_images: usize) -> Response {
 /// the per-request vision-forward timing so clients can verify the
 /// path is real even though the engine doesn't yet consume the
 /// embeddings.
-/// Vision-path transparency headers (Phase 2c Task #17 / iter-99).  Set
-/// on every successful chat-completion that routed through the soft-
-/// token path:
+/// Vision-path transparency headers (Phase 2c Task #17 / iter-99 + iter-102).
+/// Set on every successful chat-completion that routed through the
+/// soft-token path:
 ///
-///   - `X-HF2Q-ViT-Forward-Ms` — wall-clock for the ViT GPU forward.
-///   - `X-HF2Q-ViT-Images`     — count of images consumed.
+///   - `X-HF2Q-ViT-Forward-Ms`     — wall-clock for the ViT GPU forward.
+///   - `X-HF2Q-ViT-Images`         — count of images consumed.
+///   - `X-HF2Q-Soft-Tokens-Total`  — sum of placeholder positions the
+///     prefill bypassed the embed-table at (per-image image-token
+///     count summed across all images).  Iter-102 added so the iter-101
+///     acceptance harness can immediately tell when hf2q's image-token
+///     count diverges from mlx-vlm's expectation (e.g., 49 vs 280 per
+///     image for Gemma 4 — the test mmproj is small SigLIP, production
+///     Gemma 4 has its own per-image count from `vision_soft_tokens_per_image`).
 ///
 /// Lets clients see the per-request vision cost without parsing the
-/// body.  No-op when both fields are `None` (text-only request).
+/// body.  No-op for fields that are `None` (text-only request).
 fn apply_vit_transparency_headers(
     resp: &mut Response,
     forward_ms: Option<u64>,
     n_images: Option<usize>,
+    soft_tokens_total: Option<usize>,
 ) {
     use axum::http::{header::HeaderName, HeaderValue};
     let headers = resp.headers_mut();
@@ -1491,6 +1521,11 @@ fn apply_vit_transparency_headers(
     if let Some(n) = n_images {
         if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
             headers.insert(HeaderName::from_static("x-hf2q-vit-images"), v);
+        }
+    }
+    if let Some(n) = soft_tokens_total {
+        if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+            headers.insert(HeaderName::from_static("x-hf2q-soft-tokens-total"), v);
         }
     }
 }
