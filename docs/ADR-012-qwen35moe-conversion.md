@@ -201,6 +201,20 @@ The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-
   The remaining gap is most likely an internal Apple Metal driver / scheduler interaction with the specific Q4_0 mv_id workload signature that pure-Rust mlx-native cannot easily match without per-dispatch GPU profiling + dispatch-graph fusion that goes beyond ADR-012's conversion-pipeline scope.  Belongs in a new mlx-native ADR.
 
   **2026-04-26 verification re-bench** (post-fa42395, post-9a3d953, post-z-routing-revert): 5-cold runs at n=256, dwq46 = 109.6, 110.5, 111.0 t/s (median 110.5 t/s) — matches ADR-recorded baseline.  llama.cpp at n=64 = 119.36 t/s.  Current ratio: 0.926× = 0.93× (rounded).  **dwq46 GGUF tensor-type breakdown via `gguf-dump`**: 487 Q4_0 + 24 Q6_K + 221 F32 + 1 F16 (vs dwq48: 232 Q4_0 + 279 Q8_0 + 221 F32 + 1 F16).  In MoE expert-stack tensors specifically: dwq46 has 114 Q4_0 + 6 Q6_K, dwq48 has 54 Q4_0 + 66 Q8_0 — confirms the 2× Q4_0 dispatch volume in dwq46 vs dwq48 amplifies the per-Q4_0-dispatch slowness.
+
+  **2026-04-26 high-level forward-graph audit** (vs llama.cpp's `qwen35moe.cpp` + `llama-graph.cpp:build_moe_ffn`):
+    - llama.cpp's `build_moe_ffn` accepts a **fused `gate_up_exps`** tensor (`llama-graph.cpp:1512-1535`) — when present, ONE `mul_mat_id` produces gate||up concatenated, then split into views.  This halves expert-FFN mv_id dispatches per MoE layer (2 → 1 for the gate/up pair).  **Verified absent in our dwq46 GGUF**: only `blk.{L}.ffn_gate_exps.weight` + `blk.{L}.ffn_up_exps.weight` exist as separate tensors.  Conclusion: llama.cpp uses the same separate-gate+up code path as hf2q on our GGUFs (`llama-graph.cpp:1536-1575`), so this is not the lever.  Could become a future optimization if we emit `ffn_gate_up_exps` as a fused tensor in the convert pipeline (would need llama.cpp loader support too).
+    - hf2q's MoE-Q decode path (`build_moe_ffn_layer_gpu_q_into`, line 1047–) already uses GPU `dispatch_silu_mul` for gate/up combine — no CPU round-trip in the hot path.  CPU silu_mul calls (`gpu_ffn.rs:861, 913`) are in the LEGACY `build_moe_ffn_layer_gpu_q` non-_into helper used only by tests / non-MoeQ-decode callers.
+    - mlx-native's `moe_swiglu_fused` kernel (`moe_dispatch.rs:393`) implements **GELU** not SILU activation — applies to gemma-4 MoE, not qwen3.6 SILU MoE.  Adding a SILU variant could fuse silu_mul into expert_down's preceding multiply, but the dispatch saving is only 40/token (one silu_mul per layer); kernel-fusion at this granularity is bounded ≤1% per the cb-creation-cost measurements above.
+
+  **Per-token cost decomposition** (from `HF2Q_DECODE_PROFILE=1` instrumentation at HEAD):
+    - 100 cb / 1070 dispatches per token
+    - CPU encoding wall: 3.3ms (3.1µs/dispatch average)
+    - GPU drain in `output_head` after layer-loop: 5.7-6.3ms
+    - Total per-token wall: 8.87ms (= 1/112.7 t/s)
+    - llama.cpp at 1/119.36 = 8.38ms/token
+
+  Closing the remaining 0.49ms/token gap via further mlx-native optimization belongs in a separate ADR — candidates: (1) per-dispatch GPU sampling via `MTLCounterSampleBuffer` to surface true per-kernel time, (2) parallel-encoding `dispatch_apply` pattern (mirrors llama.cpp's `ggml-metal-context.m:550`) to reduce the 3.3ms CPU encoding, (3) cross-token speculative pipelining.  None of these are within ADR-012's conversion-pipeline scope.
 * **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
 
 **Decision Makers:** Robert, Claude
