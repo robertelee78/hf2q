@@ -1083,6 +1083,8 @@ The two-pass conversion pipeline works end-to-end for **qwen35 dense** (27B) —
 
 **Practical conclusion:** activation-aware DWQ for apex 35B-A3B requires the capture forward pass to run on the **GPU** via mlx-native's existing `quantized_matmul_ggml` kernel, not the CPU `forward_cpu` path. That's a real ADR-013 follow-up: extend `RealActivationCapture::run_calibration_prompt` to dispatch to the GPU forward when the model is `MoeQ`. Out of scope for P9b — would require coupling the convert-time activation capture to the runtime GPU forward path.
 
+**Update 2026-04-25 (mantra-aligned wire-up shipped):** GPU capture path landed in commits `834828f` + `c352d0e`. `Qwen35Model::forward_gpu_with_capture` is a thin wrapper over the existing `forward_gpu_impl` with a `&mut LayerActivations` target threaded through; layer-input/output residual streams are downloaded to F32 CPU memory at the start/end of each layer iteration via the same `download_f32` bridge `forward_gpu` already uses for `HF2Q_DUMP_LAYER_ACTIVATIONS`. `RealActivationCapture::run_calibration_prompt` now dispatches to `run_calibration_prompt_gpu` when any layer FFN is `Moe` or `MoeQ` — i.e. apex 35B-A3B no longer requires the F32 expansion at all (production `MoeQ` runs `quantized_matmul_ggml` directly on native GGML blocks). CPU forward stays as the byte-identical reference path for Dense and is the test-only path for synthetic models. `HF2Q_FORCE_CPU_CAPTURE=1` escapes only for parity debugging. All 9 `activation_capture_real` tests pass.
+
 For this session's Task #16 close: **qwen35 dense × dwq46/dwq48 shipped (2/4)**; apex MoE × dwq46/dwq48 deferred to the GPU-capture follow-up.
 
 #### P9 first real-model DWQ GGUF SHIPPED 2026-04-25
