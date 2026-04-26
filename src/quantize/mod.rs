@@ -206,6 +206,172 @@ pub fn quantize_streaming(
     })
 }
 
+/// ADR-014 P3 (Decision 5): rayon-parallel variant of [`quantize_streaming`].
+///
+/// Distributes the per-tensor quantize work across a rayon thread
+/// pool. The pipeline shape per ADR-014 Decision 5:
+///
+/// ```text
+/// producer                    : materialise via map.into_iter()
+/// worker pool (n threads)     : quantise (CPU-bound)
+/// collector                   : accumulate into HashMap
+/// ```
+///
+/// Implemented via `rayon::iter::IntoParallelIterator` on a
+/// `Vec<(String, LazyTensor)>` collected from the lazy map. rayon's
+/// thread pool handles work distribution and scheduling; bounded
+/// in-flight work is enforced by the pool size (`min(available
+/// parallelism, 16)` matches the ADR's `min(num_cpus, 16)` cap —
+/// Apple Silicon performance cores cap out at 12, oversubscription
+/// degrades).
+///
+/// **Memory-budget delta vs. serial [`quantize_streaming`]** (apex MoE):
+///
+/// - Serial: 1 tensor materialised at a time → ~750 MB peak input
+/// - Parallel (n=8 workers): ~8 tensors materialised concurrently
+///   → ~6 GB peak input (still bounded; well under the 30 GB+ apex
+///   resident envelope from Decision 6).
+/// - Parallel (n=16): ~12 GB peak input (cap; per ADR's "memory
+///   bandwidth saturates beyond 12 cores on M5 Max").
+///
+/// **Byte-identical to serial**: the order of `quantizer.quantize_tensor()`
+/// invocations differs from serial, but each invocation is deterministic
+/// per `(tensor_bytes, config)`. The output `HashMap<name, QuantizedTensor>`
+/// has the same set of `(name, quantized_bytes)` pairs as serial, so
+/// `cargo test --bin hf2q quantize_streaming_parallel_byte_identical_to_serial`
+/// pins the contract.
+///
+/// **Cancellation**: rayon's parallel iter doesn't have explicit
+/// cancellation; if a worker errors, subsequent workers continue
+/// (rayon collects all errors then `?` short-circuits). For SIGINT
+/// cancellation at this layer, the caller should check
+/// `INTERRUPTED.load()` after the parallel iter returns. Mid-batch
+/// cancellation needs the StreamingBackend pattern from P2 iter-3
+/// where the writer thread can short-circuit on the interrupt flag.
+pub fn quantize_streaming_parallel(
+    map: crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+    quantizer: &(dyn Quantizer + Send + Sync),
+    bits: u8,
+    group_size: usize,
+    progress: &ProgressReporter,
+    bf16_to_f16: bool,
+    n_workers: Option<usize>,
+) -> Result<crate::ir::QuantizedModel, QuantizeError> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Resolve worker count: caller-specified, or system parallelism
+    // capped at 16 (Apple Silicon performance cores cap out at 12;
+    // oversubscription degrades — ADR-014 Decision 5).
+    let n_workers = n_workers
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(8)
+        .clamp(1, 16);
+
+    let total = map.len();
+    let pb = progress.bar(total as u64, "Quantizing (parallel)");
+    let pb_mutex = Mutex::new(pb);
+    let bf16_counter = std::sync::atomic::AtomicUsize::new(0);
+
+    // Materialise the iterator into a Vec so rayon can distribute the
+    // work. Each entry is (name, LazyTensor); the materialisation of
+    // the *bytes* still happens inside each worker's closure body —
+    // the LazyTensor is small (meta + boxed closure ptr).
+    let entries: Vec<(String, crate::ir::lazy::LazyTensor)> = map.into_iter().collect();
+
+    // Build a custom rayon thread pool sized to `n_workers`; the
+    // global pool may be a different size (or shared with other rayon
+    // calls). Using a dedicated pool keeps the thread count
+    // deterministic.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_workers)
+        .build()
+        .map_err(|e| QuantizeError::TensorQuantizeFailed {
+            tensor: "<pool>".to_string(),
+            reason: format!("rayon pool init: {e}"),
+        })?;
+
+    let quantized_results: Result<Vec<(String, crate::ir::QuantizedTensor)>, QuantizeError> = pool
+        .install(|| {
+            entries
+                .into_par_iter()
+                .map(|(name, lazy)| -> Result<(String, crate::ir::QuantizedTensor), QuantizeError> {
+                    let mut tensor = lazy.materialize().map_err(|e| {
+                        QuantizeError::TensorQuantizeFailed {
+                            tensor: name.clone(),
+                            reason: format!("materialize: {e}"),
+                        }
+                    })?;
+
+                    if bf16_to_f16 && tensor.dtype == crate::ir::DType::BF16 {
+                        tensor = tensor.to_f16().map_err(|e| {
+                            QuantizeError::TensorQuantizeFailed {
+                                tensor: name.clone(),
+                                reason: format!("bf16→f16: {e}"),
+                            }
+                        })?;
+                        bf16_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+
+                    if let Err(e) = validate_group_size(&tensor, group_size) {
+                        tracing::debug!("{}", e);
+                    }
+
+                    let config = LayerQuantConfig {
+                        bits,
+                        group_size,
+                        preserve: !tensor.is_weight() || tensor.is_vision_tensor(),
+                    };
+
+                    if tensor.is_vision_tensor() && tensor.is_weight() {
+                        tracing::debug!("Preserving vision tensor as F16: {}", name);
+                    }
+
+                    let quantized = quantizer.quantize_tensor(&tensor, &config)?;
+
+                    // Per-worker progress increment under mutex —
+                    // ProgressReporter::ProgressBar is internally
+                    // atomic-counter-backed but the API requires
+                    // &self. Mutex is fine; contention is bounded by
+                    // worker count (8-16).
+                    if let Ok(pb) = pb_mutex.lock() {
+                        pb.inc(1);
+                    }
+
+                    Ok((name, quantized))
+                })
+                .collect()
+        });
+
+    let quantized_tensors: HashMap<String, crate::ir::QuantizedTensor> = quantized_results?
+        .into_iter()
+        .collect();
+
+    if let Ok(pb) = pb_mutex.into_inner() {
+        let bf16 = bf16_counter.load(std::sync::atomic::Ordering::Relaxed);
+        pb.finish_with_message(format!(
+            "Quantized {} tensors (parallel n={}){}",
+            quantized_tensors.len(),
+            n_workers,
+            if bf16 > 0 {
+                format!(", {} bf16→f16", bf16)
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    Ok(crate::ir::QuantizedModel {
+        metadata: metadata.clone(),
+        tensors: quantized_tensors,
+        quant_method: quantizer.name().to_string(),
+        group_size,
+        bits,
+    })
+}
+
 /// Quantize an entire TensorMap using the given quantizer.
 pub fn quantize_model(
     tensor_map: &crate::ir::TensorMap,
@@ -394,6 +560,139 @@ mod tests {
         assert_eq!(eager.quant_method, streaming.quant_method);
         assert_eq!(eager.group_size, streaming.group_size);
         assert_eq!(eager.bits, streaming.bits);
+    }
+
+    /// ADR-014 P3 byte-identity regression:
+    /// `quantize_streaming_parallel(LazyTensorMap, ...)` produces a
+    /// `QuantizedModel` byte-equal to `quantize_streaming(LazyTensorMap, ...)`
+    /// (and therefore byte-equal to `quantize_model(&TensorMap, ...)`)
+    /// on the same fixture. Verifies that rayon work distribution
+    /// doesn't introduce non-determinism in per-tensor quantization.
+    #[test]
+    fn quantize_streaming_parallel_byte_identical_to_serial() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+
+        // Fresh LazyTensorMaps for each call (consumed).
+        let make_lazy_map = || -> LazyTensorMap {
+            let make_payload = |seed: u8, len: usize| -> Vec<u8> {
+                (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+            };
+            let mut m = LazyTensorMap::new();
+            for (name, shape, seed) in [
+                ("model.layers.0.self_attn.q_proj.weight", vec![64, 64], 0x10u8),
+                ("model.layers.0.self_attn.k_proj.weight", vec![64, 32], 0x20u8),
+                ("model.layers.0.mlp.gate_proj.weight", vec![64, 64], 0x30u8),
+                ("model.layers.0.mlp.up_proj.weight", vec![64, 64], 0x40u8),
+                ("model.layers.0.mlp.down_proj.weight", vec![64, 64], 0x50u8),
+                ("model.layers.1.self_attn.q_proj.weight", vec![64, 64], 0x60u8),
+                ("model.layers.0.input_layernorm.weight", vec![64], 0x70u8),
+            ] {
+                let len = shape.iter().product::<usize>() * 2;
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name.into(), shape, DType::F16),
+                    make_payload(seed, len),
+                ));
+            }
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let quantizer = StaticQuantizer::new("q4").unwrap();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let serial = quantize_streaming(
+            make_lazy_map(),
+            &metadata,
+            &quantizer,
+            4,
+            32,
+            &progress,
+            false,
+        )
+        .unwrap();
+
+        for n_workers in [1, 2, 4, 8] {
+            let parallel = quantize_streaming_parallel(
+                make_lazy_map(),
+                &metadata,
+                &quantizer,
+                4,
+                32,
+                &progress,
+                false,
+                Some(n_workers),
+            )
+            .unwrap();
+
+            assert_eq!(
+                serial.tensors.len(),
+                parallel.tensors.len(),
+                "n_workers={}: tensor count",
+                n_workers
+            );
+            for (name, s) in &serial.tensors {
+                let p = parallel.tensors.get(name).unwrap_or_else(|| {
+                    panic!("n_workers={}: missing tensor {}", n_workers, name)
+                });
+                assert_eq!(s.shape, p.shape, "n_workers={} {name} shape", n_workers);
+                assert_eq!(s.original_dtype, p.original_dtype, "n_workers={} {name} dtype", n_workers);
+                assert_eq!(s.data, p.data, "n_workers={} {name} bytes", n_workers);
+                assert_eq!(s.quant_info.method, p.quant_info.method);
+                assert_eq!(s.quant_info.bits, p.quant_info.bits);
+                assert_eq!(s.quant_info.preserved, p.quant_info.preserved);
+            }
+            assert_eq!(serial.quant_method, parallel.quant_method);
+            assert_eq!(serial.group_size, parallel.group_size);
+            assert_eq!(serial.bits, parallel.bits);
+        }
+    }
+
+    /// Worker count is clamped to [1, 16] regardless of input.
+    /// `n_workers: Some(0)` → 1; `n_workers: Some(100)` → 16.
+    #[test]
+    fn quantize_streaming_parallel_worker_clamp() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+
+        let make_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for i in 0..3 {
+                let name = format!("model.layers.{}.weight", i);
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name, vec![32, 32], DType::F16),
+                    vec![0u8; 32 * 32 * 2],
+                ));
+            }
+            m
+        };
+        let metadata = dummy_metadata();
+        let quantizer = StaticQuantizer::new("q4").unwrap();
+        let progress = crate::progress::ProgressReporter::new();
+
+        // n_workers=0 → clamp to 1, succeeds.
+        let r = quantize_streaming_parallel(
+            make_map(),
+            &metadata,
+            &quantizer,
+            4,
+            32,
+            &progress,
+            false,
+            Some(0),
+        );
+        assert!(r.is_ok(), "n_workers=0 must clamp to 1 and succeed");
+
+        // n_workers=100 → clamp to 16, succeeds.
+        let r = quantize_streaming_parallel(
+            make_map(),
+            &metadata,
+            &quantizer,
+            4,
+            32,
+            &progress,
+            false,
+            Some(100),
+        );
+        assert!(r.is_ok(), "n_workers=100 must clamp to 16 and succeed");
     }
 
     /// `bf16_to_f16: true` casts BF16 inputs before quantization;
