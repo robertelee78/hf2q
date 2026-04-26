@@ -155,6 +155,36 @@ HF2Q_QWEN35_DROP_MTP=1 hf2q convert \
 `HF2Q_QWEN35_DROP_MTP=1` is the temporary escape hatch from the ADR-013 P14 interaction (see "Note on ADR-013 P14 interaction" above) and removes when llama.cpp gains qwen35 MTP loading or by 2026-Q4.  `--skip-quality` defers the Phase 4.5 PPL/KL measurement (separate streaming-dequant refactor follow-up — ~170 GB peak vs. 128 GB physical RAM on M5 Max).
 
 Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  That addendum was correctly reverted in `eee1c39`; this closure re-flips the status only after all four GGUFs were independently load-verified by `/opt/homebrew/bin/llama-completion` end-to-end.
+
+### §Benchmark — decode tok/s vs llama.cpp baseline (2026-04-26)
+
+Measured on M5 Max + 128 GB unified RAM, llama.cpp build `b8680-15f786e65`, hf2q HEAD `10fb092` (post-Bug-3 closure).  Methodology per `reference_decode_benchmark_methodology` and `tooling_llama_bench_ub_methodology`:
+
+* **llama.cpp baseline**: `llama-bench -m <gguf> -p 0 -n 256 -r 5` (5 reps, in-process median, BLAS+MTL backend).
+* **hf2q**: `hf2q generate --benchmark --max-tokens 256 --temperature 0` (in-process 5-run median; mlx-native Metal backend).
+
+| Model + repo | Quant | hf2q decode | llama.cpp decode | Parity ratio |
+|---|---|---|---|---|
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | ⏳ generate path hung at prefill (Task #14) | 28.56 ± 0.48 t/s | — |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | ⏳ generate path hung at prefill (Task #14) | 27.75 ± 0.43 t/s | — |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-6 | 108.8 t/s | 120.03 ± 0.11 t/s | **0.91×** |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-8 | 103.4 t/s | 104.15 ± 0.11 t/s | **0.99×** |
+
+**MoE parity verdict:** hf2q is at 0.91–0.99× of llama.cpp's BLAS+MTL backend for the 35B-A3B MoE GGUFs.  Within tolerance for a pure-Rust + mlx-native implementation against llama.cpp's mature tensor-cores Metal path.  dwq48 is essentially at parity (0.99×); dwq46 trails by ~10% — likely the additional Lloyd-Max codebook decode cost on the 4-bit majority of layers (see `project_tq_sdpa_perf_analysis.md` for the codebook-decode hypothesis on the related TQ family).
+
+**Dense generate hang:** `hf2q generate` against the 27B dense GGUFs (`qwen3.6-27b-dwq{46,48}`) loads the model successfully (17.3 GB, 64 layers, variant=Dense recognized) but hangs at the prefill phase (no decode tokens emitted within a 90 s timeout).  llama.cpp generates 27.75–28.56 t/s on the same GGUFs end-to-end, so the GGUFs themselves are sound; the hang is in hf2q's qwen35 dense inference path (NOT the conversion pipeline that ADR-012 covers).  Tracked separately as Task #14 — out of ADR-012's scope; ADR-012 closure stands on the conversion-pipeline correctness verified by llama.cpp loading + generating coherent output.
+
+**Why not match -ub batching:** llama-bench at `-p 0 -n 256` is decode-only (no prefill batching), so `-ub` doesn't apply.  The bench compares apples-to-apples on pure decode token throughput.
+
+### §Optimize — follow-ups beyond ADR-012 closure
+
+The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-012's scope is the conversion pipeline:
+
+* **Task #13** — Refactor Phase 4.5 quality measurement to streaming dequant.  Current `--skip-quality` is the closure-day workaround; full-quality re-emit would PPL/KL-gate the four DWQ GGUFs.  Bounded by ~max_tensor_F32 × 2 instead of whole-model × 2.
+* **Task #14** — Diagnose hf2q dense Qwen3.5-27B generate hang.  llama.cpp shows 28 t/s decode on the same GGUFs; hf2q's mlx-native dense path needs investigation.  MoE path is fine.
+* **MoE dwq46 parity gap (0.91×)** — investigate Lloyd-Max codebook decode in the 4-bit majority layers per `project_tq_sdpa_perf_analysis.md`-class methodology; likely representation-level optimization, not kernel-level.
+* **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
+
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
 
