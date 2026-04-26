@@ -102,6 +102,13 @@ pub fn vit_linear_gpu(
         CastDirection::F32ToBF16,
     )
     .context("vit_linear_gpu: F32→BF16 cast")?;
+    // mlx-native dispatches with Concurrent execution; the matmul below
+    // reads `weight_bf16` written by the cast above (RAW). An explicit
+    // barrier is required to guarantee the matmul observes the cast's
+    // writes. Without it the race surfaces when many `vit_linear_gpu`
+    // calls chain in one encoder (e.g. Gemma 4V block: q/k/v/o + gate/
+    // up/down = 7 back-to-back) and produces non-deterministic output.
+    encoder.memory_barrier();
 
     // --- Allocate F32 output ---
     let out_bytes = (seq_len as usize) * (out_features as usize) * 4;
