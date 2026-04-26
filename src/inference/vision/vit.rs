@@ -1166,6 +1166,210 @@ pub fn patch_embed_from_mmproj_weights(
 }
 
 // ---------------------------------------------------------------------------
+// Gemma4V (variable-resolution, 2D-RoPE) CPU primitives
+// ---------------------------------------------------------------------------
+//
+// These mirror `patch_embed_forward` and `position_embed_add` (above) but
+// follow the gemma4v graph from `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp`
+// + the candle reference at `/opt/candle/.../gemma4/vision.rs:114-183`:
+//
+//   - PatchEmbedder is a Linear-no-bias `[hidden, p²·3]`, NOT a Conv2d.
+//     The pre-flattened `[N_patches, p²·3]` patches buffer (produced by
+//     `preprocess_gemma4v`) is fed straight in.
+//   - Position embedding is a DUAL `[2, pos_size, hidden]` table. For
+//     each patch at `(pos_x, pos_y)`, we add `pe[0][pos_x] + pe[1][pos_y]`
+//     to the patch embedding.
+//
+// Both functions are CPU correctness references — the GPU port lives in
+// `vit_gpu.rs` (`gemma4v_patch_embed_gpu` + `gemma4v_apply_position_embed_gpu`).
+// They are byte-identical-on-tiny-shapes parity validators, never the
+// production hot path on real `[256, 1152]` shapes.
+
+/// Gemma 4.6 (gemma4v) patch embedding: flat Linear with NO bias.
+///
+/// Equivalent to `candle_nn::linear_no_bias(p² · 3, hidden)` in the
+/// candle reference (`gemma4/vision.rs:127`). The expected weight layout
+/// is `[hidden, p² · 3]` row-major (PyTorch's `nn.Linear.weight`
+/// convention) so:
+///
+///   `out[n, o] = Σᵢ patches[n, i] * weight[o, i]`
+///
+/// Inputs:
+///   - `patches`: `[N_patches, p² · 3]` flat buffer in row-major order
+///     (typically the `Gemma4vPreprocessed::patches` field).
+///   - `weight`: `[hidden, p² · 3]` flat buffer (the gemma4v
+///     `v.patch_embd.weight` tensor as loaded by the mmproj loader).
+///   - `n_patches`, `inner` (= `p² · 3`), `hidden`: shape parameters.
+///
+/// Output: `[N_patches, hidden]` row-major, freshly allocated.
+///
+/// # Errors
+///
+/// Shape-mismatch: `patches.len() != n_patches * inner`,
+/// `weight.len() != hidden * inner`, or any zero dim.
+///
+/// # Why a sibling instead of reusing `linear_forward`
+///
+/// `linear_forward` already implements `y = x @ W.T` for `[batch,
+/// in_features]` × `[out_features, in_features]`. We delegate to it
+/// rather than re-rolling the GEMM — keeps the parity story honest
+/// (any future linear-kernel fix touches one place).
+pub fn gemma4v_patch_embed_forward(
+    patches: &[f32],
+    weight: &[f32],
+    n_patches: u32,
+    inner: u32,
+    hidden: u32,
+) -> Result<Vec<f32>> {
+    if n_patches == 0 || inner == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "gemma4v_patch_embed_forward: n_patches ({n_patches}), inner ({inner}), \
+             hidden ({hidden}) must all be > 0"
+        ));
+    }
+    let n_us = n_patches as usize;
+    let in_us = inner as usize;
+    let h_us = hidden as usize;
+    if patches.len() != n_us * in_us {
+        return Err(anyhow!(
+            "gemma4v_patch_embed_forward: patches.len() ({}) != n_patches*inner ({})",
+            patches.len(),
+            n_us * in_us
+        ));
+    }
+    if weight.len() != h_us * in_us {
+        return Err(anyhow!(
+            "gemma4v_patch_embed_forward: weight.len() ({}) != hidden*inner ({})",
+            weight.len(),
+            h_us * in_us
+        ));
+    }
+    // Naive triple-nested-loop GEMM. The CPU reference is for tiny-shape
+    // parity testing; production goes through `gemma4v_patch_embed_gpu`.
+    let mut out = vec![0f32; n_us * h_us];
+    for n in 0..n_us {
+        let p_base = n * in_us;
+        let o_base = n * h_us;
+        for o in 0..h_us {
+            let w_base = o * in_us;
+            let mut acc: f32 = 0.0;
+            for i in 0..in_us {
+                acc += patches[p_base + i] * weight[w_base + i];
+            }
+            out[o_base + o] = acc;
+        }
+    }
+    Ok(out)
+}
+
+/// Dual position-embed lookup for the gemma4v vision tower.
+///
+/// Implements the C++ reference at `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:18-42`:
+///
+/// ```text
+///   tbl_x = pe_table[0]                  // [pos_size, hidden]
+///   tbl_y = pe_table[1]                  // [pos_size, hidden]
+///   emb_x = ggml_get_rows(tbl_x, pos_x)  // [N_patches, hidden]
+///   emb_y = ggml_get_rows(tbl_y, pos_y)
+///   out[n, h] = emb_x[n, h] + emb_y[n, h]
+/// ```
+///
+/// Equivalent candle reference: `vision.rs:163-179` — two
+/// `index_select` calls + an add.
+///
+/// Inputs:
+///   - `pos_x`, `pos_y`: per-patch indices, length `N_patches` each.
+///     Out-of-range indices are clamped to `pos_size − 1` (matches
+///     candle's `clamp(0, i64::MAX)` + the table's natural bound;
+///     a panic-on-OOB would surface a real producer bug).
+///   - `pe_table`: `[2, pos_size, hidden]` flat buffer (row-major,
+///     X-axis table first then Y-axis table — matches the GGUF
+///     writer at `src/backends/gguf.rs:1783`'s 3-D shape).
+///   - `pos_size`, `hidden`: table shape parameters.
+///
+/// Output: `[N_patches, hidden]` row-major, freshly allocated.
+///
+/// # Errors
+///
+/// Shape-mismatch: `pos_x.len() != pos_y.len()`,
+/// `pe_table.len() != 2 * pos_size * hidden`, any zero dim.
+pub fn gemma4v_position_embed_lookup(
+    pos_x: &[u32],
+    pos_y: &[u32],
+    pe_table: &[f32],
+    pos_size: u32,
+    hidden: u32,
+) -> Result<Vec<f32>> {
+    if pos_size == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "gemma4v_position_embed_lookup: pos_size ({pos_size}) and hidden ({hidden}) must be > 0"
+        ));
+    }
+    if pos_x.len() != pos_y.len() {
+        return Err(anyhow!(
+            "gemma4v_position_embed_lookup: pos_x.len() ({}) != pos_y.len() ({})",
+            pos_x.len(),
+            pos_y.len()
+        ));
+    }
+    let n = pos_x.len();
+    let h_us = hidden as usize;
+    let ps_us = pos_size as usize;
+    let expected = 2 * ps_us * h_us;
+    if pe_table.len() != expected {
+        return Err(anyhow!(
+            "gemma4v_position_embed_lookup: pe_table.len() ({}) != 2*pos_size*hidden ({})",
+            pe_table.len(),
+            expected
+        ));
+    }
+    let table_x_base = 0;
+    let table_y_base = ps_us * h_us;
+    let max_idx = (pos_size - 1) as u32;
+    let mut out = vec![0f32; n * h_us];
+    for k in 0..n {
+        let x_idx = pos_x[k].min(max_idx) as usize;
+        let y_idx = pos_y[k].min(max_idx) as usize;
+        let row_x = table_x_base + x_idx * h_us;
+        let row_y = table_y_base + y_idx * h_us;
+        let out_base = k * h_us;
+        for j in 0..h_us {
+            out[out_base + j] = pe_table[row_x + j] + pe_table[row_y + j];
+        }
+    }
+    Ok(out)
+}
+
+/// Add a dual position embedding into a patch-embedding tensor in place.
+///
+/// Convenience composition: `gemma4v_position_embed_lookup` produces
+/// `pos_emb`, then we sum `patch_embeds += pos_emb` row-wise. Matches
+/// candle's final line at `vision.rs:181` (`patches + pos_emb`).
+///
+/// `patch_embeds` is `[N_patches, hidden]` and is mutated in place.
+pub fn gemma4v_position_embed_add(
+    patch_embeds: &mut [f32],
+    pos_x: &[u32],
+    pos_y: &[u32],
+    pe_table: &[f32],
+    pos_size: u32,
+    hidden: u32,
+) -> Result<()> {
+    let pos_emb = gemma4v_position_embed_lookup(pos_x, pos_y, pe_table, pos_size, hidden)?;
+    if patch_embeds.len() != pos_emb.len() {
+        return Err(anyhow!(
+            "gemma4v_position_embed_add: patch_embeds.len() ({}) != pos_emb.len() ({})",
+            patch_embeds.len(),
+            pos_emb.len()
+        ));
+    }
+    for (dst, src) in patch_embeds.iter_mut().zip(pos_emb.iter()) {
+        *dst += *src;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3576,5 +3780,126 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!(l2_diff > 1e-3, "patch 0 and patch 195 are identical — stride bug");
+    }
+
+    // -------------------------------------------------------------------
+    // gemma4v primitives — CPU-side correctness + shape tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn gemma4v_patch_embed_shapes_and_math() {
+        // 4 patches × inner=12 → hidden=8. Hand-rolled GEMM check on
+        // a tiny shape: y[n, o] = Σᵢ patches[n, i] * weight[o, i].
+        let n_patches = 4u32;
+        let inner = 12u32;
+        let hidden = 8u32;
+        let patches: Vec<f32> = (0..(n_patches * inner)).map(|i| i as f32 * 0.01).collect();
+        let weight: Vec<f32> = (0..(hidden * inner))
+            .map(|i| ((i % 5) as f32) * 0.1 - 0.2)
+            .collect();
+        let out =
+            gemma4v_patch_embed_forward(&patches, &weight, n_patches, inner, hidden).unwrap();
+        assert_eq!(out.len(), (n_patches * hidden) as usize);
+
+        // Spot-check one cell against the formula directly.
+        let n = 2usize;
+        let o = 3usize;
+        let in_us = inner as usize;
+        let mut expect: f32 = 0.0;
+        for i in 0..in_us {
+            expect += patches[n * in_us + i] * weight[o * in_us + i];
+        }
+        let got = out[n * (hidden as usize) + o];
+        assert!(
+            (got - expect).abs() < 1e-5,
+            "got {got} expect {expect}"
+        );
+    }
+
+    #[test]
+    fn gemma4v_patch_embed_rejects_zero_dims() {
+        let err = gemma4v_patch_embed_forward(&[1.0], &[1.0], 0, 1, 1).unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
+        let err2 = gemma4v_patch_embed_forward(&[1.0], &[1.0], 1, 0, 1).unwrap_err();
+        assert!(format!("{err2}").contains("must all be > 0"));
+    }
+
+    #[test]
+    fn gemma4v_patch_embed_rejects_shape_mismatch() {
+        // Patches buf too small.
+        let err = gemma4v_patch_embed_forward(&[1.0; 5], &[1.0; 24], 4, 12, 2).unwrap_err();
+        assert!(format!("{err}").contains("patches.len()"));
+        // Weight buf too small.
+        let err2 = gemma4v_patch_embed_forward(&[1.0; 48], &[1.0; 5], 4, 12, 2).unwrap_err();
+        assert!(format!("{err2}").contains("weight.len()"));
+    }
+
+    #[test]
+    fn gemma4v_position_embed_lookup_basic() {
+        // pos_size=3, hidden=4 → table is 2*3*4 = 24 floats.
+        // Table[0] (X-axis): rows [10,11,12,13], [20,21,22,23], [30,31,32,33]
+        // Table[1] (Y-axis): rows [40,41,42,43], [50,51,52,53], [60,61,62,63]
+        let pe: Vec<f32> = vec![
+            10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0, 30.0, 31.0, 32.0, 33.0,
+            40.0, 41.0, 42.0, 43.0, 50.0, 51.0, 52.0, 53.0, 60.0, 61.0, 62.0, 63.0,
+        ];
+        // 4 patches at (x, y) = (0,0), (1,0), (0,1), (2,2).
+        let pos_x = vec![0u32, 1, 0, 2];
+        let pos_y = vec![0u32, 0, 1, 2];
+        let out = gemma4v_position_embed_lookup(&pos_x, &pos_y, &pe, 3, 4).unwrap();
+        assert_eq!(out.len(), 16);
+        // patch 0: pe_x[0] + pe_y[0] = [10+40, 11+41, 12+42, 13+43]
+        assert_eq!(&out[0..4], &[50.0, 52.0, 54.0, 56.0]);
+        // patch 1: pe_x[1] + pe_y[0]
+        assert_eq!(&out[4..8], &[60.0, 62.0, 64.0, 66.0]);
+        // patch 2: pe_x[0] + pe_y[1]
+        assert_eq!(&out[8..12], &[60.0, 62.0, 64.0, 66.0]);
+        // patch 3: pe_x[2] + pe_y[2]
+        assert_eq!(&out[12..16], &[90.0, 92.0, 94.0, 96.0]);
+    }
+
+    #[test]
+    fn gemma4v_position_embed_lookup_clamps_out_of_range() {
+        // pos_size=2; index 99 should clamp to 1 (max_idx = pos_size − 1).
+        let pe: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let pos_x = vec![99u32];
+        let pos_y = vec![99u32];
+        // pos_size=2, hidden=2 → table is 2*2*2 = 8.
+        let out = gemma4v_position_embed_lookup(&pos_x, &pos_y, &pe, 2, 2).unwrap();
+        // X-table[1] = [3, 4], Y-table[1] = [30, 40], sum = [33, 44].
+        assert_eq!(out, vec![33.0, 44.0]);
+    }
+
+    #[test]
+    fn gemma4v_position_embed_lookup_shape_errors() {
+        let pe = vec![0f32; 12];
+        // Mismatched pos arrays.
+        let err =
+            gemma4v_position_embed_lookup(&[0u32, 1], &[0u32], &pe, 3, 2).unwrap_err();
+        assert!(format!("{err}").contains("pos_x.len()"));
+        // Wrong table size.
+        let err2 = gemma4v_position_embed_lookup(&[0u32], &[0u32], &pe, 7, 2).unwrap_err();
+        assert!(format!("{err2}").contains("pe_table.len()"));
+    }
+
+    #[test]
+    fn gemma4v_position_embed_add_in_place() {
+        let mut patch_embeds = vec![1.0_f32; 8]; // [2, 4]
+        // pos_size=2, hidden=4 → table is 16 floats.
+        let pe: Vec<f32> = vec![
+            // X-table:
+            1.0, 2.0, 3.0, 4.0, // row 0
+            5.0, 6.0, 7.0, 8.0, // row 1
+            // Y-table:
+            9.0, 10.0, 11.0, 12.0, // row 0
+            13.0, 14.0, 15.0, 16.0, // row 1
+        ];
+        let pos_x = vec![0u32, 1];
+        let pos_y = vec![1u32, 0];
+        gemma4v_position_embed_add(&mut patch_embeds, &pos_x, &pos_y, &pe, 2, 4).unwrap();
+        // patch 0: 1 + (1+13, 2+14, 3+15, 4+16) = [15, 17, 19, 21]
+        assert_eq!(&patch_embeds[0..4], &[15.0, 17.0, 19.0, 21.0]);
+        // patch 1: 1 + (5+9, 6+10, 7+11, 8+12) = [15, 17, 19, 21]
+        assert_eq!(&patch_embeds[4..8], &[15.0, 17.0, 19.0, 21.0]);
     }
 }

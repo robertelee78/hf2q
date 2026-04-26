@@ -30,6 +30,7 @@ use mlx_native::metal::MTLSize;
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::gather::dispatch_gather_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
@@ -1694,6 +1695,223 @@ pub fn compute_vision_embeddings_gpu(
 }
 
 // ---------------------------------------------------------------------------
+// Gemma4V (variable-resolution, 2D-RoPE) GPU primitives
+// ---------------------------------------------------------------------------
+//
+// Sibling to the SigLIP-49 path. The CPU references in `vit.rs` are
+// `gemma4v_patch_embed_forward` and `gemma4v_position_embed_lookup` — the
+// GPU primitives below are byte-equivalent (within the BF16 cast
+// tolerance of `vit_linear_gpu`). Used together they implement the
+// gemma4v patch-embed stage:
+//
+//   GPU pipeline:
+//     1. `gemma4v_patch_embed_gpu`           [N_patches, hidden]
+//     2. `gemma4v_apply_position_embed_gpu`  patches += pe[0][pos_x] + pe[1][pos_y]
+//
+// Subsequent iters wire 2D RoPE (per-axis NEOX ordering, `gemma4v.cpp:46-91`)
+// and the per-block forward.
+
+/// GPU patch-embed for gemma4v: flat Linear with NO bias.
+///
+/// Wraps `vit_linear_gpu` for the gemma4v `[N_patches, p²·3] × [hidden, p²·3]`
+/// projection. The candle reference uses `linear_no_bias(p²·3, hidden)`
+/// (`/opt/candle/.../gemma4/vision.rs:127`); the GPU dispatch is the
+/// same as any other Linear in the ViT stack — we add a typed entry
+/// point so the call-site reads as the gemma4v graph step rather than
+/// a generic linear.
+///
+/// Inputs (all device buffers):
+///   - `patches`: F32 `[N_patches, inner = p²·3]` row-major.
+///   - `weight`: F32 `[hidden, inner]` row-major.
+/// Output: F32 `[N_patches, hidden]` row-major (freshly allocated).
+///
+/// # Constraints
+///
+/// `inner >= 32` (`vit_linear_gpu`'s tensor-core tile requirement).
+/// For p=16 / 3 channels, `inner = 768` so the constraint is met.
+///
+/// # Errors
+///
+/// Propagated from `vit_linear_gpu`.
+pub fn gemma4v_patch_embed_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    patches: &MlxBuffer,
+    weight: &MlxBuffer,
+    n_patches: u32,
+    inner: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if n_patches == 0 {
+        return Err(anyhow!("gemma4v_patch_embed_gpu: n_patches must be > 0"));
+    }
+    vit_linear_gpu(
+        encoder,
+        registry,
+        device,
+        patches,
+        weight,
+        n_patches,
+        inner,
+        hidden,
+    )
+    .context("gemma4v_patch_embed_gpu: vit_linear_gpu")
+}
+
+/// GPU dual position-embed lookup for gemma4v.
+///
+/// Implements `gemma4v.cpp:18-42` on-GPU using two `dispatch_gather_f32`
+/// calls (X-table + Y-table) followed by a single `elementwise_add`:
+///
+///   emb_x = gather(pe_table[0..pos_size,:], pos_x)
+///   emb_y = gather(pe_table[pos_size..2*pos_size,:], pos_y)
+///   out   = emb_x + emb_y
+///
+/// `pe_table` is the `[2, pos_size, hidden]` GGUF tensor (see
+/// `mmproj_weights::position_embd_table_3d`); we slice it into two
+/// `[pos_size, hidden]` row-aligned views via `MlxBuffer::slice_view`.
+/// The X table starts at byte offset 0 and the Y table at byte offset
+/// `pos_size * hidden * 4` (F32).
+///
+/// `pos_x` and `pos_y` are F32 buffers carrying U32 indices via
+/// `as_mut_slice::<u32>()` (the gather kernel reads U32). Caller is
+/// responsible for uploading them.
+///
+/// # Concurrent dispatch — barriers
+///
+/// Per `project_mlx_native_concurrent_dispatch.md`, the two gathers
+/// can run concurrently (they read disjoint regions of `pe_table` and
+/// write disjoint outputs). We DO insert a barrier before the
+/// `elementwise_add` since the add reads BOTH gathers' outputs (RAW).
+///
+/// # Errors
+///
+/// - any zero dim
+/// - propagated from gather/elementwise_add dispatches
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_position_embed_lookup_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    pe_table: &MlxBuffer,
+    pos_x_idx: &MlxBuffer,
+    pos_y_idx: &MlxBuffer,
+    n_patches: u32,
+    pos_size: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if n_patches == 0 || pos_size == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "gemma4v_position_embed_lookup_gpu: n_patches ({n_patches}), pos_size ({pos_size}), \
+             hidden ({hidden}) must all be > 0"
+        ));
+    }
+
+    // Slice the [2, pos_size, hidden] table into two [pos_size, hidden]
+    // views — same backing buffer, distinct byte offsets. F32, so 4 bytes
+    // per element.
+    let row_elems = (pos_size as usize) * (hidden as usize);
+    let table_bytes = row_elems * 4;
+    let table_x = pe_table.slice_view(0, row_elems);
+    let table_y = pe_table.slice_view(table_bytes as u64, row_elems);
+
+    // Allocate two gather outputs. Caller-visible result is `out_xy`,
+    // returned at end after add.
+    let n_us = n_patches as usize;
+    let h_us = hidden as usize;
+    let out_bytes = n_us * h_us * 4;
+    let emb_x = device
+        .alloc_buffer(out_bytes, DType::F32, vec![n_us, h_us])
+        .map_err(|e| anyhow!("alloc emb_x: {e}"))?;
+    let emb_y = device
+        .alloc_buffer(out_bytes, DType::F32, vec![n_us, h_us])
+        .map_err(|e| anyhow!("alloc emb_y: {e}"))?;
+
+    // Two concurrent gathers: each reads a disjoint table region and
+    // writes a disjoint output buffer.
+    dispatch_gather_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &table_x,
+        pos_x_idx,
+        &emb_x,
+        pos_size,
+        hidden,
+        n_patches,
+    )
+    .context("gemma4v_position_embed_lookup_gpu: gather X")?;
+    dispatch_gather_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        &table_y,
+        pos_y_idx,
+        &emb_y,
+        pos_size,
+        hidden,
+        n_patches,
+    )
+    .context("gemma4v_position_embed_lookup_gpu: gather Y")?;
+
+    // RAW: the add below reads both gather outputs.
+    encoder.memory_barrier();
+
+    let out = device
+        .alloc_buffer(out_bytes, DType::F32, vec![n_us, h_us])
+        .map_err(|e| anyhow!("alloc pos_emb sum: {e}"))?;
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        &emb_x,
+        &emb_y,
+        &out,
+        n_us * h_us,
+        DType::F32,
+    )
+    .context("gemma4v_position_embed_lookup_gpu: elementwise_add")?;
+    Ok(out)
+}
+
+/// GPU `patch_embeds += pe[0][pos_x] + pe[1][pos_y]`.
+///
+/// Composes `gemma4v_position_embed_lookup_gpu` with a residual-add into
+/// the patch-embedding tensor. Returns the summed buffer (freshly
+/// allocated; the caller's `patch_embeds` is unchanged so the residual
+/// can be reused if needed).
+///
+/// Inserts a memory barrier between the gather/add stage and the final
+/// residual-add (RAW: residual add reads both inputs).
+#[allow(clippy::too_many_arguments)]
+pub fn gemma4v_apply_position_embed_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    patch_embeds: &MlxBuffer,
+    pe_table: &MlxBuffer,
+    pos_x_idx: &MlxBuffer,
+    pos_y_idx: &MlxBuffer,
+    n_patches: u32,
+    pos_size: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    let pos_emb = gemma4v_position_embed_lookup_gpu(
+        encoder, registry, device, pe_table, pos_x_idx, pos_y_idx, n_patches, pos_size, hidden,
+    )?;
+    encoder.memory_barrier();
+    let n_elem = (n_patches as u64).saturating_mul(hidden as u64);
+    if n_elem > u32::MAX as u64 {
+        return Err(anyhow!(
+            "gemma4v_apply_position_embed_gpu: n_patches*hidden ({n_elem}) exceeds u32::MAX"
+        ));
+    }
+    vit_residual_add_gpu(encoder, registry, device, patch_embeds, &pos_emb, n_elem as u32)
+        .context("gemma4v_apply_position_embed_gpu: residual add")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1702,6 +1920,8 @@ mod tests {
     use super::*;
     use crate::inference::vision::vit::{
         apply_vit_block_forward as apply_vit_block_forward_cpu, elementwise_mul_in_place,
+        gemma4v_patch_embed_forward as gemma4v_patch_embed_cpu,
+        gemma4v_position_embed_lookup as gemma4v_pos_embed_cpu,
         linear_forward as linear_cpu, per_head_rms_norm_forward as per_head_rms_cpu,
         residual_add as residual_add_cpu, rms_norm_forward as rms_norm_cpu,
         scaled_dot_product_attention as attention_cpu, silu_in_place,
@@ -3693,5 +3913,251 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
+    }
+
+    // -------------------------------------------------------------------
+    // gemma4v GPU primitives — CPU-vs-GPU parity tests
+    // -------------------------------------------------------------------
+
+    /// Upload a `&[u32]` into a fresh device buffer (for index gathers).
+    fn upload_u32(device: &MlxDevice, data: &[u32], shape: Vec<usize>) -> MlxBuffer {
+        let bytes = data.len() * 4;
+        let buf = device
+            .alloc_buffer(bytes, DType::F32, shape)
+            .expect("alloc upload u32");
+        let slice: &mut [u32] = unsafe {
+            std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut u32, data.len())
+        };
+        slice.copy_from_slice(data);
+        buf
+    }
+
+    #[test]
+    fn gemma4v_patch_embed_cpu_gpu_parity() {
+        // Tiny shape: 4 patches × inner=64 → hidden=32. Keep inner ≥ 32
+        // (vit_linear_gpu's tensor-core tile floor).
+        let n_patches = 4usize;
+        let inner = 64usize;
+        let hidden = 32usize;
+
+        let patches_cpu: Vec<f32> = (0..n_patches * inner)
+            .map(|i| ((i as f32) * 0.003).sin() * 0.5)
+            .collect();
+        let weight_cpu: Vec<f32> = (0..hidden * inner)
+            .map(|i| ((i as f32) * 0.011).cos() * 0.2)
+            .collect();
+
+        let expect_cpu = gemma4v_patch_embed_cpu(
+            &patches_cpu,
+            &weight_cpu,
+            n_patches as u32,
+            inner as u32,
+            hidden as u32,
+        )
+        .expect("cpu ref");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let patches_buf = upload_f32(executor.device(), &patches_cpu, vec![n_patches, inner]);
+        let weight_buf = upload_f32(executor.device(), &weight_cpu, vec![hidden, inner]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out = gemma4v_patch_embed_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &patches_buf,
+            &weight_buf,
+            n_patches as u32,
+            inner as u32,
+            hidden as u32,
+        )
+        .expect("gpu dispatch");
+        session.finish().expect("finish");
+
+        let got = readback_f32(&out, n_patches * hidden);
+        // BF16 weight round-trip tolerance — same bar as `vit_linear_gpu`'s
+        // own parity test (1e-2 max-abs).
+        for (i, (g, e)) in got.iter().zip(expect_cpu.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-2,
+                "patch_embed parity mismatch at {i}: gpu={g} cpu={e}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4v_patch_embed_gpu_rejects_zero_n() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let p = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
+        let w = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("b");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = gemma4v_patch_embed_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &p,
+            &w,
+            0,
+            64,
+            32,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("n_patches must be > 0"));
+    }
+
+    #[test]
+    fn gemma4v_position_embed_cpu_gpu_parity() {
+        // 6 patches into a [2, pos_size=4, hidden=8] table.
+        let pos_size = 4usize;
+        let hidden = 8usize;
+        let pe_cpu: Vec<f32> = (0..2 * pos_size * hidden)
+            .map(|i| (i as f32) * 0.1 - 5.0)
+            .collect();
+        let pos_x: Vec<u32> = vec![0, 1, 2, 3, 0, 2];
+        let pos_y: Vec<u32> = vec![0, 0, 1, 2, 3, 1];
+        let n_patches = pos_x.len() as u32;
+
+        let expect_cpu = gemma4v_pos_embed_cpu(
+            &pos_x,
+            &pos_y,
+            &pe_cpu,
+            pos_size as u32,
+            hidden as u32,
+        )
+        .expect("cpu pos lookup");
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let pe_buf = upload_f32(executor.device(), &pe_cpu, vec![2, pos_size, hidden]);
+        let posx_buf = upload_u32(executor.device(), &pos_x, vec![pos_x.len()]);
+        let posy_buf = upload_u32(executor.device(), &pos_y, vec![pos_y.len()]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        // gather_f32 needs to be registered.
+        mlx_native::ops::gather::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out = gemma4v_position_embed_lookup_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &pe_buf,
+            &posx_buf,
+            &posy_buf,
+            n_patches,
+            pos_size as u32,
+            hidden as u32,
+        )
+        .expect("gpu pos lookup");
+        session.finish().expect("finish");
+
+        let got = readback_f32(&out, (n_patches as usize) * hidden);
+        // Pure F32 path (no BF16 cast) — should be byte-exact.
+        for (i, (g, e)) in got.iter().zip(expect_cpu.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "pos_embed parity at {i}: gpu={g} cpu={e}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4v_position_embed_lookup_gpu_rejects_zero_dims() {
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let pe = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
+        let px = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("b");
+        let py = executor.device().alloc_buffer(4 * 4, DType::F32, vec![4]).expect("c");
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let err = gemma4v_position_embed_lookup_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &pe,
+            &px,
+            &py,
+            0,
+            4,
+            8,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must all be > 0"));
+    }
+
+    #[test]
+    fn gemma4v_apply_position_embed_gpu_adds_pe_to_patch_embeds() {
+        // patch_embeds = ones[N=3, hidden=4] → after add, each row is
+        // 1 + (pe[0][pos_x] + pe[1][pos_y]).
+        let pos_size = 2usize;
+        let hidden = 4usize;
+        let pe_cpu: Vec<f32> = vec![
+            // X-table:
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+            // Y-table:
+            10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        ];
+        let pos_x: Vec<u32> = vec![0, 1, 0];
+        let pos_y: Vec<u32> = vec![1, 0, 0];
+        let n_patches = pos_x.len() as u32;
+        let patch_embeds_cpu: Vec<f32> = vec![1.0; (n_patches as usize) * hidden];
+
+        // Expected: (pe_x + pe_y) row-wise, plus 1 baseline.
+        let pos_emb = gemma4v_pos_embed_cpu(
+            &pos_x, &pos_y, &pe_cpu,
+            pos_size as u32,
+            hidden as u32,
+        )
+        .unwrap();
+        let mut expect: Vec<f32> = patch_embeds_cpu.clone();
+        for (e, s) in expect.iter_mut().zip(pos_emb.iter()) {
+            *e += *s;
+        }
+
+        let device = MlxDevice::new().expect("device");
+        let executor = GraphExecutor::new(device);
+        let pe_buf = upload_f32(executor.device(), &pe_cpu, vec![2, pos_size, hidden]);
+        let pe_table = pe_buf;
+        let patch_buf = upload_f32(executor.device(), &patch_embeds_cpu, vec![n_patches as usize, hidden]);
+        let posx_buf = upload_u32(executor.device(), &pos_x, vec![pos_x.len()]);
+        let posy_buf = upload_u32(executor.device(), &pos_y, vec![pos_y.len()]);
+
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        mlx_native::ops::gather::register(&mut registry);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let out = gemma4v_apply_position_embed_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &patch_buf,
+            &pe_table,
+            &posx_buf,
+            &posy_buf,
+            n_patches,
+            pos_size as u32,
+            hidden as u32,
+        )
+        .expect("gpu apply pos");
+        session.finish().expect("finish");
+
+        let got = readback_f32(&out, (n_patches as usize) * hidden);
+        for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "apply_pos parity at {i}: gpu={g} cpu={e}"
+            );
+        }
     }
 }

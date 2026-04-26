@@ -157,6 +157,69 @@ impl LoadedMmprojWeights {
             .ok_or_else(|| anyhow!("mmproj missing '{}'", super::mmproj::TENSOR_POS_EMBD))
     }
 
+    /// Read the gemma4v dual position-embed table as a typed
+    /// `[2, pos_size, hidden]` 3-D view.
+    ///
+    /// Returns `(buf, pos_size, hidden)` where `buf` is the same backing
+    /// `MlxBuffer` returned by `position_embd_weight()` (no copy). The
+    /// gemma4v vision tower stores this as `model.embed_vision.
+    /// position_embedding_table`, mapped to `v.position_embd.weight` by
+    /// `src/backends/gguf.rs:1782-1786`. The first dim is fixed at 2
+    /// (X-axis table at `[0, ..]`, Y-axis table at `[1, ..]`).
+    ///
+    /// # Errors
+    ///
+    /// - tensor missing
+    /// - shape isn't 3-D, or first dim isn't 2
+    /// - product of dims doesn't match the buffer's element count
+    ///   (catches a stale GGUF write or a producer mismatch)
+    ///
+    /// # Why a sibling accessor instead of changing
+    /// `position_embd_weight()`
+    ///
+    /// SigLIP-49's vision tower stores a 2-D
+    /// `[num_patches (+1 cls), hidden]` table; gemma4v's is 3-D. The
+    /// untyped accessor returns the raw buffer for both — callers that
+    /// need typed shape information branch on `ArchProfile`. This
+    /// addition lands the gemma4v branch without churning the SigLIP
+    /// path.
+    pub fn position_embd_table_3d(&self) -> Result<(&MlxBuffer, u32, u32)> {
+        let buf = self.position_embd_weight()?;
+        let shape = buf.shape();
+        if shape.len() != 3 {
+            return Err(anyhow!(
+                "v.position_embd.weight: expected 3-D [2, pos_size, hidden], got shape {:?}",
+                shape
+            ));
+        }
+        if shape[0] != 2 {
+            return Err(anyhow!(
+                "v.position_embd.weight: expected first dim 2 (gemma4v dual table), got {}",
+                shape[0]
+            ));
+        }
+        let pos_size = shape[1] as u32;
+        let hidden = shape[2] as u32;
+        if pos_size == 0 || hidden == 0 {
+            return Err(anyhow!(
+                "v.position_embd.weight: pos_size ({pos_size}) and hidden ({hidden}) must be > 0"
+            ));
+        }
+        // Buffer-element-count cross-check: 2 * pos_size * hidden f32s.
+        let expected_bytes =
+            2usize * (pos_size as usize) * (hidden as usize) * std::mem::size_of::<f32>();
+        if buf.byte_len() < expected_bytes {
+            return Err(anyhow!(
+                "v.position_embd.weight: byte_len {} < expected {} (2 * {} * {} * 4)",
+                buf.byte_len(),
+                expected_bytes,
+                pos_size,
+                hidden
+            ));
+        }
+        Ok((buf, pos_size, hidden))
+    }
+
     pub fn post_ln_weight(&self) -> Result<&MlxBuffer> {
         self.tensors
             .get(super::mmproj::TENSOR_POST_LN_WEIGHT)
@@ -330,6 +393,76 @@ mod tests {
             _device: MlxDevice::new().expect("device"),
         };
         assert!(weights.get("v.patch_embd.weight").is_none());
+    }
+
+    #[test]
+    fn position_embd_table_3d_rejects_non_3d_shape() {
+        // Synthesize a LoadedMmprojWeights with a 2-D position-embd
+        // (the SigLIP shape). The 3-D accessor must reject it cleanly.
+        let device = MlxDevice::new().expect("device");
+        let buf = device
+            .alloc_buffer(64 * 4, mlx_native::DType::F32, vec![8, 8])
+            .expect("alloc");
+        let mut tensors = HashMap::new();
+        tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
+        let weights = LoadedMmprojWeights {
+            tensors,
+            _device: device,
+        };
+        let err = weights.position_embd_table_3d().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected 3-D"),
+            "wrong error msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn position_embd_table_3d_rejects_first_dim_not_two() {
+        let device = MlxDevice::new().expect("device");
+        let buf = device
+            .alloc_buffer(96 * 4, mlx_native::DType::F32, vec![3, 4, 8])
+            .expect("alloc");
+        let mut tensors = HashMap::new();
+        tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
+        let weights = LoadedMmprojWeights {
+            tensors,
+            _device: device,
+        };
+        let err = weights.position_embd_table_3d().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("first dim 2"),
+            "wrong error msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn position_embd_table_3d_returns_dims_for_valid_shape() {
+        let device = MlxDevice::new().expect("device");
+        let pos_size = 27usize;
+        let hidden = 1152usize;
+        let buf = device
+            .alloc_buffer(2 * pos_size * hidden * 4, mlx_native::DType::F32, vec![2, pos_size, hidden])
+            .expect("alloc");
+        let mut tensors = HashMap::new();
+        tensors.insert(super::super::mmproj::TENSOR_POS_EMBD.to_string(), buf);
+        let weights = LoadedMmprojWeights {
+            tensors,
+            _device: device,
+        };
+        let (buf, ps, h) = weights.position_embd_table_3d().expect("3d ok");
+        assert_eq!(ps, pos_size as u32);
+        assert_eq!(h, hidden as u32);
+        assert_eq!(buf.shape(), &[2, pos_size, hidden]);
+    }
+
+    #[test]
+    fn position_embd_table_3d_propagates_missing_tensor_error() {
+        let device = MlxDevice::new().expect("device");
+        let weights = LoadedMmprojWeights::empty(device);
+        let err = weights.position_embd_table_3d().unwrap_err();
+        assert!(format!("{err}").contains("v.position_embd.weight"));
     }
 
     #[test]
