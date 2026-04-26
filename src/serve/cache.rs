@@ -76,8 +76,19 @@ use std::time::SystemTime;
 use super::quant_select::QuantType;
 
 /// Schema version for [`CacheManifest`].  Bumped when on-disk JSON layout
-/// changes incompatibly.  v1 is the initial Phase 3 layout.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// changes incompatibly.
+///
+/// - **v1** (iter-202): initial Phase 3 layout — `models: BTreeMap<String,
+///   ModelEntry>`, `ModelEntry { repo_id, revision, source, quantizations,
+///   last_accessed_secs }`.
+/// - **v2** (iter-203): adds `ModelEntry::source_shards: Vec<SourceShard>`
+///   for ADR-005 Phase 3 item 3/4 (HF integrity).  v1 manifests load
+///   transparently — missing field defaults to empty Vec — and are
+///   re-written as v2 on the next mutation.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// Lowest schema version the loader still understands.  v1 manifests are
+/// migrated in-place to v2 on read (no field invalidation).
+pub const MANIFEST_SCHEMA_MIN_SUPPORTED: u32 = 1;
 
 /// Env var that (if set + non-empty) overrides every other root resolution
 /// rule.  Documented in ADR-005 Phase 3.
@@ -120,6 +131,47 @@ pub struct ModelEntry {
     /// Wall-clock seconds-since-epoch.  Updated by [`ModelCache::touch`].
     /// Drives LRU eviction (Phase 4).
     pub last_accessed_secs: u64,
+    /// Per-shard integrity records captured by ADR-005 Phase 3 item 3/4
+    /// (`hf2q convert` / `hf2q serve` against `--repo`).  Empty when the
+    /// source is local or when integrity was bypassed via
+    /// `--no-integrity`.  Schema bumped from v1 → v2 to introduce this
+    /// field; v1 manifests load with `source_shards = vec![]` (default).
+    #[serde(default)]
+    pub source_shards: Vec<SourceShard>,
+}
+
+/// One per-shard integrity record (ADR-005 Phase 3 item 3/4).  Mirrors
+/// [`crate::input::integrity::ShardIntegrity`] in JSON shape so the two
+/// surfaces stay aligned and a `From` adapter is a memberwise copy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceShard {
+    pub filename: String,
+    pub bytes: u64,
+    /// Lowercase hex SHA-256 from HF's `x-linked-etag` (LFS-managed
+    /// shards only).  `None` for non-LFS files (config.json,
+    /// tokenizer.json) — see `crate::input::integrity` module docs.
+    pub sha256: Option<String>,
+    /// Raw etag as returned by HF (LFS sha256 hex when LFS, Git-style
+    /// blob SHA-1 otherwise) — kept verbatim for traceability.
+    pub hf_etag: String,
+    pub is_lfs: bool,
+    /// Wall-clock seconds-since-epoch when this record was added.
+    pub verified_at_secs: u64,
+}
+
+impl SourceShard {
+    /// Adapter from the integrity-side struct.  Stamps `verified_at_secs`
+    /// at adapter time so the cache's clock is the canonical timestamp.
+    pub fn from_integrity(value: &crate::input::integrity::ShardIntegrity) -> Self {
+        Self {
+            filename: value.filename.clone(),
+            bytes: value.bytes,
+            sha256: value.sha256.clone(),
+            hf_etag: value.hf_etag.clone(),
+            is_lfs: value.is_lfs,
+            verified_at_secs: secs_since_epoch(),
+        }
+    }
 }
 
 /// Where the unquantized source bytes live.
@@ -427,6 +479,7 @@ impl ModelCache {
                 source: None,
                 quantizations: BTreeMap::new(),
                 last_accessed_secs: now,
+                source_shards: Vec::new(),
             });
         entry.revision = revision.to_string();
         entry.source = Some(source);
@@ -471,6 +524,99 @@ impl ModelCache {
         write_json_atomic(&companion, &entry)?;
 
         self.flush()
+    }
+
+    /// Record a model's source bytes alongside the per-shard integrity
+    /// records produced by [`crate::input::integrity::verify_repo`].
+    /// Stores the shard list under `ModelEntry::source_shards` so future
+    /// loads can re-verify without re-fetching HF metadata.
+    ///
+    /// This is the v2-schema entry point: callers that want the integrity
+    /// trail in the manifest use this method; callers that legitimately
+    /// have no shard list (local-path source, `--no-integrity`) keep
+    /// using [`record_source`] which seeds `source_shards = vec![]`.
+    pub fn record_source_with_shards(
+        &mut self,
+        repo_id: &str,
+        revision: &str,
+        source: SourcePointer,
+        shards: Vec<crate::input::integrity::ShardIntegrity>,
+    ) -> Result<()> {
+        let _ = slug_repo_id(repo_id)?;
+
+        let now = secs_since_epoch();
+        let entry = self
+            .manifest
+            .models
+            .entry(repo_id.to_string())
+            .or_insert_with(|| ModelEntry {
+                repo_id: repo_id.to_string(),
+                revision: revision.to_string(),
+                source: None,
+                quantizations: BTreeMap::new(),
+                last_accessed_secs: now,
+                source_shards: Vec::new(),
+            });
+        entry.revision = revision.to_string();
+        entry.source = Some(source);
+        entry.last_accessed_secs = now;
+        entry.source_shards = shards.iter().map(SourceShard::from_integrity).collect();
+
+        // Persist a `repo_meta.json` companion alongside `models/<slug>/`.
+        let slug = slug_repo_id(repo_id)?;
+        let model_dir = self.root.join("models").join(&slug);
+        fs::create_dir_all(&model_dir)
+            .with_context(|| format!("create model dir: {}", model_dir.display()))?;
+        let meta_path = model_dir.join("repo_meta.json");
+        let entry_clone = entry.clone();
+        write_json_atomic(&meta_path, &entry_clone)?;
+
+        self.flush()
+    }
+
+    /// Re-hash the cached GGUF on disk and compare to the SHA-256 stored
+    /// in the manifest by [`record_quantized`].  Used at serve-time to
+    /// detect cache corruption (disk bit-rot, partial write, manual edit).
+    ///
+    /// Errors:
+    /// - `manifest_no_entry` if the `(repo_id, quant)` pair isn't cached.
+    /// - `gguf_missing` if the recorded `gguf_path` no longer exists.
+    /// - `sha256_mismatch` (the load-bearing one) when the on-disk SHA-256
+    ///   diverges from the manifest entry.
+    ///
+    /// Naming + wording is asserted on by tests; do not change without
+    /// updating the tests.
+    pub fn verify_quantized(&self, repo_id: &str, quant: QuantType) -> Result<()> {
+        let entry = self
+            .lookup(repo_id, quant)
+            .ok_or_else(|| anyhow!(
+                "verify_quantized: no manifest entry for {}@{}",
+                repo_id,
+                quant.as_str()
+            ))?;
+        if !entry.gguf_path.exists() {
+            return Err(anyhow!(
+                "verify_quantized: cached GGUF missing on disk: {}",
+                entry.gguf_path.display()
+            ));
+        }
+        let actual = sha256_file(&entry.gguf_path)?;
+        if !actual.eq_ignore_ascii_case(&entry.sha256) {
+            return Err(anyhow!(
+                "verify_quantized: SHA-256 mismatch for {}@{} at {}: \
+                 manifest says {}, on-disk computes {}. \
+                 The cached GGUF is corrupted; remove it (rm {}) and \
+                 re-quantize, or pass --no-integrity to skip the check \
+                 (NOT recommended).",
+                repo_id,
+                quant.as_str(),
+                entry.gguf_path.display(),
+                entry.sha256,
+                actual,
+                entry.gguf_path.display(),
+            ));
+        }
+        Ok(())
     }
 
     /// Update `last_accessed_secs` for a model (LRU touch).  No-op if the
@@ -581,15 +727,30 @@ fn ensure_layout(root: &Path) -> Result<()> {
 fn read_manifest(path: &Path) -> Result<CacheManifest> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("read manifest: {}", path.display()))?;
-    let m: CacheManifest = serde_json::from_str(&text)
+    let mut m: CacheManifest = serde_json::from_str(&text)
         .with_context(|| format!("parse manifest JSON: {}", path.display()))?;
-    if m.schema_version != MANIFEST_SCHEMA_VERSION {
+    // Schema range: any version in [MIN_SUPPORTED, CURRENT] loads.  v1
+    // manifests work because `source_shards` is `#[serde(default)]` —
+    // missing field deserializes as empty Vec.  We then bump the
+    // in-memory `schema_version` to the current value so the next flush
+    // persists a v2-compliant file (forward migration is one-way; we
+    // never write a v1 manifest after a v2 has loaded).
+    if m.schema_version < MANIFEST_SCHEMA_MIN_SUPPORTED
+        || m.schema_version > MANIFEST_SCHEMA_VERSION
+    {
         return Err(anyhow!(
-            "manifest schema_version mismatch at {}: expected {}, got {}",
+            "manifest schema_version mismatch at {}: expected {}..={}, got {}",
             path.display(),
+            MANIFEST_SCHEMA_MIN_SUPPORTED,
             MANIFEST_SCHEMA_VERSION,
             m.schema_version
         ));
+    }
+    if m.schema_version < MANIFEST_SCHEMA_VERSION {
+        // Migrate in memory.  No field invalidation v1 → v2 since we
+        // only added a defaulted field — but be explicit so the next
+        // schema bump has a hook to extend.
+        m.schema_version = MANIFEST_SCHEMA_VERSION;
     }
     Ok(m)
 }
@@ -1299,5 +1460,266 @@ mod tests {
             sha256_file(&path).unwrap(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    // ── ADR-005 Phase 3 iter-203 — schema v1→v2 migration ───────────────
+
+    #[test]
+    fn schema_v1_manifest_loads_with_empty_source_shards() {
+        // Hand-craft a v1 manifest (no `source_shards` field).  Loader
+        // must accept it and default the field to an empty Vec.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("locks")).unwrap();
+        let v1_json = r#"{
+            "schema_version": 1,
+            "models": {
+                "old/model": {
+                    "repo_id": "old/model",
+                    "revision": "abc",
+                    "source": null,
+                    "quantizations": {},
+                    "last_accessed_secs": 100
+                }
+            }
+        }"#;
+        fs::write(tmp.path().join("manifest.json"), v1_json).unwrap();
+        let cache = ModelCache::open_at(tmp.path()).unwrap();
+        let m = cache.lookup_model("old/model").expect("v1 entry loaded");
+        assert_eq!(m.revision, "abc");
+        assert!(
+            m.source_shards.is_empty(),
+            "v1 manifest must default source_shards to empty Vec"
+        );
+        // In-memory schema_version is bumped to current.
+        assert_eq!(cache.manifest().schema_version, MANIFEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v1_manifest_persists_as_v2_on_next_write() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("models")).unwrap();
+        fs::create_dir_all(tmp.path().join("locks")).unwrap();
+        let v1_json = r#"{
+            "schema_version": 1,
+            "models": {}
+        }"#;
+        fs::write(tmp.path().join("manifest.json"), v1_json).unwrap();
+        // Open + mutate (touch a non-existent model is a no-op for the
+        // manifest, so we record a real source instead).
+        {
+            let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+            cache
+                .record_source(
+                    "x/y",
+                    "rev",
+                    SourcePointer::Local {
+                        path: PathBuf::from("/p"),
+                        sha256: "0".repeat(64),
+                    },
+                )
+                .unwrap();
+        }
+        // Reread on cold disk; schema_version is now 2.
+        let raw = fs::read_to_string(tmp.path().join("manifest.json")).unwrap();
+        assert!(
+            raw.contains(r#""schema_version": 2"#) || raw.contains(r#""schema_version":2"#),
+            "v2 manifest must persist schema_version=2: {raw}"
+        );
+    }
+
+    #[test]
+    fn schema_unsupported_too_old_errors() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path()).unwrap();
+        fs::write(
+            tmp.path().join("manifest.json"),
+            r#"{"schema_version": 0, "models": {}}"#,
+        )
+        .unwrap();
+        let err = ModelCache::open_at(tmp.path()).unwrap_err();
+        assert!(format!("{err}").contains("schema_version"));
+    }
+
+    // ── record_source_with_shards ───────────────────────────────────────
+
+    fn fake_shard(filename: &str, bytes: u64, sha256: Option<&str>) -> crate::input::integrity::ShardIntegrity {
+        crate::input::integrity::ShardIntegrity {
+            filename: filename.to_string(),
+            bytes,
+            sha256: sha256.map(|s| s.to_string()),
+            hf_etag: sha256.unwrap_or("etag").to_string(),
+            is_lfs: sha256.is_some(),
+        }
+    }
+
+    #[test]
+    fn record_source_with_shards_persists_into_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        let shards = vec![
+            fake_shard(
+                "model-00001-of-00002.safetensors",
+                1024,
+                Some(&"a".repeat(64)),
+            ),
+            fake_shard(
+                "model-00002-of-00002.safetensors",
+                2048,
+                Some(&"b".repeat(64)),
+            ),
+            fake_shard("config.json", 200, None),
+        ];
+        cache
+            .record_source_with_shards(
+                "org/m",
+                "rev1",
+                SourcePointer::HfHub {
+                    path: PathBuf::from("/hub/path"),
+                    revision: "rev1".into(),
+                },
+                shards.clone(),
+            )
+            .unwrap();
+        let m = cache.lookup_model("org/m").unwrap();
+        assert_eq!(m.source_shards.len(), 3);
+        assert_eq!(
+            m.source_shards[0].filename,
+            "model-00001-of-00002.safetensors"
+        );
+        assert_eq!(m.source_shards[0].bytes, 1024);
+        assert_eq!(m.source_shards[0].sha256.as_deref(), Some(&*"a".repeat(64)));
+        assert!(m.source_shards[0].is_lfs);
+        assert_eq!(m.source_shards[2].filename, "config.json");
+        assert!(!m.source_shards[2].is_lfs);
+        // verified_at_secs is non-zero (best-effort timestamp).
+        assert!(m.source_shards[0].verified_at_secs > 0);
+    }
+
+    #[test]
+    fn record_source_with_shards_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+            let shards = vec![fake_shard("a.safetensors", 8, Some(&"c".repeat(64)))];
+            cache
+                .record_source_with_shards(
+                    "org/m",
+                    "rev",
+                    SourcePointer::HfHub {
+                        path: PathBuf::from("/p"),
+                        revision: "rev".into(),
+                    },
+                    shards,
+                )
+                .unwrap();
+        }
+        let cache = ModelCache::open_at(tmp.path()).unwrap();
+        let m = cache.lookup_model("org/m").unwrap();
+        assert_eq!(m.source_shards.len(), 1);
+        assert_eq!(m.source_shards[0].filename, "a.safetensors");
+    }
+
+    // ── verify_quantized ────────────────────────────────────────────────
+
+    fn record_real_quant(tmp: &Path, repo: &str, contents: &[u8]) -> ModelCache {
+        let mut cache = ModelCache::open_at(tmp).unwrap();
+        cache
+            .record_source(
+                repo,
+                "rev",
+                SourcePointer::Local {
+                    path: PathBuf::from("/p"),
+                    sha256: "0".repeat(64),
+                },
+            )
+            .unwrap();
+        let gguf = cache_model_path(tmp, repo, QuantType::Q4_K_M).unwrap();
+        fs::create_dir_all(gguf.parent().unwrap()).unwrap();
+        fs::write(&gguf, contents).unwrap();
+        let entry = QuantEntry {
+            quant_type: QuantType::Q4_K_M.as_str().to_string(),
+            gguf_path: gguf.clone(),
+            mmproj_path: None,
+            bytes: contents.len() as u64,
+            sha256: sha256_file(&gguf).unwrap(),
+            quantized_at_secs: secs_since_epoch(),
+            quantized_by_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        cache.record_quantized(repo, entry).unwrap();
+        cache
+    }
+
+    #[test]
+    fn verify_quantized_pass_when_bytes_match_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let cache = record_real_quant(tmp.path(), "org/m", b"GGUF\0valid\0bytes");
+        cache
+            .verify_quantized("org/m", QuantType::Q4_K_M)
+            .expect("matching bytes should verify");
+    }
+
+    #[test]
+    fn verify_quantized_fail_when_bytes_mutated_after_record() {
+        let tmp = TempDir::new().unwrap();
+        let cache = record_real_quant(tmp.path(), "org/m", b"original");
+        // Tamper: overwrite the GGUF with different bytes (same length so
+        // the size match doesn't short-circuit any logic — we still rely
+        // on the sha256 catching it).
+        let gguf = cache_model_path(tmp.path(), "org/m", QuantType::Q4_K_M).unwrap();
+        fs::write(&gguf, b"tampered").unwrap();
+        let err = cache
+            .verify_quantized("org/m", QuantType::Q4_K_M)
+            .expect_err("tampered bytes must be detected");
+        let msg = format!("{err}");
+        assert!(msg.contains("SHA-256 mismatch"), "msg: {msg}");
+        assert!(msg.contains("org/m"), "msg: {msg}");
+        assert!(msg.contains("Q4_K_M"), "msg: {msg}");
+        assert!(msg.contains("--no-integrity"), "msg: {msg}");
+    }
+
+    #[test]
+    fn verify_quantized_fail_when_no_manifest_entry() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ModelCache::open_at(tmp.path()).unwrap();
+        let err = cache
+            .verify_quantized("ghost/repo", QuantType::Q4_K_M)
+            .expect_err("uncached repo must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("no manifest entry"), "msg: {msg}");
+    }
+
+    #[test]
+    fn verify_quantized_fail_when_gguf_deleted_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cache = record_real_quant(tmp.path(), "org/m", b"valid");
+        // Delete the GGUF after recording.
+        let gguf = cache_model_path(tmp.path(), "org/m", QuantType::Q4_K_M).unwrap();
+        fs::remove_file(&gguf).unwrap();
+        let err = cache
+            .verify_quantized("org/m", QuantType::Q4_K_M)
+            .expect_err("missing gguf must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("missing on disk"), "msg: {msg}");
+    }
+
+    // ── SourceShard::from_integrity adapter ─────────────────────────────
+
+    #[test]
+    fn source_shard_adapter_copies_all_fields_and_stamps_timestamp() {
+        let integ = crate::input::integrity::ShardIntegrity {
+            filename: "model.safetensors".into(),
+            bytes: 4096,
+            sha256: Some("d".repeat(64)),
+            hf_etag: "d".repeat(64),
+            is_lfs: true,
+        };
+        let s = SourceShard::from_integrity(&integ);
+        assert_eq!(s.filename, integ.filename);
+        assert_eq!(s.bytes, integ.bytes);
+        assert_eq!(s.sha256, integ.sha256);
+        assert_eq!(s.hf_etag, integ.hf_etag);
+        assert_eq!(s.is_lfs, integ.is_lfs);
+        assert!(s.verified_at_secs > 0);
     }
 }
