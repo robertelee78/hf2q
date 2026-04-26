@@ -23,4 +23,5 @@
 //! `src/quantize/`.
 
 pub mod cache;
+pub mod calibrator;
 pub mod imatrix;
