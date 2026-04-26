@@ -173,6 +173,42 @@ pub struct InvestigationEnv {
     pub dump_prompt_tokens: bool,
 
     // ========================================================================
+    // Category 4 — Gate H release-check companion plumbing (ADR-007 §853-866).
+    // Three env vars that the audit binaries (iter23/24/25_audit.rs) set on
+    // the hf2q child process; iter-108a wires them through the production
+    // decode loop in `forward_mlx::forward_decode` so iter-108b can replace
+    // the audit-binary harness with a release-check.sh-driven Gate 5 run.
+    // All three are diagnostic-only — emit-only or token-replay; none touch
+    // model weights or alter forward-pass math beyond replacing the *picked*
+    // token (logits stay live for cosine/NLL capture).
+    // ========================================================================
+    /// `HF2Q_EMIT_NLL=1` — after each decoded-token's logits are computed,
+    /// compute and emit the per-token NLL on stderr in the format
+    /// `[HF2Q_NLL] step=<N> token=<X> nll=<Y>`. The format is the contract
+    /// consumed by `iter25_audit.rs::parse_nll_values` for PPL aggregation.
+    /// Original parse: `map_or(false, |v| v == "1")`.
+    pub emit_nll: bool,
+
+    /// `HF2Q_DECODE_EMIT_TOKENS=1` — after each decode iteration, emit the
+    /// picked token on stderr in the format
+    /// `[HF2Q_DECODE_EMIT] step=<N> token=<X>`. The format is the contract
+    /// consumed by `iter23/24/25_audit.rs::parse_emitted_tokens`.
+    /// Original parse: `map_or(false, |v| v == "1")`.
+    pub decode_emit_tokens: bool,
+
+    /// `HF2Q_DECODE_INPUT_TOKENS=<space-separated u32 list>` — replay fixed
+    /// tokens overriding the on-GPU argmax (and any rerank). When set, for
+    /// step `i < replay.len()` the decode loop returns `replay[i]` instead
+    /// of the sampler's pick. After the replay buffer is exhausted, control
+    /// falls through to the normal sampler. The argmax/rerank still runs
+    /// (so cosine/NLL captures see live logits) — only the *picked* token
+    /// is overridden.  Format mirrors the audit-binary contract:
+    /// `iter23_audit.rs:206-216` writes the env var as
+    /// `dense_tokens.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")`.
+    /// Empty / unparsable entries are silently skipped.
+    pub decode_input_tokens: Vec<u32>,
+
+    // ========================================================================
     // Category 4 — timing/profiling attribution (no effect on output).
     // ========================================================================
     /// `HF2Q_MLX_TIMING` — log per-token encode/gpu_wait times etc.
@@ -280,6 +316,11 @@ impl InvestigationEnv {
             dump_tq_layers_list: env_usize_list("HF2Q_DUMP_LAYERS_LIST"),
             dump_rendered_prompt: env::var("HF2Q_DUMP_RENDERED_PROMPT").ok(),
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),
+
+            // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
+            emit_nll: env_eq_one("HF2Q_EMIT_NLL"),
+            decode_emit_tokens: env_eq_one("HF2Q_DECODE_EMIT_TOKENS"),
+            decode_input_tokens: env_u32_list_space("HF2Q_DECODE_INPUT_TOKENS"),
 
             // Profiling / timing.
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
@@ -534,6 +575,18 @@ fn env_usize_list(name: &str) -> Vec<usize> {
     env::var(name).ok()
         .filter(|v| !v.is_empty())
         .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Parses `HF2Q_DECODE_INPUT_TOKENS="123 456 789"` as a `Vec<u32>`.
+/// Returns an empty Vec if the env var is unset or empty.  Whitespace
+/// is the separator (matching `iter23_audit.rs:207`'s `.join(" ")`);
+/// unparsable entries are silently skipped so the replay simply ends
+/// at the first malformed token (rather than blowing up the whole run).
+fn env_u32_list_space(name: &str) -> Vec<u32> {
+    env::var(name).ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split_whitespace().filter_map(|s| s.parse::<u32>().ok()).collect())
         .unwrap_or_default()
 }
 

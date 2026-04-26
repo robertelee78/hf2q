@@ -527,6 +527,14 @@ pub struct MlxModelWeights {
     /// Layout: `[nkv_heads, capacity, head_dim]` U8 (1 byte per element).
     /// Norms: same layout as 4-bit caches (D=256: 1 norm/pos, D=512: 2/pos).
     pub leg_hb_encoded: Option<Vec<HbKvBuffers>>,
+    /// Per-instance decode-step counter for the Gate H stderr emit lines.
+    ///
+    /// Increments on every successful `forward_decode`.  The audit-binary
+    /// contract (`iter25_audit.rs::parse_nll_values`) sorts by `step=`,
+    /// so a monotonic 0-based counter is the right shape.  Reset to 0
+    /// at construction; iter-108b's runtime regime toggle also resets
+    /// it between regimes.
+    pub decode_step: u64,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -975,6 +983,10 @@ impl MlxModelWeights {
             leg_f_kvs: None,
             leg_f_sdpa_tmp: None,
             leg_hb_encoded: None,
+            // ADR-007 Gate H release-check counter — increments per
+            // forward_decode call, used by the `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]`
+            // stderr lines (W12 iter-108a blocker #1).
+            decode_step: 0,
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -3141,7 +3153,78 @@ impl MlxModelWeights {
             p.total_us = token_start.elapsed().as_secs_f64() * 1e6;
         }
 
-        Ok(token_id)
+        // -----------------------------------------------------------------
+        // ADR-007 Gate H release-check plumbing (W12 iter-108a blocker #1).
+        //
+        // Three coupled hooks, gated by env vars cached at process start:
+        //
+        //   HF2Q_DECODE_INPUT_TOKENS  → replay fixed tokens (override pick).
+        //                               The argmax + Q8 rerank above already
+        //                               ran, so cosine/NLL captures see live
+        //                               logits — only the *picked* token is
+        //                               replaced.  Falls through to the
+        //                               sampler's pick once the replay is
+        //                               exhausted.
+        //   HF2Q_EMIT_NLL             → emit `[HF2Q_NLL] step=N token=X
+        //                               nll=Y` per token (matches the audit
+        //                               binaries' `parse_nll_values` regex).
+        //                               The NLL is computed on the FINAL
+        //                               picked token (post-replay), so a
+        //                               TQ-active run replaying dense
+        //                               tokens reports each replayed
+        //                               token's NLL under the TQ logits —
+        //                               this is the ADR-007 Gate C PPL
+        //                               input shape.
+        //   HF2Q_DECODE_EMIT_TOKENS   → emit `[HF2Q_DECODE_EMIT] step=N
+        //                               token=X` per token (matches
+        //                               `parse_emitted_tokens`).
+        //
+        // All three were previously honored only by the audit-binary
+        // wrappers (`src/bin/iter2{3,4,5}_audit.rs`) shelling out to a
+        // separate hf2q subprocess; per-token NLL/replay never reached the
+        // production decode path.  iter-108b will replace the audit
+        // binaries with a release-check.sh-driven Gate 5; for that to
+        // work, the production binary itself must honor the contract.
+        // -----------------------------------------------------------------
+        let env = &*INVESTIGATION_ENV;
+        let step = self.decode_step;
+        // Replay first — substitute picked token before NLL/emit so both
+        // downstream observers see the SAME token id (otherwise a replay
+        // run would emit replay tokens but NLL the original argmax pick).
+        let final_token = if !env.decode_input_tokens.is_empty()
+            && (step as usize) < env.decode_input_tokens.len()
+        {
+            env.decode_input_tokens[step as usize]
+        } else {
+            token_id
+        };
+        if env.emit_nll {
+            // token_nll_from_logits asserts token_id < vocab_size; replay
+            // tokens come from the user, so guard against an out-of-vocab
+            // entry rather than panicking the whole decode loop.
+            if (final_token as usize) < self.vocab_size {
+                match self.token_nll_from_logits(final_token) {
+                    Ok(nll) => eprintln!(
+                        "[HF2Q_NLL] step={step} token={final_token} nll={nll:.6}"
+                    ),
+                    Err(e) => eprintln!(
+                        "[HF2Q_NLL] step={step} token={final_token} error={e}"
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "[HF2Q_NLL] step={step} token={final_token} \
+                     error=token_id_out_of_vocab vocab_size={}",
+                    self.vocab_size
+                );
+            }
+        }
+        if env.decode_emit_tokens {
+            eprintln!("[HF2Q_DECODE_EMIT] step={step} token={final_token}");
+        }
+        self.decode_step = self.decode_step.saturating_add(1);
+
+        Ok(final_token)
     }
 
     // forward_prefill() is defined in forward_prefill.rs (ADR-009 Track 1).
@@ -4018,6 +4101,129 @@ impl MlxModelWeights {
         Ok(-log_prob as f32)
     }
 
+}
+
+/// Cosine similarity dot/(||a||·||b||) for two equal-length F32 vectors.
+///
+/// Returns NaN if either norm is zero; otherwise a value in [-1, 1].
+/// The dot and per-vector norms are accumulated in F64 for numerical
+/// stability against the long SDPA-output vectors Gate H feeds it
+/// (the iter-23/24 dump pattern is `[num_heads * head_dim] = 8192 +`
+/// elements per pair, where naive F32 accumulation can lose ~1 ULP per
+/// multiplied pair → measurable cosine drift for vectors near 1.0).
+/// The final ratio is cast back to F32 for downstream comparisons.
+///
+/// # Purpose
+///
+/// Pure-Rust port of `src/bin/iter24_audit.rs:752-789`'s numpy-cosine
+/// kernel.  Clears blocker #2 in W12's iter-108a scope: the audit
+/// binaries shell out to a `cosine_sim.py` script for the SDPA-output
+/// cosine — that violates `feedback_hf2q_sovereignty.md` ("no Python
+/// at runtime") and blocks Gate H from running release-check-side.
+///
+/// # ADR-007 Gate H lineage
+///
+/// Used as the inner kernel for the Gate H cosine-similarity check
+/// (see ADR-007 close §853-866: "cosine similarity at SDPA outputs",
+/// p1-percentile gate ≥ 0.998, mean ≥ 0.9998).  iter-108b will wire
+/// it into release-check.sh's two-regime byte-validation harness;
+/// for now the audit binaries can drop their Python detour by
+/// calling this function directly.
+///
+/// # Errors
+///
+/// Debug-asserts on length mismatch; release builds silently use
+/// the shorter length.  Inputs of unequal length are an upstream
+/// contract violation — the caller is expected to be passing two
+/// dumps of the same SDPA-output shape.
+///
+/// (Wired by iter-108b's release-check.sh Gate 5 harness; the audit
+/// binaries iter23/24_audit.rs will switch from `python3 cosine_sim.py`
+/// to a direct call into this function in iter-108b.  No in-tree
+/// caller as of iter-108a — the surface is designed for the iter-108b
+/// release-check entry point + the unit tests below.)
+#[allow(dead_code)]
+pub fn cosine_pairwise_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "cosine vectors must match length");
+    let n = a.len().min(b.len());
+    let mut dot: f64 = 0.0;
+    let mut na2: f64 = 0.0;
+    let mut nb2: f64 = 0.0;
+    for i in 0..n {
+        let x = a[i] as f64;
+        let y = b[i] as f64;
+        dot += x * y;
+        na2 += x * x;
+        nb2 += y * y;
+    }
+    let na = na2.sqrt();
+    let nb = nb2.sqrt();
+    if na == 0.0 || nb == 0.0 {
+        f32::NAN
+    } else {
+        (dot / (na * nb)) as f32
+    }
+}
+
+#[cfg(test)]
+mod cosine_tests {
+    use super::cosine_pairwise_f32;
+
+    #[test]
+    fn identity_is_one() {
+        let a = vec![1.0_f32, 2.0, 3.0, -4.5, 0.25];
+        let s = cosine_pairwise_f32(&a, &a);
+        assert!((s - 1.0).abs() < 1e-6, "identity cosine = {s}");
+    }
+
+    #[test]
+    fn antiparallel_is_negative_one() {
+        let a: Vec<f32> = (0..128).map(|i| (i as f32) - 64.0).collect();
+        let neg: Vec<f32> = a.iter().map(|x| -x).collect();
+        let s = cosine_pairwise_f32(&a, &neg);
+        assert!((s + 1.0).abs() < 1e-6, "antiparallel cosine = {s}");
+    }
+
+    #[test]
+    fn zero_norm_is_nan() {
+        let a = vec![0.0_f32; 32];
+        let b: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let s = cosine_pairwise_f32(&a, &b);
+        assert!(s.is_nan(), "zero-norm cosine should be NaN, got {s}");
+        // And symmetric: nonzero on the left, zero on the right.
+        let s2 = cosine_pairwise_f32(&b, &a);
+        assert!(s2.is_nan(), "zero-norm cosine (rhs) should be NaN, got {s2}");
+        // Both zero → NaN.
+        let z = vec![0.0_f32; 32];
+        let s3 = cosine_pairwise_f32(&z, &z);
+        assert!(s3.is_nan(), "both-zero cosine should be NaN, got {s3}");
+    }
+
+    #[test]
+    fn orthogonal_is_zero() {
+        // [1,0,0,...] vs [0,1,0,...] → dot=0, both norms=1 → cosine=0.
+        let mut a = vec![0.0_f32; 16];
+        let mut b = vec![0.0_f32; 16];
+        a[0] = 1.0;
+        b[1] = 1.0;
+        let s = cosine_pairwise_f32(&a, &b);
+        assert!(s.abs() < 1e-6, "orthogonal cosine = {s}");
+    }
+
+    #[test]
+    fn matches_python_reference_within_tolerance() {
+        // Reference shape: same kernel as iter24_audit.rs:752-761 in F64.
+        // We compare against the explicit numpy-style formula to make sure
+        // our F64 accumulation tracks the audit-binary numbers.
+        let a: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let b: Vec<f32> = (0..512).map(|i| ((i as f32) * 0.013).sin() + 1e-3).collect();
+        let s = cosine_pairwise_f32(&a, &b);
+        let py_dot: f64 = a.iter().zip(&b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let py_na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let py_nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        let py = (py_dot / (py_na * py_nb)) as f32;
+        assert!((s - py).abs() < 1e-6, "rust cosine={s} vs python-equiv={py}");
+    }
 }
 
 /// Helper: load a GGUF tensor as raw quantized bytes into an MlxQWeight.
