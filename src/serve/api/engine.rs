@@ -1456,8 +1456,9 @@ fn generate_stream_once(
     //
     // Composition: the engine runs ReasoningSplitter first; any
     // `Content`-classified output then flows into ToolCallSplitter. Reasoning
-    // never appears inside a tool call — neither chat template emits
-    // `<|think|>` between tool-call markers — so this layering is safe.
+    // never appears inside a tool call — neither chat template emits a
+    // reasoning-open marker (Gemma 4 `<|channel>` or Qwen 3.5/3.6 `<think>`)
+    // between tool-call markers — so this layering is safe.
     let mut tool_splitter = registration
         .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
     // Per-call body accumulator + per-stream tool-call index. Body is

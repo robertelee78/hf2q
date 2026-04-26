@@ -3,11 +3,15 @@
 //!
 //! Each supported model family registers the literal text markers its chat
 //! template emits for:
-//!   - **Reasoning boundaries** — `<|think|>` / `</think|>` style markers
-//!     that delimit pre-answer reasoning traces. Tokens between the open
-//!     and close markers go into `message.reasoning_content`;
-//!     the rest goes into `message.content`. Streaming splits into
-//!     `delta.reasoning_content` vs `delta.content` the same way.
+//!   - **Reasoning boundaries** — open/close marker pair that delimits
+//!     pre-answer reasoning traces. Tokens between the open and close markers
+//!     go into `message.reasoning_content`; the rest goes into
+//!     `message.content`. Streaming splits into `delta.reasoning_content`
+//!     vs `delta.content` the same way. Per-family marker shapes vary:
+//!     Qwen 3.5/3.6 emits the standard `<think>` / `</think>` HF convention;
+//!     Gemma 4 emits its `<|channel>` / `<channel|>` channel-block convention
+//!     (matches the chat-template `strip_thinking` macro and the
+//!     tokenizer_config `x-regex` that spans `<|channel>thought\n…<channel|>`).
 //!   - **Tool-call boundaries** — markers delimiting a grammar-constrained
 //!     JSON tool-call fragment. Applied by the engine in a later iter when
 //!     the grammar sampler is wired into the decode loop.
@@ -85,26 +89,44 @@ impl ModelRegistration {
 // Built-in registrations (day-one models)
 // ---------------------------------------------------------------------------
 
-/// Gemma 4 (26B / A4B / variants). Uses `<|think|>` / `</think|>` for
-/// reasoning spans (matches the in-template marker `<|think|>` hardcoded in
-/// `FALLBACK_GEMMA4_CHAT_TEMPLATE`). Tool calling uses the literal Gemma 4
-/// in-template markers `<|tool_call>` (open) and `<tool_call|>` (close);
-/// note the asymmetric pipe placement — see
-/// `models/gemma4/chat_template.jinja:189-203`.
+/// Gemma 4 (26B / A4B / variants). Uses `<|channel>` / `<channel|>` for
+/// reasoning spans — the asymmetric channel-block convention emitted by the
+/// model whenever it produces a thinking trace
+/// (`<|channel>thought\n…<channel|>`; see `models/gemma-4-26B-A4B-it-ara-abliterated-dwq/chat_template.jinja:141-151`'s
+/// `strip_thinking` macro and `tokenizer_config.json` `x-regex`
+/// `\<\|channel\>thought\n(?P<thinking>.*?)\<channel\|\>`). Tool calling
+/// uses the parallel `<|tool_call>` / `<tool_call|>` shape — note the
+/// asymmetric pipe placement on both pairs (see chat_template lines 189-203).
 ///
-/// **Marker shape audit (2026-04-26 W66 iter-133 Iter B-2):** Pre-fix this
-/// entry declared `<tool_call>` / `</tool_call>` (the Qwen convention). The
-/// gemma-4 GGUF chat template actually emits `<|tool_call>call:NAME{...}<tool_call|>`,
-/// not `<tool_call>...</tool_call>`. Real-model fixture
-/// `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt`
+/// **Marker shape audit (2026-04-26 W66 iter-133 Iter B-2):** the tool-call
+/// pair was previously declared as `<tool_call>` / `</tool_call>` (the Qwen
+/// convention). The gemma-4 GGUF chat template actually emits
+/// `<|tool_call>call:NAME{...}<tool_call|>`, not `<tool_call>...</tool_call>`.
+/// Real-model fixture `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt`
 /// (W65 iter-133 Iter B) confirmed the literal mismatch. Iter B-2 fixed
 /// the registration to match the in-template strings so the engine's
 /// `ToolCallSplitter` actually detects what the model emits.
+///
+/// **Reasoning marker audit (2026-04-26 W67 iter-133 Iter D):** same
+/// bug-class as the iter-B-2 tool-call fix. The reasoning pair was
+/// previously declared as `<|think|>` / `</think|>` — both wrong. The
+/// `<|think|>` literal is the system-block thinking-hint emitted only when
+/// `enable_thinking=true` is passed to the chat template (chat_template:162);
+/// it is not the runtime reasoning-emission boundary. The actual emission
+/// pair (consulted authoritatively by `strip_thinking` and the
+/// tokenizer_config `x-regex`) is `<|channel>` (open; aliased `soc_token`
+/// in tokenizer_config:87) / `<channel|>` (close; aliased `eoc_token` in
+/// tokenizer_config:8,28). This iter corrects the registration so the
+/// engine's `ReasoningSplitter` detects what the model emits during decode
+/// (any `<|channel>thought\n…<channel|>` block the model produces gets
+/// routed to `delta.reasoning_content`; the literal `thought\n` channel
+/// identifier remains visible inside the routed reasoning text by design,
+/// mirroring `strip_thinking`'s scope).
 pub const GEMMA4: ModelRegistration = ModelRegistration {
     family: "gemma4",
     id_substrings: &["gemma-4", "gemma4"],
-    reasoning_open: Some("<|think|>"),
-    reasoning_close: Some("</think|>"),
+    reasoning_open: Some("<|channel>"),
+    reasoning_close: Some("<channel|>"),
     tool_open: Some("<|tool_call>"),
     tool_close: Some("<tool_call|>"),
     tool_preamble: None,
@@ -750,16 +772,49 @@ mod tests {
     fn gemma4_has_reasoning_and_tools() {
         assert!(GEMMA4.has_reasoning());
         assert!(GEMMA4.has_tools());
-        assert_eq!(GEMMA4.reasoning_open, Some("<|think|>"));
-        assert_eq!(GEMMA4.reasoning_close, Some("</think|>"));
+        // Iter D W67: the reasoning pair is the runtime `<|channel>` /
+        // `<channel|>` channel-block convention (matches `strip_thinking`
+        // and tokenizer_config.json `x-regex`), NOT the `<|think|>` /
+        // `</think|>` literal which is the prompt-side thinking-mode hint.
+        assert_eq!(GEMMA4.reasoning_open, Some("<|channel>"));
+        assert_eq!(GEMMA4.reasoning_close, Some("<channel|>"));
+    }
+
+    /// Iter D W67: lock in the corrected Gemma 4 reasoning markers — same
+    /// bug-class as iter B-2's tool-call fix. The chat-template
+    /// `strip_thinking` macro authoritatively defines the reasoning span as
+    /// `<|channel>` … `<channel|>` (text.split('<channel|>') THEN look for
+    /// `'<|channel>' in part`); the tokenizer_config `x-regex` confirms the
+    /// emission shape. Pre-fix the registry declared `<|think|>` /
+    /// `</think|>`, the system-side thinking-mode hint, which the model
+    /// never emits as a runtime delimiter — so the splitter would never
+    /// detect a real Gemma 4 reasoning span.
+    #[test]
+    fn gemma4_reasoning_markers_match_chat_template_emission() {
+        // Authoritative reference: chat_template.jinja `strip_thinking`
+        // splits on `<channel|>` then trims `<|channel>...` prefix from
+        // each part. Same pair the runtime tokens emit.
+        assert_eq!(GEMMA4.reasoning_open, Some("<|channel>"));
+        assert_eq!(GEMMA4.reasoning_close, Some("<channel|>"));
+        // Cross-check: tokenizer_config.json declares `soc_token` =
+        // `<|channel>` and `eoc_token` = `<channel|>`; these are the
+        // canonical channel-block delimiters Gemma 4 emits.
+        assert_eq!(GEMMA4.reasoning_open.unwrap(), "<|channel>");
+        assert_eq!(GEMMA4.reasoning_close.unwrap(), "<channel|>");
     }
 
     #[test]
     fn qwen35_has_different_reasoning_markers() {
-        // Regression: don't conflate gemma's `<|think|>` with qwen's `<think>`.
+        // Regression: don't conflate Qwen's `<think>` / `</think>` HF
+        // convention with Gemma's asymmetric `<|channel>` / `<channel|>`
+        // channel-block convention.
         assert_ne!(
             GEMMA4.reasoning_open,
             QWEN35.reasoning_open
+        );
+        assert_ne!(
+            GEMMA4.reasoning_close,
+            QWEN35.reasoning_close
         );
     }
 
@@ -803,8 +858,10 @@ mod tests {
 
     #[test]
     fn splitter_single_reasoning_span() {
-        // Use real gemma markers: `<|think|>` open, `</think|>` close.
-        let out = split(&GEMMA4, "pre <|think|>because</think|> post");
+        // Use real gemma markers: `<|channel>` open, `<channel|>` close
+        // (iter D W67 corrected from the previous `<|think|>` / `</think|>`
+        // declaration that the model never emits at runtime).
+        let out = split(&GEMMA4, "pre <|channel>because<channel|> post");
         assert_eq!(
             out,
             vec![
@@ -817,7 +874,7 @@ mod tests {
 
     #[test]
     fn splitter_open_without_close_reasoning_continues_to_end() {
-        let out = split(&GEMMA4, "pre <|think|>still thinking");
+        let out = split(&GEMMA4, "pre <|channel>still thinking");
         assert_eq!(
             out,
             vec![
@@ -829,11 +886,11 @@ mod tests {
 
     #[test]
     fn splitter_marker_spans_fragment_boundary() {
-        // The open marker `<|think|>` is 9 bytes. Feeding it in two
+        // The open marker `<|channel>` is 10 bytes; feeding it in two
         // fragments should still detect it via the sliding tail buffer.
         let mut sp = ReasoningSplitter::from_registration(&GEMMA4).unwrap();
-        let a = sp.feed("before <|th");
-        let b = sp.feed("ink|>reasoning</think|>after");
+        let a = sp.feed("before <|chan");
+        let b = sp.feed("nel>reasoning<channel|>after");
         let c = sp.finish();
         let mut all: Vec<(SplitSlot, String)> = Vec::new();
         all.extend(a);
@@ -856,7 +913,7 @@ mod tests {
     fn splitter_multiple_reasoning_spans() {
         let out = split(
             &GEMMA4,
-            "a<|think|>b</think|>c<|think|>d</think|>e",
+            "a<|channel>b<channel|>c<|channel>d<channel|>e",
         );
         let joined = coalesce(&out);
         assert_eq!(
@@ -867,6 +924,27 @@ mod tests {
                 (SplitSlot::Content, "c".into()),
                 (SplitSlot::Reasoning, "d".into()),
                 (SplitSlot::Content, "e".into()),
+            ]
+        );
+    }
+
+    /// Iter D W67: realistic Gemma 4 emission — the model produces
+    /// `<|channel>thought\n[REASONING_TEXT]<channel|>[ANSWER]` per the
+    /// tokenizer_config `x-regex`. The literal `thought\n` channel
+    /// identifier is part of the routed reasoning span (`strip_thinking`
+    /// preserves the channel name), and the post-close run is content.
+    #[test]
+    fn splitter_gemma4_realistic_thought_channel_emission() {
+        let out = split(
+            &GEMMA4,
+            "<|channel>thought\nlet me compute 73 * 47<channel|>The answer is 3431",
+        );
+        let joined = coalesce(&out);
+        assert_eq!(
+            joined,
+            vec![
+                (SplitSlot::Reasoning, "thought\nlet me compute 73 * 47".into()),
+                (SplitSlot::Content, "The answer is 3431".into()),
             ]
         );
     }
@@ -897,10 +975,11 @@ mod tests {
 
     #[test]
     fn split_full_output_helper_returns_both_slots() {
-        // Two reasoning spans with real Gemma markers.
+        // Two reasoning spans with real Gemma markers (iter D W67:
+        // `<|channel>` / `<channel|>` per `strip_thinking`).
         let (content, reasoning) = split_full_output(
             &GEMMA4,
-            "a <|think|>r1</think|> b <|think|>r2</think|> c",
+            "a <|channel>r1<channel|> b <|channel>r2<channel|> c",
         );
         assert_eq!(content, "a  b  c");
         assert_eq!(reasoning.as_deref(), Some("r1r2"));

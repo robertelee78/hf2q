@@ -20,16 +20,21 @@
 //! # Test fixture model
 //!
 //! Reasoning markers per family (`src/serve/api/registry.rs`):
-//!   * `gemma4`  → `<|think|>` / `</think|>`
-//!   * `qwen35`  → `<think>` / `</think>` (covers Qwen 3.5 + 3.6)
+//!   * `gemma4`  → `<|channel>` / `<channel|>` (channel-block convention,
+//!     matches the chat-template `strip_thinking` macro and the
+//!     tokenizer_config `x-regex`; iter D W67 corrected from the
+//!     pre-fix `<|think|>` / `</think|>` declaration which was the
+//!     system-side thinking-hint, not the runtime emission boundary)
+//!   * `qwen35`  → `<think>` / `</think>` (HF convention, covers
+//!     Qwen 3.5 + 3.6)
 //!
-//! Iter C defaults to a **Qwen 3.6** GGUF because Qwen 3.5/3.6's
-//! `<think>` / `</think>` markers exactly match the registry's QWEN35
-//! entry and the standard HF reasoning convention. Gemma 4's actual
-//! emission shape (`<|channel>thought\n<channel|>...<channel|>`) is
-//! more nuanced and does NOT map cleanly to the registry's
-//! `<|think|>` / `</think|>` declaration; using gemma-4 here would
-//! conflate registry correctness with model-emission correctness.
+//! Iter C defaults to a **Qwen 3.6** GGUF because the QWEN35 markers
+//! are the standard HF reasoning convention and the model is the
+//! canonical reasoning fixture. Iter D added Gemma 4 as a viable
+//! override target via `HF2Q_REASONING_TEST_MODEL=<gemma-4-gguf>` once
+//! the registry's GEMMA4 markers were corrected to match the actual
+//! channel-block emission. Either model exercises the same engine
+//! splitter path.
 //!
 //! Override via `HF2Q_REASONING_TEST_MODEL=<path-to-gguf>` for any
 //! other reasoning-capable cached model.
@@ -305,7 +310,25 @@ fn openwebui_reasoning_streaming_scenario_3() {
     // A bug in the splitter (e.g. tail-buffer race) would surface
     // here.
     // -----------------------------------------------------------------
-    let reasoning_markers = ["<think>", "</think>", "<|think|>", "</think|>"];
+    // All registered reasoning marker pairs across model families. The
+    // splitter swallows whichever pair its registration declares; the
+    // others must also never leak (a bug routing the wrong family's
+    // markers as content would surface here).
+    //   * Qwen 3.5/3.6: `<think>` / `</think>` (HF convention)
+    //   * Gemma 4 (iter D W67): `<|channel>` / `<channel|>` (channel-block)
+    //   * Pre-iter-D legacy: `<|think|>` / `</think|>` (must never appear —
+    //     these were the wrong-but-registered markers Gemma's
+    //     ReasoningSplitter would have looked for; if the splitter still
+    //     uses them somehow they'd surface as "leakage" by virtue of being
+    //     swallowed without effect — keep the assertion to lock the fix in).
+    let reasoning_markers = [
+        "<think>",
+        "</think>",
+        "<|think|>",
+        "</think|>",
+        "<|channel>",
+        "<channel|>",
+    ];
     for m in &reasoning_markers {
         assert!(
             !cap.accumulated_content.contains(*m),
