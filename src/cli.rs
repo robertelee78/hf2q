@@ -89,6 +89,59 @@ pub enum Command {
 
     /// ADR-012 Decision 16 — end-gate smoke test for a registered arch
     Smoke(SmokeArgs),
+
+    /// Manage the local model cache (`~/.cache/hf2q/`).
+    ///
+    /// `hf2q cache list` enumerates cached models. `hf2q cache size`
+    /// totals on-disk bytes. `hf2q cache clear` invalidates entries
+    /// (single quant, all quants for one model, or the entire cache).
+    /// All clear operations atomically rewrite the cache manifest;
+    /// concurrent serves observe coherent before/after state.
+    Cache(CacheArgs),
+}
+
+/// Top-level args for `hf2q cache`. The actual surface is split into
+/// `CacheAction` subcommands (clap convention shared with `parity`).
+#[derive(clap::Args, Debug)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub action: CacheAction,
+}
+
+/// `hf2q cache` subcommands. ADR-005 Phase 3 iter-205 (AC line 5351).
+#[derive(Subcommand, Debug)]
+pub enum CacheAction {
+    /// List cached models with their quantizations and on-disk sizes.
+    List,
+
+    /// Print the total on-disk size of the cache.
+    Size,
+
+    /// Clear cache entries — single (model, quant), all quants for
+    /// one model, or the entire cache (`--all --yes`).
+    Clear {
+        /// HF repo-id of the model whose cache entry to clear
+        /// (e.g. `google/gemma-4-27b-it`). Required unless `--all`.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Limit removal to a single quantization (`Q8_0`, `Q6_K`,
+        /// `Q4_K_M`, `Q3_K_M`). When omitted with `--model`, every
+        /// quant cached for that model is removed (plus the model dir
+        /// `source/` and `repo_meta.json`).
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Clear every cached model. Refuses without `--yes` to
+        /// prevent accidental wipes (the entire on-disk cache is
+        /// removed; manifest is reset to empty).
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Confirm a destructive operation. Required by `--all`.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone)]

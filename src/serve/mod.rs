@@ -1512,6 +1512,156 @@ async fn shutdown_signal() {
     }
 }
 
+/// Run the `cache` subcommand (ADR-005 Phase 3 iter-205, AC line 5351).
+///
+/// Three actions:
+/// - `cache list`  — enumerate cached models + quants + on-disk size.
+/// - `cache size`  — total bytes used by the cache.
+/// - `cache clear` — invalidate entries (single quant, whole repo, or all).
+///
+/// Output is human-readable text on stdout; errors go through stderr
+/// via the standard `Result` plumbing.  Bytes-freed is reported back
+/// to the operator from the on-disk walk performed before removal.
+///
+/// Safety:
+/// - `--all` requires `--yes` (refuses with a named error otherwise).
+/// - Without `--model` and without `--all`, prints the usage and
+///   exits with `Err` (not a silent no-op — the operator likely
+///   intended one of the two).
+pub fn cmd_cache(args: cli::CacheArgs) -> Result<()> {
+    use cli::CacheAction;
+
+    let mut cache = cache::ModelCache::open()
+        .context("open model cache")?;
+    match args.action {
+        CacheAction::List => cmd_cache_list(&cache),
+        CacheAction::Size => cmd_cache_size(&cache),
+        CacheAction::Clear {
+            model,
+            quant,
+            all,
+            yes,
+        } => cmd_cache_clear(&mut cache, model, quant, all, yes),
+    }
+}
+
+fn cmd_cache_list(cache: &cache::ModelCache) -> Result<()> {
+    let entries: Vec<_> = cache.iter_entries().collect();
+    if entries.is_empty() {
+        println!("(cache empty — root: {})", cache.root().display());
+        return Ok(());
+    }
+    println!("hf2q cache @ {}", cache.root().display());
+    println!(
+        "{:<48} {:<10} {:>12} {:>20}",
+        "MODEL", "QUANT", "BYTES", "LAST_ACCESSED"
+    );
+    for view in &entries {
+        if view.model.quantizations.is_empty() {
+            // Source recorded but no quants yet (an in-flight or
+            // failed quantize); render the model row with `(none)`
+            // so it's visible to `cache list`.
+            println!(
+                "{:<48} {:<10} {:>12} {:>20}",
+                view.repo_id,
+                "(none)",
+                "-",
+                view.model.last_accessed_secs,
+            );
+            continue;
+        }
+        for (quant, qe) in &view.model.quantizations {
+            println!(
+                "{:<48} {:<10} {:>12} {:>20}",
+                view.repo_id,
+                quant,
+                qe.bytes,
+                view.model.last_accessed_secs,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cache_size(cache: &cache::ModelCache) -> Result<()> {
+    let total = cache.total_bytes_on_disk();
+    println!(
+        "hf2q cache @ {} — {} bytes ({:.2} GiB)",
+        cache.root().display(),
+        total,
+        total as f64 / (1u64 << 30) as f64,
+    );
+    Ok(())
+}
+
+fn cmd_cache_clear(
+    cache: &mut cache::ModelCache,
+    model: Option<String>,
+    quant: Option<String>,
+    all: bool,
+    yes: bool,
+) -> Result<()> {
+    use crate::serve::quant_select::QuantType;
+
+    // Sanity: cannot mix --all with --model / --quant.  Refusing here
+    // (rather than silently picking one path) prevents an operator
+    // from running `cache clear --model x --all --yes` and being
+    // surprised which one won.
+    if all && (model.is_some() || quant.is_some()) {
+        return Err(anyhow::anyhow!(
+            "hf2q cache clear: --all is mutually exclusive with --model / --quant"
+        ));
+    }
+    if !all && model.is_none() {
+        return Err(anyhow::anyhow!(
+            "hf2q cache clear: must specify --model <repo-id> [--quant <type>] \
+             OR --all --yes (the latter purges every cached model)"
+        ));
+    }
+
+    if all {
+        if !yes {
+            return Err(anyhow::anyhow!(
+                "hf2q cache clear --all: refused without --yes \
+                 (this would remove every cached model under {})",
+                cache.root().display()
+            ));
+        }
+        let freed = cache.purge().context("purge cache")?;
+        println!(
+            "hf2q cache: purged ({} bytes / {:.2} GiB freed)",
+            freed,
+            freed as f64 / (1u64 << 30) as f64,
+        );
+        return Ok(());
+    }
+
+    // --model is set (validated above).  --quant optional.
+    let repo = model.expect("validated above");
+    if let Some(q_str) = quant {
+        let q = QuantType::from_canonical_str(&q_str)
+            .map_err(|e| anyhow::anyhow!("--quant: {}", e))?;
+        let freed = cache
+            .invalidate(&repo, q)
+            .with_context(|| format!("clear {}@{}", repo, q.as_str()))?;
+        println!(
+            "hf2q cache: cleared {}@{} ({} bytes freed)",
+            repo,
+            q.as_str(),
+            freed
+        );
+    } else {
+        let freed = cache
+            .invalidate_repo(&repo)
+            .with_context(|| format!("clear {} (all quants)", repo))?;
+        println!(
+            "hf2q cache: cleared {} (all quants — {} bytes freed)",
+            repo, freed
+        );
+    }
+    Ok(())
+}
+
 /// Run the `parity` subcommand (ADR-009 Phase 2).
 ///
 /// `parity check` — compare hf2q output against locked reference fixtures.

@@ -192,6 +192,12 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Serve(args) => serve::cmd_serve(args).map_err(AppError::Conversion),
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
         Command::Smoke(args) => cmd_smoke(args),
+        // ADR-005 Phase 3 iter-205 (AC line 5351): operator-facing
+        // cache management.  Errors map to AppError::Input because
+        // every failure surface (unknown_repo, unknown_quant, missing
+        // --yes, mutually-exclusive-flags) is a user-input mistake;
+        // exit-3 is the documented signal.
+        Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
     }
 }
 
