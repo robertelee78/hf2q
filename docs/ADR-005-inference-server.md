@@ -1047,6 +1047,31 @@ W21 landed the Rust + script edits for the ADR-007 §853-866 TQ-active companion
 
 ---
 
+#### Phase 2c iter-113 — preprocess + patch-embed primitives landed (2026-04-26, W23+W23-verify)
+
+W23 implemented the preprocess + patch-embed sibling layer per W22's iter-113-prep scope (no existing SigLIP-49 function modified). Commit `8a845d4` added 1373 lines across 4 files, sibling-only:
+
+| File | LOC (`git diff --stat`) | Surface area |
+|---|---|---|
+| `src/inference/vision/mmproj_weights.rs` | +133 | 3-D `[2, pos_size, hidden]` position-embed table loader |
+| `src/inference/vision/preprocess.rs`     | +449 (+450 / -1) | `preprocess_gemma4v` (variable-resolution patch grid 252-280 tokens, `2x-1` pixel pre-scaling) |
+| `src/inference/vision/vit.rs`            | +325 | `gemma4v_patch_embed_forward` CPU + `gemma4v_position_embed_lookup` + `gemma4v_position_embed_add` |
+| `src/inference/vision/vit_gpu.rs`        | +466 | `gemma4v_patch_embed_gpu` + `gemma4v_position_embed_lookup_gpu` + `gemma4v_apply_position_embed_gpu` (Metal dispatch) |
+
+**Verification (W23-verify, this iter):**
+- `cargo check --release` clean — only 3 pre-existing dead-code warnings in `src/main.rs` (unrelated, owned by concurrent ADR-012 Bug 6 work).
+- `cargo test --release --bin hf2q -- gemma4v` — **20 / 20 PASS** in 0.25 s, including the four named acceptance tests:
+  - `gemma4v_patch_embed_cpu_gpu_parity`
+  - `gemma4v_position_embed_cpu_gpu_parity`
+  - `gemma4v_preprocess_token_budget`
+  - `gemma4v_preprocess_pixel_scaling_2x_minus_1`
+- No `todo!`/`unimplemented!`/stub-panic in any of the 4 files.
+- `compute_vision_embeddings_gpu` still routes the SigLIP-49 path; no arch-profile dispatch wired yet (deferred to iter-118).
+
+**Outstanding for iter-114 (W24):** 2D NeoX RoPE Metal kernel (first-half by pos_x, second-half by pos_y, theta=100) + per-block forward implementing the Gemma4 4-RMSNorm pattern (`input_layernorm → attn → post_attention_layernorm → residual → pre_ff_layernorm → mlp → post_ff_layernorm → residual`). ~700 src + 350 test LOC per W22's table.
+
+---
+
 #### Phase 2c iter-113-prep — gemma4_vision ViT-arch port scope (2026-04-26, W22)
 
 W22 mapped the port from current SigLIP-49 (49 tokens, pool=2×2) to gemma4_vision (≤280 tokens, pool=3×3, GQA, 2D NeoX RoPE, dual position-embed table, Gemma4ClippableLinear projector, GELU(pytorch_tanh) activation). All four reference implementations are LOCAL on disk: `/opt/candle/candle-transformers/src/models/gemma4/vision.rs` (552 lines), `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` (151 lines), `/opt/llama.cpp/convert_hf_to_gguf.py:7804-7879`, `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (rope_theta=100, n_merge=3, image-token-limit 252-280).
