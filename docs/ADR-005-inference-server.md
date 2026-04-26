@@ -1151,6 +1151,70 @@ W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off
 
 ---
 
+#### Phase 2c iter-116f — full vision-namespace audit lands FIVE writer-side tensor name fixes; Phase C now reaches CLIP graph warmup and surfaces a SHAPE-transform blocker (`patch_embd` 2-D vs 4-D), not a name blocker (2026-04-26, W36)
+
+**Background.** iter-116e (W34/W35) found a SECOND vision-namespace mapping gap (`mm.input_projection.weight` projector name) after iter-116d's `attn_out` short form fix unblocked the per-block attention layers. The pattern was iter-by-iter discovery (one mismatch per smoke run). iter-116f flipped the loop: full audit FIRST against `/opt/llama.cpp/tools/mtmd/clip-impl.h` + `clip.cpp` + `gguf-py/gguf/{tensor_mapping,constants}.py`, apply ALL gaps together, single smoke verification.
+
+**Audit method (Phases 1-3).** Cross-referenced llama.cpp's gemma4v CLIP loader expected tensor list (clip.cpp:1640-1694 layer load loop + 1935-1960 PROJECTOR_TYPE_GEMMA4V branch) against hf2q's `vision_layer_map` (`src/backends/gguf.rs:1855-1869`) + `hf_name_to_gguf` static_map (`src/backends/gguf.rs:1817-1832`). Ground-truth name table sourced from `gguf-py/gguf/constants.py:1211-1222` (V_ENC_INPUT_NORM → "v.blk.{bid}.ln1", V_ENC_POST_ATTN_NORM → "v.blk.{bid}.ln2", V_ENC_ATTN_POST_NORM → "v.blk.{bid}.attn_post_norm", V_ENC_FFN_POST_NORM → "v.blk.{bid}.ffn_post_norm", V_MM_INP_PROJ → "mm.input_projection") cross-checked against `gguf-py/gguf/tensor_mapping.py:1517-1635` (HF source → MODEL_TENSOR enum table) and `convert_hf_to_gguf.py:7869-7878` (Gemma4VisionAudioModel HF→GGUF rewrite chain).
+
+**Five gaps identified, all fixed in one writer-side commit.** Per-fix mapping with citation:
+
+| Gap | HF source | Pre-iter-116f emit | Post-iter-116f emit | Citation |
+|---|---|---|---|---|
+| #1 (W34, kept) | `self_attn.o_proj.linear.weight` | `attn_out.weight` ✓ | `attn_out.weight` | `clip-impl.h:82` TN_ATTN_OUTPUT |
+| #2 PROJECTOR | `model.embed_vision.embedding_projection.weight` | `mm.0.weight` | `mm.input_projection.weight` | `clip-impl.h:110` TN_MM_INP_PROJ |
+| #3 4 CLAMP scalars | `embedding_projection.{input_min,input_max,output_min,output_max}` | `mm.0.{...}` | `mm.input_projection.{...}` | `clip.cpp:1941-1959` (substitutes `.weight` → `.input_min` on same projector base) |
+| #4 ATTN POST-NORM | `post_attention_layernorm.weight` | `ln2.weight` | `attn_post_norm.weight` | `tensor_mapping.py:1630` + `constants.py:1218` V_ENC_ATTN_POST_NORM |
+| #5a PRE-FFN NORM | `pre_feedforward_layernorm.weight` | `ffn_norm.weight` | `ln2.weight` | `tensor_mapping.py:1575` (gemma4 → V_ENC_POST_ATTN_NORM = `ln2`) |
+| #5b POST-FFN NORM | `post_feedforward_layernorm.weight` | `post_ffw_norm.weight` | `ffn_post_norm.weight` | `tensor_mapping.py:1634` + `constants.py:1219` V_ENC_FFN_POST_NORM |
+
+Notable: gaps #4 and #5a are paired — gemma4's vision encoder uses a DIFFERENT norm-ordering than gemma4's text decoder. HF's `pre_feedforward_layernorm` IS the vision `ln2` (the second pre-norm in `build_vit`); HF's `post_attention_layernorm` is a SEPARATE post-attention residual norm (`attn_post_norm`). The earlier hf2q mapping conflated these — dropping the post-attention residual norm into `ln2` and the pre-FFN norm into `ffn_norm` (which `build_vit` doesn't load for vision, only for text). Both norms are now consumed by `build_vit` at the correct call sites (`clip.cpp:439` for `attn_post_norm`, `clip.cpp:451` for `ln_2_w`).
+
+**Single writer-side commit.** All 5 fixes committed together to `src/backends/gguf.rs`:
+- `vision_layer_map` (lines 1841-1894) gains 3 norm renames + keeps W34's `attn_out`.
+- `hf_name_to_gguf` static_map (lines 1822-1842) gains projector base + 4 clamp scalar renames.
+- `test_gemma4v_clippable_linear_scalar_bounds_mapping` updated to assert canonical names (was iter-115's `mm.0.*`).
+- Surgical scope per iter-116f spec — no changes outside `src/backends/gguf.rs`. The hf2q-INFERENCE-side reader (`mmproj_weights::mm_0_weight`, `vit.rs:1100`) still looks up the old `mm.0.weight` name; that desync is an existing condition (introduced when W34's `attn_out` landed) and is its own follow-up — the cross-compat smoke does not exercise hf2q's vision forward path.
+
+**Verification (release build, iter-116f).**
+- `cargo check --release` — clean (3 dead-code warnings on `EXIT_SMOKE_*` constants, pre-existing).
+- `cargo test --release --bin hf2q -- backends::gguf` — 32/32 PASS including the renamed `test_gemma4v_clippable_linear_scalar_bounds_mapping`.
+- `cargo build --release --bin hf2q` — clean.
+- Fresh mmproj re-emit (`hf2q convert --emit-vision-tower --skip-quality`, 1m52s wall-clock under quiet host, PID 2455). Output: `/tmp/iter116f-emit/gemma-4-throwaway-mmproj.gguf` (1145 MB, 356 vision tensors). Verified all 5 expected canonical names present in `strings | grep "^mm\.|^v\.blk\.0\."`: `mm.input_projection.weight`, `v.blk.0.attn_out.weight`, `v.blk.0.ln1.weight`, `v.blk.0.ln2.weight`, `v.blk.0.attn_post_norm.weight`, `v.blk.0.ffn_post_norm.weight`. Old `v.blk.{N}.ffn_norm.weight` and `v.blk.{N}.post_ffw_norm.weight` are GONE — semantic collision (post_attention_layernorm + pre_feedforward_layernorm both → `ln2`) resolved.
+- Fixture swap: stale mmproj backed up to `/tmp/iter116f-emit/stale-mmproj.gguf.backup`; fresh fixture installed at canonical `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf`. Chat GGUF SHA `ae19574dab588e0a742a8cfa1282ccf358ed8a58c5a3483f2bf596020a4f8e6f` verified pre+post-swap (Gate D self-baseline intact).
+
+**Phase A+B+C smoke run (HF2Q_LLAMA_MMPROJ_COMPAT=1 + HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1, fresh mmproj):**
+
+| Phase | Result | Detail |
+|---|---|---|
+| A (fixture exists) | PASS | mmproj + chat GGUF on disk |
+| B (GGUF metadata round-trip) | PASS | 356 tensors, arch='clip', 0/4 clamp scalars (publisher-stripped, source-driven) |
+| C (llama-mtmd-cli load + warmup) | FAIL — NEW failure mode | clip_model_loader fully loads all hparams (`projector: gemma4v`, `n_embd: 1152`, `n_head: 16`, `n_ff: 4304`, `n_layer: 27`, `ffn_op: gelu_quick`, `image_size: 224`, `patch_size: 16`, `n_merge: 3`, `model size: 1092.52 MiB`). NO tensor-name lookup fails. Crash at warmup deeper inside `clip_graph_gemma4v::build()` line 12 (`ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1)`): `GGML_ASSERT(a->ne[2] == b->ne[2]) failed` in `ggml_im2col`. |
+
+**Phase C blocker root cause (writer-side data-shape transform — pending iter-116g).** `ggml_conv_2d`'s assert fires when input tensor channels (`a->ne[2]` = 3 for RGB) don't match the kernel's input-channel dim. HF source `model.vision_tower.patch_embedder.input_proj.weight` is a 2-D `[1152, 768]` bf16 tensor (`n_embd × patch²·channels = 1152 × (16×16×3)`). llama.cpp's converter at `convert_hf_to_gguf.py:7873-7877` reshapes it to 4-D `[1152, 3, 16, 16]` via `data_torch.reshape(n_embd, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()` before emit. **hf2q's writer ships the raw 2-D tensor as-is** — `clip_graph_gemma4v::build`'s `ggml_conv_2d` call expects the 4-D layout and aborts. This is NOT a tensor-name mismatch (so cannot be discovered by the iter-116f name audit) — it's a tensor-DATA shape transform missing in the writer's vision-tower emission path.
+
+**Verification of root-cause hypothesis.** Pulled HF tensor shape via `safetensors.safe_open(...)`: `model.vision_tower.patch_embedder.input_proj.weight  shape=[1152, 768]  dtype=torch.bfloat16` — confirms the 2-D source. Patch_size=16, channels=3, hidden=1152: `16² × 3 = 768` matches. Position embedding is 3-D `[2, 10240, 1152]` (the 2-row x/y lookup table — clip_graph_gemma4v uses `ggml_view_2d` to slice it; that path does NOT need a separate transform).
+
+**Why this didn't surface earlier.** Iters 116a-e never reached graph warmup — they all blocked at tensor-name lookup (W34's `attn_out`, W35's `mm.input_projection.weight`). With all 5 name gaps closed, llama.cpp now reaches `clip_model_loader::warmup` for the first time, which exercises the full forward graph including `ggml_conv_2d`. The shape transform was always missing; it was just behind a deeper gate.
+
+**Verification (cross-compat smoke, iter-116f):**
+- Phase A PASS (fixtures on disk).
+- Phase B PASS (`356 tensors, arch='clip'`; clamp scalars 0/4 source-driven; `v.patch_embd.weight` present).
+- Phase C FAIL at `ggml_im2col GGML_ASSERT(a->ne[2] == b->ne[2])` (`/private/tmp/ggml-20260402-5181-3ou1lf/ggml-0.9.11/src/ggml.c:4393`); abort signal SIGABRT (exit code 6). Smoke log preserved at `/tmp/w36_phase_abc.log`.
+- Chat GGUF SHA `ae19574dab588e0a742a8cfa1282ccf358ed8a58c5a3483f2bf596020a4f8e6f` verified pre+post-smoke (Gate D self-baseline intact).
+- All 5 writer fixes KEPT in tree (per iter-116f spec: "Don't revert the writer fix — keep it for iter-116g") — they are correct as far as tensor naming goes; iter-116g layers a tensor-data transform on top.
+
+**Outstanding for iter-116g (next worker):**
+1. **Apply the patch_embd reshape transform in the writer.** Read the HF `model.vision_tower.patch_embedder.input_proj.weight` 2-D tensor `[n_embd, patch²·channels]`, reshape to 4-D `[n_embd, channels, patch, patch]` (per `convert_hf_to_gguf.py:7873-7877`), and emit with the correct GGUF shape header. This requires touching the writer's vision-tower tensor-emission path (likely `src/backends/gguf.rs:write_mmproj_gguf` near where vision tensors are walked) — outside the static name-map. Inspect whether a similar transform is needed for `position_embedding_table` (3-D `[2, 10240, 1152]` source — clip_graph_gemma4v uses 2-D views into it, so likely needs flattening to 2-D `[20480, 1152]` per llama.cpp's `TN_POS_EMBD` shape convention; verify against `convert_hf_to_gguf.py` and the live `clip.cpp` view code).
+2. **Re-emit mmproj** under quiet host with both fixes; re-run Phase A+B+C end-to-end. Expected: all three green.
+3. **Phase D parity proxy** (default-off, `HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1`) lands in iter-116h, after Phase C goes green.
+
+**Why writer-only scope held even at the new blocker.** Per iter-116f spec: "Surgical writer fix in `src/backends/gguf.rs` only." The 5 name fixes ARE the surgical writer fix — name-table audit was the iter's contract. The shape-transform discovery is a strictly DOWNSTREAM gate that opens behind the names; it warrants its own iter (iter-116g) with a separate audit-then-fix loop over llama.cpp's reshape steps in `convert_hf_to_gguf.py`. Keeping iter scope tight ensures blame attribution stays clean if iter-116g surfaces a fourth blocker (e.g. dtype mismatch, additional missing transform).
+
+**Per-fix lineage at iter-116f close.** W6 (clip.projector_type un-namespacing) → W34 (attn_out short form) → W36 (5-name audit fixes: projector base + 4 clamp + 3 norms) → [iter-116g: patch_embd shape transform] → [iter-116h: Phase D parity proxy].
+
+---
+
 #### Phase 2c iter-116e — `attn_out` short form fixes attention layer load; Phase C surfaces NEXT blocker `mm.input_projection.weight` projector tensor name mismatch (2026-04-26, W34/W35)
 
 **Background.** iter-116d (W33) closed Phase C at `unable to find tensor v.blk.0.attn_out.weight`. iter-116e tested W34's 1-char vision-namespace fix (`attn_output` → `attn_out` in `vision_layer_map` at `src/backends/gguf.rs:1853`) by re-emitting mmproj and re-running smoke synchronously under a quiet host (W35).
