@@ -911,6 +911,8 @@ Absorbed from the previous Phase 3 per the 2026-04-23 scope refinement. Vision i
   | < 8 GB | refuse with a clear error naming the minimum supported config |
 
   The table lives in code (`src/serve/quant_select.rs`) and is unit-tested against synthetic `GpuInfo` fixtures. Thresholds can be tuned; the *rule shape* (static table, VRAM-indexed, documented) is committed.
+
+  **Status (2026-04-25, iter-201, commit `59c9e0c`):** Phase 3 spec item 1/4 LANDED. `src/serve/quant_select.rs` ships the static table + `QuantType` enum (Q8_0 / Q6_K / Q4_K_M / Q3_K_M) + `GpuInfo` struct + `select_quant()` + `GpuInfo::from_hardware_profile()` adapter against `intelligence::hardware::HardwareProfile::available_memory_bytes`. 19 unit tests cover all five table rows plus boundary cases at 8/16/32/64 GiB exact, ±1 byte just-above/just-below, zero, and the error-message contract (msg names "8 GiB" + "Q3_K_M" + detected size). Zero deps on other Phase 3 iters; prerequisite for iter-204's `serve --model <repo-or-path>` wiring.
 - **Cache policy:** `~/.cache/hf2q/` keyed by `{model-id}/{quant-type}/{sha256}`. Re-download on HuggingFace safetensors sha256 mismatch OR on explicit `hf2q cache clear`. Otherwise offline mode uses the cached quantized GGUF indefinitely.
 - **Integrity check:** compare sha256 of downloaded safetensors shards against the HuggingFace-published hashes from the model card's `safetensors` metadata; refuse to quantize on mismatch.
 
