@@ -1930,6 +1930,29 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 100 — Phase 2c Task #17 hardening: extract `compute_soft_token_layout` pure helper from `expand_image_placeholders` so the iter-99 expansion math is unit-testable without a live `Engine` (which carries the tokenizer + `MlxDevice`).  The math — placeholder positions → contiguous N_image_tokens runs → post-expansion ranges — is the most error-prone bit of the iter-99 vision path and the only part that can be exercised without a 26B model load.  Refactor + 8 new tests.**
+  - **What landed.**
+    - **`compute_soft_token_layout(img_token_id, prompt_tokens, n_image_tokens_per_image)`** (handlers.rs, `pub(crate)`): pure compute, returns `(expanded_tokens, ranges)` or `Err(PlaceholderCountMismatch{ found, supplied })`.  No Metal, no Engine, no allocator side effects.
+    - **`PlaceholderCountMismatch`** struct: carries both observed counts so the caller can build a descriptive error message (chat template emitted wrong number of markers, or request's image count drifted from what the renderer saw).
+    - **`expand_image_placeholders` refactored** to delegate the math to the new helper, then handle the rest of the surface (tokenizer probe, `MlxDevice` alloc, per-image buffer fill, `SoftTokenData` assembly).  Behavior unchanged; pure code reorg.
+  - **Tests added** (8 new in `multimodal_tests`, all GREEN):
+    - `compute_soft_token_layout_empty_prompt_zero_images_returns_empty` — degenerate identity.
+    - `compute_soft_token_layout_no_placeholders_passes_through` — pure-text prompt is preserved verbatim with empty ranges.
+    - `compute_soft_token_layout_single_placeholder_expands_to_n_copies` — middle-of-prompt expansion + range bounds + token-id slot content.
+    - `compute_soft_token_layout_placeholder_at_start` — boundary case at position 0.
+    - `compute_soft_token_layout_placeholder_at_end` — boundary case at last position.
+    - `compute_soft_token_layout_two_placeholders_independent_ranges` — multi-image with different per-image counts; verifies post-expansion ranges account for prior expansions.
+    - `compute_soft_token_layout_mismatch_reports_both_counts` — error path covers both too-few and too-many placeholder cases; checks both fields of `PlaceholderCountMismatch` carry the right counts.
+    - `compute_soft_token_layout_zero_image_tokens_drops_placeholder` — degenerate N=0 image collapses the placeholder out (defended even though the upstream validator in `prepare_chat_generation` rejects empty embeddings; the helper itself is permissive).
+    - `compute_soft_token_layout_ranges_match_n_image_tokens` — invariant cross-check: every range's length equals its requested count.
+  - **Verification.** `cargo test --release --bin hf2q multimodal_tests` → **22/22 PASS** (8 new + 14 existing).  `cargo test --release --bin hf2q -- serve` → **284/284 PASS**.  `cargo check` → clean.
+  - **Why this isn't the full iter-100 acceptance bar.**  The bar from iter-99 was "hf2q vision output matches mlx-lm Gemma 4 vision on 5 prompts × 5 images at T=0".  Driving that needs **sequential** ~30 GB processes (hf2q + mmproj for the hf2q matrix, then mlx-vlm for the reference matrix) per the project's OOM-prevention directive — one model-loading inference at a time.  That E2E remains scheduled for a follow-up iter when the harness + image fixtures are wired in.  This iter raises coverage of the iter-99 critical path so when E2E divergence surfaces, the range computation is **provably** not the source.
+  - **Iter-101 plan: wire the mlx-vlm comparison harness.**
+    1. Create `tests/fixtures/vision/` with 5 standard images (synthetic + real, mixed sizes).
+    2. Define 5 standard prompts (caption, OCR, classification, count-objects, follow-up question).
+    3. Add `tests/vision_e2e_vs_mlx_vlm.rs` integration test, gated on `HF2Q_VISION_E2E=1` (skipped by default to keep the daily test loop OOM-safe).  Test starts hf2q server in a child process, sends each `(prompt, image)` via HTTP `/v1/chat/completions`, kills the server, then runs `mlx_vlm.generate` on the same matrix and diffs the first 50 generated tokens at T=0.
+    4. Run the matrix once; document divergences in ADR-005.  Likely failure modes: (a) placeholder text choice — `<|image|>` vs Gemma 4's full `<start_of_image><image_soft_token>...<end_of_image>` boundary template — and/or (b) the per-embedding pre-scaling contract documented on `SoftTokenInjection` (we copy the projected ViT row verbatim; mlx-vlm may apply a `sqrt(hidden_size)` post-projector scale).
+
 - **2026-04-25 loop iter 99 — Phase 2c Tasks #15 + #17 closed end-to-end: chat handler wiring + drop the 501. Multimodal `/v1/chat/completions` requests now run all the way through the soft-token path: ViT GPU forward → projected embeddings → `MlxBuffer` alloc + memcpy → `forward_prefill_with_soft_tokens` (iter-97) via `Engine::generate_with_soft_tokens` (iter-98) → identical OpenAI `ChatCompletionResponse` envelope as the text-only path.**
   - **What landed.**
     - **Vision flow in `prepare_chat_generation`.**
