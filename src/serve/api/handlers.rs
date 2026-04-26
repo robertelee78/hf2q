@@ -1849,13 +1849,37 @@ async fn chat_model_embeddings(
     let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
     let mut total_tokens: usize = 0;
 
+    // Resolve the model's BOS token id once per request.  llama-embedding
+    // (the byte-for-byte parity bar for Phase 2a Task #8) prepends BOS
+    // unconditionally for embedding inputs — that's what aligns the
+    // embedding's last-token hidden state with the model's training-time
+    // sequence-prefix convention.  hf2q's chat tokenizer (HuggingFace
+    // `tokenizers` crate) does NOT auto-add BOS for Gemma 4 even with
+    // `add_special_tokens=true`, because the Gemma tokenizer.json
+    // post-processor leaves bos handling to the chat-template render
+    // layer.  Probe the tokenizer's special-token map for the BOS
+    // string used by the major chat-model families and prepend its id
+    // manually.
+    //
+    // Probe order — first match wins:
+    //   "<bos>"             — Gemma 1/2/3/4
+    //   "<|begin_of_text|>" — Llama 3 / 3.1 / 3.2
+    //   "<s>"               — Llama 1/2, Mistral
+    //   "<|im_start|>"      — Qwen 2/2.5 (used as start-of-turn, treated
+    //                         as bos by llama-embedding)
+    //
+    // Models without a recognised BOS token skip the prepend silently.
+    // The `tokenizer.ggml.bos_token_id` GGUF key would be the
+    // authoritative source; surfacing it through Engine (rather than
+    // probing the HF tokenizer) is iter-94+ work.
+    let bos_id: Option<u32> = ["<bos>", "<|begin_of_text|>", "<s>", "<|im_start|>"]
+        .iter()
+        .find_map(|t| engine.tokenizer().token_to_id(t));
+
     for (i, input) in inputs.into_iter().enumerate() {
-        // Tokenize with the chat model's tokenizer.  `add_special_tokens=true`
-        // applies any bos/eos the model normally sees — chat models embed
-        // the same prompt-shape they decode from.  An empty token sequence
-        // is rejected here rather than at the engine boundary so the error
-        // path is unambiguous.
-        let encoded = match engine.tokenizer().encode(input.as_str(), true) {
+        // Tokenize without auto-special-tokens — we manually prepend BOS
+        // above to match llama-embedding's wire format byte-for-byte.
+        let encoded = match engine.tokenizer().encode(input.as_str(), false) {
             Ok(e) => e,
             Err(e) => {
                 return ApiError::invalid_request(
@@ -1865,7 +1889,10 @@ async fn chat_model_embeddings(
                 .into_response();
             }
         };
-        let prompt_tokens: Vec<u32> = encoded.get_ids().to_vec();
+        let mut prompt_tokens: Vec<u32> = encoded.get_ids().to_vec();
+        if let Some(b) = bos_id {
+            prompt_tokens.insert(0, b);
+        }
         if prompt_tokens.is_empty() {
             return ApiError::invalid_request(
                 format!("input[{i}] tokenized to zero tokens (empty after preprocessing)"),

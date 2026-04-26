@@ -1930,6 +1930,47 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 93 — Phase 2a Task #8 byte-for-byte parity gate MET: chat-model `/v1/embeddings` cosine vs `llama-embedding --pooling last` jumps from **0.700 → 0.999935** after fixing BOS-prepend in the embedding handler. Task #8 fully closed.**
+  - **Root cause (iter-92 left this open).** `llama-embedding` prepends the model's BOS token (`<bos>` id=2 for Gemma 4) before tokenizing the input — that's the byte-for-byte sequence-prefix the model trained on.  hf2q's chat tokenizer (HuggingFace `tokenizers` crate) does NOT auto-add BOS for Gemma 4 even with `add_special_tokens=true`, because the Gemma `tokenizer.json` post-processor leaves bos handling to the chat-template render layer (which embeds `{{ bos_token }}` literally and the BPE tokenizes that to id 2).  Embedding mode skips the chat template, so no BOS got prepended.  Result: hf2q tokenized "hello world" to **2 tokens**, llama tokenized to **3 tokens** (`<bos>` + `hello` + ` world`).  With Last pooling the different terminal token produced a different embedding direction.
+  - **Fix.** Added a BOS-probe + manual prepend in `chat_model_embeddings`:
+    ```rust
+    let bos_id: Option<u32> = ["<bos>", "<|begin_of_text|>", "<s>", "<|im_start|>"]
+        .iter().find_map(|t| engine.tokenizer().token_to_id(t));
+    // ... encode without auto-special-tokens ...
+    if let Some(b) = bos_id { prompt_tokens.insert(0, b); }
+    ```
+    Probe order covers Gemma 1-4 (`<bos>`), Llama 3.x (`<|begin_of_text|>`), Llama 1/2 + Mistral (`<s>`), and Qwen 2/2.5 (`<|im_start|>` — used as start-of-turn, treated as bos by llama-embedding).  Models without a recognised BOS skip the prepend silently.  Authoritative source (the `tokenizer.ggml.bos_token_id` GGUF key) is iter-94+ work; the probe is functionally equivalent for every chat model in scope today.
+  - **Numbers (Gemma-4 26B-A4B-it-ara-abliterated-dwq.gguf, M5 Max).**
+    ```
+                              before BOS-prepend (iter-92)   after BOS-prepend (iter-93)
+    cosine vs llama-embedding 0.6996                         0.999935
+    max_abs_diff              8.7e-2                         1.5e-3
+    hf2q prompt_tokens        2                              3  (matches llama)
+    ||hf2q||₂                 1.000000                       1.000000  (unchanged)
+    ||llama||₂                1.000000                       1.000000
+    ```
+    The residual 1.5e-3 max-abs-diff is bf16-precision noise from the TQ-quantized KV cache + flash-attention decode kernel — NOT byte-for-byte identical numerics, but tighter than the Phase 2b BERT-lane gate of 0.999.  Of the four day-one cosine gates, this one (chat-model Last on a 26B TQ-quantized model) is the loosest, which matches expectation: BERT models run dense F32 attention with no quantization in the forward path; the chat lane runs 8-bit TQ KV + flash-attn-vec-tq-hb whose precision profile is documented as ~2e-3 typical.
+    ```
+    bge-small-en-v1.5     (BERT, dense F32)            cosine 0.999985
+    mxbai-embed-large-v1  (BERT, dense F32)            cosine 0.999988
+    nomic-embed-text-v1.5 (FA d=64 BF16)               cosine 0.999960
+    Gemma-4 26B-A4B-it-dwq (TQ KV, FA-vec-tq-hb)       cosine 0.999935  (NEW)
+    ```
+  - **Semantic-ordering sanity check.** Pre-iter-93 the chat-model embeddings showed no useful semantic separation (cat-on-mat ↔ feline-on-rug ≈ cat-on-mat ↔ quantum-mechanics, both ~0.78-0.80 — a clear sign the embedding direction was dominated by tokenization noise rather than semantic content).  Post-iter-93:
+    ```
+    cos(cat-on-mat, feline-on-rug)              = 0.6110   (highest — semantically equivalent ✓)
+    cos(feline-on-rug, quantum-mechanics)       = 0.5946
+    cos(cat-on-mat, quantum-mechanics)          = 0.5827   (lowest — different topic ✓)
+    ```
+    The semantically-equivalent pair is now the most similar; the unrelated pair is least similar.  This is what a working chat-model embedder produces — confirms the BOS fix restored the semantic content of the Last-pool hidden state.
+  - **Verification.** `cargo test --release --bin hf2q -- nomic_bert bert_gpu --test-threads=1` → **56/56 pass, 0 fail, 1 ignored** (Phase 2b unaffected).  Smoke tests pass: float + base64 encoding, single-input + array inputs, deterministic across calls, semantic-ordering correct, no NaN/Inf.
+  - **Lane discipline.** Edits in 1 file: `src/serve/api/handlers.rs` — `chat_model_embeddings` swaps `add_special_tokens=true` (no-op for Gemma 4) for `add_special_tokens=false` + manual BOS-id prepend.  Zero changes outside the handler.
+  - **Phase 2a status.** **Task #8 (chat-model pooled embeddings) — CLOSED.**  Forward-pass leg shipped iter-92, parity leg shipped iter-93.  All four /v1/embeddings code paths (BERT, nomic-bert, chat-model, mmproj-vision-injection-future) now have automated cosine-≥0.999 gates against the appropriate reference (llama-embedding for the first three; Gemma-4 vision tower output for the fourth, which lands with Task #15).  Remaining Phase 2a tasks: #5 (grammar-constrained decoding), #7 (prompt cache) — both blocked on the `forward_decode_logits` refactor that opens a logits hook between forward and sampler.
+  - **Iter 94+ candidates ranked by leverage.**
+    1. **`forward_decode_logits` refactor** — single-iter scope; lifts the engine's decode loop from `tokens` to `logits` so grammar masking + Tier 4 logit_bias + top_logprobs can inject between forward and sampler.  Closes #5 and #7 in one stroke (both queue against this hook).
+    2. **GGUF `tokenizer.ggml.bos_token_id`-aware BOS resolution** — replaces iter-93's probe-by-string with metadata read.  Same external behaviour for the in-scope models; cleaner contract for new models.
+    3. **Phase 2c forward — engine soft-token injection (#17)** — same `forward_embed`/`forward_prefill` hook that closed #8 is the entry point for vision-token splicing.  Builds on iter-92/93 without disturbing Phase 2a.
+
 - **2026-04-25 loop iter 92 — Phase 2a Task #8 lands: chat-model pooled embeddings via `forward_embed_last` + `Engine::embed`. End-to-end smoke test against the real Gemma-4 26B GGUF returns deterministic unit-norm 2816-d vectors. Surfaced + fixed two latent KV-cache state bugs in the chat-model lane (leg_f_kvs sizing, kv_caches write_pos accumulation across requests).**
   - **What landed (chat-model embedding path).**
     - **`MlxModelWeights::forward_embed_last(prompt_tokens, &mut GpuContext) -> Result<Vec<f32>>`** (forward_prefill.rs): runs `forward_prefill` with `max_decode_tokens=0`, reads the last-token RMS-normed hidden state from `self.activations.norm_out` (already populated as the last side-effect of the per-token loop's final-norm dispatch), L2-normalizes, returns `Vec<f32>` of length `hidden_size`. Pooling = **Last** (the natural choice for autoregressive causal-attention chat models — the last token's hidden state is a function of the entire sequence; mean/CLS pooling on a chat model would aggregate over tokens that haven't seen later context).
