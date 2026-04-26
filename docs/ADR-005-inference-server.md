@@ -1151,6 +1151,39 @@ W28 root-caused and fixed the 3 vision_2d_rope_f32-not-found failures handed off
 
 ---
 
+#### Phase 2c iter-116b — cross-compat Phase C body landed; Phase B blocked on stale on-disk mmproj fixture (2026-04-25, W30)
+
+W30 (CFA wave-25) ran the iter-116b retry of the ADR-005 cross-compat smoke under a quiet host. **Phase C body landed** in `tests/mmproj_llama_cpp_compat.rs` (replaces W26's `iter-116a` placeholder-panic with a real `Command::new("/opt/homebrew/bin/llama-mtmd-cli")` spawn + stderr-substring gates + status-success + non-empty-stdout asserts; gated on `HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1` per the iter-116a contract). **Phase A+B FAILED** because the on-disk mmproj GGUF predates W6's iter-104 writer fix (`8543a83`, 2026-04-25 21:28).
+
+| Layer | Result | Detail |
+|---|---|---|
+| Host stability | CLEAR | `pgrep` count = 0 after 35 s grace window; one transient `hf2q generate` cleared mid-window |
+| Phase A (file-on-disk) | PASS | mmproj 1.07 GB + chat 15.8 GB both `Path::exists()` |
+| Phase B (metadata header) | **FAIL** | `panic at tests/mmproj_llama_cpp_compat.rs:191`: `mmproj missing required metadata key: 'clip.projector_type'` |
+| Phase C body | LANDED (code-only) | Spawn + stderr gates + status check; gated off pending iter-116c re-emit |
+
+**Root cause.** The on-disk mmproj at `models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq-mmproj.gguf` has `mtime = 2026-04-09 03:31:43` — emitted by the **pre-fix** `write_mmproj_metadata` which wrote `clip.vision.projector_type` (namespaced). W6's iter-104 fix at commit `8543a83` (2026-04-25 21:28) re-aligned the writer with llama.cpp's vendored `clip-impl.h:23 (KEY_PROJ_TYPE)` to emit the un-namespaced top-level `clip.projector_type` instead. `strings(1)` on the on-disk file confirms only `clip.vision.projector_type` is present. The current writer (verified at `src/backends/gguf.rs:651`) is correct. **The fixture is stale; the code path is not.**
+
+**Why W30 did not re-emit.** Re-emitting the mmproj requires `hf2q convert --emit-mmproj` against a 26B model — a ~16 GB single-process load that violates the constraint "Don't load any other model" and the OOM-prevention directive (`feedback_oom_prevention.md`: one model-loading inference at a time; 35B-A3B apex = ~30 GB). iter-116c is the correct landing for the re-emit + the green Phase A+B+C run — it can sequence the convert (~16 GB) and the `llama-mtmd-cli` load (~16 GB) under a verified quiet host with a single owner.
+
+**Phase C body design.** The landed `phase_c_llama_mtmd_stderr_smoke` mirrors the iter-116a docstring contract (lines 238-248) verbatim:
+- Spawn: `llama-mtmd-cli -m <chat-gguf> --mmproj <mmproj-gguf> --image <fixture> -p "Describe this image in 5 words." -n 16 --temperature 0 -no-cnv` with `LLAMA_ARG_MMPROJ_OFFLOAD=0` (CPU CLIP encoder; avoids fighting hf2q's Metal context for VRAM).
+- Capture: `output.stderr` and `output.stdout` via `String::from_utf8_lossy`.
+- Asserts: absence of `clip.cpp:`, `unsupported projector`, `tensor not found`, and `error: ` substrings; `output.status.success()`; non-empty stdout.
+- Forensic logging: `eprintln!` with stdout/stderr byte counts on PASS; verbatim stderr in panic message on FAIL.
+
+**Verification (release build):**
+- `cargo test --release --test mmproj_llama_cpp_compat --no-run` — clean (only the 3 pre-existing `EXIT_SMOKE_*` warnings in `src/main.rs`, unrelated).
+- `HF2Q_LLAMA_MMPROJ_COMPAT=1 cargo test --release --test mmproj_llama_cpp_compat -- --ignored --nocapture` — Phase A PASS, Phase B FAIL with the verbatim panic above. Phase C body NOT exercised this iter (gate `HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1` not set).
+- No model load triggered. mlx-native untouched. `src/inference/vision/*` and `src/backends/gguf.rs` untouched.
+
+**Outstanding for iter-116c (W31 or later):**
+1. **Re-emit the mmproj fixture** under a verified-quiet host: `hf2q convert --emit-mmproj …` against the gemma-4-26B-A4B HF source. The current writer at `src/backends/gguf.rs:642-666` is correct; the on-disk fixture just needs to be regenerated against it.
+2. **Run Phase A+B+C end-to-end** with `HF2Q_LLAMA_MMPROJ_COMPAT=1 HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD=1`. Expected: all three green. ~5 min model load + ~30 s decode in `llama-mtmd-cli`; bash timeout ~25 min.
+3. **Phase D parity proxy** (deferred from iter-116b per W29 brief): same fixture image + prompt at T=0/n=16 through both hf2q's `/v1/chat/completions` and `llama-mtmd-cli`; gate on `N_image_tokens` parity (hf2q `X-HF2Q-Soft-Tokens-Total` header vs `llama-mtmd-cli` stderr image-token report). Output text need not match — the BF16 attention saturation drift documented in `project_vit_attention_bf16_softmax_drift.md` is production-correct, so a strict byte-equal proxy is too strict.
+
+---
+
 #### Phase 2c iter-114 — 2D RoPE + per-block forward landed (2026-04-25, W24)
 
 W24 implemented the 2-D NeoX RoPE Metal kernel (in `mlx-native`) and the gemma4v per-block forward (in `hf2q`) per W22's iter-114 scope. All work is **sibling-only** — every existing SigLIP-49 function (`apply_vit_block_forward[_gpu]`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`) is unchanged.
