@@ -744,12 +744,48 @@ fn write_mmproj_gguf(
             &model.metadata.model_type,
             model.metadata.num_layers,
         );
-        let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+        let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
+
+        // ADR-005 Phase 2c iter-116a: clamp-scalar emit for Gemma4
+        // ClippableLinear bounds (`mm.0.{input_min,input_max,output_min,
+        // output_max}`).  HF safetensors stores these as 0-d F32 scalars;
+        // llama.cpp's CLIP loader expects 1-D F32 tensors — see
+        // `convert_hf_to_gguf.py:7851-7879` (`Gemma4VisionAudioModel.modify_tensors`,
+        // `data_torch.unsqueeze(0)` + `tensor_force_quant` returning F32).
+        //
+        // Promote the shape to `[1]` and the ggml_type to F32 here so the
+        // emitted mmproj round-trips through both hf2q's `mmproj_weights`
+        // loader (W25) and llama-mtmd-cli's CLIP loader.  The shape
+        // promotion is unconditional for 0-d tensors (defensive — only
+        // clamp scalars hit this path today, but any future 0-d tensor
+        // would need the same fix).  The F32 promotion is gated on the
+        // tensor name's suffix so we don't change behavior for any other
+        // 0-d tensor that might want to stay F16.
+        let is_clamp_scalar = name.ends_with(".input_min")
+            || name.ends_with(".input_max")
+            || name.ends_with(".output_min")
+            || name.ends_with(".output_max");
+        let emit_shape: Vec<usize> = if qt.shape.is_empty() {
+            vec![1]
+        } else {
+            qt.shape.clone()
+        };
+        if is_clamp_scalar {
+            ggml_type = GGML_TYPE_F32;
+        }
 
         // Vision tensors are preserved as F16 — no repacking needed, data passes through
-        let total_elements: usize = qt.shape.iter().product();
+        let total_elements: usize = emit_shape.iter().product();
         let repacked_size = if qt.quant_info.preserved || ggml_type == GGML_TYPE_F16 || ggml_type == GGML_TYPE_F32 {
-            qt.data.len()
+            // F16→F32 upcast: each input element becomes 4 bytes instead
+            // of 2, so the on-disk size for an F16 source promoted to
+            // F32 is 2× the input byte count.  This also covers F32→F32
+            // passthrough (data.len() == total_elements * 4 already).
+            if ggml_type == GGML_TYPE_F32 && qt.data.len() == total_elements * 2 {
+                total_elements * 4
+            } else {
+                qt.data.len()
+            }
         } else {
             ggml_tensor_size(total_elements, ggml_type)
         };
@@ -758,7 +794,7 @@ fn write_mmproj_gguf(
 
         tensor_infos.push(TensorWriteInfo {
             gguf_name,
-            shape: qt.shape.clone(),
+            shape: emit_shape,
             ggml_type,
             data_offset: tensor_data_offset,
             data_len: repacked_size,
