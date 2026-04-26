@@ -1,0 +1,4 @@
+{"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"<request-id>","model":"Gemma4ForConditionalGeneration","object":"chat.completion.chunk","system_fingerprint":"hf2q-0.1.0-mlx-native"}
+{"choices":[{"delta":{"content":"Hello!"},"finish_reason":null,"index":0}],"created":0,"id":"<request-id>","model":"Gemma4ForConditionalGeneration","object":"chat.completion.chunk","system_fingerprint":"hf2q-0.1.0-mlx-native"}
+{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"<request-id>","model":"Gemma4ForConditionalGeneration","object":"chat.completion.chunk","system_fingerprint":"hf2q-0.1.0-mlx-native"}
+[DONE]
