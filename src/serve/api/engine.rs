@@ -189,6 +189,14 @@ pub struct GenerationResult {
     pub prefill_duration: Duration,
     /// Decode wall-clock.
     pub decode_duration: Duration,
+    /// Number of prompt tokens served from the prompt cache (Phase 2a
+    /// Task #7, Decision #24).  Reported via OpenAI's
+    /// `usage.prompt_tokens_details.cached_tokens`.  Iter-96 single-slot
+    /// full-equality cache: this is `prompt_tokens` on a cache hit
+    /// (entire prefill + decode skipped) and `0` otherwise.  Iter-97+
+    /// extends to LCP-based partial-prefill resume which can report
+    /// any value `0 ≤ cached_tokens ≤ prompt_tokens`.
+    pub cached_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +308,137 @@ pub struct LoadedModel {
     pub chat_template: String,
     pub eos_token_ids: Vec<u32>,
     pub load_duration: Duration,
+    /// Single-slot prompt cache (Phase 2a Task #7 / Decision #24, iter-96).
+    /// Owned by the worker thread; lives across requests.  See
+    /// `PromptCache` doc for the cache contract.
+    pub prompt_cache: PromptCache,
+}
+
+/// Single-slot prompt cache (Phase 2a Task #7, iter-96).
+///
+/// **Iter-96 scope: full-equality + temperature=0 cache.**  When the
+/// next chat request's prompt_tokens exactly matches `tokens` AND the
+/// caller's `temperature == 0` (deterministic decode), the cache
+/// short-circuits the entire prefill+decode and replays the previous
+/// response.  Useful for retries (network failures), eval consistency,
+/// repeated benchmarks, idempotent agentic loops.
+///
+/// **Iter-97+ scope: LCP-based partial-prefill resume.**  Compute the
+/// longest common prefix between the new prompt and `tokens`, set
+/// `kv_caches[*].write_pos = LCP`, pre-warm `dense_kvs[0..LCP)` by
+/// dequantizing `kv_caches[0..LCP)` via `tq_dequantize_kv`, then run
+/// `forward_prefill` for tokens `[LCP..N)`.  Reports `cached_tokens =
+/// LCP` (any value `0 ≤ LCP ≤ prompt_tokens`).  Defers to a later
+/// iteration because the dequant pre-warm is non-trivial — the iter-96
+/// full-equality cache is a real, shippable subset.
+///
+/// Sampling (`temperature > 0`) **bypasses the cache** even on full
+/// equality — replaying the deterministic-greedy decoded text under a
+/// sampling request would silently violate the user's expectation of
+/// per-call variation.  No cache write happens on sampling-mode hits
+/// either; sampling completions are always re-generated.
+///
+/// Grammar-constrained requests (`response_format=json_object` /
+/// `json_schema`) follow the same rule: greedy + matching prompt =
+/// cache hit; sampling = cache bypass.  The grammar runtime state
+/// at the end of generation is NOT cached (would over-constrain a
+/// future hit if the cached grammar differed from the new request's).
+#[derive(Debug, Clone, Default)]
+pub struct PromptCache {
+    /// The previous request's prompt token sequence (post-rendering,
+    /// post-tokenization).  Empty on a fresh worker (no prior request).
+    pub tokens: Vec<u32>,
+    /// The text the previous request emitted (post reasoning-marker
+    /// split).  This is what gets replayed on a cache hit.
+    pub text: String,
+    /// The `reasoning_text` field from the previous result.  Replayed
+    /// alongside `text` so the response shape matches the original.
+    pub reasoning_text: Option<String>,
+    /// Number of completion tokens the previous request emitted.
+    pub completion_tokens: usize,
+    /// Reasoning-token count from the previous result.
+    pub reasoning_tokens: Option<usize>,
+    /// `"stop"` | `"length"` from the previous result.
+    pub finish_reason: &'static str,
+}
+
+impl PromptCache {
+    /// Empty cache — initial state for a fresh worker.
+    pub fn new() -> Self {
+        Self {
+            tokens: Vec::new(),
+            text: String::new(),
+            reasoning_text: None,
+            completion_tokens: 0,
+            reasoning_tokens: None,
+            finish_reason: "length",
+        }
+    }
+
+    /// Iter-96 cache check: returns the cached result if and only if
+    /// `prompt_tokens` exactly equals the cached prompt AND the caller
+    /// is in greedy decode mode (temperature = 0, no sampling-only
+    /// fields set).  See struct doc for the full eligibility contract.
+    pub fn lookup(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Option<GenerationResult> {
+        // Bypass for any non-greedy mode.  These all introduce per-call
+        // variance that a cached replay would silently erase.
+        if params.temperature > 0.0
+            || params.top_k > 0
+            || params.top_p < 1.0
+            || params.repetition_penalty != 1.0
+            || params.seed.is_some()
+        {
+            return None;
+        }
+        // logit_bias and grammar are deterministic given the prompt +
+        // greedy decode, so they DO cache (their effects are fully
+        // captured in the cached `text`).
+        if self.tokens.is_empty() || self.tokens.as_slice() != prompt_tokens {
+            return None;
+        }
+        Some(GenerationResult {
+            text: self.text.clone(),
+            reasoning_text: self.reasoning_text.clone(),
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens: self.completion_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            finish_reason: self.finish_reason,
+            // Cache hit: prefill and decode were both skipped — report
+            // zero wall-clock for both phases.  TTFT effectively becomes
+            // the cache lookup time (~1µs), surfaced as 0 in the response.
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: prompt_tokens.len(),
+        })
+    }
+
+    /// Iter-96 cache write: store this request's result so the next
+    /// equal-prompt + greedy request can short-circuit.
+    ///
+    /// Same eligibility gate as `lookup` — sampling-mode requests are
+    /// not cached (storing them would mean a future greedy request
+    /// could replay a sampling outcome, violating determinism).
+    pub fn store(
+        &mut self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        result: &GenerationResult,
+    ) {
+        if params.temperature > 0.0
+            || params.top_k > 0
+            || params.top_p < 1.0
+            || params.repetition_penalty != 1.0
+            || params.seed.is_some()
+        {
+            return;
+        }
+        self.tokens = prompt_tokens.to_vec();
+        self.text = result.text.clone();
+        self.reasoning_text = result.reasoning_text.clone();
+        self.completion_tokens = result.completion_tokens;
+        self.reasoning_tokens = result.reasoning_tokens;
+        self.finish_reason = result.finish_reason;
+    }
 }
 
 /// Options for `LoadedModel::load`. Mirrors `cli::ServeArgs` without pulling
@@ -429,6 +568,7 @@ impl LoadedModel {
             chat_template,
             eos_token_ids,
             load_duration,
+            prompt_cache: PromptCache::new(),
         })
     }
 }
@@ -822,6 +962,28 @@ fn generate_once(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
+    // ── Prompt cache fast-path (Phase 2a Task #7 / iter-96) ────────────
+    //
+    // When the request is fully deterministic (greedy: T=0, no top_k /
+    // top_p / repetition_penalty / seed) AND the prompt_tokens exactly
+    // match the previous request's prompt, replay the cached result.
+    // Skips the entire prefill+decode chain — the only cost is the
+    // O(N) prompt-tokens equality compare.  The OpenAI usage shape
+    // surfaces `cached_tokens = prompt_len` so clients can attribute
+    // the saving.
+    //
+    // Sampling-mode bypasses the cache: replaying a deterministic
+    // greedy decode for a sampling request would silently violate the
+    // user's expectation of per-call variation.  See `PromptCache`
+    // module doc for the full eligibility rules.
+    if let Some(cached) = loaded.prompt_cache.lookup(prompt_tokens, params) {
+        tracing::debug!(
+            "prompt_cache: HIT — {} tokens served from cache, prefill+decode skipped",
+            cached.prompt_tokens
+        );
+        return Ok(cached);
+    }
+
     // ── Sampler config — Tier 2/3/4 surface + grammar (iter-94 / iter-95) ──
     //
     // Pre-iter-94 the decode loop only consumed `forward_decode`'s
@@ -1081,7 +1243,7 @@ fn generate_once(
         _ => (decoded_text, None),
     };
 
-    Ok(GenerationResult {
+    let result = GenerationResult {
         text: content,
         reasoning_text,
         prompt_tokens: prompt_len,
@@ -1094,7 +1256,16 @@ fn generate_once(
         finish_reason,
         prefill_duration,
         decode_duration,
-    })
+        cached_tokens: 0, // iter-96: 0 on cache miss; > 0 on hit (handled by fast-path return earlier)
+    };
+
+    // Store this generation in the prompt cache — same eligibility
+    // gate as `lookup` (sampling-mode requests are not cached).  The
+    // store happens AFTER all error paths above so a partial / failed
+    // generation can never poison the cache.
+    loaded.prompt_cache.store(prompt_tokens, params, &result);
+
+    Ok(result)
 }
 
 /// Infer a quant label from an open GGUF. Shared algorithm with the
@@ -1484,6 +1655,29 @@ fn generate_stream_once(
         completion_tokens,
         stats,
     });
+
+    // Iter-96 prompt cache update on streaming completion.  Streaming
+    // currently does NOT consult the cache on input (would require
+    // fake-emitting Delta events from cached text — iter-97 follow-up).
+    // But updating the cache on EVERY successful generation, regardless
+    // of streaming mode, means that a streaming request followed by a
+    // non-streaming request with the same prompt will hit the cache.
+    let cache_result = GenerationResult {
+        text: accumulated_text.clone(),
+        reasoning_text: None, // splitter already routed reasoning into Delta events
+        prompt_tokens: prompt_len,
+        completion_tokens,
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        cached_tokens: 0,
+    };
+    loaded.prompt_cache.store(prompt_tokens, params, &cache_result);
 }
 
 fn hit_stop_string(text: &str, stops: &[String]) -> bool {

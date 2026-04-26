@@ -173,9 +173,11 @@ pub async fn chat_completions(
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,
             total_tokens: result.prompt_tokens + result.completion_tokens,
-            // Prompt caching (Decision #24) lands with Task #7 — no cached
-            // tokens reported until then.
-            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+            // Prompt caching (Decision #24, Task #7, iter-96).  > 0 on a
+            // cache hit (full-equality, greedy decode); 0 on miss.
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: result.cached_tokens,
+            }),
             completion_tokens_details: reasoning_tokens
                 .map(|reasoning_tokens| super::schema::CompletionTokensDetails { reasoning_tokens }),
         },
