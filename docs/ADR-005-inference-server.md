@@ -1072,6 +1072,32 @@ W23 implemented the preprocess + patch-embed sibling layer per W22's iter-113-pr
 
 ---
 
+#### Phase 2c iter-114 — 2D RoPE + per-block forward landed (2026-04-25, W24)
+
+W24 implemented the 2-D NeoX RoPE Metal kernel (in `mlx-native`) and the gemma4v per-block forward (in `hf2q`) per W22's iter-114 scope. All work is **sibling-only** — every existing SigLIP-49 function (`apply_vit_block_forward[_gpu]`, `vit_rms_norm_gpu`, `vit_per_head_rms_norm_gpu`) is unchanged.
+
+| Repo | Files | LOC (`git diff --stat`) | Surface area |
+|---|---|---|---|
+| mlx-native | `src/shaders/vision_2d_rope.metal` + `src/ops/vision_2d_rope.rs` + `src/ops/mod.rs` + `tests/test_vision_2d_rope.rs` + `Cargo.{toml,lock}` | +833 | New `vision_2d_rope_{f32,bf16}` kernel (NeoX-pair, dual-axis pos_x/pos_y, theta=100) + Rust dispatch + 5 tests |
+| hf2q       | `src/inference/vision/vit.rs`            | +607 | `gemma_rms_norm_forward` (weight+1) + `v_norm_no_scale_forward` + `vision_2d_rope_forward_cpu` + `gelu_pytorch_tanh_in_place` + `repeat_kv_cpu` + `gemma4v_attention_unit_scale` + `gemma4v_block_forward` + `Gemma4VisionBlockShape`/`Gemma4VisionBlockWeights` |
+| hf2q       | `src/inference/vision/vit_gpu.rs`        | +973 | `vit_gemma_rms_norm_gpu` (transient gain+1) + `vit_gemma_per_head_rms_norm_gpu` + `vit_v_norm_no_scale_gpu` (mlx-native `rms_norm_no_scale_f32`) + `vit_vision_2d_rope_gpu` + `vit_repeat_kv_gpu` (gather-based) + `vit_gelu_pytorch_tanh_gpu` + `Gemma4VisionBlockShapeGpu` + `gemma4v_block_forward_gpu` + 3 parity tests |
+| hf2q       | `src/inference/vision/mmproj_weights.rs` | +15  | `LoadedMmprojWeights::from_tensors_for_test` (cfg(test) ctor) |
+| hf2q       | `Cargo.{toml,lock}`                     | +2   | `mlx-native` 0.4.5 → 0.4.6 |
+
+**Verification:**
+- `cd /opt/mlx-native && cargo test --release --test test_vision_2d_rope` — **5 / 5 PASS** (identity at origin, inverse, NeoX-pair structure, BF16 parity, error rejection).
+- `cd /opt/mlx-native && cargo test --release --lib` — **98 / 98 PASS** (no regression on lib tests).
+- `cd /opt/hf2q && cargo check --release` — clean (only 3 pre-existing dead-code warnings in `src/main.rs`, unrelated).
+- `cd /opt/hf2q && cargo test --release --bin hf2q -- gemma4v_block` — **3 / 3 PASS** (`cpu_gpu_parity` cosine > 0.999 at batch=32, `gqa_dimensions`, `4_rmsnorm_count_is_exactly_four`).
+- `cd /opt/hf2q && cargo test --release --bin hf2q -- vision::` — **213 / 213 PASS, 1 ignored** (the new gemma4v_block tests + every prior SigLIP-49 test — no regression on the SigLIP path).
+- No model load triggered. Concurrent `hf2q convert` host activity not blocked.
+
+**Outstanding for iter-115:** parameterized average-pool (gemma4 `n_merge=3` vs SigLIP `pool=2×2`); `Gemma4ClippableLinear` projector (replaces `mm.0.weight` straight Linear with the clippable head); arch-profile dispatch in `compute_vision_embeddings_gpu` to actually route gemma4v inputs through `gemma4v_block_forward_gpu` end-to-end (currently the function exists but is not yet called from the public entry point); GGUF loader for the (≤280 tokens, variable-resolution) image path. ~1100 src + ~400 test LOC estimated.
+
+The mlx-native `gelu` op already provides the `pytorch_tanh` formula `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))` — verified at `/opt/mlx-native/src/shaders/gelu.metal:14-30`. No new GELU kernel needed; W22's blocker #4 is RESOLVED.
+
+---
+
 #### Phase 2c iter-113-prep — gemma4_vision ViT-arch port scope (2026-04-26, W22)
 
 W22 mapped the port from current SigLIP-49 (49 tokens, pool=2×2) to gemma4_vision (≤280 tokens, pool=3×3, GQA, 2D NeoX RoPE, dual position-embed table, Gemma4ClippableLinear projector, GELU(pytorch_tanh) activation). All four reference implementations are LOCAL on disk: `/opt/candle/candle-transformers/src/models/gemma4/vision.rs` (552 lines), `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` (151 lines), `/opt/llama.cpp/convert_hf_to_gguf.py:7804-7879`, `/opt/llama.cpp/tools/mtmd/clip.cpp:1334-1343` (rope_theta=100, n_merge=3, image-token-limit 252-280).
