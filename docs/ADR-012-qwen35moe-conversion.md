@@ -165,14 +165,16 @@ Measured on M5 Max + 128 GB unified RAM, llama.cpp build `b8680-15f786e65`, hf2q
 
 | Model + repo | Quant | hf2q decode | llama.cpp decode | Parity ratio |
 |---|---|---|---|---|
-| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | ⏳ generate path hung at prefill (Task #14) | 28.56 ± 0.48 t/s | — |
-| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | ⏳ generate path hung at prefill (Task #14) | 27.75 ± 0.43 t/s | — |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | 31.4 t/s | 28.56 ± 0.48 t/s | **1.10×** |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | 26.5 t/s | 27.75 ± 0.43 t/s | **0.96×** |
 | jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-6 | 108.8 t/s | 120.03 ± 0.11 t/s | **0.91×** |
 | jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-8 | 103.4 t/s | 104.15 ± 0.11 t/s | **0.99×** |
 
 **MoE parity verdict:** hf2q is at 0.91–0.99× of llama.cpp's BLAS+MTL backend for the 35B-A3B MoE GGUFs.  Within tolerance for a pure-Rust + mlx-native implementation against llama.cpp's mature tensor-cores Metal path.  dwq48 is essentially at parity (0.99×); dwq46 trails by ~10% — likely the additional Lloyd-Max codebook decode cost on the 4-bit majority of layers (see `project_tq_sdpa_perf_analysis.md` for the codebook-decode hypothesis on the related TQ family).
 
-**Dense generate hang:** `hf2q generate` against the 27B dense GGUFs (`qwen3.6-27b-dwq{46,48}`) loads the model successfully (17.3 GB, 64 layers, variant=Dense recognized) but hangs at the prefill phase (no decode tokens emitted within a 90 s timeout).  llama.cpp generates 27.75–28.56 t/s on the same GGUFs end-to-end, so the GGUFs themselves are sound; the hang is in hf2q's qwen35 dense inference path (NOT the conversion pipeline that ADR-012 covers).  Tracked separately as Task #14 — out of ADR-012's scope; ADR-012 closure stands on the conversion-pipeline correctness verified by llama.cpp loading + generating coherent output.
+**Dense parity verdict (post Task #14):** hf2q is at 0.96–1.10× of llama.cpp on the 27B dense GGUFs after Task #14 closed (commits `d975cb8` + `92604a2`, 2026-04-26).  dwq46 *exceeds* llama.cpp by 10% (31.4 vs 28.56 t/s); dwq48 is at 0.96× (26.5 vs 27.75 t/s).  R14 entry gate (load + canonical pangram via llama-completion) is GREEN on all four GGUFs.
+
+**Task #14 root cause (closed 2026-04-26):** the dense path uploaded weights via Q4_0→F32→Q4_0 round-trip (`upload_q4_0_from_f32`), expanding a 14 GB Q4_0 GGUF to ~108 GB F32 CPU staging + 17 GB GGUF mmap = 129 GB physical on a 128 GB M5 Max.  Fix: mirror the MoE pattern (`MoeFfnWeightsGpuQ::from_quantized`) — landed `DenseFfnWeightsGpuQ` + `load_dense_ffn_quantized` + `build_dense_ffn_layer_gpu_q` to keep raw GGML blocks on Metal as U8.  Plus a special-token coverage extension (token_embd 248044→248320 with zero rows for `<|im_start|>=248045`..`<|fim_suffix|>=248062` from tokenizer.json's added_tokens, which are absent from `tokenizer.ggml.tokens`).  Working set 129 GB → 17.3 GB; load 7.8 s; coherent decode.
 
 **Why not match -ub batching:** llama-bench at `-p 0 -n 256` is decode-only (no prefill batching), so `-ub` doesn't apply.  The bench compares apples-to-apples on pure decode token throughput.
 
@@ -181,7 +183,7 @@ Measured on M5 Max + 128 GB unified RAM, llama.cpp build `b8680-15f786e65`, hf2q
 The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-012's scope is the conversion pipeline:
 
 * **Task #13** — Refactor Phase 4.5 quality measurement to streaming dequant.  Current `--skip-quality` is the closure-day workaround; full-quality re-emit would PPL/KL-gate the four DWQ GGUFs.  Bounded by ~max_tensor_F32 × 2 instead of whole-model × 2.
-* **Task #14** — Diagnose hf2q dense Qwen3.5-27B generate hang.  llama.cpp shows 28 t/s decode on the same GGUFs; hf2q's mlx-native dense path needs investigation.  MoE path is fine.
+* **Task #14** — ✅ CLOSED 2026-04-26 (commits `d975cb8` dense Q-path + `92604a2` special-token coverage).  hf2q dense 27B now decodes at 0.96–1.10× of llama.cpp.  Working set 129 GB → 17.3 GB.
 * **MoE dwq46 parity gap (0.91×)** — investigate Lloyd-Max codebook decode in the 4-bit majority layers per `project_tq_sdpa_perf_analysis.md`-class methodology; likely representation-level optimization, not kernel-level.
 * **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
 
