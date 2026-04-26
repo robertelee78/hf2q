@@ -725,6 +725,7 @@ mod tests {
             dry_run: false,
             yes: false,
             unsupported_layers: None,
+            no_integrity: false,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -767,6 +768,7 @@ mod tests {
             dry_run: false,
             yes: false,
             unsupported_layers: Some(UnsupportedLayerPolicy::Passthrough),
+            no_integrity: false,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -805,6 +807,7 @@ mod tests {
             dry_run: false,
             yes: false,
             unsupported_layers: None,
+            no_integrity: false,
         };
 
         let result = validate(&config, &metadata);

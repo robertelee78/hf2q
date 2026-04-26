@@ -207,6 +207,16 @@ pub struct ConvertArgs {
     /// when no vision_config is present (Gemma4, Qwen3.6-35B-A3B MoE).
     #[arg(long, default_value_t = false)]
     pub emit_vision_tower: bool,
+
+    /// ADR-005 Phase 3 item 3/4 — skip post-download per-shard SHA-256
+    /// integrity verification against HuggingFace's `x-linked-etag`.
+    ///
+    /// **NOT recommended.** Integrity is on by default; this opt-out
+    /// exists for development workflows + air-gapped setups.  With this
+    /// flag, downloaded shards are accepted as-is — corruption, MITM,
+    /// and silent force-push of the source repo will not be detected.
+    #[arg(long, default_value_t = false)]
+    pub no_integrity: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -398,6 +408,17 @@ pub struct ServeArgs {
     /// 400 `no_mmproj_loaded` (ADR-005 Phase 2c Task #14).
     #[arg(long)]
     pub mmproj: Option<PathBuf>,
+
+    /// ADR-005 Phase 3 item 3/4 — skip pre-load cache integrity
+    /// verification of the cached GGUF on disk.
+    ///
+    /// **NOT recommended.** When the model came from `hf2q convert`'s
+    /// auto-pipeline (iter-204), the cache manifest carries the SHA-256
+    /// recorded at quantize time; serve re-hashes the file on load to
+    /// catch disk bit-rot, partial writes, or manual edits. This flag
+    /// disables that check; corruption silently passes through.
+    #[arg(long, default_value_t = false)]
+    pub no_integrity: bool,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
@@ -683,6 +704,10 @@ pub struct ConvertConfig {
     pub yes: bool,
     /// How to handle unsupported layer types
     pub unsupported_layers: Option<UnsupportedLayerPolicy>,
+    /// Skip post-download SHA-256 integrity verification against HF's
+    /// `x-linked-etag`. Default `false` (integrity ON). ADR-005 Phase 3
+    /// item 3/4.
+    pub no_integrity: bool,
 }
 
 #[allow(dead_code)]
@@ -743,8 +768,32 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         (None, Some(repo_id)) => {
             // HF Hub download (Epic 3, Story 3.1)
             let progress = crate::progress::ProgressReporter::new();
-            crate::input::hf_download::download_model(repo_id, &progress)
-                .map_err(|e| anyhow::anyhow!("{}", e))?
+            let dir = crate::input::hf_download::download_model(repo_id, &progress)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // ADR-005 Phase 3 item 3/4 — verify per-shard integrity
+            // against HF's x-linked-etag immediately after download.
+            // On by default; --no-integrity bypasses with a stern warn.
+            if args.no_integrity {
+                tracing::warn!(
+                    repo = %repo_id,
+                    "integrity check skipped per --no-integrity (NOT recommended)"
+                );
+            } else {
+                // Use the snapshot dir's name as the revision when it
+                // looks like a 40-hex commit SHA; otherwise fall back to
+                // "main" (the rolling tip).  hf-hub's snapshot layout
+                // names directories by the commit hash, so the dir's
+                // file_name() is the authoritative pin.
+                let revision = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+                    .unwrap_or("main")
+                    .to_string();
+                crate::input::integrity::verify_repo(repo_id, &revision, &dir)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+            dir
         }
         (None, None) => {
             anyhow::bail!("Either --input or --repo must be specified");
@@ -820,6 +869,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         dry_run: args.dry_run,
         yes: args.yes,
         unsupported_layers: args.unsupported_layers,
+        no_integrity: args.no_integrity,
     })
 }
 
@@ -948,5 +998,112 @@ mod tests {
             "dwq46",
             "Gemma-4 regression: DwqMixed46 filename suffix must be 'dwq46'"
         );
+    }
+
+    // ── ADR-005 Phase 3 iter-203 — --no-integrity flag parsing ──────────
+
+    use clap::Parser;
+
+    #[test]
+    fn convert_no_integrity_default_false() {
+        // Without the flag, integrity is ON (no_integrity == false).
+        let cli =
+            Cli::parse_from(["hf2q", "convert", "--input", "/tmp/x", "--format", "gguf"]);
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert!(!args.no_integrity, "default must be --no-integrity OFF");
+    }
+
+    #[test]
+    fn convert_no_integrity_flag_parses_to_true() {
+        let cli = Cli::parse_from([
+            "hf2q",
+            "convert",
+            "--input",
+            "/tmp/x",
+            "--format",
+            "gguf",
+            "--no-integrity",
+        ]);
+        let Command::Convert(args) = cli.command else {
+            panic!("expected Convert");
+        };
+        assert!(args.no_integrity, "--no-integrity must set the flag");
+    }
+
+    #[test]
+    fn serve_no_integrity_default_false() {
+        let cli = Cli::parse_from(["hf2q", "serve"]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert!(!args.no_integrity);
+    }
+
+    #[test]
+    fn serve_no_integrity_flag_parses_to_true() {
+        let cli = Cli::parse_from(["hf2q", "serve", "--no-integrity"]);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected Serve");
+        };
+        assert!(args.no_integrity);
+    }
+
+    #[test]
+    fn convert_no_integrity_propagates_into_resolved_config() {
+        // resolve_convert_config is the canonical lift from ConvertArgs to
+        // ConvertConfig.  Verify the boolean copy makes it through.  Use
+        // an --input path so the network leg never runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = ConvertArgs {
+            input: Some(tmp.path().to_path_buf()),
+            repo: None,
+            format: OutputFormat::Gguf,
+            quant: QuantMethod::Q4,
+            sensitive_layers: None,
+            calibration_samples: 1024,
+            target_bpw: 4.5,
+            bits: None,
+            group_size: None,
+            output: None,
+            json_report: false,
+            skip_quality: false,
+            quality_gate: false,
+            dry_run: false,
+            yes: false,
+            unsupported_layers: None,
+            emit_vision_tower: false,
+            no_integrity: true,
+        };
+        let cfg = resolve_convert_config(&args).unwrap();
+        assert!(cfg.no_integrity);
+    }
+
+    #[test]
+    fn convert_no_integrity_default_propagates_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = ConvertArgs {
+            input: Some(tmp.path().to_path_buf()),
+            repo: None,
+            format: OutputFormat::Gguf,
+            quant: QuantMethod::Q4,
+            sensitive_layers: None,
+            calibration_samples: 1024,
+            target_bpw: 4.5,
+            bits: None,
+            group_size: None,
+            output: None,
+            json_report: false,
+            skip_quality: false,
+            quality_gate: false,
+            dry_run: false,
+            yes: false,
+            unsupported_layers: None,
+            emit_vision_tower: false,
+            no_integrity: false,
+        };
+        let cfg = resolve_convert_config(&args).unwrap();
+        assert!(!cfg.no_integrity);
     }
 }
