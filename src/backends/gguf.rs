@@ -672,7 +672,9 @@ fn build_mmproj_metadata(model: &QuantizedModel) -> Vec<(String, MetaValue)> {
 /// The mmproj file contains only tensors with vision-related HF names
 /// (`vision_tower.*`, `embed_vision.*`) — exactly the tensors filtered OUT of
 /// the text GGUF. Tensor names are mapped using the same `hf_name_to_gguf()`
-/// function which already handles `v.blk.N.*` and `mm.0.*` patterns.
+/// function which already handles `v.blk.N.*` and `mm.input_projection.*`
+/// patterns (was `mm.0.*` pre-iter-116f, before the gemma4v projector
+/// rename).
 fn write_mmproj_gguf(
     model: &QuantizedModel,
     text_path: &Path,
@@ -746,9 +748,13 @@ fn write_mmproj_gguf(
         );
         let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
-        // ADR-005 Phase 2c iter-116a: clamp-scalar emit for Gemma4
-        // ClippableLinear bounds (`mm.0.{input_min,input_max,output_min,
-        // output_max}`).  HF safetensors stores these as 0-d F32 scalars;
+        // ADR-005 Phase 2c iter-116a (renamed iter-116f): clamp-scalar
+        // emit for Gemma4 ClippableLinear bounds
+        // (`mm.input_projection.{input_min,input_max,output_min,output_max}`
+        // — was `mm.0.*` pre-iter-116f, see hf_name_to_gguf static_map +
+        // test_gemma4v_clippable_linear_scalar_bounds_mapping for the
+        // canonical name + llama.cpp citation).
+        // HF safetensors stores these as 0-d F32 scalars;
         // llama.cpp's CLIP loader expects 1-D F32 tensors — see
         // `convert_hf_to_gguf.py:7851-7879` (`Gemma4VisionAudioModel.modify_tensors`,
         // `data_torch.unsqueeze(0)` + `tensor_force_quant` returning F32).
@@ -1819,17 +1825,29 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
         ("model.vision_tower.patch_embedder.position_embedding_table", "v.position_embd.weight"),
         ("model.vision_tower.std_bias", "v.std_bias"),
         ("model.vision_tower.std_scale", "v.std_scale"),
-        ("model.embed_vision.embedding_projection.weight", "mm.0.weight"),
+        // ADR-005 Phase 2c iter-116f: gemma4v projector base name must be
+        // `mm.input_projection.weight` (TN_MM_INP_PROJ at
+        // /opt/llama.cpp/tools/mtmd/clip-impl.h:110), not `mm.0.weight`.
+        // PROJECTOR_TYPE_GEMMA4V at clip.cpp:1937 hard-requires this exact
+        // name via `get_tensor(TN_MM_INP_PROJ)` (no fallback). See also
+        // /opt/llama.cpp/gguf-py/gguf/tensor_mapping.py:135 +
+        // /opt/llama.cpp/gguf-py/gguf/constants.py:1226 (V_MM_INP_PROJ ->
+        // "mm.input_projection"). Note: hf2q's INFERENCE-side reader
+        // (`mmproj_weights::mm_0_weight`) still looks up `mm.0.weight` —
+        // self-load drift is tracked separately; this iter's gate is
+        // llama-mtmd-cli's CLIP loader (`HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD`).
+        ("model.embed_vision.embedding_projection.weight", "mm.input_projection.weight"),
         // Gemma4ClippableLinear scalar bounds for the multimodal projection.
         // Each is a single-f32 tensor in HF (PyTorch 0-D scalar); the
         // llama.cpp converter `unsqueeze(0)`s them to GGUF 1-D `[1]`
-        // tensors. Loaded as `Option<f32>` by `mmproj_weights::mm_0_bounds`
-        // and consumed by `gemma4v_clippable_linear_{forward,gpu}`.
-        // Reference: `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
-        ("model.embed_vision.embedding_projection.input_min", "mm.0.input_min"),
-        ("model.embed_vision.embedding_projection.input_max", "mm.0.input_max"),
-        ("model.embed_vision.embedding_projection.output_min", "mm.0.output_min"),
-        ("model.embed_vision.embedding_projection.output_max", "mm.0.output_max"),
+        // tensors. The clamp-scalar names key off the projector base
+        // (clip.cpp:1941-1959 substitutes `.weight` -> `.input_min` etc on
+        // the same base name), so they MUST share the `mm.input_projection`
+        // prefix. Reference: `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
+        ("model.embed_vision.embedding_projection.input_min", "mm.input_projection.input_min"),
+        ("model.embed_vision.embedding_projection.input_max", "mm.input_projection.input_max"),
+        ("model.embed_vision.embedding_projection.output_min", "mm.input_projection.output_min"),
+        ("model.embed_vision.embedding_projection.output_max", "mm.input_projection.output_max"),
     ];
 
     for &(hf, gguf) in static_map {
@@ -1843,17 +1861,60 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String 
     let layer_map = layer_map_for_arch(arch);
 
     // Vision encoder layer patterns: model.vision_tower.encoder.layers.N.<suffix> → v.blk.N.<gguf_suffix>
+    //
+    // ADR-005 Phase 2c iter 116f: vision-namespace tensor names must match
+    // llama.cpp's CLIP loader exactly. Per-mapping citations below — every
+    // name was cross-checked against the canonical
+    // /opt/llama.cpp/gguf-py/gguf/tensor_mapping.py + constants.py table
+    // (the same table the upstream `convert_hf_to_gguf.py:Gemma4VisionAudioModel`
+    // uses for HF→GGUF emit) and the live get_tensor calls in
+    // /opt/llama.cpp/tools/mtmd/clip.cpp:1665-1694.
+    //
+    // Three norm mappings differ between text-decoder Gemma 4 and
+    // vision-encoder Gemma 4, because gemma4's vision uses a DIFFERENT
+    // norm ordering than gemma4's text decoder:
+    //   - `pre_feedforward_layernorm` is the pre-FFN norm in HF, which
+    //     llama.cpp's vision loader treats as V_ENC_POST_ATTN_NORM (i.e.
+    //     `ln2`, the second pre-norm in build_vit). See tensor_mapping.py:1575.
+    //   - `post_attention_layernorm` is a SEPARATE ATTN-OUTPUT post-norm
+    //     in gemma4 vision (V_ENC_ATTN_POST_NORM = `attn_post_norm`).
+    //     See tensor_mapping.py:1630 + constants.py:1218.
+    //   - `post_feedforward_layernorm` is V_ENC_FFN_POST_NORM
+    //     (`ffn_post_norm`). See tensor_mapping.py:1634 + constants.py:1219.
+    // The text decoder mappings (gemma4 arch in `layer_map_for_arch`) are
+    // unchanged — they live in a separate codepath above.
+    //
+    // Vision-namespace `attn_out` (W34's iter-116e fix) is preserved per
+    // TN_ATTN_OUTPUT at /opt/llama.cpp/tools/mtmd/clip-impl.h:82
+    // (`"%s.blk.%d.attn_out.%s"`) — text decoder's full `attn_output`
+    // form remains in `shared` at line ~1663 above, unrelated.
     let vision_layer_map: &[(&str, &str)] = &[
+        // Q/K/V/O projections — clip.cpp:1665-1668, prefix=`v`.
         ("self_attn.q_proj.linear.weight", "attn_q.weight"),
         ("self_attn.k_proj.linear.weight", "attn_k.weight"),
         ("self_attn.v_proj.linear.weight", "attn_v.weight"),
-        ("self_attn.o_proj.linear.weight", "attn_output.weight"),
+        // TN_ATTN_OUTPUT short form (clip-impl.h:82 / W34 iter-116e).
+        ("self_attn.o_proj.linear.weight", "attn_out.weight"),
+        // Optional Q/K norms — clip.cpp:1670-1671.
         ("self_attn.q_norm.weight", "attn_q_norm.weight"),
         ("self_attn.k_norm.weight", "attn_k_norm.weight"),
+        // ln1 = pre-attention norm. tensor_mapping.py:1526
+        // (V_ENC_INPUT_NORM line for gemma4) + constants.py:1211.
         ("input_layernorm.weight", "ln1.weight"),
-        ("post_attention_layernorm.weight", "ln2.weight"),
-        ("pre_feedforward_layernorm.weight", "ffn_norm.weight"),
-        ("post_feedforward_layernorm.weight", "post_ffw_norm.weight"),
+        // ln2 = pre-FFN norm. gemma4's HF `pre_feedforward_layernorm` is
+        // what build_vit's `layer.ln_2_w` consumes (clip.cpp:451).
+        // tensor_mapping.py:1575 maps gemma4's pre_feedforward_layernorm to
+        // V_ENC_POST_ATTN_NORM = "v.blk.{bid}.ln2" (constants.py:1214).
+        ("pre_feedforward_layernorm.weight", "ln2.weight"),
+        // attn_post_norm = post-attention residual norm. Gemma4-only
+        // (vision V_ENC_ATTN_POST_NORM). tensor_mapping.py:1630 + constants.py:1218.
+        // build_vit consumes via `layer.attn_post_norm_w` at clip.cpp:439.
+        ("post_attention_layernorm.weight", "attn_post_norm.weight"),
+        // ffn_post_norm = post-FFN residual norm. tensor_mapping.py:1634
+        // + constants.py:1219 (V_ENC_FFN_POST_NORM = `v.blk.{bid}.ffn_post_norm`).
+        // build_vit consumes via `layer.ff_post_norm_w` at clip.cpp:464.
+        ("post_feedforward_layernorm.weight", "ffn_post_norm.weight"),
+        // FFN — gate/up/down. tensor_mapping.py:1597,1605,1625.
         ("mlp.gate_proj.linear.weight", "ffn_gate.weight"),
         ("mlp.up_proj.linear.weight", "ffn_up.weight"),
         ("mlp.down_proj.linear.weight", "ffn_down.weight"),
@@ -3900,36 +3961,42 @@ mod tests {
         }
     }
 
-    /// iter-115: gemma4v Gemma4ClippableLinear scalar bounds map to GGUF
-    /// `mm.0.{input_min, input_max, output_min, output_max}`. Reference:
-    /// `/opt/llama.cpp/tools/mtmd/clip.cpp:1935-1959`.
+    /// iter-116f (was iter-115): gemma4v Gemma4ClippableLinear scalar
+    /// bounds map to GGUF `mm.input_projection.{input_min, input_max,
+    /// output_min, output_max}` (TN_MM_INP_PROJ at
+    /// `/opt/llama.cpp/tools/mtmd/clip-impl.h:110` + clip.cpp:1937-1959
+    /// scalar lookup substituting `.weight` -> `.input_min` etc on the
+    /// SAME projector base name). iter-115 originally used `mm.0.*` which
+    /// llama.cpp's CLIP loader rejects (V_MMPROJ "mm.{bid}" is
+    /// projector_type=mlp/llava — gemma4v's PROJECTOR_TYPE_GEMMA4V uses
+    /// V_MM_INP_PROJ "mm.input_projection" exclusively).
     #[test]
     fn test_gemma4v_clippable_linear_scalar_bounds_mapping() {
         for arch in &["gemma4", "gemma4_multimodal", "llama"] {
             assert_eq!(
                 hf_name_to_gguf("model.embed_vision.embedding_projection.input_min", arch, 0),
-                "mm.0.input_min",
+                "mm.input_projection.input_min",
                 "[{arch}] input_min mapping"
             );
             assert_eq!(
                 hf_name_to_gguf("model.embed_vision.embedding_projection.input_max", arch, 0),
-                "mm.0.input_max",
+                "mm.input_projection.input_max",
                 "[{arch}] input_max mapping"
             );
             assert_eq!(
                 hf_name_to_gguf("model.embed_vision.embedding_projection.output_min", arch, 0),
-                "mm.0.output_min",
+                "mm.input_projection.output_min",
                 "[{arch}] output_min mapping"
             );
             assert_eq!(
                 hf_name_to_gguf("model.embed_vision.embedding_projection.output_max", arch, 0),
-                "mm.0.output_max",
+                "mm.input_projection.output_max",
                 "[{arch}] output_max mapping"
             );
-            // Sanity: weight still maps the same way.
+            // Sanity: weight maps to the same projector base.
             assert_eq!(
                 hf_name_to_gguf("model.embed_vision.embedding_projection.weight", arch, 0),
-                "mm.0.weight"
+                "mm.input_projection.weight"
             );
         }
     }
