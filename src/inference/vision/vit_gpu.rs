@@ -38,7 +38,7 @@ use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::elementwise::{elementwise_add, elementwise_mul, scalar_mul_f32};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::softmax::dispatch_softmax;
-use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_bf16};
+use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_f16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// ADR-005 Phase 2c iter-120 (W49) — F32-attention env-gate.
@@ -614,15 +614,27 @@ pub fn vit_attention_scores_gpu(
 /// Pipeline:
 ///   1. `vit_attention_scores_gpu` → scores `[num_heads, batch, batch]` F32.
 ///   2. `vit_softmax_last_dim_gpu` → softmax along last dim.
-///   3. Permute V seq→head major; cast to BF16; `transpose_last2_bf16`
+///   3. Permute V seq→head major; cast to F16; `transpose_last2_f16`
 ///      to `[num_heads, head_dim, batch]`.
-///   4. `dense_matmul_bf16_f32_tensor` per head: `attn = scores @ V`,
+///   4. `dense_matmul_f16_f32_tensor` per head: `attn = scores @ V`,
 ///      output `[num_heads, batch, head_dim]` F32.
 ///   5. `permute_021_f32` back to seq-major
 ///      `[batch, num_heads, head_dim]`.
 ///
 /// `scale` matches `vit_attention_scores_gpu`. For Gemma 4V pass `1.0`
 /// (per llama.cpp); for standard ViT pass `1 / sqrt(head_dim)`.
+///
+/// ADR-005 Phase 2c iter-129 (W60): V is staged at F16 (peer-precision
+/// parity).  Peer's gemma4v ViT uses `flash_attn_ext` on Metal (default
+/// AUTO upgrades to ENABLED at clip.cpp:2494-2528) and casts both K and
+/// V to F16 before the FA call (clip.cpp:663-664).  We replicate that
+/// 10-bit-mantissa staging through our decomposed scores@V matmul; the
+/// arithmetic contract stays F32-accumulated across the K reduction
+/// (`dense_matmul_f16_f32_tensor` matches llama.cpp's
+/// `kernel_mul_mm_f16_f32`, which uses `simdgroup_half8x8` MMA with
+/// float4x4 accumulator).  Pre-iter-129 hf2q cast V F32→BF16 (7-bit
+/// mantissa), capturing the dominant residual per-block cascade after
+/// iter-128's weight-matmul F16 fix.
 ///
 /// # Errors
 ///
@@ -691,51 +703,56 @@ pub fn vit_attention_gpu(
     .context("permute V seq→head major")?;
     encoder.memory_barrier();
 
-    // 3b. Cast V_perm f32 → bf16 (transpose_last2 only has a bf16 variant
-    // and dense_matmul wants bf16 src0).
-    let v_bf16 = device
+    // 3b. Cast V_perm f32 → f16 (peer-precision parity, iter-129).
+    // Peer's flash_attn_ext stages V at F16 (clip.cpp:664). We use the
+    // F16 transpose + F16-staged matmul (mlx-native 0.4.9
+    // `transpose_last2_f16` + `dense_matmul_f16_f32_tensor`, which
+    // mirrors `kernel_mul_mm_f16_f32` simdgroup_half8x8 MMA with F32
+    // accumulator). 10-bit mantissa per element, 8x tighter than the
+    // pre-iter-129 BF16 staging.
+    let v_f16 = device
         .alloc_buffer(
             n_v * 2,
-            DType::BF16,
+            DType::F16,
             vec![num_heads as usize, batch as usize, head_dim as usize],
         )
-        .map_err(|e| anyhow!("alloc v_bf16: {e}"))?;
+        .map_err(|e| anyhow!("alloc v_f16: {e}"))?;
     cast(
         encoder,
         registry,
         metal_dev,
         &v_perm,
-        &v_bf16,
+        &v_f16,
         n_v,
-        CastDirection::F32ToBF16,
+        CastDirection::F32ToF16,
     )
-    .context("cast V f32→bf16")?;
+    .context("cast V f32→f16")?;
     encoder.memory_barrier();
 
-    // 3c. transpose_last2_bf16: [num_heads, batch, head_dim] →
+    // 3c. transpose_last2_f16: [num_heads, batch, head_dim] →
     //     [num_heads, head_dim, batch].
-    let v_t_bf16 = device
+    let v_t_f16 = device
         .alloc_buffer(
             n_v * 2,
-            DType::BF16,
+            DType::F16,
             vec![num_heads as usize, head_dim as usize, batch as usize],
         )
-        .map_err(|e| anyhow!("alloc v_t_bf16: {e}"))?;
-    transpose_last2_bf16(
+        .map_err(|e| anyhow!("alloc v_t_f16: {e}"))?;
+    transpose_last2_f16(
         encoder,
         registry,
         metal_dev,
-        &v_bf16,
-        &v_t_bf16,
+        &v_f16,
+        &v_t_f16,
         num_heads as usize,
         batch as usize,
         head_dim as usize,
     )
-    .context("transpose V last 2")?;
+    .context("transpose V last 2 (f16)")?;
     encoder.memory_barrier();
 
     // --- Stage 4: attn = scores @ V per head batch ---
-    // Layout: src0 = V_T [num_heads, head_dim, batch_k] BF16,
+    // Layout: src0 = V_T [num_heads, head_dim, batch_k] F16,
     //         src1 = softmaxed scores [num_heads, batch_q, batch_k] F32.
     // output[h, m, n] = sum_k V_T[h, n, k] * scores[h, m, k]
     //                 = sum_k V[h, k, n] * scores[h, m, k] = attn[h, m, n] ✓
@@ -748,23 +765,23 @@ pub fn vit_attention_gpu(
             vec![num_heads as usize, batch as usize, head_dim as usize],
         )
         .map_err(|e| anyhow!("alloc attn_head_major: {e}"))?;
-    let params = DenseMmBf16F32Params {
+    let params = DenseMmF16F32Params {
         m: batch,      // batch_q
         n: head_dim,   // output last dim
         k: batch,      // batch_k (contract)
         src0_batch: num_heads,
         src1_batch: num_heads,
     };
-    dense_matmul_bf16_f32_tensor(
+    dense_matmul_f16_f32_tensor(
         encoder,
         registry,
         device,
-        &v_t_bf16,
+        &v_t_f16,
         &softmaxed,
         &mut attn_head_major,
         &params,
     )
-    .context("attention scores @ V matmul")?;
+    .context("attention scores @ V matmul (f16)")?;
     encoder.memory_barrier();
 
     // --- Stage 5: permute back to seq-major ---
