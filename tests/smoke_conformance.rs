@@ -149,9 +149,16 @@ fn smoke_hf_token_missing_returns_preflight_exit() {
     // Known arch qwen35 + missing HF_TOKEN → preflight fails with
     // exit code 2 and a single-line HF_TOKEN-named error. --dry-run
     // still runs preflight per Decision 16 §CLI.
+    //
+    // Point HOME at a temp dir so the ~/.cache/huggingface/token
+    // fallback (RealSmokeEnv::hf_token) cannot resolve a cached login.
+    // Without this, a developer who ran `hf auth login` locally would
+    // see the test pass preflight and exit 0, silently breaking the gate.
+    let tmp_home = tempfile::tempdir().expect("tempdir");
     let out = hf2q()
         .args(["smoke", "--arch", "qwen35", "--dry-run"])
         .env_remove("HF_TOKEN")
+        .env("HOME", tmp_home.path())
         .output()
         .expect("exec hf2q");
     // On a non-CI dev machine both llama-cli and a dev (non-release) build
@@ -188,9 +195,15 @@ fn smoke_hf_token_missing_returns_preflight_exit() {
 fn smoke_hf_token_empty_string_rejected_same_as_missing() {
     // Decision 16 §1: "HF_TOKEN is set (non-empty)" — the empty string
     // is NOT a valid token.
+    //
+    // Point HOME at a temp dir so the ~/.cache/huggingface/token
+    // fallback cannot supply a cached login even when HF_TOKEN=""
+    // explicitly clears the env var.
+    let tmp_home = tempfile::tempdir().expect("tempdir");
     let out = hf2q()
         .args(["smoke", "--arch", "qwen35", "--dry-run"])
         .env("HF_TOKEN", "")
+        .env("HOME", tmp_home.path())
         .output()
         .expect("exec hf2q");
     assert!(!out.status.success(), "empty HF_TOKEN must be rejected");
