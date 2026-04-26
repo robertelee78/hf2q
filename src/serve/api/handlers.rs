@@ -1550,6 +1550,76 @@ fn rewrite_messages_for_vision_placeholders(messages: &[ChatMessage]) -> Vec<Cha
         .collect()
 }
 
+/// Reported by `compute_soft_token_layout` when the prompt's
+/// placeholder-token count doesn't match the supplied per-image
+/// vector.  Carries both observed counts so the caller can build a
+/// useful error message (the chat-template emitted the wrong number
+/// of image markers, or the request's image count drifted from what
+/// the renderer saw).
+///
+/// Phase 2c Task #17 / iter-100.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlaceholderCountMismatch {
+    pub placeholder_positions_found: usize,
+    pub n_image_tokens_supplied: usize,
+}
+
+/// Pure compute: given the placeholder token id, the input prompt
+/// tokens, and the per-image `N_image_tokens` counts, build the
+/// post-expansion prompt vector + per-image post-expansion ranges.
+///
+/// Splits out of `expand_image_placeholders` so it's unit-testable
+/// without a live `Engine` (which carries the tokenizer and the
+/// `MlxDevice`).  The caller of this helper then allocs + populates
+/// one `MlxBuffer` per range and builds the `SoftTokenData` entries.
+///
+/// Returns:
+///   * `Ok((expanded_tokens, ranges))` where `ranges[i]` is the
+///     post-expansion `[start, end)` slot for image `i`'s embedding.
+///   * `Err(PlaceholderCountMismatch)` when the prompt holds a
+///     different number of `img_token_id` placeholders than the
+///     supplied `n_image_tokens_per_image` count vector.
+///
+/// Phase 2c Task #17 / iter-100.
+pub(crate) fn compute_soft_token_layout(
+    img_token_id: u32,
+    prompt_tokens: &[u32],
+    n_image_tokens_per_image: &[usize],
+) -> std::result::Result<(Vec<u32>, Vec<std::ops::Range<usize>>), PlaceholderCountMismatch> {
+    let placeholder_positions: Vec<usize> = prompt_tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(p, t)| if *t == img_token_id { Some(p) } else { None })
+        .collect();
+    if placeholder_positions.len() != n_image_tokens_per_image.len() {
+        return Err(PlaceholderCountMismatch {
+            placeholder_positions_found: placeholder_positions.len(),
+            n_image_tokens_supplied: n_image_tokens_per_image.len(),
+        });
+    }
+    let total_extra: usize = n_image_tokens_per_image
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_sub(placeholder_positions.len()); // each placeholder already counts once
+    let mut prompt_expanded: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + total_extra);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(placeholder_positions.len());
+    let mut last_pos = 0usize;
+    for (i, &pos) in placeholder_positions.iter().enumerate() {
+        prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..pos]);
+        let n = n_image_tokens_per_image[i];
+        let start = prompt_expanded.len();
+        for _ in 0..n {
+            prompt_expanded.push(img_token_id);
+        }
+        let end = prompt_expanded.len();
+        ranges.push(start..end);
+        last_pos = pos + 1;
+    }
+    prompt_expanded.extend_from_slice(&prompt_tokens[last_pos..]);
+    Ok((prompt_expanded, ranges))
+}
+
 /// Locate `<|image|>` placeholder positions in the rendered prompt
 /// tokens and EXPAND each into a contiguous run of `N_image_tokens`
 /// copies (where `N_image_tokens = embeddings[i].len() / hidden`).  For
@@ -3055,6 +3125,128 @@ mod multimodal_tests {
                 assert!(t.starts_with("a:"));
             }
             other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_soft_token_layout — pure expansion math (iter-100)
+    // -----------------------------------------------------------------------
+
+    /// Empty prompt + zero images is a valid no-op identity.
+    #[test]
+    fn compute_soft_token_layout_empty_prompt_zero_images_returns_empty() {
+        let (out, ranges) = compute_soft_token_layout(258880, &[], &[]).expect("ok");
+        assert!(out.is_empty());
+        assert!(ranges.is_empty());
+    }
+
+    /// Pure-text prompt (no placeholders) is passed through unchanged
+    /// and yields zero ranges.
+    #[test]
+    fn compute_soft_token_layout_no_placeholders_passes_through() {
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let (out, ranges) = compute_soft_token_layout(258880, &prompt, &[]).expect("ok");
+        assert_eq!(out, prompt);
+        assert!(ranges.is_empty());
+    }
+
+    /// Single placeholder in the middle expands into N consecutive
+    /// copies of the image token id, growing the prompt by N-1.
+    #[test]
+    fn compute_soft_token_layout_single_placeholder_expands_to_n_copies() {
+        const IMG: u32 = 258880;
+        let prompt = vec![10u32, 20, IMG, 30, 40];
+        let (out, ranges) = compute_soft_token_layout(IMG, &prompt, &[4]).expect("ok");
+        assert_eq!(out, vec![10, 20, IMG, IMG, IMG, IMG, 30, 40]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 2..6);
+        for slot in &out[ranges[0].clone()] {
+            assert_eq!(*slot, IMG);
+        }
+    }
+
+    /// Placeholder at the very start (position 0) expands cleanly.
+    #[test]
+    fn compute_soft_token_layout_placeholder_at_start() {
+        const IMG: u32 = 258880;
+        let prompt = vec![IMG, 1, 2, 3];
+        let (out, ranges) = compute_soft_token_layout(IMG, &prompt, &[3]).expect("ok");
+        assert_eq!(out, vec![IMG, IMG, IMG, 1, 2, 3]);
+        assert_eq!(ranges[0], 0..3);
+    }
+
+    /// Placeholder at the very end (last position) expands cleanly.
+    #[test]
+    fn compute_soft_token_layout_placeholder_at_end() {
+        const IMG: u32 = 258880;
+        let prompt = vec![1, 2, 3, IMG];
+        let (out, ranges) = compute_soft_token_layout(IMG, &prompt, &[2]).expect("ok");
+        assert_eq!(out, vec![1, 2, 3, IMG, IMG]);
+        assert_eq!(ranges[0], 3..5);
+    }
+
+    /// Two placeholders, possibly with different per-image token
+    /// counts, expand independently.  Range bounds are computed in the
+    /// post-expansion vector.
+    #[test]
+    fn compute_soft_token_layout_two_placeholders_independent_ranges() {
+        const IMG: u32 = 258880;
+        // Prompt: [a, IMG, b, IMG, c]; image 0 → 2 tokens, image 1 → 4 tokens.
+        let prompt = vec![100u32, IMG, 200, IMG, 300];
+        let (out, ranges) = compute_soft_token_layout(IMG, &prompt, &[2, 4]).expect("ok");
+        assert_eq!(out.len(), 5 - 2 + 2 + 4);
+        assert_eq!(ranges[0], 1..3);
+        assert_eq!(ranges[1], 4..8);
+        assert_eq!(out[0], 100);
+        assert_eq!(out[3], 200);
+        assert_eq!(out[8], 300);
+    }
+
+    /// Mismatched placeholder count vs image count returns the
+    /// `PlaceholderCountMismatch` error variant carrying both counts.
+    #[test]
+    fn compute_soft_token_layout_mismatch_reports_both_counts() {
+        const IMG: u32 = 258880;
+        let prompt = vec![1, IMG, 2, IMG, 3];
+        let err = compute_soft_token_layout(IMG, &prompt, &[5]).expect_err("must reject");
+        assert_eq!(
+            err,
+            PlaceholderCountMismatch {
+                placeholder_positions_found: 2,
+                n_image_tokens_supplied: 1,
+            }
+        );
+        let err = compute_soft_token_layout(IMG, &[1, 2, 3], &[5, 5]).expect_err("must reject");
+        assert_eq!(
+            err,
+            PlaceholderCountMismatch {
+                placeholder_positions_found: 0,
+                n_image_tokens_supplied: 2,
+            }
+        );
+    }
+
+    /// Placeholder with N=0 image tokens is a degenerate case (drops
+    /// the placeholder entirely without inserting copies).
+    #[test]
+    fn compute_soft_token_layout_zero_image_tokens_drops_placeholder() {
+        const IMG: u32 = 258880;
+        let prompt = vec![10u32, IMG, 20];
+        let (out, ranges) = compute_soft_token_layout(IMG, &prompt, &[0]).expect("ok");
+        assert_eq!(out, vec![10, 20]);
+        assert_eq!(ranges[0], 1..1);
+    }
+
+    /// For every range, the corresponding slot count equals the
+    /// requested count.
+    #[test]
+    fn compute_soft_token_layout_ranges_match_n_image_tokens() {
+        const IMG: u32 = 258880;
+        let prompt = vec![1u32, IMG, 2, 3, IMG, 4, IMG];
+        let n_per = vec![3usize, 7, 1];
+        let (_, ranges) = compute_soft_token_layout(IMG, &prompt, &n_per).expect("ok");
+        for (i, range) in ranges.iter().enumerate() {
+            assert_eq!(range.len(), n_per[i], "range {i} len");
         }
     }
 
