@@ -762,42 +762,23 @@ oracles used by P9b.  See ffn.rs.
 
 **Estimated LOC:** ~250.
 
-#### P12.a COMPLETE — trait + mock landed at ADR-013 close (commit `c1b5a30`, 2026-04-25)
-`activation_capture.rs` defines the `ActivationCapture` trait and `LayerActivations` shape, plus `MockActivationCapture` for ADR-012-side calibration tests. Real impl on `Qwen35Model` was deferred at the close.
+### P14 — MTP speculative-decoding execution (planned; blocked on ADR-012 P11)
 
-#### P12.b COMPLETE — real impl on `Qwen35Model` (CPU path, 2026-04-25)
-`src/inference/models/qwen35/activation_capture_real.rs` ports the real `impl ActivationCapture for Qwen35Model` from the ADR-012 P9 worktree branch (`28df83c`) into main. Mirrors `forward_cpu`'s loop body so captured residual streams are byte-identical to a forward call's intermediate state. Variant coverage:
-- **Dense Qwen3.5** (`Qwen35FfnWeights::Dense`): full CPU capture works on F32-loaded weights.
-- **MoE Qwen3.5 unquantized** (`Qwen35FfnWeights::Moe`): F32 path works.
-- **MoE Qwen3.5 GGUF-loaded** (`Qwen35FfnWeights::MoeQ`): returns typed `RealActivationCaptureError::ForwardPass` per the no-fallback mantra rather than F32-expanding 256 experts (~128 GB OOM). GPU-backed capture for `MoeQ` is the explicit follow-up; conversion-side guard already enforces this via `requires_activation_capture()` in `quantize::dwq`.
+**Status:** ⏳ **planned** — new phase added 2026-04-24 alongside ADR-012 Decision 19's conversion-side MTP tensor round-trip gate.
 
-Tests: 9 new tests in `activation_capture_real::tests` — all passing (`dense_capture_returns_correct_shape`, `dense_layer_input_zero_equals_post_embedding`, `moe_unquantized_capture_returns_correct_shape`, `moe_quantized_returns_typed_forward_pass_error`, `empty_tokens_returns_error`, `real_activation_capture_wrapper_delegates_to_model`, `not_ready_shim_returns_not_ready_error`, `error_display_for_load_includes_path`, `forward_pass_error_carries_layer_and_reason`). Stale "P11 follow-up" notes in `activation_capture.rs` updated to point at the real impl.
+**Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
 
-### P14 — MTP speculative-decoding execution (planned, blocked on ADR-012 P11)
+**Dependency:** ADR-012 P11 (MTP tensor round-trip integrity gate). If P11 is not green, P14 is not started — the cross-link exists precisely so a "we'll do the inference side later" stub cannot silently accumulate on this side of the boundary.
 
-**Status:** planned (entry committed alongside ADR-012 P11's roundtrip gate, 2026-04-25).
+**Deliverables (provisional, to be refined when P14 opens):**
+- `src/inference/models/qwen35/mtp.rs` — load-only scaffold is promoted to a full forward implementation. The `MtpWeights` bag-of-tensors structure gains a `forward_draft` entry point.
+- Rejection sampling loop in `src/inference/models/qwen35/model.rs` (both dense + MoE variants).
+- Unit tests for the rejection sampler against a hand-authored log-prob fixture.
+- Acceptance: speculative decoding does not change output logits vs. greedy single-token decode at temperature 0. Throughput improvement measured on a small-fixture generate; must be positive (≥ 10%) on at least one prompt set.
 
-**Scope:** Implement the MTP draft/accept loop:
-- Draft N tokens via the loaded `MtpWeights` block (live in `src/inference/models/qwen35/mtp.rs`).
-- Verify each draft token against the main-stack forward pass.
-- Reject + replay on mismatch (DeepSeek-V3-style speculative decoding).
+**Cross-link:** ADR-012 P11 landed 2026-04-24. That commit is the precondition for this phase. When P14 opens, both ADRs update their phase tables together.
 
-**Dependency:** **ADR-012 P11 must be green** before P14 starts.  P11
-(`tests/convert_qwen35_mtp_roundtrip.rs`) proves the conversion-side emits
-MTP tensors at the GGUF names this loader expects (`blk.{num_hidden_layers}.nextn.*`,
-post-Decision-19 resolver).  Without P11, every MTP tensor in our shipped
-GGUFs would silently mis-name and the speculative loop would have no weights
-to draft from.  P11 catches that failure mode at convert time, before
-P14 ever runs.
-
-**Cross-ADR contract:** ADR-012 owns the conversion-side tensor naming
-(Decision 11) + the round-trip integrity gate (Decision 19).  This entry
-exists so P14 has a documented blocker that prevents the contract from
-silently rotting.  When P11 lands and goes green, P14 may begin.  If P11
-ever regresses (a future tensor-naming change breaks the roundtrip), P14
-work pauses until P11 is green again — fix the blocker, don't route around.
-
-**Estimated LOC:** ~600 (draft loop + verification + per-token reject/replay).
+**Estimated LOC:** ~500 (MTP forward + rejection sampling + tests).
 
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 

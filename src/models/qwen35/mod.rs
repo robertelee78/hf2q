@@ -71,7 +71,9 @@
 pub mod dense;
 pub mod moe;
 
-use crate::input::config_parser::{validate_required_qwen35moe_fields, ConfigParseError};
+use crate::input::config_parser::{
+    validate_required_qwen35_fields, validate_required_qwen35moe_fields, ConfigParseError,
+};
 use crate::ir::{DType, ModelMetadata, TensorRef};
 use thiserror::Error;
 
@@ -128,6 +130,39 @@ pub enum Qwen35Arch {
     Dense,
     /// Mixture-of-Experts FFN (e.g. Qwen3.5-MoE-35B-A3.9B).
     Moe,
+}
+
+// ---------------------------------------------------------------------------
+// Architecture-string predicates (Decision 1 dispatch surface)
+// ---------------------------------------------------------------------------
+
+/// True for any Qwen3.5-family model (dense OR MoE) based on
+/// `config.architectures[0]` + `config.model_type`.
+///
+/// Accepts four HF architecture aliases (`*ForCausalLM` and
+/// `*ForConditionalGeneration` for each of dense + MoE) plus two
+/// `model_type` fallbacks (`qwen3_5` / `qwen3_5_moe_text`). Kept in
+/// one place so the four historical call sites that duplicated this
+/// six-alternative match cannot drift — dropping an alias at one site
+/// but keeping it at another silently corrupts the convert pipeline.
+pub(crate) fn is_qwen35_family_architecture(architecture: &str, model_type: &str) -> bool {
+    matches!(
+        architecture,
+        "Qwen3_5ForCausalLM"
+            | "Qwen3_5ForConditionalGeneration"
+            | "Qwen3_5MoeForCausalLM"
+            | "Qwen3_5MoeForConditionalGeneration"
+    ) || matches!(model_type, "qwen3_5" | "qwen3_5_moe_text")
+}
+
+/// True for Qwen3.5-MoE **only** (rejects dense variants). Used by the
+/// MoE-specific expert-merge walkers; dense models must not enter those
+/// paths because they have no expert tensors to merge.
+pub(crate) fn is_qwen35moe_architecture(architecture: &str, model_type: &str) -> bool {
+    matches!(
+        architecture,
+        "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration"
+    ) || model_type == "qwen3_5_moe_text"
 }
 
 // ---------------------------------------------------------------------------
@@ -203,11 +238,15 @@ impl Qwen35ConvertContext {
     ///
     /// The `arch` variant is inferred from `metadata.is_moe()`.
     pub fn from_metadata(metadata: &ModelMetadata) -> Result<Self, ConvertError> {
-        validate_required_qwen35moe_fields(metadata)?;
-
+        // Arch-specific validators: dense doesn't need moe_intermediate_size
+        // or shared_expert_intermediate_size. Calling the MoE validator on a
+        // dense model produced false-positive "missing field" errors pre-
+        // 2026-04-24.
         let arch = if metadata.is_moe() {
+            validate_required_qwen35moe_fields(metadata)?;
             Qwen35Arch::Moe
         } else {
+            validate_required_qwen35_fields(metadata)?;
             Qwen35Arch::Dense
         };
 
@@ -703,37 +742,80 @@ fn transform_case4_linear_attn_scalar(
     mut tensor: TensorRef,
     nk: u32,
     nv_per_k: u32,
-    elem_size: usize,
+    mut elem_size: usize,
 ) -> Result<TensorRef, ConvertError> {
     let is_a_log = tensor.name.ends_with(".A_log");
 
     // If A_log: negate elementwise — output[i] = -exp(input[i]) (py:4788-4789).
     // Overflow: exp(large x) → +inf, negated → -inf. This matches llama.cpp exactly.
+    //
+    // Real Qwen3.6 ships A_log at BF16 (and earlier f16 variants exist); the
+    // Python reference performs `data_torch.float().exp()` which casts to F32
+    // first. We mirror that by promoting BF16/F16 source data to F32 before
+    // the negation, then leaving the tensor as F32 for the downstream V-head
+    // reorder. Matches `convert_hf_to_gguf.py:4788-4789` semantics exactly.
     if is_a_log {
-        if elem_size != 4 {
-            return Err(ConvertError::ReorderInvariantViolated {
-                name: tensor.name.clone(),
-                reason: format!(
-                    "A_log negation requires F32 data (elem_size=4), got elem_size={}",
-                    elem_size
-                ),
-            });
+        // Promote source data to F32 (no-op when already F32).
+        let promoted_f32: Vec<f32> = match tensor.dtype {
+            DType::F32 => {
+                let n = tensor.data.len() / 4;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 4;
+                    out.push(f32::from_le_bytes([
+                        tensor.data[off],
+                        tensor.data[off + 1],
+                        tensor.data[off + 2],
+                        tensor.data[off + 3],
+                    ]));
+                }
+                out
+            }
+            DType::BF16 => {
+                // BF16 → F32: low 16 bits zero, high 16 bits = BF16 bits.
+                let n = tensor.data.len() / 2;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 2;
+                    let bf16_bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                    let f32_bits = (bf16_bits as u32) << 16;
+                    out.push(f32::from_bits(f32_bits));
+                }
+                out
+            }
+            DType::F16 => {
+                let n = tensor.data.len() / 2;
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = i * 2;
+                    let f16_bits = u16::from_le_bytes([tensor.data[off], tensor.data[off + 1]]);
+                    out.push(half::f16::from_bits(f16_bits).to_f32());
+                }
+                out
+            }
+            _ => {
+                return Err(ConvertError::ReorderInvariantViolated {
+                    name: tensor.name.clone(),
+                    reason: format!(
+                        "A_log negation: unsupported dtype {:?}; expected F32 / BF16 / F16",
+                        tensor.dtype
+                    ),
+                });
+            }
+        };
+
+        // Apply negation: -exp(val). Overflow → -inf; underflow → -1.0.
+        // No clamping — matches llama.cpp / Python exactly.
+        let mut new_bytes = Vec::with_capacity(promoted_f32.len() * 4);
+        for v in promoted_f32 {
+            let negexp = -v.exp();
+            new_bytes.extend_from_slice(&negexp.to_le_bytes());
         }
-        let n_elems = tensor.data.len() / 4;
-        for i in 0..n_elems {
-            let off = i * 4;
-            let val = f32::from_le_bytes([
-                tensor.data[off],
-                tensor.data[off + 1],
-                tensor.data[off + 2],
-                tensor.data[off + 3],
-            ]);
-            // -exp(val): overflow (val >> 0) gives -inf; underflow (val << 0) gives -1.0.
-            // No clamping — match llama.cpp behaviour exactly.
-            let negexp = -val.exp();
-            let bytes = negexp.to_le_bytes();
-            tensor.data[off..off + 4].copy_from_slice(&bytes);
-        }
+
+        // Store as F32; downstream V-head reorder will use the new elem_size.
+        tensor.data = new_bytes;
+        tensor.dtype = DType::F32;
+        elem_size = 4;
     }
 
     // V-head reorder along last dim with head_dim=1 (py:5402-5409).
@@ -1113,6 +1195,151 @@ pub fn transform_in_proj_qkvz(
 /// For BF16 tensors: decode, add 1.0, re-encode.
 /// For F16 tensors: decode, add 1.0, re-encode.
 /// Other dtypes (norm weights should always be a float type): return typed error.
+/// Apply `apply_rms_norm_plus_one` to every qualifying norm tensor in
+/// a pre-quantization `TensorMap`. Arch-gated: no-op for non-Qwen3.5
+/// arches (Gemma4, LLaMA, etc. do not use the `gamma + 1` convention).
+///
+/// Qualifying: tensor name ends with `norm.weight` AND does NOT end
+/// with `linear_attn.norm.weight` — matches convert_hf_to_gguf.py:4794-4795
+/// exactly.
+///
+/// # Silent wire-up gap (2026-04-24)
+///
+/// P3 shipped `apply_rms_norm_plus_one` in commit `73a96e4` but never
+/// wired it into the convert pipeline. Before this function, the
+/// per-tensor transform only ran inside its own unit tests; real
+/// qwen35/qwen35moe convert output shipped RMS norm weights WITHOUT
+/// the +1 bias. llama.cpp's forward pass assumes `gamma + 1` baked
+/// in at convert time (`build_norm` at `llama-graph.cpp:1028-1055`
+/// does plain multiply, no +1), so the missing bias produces ~1.0x
+/// norm multiplier shift through every layer — compounding silent
+/// logit skew.
+///
+/// This walker is the fix. Called from `src/main.rs` Phase 1.5
+/// alongside the MoE expert merge.
+/// Apply the full Qwen3.5 linear-attention transform suite to every
+/// qualifying tensor in a pre-quantization `TensorMap`.
+///
+/// Matches `convert_hf_to_gguf.py` `_LinearAttentionVReorderBase.modify_tensors`
+/// (py:5367-5424) + `Qwen3NextModel.modify_tensors` preprocessing
+/// (py:4786-4830): A_log negation, conv1d squeeze, in_proj_qkvz split,
+/// then the 6-case V-head reorder for the remaining linear-attn tensors.
+///
+/// # Silent wire-up gap (2026-04-24)
+///
+/// P2/P3 shipped `transform_linear_attn_tensor` + `transform_in_proj_qkvz`
+/// in commits `1a849e1` + `73a96e4` but neither was ever called from the
+/// convert pipeline. Result: every Qwen3.5 GGUF produced before this
+/// fix shipped HF-grouped V-head layout (not the ggml-tiled layout the
+/// loader expects) — THE named silent-corruption R2 failure mode ADR-012
+/// called out, producing "plausible-looking nonsense" at inference.
+///
+/// This walker is the wire-up. Called from `src/main.rs` Phase 1.7
+/// alongside the MoE merge + RMS norm +1 bias.
+///
+/// # Arch gate
+///
+/// No-op for non-Qwen3.5 arches. Linear-attention transforms are specific
+/// to the Qwen3.5 family's Gated DeltaNet; Gemma4 and LLaMA have no
+/// linear_attn tensors.
+///
+/// # Short-circuit when num_k_heads == num_v_heads
+///
+/// Per py:5379, the V-head reorder only fires when
+/// `num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads`.
+/// `transform_linear_attn_tensor` short-circuits itself when
+/// `ctx.linear_num_v_per_k == 1` — we rely on that short-circuit rather
+/// than duplicating the check here.
+pub fn apply_qwen35_linear_attn_transforms_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    let ctx = Qwen35ConvertContext::from_metadata(metadata)?;
+
+    // Step 1: handle in_proj_qkvz tensors first (split into qkv + z),
+    // then transform the split qkv through case 1 (V-head reorder).
+    // The qkvz form is used by Qwen3Next/3.5 fused projections.
+    let qkvz_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| n.contains("in_proj_qkvz.weight"))
+        .cloned()
+        .collect();
+
+    for key in qkvz_keys {
+        let Some(qkvz_tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let (qkv_tensor, z_tensor) = transform_in_proj_qkvz(qkvz_tensor, &ctx)?;
+        // Apply V-head reorder to the qkv tensor (case 1).
+        let qkv_reordered = transform_linear_attn_tensor(qkv_tensor, &ctx)?;
+        // z_tensor follows the same V-head reorder path as in_proj_z (case 2).
+        let z_reordered = transform_linear_attn_tensor(z_tensor, &ctx)?;
+        tensor_map.tensors.insert(qkv_reordered.name.clone(), qkv_reordered);
+        tensor_map.tensors.insert(z_reordered.name.clone(), z_reordered);
+    }
+
+    // Step 2: walk all linear-attn tensors that didn't come from qkvz
+    // split (independent in_proj_qkv, in_proj_z, in_proj_a/b, A_log,
+    // dt_bias, dt_proj, conv1d, out_proj). transform_linear_attn_tensor
+    // dispatches to the right case or no-ops.
+    let linear_attn_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| n.contains("linear_attn."))
+        .cloned()
+        .collect();
+
+    for key in linear_attn_keys {
+        let Some(tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let transformed = transform_linear_attn_tensor(tensor, &ctx)?;
+        tensor_map
+            .tensors
+            .insert(transformed.name.clone(), transformed);
+    }
+
+    Ok(())
+}
+
+pub fn apply_rms_norm_plus_one_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    // Arch gate — Qwen3.5 family only. convert_hf_to_gguf.py:4794 is
+    // scoped to Qwen3NextModel which Qwen3_5TextModel + Qwen3_5MoeTextModel
+    // both inherit from (py:5259, 5427-5434).
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    // Collect the names first (cannot mutate the map while iterating).
+    let qualifying: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.ends_with("norm.weight")
+                && !n.ends_with("linear_attn.norm.weight")
+        })
+        .cloned()
+        .collect();
+
+    for name in qualifying {
+        let Some(tensor) = tensor_map.tensors.remove(&name) else {
+            continue;
+        };
+        let transformed = apply_rms_norm_plus_one(tensor)?;
+        tensor_map.tensors.insert(transformed.name.clone(), transformed);
+    }
+
+    Ok(())
+}
+
 pub fn apply_rms_norm_plus_one(
     mut tensor: TensorRef,
 ) -> Result<TensorRef, ConvertError> {
@@ -1218,6 +1445,96 @@ pub(crate) fn dtype_elem_size(dtype: DType) -> usize {
 mod tests {
     use super::*;
     use crate::ir::DType;
+
+    // -------------------------------------------------------------------------
+    // Architecture-predicate tests (Decision 1 dispatch surface)
+    // -------------------------------------------------------------------------
+
+    /// `is_qwen35_family_architecture` must accept all 4 HF architecture
+    /// aliases (dense+MoE × ForCausalLM+ForConditionalGeneration) plus
+    /// both `model_type` fallbacks. Silent-drift regression gate —
+    /// dropping any alias at any call site now surfaces here.
+    #[test]
+    fn is_qwen35_family_accepts_all_six_forms() {
+        // All 4 architecture strings with empty model_type.
+        for arch in [
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+        ] {
+            assert!(
+                is_qwen35_family_architecture(arch, ""),
+                "{arch} must be accepted as Qwen3.5 family"
+            );
+        }
+        // Both model_type fallbacks with empty architecture.
+        for mt in ["qwen3_5", "qwen3_5_moe_text"] {
+            assert!(
+                is_qwen35_family_architecture("", mt),
+                "model_type={mt:?} must be accepted as Qwen3.5 family"
+            );
+        }
+    }
+
+    #[test]
+    fn is_qwen35_family_rejects_other_archs() {
+        for (arch, mt) in [
+            ("LlamaForCausalLM", "llama"),
+            ("Gemma4ForConditionalGeneration", "gemma4"),
+            ("MistralForCausalLM", "mistral"),
+            ("MixtralForCausalLM", "mixtral"),
+            // Case sensitivity — the check is exact-match (not
+            // case-insensitive), so lowercase variants must NOT trip.
+            ("qwen3_5forcausallm", ""),
+            ("QWEN3_5MoeForCausalLM", ""),
+            ("", ""),
+        ] {
+            assert!(
+                !is_qwen35_family_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must NOT be accepted as Qwen3.5 family"
+            );
+        }
+    }
+
+    /// `is_qwen35moe_architecture` accepts ONLY the MoE aliases (2 archs
+    /// + 1 model_type) — dense variants must be rejected since the MoE
+    /// expert-merge path requires expert tensors that dense models do
+    /// not carry.
+    #[test]
+    fn is_qwen35moe_accepts_only_moe_forms() {
+        for (arch, mt) in [
+            ("Qwen3_5MoeForCausalLM", ""),
+            ("Qwen3_5MoeForConditionalGeneration", ""),
+            ("", "qwen3_5_moe_text"),
+        ] {
+            assert!(
+                is_qwen35moe_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must be accepted as qwen35moe"
+            );
+        }
+    }
+
+    #[test]
+    fn is_qwen35moe_rejects_dense_variants() {
+        for (arch, mt) in [
+            // Dense arch aliases must NOT be treated as MoE — expert-merge
+            // walkers would otherwise try to find expert tensors in a
+            // dense model and produce confusing errors.
+            ("Qwen3_5ForCausalLM", ""),
+            ("Qwen3_5ForConditionalGeneration", ""),
+            ("", "qwen3_5"),
+            // Other archs.
+            ("LlamaForCausalLM", "llama"),
+            ("Gemma4ForConditionalGeneration", "gemma4"),
+            ("", ""),
+        ] {
+            assert!(
+                !is_qwen35moe_architecture(arch, mt),
+                "({arch:?}, {mt:?}) must NOT be accepted as qwen35moe"
+            );
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -2305,5 +2622,176 @@ mod tests {
         let fwd = transform_linear_attn_tensor(tensor.clone(), &ctx_fwd).unwrap();
         let inv = transform_linear_attn_tensor(fwd, &ctx_inv).unwrap();
         assert_eq!(inv.data, original_data, "case6 round-trip (fwd then inv) failed");
+    }
+
+    // ----------------------------------------------------------------
+    // apply_qwen35_linear_attn_transforms_in_tensor_map walker tests
+    // ----------------------------------------------------------------
+    //
+    // These prove the walker dispatches correctly, short-circuits for
+    // non-Qwen3.5 arches, and produces the same byte-output as direct
+    // `transform_linear_attn_tensor` calls. Flips from UNWIRED to WIRED
+    // is a separate commit that updates the older fixture shapes +
+    // turns on the Phase 1.7 invocation in main.rs.
+
+    use crate::ir::{ModelMetadata, RopeParameters, TensorMap};
+
+    fn walker_metadata_qwen35moe(nk: u32, nv: u32) -> ModelMetadata {
+        ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".to_string(),
+            model_type: "qwen3_5_moe_text".to_string(),
+            num_layers: 4,
+            num_attention_heads: 4,
+            num_kv_heads: Some(1),
+            hidden_size: 64,
+            intermediate_size: Some(128),
+            vocab_size: 128,
+            head_dim: Some(16),
+            num_experts: Some(4),
+            top_k_experts: Some(2),
+            param_count: 0,
+            layer_types: vec![],
+            dtype: "float16".to_string(),
+            shard_count: 1,
+            partial_rotary_factor: Some(0.25),
+            rope_parameters: Some(RopeParameters {
+                mrope_interleaved: false,
+                mrope_section: vec![3, 3, 2],
+                rope_theta: 10_000_000.0,
+                rope_type: "mrope".to_string(),
+                partial_rotary_factor: 0.25,
+            }),
+            full_attention_interval: Some(4),
+            attn_output_gate: Some(true),
+            mamba_ssm_dtype: Some("float32".to_string()),
+            moe_intermediate_size: Some(64),
+            shared_expert_intermediate_size: Some(64),
+            mtp_num_hidden_layers: Some(0),
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+            explicit_layer_types: None,
+            linear_num_value_heads: Some(nv),
+            linear_num_key_heads: Some(nk),
+            linear_key_head_dim: Some(16),
+            linear_value_head_dim: Some(16),
+            linear_conv_kernel_dim: Some(4),
+            raw_config: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    #[test]
+    fn walker_noop_when_nv_equals_nk() {
+        // Short-circuit: transform_linear_attn_tensor returns input unchanged
+        // when nv_per_k == 1 (nk == nv). Walker must preserve that behavior.
+        let mut tm = TensorMap::new();
+        // A tensor whose name matches but shapes don't matter because
+        // the short-circuit fires first.
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: vec![0xAAu8; 16],
+        });
+        let meta = walker_metadata_qwen35moe(4, 4); // nk == nv
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        assert_eq!(t.data, vec![0xAAu8; 16], "nv == nk must short-circuit unchanged");
+    }
+
+    #[test]
+    fn walker_skips_non_qwen35_arch() {
+        // Non-Qwen3.5 arches (Gemma, LLaMA) must be no-op.
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: vec![0xCCu8; 16],
+        });
+        let mut meta = walker_metadata_qwen35moe(2, 4);
+        meta.architecture = "Gemma4ForCausalLM".to_string();
+        meta.model_type = "gemma4".to_string();
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        assert_eq!(t.data, vec![0xCCu8; 16], "non-Qwen3.5 arches must be no-op");
+    }
+
+    #[test]
+    fn walker_skips_tensors_without_linear_attn_prefix() {
+        // Tensors that don't contain "linear_attn." must pass through.
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![64, 64],
+            dtype: DType::F16,
+            data: vec![0xBBu8; 64 * 64 * 2],
+        });
+        let meta = walker_metadata_qwen35moe(2, 4);
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+        let t = tm.tensors.get("blk.0.attn_q.weight").unwrap();
+        assert_eq!(
+            t.data,
+            vec![0xBBu8; 64 * 64 * 2],
+            "non-linear_attn tensor must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn walker_applies_v_head_reorder_to_a_log() {
+        // nk=2, nv=4 → nv_per_k = 2. A_log is 1-D [nv] = [4].
+        // Hand-computed reorder: src index → dst index per case 4.
+        // With ndim==1, Python unsqueezes to [4, 1], reorders, squeezes back.
+        //
+        // The reorder formula from case 3/4:
+        //   src[k * nv_per_k + v] → dst[v * nk + k] for k in [0,nk), v in [0,nv_per_k)
+        //
+        // Seed: [0x01, 0x02, 0x03, 0x04] (F32 values 1..4 as bytes — but
+        // actually we want known-distinct F32 values). Use 1.0, 2.0, 3.0, 4.0.
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let mut data = Vec::with_capacity(16);
+        for v in &values {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "blk.0.linear_attn.A_log".into(),
+            shape: vec![4],
+            dtype: DType::F32,
+            data: data.clone(),
+        });
+        let meta = walker_metadata_qwen35moe(2, 4); // nk=2, nv=4
+
+        apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tm, &meta).unwrap();
+
+        let t = tm.tensors.get("blk.0.linear_attn.A_log").unwrap();
+        let out: Vec<f32> = t
+            .data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        // A_log applies BOTH the negation (`data = -exp(data)` per
+        // convert_hf_to_gguf.py:4788-4789) AND the V-head reorder.
+        // Negation first then reorder:
+        //   [1, 2, 3, 4] → [-e^1, -e^2, -e^3, -e^4]
+        // V-head reorder with nk=2, nv_per_k=2 (tiled layout):
+        //   src K0V0=-e^1, K0V1=-e^2, K1V0=-e^3, K1V1=-e^4
+        //   dst K0V0=-e^1, K1V0=-e^3, K0V1=-e^2, K1V1=-e^4
+        let e = std::f32::consts::E;
+        let expected = vec![-e, -e.powi(3), -e.powi(2), -e.powi(4)];
+        for (i, (&g, &x)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - x).abs() < 1e-4,
+                "idx {} expected {} got {} (negation + V-head reorder)",
+                i,
+                x,
+                g
+            );
+        }
     }
 }

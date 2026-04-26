@@ -122,15 +122,43 @@ model classes as of ADR-012. Inference coherence is delegated to ADR-013.
 | Tensor naming | Every tensor name matches the ADR-012 Decision 8 naming spec |
 | llama.cpp load | `llama-cli --model out.gguf -p "Hello" -n 8` exits 0 |
 | Sidecar set | `tokenizer.json`, `tokenizer_config.json`, `config.json`, `generation_config.json`, `special_tokens_map.json` (and `chat_template.jinja` when present) are byte-identical copies alongside the GGUF |
+| MTP tensors (when `mtp_num_hidden_layers > 0`) | Round-trip integrity gate at `tests/convert_qwen35_mtp_roundtrip.rs` (Decision 19); 4 tensors land at `blk.{num_hidden_layers}.nextn.{enorm,hnorm,embed_tokens,eh_proj}.weight` |
+| mmproj (when `--emit-vision-tower` and `vision_config` present) | Pure-Rust emitter at `src/models/vit/`; produces `mmproj-<slug>-F16.gguf` per Decision 18 with three layers of structural / round-trip / spec-driven test coverage |
+| Smoke harness | `hf2q smoke --arch <qwen35\|qwen35moe> --quant q4_0` exits 0 with byte-identical transcripts across two fresh runs (Decision 16) |
+
+### DWQ activation-based quantization for qwen35/qwen35moe
+
+**Shipped 2026-04-25** under ADR-012 P9 + P9b (formerly listed as
+"out-of-scope" pending ADR-013 P12). The convert pipeline now runs
+the full two-pass activation calibration end-to-end:
+
+  1. Emit intermediate F16 GGUF from the in-memory tensor_map
+     (`backends::gguf::emit_gguf_from_tensor_map`, P9b.1).
+  2. Construct `RealActivationCapture::new(intermediate_gguf, tokenizer)`
+     which loads via the ADR-013 `Qwen35Model::load_from_gguf` path
+     (P9b.3b).
+  3. Run `quantize::dwq_activation::run_dwq_activation_calibration`
+     which generates calibration tokens, runs the CPU forward pass
+     through the loaded model, computes per-layer sensitivity, and
+     produces a derived `MixedBitQuantizer` configured with
+     activation-driven sensitive layers (P9b.3a).
+  4. Final GGUF is emitted at the user-specified output path. The
+     intermediate is dropped via `tempfile::TempDir` RAII (P9b.5).
+
+No weight-space fallback for these architectures (Decision 13).
+
+Real-model artifact production for the four end-deliverable GGUFs
+(qwen35/qwen35moe × dwq46/dwq48) is gated only on environment
+(HF_TOKEN + ~150 GB disk + Metal-validated llama.cpp build).
 
 ### Out-of-scope for ADR-012
 
 - Inference coherence (sourdough gate, sliding-window parity) — ADR-013.
-- DWQ activation-based quantization for qwen35/qwen35moe — requires
-  `ActivationCapture` from ADR-013 inference session; ADR-012 P6 wires the
-  guard that returns a clear error if activation capture is not available.
-- Vision tower for Qwen3.5-27B multimodal — follow-up ADR.
-- MTP head inference — ADR-013.
+- MTP head **inference** (speculative decoding) — ADR-013 P14. ADR-012 P11
+  ships the conversion-side tensor round-trip integrity gate; runtime
+  draft/accept loops are owned by ADR-013.
+- ViT compute path for the converted mmproj — ADR-005 phase 2c. ADR-012 P10
+  ships the GGUF emitter; forward-pass execution is ADR-005's deliverable.
 
 ### CI integration tests
 

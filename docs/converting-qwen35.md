@@ -75,6 +75,15 @@ same for all model classes (Gemma, Qwen3.5-MoE, Qwen3.5 dense).
 
 ## Converting Qwen3.6-35B-A3B (MoE variant)
 
+> **Pre-P12 status (as of 2026-04-24):** DWQ on `qwen35` / `qwen35moe`
+> requires real forward-pass activations from ADR-013 P12's
+> `RealActivationCapture` impl. Until P12 ships, the command below
+> **fails fast** with the structured `NoActivationCapture` error
+> (see `feedback_never_ship_fallback_without_rootcause.md`). For the
+> shipping path today, use `--quant q4_0` — see the smoke section
+> below — and switch to DWQ once ADR-013 P12 lands. There is no
+> weight-space fallback.
+
 ```bash
 hf2q convert \
   --repo jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated \
@@ -127,6 +136,142 @@ llama-cli --model models/.../out.gguf -p "Hello" -n 8
 Expected: llama.cpp prints the model load summary and emits 8 tokens without
 error. Inference coherence is out of scope for the convert acceptance contract
 (see ADR-013).
+
+---
+
+## Running `hf2q smoke` (ADR-012 Decision 16)
+
+`hf2q smoke` is the automated end-gate harness. Preflights the environment,
+then runs convert + 8-token inference deterministically, asserts transcript
+integrity, and lands the transcript under `tests/fixtures/smoke-transcripts/`.
+
+```bash
+# Dry-run just runs preflight; useful in CI to catch missing prerequisites.
+cargo run --release -- smoke --arch qwen35 --quant q4_0 --dry-run
+
+# Full smoke (requires HF_TOKEN, free disk per arch floor, /opt/llama.cpp built).
+cargo run --release -- smoke --arch qwen35 --quant q4_0
+cargo run --release -- smoke --arch qwen35moe --quant q4_0
+```
+
+**Preflight exit codes (single-line failure mode naming the prerequisite):**
+
+| Exit | Meaning |
+|---|---|
+| 2 | `HF_TOKEN` missing or empty |
+| 3 | Insufficient free disk (`disk_floor_gb + 10 GB` buffer) |
+| 4 | `llama-cli` not at `/opt/llama.cpp/build/bin/` or in `$PATH` |
+| 5 | hf2q not built in release mode |
+| 6 | HF repo unresolvable (private / bad token / network) |
+| 7 | Unknown arch — known arches: `qwen35`, `qwen35moe` |
+| 8 | Smoke transcript assertion failed (tensor count / n_eval / regression pattern) |
+
+Determinism is real (`--seed 42 --temp 0 --no-warmup`): two fresh runs on the
+same host produce byte-identical transcripts.
+
+**CI note:** the full smoke path is NOT invoked by CI (disk + HF + wall-clock
+requirements). `tests/smoke_conformance.rs` exercises every preflight exit
+code via `assert_cmd` + `env_remove` — zero disk / HF / token dependency.
+
+### Smoke against an already-converted GGUF (skip the convert step)
+
+If you already have a converted `.gguf` on disk (e.g. produced by an earlier
+`hf2q convert` run), you can skip the convert step entirely and only validate
+the inference + transcript half of the pipeline:
+
+```bash
+# 1. Symlink the canonical filename smoke expects (`{arch}-{quant}.gguf`).
+ln -sf qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf \
+       /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen35moe-q4_0.gguf
+
+# 2. Run smoke with --skip-convert + --convert-output-dir pointing at the
+#    same dir as --local-dir.
+./target/release/hf2q smoke \
+    --arch qwen35moe \
+    --skip-convert \
+    --local-dir /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex \
+    --convert-output-dir /opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex
+```
+
+`--local-dir` skips the HF_TOKEN preflight (exit code 2), and `--skip-convert`
+skips the convert subprocess. Disk floor is still checked; preflight exit
+code 3 fires if free space < `disk_floor_gb + 10 GB` even though no convert
+is actually run.
+
+This unblocks P8's "real-model close" deliverable — committing a real
+`tests/fixtures/smoke-transcripts/{arch}-{quant}.txt` — without needing
+HF_TOKEN or re-downloading safetensors. Useful when you already converted
+the model on a prior session or via a different tool.
+
+**Wall-clock budget on M5 Max** (apex MoE Q4_0, ~25 GB GGUF): empirically
+**>10 minutes** for the 8-token decode (validated 2026-04-25). Even with
+`/opt/llama.cpp/build/bin/llama-cli` having Metal kernels available,
+the apex MoE path appears to fall back to single-thread CPU under heavy
+memory paging (~4M syscalls/sec, single-core saturation, 30 GB RSS).
+**Apex-scale q4_0 smoke validation is impractical without further
+tuning** (e.g. explicit `-ngl 99` + a Metal-validated llama.cpp build
+that supports the qwen35moe MoE expert-routing kernel).
+
+For now, real-model q4_0 smoke transcripts at apex scale are deferred:
+the smoke pipeline DESIGN is correct (synthetic small-arch testing in
+`tests/smoke_conformance.rs` covers all preflight + dispatch contracts);
+the GAP is environment / kernel availability for inference at the apex
+size class on this hardware. Smaller real models (e.g. a hypothetical
+qwen3.5-dense-3B if it existed) would complete the smoke in seconds —
+no design change required.
+
+The smoke transcript is intentionally deterministic across systems
+(`--seed 42 --temp 0 --no-warmup`) so adjusting the default thread
+count or `-ngl` would invalidate any prior committed transcripts and
+require a one-shot agreement on the new canonical command line.
+
+---
+
+## How P11 catches MTP regressions (manual bisection)
+
+`tests/convert_qwen35_mtp_roundtrip.rs` (ADR-012 Decision 19, landed with
+ADR-013 P14 cross-link) converts a synthetic `mtp_num_hidden_layers: 1`
+model and asserts the 4 MTP tensors land at the exact GGUF names ADR-013's
+loader + llama.cpp expect:
+
+```
+blk.{num_hidden_layers}.nextn.enorm.weight        (llama-arch.cpp:449)
+blk.{num_hidden_layers}.nextn.hnorm.weight        (llama-arch.cpp:450)
+blk.{num_hidden_layers}.nextn.embed_tokens.weight (llama-arch.cpp:448)
+blk.{num_hidden_layers}.nextn.eh_proj.weight      (llama-arch.cpp:447)
+```
+
+### Bisection: renaming any suffix trips the gate
+
+To confirm the gate is live, introduce a one-letter regression in
+`src/backends/gguf.rs:hf_name_to_gguf`:
+
+```diff
+-                    "embed_tokens.weight" => Some("nextn.embed_tokens.weight"),
++                    "embed_tokens.weight" => Some("nextn.emb_tokens.weight"),
+```
+
+then:
+
+```bash
+cargo test --test convert_qwen35_mtp_roundtrip qwen35_mtp_roundtrip
+```
+
+Expected failure message names the missing tensor exactly:
+
+```
+missing MTP tensor "blk.4.nextn.embed_tokens.weight" in converted GGUF.
+Found names: ["blk.4.nextn.emb_tokens.weight", ...]
+```
+
+Revert the diff when done.
+
+### Bisection: re-introducing the P4 stub form trips the gate
+
+Earlier P4 emission used `blk.mtp{idx}.nextn.*` as a literal-"mtp" placeholder
+for the block index. The P11 gate's negative assertion forbids that — if a
+future refactor re-introduces it, the round-trip fails with `P4 stub MTP
+placeholder ... should never reach GGUF — see ADR-012 P11`.
 
 ---
 

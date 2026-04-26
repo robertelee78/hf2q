@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::backends::{BackendError, OutputBackend};
 use crate::ir::{
-    FormatWarning, OutputFile, OutputManifest, QuantizedModel,
-    TensorQuantInfo, WarningSeverity,
+    FormatWarning, ModelMetadata, OutputFile, OutputManifest, QuantizedModel,
+    TensorMap, TensorQuantInfo, WarningSeverity,
 };
 use crate::progress::ProgressReporter;
 
@@ -72,6 +72,61 @@ impl Default for GgufBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Emit an F16 GGUF from an in-memory `TensorMap` to `output_path`.
+///
+/// All weight tensors are converted to F16 (no DWQ / k-quant compression).
+/// Norms, biases, and other preserved tensors pass through at their original
+/// precision. Used by ADR-012 P9b two-pass conversion to produce an
+/// intermediate GGUF that `Qwen35Model::load_from_gguf` can consume for
+/// activation capture, before the final DWQ pass over the held tensor_map.
+///
+/// `input_dir` is required because tokenizer metadata (chat-template,
+/// vocab, etc.) is loaded from `tokenizer.json` / `tokenizer_config.json`
+/// during `build_metadata`.
+///
+/// `output_path` is treated as a `.gguf` file path when it ends in `.gguf`,
+/// otherwise as an output directory in which the file is auto-named — the
+/// same dispatch as `OutputBackend::write`.
+///
+/// **Reuses `GgufBackend::write` end-to-end** — the only behavioral
+/// difference vs. a normal `hf2q convert --quant f16` is that this fn is
+/// callable mid-pipeline without going through CLI parsing. Layout, tensor
+/// name mapping, metadata emission, MTP scaffolding, etc. are all handled
+/// by the existing tested write path.
+pub fn emit_gguf_from_tensor_map(
+    tensor_map: &TensorMap,
+    metadata: &ModelMetadata,
+    input_dir: &Path,
+    output_path: &Path,
+    progress: &ProgressReporter,
+) -> Result<OutputManifest, BackendError> {
+    use crate::quantize::{
+        intermediate_moe_q8::IntermediateMoeQ8Quantizer, quantize_model,
+    };
+
+    // ADR-012 P9b apex MoE OOM fix (2026-04-25): MoE expert tensors emit
+    // at Q8_0 instead of F16. Routing rationale: when the convert pipeline
+    // reloads this intermediate as a `Qwen35Model` for activation capture,
+    // F16 expert dtype triggers `weight_loader::load_moe_ffn`'s F32-expand
+    // path (~128 GB peak — kills 128 GB systems via swap thrash).
+    // Q8_0 keeps the loader on `load_moe_ffn_quantized` (MoeQ, ~33 GB),
+    // and is near-lossless for the calibration forward (final DWQ output
+    // is unaffected — DWQ re-quantizes from the original tensor_map, not
+    // from the intermediate). Non-MoE tensors stay F16, byte-identical to
+    // the previous intermediate format. See `quantize/intermediate_moe_q8.rs`.
+    let quantizer = IntermediateMoeQ8Quantizer::new();
+
+    // bits=16 / group_size=32 are the F16 default; the Q8 route inside
+    // IntermediateMoeQ8Quantizer overrides to bits=8/group_size=32 per-tensor.
+    let quantized = quantize_model(tensor_map, metadata, &quantizer, 16, 32, progress)
+        .map_err(|e| BackendError::WriteFailed {
+            reason: format!("Intermediate F16+MoE-Q8 quantize step: {e}"),
+        })?;
+
+    let backend = GgufBackend::new();
+    backend.write(&quantized, input_dir, output_path, progress)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,9 +219,16 @@ impl OutputBackend for GgufBackend {
         // text model loader rejects the file with "wrong number of tensors".
         let mut tensor_names: Vec<&String> = model.tensors.keys()
             .filter(|name| {
-                // Skip vision/audio tensors — they belong in a separate mmproj GGUF
+                // Skip vision/audio tensors — they belong in a separate mmproj GGUF.
+                // Three namespace conventions seen in the wild:
+                //   - Gemma:    model.vision_tower.* + model.embed_vision.*
+                //   - Qwen3.6:  model.visual.*   (real-model finding 2026-04-25)
+                //   - Audio:    model.audio_tower.*
                 let n = name.as_str();
-                !(n.contains("vision_tower") || n.contains("embed_vision") || n.contains("audio_tower"))
+                !(n.contains("vision_tower")
+                    || n.contains("embed_vision")
+                    || n.contains("audio_tower")
+                    || n.contains("model.visual."))
             })
             .collect();
         tensor_names.sort();
@@ -235,11 +297,11 @@ impl OutputBackend for GgufBackend {
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let raw_gguf_name = hf_name_to_gguf(name, &resolved_arch_for_tensors);
-            // ADR-012 Decision 19: resolve the MTP placeholder using the
-            // model's main-stack layer count.  Non-MTP names pass through.
-            let gguf_name =
-                resolve_mtp_block_index(&raw_gguf_name, model.metadata.num_layers);
+            let gguf_name = hf_name_to_gguf(
+                name,
+                &resolved_arch_for_tensors,
+                model.metadata.num_layers,
+            );
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
@@ -255,6 +317,17 @@ impl OutputBackend for GgufBackend {
             // When incompatible, use llama.cpp's standard fallback chain from
             // tensor_type_fallback() in llama-quant.cpp:362-408:
             //   Q6_K → Q8_0, Q5_K → Q5_1, Q4_K → Q5_0, Q3_K/Q2_K → Q4_0
+            //
+            // ADR-012 P9b real-model finding (2026-04-25): the original chain
+            // only handled K-quant types when row_dim wasn't divisible by 256.
+            // But Q4_0 / Q5_0 / Q8_0 (block_size = 32 = QK4_0) ALSO require
+            // row_dim divisible by their block size. Tensors with very small
+            // row_dim (e.g. ssm_conv1d.weight with K=4 conv kernel) aren't
+            // representable in any block-quant type — must fall back to F16.
+            // Without this fix, the GGUF emits with row_dim=4 Q4_0 which
+            // llama.cpp's loader rejects:
+            //   "blk.0.ssm_conv1d.weight of type 2 (q4_0) has 4 elements per
+            //    row, not a multiple of block size (32)"
             if !qt.shape.is_empty() {
                 let row_dim = *qt.shape.last().unwrap();
                 if row_dim % QK6_K != 0 {
@@ -281,6 +354,23 @@ impl OutputBackend for GgufBackend {
                             ggml_type = GGML_TYPE_F16;
                         }
                     }
+                }
+
+                // Independent of the K-quant chain above: any Q4_0 / Q5_0 /
+                // Q8_0 (block 32) tensor with row_dim < 32 OR row_dim not
+                // divisible by 32 → fall back to F16. Catches ssm_conv1d
+                // (K=4) and any other small-row-dim weight that slipped
+                // past the K-quant fallback.
+                let block_32_quant = matches!(
+                    ggml_type,
+                    GGML_TYPE_Q4_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q8_0
+                );
+                if block_32_quant && row_dim % QK4_0 != 0 {
+                    debug!(
+                        "Tensor '{}': ne[0]={} not block-32 aligned, {} → F16",
+                        gguf_name, row_dim, ggml_type_name(ggml_type)
+                    );
+                    ggml_type = GGML_TYPE_F16;
                 }
             }
 
@@ -627,7 +717,11 @@ fn write_mmproj_gguf(
 
     for name in &vision_tensor_names {
         let qt = &model.tensors[*name];
-        let gguf_name = hf_name_to_gguf(name, &model.metadata.model_type);
+        let gguf_name = hf_name_to_gguf(
+            name,
+            &model.metadata.model_type,
+            model.metadata.num_layers,
+        );
         let ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
         // Vision tensors are preserved as F16 — no repacking needed, data passes through
@@ -1432,6 +1526,44 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
 /// `ffn_norm.weight` for LLaMA-family models (where it is the only post-attention
 /// norm and acts as the FFN pre-norm), but to `post_attention_norm.weight` for
 /// Gemma4 (which has a separate `pre_feedforward_layernorm` for the FFN pre-norm).
+/// Qwen3.5-family linear-attention (Gated DeltaNet) layer-map entries.
+///
+/// Shared between the qwen35 (dense) and qwen35moe (MoE) arches because the
+/// hybrid 3:1 DeltaNet:Full attention pattern is identical between variants
+/// (only the FFN differs). Citations transcribed from llama-arch.cpp via
+/// `src/models/qwen35/dense.rs::map_linear_attn_suffix`.
+fn qwen35_linear_attn_layer_map() -> &'static [(&'static str, &'static str)] {
+    &[
+        // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
+        ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+        // llama-arch.cpp:382 LLM_TENSOR_ATTN_QKV → "blk.%d.attn_qkv"
+        // (in_proj_qkvz is split → in_proj_qkv + in_proj_z by Phase 1.7)
+        ("linear_attn.in_proj_qkv.weight", "attn_qkv.weight"),
+        // llama-arch.cpp:370 LLM_TENSOR_ATTN_GATE → "blk.%d.attn_gate"
+        ("linear_attn.in_proj_z.weight", "attn_gate.weight"),
+        // llama-arch.cpp:400 LLM_TENSOR_SSM_ALPHA → "blk.%d.ssm_alpha"
+        ("linear_attn.in_proj_a.weight", "ssm_alpha.weight"),
+        // llama-arch.cpp:416 LLM_TENSOR_SSM_BETA → "blk.%d.ssm_beta"
+        ("linear_attn.in_proj_b.weight", "ssm_beta.weight"),
+        // llama-arch.cpp:402 LLM_TENSOR_SSM_OUT → "blk.%d.ssm_out"
+        ("linear_attn.out_proj.weight", "ssm_out.weight"),
+        // llama-arch.cpp:395 LLM_TENSOR_SSM_A_NOSCAN → "blk.%d.ssm_a"
+        // (no .weight suffix — the ssm_a tensor is just `blk.N.ssm_a`)
+        ("linear_attn.A_log", "ssm_a"),
+        // llama-arch.cpp:397 LLM_TENSOR_SSM_DT → "blk.%d.ssm_dt"
+        // py:4791 renames .dt_bias → .dt_proj.bias before mapping; we accept
+        // either form so the convert pipeline stays robust to that rename.
+        ("linear_attn.dt_bias", "ssm_dt.bias"),
+        ("linear_attn.dt_proj.bias", "ssm_dt.bias"),
+        ("linear_attn.dt_proj.weight", "ssm_dt.weight"),
+        // llama-arch.cpp:396 LLM_TENSOR_SSM_CONV1D → "blk.%d.ssm_conv1d"
+        ("linear_attn.conv1d.weight", "ssm_conv1d.weight"),
+        ("linear_attn.conv1d.bias", "ssm_conv1d.bias"),
+        // llama-arch.cpp:401 LLM_TENSOR_SSM_NORM → "blk.%d.ssm_norm"
+        ("linear_attn.norm.weight", "ssm_norm.weight"),
+    ]
+}
+
 fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
     // Shared entries — identical across all architectures
     let shared: &[(&str, &str)] = &[
@@ -1478,10 +1610,51 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
         // LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm" (llama-arch.cpp:367).
         // There is NO separate ffn_norm tensor — the post-attn norm gates the FFN.
         // ADR-012 Decision 8: post_attention_layernorm verdict.
-        "qwen35" | "qwen35moe" => {
+        //
+        // Plus the qwen35-specific linear-attention (Gated DeltaNet) tensor
+        // family. Mappings transcribed from src/models/qwen35/dense.rs::
+        // map_linear_attn_suffix (which had the canonical citations to
+        // llama-arch.cpp but was never wired into the GGUF backend's
+        // layer_map). Each entry cites the matching llama-arch.cpp line.
+        // Note: `in_proj_qkvz.weight` is split into `in_proj_qkv` +
+        // `in_proj_z` upstream by `transform_in_proj_qkvz` in Phase 1.7,
+        // so the layer-map only sees the post-split names.
+        "qwen35" => {
+            map.extend_from_slice(&qwen35_linear_attn_layer_map());
+        }
+        // ADR-012 Decision 11 + P5: qwen35moe adds the MoE-specific surface:
+        // router (mlp.gate), per-expert merged stacks (mlp.experts.* post-merge
+        // named mlp.experts.{proj}.weight by merge_moe_experts_in_place), and
+        // shared-expert + shared-expert-gate. Each entry cites the
+        // llama-arch.cpp / src/models/qwen35/moe.rs line that pinned it.
+        // Previously this branch only mapped post_attention_layernorm,
+        // silently passing MoE tensors through as `blk.N.mlp.*.weight`
+        // (wrong GGUF names; llama.cpp loader would reject the file).
+        // P11 round-trip gate caught it — fix lands here.
+        //
+        // qwen35moe ALSO has the qwen35 linear-attention family (the hybrid
+        // 3:1 DeltaNet:Full pattern is identical between dense + MoE
+        // variants); only the FFN differs. Same mapping table is reused
+        // for both arches.
+        "qwen35moe" => {
+            map.extend_from_slice(&qwen35_linear_attn_layer_map());
             map.extend_from_slice(&[
-                // llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM → "blk.%d.post_attention_norm"
-                ("post_attention_layernorm.weight", "post_attention_norm.weight"),
+                // llama-arch.cpp:393 LLM_TENSOR_FFN_GATE_INP → "blk.%d.ffn_gate_inp"
+                // src/models/qwen35/moe.rs:83 — MoE router.
+                ("mlp.gate.weight", "ffn_gate_inp.weight"),
+                // llama-arch.cpp:394 LLM_TENSOR_FFN_GATE_INP_SHEXP → "blk.%d.ffn_gate_inp_shexp"
+                // src/models/qwen35/moe.rs:90 — shared-expert scalar gate.
+                ("mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight"),
+                // Shared-expert per-projection tensors (src/models/qwen35/moe.rs:138-140).
+                ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
+                ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
+                ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
+                // Merged expert tensors — post-merge names produced by
+                // merge_moe_experts_in_place at src/models/qwen35/moe.rs:494-497.
+                // Shape [N_experts, out_features, in_features].
+                ("mlp.experts.gate_proj.weight", "ffn_gate_exps.weight"),
+                ("mlp.experts.up_proj.weight", "ffn_up_exps.weight"),
+                ("mlp.experts.down_proj.weight", "ffn_down_exps.weight"),
             ]);
         }
         // LLaMA-like default: covers llama, mistral, qwen2, qwen3, phi, etc.
@@ -1529,13 +1702,17 @@ pub(crate) fn resolve_mtp_block_index(gguf_name: &str, num_hidden_layers: u32) -
 /// from `model.metadata.model_type`. Different architectures use different
 /// GGUF names for the same HF tensor suffixes.
 ///
-/// # MTP placeholder
-///
-/// For qwen35/qwen35moe `mtp.layers.{idx}.*` inputs this function emits a
-/// **placeholder** `blk.mtp{idx}.nextn.*` that the production write path
-/// resolves via [`resolve_mtp_block_index`] using `metadata.num_layers`.
-/// Test callers that don't go through the write path see the placeholder.
-fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
+/// `num_hidden_layers` is required for MTP tensor resolution (ADR-012
+/// Decision 11). Non-MTP callers may pass 0.
+/// Convenience wrapper for non-MTP callers (tests, one-off probes). Uses
+/// `num_hidden_layers = 0` — MTP paths hit the `mtp.layers.` branch which
+/// requires the real value, so this is only correct for non-MTP inputs.
+#[cfg(test)]
+fn hf_name_to_gguf_no_mtp(hf_name: &str, arch: &str) -> String {
+    hf_name_to_gguf(hf_name, arch, 0)
+}
+
+fn hf_name_to_gguf(hf_name: &str, arch: &str, num_hidden_layers: u32) -> String {
     // Strip language_model. prefix (Gemma4 conditional-generation models)
     let hf_name = hf_name.replace("language_model.", "");
     let hf_name = hf_name.as_str();
@@ -1627,27 +1804,16 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
     //   LLM_TENSOR_NEXTN_ENORM         → "blk.%d.nextn.enorm"
     //   LLM_TENSOR_NEXTN_HNORM         → "blk.%d.nextn.hnorm"
     //
-    // The MTP block index in GGUF = num_hidden_layers (e.g. 40 for qwen35moe, 64 for
-    // qwen35 dense), stored in `metadata.num_layers` from config.json.
-    //
-    // `hf_name_to_gguf` does not have num_hidden_layers context, so we emit a
-    // sentinel prefix `blk.mtp{mtp_idx}.nextn.…` here and resolve it to the real
-    // block index in [`resolve_mtp_block_index`] via the production write path
-    // (`write_gguf` at the call site that has metadata in scope).  P11's
-    // `convert_qwen35_mtp_roundtrip` integration test asserts the resolved name
-    // is what the inference loader at
-    // `src/inference/models/qwen35/mtp.rs::load_mtp_weights_if_present` expects.
+    // ADR-012 P11 fix (2026-04-24): resolved block index = num_hidden_layers + mtp_idx.
+    // Previously used sentinel "blk.mtp{idx}.nextn.*" placeholder which P4 left as a
+    // "resolve at write time" TODO. P11's MTP round-trip gate caught the stub —
+    // llama.cpp's loader + ADR-013's load_mtp_weights_if_present BOTH expect the
+    // resolved name `blk.{num_hidden_layers}.nextn.*`, not the placeholder.
     if (arch == "qwen35" || arch == "qwen35moe") && hf_name.starts_with("mtp.layers.") {
-        // Strip "mtp.layers." prefix
         if let Some(rest) = hf_name.strip_prefix("mtp.layers.") {
             if let Some(dot_pos) = rest.find('.') {
-                let mtp_idx = &rest[..dot_pos];
+                let mtp_idx: u32 = rest[..dot_pos].parse().unwrap_or(0);
                 let suffix = &rest[dot_pos + 1..];
-                // Map known MTP suffixes to GGUF nextn names
-                // llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ → "blk.%d.nextn.eh_proj"
-                // llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS → "blk.%d.nextn.embed_tokens"
-                // llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM → "blk.%d.nextn.enorm"
-                // llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM → "blk.%d.nextn.hnorm"
                 let nextn_suffix = match suffix {
                     "enorm.weight"        => Some("nextn.enorm.weight"),
                     "hnorm.weight"        => Some("nextn.hnorm.weight"),
@@ -1656,10 +1822,8 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
                     _ => None,
                 };
                 if let Some(ns) = nextn_suffix {
-                    // We use "mtp{idx}" as a placeholder block number;
-                    // the real block index (num_hidden_layers + mtp_idx) must be resolved
-                    // by the qwen35 conversion pipeline at write time.
-                    return format!("blk.mtp{}.{}", mtp_idx, ns);
+                    let block_idx = num_hidden_layers.saturating_add(mtp_idx);
+                    return format!("blk.{}.{}", block_idx, ns);
                 }
             }
         }
@@ -1875,10 +2039,22 @@ fn load_tokenizer_metadata(input_dir: &Path, arch: &str) -> Option<Vec<(String, 
         MetaValue::Bool(false),
     ));
 
-    // Pre-tokenizer type — used by llama.cpp to select the right pre-tokenizer
+    // Pre-tokenizer type — used by llama.cpp to select the right pre-tokenizer.
+    //
+    // ADR-012 P9b real-model finding (2026-04-25): we previously emitted
+    // `tokenizer.ggml.pre = tokenizer.ggml.model` (e.g. "gpt2"), which
+    // llama.cpp's vocab loader rejects:
+    //   "unknown pre-tokenizer type: 'gpt2'"
+    // The two keys serve different purposes:
+    //   tokenizer.ggml.model = BPE/SP family (llama, gpt2, gemma4, ...)
+    //   tokenizer.ggml.pre   = pre-tokenizer regex bucket
+    //                          (qwen35, qwen2, llama-bpe, gemma4, ...)
+    // The `pre` field is enumerated in /opt/llama.cpp/src/llama-vocab.cpp
+    // around line 1948-2061. Here we map by GGUF arch.
+    let pre_tokenizer = determine_pre_tokenizer_type(arch);
     kv.push((
         "tokenizer.ggml.pre".into(),
-        MetaValue::String(tokenizer_model_name.clone()),
+        MetaValue::String(pre_tokenizer),
     ));
 
     // Chat template — read from chat_template.jinja or tokenizer_config.json
@@ -1928,6 +2104,31 @@ fn is_byte_token(token: &str) -> bool {
         && bytes[3].is_ascii_hexdigit()
         && bytes[4].is_ascii_hexdigit()
         && bytes[5] == b'>'
+}
+
+/// Determine the GGUF `tokenizer.ggml.pre` (pre-tokenizer type) per arch.
+///
+/// Enumeration source: `/opt/llama.cpp/src/llama-vocab.cpp` around line
+/// 1948-2061. The `pre` field selects the regex-bucket pre-tokenizer that
+/// llama.cpp uses to split text before BPE encoding. Different model
+/// families use different regex rules.
+///
+/// ADR-012 P9b real-model finding 2026-04-25 — bug #10: previously we
+/// emitted the BPE-family tag (e.g. "gpt2") here, which llama.cpp
+/// rejects with "unknown pre-tokenizer type: 'gpt2'".
+fn determine_pre_tokenizer_type(arch: &str) -> String {
+    match arch {
+        // llama-vocab.cpp:2029 — Qwen3.5 / Qwen3.6 family.
+        "qwen35" | "qwen35moe" => "qwen35".into(),
+        // llama-vocab.cpp:2022 — Qwen2 family.
+        "qwen2" | "qwen3" => "qwen2".into(),
+        // llama-vocab.cpp:2005 — Gemma4.
+        "gemma4" | "gemma3" => "gemma4".into(),
+        // llama-vocab.cpp:1951-1959 — LLaMA3 BPE family.
+        "llama" | "mistral" => "llama-bpe".into(),
+        // Fallback for unknown arch — "default" (LLAMA_VOCAB_PRE_TYPE_DEFAULT).
+        _ => "default".into(),
+    }
 }
 
 /// Determine the GGUF tokenizer model name based on tokenizer.json contents and arch.
@@ -2647,9 +2848,9 @@ mod tests {
     #[test]
     fn test_name_mapping_llama() {
         // Static mappings (arch-independent)
-        assert_eq!(hf_name_to_gguf("model.embed_tokens.weight", "llama"), "token_embd.weight");
-        assert_eq!(hf_name_to_gguf("model.norm.weight", "llama"), "output_norm.weight");
-        assert_eq!(hf_name_to_gguf("lm_head.weight", "llama"), "output.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.embed_tokens.weight", "llama"), "token_embd.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.norm.weight", "llama"), "output_norm.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("lm_head.weight", "llama"), "output.weight");
         // Layer mappings for LLaMA-family
         let cases = [
             ("model.layers.0.self_attn.q_proj.weight", "blk.0.attn_q.weight"),
@@ -2662,14 +2863,14 @@ mod tests {
             ("model.layers.0.input_layernorm.weight", "blk.0.attn_norm.weight"),
             ("model.layers.0.post_attention_layernorm.weight", "blk.0.ffn_norm.weight"),
         ];
-        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf(hf, "llama"), gguf, "mapping failed for {}", hf); }
+        for (hf, gguf) in cases { assert_eq!(hf_name_to_gguf_no_mtp(hf, "llama"), gguf, "mapping failed for {}", hf); }
         // Unknown passthrough
-        assert_eq!(hf_name_to_gguf("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
-        assert_eq!(hf_name_to_gguf("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("model.layers.5.some_new.weight", "llama"), "blk.5.some_new.weight");
+        assert_eq!(hf_name_to_gguf_no_mtp("decoder.block.0.weight", "llama"), "decoder.block.0.weight");
         // Verify LLaMA-like archs all behave the same
         for arch in &["mistral", "qwen3", "qwen2", "phi"] {
             assert_eq!(
-                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
                 "LLaMA-like arch '{}' should map post_attention_layernorm to ffn_norm", arch,
             );
@@ -2680,78 +2881,78 @@ mod tests {
     fn test_name_mapping_gemma4() {
         // Gemma4: post_attention_layernorm is a distinct norm, NOT ffn_norm
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma4"),
             "blk.0.post_attention_norm.weight",
         );
         // Gemma4: pre_feedforward_layernorm IS ffn_norm
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
             "blk.0.ffn_norm.weight",
         );
         // MoE norms
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_1.weight", "gemma4"),
             "blk.5.post_ffw_norm_1.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm_2.weight", "gemma4"),
             "blk.5.post_ffw_norm_2.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.pre_feedforward_layernorm_2.weight", "gemma4"),
             "blk.5.pre_ffw_norm_2.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_feedforward_layernorm.weight", "gemma4"),
             "blk.5.post_ffw_norm.weight",
         );
         // MoE routing
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.proj.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.proj.weight", "gemma4"),
             "blk.3.ffn_gate_inp.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.scale", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.scale", "gemma4"),
             "blk.3.ffn_gate_inp.scale",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.experts.gate_up_proj", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.experts.gate_up_proj", "gemma4"),
             "blk.3.ffn_gate_up_exps.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.experts.down_proj", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.experts.down_proj", "gemma4"),
             "blk.3.ffn_down_exps.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.3.router.per_expert_scale", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.3.router.per_expert_scale", "gemma4"),
             "blk.3.ffn_down_exps.scale",
         );
         // Layer scalar
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.layer_scalar", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.layer_scalar", "gemma4"),
             "blk.0.layer_output_scale.weight",
         );
         // Shared entries still work for Gemma4
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.self_attn.q_proj.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.self_attn.q_proj.weight", "gemma4"),
             "blk.0.attn_q.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.input_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("model.layers.0.input_layernorm.weight", "gemma4"),
             "blk.0.attn_norm.weight",
         );
         // Gemma3/Gemma2 behave the same as Gemma4
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma3"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma3"),
             "blk.0.post_attention_norm.weight",
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "gemma2"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "gemma2"),
             "blk.0.post_attention_norm.weight",
         );
         // language_model. prefix stripping still works
         assert_eq!(
-            hf_name_to_gguf("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
+            hf_name_to_gguf_no_mtp("language_model.model.layers.0.pre_feedforward_layernorm.weight", "gemma4"),
             "blk.0.ffn_norm.weight",
         );
     }
@@ -2811,6 +3012,158 @@ mod tests {
         for (input, expected) in [(0, 0), (1, 32), (32, 32), (33, 64), (63, 64), (64, 64)] {
             assert_eq!(align_up(input, 32), expected);
         }
+    }
+
+    /// ADR-012 P9b.1: round-trip smoke — emit a GGUF via the helper, then
+    /// re-open it via `mlx_native::gguf::GgufFile::open`. Proves the F16
+    /// emit produces a structurally valid GGUF that the load-side parser
+    /// can consume — the load-bearing contract for the two-pass
+    /// conversion path's intermediate artifact.
+    ///
+    /// Doesn't test full `Qwen35Model::load_from_gguf` because the tiny
+    /// fixture below isn't shape-correct for `Qwen35Config::from_gguf`'s
+    /// 22-key requirement. That positive-path round-trip is exercised
+    /// by the apex real-model tests under `--ignored real_apex` once
+    /// HF safetensors are downloaded and converted.
+    #[test]
+    fn test_emit_gguf_from_tensor_map_reopens_cleanly() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let mut tm = TensorMap::new();
+        // A representative mix: F16 weight + F16 norm + BF16 weight (will
+        // be converted to F16 by the emit). Cover both pass-through and
+        // conversion code paths.
+        tm.insert(TensorRef {
+            name: "model.embed_tokens.weight".into(),
+            shape: vec![16, 32],
+            dtype: DType::F16,
+            data: vec![0u8; 16 * 32 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.norm.weight".into(),
+            shape: vec![32],
+            dtype: DType::F16,
+            data: vec![0u8; 32 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.layers.0.self_attn.q_proj.weight".into(),
+            shape: vec![32, 32],
+            dtype: DType::BF16,
+            data: vec![0u8; 32 * 32 * 2], // BF16 — same byte size as F16
+        });
+
+        let metadata = meta();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("intermediate.gguf");
+
+        super::emit_gguf_from_tensor_map(
+            &tm,
+            &metadata,
+            tmp.path(),
+            &out_path,
+            &ProgressReporter::new(),
+        )
+        .expect("emit_gguf_from_tensor_map");
+
+        // Re-open via the mlx-native parser — proves structural validity.
+        let gguf = mlx_native::gguf::GgufFile::open(&out_path)
+            .expect("emitted GGUF must be openable by mlx_native::gguf::GgufFile");
+
+        // Spot-check a few tensors are present + have the right shape.
+        // Note: tensor names are mapped HF→GGUF inside `write` per the
+        // arch's `hf_name_to_gguf` table (see `arch_gguf_name`).
+        let arch = gguf
+            .metadata_string("general.architecture")
+            .expect("general.architecture must be set");
+        assert!(!arch.is_empty(), "arch metadata must be non-empty");
+
+        // The mlx-native parser must enumerate the tensors we emitted.
+        // For LLaMA arch (default in `meta()`), expected GGUF names:
+        //   model.embed_tokens.weight                    → token_embd.weight
+        //   model.norm.weight                            → output_norm.weight
+        //   model.layers.0.self_attn.q_proj.weight       → blk.0.attn_q.weight
+        for expected_gguf_name in [
+            "token_embd.weight",
+            "output_norm.weight",
+            "blk.0.attn_q.weight",
+        ] {
+            assert!(
+                gguf.tensor_info(expected_gguf_name).is_some(),
+                "emitted GGUF must contain tensor {expected_gguf_name}"
+            );
+        }
+    }
+
+    /// ADR-012 P9b.1: smoke test for `emit_gguf_from_tensor_map`.
+    ///
+    /// Build a tiny TensorMap (one F16 weight + one F16 norm), call the
+    /// helper, verify the output file has GGUF magic + version. Confirms
+    /// the orchestration wiring (TensorMap → StaticQuantizer("f16") →
+    /// quantize_model → GgufBackend::write) works end-to-end without a
+    /// full convert-pipeline run.
+    ///
+    /// Prints wall-time + tensor byte count to stderr for benchmark
+    /// regression visibility (test never asserts a time bound — CI-safe).
+    /// At apex MoE scale, expect ~120 s for ~30 GB. This synthetic case
+    /// provides a sub-millisecond baseline to scale from linearly.
+    #[test]
+    fn test_emit_gguf_from_tensor_map_smoke() {
+        use crate::ir::{DType, TensorMap, TensorRef};
+
+        let mut tm = TensorMap::new();
+        tm.insert(TensorRef {
+            name: "model.embed_tokens.weight".into(),
+            shape: vec![8, 16],
+            dtype: DType::F16,
+            data: vec![0u8; 8 * 16 * 2],
+        });
+        tm.insert(TensorRef {
+            name: "model.norm.weight".into(),
+            shape: vec![16],
+            dtype: DType::F16,
+            data: vec![0u8; 16 * 2],
+        });
+
+        let total_input_bytes: usize = tm
+            .tensors
+            .values()
+            .map(|t| t.data.len())
+            .sum();
+        let metadata = meta();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("intermediate.gguf");
+
+        let t0 = std::time::Instant::now();
+        let manifest = super::emit_gguf_from_tensor_map(
+            &tm,
+            &metadata,
+            tmp.path(),
+            &out_path,
+            &ProgressReporter::new(),
+        )
+        .expect("emit_gguf_from_tensor_map should succeed for tiny tensor_map");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(manifest.shard_count, 1);
+        assert_eq!(manifest.files.len(), 1);
+        assert!(out_path.exists(), "expected GGUF written at {:?}", out_path);
+
+        let data = std::fs::read(&out_path).unwrap();
+        assert!(data.len() >= 16, "GGUF must have at least magic + version + counts");
+        assert_eq!(&data[0..4], &GGUF_MAGIC, "GGUF magic");
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            GGUF_VERSION,
+            "GGUF version"
+        );
+
+        eprintln!(
+            "[bench] emit_gguf_from_tensor_map: {} input bytes → {} output bytes in {:?} ({} tensors)",
+            total_input_bytes,
+            data.len(),
+            elapsed,
+            tm.tensors.len()
+        );
     }
 
     #[test]
@@ -3232,6 +3585,30 @@ mod tests {
         assert_eq!(arch_gguf_name(&m), "gemma4");
     }
 
+    /// Decision 1: Qwen3.5 ships two HF architecture aliases per variant —
+    /// `*ForCausalLM` (pure language model) and `*ForConditionalGeneration`
+    /// (multimodal / vision-tower shipping models). Both must route to the
+    /// same llama.cpp arch string. Dropping either alias in a "simpler"
+    /// refactor would silently misroute multimodal checkpoints.
+    #[test]
+    fn arch_routing_qwen35_conditional_generation() {
+        let mut m = meta_qwen35_dense();
+        m.architecture = "Qwen3_5ForConditionalGeneration".into();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35",
+            "Qwen3_5ForConditionalGeneration must route to 'qwen35' same as *ForCausalLM"
+        );
+
+        let mut m = meta_qwen35_moe();
+        m.architecture = "Qwen3_5MoeForConditionalGeneration".into();
+        assert_eq!(
+            arch_gguf_name(&m),
+            "qwen35moe",
+            "Qwen3_5MoeForConditionalGeneration must route to 'qwen35moe' same as *ForCausalLM"
+        );
+    }
+
     /// Decision 1: llama architecture passes through unchanged.
     #[test]
     fn arch_routing_llama_unchanged() {
@@ -3248,12 +3625,12 @@ mod tests {
     #[test]
     fn test_qwen35_post_attention_norm_mapping() {
         assert_eq!(
-            hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", "qwen35"),
+            hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", "qwen35"),
             "blk.0.post_attention_norm.weight",
             "qwen35: post_attention_layernorm must map to post_attention_norm, not ffn_norm"
         );
         assert_eq!(
-            hf_name_to_gguf("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
+            hf_name_to_gguf_no_mtp("model.layers.5.post_attention_layernorm.weight", "qwen35moe"),
             "blk.5.post_attention_norm.weight",
             "qwen35moe: post_attention_layernorm must map to post_attention_norm"
         );
@@ -3264,40 +3641,50 @@ mod tests {
     fn test_llama_post_attention_norm_unchanged() {
         for arch in &["llama", "qwen3", "mistral"] {
             assert_eq!(
-                hf_name_to_gguf("model.layers.0.post_attention_layernorm.weight", arch),
+                hf_name_to_gguf_no_mtp("model.layers.0.post_attention_layernorm.weight", arch),
                 "blk.0.ffn_norm.weight",
                 "LLaMA-like arch '{}' must still map to ffn_norm", arch
             );
         }
     }
 
-    /// Decision 11 + 19: MTP tensors map to `blk.mtpN.nextn.*` (placeholder)
-    /// then resolve to `blk.{num_hidden_layers + N}.nextn.*` in the production
-    /// write path.  `hf_name_to_gguf` itself emits the placeholder; the test
-    /// here pins both halves of the contract.  llama-arch.cpp:447-450
-    /// LLM_TENSOR_NEXTN_*.
+    /// Decision 11 + P11 fix: MTP tensors map to blk.{num_hidden_layers + mtp_idx}.nextn.*
+    /// for qwen35/qwen35moe — the resolved block index, NOT a "blk.mtpN" placeholder.
+    /// llama-arch.cpp:447-450 LLM_TENSOR_NEXTN_*.
+    ///
+    /// The earlier "blk.mtp{idx}" form was a P4 stub that ADR-012 P11 (2026-04-24)
+    /// caught via the MTP round-trip gate: llama.cpp's loader + ADR-013's
+    /// load_mtp_weights_if_present both look for `blk.{num_hidden_layers}.nextn.*`.
+    /// The placeholder was silently dropping MTP tensors from converted GGUFs.
     #[test]
     fn test_qwen35_mtp_tensor_mapping() {
-        // Placeholder shape (Decision 11).
+        // With num_hidden_layers=40 (Qwen3.5-MoE / Qwen3.6-35B-A3B), mtp_idx=0 →
+        // block index 40. The resolved names are what llama.cpp's loader expects.
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe"),
-            "blk.mtp0.nextn.enorm.weight",
-            "MTP enorm must map to placeholder nextn.enorm (llama-arch.cpp:449)"
+            hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe", 40),
+            "blk.40.nextn.enorm.weight",
+            "MTP enorm must map to nextn.enorm at resolved block (llama-arch.cpp:449)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35"),
-            "blk.mtp0.nextn.hnorm.weight",
-            "MTP hnorm must map to placeholder nextn.hnorm (llama-arch.cpp:450)"
+            hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35", 64),
+            "blk.64.nextn.hnorm.weight",
+            "MTP hnorm must map to nextn.hnorm at resolved block (llama-arch.cpp:450)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe"),
-            "blk.mtp0.nextn.embed_tokens.weight",
-            "MTP embed_tokens must map to placeholder nextn.embed_tokens (llama-arch.cpp:448)"
+            hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe", 40),
+            "blk.40.nextn.embed_tokens.weight",
+            "MTP embed_tokens at resolved block (llama-arch.cpp:448)"
         );
         assert_eq!(
-            hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe"),
-            "blk.mtp0.nextn.eh_proj.weight",
-            "MTP eh_proj must map to placeholder nextn.eh_proj (llama-arch.cpp:447)"
+            hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe", 40),
+            "blk.40.nextn.eh_proj.weight",
+            "MTP eh_proj at resolved block (llama-arch.cpp:447)"
+        );
+        // Second MTP block (mtp_idx=1) with 40 layers → block 41.
+        assert_eq!(
+            hf_name_to_gguf("mtp.layers.1.enorm.weight", "qwen35moe", 40),
+            "blk.41.nextn.enorm.weight",
+            "mtp_idx=1 with num_layers=40 → block 41"
         );
     }
 

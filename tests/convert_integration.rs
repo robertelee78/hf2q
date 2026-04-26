@@ -109,6 +109,52 @@ fn test_convert_q8_gguf() {
     assert_has_gguf(&output_dir);
 }
 
+/// `--quant q4_0` and `--quant q8_0` are GGUF-canonical names; they're
+/// what the smoke harness's default and any user familiar with
+/// llama.cpp's tensor-type naming would type. Pre-fix clap rejected
+/// these because only the bare `q4` / `q8` value enum names were
+/// registered, breaking `hf2q smoke --arch qwen35` (default --quant
+/// q4_0) at the convert subprocess step.
+#[test]
+fn test_convert_quant_q4_0_alias_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q4_0",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+}
+
+#[test]
+fn test_convert_quant_q8_0_alias_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    setup_tiny_model(&input_dir);
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q8_0",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+}
+
 #[test]
 fn test_convert_missing_input_fails() {
     Command::cargo_bin("hf2q")
@@ -280,4 +326,112 @@ fn test_convert_skip_quality_flag() {
         .success();
 
     assert_has_gguf(&output_dir);
+}
+
+/// ADR-012 Decision 15 second AC bullet: "Test that Gemma-4 conversion
+/// still produces the same sidecar set it did before." We cover the
+/// qwen35 + qwen35moe paths in their own integration suites; this test
+/// anchors the non-qwen35 path so any future edit that accidentally
+/// arch-gates `copy_sidecars` (making it a qwen-only behaviour) trips
+/// immediately. TinyTestModel is the generic, non-qwen35 carrier.
+#[test]
+fn test_convert_sidecars_preserved_on_non_qwen35_path() {
+    use std::fs as stdfs;
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input_sidecars");
+    let output_dir = tmp.path().join("output_sidecars");
+    setup_tiny_model(&input_dir);
+
+    // Overwrite the minimal sidecars setup_tiny_model wrote + add the rest
+    // with distinctive content so byte-identity is meaningfully checked.
+    let sidecar_contents: &[(&str, &str)] = &[
+        ("chat_template.jinja", "{% for m in messages %}USER:{{ m.content }}{% endfor %}"),
+        ("tokenizer.json", "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\"}}"),
+        ("tokenizer_config.json", "{\"model_max_length\":4096,\"bos_token\":\"<s>\"}"),
+        ("config.json", "OVERWRITE_ME_PRESERVE_CHECK"), // overwritten below
+        ("generation_config.json", "{\"temperature\":0.7,\"top_p\":0.9}"),
+        ("special_tokens_map.json", "{\"bos_token\":\"<s>\",\"eos_token\":\"</s>\"}"),
+    ];
+    for (name, body) in sidecar_contents {
+        if *name == "config.json" {
+            // Preserve the valid config.json setup_tiny_model wrote.
+            continue;
+        }
+        stdfs::write(input_dir.join(name), body).unwrap();
+    }
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q4",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+
+    // Every sidecar we wrote to input must appear in output with
+    // byte-identical content. config.json included — its content was
+    // written by setup_tiny_model.
+    let expected_files = [
+        "chat_template.jinja",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "config.json",
+        "generation_config.json",
+        "special_tokens_map.json",
+    ];
+    for name in expected_files {
+        let src = input_dir.join(name);
+        let dst = output_dir.join(name);
+        assert!(
+            dst.exists(),
+            "sidecar '{name}' missing from non-qwen35 output — \
+             copy_sidecars may have been arch-gated (Decision 15 regression)"
+        );
+        let src_bytes = stdfs::read(&src).unwrap();
+        let dst_bytes = stdfs::read(&dst).unwrap();
+        assert_eq!(
+            src_bytes, dst_bytes,
+            "sidecar '{name}' content is not byte-identical \
+             (Decision 15 byte-preservation AC broken)"
+        );
+    }
+}
+
+/// Missing-sidecar silent-skip AC — Decision 15 says "If any are missing
+/// in the HF repo, skip silently (not all models ship all sidecars)."
+/// Proves convert succeeds and emits whatever sidecars exist, without
+/// whinging about the absent ones.
+#[test]
+fn test_convert_sidecars_missing_silently_skipped_on_non_qwen35_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_dir = tmp.path().join("input_no_sidecars");
+    let output_dir = tmp.path().join("output_no_sidecars");
+    setup_tiny_model(&input_dir);
+    // setup_tiny_model wrote only tokenizer.json + tokenizer_config.json —
+    // the other 4 sidecars are deliberately absent.
+
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .args([
+            "convert", "--input", input_dir.to_str().unwrap(),
+            "--format", "gguf", "--quant", "q4",
+            "--output", output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_has_gguf(&output_dir);
+
+    // The 4 sidecars that were never in input must NOT appear in output.
+    for name in ["chat_template.jinja", "generation_config.json", "special_tokens_map.json"] {
+        assert!(
+            !output_dir.join(name).exists(),
+            "sidecar '{name}' appeared in output when not present in input \
+             — copy_sidecars must not fabricate files"
+        );
+    }
 }

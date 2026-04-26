@@ -87,13 +87,20 @@ regex = "1"
 # common/jinja/ parser and mlx-lm's Python jinja2 behavior — see ADR-005 line 681)
 minijinja = "2"
 
+# tempfile is used at runtime by the convert pipeline (ADR-012 P9b two-pass
+# intermediate GGUF for qwen35 / qwen35moe activation capture) AND by tests.
+# Promoted from dev-dep to runtime dep when P9b.2 / P9b.3b shipped.
+tempfile = "3"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"
 criterion = "0.5"
 regex = "1"
 tower = { version = "0.4", features = ["util"] }
+# ADR-012 P9: corpus drift + disjointness assertions.
+sha2 = "0.10"
+hex = "0.4"
 
 [[bin]]
 name = "iter23_audit"

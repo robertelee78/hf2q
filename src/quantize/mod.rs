@@ -9,6 +9,7 @@
 pub mod apex;
 pub mod dwq;
 pub mod dwq_activation;
+pub mod intermediate_moe_q8;
 pub mod mixed;
 pub mod sensitivity;
 pub mod static_quant;

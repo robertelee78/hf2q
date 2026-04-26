@@ -78,9 +78,13 @@ enum AppError {
     QualityExceeded(anyhow::Error),
     #[allow(dead_code)]
     Interrupted,
-    /// `hf2q smoke` returns a code chosen by the smoke module.  Never `1`
-    /// (preflight has its own codes), never overlaps with convert codes.
-    SmokeWithCode(u8, anyhow::Error),
+    /// Smoke-subcommand exit codes per ADR-012 Decision 16 §preflight (2-8).
+    /// Carries the smoke-specific code so the process exits with the
+    /// documented value rather than the generic `EXIT_CONVERSION_ERROR=1`
+    /// AppError default. Without this variant, every distinct smoke
+    /// failure mode collapses to exit 1 — defeating Decision 16's
+    /// "distinct non-zero code" contract at the OS-process level.
+    Smoke { code: u8, msg: anyhow::Error },
 }
 
 impl AppError {
@@ -90,7 +94,7 @@ impl AppError {
             AppError::Conversion(_) => EXIT_CONVERSION_ERROR,
             AppError::QualityExceeded(_) => EXIT_QUALITY_EXCEEDED,
             AppError::Interrupted => EXIT_CONVERSION_ERROR,
-            AppError::SmokeWithCode(c, _) => *c,
+            AppError::Smoke { code, .. } => *code,
         }
     }
 }
@@ -102,7 +106,7 @@ impl std::fmt::Display for AppError {
             AppError::Conversion(e) => write!(f, "{:#}", e),
             AppError::QualityExceeded(e) => write!(f, "{:#}", e),
             AppError::Interrupted => write!(f, "Conversion interrupted by user"),
-            AppError::SmokeWithCode(_, e) => write!(f, "{:#}", e),
+            AppError::Smoke { msg, .. } => write!(f, "{:#}", msg),
         }
     }
 }
@@ -190,55 +194,45 @@ fn run(cli: Cli) -> Result<(), AppError> {
     }
 }
 
-/// Handle the `smoke` subcommand (ADR-012 Decision 16).
+/// Handle the `smoke` subcommand — ADR-012 Decision 16.
+///
+/// Dispatches via `ArchRegistry::get(arch)` — unknown arches (including
+/// gemma4, ministral, deepseekv3, bogus) return a uniform structured
+/// error. Preflight failures map to the documented exit codes 2-6.
 fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
-    use arch::{run_smoke, SmokeOptions, SmokeQuant};
-
-    let quant = match args.quant {
-        cli::SmokeQuantArg::Q4_0 => SmokeQuant::Q4_0,
-        cli::SmokeQuantArg::DwqMixed46 => SmokeQuant::DwqMixed46,
-        cli::SmokeQuantArg::DwqMixed48 => SmokeQuant::DwqMixed48,
+    let smoke_args = arch::smoke::SmokeArgs {
+        arch: args.arch,
+        quant: arch::smoke::normalize_quant_label(&args.quant),
+        with_vision: args.with_vision,
+        skip_convert: args.skip_convert,
+        dry_run: args.dry_run,
+        fixtures_root: args.fixtures_root,
+        local_dir: args.local_dir,
+        convert_output_dir: args.convert_output_dir,
+        llama_cli_override: args.llama_cli_override,
     };
-
-    let mut options = SmokeOptions::new(args.arch.clone(), quant);
-    options.with_vision = args.with_vision;
-    options.skip_convert = args.skip_convert;
-    options.dry_run = args.dry_run;
-    options.llama_cli_path = args.llama_cli;
-    options.hf2q_path = args.hf2q_binary;
-    options.transcript_dir = args.transcript_dir;
-
-    match run_smoke(&options) {
-        Ok(assertion) => {
-            tracing::info!(
-                arch = %assertion.arch,
-                tokens = assertion.tokens_generated,
-                tensors = assertion.tensors_loaded,
-                "smoke gate passed"
-            );
-            println!("smoke ok: {}", assertion);
-            Ok(())
-        }
-        Err(e) => {
-            let exit = e.exit_code_override();
-            let err: anyhow::Error = anyhow::anyhow!("{e}");
-            match exit {
-                Some(c) if c == EXIT_SMOKE_LLAMA_CLI_MISSING
-                    || c == EXIT_SMOKE_BINARY_MISSING
-                    || c == EXIT_SMOKE_REPO_MISSING => Err(AppError::SmokeWithCode(c, err)),
-                Some(c) if c == EXIT_QUALITY_EXCEEDED || c == EXIT_INPUT_ERROR => {
-                    // 2 + 3 are the existing convert codes — reuse the
-                    // standard arms so behavior stays uniform.
-                    if c == EXIT_QUALITY_EXCEEDED {
-                        Err(AppError::QualityExceeded(err))
-                    } else {
-                        Err(AppError::Input(err))
-                    }
-                }
-                Some(c) => Err(AppError::SmokeWithCode(c, err)),
-                None => Err(AppError::Conversion(err)),
-            }
-        }
+    let env = arch::smoke::RealSmokeEnv {
+        convert_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    let outcome = arch::smoke::dispatch(&smoke_args, &env);
+    let code = outcome.exit_code();
+    let rendered = arch::smoke::render_outcome(&outcome);
+    if matches!(outcome, arch::smoke::SmokeOutcome::Pass { .. }
+                        | arch::smoke::SmokeOutcome::Skipped { .. })
+    {
+        println!("{}", rendered);
+        Ok(())
+    } else {
+        // Preflight / unknown-arch — propagate the smoke-specific exit
+        // code (Decision 16 §preflight: 2-8 distinct non-zero codes)
+        // rather than collapsing to AppError::Conversion's exit 1.
+        // Without `AppError::Smoke`, the documented exit codes were
+        // shadowed at the process boundary — fixed in this commit.
+        eprintln!("{}", rendered);
+        Err(AppError::Smoke {
+            code,
+            msg: anyhow::anyhow!("{}", rendered),
+        })
     }
 }
 
@@ -470,6 +464,124 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
     check_interrupted()?;
 
+    // Phase 1.4: ADR-012 P9b real-model finding — strip `language_model.`
+    // prefix from all tensor names before the qwen35 transforms run.
+    //
+    // Real Qwen3.6 safetensors use the nested
+    //   `model.language_model.layers.N.*`
+    // namespace (mirroring the `Qwen3_5{,Moe}ForConditionalGeneration` HF
+    // class hierarchy). The qwen35 transforms downstream were written for
+    // the simpler `model.layers.N.*` namespace:
+    //   - `apply_qwen35_linear_attn_transforms_in_tensor_map` uses
+    //     `.contains()` substring matches (incidentally robust to either
+    //     prefix).
+    //   - `merge_moe_experts_in_tensor_map` uses exact-format matches
+    //     `model.layers.{N}.mlp.experts.{E}.{proj}.weight` (silently
+    //     no-ops on `language_model.` variants — caught by the qwen35moe
+    //     real-model run on jenerallee78/Qwen3.6-35B-A3B-...).
+    //
+    // Normalizing globally here matches what `hf_name_to_gguf` does at
+    // GGUF-write time (line ~1599: `replace("language_model.", "")`), so
+    // the input-side and output-side namespaces stay consistent for the
+    // entire pipeline.
+    //
+    // Vision tensors (`model.vision_tower.*`, `model.embed_vision.*`) and
+    // root-level non-language_model paths are unaffected (the strip is a
+    // simple `.replace` and only fires on tensors that actually contain
+    // the literal `language_model.` segment).
+    {
+        let renames: Vec<(String, String)> = tensor_map
+            .tensors
+            .keys()
+            .filter(|n| n.contains("language_model."))
+            .map(|n| (n.clone(), n.replace("language_model.", "")))
+            .collect();
+        if !renames.is_empty() {
+            tracing::info!(
+                count = renames.len(),
+                "qwen35 P9b real-model finding: stripping `language_model.` prefix from {} tensors",
+                renames.len()
+            );
+            for (old_name, new_name) in renames {
+                if let Some(mut tensor) = tensor_map.tensors.remove(&old_name) {
+                    tensor.name = new_name.clone();
+                    tensor_map.tensors.insert(new_name, tensor);
+                }
+            }
+        }
+    }
+
+    // Phase 1.45: ADR-012 P9b real-model finding (jenerallee78 abliterated apex):
+    // some qwen35moe checkpoints ship a FUSED gate+up tensor named
+    //   model.layers.N.mlp.experts.gate_up_proj   (shape [N_exp, 2*moe_inter, hidden])
+    // plus
+    //   model.layers.N.mlp.experts.down_proj      (shape [N_exp, hidden, moe_inter])
+    // — both WITHOUT the `.weight` suffix llama.cpp / hf_name_to_gguf
+    // expect. Split the fused gate_up along axis 1 into separate
+    // gate_proj/up_proj and add `.weight` to all three. After this phase
+    // the tensors are in the canonical pre-merged form expected by
+    // `merge_moe_experts_in_tensor_map`'s pre-merged-skip path
+    // (commit 9045d04).
+    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
+        &mut tensor_map,
+        &metadata,
+    )
+    .context("qwen35moe fused gate_up split + .weight rename failed")
+    .map_err(AppError::Conversion)?;
+
+    // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
+    //
+    // Must run BEFORE quantization: `merge_moe_experts_in_tensor_map`
+    // consumes pre-quantization F16/BF16 bytes where shape × dtype.size
+    // matches data.len(). Running post-quant on Q4_0 bytes trips the
+    // expected-bytes check in `merge_expert_tensors`.
+    //
+    // Without this call, qwen35moe GGUFs emit N_experts × 3 × N_layers
+    // separate per-expert tensors instead of 3 × N_layers merged ones,
+    // and llama.cpp's loader rejects the file (silent P4→P5 wire-up
+    // gap caught by ADR-012 P11 round-trip test).
+    //
+    // No-op for dense arches (guarded by the arch string check inside
+    // the function itself).
+    models::qwen35::moe::merge_moe_experts_in_tensor_map(&mut tensor_map, &metadata)
+        .context("qwen35moe expert merge failed")
+        .map_err(AppError::Conversion)?;
+
+    // Phase 1.6: ADR-012 P3 Decision 6 — RMS norm +1 bias (Qwen3.5 family
+    // `gamma + 1` convention, py:4794-4795). Baked into the stored weights
+    // at convert time. Silent wire-up gap caught by spec-source audit
+    // 2026-04-24 — P3 shipped the per-tensor transform but never called
+    // it; before this fix, converted Qwen3.5 GGUFs shipped RMS norm
+    // weights WITHOUT the +1 bias, producing silent logit skew at
+    // inference. No-op for non-Qwen3.5 arches (Gemma4, LLaMA).
+    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(&mut tensor_map, &metadata)
+        .context("qwen35 RMS norm +1 bias application failed")
+        .map_err(AppError::Conversion)?;
+
+    // Phase 1.7: ADR-012 P2/P3 Decision 5 + R2 — linear-attention transforms.
+    // A_log negation, conv1d squeeze, in_proj_qkvz split into qkv + z,
+    // and the 6-case V-head grouped→tiled reorder per py:5367-5424.
+    //
+    // 4th silent wire-up gap caught by the 2026-04-24 audit. ADR-012 R2
+    // was the named "plausible-looking nonsense" failure mode — pre-fix
+    // every Qwen3.5 GGUF we produced shipped HF-grouped V-head layout
+    // instead of ggml-tiled. Enabled here after the fixture shapes in
+    // tests/convert_qwen35{,moe}_integration.rs were corrected to match
+    // real Qwen3.5 spec ([linear_num_value_heads, hidden] for A_log /
+    // in_proj_a etc., not [num_heads, hidden]).
+    //
+    // Spec sources: convert_hf_to_gguf.py:5367-5424 (6-case dispatcher)
+    // + Qwen3NextModel.modify_tensors:4786-4830 (A_log negation, dt_bias
+    // rename, conv1d squeeze). No-op for non-Qwen3.5 arches.
+    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
+        &mut tensor_map,
+        &metadata,
+    )
+    .context("qwen35 linear-attention transforms failed")
+    .map_err(AppError::Conversion)?;
+
+    check_interrupted()?;
+
     let input_size = tensor_map.total_size_bytes() as u64;
 
     tracing::info!(
@@ -561,22 +673,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     metadata.is_moe(),
                 );
 
-                // ADR-012 Decision 13 no-fallback guard:
-                // If the model is qwen35 or qwen35moe, we MUST have an ActivationCapture
-                // implementation from the inference session.  At present (pre-ADR-013 real
-                // impl), we error clearly rather than silently running weight-space DWQ.
-                // When ADR-013 P12 real ActivationCapture lands, this block is replaced by
-                // the real capture injection.
-                if dwq_arch.requires_activation_capture() {
-                    // No real ActivationCapture impl available yet — error clearly.
-                    // Per ADR-012 Decision 13 / no-fallback mantra: fix the blocker upstream,
-                    // do not route around it with weight-space fallback.
-                    return Err(AppError::Conversion(anyhow::anyhow!(
-                        "{}",
-                        quantize::dwq::DwqError::NoActivationCapture
-                    )));
-                }
-
                 let dwq_config = quantize::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
@@ -599,39 +695,176 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     dwq_quantizer.name()
                 );
 
-                // Activation-based calibration path (non-qwen35 archs with tokenizer).
-                // For qwen35/qwen35moe the guard above has already returned an error,
-                // so this branch is unreachable for those archs.
-                if dwq_config.use_activations {
-                    tracing::info!("Tokenizer found, using activation-based DWQ calibration");
-                    match quantize::dwq_activation::run_dwq_activation_calibration(
+                if dwq_arch.requires_activation_capture() {
+                    // ADR-012 P9b.2/3b — qwen35 / qwen35moe two-pass conversion.
+                    //
+                    // Decision 13 mandates ActivationCapture for these arches; no
+                    // weight-space fallback. Steps:
+                    //   1. Tokenizer.json is mandatory (capture tokenization
+                    //      contract) — error if missing.
+                    //   2. Emit an intermediate F16 GGUF from the in-memory
+                    //      tensor_map via `emit_gguf_from_tensor_map` (P9b.1).
+                    //      `tensor_map` is held in scope for the subsequent
+                    //      DWQ pass — no double-read from safetensors (P9b.4).
+                    //   3. Construct a `RealActivationCapture` from the
+                    //      intermediate GGUF + tokenizer (P9b.3b). This loads
+                    //      the model into RAM; the file is no longer needed
+                    //      after the constructor returns.
+                    //   4. Run activation-aware DWQ via
+                    //      `run_dwq_activation_calibration` (P9b.3a — the real
+                    //      impl that consumes a `&mut dyn ActivationCapture`).
+                    //   5. The `tempfile::TempDir` is dropped at the end of
+                    //      this scope, removing the intermediate GGUF — RAII
+                    //      cleanup (P9b.5).
+                    let tokenizer_json = config.input_dir.join("tokenizer.json");
+                    if !tokenizer_json.exists() {
+                        return Err(AppError::Conversion(anyhow::anyhow!(
+                            "ADR-012 P9b: qwen35/qwen35moe DWQ requires \
+                             tokenizer.json in {}; not found. No weight-space \
+                             fallback per Decision 13.",
+                            config.input_dir.display()
+                        )));
+                    }
+
+                    let intermediate_dir = tempfile::tempdir()
+                        .context("ADR-012 P9b: failed to create tempdir for intermediate GGUF")
+                        .map_err(AppError::Conversion)?;
+                    let intermediate_path =
+                        intermediate_dir.path().join("intermediate-f16.gguf");
+
+                    tracing::info!(
+                        path = %intermediate_path.display(),
+                        "ADR-012 P9b: emitting intermediate F16 GGUF for activation capture"
+                    );
+                    backends::gguf::emit_gguf_from_tensor_map(
                         &tensor_map,
                         &metadata,
-                        &dwq_config,
                         &config.input_dir,
+                        &intermediate_path,
                         &progress,
-                    ) {
-                        Ok(model) => model,
-                        Err(e) => {
-                            // ADR-012 Decision 13: the weight-space fallback below is ONLY
-                            // reachable for non-qwen35 archs (guard above enforces this).
-                            // For qwen35/qwen35moe we never reach here.
-                            warn!(
-                                "Activation-based DWQ failed ({}), falling back to weight-space calibration",
-                                e
-                            );
-                            quantize::dwq::run_dwq_calibration(
-                                &tensor_map,
-                                &metadata,
-                                &dwq_config,
-                                &progress,
-                            )
-                            .context("DWQ weight-space calibration failed")
-                            .map_err(AppError::Conversion)?
+                    )
+                    .context("ADR-012 P9b: intermediate F16 GGUF emission failed")
+                    .map_err(AppError::Conversion)?;
+
+                    // ADR-012 P9b apex MoE OOM mitigation (cost-model
+                    // candidate #3, 2026-04-25): swap tensor_map out for an
+                    // empty placeholder across the capture call so the
+                    // F32-expanded Qwen35Model (~128 GB MoE params) doesn't
+                    // have to coexist with tensor_map (~70 GB BF16) on a
+                    // 128 GB system. Re-read the safetensors after capture
+                    // (~30s I/O cost) and re-apply Phases 1.4 + 1.45 + 1.6 +
+                    // 1.7 transforms (idempotent — same input produces same
+                    // tensor_map). The placeholder lets `tensor_map` stay
+                    // in-scope for the downstream Phase 4.x usage.
+                    let _drop_for_capture = std::mem::replace(
+                        &mut tensor_map,
+                        ir::TensorMap::new(),
+                    );
+                    drop(_drop_for_capture);
+
+                    let mut capture =
+                        inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
+                            &intermediate_path,
+                            &tokenizer_json,
+                        )
+                        .map_err(|e| {
+                            AppError::Conversion(anyhow::anyhow!(
+                                "ADR-012 P9b: RealActivationCapture::new failed: {e}"
+                            ))
+                        })?;
+
+                    tracing::info!(
+                        "ADR-012 P9b: capturing activations from intermediate F16 GGUF"
+                    );
+                    let derived_sensitive_ranges =
+                        quantize::dwq_activation::capture_activations_to_sensitive_ranges(
+                            &metadata,
+                            &dwq_config,
+                            &mut capture,
+                        )
+                        .context(
+                            "ADR-012 P9b: activation capture / sensitivity derivation failed",
+                        )
+                        .map_err(AppError::Conversion)?;
+
+                    drop(capture); // release Qwen35Model (~128 GB for apex MoE) ASAP
+                    drop(intermediate_dir); // RAII cleanup of tempdir
+
+                    // Re-read tensor_map from safetensors and re-apply the
+                    // qwen35 normalization + transform phases. All
+                    // transforms are idempotent (input safetensors haven't
+                    // changed), so the result is byte-equivalent to the
+                    // tensor_map we just dropped.
+                    tracing::info!(
+                        "ADR-012 P9b: re-reading tensor_map for DWQ pass after capture"
+                    );
+                    let (_, mut tensor_map_re) =
+                        input::read_model(&config.input_dir, &progress)
+                            .context("ADR-012 P9b: re-read of model after capture failed")
+                            .map_err(AppError::Conversion)?;
+
+                    // Re-apply the same qwen35 normalization the original
+                    // tensor_map went through (Phases 1.4 + 1.45 + 1.6 + 1.7).
+                    {
+                        let renames: Vec<(String, String)> = tensor_map_re
+                            .tensors
+                            .keys()
+                            .filter(|n| n.contains("language_model."))
+                            .map(|n| (n.clone(), n.replace("language_model.", "")))
+                            .collect();
+                        for (old_name, new_name) in renames {
+                            if let Some(mut tensor) = tensor_map_re.tensors.remove(&old_name) {
+                                tensor.name = new_name.clone();
+                                tensor_map_re.tensors.insert(new_name, tensor);
+                            }
                         }
                     }
+                    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read fused gate_up split failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::moe::merge_moe_experts_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read MoE expert merge failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read RMS+1 transform failed")
+                    .map_err(AppError::Conversion)?;
+                    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
+                        &mut tensor_map_re,
+                        &metadata,
+                    )
+                    .context("ADR-012 P9b: re-read linear-attn transforms failed")
+                    .map_err(AppError::Conversion)?;
+
+                    tracing::info!(
+                        "ADR-012 P9b: running DWQ scale calibration with {} activation-derived sensitive layer ranges",
+                        derived_sensitive_ranges.len()
+                    );
+                    let model = quantize::dwq_activation::run_dwq_with_sensitive_ranges(
+                        &tensor_map_re,
+                        &metadata,
+                        &dwq_config,
+                        derived_sensitive_ranges,
+                        &progress,
+                    )
+                    .context("ADR-012 P9b: DWQ scale calibration failed")
+                    .map_err(AppError::Conversion)?;
+                    // Re-bind tensor_map to the re-read version for the
+                    // downstream Phase 4.x bit-overrides + write path.
+                    tensor_map = tensor_map_re;
+                    model
                 } else {
-                    tracing::info!("No tokenizer found, using weight-space DWQ calibration");
+                    tracing::info!(
+                        "Using DWQ weight-space calibration (non-qwen35 arch)"
+                    );
                     quantize::dwq::run_dwq_calibration(
                         &tensor_map,
                         &metadata,
@@ -811,6 +1044,67 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // manifest.output_dir is the canonical parent directory that contains
     // the written .gguf or safetensors files.
     copy_sidecars(&config.input_dir, std::path::Path::new(&manifest.output_dir));
+
+    // Phase 4.8: ADR-012 P10 / Decision 18 — emit pure-Rust mmproj when
+    // --emit-vision-tower is set AND the HF config has a vision_config.
+    // Silent skip for Gemma4 (no vision_config) and Qwen3.6-35B-A3B MoE
+    // (publisher dropped vision_config). Only Qwen3.6-27B dense emits.
+    //
+    // Sovereignty: when the P10 emitter succeeds, delete the backend's
+    // auto-emitted legacy `<text>-mmproj.gguf` so there's ONE
+    // authoritative mmproj per convert invocation — the pure-Rust P10
+    // output produced from clip.cpp/clip-model.h spec.
+    if args.emit_vision_tower {
+        let output_parent = std::path::Path::new(&manifest.output_dir);
+        match models::vit::convert_vision_tower(&config.input_dir, output_parent) {
+            Ok(Some(path)) => {
+                tracing::info!(
+                    "ADR-012 P10: mmproj emitted at {}",
+                    path.display()
+                );
+                // Remove the backend's legacy auto-emitted mmproj if
+                // present. The legacy path fires whenever the model
+                // has `vision_tower.*` tensors (see src/backends/gguf.rs
+                // line 449 `has_vision` check). With P10 in play the
+                // legacy file is now redundant duplication; keeping
+                // both invites loader confusion.
+                for entry in std::fs::read_dir(output_parent)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let p = entry.path();
+                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with("-mmproj.gguf")
+                            && !name.starts_with("mmproj-")
+                            && p != path
+                        {
+                            if let Err(e) = std::fs::remove_file(&p) {
+                                warn!(
+                                    "failed to remove legacy mmproj {:?}: {}",
+                                    p, e
+                                );
+                            } else {
+                                tracing::info!(
+                                    "ADR-012 P10 sovereignty: removed legacy backend mmproj {:?}",
+                                    p
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "--emit-vision-tower requested but {} has no vision_config — skipping",
+                    config.input_dir.display()
+                );
+            }
+            Err(e) => {
+                warn!("vision-tower emission failed: {}", e);
+            }
+        }
+    }
 
     // Phase 5.1: Regression detection against previous baseline
     let quality_gate_result = if quality_report.has_metrics() {

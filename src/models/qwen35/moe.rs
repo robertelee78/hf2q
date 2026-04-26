@@ -382,7 +382,332 @@ pub fn merge_expert_tensors(
     })
 }
 
+/// Merge all per-expert tensors in a **pre-quantization** `TensorMap`
+/// for the `qwen35moe` arch.
+///
+/// # Why pre-quantization
+///
+/// `merge_moe_experts_in_place` (below) was originally written against
+/// `QuantizedModel` but runs post-quantization — by then each
+/// per-expert tensor's byte count reflects its quantized form (Q4_0:
+/// 0.5 bytes/elem) not its declared F16 dtype, which tripped the
+/// expected-bytes check in `merge_expert_tensors`.
+///
+/// This variant runs BEFORE quantization — the TensorMap still holds
+/// the original F16/BF16 bytes, so `shape.numel() * element_size()`
+/// matches `data.len()` and the merge's shape-check passes.
+///
+/// # Ordering
+///
+/// Callers run this immediately after `input::read_model` and before
+/// the quantizer dispatch. Gemma and other non-MoE arches hit the
+/// early-return guard and incur no cost.
+/// ADR-012 P9b real-model finding (jenerallee78 abliterated apex 2026-04-25):
+/// split the fused `mlp.experts.gate_up_proj` tensor into separate
+/// `gate_proj.weight` + `up_proj.weight`, and add the missing `.weight`
+/// suffix to `down_proj`.
+///
+/// # Input
+///
+///   model.layers.N.mlp.experts.gate_up_proj  shape [n_experts, 2*moe_inter, hidden] BF16/F16
+///   model.layers.N.mlp.experts.down_proj     shape [n_experts, hidden, moe_inter]    BF16/F16
+///
+/// # Output
+///
+///   model.layers.N.mlp.experts.gate_proj.weight  shape [n_experts, moe_inter, hidden]
+///   model.layers.N.mlp.experts.up_proj.weight    shape [n_experts, moe_inter, hidden]
+///   model.layers.N.mlp.experts.down_proj.weight  shape [n_experts, hidden, moe_inter]
+///
+/// The split takes the fused `[2 * moe_inter, hidden]` per-expert sub-tensor
+/// and emits gate as the first `moe_inter` rows, up as the second
+/// `moe_inter` rows. This matches the convention used by HF's
+/// `Qwen3MoeMLP`-style fusion (gate is first half by output channel) and
+/// reproduces what `convert_hf_to_gguf.py` would emit if it processed the
+/// per-expert form.
+///
+/// No-op for non-qwen35moe arches.
+pub fn split_and_rename_fused_gate_up_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    // Collect input tensor keys to mutate (can't iterate while modifying).
+    let gate_up_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.layers.")
+                && n.ends_with(".mlp.experts.gate_up_proj")
+        })
+        .cloned()
+        .collect();
+
+    let down_keys: Vec<String> = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.layers.")
+                && n.ends_with(".mlp.experts.down_proj")
+        })
+        .cloned()
+        .collect();
+
+    if gate_up_keys.is_empty() && down_keys.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        gate_up_count = gate_up_keys.len(),
+        down_count = down_keys.len(),
+        "qwen35moe fused gate_up split + rename: processing {} gate_up_proj + {} down_proj tensors",
+        gate_up_keys.len(),
+        down_keys.len()
+    );
+
+    // Split each gate_up_proj.
+    for key in gate_up_keys {
+        let Some(tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        // Shape contract: [n_experts, 2 * moe_inter, hidden].
+        if tensor.shape.len() != 3 {
+            return Err(ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj expected 3-D [n_experts, 2*moe_inter, hidden], got shape {:?}",
+                    tensor.shape
+                ),
+            });
+        }
+        let n_experts = tensor.shape[0];
+        let two_inter = tensor.shape[1];
+        let hidden = tensor.shape[2];
+        if two_inter % 2 != 0 {
+            return Err(ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj middle dim {} must be even (2 * moe_intermediate_size)",
+                    two_inter
+                ),
+            });
+        }
+        let moe_inter = two_inter / 2;
+        let elem_size = tensor.dtype.element_size();
+        let per_expert_bytes = two_inter * hidden * elem_size;
+        let half_bytes = moe_inter * hidden * elem_size;
+
+        let mut gate_data = Vec::with_capacity(n_experts * half_bytes);
+        let mut up_data = Vec::with_capacity(n_experts * half_bytes);
+
+        for e in 0..n_experts {
+            let base = e * per_expert_bytes;
+            // Gate: first moe_inter rows of the [2*moe_inter, hidden] block.
+            gate_data.extend_from_slice(&tensor.data[base..base + half_bytes]);
+            // Up: second moe_inter rows.
+            up_data.extend_from_slice(
+                &tensor.data[base + half_bytes..base + per_expert_bytes],
+            );
+        }
+
+        let split_shape = vec![n_experts, moe_inter, hidden];
+        // Construct new names by replacing the fused suffix.
+        let gate_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.gate_proj.weight",
+        );
+        let up_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.up_proj.weight",
+        );
+
+        tensor_map.tensors.insert(
+            gate_name.clone(),
+            crate::ir::TensorRef {
+                name: gate_name,
+                shape: split_shape.clone(),
+                dtype: tensor.dtype,
+                data: gate_data,
+            },
+        );
+        tensor_map.tensors.insert(
+            up_name.clone(),
+            crate::ir::TensorRef {
+                name: up_name,
+                shape: split_shape,
+                dtype: tensor.dtype,
+                data: up_data,
+            },
+        );
+    }
+
+    // Rename down_proj → down_proj.weight (no data changes).
+    for key in down_keys {
+        let Some(mut tensor) = tensor_map.tensors.remove(&key) else {
+            continue;
+        };
+        let new_name = key.replace(
+            ".mlp.experts.down_proj",
+            ".mlp.experts.down_proj.weight",
+        );
+        tensor.name = new_name.clone();
+        tensor_map.tensors.insert(new_name, tensor);
+    }
+
+    Ok(())
+}
+
+pub fn merge_moe_experts_in_tensor_map(
+    tensor_map: &mut crate::ir::TensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+    let num_experts = match metadata.num_experts {
+        Some(n) => n as usize,
+        None => return Ok(()),
+    };
+
+    let mut moe_layers: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
+    for name in tensor_map.tensors.keys() {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(layer_idx) = rest[..dot].parse::<usize>() {
+                    if rest[dot + 1..].starts_with("mlp.experts.") {
+                        moe_layers.insert(layer_idx);
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!(
+        moe_layers_found = moe_layers.len(),
+        "qwen35moe expert merge: scanning {} tensor names, found {} MoE-bearing layers",
+        tensor_map.tensors.len(),
+        moe_layers.len()
+    );
+
+    // ADR-012 P9b real-model finding (jenerallee78/Qwen3.6-35B-A3B-...): some
+    // MoE checkpoints ship the experts ALREADY PRE-MERGED — the safetensors
+    // contain a single tensor per (layer, projection) with shape
+    // `[num_experts, out_features, in_features]` named
+    // `model.layers.N.mlp.experts.{proj}.weight`, not 256 separate per-expert
+    // tensors. Detect the pre-merged form and skip the merge body for those
+    // layer/proj combinations (the tensor is already in the canonical
+    // post-merge name expected by `qwen35_linear_attn_layer_map`'s
+    // `mlp.experts.{proj}.weight` → `ffn_{proj}_exps.weight` mapping).
+    let pre_merged_count = tensor_map
+        .tensors
+        .keys()
+        .filter(|n| {
+            let s = n.as_str();
+            s.starts_with("model.layers.")
+                && (s.ends_with(".mlp.experts.gate_proj.weight")
+                    || s.ends_with(".mlp.experts.up_proj.weight")
+                    || s.ends_with(".mlp.experts.down_proj.weight"))
+        })
+        .count();
+    if pre_merged_count > 0 {
+        tracing::info!(
+            count = pre_merged_count,
+            "qwen35moe expert merge: detected {} pre-merged expert tensors; skipping merge for those (input is already in canonical form)",
+            pre_merged_count
+        );
+    } else {
+        // Diagnostic: dump up to 20 names containing `mlp.experts.` so we
+        // can see what the actual naming form is for this model.
+        let mut sample: Vec<&String> = tensor_map
+            .tensors
+            .keys()
+            .filter(|n| n.contains("mlp.experts."))
+            .take(20)
+            .collect();
+        sample.sort();
+        tracing::warn!(
+            sample = ?sample,
+            "qwen35moe expert merge: no pre-merged form detected; first 20 mlp.experts. tensor names dumped"
+        );
+    }
+
+    for proj in &["gate_proj", "up_proj", "down_proj"] {
+        let expert_proj = match *proj {
+            "gate_proj" => ExpertProj::Gate,
+            "up_proj" => ExpertProj::Up,
+            "down_proj" => ExpertProj::Down,
+            _ => unreachable!(),
+        };
+        for &layer_idx in &moe_layers {
+            // Skip if the pre-merged form is already present in the input
+            // (real Qwen3.6 ships this way — see comment block above).
+            let pre_merged_name = format!(
+                "model.layers.{}.mlp.experts.{}.weight",
+                layer_idx, proj
+            );
+            if tensor_map.tensors.contains_key(&pre_merged_name) {
+                continue;
+            }
+
+            let mut collected: Vec<TensorRef> = Vec::with_capacity(num_experts);
+            let mut keys: Vec<String> = Vec::with_capacity(num_experts);
+            for e in 0..num_experts {
+                let hf = format!(
+                    "model.layers.{}.mlp.experts.{}.{}.weight",
+                    layer_idx, e, proj
+                );
+                let Some(t) = tensor_map.tensors.get(&hf) else {
+                    break;
+                };
+                collected.push(TensorRef {
+                    name: hf.clone(),
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                    data: t.data.clone(),
+                });
+                keys.push(hf);
+            }
+            if collected.len() != num_experts {
+                continue;
+            }
+            let merged =
+                merge_expert_tensors(&collected, expert_proj, super::Qwen35Arch::Moe)?;
+            // Remove per-expert; insert merged with canonical HF name.
+            for k in &keys {
+                tensor_map.tensors.remove(k);
+            }
+            let merged_ref = TensorRef {
+                name: format!(
+                    "model.layers.{}.mlp.experts.{}.weight",
+                    layer_idx, proj
+                ),
+                shape: merged.shape,
+                dtype: merged.dtype,
+                data: merged.data,
+            };
+            tensor_map.tensors.insert(merged_ref.name.clone(), merged_ref);
+        }
+    }
+    Ok(())
+}
+
 /// Merge all per-expert tensors in a `QuantizedModel` for the `qwen35moe` arch.
+///
+/// # DEPRECATED (2026-04-24)
+///
+/// This post-quantization variant is superseded by
+/// `merge_moe_experts_in_tensor_map` which runs BEFORE quantization.
+/// The post-quant variant's internal byte-size check against
+/// `original_dtype.element_size()` trips on Q4_0-quantized data (0.5
+/// bytes/elem vs 2 bytes for F16 declared dtype). The pre-quant
+/// variant does not have that issue and is the active code path
+/// called from `src/main.rs` Phase 1.5.
+///
+/// Kept for now as a reference implementation of the QuantizedModel
+/// surface. Not called from any active code path; exercised only by
+/// its own unit tests.
 ///
 /// # Layer-streaming orchestration (ADR-012 Decision 9)
 ///
@@ -407,15 +732,19 @@ pub fn merge_expert_tensors(
 ///
 /// If `num_experts` is absent from metadata, the model is dense and this
 /// function returns `Ok(())` immediately without touching any tensors.
+#[deprecated(
+    since = "0.1.0",
+    note = "use merge_moe_experts_in_tensor_map; this post-quant variant trips on Q4_0 byte-size check"
+)]
+#[allow(dead_code)]
 pub fn merge_moe_experts_in_place(
     model: &mut crate::ir::QuantizedModel,
 ) -> Result<(), ConvertError> {
-    let arch_str = model.metadata.architecture.as_str();
     // Only act on qwen35moe architecture.
-    if arch_str != "Qwen3_5MoeForCausalLM"
-        && arch_str != "Qwen3_5MoeForConditionalGeneration"
-        && model.metadata.model_type != "qwen3_5_moe_text"
-    {
+    if !super::is_qwen35moe_architecture(
+        &model.metadata.architecture,
+        &model.metadata.model_type,
+    ) {
         return Ok(());
     }
 
@@ -553,6 +882,13 @@ pub fn merge_moe_experts_in_place(
 /// - `qwen35moe.expert_used_count`                  — llama-arch.cpp:183 (LLM_KV_EXPERT_USED_COUNT)
 /// - `qwen35moe.expert_feed_forward_length`         — llama-arch.cpp:175 / llama-model.cpp:2835 (optional)
 /// - `qwen35moe.expert_shared_feed_forward_length`  — llama-arch.cpp:176 / llama-model.cpp:2836 (optional)
+#[deprecated(
+    since = "0.1.0",
+    note = "kv emission happens in src/backends/gguf.rs::emit_qwen35_metadata; \
+            validation happens in Qwen35ConvertContext::from_metadata + \
+            validate_required_qwen35moe_fields — this validator is redundant."
+)]
+#[allow(dead_code)]
 pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError> {
     // Validate MoE-specific required fields
     if ctx.num_experts.is_none() {
@@ -959,6 +1295,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns Ok when context is valid (P4 implementation).
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_returns_ok_when_valid() {
         let ctx = moe_ctx();
@@ -969,6 +1306,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns error when num_experts is absent.
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_errors_when_missing_num_experts() {
         let mut ctx = moe_ctx();
@@ -982,6 +1320,7 @@ mod tests {
     }
 
     /// emit_metadata_moe returns error when moe_intermediate_size is absent.
+    #[allow(deprecated)]
     #[test]
     fn emit_metadata_moe_errors_when_missing_moe_ff_size() {
         let mut ctx = moe_ctx();

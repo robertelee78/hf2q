@@ -1,30 +1,20 @@
-//! ADR-012 P11 — MTP tensor round-trip integrity gate (Decision 19).
+//! ADR-012 P11 (Decision 19) — MTP tensor round-trip integrity gate.
 //!
-//! Both Qwen3.5 dense and Qwen3.5-MoE may carry a single MTP block
-//! (`mtp_num_hidden_layers: 1` for the apex models).  Decision 11 (shipped
-//! P4) emits the tensors at `blk.{num_hidden_layers + idx}.nextn.*`; Decision
-//! 19 (this file) **proves** they are loadable by ADR-013's weight loader at
-//! `src/inference/models/qwen35/mtp.rs::load_mtp_weights_if_present`.
+//! Convert a synthetic qwen35 / qwen35moe model with `mtp_num_hidden_layers: 1`,
+//! then assert the emitted GGUF carries the 4 MTP tensors at the exact names
+//! ADR-013's weight loader (`src/inference/models/qwen35/mtp.rs::load_mtp_weights_if_present`)
+//! and llama.cpp's loader (`llama-arch.cpp:447-450`) expect:
 //!
-//! # What the test does
+//!   `blk.{num_hidden_layers}.nextn.{enorm,hnorm,embed_tokens,eh_proj}.weight`
 //!
-//! 1. Build a synthetic tiny qwen35/qwen35moe HF model directory with
-//!    `mtp_num_hidden_layers: 1` and full HF MTP tensors at
-//!    `mtp.layers.0.{enorm,hnorm,embed_tokens,eh_proj}.weight`.
-//! 2. Drive `hf2q convert --quant q4` end-to-end.
-//! 3. Open the produced GGUF and assert every expected tensor in
-//!    `EXPECTED_MTP_TENSORS` is present at the resolved block index
-//!    `blk.{num_hidden_layers}.nextn.*`.
-//! 4. The same scan logic the inference loader uses
-//!    (`prefix = "blk.{num_hidden_layers}.nextn."`) is applied here — if the
-//!    test passes the loader will populate.
+//! This test catches the P4 stub bug that emitted `blk.mtp0.nextn.*` with a
+//! literal "mtp" block label instead of the resolved block index — invisible
+//! to unit tests on the mapper alone, but fatal on the load side.
 //!
-//! # Why this exists
+//! A companion negative test asserts the STUB name form (`blk.mtp0.nextn.*`)
+//! is NOT present — a one-letter regression in the mapper would trip it.
 //!
-//! Without this gate, a one-letter typo in the MTP rename (e.g.
-//! `nextn.eh_proj` → `nextn.eh_pjroj`) would silently strip MTP from every
-//! Qwen3.5 GGUF we ship.  No unit-level test catches that — only the
-//! end-to-end convert+inspect roundtrip does.
+//! Runs under 30 s on a laptop; no disk download. CI-green by default.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -33,44 +23,45 @@ use std::path::Path;
 use assert_cmd::Command;
 use mlx_native::gguf::GgufFile;
 
-// ─── Expected MTP tensors (hand-transcribed) ─────────────────────────────────
+// ---------------------------------------------------------------------------
+// EXPECTED_MTP_TENSORS — hand-authored, derived from llama-arch.cpp:447-450.
 //
-// Source: /opt/llama.cpp/src/llama-arch.cpp:447-450, LLM_TENSOR_NEXTN_*.
-//
-//   LLM_TENSOR_NEXTN_EH_PROJ       → "blk.%d.nextn.eh_proj"
-//   LLM_TENSOR_NEXTN_EMBED_TOKENS  → "blk.%d.nextn.embed_tokens"
-//   LLM_TENSOR_NEXTN_ENORM         → "blk.%d.nextn.enorm"
-//   LLM_TENSOR_NEXTN_HNORM         → "blk.%d.nextn.hnorm"
-//
-// The four tensors above correspond 1:1 with the HF source tensors
-// `mtp.layers.0.{eh_proj,embed_tokens,enorm,hnorm}.weight`.  llama-arch.cpp
-// has two additional NEXTN tensors (`shared_head_head`, `shared_head_norm`)
-// but Qwen3.5 does not emit those at the HF source level — they're
-// DeepSeek-V3-only fields whose Qwen3.5 analog is the main `output.weight`
-// + `output_norm.weight`.
-// Each entry is the suffix after the `blk.{num_hidden_layers}.nextn.` prefix —
-// matches the loader's scan key in
-// `src/inference/models/qwen35/mtp.rs::MtpWeights::has_tensor_suffix`.
+// The ADR says "shapes + names derived from /opt/llama.cpp/src/llama-arch.cpp:447-450".
+// We assert NAME presence only; shape is per-model (hand-transcribed separately
+// inside each test case from the synthetic safetensors config).
+// ---------------------------------------------------------------------------
+
+/// Expected MTP suffixes at `blk.{N}.nextn.{suffix}` where N = num_hidden_layers.
 const EXPECTED_MTP_SUFFIXES: &[&str] = &[
-    "enorm.weight",
-    "hnorm.weight",
-    "embed_tokens.weight",
-    "eh_proj.weight",
+    // llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM → "blk.%d.nextn.enorm"
+    "nextn.enorm.weight",
+    // llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM → "blk.%d.nextn.hnorm"
+    "nextn.hnorm.weight",
+    // llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS → "blk.%d.nextn.embed_tokens"
+    "nextn.embed_tokens.weight",
+    // llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ → "blk.%d.nextn.eh_proj"
+    "nextn.eh_proj.weight",
 ];
 
-// ─── Synthetic model configs ─────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Synthetic qwen35 dense model with MTP — 4 layers, hidden=64, MTP=1.
+// ---------------------------------------------------------------------------
 
-const QWEN35_DENSE_CONFIG_MTP: &str = r#"{
+const QWEN35_DENSE_MTP_CONFIG: &str = r#"{
     "architectures": ["Qwen3_5ForCausalLM"],
     "model_type": "qwen3_5",
     "hidden_size": 64,
     "num_hidden_layers": 4,
     "num_attention_heads": 4,
     "num_key_value_heads": 1,
-    "intermediate_size": 64,
+    "intermediate_size": 128,
     "vocab_size": 128,
     "head_dim": 16,
     "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
     "full_attention_interval": 4,
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,
@@ -85,20 +76,21 @@ const QWEN35_DENSE_CONFIG_MTP: &str = r#"{
     "dtype": "float16"
 }"#;
 
-const QWEN35_MOE_CONFIG_MTP: &str = r#"{
+const QWEN35MOE_MTP_CONFIG: &str = r#"{
     "architectures": ["Qwen3_5MoeForCausalLM"],
-    "model_type": "qwen3_5_moe",
+    "model_type": "qwen3_5_moe_text",
     "hidden_size": 64,
     "num_hidden_layers": 4,
     "num_attention_heads": 4,
     "num_key_value_heads": 1,
-    "moe_intermediate_size": 16,
-    "shared_expert_intermediate_size": 16,
-    "num_experts": 4,
-    "num_experts_per_tok": 2,
+    "intermediate_size": 128,
     "vocab_size": 128,
     "head_dim": 16,
     "linear_num_value_heads": 8,
+    "linear_num_key_heads": 4,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
     "full_attention_interval": 4,
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,
@@ -106,6 +98,10 @@ const QWEN35_MOE_CONFIG_MTP: &str = r#"{
         "mrope_section": [3, 3, 2],
         "type": "mrope"
     },
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 64,
+    "shared_expert_intermediate_size": 64,
     "mtp_num_hidden_layers": 1,
     "attn_output_gate": true,
     "mamba_ssm_dtype": "float32",
@@ -113,143 +109,166 @@ const QWEN35_MOE_CONFIG_MTP: &str = r#"{
     "dtype": "float16"
 }"#;
 
-// ─── Synthetic model builders ────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Safetensors builder — appends 4 MTP tensors to a base model layout.
+// ---------------------------------------------------------------------------
 
-const NUM_LAYERS: usize = 4;
-const HIDDEN: usize = 64;
-const VOCAB: usize = 128;
-const NUM_HEADS: usize = 4;
-const KV_HEADS: usize = 1;
-const HEAD_DIM: usize = 16;
-const LIN_V_HEADS: usize = 8;
-const F16: usize = 2;
-
-fn add_global_tensors(tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>) {
-    tensors.push((
-        "model.embed_tokens.weight".into(),
-        vec![VOCAB, HIDDEN],
-        "F16",
-        vec![0u8; VOCAB * HIDDEN * F16],
-    ));
-    tensors.push((
-        "lm_head.weight".into(),
-        vec![VOCAB, HIDDEN],
-        "F16",
-        vec![1u8; VOCAB * HIDDEN * F16],
-    ));
-    tensors.push((
-        "model.norm.weight".into(),
-        vec![HIDDEN],
-        "F16",
-        vec![0u8; HIDDEN * F16],
-    ));
-}
-
-fn add_full_attn_block(
+fn push_f16_zeros(
     tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>,
-    layer: usize,
+    name: &str,
+    shape: Vec<usize>,
 ) {
-    let prefix = format!("model.layers.{layer}");
-    let q_size = NUM_HEADS * HEAD_DIM;
-    let kv_size = KV_HEADS * HEAD_DIM;
-    tensors.push((format!("{prefix}.input_layernorm.weight"), vec![HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.post_attention_layernorm.weight"), vec![HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.self_attn.q_proj.weight"), vec![q_size, HIDDEN], "F16", vec![2u8; q_size * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.self_attn.k_proj.weight"), vec![kv_size, HIDDEN], "F16", vec![3u8; kv_size * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.self_attn.v_proj.weight"), vec![kv_size, HIDDEN], "F16", vec![4u8; kv_size * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.self_attn.o_proj.weight"), vec![HIDDEN, q_size], "F16", vec![5u8; HIDDEN * q_size * F16]));
-    tensors.push((format!("{prefix}.self_attn.gate.weight"), vec![1, HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
+    let size: usize = shape.iter().product::<usize>() * 2; // F16 = 2 bytes
+    tensors.push((name.to_string(), shape, "F16", vec![0u8; size]));
 }
 
-fn add_linear_attn_block(
+fn push_f32_zeros(
     tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>,
-    layer: usize,
+    name: &str,
+    shape: Vec<usize>,
 ) {
-    let prefix = format!("model.layers.{layer}");
-    let qkv_size = (NUM_HEADS + KV_HEADS + LIN_V_HEADS) * HEAD_DIM;
-    tensors.push((format!("{prefix}.input_layernorm.weight"), vec![HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.post_attention_layernorm.weight"), vec![HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_size, HIDDEN], "F16", vec![6u8; qkv_size * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.out_proj.weight"), vec![HIDDEN, LIN_V_HEADS * HEAD_DIM], "F16", vec![7u8; HIDDEN * LIN_V_HEADS * HEAD_DIM * F16]));
-    tensors.push((format!("{prefix}.linear_attn.in_proj_a.weight"), vec![NUM_HEADS, HIDDEN], "F16", vec![0u8; NUM_HEADS * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.in_proj_b.weight"), vec![NUM_HEADS, HIDDEN], "F16", vec![0u8; NUM_HEADS * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.in_proj_z.weight"), vec![LIN_V_HEADS * HEAD_DIM, HIDDEN], "F16", vec![0u8; LIN_V_HEADS * HEAD_DIM * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.A_log"), vec![NUM_HEADS], "F32", vec![0u8; NUM_HEADS * 4]));
-    tensors.push((format!("{prefix}.linear_attn.dt_proj.weight"), vec![NUM_HEADS, HIDDEN], "F16", vec![0u8; NUM_HEADS * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.linear_attn.dt_bias"), vec![NUM_HEADS], "F32", vec![0u8; NUM_HEADS * 4]));
-    tensors.push((format!("{prefix}.linear_attn.conv1d.weight"), vec![NUM_HEADS, 1, HIDDEN / NUM_HEADS], "F16", vec![0u8; NUM_HEADS * (HIDDEN / NUM_HEADS) * F16]));
-    tensors.push((format!("{prefix}.linear_attn.norm.weight"), vec![HIDDEN], "F16", vec![0u8; HIDDEN * F16]));
+    let size: usize = shape.iter().product::<usize>() * 4;
+    tensors.push((name.to_string(), shape, "F32", vec![0u8; size]));
 }
 
-fn add_dense_ffn(tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>, layer: usize) {
-    let prefix = format!("model.layers.{layer}.mlp");
-    let inter = 64usize;
-    tensors.push((format!("{prefix}.gate_proj.weight"), vec![inter, HIDDEN], "F16", vec![1u8; inter * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.up_proj.weight"), vec![inter, HIDDEN], "F16", vec![1u8; inter * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.down_proj.weight"), vec![HIDDEN, inter], "F16", vec![1u8; HIDDEN * inter * F16]));
-}
+/// Build a dense qwen35 safetensors with 4 layers + 1 MTP block.
+/// Layer 3 is full-attention (full_attention_interval=4); layers 0,1,2 are
+/// linear-attention. MTP adds 4 tensors at `mtp.layers.0.*`.
+fn build_qwen35_dense_mtp_safetensors() -> Vec<u8> {
+    let hidden: usize = 64;
+    let vocab: usize = 128;
+    let inter: usize = 128;
+    let num_heads: usize = 4;
+    let kv_heads: usize = 1;
+    let head_dim: usize = 16;
+    let lin_v_heads: usize = 8;
+    let num_layers: usize = 4;
 
-fn add_moe_ffn(tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>, layer: usize) {
-    let prefix = format!("model.layers.{layer}.mlp");
-    let moe_inter = 16usize;
-    let shared_inter = 16usize;
-    let num_experts = 4usize;
+    let mut tensors: Vec<(String, Vec<usize>, &str, Vec<u8>)> = Vec::new();
+    push_f16_zeros(&mut tensors, "model.embed_tokens.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "lm_head.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "model.norm.weight", vec![hidden]);
 
-    tensors.push((format!("{prefix}.gate.weight"), vec![num_experts, HIDDEN], "F16", vec![0u8; num_experts * HIDDEN * F16]));
-    for e in 0..num_experts {
-        tensors.push((format!("{prefix}.experts.{e}.gate_proj.weight"), vec![moe_inter, HIDDEN], "F16", vec![0u8; moe_inter * HIDDEN * F16]));
-        tensors.push((format!("{prefix}.experts.{e}.up_proj.weight"), vec![moe_inter, HIDDEN], "F16", vec![0u8; moe_inter * HIDDEN * F16]));
-        tensors.push((format!("{prefix}.experts.{e}.down_proj.weight"), vec![HIDDEN, moe_inter], "F16", vec![0u8; HIDDEN * moe_inter * F16]));
-    }
-    tensors.push((format!("{prefix}.shared_expert.gate_proj.weight"), vec![shared_inter, HIDDEN], "F16", vec![8u8; shared_inter * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.shared_expert.up_proj.weight"), vec![shared_inter, HIDDEN], "F16", vec![9u8; shared_inter * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.shared_expert.down_proj.weight"), vec![HIDDEN, shared_inter], "F16", vec![10u8; HIDDEN * shared_inter * F16]));
-}
-
-fn add_mtp_block(tensors: &mut Vec<(String, Vec<usize>, &'static str, Vec<u8>)>) {
-    // MTP idx 0 → resolves to blk.{num_hidden_layers}.nextn.* in GGUF.
-    // The four tensors are the Qwen3.5-side analog of llama-arch.cpp's
-    // LLM_TENSOR_NEXTN_{ENORM,HNORM,EMBED_TOKENS,EH_PROJ}.
-    let prefix = "mtp.layers.0";
-    tensors.push((format!("{prefix}.enorm.weight"), vec![HIDDEN], "F16", vec![20u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.hnorm.weight"), vec![HIDDEN], "F16", vec![21u8; HIDDEN * F16]));
-    tensors.push((format!("{prefix}.embed_tokens.weight"), vec![VOCAB, HIDDEN], "F16", vec![22u8; VOCAB * HIDDEN * F16]));
-    tensors.push((format!("{prefix}.eh_proj.weight"), vec![HIDDEN, 2 * HIDDEN], "F16", vec![23u8; HIDDEN * 2 * HIDDEN * F16]));
-}
-
-fn build_dense_safetensors() -> Vec<u8> {
-    let mut tensors: Vec<(String, Vec<usize>, &'static str, Vec<u8>)> = Vec::new();
-    add_global_tensors(&mut tensors);
-    for layer in 0..NUM_LAYERS {
-        let is_full = layer == NUM_LAYERS - 1; // last layer is full-attn (interval=4)
+    for layer in 0..num_layers {
+        let is_full = layer == 3;
+        let prefix = format!("model.layers.{layer}");
+        push_f16_zeros(&mut tensors, &format!("{prefix}.input_layernorm.weight"), vec![hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.post_attention_layernorm.weight"), vec![hidden]);
         if is_full {
-            add_full_attn_block(&mut tensors, layer);
+            let q_size = num_heads * head_dim;
+            let kv_size = kv_heads * head_dim;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.q_proj.weight"), vec![q_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.k_proj.weight"), vec![kv_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.v_proj.weight"), vec![kv_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.o_proj.weight"), vec![hidden, q_size]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
-            add_linear_attn_block(&mut tensors, layer);
+            // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
+            let nk = 4usize;
+            let hk = head_dim;
+            let hv = head_dim;
+            let qkv_rows = nk * hk * 2 + lin_v_heads * hv;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * hv]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * hv, hidden]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![lin_v_heads]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![lin_v_heads]);
+            let conv_channels = 2 * nk * hk + lin_v_heads * hv;
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![conv_channels, 1, 4]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * hv]);
         }
-        add_dense_ffn(&mut tensors, layer);
+        // Dense FFN
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.gate_proj.weight"), vec![inter, hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.up_proj.weight"), vec![inter, hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.down_proj.weight"), vec![hidden, inter]);
     }
-    add_mtp_block(&mut tensors);
+
+    // MTP tensors (mtp_num_hidden_layers=1).
+    push_f32_zeros(&mut tensors, "mtp.layers.0.enorm.weight", vec![hidden]);
+    push_f32_zeros(&mut tensors, "mtp.layers.0.hnorm.weight", vec![hidden]);
+    push_f16_zeros(&mut tensors, "mtp.layers.0.embed_tokens.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "mtp.layers.0.eh_proj.weight", vec![hidden, hidden * 2]);
+
     build_safetensors_bytes(tensors)
 }
 
-fn build_moe_safetensors() -> Vec<u8> {
-    let mut tensors: Vec<(String, Vec<usize>, &'static str, Vec<u8>)> = Vec::new();
-    add_global_tensors(&mut tensors);
-    for layer in 0..NUM_LAYERS {
-        let is_full = layer == NUM_LAYERS - 1;
+/// Build an MoE qwen35 safetensors with 4 layers + 4 experts + 1 MTP block.
+/// Layer 3 is full-attention, layers 0/1/2 are linear-attention (shared spine
+/// with dense); FFN is 4-expert + shared-expert instead of dense.
+fn build_qwen35moe_mtp_safetensors() -> Vec<u8> {
+    let hidden: usize = 64;
+    let vocab: usize = 128;
+    let moe_inter: usize = 64;
+    let shared_inter: usize = 64;
+    let num_heads: usize = 4;
+    let kv_heads: usize = 1;
+    let head_dim: usize = 16;
+    let lin_v_heads: usize = 8;
+    let num_layers: usize = 4;
+    let num_experts: usize = 4;
+
+    let mut tensors: Vec<(String, Vec<usize>, &str, Vec<u8>)> = Vec::new();
+    push_f16_zeros(&mut tensors, "model.embed_tokens.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "lm_head.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "model.norm.weight", vec![hidden]);
+
+    for layer in 0..num_layers {
+        let is_full = layer == 3;
+        let prefix = format!("model.layers.{layer}");
+        push_f16_zeros(&mut tensors, &format!("{prefix}.input_layernorm.weight"), vec![hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.post_attention_layernorm.weight"), vec![hidden]);
         if is_full {
-            add_full_attn_block(&mut tensors, layer);
+            let q_size = num_heads * head_dim;
+            let kv_size = kv_heads * head_dim;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.q_proj.weight"), vec![q_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.k_proj.weight"), vec![kv_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.v_proj.weight"), vec![kv_size, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.o_proj.weight"), vec![hidden, q_size]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.self_attn.gate.weight"), vec![1, hidden]);
         } else {
-            add_linear_attn_block(&mut tensors, layer);
+            // Spec-correct shapes (nk=4, nv=lin_v_heads=8, head_k/v_dim=head_dim).
+            let nk = 4usize;
+            let hk = head_dim;
+            let hv = head_dim;
+            let qkv_rows = nk * hk * 2 + lin_v_heads * hv;
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_qkv.weight"), vec![qkv_rows, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.out_proj.weight"), vec![hidden, lin_v_heads * hv]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), vec![lin_v_heads, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.linear_attn.in_proj_z.weight"), vec![lin_v_heads * hv, hidden]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.A_log"), vec![lin_v_heads]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![lin_v_heads]);
+            let conv_channels = 2 * nk * hk + lin_v_heads * hv;
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![conv_channels, 1, 4]);
+            push_f32_zeros(&mut tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![lin_v_heads * hv]);
         }
-        add_moe_ffn(&mut tensors, layer);
+        // MoE router.
+        push_f32_zeros(&mut tensors, &format!("{prefix}.mlp.gate.weight"), vec![num_experts, hidden]);
+        // Per-expert weights.
+        for e in 0..num_experts {
+            push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.experts.{e}.gate_proj.weight"), vec![moe_inter, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.experts.{e}.up_proj.weight"), vec![moe_inter, hidden]);
+            push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.experts.{e}.down_proj.weight"), vec![hidden, moe_inter]);
+        }
+        // Shared expert + its gate.
+        push_f32_zeros(&mut tensors, &format!("{prefix}.mlp.shared_expert_gate.weight"), vec![1, hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.shared_expert.gate_proj.weight"), vec![shared_inter, hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.shared_expert.up_proj.weight"), vec![shared_inter, hidden]);
+        push_f16_zeros(&mut tensors, &format!("{prefix}.mlp.shared_expert.down_proj.weight"), vec![hidden, shared_inter]);
     }
-    add_mtp_block(&mut tensors);
+
+    // MTP tensors.
+    push_f32_zeros(&mut tensors, "mtp.layers.0.enorm.weight", vec![hidden]);
+    push_f32_zeros(&mut tensors, "mtp.layers.0.hnorm.weight", vec![hidden]);
+    push_f16_zeros(&mut tensors, "mtp.layers.0.embed_tokens.weight", vec![vocab, hidden]);
+    push_f16_zeros(&mut tensors, "mtp.layers.0.eh_proj.weight", vec![hidden, hidden * 2]);
+
     build_safetensors_bytes(tensors)
 }
 
-fn build_safetensors_bytes(tensors: Vec<(String, Vec<usize>, &'static str, Vec<u8>)>) -> Vec<u8> {
+fn build_safetensors_bytes(tensors: Vec<(String, Vec<usize>, &str, Vec<u8>)>) -> Vec<u8> {
     let mut header_map = BTreeMap::new();
     let mut offset = 0usize;
     let mut payload = Vec::new();
@@ -276,135 +295,199 @@ fn build_safetensors_bytes(tensors: Vec<(String, Vec<usize>, &'static str, Vec<u
     out
 }
 
-fn write_sidecars(dir: &Path) {
+fn setup_dense_mtp(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("config.json"), QWEN35_DENSE_MTP_CONFIG).unwrap();
     fs::write(dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
     fs::write(dir.join("tokenizer_config.json"), r#"{"model_max_length":131072}"#).unwrap();
     fs::write(dir.join("generation_config.json"), r#"{"do_sample":false}"#).unwrap();
     fs::write(dir.join("special_tokens_map.json"), r#"{"bos_token":"<|im_start|>"}"#).unwrap();
-    fs::write(
-        dir.join("chat_template.jinja"),
-        "{% for msg in messages %}{{ msg.content }}{% endfor %}",
-    )
-    .unwrap();
+    fs::write(dir.join("model.safetensors"), build_qwen35_dense_mtp_safetensors()).unwrap();
 }
 
+fn setup_moe_mtp(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("config.json"), QWEN35MOE_MTP_CONFIG).unwrap();
+    fs::write(dir.join("tokenizer.json"), r#"{"version":"1.0"}"#).unwrap();
+    fs::write(dir.join("tokenizer_config.json"), r#"{"model_max_length":131072}"#).unwrap();
+    fs::write(dir.join("generation_config.json"), r#"{"do_sample":false}"#).unwrap();
+    fs::write(dir.join("special_tokens_map.json"), r#"{"bos_token":"<|im_start|>"}"#).unwrap();
+    fs::write(dir.join("model.safetensors"), build_qwen35moe_mtp_safetensors()).unwrap();
+}
+
+/// Convert a synthetic model dir → GGUF and return the output path.
 fn convert_to_gguf(input: &Path, output: &Path) {
-    Command::cargo_bin("hf2q")
+    let assert = Command::cargo_bin("hf2q")
         .unwrap()
         .args([
             "convert",
             "--input", input.to_str().unwrap(),
             "--format", "gguf",
-            "--quant", "q4",
+            "--quant", "f16",
             "--output", output.to_str().unwrap(),
-            "--skip-quality",
+            "--yes",
         ])
-        .assert()
-        .success();
-}
-
-fn locate_gguf(output_dir: &Path) -> std::path::PathBuf {
-    fs::read_dir(output_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().extension().map(|x| x == "gguf").unwrap_or(false))
-        .expect("no GGUF emitted")
-        .path()
-}
-
-/// Mirror of `src/inference/models/qwen35/mtp.rs::load_mtp_weights_if_present`'s
-/// scan logic — if every expected MTP suffix appears under the
-/// `blk.{num_hidden_layers}.nextn.` prefix, the loader will populate.
-fn assert_mtp_present(gguf_path: &Path, num_hidden_layers: u32) {
-    let gguf = GgufFile::open(gguf_path).expect("open gguf");
-    let prefix = format!("blk.{}.nextn.", num_hidden_layers);
-    let names: Vec<String> = gguf
-        .tensor_names()
-        .into_iter()
-        .map(|s: &str| s.to_string())
-        .collect();
-
-    let found: Vec<&str> = names.iter().map(|s| s.as_str()).filter(|n| n.starts_with(&prefix)).collect();
-    assert!(
-        !found.is_empty(),
-        "no MTP tensors found at prefix '{prefix}'; \
-         GGUF carried {} tensors, none under that prefix — \
-         this is the silent-stub failure mode the gate exists to catch",
-        names.len()
-    );
-
-    for expected_suffix in EXPECTED_MTP_SUFFIXES {
-        let expected_name = format!("{prefix}{expected_suffix}");
-        assert!(
-            names.iter().any(|n| n == &expected_name),
-            "missing MTP tensor '{expected_name}' \
-             (Decision 11 + 19; llama-arch.cpp:447-450 LLM_TENSOR_NEXTN_*); \
-             tensors at prefix were: {found:?}",
+        .assert();
+    let out = assert.get_output().clone();
+    if !out.status.success() {
+        panic!(
+            "hf2q convert failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[test]
-fn qwen35_dense_mtp_roundtrip() {
+fn qwen35_mtp_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
-    let input = tmp.path().join("qwen35-mtp-dense-input");
-    let output = tmp.path().join("qwen35-mtp-dense-output");
-    fs::create_dir_all(&input).unwrap();
-
-    fs::write(input.join("config.json"), QWEN35_DENSE_CONFIG_MTP).unwrap();
-    write_sidecars(&input);
-    fs::write(input.join("model.safetensors"), build_dense_safetensors()).unwrap();
-
+    let input = tmp.path().join("dense-mtp-in");
+    let output = tmp.path().join("dense-mtp-out.gguf");
+    setup_dense_mtp(&input);
     convert_to_gguf(&input, &output);
 
-    // Decision 11: MTP block lands at blk.{num_hidden_layers} = blk.4 for the
-    // synthetic 4-layer model.  Decision 19's resolver makes this real.
-    assert_mtp_present(&locate_gguf(&output), NUM_LAYERS as u32);
+    let gguf = GgufFile::open(&output).expect("open converted GGUF");
+    let names: Vec<&str> = gguf.tensor_names();
+
+    // Positive: every EXPECTED_MTP_SUFFIX is present at blk.4.* (num_hidden_layers=4).
+    let num_hidden_layers = 4u32;
+    for suffix in EXPECTED_MTP_SUFFIXES {
+        let expected = format!("blk.{}.{}", num_hidden_layers, suffix);
+        let found = names.iter().any(|n| *n == expected);
+        assert!(
+            found,
+            "missing MTP tensor {:?} in converted GGUF. Found names: {:?}",
+            expected,
+            names.iter().filter(|n| n.contains("nextn") || n.contains("mtp")).collect::<Vec<_>>()
+        );
+    }
+
+    // Negative: no tensor carries the P4 stub form `blk.mtp0.nextn.*`.
+    // If this assertion fires, the P4 stub has been re-introduced — read
+    // docs/ADR-012-qwen35moe-conversion.md P11 before changing src/backends/gguf.rs.
+    for name in &names {
+        assert!(
+            !name.contains("blk.mtp"),
+            "P4 stub MTP placeholder {:?} should never reach GGUF — see ADR-012 P11",
+            name
+        );
+    }
+
+    // Shape sanity on the embed_tokens MTP tensor (spot check).
+    // mlx-native's TensorInfo.shape preserves the GGUF wire order (innermost-first
+    // is how ggml writes ne), so HF PyTorch shape [vocab=128, hidden=64] travels
+    // through convert_hf_to_gguf transpose conventions and materializes as a
+    // two-element shape containing both dims; assert just the dim set.
+    let embed_name = format!("blk.{}.nextn.embed_tokens.weight", num_hidden_layers);
+    let info = gguf
+        .tensor_info(&embed_name)
+        .unwrap_or_else(|| panic!("info for {} present", embed_name));
+    assert_eq!(info.shape.len(), 2, "embed_tokens is 2-D");
+    let mut dims = info.shape.clone();
+    dims.sort();
+    assert_eq!(dims, vec![64, 128], "MTP embed_tokens dim set = {{64, 128}}");
 }
 
 #[test]
 fn qwen35moe_mtp_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
-    let input = tmp.path().join("qwen35-mtp-moe-input");
-    let output = tmp.path().join("qwen35-mtp-moe-output");
-    fs::create_dir_all(&input).unwrap();
-
-    fs::write(input.join("config.json"), QWEN35_MOE_CONFIG_MTP).unwrap();
-    write_sidecars(&input);
-    fs::write(input.join("model.safetensors"), build_moe_safetensors()).unwrap();
-
+    let input = tmp.path().join("moe-mtp-in");
+    let output = tmp.path().join("moe-mtp-out.gguf");
+    setup_moe_mtp(&input);
     convert_to_gguf(&input, &output);
 
-    assert_mtp_present(&locate_gguf(&output), NUM_LAYERS as u32);
+    let gguf = GgufFile::open(&output).expect("open converted GGUF");
+    let names: Vec<&str> = gguf.tensor_names();
+
+    let num_hidden_layers = 4u32;
+    for suffix in EXPECTED_MTP_SUFFIXES {
+        let expected = format!("blk.{}.{}", num_hidden_layers, suffix);
+        assert!(
+            names.iter().any(|n| *n == expected),
+            "missing MTP tensor {:?} in qwen35moe GGUF. nextn-like names: {:?}",
+            expected,
+            names.iter().filter(|n| n.contains("nextn")).collect::<Vec<_>>()
+        );
+    }
+
+    // Negative: no placeholder.
+    for name in &names {
+        assert!(
+            !name.contains("blk.mtp"),
+            "qwen35moe: P4 stub {:?} must not reach GGUF — see ADR-012 P11",
+            name
+        );
+    }
+
+    // Strict MoE-path assertion (upgraded from evidence-only 2026-04-24):
+    // the P4/P5 merge + metadata pipeline MUST produce these canonical
+    // GGUF names per llama-arch.cpp:393-394 and src/models/qwen35/moe.rs.
+    // If they're missing, the expert-merge was never invoked OR the
+    // hf_name_to_gguf mapper isn't recognizing the merged names —
+    // both are silent P4/P5 regressions.
+    let router = names
+        .iter()
+        .find(|n| n.contains("ffn_gate_inp") && !n.contains("shexp"));
+    assert!(
+        router.is_some(),
+        "qwen35moe GGUF must include blk.{{L}}.ffn_gate_inp.weight (MoE router). \
+         Full names: {:?}",
+        names
+    );
+
+    let merged_gate_exps = names.iter().find(|n| n.contains("ffn_gate_exps.weight"));
+    assert!(
+        merged_gate_exps.is_some(),
+        "qwen35moe GGUF must include merged blk.{{L}}.ffn_gate_exps.weight \
+         — if this is missing, P5's merge_moe_experts_in_place was never invoked. \
+         Raw per-expert tensors visible: {:?}",
+        names.iter().filter(|n| n.contains("experts")).collect::<Vec<_>>()
+    );
 }
 
+/// Bisection proof: the 4 MTP suffixes are each distinct in the GGUF.
+/// If a mapper regression renamed `embed_tokens.weight` to `emb_tokens.weight`
+/// (one-letter typo), this assertion fires by name — the test explicitly
+/// documents that form per ADR-012 P11 Decision 19 §2.
 #[test]
-fn qwen35_dense_mtp_emitted_at_resolved_block_not_placeholder() {
-    // The placeholder `blk.mtp0.nextn.*` MUST NOT appear in the output —
-    // that would mean the resolver in src/backends/gguf.rs:resolve_mtp_block_index
-    // failed to fire, and the inference loader would silently skip the tensors.
+fn qwen35_mtp_suffix_set_is_exact() {
     let tmp = tempfile::tempdir().unwrap();
-    let input = tmp.path().join("qwen35-mtp-noplace-input");
-    let output = tmp.path().join("qwen35-mtp-noplace-output");
-    fs::create_dir_all(&input).unwrap();
-    fs::write(input.join("config.json"), QWEN35_DENSE_CONFIG_MTP).unwrap();
-    write_sidecars(&input);
-    fs::write(input.join("model.safetensors"), build_dense_safetensors()).unwrap();
-
+    let input = tmp.path().join("dense-mtp-exact-in");
+    let output = tmp.path().join("dense-mtp-exact-out.gguf");
+    setup_dense_mtp(&input);
     convert_to_gguf(&input, &output);
 
-    let gguf = GgufFile::open(&locate_gguf(&output)).expect("open gguf");
-    let placeholders: Vec<String> = gguf
+    let gguf = GgufFile::open(&output).expect("open");
+    let mtp_names: Vec<String> = gguf
         .tensor_names()
-        .into_iter()
-        .filter(|n: &&str| n.starts_with("blk.mtp"))
-        .map(|n: &str| n.to_string())
+        .iter()
+        .filter(|n| n.contains(".nextn."))
+        .map(|s| s.to_string())
         .collect();
-    assert!(
-        placeholders.is_empty(),
-        "found unresolved MTP placeholders {placeholders:?} — \
-         resolve_mtp_block_index never fired",
+
+    assert_eq!(
+        mtp_names.len(),
+        EXPECTED_MTP_SUFFIXES.len(),
+        "expected exactly {} MTP tensors, got {}: {:?}",
+        EXPECTED_MTP_SUFFIXES.len(),
+        mtp_names.len(),
+        mtp_names
     );
+
+    // Name audit — exact suffix match, no typos.
+    for suffix in EXPECTED_MTP_SUFFIXES {
+        let hits: Vec<&String> = mtp_names.iter().filter(|n| n.ends_with(suffix)).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "suffix {:?} must appear exactly once; got {:?} all_mtp={:?}",
+            suffix,
+            hits,
+            mtp_names
+        );
+    }
 }

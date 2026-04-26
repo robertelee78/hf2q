@@ -1,177 +1,267 @@
-//! `qwen35` (Qwen3.5/3.6 dense) registry entry.
+//! qwen35 (dense Qwen3.5 / Qwen3.6-27B) registry entry.
 //!
-//! Tensor catalog hand-transcribed from `/opt/llama.cpp/src/models/qwen35.cpp`
-//! and `/opt/llama.cpp/src/llama-arch.cpp` (LLM_TENSOR_* table).  Per the
-//! sovereignty rule, the catalog is derived by reading llama.cpp source, not
-//! by parsing a GGUF produced externally.
+//! Tensor catalog hand-transcribed from `/opt/llama.cpp/src/llama-arch.cpp`
+//! and the P4-shipped mapping in `src/models/qwen35/dense.rs`.
 
-use crate::arch::catalog::{TensorCatalog, TensorSpec};
+use crate::arch::catalog::{LayerScope, TensorCatalog, TensorCatalogEntry, TensorDtype};
 use crate::arch::registry::{ArchEntry, EvalCorpus, QualityThresholds};
 
-// ---------------------------------------------------------------------------
-// Tensor catalog
-// ---------------------------------------------------------------------------
-
-const GLOBAL: &[TensorSpec] = &[
-    // Token embedding + LM head + output norm.  llama-arch.cpp tensor table
-    // (LLM_TENSOR_TOKEN_EMBD / LLM_TENSOR_OUTPUT_NORM / LLM_TENSOR_OUTPUT).
-    TensorSpec::global("token_embd.weight"),
-    TensorSpec::global("output_norm.weight"),
-    TensorSpec::global("output.weight"),
-];
-
-const FULL_ATTENTION_LAYER: &[TensorSpec] = &[
-    // Pre/post norms.  llama-arch.cpp:367 (LLM_TENSOR_ATTN_NORM /
-    // LLM_TENSOR_POST_ATTENTION_NORM — Qwen3.5 uses Gemma-style post-norm
-    // per ADR-012 P4 verdict).
-    TensorSpec::per_layer("blk.{L}.attn_norm.weight"),
-    TensorSpec::per_layer("blk.{L}.post_attention_norm.weight"),
-    // Q/K/V/O projections (LLM_TENSOR_ATTN_Q/K/V/OUTPUT).
-    TensorSpec::per_layer("blk.{L}.attn_q.weight"),
-    TensorSpec::per_layer("blk.{L}.attn_k.weight"),
-    TensorSpec::per_layer("blk.{L}.attn_v.weight"),
-    TensorSpec::per_layer("blk.{L}.attn_output.weight"),
-    // Q/K norms (LLM_TENSOR_ATTN_Q_NORM / LLM_TENSOR_ATTN_K_NORM).
-    TensorSpec::per_layer("blk.{L}.attn_q_norm.weight"),
-    TensorSpec::per_layer("blk.{L}.attn_k_norm.weight"),
-    // Output gate (LLM_TENSOR_ATTN_GATE, llama-arch.cpp:370).
-    TensorSpec::per_layer("blk.{L}.attn_gate.weight"),
-    // Dense FFN (LLM_TENSOR_FFN_GATE/UP/DOWN).
-    TensorSpec::per_layer("blk.{L}.ffn_gate.weight"),
-    TensorSpec::per_layer("blk.{L}.ffn_up.weight"),
-    TensorSpec::per_layer("blk.{L}.ffn_down.weight"),
-];
-
-const LINEAR_ATTENTION_LAYER: &[TensorSpec] = &[
-    // Pre/post norms (shared with full-attention).
-    TensorSpec::per_layer("blk.{L}.attn_norm.weight"),
-    TensorSpec::per_layer("blk.{L}.post_attention_norm.weight"),
-    // Linear-attention QKV/Z fusion.  llama-arch.cpp:382 (LLM_TENSOR_ATTN_QKV)
-    // for the qkv-fused stream; :370 (LLM_TENSOR_ATTN_GATE) for the z gate.
-    TensorSpec::per_layer("blk.{L}.attn_qkv.weight"),
-    TensorSpec::per_layer("blk.{L}.attn_gate.weight"),
-    // SSM / DeltaNet state tensors.  llama-arch.cpp:395-402:
-    //   LLM_TENSOR_SSM_A → "blk.%d.ssm_a"
-    //   LLM_TENSOR_SSM_DT → "blk.%d.ssm_dt"  (carries the .bias variant)
-    //   LLM_TENSOR_SSM_OUT → "blk.%d.ssm_out"
-    //   LLM_TENSOR_SSM_CONV1D → "blk.%d.ssm_conv1d"
-    //   LLM_TENSOR_SSM_NORM → "blk.%d.ssm_norm"
-    TensorSpec::per_layer("blk.{L}.ssm_a"),
-    TensorSpec::per_layer("blk.{L}.ssm_dt.bias"),
-    TensorSpec::per_layer("blk.{L}.ssm_dt.weight"),
-    TensorSpec::per_layer("blk.{L}.ssm_out.weight"),
-    TensorSpec::per_layer("blk.{L}.ssm_conv1d.weight"),
-    TensorSpec::per_layer("blk.{L}.ssm_norm.weight"),
-    // Dense FFN follows linear-attn block (Qwen3.5 dense has FFN every layer).
-    TensorSpec::per_layer("blk.{L}.ffn_gate.weight"),
-    TensorSpec::per_layer("blk.{L}.ffn_up.weight"),
-    TensorSpec::per_layer("blk.{L}.ffn_down.weight"),
-];
-
-const MTP: &[TensorSpec] = &[
-    // llama-arch.cpp:447-450 (LLM_TENSOR_NEXTN_*).  Optional because emission
-    // is gated on `mtp_num_hidden_layers > 0`.
-    TensorSpec::optional_per_layer("blk.{N}.nextn.eh_proj.weight"),
-    TensorSpec::optional_per_layer("blk.{N}.nextn.embed_tokens.weight"),
-    TensorSpec::optional_per_layer("blk.{N}.nextn.enorm.weight"),
-    TensorSpec::optional_per_layer("blk.{N}.nextn.hnorm.weight"),
-];
-
-const CATALOG: TensorCatalog = TensorCatalog {
-    global: GLOBAL,
-    full_attention_layer: FULL_ATTENTION_LAYER,
-    linear_attention_layer: LINEAR_ATTENTION_LAYER,
-    mtp: MTP,
+/// Tensor templates emitted by the dense qwen35 convert path.
+///
+/// Every entry cites either llama-arch.cpp:{line} or the P4-shipped
+/// mapper line that emits the tensor. Per-layer tensors use `{L}`.
+///
+/// NOTE: linear-attn tensors are emitted on linear-attention layers
+/// only; full-attn tensors on full-attention layers only. The
+/// expansion helper uses `LayerScope::{LinearAttention,FullAttention}LayersOnly`
+/// so the expected count folds `full_attention_interval` correctly.
+const DENSE_CATALOG: TensorCatalog = TensorCatalog {
+    entries: &[
+        // Global.
+        TensorCatalogEntry {
+            name_template: "token_embd.weight",
+            scope: LayerScope::Global,
+            dtype: TensorDtype::F16,
+            citation: "src/models/qwen35/dense.rs:50 (model.embed_tokens.weight → token_embd.weight)",
+        },
+        TensorCatalogEntry {
+            name_template: "output_norm.weight",
+            scope: LayerScope::Global,
+            dtype: TensorDtype::F32,
+            citation: "src/models/qwen35/dense.rs:54 (model.norm.weight → output_norm.weight)",
+        },
+        TensorCatalogEntry {
+            name_template: "output.weight",
+            scope: LayerScope::Global,
+            dtype: TensorDtype::F16,
+            citation: "src/models/qwen35/dense.rs:58 (lm_head.weight → output.weight)",
+        },
+        // Per-block norms (present on every block).
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_norm.weight",
+            scope: LayerScope::AllLayers,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:LLM_TENSOR_ATTN_NORM; src/models/qwen35/dense.rs:198",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.post_attention_norm.weight",
+            scope: LayerScope::AllLayers,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:367 LLM_TENSOR_ATTN_POST_NORM; src/models/qwen35/dense.rs:201",
+        },
+        // Full-attention block tensors.
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_q.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:98 (self_attn.q_proj → attn_q)",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_k.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:99",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_v.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:100",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_output.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:101",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_q_norm.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "src/models/qwen35/dense.rs:102",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_k_norm.weight",
+            scope: LayerScope::FullAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "src/models/qwen35/dense.rs:103",
+        },
+        // Linear-attention block tensors.
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_qkv.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:382 LLM_TENSOR_ATTN_QKV; src/models/qwen35/dense.rs:136",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.attn_gate.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:370 LLM_TENSOR_ATTN_GATE; src/models/qwen35/dense.rs:139",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_alpha.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:400 LLM_TENSOR_SSM_ALPHA; src/models/qwen35/dense.rs:142",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_beta.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:416 LLM_TENSOR_SSM_BETA; src/models/qwen35/dense.rs:145",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_out.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:402 LLM_TENSOR_SSM_OUT; src/models/qwen35/dense.rs:148",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_a",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:395 LLM_TENSOR_SSM_A_NOSCAN; src/models/qwen35/dense.rs:151",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_dt.bias",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:397 + convert_hf_to_gguf.py:4791; src/models/qwen35/dense.rs:156",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_conv1d.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:396 LLM_TENSOR_SSM_CONV1D; src/models/qwen35/dense.rs:159",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ssm_norm.weight",
+            scope: LayerScope::LinearAttentionLayersOnly,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:401 LLM_TENSOR_SSM_NORM; src/models/qwen35/dense.rs:163",
+        },
+        // Dense FFN.
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ffn_gate.weight",
+            scope: LayerScope::AllLayers,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:174 (mlp.gate_proj → ffn_gate)",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ffn_up.weight",
+            scope: LayerScope::AllLayers,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:175",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.ffn_down.weight",
+            scope: LayerScope::AllLayers,
+            dtype: TensorDtype::Quantized,
+            citation: "src/models/qwen35/dense.rs:176",
+        },
+        // MTP tensors (emitted when mtp_num_hidden_layers > 0).
+        TensorCatalogEntry {
+            name_template: "blk.{L}.nextn.enorm.weight",
+            scope: LayerScope::MtpLayers,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:449 LLM_TENSOR_NEXTN_ENORM",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.nextn.hnorm.weight",
+            scope: LayerScope::MtpLayers,
+            dtype: TensorDtype::F32,
+            citation: "llama-arch.cpp:450 LLM_TENSOR_NEXTN_HNORM",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.nextn.embed_tokens.weight",
+            scope: LayerScope::MtpLayers,
+            dtype: TensorDtype::F16,
+            citation: "llama-arch.cpp:448 LLM_TENSOR_NEXTN_EMBED_TOKENS",
+        },
+        TensorCatalogEntry {
+            name_template: "blk.{L}.nextn.eh_proj.weight",
+            scope: LayerScope::MtpLayers,
+            dtype: TensorDtype::Quantized,
+            citation: "llama-arch.cpp:447 LLM_TENSOR_NEXTN_EH_PROJ",
+        },
+    ],
 };
 
-// ---------------------------------------------------------------------------
-// Smoke prompts
-// ---------------------------------------------------------------------------
-
-const SMOKE_PROMPTS: &[&str] = &[
-    "The quick brown fox",
-    "Once upon a time",
-];
-
-// ---------------------------------------------------------------------------
-// Canonical HF repos
-// ---------------------------------------------------------------------------
-
-const HF_REPOS: &[&str] = &[
-    // Robert's primary dense target (ADR-012 §Business problem).
-    "Qwen/Qwen3.6-27B",
-];
-
-// ---------------------------------------------------------------------------
-// Entry
-// ---------------------------------------------------------------------------
-
-pub static ENTRY: &ArchEntry = &ArchEntry {
+/// The qwen35 arch entry.
+pub const ENTRY: ArchEntry = ArchEntry {
     arch: "qwen35",
-    hf_architectures: &["Qwen3_5ForCausalLM"],
-    tensor_catalog: &CATALOG,
+    // Both HF architecture aliases — *ForCausalLM is the text-only form,
+    // *ForConditionalGeneration ships on multimodal Qwen3.5 checkpoints.
+    // `arch_gguf_name` (src/backends/gguf.rs:2585) accepts both; the
+    // registry must too so `get_by_hf_architecture` matches what convert
+    // sees in config.json.
+    hf_architectures: &["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"],
+    tensor_catalog: &DENSE_CATALOG,
     has_mtp: true,
-    has_vision: true,
-    // 27B dense + DWQ intermediate + output ≈ 55 GB floor per ADR-012 P7.
-    disk_floor_gb: 55,
-    smoke_prompts: SMOKE_PROMPTS,
-    hf_repos: HF_REPOS,
-    ppl_corpus: EvalCorpus::WIKITEXT2_512,
-    quality_thresholds: QualityThresholds::ADR_012_DEFAULTS,
+    has_vision: true, // Qwen3.6-27B ships a vision_config; --emit-vision-tower honored when present.
+    smoke_prompts: &["The quick brown fox"],
+    ppl_corpus: EvalCorpus {
+        id: "wikitext2",
+        token_count: 512,
+        sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+    },
+    quality_thresholds: QualityThresholds::ADR_012_DEFAULT,
+    disk_floor_gb: 100, // src/input/hf_download.rs Decision 14 floor
+    hf_repos: &["Qwen/Qwen3.6-27B"],
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::catalog::CatalogExpansion;
 
     #[test]
-    fn entry_arch_string() {
+    fn dense_catalog_has_expected_entry_count() {
+        // 3 global + 2 per-layer norms + 6 full-attn + 9 linear-attn + 3 dense-ffn + 4 MTP = 27
+        assert_eq!(DENSE_CATALOG.entries.len(), 27);
+    }
+
+    #[test]
+    fn qwen36_27b_tensor_count_folds_correctly() {
+        // Qwen3.6-27B: 64 layers, full_attention_interval 4 → 16 full, 48 linear.
+        let exp = CatalogExpansion {
+            num_hidden_layers: 64,
+            num_full_attention_layers: 16,
+            num_linear_attention_layers: 48,
+            num_experts: 0,
+            has_shared_expert: false,
+            mtp_num_hidden_layers: 1,
+        };
+        let count = ENTRY.expected_tensor_count(exp);
+        // globals(3) + per_block_norms(2*64=128) + full_attn(6*16=96) + linear_attn(9*48=432)
+        //            + dense_ffn(3*64=192) + mtp(4*1=4) = 855
+        assert_eq!(count, 3 + 128 + 96 + 432 + 192 + 4);
+        assert_eq!(count, 855);
+    }
+
+    #[test]
+    fn hf_architectures_routes_to_dense_entry() {
+        assert_eq!(
+            ENTRY.hf_architectures,
+            &["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"]
+        );
         assert_eq!(ENTRY.arch, "qwen35");
     }
 
     #[test]
-    fn entry_hf_architectures_present() {
-        assert!(ENTRY.hf_architectures.contains(&"Qwen3_5ForCausalLM"));
+    fn quality_thresholds_are_adr012_defaults() {
+        assert_eq!(
+            ENTRY.quality_thresholds,
+            QualityThresholds::ADR_012_DEFAULT
+        );
     }
 
     #[test]
-    fn catalog_includes_ssm_state_tensors() {
-        // ADR-012 P3 verdict: SSM state tensors are mandatory on
-        // linear-attention layers; missing one = silent inference failure.
-        let names: Vec<&str> = CATALOG
-            .linear_attention_layer
-            .iter()
-            .map(|t| t.name)
-            .collect();
-        for required in &[
-            "blk.{L}.ssm_a",
-            "blk.{L}.ssm_dt.bias",
-            "blk.{L}.ssm_conv1d.weight",
-            "blk.{L}.ssm_out.weight",
-        ] {
-            assert!(
-                names.contains(required),
-                "missing SSM tensor {required} from qwen35 linear-attn catalog"
-            );
-        }
-    }
-
-    #[test]
-    fn catalog_full_attn_includes_attn_gate() {
-        // ADR-012 P4 correction: attn_output_gate=true makes attn_gate
-        // mandatory on full-attention blocks.
-        let names: Vec<&str> = CATALOG
-            .full_attention_layer
-            .iter()
-            .map(|t| t.name)
-            .collect();
-        assert!(names.contains(&"blk.{L}.attn_gate.weight"));
-    }
-
-    #[test]
-    fn mtp_tensors_marked_optional() {
-        for spec in CATALOG.mtp {
-            assert!(spec.optional, "MTP {} should be optional", spec.name);
-        }
+    fn has_mtp_and_has_vision_are_true_for_qwen35() {
+        // Qwen3.5 dense has MTP (mtp_num_hidden_layers: 1) and vision_config
+        // (Qwen3.6-27B ships a ViT that needs --emit-vision-tower).
+        assert!(ENTRY.has_mtp);
+        assert!(ENTRY.has_vision);
     }
 }

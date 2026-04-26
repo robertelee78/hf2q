@@ -87,12 +87,53 @@ pub enum Command {
     /// ADR-009 parity validation against locked references
     Parity(ParityArgs),
 
-    /// Run a smoke conformance gate for an arch (ADR-012 Decision 16).
-    ///
-    /// Convert + load + 8-token inference for an arch's canonical repo at the
-    /// requested quant.  Distinct exit codes for each preflight failure mode
-    /// (2=HF_TOKEN, 3=disk, 4=llama-cli, 5=hf2q binary, 6=HF repo).
+    /// ADR-012 Decision 16 — end-gate smoke test for a registered arch
     Smoke(SmokeArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SmokeArgs {
+    /// Arch key as registered in `src/arch/` (qwen35, qwen35moe)
+    #[arg(long)]
+    pub arch: String,
+
+    /// Quant method to smoke-test
+    #[arg(long, default_value = "q4_0")]
+    pub quant: String,
+
+    /// Also exercise the --emit-vision-tower path (dense variants with vision_config)
+    #[arg(long, default_value_t = false)]
+    pub with_vision: bool,
+
+    /// Skip the convert step and reuse an existing GGUF on disk
+    #[arg(long, default_value_t = false)]
+    pub skip_convert: bool,
+
+    /// Run preflight + dispatch, skip convert/inference, emit transcript path
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Fixtures root (defaults to `tests/fixtures/`)
+    #[arg(long)]
+    pub fixtures_root: Option<PathBuf>,
+
+    /// Use a local safetensors directory instead of downloading from HF.
+    /// When set, preflight skips HF_TOKEN + repo-resolution checks.
+    /// Enables CI testing of the Q4_0 end-to-end path on synthetic models.
+    #[arg(long)]
+    pub local_dir: Option<PathBuf>,
+
+    /// Keep converted GGUF(s) in this directory. Defaults to a temp dir
+    /// so repeat smoke runs don't accumulate disk.
+    #[arg(long)]
+    pub convert_output_dir: Option<PathBuf>,
+
+    /// Override path for llama-cli. When set, preflight skips the default
+    /// llama-cli search (/opt/llama.cpp/build/bin/ + PATH) and the smoke
+    /// runner uses this path directly. Enables CI tests to inject a
+    /// mock stub emitting a deterministic transcript.
+    #[arg(long)]
+    pub llama_cli_override: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -160,6 +201,12 @@ pub struct ConvertArgs {
     /// How to handle unsupported layer types
     #[arg(long, value_enum)]
     pub unsupported_layers: Option<UnsupportedLayerPolicy>,
+
+    /// ADR-012 P10 (Decision 18) — emit mmproj-<slug>-F16.gguf alongside
+    /// the text GGUF when the HF repo has a vision_config. Silently skipped
+    /// when no vision_config is present (Gemma4, Qwen3.6-35B-A3B MoE).
+    #[arg(long, default_value_t = false)]
+    pub emit_vision_tower: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -483,7 +530,14 @@ impl std::fmt::Display for OutputFormat {
 pub enum QuantMethod {
     Auto,
     F16,
+    #[value(alias = "q8_0")]
     Q8,
+    /// `q4_0` is accepted as an alias — the smoke harness's default
+    /// (`hf2q smoke --arch ... --quant q4_0` per Decision 16 §3) was
+    /// previously rejected by clap because only the bare `q4` form
+    /// was registered. Both names refer to the same bit-identical
+    /// 4-bit emission.
+    #[value(alias = "q4_0")]
     Q4,
     Q2,
     #[value(name = "mixed-2-6")]

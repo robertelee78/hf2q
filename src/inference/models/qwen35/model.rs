@@ -170,7 +170,7 @@ impl Qwen35Model {
     /// For Dense models the behaviour is unchanged: weights are dequantized
     /// to f32 via [`weight_loader::load_layer`].
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
-        let cfg = Self::load_config_only(gguf)?;
+        let mut cfg = Self::load_config_only(gguf)?;
         let mtp = load_mtp_weights_if_present(gguf, cfg.num_hidden_layers)?;
 
         let device = MlxDevice::new()
@@ -180,20 +180,71 @@ impl Qwen35Model {
             weight_loader::load_global_tensors(gguf, &cfg, &device)
                 .context("load_global_tensors")?;
 
+        // ADR-012 P9b real-model finding (Qwen3.6-27B): the embedding table is
+        // physically padded for alignment (e.g. 248320 rows) while the metadata
+        // vocab_size reports the logical vocab (e.g. 248044). When they
+        // disagree, take the tensor shape as authoritative for cfg.vocab_size
+        // — the io_heads.rs assertion `token_embd.len() == vocab * hidden`
+        // and the LM head matmul both require the row-count match. The logical
+        // vocab is still recoverable from `tokenizer.ggml.tokens` metadata if
+        // ever needed (e.g. for sampler masking of pad rows).
+        let h = cfg.hidden_size as usize;
+        if h > 0 {
+            let physical_vocab = token_embd.len() / h;
+            if (physical_vocab as u32) != cfg.vocab_size {
+                tracing::info!(
+                    metadata_vocab = cfg.vocab_size,
+                    physical_vocab = physical_vocab,
+                    "qwen35 vocab pad: metadata reports {} but token_embd has {} rows; using physical for cfg.vocab_size",
+                    cfg.vocab_size,
+                    physical_vocab,
+                );
+                cfg.vocab_size = physical_vocab as u32;
+            }
+        }
+
+        // ADR-012 item-2 architectural fix (2026-04-25): MoE experts MUST
+        // be loaded as native ggml-quantized blocks (`MoeQ`). The previous
+        // F16-detection / F32-expand fallback ("Moe" variant via
+        // `weight_loader::load_moe_ffn`) was peer-misaligned — peers
+        // (mlx-lm, llama.cpp, AutoAWQ) never F32-expand MoE experts at load
+        // time. Apex 35B-A3B at F32 is ~128 GB which doesn't fit on a
+        // 128 GB system; the convert pipeline now emits MoE experts at
+        // Q8_0 in the intermediate (see `quantize::intermediate_moe_q8`)
+        // so this branch is unreachable for production inputs. If a caller
+        // ever supplies F16/F32 experts (e.g. legacy GGUFs), we fail loud
+        // at load time rather than silently expanding.
+        use mlx_native::ops::quantized_matmul_ggml::GgmlType;
+        if cfg.variant == Qwen35Variant::Moe {
+            if let Some(info) = gguf.tensor_info("blk.0.ffn_gate_exps.weight") {
+                if matches!(info.ggml_type, GgmlType::F16 | GgmlType::F32) {
+                    return Err(anyhow!(
+                        "qwen35moe load: MoE expert tensor 'blk.0.ffn_gate_exps.weight' \
+                         is dtype {:?}; native ggml-block quantization (Q4_0, Q5_K, Q6_K, Q8_0) \
+                         is required. Re-emit the GGUF with quantized MoE experts — no \
+                         F32-expansion fallback per ADR-012 item-2 (peer alignment).",
+                        info.ggml_type
+                    ));
+                }
+            }
+        }
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
         for i in 0..cfg.num_hidden_layers {
             let layer = match cfg.variant {
                 Qwen35Variant::Moe => {
-                    // Use quantized loader for MoE: expert weights stay as GGML
-                    // blocks on Metal; no F32 expansion.
                     let kind = cfg
                         .layer_types
                         .get(i as usize)
                         .copied()
                         .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
-                    let ffn = weight_loader::load_moe_ffn_quantized(gguf, i, &device)
-                        .with_context(|| format!("load_moe_ffn_quantized layer {i}"))?;
-                    let ffn_weights = Qwen35FfnWeights::MoeQ(ffn);
+                    // Production quantized experts (Q4_0/Q5_K/Q6_K/Q8_0) —
+                    // keep native blocks on Metal; no F32 expansion.
+                    let ffn_weights = {
+                        let ffn = weight_loader::load_moe_ffn_quantized(gguf, i, &device)
+                            .with_context(|| format!("load_moe_ffn_quantized layer {i}"))?;
+                        Qwen35FfnWeights::MoeQ(ffn)
+                    };
                     match kind {
                         Qwen35LayerKind::FullAttention => {
                             let attn = weight_loader::load_full_attn_layer(gguf, &cfg, i, &device)

@@ -206,7 +206,11 @@ fn parse_config_value(config: &Value, config_path: &Path) -> Result<ModelMetadat
 ///
 /// ADR-012 Decision 2: "missing required-for-qwen35moe fields … returns an error
 /// with a clear message identifying the missing field — not silent zero-filling."
-pub fn validate_required_qwen35moe_fields(
+/// Shared qwen35-family field validator (both dense and MoE).
+///
+/// Checks every hparam the linear-attention transforms need. The MoE
+/// variant calls this PLUS `validate_required_qwen35moe_extra_fields`.
+fn validate_required_qwen35_common_fields(
     metadata: &ModelMetadata,
 ) -> Result<(), ConfigParseError> {
     macro_rules! require {
@@ -220,7 +224,6 @@ pub fn validate_required_qwen35moe_fields(
     }
 
     require!(metadata.rope_parameters, "rope_parameters");
-    // rope_parameters is present; verify mrope_section is non-empty
     if let Some(ref rp) = metadata.rope_parameters {
         if rp.mrope_section.is_empty() {
             return Err(ConfigParseError::MissingField {
@@ -237,12 +240,41 @@ pub fn validate_required_qwen35moe_fields(
     require!(metadata.linear_value_head_dim, "linear_value_head_dim");
     require!(metadata.linear_num_value_heads, "linear_num_value_heads");
     require!(metadata.mamba_ssm_dtype, "mamba_ssm_dtype");
+    require!(metadata.mtp_num_hidden_layers, "mtp_num_hidden_layers");
+
+    Ok(())
+}
+
+/// Dense-variant field validator — subset of MoE requirements.
+///
+/// Dense Qwen3.5 does not use `moe_intermediate_size` or
+/// `shared_expert_intermediate_size`. Calling the MoE validator on a
+/// dense model produces a false-positive "missing field" error.
+pub fn validate_required_qwen35_fields(
+    metadata: &ModelMetadata,
+) -> Result<(), ConfigParseError> {
+    validate_required_qwen35_common_fields(metadata)
+}
+
+pub fn validate_required_qwen35moe_fields(
+    metadata: &ModelMetadata,
+) -> Result<(), ConfigParseError> {
+    validate_required_qwen35_common_fields(metadata)?;
+
+    macro_rules! require {
+        ($field:expr, $name:literal) => {
+            if $field.is_none() {
+                return Err(ConfigParseError::MissingField {
+                    field: $name.to_string(),
+                });
+            }
+        };
+    }
     require!(metadata.moe_intermediate_size, "moe_intermediate_size");
     require!(
         metadata.shared_expert_intermediate_size,
         "shared_expert_intermediate_size"
     );
-    require!(metadata.mtp_num_hidden_layers, "mtp_num_hidden_layers");
 
     Ok(())
 }
@@ -321,11 +353,31 @@ fn extract_explicit_layer_types(config: &Value) -> Option<Vec<String>> {
     })
 }
 
-/// Extract nested `rope_parameters` object.
+/// Extract nested rope config.
 ///
-/// Returns None when absent (Gemma4, LLaMA, etc.).
+/// Accepts EITHER of two HF config formats (some models ship one,
+/// some the other — both are "valid" HF; Qwen3.6 uses `rope_parameters`,
+/// older models use `rope_scaling`):
+///
+///   - `rope_parameters` (Qwen3.6 / Qwen3.5-MoE convention) — nested
+///     object with explicit `rope_theta`, `mrope_section`, etc.
+///   - `rope_scaling` (older Qwen / Llama convention) — same nested
+///     object shape but keyed under a different name; `type` field
+///     maps to our `rope_type` field. `rope_theta` may live on the
+///     parent config rather than inside the object.
+///
+/// Returns None when neither is present (Gemma4, LLaMA, etc.).
+/// Per mantra (Chesterton's fence): the caller in P2+ was silently
+/// missing rope metadata emission when configs used `rope_scaling`;
+/// this accepts both forms to eliminate that silent fallback.
 fn extract_rope_parameters(config: &Value) -> Option<RopeParameters> {
-    let obj = config.get("rope_parameters").and_then(|v| v.as_object())?;
+    let (obj, is_scaling_form) = match config.get("rope_parameters").and_then(|v| v.as_object()) {
+        Some(o) => (o, false),
+        None => match config.get("rope_scaling").and_then(|v| v.as_object()) {
+            Some(o) => (o, true),
+            None => return None,
+        },
+    };
 
     let mrope_interleaved = obj
         .get("mrope_interleaved")
@@ -342,13 +394,19 @@ fn extract_rope_parameters(config: &Value) -> Option<RopeParameters> {
         })
         .unwrap_or_default();
 
+    // `rope_theta` can live inside the nested object (preferred) OR
+    // on the parent config (legacy `rope_scaling` form). Check both.
     let rope_theta = obj
         .get("rope_theta")
         .and_then(|v| v.as_f64())
+        .or_else(|| config.get("rope_theta").and_then(|v| v.as_f64()))
         .unwrap_or(0.0);
 
+    // Rope type naming: `rope_type` in the new form, `type` in the
+    // legacy `rope_scaling` form.
     let rope_type = obj
         .get("rope_type")
+        .or_else(|| if is_scaling_form { obj.get("type") } else { None })
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -356,6 +414,7 @@ fn extract_rope_parameters(config: &Value) -> Option<RopeParameters> {
     let partial_rotary_factor = obj
         .get("partial_rotary_factor")
         .and_then(|v| v.as_f64())
+        .or_else(|| config.get("partial_rotary_factor").and_then(|v| v.as_f64()))
         .unwrap_or(0.0) as f32;
 
     Some(RopeParameters {
@@ -493,7 +552,14 @@ pub fn format_info(metadata: &ModelMetadata) -> String {
     lines.push(format!("  Hidden size:  {}", metadata.hidden_size));
     lines.push(format!("  Layers:       {}", metadata.num_layers));
 
-    let unique_types = metadata.unique_layer_types();
+    // ADR-012 Decision 2 contract: use resolved_layer_types() rather than
+    // the raw `layer_types` field for diagnostics. For Qwen3.5 configs that
+    // supply only `full_attention_interval` (no explicit per-layer
+    // enumeration), the raw field is the parser placeholder `["attention"; N]`
+    // — a misleading display that hides the actual hybrid layer mix.
+    let mut unique_types: Vec<String> = metadata.resolved_layer_types();
+    unique_types.sort();
+    unique_types.dedup();
     if !unique_types.is_empty() {
         lines.push(format!("  Layer types:  {}", unique_types.join(", ")));
     }
@@ -1048,5 +1114,164 @@ mod tests {
         assert_eq!(resolved[3], "full_attention");
         assert_eq!(resolved[4], "linear_attention");
         assert_eq!(resolved[7], "full_attention");
+    }
+
+    // ------------------------------------------------------------------
+    // Rope schema flexibility tests (2026-04-24)
+    // ------------------------------------------------------------------
+    // Real-world HF configs use either `rope_parameters` (Qwen3.6) or
+    // `rope_scaling` (older Qwen / Llama). Both must produce a populated
+    // `RopeParameters` so Decision 7's rope.* keys emit.
+
+    #[test]
+    fn rope_parameters_nested_form_parses() {
+        let config: Value = serde_json::from_str(
+            r#"{"rope_parameters": {
+                "mrope_section": [3, 3, 2],
+                "rope_theta": 10000000.0,
+                "rope_type": "mrope",
+                "mrope_interleaved": true,
+                "partial_rotary_factor": 0.25
+            }}"#,
+        )
+        .unwrap();
+        let rp = extract_rope_parameters(&config).expect("parsed");
+        assert_eq!(rp.rope_theta, 10_000_000.0);
+        assert_eq!(rp.mrope_section, vec![3, 3, 2]);
+        assert_eq!(rp.rope_type, "mrope");
+        assert!(rp.mrope_interleaved);
+        assert_eq!(rp.partial_rotary_factor, 0.25);
+    }
+
+    #[test]
+    fn rope_scaling_legacy_form_parses_with_rope_theta_on_parent() {
+        // Older HF convention: `rope_scaling` carries the mrope_section
+        // but rope_theta lives on the parent config. Verify both values
+        // flow through to the emitter.
+        let config: Value = serde_json::from_str(
+            r#"{
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25,
+                "rope_scaling": {
+                    "mrope_section": [11, 11, 10],
+                    "type": "mrope"
+                }
+            }"#,
+        )
+        .unwrap();
+        let rp = extract_rope_parameters(&config).expect("legacy form parsed");
+        assert_eq!(rp.rope_theta, 10_000_000.0, "theta from parent");
+        assert_eq!(rp.mrope_section, vec![11, 11, 10]);
+        assert_eq!(rp.rope_type, "mrope", "legacy `type` maps to rope_type");
+        assert_eq!(rp.partial_rotary_factor, 0.25, "factor from parent");
+    }
+
+    #[test]
+    fn rope_parameters_takes_precedence_over_rope_scaling() {
+        // If BOTH are present, the newer `rope_parameters` form wins
+        // — matches Qwen's own migration path (newer configs ship both
+        // keys during transition periods).
+        let config: Value = serde_json::from_str(
+            r#"{
+                "rope_parameters": {
+                    "mrope_section": [3, 3, 2],
+                    "rope_theta": 999.0
+                },
+                "rope_scaling": {
+                    "mrope_section": [99, 99, 99],
+                    "type": "mrope"
+                }
+            }"#,
+        )
+        .unwrap();
+        let rp = extract_rope_parameters(&config).expect("parsed");
+        assert_eq!(rp.mrope_section, vec![3, 3, 2], "prefers rope_parameters");
+        assert_eq!(rp.rope_theta, 999.0);
+    }
+
+    #[test]
+    fn rope_absent_returns_none() {
+        let config: Value = serde_json::from_str(r#"{"hidden_size": 64}"#).unwrap();
+        assert!(extract_rope_parameters(&config).is_none());
+    }
+
+    #[test]
+    fn rope_scaling_without_parent_theta_defaults_to_zero() {
+        // Safety net — ensures the parser doesn't panic when theta
+        // is truly missing. Decision 7 emitter fallbacks to 10_000_000
+        // for qwen35 when rp.rope_theta is zero.
+        let config: Value = serde_json::from_str(
+            r#"{"rope_scaling": {"mrope_section": [1, 2, 3], "type": "mrope"}}"#,
+        )
+        .unwrap();
+        let rp = extract_rope_parameters(&config).expect("parsed");
+        assert_eq!(rp.rope_theta, 0.0);
+        assert_eq!(rp.mrope_section, vec![1, 2, 3]);
+    }
+
+    /// Decision 2 contract: format_info must use resolved_layer_types() so
+    /// a Qwen3.5 config with `full_attention_interval=4` (no explicit
+    /// per-layer enumeration) shows the actual hybrid layer mix in the
+    /// "Layer types:" line — not the parser placeholder `["attention"; N]`.
+    /// Pre-fix output: `Layer types:  attention`. Post-fix:
+    /// `Layer types:  full_attention, linear_attention`.
+    #[test]
+    fn format_info_renders_resolved_layer_types_for_qwen35_derived() {
+        let config: Value = serde_json::from_str(
+            r#"{
+                "architectures": ["Qwen3_5MoeForCausalLM"],
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2048,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 16,
+                "vocab_size": 248320,
+                "dtype": "bfloat16",
+                "full_attention_interval": 4
+            }"#,
+        )
+        .unwrap();
+        let meta = parse_config_value(&config, Path::new("/nonexistent/config.json"))
+            .unwrap();
+
+        // Sanity: raw layer_types is the parser placeholder.
+        assert!(
+            meta.layer_types.iter().all(|t| t == "moe_attention" || t == "attention"),
+            "raw layer_types must be parser placeholder for Qwen3.5 derived config"
+        );
+
+        let info = format_info(&meta);
+        let layer_types_line = info
+            .lines()
+            .find(|l| l.contains("Layer types:"))
+            .expect("Layer types line present");
+        // Pre-fix: line was `Layer types:  attention` (placeholder).
+        // Post-fix: line is `Layer types:  full_attention, linear_attention`
+        // (resolved hybrid). The presence of both qualified types proves
+        // resolved_layer_types() drove the diagnostic, not the raw field.
+        assert!(
+            layer_types_line.contains("full_attention"),
+            "Layer types line must include `full_attention` — got: {layer_types_line}"
+        );
+        assert!(
+            layer_types_line.contains("linear_attention"),
+            "Layer types line must include `linear_attention` — got: {layer_types_line}"
+        );
+        // Negative — the bare placeholder string `attention` (with no
+        // qualifying prefix) must not appear as a standalone token.
+        // Using comma-separated parsing for a precise membership check.
+        let after_colon = layer_types_line
+            .split_once("Layer types:")
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        let tokens: Vec<&str> = after_colon.split(',').map(|s| s.trim()).collect();
+        assert!(
+            !tokens.contains(&"attention"),
+            "bare `attention` placeholder must not appear in tokenised layer types: \
+             tokens={tokens:?}"
+        );
+        assert!(
+            !tokens.contains(&"moe_attention"),
+            "bare `moe_attention` placeholder must not appear: tokens={tokens:?}"
+        );
     }
 }

@@ -1,259 +1,520 @@
-//! Arch-generic conformance helpers (ADR-012 Decision 20).
+//! Arch-generic conformance helpers — ADR-012 Decision 20.
 //!
-//! Each helper takes a `&ArchEntry` and returns a structured result.  No
-//! per-arch hardcoding lives here — every Qwen-specific path is reached via
-//! the registered entry's catalog/thresholds/corpus knobs.
+//! These helpers are consumed by:
+//!   - `smoke.rs` (Decision 16) to assert tensor count, scan stderr
+//!   - `hf2q smoke --quant dwq-*` (Decision 17) to measure PPL + KL
+//!   - Integration tests for P11 MTP round-trip
 //!
-//! P8 ships:
-//!   * [`assert_smoke_transcript`] — parse a `llama-cli -n 8 --temp 0
-//!     --seed 42` transcript and assert it satisfies the smoke gate.
-//!
-//! P9 will extend this module with `ppl_kl_eval()` (Decision 17 PPL/KL).
-//! P10's mmproj round-trip and P11's MTP round-trip helpers also land here.
+//! All helpers take `&ArchEntry` rather than hard-coded qwen paths
+//! so Ministral (ADR-015) and DeepSeek-V3 (ADR-016) reuse them.
 
-use std::fmt;
+use std::path::{Path, PathBuf};
 
-use thiserror::Error;
+use super::catalog::CatalogExpansion;
+use super::registry::{ArchEntry, QualityThresholds};
 
-use super::registry::ArchEntry;
+/// Exit codes used by `hf2q smoke` per ADR-012 Decision 16.
+pub const EXIT_OK: u8 = 0;
+pub const EXIT_HF_TOKEN_MISSING: u8 = 2;
+pub const EXIT_INSUFFICIENT_DISK: u8 = 3;
+pub const EXIT_LLAMA_CLI_MISSING: u8 = 4;
+pub const EXIT_HF2Q_BINARY_NOT_RELEASE: u8 = 5;
+pub const EXIT_HF_REPO_UNRESOLVABLE: u8 = 6;
+pub const EXIT_UNKNOWN_ARCH: u8 = 7;
+pub const EXIT_SMOKE_ASSERTION_FAILED: u8 = 8;
 
-#[derive(Debug, Error)]
-pub enum ConformanceError {
-    #[error("smoke transcript missing required token-count line for arch '{arch}'")]
-    NoTokenCount { arch: String },
-
-    #[error(
-        "smoke transcript reported {actual} generated tokens for arch '{arch}', expected exactly 8"
-    )]
-    WrongTokenCount { arch: String, actual: u32 },
-
-    #[error("smoke transcript for arch '{arch}' contained an error indicator: {line}")]
-    ErrorIndicator { arch: String, line: String },
-
-    #[error(
-        "smoke transcript for arch '{arch}' reported {loaded} loaded tensors, expected at least {expected_min}"
-    )]
-    InsufficientTensors {
-        arch: String,
-        loaded: u64,
-        expected_min: u64,
-    },
+/// Result of a PPL + KL quality pass. Populated by P9 once `RealActivationCapture`
+/// and the F16 reference forward are landed. Pre-P9 callers emit a `None`
+/// measurement with a `skipped_reason`.
+#[derive(Debug, Clone)]
+pub struct QualityReport {
+    pub arch: &'static str,
+    pub quant_label: String,
+    pub f16_perplexity: Option<f64>,
+    pub dwq_perplexity: Option<f64>,
+    pub median_kl_nats: Option<f64>,
+    pub skipped_reason: Option<String>,
 }
 
-/// Parsed outcome of a smoke run, suitable for committing as a fixture.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SmokeAssertion {
-    pub arch: String,
-    pub tokens_generated: u32,
-    pub tensors_loaded: u64,
-}
-
-impl fmt::Display for SmokeAssertion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "arch={}, tokens_generated={}, tensors_loaded={}",
-            self.arch, self.tokens_generated, self.tensors_loaded,
-        )
+impl QualityReport {
+    /// Apply the per-arch thresholds. Returns `Ok(())` on pass,
+    /// `Err(reason)` on fail. A `skipped_reason` report is treated as
+    /// pass for P8 smoke at Q4_0 (quality ACs land with P9).
+    pub fn check(&self, thresholds: QualityThresholds) -> Result<(), String> {
+        if self.skipped_reason.is_some() {
+            return Ok(());
+        }
+        let Some(f16) = self.f16_perplexity else {
+            return Err("f16_perplexity missing on non-skipped report".into());
+        };
+        let Some(dwq) = self.dwq_perplexity else {
+            return Err("dwq_perplexity missing on non-skipped report".into());
+        };
+        let ratio = dwq / f16;
+        let max_ratio = if self.quant_label.contains("4-6") || self.quant_label.contains("46") {
+            thresholds.ppl_ratio_dwq46
+        } else if self.quant_label.contains("4-8") || self.quant_label.contains("48") {
+            thresholds.ppl_ratio_dwq48
+        } else {
+            // Q4_0 baseline — no PPL threshold in P8, treat as pass.
+            return Ok(());
+        };
+        if ratio > max_ratio {
+            return Err(format!(
+                "{} PPL ratio {:.4} > {:.4} threshold (F16={:.4}, DWQ={:.4})",
+                self.quant_label, ratio, max_ratio, f16, dwq
+            ));
+        }
+        if let Some(kl) = self.median_kl_nats {
+            if kl > thresholds.max_median_kl {
+                return Err(format!(
+                    "median KL {:.4} nats > {:.4} threshold",
+                    kl, thresholds.max_median_kl
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
-/// Substrings that, if present anywhere in a transcript, fail the smoke gate.
-///
-/// Match Decision 16 acceptance: `error|ERROR|panic|assertion|segfault`.  We
-/// intentionally use a small substring list rather than regex to keep the
-/// helper dep-free and obviously-correct.
-const ERROR_INDICATORS: &[&str] = &[
-    "error", "ERROR",  // case-sensitive: `Error:` and `ERROR:` both caught
-    "panic",           // Rust panic
-    "panicked",        // Rust panic-handler line
-    "assertion",       // assertion failure
-    "segfault",        // segmentation fault
-    "Aborted",         // POSIX abort
-    "fatal",           // generic fatal-log marker
-    "FATAL",
-];
+/// Smoke transcript output path — `tests/fixtures/smoke-transcripts/{arch}-{quant}.txt`
+pub fn smoke_transcript_path(
+    fixtures_root: &Path,
+    arch: &str,
+    quant: &str,
+) -> PathBuf {
+    fixtures_root
+        .join("smoke-transcripts")
+        .join(format!("{}-{}.txt", arch, quant))
+}
 
-/// Parse a `llama-cli -n 8 --seed 42 --temp 0 --no-warmup` transcript and
-/// assert it satisfies the smoke gate.
+/// Scan llama-cli stderr for regression patterns per Decision 16 §4.
 ///
-/// The transcript is expected to contain (verbatim from llama-cli output):
-///   * `n_eval = 8` somewhere on a `llama_print_timings` line
-///   * `loaded tensor 0x<HEX>` (or equivalent) — checked loosely as a
-///     `loaded tensor` substring count for now to avoid hex-parse fragility
-///
-/// Returns `Ok(SmokeAssertion)` with the parsed counts on success.
-pub fn assert_smoke_transcript(
-    entry: &ArchEntry,
-    transcript: &str,
-) -> Result<SmokeAssertion, ConformanceError> {
-    // 1. No error indicators.  Skip lines that are clearly llama-cli's own
-    //    metadata about *output* (e.g. "error_rate") — we only flag standalone
-    //    occurrences that look like real errors.  For the conservative cut
-    //    we just check exact substrings; if a future false positive appears
-    //    the indicator list updates.
-    for line in transcript.lines() {
-        let trimmed = line.trim();
-        for needle in ERROR_INDICATORS {
-            if trimmed.contains(needle) {
-                return Err(ConformanceError::ErrorIndicator {
-                    arch: entry.arch.to_string(),
-                    line: trimmed.to_string(),
-                });
+/// Returns `Ok(())` if no pattern matched, `Err(reason)` on match.
+pub fn scan_llama_cli_stderr(stderr: &str) -> Result<(), String> {
+    const PATTERNS: &[&str] = &["error", "ERROR", "panic", "assertion", "segfault"];
+    for line in stderr.lines() {
+        for pat in PATTERNS {
+            if line.contains(pat) {
+                return Err(format!(
+                    "llama-cli stderr matched regression pattern {:?}: {}",
+                    pat, line
+                ));
             }
         }
     }
-
-    // 2. Token count.  Look for "n_eval = N" on a llama_print_timings line.
-    let tokens_generated = parse_token_count(transcript).ok_or_else(|| {
-        ConformanceError::NoTokenCount {
-            arch: entry.arch.to_string(),
-        }
-    })?;
-    if tokens_generated != 8 {
-        return Err(ConformanceError::WrongTokenCount {
-            arch: entry.arch.to_string(),
-            actual: tokens_generated,
-        });
-    }
-
-    // 3. Tensor count sanity.  llama-cli prints "loaded tensor" lines per
-    //    tensor; we count occurrences and require at least the catalog's
-    //    pattern count (a real model has many more — patterns × layers ×
-    //    experts — but this floor protects against a stripped GGUF.)
-    let tensors_loaded = count_loaded_tensors(transcript);
-    let expected_min = entry.tensor_catalog.pattern_count() as u64;
-    if tensors_loaded < expected_min {
-        return Err(ConformanceError::InsufficientTensors {
-            arch: entry.arch.to_string(),
-            loaded: tensors_loaded,
-            expected_min,
-        });
-    }
-
-    Ok(SmokeAssertion {
-        arch: entry.arch.to_string(),
-        tokens_generated,
-        tensors_loaded,
-    })
+    Ok(())
 }
 
-fn parse_token_count(transcript: &str) -> Option<u32> {
-    // llama-cli format: "llama_print_timings:        eval time = ... ( n_eval = 8 ...)"
-    // We grep for "n_eval" anywhere and parse the integer after the next "=".
-    for line in transcript.lines() {
-        if let Some(idx) = line.find("n_eval") {
-            let rest = &line[idx + "n_eval".len()..];
-            // Skip optional whitespace and an "=" sign.
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
-            // Take the leading digits.
-            let mut chars = rest.chars();
-            let mut n = 0u32;
-            let mut any = false;
-            while let Some(c) = chars.next() {
-                if let Some(d) = c.to_digit(10) {
-                    n = n.saturating_mul(10).saturating_add(d);
-                    any = true;
-                } else {
-                    break;
+/// Extract `n_eval` (number of generated tokens) from llama-cli's timing
+/// block. Returns `None` if no recognised line is present.
+///
+/// Accepts two formats:
+/// 1. **Real llama-cli** (`llama_print_timings:        eval time =
+///    XX.XX ms /     N runs ...`). Distinguished from `prompt eval time`
+///    by skipping lines containing `prompt`.
+/// 2. **Synthetic test fixture** (`n_eval = N`) — used by the mock
+///    llama-cli stub in tests/smoke_conformance.rs to keep the harness
+///    CI-safe. Scanning the older format last preserves precedence
+///    when both happen to appear.
+pub fn extract_n_eval(stderr: &str) -> Option<u32> {
+    // Real format: `eval time = X ms / N runs` (NOT `prompt eval time`).
+    for line in stderr.lines() {
+        if line.contains("prompt eval time") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("eval time =") {
+            // Find the `/ N runs` token after the time.
+            if let Some((_, after_slash)) = rest.split_once('/') {
+                let num: String = after_slash
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = num.parse() {
+                    return Some(n);
                 }
             }
-            if any {
-                return Some(n);
-            }
+        }
+    }
+    // Synthetic-fixture format: `n_eval = N` (mock llama-cli).
+    for line in stderr.lines() {
+        if let Some(rest) = line.split_once("n_eval = ") {
+            let num: String = rest
+                .1
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            return num.parse().ok();
         }
     }
     None
 }
 
-fn count_loaded_tensors(transcript: &str) -> u64 {
-    let mut n = 0u64;
-    for line in transcript.lines() {
-        // Either "loaded tensor" (newer llama.cpp) or "load_tensors:" lines
-        // count toward the tensor floor.  We accept both because llama.cpp's
-        // log format varies across builds — we care about presence, not
-        // exact phrasing.
-        if line.contains("loaded tensor") || line.contains("load_tensors:") {
-            n += 1;
+/// Extract loaded-tensor count from llama-cli stderr.
+///
+/// Accepts two formats:
+/// 1. **Real llama-cli**:
+///    `llama_model_loader: loaded meta data with N key-value pairs
+///    and X tensors from ...` — see `/opt/llama.cpp/src/llama-model-
+///    loader.cpp:704`.
+/// 2. **Synthetic test fixture**: `llama_model_load: loaded tensor 0xN`
+///    (decimal or hex) — emitted by the mock stub in
+///    tests/smoke_conformance.rs.
+pub fn extract_loaded_tensor_count(stderr: &str) -> Option<u64> {
+    // Real format: `... and X tensors from ...`.
+    for line in stderr.lines() {
+        if !line.contains("loaded meta data") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once(" and ") {
+            let num: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = num.parse() {
+                return Some(n);
+            }
         }
     }
-    n
+    // Synthetic-fixture format: `loaded tensor 0xN` (decimal or hex).
+    for line in stderr.lines() {
+        if let Some(rest) = line.split_once("loaded tensor ") {
+            let token = rest.1.split_whitespace().next()?;
+            if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+                return u64::from_str_radix(hex, 16).ok();
+            }
+            return token.parse().ok();
+        }
+    }
+    None
+}
+
+/// Assert a smoke transcript against a catalog.
+///
+/// Given a model's concrete parameters, verify (a) the number of
+/// generated tokens is exactly `expected_n_gen`, (b) no regression
+/// pattern in stderr, (c) the loaded-tensor count matches the
+/// catalog expansion.
+pub fn assert_smoke_transcript(
+    entry: &ArchEntry,
+    exp: CatalogExpansion,
+    stderr: &str,
+    expected_n_gen: u32,
+) -> Result<(), String> {
+    scan_llama_cli_stderr(stderr)?;
+    let n_eval = extract_n_eval(stderr).ok_or(
+        "missing `eval time =` (real llama-cli) or `n_eval =` (mock) line in stderr",
+    )?;
+    if n_eval != expected_n_gen {
+        return Err(format!(
+            "generated tokens: expected {}, got {}",
+            expected_n_gen, n_eval
+        ));
+    }
+    let expected = entry.expected_tensor_count(exp);
+    let Some(actual) = extract_loaded_tensor_count(stderr) else {
+        return Err(
+            "missing `loaded meta data with N tensors` (real llama-cli) or \
+             `loaded tensor 0xN` (mock) line in stderr"
+                .into(),
+        );
+    };
+    if actual != expected {
+        return Err(format!(
+            "{}: loaded {} tensors, catalog expects {} (arch={}, num_layers={}, experts={}, mtp={})",
+            entry.arch,
+            actual,
+            expected,
+            entry.arch,
+            exp.num_hidden_layers,
+            exp.num_experts,
+            exp.mtp_num_hidden_layers
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::Registry;
+    use crate::arch::entries::qwen35moe;
 
-    fn entry(name: &str) -> &'static ArchEntry {
-        Registry::global().get(name).expect("entry registered")
+    #[test]
+    fn scan_stderr_passes_clean_output() {
+        let s = "llama_model_load: loaded tensor 0x2ff\n\
+                 llama_print_timings: n_eval = 8\n";
+        scan_llama_cli_stderr(s).expect("no regression patterns");
     }
 
-    fn good_transcript() -> String {
-        // Minimal synthetic transcript that satisfies the gate for qwen35moe
-        // (catalog pattern count is small; we add many `loaded tensor` lines).
-        let mut s = String::new();
-        s.push_str("loading qwen3.5-moe\n");
-        for i in 0..200 {
-            s.push_str(&format!("loaded tensor 0x{:x}: blk.{}.attn_q.weight\n", i, i % 40));
+    #[test]
+    fn scan_stderr_flags_panic_line() {
+        let s = "some line\npanic: boom\nmore\n";
+        let err = scan_llama_cli_stderr(s).unwrap_err();
+        assert!(err.contains("panic"));
+    }
+
+    #[test]
+    fn scan_stderr_flags_assertion_line() {
+        let s = "assertion failed: nope\n";
+        let err = scan_llama_cli_stderr(s).unwrap_err();
+        assert!(err.contains("assertion"));
+    }
+
+    #[test]
+    fn extract_n_eval_reads_timings_block() {
+        let s = "llama_print_timings: n_eval = 8 runs\n";
+        assert_eq!(extract_n_eval(s), Some(8));
+    }
+
+    #[test]
+    fn extract_loaded_tensor_count_parses_hex() {
+        let s = "llama_model_load: loaded tensor 0x2ff\n";
+        assert_eq!(extract_loaded_tensor_count(s), Some(0x2ff));
+    }
+
+    #[test]
+    fn extract_loaded_tensor_count_parses_decimal() {
+        let s = "llama_model_load: loaded tensor 767\n";
+        assert_eq!(extract_loaded_tensor_count(s), Some(767));
+    }
+
+    #[test]
+    fn assert_smoke_transcript_accepts_matching_count() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        // qwen35moe expected: 737 tensors at these params (0x2e1).
+        let stderr = "llama_model_load: loaded tensor 0x2e1\n\
+                      llama_print_timings: n_eval = 8 runs\n";
+        assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).expect("pass");
+    }
+
+    #[test]
+    fn assert_smoke_transcript_rejects_wrong_tensor_count() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        // Off by one — 736 when catalog expects 737 (0x2e0 vs 0x2e1).
+        let stderr = "llama_model_load: loaded tensor 0x2e0\n\
+                      llama_print_timings: n_eval = 8 runs\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(err.contains("737"), "err = {}", err);
+        assert!(err.contains("736"), "err = {}", err);
+    }
+
+    #[test]
+    fn assert_smoke_transcript_rejects_wrong_n_gen() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        let stderr = "llama_model_load: loaded tensor 0x2ff\n\
+                      llama_print_timings: n_eval = 4 runs\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(err.contains("expected 8"));
+    }
+
+    /// Missing `n_eval` line — `extract_n_eval` returns None and the
+    /// validator surfaces the actionable "missing n_eval" error.
+    /// Defends against an upstream llama-cli format change that drops
+    /// the timings block, which would silently pass an old smoke
+    /// transcript by reading nothing as "okay".
+    #[test]
+    fn assert_smoke_transcript_rejects_missing_n_eval_line() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        let stderr = "llama_model_load: loaded tensor 0x2e1\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(
+            err.contains("n_eval"),
+            "missing-n_eval error must name the line, got: {err}"
+        );
+    }
+
+    /// Real llama-cli emits `eval time = X ms / N runs` for generated
+    /// tokens (see /opt/llama.cpp docs/multimodal/MobileVLM.md:99). The
+    /// parser must accept this format, NOT just the synthetic
+    /// `n_eval = N` form the mock emits. Without this, P8's "real-model
+    /// close" is impossible — the parser would silently fail to find
+    /// n_eval and return None, falling through to a "missing n_eval"
+    /// error against perfectly valid llama-cli stderr.
+    #[test]
+    fn extract_n_eval_parses_real_llama_cli_format() {
+        let s = "llama_print_timings:      sample time =       1.24 ms /     6 runs   (    0.21 ms per token)\n\
+                 llama_print_timings: prompt eval time =     109.91 ms /     7 tokens (   15.70 ms per token)\n\
+                 llama_print_timings:        eval time =      58.90 ms /     8 runs   (    8.41 ms per token)\n\
+                 llama_print_timings:       total time =     169.31 ms /    14 tokens\n";
+        assert_eq!(extract_n_eval(s), Some(8), "must skip `prompt eval time` and pick `eval time`");
+    }
+
+    /// Real llama-cli's tensor count line:
+    /// `llama_model_loader: loaded meta data with K key-value pairs and N tensors from ...`.
+    /// (`/opt/llama.cpp/src/llama-model-loader.cpp:704`)
+    #[test]
+    fn extract_loaded_tensor_count_parses_real_llama_cli_format() {
+        let s = "llama_model_loader: loaded meta data with 38 key-value pairs and 737 tensors from \
+                 /tmp/qwen35moe.gguf (version GGUF V3 (latest))\n";
+        assert_eq!(extract_loaded_tensor_count(s), Some(737));
+    }
+
+    /// Real llama-cli format must not be tripped by `prompt eval time`'s
+    /// `N tokens` count. Belt-and-braces: `extract_n_eval` already skips
+    /// `prompt eval time` lines explicitly, but if the implementation
+    /// regressed to "first eval-time match wins", this test would fire.
+    #[test]
+    fn extract_n_eval_rejects_prompt_eval_time_token_count() {
+        let s = "llama_print_timings: prompt eval time =     109.91 ms /     7 tokens (...)\n\
+                 llama_print_timings:        eval time =      58.90 ms /     8 runs (...)\n";
+        assert_eq!(
+            extract_n_eval(s),
+            Some(8),
+            "must NOT return 7 (prompt tokens); 8 (eval/generated runs) is correct"
+        );
+    }
+
+    /// Missing `loaded tensor` line — `extract_loaded_tensor_count`
+    /// returns None and the validator surfaces "missing `loaded tensor`".
+    /// Defends against an upstream llama-cli format change that drops
+    /// the model-load summary, which would silently pass.
+    #[test]
+    fn assert_smoke_transcript_rejects_missing_loaded_tensor_line() {
+        let exp = CatalogExpansion {
+            num_hidden_layers: 40,
+            num_full_attention_layers: 10,
+            num_linear_attention_layers: 30,
+            num_experts: 256,
+            has_shared_expert: true,
+            mtp_num_hidden_layers: 1,
+        };
+        let stderr = "llama_print_timings: n_eval = 8 runs\n";
+        let err =
+            assert_smoke_transcript(&qwen35moe::ENTRY, exp, stderr, 8).unwrap_err();
+        assert!(
+            err.contains("loaded tensor"),
+            "missing-loaded-tensor error must name the line, got: {err}"
+        );
+    }
+
+    #[test]
+    fn quality_report_q4_0_passes_without_thresholds() {
+        let report = QualityReport {
+            arch: "qwen35",
+            quant_label: "q4_0".to_string(),
+            f16_perplexity: Some(10.0),
+            dwq_perplexity: Some(100.0), // Any ratio — no threshold for q4_0 in P8.
+            median_kl_nats: None,
+            skipped_reason: None,
+        };
+        report
+            .check(QualityThresholds::ADR_012_DEFAULT)
+            .expect("q4_0 has no PPL gate in P8");
+    }
+
+    #[test]
+    fn quality_report_dwq46_enforces_110_percent_bound() {
+        let under = QualityReport {
+            arch: "qwen35",
+            quant_label: "dwq46".to_string(),
+            f16_perplexity: Some(10.0),
+            dwq_perplexity: Some(10.9),
+            median_kl_nats: Some(0.01),
+            skipped_reason: None,
+        };
+        under
+            .check(QualityThresholds::ADR_012_DEFAULT)
+            .expect("10.9/10.0 = 1.09 < 1.10");
+
+        let over = QualityReport {
+            arch: "qwen35",
+            quant_label: "dwq46".to_string(),
+            f16_perplexity: Some(10.0),
+            dwq_perplexity: Some(11.5),
+            median_kl_nats: Some(0.01),
+            skipped_reason: None,
+        };
+        let err = over.check(QualityThresholds::ADR_012_DEFAULT).unwrap_err();
+        assert!(err.contains("1.1500") || err.contains("PPL ratio"));
+    }
+
+    #[test]
+    fn quality_report_skipped_passes() {
+        let r = QualityReport {
+            arch: "qwen35",
+            quant_label: "dwq48".to_string(),
+            f16_perplexity: None,
+            dwq_perplexity: None,
+            median_kl_nats: None,
+            skipped_reason: Some("P9 not yet shipped".into()),
+        };
+        r.check(QualityThresholds::ADR_012_DEFAULT)
+            .expect("skipped report passes");
+    }
+
+    #[test]
+    fn smoke_transcript_path_is_stable() {
+        let root = PathBuf::from("tests/fixtures");
+        let p = smoke_transcript_path(&root, "qwen35", "q4_0");
+        assert_eq!(
+            p,
+            PathBuf::from("tests/fixtures/smoke-transcripts/qwen35-q4_0.txt")
+        );
+    }
+
+    /// Decision 16 AC — "exit with the distinct non-zero code listed
+    /// above (2/3/4/5/6)". Exit codes are the user's debugging handle
+    /// when a preflight fails; two constants colliding on the same
+    /// integer would silently conflate two different prerequisites.
+    /// Load-bearing guard as future ADRs register new arches that may
+    /// need new exit codes (Decision 20 §extensibility).
+    #[test]
+    fn exit_codes_are_all_distinct() {
+        let codes: Vec<(&str, u8)> = vec![
+            ("EXIT_OK", EXIT_OK),
+            ("EXIT_HF_TOKEN_MISSING", EXIT_HF_TOKEN_MISSING),
+            ("EXIT_INSUFFICIENT_DISK", EXIT_INSUFFICIENT_DISK),
+            ("EXIT_LLAMA_CLI_MISSING", EXIT_LLAMA_CLI_MISSING),
+            ("EXIT_HF2Q_BINARY_NOT_RELEASE", EXIT_HF2Q_BINARY_NOT_RELEASE),
+            ("EXIT_HF_REPO_UNRESOLVABLE", EXIT_HF_REPO_UNRESOLVABLE),
+            ("EXIT_UNKNOWN_ARCH", EXIT_UNKNOWN_ARCH),
+            ("EXIT_SMOKE_ASSERTION_FAILED", EXIT_SMOKE_ASSERTION_FAILED),
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(
+                    codes[i].1, codes[j].1,
+                    "exit code collision: {} and {} both = {}",
+                    codes[i].0, codes[j].0, codes[i].1
+                );
+            }
         }
-        s.push_str("llama_print_timings: prompt eval time = 100 ms\n");
-        s.push_str("llama_print_timings:        eval time = 50 ms / 8 runs ( n_eval = 8 )\n");
-        s
-    }
-
-    #[test]
-    fn good_transcript_passes() {
-        let assertion = assert_smoke_transcript(entry("qwen35moe"), &good_transcript()).unwrap();
-        assert_eq!(assertion.arch, "qwen35moe");
-        assert_eq!(assertion.tokens_generated, 8);
-        assert!(assertion.tensors_loaded >= entry("qwen35moe").tensor_catalog.pattern_count() as u64);
-    }
-
-    #[test]
-    fn missing_n_eval_fails() {
-        let bad = "loaded tensor 0x0\n".to_string();
-        let err = assert_smoke_transcript(entry("qwen35"), &bad).unwrap_err();
-        assert!(matches!(err, ConformanceError::NoTokenCount { .. }));
-    }
-
-    #[test]
-    fn wrong_token_count_fails() {
-        let mut bad = String::new();
-        for i in 0..200 {
-            bad.push_str(&format!("loaded tensor 0x{:x}\n", i));
+        // Decision 16 §AC also implies all non-zero codes are non-zero —
+        // EXIT_OK is the only zero; everything else is a real failure.
+        for (name, c) in codes.iter().filter(|(n, _)| *n != "EXIT_OK") {
+            assert_ne!(*c, 0, "{name} must be non-zero (it signals failure)");
         }
-        bad.push_str("llama_print_timings: eval time = 50 ms ( n_eval = 16 )\n");
-        let err = assert_smoke_transcript(entry("qwen35"), &bad).unwrap_err();
-        match err {
-            ConformanceError::WrongTokenCount { actual, .. } => assert_eq!(actual, 16),
-            other => panic!("unexpected err: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn error_indicator_in_transcript_fails() {
-        let mut bad = good_transcript();
-        bad.push_str("ERROR: tensor mismatch\n");
-        let err = assert_smoke_transcript(entry("qwen35"), &bad).unwrap_err();
-        assert!(matches!(err, ConformanceError::ErrorIndicator { .. }));
-    }
-
-    #[test]
-    fn insufficient_tensors_fails() {
-        // Only 2 loaded-tensor lines, far below the catalog floor.
-        let bad = "loaded tensor 0x0\nloaded tensor 0x1\n\
-                   llama_print_timings: ( n_eval = 8 )\n";
-        let err = assert_smoke_transcript(entry("qwen35"), bad).unwrap_err();
-        assert!(matches!(err, ConformanceError::InsufficientTensors { .. }));
-    }
-
-    #[test]
-    fn parse_token_count_handles_variations() {
-        assert_eq!(parse_token_count("foo n_eval = 8 bar"), Some(8));
-        assert_eq!(parse_token_count("n_eval=12,"), Some(12));
-        assert_eq!(parse_token_count("(n_eval = 256)"), Some(256));
-        assert_eq!(parse_token_count("no count here"), None);
     }
 }
