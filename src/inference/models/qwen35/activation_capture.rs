@@ -7,11 +7,10 @@
 //!
 //! # Why a trait, not a concrete method
 //!
-//! ADR-012 needs to run calibration while ADR-013's end-to-end forward
-//! pass is still in flight. The trait lets ADR-012 wire up against a
-//! `Box<dyn ActivationCapture>` today; hf2q's real implementation on
-//! `Qwen35Model` lands after P11 (end-to-end wire-up) without changing
-//! the ADR-012 side.
+//! ADR-012 wires DWQ calibration against `Box<dyn ActivationCapture>`;
+//! hf2q's real implementation lives in [`super::activation_capture_real`]
+//! (`impl ActivationCapture for Qwen35Model` plus the `RealActivationCapture`
+//! load-from-GGUF wrapper).
 //!
 //! # Mock implementation
 //!
@@ -26,7 +25,7 @@
 //!
 //! * Trait defined in hf2q before ADR-012 P6 starts wiring. ✓
 //! * Mock impl exists for ADR-012-side tests. ✓ (MockActivationCapture)
-//! * Real impl on Qwen35Model — **P11 follow-up** (requires working forward).
+//! * Real impl on Qwen35Model. ✓ (see [`super::activation_capture_real`])
 //! * No dependency on end-to-end inference at merge time. ✓
 
 use anyhow::Result;

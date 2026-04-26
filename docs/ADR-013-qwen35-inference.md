@@ -762,6 +762,17 @@ oracles used by P9b.  See ffn.rs.
 
 **Estimated LOC:** ~250.
 
+#### P12.a COMPLETE — trait + mock landed at ADR-013 close (commit `c1b5a30`, 2026-04-25)
+`activation_capture.rs` defines the `ActivationCapture` trait and `LayerActivations` shape, plus `MockActivationCapture` for ADR-012-side calibration tests. Real impl on `Qwen35Model` was deferred at the close.
+
+#### P12.b COMPLETE — real impl on `Qwen35Model` (CPU path, 2026-04-25)
+`src/inference/models/qwen35/activation_capture_real.rs` ports the real `impl ActivationCapture for Qwen35Model` from the ADR-012 P9 worktree branch (`28df83c`) into main. Mirrors `forward_cpu`'s loop body so captured residual streams are byte-identical to a forward call's intermediate state. Variant coverage:
+- **Dense Qwen3.5** (`Qwen35FfnWeights::Dense`): full CPU capture works on F32-loaded weights.
+- **MoE Qwen3.5 unquantized** (`Qwen35FfnWeights::Moe`): F32 path works.
+- **MoE Qwen3.5 GGUF-loaded** (`Qwen35FfnWeights::MoeQ`): returns typed `RealActivationCaptureError::ForwardPass` per the no-fallback mantra rather than F32-expanding 256 experts (~128 GB OOM). GPU-backed capture for `MoeQ` is the explicit follow-up; conversion-side guard already enforces this via `requires_activation_capture()` in `quantize::dwq`.
+
+Tests: 9 new tests in `activation_capture_real::tests` — all passing (`dense_capture_returns_correct_shape`, `dense_layer_input_zero_equals_post_embedding`, `moe_unquantized_capture_returns_correct_shape`, `moe_quantized_returns_typed_forward_pass_error`, `empty_tokens_returns_error`, `real_activation_capture_wrapper_delegates_to_model`, `not_ready_shim_returns_not_ready_error`, `error_display_for_load_includes_path`, `forward_pass_error_carries_layer_and_reason`). Stale "P11 follow-up" notes in `activation_capture.rs` updated to point at the real impl.
+
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 
 **Scope:** Decisions 17, 18.
