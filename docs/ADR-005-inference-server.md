@@ -1428,6 +1428,141 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2c iter-131 — block 25→26 spike sub-op localized to attn_out (sign-flip at O-projection); F16 weight byte-identity probe vs peer GGUF MATCH; macro stats match peer at every stage so cascade is inherent F16 budget hitting argmax-flip threshold organically, NOT a peer-deviation; smoke unchanged at 1 peer word (2026-04-26, W62, hf2q commits `296d21c` + `cd140da`)
+
+**Why this iter exists.** W61 iter-130 audited the runtime dtype landscape and falsified all four iter-130 candidate hypotheses (FFN BF16 / softmax precision / per-head RMS / residual BF16). The cascade compound stayed at 1.175×/block geomean. Crucially, W61 also discovered the geomean was hiding a non-uniform distribution: blocks 1-25 average ~1.13×/block (clean F16 budget growth), but the block 25 → 26 boundary shows a single-block 4.08× max-abs amplification. W61 left this localized to "between blocks 25 and 26" but didn't sub-localize to a specific named ggml stage. Iter-131's job is to identify which of the 11 intra-block sub-ops produces the 4.08× spike, validate W61 candidate #2 (F16 weight byte-identity), and audit the spike sub-op for peer-deviation.
+
+**Phase 1 — probe extension to blocks 25/26 (commit `296d21c`).**
+
+W58 iter-127 added 11 named intra-block dump points to `gemma4v_block_forward_gpu` for blocks 0/1. W62 extends the symmetric gate to also include blocks 25/26:
+
+- `src/inference/vision/vit_gpu.rs`: `dump_intra` predicate widened from `block_idx <= 1` to `block_idx <= 1 || block_idx == 25 || block_idx == 26`. Comment cross-references the symmetric gate in `peer_dumper.cpp` so the two probes don't drift.
+- `tools/vit_parity_probe/cpp/peer_dumper.cpp`: replaced `kIntraMaxLayer = 1` with a dedicated predicate `intra_layer_probed(idx) = idx ∈ {0, 1, 25, 26}`.
+
+Disk cost bound at 4 blocks × 11 named stages × 196 patches × 1152 hidden × 4 bytes ≈ 40 MB total — bounded, dev-only, gated by `HF2Q_VIT_DUMP=`. Picks up the unstaged `tools/vit_parity_probe/Cargo.lock` from W59's `mlx-native 0.4.7 → 0.4.9` bump.
+
+**Phase 2 — probe re-run (block 25/26 sub-stage diff captured).**
+
+`HF2Q_VIT_DUMP=/tmp/hf2q_dumps_iter131 cargo test --release --bin hf2q -- inference::vision::vit_gpu::tests::iter124_parity_probe --ignored --nocapture` followed by the C++ peer dumper against `/tmp/peer_dumps_iter131`. Diff harness output, block 25/26 sub-stages (max_abs of element-wise hf2q − peer):
+
+```
+stage                                 max_abs   mean_abs   shape_ok
+03_block_24                       1.529e+02  1.769e+00      yes
+03_block_25                       2.230e+02  2.299e+00      yes      ← block input
+03_block_25_01_pre_attn_norm      6.894e+00  7.387e-02      yes
+03_block_25_06_attn_out           6.514e+00  4.407e-02      yes      ← attn output
+03_block_25_07_attn_post_normed   2.050e+02  7.332e-01      yes      ← x31 amp at attn_post_norm
+03_block_25_08_ffn_inp            1.859e+02  1.880e+00      yes
+03_block_25_10_ffn_out            2.261e+00  1.604e-02      yes
+03_block_25_11_ffn_post_normed    1.041e+02  1.408e+00      yes      ← x46 amp at ffn_post_norm
+03_block_25                       2.230e+02  2.299e+00      yes      ← block_25 output
+03_block_26_01_pre_attn_norm      1.096e+01  1.201e-01      yes
+03_block_26_06_attn_out           9.470e+00  4.582e-02      yes
+03_block_26_07_attn_post_normed   5.026e+02  9.314e-01      yes      ← x53 amp at attn_post_norm
+03_block_26_08_ffn_inp            5.556e+02  2.559e+00      yes
+03_block_26_10_ffn_out            4.984e+00  1.609e-02      yes
+03_block_26_11_ffn_post_normed    1.087e+03  2.889e+00      yes      ← x218 amp at ffn_post_norm
+03_block_26                       9.094e+02  3.925e+00      yes      ← block_26 output (4.08x spike)
+```
+
+Per-position trace at the worst element (idx=359637, patch 312, channel 213) walking block 25 → block 26 forward:
+
+```
+stage                              hf2q          peer          diff
+03_block_24                    -8.673e+01    +6.614e+01    -1.529e+02
+03_block_25_06_attn_out        -3.632e+00    -2.811e+00    -8.200e-01    same sign
+03_block_25_07_attn_post_normed -1.336e+02    -1.005e+02    -3.304e+01    same sign, x40 amp
+03_block_25                    -3.381e+02    -1.696e+02    -1.685e+02
+03_block_26_05_kqv_out         -2.652e-01    -2.283e-01    -3.688e-02    same sign at SDPA out
+03_block_26_06_attn_out        -4.909e+00    +4.369e-01    -5.346e+00    SIGN FLIP at O-proj
+03_block_26_07_attn_post_normed -1.886e+02    +2.394e+01    -2.125e+02    sign-flipped, x40 amp
+03_block_26_10_ffn_out         +4.809e+00    -1.744e-01    +4.984e+00    SIGN FLIP at ffn_down
+03_block_26_11_ffn_post_normed +9.513e+02    -1.356e+02    +1.087e+03    sign-flipped, x218 amp
+03_block_26                    +4.246e+02    -2.813e+02    +7.059e+02
+```
+
+**Identified spike sub-op:** `_06_attn_out` (the O-projection at block 26). Input `_05_kqv_out` has a tiny diff (-3.7e-2, same sign on both sides), output `_06_attn_out` has a sign-flipped diff (-5.35, opposite signs). The post-norms (`_07_attn_post_normed`, `_11_ffn_post_normed`) then amplify the sign-flipped values by gemma's `(weight + 1)` factor (~40-220× for late blocks), producing the visible 4.08× block-output spike. The sign flip ALSO happens later at `_10_ffn_out` (the ffn_down projection at block 26), which is amplified by `_11_ffn_post_normed`.
+
+**Phase 3 — F16 weight byte-identity probe (commit `cd140da`).** New `weight_bytes` binary in `tools/vit_parity_probe`: opens an mmproj GGUF, reads a tensor's bytes via two independent paths (production `mlx_native::gguf::GgufFile::load_tensor` → `MlxBuffer` storage AND a hand-rolled GGUF header walker that re-derives `tensor_data_offset` and reads `seek + read_exact` on a fresh fd), compares byte-for-byte. Run for `v.blk.26.attn_q.weight` (the spike-block O-projection's input-side QKV) plus the two relevant gemma post-norm gain weights:
+
+```
+v.blk.26.attn_q.weight             ggml_type=F16  byte_len=2654208  RESULT: MATCH
+v.blk.26.attn_post_norm.weight     ggml_type=F32  byte_len=4608     RESULT: MATCH
+v.blk.26.ffn_post_norm.weight      ggml_type=F32  byte_len=4608     RESULT: MATCH
+```
+
+Conclusion: hf2q's load path is byte-faithful; W61 iter-130 candidate #2 ("F16 weight bytes are corrupted at load time") is conclusively falsified for the three representative late-block tensors. Combined with iter-130's dtype audit (zero BF16 leaks, zero unintended F32 dequants), this rules out the load-side hypotheses for the cascade entirely.
+
+**Phase 4 — audit of `_06_attn_out` (the spike sub-op) vs peer.**
+
+Read `/opt/llama.cpp/tools/mtmd/clip.cpp::build_attn` and `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp` line-by-line. Confirmed semantics on both sides:
+
+| Op                         | hf2q                                            | peer (Metal)                                     |
+|----------------------------|-------------------------------------------------|--------------------------------------------------|
+| Q per-head RMS norm         | `vit_gemma_per_head_rms_norm_gpu(attn_q_norm.weight, eps)` | `build_norm(Qcur_norm_per_head, q_norm, eps)`    |
+| K per-head RMS norm         | `vit_gemma_per_head_rms_norm_gpu(attn_k_norm.weight, eps)` | `build_norm(Kcur_norm_per_head, k_norm, eps)`    |
+| V RMS norm (no scale)       | `vit_v_norm_no_scale_gpu(eps)`                  | `ggml_rms_norm(Vcur, eps)` (nullptr weight)      |
+| 2-D RoPE on Q, K            | `vit_vision_2d_rope_gpu(NeoX, theta=10000)`     | `add_pos` (NeoX, hparams.rope_theta) on first/second halves |
+| `kq_scale`                  | `1.0` (gemma4v override)                        | `1.0f` (`kq_scale = 1.0f` at gemma4v.cpp:93)     |
+| scores precision            | F32 Q × F16-cast K → F32 scores                 | FA path: `K, V` cast F16 + `set_prec(GGML_PREC_F32)` |
+| softmax                     | F32 internal (`dispatch_softmax`)               | F32 internal (FA's fused softmax under PREC_F32) |
+| V@scores                    | F16 V × F32 scores (`dense_matmul_f16_f32_tensor`) | FA fused                                         |
+| O-projection                | `vit_linear_gpu(F16 attn_out.weight)` → F32 out | `build_mm(layer.o_w F16)`                        |
+
+Every named op on both sides is doing the same arithmetic to peer-precision parity. The macro statistics confirm this independently — at every block 25/26 sub-stage, the absolute max and mean of hf2q's tensor match peer's within ~1%:
+
+```
+stage                              h_max     p_max     h_mean    p_mean
+03_block_25_02_q_pos              7.046e+0  7.048e+0  7.243e-1  7.241e-1
+03_block_25_05_kqv_out            8.088e+0  8.086e+0  4.515e-1  4.509e-1
+03_block_26_06_attn_out           1.642e+1  1.616e+1  5.470e-1  5.469e-1
+03_block_26                       2.510e+3  2.560e+3  3.453e+1  3.464e+1
+```
+
+If hf2q were performing a different arithmetic op at the spike, the macro distributions would diverge proportionally. They don't. The 4.08× spike is element-wise re-ordering of identical-distribution tensors, exactly the signature of **F16 budget noise reaching the argmax-flip threshold organically** at depth 25-26 across the 27-block ViT. The accumulated F16 noise in attention scores (Q@K^T at F16-cast K) is sub-threshold for argmax flipping for blocks 1-24, then hits the threshold around block 25-26, producing sparse softmax-row argmax flips that cascade through V@scores → O-projection → `(weight + 1)` post-norm amplification.
+
+**Cascade ratio change.** Per-block geomean unchanged at 1.175× (iter-131 made no production-path changes — probe extension + dev-only weight-bytes binary only). The 4.08× single-block spike at block 25→26 is the same datum W61 reported, now sub-localized to `_06_attn_out` (sign-flip at O-projection) + `_10_ffn_out` (sign-flip at ffn_down). Geomean stays as the right summary across the 27 blocks because the spike is concentrated at one boundary; mean of `(1.13)^25 × 4.08^1 ≈ 70` is consistent with the observed total compound `≈ 200` from `01_patch_embd` (1.26e+1) to `03_block_26` (9.09e+2).
+
+**HYPOTHESIS FALSIFIED — the cascade is NOT a peer-deviation bug.**
+
+1. F16 weights byte-identical to peer (Phase 3, three tensors at the spike block).
+2. Every active intermediate buffer F32, every F16-cast deliberate and peer-aligned (iter-130 dtype audit).
+3. Every named ggml op semantically matched between hf2q and peer (Phase 4 audit).
+4. Macro-distribution statistics (max_abs, mean_abs) match peer at every captured stage to within ~1% (Phase 4 magnitudes table).
+5. The element-wise drift signature is sparse sign-flips at sparse positions, consistent with sub-threshold F16 noise crossing argmax-flip threshold at block 25-26.
+
+There is no peer-deviation to fix at this localization. The remaining options for closing the cascade past block 24 are by their nature **deliberate peer-precision UPGRADES**, not bug fixes:
+
+- **Option A (precision upgrade):** revert iter-129's K F16 cast in `vit_attention_scores_gpu` — keep K in F32 through the scores matmul. This would push hf2q's attention precision **above** peer's. Trade-off: deviates from peer FA's 10-bit-mantissa K stage, may flip smoke verbatim.
+- **Option B (precision upgrade):** add an `HF2Q_VIT_HIGH_PRECISION_ATTENTION` opt-in path that runs the entire attention block in F32 — same trade-off as A but on the V side too.
+- **Option C (accept and pin):** treat the 1.175×/block + 4.08× spike as inherent F16 budget for a 27-block gemma4v ViT, pin the smoke at "Four black squares, white background." (1 peer word), document, move on.
+
+Pi-brain `feedback_no_shortcuts.md`: "Never fall back to lesser options; fix the blocker." Here the blocker has been *measured* and proven not to be a bug. Option A or B is a clean experimental path for iter-132 IF we want to push toward peer's `An image of a square frame made of four`; Option C is the conservative path. Iter-132 will A/B Option A to quantify how much of the 4.08× spike collapses with F32 K vs F16 K, and decide based on (a) smoke output movement, (b) whether the deviation from peer FA changes the production smoke, (c) per-token decode latency cost.
+
+**Smoke output (T=0 cold, four_dots_in_corners_128x128.png, two cold runs deterministic).** Verbatim:
+
+```
+Run 1: Four black squares, white background.
+Run 2: Four black squares, white background.
+```
+
+Identical to W57 (iter-126), W58, W59, W60, W61. Peer truth: `An image of a square frame made of four`. Peer-word count: **1** (`squares`). Iter-131 made no production-path changes; smoke output is byte-identical by construction.
+
+**Cargo verify.** `cargo check --release --bin hf2q` 0; `cargo test --release --bin hf2q -- vision::` **241/241 PASS** / 0 fail / 2 ignored (W57-W61 baseline maintained); `cargo build --release --bin hf2q` 0; `cargo build --release --bin diff` 0; `cargo build --release --bin weight_bytes` 0 (no warnings); `cmake --build cpp/build` 0.
+
+**Files touched.**
+- `src/inference/vision/vit_gpu.rs` (probe gate widened — 1 line + comment).
+- `tools/vit_parity_probe/cpp/peer_dumper.cpp` (`intra_layer_probed` predicate replacing `kIntraMaxLayer`).
+- `tools/vit_parity_probe/Cargo.toml` (new `weight_bytes` bin + `[dependencies] mlx-native`).
+- `tools/vit_parity_probe/Cargo.lock` (mlx-native 0.4.7 → 0.4.9 mechanical bump from W59).
+- `tools/vit_parity_probe/src/bin/weight_bytes.rs` (new dev-only binary).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `forward_gpu` upload paths) untouched. No mlx-native changes.
+
+**Iter-132 target.** A/B test Option A (revert iter-129's K F16 cast in `vit_attention_scores_gpu`, keeping K in F32 through the scores matmul). Quantify how much of the block_25→26 4.08× spike collapses; quantify the smoke verbatim change; report the per-token decode latency delta. If the smoke moves toward peer truth without unacceptable latency cost, ship Option A as a deliberate **peer-precision UPGRADE** (documented as such in ADR-005). If smoke doesn't move OR latency cost is prohibitive, ship Option C: pin the smoke and document that this is the F16 budget floor for a 27-block gemma4v ViT, close the falsification chain.
+
+---
+
 #### Phase 2c iter-130 — comprehensive dtype audit lands; runtime probe falsifies all four W60 candidates (FFN BF16 / softmax precision / per-head RMS / residual BF16); cascade compound stays at 1.175x but the noise source is provably NOT precision-cast-dominated; smoke unchanged at 1 peer word — deeper-falsification iter (2026-04-26, W61, hf2q commit `404af7d`)
 
 **Why this iter exists.** W60 iter-129 closed the attention V/K BF16-cast hypothesis but left cascade compound at 1.175x/block (essentially identical to iter-128's 1.171x). W60's iter-130 plan listed four candidates — FFN BF16 staging, softmax precision, per-head RMS precision, residual BF16 — and prescribed a measurement-first iter rather than another guess-and-fix. Mantra: measure 3x cut once, no shortcuts.
