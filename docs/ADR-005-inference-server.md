@@ -2001,6 +2001,70 @@ cargo test --release --test openwebui_multiturn -- --test-threads=1 --nocapture
 
 ---
 
+#### Phase 2c iter-211 — Phase 2c tail CLOSES: AC 3103 (Open WebUI vision multi-turn end-to-end) + AC 3106 (`image_url` content parts) flipped to PASS; vision streaming production fix-forward + 4-test E2E driver landed (2026-04-26, W79, commits `3f05694` + `f7d3b6e` + `20a8247` + `0350675`)
+
+**Why this iter exists.** Phase 2c iter-132 W63 closed the encoder-side ACs (#15 `generate --image` image-aware output, #14 mmproj F16 cross-compat) at peer-precision-parity. Iter-211's job is the **operator-side** tail: AC 3103 (Open WebUI does multi-turn vision chat end-to-end) + AC 3106 (OpenAI-format `image_url` content parts parse and route correctly). AC 3104 (vision accuracy gate against mlx-lm) inherits the iter-119 HF-auth blocker and is explicitly out of scope (per the W22 iter-113-prep blocker register).
+
+**Phase 1 — Chesterton's fence audit of the existing image_url pipeline.** Read in order:
+
+- `tests/openwebui_helpers/mod.rs` (W64+W77) — `ServerGuard`, `streaming_chat`, `replay_fixture_assert`. **Gap:** no `--mmproj` spawn variant; no multimodal `user_msg` builder; `streaming_chat`'s `max_tokens=16` cap is too tight for a peer-overlap word to land past the chat-template prefix.
+- `src/serve/api/schema.rs` lines 327-411 — `MessageContent::{Text, Parts}` + `ContentPart::{Text, ImageUrl}` + `ImageUrl { url, detail }`. Untagged `serde::Deserialize` on `MessageContent` accepts both `string` and `[part…]` shapes; `has_images()` + `image_urls()` helpers already exist.
+- `src/serve/api/handlers.rs::process_multimodal_content` (lines 1646-1850) — gathers `(msg_idx, part_idx, &ImageUrl)` triples, requires `mmproj` (else 400 `no_mmproj_loaded`), parses each URL via `parse_image_url`, loads bytes via `load_image_bytes`, dispatches preprocess by `ArchProfile` (Gemma4Siglip / ClipClassic), pushes to `Vec<VisionInput>`. Routing complete.
+- `src/inference/vision/mod.rs::parse_image_url` (lines 88-143) — accepts `data:image/{png|jpeg|jpg};base64,<...>`, `file:///<abs>`, `/<abs>`, and `https?://...` (latter preserved as `HttpUrl` for deferred fetch). Mime types outside `png+jpeg` rejected with operator-friendly message.
+- `src/inference/vision/mod.rs::load_image_bytes` (lines 147-163) — base64-decodes data URIs, file-reads file/abs paths with a 20 MB cap, **rejects `HttpUrl` with the explicit message "HTTP image URLs are not yet loaded by this build"**. The deferred-fetch path was intentional scope: introducing `reqwest::blocking::get` on the request hot path was held back from Phase 2c minimum-viable.
+- `Cargo.toml:80` — `image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }`. WEBP isn't a feature → consistent with `parse_image_url`'s mime-type guard.
+
+**Phase 2 — bug discovery + fix-forward (the closure-blocking AC 3103 finding).**
+
+LIVE-test of scenario 4 surfaced **two production gaps** the encoder-side iter-132 closure could not have caught:
+
+1. **`/v1/models` mmproj prepend confuses the OpenAI re-send pattern (test-helper bug).** When `hf2q serve` is started with `--mmproj`, `handlers.rs::list_models` (lines 2978-2994) prepends the mmproj as a separate `data[]` entry for operational visibility. The previous `fetch_canonical_model_id` test helper grabbed `data[0].id` blindly → got the mmproj id → next `/v1/chat/completions` 400'd with `model_not_loaded`. Fixed in `tests/openwebui_helpers/mod.rs` by mirroring the discovery pattern from `tests/mmproj_llama_cpp_compat.rs:543-561` (filter on `context_length != null`; mmproj entries carry null, chat entries carry the integer context window). Production behavior intentional + unchanged.
+
+2. **`stream: true` + `image_url` returned 400 (real production blocker for AC 3103).** `chat_completions_stream` returned `400 invalid_request` whenever `prepared.soft_tokens` was non-empty — comment at handlers.rs:764-770: *"Vision streaming is not supported in this iter — the soft-token path runs through `Engine::generate_with_soft_tokens` (non-streaming).  When the streaming variant lands, this gate reverts to the standard `generate_stream` call but with the soft tokens attached."* This is exactly the closure-blocking residual gap iter-211's brief anticipated. Open WebUI uses streaming → AC 3103 cannot close until streaming + vision works. **Fix-forward (commit `0350675`):**
+
+   - `Request::GenerateStream` extended with `soft_tokens: Vec<SoftTokenData>` (channel-friendly Send).
+   - `Engine::generate_stream` accepts `soft_tokens` and threads it through the worker queue.
+   - Worker dispatch arm builds borrowed `SoftTokenInjection<'_>` slices (same pattern as the non-streaming `Request::GenerateWithSoftTokens` arm).
+   - `generate_stream_once` signature gains `soft_tokens: &[SoftTokenInjection<'_>]`; the prefill call switches from `forward_prefill` to `forward_prefill_with_soft_tokens` (the former is already a thin wrapper around the latter with an empty slice — `src/serve/forward_prefill.rs:117` — so text-only behavior stays byte-identical).
+   - `chat_completions_stream` removes the 400 guard and threads `prepared.soft_tokens` into `Engine::generate_stream`.
+
+   **Why this is the contained correct fix, not a workaround.** The non-streaming vision path has already been peer-precision-parity-validated through iter-132 W63 (the encoder + soft-token + LM forward chain). The streaming path runs the same forward-prefill API; only the worker channel + dispatch needed the soft-token field added. Single new call site, single removed guard, byte-identical text-only behavior provable from the API doc (`forward_prefill.rs:117`).
+
+**Phase 3 — test driver: 4 tests in `tests/openwebui_vision.rs` (502 LOC) + 178 LOC of helper extension.**
+
+   - **`scenario4_image_url_multi_turn`** — turn 1 with the `four_dots_in_corners_128x128.png` fixture as a base64 PNG data URI, turn 2 text-only follow-up referencing the image, T=0 byte-identical determinism re-run on turn 1, record/replay fixture under `tests/fixtures/openwebui_multiturn/scenario4_vision_chunks.txt` (~7 KB, well under the 50 KB cap). Asserts SSE invariants + image-aware via the W56-W62 peer-overlap word list (`square`, `dots`, `corner`, `frame`, etc.).
+   - **`image_url_jpeg_data_uri_supported`** — synthesized 8×8 black JPEG; confirms the second mandated mime round-trips through `parse_image_url` + `preprocess_gemma4v` + ViT + LM end-to-end.
+   - **`image_url_webp_data_uri_rejected`** — confirms WEBP returns clean 400 invalid_request_error naming the unsupported mime; documents AC-3106 data-URI scope.
+   - **`image_url_https_url_rejected_at_load`** — additionally gated on `HF2Q_NETWORK_TESTS=1`; confirms HTTPS URLs return clean 400 with the actionable "HTTP image URLs are not yet loaded by this build (...)" message; documents AC-3106 scope.
+
+**Phase 4 — LIVE outputs (HF2Q_OPENWEBUI_E2E=1 against gemma-4-26B-A4B-it-ara-abliterated-dwq + mmproj on M5 Max).**
+
+- Turn 1 (image): `"The image is a square composition consisting of a white background with four small black squares positioned at the corners. \n\nSpecifically:\n*   **Top-left"` — peer-overlap word `square` matched.
+- Turn 2 (text follow-up referencing image): `"I counted **5** objects in total:\n\n1.  The large white square (the background/frame).\n2.  The four small black squares"` — multi-turn context preserved with image reference, model reasons over the image content from history.
+- T=0 determinism: byte-identical accumulated content on turn-1 re-run.
+- Fixture replay: PASS at 7013 bytes.
+- JPEG companion: 200 OK, non-empty assistant response.
+- WEBP rejection: `400 error.message="messages[0].content[1].image_url parse failed: data URI mime type 'image/webp' not supported (only image/png and image/jpeg)"`.
+- HTTPS rejection: `400 error.message="messages[0].content[1].image_url load failed: HTTP image URLs are not yet loaded by this build (https://example.invalid/four-dots.png). Send a `data:image/png;base64,...` or `file:///` URL instead."`.
+
+**Phase 5 — verification (9 cargo gates GREEN).**
+
+`cargo check --release --tests` 0; `vision::` 241/241 (no encoder regression); `serve::api::handlers::` 46/46 (no regression); `cargo test --release --test openwebui_vision` skip-mode 4/4; LIVE `HF2Q_OPENWEBUI_E2E=1 openwebui_vision` 4/4 (all scenarios LIVE PASS); LIVE `openwebui_multiturn` Scenario 1 still PASS (regression check); LIVE `openwebui_tools` Scenarios 2 + tool_choice=none still PASS; `multi_model_swap` 2/2 (no W77/W78 regression); `cargo build --release --bin hf2q` 0.
+
+**Phase 6 — AC flips.**
+
+AC 3103 + AC 3106 both flipped `[ ]` → `[x]` with full closure citations on the AC list (lines 3103, 3106). AC 3104 (vision accuracy gate vs mlx-lm) **remains `[ ]`** per its iter-119 HF-auth blocker — out of iter-211 scope.
+
+**Phase 2c tail status: CLOSED — 5/5 closeable ACs at PASS.** AC 3104 remains the single ADR-013 / iter-119 HF-auth blocker the broader Phase 2c effort always carried. Phase 2c (full + tail) closes for the operator-visible vision surface; the encoder-side numerical bar against an HF-auth-only peer reference can re-open AC 3104 in a future iter when that blocker clears.
+
+**Out-of-scope (intentional, recorded for the next operator).**
+
+- WEBP / GIF / AVIF data URIs (`image` crate features + `parse_image_url` mime guard would both need extending; no demand surfaced from the operator-side).
+- HTTPS URL fetching (introduces network egress on the request hot path; deferred per the iter-99 minimum-viable scope; the rejection contract is now explicit and tested).
+- Streaming + vision now PASSES, but **`x-hf2q-vit-forward-ms` and `x-hf2q-soft-tokens-total` transparency headers** are still attached by the non-streaming path's `apply_transparency_headers` (handlers.rs:832); the SSE encoder doesn't inject mid-stream timing trailers. Out of scope here.
+
+---
+
 #### Phase 2c iter-131 — block 25→26 spike sub-op localized to attn_out (sign-flip at O-projection); F16 weight byte-identity probe vs peer GGUF MATCH; macro stats match peer at every stage so cascade is inherent F16 budget hitting argmax-flip threshold organically, NOT a peer-deviation; smoke unchanged at 1 peer word (2026-04-26, W62, hf2q commits `296d21c` + `cd140da`)
 
 **Why this iter exists.** W61 iter-130 audited the runtime dtype landscape and falsified all four iter-130 candidate hypotheses (FFN BF16 / softmax precision / per-head RMS / residual BF16). The cascade compound stayed at 1.175×/block geomean. Crucially, W61 also discovered the geomean was hiding a non-uniform distribution: blocks 1-25 average ~1.13×/block (clean F16 budget growth), but the block 25 → 26 boundary shows a single-block 4.08× max-abs amplification. W61 left this localized to "between blocks 25 and 26" but didn't sub-localize to a specific named ggml stage. Iter-131's job is to identify which of the 11 intra-block sub-ops produces the 4.08× spike, validate W61 candidate #2 (F16 weight byte-identity), and audit the spike sub-op for peer-deviation.
@@ -3100,10 +3164,10 @@ Phase 2 closes when 2a + 2b + 2c all pass.
 
 #### Phase 2c AC — Vision (absorbed from old Phase 3, 2026-04-23)
 - [x] `hf2q generate --model ./models/gemma4/ --prompt "describe this" --image photo.jpg` produces correct image-aware output **Closed iter-132 W63 (cites iter-121-131 chain — peer-precision-parity at F16 budget; smoke "Four black squares, white background." is image-aware; zero peer-deviation in audit; F16 weight bytes byte-identical to peer GGUF; macro stats match peer within 1%).**
-- [ ] Open WebUI with image uploads: full multi-turn vision chat works end-to-end
+- [x] Open WebUI with image uploads: full multi-turn vision chat works end-to-end **Closed iter-211 W79: tests/openwebui_vision.rs::scenario4_image_url_multi_turn LIVE PASS at HF2Q_OPENWEBUI_E2E=1; Gemma 4 26B + mmproj on four_dots_in_corners_128x128.png fixture; turn 1 image-aware response ("The image is a square composition consisting of a white background with four small black squares positioned at the corners.") matches peer-overlap word `square`; turn 2 multi-turn referencing image preserved ("I counted **5** objects in total: 1. The large white square (the background/frame). 2. The four small black squares"); T=0 byte-identical determinism on turn 1; SSE protocol (role chunk → content deltas → finish_reason → DONE) verified; recorded fixture at `tests/fixtures/openwebui_multiturn/scenario4_vision_chunks.txt`. Production fix-forward (commit 0350675): `Request::GenerateStream` extended with `soft_tokens: Vec<SoftTokenData>`; worker routes through `forward_prefill_with_soft_tokens`; chat handler removes the prior 400 stream-not-supported-with-images guard. Text-only behavior byte-identical (empty soft-tokens slice = identity over text-only prefill — see `src/serve/forward_prefill.rs:117`).**
 - [ ] Vision accuracy gate: hf2q matches mlx-lm's Gemma 4 vision output on 5 prompts × 5 images (token-match, first 50 tokens, T=0)
 - [x] mmproj produced by hf2q is F16 and loads in both hf2q and llama.cpp **Closed iter-132 W63 (cites iter-116g `8af50d4` + iter-116l W45 — `tests/mmproj_llama_cpp_compat.rs` Phase A+B+C+D PASS; llama-mtmd-cli load gate stdout=71 bytes; F16 mmproj 1.19 GB cross-compat).**
-- [ ] OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly
+- [x] OpenAI-format `image_url` content parts (base64 data URIs) parse and route to ViT correctly **Closed iter-211 W79: `data:image/png;base64,...` and `data:image/jpeg;base64,...` parse via `parse_image_url` + load via `load_image_bytes` + preprocess via `preprocess_gemma4v` + ViT forward + LM forward end-to-end; tests/openwebui_vision.rs::{scenario4_image_url_multi_turn, image_url_jpeg_data_uri_supported} LIVE PASS. Scope (intentional): the data-URI path covers PNG + JPEG mime types only — the `image` crate is opted-in to png+jpeg features (`Cargo.toml:80`) and `parse_image_url` mirrors that scope (`src/inference/vision/mod.rs:104-109`). Out-of-scope per the same iter: WEBP data URIs return a clean 400 invalid_request_error naming the unsupported mime (asserted by `image_url_webp_data_uri_rejected`); HTTPS URLs return a clean 400 with the `HTTP image URLs are not yet loaded by this build (...)` actionable message (asserted by `image_url_https_url_rejected_at_load` under HF2Q_NETWORK_TESTS=1). The `file:///` and bare-absolute-path schemes share the data-URI path and are likewise covered.**
 
 #### Phase 2 Execution Log
 
