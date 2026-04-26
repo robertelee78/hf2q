@@ -980,7 +980,7 @@ pub fn apply_sdpa_with_kv_cache(
         // slot.current_len update below is a CPU-only counter — safe to update
         // before GPU completes; the next read of current_len is on the next token
         // by which time the queue is drained.
-        enc.commit();
+        enc.commit_labeled("layer.full_attn.sdpa_kv");
     } else {
         // Prefill path (seq > 1) or non-standard head_dim:
         // CPU K/V permute is required for the head-major cache layout.
@@ -1177,7 +1177,7 @@ pub fn build_gated_attn_layer(
         // (CPU read) on k_rope/v_flat before submitting any GPU work, so the
         // GPU must have finished writing those buffers before we return.
         if seq_len == 1 && head_dim % 32 == 0 {
-            enc.commit();
+            enc.commit_labeled("layer.full_attn.ops1-4");
         } else {
             enc.commit_and_wait().context("commit ops1-4 prefill")?;
         }
@@ -1226,7 +1226,7 @@ pub fn build_gated_attn_layer(
         // CPU read of the returned buffer, and because prefill throughput is
         // not the hot path.
         if seq_len == 1 {
-            enc.commit();
+            enc.commit_labeled("layer.full_attn.ops6-7");
         } else {
             enc.commit_and_wait().context("commit ops6-7")?;
         }

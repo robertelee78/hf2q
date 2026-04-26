@@ -387,13 +387,16 @@ fn apply_output_head_gpu_greedy(
 
     // ---- Encoder A: output_norm + lm_head → logits_buf ----
     // output_norm is pipelined (commit()) into lm_head via serial queue.
+    // Labeled commits: when MLX_PROFILE_CB=1 is set, each commit_labeled
+    // forces sync + records GPU time under the label.  Otherwise async
+    // commit (zero overhead).  ADR-012 §Optimize / Task #15.
     let mut enc_norm = device.command_encoder().context("enc output_norm greedy")?;
     rms_norm::dispatch_rms_norm(
         &mut enc_norm, registry, device.metal_device(),
         hidden, &head.norm_w, &normed, &norm_params,
         seq_len, hidden_size,
     ).context("dispatch_rms_norm output greedy")?;
-    enc_norm.commit();
+    enc_norm.commit_labeled("output_head.norm");
 
     // Use Q4_0 lm_head for decode: 3.57× less bandwidth vs BF16.
     // Pre-allocated logits_buf avoids ~600KB newBuffer per decode token.
@@ -403,7 +406,7 @@ fn apply_output_head_gpu_greedy(
         &head.lm_head_q4, logits_buf, seq_len, hidden_size, vocab_size,
     ).context("lm_head projection greedy")?;
     // commit() and immediately encode argmax on the same queue.
-    enc_lm.commit();
+    enc_lm.commit_labeled("output_head.lm_head_q4");
 
     // ---- Encoder B: argmax on logits_buf → out_index ----
     let mut enc_argmax = device.command_encoder().context("enc argmax greedy")?;
@@ -411,7 +414,8 @@ fn apply_output_head_gpu_greedy(
         &mut enc_argmax, registry, device.metal_device(),
         &logits_buf, &out_index, &out_value, &argmax_params, vocab_size,
     ).context("dispatch_argmax_f32 greedy")?;
-    enc_argmax.commit_and_wait().context("commit argmax greedy")?;
+    enc_argmax.commit_and_wait_labeled("output_head.argmax")
+        .context("commit argmax greedy")?;
 
     // Download only 4 bytes (the winning token ID).
     let token_id = out_index.as_slice::<u32>()
@@ -1438,9 +1442,10 @@ impl Qwen35Model {
                 )
                 .with_context(|| format!("moe_ffn_q_into fused greedy layer {layer_idx}"))?;
                 if seq_len == 1 {
-                    enc.commit();
+                    enc.commit_labeled("layer.moe_ffn");
                 } else {
-                    enc.commit_and_wait().with_context(|| format!("commit fused-MoeQ greedy layer {layer_idx}"))?;
+                    enc.commit_and_wait_labeled("layer.moe_ffn")
+                        .with_context(|| format!("commit fused-MoeQ greedy layer {layer_idx}"))?;
                 }
                 out
             } else {
@@ -1551,6 +1556,33 @@ impl Qwen35Model {
         if let Some(t) = t_output_head {
             eprintln!("[GREEDY_PROFILE] output_head={:.1}ms", t.elapsed().as_micros() as f64 / 1000.0);
         }
+
+        // MLX_PROFILE_CB=1 — dump per-cb GPU time table after each token.
+        // Profile mode is slow (forces sync per labeled commit) but gives
+        // per-cb attribution for the ADR-012 §Optimize / Task #15 gap.
+        if std::env::var("MLX_PROFILE_CB").is_ok() {
+            let table = mlx_native::kernel_profile::dump();
+            if !table.is_empty() {
+                let total_ns: u64 = table.iter().map(|(_, e)| e.total_ns).sum();
+                eprintln!("[CB_PROFILE] total={:.2}ms across {} labels:", total_ns as f64 / 1e6, table.len());
+                for (label, e) in table.iter().take(20) {
+                    let avg_us = if e.count > 0 { e.total_ns as f64 / e.count as f64 / 1000.0 } else { 0.0 };
+                    let pct = if total_ns > 0 { 100.0 * e.total_ns as f64 / total_ns as f64 } else { 0.0 };
+                    eprintln!(
+                        "  {:>5.1}%  {:>8.2}ms  count={:<4}  avg={:>6.1}µs  min={:>5.1}µs  max={:>5.1}µs  {}",
+                        pct,
+                        e.total_ns as f64 / 1e6,
+                        e.count,
+                        avg_us,
+                        e.min_ns as f64 / 1000.0,
+                        e.max_ns as f64 / 1000.0,
+                        label,
+                    );
+                }
+                mlx_native::kernel_profile::reset();
+            }
+        }
+
         Ok(token_id)
     }
 

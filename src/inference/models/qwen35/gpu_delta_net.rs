@@ -967,7 +967,7 @@ pub fn build_delta_net_layer(
         // commit() without wait: output is fed into fused_residual_norm
         // on the same Metal serial queue; GPU ordering is guaranteed.
         // state_out/conv_state_out hold the updated states; caller swaps ping-pong.
-        enc.commit();
+        enc.commit_labeled("layer.delta_net.ops1-9");
         output
     } else {
         // ---- PREFILL PATH (seq>1): two encoders — CPU de-interleave between ----
