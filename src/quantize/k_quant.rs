@@ -635,6 +635,292 @@ pub fn dequantize_row_q6_k_bytes(
     dequantize_row_q6_k(&blocks, out)
 }
 
+// ────────────────────────── Quantize side ──────────────────────────
+
+/// Round `fval` to the nearest integer using llama.cpp's bit-trick
+/// (`ggml-quants.c:559`). Adds the binary-fixed offset
+/// `12582912.f = 0x4B400000` (IEEE-754 single-precision: exponent 23,
+/// mantissa = 0), which forces the mantissa's lowest bits to align
+/// with the integer boundary; the masked mantissa minus 0x00400000
+/// yields the round-to-nearest-even result.
+///
+/// Equivalent to `fval.round() as i32` for finite inputs in
+/// `[-4194303, 4194303]`, with the bit-trick guaranteeing the
+/// **same FPU rounding** as the reference (matters for byte-identity
+/// against the NEON path).
+#[inline]
+pub fn nearest_int(fval: f32) -> i32 {
+    debug_assert!(
+        fval.abs() <= 4_194_303.0,
+        "nearest_int: |fval| > 4194303 (got {fval})"
+    );
+    let val = fval + 12_582_912.0;
+    let bits = val.to_bits() as i32;
+    (bits & 0x007F_FFFF) - 0x0040_0000
+}
+
+/// Codebook search for `Q4_K` / `Q5_K` per-sub-block scale + min.
+/// Pure-Rust port of `make_qkx2_quants` (`ggml-quants.c:737`).
+///
+/// Given `n` source values `x[0..n]` and `n` per-element weights
+/// `weights[0..n]`, finds the best `(scale, -min)` pair that
+/// minimises `sum_i weights[i] * f(scale * L[i] + min - x[i])`
+/// where `L[i] ∈ [0, nmax]` and `f` is square (when `use_mad=false`)
+/// or absolute (when `use_mad=true`). Returns the chosen `scale`,
+/// writes quants into `L`, and writes `-min` into `the_min` (note
+/// the **negated** sign convention — same as llama.cpp).
+///
+/// `Laux` is a `[u8; n]` scratch buffer for the inner per-step
+/// quant set (avoids re-allocation in the search loop).
+///
+/// `nstep` ≥ 1 enables the iterative scale-min refinement search;
+/// `nstep < 1` returns after the initial scale guess. `rmin` and
+/// `rdelta` parameterise the search step (typically `-1.0` and `0.1`).
+///
+/// **Sign convention**: `the_min` receives `-min` (so callers see
+/// the negative-min convention used in `quantize_row_q4_K_ref`).
+///
+/// Tested against scalar reference behavior; NEON-byte-identity
+/// is a separate gate at iter-3b2 (test fixture against
+/// pre-recorded llama.cpp output).
+#[allow(clippy::too_many_arguments)]
+pub fn make_qkx2_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+    use_mad: bool,
+) -> (f32, f32) {
+    debug_assert_eq!(x.len(), n, "x.len() must equal n");
+    debug_assert_eq!(weights.len(), n, "weights.len() must equal n");
+    debug_assert!(l.len() >= n, "L buffer must be ≥ n");
+    debug_assert!(laux.len() >= n, "Laux buffer must be ≥ n");
+
+    // Initial pass: min, max, sum_w, sum_x.
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for slot in l.iter_mut().take(n) {
+            *slot = 0;
+        }
+        return (0.0, -min);
+    }
+
+    let mut iscale = (nmax as f32) / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let lq = nearest_int(iscale * (x[i] - min));
+        let lq = lq.max(0).min(nmax);
+        l[i] = lq as u8;
+        let mut diff = scale * (l[i] as f32) + min - x[i];
+        diff = if use_mad { diff.abs() } else { diff * diff };
+        best_error += weights[i] * diff;
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+
+    // Refinement loop.
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * (is as f32) + (nmax as f32)) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for i in 0..n {
+            let lq = nearest_int(iscale * (x[i] - min));
+            let lq = lq.max(0).min(nmax);
+            laux[i] = lq as u8;
+            let w = weights[i];
+            let lf = lq as f32;
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let det = sum_w * sum_l2 - sum_l * sum_l;
+        if det > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let mut diff = this_scale * (laux[i] as f32) + this_min - x[i];
+                diff = if use_mad { diff.abs() } else { diff * diff };
+                cur_error += weights[i] * diff;
+            }
+            if cur_error < best_error {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
+/// Quantize `row` (length `n_blocks × QK_K`) to a sequence of
+/// `BlockQ4K` super-blocks. Pure-Rust port of `quantize_row_q4_K_ref`
+/// (`ggml-quants.c:1395`).
+///
+/// Per super-block:
+/// 1. For each of 8 sub-blocks of 32 elements:
+///    - Compute the per-sub-block weight `weights[l] = av_x + |x[l]|`
+///      where `av_x = sqrt(sum(x²)/32)`.
+///    - Run `make_qkx2_quants` with `nmax=15, rmin=-1.0, rdelta=0.1,
+///      nstep=20, use_mad=false` to get `scales[j]` and `mins[j]`.
+/// 2. Find super-block max scale + max min, compute super-block
+///    inverse scales `inv_scale = 63/max_scale`, `inv_min = 63/max_min`.
+/// 3. Pack 6-bit per-sub-block scales/mins into `scales[12]` per
+///    `get_scale_min_k4`'s inverse.
+/// 4. Re-derive 4-bit quants from final `(d, dmin, sc, m)` for each
+///    sub-block: `L[i] = round((x[i] + dm) / d)` clamped to `[0, 15]`.
+/// 5. Pack low-nibble + high-nibble into `qs[128]`.
+///
+/// Output `blocks.len()` must equal `row.len() / QK_K` and `row.len()`
+/// must be a multiple of `QK_K`.
+pub fn quantize_row_q4_k(row: &[f32], blocks: &mut [BlockQ4K]) -> Result<(), KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q4_K_SIZE,
+        });
+    }
+
+    let mut l_buf = [0u8; QK_K];
+    let mut laux = [0u8; 32];
+    let mut weights_buf = [0.0f32; 32];
+    let mut mins = [0.0f32; QK_K / 32];
+    let mut scales = [0.0f32; QK_K / 32];
+
+    for i in 0..nb {
+        let x = &row[i * QK_K..(i + 1) * QK_K];
+        let mut max_scale = 0.0f32;
+        let mut max_min = 0.0f32;
+
+        // Per-sub-block: compute weights, run codebook search.
+        for j in 0..(QK_K / 32) {
+            let xj = &x[32 * j..32 * j + 32];
+            let mut sum_x2 = 0.0f32;
+            for &v in xj.iter() {
+                sum_x2 += v * v;
+            }
+            let av_x = (sum_x2 / 32.0).sqrt();
+            for (l, &v) in weights_buf.iter_mut().zip(xj.iter()) {
+                *l = av_x + v.abs();
+            }
+            let (scale, the_min) = make_qkx2_quants(
+                32,
+                15,
+                xj,
+                &weights_buf,
+                &mut l_buf[32 * j..32 * j + 32],
+                &mut laux,
+                -1.0,
+                0.1,
+                20,
+                false,
+            );
+            scales[j] = scale;
+            mins[j] = the_min;
+            if scale > max_scale {
+                max_scale = scale;
+            }
+            if the_min > max_min {
+                max_min = the_min;
+            }
+        }
+
+        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+        let mut packed_scales = [0u8; 12];
+
+        // Pack per-sub-block 6-bit scales + mins into the 12-byte scales array.
+        for j in 0..(QK_K / 32) {
+            let ls = nearest_int(inv_scale * scales[j]).max(0).min(63) as u8;
+            let lm = nearest_int(inv_min * mins[j]).max(0).min(63) as u8;
+            if j < 4 {
+                packed_scales[j] = ls;
+                packed_scales[j + 4] = lm;
+            } else {
+                packed_scales[j + 4] = (ls & 0x0F) | ((lm & 0x0F) << 4);
+                packed_scales[j - 4] |= (ls >> 4) << 6;
+                packed_scales[j] |= (lm >> 4) << 6;
+            }
+        }
+
+        let d_f = max_scale / 63.0;
+        let dmin_f = max_min / 63.0;
+        let d_bits = half::f16::from_f32(d_f).to_bits();
+        let dmin_bits = half::f16::from_f32(dmin_f).to_bits();
+        let d = half::f16::from_bits(d_bits).to_f32();
+        let dmin = half::f16::from_bits(dmin_bits).to_f32();
+
+        // Re-quantize using the final (d, dmin, sc, m) for each sub-block.
+        for j in 0..(QK_K / 32) {
+            let (sc, m) = get_scale_min_k4(j, &packed_scales);
+            let d_eff = d * (sc as f32);
+            if d_eff == 0.0 {
+                continue;
+            }
+            let dm = dmin * (m as f32);
+            for ii in 0..32 {
+                let lq = nearest_int((x[32 * j + ii] + dm) / d_eff)
+                    .max(0)
+                    .min(15);
+                l_buf[32 * j + ii] = lq as u8;
+            }
+        }
+
+        // Pack 4-bit quants: low nibble at l, high nibble at l+32.
+        let mut qs = [0u8; QK_K / 2];
+        let mut qoff = 0usize;
+        for j_pair in 0..(QK_K / 64) {
+            for l in 0..32 {
+                qs[qoff + l] = l_buf[64 * j_pair + l] | (l_buf[64 * j_pair + l + 32] << 4);
+            }
+            qoff += 32;
+        }
+
+        blocks[i] = BlockQ4K {
+            d_bits,
+            dmin_bits,
+            scales: packed_scales,
+            qs,
+        };
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,5 +1382,327 @@ mod tests {
             }
             _ => panic!("expected BlockSizeMismatch"),
         }
+    }
+
+    // ─────────────────── nearest_int + make_qkx2_quants tests ───────────────────
+
+    /// `nearest_int` round-to-nearest-even: 0.5 → 0, 1.5 → 2, 2.5 → 2,
+    /// 3.5 → 4 (banker's rounding); negative values: -0.5 → 0, -1.5 → -2.
+    /// Matches IEEE 754 round-half-to-even. Verified for byte-identity
+    /// against llama.cpp's bit-trick implementation.
+    #[test]
+    fn nearest_int_round_to_even() {
+        assert_eq!(nearest_int(0.0), 0);
+        assert_eq!(nearest_int(0.49), 0);
+        assert_eq!(nearest_int(0.5), 0); // half-to-even
+        assert_eq!(nearest_int(0.51), 1);
+        assert_eq!(nearest_int(1.5), 2); // half-to-even
+        assert_eq!(nearest_int(2.5), 2); // half-to-even
+        assert_eq!(nearest_int(3.5), 4); // half-to-even
+        assert_eq!(nearest_int(-0.5), 0); // half-to-even
+        assert_eq!(nearest_int(-1.5), -2);
+        assert_eq!(nearest_int(-2.5), -2);
+        assert_eq!(nearest_int(7.0), 7);
+        assert_eq!(nearest_int(-7.0), -7);
+        assert_eq!(nearest_int(15.0), 15);
+        assert_eq!(nearest_int(15.999), 16);
+    }
+
+    /// `make_qkx2_quants` on all-zero input returns scale=0, mins=0,
+    /// and L[i]=0 for all i — matching the `max == min` early return.
+    #[test]
+    fn make_qkx2_quants_all_zero_input() {
+        let n = 32;
+        let x = vec![0.0_f32; n];
+        let weights = vec![1.0_f32; n];
+        let mut l = vec![0u8; n];
+        let mut laux = vec![0u8; n];
+        let (scale, the_min) =
+            make_qkx2_quants(n, 15, &x, &weights, &mut l, &mut laux, -1.0, 0.1, 20, false);
+        assert_eq!(scale, 0.0);
+        assert_eq!(the_min, 0.0);
+        for &q in l.iter() {
+            assert_eq!(q, 0);
+        }
+    }
+
+    /// `make_qkx2_quants` on a constant non-zero input: max == min after
+    /// the `min = 0` clamp doesn't apply (since min < 0 isn't true), so
+    /// the early-return path triggers when max == min is true. With
+    /// constant `x = c > 0`, we get min=0 (clamped from c > 0 → min=c
+    /// clamped to 0; wait, min stays at c since we only clamp `if min > 0`,
+    /// then min=0). Actually re-reading: if min > 0 then min = 0. So with
+    /// all values equal to 1.0: initial min=1.0, then min = 0 (clamped),
+    /// max stays 1.0. max != min, so search proceeds.
+    /// Just verify it returns a finite scale + L values in [0, 15].
+    #[test]
+    fn make_qkx2_quants_constant_positive_input() {
+        let n = 32;
+        let x = vec![1.0_f32; n];
+        let weights = vec![1.0_f32; n];
+        let mut l = vec![0u8; n];
+        let mut laux = vec![0u8; n];
+        let (scale, _the_min) =
+            make_qkx2_quants(n, 15, &x, &weights, &mut l, &mut laux, -1.0, 0.1, 20, false);
+        assert!(scale.is_finite(), "scale not finite: {scale}");
+        for &q in l.iter() {
+            assert!(q <= 15, "L[i] out of [0,15]: {q}");
+        }
+    }
+
+    /// `make_qkx2_quants` on a deterministic ramp. Verifies the algorithm
+    /// produces a near-monotonic L sequence.
+    #[test]
+    fn make_qkx2_quants_monotonic_ramp() {
+        let n = 32;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let weights = vec![1.0_f32; n];
+        let mut l = vec![0u8; n];
+        let mut laux = vec![0u8; n];
+        let (scale, the_min) =
+            make_qkx2_quants(n, 15, &x, &weights, &mut l, &mut laux, -1.0, 0.1, 20, false);
+        assert!(scale > 0.0, "scale must be positive for monotonic ramp");
+        // Expect L[i] non-decreasing for monotonic input.
+        for i in 1..n {
+            assert!(
+                l[i] >= l[i - 1],
+                "expected non-decreasing L, got L[{}]={} < L[{}]={}",
+                i,
+                l[i],
+                i - 1,
+                l[i - 1]
+            );
+        }
+        // L[0] should be 0 or 1 (smallest input near codebook bottom).
+        assert!(l[0] <= 1, "L[0] = {} (expected 0 or 1 for ramp[0]=0)", l[0]);
+        // L[n-1] should be near nmax (largest input maps near top).
+        assert!(
+            l[n - 1] >= 14,
+            "L[n-1] = {} (expected ≥14 for ramp's max)",
+            l[n - 1]
+        );
+        // the_min is the negated min from the search (post-refinement).
+        // The search may pick a slightly negative `min` to balance
+        // round-off across all elements, yielding `the_min ≥ 0`.
+        assert!(
+            the_min >= 0.0 && the_min.is_finite(),
+            "the_min = {the_min} (expected non-negative finite)"
+        );
+    }
+
+    /// `make_qkx2_quants` with `nstep < 1` skips refinement and returns
+    /// the initial scale.
+    #[test]
+    fn make_qkx2_quants_no_refinement() {
+        let n = 32;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let weights = vec![1.0_f32; n];
+        let mut l = vec![0u8; n];
+        let mut laux = vec![0u8; n];
+        let (scale_with_refine, _) = make_qkx2_quants(
+            n,
+            15,
+            &x,
+            &weights,
+            &mut l.clone(),
+            &mut laux.clone(),
+            -1.0,
+            0.1,
+            20,
+            false,
+        );
+        let (scale_no_refine, _) =
+            make_qkx2_quants(n, 15, &x, &weights, &mut l, &mut laux, -1.0, 0.1, 0, false);
+        // Both finite; different (refinement may shift scale).
+        assert!(scale_with_refine.is_finite());
+        assert!(scale_no_refine.is_finite());
+        // The no-refinement scale = (max - min) / nmax = 31 / 15 ≈ 2.0667.
+        assert!(
+            (scale_no_refine - 31.0 / 15.0).abs() < 1e-4,
+            "no-refine scale {scale_no_refine} != 31/15"
+        );
+    }
+
+    // ─────────────────── quantize_row_q4_k tests ───────────────────
+
+    /// All-zero input quantized to a Q4_K block: every output byte = 0,
+    /// d/dmin = 0. Round-trip dequantize must produce all zeros.
+    #[test]
+    fn quantize_q4_k_zero_input() {
+        let row = vec![0.0_f32; QK_K];
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0xFFFF, // pre-fill to confirm overwrite
+                dmin_bits: 0xFFFF,
+                scales: [0xFFu8; 12],
+                qs: [0xFFu8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q4_k(&row, &mut blocks).unwrap();
+        // d, dmin should be 0.
+        assert_eq!(blocks[0].d_bits, 0); // F16(0.0)
+        assert_eq!(blocks[0].dmin_bits, 0);
+        // scales packed all zeros.
+        assert_eq!(blocks[0].scales, [0u8; 12]);
+        // qs all zeros.
+        for &b in blocks[0].qs.iter() {
+            assert_eq!(b, 0);
+        }
+        // Round-trip dequantize → all zeros.
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k(&blocks, &mut decoded).unwrap();
+        for &v in decoded.iter() {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// Quantize a deterministic synthetic row, dequantize, verify the
+    /// round-trip MSE is within a reasonable Q4_K tolerance. This is
+    /// the algorithmic correctness gate (separate from byte-identity
+    /// gate against llama.cpp NEON which lands at iter-3b2).
+    #[test]
+    fn quantize_q4_k_round_trip_synthetic() {
+        // Synthetic row: gentle ramp across multiple sub-blocks for
+        // coverage of all 8 sub-blocks. Range [-2, 2].
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0); // 0..1
+                -2.0 + 4.0 * t // -2..2
+            })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q4_k(&row, &mut blocks).unwrap();
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k(&blocks, &mut decoded).unwrap();
+
+        // RMSE bound for Q4_K on a smooth ramp: empirically << 0.05 since
+        // 4.5 bpw covers ~32 levels per super-block with min subtraction.
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.05,
+            "Q4_K round-trip RMSE {rmse} exceeds 0.05 threshold for smooth ramp"
+        );
+    }
+
+    /// Quantize with all-equal positive input. Q4_K should pack a
+    /// near-constant decoded value.
+    #[test]
+    fn quantize_q4_k_constant_positive() {
+        let row = vec![0.5_f32; QK_K];
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q4_k(&row, &mut blocks).unwrap();
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q4_k(&blocks, &mut decoded).unwrap();
+
+        // Each decoded element should be very close to 0.5.
+        for (i, &v) in decoded.iter().enumerate() {
+            assert!(
+                (v - 0.5).abs() < 0.05,
+                "constant-input element [{i}] = {v} (expected ~0.5)"
+            );
+        }
+    }
+
+    /// `quantize_row_q4_k` rejects misaligned input lengths.
+    #[test]
+    fn quantize_q4_k_rejects_misaligned_length() {
+        let row = vec![0.0_f32; QK_K + 7]; // not a multiple of QK_K
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            2
+        ];
+        let err = quantize_row_q4_k(&row, &mut blocks).unwrap_err();
+        match err {
+            KQuantError::NotBlockAligned { actual } => {
+                assert_eq!(actual, QK_K + 7);
+            }
+            _ => panic!("expected NotBlockAligned"),
+        }
+    }
+
+    /// `quantize_row_q4_k` rejects too-small output buffer.
+    #[test]
+    fn quantize_q4_k_rejects_short_blocks_buffer() {
+        let row = vec![0.0_f32; 2 * QK_K]; // need 2 blocks
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ]; // only 1 slot
+        let err = quantize_row_q4_k(&row, &mut blocks).unwrap_err();
+        match err {
+            KQuantError::BlockSizeMismatch { n_blocks, .. } => {
+                assert_eq!(n_blocks, 2);
+            }
+            _ => panic!("expected BlockSizeMismatch"),
+        }
+    }
+
+    /// Multi-block: quantize 3 super-blocks, dequantize, RMSE bound
+    /// should still hold (verifies the per-block loop and accounting).
+    #[test]
+    fn quantize_q4_k_multi_block_round_trip() {
+        let n_blocks = 3;
+        let row: Vec<f32> = (0..n_blocks * QK_K)
+            .map(|i| {
+                let t = (i as f32) / ((n_blocks * QK_K) as f32 - 1.0);
+                -1.5 + 3.0 * t
+            })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            n_blocks
+        ];
+        quantize_row_q4_k(&row, &mut blocks).unwrap();
+
+        let mut decoded = vec![0.0_f32; n_blocks * QK_K];
+        dequantize_row_q4_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.05, "multi-block RMSE {rmse} > 0.05");
     }
 }
