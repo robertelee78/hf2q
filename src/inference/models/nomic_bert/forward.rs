@@ -59,7 +59,8 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::super::bert::bert_gpu::{
     alloc_bert_attention_mask, bert_attention_with_mask_gpu, bert_embed_gather_gpu,
     bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu, bert_linear_gpu,
-    bert_pool_gpu, bert_residual_add_gpu, register_bert_custom_shaders, BertPoolKind,
+    bert_pool_gpu, bert_residual_add_gpu, bert_residual_layer_norm_gpu,
+    register_bert_custom_shaders, BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
 use super::config::NomicBertConfig;
@@ -544,30 +545,25 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     };
     encoder.memory_barrier();
 
-    // ---- 5. Residual + post-attention LayerNorm ----
-    let after_attn_resid = bert_residual_add_gpu(
+    // ---- 5. Fused residual + post-attention LayerNorm ----
+    // Iter-86 perf optimization: replaces the bert_residual_add_gpu →
+    // bert_layer_norm_gpu pair with one fused dispatch. Saves the
+    // intermediate `after_attn_resid` writethrough + one Metal
+    // dispatch + one barrier.
+    let _ = n_hidden_elems; // shape arithmetic preserved for the embed-stage caller
+    let after_attn_norm = bert_residual_layer_norm_gpu(
         encoder,
         registry,
         device,
         &attn_proj,
         input,
-        n_hidden_elems as u32,
-    )
-    .context("nomic block: post-attention residual")?;
-    encoder.memory_barrier();
-
-    let after_attn_norm = bert_layer_norm_gpu(
-        encoder,
-        registry,
-        device,
-        &after_attn_resid,
         tensors.attn_norm_gamma,
         tensors.attn_norm_beta,
         eps,
         seq_len,
         hidden,
     )
-    .context("nomic block: post-attention LayerNorm")?;
+    .context("nomic block: post-attention residual+LayerNorm (fused)")?;
     encoder.memory_barrier();
 
     // ---- 6. SwiGLU FFN ----
@@ -658,30 +654,22 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     };
     encoder.memory_barrier();
 
-    // ---- 7. Residual + post-FFN LayerNorm ----
-    let after_ffn_resid = bert_residual_add_gpu(
+    // ---- 7. Fused residual + post-FFN LayerNorm ----
+    // Same fusion as step 5 — saves the intermediate writethrough +
+    // one dispatch + one barrier.
+    let block_out = bert_residual_layer_norm_gpu(
         encoder,
         registry,
         device,
         &down_proj,
         &after_attn_norm,
-        n_hidden_elems as u32,
-    )
-    .context("nomic block: post-FFN residual")?;
-    encoder.memory_barrier();
-
-    let block_out = bert_layer_norm_gpu(
-        encoder,
-        registry,
-        device,
-        &after_ffn_resid,
         tensors.ffn_norm_gamma,
         tensors.ffn_norm_beta,
         eps,
         seq_len,
         hidden,
     )
-    .context("nomic block: post-FFN LayerNorm")?;
+    .context("nomic block: post-FFN residual+LayerNorm (fused)")?;
     encoder.memory_barrier();
 
     // The silu_mul params buffer is dropped at function exit, AFTER

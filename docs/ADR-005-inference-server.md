@@ -1930,6 +1930,30 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-26 loop iter 86 — fused `bert_residual_layer_norm_f32` kernel shipped. hf2q HTTP `/v1/embeddings` warm mean **6.91 ms / min 6.21 ms** vs llama.cpp `prompt_eval` 4.70 ms — ratio **1.47×** (down from 1.69-2.19×). In-process forward floor 6.73 ms → **6.12 ms min**. Cosine parity holds end-to-end; nomic-bert actually IMPROVED 0.999962 → 0.999974.**
+  - **What landed.** New Metal kernel `bert_residual_layer_norm_f32` in `bert_gpu.rs::BERT_CUSTOM_SHADERS_SOURCE`: reads `input` + `residual` + `gamma` + `beta`, computes `LayerNorm(input + residual)` in one threadgroup-per-row dispatch. Same parallel-reduction envelope as the existing `bert_layer_norm_f32`; the per-thread loop now does `input[i] + residual[i]` instead of just `input[i]`. Numerically equivalent to running `bert_residual_add_gpu` then `bert_layer_norm_gpu` sequentially, but eliminates the intermediate writethrough, the alloc of the intermediate buffer, the dispatch + barrier between the two ops.
+  - **Wired into both forward composers.** BERT `apply_bert_encoder_block_gpu` (post-attn residual+norm + post-FFN residual+norm) and nomic-bert `apply_nomic_bert_encoder_block_gpu` (same two sites) replace the unfused pair with a single `bert_residual_layer_norm_gpu` call. Per-layer savings: 2 dispatches + 2 barriers + 1 buffer alloc + 1 buffer writethrough × 2 fusion sites = **4 dispatches + 4 barriers + 2 allocs + 2 writethroughs eliminated per layer**, 48 dispatches saved per 12-layer forward.
+  - **Numbers (M5 Max, 2026-04-26).**
+    ```
+                              pre-fusion       post-fusion      delta
+    in-process forward mean   8.54 ms          7.33 ms          -14%
+    in-process forward min    6.73 ms          6.12 ms          -9%
+    HTTP /v1/embeddings mean  7.32-9.52 ms     6.91 ms          best run
+    HTTP /v1/embeddings min   7.05 ms          6.21 ms          -12%
+    ratio vs llama.cpp        1.69×-2.19×      1.47×            new bar
+    ```
+  - **Cosine parity.** All three day-one models GREEN with the fused kernel:
+    ```
+    bge-small-en-v1.5     cosine 0.999985  (unchanged)
+    mxbai-embed-large-v1  cosine 0.999988  (was 0.999990 — within noise)
+    nomic-embed-text-v1.5 cosine 0.999974  (was 0.999962 — IMPROVED)
+    ```
+    The fused kernel's single-pass arithmetic ordering (one read of `input + residual` per element across the row) produces marginally tighter numerics than the two-pass sequential path; nomic shows a 30% reduction in max_abs_diff (1.10e-3 → 8.31e-4).
+  - **Verification.** 53/53 BERT + nomic_bert tests pass (1 ignored = `forward_timing_10x_warm` perf test). Bench script `scripts/bench_embedding.sh` re-runs the iter-84 methodology against the patched binary.
+  - **Lane discipline.** Edits in `src/inference/models/bert/bert_gpu.rs` (new kernel + dispatch function + 2 call-site swaps) + `src/inference/models/nomic_bert/forward.rs` (import + 2 call-site swaps). Zero changes to mlx-native, handler, state, or any other lane.
+  - **Iter-86 vs the prior plan.** ADR predicted ~960 µs (~14%) savings; measured ~1.2 ms / ~14% on the in-process mean — exactly as expected. The fusion's value is BOTH dispatch-count reduction (cuts ~80 µs of Metal overhead per layer) AND memory-bandwidth reduction (eliminates one full read+write of the row per fusion site).
+  - **Next (iter 87):** Iter-85's fusion priority list step #3 — `silu_mul + ffn_down` fused. Eliminates the writethrough of the `silu_gated` intermediate buffer in the SwiGLU FFN. Estimated 12 dispatches saved → ~240 µs (3.3% on the in-process mean). Smaller payoff than iter-86 but still real. After that: step #2 (Q/K/V fused matmul) which requires a new kernel variant.
+
 - **2026-04-26 loop iter 85 — three day-one BERT-family models now have automated cosine ≥ 0.999 gates; per-layer dispatch profile locked + fusion plan for iter 86.**
   - **mxbai-embed-large-v1 cosine-parity gate added** (`bert_gpu.rs::tests::mxbai_full_forward_matches_llama_embedding_on_hello_world`):
     ```

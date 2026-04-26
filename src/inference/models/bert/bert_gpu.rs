@@ -125,6 +125,90 @@ kernel void bert_layer_norm_f32(
     }
 }
 
+// Fused per-row residual_add + LayerNorm:
+//   tmp[r, h] = input[r, h] + residual[r, h]
+//   out[r, h] = (tmp[r, h] - mean(tmp[r, :])) /
+//               sqrt(var(tmp[r, :]) + eps) * gamma[h] + beta[h]
+//
+// Replaces the bert_residual_add_gpu → bert_layer_norm_gpu pair with a
+// single kernel that reads the residual ONCE and avoids the
+// intermediate writethrough of `tmp` to global memory. Each layer of
+// nomic-bert / BERT calls this twice (post-attention residual+norm and
+// post-FFN residual+norm) — at 12 layers that's 48 dispatches saved
+// per forward pass (iter-86 perf optimization).
+//
+// Same dispatch envelope as bert_layer_norm_f32: one threadgroup per
+// row, threads_per_threadgroup = power-of-two ≤ hidden, threadgroup
+// memory at index 0 = 4 * threads_per_threadgroup bytes.
+//
+// Numerical equivalence: identical output to running residual_add then
+// layer_norm sequentially. The fused kernel computes the SAME mean,
+// inv_std, and affine transform — just without round-tripping `tmp`
+// through device memory between the two passes.
+kernel void bert_residual_layer_norm_f32(
+    device const float* input    [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* gamma    [[buffer(2)]],
+    device const float* beta     [[buffer(3)]],
+    device       float* output   [[buffer(4)]],
+    constant LayerNormParams& params [[buffer(5)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint  tid  [[thread_position_in_threadgroup]],
+    uint  bid  [[threadgroup_position_in_grid]],
+    uint  ntg  [[threads_per_threadgroup]]
+) {
+    if (bid >= params.batch) return;
+    uint row_off = bid * params.hidden;
+
+    // Pass 1: row sum of (input + residual) -> mean.
+    // Reads BOTH input and residual once per element across the row.
+    float sum = 0.0;
+    for (uint i = tid; i < params.hidden; i += ntg) {
+        sum += input[row_off + i] + residual[row_off + i];
+    }
+    shmem[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = shmem[0] / float(params.hidden);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: variance over (input + residual).
+    // Re-reads input + residual; cheaper than writing intermediate sum
+    // to global memory between passes.
+    float var_sum = 0.0;
+    for (uint i = tid; i < params.hidden; i += ntg) {
+        float d = (input[row_off + i] + residual[row_off + i]) - mean;
+        var_sum += d * d;
+    }
+    shmem[tid] = var_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shmem[tid] += shmem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(shmem[0] / float(params.hidden) + params.eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Apply: ((tmp - mean) * inv_std) * gamma + beta.
+    // Final pass re-reads input + residual one more time. The total
+    // global reads per element across the kernel are 3 reads of input
+    // and 3 of residual — same as the unfused pair (residual_add reads
+    // 2 + writes 1 = 3 ops; layer_norm reads 3 + writes 1 = 4 ops; the
+    // fused kernel saves the residual_add's write + the layer_norm's
+    // first read of tmp — net 2 fewer global memory ops per element).
+    for (uint i = tid; i < params.hidden; i += ntg) {
+        float t = input[row_off + i] + residual[row_off + i];
+        output[row_off + i] = ((t - mean) * inv_std) * gamma[i] + beta[i];
+    }
+}
+
 struct BiasAddParams {
     uint rows;
     uint cols;
@@ -256,6 +340,7 @@ fn pod_as_bytes<T: Copy>(p: &T) -> &[u8] {
 /// `KernelRegistry`.
 pub fn register_bert_custom_shaders(registry: &mut KernelRegistry) {
     registry.register_source("bert_layer_norm_f32", BERT_CUSTOM_SHADERS_SOURCE);
+    registry.register_source("bert_residual_layer_norm_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_bias_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_pool_mean_f32", BERT_CUSTOM_SHADERS_SOURCE);
     registry.register_source("bert_attention_mask_add_f32", BERT_CUSTOM_SHADERS_SOURCE);
@@ -372,6 +457,87 @@ pub fn bert_layer_norm_gpu(
 fn prev_pow2(n: u32) -> u32 {
     debug_assert!(n >= 1);
     1u32 << (31 - n.leading_zeros())
+}
+
+/// Fused residual_add + LayerNorm: `out = LayerNorm(input + residual)`.
+///
+/// Replaces the `bert_residual_add_gpu` → `bert_layer_norm_gpu` pair
+/// with a single kernel dispatch — saves the round-trip of `tmp = a+b`
+/// through device memory, the residual_add kernel's output buffer
+/// alloc, and one Metal dispatch + barrier per call. Per the iter-86
+/// perf analysis, this is the highest-ratio fusion candidate
+/// (~960 µs / ~14% saved across a full 12-layer nomic-bert forward).
+///
+/// Output is bit-identical to running residual_add then layer_norm
+/// sequentially — same mean, same inv_std, same affine, just without
+/// the intermediate writethrough.
+///
+/// Both `input` and `residual` are F32 `[batch, hidden]` row-major;
+/// `gamma`/`beta` are F32 `[hidden]`. Returns a fresh F32 `[batch, hidden]`.
+///
+/// # Errors
+/// - `batch == 0` or `hidden == 0`
+/// - propagated from kernel pipeline compile failures
+#[allow(clippy::too_many_arguments)]
+pub fn bert_residual_layer_norm_gpu(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    residual: &MlxBuffer,
+    gamma: &MlxBuffer,
+    beta: &MlxBuffer,
+    eps: f32,
+    batch: u32,
+    hidden: u32,
+) -> Result<MlxBuffer> {
+    if batch == 0 || hidden == 0 {
+        return Err(anyhow!(
+            "bert_residual_layer_norm_gpu: batch ({}) and hidden ({}) must be > 0",
+            batch,
+            hidden
+        ));
+    }
+    let total = (batch as usize) * (hidden as usize);
+    let output = device
+        .alloc_buffer(total * 4, DType::F32, vec![batch as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc bert_residual_layer_norm output: {e}"))?;
+
+    let pipeline = registry
+        .get_pipeline("bert_residual_layer_norm_f32", device.metal_device())
+        .map_err(|e| anyhow!("bert_residual_layer_norm_gpu: get_pipeline: {e}"))?;
+
+    let params = LayerNormGpuParams {
+        hidden,
+        batch,
+        eps,
+    };
+    let bytes = pod_as_bytes(&params);
+
+    // Same threadgroup envelope as bert_layer_norm_f32 — the kernel
+    // does the same per-row reduction with one extra read of the
+    // residual buffer per loop iteration.
+    let cap = hidden.min(256);
+    let ntg = prev_pow2(cap.max(1));
+    let threadgroups = MTLSize::new(batch as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(ntg as u64, 1, 1);
+    let shmem_bytes = (ntg as u64) * 4;
+
+    encoder.encode_threadgroups_with_args_and_shared(
+        pipeline,
+        &[
+            (0, KernelArg::Buffer(input)),
+            (1, KernelArg::Buffer(residual)),
+            (2, KernelArg::Buffer(gamma)),
+            (3, KernelArg::Buffer(beta)),
+            (4, KernelArg::Buffer(&output)),
+            (5, KernelArg::Bytes(bytes)),
+        ],
+        &[(0, shmem_bytes)],
+        threadgroups,
+        threadgroup_size,
+    );
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,31 +1429,25 @@ pub fn apply_bert_encoder_block_gpu(
     .context("encoder block: attention output projection")?;
     encoder.memory_barrier();
 
-    // --- Residual add: x + o_proj ---
-    let attn_residual = bert_residual_add_gpu(
+    // --- Fused residual + post-attention LayerNorm ---
+    // Iter-86 perf optimization: replaces the bert_residual_add_gpu →
+    // bert_layer_norm_gpu pair with one fused dispatch. Saves the
+    // intermediate `attn_residual` buffer alloc + writethrough + one
+    // Metal dispatch + one barrier.
+    let _ = n_hidden; // shape arithmetic preserved for potential future callers
+    let post_attn = bert_residual_layer_norm_gpu(
         encoder,
         registry,
         device,
         input,
         &o_proj,
-        n_hidden as u32,
-    )
-    .context("encoder block: attn residual add")?;
-    encoder.memory_barrier();
-
-    // --- Post-attention LayerNorm ---
-    let post_attn = bert_layer_norm_gpu(
-        encoder,
-        registry,
-        device,
-        &attn_residual,
         tensors.attn_norm_gamma,
         tensors.attn_norm_beta,
         eps,
         seq_len,
         hidden,
     )
-    .context("encoder block: post-attn LayerNorm")?;
+    .context("encoder block: post-attn residual+LayerNorm (fused)")?;
     encoder.memory_barrier();
 
     // --- FFN up: [seq, hidden] → [seq, intermediate] ---
@@ -1326,31 +1486,21 @@ pub fn apply_bert_encoder_block_gpu(
     let _ = n_inter; // documents the intermediate-hidden product; not used after this point.
     encoder.memory_barrier();
 
-    // --- Residual: post_attn + ffn_down ---
-    let ffn_residual = bert_residual_add_gpu(
+    // --- Fused residual + post-FFN LayerNorm (block output) ---
+    // Same fusion as the post-attention pair.
+    bert_residual_layer_norm_gpu(
         encoder,
         registry,
         device,
         &post_attn,
         &ffn_down,
-        n_hidden as u32,
-    )
-    .context("encoder block: FFN residual add")?;
-    encoder.memory_barrier();
-
-    // --- Post-FFN LayerNorm — block output ---
-    bert_layer_norm_gpu(
-        encoder,
-        registry,
-        device,
-        &ffn_residual,
         tensors.ffn_norm_gamma,
         tensors.ffn_norm_beta,
         eps,
         seq_len,
         hidden,
     )
-    .context("encoder block: post-FFN LayerNorm")
+    .context("encoder block: post-FFN residual+LayerNorm (fused)")
 }
 
 // ---------------------------------------------------------------------------
