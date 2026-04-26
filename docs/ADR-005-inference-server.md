@@ -1930,6 +1930,33 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 101 — Phase 2c acceptance harness: `tests/vision_e2e_vs_mlx_vlm.rs` wires the iter-99 acceptance bar (hf2q vision output matches mlx-lm Gemma 4 vision on 5 prompts × 5 images at T=0) as an integration test gated behind `HF2Q_VISION_E2E=1`. Default `cargo test` runs no model — only the cheap path (4 mlx-vlm-output extractor tests + 3 fixture-array invariants + 1 fixture-PNG round-trip + 1 gated-test-skip-noop) fires.**
+  - **What landed.**
+    - **5 standard prompts** (color, caption, OCR, count-shapes, light-vs-dark) — short + closed-ended so token-level comparison against mlx-vlm is feasible.
+    - **5 standard fixtures**, materialized on-the-fly via `materialize_fixture_images()` using the existing `image` dev-dep.  Deterministic + byte-stable: red 64×64 square, green-circle-on-white 128×128, "HELLO" rendered in a hand-rolled 5×7 pixel font on 256×64, four black 12×12 dots in the corners of a 128×128 white canvas, vertical dark gradient 128×128.  Land at `tests/fixtures/vision/`; git-ignored (regenerated each run).
+    - **`extract_mlx_vlm_output`** — heuristic that pulls the actual generation text from `mlx_vlm.generate` stdout (which wraps the output in `==========` divider banners around config + per-step timing rows).  4 unit tests cover divider-bracketed, leading-divider-only, no-divider fallback, and trim-whitespace.
+    - **`vision_e2e_matrix_against_mlx_vlm`** (gated) end-to-end driver:
+      1. Spawns `hf2q serve --model <gguf> --mmproj <mmproj>` as a child process on port 18181.
+      2. Polls `GET /readyz` for up to 120s.
+      3. Sends 25 chat-completion requests via `curl` with `image_url` data URIs at `temperature=0`, `max_tokens=50`.
+      4. Drains the hf2q child cleanly (SIGTERM + wait).
+      5. Runs `mlx_vlm.generate` on the same 25 (prompt, image) pairs sequentially.
+      6. Diffs hf2q vs mlx-vlm text per pair (exact-match + first-word-prefix), serializes a `MatrixReport` to `tests/fixtures/vision/last_e2e_report.json`, and asserts the matrix produced 25 pairs without panicking.
+      7. **Hard exact-match assertion deferred to iter-102** so this iter records the baseline matrix without false-failing on first-run divergence.
+  - **Three env knobs** control the gated path (defaults point at `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/` which holds both the chat GGUF and the mmproj GGUF as sibling files):
+    - `HF2Q_VISION_E2E=1` — enables the matrix run.
+    - `HF2Q_VISION_E2E_GGUF=<path>` — chat-model GGUF override.
+    - `HF2Q_VISION_E2E_MMPROJ=<path>` — mmproj GGUF override.
+    - `HF2Q_VISION_E2E_MLX_REPO=<id>` — mlx-vlm reference model id (default `mlx-community/gemma-4-vision-26b-A4B-it-bf16`).
+  - **Verification.** `cargo test --release --test vision_e2e_vs_mlx_vlm` → **9/9 PASS**.  `cargo build --release --test vision_e2e_vs_mlx_vlm` → clean.
+  - **Why not run the full matrix in this iter.**  The standing OOM-prevention directive says one model-loading inference at a time; the matrix needs sequential ~30 GB processes (hf2q + mmproj load, then mlx-vlm load).  Running it on demand under `HF2Q_VISION_E2E=1` keeps the daily test loop OOM-safe.
+  - **Iter-102 plan: capture the baseline + ratchet.**
+    1. Run `HF2Q_VISION_E2E=1 cargo test --release --test vision_e2e_vs_mlx_vlm vision_e2e_matrix_against_mlx_vlm` once on the iter-101 hf2q binary.
+    2. Inspect `tests/fixtures/vision/last_e2e_report.json` — record exact-match count, first-word-prefix-match count, and the divergence shape per pair.
+    3. Replace the `assert!(!report.pairs.is_empty(), …)` with a calibrated bar: `exact_matches >= K` where K is the iter-102-baseline count.
+    4. If exact-match < 25, triage the most likely root causes (per iter-100 doc): (a) placeholder text — `<|image|>` vs Gemma 4's full `<start_of_image><image_soft_token>...<end_of_image>` boundary template — and (b) the per-embedding pre-scaling contract on `SoftTokenInjection` (we copy the projected ViT row verbatim; mlx-vlm may apply a `sqrt(hidden_size)` post-projector scale).
+    5. Iterate on the failing dimension until matrix is GREEN.
+
 - **2026-04-25 loop iter 100 — Phase 2c Task #17 hardening: extract `compute_soft_token_layout` pure helper from `expand_image_placeholders` so the iter-99 expansion math is unit-testable without a live `Engine` (which carries the tokenizer + `MlxDevice`).  The math — placeholder positions → contiguous N_image_tokens runs → post-expansion ranges — is the most error-prone bit of the iter-99 vision path and the only part that can be exercised without a 26B model load.  Refactor + 8 new tests.**
   - **What landed.**
     - **`compute_soft_token_layout(img_token_id, prompt_tokens, n_image_tokens_per_image)`** (handlers.rs, `pub(crate)`): pure compute, returns `(expanded_tokens, ranges)` or `Err(PlaceholderCountMismatch{ found, supplied })`.  No Metal, no Engine, no allocator side effects.
