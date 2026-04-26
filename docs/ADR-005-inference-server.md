@@ -1,6 +1,6 @@
 # ADR-005: Inference Server — OpenAI-Compatible API for hf2q
 
-**Status:** Phase 1b Walk **CLOSED 2026-04-25 (iter-110 W20)** — `scripts/release-check.sh` PASS on all seven gates A–G end-to-end at HEAD `24b4029` on cold-perf-first methodology (Gate B median-of-3 = 101.2 tok/s, parity suite 6/6, prefill = 3086.6 tok/s, dispatches/decode_tok = 988.2, syncs = 1). Original closeout-in-progress declared 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. **Phase 2 scope refined 2026-04-23 (party-mode session `adr_005_phase_2`)**: vision absorbed into Phase 2 as sub-phase **2c**; downstream phases renumbered (old Phase 3 → 2c, old Phase 4 → Phase 3, old Phase 5 → Phase 4); 27 design decisions recorded; continuous-batching carved out to a future ADR (see "Concurrent-deployment scaling (deferred)" section). Phase 2 (2a + 2b + 2c), Phase 3, Phase 4 **In Progress**. See the Phase 1b Closeout section and the Phase 1b Closeout Amendment immediately below it in Acceptance Criteria for gate-by-gate status.
+**Status:** Phase 1b Walk **CLOSED with full coverage 2026-04-26 (iter-112b W39)** — `scripts/release-check.sh` PASS on **all eight gates A–H** end-to-end at HEAD `8e5776e` (Gate B median-of-3 = 101.1 tok/s, parity suite 6/6, prefill = 3279.5 tok/s, dispatches/decode_tok = 988.2, syncs = 1, **Gate H cosine_mean=0.999672, p1=0.996080, argmax=0.0080, PPL Δ=0.0014**). Original seven-dense-gate closure landed iter-110 W20 2026-04-25 at HEAD `24b4029`; the TQ-active companion Gate H (ADR-007 §853-866) closed iter-112b W39 after fixing W21's two layered LazyLock-freeze + static-atomic bugs. Original closeout-in-progress declared 2026-04-16 via backend migration (ADR-008 candle divorce) + sharpened closure contract (party-mode disposition, same date). Walk-correctness end gate met 2026-04-11; Walk-speed end gate met within measurement variance (101.7 tok/s median sourdough decode on HEAD `388ad3d` vs 102.01 peer). The 2026-04-16 amendment reclassified the four "open after closeout" items and the historical `[ ]` checklist into a concrete gate set (A–G) enforced mechanically by `scripts/release-check.sh`; Phase 1b is formally closed when release-check.sh PASSes on all seven gates. Residual parity and determinism work that was "tracked downstream" is now surfaced as Phase 1b gates A–G prerequisites. **Phase 2 scope refined 2026-04-23 (party-mode session `adr_005_phase_2`)**: vision absorbed into Phase 2 as sub-phase **2c**; downstream phases renumbered (old Phase 3 → 2c, old Phase 4 → Phase 3, old Phase 5 → Phase 4); 27 design decisions recorded; continuous-batching carved out to a future ADR (see "Concurrent-deployment scaling (deferred)" section). Phase 2 (2a + 2b + 2c), Phase 3, Phase 4 **In Progress**. See the Phase 1b Closeout section and the Phase 1b Closeout Amendment immediately below it in Acceptance Criteria for gate-by-gate status.
 **Date:** 2026-04-09 (original), 2026-04-10 (Walk replan), 2026-04-16 (Phase 1b closeout)
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-006 (mlx-native destination), ADR-007 (TurboQuant KV), ADR-008 (candle divorce), ADR-009 (parity recovery), ADR-010 (exact batched parity + Q8 rerank shipping strategy)
@@ -1044,6 +1044,41 @@ W21 landed the Rust + script edits for the ADR-007 §853-866 TQ-active companion
 1. `hf2q parity capture --tq-quality --model <gguf> --prompt sourdough` writes `tests/evals/reference/sourdough_tq_quality.json`.
 2. End-to-end `release-check.sh` PASS run with the new fixture + Gate H block green.
 3. ADR Phase 1b "CLOSED" entry updated to record Gate H PASS alongside the existing seven gates A-G.
+
+---
+
+#### Phase 1b iter-112b — Gate H GREEN, Phase 1b FULL COVERAGE CLOSES (2026-04-26, W39)
+
+W39 closed iter-112's three outstanding items in one synchronous run after diagnosing two layered bugs in W21's iter-108b plumbing that had silently dropped every Gate H dump.
+
+**The two bugs (W38 diagnosis, W39 fix).**
+
+1. **`INVESTIGATION_ENV` LazyLock freezes before `Cli::parse`.** `main.rs::main` calls `INVESTIGATION_ENV.activate()` at line 120, BEFORE `Cli::parse` reaches the `parity capture --tq-quality` subcommand. By the time `parity_quality::run_two_regime_decode` ran W21's `unsafe { std::env::set_var("HF2Q_DUMP_DIR", ...); std::env::set_var("HF2Q_DUMP_ALL_CACHE", "1"); }`, the LazyLock's `dump_dir` (default `/tmp`) and `dump_all_cache` (default `false`) were already frozen. The SDPA-out dump gate at `forward_decode` lines 1268-1271 evaluated false at every step; the dump-path formatter inside `dumps::dump_f32` would have written to `/tmp` even if the gate fired.
+
+2. **Static atomic `decode_step_for_dump` accumulated across passes.** The counter at `forward_decode` lines 1262-1267 was a process-static `AtomicUsize`. After pass 1 (1000 dense decode steps), the counter sat at 1000; pass 2's TQ steps ran at counter values 1000-2000, all `>= max_pos=1000`, so even with bug 1 fixed, the gate still wouldn't fire on pass 2.
+
+**The fix (mantra-aligned: smallest correct diff, leverages the established W13/W21 per-instance override pattern).** Three commits, all on `main`:
+
+- **`9c7a473` (fix, +202 -27 LOC across 3 files):** new per-instance fields on `MlxModelWeights` — `dump_dir_override: Option<PathBuf>`, `dump_all_cache_override: Option<bool>`, `decode_step_dump_counter: usize` (replaces the process-static atomic). New setter `set_dump_overrides(dir, all_cache)` wired by parity_quality before each pass; `set_decode_regime` and `set_replay_tokens` reset the dump counter. New `dumps::dump_f32_to(buf, ..., dir_override)` overload — `dump_f32` forwards to `dump_f32_to(..., None)` to preserve byte-identical default behavior for every other caller. The forward_decode SDPA-out / QKV-pre-SDPA dump sites consult `self.dump_dir_override` / `dump_all_cache_eff` (override-or-LazyLock) at the call site. `HF2Q_DUMP_SDPA_MAX_POS` keeps its function-local `OnceLock` because it's read once on first `forward_decode`, AFTER `parity_quality`'s `set_var` lands; both passes want the same window, so per-instance override isn't needed.
+- **`8e5776e` (feat, fixture):** `tests/evals/reference/sourdough_tq_quality.json` (37 KB; 2017 lines including the dense_nll_per_step + dense_tokens arrays). Captured against `gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` SHA `ae19574d…f8e6f` at `--max-tokens 1000`, HEAD `9c7a473`. **Day-of-capture envelope: cosine_mean = 0.999672, cosine_p1 = 0.996080, argmax_div = 0.0080 (8 / 1000), ppl_delta_pct = 0.0014 (PPL_dense=1.1032, PPL_tq=1.1048).**
+- **(this commit) docs:** Phase 1b CLOSED-with-Gate-H entry below.
+
+**Validation: synchronous foreground `release-check.sh` end-to-end at HEAD `8e5776e`, ALL EIGHT GATES PASS.** Single Bash invocation, `pgrep -f 'hf2q convert|hf2q generate|hf2q parity|llama-cli|llama-mtmd'` = 0 at dispatch. Verbatim per-gate result:
+
+| Gate | Description | Result | Measured |
+|---|---|---|---|
+| A | Prefill ≥2048-tok (batched) | PASS | 3279.5 tok/s on pp2455 (floor 130) |
+| B | Decode median-of-3 | PASS | 101.1 tok/s [100.9, 101.1, 101.2] (floor 100) |
+| C | sourdough exact-parity vs llama.cpp | PASS | 3/3 (min-prefix=3094) |
+| D | self-baselines (3 prompts × 3 runs) | PASS | 9/9 byte-identical |
+| E | sliding_wrap floor | PASS | 3/3 (min-prefix=700) |
+| F | short_hello exact vs llama.cpp | PASS | 3/3 (min-prefix=29) |
+| G | mlx-native counter thresholds | PASS | dispatches/decode_tok=988.2 (max 1300); syncs=1 (max 60) |
+| H | TQ quality envelope | PASS | cos_mean=0.999672, p1=0.996080, argmax=0.0080, PPL Δ=0.0014 |
+
+Run artifact: `/tmp/w39_release_check.log`. Capture artifact: `/tmp/w39_capture.log` (359,656 lines — every `[DUMP]` line points at `<temp_dir>/hf2q_gate_h_capture_*/` across both passes, which was empty pre-fix).
+
+**Phase 1b is now CLOSED with full coverage:** seven dense gates A-G (closed iter-110 W20 2026-04-25) plus the TQ-active companion Gate H (closed iter-112b W39 2026-04-26). The Walk-correctness end gate (byte-identical top-k logits, coherent generation) and Walk-speed end gate (within measurement variance of llama.cpp peer median) both hold; release-check.sh's eight-gate suite is the mechanical enforcement contract.
 
 ---
 
