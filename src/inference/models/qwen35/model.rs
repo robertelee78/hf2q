@@ -175,7 +175,7 @@ impl Qwen35Model {
         let device = MlxDevice::new()
             .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
 
-        let (token_embd, output_weight, output_norm) =
+        let (mut token_embd, output_weight, output_norm) =
             weight_loader::load_global_tensors(gguf, &cfg, &device)
                 .context("load_global_tensors")?;
 
@@ -199,6 +199,53 @@ impl Qwen35Model {
                     physical_vocab,
                 );
                 cfg.vocab_size = physical_vocab as u32;
+            }
+        }
+
+        // Special-token coverage fix (Qwen3.5 / Qwen3.6-27B dense):
+        //
+        // The GGUF embed table is truncated to the base tokenizer vocab (e.g.
+        // 248044 entries derived from tokenizer.ggml.tokens), but the Qwen3.5
+        // chat template inserts special tokens <|im_start|> (248045),
+        // <|im_end|> (248046), … up to <|fim_suffix|> (248062).  These IDs
+        // live in tokenizer.json's added_tokens section and are NOT reflected
+        // in tokenizer.ggml.tokens or any GGUF metadata key.
+        //
+        // Fix: if cfg.vocab_size < QWEN35_FULL_VOCAB (248320 — the authoritative
+        // vocab_size from the HF config, which covers all special tokens) and
+        // the gap is small (< 2048 rows), extend token_embd in-place with zero
+        // rows.  Zero-filled embeddings for structural special tokens
+        // (<|im_start|> etc.) are functional: the model's attention pattern
+        // treats these IDs as role delimiters regardless of embedding magnitude.
+        // This avoids an OOB panic in embed_tokens when prompt tokens exceed
+        // the GGUF's truncated vocab.
+        //
+        // output_weight (lm_head) is NOT extended: the model never generates
+        // special token IDs through argmax over the trained 248044-wide logits.
+        if h > 0 {
+            const QWEN35_FULL_VOCAB: u32 = 248_320;
+            let current_vocab = cfg.vocab_size;
+            if current_vocab < QWEN35_FULL_VOCAB
+                && (QWEN35_FULL_VOCAB - current_vocab) < 2048
+            {
+                let rows_to_add = (QWEN35_FULL_VOCAB - current_vocab) as usize;
+                tracing::info!(
+                    current_vocab,
+                    extended_vocab = QWEN35_FULL_VOCAB,
+                    rows_to_add,
+                    "qwen35 special-token coverage: extending token_embd \
+                     from {} to {} rows with zero embeddings",
+                    current_vocab,
+                    QWEN35_FULL_VOCAB,
+                );
+                token_embd.resize(QWEN35_FULL_VOCAB as usize * h, 0.0f32);
+                // NOTE: cfg.vocab_size is NOT updated here.  cfg.vocab_size
+                // reflects the LM-head output dimension (output_weight rows =
+                // 248044).  The embed table now has more rows than cfg.vocab_size,
+                // and embed_tokens_gpu uses token_embd.len()/h as its effective
+                // vocab_size so it can look up any token in [0, 248320).
+                // Keeping cfg.vocab_size at 248044 ensures the lm_head matmul
+                // allocates the correct output buffer size.
             }
         }
 

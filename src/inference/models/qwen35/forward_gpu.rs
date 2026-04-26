@@ -259,7 +259,17 @@ fn embed_tokens_gpu(
     hidden_size: u32,
     device: &MlxDevice,
 ) -> Result<MlxBuffer> {
-    let cpu = embed_tokens(tokens, token_embd, vocab_size, hidden_size);
+    // Use the actual token_embd table row count as the embed vocab, not
+    // cfg.vocab_size.  When the GGUF embed table is extended with zero rows
+    // to cover special tokens (e.g. <|im_start|>=248045 beyond the 248044-row
+    // base table), token_embd.len()/h > cfg.vocab_size; using the table size
+    // lets embed_tokens find any valid special-token row without OOB panic.
+    let embed_vocab = if hidden_size > 0 {
+        (token_embd.len() / hidden_size as usize) as u32
+    } else {
+        vocab_size
+    };
+    let cpu = embed_tokens(tokens, token_embd, embed_vocab, hidden_size);
     upload_f32(&cpu, device).context("embed_tokens_gpu upload")
 }
 
@@ -1228,7 +1238,14 @@ impl Qwen35Model {
         // is valid for the duration of this call. We hold exclusive access to
         // embed_buf here (no other reference exists during the embedding step).
         let mut hidden = {
-            let cpu_embed = embed_tokens(tokens, &self.token_embd, cfg.vocab_size, h);
+            // Use actual token_embd row count as embed_vocab (may exceed cfg.vocab_size
+            // when token_embd was extended with zero rows for special-token coverage).
+            let embed_vocab = if h > 0 {
+                (self.token_embd.len() / h as usize) as u32
+            } else {
+                cfg.vocab_size
+            };
+            let cpu_embed = embed_tokens(tokens, &self.token_embd, embed_vocab, h);
             let embed_buf_mut = unsafe { &mut (*decode_bufs_ref).embed_buf };
             upload_f32_into(&cpu_embed, embed_buf_mut)
                 .context("embed upload_f32_into greedy")?;
