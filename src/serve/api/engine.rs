@@ -53,11 +53,30 @@ use crate::serve::sampler_pure::{
 // ---------------------------------------------------------------------------
 
 /// Sampling parameters passed to the engine worker. Full Tier 2/3/4
-/// surface plumbed from the request; sampler_pure currently honors the
-/// first four (temperature, top_p, top_k, repetition_penalty, max_tokens).
-/// The remaining fields (frequency/presence penalty, min_p, seed,
-/// logit_bias) plumb through untouched until the forward-decode refactor
-/// exposes logits so they can be applied at sample time.
+/// surface plumbed from the request.
+///
+/// **Honored at decode time** (iter-94, iter-95):
+/// - `temperature`, `top_p`, `top_k`, `repetition_penalty` —
+///   routed through `sampler_pure::sample_token` over the live
+///   logits whenever any field requests non-greedy sampling
+///   (see `sample_logits` gate in `generate_once`).  All-default
+///   request → on-GPU greedy argmax fast path (no logits readback).
+/// - `max_tokens`, `stop_strings` — decode-loop terminators.
+/// - `logit_bias` — additive bias applied to live logits before
+///   `sampler_pure` (Tier 4, OpenAI semantics).
+/// - `grammar` + `token_bytes` — when present, mask invalid tokens
+///   per-step before sampling (iter-95 grammar-constrained decode,
+///   gated on `response_format=json_object`/`json_schema`).
+///
+/// **Plumbed but NOT yet honored** (accepted from the request,
+/// retained on the struct, but not consumed by the current sampler):
+/// - `frequency_penalty`, `presence_penalty` — Tier 2 OpenAI extras.
+/// - `min_p` — Tier 3 llama.cpp extension.
+/// - `seed` — RNG seeding (sampler_pure uses a thread-local RNG today).
+/// - `logprobs`, `top_logprobs` — Tier 4 response shape; surface only.
+/// - `parallel_tool_calls` — Tier 4; lands with the tool-call path
+///   referenced at the worker dispatch site (see Decision #21 in the
+///   registration block).
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
