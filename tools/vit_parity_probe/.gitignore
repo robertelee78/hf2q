@@ -1,0 +1,8 @@
+# Cargo build artifacts
+target/
+
+# CMake build artifacts (generated; keep cpp/CMakeLists.txt + .cpp).
+cpp/build/
+
+# NOTE: Cargo.lock IS checked in (binary-only crate; reproducible
+# diff builds matter for parity probe regression).

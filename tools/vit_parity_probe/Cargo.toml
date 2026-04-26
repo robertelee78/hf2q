@@ -1,0 +1,39 @@
+# vit_parity_probe — ADR-005 Phase 2c iter 124.
+#
+# Standalone Cargo project (NOT a workspace member of /opt/hf2q so it
+# doesn't pollute the main hf2q crate's build). Provides:
+#
+#   * `diff` binary: stage-by-stage element-wise max-abs-error between a
+#     hf2q dump dir and an llama.cpp peer-reference dump dir.
+#
+# The C++ peer dumper lives at `cpp/peer_dumper.cpp` (built via cmake).
+# This crate stays pure-Rust per the hf2q sovereignty mandate; it links
+# only against std and the dump format (raw F32 LE + JSON sidecar).
+#
+# Build:
+#   cargo build --release --manifest-path tools/vit_parity_probe/Cargo.toml
+#
+# Run diff:
+#   target/release/diff /tmp/hf2q_dumps /tmp/peer_dumps
+
+[package]
+name = "vit_parity_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "diff"
+path = "src/bin/diff.rs"
+
+# Independent target dir so we don't share build state with the main
+# hf2q crate. Also keeps the artefact out of accidental `cargo install`s.
+[workspace]
+
+# The parent /opt/hf2q/.cargo/config.toml has a `[patch.crates-io]`
+# entry for `mlx-native` (path-pinned to /opt/mlx-native) that this
+# crate doesn't depend on. Cargo emits a "patch was not used" warning
+# unless we mirror the patch here. Mirror it to silence the noise; the
+# patch is a no-op for our dep-less crate.
+[patch.crates-io]
+mlx-native = { path = "/opt/mlx-native" }
