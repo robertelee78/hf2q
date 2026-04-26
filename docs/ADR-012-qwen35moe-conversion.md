@@ -1,6 +1,6 @@
 # ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
 
-**Status:** 🟡 **IN PROGRESS** — engineering pipeline complete, **Bug 4 closed 2026-04-25, Bug 3 (DWQ re-emit) still open**.
+**Status:** ✅ **COMPLETE** — closed 2026-04-26.  Engineering pipeline P0–P11 shipped 2026-04-24.  Post-shipment regression bug ladder (Bugs 1, 2, 4, 5, 6, 7) all FIXED across `85e488f`, `fc85681`, `f02a293`, `469f837`, `d4ba8ee`, `db9aa0d`.  Bug 3 closed 2026-04-26 — all four DWQ GGUFs (qwen35/qwen35moe × dwq46/dwq48) re-emitted through the post-fix pipeline, each loads in llama.cpp without rejection and generates coherent text at the canonical pangram prompt.
 
 P0–P11 all shipped on main (post-merge `da030a5`).  1185 unit + ~117 integration tests green.
 
@@ -128,16 +128,33 @@ The smoke run at commit `eee1c39` surfaced "wrong number of tensors; expected 86
 
   **Fix design (next iter):** extend `gguf.rs::hf_name_to_gguf` MTP branch to recognize all 15 `mtp.*` patterns and route them per `llama-arch.cpp:447-452` (the 6 `LLM_TENSOR_NEXTN_*` slots) plus the inner transformer block at `blk.{n_layer}.*`.  Cross-reference `/opt/llama.cpp/convert_hf_to_gguf.py` for the canonical HF→GGUF MTP mapping to avoid guesswork.  Update the ADR-012 P11 round-trip test to load all 15 (currently only verifies 4); ADR-013's `mtp.rs::load_mtp_weights_if_present` already scans the full `blk.{N}.nextn.*` prefix so it picks up whatever new mappings land.
 
-**Bug 3 — ssm_conv1d Q4_0 alignment (PRE-FIX SHIPPED ARTIFACTS):** ⏳ **OPEN.**  All four "shipped" DWQ GGUFs (`models/qwen3.6-27b-dwq{46,48}/`, `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq{46,48}/`) were produced before the post-shipment `is_weight()` guard (`436b923`) landed.  Every one fails to load:
+**Bug 3 — ssm_conv1d Q4_0 alignment (PRE-FIX SHIPPED ARTIFACTS):** ✅ **FIXED** 2026-04-26 — all four DWQ GGUFs re-emitted through the post-fix pipeline (post-Bug-1, post-Bug-2, post-Bug-4, post-Bug-6, post-Bug-7).  The pre-fix shipped GGUFs at `models/qwen3.6-27b-dwq{46,48}/` and `models/qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq{46,48}/` were originally produced before the post-shipment `is_weight()` guard (`436b923`) landed and failed to load with `tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements per row, not a multiple of block size (32)`.
 
-  ```
-  gguf_init_from_file_ptr: tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0)
-                           has 4 elements per row, not a multiple of block size (32)
-  ```
+**Re-emit verification (2026-04-26 01:02–01:17, this commit):**
 
-  **Fix:** re-emit each of the four GGUFs through the post-fix pipeline once Bug 2 is closed.  The 27B-dwq46 GGUF appears to have been deleted from disk entirely; the other three are present but unloadable.  Each re-emit costs ~150 GB peak disk + ~2 h DWQ wall-clock per ADR-012 P9b's documented numbers.
+| Model + repo | Quant | Output GGUF size | Compression | Decode | Pangram |
+|---|---|---|---|---|---|
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-6 | 16.08 GB | 3.2× | 28.24 t/s | "jumps over the lazy" |
+| Qwen/Qwen3.6-27B (dense) | dwq-mixed-4-8 | 16.69 GB | 3.1× | 27.48 t/s | "jumps over the lazy" |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-6 | 19.25 GB | 3.4× | 114.69 t/s | "jumps over the lazy dog." |
+| jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated (MoE) | dwq-mixed-4-8 | 27.46 GB | 2.4× | 97.81 t/s | "jumps over the lazy" |
 
-Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  This addendum reverts that claim with the verification evidence and names the remaining work explicitly.
+All four load in `/opt/homebrew/bin/llama-completion` (llama.cpp build b8680-15f786e65) without rejection — no shape mismatch, no tensor-count mismatch, no GGML_ASSERT, no Aborted.  At `--prompt "The quick brown fox" --seed 42 --temp 0 --n 8`, each produces the canonical pangram completion deterministically.  Wall-clock per re-emit: 7–10 minutes on M5 Max + 128 GB unified RAM (significantly faster than the docs' "~2 h" conservative estimate, attributable to (a) the existing safetensors cache (no HF download), (b) `--skip-quality` bypass of the Phase 4.5 dequant peak — see `project_phase45_quality_oom.md`, and (c) cohort-prior bit allocation pruning calibration to 1–3 sensitive layer ranges).
+
+Re-emit invocation (canonical for follow-up runs):
+
+```
+HF2Q_QWEN35_DROP_MTP=1 hf2q convert \
+  --repo <hf-repo> \
+  --format gguf \
+  --quant dwq-mixed-{4-6,4-8} \
+  --skip-quality \
+  --output models/<slug>/<slug>.gguf
+```
+
+`HF2Q_QWEN35_DROP_MTP=1` is the temporary escape hatch from the ADR-013 P14 interaction (see "Note on ADR-013 P14 interaction" above) and removes when llama.cpp gains qwen35 MTP loading or by 2026-Q4.  `--skip-quality` defers the Phase 4.5 PPL/KL measurement (separate streaming-dequant refactor follow-up — ~170 GB peak vs. 128 GB physical RAM on M5 Max).
+
+Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  That addendum was correctly reverted in `eee1c39`; this closure re-flips the status only after all four GGUFs were independently load-verified by `/opt/homebrew/bin/llama-completion` end-to-end.
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
 
