@@ -1446,34 +1446,214 @@ fn generate_stream_once(
     let mut splitter = registration
         .and_then(|r| super::registry::ReasoningSplitter::from_registration(r));
 
-    // Local helper to emit a fragment through the splitter (if any) into
-    // the correct DeltaKind slot. Returns the bytes emitted (for stop-string
-    // bookkeeping). Note: the splitter holds back a tail that's drained at
-    // generation end.
-    let emit_fragment = |splitter: &mut Option<super::registry::ReasoningSplitter>,
+    // Tool-call splitter (iter-133 Iter B-2) — classifies the
+    // post-reasoning Content stream into in/out-of-tool-call spans. When a
+    // tool-call span closes, its body is parsed into structured
+    // `name + arguments_json` and emitted as one or more
+    // `GenerationEvent::ToolCallDelta` chunks (id+name first, full
+    // arguments string second; matches the SSE encoder's expectation in
+    // `sse.rs:208-247`).
+    //
+    // Composition: the engine runs ReasoningSplitter first; any
+    // `Content`-classified output then flows into ToolCallSplitter. Reasoning
+    // never appears inside a tool call — neither chat template emits
+    // `<|think|>` between tool-call markers — so this layering is safe.
+    let mut tool_splitter = registration
+        .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
+    // Per-call body accumulator + per-stream tool-call index. Body is
+    // bounded by max_tokens so unbounded growth is impossible. Index is
+    // incremented every time a tool-call closes and emits a delta — used
+    // as the OpenAI `delta.tool_calls[*].index` field.
+    let mut tool_call_body: String = String::new();
+    let mut tool_call_index: usize = 0;
+    // Set true on first ToolCallClose; latched. Drives `finish_reason ==
+    // "tool_calls"` per OpenAI spec (decode loop's normal `"stop"` /
+    // `"length"` is overridden when this flag is set on the terminating
+    // path).
+    let mut saw_tool_call: bool = false;
+
+    // Helper: for a Content-classified text run, route through the
+    // ToolCallSplitter (if any) and emit the appropriate
+    // GenerationEvent. When ToolCallSplitter is None, route every byte to
+    // `DeltaKind::Content` (current behavior pre-iter-B-2).
+    let route_content = |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+                         body: &mut String,
+                         tc_index: &mut usize,
+                         saw_tc: &mut bool,
                          events: &mpsc::Sender<GenerationEvent>,
-                         fragment: &str| -> Result<(), ()> {
+                         text: &str,
+                         reg: Option<&super::registry::ModelRegistration>|
+     -> Result<(), ()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(tcs) = tool_splitter.as_mut() else {
+            // No tool markers registered — original behavior.
+            if events
+                .blocking_send(GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: text.to_string(),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            return Ok(());
+        };
+        for ev in tcs.feed(text) {
+            match ev {
+                super::registry::ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen => {
+                    body.clear();
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) => {
+                    body.push_str(&t);
+                }
+                super::registry::ToolCallEvent::ToolCallClose => {
+                    // Parse the accumulated body. On parse failure, log +
+                    // re-emit the body as Content so the user still sees
+                    // something (the per-model parser is best-effort
+                    // fallback; well-formed output is the common case
+                    // because the in-template syntax is fixed).
+                    let parsed = reg
+                        .and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let body_dump = std::mem::take(body);
+                    match parsed {
+                        Some(pc) => {
+                            // First chunk: id + type + name. The id is a
+                            // synthesized opaque identifier; clients echo
+                            // it in their `tool_call_id` follow-up message.
+                            // Format mirrors OpenAI's `call_<24hex>` shape.
+                            let id = format!(
+                                "call_hf2q_{:016x}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos() as u64)
+                                    .unwrap_or(0)
+                                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                            );
+                            if events
+                                .blocking_send(
+                                    GenerationEvent::ToolCallDelta {
+                                        index: *tc_index,
+                                        id: Some(id),
+                                        call_type: Some("function".into()),
+                                        name: Some(pc.name),
+                                        arguments: None,
+                                    },
+                                )
+                                .is_err()
+                            {
+                                return Err(());
+                            }
+                            // Second chunk: full arguments JSON string.
+                            // OpenAI clients accumulate `function.arguments`
+                            // deltas; one chunk is spec-valid.
+                            if events
+                                .blocking_send(
+                                    GenerationEvent::ToolCallDelta {
+                                        index: *tc_index,
+                                        id: None,
+                                        call_type: None,
+                                        name: None,
+                                        arguments: Some(pc.arguments_json),
+                                    },
+                                )
+                                .is_err()
+                            {
+                                return Err(());
+                            }
+                            *tc_index += 1;
+                            *saw_tc = true;
+                        }
+                        None => {
+                            tracing::warn!(
+                                body = %body_dump,
+                                "tool-call body unparseable; emitting as content fallback"
+                            );
+                            if events
+                                .blocking_send(GenerationEvent::Delta {
+                                    kind: DeltaKind::Content,
+                                    text: body_dump,
+                                })
+                                .is_err()
+                            {
+                                return Err(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Local helper to emit a fragment through the reasoning splitter (if
+    // any) and then through the tool-call router. Returns the bytes emitted
+    // (for stop-string bookkeeping). Note: each splitter holds back a tail
+    // that's drained at generation end.
+    let emit_fragment = |splitter: &mut Option<super::registry::ReasoningSplitter>,
+                         tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+                         body: &mut String,
+                         tc_index: &mut usize,
+                         saw_tc: &mut bool,
+                         events: &mpsc::Sender<GenerationEvent>,
+                         fragment: &str,
+                         reg: Option<&super::registry::ModelRegistration>|
+     -> Result<(), ()> {
         if fragment.is_empty() {
             return Ok(());
         }
         if let Some(sp) = splitter.as_mut() {
             for (slot, text) in sp.feed(fragment) {
-                let kind = match slot {
-                    super::registry::SplitSlot::Content => DeltaKind::Content,
-                    super::registry::SplitSlot::Reasoning => DeltaKind::Reasoning,
-                };
-                if events.blocking_send(GenerationEvent::Delta { kind, text }).is_err() {
-                    return Err(());
+                match slot {
+                    super::registry::SplitSlot::Reasoning => {
+                        if !text.is_empty()
+                            && events
+                                .blocking_send(GenerationEvent::Delta {
+                                    kind: DeltaKind::Reasoning,
+                                    text,
+                                })
+                                .is_err()
+                        {
+                            return Err(());
+                        }
+                    }
+                    super::registry::SplitSlot::Content => {
+                        route_content(
+                            tool_splitter,
+                            body,
+                            tc_index,
+                            saw_tc,
+                            events,
+                            &text,
+                            reg,
+                        )?;
+                    }
                 }
             }
-        } else if events
-            .blocking_send(GenerationEvent::Delta {
-                kind: DeltaKind::Content,
-                text: fragment.to_string(),
-            })
-            .is_err()
-        {
-            return Err(());
+        } else {
+            // No reasoning splitter — route everything as Content.
+            route_content(
+                tool_splitter,
+                body,
+                tc_index,
+                saw_tc,
+                events,
+                fragment,
+                reg,
+            )?;
         }
         Ok(())
     };
@@ -1596,7 +1776,18 @@ fn generate_stream_once(
     let mut is_eos_first = loaded.eos_token_ids.contains(&next_token);
     if !is_eos_first && !first_text.is_empty() {
         accumulated_text.push_str(&first_text);
-        if emit_fragment(&mut splitter, events, &first_text).is_err() {
+        if emit_fragment(
+            &mut splitter,
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            events,
+            &first_text,
+            registration,
+        )
+        .is_err()
+        {
             tracing::info!("SSE stream dropped by client; aborting decode");
             return;
         }
@@ -1671,7 +1862,18 @@ fn generate_stream_once(
                 .decode(&[next_token], false)
                 .unwrap_or_default();
             accumulated_text.push_str(&fragment);
-            if emit_fragment(&mut splitter, events, &fragment).is_err() {
+            if emit_fragment(
+                &mut splitter,
+                &mut tool_splitter,
+                &mut tool_call_body,
+                &mut tool_call_index,
+                &mut saw_tool_call,
+                events,
+                &fragment,
+                registration,
+            )
+            .is_err()
+            {
                 tracing::info!("SSE stream dropped by client; aborting decode");
                 return;
             }
@@ -1706,20 +1908,98 @@ fn generate_stream_once(
         }
     }
 
-    // Drain any leftover tail the splitter was holding back.
+    // Drain any leftover tail the reasoning splitter was holding back. If
+    // the tail is Content-classified, route it through the tool-call
+    // splitter so a marker straddling EOS is still detected.
     if let Some(sp) = splitter.as_mut() {
         if let Some((slot, tail)) = sp.finish() {
-            let kind = match slot {
-                super::registry::SplitSlot::Content => DeltaKind::Content,
-                super::registry::SplitSlot::Reasoning => DeltaKind::Reasoning,
-            };
-            if !tail.is_empty() {
-                if events.blocking_send(GenerationEvent::Delta { kind, text: tail }).is_err() {
-                    tracing::info!("SSE stream dropped by client; aborting decode");
-                    return;
+            match slot {
+                super::registry::SplitSlot::Reasoning => {
+                    if !tail.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Reasoning,
+                                text: tail,
+                            })
+                            .is_err()
+                    {
+                        tracing::info!("SSE stream dropped by client; aborting decode");
+                        return;
+                    }
+                }
+                super::registry::SplitSlot::Content => {
+                    if route_content(
+                        &mut tool_splitter,
+                        &mut tool_call_body,
+                        &mut tool_call_index,
+                        &mut saw_tool_call,
+                        events,
+                        &tail,
+                        registration,
+                    )
+                    .is_err()
+                    {
+                        tracing::info!("SSE stream dropped by client; aborting decode");
+                        return;
+                    }
                 }
             }
         }
+    }
+    // Drain any tool-splitter tail. If the stream ended mid-tool-call (no
+    // close marker observed), the tail is ToolCallText: re-emit as plain
+    // Content so the partial body isn't silently dropped — the operator
+    // can see the truncation in `delta.content` and the test harness asserts
+    // SSE shape, not byte-perfect content.
+    if let Some(tcs) = tool_splitter.as_mut() {
+        if let Some(ev) = tcs.finish() {
+            match ev {
+                super::registry::ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        tracing::info!("SSE stream dropped by client; aborting decode");
+                        return;
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) => {
+                    // Mid-call truncation. Emit residual body as Content
+                    // (open marker was already swallowed by the splitter,
+                    // but for diagnostic clarity we wrap with the literal
+                    // open marker so a stop-mid-call is still visible).
+                    let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
+                    let fallback = format!("{prefix}{t}");
+                    if !fallback.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: fallback,
+                            })
+                            .is_err()
+                    {
+                        tracing::info!("SSE stream dropped by client; aborting decode");
+                        return;
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen
+                | super::registry::ToolCallEvent::ToolCallClose => {
+                    // unreachable: finish() never emits Open/Close.
+                }
+            }
+        }
+    }
+    // Override finish_reason to "tool_calls" per OpenAI spec when at least
+    // one structured tool-call delta was emitted on this stream. Spec:
+    // https://platform.openai.com/docs/guides/function-calling — when the
+    // model invokes a tool, finish_reason becomes "tool_calls" rather than
+    // "stop"/"length". This overrides EOS-driven "stop" set above.
+    if saw_tool_call {
+        finish_reason = "tool_calls";
     }
 
     let decode_duration = decode_start.elapsed();

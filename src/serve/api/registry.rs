@@ -87,15 +87,26 @@ impl ModelRegistration {
 
 /// Gemma 4 (26B / A4B / variants). Uses `<|think|>` / `</think|>` for
 /// reasoning spans (matches the in-template marker `<|think|>` hardcoded in
-/// `FALLBACK_GEMMA4_CHAT_TEMPLATE`). Tool calling uses a grammar-constrained
-/// JSON block wrapped in `<tool_call>` / `</tool_call>`.
+/// `FALLBACK_GEMMA4_CHAT_TEMPLATE`). Tool calling uses the literal Gemma 4
+/// in-template markers `<|tool_call>` (open) and `<tool_call|>` (close);
+/// note the asymmetric pipe placement — see
+/// `models/gemma4/chat_template.jinja:189-203`.
+///
+/// **Marker shape audit (2026-04-26 W66 iter-133 Iter B-2):** Pre-fix this
+/// entry declared `<tool_call>` / `</tool_call>` (the Qwen convention). The
+/// gemma-4 GGUF chat template actually emits `<|tool_call>call:NAME{...}<tool_call|>`,
+/// not `<tool_call>...</tool_call>`. Real-model fixture
+/// `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt`
+/// (W65 iter-133 Iter B) confirmed the literal mismatch. Iter B-2 fixed
+/// the registration to match the in-template strings so the engine's
+/// `ToolCallSplitter` actually detects what the model emits.
 pub const GEMMA4: ModelRegistration = ModelRegistration {
     family: "gemma4",
     id_substrings: &["gemma-4", "gemma4"],
     reasoning_open: Some("<|think|>"),
     reasoning_close: Some("</think|>"),
-    tool_open: Some("<tool_call>"),
-    tool_close: Some("</tool_call>"),
+    tool_open: Some("<|tool_call>"),
+    tool_close: Some("<tool_call|>"),
     tool_preamble: None,
 };
 
@@ -309,6 +320,365 @@ pub enum SplitSlot {
     Content,
     /// `delta.reasoning_content` / `message.reasoning_content`.
     Reasoning,
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call boundary state machine (Decision #21 sibling, iter-133 Iter B-2)
+// ---------------------------------------------------------------------------
+
+/// Output emitted by `ToolCallSplitter::feed`. The splitter classifies each
+/// decoded fragment into one of:
+///   - **`Content(text)`** — outside any tool-call span; route to
+///     `delta.content` (or further classify via `ReasoningSplitter`).
+///   - **`ToolCallOpen`** — a tool-call open marker has just been observed;
+///     emitted exactly once per call. The producer should:
+///       1. Synthesize a `tool_call_id` (`call_<rand>`).
+///       2. Buffer subsequent `ToolCallText` fragments until `ToolCallClose`.
+///   - **`ToolCallText(text)`** — accumulated raw text inside the open/close
+///     markers (including the `call:NAME{...}` Gemma 4 syntax). The marker
+///     literals themselves are swallowed; the text run is the model's verbatim
+///     argument syntax.
+///   - **`ToolCallClose`** — the close marker has been observed; the
+///     accumulated tool-call body is complete and the producer can parse +
+///     emit the structured `delta.tool_calls.function.{name,arguments}` chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallEvent {
+    Content(String),
+    ToolCallOpen,
+    ToolCallText(String),
+    ToolCallClose,
+}
+
+/// Tracks position inside a tool-call span while decoded text accumulates.
+/// Sibling to `ReasoningSplitter` — same tail-buffer pattern, same
+/// boundary-marker semantics, different output enum because tool-call
+/// downstream wiring (`GenerationEvent::ToolCallDelta`) carries more
+/// structure than `Reasoning` vs `Content`.
+///
+/// **Marker shape (per-model registration, not parsing):** the splitter
+/// detects the literal open/close markers from `ModelRegistration.tool_open`
+/// / `tool_close` (e.g. Gemma 4: `<|tool_call>` / `<tool_call|>`; Qwen 3.5/3.6:
+/// `<tool_call>` / `</tool_call>`). The text run between them — the `call:NAME{kv-list}`
+/// Gemma syntax or the `<function=NAME><parameter=...>...</function>` Qwen
+/// syntax — is parsed by a per-model parser at `ToolCallClose` emission, not
+/// by this splitter.
+///
+/// **Composition with `ReasoningSplitter`:** the engine runs
+/// `ReasoningSplitter` first (reasoning is always outside tool calls); the
+/// `Content`-classified fragments then flow into `ToolCallSplitter`. The
+/// same tail-buffer discipline guarantees markers spanning fragment
+/// boundaries are still detected.
+#[derive(Debug, Clone)]
+pub struct ToolCallSplitter {
+    open_marker: &'static str,
+    close_marker: &'static str,
+    in_tool_call: bool,
+    /// Sliding tail of decoded text — long enough to see either marker span
+    /// across token boundaries. See `ReasoningSplitter::tail_buf` for the
+    /// identical mechanism.
+    tail_buf: String,
+    tail_cap: usize,
+}
+
+impl ToolCallSplitter {
+    /// Build from a registration. If the registration has no tool markers,
+    /// returns `None` — callers route all text to `Content`.
+    pub fn from_registration(reg: &ModelRegistration) -> Option<Self> {
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => (o, c),
+            _ => return None,
+        };
+        let cap = open.len().max(close.len()).max(1);
+        Some(Self {
+            open_marker: open,
+            close_marker: close,
+            in_tool_call: false,
+            tail_buf: String::with_capacity(cap * 2),
+            tail_cap: cap,
+        })
+    }
+
+    /// Accept a fragment of decoded text. Returns a sequence of
+    /// `ToolCallEvent`s describing how the fragment should be routed. A
+    /// fragment may produce multiple events if a marker boundary falls
+    /// inside it (e.g. `pre <|tool_call>call:f{}<tool_call|> post` →
+    /// `[Content("pre "), ToolCallOpen, ToolCallText("call:f{}"),
+    /// ToolCallClose, Content(" post")]`).
+    ///
+    /// Markers themselves are **swallowed** — they don't appear in any
+    /// emitted text event. This matches the OpenAI spec: `delta.content`
+    /// gets natural-language text only; `delta.tool_calls.function.{name,
+    /// arguments}` gets the parsed call syntax (parsed by the engine after
+    /// observing `ToolCallClose`).
+    pub fn feed(&mut self, fragment: &str) -> Vec<ToolCallEvent> {
+        let mut out: Vec<ToolCallEvent> = Vec::new();
+        // Prepend the sliding tail so markers that span fragment boundaries
+        // are still detected (same mechanism as ReasoningSplitter).
+        let mut scan = std::mem::take(&mut self.tail_buf);
+        scan.push_str(fragment);
+
+        let mut scan_cursor = 0usize;
+        let mut out_cursor = 0usize;
+
+        loop {
+            let active_marker = if self.in_tool_call {
+                self.close_marker
+            } else {
+                self.open_marker
+            };
+            match scan[scan_cursor..].find(active_marker) {
+                Some(rel) => {
+                    let marker_start = scan_cursor + rel;
+                    // Emit text [out_cursor..marker_start] as the current slot.
+                    if marker_start > out_cursor {
+                        let text = scan[out_cursor..marker_start].to_string();
+                        if self.in_tool_call {
+                            out.push(ToolCallEvent::ToolCallText(text));
+                        } else {
+                            out.push(ToolCallEvent::Content(text));
+                        }
+                    }
+                    // Flip state + emit the open/close synthetic event.
+                    if self.in_tool_call {
+                        out.push(ToolCallEvent::ToolCallClose);
+                    } else {
+                        out.push(ToolCallEvent::ToolCallOpen);
+                    }
+                    self.in_tool_call = !self.in_tool_call;
+                    scan_cursor = marker_start + active_marker.len();
+                    out_cursor = scan_cursor;
+                }
+                None => {
+                    // No more markers in the remainder. Emit the portion that's
+                    // still after out_cursor MINUS the last `tail_cap` bytes,
+                    // which we hold back in case they're the start of a
+                    // next-fragment marker.
+                    let total_len = scan.len();
+                    let emit_end = total_len.saturating_sub(self.tail_cap);
+                    if emit_end > out_cursor {
+                        let emit_end = snap_down_char_boundary(&scan, emit_end);
+                        if emit_end > out_cursor {
+                            let text = scan[out_cursor..emit_end].to_string();
+                            if self.in_tool_call {
+                                out.push(ToolCallEvent::ToolCallText(text));
+                            } else {
+                                out.push(ToolCallEvent::Content(text));
+                            }
+                            out_cursor = emit_end;
+                        }
+                    }
+                    self.tail_buf = scan[out_cursor..].to_string();
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Drain any buffered tail at generation end. Called by the engine when
+    /// decode finishes so tail-stashed text isn't lost. Note: if generation
+    /// ends mid-tool-call (e.g. EOS while `in_tool_call=true`) the tail goes
+    /// into `ToolCallText`; the caller is responsible for deciding what to
+    /// do with an unterminated call (typical: emit a synthetic
+    /// `ToolCallClose` and finalize anyway, OR drop the partial call).
+    pub fn finish(&mut self) -> Option<ToolCallEvent> {
+        if self.tail_buf.is_empty() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.tail_buf);
+        if self.in_tool_call {
+            Some(ToolCallEvent::ToolCallText(text))
+        } else {
+            Some(ToolCallEvent::Content(text))
+        }
+    }
+
+    pub fn in_tool_call(&self) -> bool {
+        self.in_tool_call
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call body parser (Gemma 4 + Qwen 3.5/3.6 syntaxes)
+// ---------------------------------------------------------------------------
+
+/// Parsed shape of a single tool-call body, ready to populate the
+/// OpenAI `delta.tool_calls.function.{name, arguments}` chunk fields.
+///
+/// `arguments` is a JSON-encoded string per the OpenAI streaming spec —
+/// clients accumulate it across deltas and `JSON.parse` at the end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedToolCall {
+    pub name: String,
+    /// JSON-encoded arguments (e.g. `{"location":"Paris"}`).
+    pub arguments_json: String,
+}
+
+/// Parse a tool-call body emitted between the open/close markers.
+///
+/// Day-one supports two per-family syntaxes:
+///
+/// * **Gemma 4** — `call:NAME{key1:<|"|>val1<|"|>,key2:<|"|>val2<|"|>}` (string
+///   args wrapped in `<|"|>` quote-markers; numeric/boolean args bare). See
+///   `models/gemma4/chat_template.jinja:113-200`.
+/// * **Qwen 3.5/3.6** — `\n<function=NAME>\n<parameter=key>\nval\n</parameter>\n...\n</function>\n`.
+///   See the Qwen 3.6 GGUF tokenizer_config.json `chat_template` field.
+///
+/// Returns `None` when the body is unparseable (logged at the call site so
+/// the engine can degrade gracefully — emit a `Content(raw_body)` fragment
+/// rather than a malformed tool-call delta).
+pub fn parse_tool_call_body(reg: &ModelRegistration, body: &str) -> Option<ParsedToolCall> {
+    match reg.family {
+        "gemma4" => parse_gemma4_tool_call(body),
+        "qwen35" => parse_qwen35_tool_call(body),
+        _ => None,
+    }
+}
+
+/// Parse Gemma 4's `call:NAME{kv-list}` body. Whitespace-tolerant.
+///
+/// String values are wrapped in `<|"|>...<|"|>` markers (the Gemma quote
+/// convention; see `models/gemma4/chat_template.jinja:113`). Bare values
+/// (no surrounding quote-markers) are treated as JSON-literals (numbers,
+/// booleans). Keys are bare identifiers.
+fn parse_gemma4_tool_call(body: &str) -> Option<ParsedToolCall> {
+    let body = body.trim();
+    // Expect `call:NAME{...}`. The open marker has been swallowed by the
+    // splitter; the close marker has too. So we start with `call:`.
+    let rest = body.strip_prefix("call:")?;
+    let brace_start = rest.find('{')?;
+    let name = rest[..brace_start].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    // Match braces — body of args ends at the LAST `}` (Gemma can have
+    // nested args via the `<|"|>` quote-markers, but the outer brace is
+    // the call boundary).
+    let after_open = &rest[brace_start + 1..];
+    let close_idx = after_open.rfind('}')?;
+    let kv_str = &after_open[..close_idx];
+
+    // Split on top-level commas — top-level meaning: not inside `<|"|>...<|"|>`.
+    let kvs = split_top_level_kvs(kv_str);
+    let mut args = serde_json::Map::new();
+    for kv in kvs {
+        let (k, v) = kv.split_once(':')?;
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        // Decode the value: if wrapped in `<|"|>...<|"|>`, treat as string;
+        // otherwise treat as JSON literal (number, bool, null).
+        let v = v.trim();
+        let json_val = if let Some(stripped) = v
+            .strip_prefix("<|\"|>")
+            .and_then(|s| s.strip_suffix("<|\"|>"))
+        {
+            serde_json::Value::String(stripped.to_string())
+        } else if let Ok(num) = v.parse::<i64>() {
+            serde_json::Value::from(num)
+        } else if let Ok(num) = v.parse::<f64>() {
+            serde_json::Value::from(num)
+        } else if v == "true" {
+            serde_json::Value::Bool(true)
+        } else if v == "false" {
+            serde_json::Value::Bool(false)
+        } else if v == "null" {
+            serde_json::Value::Null
+        } else {
+            // Fallback: treat unquoted bare-value as a string. Better to
+            // forward the model's intent than to drop the field. Logged at
+            // the call site so calibration drift is visible.
+            serde_json::Value::String(v.to_string())
+        };
+        args.insert(key, json_val);
+    }
+    let arguments_json = serde_json::to_string(&serde_json::Value::Object(args))
+        .ok()?;
+    Some(ParsedToolCall {
+        name,
+        arguments_json,
+    })
+}
+
+/// Split a Gemma 4 kv-list on top-level commas — i.e. commas NOT inside a
+/// `<|"|>...<|"|>` string-quote span. Lightweight scanner; does not handle
+/// nested objects (Gemma 4 doesn't emit them per the chat template).
+fn split_top_level_kvs(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_str = false;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Detect `<|"|>` (5 bytes) at byte i.
+        if !in_str && bytes[i..].starts_with(b"<|\"|>") {
+            in_str = true;
+            i += 5;
+            continue;
+        }
+        if in_str && bytes[i..].starts_with(b"<|\"|>") {
+            in_str = false;
+            i += 5;
+            continue;
+        }
+        if !in_str && bytes[i] == b',' {
+            out.push(&s[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// Parse Qwen 3.5/3.6's `<function=NAME>\n<parameter=key>\nval\n</parameter>\n...\n</function>` body.
+///
+/// Whitespace-tolerant; `<parameter=key>...</parameter>` blocks become args.
+fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
+    let body = body.trim();
+    // Expect `<function=NAME>...</function>`.
+    let after_func = body.strip_prefix("<function=")?;
+    let name_end = after_func.find('>')?;
+    let name = after_func[..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after_name_close = &after_func[name_end + 1..];
+    let func_close = after_name_close.rfind("</function>")?;
+    let inner = after_name_close[..func_close].trim();
+
+    // Walk `<parameter=KEY>VAL</parameter>` blocks.
+    let mut args = serde_json::Map::new();
+    let mut cursor = 0usize;
+    while cursor < inner.len() {
+        let Some(rel_open) = inner[cursor..].find("<parameter=") else { break };
+        let p_open = cursor + rel_open;
+        let key_start = p_open + "<parameter=".len();
+        let Some(rel_gt) = inner[key_start..].find('>') else { break };
+        let key_end = key_start + rel_gt;
+        let key = inner[key_start..key_end].trim().to_string();
+        let val_start = key_end + 1;
+        let Some(rel_close) = inner[val_start..].find("</parameter>") else { break };
+        let val_end = val_start + rel_close;
+        let val_raw = inner[val_start..val_end].trim();
+        // Try JSON-literal parse first (for numbers/booleans/objects);
+        // fall back to plain string. Qwen's template recommends `tojson` on
+        // the value, so well-formed JSON is the common case.
+        let json_val: serde_json::Value = match serde_json::from_str(val_raw) {
+            Ok(v) => v,
+            Err(_) => serde_json::Value::String(val_raw.to_string()),
+        };
+        args.insert(key, json_val);
+        cursor = val_end + "</parameter>".len();
+    }
+    let arguments_json = serde_json::to_string(&serde_json::Value::Object(args)).ok()?;
+    Some(ParsedToolCall {
+        name,
+        arguments_json,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +918,262 @@ mod tests {
         let fams = list_families();
         assert!(fams.iter().any(|f| f == "gemma4"));
         assert!(fams.iter().any(|f| f == "qwen35"));
+    }
+
+    // --- ToolCallSplitter (iter-133 Iter B-2) ---
+
+    /// Iter B-2 W66: lock in the corrected Gemma 4 tool-call markers. Pre-fix
+    /// these were `<tool_call>` / `</tool_call>` (the Qwen convention); the
+    /// gemma-4 GGUF chat template actually emits `<|tool_call>` (open) and
+    /// `<tool_call|>` (close). Real-model fixture
+    /// `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt`
+    /// from W65 confirmed the literal mismatch.
+    #[test]
+    fn gemma4_tool_call_markers_match_chat_template_emission() {
+        assert_eq!(GEMMA4.tool_open, Some("<|tool_call>"));
+        assert_eq!(GEMMA4.tool_close, Some("<tool_call|>"));
+    }
+
+    fn tcfeed(reg: &ModelRegistration, s: &str) -> Vec<ToolCallEvent> {
+        let mut sp = ToolCallSplitter::from_registration(reg).unwrap();
+        let mut out = sp.feed(s);
+        if let Some(tail) = sp.finish() {
+            out.push(tail);
+        }
+        out
+    }
+
+    fn tc_coalesce(v: &[ToolCallEvent]) -> Vec<ToolCallEvent> {
+        let mut out: Vec<ToolCallEvent> = Vec::new();
+        for ev in v {
+            if let (Some(last), ev) = (out.last_mut(), ev) {
+                match (last, ev) {
+                    (ToolCallEvent::Content(a), ToolCallEvent::Content(b)) => {
+                        a.push_str(b);
+                        continue;
+                    }
+                    (ToolCallEvent::ToolCallText(a), ToolCallEvent::ToolCallText(b)) => {
+                        a.push_str(b);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(ev.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn tool_call_splitter_no_markers_all_content() {
+        let out = tcfeed(&GEMMA4, "hello world");
+        assert_eq!(out, vec![ToolCallEvent::Content("hello world".into())]);
+    }
+
+    #[test]
+    fn tool_call_splitter_single_call_gemma4_markers() {
+        let out = tcfeed(
+            &GEMMA4,
+            "pre <|tool_call>call:f{x:1}<tool_call|> post",
+        );
+        let joined = tc_coalesce(&out);
+        assert_eq!(
+            joined,
+            vec![
+                ToolCallEvent::Content("pre ".into()),
+                ToolCallEvent::ToolCallOpen,
+                ToolCallEvent::ToolCallText("call:f{x:1}".into()),
+                ToolCallEvent::ToolCallClose,
+                ToolCallEvent::Content(" post".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_splitter_qwen35_markers_distinct() {
+        let out = tcfeed(
+            &QWEN35,
+            "pre <tool_call>\n<function=f><parameter=x>\n1\n</parameter></function>\n</tool_call> post",
+        );
+        let joined = tc_coalesce(&out);
+        assert_eq!(joined.len(), 5, "got {joined:?}");
+        match (&joined[0], &joined[1], &joined[3], &joined[4]) {
+            (
+                ToolCallEvent::Content(a),
+                ToolCallEvent::ToolCallOpen,
+                ToolCallEvent::ToolCallClose,
+                ToolCallEvent::Content(b),
+            ) => {
+                assert_eq!(a, "pre ");
+                assert_eq!(b, " post");
+            }
+            other => panic!("unexpected event sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_splitter_marker_spans_fragment_boundary() {
+        let mut sp = ToolCallSplitter::from_registration(&GEMMA4).unwrap();
+        let a = sp.feed("before <|tool");
+        let b = sp.feed("_call>call:f{a:1}<tool_call");
+        let c = sp.feed("|>after");
+        let d = sp.finish();
+        let mut all: Vec<ToolCallEvent> = Vec::new();
+        all.extend(a);
+        all.extend(b);
+        all.extend(c);
+        if let Some(t) = d {
+            all.push(t);
+        }
+        let joined = tc_coalesce(&all);
+        assert_eq!(
+            joined,
+            vec![
+                ToolCallEvent::Content("before ".into()),
+                ToolCallEvent::ToolCallOpen,
+                ToolCallEvent::ToolCallText("call:f{a:1}".into()),
+                ToolCallEvent::ToolCallClose,
+                ToolCallEvent::Content("after".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_splitter_open_without_close_finishes_in_call() {
+        // Mid-call EOS: `finish()` returns the partial body as ToolCallText.
+        let out = tcfeed(&GEMMA4, "<|tool_call>call:f{a:1");
+        // Coalesce because the splitter holds back a tail.
+        let joined = tc_coalesce(&out);
+        assert_eq!(
+            joined,
+            vec![
+                ToolCallEvent::ToolCallOpen,
+                ToolCallEvent::ToolCallText("call:f{a:1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_splitter_no_registration_returns_none() {
+        let none_reg = ModelRegistration {
+            family: "no-tools",
+            id_substrings: &["test"],
+            reasoning_open: None,
+            reasoning_close: None,
+            tool_open: None,
+            tool_close: None,
+            tool_preamble: None,
+        };
+        assert!(ToolCallSplitter::from_registration(&none_reg).is_none());
+    }
+
+    // --- parse_tool_call_body ---
+
+    #[test]
+    fn parse_gemma4_simple_string_arg() {
+        let parsed = parse_tool_call_body(
+            &GEMMA4,
+            "call:get_current_weather{location:<|\"|>Paris<|\"|>}",
+        )
+        .expect("parse");
+        assert_eq!(parsed.name, "get_current_weather");
+        // Order is HashMap-iteration → json string canonicalized via
+        // serde_json (sorted keys not guaranteed but the SET of fields is).
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        assert_eq!(v["location"], "Paris");
+    }
+
+    #[test]
+    fn parse_gemma4_multi_arg_string_and_enum() {
+        let parsed = parse_tool_call_body(
+            &GEMMA4,
+            "call:f{location:<|\"|>San Francisco<|\"|>,unit:<|\"|>celsius<|\"|>}",
+        )
+        .expect("parse");
+        assert_eq!(parsed.name, "f");
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        assert_eq!(v["location"], "San Francisco");
+        assert_eq!(v["unit"], "celsius");
+    }
+
+    #[test]
+    fn parse_gemma4_numeric_and_bool_args() {
+        let parsed = parse_tool_call_body(
+            &GEMMA4,
+            "call:f{count:42,enabled:true,ratio:1.5}",
+        )
+        .expect("parse");
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        assert_eq!(v["count"], 42);
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["ratio"], 1.5);
+    }
+
+    #[test]
+    fn parse_gemma4_string_with_comma_inside_quotes() {
+        // Comma inside `<|"|>...<|"|>` must NOT split top-level args.
+        let parsed = parse_tool_call_body(
+            &GEMMA4,
+            "call:f{addr:<|\"|>1, Main St<|\"|>,city:<|\"|>NYC<|\"|>}",
+        )
+        .expect("parse");
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        assert_eq!(v["addr"], "1, Main St");
+        assert_eq!(v["city"], "NYC");
+    }
+
+    #[test]
+    fn parse_gemma4_empty_args() {
+        let parsed = parse_tool_call_body(&GEMMA4, "call:noop{}").expect("parse");
+        assert_eq!(parsed.name, "noop");
+        assert_eq!(parsed.arguments_json, "{}");
+    }
+
+    #[test]
+    fn parse_gemma4_invalid_returns_none() {
+        // Missing `call:` prefix.
+        assert!(parse_tool_call_body(&GEMMA4, "garbage{}").is_none());
+        // Missing braces.
+        assert!(parse_tool_call_body(&GEMMA4, "call:f").is_none());
+        // Missing function name.
+        assert!(parse_tool_call_body(&GEMMA4, "call:{}").is_none());
+    }
+
+    #[test]
+    fn parse_qwen35_function_with_parameters() {
+        let parsed = parse_tool_call_body(
+            &QWEN35,
+            "<function=get_current_weather>\n<parameter=location>\nParis\n</parameter>\n</function>",
+        )
+        .expect("parse");
+        assert_eq!(parsed.name, "get_current_weather");
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        // Qwen recommends `tojson`; bare `Paris` is not valid JSON → string fallback.
+        assert_eq!(v["location"], "Paris");
+    }
+
+    #[test]
+    fn parse_qwen35_function_with_jsonish_value() {
+        let parsed = parse_tool_call_body(
+            &QWEN35,
+            "<function=set>\n<parameter=count>\n42\n</parameter>\n</function>",
+        )
+        .expect("parse");
+        let v: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arg JSON");
+        // 42 IS valid JSON → number.
+        assert_eq!(v["count"], 42);
+    }
+
+    #[test]
+    fn parse_qwen35_invalid_returns_none() {
+        assert!(parse_tool_call_body(&QWEN35, "garbage").is_none());
+        assert!(parse_tool_call_body(&QWEN35, "<function=>").is_none());
     }
 
     // Merge adjacent same-slot runs — useful for asserting against streaming

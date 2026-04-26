@@ -24,26 +24,41 @@
 //!     per-model tool-call markers (Gemma 4:
 //!     `<|tool_call>call:NAME{kv-list}<tool_call|>`) in its output text.
 //!
-//! Iter B deferred (planned follow-up before AC 2509 flips):
-//!   * No per-model `<tool_call>...<tool_call|>` boundary-marker
-//!     state machine in the engine streaming path. The
-//!     `GenerationEvent::ToolCallDelta` SSE event variant (already plumbed
-//!     in `src/serve/api/sse.rs`) is NEVER produced by the engine today;
-//!     the marker text stays in `delta.content`. Closing this gap is the
-//!     next iter's work and lands the OpenAI-spec
-//!     `delta.tool_calls[*].function.{name,arguments}` streaming-arguments
-//!     pattern that real Open WebUI tool-call UI consumes.
+//! Iter B-2 W66 fix-forward (engine `ToolCallSplitter` + per-model parser):
+//!   * `src/serve/api/registry.rs` — `ToolCallSplitter` sibling to
+//!     `ReasoningSplitter` (Decision #21 boundary-marker pattern).
+//!     Plus `parse_tool_call_body` for Gemma 4's `call:NAME{kv-list}` and
+//!     Qwen 3.5/3.6's `<function=NAME><parameter=k>v</parameter></function>`
+//!     body shapes; emits structured `ParsedToolCall { name, arguments_json }`.
+//!   * `src/serve/api/registry.rs` GEMMA4 markers fixed: `<|tool_call>` /
+//!     `<tool_call|>` (asymmetric pipe placement matches the in-template
+//!     emission at `models/gemma4/chat_template.jinja:189-203`); pre-fix
+//!     they were `<tool_call>` / `</tool_call>` (the Qwen convention),
+//!     which the splitter would never have detected at runtime.
+//!   * `src/serve/api/engine.rs::generate_stream_once` — splitter wired
+//!     after the ReasoningSplitter; `ToolCallEvent::{Open,Text,Close}`
+//!     drives `GenerationEvent::ToolCallDelta` emission with two-chunk
+//!     shape (id+type+name first, full arguments_json second).
+//!     `finish_reason` overrides to `"tool_calls"` when ≥1 structured
+//!     delta was emitted, per OpenAI spec.
 //!
 //! What this test asserts honestly today:
 //!   * Tool-aware request (200 OK + valid SSE).
-//!   * `tools` reach the model: accumulated content contains the per-model
-//!     tool-call literal markers (Gemma 4: `<|tool_call>` substring).
-//!   * `tool_choice="none"` companion: request 200 OK, accumulated content
-//!     contains NO tool-call markers (the model produces natural-language
-//!     content instead).
+//!   * `tools` reach the model: model invokes a tool by emitting structured
+//!     `delta.tool_calls[*].function.{name,arguments}` chunks (NOT raw
+//!     `<|tool_call>` text in `delta.content`).
+//!   * Structural invariants on every emitted tool_call: `id` starts with
+//!     `call_`, `type` is `"function"`, `name` is non-empty, `arguments`
+//!     round-trips through `serde_json::from_str` (clients can parse).
+//!   * `finish_reason == "tool_calls"` when delta.tool_calls is non-empty.
+//!   * Negative path: `delta.content` does NOT leak raw `<|tool_call>`
+//!     text when the splitter is on.
+//!   * Determinism: re-run at T=0 produces byte-identical content +
+//!     finish_reason + tool_calls (modulo the per-call wall-clock id).
+//!   * `tool_choice="none"` companion: request 200 OK, no tool-call
+//!     markers in delta.content, no structured tool_calls emitted.
 //!   * If the model produced a parseable tool call, a turn-2 round-trip
-//!     with synthetic tool result is exercised; otherwise the soft path is
-//!     skipped with a logged note (model fit, not protocol fault).
+//!     with synthetic tool result is exercised.
 //!
 //! # Env gates
 //!
@@ -90,10 +105,39 @@ fn fixture_path() -> PathBuf {
 /// fixture model.
 const GEMMA4_TOOL_CALL_OPEN: &str = "<|tool_call>";
 
+/// Per-stream accumulated structured tool-call data extracted from
+/// `delta.tool_calls[*]` chunks (iter B-2 W66). One entry per `index`. The
+/// `index` field is the OpenAI streaming-tool-call discriminator: multiple
+/// parallel tool calls are serialized with distinct `index` values; deltas
+/// with the same index merge.
+#[derive(Debug, Default, Clone)]
+struct AccumulatedToolCall {
+    pub id: Option<String>,
+    pub call_type: Option<String>,
+    pub name: Option<String>,
+    /// Concatenated `function.arguments` fragments per the OpenAI spec.
+    pub arguments: String,
+}
+
+/// Stream-extracted side-channels. Iter B-2 broadens the helper return
+/// shape to also carry structured tool-call data so tests can assert on
+/// the OpenAI `delta.tool_calls[*]` shape rather than the raw-text
+/// fallback. Iter A/iter B's `accumulated_content` field still carries the
+/// `delta.content` byte-stream for backward compatibility.
+#[derive(Debug, Default, Clone)]
+struct StreamCapture {
+    pub frames: Vec<String>,
+    pub accumulated_content: String,
+    pub finish_reason: Option<String>,
+    /// Indexed by `delta.tool_calls[*].index`. Empty when the stream
+    /// emitted no tool calls.
+    pub tool_calls: Vec<AccumulatedToolCall>,
+}
+
 /// SSE-streaming chat helper that — unlike `helpers::streaming_chat` —
 /// also accepts a `tools` array and `tool_choice` value, plus an optional
 /// `prior_messages` extension for the turn-2 tool-result-injection round
-/// trip. Returns `(raw_chunks, accumulated_content, finish_reason)`.
+/// trip. Returns the full `StreamCapture`.
 ///
 /// We define this locally (rather than extending the shared helper module)
 /// because the helper module is already shared with iter A and iter C; a
@@ -105,7 +149,7 @@ async fn streaming_chat_with_tools(
     tools: &serde_json::Value,
     tool_choice: &serde_json::Value,
     max_tokens: u64,
-) -> (Vec<String>, String, Option<String>) {
+) -> StreamCapture {
     use futures_util::StreamExt;
     use std::time::Duration;
 
@@ -156,9 +200,7 @@ async fn streaming_chat_with_tools(
 
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    let mut frames: Vec<String> = Vec::new();
-    let mut accumulated_content = String::new();
-    let mut finish_reason: Option<String> = None;
+    let mut cap = StreamCapture::default();
 
     while let Some(next) = stream.next().await {
         let bytes = next.expect("SSE bytes_stream chunk error");
@@ -170,28 +212,65 @@ async fn streaming_chat_with_tools(
             buf.drain(..end + 2);
             for line in msg.lines() {
                 if let Some(payload) = line.strip_prefix("data: ") {
-                    frames.push(payload.to_string());
+                    cap.frames.push(payload.to_string());
                     if payload != "[DONE]" {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
                             if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
-                                accumulated_content.push_str(text);
+                                cap.accumulated_content.push_str(text);
                             }
                             if let Some(fr) =
                                 v["choices"][0]["finish_reason"].as_str()
                             {
-                                finish_reason = Some(fr.to_string());
+                                cap.finish_reason = Some(fr.to_string());
+                            }
+                            // Iter B-2 W66: extract structured tool-call
+                            // deltas. Each chunk's `delta.tool_calls`
+                            // array has one or more entries keyed by
+                            // `index`. First-seen `id`/`type`/`name`
+                            // win; `function.arguments` fragments are
+                            // concatenated.
+                            if let Some(arr) =
+                                v["choices"][0]["delta"]["tool_calls"].as_array()
+                            {
+                                for entry in arr {
+                                    let idx = entry["index"].as_u64().unwrap_or(0) as usize;
+                                    while cap.tool_calls.len() <= idx {
+                                        cap.tool_calls.push(AccumulatedToolCall::default());
+                                    }
+                                    let slot = &mut cap.tool_calls[idx];
+                                    if let Some(id) = entry["id"].as_str() {
+                                        if slot.id.is_none() {
+                                            slot.id = Some(id.to_string());
+                                        }
+                                    }
+                                    if let Some(t) = entry["type"].as_str() {
+                                        if slot.call_type.is_none() {
+                                            slot.call_type = Some(t.to_string());
+                                        }
+                                    }
+                                    if let Some(n) = entry["function"]["name"].as_str() {
+                                        if slot.name.is_none() {
+                                            slot.name = Some(n.to_string());
+                                        }
+                                    }
+                                    if let Some(a) =
+                                        entry["function"]["arguments"].as_str()
+                                    {
+                                        slot.arguments.push_str(a);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-            if frames.last().map(|s| s == "[DONE]").unwrap_or(false) {
-                return (frames, accumulated_content, finish_reason);
+            if cap.frames.last().map(|s| s == "[DONE]").unwrap_or(false) {
+                return cap;
             }
         }
     }
 
-    (frames, accumulated_content, finish_reason)
+    cap
 }
 
 /// Scenario 2: tool-call round-trip with `tool_choice = "auto"`.
@@ -271,7 +350,7 @@ fn openwebui_tools_streaming_scenario_2() {
         serde_json::json!({"role": "user", "content": "What is the weather in Paris?"}),
     ];
 
-    let (turn1_chunks, turn1_text, turn1_finish) = rt.block_on(streaming_chat_with_tools(
+    let turn1 = rt.block_on(streaming_chat_with_tools(
         &model_id,
         &messages_t1,
         &tools,
@@ -279,73 +358,120 @@ fn openwebui_tools_streaming_scenario_2() {
         256,
     ));
 
-    // Standard SSE protocol invariants (same as scenario 1, even though
-    // the content shape may include tool-call literals in `delta.content`
-    // until the engine extractor lands).
+    // Standard SSE protocol invariants (same as scenario 1).
     assert!(
-        !turn1_chunks.is_empty(),
+        !turn1.frames.is_empty(),
         "turn1 produced zero SSE chunks"
     );
     assert_eq!(
-        turn1_chunks.last().expect("non-empty"),
+        turn1.frames.last().expect("non-empty"),
         "[DONE]",
         "turn1 last frame must be [DONE]"
     );
     assert!(
-        turn1_finish.is_some(),
-        "turn1 must produce a finish_reason; got chunks={turn1_chunks:?}"
+        turn1.finish_reason.is_some(),
+        "turn1 must produce a finish_reason; got chunks={:?}",
+        turn1.frames
     );
-    let fr = turn1_finish.as_deref().unwrap();
+    let fr = turn1.finish_reason.as_deref().unwrap();
     assert!(
         matches!(fr, "stop" | "length" | "tool_calls" | "error"),
         "turn1 finish_reason must be a known OpenAI value; got {fr:?}"
     );
-    assert!(
-        !turn1_text.trim().is_empty(),
-        "turn1 accumulated_content must be non-empty"
-    );
     eprintln!("openwebui_tools: turn1_finish={fr:?}");
-    eprintln!("openwebui_tools: turn1_text={turn1_text:?}");
+    eprintln!("openwebui_tools: turn1_text={:?}", turn1.accumulated_content);
+    eprintln!("openwebui_tools: turn1_tool_calls={:?}", turn1.tool_calls);
 
     // -----------------------------------------------------------------
-    // Iter B fix-forward acceptance: the model MUST have seen the tools.
+    // Iter B-2 W66 acceptance: structured `delta.tool_calls` deltas.
     //
-    // Pre-fix-forward, every tool-aware chat template saw an empty
-    // `tools` Jinja variable, so the model never knew about
-    // `get_current_weather`. Post-fix-forward, the Gemma 4 template
-    // emits `<|tool>declaration:get_current_weather...<tool|>` into the
-    // system block, and a tool-trained model responds with a tool-call
-    // marker `<|tool_call>call:NAME{...}<tool_call|>` in its output.
+    // Pre-iter-B-2 the model's `<|tool_call>...<tool_call|>` raw text
+    // streamed in `delta.content` (verified by the recorded fixture
+    // `tests/fixtures/openwebui_multiturn/scenario2_tool_call_chunks.txt`
+    // captured on W65). Post-iter-B-2 the engine's `ToolCallSplitter`
+    // detects the per-model markers (Gemma 4: `<|tool_call>` /
+    // `<tool_call|>`; Qwen 3.5/3.6: `<tool_call>` / `</tool_call>`),
+    // parses the body via `parse_tool_call_body`, and emits structured
+    // `GenerationEvent::ToolCallDelta` chunks → the SSE encoder routes
+    // those through `delta.tool_calls[*].function.{name, arguments}`.
     //
-    // SOFT assertion: if the marker is present, we passed; if not, log
-    // explicitly so the operator can decide if it's a model-fit issue
-    // (this fixture is a chat-tuned 26B that may or may not actually
-    // emit tool calls under T=0). DO NOT mock the response (per
-    // directive); DO NOT silently pass on failure.
-    let saw_tool_call_marker = turn1_text.contains(GEMMA4_TOOL_CALL_OPEN);
-    if saw_tool_call_marker {
+    // The model's *decision* to invoke a tool is still model-fit: a
+    // chat-tuned model under T=0 may answer in natural language. So we
+    // gate the structured-delta assertion on `tool_calls[]` being
+    // non-empty (the model invoked SOMETHING) and assert ONLY when it
+    // did. Conversely, ANY non-empty `tool_calls[]` MUST be structured —
+    // the splitter cannot silently degrade — so the negative-path
+    // `<|tool_call>` literal MUST NOT appear in `delta.content` when
+    // tool_calls is non-empty.
+    let model_invoked_tool = !turn1.tool_calls.is_empty();
+    if model_invoked_tool {
         eprintln!(
-            "openwebui_tools: turn1 emitted tool-call marker {GEMMA4_TOOL_CALL_OPEN:?} \
-             in delta.content → iter B fix-forward CONFIRMED end-to-end"
+            "openwebui_tools: turn1 emitted {} structured tool-call(s) → iter B-2 \
+             ToolCallSplitter CONFIRMED end-to-end",
+            turn1.tool_calls.len()
+        );
+        // Structural invariants on EVERY structured tool-call delta:
+        //   - first chunk must carry id (`call_*`) and type ("function")
+        //     and name (the function the model invoked).
+        //   - arguments must be a non-empty JSON-encoded string.
+        //   - finish_reason must be "tool_calls" per OpenAI spec.
+        for (i, tc) in turn1.tool_calls.iter().enumerate() {
+            assert!(
+                tc.id.as_ref().is_some_and(|s| s.starts_with("call_")),
+                "tool_calls[{i}].id missing or not `call_`-prefixed: {tc:?}"
+            );
+            assert_eq!(
+                tc.call_type.as_deref(),
+                Some("function"),
+                "tool_calls[{i}].type must be 'function': {tc:?}"
+            );
+            assert!(
+                tc.name.as_ref().is_some_and(|s| !s.is_empty()),
+                "tool_calls[{i}].function.name missing: {tc:?}"
+            );
+            assert!(
+                !tc.arguments.is_empty(),
+                "tool_calls[{i}].function.arguments empty: {tc:?}"
+            );
+            // Arguments string MUST round-trip through `serde_json::from_str`
+            // — OpenAI clients do exactly this to reach the args object.
+            let _: serde_json::Value = serde_json::from_str(&tc.arguments)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "tool_calls[{i}].function.arguments not valid JSON \
+                         (clients can't parse): err={e}, args={:?}",
+                        tc.arguments
+                    )
+                });
+        }
+        // finish_reason must be "tool_calls" per OpenAI spec when at
+        // least one tool call was emitted.
+        assert_eq!(
+            fr, "tool_calls",
+            "finish_reason must be 'tool_calls' when delta.tool_calls is non-empty; got {fr:?}"
+        );
+        // Negative-path assertion: when the splitter is on, the raw
+        // `<|tool_call>` literal MUST NOT leak into delta.content.
+        assert!(
+            !turn1.accumulated_content.contains(GEMMA4_TOOL_CALL_OPEN),
+            "splitter regression: delta.content contains raw {GEMMA4_TOOL_CALL_OPEN:?} \
+             marker despite delta.tool_calls being non-empty. Splitter passthrough bug. \
+             Content was: {:?}",
+            turn1.accumulated_content
         );
     } else {
-        // The fix-forward landed `tools` into the prompt, but the model
-        // chose to answer in natural language rather than a tool call.
-        // That's a model-fit observation, not a protocol fault. We log
-        // it so iter B's report is honest, and the test does NOT panic
-        // (the directive explicitly says: "If the model never emits
-        // delta.tool_calls, that's important data").
+        // Model chose natural-language answer over tool invocation. That's
+        // a model-fit observation, not a protocol fault — log explicitly.
         eprintln!(
-            "openwebui_tools: turn1 did NOT emit {GEMMA4_TOOL_CALL_OPEN:?} \
-             in delta.content. Model likely chose natural-language answer \
-             over tool invocation under T=0. Iter B's request-side fix \
-             still landed (the prompt rendered with tools); the streaming \
-             tool-call extractor + boundary-marker state machine that \
-             would surface delta.tool_calls is the deferred follow-up."
+            "openwebui_tools: turn1 did NOT emit any structured tool-call delta. \
+             Model chose natural-language answer over tool invocation under T=0. \
+             ToolCallSplitter is wired (Scenario 2 unit-tests in registry.rs cover \
+             the marker→delta conversion); the model's decision is model-fit, not \
+             protocol fault."
         );
         eprintln!(
             "openwebui_tools: turn1_text first 600 chars: {:?}",
-            turn1_text.chars().take(600).collect::<String>()
+            turn1.accumulated_content.chars().take(600).collect::<String>()
         );
     }
 
@@ -355,8 +481,12 @@ fn openwebui_tools_streaming_scenario_2() {
     // The "multi-turn chat works (streaming, tool use, ...)" claim
     // implicitly requires reproducibility under T=0. Same property as
     // scenario 1: byte-identical accumulated content on a re-run.
+    // Tool-call ids include a `SystemTime::UNIX_EPOCH`-based suffix so
+    // they're NOT byte-identical across runs by design (same pattern as
+    // OpenAI's own `chatcmpl-<random>` ids). We compare the
+    // `tool_calls` shape MINUS the id field for determinism.
     // -----------------------------------------------------------------
-    let (rerun_chunks, rerun_text, rerun_finish) = rt.block_on(streaming_chat_with_tools(
+    let rerun = rt.block_on(streaming_chat_with_tools(
         &model_id,
         &messages_t1,
         &tools,
@@ -364,19 +494,38 @@ fn openwebui_tools_streaming_scenario_2() {
         256,
     ));
     assert!(
-        !rerun_chunks.is_empty(),
+        !rerun.frames.is_empty(),
         "turn1_rerun produced zero SSE chunks"
     );
     assert_eq!(
-        turn1_text, rerun_text,
-        "turn1 determinism violation at T=0:\n  first:  {turn1_text:?}\n  rerun:  {rerun_text:?}"
+        turn1.accumulated_content, rerun.accumulated_content,
+        "turn1 determinism violation at T=0:\n  first:  {:?}\n  rerun:  {:?}",
+        turn1.accumulated_content, rerun.accumulated_content
     );
     assert_eq!(
-        turn1_finish, rerun_finish,
-        "turn1_finish_reason determinism violation: first={turn1_finish:?} \
-         rerun={rerun_finish:?}"
+        turn1.finish_reason, rerun.finish_reason,
+        "turn1_finish_reason determinism violation: first={:?} rerun={:?}",
+        turn1.finish_reason, rerun.finish_reason
+    );
+    // Compare structured tool-calls modulo the per-call id (which embeds
+    // a wall-clock ns suffix).
+    let strip_id = |tcs: &[AccumulatedToolCall]| -> Vec<(Option<String>, Option<String>, String)> {
+        tcs.iter()
+            .map(|tc| (tc.call_type.clone(), tc.name.clone(), tc.arguments.clone()))
+            .collect()
+    };
+    assert_eq!(
+        strip_id(&turn1.tool_calls),
+        strip_id(&rerun.tool_calls),
+        "tool_calls determinism violation at T=0 (modulo id):\n  first: {:?}\n  rerun: {:?}",
+        turn1.tool_calls, rerun.tool_calls
     );
     eprintln!("openwebui_tools: determinism PASS");
+
+    // Bind back to legacy names so the Turn 2 / fixture-record code below
+    // doesn't need a wholesale rename.
+    let turn1_chunks = turn1.frames.clone();
+    let saw_tool_call_marker = model_invoked_tool;
 
     // -----------------------------------------------------------------
     // Turn 2 — tool-result injection (only when turn 1 emitted a marker)
@@ -429,44 +578,43 @@ fn openwebui_tools_streaming_scenario_2() {
             }),
         ];
 
-        let (turn2_chunks, turn2_text, turn2_finish) = rt.block_on(
-            streaming_chat_with_tools(
-                &model_id,
-                &messages_t2,
-                &tools,
-                &serde_json::json!("auto"),
-                128,
-            ),
-        );
+        let turn2 = rt.block_on(streaming_chat_with_tools(
+            &model_id,
+            &messages_t2,
+            &tools,
+            &serde_json::json!("auto"),
+            128,
+        ));
         assert!(
-            !turn2_chunks.is_empty(),
+            !turn2.frames.is_empty(),
             "turn2 (tool-result) produced zero SSE chunks"
         );
         assert_eq!(
-            turn2_chunks.last().expect("non-empty"),
+            turn2.frames.last().expect("non-empty"),
             "[DONE]",
             "turn2 last frame must be [DONE]"
         );
         assert!(
-            turn2_finish.is_some(),
-            "turn2 must produce a finish_reason; got chunks={turn2_chunks:?}"
+            turn2.finish_reason.is_some(),
+            "turn2 must produce a finish_reason; got chunks={:?}",
+            turn2.frames
         );
         assert!(
-            !turn2_text.trim().is_empty(),
+            !turn2.accumulated_content.trim().is_empty(),
             "turn2 accumulated_content must be non-empty after tool-result injection"
         );
         eprintln!(
             "openwebui_tools: turn2_finish={:?}",
-            turn2_finish.as_deref()
+            turn2.finish_reason.as_deref()
         );
-        eprintln!("openwebui_tools: turn2_text={turn2_text:?}");
+        eprintln!("openwebui_tools: turn2_text={:?}", turn2.accumulated_content);
 
         // SOFT assertion: when the chat template renders the tool
         // result, the model's natural-language reply should reference
         // the data we returned. Match any of the salient tokens
         // case-insensitively. If none match it's logged but not a
         // panic (model-fit, not protocol fault).
-        let lower = turn2_text.to_ascii_lowercase();
+        let lower = turn2.accumulated_content.to_ascii_lowercase();
         let any_ref = ["18", "paris", "celsius", "cloudy"]
             .iter()
             .any(|kw| lower.contains(*kw));
@@ -572,7 +720,7 @@ fn openwebui_tools_streaming_tool_choice_none_companion() {
         serde_json::json!({"role": "user", "content": "What is the weather in Paris?"}),
     ];
 
-    let (chunks, text, finish) = rt.block_on(streaming_chat_with_tools(
+    let cap = rt.block_on(streaming_chat_with_tools(
         &model_id,
         &messages,
         &tools,
@@ -580,34 +728,45 @@ fn openwebui_tools_streaming_tool_choice_none_companion() {
         256,
     ));
 
-    assert!(!chunks.is_empty(), "tool_choice=none produced zero chunks");
+    assert!(!cap.frames.is_empty(), "tool_choice=none produced zero chunks");
     assert_eq!(
-        chunks.last().expect("non-empty"),
+        cap.frames.last().expect("non-empty"),
         "[DONE]",
         "tool_choice=none must terminate with [DONE]"
     );
     assert!(
-        finish.is_some(),
+        cap.finish_reason.is_some(),
         "tool_choice=none must produce a finish_reason"
     );
     assert!(
-        !text.trim().is_empty(),
+        !cap.accumulated_content.trim().is_empty(),
         "tool_choice=none accumulated_content must be non-empty (model must produce SOMETHING)"
     );
 
-    // Critical negative-path assertion: the accumulated content MUST
-    // NOT contain the per-model tool-call open marker. With
-    // tool_choice="none" the model cannot legitimately emit a tool
-    // call, regardless of how the prompt is built.
+    // Critical negative-path assertions:
+    //   1. delta.content MUST NOT contain the per-model tool-call open
+    //      marker. With tool_choice="none" the model has no tools in
+    //      its prompt (handlers.rs commit 153cfbd) and cannot
+    //      legitimately emit a marker.
+    //   2. delta.tool_calls MUST be empty. Iter B-2's structured
+    //      extractor would not have anything to extract; the splitter
+    //      detects nothing because no marker arrives.
     assert!(
-        !text.contains(GEMMA4_TOOL_CALL_OPEN),
+        !cap.accumulated_content.contains(GEMMA4_TOOL_CALL_OPEN),
         "tool_choice=none violation: model emitted {GEMMA4_TOOL_CALL_OPEN:?} \
-         in delta.content despite tool_choice=\"none\". Text was: {text:?}"
+         in delta.content despite tool_choice=\"none\". Text was: {:?}",
+        cap.accumulated_content
+    );
+    assert!(
+        cap.tool_calls.is_empty(),
+        "tool_choice=none violation: server emitted structured delta.tool_calls \
+         despite tool_choice=\"none\". tool_calls were: {:?}",
+        cap.tool_calls
     );
     eprintln!(
-        "openwebui_tools_none: tool_choice=none → no tool-call marker, finish_reason={:?}, \
-         text first 200 chars: {:?}",
-        finish.as_deref(),
-        text.chars().take(200).collect::<String>()
+        "openwebui_tools_none: tool_choice=none → no tool-call marker, no structured \
+         tool_calls, finish_reason={:?}, text first 200 chars: {:?}",
+        cap.finish_reason.as_deref(),
+        cap.accumulated_content.chars().take(200).collect::<String>()
     );
 }
