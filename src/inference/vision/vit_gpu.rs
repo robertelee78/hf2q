@@ -30,6 +30,7 @@ use std::sync::LazyLock;
 use mlx_native::metal::MTLSize;
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f16::{dense_matmul_f16_f32_tensor, DenseMmF16F32Params};
 use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::gather::dispatch_gather_f32;
@@ -69,27 +70,43 @@ pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool> = LazyLock::new(|| {
 ///
 /// Dtype contract:
 ///   - `input`  is F32 `[seq_len, in_features]` row-major on device.
-///   - `weight` is F32 `[out_features, in_features]` row-major on device
-///     (loaded via `GgufFile::load_tensor_f32`).
+///   - `weight` is F16, BF16, or F32 `[out_features, in_features]`
+///     row-major on device. The dispatch branches on the buffer's
+///     dtype (W59 ADR-005 Phase 2c iter-128):
+///       * `DType::F16` → `dense_matmul_f16_f32_tensor` (mlx-native
+///         0.4.8). Native peer-precision path: stages BOTH A (weight)
+///         and B (activation) as `half` in shmem and runs
+///         `simdgroup_half8x8` MMA with float4x4 accumulator. 10-bit
+///         mantissa per element, matches llama.cpp's
+///         `kernel_mul_mm_f16_f32`. Used for every Gemma 4 ViT weight
+///         (all are F16 in GGUF storage).
+///       * `DType::BF16` → `dense_matmul_bf16_f32_tensor`. 7-bit
+///         mantissa per element; legacy path retained for tensor types
+///         that the loader pre-casts to BF16.
+///       * `DType::F32` → cast F32→BF16 at dispatch, then BF16 matmul.
+///         Legacy path for F32-stored weights or for production fallback
+///         where the loader has not (yet) preserved the GGUF native
+///         dtype. Same arithmetic as the pre-iter-128 path.
 ///   - Returned buffer is F32 `[seq_len, out_features]` row-major.
 ///
-/// The weight is internally cast F32 → BF16 once per call to satisfy
-/// `dense_matmul_bf16_f32_tensor`'s tensor-core dtype contract (src0 =
-/// BF16, src1 = F32, dst = F32). The BF16 rounding introduces ≤ 1e-3
-/// error vs the pure-F32 reference; callers compare with that tolerance.
+/// The dispatch is determined by the weight's MlxBuffer dtype — natural,
+/// deterministic, no env-gated fallback. F16-stored mmproj weights flow
+/// through the F16 kernel automatically once `LoadedMmprojWeights::load`
+/// preserves their native dtype (also iter-128).
 ///
 /// Constraint: `in_features >= 32` (tensor-core tile requires one
 /// NK=32 slice).
 ///
 /// # Errors
 ///
-/// Any mlx-native dispatch error, or the `in_features < 32` check.
+/// Any mlx-native dispatch error, the `in_features < 32` check, or
+/// an unsupported weight dtype (only F16/BF16/F32 accepted).
 pub fn vit_linear_gpu(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
     device: &MlxDevice,
     input: &MlxBuffer,
-    weight_f32: &MlxBuffer,
+    weight: &MlxBuffer,
     seq_len: u32,
     in_features: u32,
     out_features: u32,
@@ -110,33 +127,6 @@ pub fn vit_linear_gpu(
 
     let metal_dev = device.metal_device();
 
-    // --- Cast weight F32 → BF16 once ---
-    let n_w = (out_features as usize) * (in_features as usize);
-    let weight_bf16 = device
-        .alloc_buffer(
-            n_w * 2,
-            DType::BF16,
-            vec![out_features as usize, in_features as usize],
-        )
-        .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
-    cast(
-        encoder,
-        registry,
-        metal_dev,
-        weight_f32,
-        &weight_bf16,
-        n_w,
-        CastDirection::F32ToBF16,
-    )
-    .context("vit_linear_gpu: F32→BF16 cast")?;
-    // mlx-native dispatches with Concurrent execution; the matmul below
-    // reads `weight_bf16` written by the cast above (RAW). An explicit
-    // barrier is required to guarantee the matmul observes the cast's
-    // writes. Without it the race surfaces when many `vit_linear_gpu`
-    // calls chain in one encoder (e.g. Gemma 4V block: q/k/v/o + gate/
-    // up/down = 7 back-to-back) and produces non-deterministic output.
-    encoder.memory_barrier();
-
     // --- Allocate F32 output ---
     let out_bytes = (seq_len as usize) * (out_features as usize) * 4;
     let mut dst = device
@@ -147,27 +137,112 @@ pub fn vit_linear_gpu(
         )
         .map_err(|e| anyhow!("alloc output: {e}"))?;
 
-    // --- Dispatch dense matmul ---
-    // Layout: src0 = weight [1, N=out, K=in] BF16,
-    //         src1 = input  [1, M=seq, K=in] F32,
-    //         dst  = output [1, M=seq, N=out] F32.
-    let params = DenseMmBf16F32Params {
-        m: seq_len,
-        n: out_features,
-        k: in_features,
-        src0_batch: 1,
-        src1_batch: 1,
-    };
-    dense_matmul_bf16_f32_tensor(
-        encoder,
-        registry,
-        device,
-        &weight_bf16,
-        input,
-        &mut dst,
-        &params,
-    )
-    .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor")?;
+    // --- Dispatch dense matmul, branching on the weight's storage dtype.
+    // Layout for all branches:
+    //   src0 = weight [1, N=out, K=in] in the storage dtype
+    //   src1 = input  [1, M=seq, K=in] F32
+    //   dst  = output [1, M=seq, N=out] F32
+    match weight.dtype() {
+        DType::F16 => {
+            // Peer-precision path (W59 iter-128). The kernel reads the
+            // F16 weight directly — no F32 round-trip and no F16→BF16
+            // narrowing. Per-element rounding budget matches llama.cpp's
+            // `kernel_mul_mm_f16_f32` exactly.
+            let params = DenseMmF16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_f16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                &mut dst,
+                &params,
+            )
+            .context("vit_linear_gpu: dense_matmul_f16_f32_tensor")?;
+        }
+        DType::BF16 => {
+            // Legacy BF16 path: weight is already BF16 in the buffer,
+            // dispatch directly. No cast needed.
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                weight,
+                input,
+                &mut dst,
+                &params,
+            )
+            .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor (BF16-native)")?;
+        }
+        DType::F32 => {
+            // Legacy F32 path (pre-iter-128 behaviour, retained for
+            // F32-stored weights). Cast F32 → BF16 once, then dispatch
+            // the BF16 matmul. NOTE: this path costs the 8x rounding
+            // budget vs the F16 sibling above; it's acceptable here
+            // because F32-stored weights have already discarded
+            // higher-precision storage by the time they reach this
+            // dispatch (norms, embeddings, etc., are not consumed by
+            // vit_linear_gpu).
+            let n_w = (out_features as usize) * (in_features as usize);
+            let weight_bf16 = device
+                .alloc_buffer(
+                    n_w * 2,
+                    DType::BF16,
+                    vec![out_features as usize, in_features as usize],
+                )
+                .map_err(|e| anyhow!("alloc weight_bf16: {e}"))?;
+            cast(
+                encoder,
+                registry,
+                metal_dev,
+                weight,
+                &weight_bf16,
+                n_w,
+                CastDirection::F32ToBF16,
+            )
+            .context("vit_linear_gpu: F32→BF16 cast (legacy F32 path)")?;
+            // mlx-native dispatches with Concurrent execution; the matmul
+            // below reads `weight_bf16` written by the cast above (RAW).
+            // An explicit barrier is required to guarantee the matmul
+            // observes the cast's writes.
+            encoder.memory_barrier();
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(
+                encoder,
+                registry,
+                device,
+                &weight_bf16,
+                input,
+                &mut dst,
+                &params,
+            )
+            .context("vit_linear_gpu: dense_matmul_bf16_f32_tensor (F32→BF16 legacy path)")?;
+        }
+        other => {
+            return Err(anyhow!(
+                "vit_linear_gpu: unsupported weight dtype {other:?} (expected F16/BF16/F32)"
+            ));
+        }
+    }
 
     Ok(dst)
 }
@@ -1756,19 +1831,28 @@ pub fn apply_vit_full_forward_gpu(
     let n_patches = (num_patches_side as u32) * (num_patches_side as u32);
 
     // --- Stage 1: CPU patch_embed ---
+    // W59 ADR-005 Phase 2c iter-128: patch_embd is F16 in GGUF storage
+    // for gemma4v mmprojs (and legacy F32 for some SigLIP-49 producers);
+    // `LoadedMmprojWeights::tensor_as_f32_owned` widens F16→F32 once
+    // for the CPU patch_embed reference. The cost is one ~3.5 MB
+    // alloc + per-element widen per image — negligible vs the 5–15 ms
+    // CPU patch_embed dominating this stage. The gemma4v-native
+    // production path uses `gemma4v_patch_embed_gpu` (a `vit_linear_gpu`
+    // wrapper) which dispatches the F16 tensor-core kernel directly
+    // without any CPU detour.
     let patch_embd_buf = weights
         .patch_embd_weight()
         .map_err(|e| anyhow!("apply_vit_full_forward_gpu: {e}"))?;
-    let patch_embd_f32: &[f32] = patch_embd_buf
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("patch_embd as_slice: {e}"))?;
-    let patch_bias_f32: Option<&[f32]> = weights
+    let patch_embd_f32_owned = weights
+        .tensor_as_f32_owned(patch_embd_buf)
+        .context("apply_vit_full_forward_gpu: patch_embd → f32 widen")?;
+    let patch_bias_f32_owned: Option<Vec<f32>> = weights
         .get("v.patch_embd.bias")
-        .and_then(|b| b.as_slice::<f32>().ok());
+        .and_then(|b| weights.tensor_as_f32_owned(b).ok());
     let patch_embeds_cpu = patch_embed_cpu(
         pixel_values,
-        patch_embd_f32,
-        patch_bias_f32,
+        &patch_embd_f32_owned,
+        patch_bias_f32_owned.as_deref(),
         cfg.image_size,
         cfg.patch_size,
         hidden,
@@ -1851,13 +1935,17 @@ pub fn apply_vit_full_forward_gpu(
     encoder.memory_barrier();
 
     // --- Stage 7: mm.0 projector ---
+    // W59 iter-128: derive `text_hidden` from `element_count()` not
+    // from `as_slice::<f32>()`, since mm.0.weight may now be F16 in
+    // the buffer (gemma4v's `mm.input_projection.weight` is F16; the
+    // legacy SigLIP `mm.0.weight` is F32). Both report the same
+    // `element_count()`, so the dimension math is dtype-agnostic.
+    // The matmul itself flows through `vit_linear_gpu` which branches
+    // on the buffer dtype.
     let mm0 = weights
         .mm_0_weight()
         .map_err(|e| anyhow!("apply_vit_full_forward_gpu: mm.0.weight: {e}"))?;
-    let mm0_f32: &[f32] = mm0
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("mm0 as_slice: {e}"))?;
-    let text_hidden = (mm0_f32.len() / (hidden as usize)) as u32;
+    let text_hidden = (mm0.element_count() / (hidden as usize)) as u32;
     let projected = vit_linear_gpu(
         encoder,
         registry,
@@ -2041,14 +2129,15 @@ pub fn compute_vision_embeddings_gpu(
         // Read back to CPU. Shape is [(N_side/2)², text_hidden].
         let n_patches_out =
             ((mmproj_cfg.num_patches_side / 2) * (mmproj_cfg.num_patches_side / 2)) as usize;
+        // W59 iter-128: `element_count()` is dtype-agnostic; mm.0
+        // may be F32 (SigLIP-49 producers) or F16 (gemma4v's
+        // mm.input_projection — though that path uses the gemma4v
+        // sibling `compute_vision_embeddings_gpu_gemma4v`, not this
+        // SigLIP-49 entry point).
         let mm0 = mmproj_weights
             .mm_0_weight()
             .map_err(|e| anyhow!("mm.0: {e}"))?;
-        let text_hidden = mm0
-            .as_slice::<f32>()
-            .map_err(|e| anyhow!("mm.0 slice: {e}"))?
-            .len()
-            / (mmproj_cfg.hidden_size as usize);
+        let text_hidden = mm0.element_count() / (mmproj_cfg.hidden_size as usize);
         let total = n_patches_out * text_hidden;
         let slice: &[f32] = buf
             .as_slice::<f32>()
@@ -2206,14 +2295,16 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
         }
 
         let pooled_n = ((img.n_x / 3) as usize) * ((img.n_y / 3) as usize);
+        // W59 iter-128: dtype-agnostic shape inference. gemma4v's
+        // `mm.input_projection.weight` is F16; pre-iter-128 the loader
+        // dequantized it to F32. Iter-128 keeps it native — the matmul
+        // dispatch at the gemma4v block path branches on the buffer's
+        // dtype, but for a length-only derivation `element_count()`
+        // works identically for F16 and F32.
         let mm0 = mmproj_weights
             .mm_0_weight()
             .map_err(|e| anyhow!("mm.0: {e}"))?;
-        let text_hidden = mm0
-            .as_slice::<f32>()
-            .map_err(|e| anyhow!("mm.0 slice: {e}"))?
-            .len()
-            / (mmproj_cfg.hidden_size as usize);
+        let text_hidden = mm0.element_count() / (mmproj_cfg.hidden_size as usize);
         let total = pooled_n * text_hidden;
         let slice: &[f32] = buf
             .as_slice::<f32>()
@@ -3708,13 +3799,15 @@ pub fn gemma4v_apply_full_forward_gpu(
     super::vit_dump::record("32_std_bias_scale", &normed);
 
     // --- Stage 8: Gemma4ClippableLinear projection ---
+    // W59 iter-128: derive `text_hidden` from `element_count()` so the
+    // call site is dtype-agnostic. gemma4v stores
+    // `mm.input_projection.weight` as F16; the matmul dispatch in
+    // `vit_linear_gpu` (used inside `gemma4v_clippable_linear_gpu`)
+    // branches on the buffer's dtype.
     let mm0 = weights
         .mm_0_weight()
         .map_err(|e| anyhow!("gemma4v_apply_full_forward_gpu: mm.0.weight: {e}"))?;
-    let mm0_slice: &[f32] = mm0
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("mm.0.weight as_slice: {e}"))?;
-    let text_hidden = (mm0_slice.len() / (hidden as usize)) as u32;
+    let text_hidden = (mm0.element_count() / (hidden as usize)) as u32;
     if text_hidden == 0 {
         return Err(anyhow!(
             "gemma4v_apply_full_forward_gpu: text_hidden derived from mm.0.weight is 0"
@@ -3957,19 +4050,20 @@ mod tests {
         let hidden = cfg.hidden_size as usize;
         let seq = 4usize;
         let mm0 = weights.mm_0_weight().expect("mm.0");
-        let mm0_f32: &[f32] = mm0.as_slice::<f32>().expect("mm.0 slice");
-        let text_hidden = mm0_f32.len() / hidden;
+        // W59 iter-128: mm.0.weight is F16 in gemma4v storage; widen
+        // for the CPU reference. text_hidden derives from
+        // `element_count()` (dtype-agnostic).
+        let text_hidden = mm0.element_count() / hidden;
         assert_eq!(text_hidden, 2816);
+        let weight_cpu: Vec<f32> = weights
+            .tensor_as_f32_owned(mm0)
+            .expect("mm.0 widen");
 
         // Synthetic input — deterministic sine-based so CPU and GPU
         // see identical float bytes on both sides.
         let input_cpu: Vec<f32> = (0..seq * hidden)
             .map(|i| ((i as f32) * 1e-4).sin() * 0.1)
             .collect();
-
-        // CPU reference — snapshot copy of mm0_f32 since the CPU fn
-        // doesn't reference-borrow the MlxBuffer.
-        let weight_cpu: Vec<f32> = mm0_f32.to_vec();
         let expected = linear_cpu(&input_cpu, &weight_cpu, None, seq, hidden, text_hidden)
             .expect("cpu ref");
 
@@ -4737,15 +4831,14 @@ mod tests {
             .map(|i| ((i as f32) * 1e-4).sin() * 0.05)
             .collect();
 
-        // Helper to extract a block tensor's f32 slice (lives forever
-        // because the weights buffer is owned by `weights`).
+        // W59 iter-128: gemma4v stores attn/ffn weights as F16; the
+        // F32-borrow pattern from pre-iter-128 is no longer valid.
+        // `tensor_as_f32_owned` widens (F16→F32) or copies (F32→Vec)
+        // depending on the underlying buffer's dtype. Each call is one
+        // ~5 MB heap alloc — acceptable for a parity test.
         let block = |suffix: &str| -> Vec<f32> {
-            weights
-                .block_tensor(0, suffix)
-                .unwrap()
-                .as_slice::<f32>()
-                .unwrap()
-                .to_vec()
+            let buf = weights.block_tensor(0, suffix).unwrap();
+            weights.tensor_as_f32_owned(buf).unwrap()
         };
 
         let l2 = |a: &[f32], b: &[f32]| -> (f32, f32) {
@@ -5693,9 +5786,9 @@ mod tests {
         eprintln!("full ViT GPU forward done in {:?}", elapsed);
 
         // Expected output shape: [49 patches, 2816 text_hidden].
+        // W59 iter-128: dtype-agnostic shape inference via element_count().
         let mm0 = weights.mm_0_weight().expect("mm.0");
-        let mm0_f32: &[f32] = mm0.as_slice::<f32>().expect("slice");
-        let text_hidden = mm0_f32.len() / (cfg.hidden_size as usize);
+        let text_hidden = mm0.element_count() / (cfg.hidden_size as usize);
         assert_eq!(text_hidden, 2816, "Gemma 4 projector output width");
         let n_patches_out = 49;
         let total = n_patches_out * text_hidden;

@@ -948,29 +948,50 @@ pub fn apply_vit_block_forward(
     }
     let batch = hidden_states.len() / hidden;
 
-    // Helper: extract a block-local tensor as &[f32].
-    let slice = |suffix: &str| -> Result<&[f32]> {
+    // W59 ADR-005 Phase 2c iter-128: gemma4v stores attn_*/ffn_*
+    // weights as F16 in GGUF (~190 of 356 mmproj tensors); norms are
+    // F32. `tensor_as_f32_owned` returns an owned Vec<f32> regardless
+    // of the storage dtype — for F32 buffers that's a borrow + clone,
+    // for F16 buffers it widens via half::f16. The CPU forward holds
+    // each Vec for the function's lifetime; production gemma4v uses
+    // `vit_linear_gpu` which dispatches the matching tensor-core
+    // kernel directly without any CPU detour.
+    let widen = |suffix: &str| -> Result<Vec<f32>> {
         let buf = weights.block_tensor(block_idx, suffix)?;
-        buf.as_slice::<f32>()
-            .map_err(|e| anyhow!("block {}: {} as_slice: {e}", block_idx, suffix))
+        weights
+            .tensor_as_f32_owned(buf)
+            .map_err(|e| anyhow!("block {}: {} tensor_as_f32_owned: {e}", block_idx, suffix))
     };
+
+    let ln1_w = widen("ln1.weight")?;
+    let attn_q_w = widen("attn_q.weight")?;
+    let attn_k_w = widen("attn_k.weight")?;
+    let attn_v_w = widen("attn_v.weight")?;
+    let attn_q_norm_w = widen("attn_q_norm.weight")?;
+    let attn_k_norm_w = widen("attn_k_norm.weight")?;
+    let attn_output_w = widen("attn_output.weight")?;
+    let ln2_w = widen("ln2.weight")?;
+    let ffn_gate_w = widen("ffn_gate.weight")?;
+    let ffn_up_w = widen("ffn_up.weight")?;
+    let ffn_down_w = widen("ffn_down.weight")?;
+    let post_ffw_norm_w = widen("post_ffw_norm.weight")?;
 
     // --- Attention half ---
     let mut residual = hidden_states;
     let mut cur = residual.clone();
-    rms_norm_forward(&mut cur, slice("ln1.weight")?, hidden, eps)?;
+    rms_norm_forward(&mut cur, &ln1_w, hidden, eps)?;
 
     let (mut q, mut k, v) = qkv_projection_forward(
         &cur,
-        slice("attn_q.weight")?,
-        slice("attn_k.weight")?,
-        slice("attn_v.weight")?,
+        &attn_q_w,
+        &attn_k_w,
+        &attn_v_w,
         batch,
         hidden,
     )?;
     per_head_rms_norm_forward(
         &mut q,
-        slice("attn_q_norm.weight")?,
+        &attn_q_norm_w,
         batch,
         num_heads,
         head_dim,
@@ -978,7 +999,7 @@ pub fn apply_vit_block_forward(
     )?;
     per_head_rms_norm_forward(
         &mut k,
-        slice("attn_k_norm.weight")?,
+        &attn_k_norm_w,
         batch,
         num_heads,
         head_dim,
@@ -988,7 +1009,7 @@ pub fn apply_vit_block_forward(
     let attn = scaled_dot_product_attention(&q, &k, &v, batch, num_heads, head_dim)?;
     let attn_projected = linear_forward(
         &attn,
-        slice("attn_output.weight")?,
+        &attn_output_w,
         None,
         batch,
         hidden,
@@ -998,23 +1019,23 @@ pub fn apply_vit_block_forward(
 
     // --- FFN half ---
     let mut cur = residual.clone();
-    rms_norm_forward(&mut cur, slice("ln2.weight")?, hidden, eps)?;
+    rms_norm_forward(&mut cur, &ln2_w, hidden, eps)?;
 
     let mut gate =
-        linear_forward(&cur, slice("ffn_gate.weight")?, None, batch, hidden, intermediate)?;
-    let up = linear_forward(&cur, slice("ffn_up.weight")?, None, batch, hidden, intermediate)?;
+        linear_forward(&cur, &ffn_gate_w, None, batch, hidden, intermediate)?;
+    let up = linear_forward(&cur, &ffn_up_w, None, batch, hidden, intermediate)?;
     silu_in_place(&mut gate);
     elementwise_mul_in_place(&mut gate, &up)?;
 
     let mut down = linear_forward(
         &gate,
-        slice("ffn_down.weight")?,
+        &ffn_down_w,
         None,
         batch,
         intermediate,
         hidden,
     )?;
-    rms_norm_forward(&mut down, slice("post_ffw_norm.weight")?, hidden, eps)?;
+    rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, eps)?;
     residual_add(&mut residual, &down)?;
 
     Ok(residual)
@@ -1096,26 +1117,30 @@ pub fn apply_vit_full_forward(
     std_bias_scale_in_place(&mut hidden_states, std_bias, std_scale, hidden)?;
 
     // --- Stage 6: mm.0 projector [n_patches_out, hidden] → [n_patches_out, text_hidden] ---
+    // W59 iter-128: gemma4v stores `mm.input_projection.weight` as F16
+    // in GGUF; this CPU reference forward widens via
+    // `tensor_as_f32_owned`. Production gemma4v dispatches the F16
+    // tensor-core kernel directly through `vit_linear_gpu`.
     let mm0_buf = weights
         .get("mm.0.weight")
         .ok_or_else(|| anyhow!("apply_vit_full_forward: missing mm.0.weight"))?;
-    let mm0: &[f32] = mm0_buf
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("mm.0 as_slice: {e}"))?;
+    let mm0_owned = weights
+        .tensor_as_f32_owned(mm0_buf)
+        .map_err(|e| anyhow!("mm.0 tensor_as_f32_owned: {e}"))?;
     // Shape: mm.0.weight is [text_hidden, hidden] per PyTorch nn.Linear
     // convention. Text hidden = mm0.len() / hidden.
-    let text_hidden = mm0.len() / hidden;
-    if mm0.len() != text_hidden * hidden {
+    let text_hidden = mm0_owned.len() / hidden;
+    if mm0_owned.len() != text_hidden * hidden {
         return Err(anyhow!(
             "mm.0.weight len {} not divisible by hidden {}",
-            mm0.len(),
+            mm0_owned.len(),
             hidden
         ));
     }
     let n_patches_out = hidden_states.len() / hidden;
     let mut projected = linear_forward(
         &hidden_states,
-        mm0,
+        &mm0_owned,
         None,
         n_patches_out,
         hidden,
@@ -1149,15 +1174,22 @@ pub fn patch_embed_from_mmproj_weights(
     weights: &super::mmproj_weights::LoadedMmprojWeights,
     cfg: &super::mmproj::MmprojConfig,
 ) -> Result<Vec<f32>> {
+    // W59 ADR-005 Phase 2c iter-128: gemma4v stores `v.patch_embd.weight`
+    // as F16 in GGUF; iter-128 keeps it native in the MlxBuffer.
+    // `tensor_as_f32_owned` widens F16→F32 (or zero-copies F32→Vec)
+    // for this CPU reference. Only used by test parity code; the
+    // production gemma4v path dispatches `gemma4v_patch_embed_gpu`
+    // which consumes the F16 buffer directly through the F16
+    // tensor-core kernel.
     let patch_buf = weights
         .patch_embd_weight()
         .map_err(|e| anyhow!("patch_embd_forward: {e}"))?;
-    let weight: &[f32] = patch_buf
-        .as_slice::<f32>()
-        .map_err(|e| anyhow!("patch_embd_forward as_slice f32: {e}"))?;
+    let weight_owned = weights
+        .tensor_as_f32_owned(patch_buf)
+        .map_err(|e| anyhow!("patch_embd_forward tensor_as_f32_owned: {e}"))?;
     patch_embed_forward(
         pixel_values,
-        weight,
+        &weight_owned,
         None, // Gemma 4 vision tower has no patch_embd bias
         cfg.image_size,
         cfg.patch_size,
@@ -2846,28 +2878,39 @@ mod tests {
         let residual_stream =
             patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
         let mut hidden_states = residual_stream.clone();
-        let slice = |name: &str| -> &[f32] {
-            // SAFETY: as_slice returns an &[f32] tied to the &MlxBuffer borrow;
-            // each closure call gets a fresh borrow through the weights ref.
-            weights
-                .block_tensor(0, name)
-                .expect(name)
-                .as_slice::<f32>()
-                .expect(name)
+        // W59 iter-128: widen F16 attn/ffn weights to owned Vec<f32>;
+        // norms (F32 in storage) widen identically. Same pattern as
+        // `apply_vit_block_forward`.
+        let widen = |name: &str| -> Vec<f32> {
+            let buf = weights.block_tensor(0, name).expect(name);
+            weights.tensor_as_f32_owned(buf).expect(name)
         };
-        rms_norm_forward(&mut hidden_states, slice("ln1.weight"), hidden, 1e-6).unwrap();
+        let ln1_w = widen("ln1.weight");
+        let attn_q_w = widen("attn_q.weight");
+        let attn_k_w = widen("attn_k.weight");
+        let attn_v_w = widen("attn_v.weight");
+        let attn_q_norm_w = widen("attn_q_norm.weight");
+        let attn_k_norm_w = widen("attn_k_norm.weight");
+        let attn_output_w = widen("attn_output.weight");
+        let ln2_w = widen("ln2.weight");
+        let ffn_gate_w = widen("ffn_gate.weight");
+        let ffn_up_w = widen("ffn_up.weight");
+        let ffn_down_w = widen("ffn_down.weight");
+        let post_ffw_norm_w = widen("post_ffw_norm.weight");
+
+        rms_norm_forward(&mut hidden_states, &ln1_w, hidden, 1e-6).unwrap();
         let (mut q, mut k, v) = qkv_projection_forward(
             &hidden_states,
-            slice("attn_q.weight"),
-            slice("attn_k.weight"),
-            slice("attn_v.weight"),
+            &attn_q_w,
+            &attn_k_w,
+            &attn_v_w,
             num_patches,
             hidden,
         )
         .unwrap();
         per_head_rms_norm_forward(
             &mut q,
-            slice("attn_q_norm.weight"),
+            &attn_q_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -2876,7 +2919,7 @@ mod tests {
         .unwrap();
         per_head_rms_norm_forward(
             &mut k,
-            slice("attn_k_norm.weight"),
+            &attn_k_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -2887,7 +2930,7 @@ mod tests {
             scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
         let attn_projected = linear_forward(
             &attn,
-            slice("attn_output.weight"),
+            &attn_output_w,
             None,
             num_patches,
             hidden,
@@ -2897,10 +2940,10 @@ mod tests {
         let mut post_attn = residual_stream.clone();
         residual_add(&mut post_attn, &attn_projected).unwrap();
         let mut pre_ffn = post_attn.clone();
-        rms_norm_forward(&mut pre_ffn, slice("ln2.weight"), hidden, 1e-6).unwrap();
+        rms_norm_forward(&mut pre_ffn, &ln2_w, hidden, 1e-6).unwrap();
         let mut gate = linear_forward(
             &pre_ffn,
-            slice("ffn_gate.weight"),
+            &ffn_gate_w,
             None,
             num_patches,
             hidden,
@@ -2909,7 +2952,7 @@ mod tests {
         .unwrap();
         let up = linear_forward(
             &pre_ffn,
-            slice("ffn_up.weight"),
+            &ffn_up_w,
             None,
             num_patches,
             hidden,
@@ -2923,7 +2966,7 @@ mod tests {
         // === Stage 11 (NEW iter 40): FFN down projection + post-norm + residual ===
         let mut down = linear_forward(
             &activated,
-            slice("ffn_down.weight"),
+            &ffn_down_w,
             None,
             num_patches,
             intermediate,
@@ -2935,7 +2978,7 @@ mod tests {
         // post_ffw_norm applied to the FFN output BEFORE the residual add
         // (matches llama.cpp build_vit: `cur = build_norm(cur, ff_post_norm_w)`
         // before `cur = inpL + cur`).
-        rms_norm_forward(&mut down, slice("post_ffw_norm.weight"), hidden, 1e-6)
+        rms_norm_forward(&mut down, &post_ffw_norm_w, hidden, 1e-6)
             .expect("post_ffw_norm");
 
         let mut block_out = post_attn.clone();
@@ -3091,30 +3134,35 @@ mod tests {
         }
         let residual_stream =
             patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
+        // W59 iter-128: widen F16 block weights to owned Vec<f32> once;
+        // see `apply_vit_block_forward` for the same pattern.
+        let widen = |suffix: &str| -> Vec<f32> {
+            let buf = weights.block_tensor(0, suffix).expect("block_tensor");
+            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+        };
+        let ln1_w = widen("ln1.weight");
+        let attn_q_w = widen("attn_q.weight");
+        let attn_k_w = widen("attn_k.weight");
+        let attn_v_w = widen("attn_v.weight");
+        let attn_q_norm_w = widen("attn_q_norm.weight");
+        let attn_k_norm_w = widen("attn_k_norm.weight");
+        let attn_output_w = widen("attn_output.weight");
+        let ln2_w = widen("ln2.weight");
+
         let mut hidden_states = residual_stream.clone();
-        rms_norm_forward(
-            &mut hidden_states,
-            weights
-                .block_tensor(0, "ln1.weight")
-                .unwrap()
-                .as_slice::<f32>()
-                .unwrap(),
-            hidden,
-            1e-6,
-        )
-        .unwrap();
+        rms_norm_forward(&mut hidden_states, &ln1_w, hidden, 1e-6).unwrap();
         let (mut q, mut k, v) = qkv_projection_forward(
             &hidden_states,
-            weights.block_tensor(0, "attn_q.weight").unwrap().as_slice::<f32>().unwrap(),
-            weights.block_tensor(0, "attn_k.weight").unwrap().as_slice::<f32>().unwrap(),
-            weights.block_tensor(0, "attn_v.weight").unwrap().as_slice::<f32>().unwrap(),
+            &attn_q_w,
+            &attn_k_w,
+            &attn_v_w,
             num_patches,
             hidden,
         )
         .unwrap();
         per_head_rms_norm_forward(
             &mut q,
-            weights.block_tensor(0, "attn_q_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            &attn_q_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3123,7 +3171,7 @@ mod tests {
         .unwrap();
         per_head_rms_norm_forward(
             &mut k,
-            weights.block_tensor(0, "attn_k_norm.weight").unwrap().as_slice::<f32>().unwrap(),
+            &attn_k_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3134,7 +3182,7 @@ mod tests {
             scaled_dot_product_attention(&q, &k, &v, num_patches, num_heads, head_dim).unwrap();
         let attn_projected = linear_forward(
             &attn,
-            weights.block_tensor(0, "attn_output.weight").unwrap().as_slice::<f32>().unwrap(),
+            &attn_output_w,
             None,
             num_patches,
             hidden,
@@ -3144,31 +3192,23 @@ mod tests {
         let mut post_attn = residual_stream.clone();
         residual_add(&mut post_attn, &attn_projected).unwrap();
         let mut pre_ffn = post_attn.clone();
-        rms_norm_forward(
-            &mut pre_ffn,
-            weights.block_tensor(0, "ln2.weight").unwrap().as_slice::<f32>().unwrap(),
-            hidden,
-            1e-6,
-        )
-        .unwrap();
+        rms_norm_forward(&mut pre_ffn, &ln2_w, hidden, 1e-6).unwrap();
 
         // Stage 8 (NEW): SwiGLU gated activation.
         // gate_w: [intermediate, hidden] = [4304, 1152]
         // up_w:   [intermediate, hidden] = [4304, 1152]
-        let ffn_gate_buf = weights.block_tensor(0, "ffn_gate.weight").expect("ffn_gate");
-        let ffn_up_buf = weights.block_tensor(0, "ffn_up.weight").expect("ffn_up");
         let intermediate = cfg.intermediate_size as usize;
         assert_eq!(intermediate, 4304);
-        let gate_w: &[f32] = ffn_gate_buf.as_slice::<f32>().unwrap();
-        let up_w: &[f32] = ffn_up_buf.as_slice::<f32>().unwrap();
+        let gate_w = widen("ffn_gate.weight");
+        let up_w = widen("ffn_up.weight");
         assert_eq!(gate_w.len(), intermediate * hidden);
         assert_eq!(up_w.len(), intermediate * hidden);
 
         // gate = pre_ffn @ gate_w.T → [num_patches, intermediate]
         let mut gate =
-            linear_forward(&pre_ffn, gate_w, None, num_patches, hidden, intermediate)
+            linear_forward(&pre_ffn, &gate_w, None, num_patches, hidden, intermediate)
                 .expect("gate proj");
-        let up = linear_forward(&pre_ffn, up_w, None, num_patches, hidden, intermediate)
+        let up = linear_forward(&pre_ffn, &up_w, None, num_patches, hidden, intermediate)
             .expect("up proj");
 
         silu_in_place(&mut gate);
@@ -3284,38 +3324,37 @@ mod tests {
             patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
 
         // Stage 2: copy → ln1 → QKV → per-head norm → attention.
-        let mut hidden_states = residual_stream.clone();
-        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
-        rms_norm_forward(
-            &mut hidden_states,
-            ln1.as_slice::<f32>().expect("ln1 slice"),
-            hidden,
-            1e-6,
-        )
-        .expect("rms ln1");
+        // W59 iter-128: widen F16 block weights once (norms stay F32);
+        // see `apply_vit_block_forward` for the same pattern.
+        let widen = |suffix: &str| -> Vec<f32> {
+            let buf = weights.block_tensor(0, suffix).expect("block_tensor");
+            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+        };
+        let ln1_w = widen("ln1.weight");
+        let attn_q_w = widen("attn_q.weight");
+        let attn_k_w = widen("attn_k.weight");
+        let attn_v_w = widen("attn_v.weight");
+        let attn_q_norm_w = widen("attn_q_norm.weight");
+        let attn_k_norm_w = widen("attn_k_norm.weight");
+        let attn_output_w = widen("attn_output.weight");
+        let ln2_w = widen("ln2.weight");
 
-        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("q");
-        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("k");
-        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("v");
+        let mut hidden_states = residual_stream.clone();
+        rms_norm_forward(&mut hidden_states, &ln1_w, hidden, 1e-6).expect("rms ln1");
+
         let (mut q, mut k, v) = qkv_projection_forward(
             &hidden_states,
-            q_buf.as_slice::<f32>().expect("q slice"),
-            k_buf.as_slice::<f32>().expect("k slice"),
-            v_buf.as_slice::<f32>().expect("v slice"),
+            &attn_q_w,
+            &attn_k_w,
+            &attn_v_w,
             num_patches,
             hidden,
         )
         .expect("qkv");
 
-        let q_norm = weights
-            .block_tensor(0, "attn_q_norm.weight")
-            .expect("attn_q_norm");
-        let k_norm = weights
-            .block_tensor(0, "attn_k_norm.weight")
-            .expect("attn_k_norm");
         per_head_rms_norm_forward(
             &mut q,
-            q_norm.as_slice::<f32>().expect("q_norm slice"),
+            &attn_q_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3324,7 +3363,7 @@ mod tests {
         .expect("per-head Q");
         per_head_rms_norm_forward(
             &mut k,
-            k_norm.as_slice::<f32>().expect("k_norm slice"),
+            &attn_k_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3336,14 +3375,9 @@ mod tests {
             .expect("attention");
 
         // Stage 3 (NEW): attn_output projection.
-        let attn_output = weights
-            .block_tensor(0, "attn_output.weight")
-            .expect("attn_output");
-        let attn_output_w: &[f32] =
-            attn_output.as_slice::<f32>().expect("attn_output slice");
         assert_eq!(attn_output_w.len(), hidden * hidden);
         let attn_projected =
-            linear_forward(&attn, attn_output_w, None, num_patches, hidden, hidden)
+            linear_forward(&attn, &attn_output_w, None, num_patches, hidden, hidden)
                 .expect("attn_output proj");
 
         // Stage 4 (NEW): residual add → post-attention hidden states.
@@ -3352,14 +3386,7 @@ mod tests {
 
         // Stage 5 (NEW): ln2 RMSNorm.
         let mut pre_ffn = post_attn.clone();
-        let ln2 = weights.block_tensor(0, "ln2.weight").expect("ln2");
-        rms_norm_forward(
-            &mut pre_ffn,
-            ln2.as_slice::<f32>().expect("ln2 slice"),
-            hidden,
-            1e-6,
-        )
-        .expect("rms ln2");
+        rms_norm_forward(&mut pre_ffn, &ln2_w, hidden, 1e-6).expect("rms ln2");
 
         // Sanity: every stage's output is finite, shape-correct, and
         // differs from the bare patch_embed (stages have changed the
@@ -3586,32 +3613,32 @@ mod tests {
         }
         let mut hidden_states =
             patch_embed_from_mmproj_weights(&pixels, &weights, &cfg).expect("patch_embed");
-        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
-        let ln1_g: &[f32] = ln1.as_slice::<f32>().expect("ln1 slice");
-        rms_norm_forward(&mut hidden_states, ln1_g, hidden, 1e-6).expect("rms ln1");
+        // W59 iter-128: widen F16 block weights once.
+        let widen = |suffix: &str| -> Vec<f32> {
+            let buf = weights.block_tensor(0, suffix).expect("block_tensor");
+            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+        };
+        let ln1_w = widen("ln1.weight");
+        let attn_q_w = widen("attn_q.weight");
+        let attn_k_w = widen("attn_k.weight");
+        let attn_v_w = widen("attn_v.weight");
+        let attn_q_norm_w = widen("attn_q_norm.weight");
+        let attn_k_norm_w = widen("attn_k_norm.weight");
 
-        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("q");
-        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("k");
-        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("v");
+        rms_norm_forward(&mut hidden_states, &ln1_w, hidden, 1e-6).expect("rms ln1");
         let (mut q, mut k, v) = qkv_projection_forward(
             &hidden_states,
-            q_buf.as_slice::<f32>().expect("q slice"),
-            k_buf.as_slice::<f32>().expect("k slice"),
-            v_buf.as_slice::<f32>().expect("v slice"),
+            &attn_q_w,
+            &attn_k_w,
+            &attn_v_w,
             num_patches,
             hidden,
         )
         .expect("qkv");
 
-        let q_norm = weights
-            .block_tensor(0, "attn_q_norm.weight")
-            .expect("attn_q_norm");
-        let k_norm = weights
-            .block_tensor(0, "attn_k_norm.weight")
-            .expect("attn_k_norm");
         per_head_rms_norm_forward(
             &mut q,
-            q_norm.as_slice::<f32>().expect("q_norm slice"),
+            &attn_q_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3620,7 +3647,7 @@ mod tests {
         .expect("per-head Q");
         per_head_rms_norm_forward(
             &mut k,
-            k_norm.as_slice::<f32>().expect("k_norm slice"),
+            &attn_k_norm_w,
             num_patches,
             num_heads,
             head_dim,
@@ -3785,43 +3812,39 @@ mod tests {
         let num_patches = 196usize;
         assert_eq!(hidden_states.len(), num_patches * hidden);
 
+        // W59 iter-128: widen F16 block weights once.
+        let widen = |suffix: &str| -> Vec<f32> {
+            let buf = weights.block_tensor(0, suffix).expect("block_tensor");
+            weights.tensor_as_f32_owned(buf).expect("tensor_as_f32_owned")
+        };
+        let ln1_gamma = widen("ln1.weight");
+        let q_w = widen("attn_q.weight");
+        let k_w = widen("attn_k.weight");
+        let v_w = widen("attn_v.weight");
+        let q_norm_gamma = widen("attn_q_norm.weight");
+        let k_norm_gamma = widen("attn_k_norm.weight");
+
         // Stage 2: ln1 RMSNorm.
-        let ln1 = weights.block_tensor(0, "ln1.weight").expect("ln1");
-        let ln1_gamma: &[f32] = ln1.as_slice::<f32>().expect("ln1 as_slice");
-        rms_norm_forward(&mut hidden_states, ln1_gamma, hidden, 1e-6).expect("rms ln1");
+        rms_norm_forward(&mut hidden_states, &ln1_gamma, hidden, 1e-6).expect("rms ln1");
 
         // Stage 3: QKV projection.
-        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("attn_q");
-        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("attn_k");
-        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("attn_v");
-        let q_w: &[f32] = q_buf.as_slice::<f32>().expect("q slice");
-        let k_w: &[f32] = k_buf.as_slice::<f32>().expect("k slice");
-        let v_w: &[f32] = v_buf.as_slice::<f32>().expect("v slice");
         let (mut q, mut k, v) = qkv_projection_forward(
             &hidden_states,
-            q_w,
-            k_w,
-            v_w,
+            &q_w,
+            &k_w,
+            &v_w,
             num_patches,
             hidden,
         )
         .expect("qkv");
 
         // Stage 4: per-head RMSNorm on Q and K (Gemma 4 quirk).
-        let q_norm = weights
-            .block_tensor(0, "attn_q_norm.weight")
-            .expect("attn_q_norm");
-        let k_norm = weights
-            .block_tensor(0, "attn_k_norm.weight")
-            .expect("attn_k_norm");
-        let q_norm_gamma: &[f32] = q_norm.as_slice::<f32>().expect("q_norm slice");
-        let k_norm_gamma: &[f32] = k_norm.as_slice::<f32>().expect("k_norm slice");
         assert_eq!(q_norm_gamma.len(), head_dim);
         assert_eq!(k_norm_gamma.len(), head_dim);
 
-        per_head_rms_norm_forward(&mut q, q_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
+        per_head_rms_norm_forward(&mut q, &q_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
             .expect("per-head Q");
-        per_head_rms_norm_forward(&mut k, k_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
+        per_head_rms_norm_forward(&mut k, &k_norm_gamma, num_patches, num_heads, head_dim, 1e-6)
             .expect("per-head K");
 
         // V stays un-normalized — sanity-check it's still finite from
@@ -3997,12 +4020,17 @@ mod tests {
         let device = mlx_native::MlxDevice::new().expect("device");
         let weights = LoadedMmprojWeights::load(&gguf, &cfg, device).expect("load");
 
-        let q_buf = weights.block_tensor(0, "attn_q.weight").expect("attn_q");
-        let k_buf = weights.block_tensor(0, "attn_k.weight").expect("attn_k");
-        let v_buf = weights.block_tensor(0, "attn_v.weight").expect("attn_v");
-        let q_w: &[f32] = q_buf.as_slice::<f32>().expect("q as_slice");
-        let k_w: &[f32] = k_buf.as_slice::<f32>().expect("k as_slice");
-        let v_w: &[f32] = v_buf.as_slice::<f32>().expect("v as_slice");
+        // W59 iter-128: attn_q/k/v.weight are F16 in gemma4v storage;
+        // widen to owned Vec<f32> for the CPU reference qkv_projection.
+        let q_w = weights
+            .tensor_as_f32_owned(weights.block_tensor(0, "attn_q.weight").expect("attn_q"))
+            .expect("widen attn_q");
+        let k_w = weights
+            .tensor_as_f32_owned(weights.block_tensor(0, "attn_k.weight").expect("attn_k"))
+            .expect("widen attn_k");
+        let v_w = weights
+            .tensor_as_f32_owned(weights.block_tensor(0, "attn_v.weight").expect("attn_v"))
+            .expect("widen attn_v");
         let hidden = cfg.hidden_size as usize;
         assert_eq!(q_w.len(), hidden * hidden);
         assert_eq!(k_w.len(), hidden * hidden);
@@ -4017,7 +4045,7 @@ mod tests {
                 input[p * hidden + h] = 0.01 + (p as f32) * 0.0001 + (h as f32) * 1e-5;
             }
         }
-        let (q, k, v) = qkv_projection_forward(&input, q_w, k_w, v_w, batch, hidden)
+        let (q, k, v) = qkv_projection_forward(&input, &q_w, &k_w, &v_w, batch, hidden)
             .expect("qkv");
         assert_eq!(q.len(), batch * hidden);
 
