@@ -1065,6 +1065,275 @@ pub fn quantize_row_q4_k_imatrix(
     Ok(())
 }
 
+/// Imatrix-weighted Q5_K quantize. Pure-Rust port of
+/// `quantize_row_q5_K_impl` (`ggml-quants.c:1696`). Structurally
+/// parallel to [`quantize_row_q4_k_imatrix`] with the following
+/// Q5_K-specific differences:
+/// - `make_qkx3_quants` is called with `nmax=31` (5-bit).
+/// - Per-element re-derivation clamps to `[0, 31]` (5-bit).
+/// - 5-bit pack: low 4 bits in `qs[128]`, high bit in `qh[32]`
+///   under per-pair `(m1, m2)` mask shifters starting at `(1, 2)`
+///   and shifting left by 2 per 64-element pair.
+pub fn quantize_row_q5_k_imatrix(
+    row: &[f32],
+    blocks: &mut [BlockQ5K],
+    quant_weights: &[f32],
+) -> Result<(), KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q5_K_SIZE,
+        });
+    }
+    if quant_weights.len() != row.len() {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: quant_weights.len(),
+            n_blocks: nb,
+            bytes_per_block: QK_K,
+        });
+    }
+
+    let mut l_buf = [0u8; QK_K];
+    let mut laux = [0u8; 32];
+    let mut weights_buf = [0.0f32; 32];
+    let mut sw = [0.0f32; QK_K / 32];
+    let mut mins = [0.0f32; QK_K / 32];
+    let mut scales = [0.0f32; QK_K / 32];
+    let mut ls_buf = [0u8; QK_K / 32];
+    let mut lm_buf = [0u8; QK_K / 32];
+
+    for i in 0..nb {
+        let x = &row[i * QK_K..(i + 1) * QK_K];
+        let qw = &quant_weights[i * QK_K..(i + 1) * QK_K];
+
+        let sum_x2: f32 = x.iter().map(|v| v * v).sum();
+        let sigma2 = 2.0 * sum_x2 / (QK_K as f32);
+
+        for j in 0..(QK_K / 32) {
+            let xj = &x[32 * j..32 * j + 32];
+            let qwj = &qw[32 * j..32 * j + 32];
+            let mut sumw = 0.0f32;
+            for (l, (qw_l, x_l)) in weights_buf.iter_mut().zip(qwj.iter().zip(xj.iter())) {
+                *l = qw_l * (sigma2 + x_l * x_l).sqrt();
+                sumw += *l;
+            }
+            sw[j] = sumw;
+
+            let (scale, the_min) = make_qkx3_quants(
+                32,
+                31,
+                xj,
+                Some(&weights_buf),
+                &mut l_buf[32 * j..32 * j + 32],
+                &mut laux,
+                -0.9,
+                0.05,
+                36,
+                false,
+            );
+            scales[j] = scale;
+            mins[j] = the_min;
+        }
+
+        let d_block = make_qp_quants(QK_K / 32, 63, &scales, &mut ls_buf, &sw);
+        let m_block = make_qp_quants(QK_K / 32, 63, &mins, &mut lm_buf, &sw);
+
+        let mut packed_scales = [0u8; 12];
+        for j in 0..(QK_K / 32) {
+            let ls = ls_buf[j];
+            let lm = lm_buf[j];
+            if j < 4 {
+                packed_scales[j] = ls;
+                packed_scales[j + 4] = lm;
+            } else {
+                packed_scales[j + 4] = (ls & 0x0F) | ((lm & 0x0F) << 4);
+                packed_scales[j - 4] |= (ls >> 4) << 6;
+                packed_scales[j] |= (lm >> 4) << 6;
+            }
+        }
+
+        let d_bits = half::f16::from_f32(d_block).to_bits();
+        let dmin_bits = half::f16::from_f32(m_block).to_bits();
+        let d = half::f16::from_bits(d_bits).to_f32();
+        let dmin = half::f16::from_bits(dmin_bits).to_f32();
+
+        // Re-derive 5-bit quants under final (d, dmin, sc, m).
+        for j in 0..(QK_K / 32) {
+            let (sc, m) = get_scale_min_k4(j, &packed_scales);
+            let d_eff = d * (sc as f32);
+            if d_eff == 0.0 {
+                continue;
+            }
+            let dm = dmin * (m as f32);
+            for ii in 0..32 {
+                let lq = nearest_int((x[32 * j + ii] + dm) / d_eff)
+                    .max(0)
+                    .min(31);
+                l_buf[32 * j + ii] = lq as u8;
+            }
+        }
+
+        // Pack 5-bit quants: low 4 bits in qs, high bit in qh.
+        let mut qs = [0u8; QK_K / 2];
+        let mut qh = [0u8; QK_K / 8];
+        let mut m1: u8 = 1;
+        let mut m2: u8 = 2;
+        let mut ql_off = 0usize;
+        for j_pair in 0..(QK_K / 64) {
+            let n = j_pair * 64;
+            for jj in 0..32 {
+                let mut l1 = l_buf[n + jj] as i32;
+                if l1 > 15 {
+                    l1 -= 16;
+                    qh[jj] |= m1;
+                }
+                let mut l2 = l_buf[n + jj + 32] as i32;
+                if l2 > 15 {
+                    l2 -= 16;
+                    qh[jj] |= m2;
+                }
+                qs[ql_off + jj] = (l1 as u8) | ((l2 as u8) << 4);
+            }
+            m1 <<= 2;
+            m2 <<= 2;
+            ql_off += 32;
+        }
+
+        blocks[i] = BlockQ5K {
+            d_bits,
+            dmin_bits,
+            scales: packed_scales,
+            qh,
+            qs,
+        };
+    }
+    Ok(())
+}
+
+/// Imatrix-weighted Q6_K quantize. Pure-Rust port of
+/// `quantize_row_q6_K_impl` (`ggml-quants.c:1908`). Differs from
+/// [`quantize_row_q6_k`] only in the per-sub-block call: passes
+/// `qw[16*ib..]` directly as the `qw` argument to
+/// [`make_qx_quants`] (the helper handles the per-element weighting).
+pub fn quantize_row_q6_k_imatrix(
+    row: &[f32],
+    blocks: &mut [BlockQ6K],
+    quant_weights: &[f32],
+) -> Result<(), KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q6_K_SIZE,
+        });
+    }
+    if quant_weights.len() != row.len() {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: quant_weights.len(),
+            n_blocks: nb,
+            bytes_per_block: QK_K,
+        });
+    }
+
+    let mut l_buf = [0i8; QK_K];
+    let mut scales = [0.0f32; QK_K / 16];
+
+    for i in 0..nb {
+        let x = &row[i * QK_K..(i + 1) * QK_K];
+        let qw = &quant_weights[i * QK_K..(i + 1) * QK_K];
+
+        let mut max_scale = 0.0f32;
+        let mut max_abs_scale = 0.0f32;
+        for ib in 0..(QK_K / 16) {
+            let xib = &x[16 * ib..16 * ib + 16];
+            let qwib = &qw[16 * ib..16 * ib + 16];
+            let scale = make_qx_quants(
+                16,
+                32,
+                xib,
+                &mut l_buf[16 * ib..16 * ib + 16],
+                1,
+                Some(qwib),
+            );
+            scales[ib] = scale;
+            let abs_scale = scale.abs();
+            if abs_scale > max_abs_scale {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+        }
+
+        if max_abs_scale < GROUP_MAX_EPS {
+            blocks[i] = BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: half::f16::from_f32(0.0).to_bits(),
+            };
+            continue;
+        }
+
+        let iscale = -128.0 / max_scale;
+        let d_f = 1.0 / iscale;
+        let d_bits = half::f16::from_f32(d_f).to_bits();
+        let d = half::f16::from_bits(d_bits).to_f32();
+
+        let mut block_scales = [0i8; QK_K / 16];
+        for ib in 0..(QK_K / 16) {
+            let lq = nearest_int(iscale * scales[ib]).min(127);
+            block_scales[ib] = lq as i8;
+        }
+
+        for j in 0..(QK_K / 16) {
+            let d_eff = d * (block_scales[j] as f32);
+            if d_eff == 0.0 {
+                continue;
+            }
+            for ii in 0..16 {
+                let lq = nearest_int(x[16 * j + ii] / d_eff).max(-32).min(31);
+                l_buf[16 * j + ii] = (lq + 32) as i8;
+            }
+        }
+
+        let mut ql = [0u8; QK_K / 2];
+        let mut qh = [0u8; QK_K / 4];
+        for half in 0..(QK_K / 128) {
+            let l_off = half * 128;
+            let ql_off = half * 64;
+            let qh_off = half * 32;
+            for l in 0..32 {
+                let q1 = (l_buf[l_off + l] as u8) & 0x0F;
+                let q2 = (l_buf[l_off + l + 32] as u8) & 0x0F;
+                let q3 = (l_buf[l_off + l + 64] as u8) & 0x0F;
+                let q4 = (l_buf[l_off + l + 96] as u8) & 0x0F;
+                ql[ql_off + l] = q1 | (q3 << 4);
+                ql[ql_off + l + 32] = q2 | (q4 << 4);
+                qh[qh_off + l] = ((l_buf[l_off + l] as u8) >> 4)
+                    | (((l_buf[l_off + l + 32] as u8) >> 4) << 2)
+                    | (((l_buf[l_off + l + 64] as u8) >> 4) << 4)
+                    | (((l_buf[l_off + l + 96] as u8) >> 4) << 6);
+            }
+        }
+
+        blocks[i] = BlockQ6K {
+            ql,
+            qh,
+            scales: block_scales,
+            d_bits,
+        };
+    }
+    Ok(())
+}
+
 /// Quantize `row` (length `n_blocks × QK_K`) to a sequence of
 /// `BlockQ5K` super-blocks. Pure-Rust port of `quantize_row_q5_K_ref`
 /// (`ggml-quants.c:1582`).
@@ -3037,6 +3306,190 @@ mod tests {
             KQuantError::BlockSizeMismatch { actual, .. } => {
                 assert_eq!(actual, QK_K - 1);
             }
+            _ => panic!("expected BlockSizeMismatch"),
+        }
+    }
+
+    // ─────────────── Q5_K + Q6_K imatrix tests (iter-3e) ───────────────
+
+    /// Q5_K imatrix uniform-weight round-trip on smooth ramp:
+    /// RMSE ≤ 0.025 (Q5_K's tighter codebook).
+    #[test]
+    fn quantize_q5_k_imatrix_uniform_weights() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+        let weights = vec![1.0_f32; QK_K];
+
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q5_k_imatrix(&row, &mut blocks, &weights).unwrap();
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q5_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.025,
+            "Q5_K imatrix uniform-weight RMSE {rmse} > 0.025"
+        );
+    }
+
+    /// Q6_K imatrix uniform-weight round-trip on a sine wave: RMSE
+    /// ≤ 0.02. Note: uniform `qw=1.0` is the **unweighted-MSE** path
+    /// in `make_qx_quants` (qw overrides rmse_type), distinct from
+    /// `_ref`'s rmse_type=1 (x²-weighted) — so RMSE here can be
+    /// slightly higher than the `_ref` variant (which lands at 0.012).
+    #[test]
+    fn quantize_q6_k_imatrix_uniform_weights() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let theta = 8.0 * std::f32::consts::PI * (i as f32) / (QK_K as f32);
+                2.0 * theta.sin()
+            })
+            .collect();
+        let weights = vec![1.0_f32; QK_K];
+
+        let mut blocks = vec![
+            BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: 0,
+            };
+            1
+        ];
+        quantize_row_q6_k_imatrix(&row, &mut blocks, &weights).unwrap();
+
+        let mut decoded = vec![0.0_f32; QK_K];
+        dequantize_row_q6_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.02,
+            "Q6_K imatrix uniform-weight RMSE {rmse} > 0.02"
+        );
+    }
+
+    /// Q5_K imatrix biased-weight test: 100× emphasis on first 16
+    /// elements should reduce focus-region MSE vs uniform weights.
+    #[test]
+    fn quantize_q5_k_imatrix_biased_weights() {
+        let mut row = vec![0.01_f32; QK_K];
+        for r in row.iter_mut().take(16) {
+            *r = 5.0;
+        }
+
+        let mut q_uniform = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let weights_uniform = vec![1.0_f32; QK_K];
+        quantize_row_q5_k_imatrix(&row, &mut q_uniform, &weights_uniform).unwrap();
+
+        let mut q_biased = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let mut weights_biased = vec![1.0_f32; QK_K];
+        for w in weights_biased.iter_mut().take(16) {
+            *w = 100.0;
+        }
+        quantize_row_q5_k_imatrix(&row, &mut q_biased, &weights_biased).unwrap();
+
+        let mut d_uniform = vec![0.0_f32; QK_K];
+        let mut d_biased = vec![0.0_f32; QK_K];
+        dequantize_row_q5_k(&q_uniform, &mut d_uniform).unwrap();
+        dequantize_row_q5_k(&q_biased, &mut d_biased).unwrap();
+
+        let mse_focus = |decoded: &[f32]| -> f64 {
+            let mut sse = 0.0;
+            for i in 0..16 {
+                let d = (row[i] as f64) - (decoded[i] as f64);
+                sse += d * d;
+            }
+            sse / 16.0
+        };
+        let m_uniform = mse_focus(&d_uniform);
+        let m_biased = mse_focus(&d_biased);
+        assert!(
+            m_biased <= m_uniform + 1e-6,
+            "Q5_K imatrix bias didn't help: biased MSE {m_biased} > uniform MSE {m_uniform}"
+        );
+    }
+
+    /// Q5_K imatrix rejects mismatched weight length.
+    #[test]
+    fn quantize_q5_k_imatrix_rejects_mismatched_weights() {
+        let row = vec![0.0_f32; QK_K];
+        let weights = vec![1.0_f32; QK_K - 1];
+        let mut blocks = vec![
+            BlockQ5K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qh: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        let err = quantize_row_q5_k_imatrix(&row, &mut blocks, &weights).unwrap_err();
+        match err {
+            KQuantError::BlockSizeMismatch { .. } => {}
+            _ => panic!("expected BlockSizeMismatch"),
+        }
+    }
+
+    /// Q6_K imatrix rejects mismatched weight length.
+    #[test]
+    fn quantize_q6_k_imatrix_rejects_mismatched_weights() {
+        let row = vec![0.0_f32; QK_K];
+        let weights = vec![1.0_f32; QK_K + 1];
+        let mut blocks = vec![
+            BlockQ6K {
+                ql: [0u8; QK_K / 2],
+                qh: [0u8; QK_K / 4],
+                scales: [0i8; QK_K / 16],
+                d_bits: 0,
+            };
+            1
+        ];
+        let err = quantize_row_q6_k_imatrix(&row, &mut blocks, &weights).unwrap_err();
+        match err {
+            KQuantError::BlockSizeMismatch { .. } => {}
             _ => panic!("expected BlockSizeMismatch"),
         }
     }
