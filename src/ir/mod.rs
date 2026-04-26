@@ -5,6 +5,20 @@
 //! Backends consume `QuantizedModel`.
 //!
 //! All types are Send + Sync.
+//!
+//! ## Lazy IR (ADR-014 P0)
+//!
+//! The submodule [`lazy`] adds [`lazy::LazyTensor`] / [`lazy::LazyTensorMap`]:
+//! a `FnOnce`-backed deferred materialization layer for the streaming
+//! convert pipeline (ADR-014 Decisions 1+2). Eager [`TensorMap`] remains
+//! the contract for P1-pre callers; ADR-014 P1 lifts the Phase 1.4–1.7
+//! transforms to consume `LazyTensorMap`. During P0 the eager
+//! `read_tensors` reader is implemented as
+//! `read_tensors_lazy(...).materialize_all()` (Decision 2 bridge), so
+//! the legacy callers continue to see byte-identical output while the
+//! new lazy primitive becomes the source of truth.
+
+pub mod lazy;
 
 use std::collections::HashMap;
 use std::fmt;
