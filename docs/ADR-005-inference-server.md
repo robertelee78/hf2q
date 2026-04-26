@@ -1930,6 +1930,44 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Operational note:** at ~1.3s per image, multi-image requests pay linear cost. Iter 53+ amortizes by running all images in a single `GraphSession::finish()` (batched compute) — should drop to ~70ms-per-image once CPU patch_embed is also GPU-ported.
   - **Next (iter 53):** engine-side embedding injection. The chat `Engine` needs a soft-token path: instead of an embedding-table lookup, accept pre-computed embedding vectors and inject them at marker positions. Concrete steps:
 
+- **2026-04-25 loop iter 90 — Flash Attention port for nomic-bert (head_dim=64). New mlx-native v0.4.5 dispatcher `flash_attn_prefill_bf16_d64` with `FlashAttnPrefillLayout::SeqMajor` consumes the BERT-family seq-major Q/K/V layout directly (no host-side transpose). Replaces the 8-stage `bert_attention_with_mask_gpu` chain with `cast_F32→BF16(Q,K,V) + flash_attn + cast_BF16→F32(O)` = 5 dispatches per layer (was 8). Cooled 3-run avg: HTTP `/v1/embeddings` mean **5.69 ms**, min **5.01 ms** vs llama.cpp `prompt_eval` 4.25 ms — ratio **1.34×** (was 1.45×). Cosine parity holds: bge 0.999985, mxbai 0.999988, nomic 0.999960.**
+  - **What landed (mlx-native v0.4.5).**
+    - `src/shaders/flash_attn_prefill.metal` — added 4 D=64 instantiations (`bf16/f16` × `additive/boolmask`) using the same BQ=32 / BK=16 / WM=4 / WN=1 geometry as D=256. Threadgroup memory at bf16 ≈ 7.7 KB (vs 32 KB cap), well under budget. Static asserts pass: `BQ ≥ kNWarps×kFragSize = 32`, `TQ = 1`, `TD = 64/8 = 8`, `TK = 16/8 = 2`.
+    - `src/ops/flash_attn_prefill.rs` — new `FlashAttnPrefillLayout` enum (`HeadMajor` `[B,H,L,D]` matches D=256/D=512; `SeqMajor` `[B,L,H,D]` is the BERT-family natural layout). New `dispatch_flash_attn_prefill_bf16_d64` accepts the layout selector and computes layout-aware strides for Q/K/V/O. Same constants 200/201/300/301/303 plumbing as D=256; `has_blk` forced to `false` (Wave-2E tile-skip is D=256-only).
+    - `tests/test_flash_attn_prefill.rs` — 5 new GPU correctness tests covering both layouts at seq_lens 32/128/512, additive rank-4 mask (head-major path), rank-2 broadcast mask (seq-major path), and head_dim≠64 rejection. All pass at the same `atol=5e-3 rtol=2e-2` budget as D=256 (max measured: 1.95e-3 abs, 7.6e-3 rel).
+    - mlx-native pre-existing 43 flash_attn_prefill tests still pass — total **48 / 48** at D=64+D=256+D=512+blk+mask coverage.
+  - **What landed (hf2q nomic-bert).**
+    - `src/inference/models/nomic_bert/forward.rs` — new `alloc_nomic_attn_mask_bf16` builds a rank-2 `[seq_len, seq_len]` BF16 mask once per request (replaces the F32 mask the old `bert_attention_with_mask_gpu` consumed). `apply_nomic_bert_encoder_block_gpu` no longer calls `bert_attention_with_mask_gpu`; it casts Q/K/V F32→BF16 (3 concurrent-dispatch casts behind one barrier), calls `dispatch_flash_attn_prefill_bf16_d64` with `SeqMajor` + the rank-2 mask + `do_causal=false`, then casts the BF16 output back to F32 for the existing output-projection path. The encoder-block signature now takes `mask_bf16: &MlxBuffer` (was `mask: &MlxBuffer` F32).
+    - `apply_nomic_bert_full_forward_gpu` — `seq_len ≥ 32` precondition relaxed to `seq_len ≥ 1` (the prior floor was a tile-K limit of the now-removed `bert_attention_with_mask_gpu`'s post-softmax matmul; flash-attn has no equivalent floor). `head_dim` precondition tightened to `== 64` (only D=64 instantiation registered for this path).
+    - `register_nomic_bert_kernels` — registers `flash_attn_prefill::register` (cast kernels are auto-registered by `KernelRegistry::new()`).
+  - **Numbers (M5 Max, 2026-04-25, 5s cool-down between runs).**
+    ```
+    Run 1: mean 5.62 ms, min 5.01 ms, max 9.90 ms — ratio 1.37× (llama 4.09)
+    Run 2: mean 5.81 ms, min 5.57 ms, max 6.62 ms — ratio 1.42× (llama 4.09)
+    Run 3: mean 5.65 ms, min 5.47 ms, max 5.94 ms — ratio 1.23× (llama 4.58)
+    Avg:   mean 5.69 ms, min 5.01 ms             — ratio 1.34× (llama 4.25)
+    ```
+    Iter-89 → iter-90 deltas: HTTP mean 6.46 → 5.69 ms (−12%), min 6.04 → 5.01 ms (−17%), ratio 1.45× → 1.34×.
+  - **Cosine parity.** All three day-one models GREEN with the flash-attn path:
+    ```
+    bge-small-en-v1.5     cosine 0.999985  (unchanged — uses BERT lane, not nomic)
+    mxbai-embed-large-v1  cosine 0.999988  (unchanged — same)
+    nomic-embed-text-v1.5 cosine 0.999960  (was 0.999974 — Δ 1.4e-5, well above 0.999 floor)
+    ```
+    The 1.4e-5 nomic drop is bf16 round-trip noise: Q/K/V cast F32→BF16 before attention loses ~1 ULP per element vs the old F32-attention path. Max element-wise drift: 1.20e-3 (was 1.10e-3). Still 14× tighter than the 0.999 acceptance gate.
+  - **Why not lower than 1.34×.** The remaining gap to llama.cpp is split roughly into:
+    1. **Mandatory casts for the BF16 attention I/O** (3 in + 1 out per layer × 12 layers = 48 cast dispatches). llama.cpp's flash-attn consumes the model's native f16 weight dtype and never does this round-trip. We could close this by casting the Q/K/V outputs of the matmul directly to bf16 (matmul has F32 accumulator → bf16 store) — that's an mlx-native kernel variant, queued as iter-91 candidate.
+    2. **HTTP-stack overhead** (Python urllib persistent session, axum routing, JSON encode/decode). Not nomic-specific; remaining floor is ~1 ms of pure server overhead.
+    3. **Embed/pool/L2-norm overhead** outside the encoder loop — currently 4-5 dispatches that don't exist in llama.cpp's bench harness.
+  - **Verification.** All 53/53 BERT + nomic_bert tests pass. `cargo test --release --bin hf2q full_forward_matches_llama_embedding_on_hello_world` runs all 3 cosine gates green in 0.26s.
+  - **Lane discipline.** Edits in two repos: mlx-native (shader instantiations + new dispatcher + tests + version bump 0.4.4 → 0.4.5) and hf2q (`forward.rs` rewrite of attention sequence + `Cargo.toml` bump + `.cargo/config.toml` patch enable). Zero changes to BERT lane (`bert_gpu.rs`), state, handler, or any other lane.
+  - **Iter-90 vs the iter-89 plan.** Predicted ~1.2 ms savings; measured 0.77-1.03 ms depending on run. Hit the directional target ("ratio < 1.45×") and the parity-must-hold gate. Did not hit the stretch ratio target of ≤ 1.25× — the BF16 cast overhead is real and only goes away by changing the matmul output dtype.
+  - **Next (iter 91 candidates):**
+    1. **Direct BF16 matmul output for Q/K/V** — extend `bert_linear_bf16_gpu` (or add a `bert_linear_bf16_to_bf16_gpu` variant) that writes BF16 instead of F32, eliminating the 3 input casts per layer (36 total). Estimated ~0.4-0.6 ms savings.
+    2. **BF16 RoPE kernel** — current `dispatch_rope_neox_f32` requires F32; if we have BF16 Q/K coming out of matmul we'd need a BF16 RoPE variant. mlx-native already has `rope_neox` infra; adding a dtype-templated entry-point is straightforward.
+    3. **Output projection in BF16** — the `attn_output.weight` matmul could consume the BF16 attn_out directly without the BF16→F32 cast.
+    Combined ceiling: another ~0.5-0.8 ms, would land hf2q in the 4.5-5.0 ms range — actually parity with llama.cpp at the HTTP envelope.
+
 - **2026-04-26 loop iter 89 — iter-88 reverted (regression confirmed). Final cooled baseline: HTTP `/v1/embeddings` mean **6.46 ms** (3-run avg), min 6.00 ms, ratio 1.45× vs llama.cpp 4.44 ms. Iter-89 documents the stable post-revert state and queues Flash Attention as the next-iter work.**
   - **Iter-88 regression: embed-stage fusion was net-slower.**
     - Replaced (token_gather + type_gather + residual_add + layer_norm) with (concurrent token_gather + type_gather + fused_residual_layer_norm).

@@ -52,15 +52,19 @@
 
 use anyhow::{anyhow, Context, Result};
 
+use mlx_native::ops::elementwise::{cast, CastDirection};
+use mlx_native::ops::flash_attn_prefill::{
+    self as flash_attn_prefill, dispatch_flash_attn_prefill_bf16_d64,
+    FlashAttnPrefillLayout, FlashAttnPrefillParams,
+};
 use mlx_native::ops::rope::dispatch_rope_neox_f32;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::super::bert::bert_gpu::{
-    alloc_bert_attention_mask, bert_attention_with_mask_gpu, bert_embed_gather_gpu,
-    bert_l2_normalize_gpu, bert_layer_norm_gpu, bert_linear_bf16_gpu, bert_linear_gpu,
-    bert_pool_gpu, bert_residual_add_gpu, bert_residual_layer_norm_gpu,
-    register_bert_custom_shaders, BertPoolKind,
+    bert_embed_gather_gpu, bert_l2_normalize_gpu, bert_layer_norm_gpu,
+    bert_linear_bf16_gpu, bert_linear_gpu, bert_pool_gpu, bert_residual_add_gpu,
+    bert_residual_layer_norm_gpu, register_bert_custom_shaders, BertPoolKind,
 };
 use super::super::bert::config::PoolingType;
 use super::config::NomicBertConfig;
@@ -83,6 +87,10 @@ pub fn register_nomic_bert_kernels(registry: &mut KernelRegistry) {
     register_bert_custom_shaders(registry);
     mlx_native::ops::rope::register(registry);
     mlx_native::ops::silu_mul::register(registry);
+    // `cast_f32_to_bf16` / `cast_bf16_to_f32` are auto-registered by
+    // `KernelRegistry::new()` via the elementwise default sources, so no
+    // explicit register call is needed for the BF16 casts feeding flash-attn.
+    flash_attn_prefill::register(registry);
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +252,42 @@ fn alloc_rope_params(
     Ok(buf)
 }
 
+/// Build a BF16 padding mask of shape `[seq_len, seq_len]` for
+/// `flash_attn_prefill_bf16_d64` SeqMajor.  Attended positions hold `0.0`,
+/// masked positions hold `-INFINITY` (llama.cpp convention — see
+/// `flash_attn_prefill.rs` module doc).
+///
+/// Built once per request from `valid_token_count`; broadcast across heads
+/// + batch via the dispatcher's rank-2 stride detection.  Replaces the
+/// per-block `bert_attention_mask_add_gpu` step that the F32 attention
+/// path used.
+fn alloc_nomic_attn_mask_bf16(
+    device: &MlxDevice,
+    seq_len: u32,
+    valid_len: u32,
+) -> Result<MlxBuffer> {
+    if seq_len == 0 {
+        return Err(anyhow!("alloc_nomic_attn_mask_bf16: seq_len must be > 0"));
+    }
+    let n = (seq_len as usize) * (seq_len as usize);
+    let buf = device
+        .alloc_buffer(n * 2, DType::BF16, vec![seq_len as usize, seq_len as usize])
+        .map_err(|e| anyhow!("alloc bf16 attention mask: {e}"))?;
+    // SAFETY: just-allocated bf16 buffer; exclusive access.
+    let s: &mut [half::bf16] =
+        unsafe { std::slice::from_raw_parts_mut(buf.contents_ptr() as *mut half::bf16, n) };
+    let valid = valid_len.min(seq_len) as usize;
+    let seq = seq_len as usize;
+    let zero = half::bf16::from_f32(0.0);
+    let neg_inf = half::bf16::from_f32(f32::NEG_INFINITY);
+    for r in 0..seq {
+        for c in 0..seq {
+            s[r * seq + c] = if c < valid { zero } else { neg_inf };
+        }
+    }
+    Ok(buf)
+}
+
 /// Build the U32 params buffer expected by `dispatch_silu_mul`: a single
 /// `n` (4 bytes). Caller MUST keep this alive until the encoder commits.
 fn alloc_silu_mul_params(device: &MlxDevice, n: u32) -> Result<MlxBuffer> {
@@ -324,19 +368,25 @@ pub struct NomicBertEncoderBlockTensors<'a> {
 /// ```
 ///
 /// Inputs:
-/// - `input`   F32 `[seq_len, hidden]`
-/// - `tensors` per-layer weight bundle
-/// - `mask`    F32 `[seq_len, seq_len]` attention mask (always-on per
-///             iter-67 BERT empirical finding — bert_attention_with_mask_gpu
-///             requires it)
+/// - `input`     F32 `[seq_len, hidden]`
+/// - `tensors`   per-layer weight bundle
+/// - `mask_bf16` BF16 `[seq_len, seq_len]` additive padding mask
+///               (`0.0` = attend, `-INFINITY` = mask out, llama.cpp
+///               convention).  Built once per request via
+///               `alloc_nomic_attn_mask_bf16` and broadcast across heads
+///               + batch by the flash-attn dispatcher's rank-2 stride
+///               detection.  Iter-90 contract: BF16 (was F32 pre-iter-90).
 /// - `rope_positions` U32 `[seq_len]` — `[0, 1, ..., seq_len-1]`
 /// - `rope_params`    F32 `[4]` — `[theta, head_dim, rope_dim, 0]`
 ///
 /// Returns F32 `[seq_len, hidden]`.
 ///
-/// `seq_len ≥ 32` floor inherited from `bert_attention_with_mask_gpu`
-/// (post-softmax matmul has K = seq_len).
-/// `head_dim ≥ 32` floor inherited from the same.
+/// `seq_len ≥ 1` accepted (iter-90: flash_attn_prefill has no K-floor; the
+/// pre-iter-90 `seq_len ≥ 32` constraint came from
+/// `bert_attention_with_mask_gpu`'s post-softmax matmul tile-K floor and
+/// is now obsolete).
+/// `head_dim` MUST be 64 (the only D=64 instantiation of
+/// `flash_attn_prefill_bf16_d64` registered).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_nomic_bert_encoder_block_gpu(
     encoder: &mut CommandEncoder,
@@ -344,7 +394,7 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     device: &MlxDevice,
     input: &MlxBuffer,
     tensors: &NomicBertEncoderBlockTensors<'_>,
-    mask: &MlxBuffer,
+    mask_bf16: &MlxBuffer,
     rope_positions: &MlxBuffer,
     rope_params: &MlxBuffer,
     seq_len: u32,
@@ -526,13 +576,97 @@ pub fn apply_nomic_bert_encoder_block_gpu(
     .map_err(|e| anyhow!("nomic block: rope on K: {e}"))?;
     encoder.memory_barrier();
 
-    // ---- 3. Attention with padding mask ----
-    let scale = 1.0_f32 / (head_dim as f32).sqrt();
-    let attn_out = bert_attention_with_mask_gpu(
-        encoder, registry, device, &q_rotated, &k_rotated, &v_proj, mask, seq_len, num_heads,
-        head_dim, scale,
+    // ---- 3. Flash-attention with padding mask (BF16 SeqMajor) ----
+    //
+    // Iter-90: replaces the 8-stage `bert_attention_with_mask_gpu` chain
+    // (Q@K^T → mask-add → softmax → V permute → V cast → V transpose →
+    // scores@V → output permute) with a single fused flash-attn kernel.
+    //
+    // Layout: nomic-bert linear projections produce `[seq, n_heads, head_dim]`
+    // (a.k.a. `[seq, hidden]` with hidden = n_heads × head_dim contiguous
+    // along the row).  This is the SeqMajor convention defined in
+    // `mlx_native::ops::flash_attn_prefill::FlashAttnPrefillLayout`, so we
+    // pass through without any host-side transpose: the kernel reads via
+    // strides directly.
+    //
+    // Cast Q/K/V to BF16 first — flash_attn_prefill_bf16_d64 requires
+    // bf16 I/O.  Each cast is one dispatch, three casts total per layer
+    // (+ one for the output back to F32).  Net dispatch count vs the
+    // F32 path: 5 (3 casts + 1 FA + 1 output cast) vs 8 (the F32 path's
+    // permute/cast/transpose/matmul sequence) — saves 3 dispatches +
+    // multiple intermediate allocations per layer.
+    let n_attn_elems = (seq_len as usize) * (hidden as usize);
+    let q_bf16 = device
+        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc q_bf16: {e}"))?;
+    let k_bf16 = device
+        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
+    let v_bf16 = device
+        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc v_bf16: {e}"))?;
+    cast(
+        encoder, registry, device.metal_device(), &q_rotated, &q_bf16,
+        n_attn_elems, CastDirection::F32ToBF16,
     )
-    .context("nomic block: bidirectional attention")?;
+    .context("nomic block: cast Q F32→BF16")?;
+    cast(
+        encoder, registry, device.metal_device(), &k_rotated, &k_bf16,
+        n_attn_elems, CastDirection::F32ToBF16,
+    )
+    .context("nomic block: cast K F32→BF16")?;
+    cast(
+        encoder, registry, device.metal_device(), &v_proj, &v_bf16,
+        n_attn_elems, CastDirection::F32ToBF16,
+    )
+    .context("nomic block: cast V F32→BF16")?;
+    // The three Q/K/V casts write to disjoint output buffers and read
+    // from disjoint input buffers (q_rotated / k_rotated / v_proj are
+    // distinct allocations).  Concurrent dispatch can run them in
+    // parallel; we only need ONE barrier before flash_attn reads any
+    // of them.
+    encoder.memory_barrier();
+
+    let mut attn_out_bf16 = device
+        .alloc_buffer(n_attn_elems * 2, DType::BF16, vec![seq_len as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc attn_out_bf16: {e}"))?;
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let fa_params = FlashAttnPrefillParams {
+        n_heads: num_heads,
+        n_kv_heads: num_heads, // self-attention, no GQA
+        head_dim,
+        seq_len_q: seq_len,
+        seq_len_k: seq_len,
+        batch: 1,
+        scale,
+        do_causal: false, // bidirectional encoder
+    };
+    dispatch_flash_attn_prefill_bf16_d64(
+        encoder,
+        device,
+        registry,
+        &q_bf16,
+        &k_bf16,
+        &v_bf16,
+        Some(mask_bf16),
+        &mut attn_out_bf16,
+        &fa_params,
+        FlashAttnPrefillLayout::SeqMajor,
+    )
+    .map_err(|e| anyhow!("nomic block: flash_attn_prefill_bf16_d64: {e}"))?;
+    encoder.memory_barrier();
+
+    // Cast output back to F32 so the rest of the encoder block (output
+    // projection + residual + LN) runs unchanged on F32.
+    let attn_out = device
+        .alloc_buffer(n_attn_elems * 4, DType::F32, vec![seq_len as usize, hidden as usize])
+        .map_err(|e| anyhow!("alloc attn_out F32: {e}"))?;
+    cast(
+        encoder, registry, device.metal_device(), &attn_out_bf16, &attn_out,
+        n_attn_elems, CastDirection::BF16ToF32,
+    )
+    .context("nomic block: cast attn_out BF16→F32")?;
     encoder.memory_barrier();
 
     // ---- 4. Output projection ----
@@ -742,15 +876,19 @@ pub fn apply_nomic_bert_full_forward_gpu(
     let head_dim = (hidden / num_heads) as u32;
     let eps = cfg.layer_norm_eps;
 
-    if seq_len < 32 {
+    // Iter-90: seq_len ≥ 1 accepted (the prior ≥ 32 floor was a tile-K
+    // limit of bert_attention_with_mask_gpu's post-softmax matmul, which
+    // is gone now that flash-attn replaces that path).  Check kept as a
+    // sanity guard rather than a hard floor.
+    if seq_len == 0 {
         return Err(anyhow!(
-            "apply_nomic_bert_full_forward_gpu: seq_len ({}) must be >= 32 (post-softmax matmul K floor)",
-            seq_len
+            "apply_nomic_bert_full_forward_gpu: seq_len must be > 0"
         ));
     }
-    if head_dim < 32 {
+    if head_dim != 64 {
         return Err(anyhow!(
-            "apply_nomic_bert_full_forward_gpu: head_dim ({}) must be >= 32",
+            "apply_nomic_bert_full_forward_gpu: head_dim must be 64 \
+             (only `flash_attn_prefill_bf16_d64` instantiation registered); got {}",
             head_dim
         ));
     }
@@ -804,7 +942,11 @@ pub fn apply_nomic_bert_full_forward_gpu(
     encoder.memory_barrier();
 
     // ---- Padding mask + RoPE positions + RoPE params (built once) ----
-    let mask = alloc_bert_attention_mask(device, seq_len, valid_token_count)?;
+    //
+    // Iter-90: mask is BF16 directly (was F32 + per-layer cast pre-iter-90).
+    // The flash-attn dispatcher consumes a rank-2 BF16 mask broadcast across
+    // batch + heads — see `FlashAttnPrefillLayout::SeqMajor` doc.
+    let mask_bf16 = alloc_nomic_attn_mask_bf16(device, seq_len, valid_token_count)?;
     let rope_positions = alloc_rope_positions(device, seq_len)?;
     let rope_params = alloc_rope_params(device, cfg.rope_freq_base, head_dim, head_dim)?;
 
@@ -837,7 +979,7 @@ pub fn apply_nomic_bert_full_forward_gpu(
             device,
             &hidden_states,
             &tensors,
-            &mask,
+            &mask_bf16,
             &rope_positions,
             &rope_params,
             seq_len,
