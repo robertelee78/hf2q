@@ -910,6 +910,178 @@ pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError>
 }
 
 // ---------------------------------------------------------------------------
+// ADR-014 P1 — Lazy variants of the qwen35moe Phase 1.45 / 1.5 helpers.
+//
+// Phase 1.45 (gate_up split + .weight rename) lifts here as
+// `split_and_rename_fused_gate_up_in_lazy_map`. Phase 1.5 (expert
+// merge — Decision 7 layer-streaming) lifts in a dedicated subsequent
+// P1 iter; the eager `merge_moe_experts_in_tensor_map` stays for the
+// P9b dance until P4 deletes both.
+// ---------------------------------------------------------------------------
+
+/// ADR-014 P1: lazy variant of [`split_and_rename_fused_gate_up_in_tensor_map`].
+///
+/// Splits each `model.layers.{N}.mlp.experts.gate_up_proj` tensor
+/// (shape `[N_exp, 2*moe_inter, hidden]`) into separate
+/// `gate_proj.weight` + `up_proj.weight` (each `[N_exp, moe_inter, hidden]`),
+/// and adds the missing `.weight` suffix to `down_proj`.
+///
+/// Implementation: the split fundamentally requires reading the fused
+/// tensor's bytes (it's a row-axis slice into halves). For each fused
+/// tensor we materialise the [`LazyTensor`], split into two byte
+/// vectors, and re-insert as [`LazyTensor::from_bytes`]. The down_proj
+/// rename is pure metadata and uses [`LazyTensor::map_with_meta`] so
+/// no bytes are touched.
+///
+/// Peak resident bytes during this phase are bounded by one fused
+/// tensor at a time — apex MoE per-layer fused gate_up is
+/// `256 × 2 × 768 × 2048 × 2 bytes ≈ 1.5 GB`; after the split, two
+/// 750 MB halves replace it. The fused parent is dropped immediately.
+///
+/// No-op for non-qwen35moe arches.
+pub fn split_and_rename_fused_gate_up_in_lazy_map(
+    lazy_map: &mut crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), super::ConvertError> {
+    use crate::ir::lazy::{LazyMeta, LazyTensor};
+
+    if !super::is_qwen35moe_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    let gate_up_keys: Vec<String> = lazy_map
+        .names()
+        .filter(|n| {
+            n.starts_with("model.layers.") && n.ends_with(".mlp.experts.gate_up_proj")
+        })
+        .cloned()
+        .collect();
+
+    let down_keys: Vec<String> = lazy_map
+        .names()
+        .filter(|n| {
+            n.starts_with("model.layers.") && n.ends_with(".mlp.experts.down_proj")
+        })
+        .cloned()
+        .collect();
+
+    if gate_up_keys.is_empty() && down_keys.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        gate_up_count = gate_up_keys.len(),
+        down_count = down_keys.len(),
+        "qwen35moe fused gate_up split (lazy): processing {} gate_up_proj + {} down_proj tensors",
+        gate_up_keys.len(),
+        down_keys.len()
+    );
+
+    // ---- Phase 1.45a: split each fused gate_up_proj into gate + up. ----
+    for key in gate_up_keys {
+        let Some(lazy) = lazy_map.remove(&key) else {
+            continue;
+        };
+
+        // Validate metadata before forcing materialisation — same
+        // 3-D + even-middle-dim invariants as the eager helper.
+        if lazy.shape().len() != 3 {
+            return Err(super::ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj expected 3-D [n_experts, 2*moe_inter, hidden], got shape {:?}",
+                    lazy.shape()
+                ),
+            });
+        }
+        let n_experts = lazy.shape()[0];
+        let two_inter = lazy.shape()[1];
+        let hidden = lazy.shape()[2];
+        if two_inter % 2 != 0 {
+            return Err(super::ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!(
+                    "gate_up_proj middle dim {} must be even (2 * moe_intermediate_size)",
+                    two_inter
+                ),
+            });
+        }
+        let moe_inter = two_inter / 2;
+        let dtype = lazy.dtype();
+        let elem_size = dtype.element_size();
+        let per_expert_bytes = two_inter * hidden * elem_size;
+        let half_bytes = moe_inter * hidden * elem_size;
+
+        // Materialise the fused parent — this is the only place in
+        // Phase 1.45 where bytes touch RAM. Caller (cmd_convert) sees
+        // ~1.5 GB peak per layer; it drops as soon as the split halves
+        // are inserted.
+        let fused = lazy
+            .materialize()
+            .map_err(|e| super::ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!("materialize fused gate_up: {e}"),
+            })?;
+
+        let mut gate_data = Vec::with_capacity(n_experts * half_bytes);
+        let mut up_data = Vec::with_capacity(n_experts * half_bytes);
+
+        for e in 0..n_experts {
+            let base = e * per_expert_bytes;
+            // Gate: first moe_inter rows of the [2*moe_inter, hidden] block.
+            gate_data.extend_from_slice(&fused.data[base..base + half_bytes]);
+            // Up: second moe_inter rows.
+            up_data.extend_from_slice(&fused.data[base + half_bytes..base + per_expert_bytes]);
+        }
+        // Fused parent dropped here.
+        drop(fused);
+
+        let gate_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.gate_proj.weight",
+        );
+        let up_name = key.replace(
+            ".mlp.experts.gate_up_proj",
+            ".mlp.experts.up_proj.weight",
+        );
+        let split_shape = vec![n_experts, moe_inter, hidden];
+
+        lazy_map.insert(LazyTensor::from_bytes(
+            LazyMeta::new(gate_name, split_shape.clone(), dtype),
+            gate_data,
+        ));
+        lazy_map.insert(LazyTensor::from_bytes(
+            LazyMeta::new(up_name, split_shape, dtype),
+            up_data,
+        ));
+    }
+
+    // ---- Phase 1.45b: rename down_proj → down_proj.weight (metadata only). ----
+    for key in down_keys {
+        let Some(old_lazy) = lazy_map.remove(&key) else {
+            continue;
+        };
+        let new_name = key.replace(
+            ".mlp.experts.down_proj",
+            ".mlp.experts.down_proj.weight",
+        );
+        let new_meta = LazyMeta::new(
+            new_name.clone(),
+            old_lazy.shape().to_vec(),
+            old_lazy.dtype(),
+        );
+        let new_name_for_closure = new_name.clone();
+        let renamed = old_lazy.map_with_meta(new_meta, move |mut tref| {
+            tref.name = new_name_for_closure.clone();
+            Ok(tref)
+        });
+        lazy_map.insert(renamed);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -917,6 +1089,212 @@ pub fn emit_metadata_moe(ctx: &Qwen35ConvertContext) -> Result<(), ConvertError>
 mod tests {
     use super::*;
     use crate::models::qwen35::{Qwen35Arch, Qwen35ConvertContext};
+
+    /// ADR-014 P1 byte-identity regression for Phase 1.45 lift.
+    /// `split_and_rename_fused_gate_up_in_lazy_map` produces a tensor
+    /// map whose post-split keys + bytes are byte-equal to the eager
+    /// `split_and_rename_fused_gate_up_in_tensor_map` on the same
+    /// fixture.
+    #[test]
+    fn split_and_rename_fused_gate_up_lazy_byte_identical_to_eager() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata, TensorMap, TensorRef};
+
+        // Synthetic 2-layer Qwen3.5-MoE: each layer ships a fused
+        // gate_up_proj of shape [n_experts=4, 2*moe_inter=8, hidden=4]
+        // (128 elements × 2 bytes = 256 bytes per layer) plus a
+        // down_proj of shape [n_experts=4, hidden=4, moe_inter=4].
+        // Distinguishing payloads so a swap or drop would be caught.
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5MoeForCausalLM".into(),
+            model_type: "qwen3_5_moe_text".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec!["full_attention".into(), "linear_attention".into()],
+            num_attention_heads: 4,
+            num_kv_heads: Some(2),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: Some(4),
+            top_k_experts: Some(2),
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: Some(4),
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        // Per-layer payloads: gate_up_proj (256 bytes), down_proj (128 bytes).
+        // Use a deterministic fill so each tensor's bytes are unique.
+        let make_payload = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+        };
+
+        let fused_shape = vec![4usize, 8, 4]; // [n_exp, 2*inter, hidden]
+        let down_shape = vec![4usize, 4, 4]; // [n_exp, hidden, moe_inter]
+        let fused_byte_len = 4 * 8 * 4 * 2; // 256 bytes (F16)
+        let down_byte_len = 4 * 4 * 4 * 2; // 128 bytes (F16)
+
+        let layer0_gate_up = make_payload(0x10, fused_byte_len);
+        let layer0_down = make_payload(0x20, down_byte_len);
+        let layer1_gate_up = make_payload(0x30, fused_byte_len);
+        let layer1_down = make_payload(0x40, down_byte_len);
+
+        // ---- Eager path ----
+        let mut eager = TensorMap::new();
+        eager.insert(TensorRef {
+            name: "model.layers.0.mlp.experts.gate_up_proj".into(),
+            shape: fused_shape.clone(),
+            dtype: DType::F16,
+            data: layer0_gate_up.clone(),
+        });
+        eager.insert(TensorRef {
+            name: "model.layers.0.mlp.experts.down_proj".into(),
+            shape: down_shape.clone(),
+            dtype: DType::F16,
+            data: layer0_down.clone(),
+        });
+        eager.insert(TensorRef {
+            name: "model.layers.1.mlp.experts.gate_up_proj".into(),
+            shape: fused_shape.clone(),
+            dtype: DType::F16,
+            data: layer1_gate_up.clone(),
+        });
+        eager.insert(TensorRef {
+            name: "model.layers.1.mlp.experts.down_proj".into(),
+            shape: down_shape.clone(),
+            dtype: DType::F16,
+            data: layer1_down.clone(),
+        });
+        split_and_rename_fused_gate_up_in_tensor_map(&mut eager, &metadata).unwrap();
+
+        // ---- Lazy path ----
+        let mut lazy = LazyTensorMap::new();
+        lazy.insert(LazyTensor::from_bytes(
+            LazyMeta::new(
+                "model.layers.0.mlp.experts.gate_up_proj".into(),
+                fused_shape.clone(),
+                DType::F16,
+            ),
+            layer0_gate_up.clone(),
+        ));
+        lazy.insert(LazyTensor::from_bytes(
+            LazyMeta::new(
+                "model.layers.0.mlp.experts.down_proj".into(),
+                down_shape.clone(),
+                DType::F16,
+            ),
+            layer0_down.clone(),
+        ));
+        lazy.insert(LazyTensor::from_bytes(
+            LazyMeta::new(
+                "model.layers.1.mlp.experts.gate_up_proj".into(),
+                fused_shape.clone(),
+                DType::F16,
+            ),
+            layer1_gate_up.clone(),
+        ));
+        lazy.insert(LazyTensor::from_bytes(
+            LazyMeta::new(
+                "model.layers.1.mlp.experts.down_proj".into(),
+                down_shape.clone(),
+                DType::F16,
+            ),
+            layer1_down.clone(),
+        ));
+        split_and_rename_fused_gate_up_in_lazy_map(&mut lazy, &metadata).unwrap();
+        let lazy_eager = lazy.materialize_all().unwrap();
+
+        // Same key set: 6 tensors (2 layers × {gate, up, down}.weight).
+        let mut eager_keys: Vec<&String> = eager.tensors.keys().collect();
+        eager_keys.sort();
+        let mut lazy_keys: Vec<&String> = lazy_eager.tensors.keys().collect();
+        lazy_keys.sort();
+        assert_eq!(eager_keys, lazy_keys, "post-split key sets must match");
+
+        // Per-key shape, dtype, and bytes byte-equal.
+        for key in eager_keys {
+            let e = eager.get(key).unwrap();
+            let l = lazy_eager.get(key).unwrap();
+            assert_eq!(e.shape, l.shape, "{key} shape");
+            assert_eq!(e.dtype, l.dtype, "{key} dtype");
+            assert_eq!(e.data, l.data, "{key} bytes");
+            assert_eq!(l.name, *key, "{key} carried-name field");
+        }
+    }
+
+    /// `split_and_rename_fused_gate_up_in_lazy_map` is a no-op for
+    /// non-qwen35moe arches (Qwen3.5 dense, LLaMA, Gemma).
+    #[test]
+    fn split_and_rename_fused_gate_up_lazy_no_op_for_dense_arch() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::ir::{DType, ModelMetadata};
+
+        let metadata = ModelMetadata {
+            architecture: "Qwen3_5ForCausalLM".into(), // dense, not Moe
+            model_type: "qwen3_5".into(),
+            param_count: 0,
+            hidden_size: 4,
+            num_layers: 2,
+            layer_types: vec![],
+            num_attention_heads: 1,
+            num_kv_heads: Some(1),
+            vocab_size: 16,
+            dtype: "float16".into(),
+            shard_count: 1,
+            num_experts: None,
+            top_k_experts: None,
+            intermediate_size: Some(8),
+            raw_config: serde_json::Value::Null,
+            explicit_layer_types: None,
+            full_attention_interval: None,
+            attn_output_gate: None,
+            head_dim: None,
+            partial_rotary_factor: None,
+            rope_parameters: None,
+            linear_conv_kernel_dim: None,
+            linear_key_head_dim: None,
+            linear_num_key_heads: None,
+            linear_value_head_dim: None,
+            linear_num_value_heads: None,
+            mamba_ssm_dtype: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            mtp_num_hidden_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            output_router_logits: None,
+            router_aux_loss_coef: None,
+        };
+
+        let mut lazy = LazyTensorMap::new();
+        let meta = LazyMeta::new(
+            "model.layers.0.mlp.experts.gate_up_proj".into(),
+            vec![2, 4, 2],
+            DType::F16,
+        );
+        lazy.insert(LazyTensor::from_bytes(meta, vec![0u8; 32]));
+
+        split_and_rename_fused_gate_up_in_lazy_map(&mut lazy, &metadata).unwrap();
+        // Untouched on dense arch.
+        assert!(lazy.contains_key("model.layers.0.mlp.experts.gate_up_proj"));
+    }
 
     fn moe_ctx() -> Qwen35ConvertContext {
         let layer_types: Vec<String> = (0..40_usize)

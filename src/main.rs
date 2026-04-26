@@ -596,17 +596,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         }
     }
 
-    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.45 / 1.5 /
-    // 1.6 / 1.7 / 1.8) are still eager — they take `&mut TensorMap` and
-    // operate on materialised bytes. Bridge through `materialize_all`
-    // here. Each Phase 1.x lifted in subsequent P1 iters moves this
-    // bridge later in the pipeline; once the streaming quantize loop
-    // (P2) lands the bridge becomes test-only.
-    let mut tensor_map = lazy_map
-        .materialize_all()
-        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
-        .map_err(AppError::Conversion)?;
-
     // Phase 1.45: ADR-012 P9b real-model finding (jenerallee78 abliterated apex):
     // some qwen35moe checkpoints ship a FUSED gate+up tensor named
     //   model.layers.N.mlp.experts.gate_up_proj   (shape [N_exp, 2*moe_inter, hidden])
@@ -618,12 +607,30 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // the tensors are in the canonical pre-merged form expected by
     // `merge_moe_experts_in_tensor_map`'s pre-merged-skip path
     // (commit 9045d04).
-    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
-        &mut tensor_map,
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap. The split materialises the
+    // fused parent tensor (1.5 GB peak per layer for apex MoE), splits
+    // into halves, drops the parent. The down_proj rename is pure
+    // metadata. Streaming benefit at this phase is bounded — Decision 7
+    // (Phase 1.5) provides the layer-streaming MoE merge that picks up
+    // these split tensors.
+    models::qwen35::moe::split_and_rename_fused_gate_up_in_lazy_map(
+        &mut lazy_map,
         &metadata,
     )
-    .context("qwen35moe fused gate_up split + .weight rename failed")
+    .context("qwen35moe fused gate_up split + .weight rename (lazy) failed")
     .map_err(AppError::Conversion)?;
+
+    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.5 / 1.6 /
+    // 1.7 / 1.8) are still eager — they take `&mut TensorMap` and
+    // operate on materialised bytes. Bridge through `materialize_all`
+    // here. Each Phase 1.x lifted in subsequent P1 iters moves this
+    // bridge later in the pipeline; once the streaming quantize loop
+    // (P2) lands the bridge becomes test-only.
+    let mut tensor_map = lazy_map
+        .materialize_all()
+        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
+        .map_err(AppError::Conversion)?;
 
     // Phase 1.5: ADR-012 Decision 9 / P5 — qwen35moe expert merge.
     //
