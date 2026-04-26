@@ -94,6 +94,16 @@ const ENV_GATE: &str = "HF2Q_LLAMA_MMPROJ_COMPAT";
 #[allow(dead_code)]
 const ENV_GATE_MODEL_LOAD: &str = "HF2Q_LLAMA_MMPROJ_COMPAT_MODEL_LOAD";
 
+/// Third gate scoped to Phase D only (parity proxy). iter-116c runs
+/// Phases A+B+C end-to-end with the freshly-emitted mmproj fixture but
+/// leaves Phase D queued — its body is still a `panic!` placeholder
+/// that lands in a follow-up iter. Default-off so MODEL_LOAD=1 alone
+/// exercises only the llama-mtmd-cli stderr smoke (Phase C). Set
+/// `HF2Q_LLAMA_MMPROJ_COMPAT_PARITY=1` once the parity proxy body is
+/// implemented.
+#[allow(dead_code)]
+const ENV_GATE_PARITY: &str = "HF2Q_LLAMA_MMPROJ_COMPAT_PARITY";
+
 /// CLIP architecture string — the value `MmprojConfig::from_gguf`
 /// expects for `general.architecture`. Mirrors the constant in
 /// `src/inference/vision/mmproj.rs::ARCH_CLIP`.
@@ -232,6 +242,18 @@ fn mmproj_llama_cpp_load_gate_gemma4v() {
     }
 
     phase_c_llama_mtmd_stderr_smoke();
+
+    // Phase D body remains a `panic!` placeholder — gated separately
+    // so iter-116c can run A+B+C end-to-end without tripping the
+    // unimplemented parity proxy. Set ENV_GATE_PARITY=1 once Phase D
+    // lands.
+    if std::env::var(ENV_GATE_PARITY).as_deref() != Ok("1") {
+        eprintln!(
+            "[mmproj-llama-cpp-compat] Phase D deferred: set \
+             {ENV_GATE_PARITY}=1 once the parity proxy body lands."
+        );
+        return;
+    }
     phase_d_parity_proxy_t0_n16();
 }
 
