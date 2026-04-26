@@ -38,6 +38,8 @@ pub mod gpu_delta_net;
 pub mod gpu_ffn;
 pub mod gpu_full_attn;
 pub mod io_heads;
+/// ADR-013 P14 — speculative-decoding rejection sampler over the MTP head.
+pub mod spec_decode;
 pub mod kernels;
 pub mod kv_cache;
 pub mod model;

@@ -1,26 +1,31 @@
 //! Top-level `Qwen35Model` struct — the load target for Qwen3.5 / Qwen3.5-MoE
-//! GGUFs (ADR-013 P11 scaffold).
+//! GGUFs (ADR-013 P11+).
 //!
 //! Ties together every component that preceding phases delivered:
 //!
 //! - [`Qwen35Config`](super::Qwen35Config) from the GGUF metadata parser.
 //! - Per-layer weights: `Qwen35LayerWeights` enum (FullAttn or LinearAttn).
 //! - FFN variant: `Qwen35FfnWeights` enum (dense SwiGLU or MoE).
-//! - Optional [`MtpWeights`](super::mtp::MtpWeights) for speculative decoding
-//!   (load-only until a follow-up ADR).
+//! - Optional [`MtpWeights`](super::mtp::MtpWeights) — legacy metadata-only
+//!   MTP scaffold (ADR-013 P10 acceptance).
+//! - Optional [`MtpFullWeights`](super::mtp::MtpFullWeights) — fully-loaded
+//!   MTP block weights for ADR-013 P14 speculative decoding.  Populated
+//!   only when the GGUF was emitted with `HF2Q_QWEN35_KEEP_MTP=1`.
 //! - Global tensors: `token_embd`, `output_weight`, `output_norm`.
 //!
-//! This module is a **scaffold**: the struct layout is final, but `load()`
-//! and `forward()` currently return partial / stubbed implementations.
-//! Phases P11 (end-to-end forward wire-up) and P5-tail (GGUF → MlxBuffer
-//! weight upload) complete the real paths.
+//! `load_from_gguf` and `forward_gpu` are production-ready (ADR-013 P11.x
+//! through P13.6 — see ADR-013 progress log for receipts). `forward_draft`
+//! (the MTP speculative-decoding draft path) is a P14 follow-on and is
+//! gated on the optional `mtp_full` field being populated.
 
 use anyhow::{anyhow, Context, Result};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
-use super::mtp::{load_mtp_weights_if_present, MtpWeights};
+use super::mtp::{
+    load_mtp_weights_full, load_mtp_weights_if_present, MtpFullWeights, MtpWeights,
+};
 use super::weight_loader::MoeFfnWeightsQ;
 use super::{weight_loader, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 
@@ -109,8 +114,17 @@ pub struct Qwen35Model {
     pub output_weight: Vec<f32>,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
-    /// Optional MTP scaffold. Never executed in the main forward.
+    /// Optional MTP scaffold (ADR-013 P10 metadata-only). Never executed
+    /// in the main forward. Used by sourdough / smoke gates as a presence
+    /// probe; superseded by `mtp_full` for actual speculative decoding.
     pub mtp: Option<MtpWeights>,
+    /// Optional fully-loaded MTP block weights (ADR-013 P14). Populated
+    /// only when the GGUF was emitted with `HF2Q_QWEN35_KEEP_MTP=1` AND
+    /// the `Qwen3.5` config carries `mtp_num_hidden_layers >= 1`.
+    /// Consumed by `forward_draft` (follow-on commit) for speculative
+    /// decoding. `None` on the apex / default-converted GGUFs that ship
+    /// today.
+    pub mtp_full: Option<MtpFullWeights>,
 }
 
 impl Qwen35Model {
@@ -151,6 +165,7 @@ impl Qwen35Model {
             output_weight: vec![0.0f32; h * vocab],
             output_norm: vec![1.0f32; h],
             mtp: None,
+            mtp_full: None,
             cfg,
         }
     }
@@ -175,6 +190,25 @@ impl Qwen35Model {
 
         let device = MlxDevice::new()
             .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
+
+        // ADR-013 P14: attempt to load full MTP block weights for
+        // speculative decoding.  Only populated for KEEP_MTP-emitted
+        // GGUFs (None for apex / default-converted today).  Errors
+        // (partial presence) propagate — we never zero-fill a missing
+        // tensor (per feedback_no_shortcuts.md).  Dense-only for now;
+        // MoE configs return None via the dense-vs-MoE gate inside
+        // load_mtp_weights_full (it requires intermediate_size which
+        // is None on MoE).
+        let mtp_full = if cfg.variant == Qwen35Variant::Dense {
+            load_mtp_weights_full(gguf, &cfg, &device)
+                .context("load_mtp_weights_full")?
+        } else {
+            tracing::debug!(
+                "qwen35moe: skipping load_mtp_weights_full (MoE MTP block \
+                 layout not yet characterized; dense-only for ADR-013 P14)"
+            );
+            None
+        };
 
         let (token_embd, output_weight, output_norm) =
             weight_loader::load_global_tensors(gguf, &cfg, &device)
@@ -273,6 +307,7 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp,
+            mtp_full,
         })
     }
 
