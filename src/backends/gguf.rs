@@ -771,13 +771,99 @@ fn write_mmproj_gguf(
             || name.ends_with(".input_max")
             || name.ends_with(".output_min")
             || name.ends_with(".output_max");
-        let emit_shape: Vec<usize> = if qt.shape.is_empty() {
+        let mut emit_shape: Vec<usize> = if qt.shape.is_empty() {
             vec![1]
         } else {
             qt.shape.clone()
         };
         if is_clamp_scalar {
             ggml_type = GGML_TYPE_F32;
+        }
+
+        // ADR-005 Phase 2c iter-116g: F32-promote 1-D tensors, *_norm.weight,
+        // and the gemma4v position-embd table to match llama.cpp's CLIP
+        // convention. The convert_hf_to_gguf.py base writer at
+        // `/opt/llama.cpp/convert_hf_to_gguf.py:807-809` forces:
+        //
+        //     if n_dims <= 1 or new_name.endswith("_norm.weight"):
+        //         data_qtype = gguf.GGMLQuantizationType.F32
+        //
+        // and gemma4v's `tensor_force_quant` override at
+        // `/opt/llama.cpp/convert_hf_to_gguf.py:7841-7842` adds:
+        //
+        //     if "position_embedding_table" in name:
+        //         return gguf.GGMLQuantizationType.F32
+        //
+        // The runtime symptom of NOT promoting these: clip's CPU graph
+        // crashes inside `ggml_compute_forward_div` with
+        // `binary_op: unsupported types: dst: f32, src0: f32, src1: f16`
+        // because RMS-norm internally divides an F32 sum by an F32
+        // intermediate, then multiplies by the F16 norm weight. The
+        // ggml-cpu binary-op kernel does not accept the resulting
+        // F32/F32/F16 triple. Promoting the norm weight + 1-D tensors +
+        // position-embd lookup table to F32 is the upstream-mandated fix.
+        let is_one_d = qt.shape.len() <= 1;
+        let is_norm_weight = gguf_name.ends_with("_norm.weight");
+        let is_position_embd = gguf_name == "v.position_embd.weight";
+        if (is_one_d || is_norm_weight || is_position_embd)
+            && (ggml_type == GGML_TYPE_F16)
+        {
+            ggml_type = GGML_TYPE_F32;
+        }
+
+        // ADR-005 Phase 2c iter-116g: gemma4v patch-embd Conv2d weight reshape.
+        //
+        // HF safetensors stores `model.vision_tower.patch_embedder.input_proj.weight`
+        // as 2-D `[n_embd, patch_size² · 3]` (e.g. `[1152, 768]` with
+        // patch_size=16, in_channels=3). llama.cpp's clip-graph builds
+        // `ggml_conv_2d(model.patch_embeddings_0, inp_raw, ...)` where
+        // `inp_raw` is 3-D `[nx, ny, channels=3]` — see
+        // `/opt/llama.cpp/tools/mtmd/models/gemma4v.cpp:12`. The im2col
+        // kernel asserts `a->ne[2] == b->ne[2]` (3 in-channels match)
+        // at `/opt/llama.cpp/ggml/src/ggml.c:4412`. With a 2-D weight
+        // `a->ne[2] = 1` ≠ `b->ne[2] = 3` and the convert assert fires.
+        //
+        // The reshape contract — verbatim from
+        // `/opt/llama.cpp/convert_hf_to_gguf.py:7873-7877`
+        // (`Gemma4VisionAudioModel.modify_tensors`):
+        //
+        //     n_embd, ksize_sq_c = data_torch.shape
+        //     patch_size = int((ksize_sq_c // 3) ** 0.5)
+        //     data_torch = data_torch.reshape(n_embd, patch_size, patch_size, 3)
+        //     data_torch = data_torch.permute(0, 3, 1, 2).contiguous()
+        //
+        // The reshape (`[n_embd, hwc] → [n_embd, h, w, c]`) is a metadata
+        // operation on contiguous row-major data — no byte movement. The
+        // permute (`[n_embd, h, w, c] → [n_embd, c, h, w]`) is a physical
+        // transpose: every output element moves. We do both in
+        // `transpose_patch_embd_hwc_to_chw` and the writer (Pass 2 below)
+        // picks up the transposed bytes via the same name-keyed branch.
+        //
+        // Output shape `[n_embd, c, h, w]` is in PyTorch convention; the
+        // GGUF writer reverses dims on emit (see `write_tensor_info`),
+        // so the on-disk `ne[]` becomes `[w, h, c, n_embd]` = `[16, 16, 3, 1152]`,
+        // which matches `a->ne[2] = c = 3` for the im2col assert.
+        let is_patch_embd_conv =
+            gguf_name == "v.patch_embd.weight" && emit_shape.len() == 2;
+        if is_patch_embd_conv {
+            let n_embd = emit_shape[0];
+            let hwc = emit_shape[1];
+            // Default in_channels = 3 (RGB). Gemma4v's vision_config has
+            // no `num_channels` — llama.cpp hardcodes `channels=3` via
+            // `build_inp_raw()`'s default arg (clip.cpp:518).
+            const IN_CHANNELS: usize = 3;
+            if hwc % IN_CHANNELS == 0 {
+                let patch_area = hwc / IN_CHANNELS;
+                let patch_size = (patch_area as f64).sqrt() as usize;
+                if patch_size * patch_size == patch_area && patch_size > 0 {
+                    emit_shape = vec![n_embd, IN_CHANNELS, patch_size, patch_size];
+                } else {
+                    warn!(
+                        "v.patch_embd.weight: hwc={} not a square*3, skipping reshape",
+                        hwc
+                    );
+                }
+            }
         }
 
         // Vision tensors are preserved as F16 — no repacking needed, data passes through
@@ -838,11 +924,42 @@ fn write_mmproj_gguf(
 
         // Repack and write (vision tensors are typically preserved F16, so this
         // is usually a passthrough copy)
-        let data = repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| {
+        let mut data = repack_to_ggml_blocks(qt, info.ggml_type).map_err(|e| {
             BackendError::WriteFailed {
                 reason: format!("Failed to repack vision tensor '{}': {}", name, e),
             }
         })?;
+
+        // ADR-005 Phase 2c iter-116g: if this tensor is the gemma4v
+        // patch-embd Conv2d weight (we know because Pass 1 promoted its
+        // emit shape from 2-D to 4-D), perform the HWC→CHW byte transpose
+        // that the upstream `modify_tensors` does via `permute(0,3,1,2)`.
+        // The reshape from `[n_embd, hwc]` to `[n_embd, h, w, c]` is a
+        // no-op on row-major bytes; only the permute moves elements.
+        if info.gguf_name == "v.patch_embd.weight" && info.shape.len() == 4 {
+            let n_embd = info.shape[0];
+            let c = info.shape[1];
+            let h = info.shape[2];
+            let w_dim = info.shape[3];
+            let elem_size = match info.ggml_type {
+                GGML_TYPE_F32 => 4,
+                GGML_TYPE_F16 => 2,
+                _ => 0,
+            };
+            if elem_size > 0 && data.len() == n_embd * c * h * w_dim * elem_size {
+                data = transpose_patch_embd_hwc_to_chw(
+                    &data, n_embd, h, w_dim, c, elem_size,
+                );
+            } else {
+                warn!(
+                    "v.patch_embd.weight: cannot transpose (ggml_type={} data_len={} elems_expected={})",
+                    info.ggml_type,
+                    data.len(),
+                    n_embd * c * h * w_dim * elem_size
+                );
+            }
+        }
+
         w.write_all(&data)?;
         pb.inc(1);
     }
@@ -861,6 +978,44 @@ fn write_mmproj_gguf(
         filename: mmproj_filename,
         size_bytes: file_size,
     })
+}
+
+/// HWC→CHW byte-level permute for the gemma4v patch-embd Conv2d weight.
+///
+/// Source layout (row-major contiguous): `[n_embd, h, w, c]` —
+/// `src[((o*h + i)*w + j)*c + k]` is the (output=o, height=i, width=j,
+/// channel=k) element.
+///
+/// Target layout: `[n_embd, c, h, w]` —
+/// `dst[((o*c + k)*h + i)*w + j]`.
+///
+/// Operates on `elem_size`-byte elements (F32=4, F16=2). PyTorch's
+/// `permute(0, 3, 1, 2).contiguous()` (see `convert_hf_to_gguf.py:7877`)
+/// produces this exact layout.
+fn transpose_patch_embd_hwc_to_chw(
+    src: &[u8],
+    n_embd: usize,
+    h: usize,
+    w: usize,
+    c: usize,
+    elem_size: usize,
+) -> Vec<u8> {
+    let total = n_embd * c * h * w * elem_size;
+    let mut dst = vec![0u8; total];
+    for o in 0..n_embd {
+        for k in 0..c {
+            for i in 0..h {
+                for j in 0..w {
+                    let src_idx = ((o * h + i) * w + j) * c + k;
+                    let dst_idx = ((o * c + k) * h + i) * w + j;
+                    let s = src_idx * elem_size;
+                    let d = dst_idx * elem_size;
+                    dst[d..d + elem_size].copy_from_slice(&src[s..s + elem_size]);
+                }
+            }
+        }
+    }
+    dst
 }
 
 // ---------------------------------------------------------------------------
@@ -3998,6 +4153,65 @@ mod tests {
                 hf_name_to_gguf("model.embed_vision.embedding_projection.weight", arch, 0),
                 "mm.input_projection.weight"
             );
+        }
+    }
+
+    /// ADR-005 Phase 2c iter-116g: HWC→CHW transpose for the gemma4v
+    /// patch-embd Conv2d weight matches PyTorch
+    /// `t.reshape(n_embd, h, w, c).permute(0, 3, 1, 2).contiguous()`
+    /// at byte level.
+    ///
+    /// Tiny fixture (n_embd=2, h=2, w=2, c=3, F32 elem_size=4):
+    /// the source is a fully-distinct sequence; we hand-compute the
+    /// expected dst index for every element and assert byte equality.
+    #[test]
+    fn test_patch_embd_hwc_to_chw_transpose() {
+        let n_embd = 2usize;
+        let h = 2usize;
+        let w = 2usize;
+        let c = 3usize;
+        let elem_size = 4usize;
+        let total = n_embd * h * w * c;
+
+        // Source: src[((o*h+i)*w+j)*c+k] = (o, i, j, k) packed into a
+        // distinct f32 so we can verify positional correctness.
+        let mut src = Vec::<u8>::with_capacity(total * elem_size);
+        for o in 0..n_embd {
+            for i in 0..h {
+                for j in 0..w {
+                    for k in 0..c {
+                        let v: f32 = (o * 1000 + i * 100 + j * 10 + k) as f32;
+                        src.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        let dst = transpose_patch_embd_hwc_to_chw(&src, n_embd, h, w, c, elem_size);
+        assert_eq!(dst.len(), total * elem_size);
+
+        // dst[((o*c+k)*h+i)*w+j] must equal source's (o,i,j,k) value.
+        for o in 0..n_embd {
+            for k in 0..c {
+                for i in 0..h {
+                    for j in 0..w {
+                        let dst_off = (((o * c + k) * h + i) * w + j) * elem_size;
+                        let bytes: [u8; 4] = [
+                            dst[dst_off],
+                            dst[dst_off + 1],
+                            dst[dst_off + 2],
+                            dst[dst_off + 3],
+                        ];
+                        let got = f32::from_le_bytes(bytes);
+                        let expected = (o * 1000 + i * 100 + j * 10 + k) as f32;
+                        assert_eq!(
+                            got, expected,
+                            "dst[o={},c={},h={},w={}] expected {} got {}",
+                            o, k, i, j, expected, got
+                        );
+                    }
+                }
+            }
         }
     }
 }
