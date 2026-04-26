@@ -43,8 +43,10 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 
 use super::cache::{
-    cache_model_path, sha256_file, ModelCache, QuantEntry, SourcePointer,
+    cache_model_path, compute_source_bundle_sha256, sha256_file, ModelCache, QuantEntry,
+    SourcePointer,
 };
+use super::provenance::{self, Provenance};
 use super::quant_select::{select_quant, GpuInfo, QuantType};
 use crate::input::integrity::verify_repo;
 use crate::intelligence::hardware::HardwareProfile;
@@ -214,8 +216,12 @@ fn run_auto_pipeline(
         "auto-pipeline: hardware → quant selected"
     );
 
-    // Pre-lock fast path: if cache hit + verify PASS, return immediately.
-    if let Some(hit) = lookup_and_verify(cache, repo_id, quant, no_integrity) {
+    // Pre-lock fast path: if cache hit + verify PASS (or short-circuit
+    // PASS for hf2q-origin provenance), return immediately.  An `Err`
+    // here is load-bearing — it means a hf2q-origin provenance claim
+    // was REJECTED (cross-verify against cache shards failed); refuse
+    // to proceed rather than silently falling through to re-quantize.
+    if let Some(hit) = lookup_and_verify(cache, repo_id, quant, no_integrity)? {
         cache.touch(repo_id).ok(); // best-effort LRU bump
         return Ok(hit);
     }
@@ -226,7 +232,7 @@ fn run_auto_pipeline(
         .lock_quant(repo_id, quant)
         .with_context(|| format!("acquire cache write lock for {repo_id}@{}", quant.as_str()))?;
 
-    if let Some(hit) = lookup_and_verify(cache, repo_id, quant, no_integrity) {
+    if let Some(hit) = lookup_and_verify(cache, repo_id, quant, no_integrity)? {
         cache.touch(repo_id).ok();
         return Ok(hit);
     }
@@ -277,16 +283,40 @@ fn run_auto_pipeline(
     })
 }
 
-/// Try the cache; return `Some(hit)` only when the manifest entry exists
-/// AND the on-disk SHA-256 still matches (or `--no-integrity` is set, in
-/// which case the verify is skipped with a warn).
+/// Try the cache; return `Ok(Some(hit))` only when the manifest entry
+/// exists AND the cached GGUF clears the integrity bar by one of three
+/// routes:
+///
+/// 1. `--no-integrity` is set (operator opt-out, logged as `warn`).
+/// 2. The GGUF carries hf2q-origin provenance keys (ADR-005 Phase 4
+///    iter-207) AND the claimed `hf2q.source_sha256` matches the
+///    [`compute_source_bundle_sha256`] of the manifest's recorded
+///    `source_shards` — short-circuits the per-load 30 GB SHA-256
+///    re-check (logged at `info`).
+/// 3. [`ModelCache::verify_quantized`] (W71 / iter-203) PASSES — the
+///    full SHA-256 of the cached file matches the manifest entry.
+///
+/// Returns `Ok(None)` for the "cache miss / cache corrupt / GGUF
+/// missing" cases so the caller proceeds to re-populate.
+///
+/// Returns `Err` for the load-bearing FAILURE mode introduced by
+/// iter-207: a GGUF that claims hf2q origin but whose declared
+/// `source_sha256` does NOT match the cache's recorded shards.  That's
+/// either tampering (bytes mutated post-emit while keys remained), a
+/// stale cache that lost shards (we already have the GGUF but not the
+/// source bundle that produced it), or a writer/reader version skew —
+/// all three are operator-action cases, not "silently re-quantize"
+/// cases.
 fn lookup_and_verify(
     cache: &ModelCache,
     repo_id: &str,
     quant: QuantType,
     no_integrity: bool,
-) -> Option<ResolvedModel> {
-    let entry = cache.lookup(repo_id, quant)?;
+) -> Result<Option<ResolvedModel>> {
+    let entry = match cache.lookup(repo_id, quant) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
     let path = entry.gguf_path.clone();
     if !path.exists() {
         tracing::warn!(
@@ -295,7 +325,7 @@ fn lookup_and_verify(
             path = %path.display(),
             "cache manifest entry references missing GGUF; re-quantizing"
         );
-        return None;
+        return Ok(None);
     }
     if no_integrity {
         tracing::warn!(
@@ -303,14 +333,15 @@ fn lookup_and_verify(
             quant = quant.as_str(),
             "auto-pipeline: --no-integrity set; skipping cached SHA-256 verify (NOT recommended)"
         );
-    } else if let Err(e) = cache.verify_quantized(repo_id, quant) {
-        tracing::warn!(
-            repo = repo_id,
-            quant = quant.as_str(),
-            error = %e,
-            "cached GGUF failed integrity check; re-quantizing"
-        );
-        return None;
+    } else {
+        match check_integrity(cache, repo_id, quant, &path)? {
+            IntegrityOutcome::Pass => {}
+            IntegrityOutcome::Fail => {
+                // verify_quantized failed; re-quantize.  Already logged
+                // inside check_integrity.
+                return Ok(None);
+            }
+        }
     }
     tracing::info!(
         repo = repo_id,
@@ -318,12 +349,132 @@ fn lookup_and_verify(
         path = %path.display(),
         "auto-pipeline: cache hit"
     );
-    Some(ResolvedModel {
+    Ok(Some(ResolvedModel {
         gguf_path: path,
         repo_id: Some(repo_id.to_string()),
         quant: Some(quant),
         from_cache: true,
-    })
+    }))
+}
+
+/// Outcome of the integrity check after eliminating `--no-integrity`.
+/// Internal to the auto-pipeline; tests assert on its public sibling
+/// (`lookup_and_verify`'s `Result<Option<_>>` shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrityOutcome {
+    /// Either `verify_quantized` passed OR the hf2q-origin short-
+    /// circuit fired with a matching source-bundle SHA.
+    Pass,
+    /// `verify_quantized` failed (corruption / mid-write / disk bit-rot).
+    /// Caller falls through to re-quantize.
+    Fail,
+}
+
+/// Run the integrity check for a cached GGUF.  Encapsulates iter-207's
+/// three-way branch (provenance short-circuit / verify_quantized /
+/// reject-on-mismatch) so `lookup_and_verify` stays readable.
+///
+/// Errors (the `Err` arm of the return) are reserved for the iter-207
+/// **mismatch** case: a GGUF claims hf2q origin but its declared
+/// `hf2q.source_sha256` doesn't match the cache's recorded shards.
+/// This is a refuse-to-proceed event by design.
+fn check_integrity(
+    cache: &ModelCache,
+    repo_id: &str,
+    quant: QuantType,
+    gguf_path: &Path,
+) -> Result<IntegrityOutcome> {
+    // Step 1: cheap GGUF metadata read for provenance detection.
+    // GGUF header parsing is O(metadata_count) — milliseconds even on
+    // a 30 GB file because tensors are not touched.  If parsing fails,
+    // we fall through to the W71 SHA path; the loader will surface a
+    // clearer error later if the file is genuinely corrupt at the
+    // header level.
+    let prov = match mlx_native::gguf::GgufFile::open(gguf_path) {
+        Ok(g) => provenance::detect(&g),
+        Err(e) => {
+            tracing::debug!(
+                repo = repo_id,
+                quant = quant.as_str(),
+                path = %gguf_path.display(),
+                error = %e,
+                "auto-pipeline: GGUF header peek failed; falling back to verify_quantized"
+            );
+            Provenance::External
+        }
+    };
+
+    if let Provenance::Hf2q {
+        producer_version,
+        source_sha256,
+        ..
+    } = &prov
+    {
+        // Compute the cache's notion of the source-bundle SHA from
+        // the recorded shards.  `None` here means the manifest has
+        // no hashable shards (local source, --no-integrity at
+        // download time, or all-non-LFS) — we have nothing to
+        // cross-verify against, so fall through to the W71 SHA path.
+        let cache_bundle_sha = cache
+            .lookup_model(repo_id)
+            .and_then(|m| compute_source_bundle_sha256(&m.source_shards));
+
+        match cache_bundle_sha {
+            Some(expected) if expected == *source_sha256 => {
+                tracing::info!(
+                    repo = repo_id,
+                    quant = quant.as_str(),
+                    producer_version,
+                    "auto-pipeline: hf2q-origin GGUF detected; integrity re-check short-circuited"
+                );
+                return Ok(IntegrityOutcome::Pass);
+            }
+            Some(expected) => {
+                // Provenance claim does NOT match the cache's recorded
+                // shards.  Refuse to proceed — operator must remove the
+                // cached GGUF or re-source.
+                return Err(anyhow!(
+                    "hf2q-origin provenance mismatch for {repo}@{quant} at {path}: \
+                     GGUF claims hf2q.source_sha256={claimed}, \
+                     cache shards compute {expected}. \
+                     Either the cached GGUF was tampered with (header keys \
+                     altered while the shard manifest stayed put), the \
+                     source shards under {repo} were re-fetched after the \
+                     GGUF was emitted (so the bundle SHA drifted), or a \
+                     writer/reader version skew is in play. \
+                     Refusing to short-circuit; remove the cached GGUF \
+                     (rm {path}) and re-quantize, or pass --no-integrity \
+                     to skip the check entirely (NOT recommended).",
+                    repo = repo_id,
+                    quant = quant.as_str(),
+                    path = gguf_path.display(),
+                    claimed = source_sha256,
+                ));
+            }
+            None => {
+                tracing::debug!(
+                    repo = repo_id,
+                    quant = quant.as_str(),
+                    "auto-pipeline: hf2q-origin GGUF detected but cache has no \
+                     hashable shards; falling back to verify_quantized"
+                );
+                // fall through to verify_quantized
+            }
+        }
+    }
+
+    // Either External or Hf2q-with-no-cache-shards; run the W71 path.
+    if let Err(e) = cache.verify_quantized(repo_id, quant) {
+        tracing::warn!(
+            repo = repo_id,
+            quant = quant.as_str(),
+            error = %e,
+            "cached GGUF failed integrity check; re-quantizing"
+        );
+        Ok(IntegrityOutcome::Fail)
+    } else {
+        Ok(IntegrityOutcome::Pass)
+    }
 }
 
 /// Source-bytes invariant: after this returns, `<snapshot.local_dir>`
@@ -767,12 +918,380 @@ mod tests {
         std::fs::write(&gguf, b"CORRUPTED").unwrap();
 
         // With integrity ON, verify must fail and lookup_and_verify must
-        // return None.
-        let hit = lookup_and_verify(&cache, repo_id, quant, false);
+        // return Ok(None).  iter-207 changed the return type to
+        // `Result<Option<_>>`; the corruption case still maps to
+        // `Ok(None)` (fall-through to re-quantize) — only an explicit
+        // hf2q-provenance mismatch maps to `Err(_)`.
+        let hit = lookup_and_verify(&cache, repo_id, quant, false).expect("must not error");
         assert!(hit.is_none(), "corrupted cache must fall through");
 
         // With --no-integrity, the same call returns the (unsafe!) hit.
-        let hit_unsafe = lookup_and_verify(&cache, repo_id, quant, true);
+        let hit_unsafe = lookup_and_verify(&cache, repo_id, quant, true).expect("must not error");
         assert!(hit_unsafe.is_some(), "--no-integrity must skip the SHA check");
+    }
+
+    // ── ADR-005 Phase 4 iter-207 — provenance short-circuit ────────────
+    //
+    // These tests exercise the integration between the iter-207
+    // provenance reader and the W71 integrity check.  They build a
+    // valid (but empty-tensor) GGUF with the three `hf2q.*` metadata
+    // keys, plant it in a tempdir cache with a deliberately-mismatched
+    // manifest SHA, and assert the short-circuit fires (returning
+    // Some(hit)) only when the GGUF's provenance claim matches the
+    // cache's recorded source-bundle SHA.
+
+    use super::super::cache::{SourceShard, compute_source_bundle_sha256};
+
+    /// Append a string-typed metadata KV pair to a GGUF buffer mid-
+    /// construction.  Wire format per the GGUF spec (gguf.md):
+    ///
+    /// - `u64 key_length`
+    /// - `key bytes`
+    /// - `u32 value_type` (8 = string)
+    /// - `u64 string_length`
+    /// - `string bytes`
+    fn write_str_kv(buf: &mut Vec<u8>, key: &str, value: &str) {
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
+        buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    /// Build a self-contained GGUF byte buffer with zero tensors and
+    /// the supplied (key, value) string metadata pairs.  Produced
+    /// bytes parse cleanly via `mlx_native::gguf::GgufFile::open`.
+    fn build_gguf_with_string_metadata(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&(pairs.len() as u64).to_le_bytes()); // metadata_kv_count
+        for (k, v) in pairs {
+            write_str_kv(&mut buf, k, v);
+        }
+        buf
+    }
+
+    /// Produce a list of source shards whose canonical bundle SHA we
+    /// compute up-front so a test can stamp the SAME hash into the
+    /// GGUF's `hf2q.source_sha256` and assert the short-circuit fires.
+    fn synthetic_shards() -> Vec<SourceShard> {
+        vec![
+            SourceShard {
+                filename: "model-00001-of-00002.safetensors".into(),
+                bytes: 100,
+                sha256: Some("a".repeat(64)),
+                hf_etag: "a".repeat(64),
+                is_lfs: true,
+                verified_at_secs: 1,
+            },
+            SourceShard {
+                filename: "model-00002-of-00002.safetensors".into(),
+                bytes: 200,
+                sha256: Some("b".repeat(64)),
+                hf_etag: "b".repeat(64),
+                is_lfs: true,
+                verified_at_secs: 1,
+            },
+            SourceShard {
+                filename: "config.json".into(),
+                bytes: 1024,
+                sha256: None, // non-LFS — never enters the bundle hash
+                hf_etag: "git-blob-sha".into(),
+                is_lfs: false,
+                verified_at_secs: 1,
+            },
+        ]
+    }
+
+    /// Plant a cache fixture: source recorded with shards, a
+    /// quantized GGUF on disk with arbitrary content (= bytes
+    /// supplied), and a manifest entry whose recorded SHA-256 is
+    /// `manifest_sha` (which may or may not match the on-disk file —
+    /// the test controls that).
+    fn fab_cache_with_provenance(
+        tmp: &Path,
+        repo_id: &str,
+        quant: QuantType,
+        gguf_bytes: &[u8],
+        manifest_sha: &str,
+        shards: Vec<SourceShard>,
+    ) -> (ModelCache, PathBuf) {
+        let mut cache = ModelCache::open_at(tmp).unwrap();
+        cache
+            .record_source(
+                repo_id,
+                "rev-iter207",
+                SourcePointer::Local {
+                    path: tmp.join("source"),
+                    sha256: "n/a".into(),
+                },
+            )
+            .unwrap();
+
+        let gguf_path = cache_model_path(cache.root(), repo_id, quant).unwrap();
+        std::fs::create_dir_all(gguf_path.parent().unwrap()).unwrap();
+        std::fs::write(&gguf_path, gguf_bytes).unwrap();
+
+        cache
+            .record_quantized(
+                repo_id,
+                QuantEntry {
+                    quant_type: quant.as_str().into(),
+                    gguf_path: gguf_path.clone(),
+                    mmproj_path: None,
+                    bytes: gguf_bytes.len() as u64,
+                    sha256: manifest_sha.into(),
+                    quantized_at_secs: 0,
+                    quantized_by_version: "test-iter207".into(),
+                },
+            )
+            .unwrap();
+
+        // Inject the shards by going through record_source_with_shards
+        // (the canonical API).  We have to fabricate a corresponding
+        // ShardIntegrity Vec because that's the public type.
+        let integ: Vec<crate::input::integrity::ShardIntegrity> = shards
+            .iter()
+            .map(|s| crate::input::integrity::ShardIntegrity {
+                filename: s.filename.clone(),
+                bytes: s.bytes,
+                sha256: s.sha256.clone(),
+                hf_etag: s.hf_etag.clone(),
+                is_lfs: s.is_lfs,
+            })
+            .collect();
+        cache
+            .record_source_with_shards(
+                repo_id,
+                "rev-iter207",
+                SourcePointer::Local {
+                    path: tmp.join("source"),
+                    sha256: "n/a".into(),
+                },
+                integ,
+            )
+            .unwrap();
+
+        (cache, gguf_path)
+    }
+
+    #[test]
+    fn auto_pipeline_short_circuits_on_hf2q_provenance_match() {
+        // The load-bearing iter-207 test: a hf2q-stamped GGUF whose
+        // claimed source SHA matches the cache shards must short-
+        // circuit verify_quantized and return Ok(Some(hit)) — even
+        // when the manifest's recorded GGUF SHA is deliberately wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_id = "iter207/short-circuit";
+        let quant = QuantType::Q8_0;
+
+        let shards = synthetic_shards();
+        let bundle_sha = compute_source_bundle_sha256(&shards)
+            .expect("synthetic shards must produce a bundle SHA");
+
+        let gguf_bytes = build_gguf_with_string_metadata(&[
+            ("hf2q.producer_version", "hf2q 0.1.0-test"),
+            ("hf2q.source_sha256", &bundle_sha),
+        ]);
+        // Manifest SHA is GARBAGE — verify_quantized would fail if
+        // the short-circuit didn't fire.
+        let bogus_manifest_sha = "0".repeat(64);
+
+        let (cache, gguf_path) = fab_cache_with_provenance(
+            tmp.path(),
+            repo_id,
+            quant,
+            &gguf_bytes,
+            &bogus_manifest_sha,
+            shards,
+        );
+
+        let result = lookup_and_verify(&cache, repo_id, quant, false)
+            .expect("short-circuit must produce Ok, not Err");
+        let hit = result.expect("short-circuit must produce Some(hit)");
+        assert_eq!(hit.gguf_path, gguf_path);
+        assert!(hit.from_cache);
+        assert_eq!(hit.repo_id.as_deref(), Some(repo_id));
+        assert_eq!(hit.quant, Some(quant));
+    }
+
+    #[test]
+    fn auto_pipeline_falls_back_to_verify_when_external() {
+        // Control: a GGUF without any hf2q.* keys is classified
+        // External; the W71 verify_quantized path runs.  Manifest SHA
+        // matches the on-disk bytes → PASS.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_id = "iter207/external-pass";
+        let quant = QuantType::Q8_0;
+
+        let gguf_bytes = build_gguf_with_string_metadata(&[
+            ("general.architecture", "qwen35"),
+            ("general.name", "test"),
+        ]);
+        let real_sha = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&gguf_bytes);
+            hex::encode(h.finalize())
+        };
+
+        let (cache, _) = fab_cache_with_provenance(
+            tmp.path(),
+            repo_id,
+            quant,
+            &gguf_bytes,
+            &real_sha,
+            synthetic_shards(),
+        );
+
+        let result =
+            lookup_and_verify(&cache, repo_id, quant, false).expect("verify path must Ok");
+        let hit = result.expect("matching SHA must produce Some(hit)");
+        assert!(hit.from_cache);
+    }
+
+    #[test]
+    fn auto_pipeline_falls_through_when_external_and_verify_fails() {
+        // Control: a GGUF without hf2q.* keys + a deliberately-broken
+        // manifest SHA → falls through to None (re-quantize), no Err.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_id = "iter207/external-fail";
+        let quant = QuantType::Q8_0;
+
+        let gguf_bytes = build_gguf_with_string_metadata(&[
+            ("general.architecture", "qwen35"),
+        ]);
+        let bogus_sha = "f".repeat(64);
+        let (cache, _) = fab_cache_with_provenance(
+            tmp.path(),
+            repo_id,
+            quant,
+            &gguf_bytes,
+            &bogus_sha,
+            synthetic_shards(),
+        );
+
+        let result = lookup_and_verify(&cache, repo_id, quant, false)
+            .expect("verify-fail must NOT error (only mismatch errors)");
+        assert!(
+            result.is_none(),
+            "external GGUF + bad manifest SHA must fall through to None"
+        );
+    }
+
+    #[test]
+    fn auto_pipeline_errors_on_hf2q_provenance_mismatch() {
+        // Load-bearing failure case: GGUF claims hf2q origin but the
+        // declared source SHA does NOT match the cache's recorded
+        // shards → return Err (refuse to short-circuit, refuse to
+        // silently fall through to re-quantize).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_id = "iter207/provenance-mismatch";
+        let quant = QuantType::Q8_0;
+
+        let shards = synthetic_shards();
+        let _real_bundle_sha = compute_source_bundle_sha256(&shards).unwrap();
+        let claimed_bundle_sha = "9".repeat(64); // deliberately wrong
+
+        let gguf_bytes = build_gguf_with_string_metadata(&[
+            ("hf2q.producer_version", "hf2q 0.1.0-test"),
+            ("hf2q.source_sha256", &claimed_bundle_sha),
+        ]);
+        // Manifest SHA happens to match the on-disk bytes (proves we
+        // wouldn't have fallen through to verify_quantized success
+        // either — the mismatch is the operative gate).
+        let real_sha = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&gguf_bytes);
+            hex::encode(h.finalize())
+        };
+
+        let (cache, gguf_path) = fab_cache_with_provenance(
+            tmp.path(),
+            repo_id,
+            quant,
+            &gguf_bytes,
+            &real_sha,
+            shards,
+        );
+
+        let err = lookup_and_verify(&cache, repo_id, quant, false)
+            .expect_err("provenance mismatch must Err, not silently re-quantize");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("provenance mismatch"),
+            "error must name the mismatch; got: {msg}"
+        );
+        assert!(
+            msg.contains(&claimed_bundle_sha),
+            "error must surface the claimed SHA so an operator can diagnose; got: {msg}"
+        );
+        assert!(
+            msg.contains(&gguf_path.display().to_string()),
+            "error must surface the cached GGUF path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn auto_pipeline_falls_back_when_hf2q_keys_present_but_no_cache_shards() {
+        // Edge case: GGUF carries hf2q.* keys but the cache manifest
+        // has no hashable shards (local source, --no-integrity at
+        // download time).  No cross-verify possible → fall back to
+        // W71 verify_quantized; if THAT passes, return Some(hit).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_id = "iter207/no-shards";
+        let quant = QuantType::Q8_0;
+
+        let gguf_bytes = build_gguf_with_string_metadata(&[
+            ("hf2q.producer_version", "hf2q 0.1.0"),
+            ("hf2q.source_sha256", &"7".repeat(64)),
+        ]);
+        let real_sha = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&gguf_bytes);
+            hex::encode(h.finalize())
+        };
+
+        // No shards — record_source instead of record_source_with_shards.
+        let mut cache = ModelCache::open_at(tmp.path()).unwrap();
+        cache
+            .record_source(
+                repo_id,
+                "rev",
+                SourcePointer::Local {
+                    path: tmp.path().join("source"),
+                    sha256: "n/a".into(),
+                },
+            )
+            .unwrap();
+        let gguf_path = cache_model_path(cache.root(), repo_id, quant).unwrap();
+        std::fs::create_dir_all(gguf_path.parent().unwrap()).unwrap();
+        std::fs::write(&gguf_path, &gguf_bytes).unwrap();
+        cache
+            .record_quantized(
+                repo_id,
+                QuantEntry {
+                    quant_type: quant.as_str().into(),
+                    gguf_path: gguf_path.clone(),
+                    mmproj_path: None,
+                    bytes: gguf_bytes.len() as u64,
+                    sha256: real_sha,
+                    quantized_at_secs: 0,
+                    quantized_by_version: "test".into(),
+                },
+            )
+            .unwrap();
+
+        // verify_quantized PASSES (manifest SHA matches), so we get
+        // Some(hit).  The hf2q.* keys are ignored because the cache
+        // has no shards to cross-verify against.
+        let result =
+            lookup_and_verify(&cache, repo_id, quant, false).expect("ok");
+        let hit = result.expect("verify-quantized passes → Some(hit)");
+        assert_eq!(hit.gguf_path, gguf_path);
     }
 }
