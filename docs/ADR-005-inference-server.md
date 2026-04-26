@@ -4041,3 +4041,47 @@ The blocker is a **preexisting hf2q runtime gap**, not a Phase D test bug, and n
 3. Re-run iter-116h's Phase D body (currently held in W40's working tree but reverted from this commit per the dispatch's "ADR-only commit" blocker protocol). The body is correct as-implemented and lands the moment hf2q serve can boot with the iter-116g mmproj.
 
 **Why the Phase D body itself was reverted from this commit, not landed alongside the blocker.** Per the iter-116h dispatch's Phase 6 protocol: *"If Phase D fails for any reason: capture verbatim, write blocker, ADR-only commit. Don't widen scope."* Landing the implementation against a known-failing runtime would either (a) leave a panicking gate behind in CI when CFA wave-36 picks it up, or (b) require a `#[ignore]` band-aid that obscures the real blocker. Both are anti-patterns vs. `feedback_no_broken_windows.md`. iter-116i's first commit re-applies the full ~330 LOC Phase D body the moment the hf2q-side blocker clears.
+
+#### Phase 2c iter-116i — `gemma4v` projector serve-startup gate UNBLOCKED; new blocker class surfaced inside Phase D ViT forward (2026-04-25, W41 + W42)
+
+W41 (CFA wave-36) re-applied the iter-116h Phase D body (~330 LOC), added `ProjectorType::Gemma4v` to `src/inference/vision/mmproj.rs` (was `Other("gemma4v")` before), and flipped `is_supported()` to true for the new variant. W42 (wave-37) finished the closure: corrected the stale required-tensor list in `validate_tensor_set` (`mm.0.weight` / `mm.2.weight` → also accept gemma4v's `mm.input_projection.weight`; per-layer `attn_output.weight` long-form → `attn_out.weight` short-form per `TN_ATTN_OUTPUT` at `/opt/llama.cpp/tools/mtmd/clip-impl.h:82`); fixed a stale unit-test reference to the old long-form name (`load_gemma4_mmproj_populates_arch_tensors` in `mmproj_weights.rs`); and fixed a Phase D test bug (the model-id was guessed from `file_stem(CHAT_GGUF_PATH)`, but the server's loaded-model id is GGUF `general.name = "Gemma4ForConditionalGeneration"` per `src/serve/api/engine.rs:511-520`; the test now queries `/v1/models` and picks the entry with `context_length` set to disambiguate the chat model from the mmproj entry).
+
+**Smoke gate state (post-W42, freshly-emitted iter-116g mmproj GGUF):**
+
+| Phase | State |
+|-------|-------|
+| A (fixtures-on-disk) | PASS |
+| B (metadata + tensor-name parse) | PASS — 356 tensors, arch=clip |
+| C (llama-mtmd-cli stderr smoke) | PASS — stdout=71 B, stderr=15633 B, exit=0 |
+| D `/readyz` startup gate | PASS — server ready in ~5 s after spawn (was BLOCKED in iter-116h) |
+| D `/v1/models` model-id resolve | PASS — chat id = `Gemma4ForConditionalGeneration` |
+| D ViT forward (`compute_vision_embeddings_gpu_gemma4v`) | **BLOCKED** — see below |
+
+**New blocker for iter-116j: gemma4v patch-grid not divisible by `n_merge=3`.**
+
+With the four-dots 128×128 PNG fixture and `patch_size=16`, `preprocess_gemma4v::compute_gemma4v_patch_grid` returns `(n_x=8, n_y=8)` (64 patches). The downstream 3×3 non-overlapping pool kernel (`gemma4v_avg_pool_3x3_gpu`, k = n_merge = 3 per `/opt/llama.cpp/tools/mtmd/clip.cpp:1337`) hard-requires `n_x % 3 == 0 && n_y % 3 == 0` (kernel docstring at `vit_gpu.rs:1306-1308`), so Phase D's chat-completions request fails at the ViT forward with HTTP 500:
+
+```
+"Generation failed: ViT forward failed: compute_vision_embeddings_gpu_gemma4v image 0:
+forward: gemma4v_apply_full_forward_gpu: n_x (16) and n_y (16) must both be multiples of 3
+(gemma4v pool kernel size)"
+```
+
+(The two `16` values in the error message come from the kernel-side params — `n_x=8, n_y=8` patches with `patch_size=16` lead to a `vit_avg_pool_kxk` arg labeling mismatch we should sharpen later, but the root cause is `8 % 3 != 0`.)
+
+**Two viable paths for iter-116j:**
+
+1. **Preprocessing fix.** Make `compute_gemma4v_patch_grid` enforce `n_x % n_merge == 0 && n_y % n_merge == 0` in addition to the `[token_min, token_max]` bound, by rounding each axis down to the nearest multiple of `n_merge`. Cross-reference llama.cpp's `clip.cpp:1334-1343` to confirm the exact rounding rule before landing.
+2. **Fixture fix.** Swap Phase D's fixture image for one whose preprocessed patch grid is naturally a multiple of 3 (e.g. resize to a 144×144 or 240×240 PNG so `n_x = n_y = 9` or `15` at `p = 16`). Lower-risk but doesn't close the bug for arbitrary user images.
+
+Path 1 is the production-correct fix (gemma4v VLMs accept arbitrary image dimensions). Path 2 is acceptable as a Phase D smoke proxy if path 1 is out of scope for the next iter.
+
+**iter-116i commit 1 (this commit's source change) lands:**
+
+- `ProjectorType::Gemma4v` enum + parser/serializer + `is_supported() = true` (W41).
+- `validate_tensor_set` accepts the gemma4v projector head name `mm.input_projection.weight` and the post-iter-116e short-form `attn_out.weight` (W41 + W42).
+- `mmproj_weights::mm_0_weight()` falls back to `mm.input_projection.weight` so the runtime forward path can resolve the head tensor under either name (W41).
+- Phase D body re-applied (~330 LOC) with the `/v1/models` model-id resolution fix (W42).
+- Unit tests updated: `load_gemma4_mmproj_populates_arch_tensors` now expects `attn_out.weight` (W42); `projector_supported_for_mlp_and_gemma4v` covers the new variant (W41).
+
+This commit unblocks every gate up to and including the ViT forward pass; the pool-kernel-divisibility blocker is left to iter-116j per the wave dispatch's "Don't widen scope" rule.
