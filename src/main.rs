@@ -9,6 +9,8 @@
 //!   3 = input/validation error
 
 #[allow(dead_code)]
+mod arch;
+#[allow(dead_code)]
 mod backends;
 mod cli;
 mod debug;
@@ -52,10 +54,20 @@ use cli::{Cli, Command};
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// Exit codes.
+///
+/// 0/1/2/3 are the long-standing convert/validate codes.  4–6 are added by
+/// ADR-012 P8's `hf2q smoke` subcommand for distinct preflight failure modes
+/// (per Decision 16 acceptance: each preflight failure surfaces a unique
+/// non-zero code so a CI runner can tell "missing token" from "missing disk").
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_CONVERSION_ERROR: u8 = 1;
 const EXIT_QUALITY_EXCEEDED: u8 = 2;
 const EXIT_INPUT_ERROR: u8 = 3;
+// Smoke preflight (mirrored from `arch::smoke` so callers don't need to
+// import the inner constants).
+const EXIT_SMOKE_LLAMA_CLI_MISSING: u8 = 4;
+const EXIT_SMOKE_BINARY_MISSING: u8 = 5;
+const EXIT_SMOKE_REPO_MISSING: u8 = 6;
 
 /// Error types for exit code classification.
 #[derive(Debug)]
@@ -66,6 +78,9 @@ enum AppError {
     QualityExceeded(anyhow::Error),
     #[allow(dead_code)]
     Interrupted,
+    /// `hf2q smoke` returns a code chosen by the smoke module.  Never `1`
+    /// (preflight has its own codes), never overlaps with convert codes.
+    SmokeWithCode(u8, anyhow::Error),
 }
 
 impl AppError {
@@ -75,6 +90,7 @@ impl AppError {
             AppError::Conversion(_) => EXIT_CONVERSION_ERROR,
             AppError::QualityExceeded(_) => EXIT_QUALITY_EXCEEDED,
             AppError::Interrupted => EXIT_CONVERSION_ERROR,
+            AppError::SmokeWithCode(c, _) => *c,
         }
     }
 }
@@ -86,6 +102,7 @@ impl std::fmt::Display for AppError {
             AppError::Conversion(e) => write!(f, "{:#}", e),
             AppError::QualityExceeded(e) => write!(f, "{:#}", e),
             AppError::Interrupted => write!(f, "Conversion interrupted by user"),
+            AppError::SmokeWithCode(_, e) => write!(f, "{:#}", e),
         }
     }
 }
@@ -169,6 +186,59 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Generate(args) => serve::cmd_generate(args).map_err(AppError::Conversion),
         Command::Serve(args) => serve::cmd_serve(args).map_err(AppError::Conversion),
         Command::Parity(args) => serve::cmd_parity(args).map_err(AppError::Conversion),
+        Command::Smoke(args) => cmd_smoke(args),
+    }
+}
+
+/// Handle the `smoke` subcommand (ADR-012 Decision 16).
+fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
+    use arch::{run_smoke, SmokeOptions, SmokeQuant};
+
+    let quant = match args.quant {
+        cli::SmokeQuantArg::Q4_0 => SmokeQuant::Q4_0,
+        cli::SmokeQuantArg::DwqMixed46 => SmokeQuant::DwqMixed46,
+        cli::SmokeQuantArg::DwqMixed48 => SmokeQuant::DwqMixed48,
+    };
+
+    let mut options = SmokeOptions::new(args.arch.clone(), quant);
+    options.with_vision = args.with_vision;
+    options.skip_convert = args.skip_convert;
+    options.dry_run = args.dry_run;
+    options.llama_cli_path = args.llama_cli;
+    options.hf2q_path = args.hf2q_binary;
+    options.transcript_dir = args.transcript_dir;
+
+    match run_smoke(&options) {
+        Ok(assertion) => {
+            tracing::info!(
+                arch = %assertion.arch,
+                tokens = assertion.tokens_generated,
+                tensors = assertion.tensors_loaded,
+                "smoke gate passed"
+            );
+            println!("smoke ok: {}", assertion);
+            Ok(())
+        }
+        Err(e) => {
+            let exit = e.exit_code_override();
+            let err: anyhow::Error = anyhow::anyhow!("{e}");
+            match exit {
+                Some(c) if c == EXIT_SMOKE_LLAMA_CLI_MISSING
+                    || c == EXIT_SMOKE_BINARY_MISSING
+                    || c == EXIT_SMOKE_REPO_MISSING => Err(AppError::SmokeWithCode(c, err)),
+                Some(c) if c == EXIT_QUALITY_EXCEEDED || c == EXIT_INPUT_ERROR => {
+                    // 2 + 3 are the existing convert codes — reuse the
+                    // standard arms so behavior stays uniform.
+                    if c == EXIT_QUALITY_EXCEEDED {
+                        Err(AppError::QualityExceeded(err))
+                    } else {
+                        Err(AppError::Input(err))
+                    }
+                }
+                Some(c) => Err(AppError::SmokeWithCode(c, err)),
+                None => Err(AppError::Conversion(err)),
+            }
+        }
     }
 }
 

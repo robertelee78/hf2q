@@ -86,6 +86,13 @@ pub enum Command {
 
     /// ADR-009 parity validation against locked references
     Parity(ParityArgs),
+
+    /// Run a smoke conformance gate for an arch (ADR-012 Decision 16).
+    ///
+    /// Convert + load + 8-token inference for an arch's canonical repo at the
+    /// requested quant.  Distinct exit codes for each preflight failure mode
+    /// (2=HF_TOKEN, 3=disk, 4=llama-cli, 5=hf2q binary, 6=HF repo).
+    Smoke(SmokeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -404,6 +411,55 @@ pub enum ParityCommand {
 pub struct ParityArgs {
     #[command(subcommand)]
     pub command: ParityCommand,
+}
+
+/// Arguments for `hf2q smoke`.
+#[derive(clap::Args, Debug)]
+pub struct SmokeArgs {
+    /// Arch to smoke-test (`qwen35`, `qwen35moe`).  Unknown arches return a
+    /// uniform error listing the registered set.
+    #[arg(long)]
+    pub arch: String,
+
+    /// Quantization to convert + smoke at.
+    #[arg(long, value_enum, default_value = "q4_0")]
+    pub quant: SmokeQuantArg,
+
+    /// Also exercise the paired vision tower (mmproj).  Errors uniformly when
+    /// the requested arch reports `has_vision: false`.
+    #[arg(long)]
+    pub with_vision: bool,
+
+    /// Skip the convert step (assume the GGUF is already on disk).
+    #[arg(long)]
+    pub skip_convert: bool,
+
+    /// Run preflight only; do not convert or invoke `llama-cli`.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Override path to `llama-cli` (default: `/opt/llama.cpp/build/bin/llama-cli`).
+    #[arg(long)]
+    pub llama_cli: Option<PathBuf>,
+
+    /// Override path to `hf2q` binary (default: `./target/release/hf2q`).
+    #[arg(long)]
+    pub hf2q_binary: Option<PathBuf>,
+
+    /// Directory to write committed smoke transcripts.
+    #[arg(long)]
+    pub transcript_dir: Option<PathBuf>,
+}
+
+/// CLI surface for [`crate::arch::SmokeQuant`].
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmokeQuantArg {
+    #[value(name = "q4_0")]
+    Q4_0,
+    #[value(name = "dwq-mixed-4-6")]
+    DwqMixed46,
+    #[value(name = "dwq-mixed-4-8")]
+    DwqMixed48,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
