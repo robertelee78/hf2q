@@ -1621,4 +1621,107 @@ mod tests {
         // impl on MockEngine; the strong_count == 1 invariant above
         // is the load-bearing assertion for this test.)
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-005 Phase 4 iter-210 (W78) — AC 5467 closure
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // AC 5467 ("Cached pool holds up to 3 loaded models with LRU eviction
+    // bounded by 80% of system unified memory (configurable)") composes
+    // three already-tested invariants:
+    //
+    //   1. `LoadedPool::from_hardware` reads `total_memory_bytes` and
+    //      applies the 80% default fraction (covered by
+    //      `from_hardware_applies_eighty_percent_default`).
+    //   2. `HotSwapManager` admits up to capacity_models entries in
+    //      LRU order (covered by `hotswap_evicts_lru_on_pressure`).
+    //   3. `pool_stats()` surfaces loaded_count + total_resident_bytes +
+    //      memory_budget_bytes for /metrics consumption (covered by
+    //      `hotswap_pool_stats_reflects_loads_and_evictions`).
+    //
+    // The new test below asserts all three invariants TOGETHER through
+    // the manager surface — three distinct repos, all admitted, all
+    // resident, total bytes under the budget, count == 3.  Combined
+    // with the metrics gauge tests in `serve::api::router::tests::
+    // iter210_metrics_emits_pool_gauges`, this closes the AC at the
+    // unit-test level without requiring a 100 GiB-budget E2E run.
+
+    #[test]
+    fn pool_holds_three_models_within_budget() {
+        // ADR-005 line 929 spec: capacity_models = 3 (DEFAULT_POOL_CAPACITY).
+        // Synthetic budget large enough to fit three 1 KiB handles with
+        // significant headroom — proves no eviction fires under nominal
+        // multi-model load.
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(DEFAULT_POOL_CAPACITY, 1_000_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let cfg = empty_config();
+
+        let f1 = synthetic_gguf(1_024);
+        let f2 = synthetic_gguf(1_024);
+        let f3 = synthetic_gguf(1_024);
+
+        let _e1 = mgr
+            .load_or_get("acme/m1", QuantType::Q4_K_M, f1.path(), &cfg)
+            .expect("admit m1");
+        let _e2 = mgr
+            .load_or_get("acme/m2", QuantType::Q4_K_M, f2.path(), &cfg)
+            .expect("admit m2");
+        let _e3 = mgr
+            .load_or_get("acme/m3", QuantType::Q4_K_M, f3.path(), &cfg)
+            .expect("admit m3");
+
+        // All three present — no eviction at capacity boundary +
+        // no byte-budget eviction (3 KiB << 1 MiB budget).
+        let stats = mgr.pool_stats();
+        assert_eq!(
+            stats.loaded_count, 3,
+            "expected 3 distinct repos pooled; stats={stats:?}"
+        );
+        assert_eq!(stats.capacity_models, DEFAULT_POOL_CAPACITY);
+        assert_eq!(stats.total_resident_bytes, 3 * 1_024);
+        assert!(
+            stats.total_resident_bytes < stats.memory_budget_bytes,
+            "AC 5467 invariant violated: total_resident_bytes={} >= memory_budget_bytes={}",
+            stats.total_resident_bytes,
+            stats.memory_budget_bytes,
+        );
+        // Loader called once per distinct repo.
+        assert_eq!(loader.call_count(), 3);
+
+        // All three reachable via try_get (no LRU promotion side-effect).
+        assert!(mgr.try_get("acme/m1", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("acme/m2", QuantType::Q4_K_M).is_some());
+        assert!(mgr.try_get("acme/m3", QuantType::Q4_K_M).is_some());
+    }
+
+    #[test]
+    fn pool_from_hardware_yields_eighty_percent_budget_for_three_models() {
+        // AC 5467 second leg: the 80% memory ceiling is sourced from
+        // `HardwareProfile::total_memory_bytes` via
+        // `LoadedPool::from_hardware`.  This test wires the production
+        // factory + a synthetic 128 GiB hardware profile (the M5 Max
+        // unified-memory tier the AC references) and asserts the
+        // budget yields a pool that admits three Gemma-sized (16 GiB)
+        // handles with headroom.
+        const M5_MAX_UNIFIED_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+        const GEMMA_SIZED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+        let hw = synthetic_hw(M5_MAX_UNIFIED_BYTES);
+        let pool = LoadedPool::from_hardware(&hw);
+
+        // 80% of 128 GiB = 102.4 GiB.  Floor to u64; parity with
+        // the existing `from_hardware_applies_eighty_percent_default`
+        // test's arithmetic.
+        let expected_budget = ((M5_MAX_UNIFIED_BYTES as f64) * 0.80).floor() as u64;
+        assert_eq!(pool.memory_budget_bytes(), expected_budget);
+        assert_eq!(pool.capacity_models(), DEFAULT_POOL_CAPACITY);
+
+        // Three 16 GiB handles must fit (3 × 16 = 48 GiB < 102.4 GiB).
+        assert!(
+            3 * GEMMA_SIZED_BYTES < pool.memory_budget_bytes(),
+            "M5 Max budget {} cannot fit 3× 16 GiB Gemma; AC 5467 sizing assumption broken",
+            pool.memory_budget_bytes()
+        );
+    }
 }
