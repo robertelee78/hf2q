@@ -26,9 +26,11 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
+use std::sync::LazyLock;
 use mlx_native::metal::MTLSize;
 use mlx_native::ops::encode_helpers::KernelArg;
 use mlx_native::ops::dense_mm_bf16::{dense_matmul_bf16_f32_tensor, DenseMmBf16F32Params};
+use mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params};
 use mlx_native::ops::elementwise::{cast, CastDirection};
 use mlx_native::ops::gather::dispatch_gather_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
@@ -37,6 +39,31 @@ use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::softmax::dispatch_softmax;
 use mlx_native::ops::transpose::{permute_021_f32, transpose_last2_bf16};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+
+/// ADR-005 Phase 2c iter-120 (W49) — F32-attention env-gate.
+///
+/// When `HF2Q_VIT_F32_ATTENTION=1`, the production gemma4v ViT
+/// attention path skips the F32→BF16 K cast and dispatches the
+/// score matmul (`Q @ K^T`) on the F32×F32→F32 tensor-core GEMM
+/// added to mlx-native 0.4.7 (`dense_matmul_f32_f32_tensor`). All
+/// other ViT primitives, including the post-softmax `attn = softmaxed
+/// @ V` matmul, retain the BF16 fast path. This isolates the K cast,
+/// which the iter-118 audit (see
+/// `project_vit_attention_bf16_softmax_drift.md`) identified as the
+/// dominant ~0.68 logit perturbation that flips saturated-softmax
+/// winners over 27 layers at gemma4v's `scale = 1.0`.
+///
+/// The env var is read exactly once per process; subsequent toggles
+/// do not take effect (matches the gate-h `INVESTIGATION_ENV` /
+/// `LazyLock` pattern in `forward_mlx.rs:556-565` so an A/B
+/// invocation must launch hf2q with the env explicitly set in the
+/// outer process).  Default (env unset / not "1") keeps the
+/// BF16-tensor production path byte-identical to iter-118.
+pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("HF2Q_VIT_F32_ATTENTION")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+});
 
 /// GPU dense linear projection `y = x @ W.T`.
 ///
@@ -404,30 +431,16 @@ pub fn vit_attention_scores_gpu(
     // are required between dispatches with RAW/WAR/WAW dependencies.
     encoder.memory_barrier();
 
-    // --- Step 2: cast K_perm F32 → BF16 ---
-    let k_bf16 = device
-        .alloc_buffer(
-            n_qk_elems * 2,
-            DType::BF16,
-            vec![num_heads as usize, batch as usize, head_dim as usize],
-        )
-        .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
-    cast(
-        encoder,
-        registry,
-        metal_dev,
-        &k_perm,
-        &k_bf16,
-        n_qk_elems,
-        CastDirection::F32ToBF16,
-    )
-    .context("cast K F32→BF16")?;
-    encoder.memory_barrier();
-
-    // --- Step 3: scores = Q @ K^T per head batch ---
-    // Layout: src0=K_bf16 [num_heads, batch_k, head_dim] BF16,
-    //         src1=Q_perm [num_heads, batch_q, head_dim] F32.
-    // output[h, m, n] = sum_k K[h, n, k] * Q[h, m, k] = (Q[h] @ K[h]^T)[m, n].
+    // --- Step 2 + 3: scores = Q @ K^T per head batch ---
+    // Default (BF16): cast K F32→BF16, then dispatch the bf16-tensor
+    // matmul (src0=K_bf16, src1=Q_f32, dst=scores_f32).
+    //
+    // ADR-005 iter-120 F32 path (`HF2Q_VIT_F32_ATTENTION=1`): skip the
+    // BF16 K cast entirely and dispatch the F32×F32→F32 tensor-core
+    // GEMM added in mlx-native 0.4.7. The two paths share the same
+    // mathematical contract (`output[h, m, n] = sum_k K[h, n, k] *
+    // Q[h, m, k]`), so the score buffer downstream is byte-shape-
+    // identical; only the K-side dtype precision differs.
     let n_scores = (num_heads as usize) * (batch as usize) * (batch as usize);
     let mut scores = device
         .alloc_buffer(
@@ -436,23 +449,69 @@ pub fn vit_attention_scores_gpu(
             vec![num_heads as usize, batch as usize, batch as usize],
         )
         .map_err(|e| anyhow!("alloc scores: {e}"))?;
-    let params = DenseMmBf16F32Params {
-        m: batch,
-        n: batch,
-        k: head_dim,
-        src0_batch: num_heads,
-        src1_batch: num_heads,
-    };
-    dense_matmul_bf16_f32_tensor(
-        encoder,
-        registry,
-        device,
-        &k_bf16,
-        &q_perm,
-        &mut scores,
-        &params,
-    )
-    .context("attention scores matmul")?;
+    if *VIT_F32_ATTENTION_ACTIVE {
+        // F32 path: K_perm is already F32 [num_heads, batch_k, head_dim].
+        // Pass it directly as src0 — the F32 GEMM interprets it as
+        // [src0_batch=num_heads, n=batch_k, k=head_dim].
+        let params = DenseMmF32F32Params {
+            m: batch,
+            n: batch,
+            k: head_dim,
+            src0_batch: num_heads,
+            src1_batch: num_heads,
+        };
+        dense_matmul_f32_f32_tensor(
+            encoder,
+            registry,
+            device,
+            &k_perm,
+            &q_perm,
+            &mut scores,
+            &params,
+        )
+        .context("attention scores matmul (F32 path, iter-120)")?;
+    } else {
+        // BF16 production path (unchanged).
+        let k_bf16 = device
+            .alloc_buffer(
+                n_qk_elems * 2,
+                DType::BF16,
+                vec![num_heads as usize, batch as usize, head_dim as usize],
+            )
+            .map_err(|e| anyhow!("alloc k_bf16: {e}"))?;
+        cast(
+            encoder,
+            registry,
+            metal_dev,
+            &k_perm,
+            &k_bf16,
+            n_qk_elems,
+            CastDirection::F32ToBF16,
+        )
+        .context("cast K F32→BF16")?;
+        encoder.memory_barrier();
+
+        // Layout: src0=K_bf16 [num_heads, batch_k, head_dim] BF16,
+        //         src1=Q_perm [num_heads, batch_q, head_dim] F32.
+        // output[h, m, n] = sum_k K[h, n, k] * Q[h, m, k] = (Q[h] @ K[h]^T)[m, n].
+        let params = DenseMmBf16F32Params {
+            m: batch,
+            n: batch,
+            k: head_dim,
+            src0_batch: num_heads,
+            src1_batch: num_heads,
+        };
+        dense_matmul_bf16_f32_tensor(
+            encoder,
+            registry,
+            device,
+            &k_bf16,
+            &q_perm,
+            &mut scores,
+            &params,
+        )
+        .context("attention scores matmul")?;
+    }
 
     // --- Step 4: apply scale (in-place via scalar_mul_f32) ---
     if scale != 1.0 {

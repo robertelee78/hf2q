@@ -1276,6 +1276,44 @@ There was no `encoder.memory_barrier()` between (1) and (2). mlx-native uses `MT
 
 ---
 
+#### Phase 2c iter-120 — `HF2Q_VIT_F32_ATTENTION` env-gate wired on mlx-native 0.4.7; A/B reveals BF16 K cast is a real but NON-DOMINANT contributor (2026-04-25, W49)
+
+**Dispatch context.** W49 in /loop /cfa wave 44. W48 closed iter-117's Phase 7 blocker by porting `kernel_mul_mm_f32_f32` from llama.cpp into mlx-native (commit `2313c85`, version bump 0.4.6 → 0.4.7, 9/9 new tests + 11/11 BF16 regression PASS). iter-120 is the diagnostic the iter-118 BF16 arm (W47) was authorized to run once the F32×F32 GEMM landed.
+
+**Phase 1 — mlx-native bump.** `Cargo.toml`: `mlx-native = "0.4.6"` → `"0.4.7"`. Local override (`/opt/hf2q/.cargo/config.toml`) already pins `path = "/opt/mlx-native"`, so `cargo update -p mlx-native` was a no-op for resolution and `cargo check --release` finished in 2.69s with no new warnings. `dense_matmul_f32_f32_tensor` resolves via `mlx_native::ops::dense_mm_f32_f32::{dense_matmul_f32_f32_tensor, DenseMmF32F32Params}` (re-exported at the crate root in `lib.rs:79`).
+
+**Phase 2 — env-gate scope decision (Chesterton).** The dispatch's full-attention F32 plan would need to skip the V BF16 cast as well, which requires a `transpose_last2_f32` mlx-native primitive (currently bf16-only at `transpose.rs:213`). That kernel is out of W48's scope. Per `feedback_no_shortcuts.md` we did NOT half-build the V path; iter-120 wires F32 *only on the K side* — exactly the cast that `project_vit_attention_bf16_softmax_drift.md` calls out as the ~0.68 logit perturbation that flips saturated-softmax winners. The V matmul retains the BF16 fast path (post-softmax convex combinations are less precision-sensitive). When `transpose_last2_f32` lands a future iter can flip the V side too.
+
+**Phase 2 — implementation.** `src/inference/vision/vit_gpu.rs`: added `pub(crate) static VIT_F32_ATTENTION_ACTIVE: LazyLock<bool>` at module top (reads `HF2Q_VIT_F32_ATTENTION == "1"` once per process; matches the `INVESTIGATION_ENV` `LazyLock` pattern in `forward_mlx.rs:556-565` so the env var must be set in the outer process before launch). Inside `vit_attention_scores_gpu` Step 2+3 became a branch:
+
+- Default (BF16 production): unchanged — `cast K F32→BF16` + `dense_matmul_bf16_f32_tensor`.
+- F32 path (`HF2Q_VIT_F32_ATTENTION=1`): skip the cast and `cast` allocation; pass `k_perm` (already F32) directly to `dense_matmul_f32_f32_tensor` with `DenseMmF32F32Params { m: batch, n: batch, k: head_dim, src0_batch: num_heads, src1_batch: num_heads }`. The mathematical contract is identical (`output[h, m, n] = sum_k K[h, n, k] * Q[h, m, k]`); only the K-side dtype precision differs.
+
+Diff stat: `+102 / -43` LOC across `Cargo.toml` (1 line), `Cargo.lock` (1 line), `src/inference/vision/vit_gpu.rs` (~140 lines including expanded doc-comments). No public-API changes; all six `vit_attention_gpu` test callers compile unchanged.
+
+**Phase 3 — green-light validation.** `cargo check --release`: PASS (2.69s). `cargo test --release --bin hf2q -- vit_attention`: 6/6 PASS (BF16 production path unchanged including `vit_attention_gpu_isolated_head_dim_72_diagnostic`). `cargo test -- vision::`: 233/233 PASS. `cargo test -- gemma4v`: 35/35 PASS. `cargo build --release --bin hf2q`: PASS (8.22s).
+
+**Phase 4 — A/B diagnostic (model-load, sequential).** Harness in `scripts/w49_iter120_ab_diagnostic.sh`. Both runs use the same model + mmproj + image (`tests/fixtures/vision/four_dots_in_corners_128x128.png`) + prompt (`"Describe this image in 5 words."`) + `temperature=0` + `max_tokens=16` against `/v1/chat/completions`. Sequential per OOM-prevention directive (one ~30 GB process at a time). Both runs landed `prompt_tokens=277, completion_tokens=8, finish_reason=stop` — i.e. the F32 path produces a well-formed 8-token reply, not a crash and not a no-op.
+
+Verbatim outputs:
+
+- **Run A (BF16, env unset)**: `Text-heavy image, minimal visual.`
+- **Run B (F32, `HF2Q_VIT_F32_ATTENTION=1`)**: `Text-based image, repetitive pattern.`
+- **llama-mtmd-cli reference (W45 iter-116l)**: `<|channel|>thought\n*   Input: An image of a square frame made of four`
+
+**Phase 5 — decision: Case 3.** F32 output is meaningfully different from BF16 (different word choice, different framing — `"Text-heavy"`/`"Text-based"`, `"minimal visual"`/`"repetitive pattern"`), confirming the BF16 K cast's ~0.68 logit perturbation is real and behaviourally observable end-to-end. **However**, neither hf2q output describes the image's geometric content (four dots in corners → "square frame made of four"); both are generic image-blind paraphrases. The K-side BF16 cast is therefore a **real but NOT dominant** contributor to the soft-token semantic divergence. Production default stays BF16 — flipping to F32 buys nothing user-visible and would be a Chesterton's-fence violation (we'd be paying ~2× memory bandwidth on the score matmul without closing the gap to llama-mtmd-cli).
+
+**Suspect re-ranking for iter-121+.** With the K cast partially-falsified, the remaining hypothesis space narrows to:
+1. **V cast + V transpose** (still BF16 in the F32 path; needs `transpose_last2_f32` first to A/B).
+2. **The 7 `vit_linear_gpu` weight casts × 27 blocks = 189 BF16 weight quantizations** per W47's iter-118 audit (Phase 1 site #1) — feeds Q/K/V/proj/down/gate/up linears. This is the only remaining sensible BF16-precision hypothesis once K and V are cleared. Would also use `dense_matmul_f32_f32_tensor` on the linear path, NOT requiring a new transpose kernel.
+3. **Non-precision causes**: image preprocessor (W44 patch_embd HWC→CHW permute, position_embd dual-table indexing, four-norm dual-RMSNorm ordering — all three flagged COULD-BE-CORRECT in W47 iter-118 Phase 0 static audit but never exercised against an isolated-input parity bench).
+
+**What this iter banks.** (a) `dense_matmul_f32_f32_tensor` is wired into production code under env-gate; future iters can A/B different cast sites without re-doing the GEMM port. (b) The K cast hypothesis is partially-falsified by behavioral evidence — iter-120 narrows the search instead of widening it. (c) Production behaviour byte-identical when env unset (6/6 + 233/233 + 35/35 PASS confirms no regression).
+
+**Files touched.** `Cargo.toml` (version bump), `Cargo.lock` (auto), `src/inference/vision/vit_gpu.rs` (env-gate + branched dispatch + closure docs), `scripts/w49_iter120_ab_diagnostic.sh` (new A/B harness, ~110 LOC). NOT touched: `docs/ADR-014-streaming-convert-pipeline.md` (untracked), chat GGUF, frozen baselines, `sourdough_tq_quality.json`. Host PIDs at start: 0; at end: 0 after stray-process pkill in harness teardown.
+
+---
+
 #### Phase 2c iter-118 BF16 arm — `HF2Q_VIT_F32_ATTENTION` audit + Phase 7 blocker: F32×F32 GEMM kernel does not exist in mlx-native (2026-04-25, W47)
 
 **Dispatch context.** W47 in /loop /cfa wave 42, parallel arm of iter-118. iter-118 (W28) closed vision tests fully green via kernel-registration fix; this BF16 arm tests W46 iter-117's top remaining soft-token-divergence suspect: the `vit_attention_gpu` BF16 K/V cast at gemma4v scale=1.0. Pi-brain `project_vit_attention_bf16_softmax_drift.md` documents that BF16-cast K perturbs logits by ~0.68 and flips saturated-softmax winners on SigLIP-49; gemma4v compounds this differently across 27 layers.
