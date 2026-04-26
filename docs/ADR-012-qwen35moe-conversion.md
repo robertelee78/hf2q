@@ -215,6 +215,23 @@ The mission's "optimize" phase is deferred to subsequent ADRs / tasks since ADR-
     - llama.cpp at 1/119.36 = 8.38ms/token
 
   Closing the remaining 0.49ms/token gap via further mlx-native optimization belongs in a separate ADR — candidates: (1) per-dispatch GPU sampling via `MTLCounterSampleBuffer` to surface true per-kernel time, (2) parallel-encoding `dispatch_apply` pattern (mirrors llama.cpp's `ggml-metal-context.m:550`) to reduce the 3.3ms CPU encoding, (3) cross-token speculative pipelining.  None of these are within ADR-012's conversion-pipeline scope.
+
+  **2026-04-26 per-CB GPU profiling SHIPPED** (mlx-native commit `f11cef9` + hf2q commit `4122f9e`): `mlx_native::kernel_profile` module + `CommandEncoder::commit_labeled` / `commit_and_wait_labeled` — when `MLX_PROFILE_CB=1` is set, each labeled commit accumulates `GPUEndTime - GPUStartTime` into a global table.  hf2q's `forward_gpu_greedy` decode dumps a sorted breakdown after each token.  Profile mode is slow (forces sync per labeled commit) but gives clean per-CB attribution.  Zero overhead when env var is unset.
+
+  **dwq46 decode per-CB breakdown** (`MLX_PROFILE_CB=1`, n=4 tokens, M5 Max):
+    | Phase | GPU time | Per-cb | Count | % |
+    |---|---|---|---|---|
+    | `layer.moe_ffn` | 3.85ms | 96µs avg | 40 | 46% |
+    | `layer.delta_net.ops1-9` | 3.03ms | 101µs avg | 30 | 36% |
+    | `output_head.lm_head_q4` | 0.50ms | 504µs | 1 | 6% |
+    | `layer.full_attn.sdpa_kv` | 0.42ms | 42µs avg | 10 | 5% |
+    | `layer.full_attn.ops1-4` | 0.39ms | 38µs avg | 10 | 5% |
+    | `layer.full_attn.ops6-7` | 0.15ms | 15µs avg | 10 | 2% |
+    | `output_head.argmax` | 0.05ms | 48µs | 1 | 1% |
+    | `output_head.norm` | 0.01ms | 7µs | 1 | 0% |
+    | **Total** | **8.45ms** | | **102 cb** | |
+
+  **Conclusion**: total profiled GPU work (8.45ms) ≈ llama.cpp's per-token wall (8.38ms).  The 0.5ms hf2q-vs-llama gap is **not in kernel speed** — both implementations spend the same amount of time computing on the GPU.  The gap is in CPU-side CB scheduling/encoding overhead × 100 cb/token vs llama.cpp's 1-2 cb/token (`ggml-metal-context.m:458` "optimal values for n_cb are 1 or 2").  Per-CB scheduling overhead at ~5µs × ~100 cb ≈ 0.5ms gap.  Closing this requires either dispatch-graph fusion (large-scope falsified per `gpu_full_attn.rs:1108-1112`) or `dispatch_apply` parallel encoding — both belong in a new mlx-native perf ADR.
 * **Phase 4.5 refactor** would also unlock real-model PPL/KL gate runs that the test infrastructure under `tests/quality_thresholds.rs` currently exercises with synthetic-tiny inputs only.
 
 **Decision Makers:** Robert, Claude
