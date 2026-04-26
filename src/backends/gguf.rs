@@ -307,7 +307,26 @@ impl OutputBackend for GgufBackend {
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
             // assume F32 for element-wise operations (router.scale, per_expert_scale,
             // layer_scalar, norms). Override F16→F32 for these.
-            let needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1;
+            let mut needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1;
+
+            // ADR-012 Decision 19 follow-up (2026-04-25 cron-iter):
+            // qwen35 / qwen35moe ssm_conv1d.weight MUST be F32 — not F16.
+            // The Metal SSM_CONV kernel (`ggml_metal_op_ssm_conv` in
+            // ggml-metal-device.cpp:490) asserts
+            //   GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32)
+            // and aborts the process at the first generation step if the
+            // conv1d weight is F16.  ssm_conv1d has shape [n_v_heads, K=4]
+            // (small inner dim → preserved by `is_weight()`'s ≥32-row guard,
+            // so it would otherwise stay at F16).  Promote to F32 here.
+            //
+            // Detection is by GGUF tensor name (post-rename), so the same
+            // guard fires for both qwen35 and qwen35moe without an arch
+            // string check (no other arch emits a tensor named
+            // `*.ssm_conv1d.weight`).
+            if !needs_f32 && gguf_name.ends_with(".ssm_conv1d.weight") {
+                needs_f32 = true;
+            }
+
             if needs_f32 && ggml_type == GGML_TYPE_F16 {
                 ggml_type = GGML_TYPE_F32;
             }

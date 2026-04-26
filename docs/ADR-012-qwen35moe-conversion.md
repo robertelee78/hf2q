@@ -26,7 +26,56 @@ The `hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snapshot>` end-
 
 **Bug 1 — vocab-pad emit (CONVERT side):** ✅ **FIXED** in commit `85e488f` (Phase 1.8 in `cmd_convert`).  HF safetensors padded `model.embed_tokens.weight` to 248320 rows; llama.cpp's loader expects the de-padded count (248044, max base-vocab id + 1) to match the emitted `tokenizer.ggml.tokens` array length.  New `input::detect_padded_vocab` + `input::truncate_padded_vocab` truncate both `model.embed_tokens.weight` and `lm_head.weight` to the de-padded count and update `metadata.vocab_size`.  Seven new unit tests pin the math.
 
-**Bug 2 — MTP tensor naming (CONVERT side, EMITTING UNRECOGNIZED NAMES):** ⏳ **OPEN.**  Smoke surfaced "wrong number of tensors; expected 866, got 851" — the GGUF emits 866 total but llama.cpp only recognizes 851.  Root cause: 15 raw `mtp.*` HF tensor names pass through `hf_name_to_gguf` unrenamed.  ADR-012 P11's MTP rename only covered four wrapper suffixes (`enorm`, `hnorm`, `embed_tokens`, `eh_proj`) and even those used the wrong HF source names — Qwen3.6-27B's HF schema actually emits:
+**Bug 2 — MTP tensor naming (CONVERT side, EMITTING UNRECOGNIZED NAMES):** ✅ **FIXED** in commit `fc85681` (Phase 1.42 in `cmd_convert` + `qwen35_nextn_wrapper_layer_map` + `block_count = num_hidden_layers` revert).  Three sub-fixes shipped together:
+
+1. **MTP-rename helper landed** at `models::qwen35::rename_mtp_tensors_to_layer_form` (~120 LOC) + pure `map_mtp_tensor_name` helper.  Mirrors `convert_hf_to_gguf.py:10529-10540`.  Kept available for the future llama.cpp version that supports qwen35 MTP loading.
+2. **Nextn wrapper layer-map entries added** in `gguf.rs::qwen35_nextn_wrapper_layer_map` (citations to `llama-arch.cpp:447-452`).  Wired into qwen35 + qwen35moe arms of `layer_map_for_arch`.
+3. **MTP DROP path** in `cmd_convert` Phase 1.42: llama.cpp's qwen35/qwen35moe loaders do not read `LLM_KV_NEXTN_PREDICT_LAYERS` (only GLM4 + DeepseekV3 do, see `llama-model.cpp:2073`/`2107`/`2154`/`2329`), so they have no per-layer slot allocated for an MTP block.  Phase 1.42 drops every `mtp.*` tensor from `tensor_map` before backend emission.  Helpers from items 1+2 stay live for the future enable; the drop is the reversible policy.  `block_count` reverts to `meta.num_layers` (no MTP).
+
+**End-gate result on Qwen/Qwen3.6-27B Q4_0 (post-`fc85681`):**
+
+```
+hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snap>
+→ preflight passes
+→ convert produces 16 GB GGUF
+→ llama_model_load: SUCCESS (no rejection)
+→ ggml-metal aborts on ssm_conv1d dtype assertion (Bug 4 — fix in flight)
+```
+
+**Bug 4 — ssm_conv1d Metal kernel F32 requirement (CONVERT side, RUNTIME ABORT):** ⏳ **FIX SHIPPED, RE-RUN PENDING** — `src/backends/gguf.rs` working-tree edit (committed in this handoff alongside the ADR refresh) extends the existing F32-promotion path (`needs_f32 = qt.quant_info.preserved && qt.shape.len() <= 1`) to also fire for any tensor whose GGUF name ends with `.ssm_conv1d.weight`.
+
+Root cause: the Metal `SSM_CONV` kernel at `ggml-metal-device.cpp:490` asserts
+
+```
+GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32)
+```
+
+and aborts the process at the first generation step if the conv1d weight is F16.  `ssm_conv1d` has shape `[n_v_heads, K=4]` — the small inner dim (`4 < 32`) means `is_weight()` returns false and the tensor is preserved at F16 (the original Phase 1 `convert_bf16_to_f16` cast), so the F16-only path runs without the new F32 promotion.
+
+Detection is by GGUF tensor name (post-rename), so the same guard fires for both qwen35 and qwen35moe without an arch-string check (no other arch emits a tensor named `*.ssm_conv1d.weight`).
+
+**Verification pending** — handoff state.  Next-iteration steps:
+
+```
+cargo build --release --bin hf2q
+QWEN27B_DIR=$(ls -d ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/*/ | head -1)
+rm -rf /tmp/smoke-qwen35-q4 /tmp/smoke-fixtures
+./target/release/hf2q smoke --arch qwen35 --quant q4_0 \
+  --local-dir "$QWEN27B_DIR" \
+  --convert-output-dir /tmp/smoke-qwen35-q4 \
+  --fixtures-root /tmp/smoke-fixtures \
+  --llama-cli-override /opt/homebrew/bin/llama-cli
+```
+
+If the resulting transcript at `/tmp/smoke-fixtures/smoke-transcripts/qwen35-q4_0.txt` shows clean 8-token generation (no `GGML_ASSERT` line, no `Aborted`), Bug 4 is closed and the ADR can flip Bug 4 → ✅ FIXED + the `qwen35-q4_0.txt` transcript can move into `tests/fixtures/smoke-transcripts/`.
+
+The same code path runs for qwen35moe.  Re-emitting the four DWQ deliverables (Bug 3 below) is then unblocked.
+
+---
+
+**Original Bug 2 surface (preserved for context):**
+
+The smoke run at commit `eee1c39` surfaced "wrong number of tensors; expected 866, got 851" — the GGUF emitted 866 total but llama.cpp only recognized 851.  Root cause: 15 raw `mtp.*` HF tensor names passed through `hf_name_to_gguf` unrenamed.  ADR-012 P11's MTP rename only covered four wrapper suffixes (`enorm`, `hnorm`, `embed_tokens`, `eh_proj`) and even those used the wrong HF source names — Qwen3.6-27B's HF schema actually emits:
   * `mtp.pre_fc_norm_embedding.weight` (not `mtp.layers.0.enorm.weight`)
   * `mtp.pre_fc_norm_hidden.weight` (not `mtp.layers.0.hnorm.weight`)
   * `mtp.embed_tokens.weight` (no `layers.0` infix on the wrapper)
