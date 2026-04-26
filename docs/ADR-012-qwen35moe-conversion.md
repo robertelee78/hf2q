@@ -92,6 +92,28 @@ Fix: added `"-no-cnv"` and `"--single-turn"` to the args list.  `-no-cnv` disabl
 
 **Verification done 2026-04-25** — Bug 5 ✅ FIXED in same commit as Bug 4 closure.  The smoke transcript at `tests/fixtures/smoke-transcripts/qwen35-q4_0.txt` materialized cleanly (68 lines, 2904 bytes, byte-identical across two fresh runs).
 
+**Bug 6 — P9b re-read path missing Phase 1.8 vocab-pad re-truncation (CONVERT side, DWQ-only):** ✅ **FIXED** 2026-04-26 — `src/input/mod.rs::truncate_padded_vocab` refactored to detect padded rows from `tensor_map` itself (not solely from `metadata.vocab_size`), and `src/main.rs:940` re-applies it on the P9b re-read path.  Surfaced 2026-04-26 cron-iter when running the post-Bug-5 Bug 3 (DWQ re-emit) ladder for `qwen35-dwq46`.
+
+The DWQ pipeline takes a two-pass shape (P9b): first pass emits an intermediate F16 GGUF for activation capture; second pass re-reads the safetensors fresh and runs the activation-aware DWQ scale calibration.  The first-pass Phase 1.8 (commit `85e488f`) truncated the safetensors-padded `model.embed_tokens.weight` + `lm_head.weight` from 248320 → 248044 rows AND updated `metadata.vocab_size` → 248044.  The re-read path applied the qwen35 normalization phases (linear-attn transforms, MoE expert merge, RMS+1) but did NOT re-apply Phase 1.8, leaving the freshly-re-read tensor_map's embeddings at the padded 248320-row shape.  The final DWQ GGUF then carried 248320-row embeddings vs. the metadata-declared 248044 vocab size, and llama.cpp rejected the load with `tensor 'token_embd.weight' has wrong shape; expected 5120, 248044, got 5120, 248320`.
+
+The original `truncate_padded_vocab` early-returned when `true_vocab >= metadata.vocab_size` — so passing `metadata.vocab_size` (248044) as `true_vocab` against a 248044 metadata was a no-op even though the tensor_map embeddings still had 248320 rows.  Refactor: the helper now detects the actual padded row count from one of the embed tensors and falls back to `metadata.vocab_size` only when no embed is present.  This makes it idempotent and lets it work on both the first-pass path (metadata + tensor in sync at padded value) and the re-read path (metadata at de-padded, tensor at padded).  New regression test `truncate_padded_vocab_handles_re_read_path_metadata_already_de_padded` pins the new behaviour.
+
+**Bug 7 — P9b re-read path missing HF2Q_QWEN35_DROP_MTP=1 re-application (CONVERT side, DWQ-only):** ✅ **FIXED** 2026-04-26 — `src/main.rs:940` re-applies the MTP-tensor drop on the re-read tensor_map.  Surfaced in the same cron-iter immediately after Bug 6 was fixed.
+
+The first-pass at `src/main.rs:543-559` drops 15 `mtp.*` tensors when `HF2Q_QWEN35_DROP_MTP=1` is set; the re-read path mirrored none of that.  After Bug 6 fixed the vocab-pad shape mismatch, the next failure was `done_getting_tensors: wrong number of tensors; expected 866, got 851` because the DWQ ran on a re-read tensor_map containing the 15 MTP tensors, producing a final GGUF with 866 tensor entries while metadata declared `block_count = 64` (no MTP block) so llama.cpp's qwen35 schema only knew 851 tensor names.
+
+Bug 6 + Bug 7 are the same class of defect: P9b re-read symmetry — every transformation the first-pass tensor_map underwent must also fire on the re-read tensor_map BEFORE the DWQ pass, since DWQ emits the final GGUF from the re-read view.  Both are gated by the same env var (`HF2Q_QWEN35_DROP_MTP`) for MTP and by `metadata.vocab_size` for vocab pad, both with the same removal/exit conditions as the first-pass call.
+
+**Verification (2026-04-26):**
+```
+HF2Q_QWEN35_DROP_MTP=1 hf2q convert --repo Qwen/Qwen3.6-27B \
+    --quant dwq-mixed-4-6 --skip-quality \
+    --output models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
+```
+Produces a 16.08 GB GGUF that llama.cpp loads cleanly (no "wrong number of tensors" rejection, no "wrong shape" rejection) and runs at 28.24 tok/s decode.  Generates the canonical pangram completion `The quick brown fox → jumps over the lazy` at `--temp 0`.
+
+`--skip-quality` is required for now because Phase 4.5 quality measurement holds `tensor_map` (~70 GB) + F32-dequantized model (~100 GB) simultaneously, exceeding 128 GB unified RAM on M5 Max.  Tracked as a separate streaming-dequant refactor follow-up.
+
 ---
 
 **Original Bug 2 surface (preserved for context):**

@@ -171,7 +171,27 @@ pub fn truncate_padded_vocab(
 ) -> usize {
     use crate::ir::DType;
 
-    let original_vocab = metadata.vocab_size;
+    // ADR-012 Bug 6 (2026-04-26): detect the actual padded row count from
+    // one of the embed tensors rather than relying solely on
+    // `metadata.vocab_size`.  This makes the helper idempotent and lets
+    // it work on the P9b re-read path where `metadata.vocab_size` was
+    // already de-padded by the first-pass call but the freshly-re-read
+    // `tensor_map` still has the padded safetensors rows (e.g. 248320 for
+    // Qwen3.6-27B with `metadata.vocab_size==248044`).  Falls back to
+    // `metadata.vocab_size` when no embed tensor is present so callers
+    // that only want a metadata-level de-pad still see the post-call
+    // invariant `metadata.vocab_size == true_vocab` (preserves the
+    // existing `truncate_padded_vocab_skips_when_no_embed_present` test
+    // contract).
+    let original_vocab = ["model.embed_tokens.weight", "lm_head.weight"]
+        .iter()
+        .find_map(|k| {
+            tensor_map
+                .tensors
+                .get(*k)
+                .and_then(|t| t.shape.first().map(|&r| r as u64))
+        })
+        .unwrap_or(metadata.vocab_size);
     if true_vocab >= original_vocab {
         return 0;
     }
@@ -325,6 +345,34 @@ mod tests {
         // Metadata IS updated even when no tensors found, since callers may
         // still use the corrected vocab_size for downstream emission.
         assert_eq!(metadata.vocab_size, 248_044);
+    }
+
+    /// ADR-012 Bug 6 regression guard (2026-04-26): the helper must work
+    /// on the P9b re-read path where `metadata.vocab_size` was already
+    /// de-padded by the first-pass call but the freshly-re-read
+    /// `tensor_map` still has the padded safetensors rows.  Without the
+    /// "detect padded rows from tensor_map" fix in `truncate_padded_vocab`,
+    /// this scenario silently no-ops because the early-return branch fires
+    /// when `true_vocab >= metadata.vocab_size` (both at de-padded value),
+    /// leaving the freshly-loaded padded embedding intact in the final
+    /// DWQ GGUF and tripping llama.cpp's
+    /// `tensor 'token_embd.weight' has wrong shape; expected H, T, got H, P`
+    /// load rejection.
+    #[test]
+    fn truncate_padded_vocab_handles_re_read_path_metadata_already_de_padded() {
+        let mut metadata = metadata_with_vocab(248_044);
+        let mut tensor_map = TensorMap::new();
+        tensor_map.insert(padded_embed_tensor("model.embed_tokens.weight", 248_320, 4));
+        tensor_map.insert(padded_embed_tensor("lm_head.weight", 248_320, 4));
+
+        let truncated = truncate_padded_vocab(&mut tensor_map, &mut metadata, 248_044);
+        assert_eq!(truncated, 2, "both embed and lm_head must be truncated");
+        assert_eq!(metadata.vocab_size, 248_044);
+
+        let embed = tensor_map.tensors.get("model.embed_tokens.weight").unwrap();
+        assert_eq!(embed.shape, vec![248_044, 4]);
+        let lm_head = tensor_map.tensors.get("lm_head.weight").unwrap();
+        assert_eq!(lm_head.shape, vec![248_044, 4]);
     }
 
     #[test]

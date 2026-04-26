@@ -938,6 +938,74 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .context("ADR-012 P9b: re-read linear-attn transforms failed")
                     .map_err(AppError::Conversion)?;
 
+                    // ADR-012 Bug 7 (2026-04-26): re-apply HF2Q_QWEN35_DROP_MTP=1
+                    // MTP-tensor drop to the re-read tensor_map.  The first-pass
+                    // call (main.rs:543-559) dropped 15 `mtp.*` tensors from the
+                    // initial tensor_map, but the freshly-re-read safetensors
+                    // still contain them.  Without this re-application, DWQ
+                    // calibrates + emits 866 tensors total (851 base + 15 MTP)
+                    // while the metadata's `block_count = 64` (no MTP) tells
+                    // llama.cpp to expect 851; load fails with
+                    //   done_getting_tensors: wrong number of tensors;
+                    //   expected 866, got 851
+                    // because the 15 MTP tensors have names llama.cpp doesn't
+                    // recognize for a 64-block qwen35 model.  Mirror the
+                    // first-pass drop here for re-read symmetry.  Same env-var
+                    // gate as the first-pass branch; same removal condition
+                    // (when llama.cpp gains qwen35 MTP loading OR 2026-Q4).
+                    {
+                        let drop_mtp = std::env::var("HF2Q_QWEN35_DROP_MTP")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        if drop_mtp {
+                            let mtp_keys: Vec<String> = tensor_map_re
+                                .tensors
+                                .keys()
+                                .filter(|n| n.starts_with("mtp."))
+                                .cloned()
+                                .collect();
+                            if !mtp_keys.is_empty() {
+                                tracing::warn!(
+                                    dropped = mtp_keys.len(),
+                                    "ADR-012 P9b Bug 7: HF2Q_QWEN35_DROP_MTP=1 re-applied on re-read; dropping {} mtp.* tensors",
+                                    mtp_keys.len()
+                                );
+                                for key in mtp_keys {
+                                    tensor_map_re.tensors.remove(&key);
+                                }
+                            }
+                        }
+                    }
+
+                    // ADR-012 Bug 6 (2026-04-26): re-apply Phase 1.8 vocab-pad
+                    // de-pad to the re-read tensor_map.  The first-pass call
+                    // already updated `metadata.vocab_size` to the de-padded
+                    // value (e.g. 248044 for Qwen3.6-27B), but the freshly-
+                    // re-read safetensors still have the padded
+                    // model.embed_tokens.weight + lm_head.weight rows
+                    // (248320).  Without this re-application, the final DWQ
+                    // GGUF embeds at 248320 rows and llama.cpp rejects with
+                    //   tensor 'token_embd.weight' has wrong shape;
+                    //   expected H, 248044, got H, 248320
+                    // The refactored `truncate_padded_vocab` detects padded
+                    // rows from `tensor_map` itself, so calling with
+                    // `true_vocab = metadata.vocab_size` is a no-op when the
+                    // tensor_map is already aligned and an active truncate
+                    // when the re-read produced padded rows.
+                    let de_padded_vocab = metadata.vocab_size;
+                    let truncated = input::truncate_padded_vocab(
+                        &mut tensor_map_re,
+                        &mut metadata,
+                        de_padded_vocab,
+                    );
+                    if truncated > 0 {
+                        tracing::info!(
+                            truncated_tensors = truncated,
+                            de_padded_vocab,
+                            "ADR-012 P9b Bug 6: re-applied vocab-pad fix to re-read tensor_map"
+                        );
+                    }
+
                     tracing::info!(
                         "ADR-012 P9b: running DWQ scale calibration with {} activation-derived sensitive layer ranges",
                         derived_sensitive_ranges.len()
