@@ -1054,13 +1054,53 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    // --- ADR-005 Phase 3 item 4/4 (iter-204): auto-pipeline resolution ---
+    // When `--model` is a HuggingFace repo-id (e.g. `google/gemma-4-27b-it`),
+    // chain quant_select (W51) + cache (W70) + integrity (W71) to produce a
+    // ready-to-load GGUF path before the existing model-load logic runs.
+    // Filesystem paths pass through unchanged (existing behavior preserved).
+    //
+    // The resolution mutates the cache manifest (records source on download,
+    // records quantized on emit, touches LRU on hit) — held in a local
+    // scope so the `&mut ModelCache` reference doesn't outlive the resolve.
+    let resolved_model_path: Option<std::path::PathBuf> = if let Some(model_arg) = args.model.as_ref() {
+        let arg_str = model_arg.to_string_lossy().into_owned();
+        let hw = crate::intelligence::hardware::HardwareProfiler::detect()
+            .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
+        let mut cache = cache::ModelCache::open()
+            .context("open model cache for auto-pipeline")?;
+        let resolved = auto_pipeline::resolve_or_prepare_model(
+            &arg_str,
+            &mut cache,
+            &hw,
+            args.no_integrity,
+        )
+        .context("auto-pipeline: resolve --model into a GGUF path")?;
+        if let Some(repo) = resolved.repo_id.as_deref() {
+            let quant_str: &str = resolved
+                .quant
+                .map(quant_select::QuantType::as_str)
+                .unwrap_or("");
+            tracing::info!(
+                repo,
+                quant = quant_str,
+                from_cache = resolved.from_cache,
+                gguf = %resolved.gguf_path.display(),
+                "auto-pipeline: --model resolved"
+            );
+        }
+        Some(resolved.gguf_path)
+    } else {
+        None
+    };
+
     // --- Optionally load the model + spawn the engine ---
     // When --model is supplied, we eagerly load (Decision #15 fail-fast) and
     // spawn the serialized-FIFO worker thread. Warmup runs on the worker
     // thread (dispatched via Engine::warmup) and once it completes we flip
     // `ready_for_gen` on the AppState so /readyz returns 200 and
     // /v1/chat/completions accepts requests.
-    let engine_opt = if let Some(model_path) = args.model.as_ref() {
+    let engine_opt = if let Some(model_path) = resolved_model_path.as_ref() {
         anyhow::ensure!(
             model_path.exists(),
             "Model not found: {}",
