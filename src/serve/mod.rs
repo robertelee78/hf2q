@@ -4,6 +4,8 @@
 
 pub mod api;
 #[allow(dead_code)]
+pub mod auto_pipeline;
+#[allow(dead_code)]
 pub mod cache;
 pub mod config;
 pub mod forward_mlx;
