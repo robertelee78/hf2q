@@ -15,11 +15,38 @@
 //!
 //!   * `HF2Q_VISION_E2E_GGUF`   — path to the chat-model GGUF (Gemma 4).
 //!   * `HF2Q_VISION_E2E_MMPROJ` — path to the mmproj GGUF.
-//!   * `HF2Q_VISION_E2E_MLX_REPO` — model id passed to `mlx_vlm.generate`
-//!                                    (defaults to `mlx-community/gemma-4-vision-26b-A4B-it-bf16`).
+//!   * `HF2Q_VISION_E2E_MLX_REPO` — model id passed to `mlx_vlm.generate`.
+//!     **REQUIRED — there is no usable default.**  The harness's historical
+//!     placeholder `mlx-community/gemma-4-vision-26b-A4B-it-bf16` does
+//!     **not exist** on HuggingFace and any peer leg run against it 404s.
+//!     Set this to a real, accessible HF repo id (or a local path that
+//!     `mlx_vlm.generate --model` can resolve) before running the matrix.
+//!     If left unset, the harness still uses the placeholder string but
+//!     the per-pair peer call will fail fast with a clear "set
+//!     HF2Q_VISION_E2E_MLX_REPO" error captured in the report's
+//!     `mlx_vlm_stderr_tail_4kb` field rather than producing a vacuous
+//!     all-zero match matrix (iter-104 fix for the vacuous-25/25 bug).
 //!
-//! When unset, defaults point at `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/`
-//! which holds both the chat GGUF and the mmproj GGUF as sibling files.
+//! When unset, the GGUF + mmproj defaults point at
+//! `/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/` which holds
+//! both the chat GGUF and the mmproj GGUF as sibling files.
+//!
+//! ## Known issues / iter-104 harness bugs (fixed in this iter)
+//!
+//!   * **Bug 1 — model id resolution.**  Iter-101..103 harnesses sent
+//!     `model = file_stem(gguf)` in the chat-completions request body.
+//!     The hf2q server registers the loaded model under its GGUF
+//!     `general.name` metadata field (or file-stem only when that's
+//!     absent), so the hardcoded file_stem rarely matched and every POST
+//!     returned HTTP 400 `model_not_loaded`.  Fixed by querying
+//!     `GET /v1/models` once after `/readyz` flips and reusing
+//!     `data[0].id` as the model id for every per-pair POST — the
+//!     server is the source of truth for the loaded model id.
+//!   * **Bug 2 — placeholder `HF2Q_VISION_E2E_MLX_REPO`.**  The default
+//!     repo id does not exist; the harness now logs a concrete
+//!     "set HF2Q_VISION_E2E_MLX_REPO" pointer when the peer call's
+//!     stderr contains a 404 / "not found" / "does not exist" / "no such
+//!     file or directory" marker.
 //!
 //! What the harness does end-to-end (only when the env-gate fires):
 //!   1. Materialize 5 synthetic fixture PNGs in `tests/fixtures/vision/` if missing.
@@ -437,6 +464,42 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
         ));
     }
 
+    // ---- Step 1.5: ask the server for the canonical loaded model id ----
+    //
+    // The hf2q server registers the loaded GGUF under its `general.name`
+    // metadata (with a file-stem fallback).  Earlier iters of this harness
+    // hardcoded `file_stem(gguf)` in the request body, which produced
+    // HTTP 400 `model_not_loaded` whenever `general.name` differed from
+    // the file stem (the common case).  Source of truth for the loaded
+    // model id is `GET /v1/models` — `data[0].id` after the server
+    // prepends its loaded model.  Fail loudly if the response is empty
+    // or unparseable so a future regression here can never silently
+    // produce a vacuous-zero matrix again.
+    let models_url = format!("{base}/v1/models");
+    let models_out = std::process::Command::new("curl")
+        .args(["-s", "-H", "Accept: application/json", &models_url])
+        .output()?;
+    let models_body = String::from_utf8_lossy(&models_out.stdout).into_owned();
+    let models_json: serde_json::Value =
+        serde_json::from_str(&models_body).map_err(|e| {
+            let _ = hf2q.kill();
+            std::io::Error::other(format!(
+                "GET /v1/models returned non-JSON ({e}): {models_body}",
+            ))
+        })?;
+    let canonical_model_id = models_json["data"][0]["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "harness expected at least one loaded model in /v1/models response; \
+                 got: {models_body}"
+            ))
+        })?;
+    eprintln!(
+        "vision_e2e harness: resolved canonical model id from /v1/models: {canonical_model_id}",
+    );
+
     // ---- Step 2: 25-pair matrix via curl/JSON ----
     let mut pairs: Vec<PairOutcome> = Vec::with_capacity(25);
     for (pi, prompt) in STANDARD_PROMPTS.iter().enumerate() {
@@ -448,7 +511,7 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             };
             let body = serde_json::json!({
-                "model": Path::new(&gguf).file_stem().and_then(|s| s.to_str()).unwrap_or("hf2q"),
+                "model": canonical_model_id,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -517,7 +580,34 @@ fn run_e2e_matrix() -> std::io::Result<MatrixReport> {
         let stdout = String::from_utf8_lossy(&mlx_out.stdout).into_owned();
         let extracted = extract_mlx_vlm_output(&stdout);
         outcome.mlx_vlm_text = extracted.clone();
-        outcome.mlx_vlm_stderr_tail_4kb = tail_bytes(&mlx_out.stderr, 4 * 1024);
+        let stderr_tail = tail_bytes(&mlx_out.stderr, 4 * 1024);
+        // Iter-104 fix for Bug 2: when the mlx-vlm peer call fails with
+        // a repo-not-found / 404 / no-such-path style error, prepend a
+        // concrete pointer to the env var so the operator doesn't have
+        // to dig through stderr to figure out the placeholder default
+        // doesn't exist.  We only check the lowercased stderr tail to
+        // avoid mistaking a generation-time mention of "404" inside the
+        // model output for an infra failure.
+        let lower = stderr_tail.to_ascii_lowercase();
+        let looks_like_repo_404 = lower.contains("404")
+            || lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("no such file or directory")
+            || lower.contains("repositorynotfounderror");
+        outcome.mlx_vlm_stderr_tail_4kb = if looks_like_repo_404 {
+            format!(
+                "[hf2q vision-e2e harness] mlx-vlm peer call for '{}' looks like a \
+                 repo-not-found / 404 failure. The default \
+                 HF2Q_VISION_E2E_MLX_REPO value \
+                 'mlx-community/gemma-4-vision-26b-A4B-it-bf16' does NOT exist on \
+                 HuggingFace; set HF2Q_VISION_E2E_MLX_REPO to a real, accessible \
+                 HF repo id (or local path) before re-running.\n\
+                 ----- mlx_vlm stderr tail -----\n{}",
+                mlx_repo, stderr_tail,
+            )
+        } else {
+            stderr_tail
+        };
         outcome.exact_match = outcome.hf2q_text.trim() == extracted.trim();
         let mlx_first_word = extracted.split_whitespace().next().unwrap_or("");
         outcome.hf2q_starts_with_mlx_first_word =
