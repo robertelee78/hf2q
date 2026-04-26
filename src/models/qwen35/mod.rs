@@ -1307,6 +1307,105 @@ pub fn apply_qwen35_linear_attn_transforms_in_tensor_map(
     Ok(())
 }
 
+/// ADR-014 P1: lazy variant of [`apply_qwen35_linear_attn_transforms_in_tensor_map`].
+///
+/// Phase 1.7 — qwen35 linear-attention transforms (in_proj_qkvz split,
+/// V-head reorder, A_log negation, conv1d squeeze, dt_proj swap; the
+/// 6-case dispatcher at `convert_hf_to_gguf.py:5367-5424`).
+///
+/// The transforms slice and permute element data — they cannot be
+/// composed via shape-preserving `.map()`. Each affected tensor must
+/// be materialised to apply the transform; the result is re-inserted
+/// as [`LazyTensor::from_bytes`].
+///
+/// **Streaming benefit at this phase is bounded.** Linear-attention
+/// projection tensors (in_proj_qkvz, in_proj_a/b, A_log, dt_bias,
+/// dt_proj, conv1d, out_proj) are MB-scale per layer — orders of
+/// magnitude smaller than the GB-scale MoE expert tiles where
+/// Decision 7's layer-streaming pays off. Materialising them at this
+/// phase costs at most a few hundred MB across all linear-attention
+/// layers (apex MoE: ~300 MB across 30 linear-attn layers).
+///
+/// Same arch gate (Qwen3.5 family only) and same per-tensor transform
+/// dispatcher ([`transform_in_proj_qkvz`] + [`transform_linear_attn_tensor`])
+/// as the eager variant. The qkvz_keys + linear_attn_keys collection
+/// order is preserved (deterministic via [`crate::ir::lazy::LazyTensorMap`]'s
+/// BTreeMap).
+pub fn apply_qwen35_linear_attn_transforms_in_lazy_map(
+    lazy_map: &mut crate::ir::lazy::LazyTensorMap,
+    metadata: &crate::ir::ModelMetadata,
+) -> Result<(), ConvertError> {
+    use crate::ir::lazy::{LazyMeta, LazyTensor};
+
+    if !is_qwen35_family_architecture(&metadata.architecture, &metadata.model_type) {
+        return Ok(());
+    }
+
+    let ctx = Qwen35ConvertContext::from_metadata(metadata)?;
+
+    // Step 1: handle in_proj_qkvz tensors first (split into qkv + z),
+    // then transform the split qkv through case 1 (V-head reorder).
+    let qkvz_keys: Vec<String> = lazy_map
+        .names()
+        .filter(|n| n.contains("in_proj_qkvz.weight"))
+        .cloned()
+        .collect();
+
+    for key in qkvz_keys {
+        let Some(lazy) = lazy_map.remove(&key) else {
+            continue;
+        };
+        let qkvz_tensor = lazy
+            .materialize()
+            .map_err(|e| ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!("Phase 1.7 lazy lift materialize: {e}"),
+            })?;
+
+        let (qkv_tensor, z_tensor) = transform_in_proj_qkvz(qkvz_tensor, &ctx)?;
+        // Case 1 V-head reorder applies to the split qkv tensor.
+        let qkv_reordered = transform_linear_attn_tensor(qkv_tensor, &ctx)?;
+        // z follows the same V-head reorder path as in_proj_z (case 2).
+        let z_reordered = transform_linear_attn_tensor(z_tensor, &ctx)?;
+
+        for tref in [qkv_reordered, z_reordered] {
+            let meta = LazyMeta::new(tref.name.clone(), tref.shape.clone(), tref.dtype);
+            lazy_map.insert(LazyTensor::from_bytes(meta, tref.data));
+        }
+    }
+
+    // Step 2: walk all linear-attn tensors (independent in_proj_qkv,
+    // in_proj_z, in_proj_a/b, A_log, dt_bias, dt_proj, conv1d,
+    // out_proj). transform_linear_attn_tensor dispatches per-name or
+    // no-ops.
+    let linear_attn_keys: Vec<String> = lazy_map
+        .names()
+        .filter(|n| n.contains("linear_attn."))
+        .cloned()
+        .collect();
+
+    for key in linear_attn_keys {
+        let Some(lazy) = lazy_map.remove(&key) else {
+            continue;
+        };
+        let tensor = lazy
+            .materialize()
+            .map_err(|e| ConvertError::ReorderInvariantViolated {
+                name: key.clone(),
+                reason: format!("Phase 1.7 lazy lift materialize: {e}"),
+            })?;
+        let transformed = transform_linear_attn_tensor(tensor, &ctx)?;
+        let meta = LazyMeta::new(
+            transformed.name.clone(),
+            transformed.shape.clone(),
+            transformed.dtype,
+        );
+        lazy_map.insert(LazyTensor::from_bytes(meta, transformed.data));
+    }
+
+    Ok(())
+}
+
 /// Rename HF MTP (`mtp.*`) tensors into the standard `model.layers.{N}.*`
 /// form so the downstream `gguf::hf_name_to_gguf` mapper produces the
 /// `blk.{N}.*` and `blk.{N}.nextn.*` names llama.cpp expects (ADR-012

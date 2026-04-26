@@ -659,16 +659,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         .context("qwen35 RMS norm +1 bias application (lazy) failed")
         .map_err(AppError::Conversion)?;
 
-    // ADR-014 P1 bridge: subsequent Phase 1.x transforms (1.7 / 1.8)
-    // are still eager. Bridge through `materialize_all` here. Each
-    // Phase 1.x lifted in subsequent P1 iters moves this bridge later;
-    // once the streaming quantize loop (P2) lands the bridge becomes
-    // test-only.
-    let mut tensor_map = lazy_map
-        .materialize_all()
-        .context("Failed to materialise lazy tensor map (P0→P1 bridge)")
-        .map_err(AppError::Conversion)?;
-
     // Phase 1.7: ADR-012 P2/P3 Decision 5 + R2 — linear-attention transforms.
     // A_log negation, conv1d squeeze, in_proj_qkvz split into qkv + z,
     // and the 6-case V-head grouped→tiled reorder per py:5367-5424.
@@ -684,11 +674,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // Spec sources: convert_hf_to_gguf.py:5367-5424 (6-case dispatcher)
     // + Qwen3NextModel.modify_tensors:4786-4830 (A_log negation, dt_bias
     // rename, conv1d squeeze). No-op for non-Qwen3.5 arches.
-    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
-        &mut tensor_map,
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap. Per-tensor materialise +
+    // transform + re-insert as LazyTensor::from_bytes (the transforms
+    // slice and permute element data, can't compose via .map()).
+    // Streaming benefit bounded — linear-attn projections are MB-scale
+    // per layer, orders of magnitude smaller than the GB MoE tiles.
+    models::qwen35::apply_qwen35_linear_attn_transforms_in_lazy_map(
+        &mut lazy_map,
         &metadata,
     )
-    .context("qwen35 linear-attention transforms failed")
+    .context("qwen35 linear-attention transforms (lazy) failed")
     .map_err(AppError::Conversion)?;
 
     // Phase 1.8: ADR-012 vocab-pad de-pad — surfaced 2026-04-25 by
@@ -709,20 +705,95 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // tensor doesn't match the original metadata.vocab_size.  Updates
     // `metadata.vocab_size` to the de-padded value so downstream metadata
     // emission is consistent.
-    if let Some(true_vocab) =
-        input::detect_padded_vocab(&config.input_dir, &metadata)
-            .context("vocab-pad detection failed")
-            .map_err(AppError::Conversion)?
+    //
+    // ADR-014 P1: lifted onto LazyTensorMap. Truncation is shape-changing
+    // (rows decrease) — embed tensors materialise, slice the byte buffer,
+    // re-insert as LazyTensor::from_bytes with updated shape. Embed
+    // tensors are ~1 GB at apex MoE scale (248k × 2048 × 2 bytes); the
+    // materialise here is bounded to the 1-2 embed tensors only.
+    if let Some(true_vocab) = input::detect_padded_vocab(&config.input_dir, &metadata)
+        .context("vocab-pad detection failed")
+        .map_err(AppError::Conversion)?
     {
-        let truncated = input::truncate_padded_vocab(&mut tensor_map, &mut metadata, true_vocab);
+        let mut truncated = 0usize;
+        for key in ["model.embed_tokens.weight", "lm_head.weight"] {
+            let Some(old_lazy) = lazy_map.remove(key) else {
+                continue;
+            };
+            // Validate metadata before forcing materialise — same 2-D
+            // shape contract as the eager `truncate_padded_vocab`.
+            if old_lazy.shape().len() != 2 {
+                lazy_map.insert(old_lazy);
+                continue;
+            }
+            let original_rows = old_lazy.shape()[0];
+            let cols = old_lazy.shape()[1];
+            let new_rows = true_vocab as usize;
+            if new_rows >= original_rows {
+                lazy_map.insert(old_lazy);
+                continue;
+            }
+            let elem_size = match old_lazy.dtype() {
+                ir::DType::F32 => 4,
+                ir::DType::F16 | ir::DType::BF16 => 2,
+                ir::DType::U8 => 1,
+                _ => {
+                    lazy_map.insert(old_lazy);
+                    continue;
+                }
+            };
+            let new_byte_len = new_rows * cols * elem_size;
+            // Materialise + truncate + re-insert.
+            let dtype = old_lazy.dtype();
+            let materialised = old_lazy
+                .materialize()
+                .context("vocab-pad de-pad materialise failed")
+                .map_err(AppError::Conversion)?;
+            if new_byte_len > materialised.data.len() {
+                // Defensive: shouldn't happen if shape matches.
+                let mut data = materialised.data;
+                let new_meta = ir::lazy::LazyMeta::new(
+                    materialised.name,
+                    vec![original_rows, cols],
+                    dtype,
+                );
+                data.truncate(original_rows * cols * elem_size);
+                lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
+                continue;
+            }
+            let mut data = materialised.data;
+            data.truncate(new_byte_len);
+            let new_meta = ir::lazy::LazyMeta::new(key.to_string(), vec![new_rows, cols], dtype);
+            lazy_map.insert(ir::lazy::LazyTensor::from_bytes(new_meta, data));
+            truncated += 1;
+            tracing::info!(
+                tensor = key,
+                from_rows = original_rows,
+                to_rows = new_rows,
+                "ADR-014 Phase 1.8 (lazy): truncated embedding to de-padded vocab"
+            );
+        }
+        // Update metadata regardless — same semantics as eager (callers
+        // expect post-call invariant `metadata.vocab_size == true_vocab`).
+        metadata.vocab_size = true_vocab;
         if truncated > 0 {
             tracing::info!(
                 truncated_tensors = truncated,
                 de_padded_vocab = true_vocab,
-                "ADR-012 Phase 1.8: vocab-pad fix applied"
+                "ADR-012 Phase 1.8 (lazy): vocab-pad fix applied"
             );
         }
     }
+
+    // ADR-014 P1 bridge: every Phase 1.x transform now lifted. The
+    // streaming quantize loop (P2) will consume from `lazy_map`
+    // directly; until P2 lands, bridge through `materialize_all` once,
+    // immediately before Phase 2's backend dispatch. After P2 the
+    // bridge becomes test-only.
+    let mut tensor_map = lazy_map
+        .materialize_all()
+        .context("Failed to materialise lazy tensor map (P1→P2 bridge)")
+        .map_err(AppError::Conversion)?;
 
     check_interrupted()?;
 
