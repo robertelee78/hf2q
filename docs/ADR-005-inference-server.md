@@ -1428,6 +1428,144 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2a iter-133 Iter A — Open WebUI multi-turn streaming chat E2E test (Scenario 1 text-stream) lands; surfaced + side-fixed minijinja-pycompat blocker for any gemma4 multi-turn render; AC 2509 partially exercised — tool use + reasoning panel deferred to iter-133 B/C (2026-04-26, W64, hf2q commits `763a1f1` + `aebbe97` + `18617b4` + `38b9917`)
+
+**Why this iter exists.** W63 iter-132 closed the Phase 2c vision-coherence chain at peer-precision-parity (F16 budget) and pivoted the iter-133 plan to the highest-priority closeable item: Phase 2a AC line 2509 ("Open WebUI on separate host: multi-turn chat works (streaming, tool use, reasoning-panel display). Image input required at 2c, not 2a."). The W4 research at line 3264 had already scoped this as 3 scenarios × 3 iters (Iter A text-stream, Iter B tool-call, Iter C reasoning-panel). Iter A lands the harness + Scenario 1 + recorded fixture so iters B/C have a working test base to extend.
+
+**Phase 1 — Chesterton's-fence read of existing serve infra.**
+
+Cross-referenced `src/serve/mod.rs::cmd_serve` (W30/W41/W96 era), `src/serve/api/handlers.rs::chat_completions` (iter-99 multimodal dispatch + iter-95 grammar wiring), `src/serve/api/sse.rs::generation_events_stream` (the SSE chunk emitter, OpenAI streaming shape), `src/serve/api/engine.rs::render_chat_prompt` (the chat-template Jinja env), and the prior-art subprocess test patterns in `tests/vision_e2e_vs_mlx_vlm.rs` (W41 iter-101) and `tests/mmproj_llama_cpp_compat.rs` (W42 iter-116i).
+
+Decision: subprocess-spawn `hf2q serve` rather than build an in-process axum oneshot — same rationale as W41 vision_e2e: subprocess testing exercises the iter-103 synchronous warmup ordering, the tokio runtime composition in `cmd_serve`, AND the Engine FIFO worker thread; in-process oneshot would skip all three. For SSE consumption, the raw `TcpStream` idiom in `mmproj_llama_cpp_compat.rs` would force re-implementing `Transfer-Encoding: chunked` plus SSE framing — `reqwest` with the `stream` feature exposes `Response::bytes_stream()`, which lets the harness reassemble SSE chunks across TCP packet boundaries cleanly. New dev-deps `reqwest = "0.12"` (default-features off; `json` + `stream` + `rustls-tls` features) and `futures-util = "0.3"` (StreamExt::next, since runtime `futures = "0.3"` re-exports only a subset).
+
+**Phase 2 — test harness (commits `763a1f1` + `18617b4` + `38b9917`).**
+
+Cargo dev-deps (`Cargo.toml`, commit `763a1f1`):
+
+```toml
+reqwest = { version = "0.12", default-features = false,
+            features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+```
+
+`rustls-tls` keeps the test build off any system OpenSSL link (the server is plain HTTP so we never negotiate TLS, but reqwest's defaults pull system OpenSSL).
+
+Test helper module (`tests/openwebui_helpers/mod.rs`, 553 LOC, commit `18617b4`) — lives under a subdirectory so Cargo's integration-test discovery does NOT auto-compile it as a separate test binary. iters B/C will reuse it via `#[path = "openwebui_helpers/mod.rs"] mod helpers;`. Provides:
+
+- `ServerGuard` — RAII subprocess wrapper; Drop kills the child so a panic mid-test never strands a 16 GB-resident server (matches the pattern in `tests/vision_e2e_vs_mlx_vlm.rs`).
+- `wait_for_readyz` — `/readyz` poll loop using a raw `TcpStream` (NOT reqwest::blocking — avoids a hot reqwest client during warmup's multi-GB GPU loads). 600 s budget matches W41 iter-101.
+- `streaming_chat` — async reqwest helper that POSTs `/v1/chat/completions` with `stream: true`, parses SSE chunks across TCP packet boundaries via `Response::bytes_stream()`, returns per-frame payloads + accumulated `delta.content`.
+- `nonstreaming_chat` — same handler, `stream: false`.
+- `fetch_canonical_model_id` — GET `/v1/models` → `data[0].id` (per W42 iter-116i, the loaded id is `general.name`, not the file stem; for the gemma4 test GGUF it's `Gemma4ForConditionalGeneration`).
+- `assert_streaming_invariants` — pins the OpenAI streaming shape: `delta.role == "assistant"` once, `delta.content` deltas, terminal `finish_reason`, `data: [DONE]` last. Cross-references the SSE emitter at `src/serve/api/sse.rs:152-295`.
+- `assert_nonstreaming_invariants` — pins `chatcmpl-` id prefix + `object: "chat.completion"` + non-empty `message.content` + `finish_reason`.
+- Fixture record / replay (`write_fixture`, `replay_fixture_assert`, `normalize_chunk_for_replay`) — strips per-request-ephemeral fields (`id`, `created`) so a recorded fixture matches across runs. 50 KB truncation cap.
+
+Test driver (`tests/openwebui_multiturn.rs`, 251 LOC, commit `38b9917`) — Cargo integration test, gated by `HF2Q_OPENWEBUI_E2E=1` (default-off, parallel to iter-101's `HF2Q_VISION_E2E`). Test flow:
+
+1. Spawn `hf2q serve` at `127.0.0.1:52334` with `HF2Q_OPENWEBUI_E2E_GGUF` (defaults to canonical gemma-4 GGUF).
+2. Wait for `/readyz` 200.
+3. Resolve canonical `model_id` from `/v1/models`.
+4. **Turn 1**: `[user("Say hello in one word.")]` → assert SSE invariants → capture `turn1_text`.
+5. **Turn 2**: `[user, assistant(turn1_text), user("Now say goodbye in one word.")]` → assert SSE invariants → capture `turn2_text`.
+6. **Turn 3**: 5-message history → assert SSE invariants → capture `turn3_text`.
+7. **Determinism**: re-run turn 1 at `temperature=0`, assert `turn1_text == rerun_text` byte-identical.
+8. **Non-streaming companion**: turn 1 with `stream: false` → assert non-streaming invariants.
+9. **Fixture record/replay** at `tests/fixtures/openwebui_multiturn/turn1_chunks.txt`. Records on `HF2Q_OPENWEBUI_E2E_RECORD=1`; otherwise replays + asserts byte-identical chunk shape (modulo `id` + `created` normalization).
+
+Distinct port `52334` from `mmproj_llama_cpp_compat.rs` (52226) and `vision_e2e_vs_mlx_vlm.rs` (18181) — collisions are operator error under the OOM `--test-threads=1` directive but distinct ports keep the failure mode obvious.
+
+**Phase 3 — minijinja-pycompat side-fix (commit `aebbe97`).**
+
+Surfaced while running the harness end-to-end: turn 1 returned 200 + `"Hello!"`, turn 2 returned **HTTP 400** with body:
+
+```json
+{"error":{"message":"chat template render failed: Failed to render chat template",
+          "type":"invalid_request_error","param":"messages","code":null}}
+```
+
+Root cause traced via `Environment::new()` strict-method behavior: the Gemma 4 chat template (`chat_template.jinja`) defines a `strip_thinking` macro:
+
+```jinja
+{%- macro strip_thinking(text) -%}
+    {%- for part in text.split('<channel|>') -%}
+        ...
+    {%- endfor -%}
+{%- endmacro -%}
+```
+
+The macro is invoked on every assistant content (line 228-229 in the template). Single-turn chat works because no `model`-role message exists yet — the macro path is dead on turn 1. The bug surfaces at the SECOND user turn, the same chat that Open WebUI sends every time the operator types a follow-up. minijinja's vanilla `Environment::new()` doesn't expose Python-style string methods (`.split()`, `.strip()`, `.lstrip()`, `.lower()`); the template render fails with `UnknownMethod: string has no method named split`.
+
+Fix: register `minijinja_contrib::pycompat::unknown_method_callback` on the chat-template `Environment` in `render_chat_prompt`. The callback is purely additive — minijinja consults it ONLY when it can't find a method natively, so existing templates that don't use Python-style methods are unaffected. Two-line surgical change:
+
+- `Cargo.toml`: add `minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }`.
+- `src/serve/api/engine.rs::render_chat_prompt`: `env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);` before `env.add_template(...)`.
+
+Regression-protected by a new unit test `render_chat_prompt_handles_pythonic_string_methods_via_pycompat` that exercises a multi-turn render with a macro calling `text.split('|')` — without the pycompat callback the test panics on unwrap; with it, the render produces the expected per-part output. All 4 pre-existing `render_chat_prompt_*` tests continue to PASS.
+
+**Side-fix scope discipline.** Per the iter-133 directive: *"Production code in src/serve/ should NOT need changes for this iter — if you find a bug in the SSE protocol, fix it forward but document the side-fix; iter A is supposed to be test-only."* The bug is in chat-template rendering, NOT SSE framing — but the spirit applies: any operator running gemma4 chat through Open WebUI hits HTTP 400 at the second user turn. Closing AC 2509 is impossible without it. The fix is two lines, documented inline in the engine commit, and is purely additive (no behavioral change to single-turn rendering, no change to non-Python-style templates). Per `feedback_no_shortcuts.md` + the mantra ("no shortcuts; just pure excellence"), shipping the harness without this fix would be an unacceptable defer of a real production bug.
+
+**Phase 4 — verification (real E2E).**
+
+Run at HEAD with `HF2Q_OPENWEBUI_E2E=1 HF2Q_OPENWEBUI_E2E_RECORD=1` against the canonical gemma-4 chat GGUF (16 GB):
+
+```
+openwebui_multiturn: spawning hf2q serve at 127.0.0.1:52334 with model=…/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf
+openwebui_helpers: /readyz=200 after 4s
+openwebui_multiturn: canonical model_id=Gemma4ForConditionalGeneration
+openwebui_multiturn: turn1_text="Hello!"
+openwebui_multiturn: turn2_text="Goodbye!"
+openwebui_multiturn: turn3_text="\"Hello\" (or more specifically, \"What did I ask first?\")"
+openwebui_multiturn: determinism PASS — turn1 byte-identical at temperature=0
+openwebui_multiturn: non-streaming companion PASS — finish_reason=stop
+openwebui_multiturn: recorded fixture at "tests/fixtures/openwebui_multiturn/turn1_chunks.txt"
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.82s
+```
+
+Re-run with `HF2Q_OPENWEBUI_E2E=1` (no `_RECORD`) — replays the fixture and asserts byte-identical chunk shape modulo `id` + `created`:
+
+```
+openwebui_multiturn: replayed fixture at "tests/fixtures/openwebui_multiturn/turn1_chunks.txt" — content-shape match
+test result: ok. 1 passed
+```
+
+Recorded fixture (`tests/fixtures/openwebui_multiturn/turn1_chunks.txt`, 4 lines, 672 bytes):
+
+1. role chunk (`delta.role == "assistant"`)
+2. content chunk (`delta.content == "Hello!"`)
+3. final chunk (`finish_reason == "stop"`)
+4. `[DONE]`
+
+Cargo verify:
+
+| Step | Command | Result |
+|---|---|---|
+| 1 | `cargo check --release` | 0 errors, 10 pre-existing warnings |
+| 2 | `cargo build --release --bin hf2q` | 0 errors |
+| 3 | `cargo test --release --test openwebui_multiturn` (skip mode) | 1 passed (skip note printed) |
+| 4 | `HF2Q_OPENWEBUI_E2E=1 cargo test --release --test openwebui_multiturn -- --test-threads=1` | **1 passed** (full E2E) |
+| 5 | `cargo test --release --bin hf2q -- vision::` | 241 passed / 0 fail / 2 ignored (matches iter-132 baseline — no regression) |
+
+**Phase 5 — AC bookkeeping.**
+
+AC line 2509 stays `[ ]`. The AC text demands four concerns: `streaming, tool use, reasoning-panel display`. Iter A exercises only the first (text-stream multi-turn). Iter B (tool-call round-trip) and iter C (reasoning-panel) close the rest. **Honest closure**: a partial implementation never flips an AC.
+
+A new AC-internal note will land in iter B or C documenting the recorded fixture path so the operator-level "I tried it in Open WebUI and it worked" claim has a regression-stable artifact.
+
+**Files touched.**
+- `Cargo.toml` + `Cargo.lock` (commit `763a1f1`: dev-deps; commit `aebbe97`: minijinja-contrib runtime dep).
+- `src/serve/api/engine.rs` (commit `aebbe97`: pycompat callback registration + regression unit test).
+- `tests/openwebui_helpers/mod.rs` (commit `18617b4`: 553 LOC helper module).
+- `tests/openwebui_multiturn.rs` (commit `38b9917`: 251 LOC test driver).
+- `tests/fixtures/openwebui_multiturn/turn1_chunks.txt` (commit `38b9917`: 4 lines / 672 bytes recorded fixture).
+- `docs/ADR-005-inference-server.md` (this entry).
+
+Fenced files (`backends/gguf.rs`, `ir/`, `convert/`, `quality/`, `forward_gpu` upload paths) untouched. No mlx-native changes. No fences crossed.
+
+**Iter-133 Iter B target.** Scenario 2 tool-call round-trip. Send a chat with `tools: [{...}]`, assert the grammar-driven tool-call delta sequence (first chunk has `id` + `type: "function"` + `name`, subsequent chunks are arguments-only deltas), inject a `tool` role response, send a follow-up turn, assert downstream content references the tool result. Will reuse `tests/openwebui_helpers/mod.rs` directly. Estimated 1 iter; AC 2509 candidate flip if iters A+B together cover "streaming, tool use" and the reasoning-panel test model isn't cached locally for iter C.
+
+---
+
 #### Phase 2c iter-132 — vision coherence CLOSURE: Phase 2c AC #14 (mmproj F16 cross-compat) + AC #15 (`generate --image` correct image-aware output) flipped to PASS; closure landed at peer-precision-parity at F16 budget; falsification chain ended via Option C pin (2026-04-26, W63, doc-only)
 
 **Why this iter exists.** W62 iter-131 closed the gemma4v ViT cascade investigation: the 4.08× block 25→26 spike was sub-localized to `_06_attn_out` (sign-flip at O-projection) and audited against peer (`/opt/llama.cpp/tools/mtmd/clip.cpp::build_attn` + `gemma4v.cpp`) — every named ggml op semantically matched, F16 weight bytes byte-identical to peer GGUF for three representative late-block tensors (`v.blk.26.attn_q.weight`, `v.blk.26.attn_post_norm.weight`, `v.blk.26.ffn_post_norm.weight`), macro stats (max_abs, mean_abs) match peer at every captured stage to within ~1%. The cascade is **inherent F16 budget reaching argmax-flip threshold organically at deep blocks** (27-block ViT × F16 attention scores × 1.13×/block compounding × terminal RMSNorm × √N amplification), the same physics in peer's pipeline; FP-non-associative cumulative noise direction differs by chance, not by precision deficit. Iter-131 left two paths open: Option A (revert iter-129's K F16 cast in `vit_attention_scores_gpu` — a deliberate peer-precision UPGRADE that violates "as fast as peer") or Option C (pin and document). Iter-132's job is closure: pick Option C, flip the two closeable Phase 2c ACs, and write the iter-133 plan.
