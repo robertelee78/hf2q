@@ -109,6 +109,31 @@ impl FullAttnWeightsGpu {
             wo:     upload_q4_0_from_f32(&weights.wo, device)?,
         })
     }
+
+    /// Test-only upload variant: keeps **all** projection weights as raw F32
+    /// (no Q4_0 quantization).  Used by the GPU↔CPU kernel-pipeline parity
+    /// tests so quantization noise (~1e-2) does not mask kernel correctness
+    /// regressions (1e-3 BF16-cast bound).  Production decode always uses
+    /// [`Self::from_cpu`] (Q4_0, ~3.56× less projection bandwidth).
+    ///
+    /// At projection time, `apply_linear_projection_f32` takes the F32 branch
+    /// (line ~565) which casts weights to BF16 on the GPU and dispatches the
+    /// MMA tiled matmul — the same numeric path the original P7b test was
+    /// written against, before Q4_0 was added in commit fad4263.
+    #[cfg(test)]
+    pub fn from_cpu_f32(weights: &FullAttnLayerWeights, device: &MlxDevice) -> Result<Self> {
+        Ok(Self {
+            attn_norm: upload_f32(&weights.attn_norm, device)?,
+            post_attn_norm: upload_f32(&weights.post_attn_norm, device)?,
+            wq:     upload_f32(&weights.wq, device)?,
+            wk:     upload_f32(&weights.wk, device)?,
+            wv:     upload_f32(&weights.wv, device)?,
+            w_gate: upload_f32(&weights.w_gate, device)?,
+            attn_q_norm: upload_f32(&weights.attn_q_norm, device)?,
+            attn_k_norm: upload_f32(&weights.attn_k_norm, device)?,
+            wo:     upload_f32(&weights.wo, device)?,
+        })
+    }
 }
 
 /// Convert a single f32 to bf16 using round-to-nearest-even (RNE).
@@ -1217,6 +1242,17 @@ mod tests {
     }
 
     /// Weight upload into `FullAttnWeightsGpu` preserves all 8 tensors.
+    ///
+    /// Per the `FullAttnWeightsGpu::from_cpu` docstring (and commit fad4263:
+    /// "Q4_0 attn projection weights — 19→22 tok/s +17%"), the four large
+    /// projection weights (wq, wk, wv, w_gate, wo) are quantized to Q4_0
+    /// GGML blocks at upload time and stored as `DType::U8` byte buffers.
+    /// The three small per-element-norm weights (attn_norm, attn_q_norm,
+    /// attn_k_norm) stay raw F32.  This test verifies *both* paths:
+    ///
+    ///   - F32 weights round-trip bitwise via `download_f32`.
+    ///   - Q4_0 weights are bit-identical to a fresh `encode_q4_0_blocks`
+    ///     of the same input data (the byte-for-byte canonical encoding).
     #[test]
     fn from_cpu_uploads_all_weights() {
         let device = MlxDevice::new().expect("device");
@@ -1230,26 +1266,53 @@ mod tests {
         let q_total = nh * d;
         let kv_total = nkv * d;
 
-        // Verify every buffer was uploaded with correct contents.
+        // Group 1: F32 small weights (RMSNorm vectors).  Round-trip exact.
         for (name, expected, buf) in [
-            ("attn_norm", &weights_cpu.attn_norm, &gpu.attn_norm),
-            ("wq", &weights_cpu.wq, &gpu.wq),
-            ("wk", &weights_cpu.wk, &gpu.wk),
-            ("wv", &weights_cpu.wv, &gpu.wv),
-            ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
+            ("attn_norm",   &weights_cpu.attn_norm,   &gpu.attn_norm),
             ("attn_q_norm", &weights_cpu.attn_q_norm, &gpu.attn_q_norm),
             ("attn_k_norm", &weights_cpu.attn_k_norm, &gpu.attn_k_norm),
-            ("wo", &weights_cpu.wo, &gpu.wo),
         ] {
-            let got = download_f32(buf).expect("download");
             assert_eq!(
-                got.len(),
-                expected.len(),
-                "{name}: length mismatch"
+                buf.dtype(), DType::F32,
+                "{name}: expected F32 storage for small RMSNorm weight, got {:?}", buf.dtype()
             );
+            let got = download_f32(buf).expect("download F32");
+            assert_eq!(got.len(), expected.len(), "{name}: length mismatch");
             for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(g.to_bits(), e.to_bits(), "{name}[{i}]");
             }
+        }
+
+        // post_attn_norm is also F32 (uploaded by upload_f32 in from_cpu).
+        assert_eq!(gpu.post_attn_norm.dtype(), DType::F32, "post_attn_norm dtype");
+        let got_post = download_f32(&gpu.post_attn_norm).expect("download post_attn_norm");
+        assert_eq!(got_post.len(), weights_cpu.post_attn_norm.len(), "post_attn_norm length");
+        for (i, (&g, &e)) in got_post.iter().zip(weights_cpu.post_attn_norm.iter()).enumerate() {
+            assert_eq!(g.to_bits(), e.to_bits(), "post_attn_norm[{i}]");
+        }
+
+        // Group 2: Q4_0-quantized projection weights.  Stored as U8 raw blocks;
+        // verify by re-encoding with the same canonical CPU encoder and
+        // comparing the byte stream.
+        for (name, expected, buf) in [
+            ("wq",     &weights_cpu.wq,     &gpu.wq),
+            ("wk",     &weights_cpu.wk,     &gpu.wk),
+            ("wv",     &weights_cpu.wv,     &gpu.wv),
+            ("w_gate", &weights_cpu.w_gate, &gpu.w_gate),
+            ("wo",     &weights_cpu.wo,     &gpu.wo),
+        ] {
+            assert_eq!(
+                buf.dtype(), DType::U8,
+                "{name}: expected U8 storage for Q4_0 blocks, got {:?}", buf.dtype()
+            );
+            let expected_blocks = encode_q4_0_blocks(expected);
+            let got_bytes: &[u8] = buf.as_slice().expect("as_slice u8");
+            assert_eq!(
+                got_bytes.len(),
+                expected_blocks.len(),
+                "{name}: Q4_0 byte length mismatch"
+            );
+            assert_eq!(got_bytes, expected_blocks.as_slice(), "{name}: Q4_0 byte mismatch");
         }
 
         // Suppress unused warnings for shape dims used in the fixture.
@@ -1662,8 +1725,13 @@ mod tests {
         );
 
         // --- GPU path ---
-        // Upload weights.
-        let gpu_weights = FullAttnWeightsGpu::from_cpu(&weights_cpu, &device)
+        // Upload weights as raw F32 (test-only path, see `from_cpu_f32`).
+        // The production `from_cpu` quantizes wq/wk/wv/w_gate/wo to Q4_0
+        // (~1e-2 magnitude noise per projection), which would mask kernel-
+        // correctness regressions at the 1e-3 tolerance this gate enforces.
+        // Q4_0-vs-F32 numerical equivalence is covered separately by the
+        // sourdough end-to-end token gate.
+        let gpu_weights = FullAttnWeightsGpu::from_cpu_f32(&weights_cpu, &device)
             .expect("upload weights");
 
         // Upload x.
