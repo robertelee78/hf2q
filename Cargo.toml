@@ -105,6 +105,22 @@ criterion = "0.5"
 regex = "1"
 tower = { version = "0.4", features = ["util"] }
 
+# ADR-005 Phase 2a iter-133 (Iter A): Open WebUI multi-turn streaming chat E2E test.
+# The test spawns `hf2q serve` as a subprocess and drives `/v1/chat/completions`
+# with `stream: true`, so it needs a real HTTP client capable of consuming a
+# chunked SSE response stream. `reqwest` with the `stream` feature exposes
+# `Response::bytes_stream()`, which lets us reassemble SSE chunks across TCP
+# packet boundaries cleanly (raw `TcpStream` would force us to re-implement
+# `Transfer-Encoding: chunked` and SSE framing). `rustls-tls` keeps the test
+# build off any system OpenSSL link; the server is plain HTTP so we never
+# negotiate TLS, but reqwest's default features include OpenSSL-linked TLS
+# which would add a system dep for nothing.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Stream consumption helpers (`StreamExt`, `try_next`) for the SSE bytes_stream.
+# `futures` is a runtime dep but only re-exports a subset; `futures-util` is
+# the canonical home for `StreamExt::next`.
+futures-util = "0.3"
+
 [[bin]]
 name = "iter23_audit"
 path = "src/bin/iter23_audit.rs"
