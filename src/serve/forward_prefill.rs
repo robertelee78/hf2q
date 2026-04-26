@@ -17,9 +17,58 @@ use anyhow::Result;
 use mlx_native::MlxBuffer;
 use mlx_native::ops::flash_attn_vec::FlashAttnVecParams;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
+use std::ops::Range;
 use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
+
+/// Per-position embedding override for soft-token injection
+/// (Phase 2c Task #17, iter-97).
+///
+/// When `forward_prefill_with_soft_tokens` (or `forward_prefill` with a
+/// non-empty soft-tokens slice) reaches a token whose position lies
+/// within `range`, it skips the standard `embedding_gather_scale_f32`
+/// dispatch and instead copies the corresponding row of `embeddings`
+/// (a `[range.len() × hidden_size]` F32 buffer) into the per-token
+/// hidden-state buffer via `mlx_native::ops::copy::dispatch_copy_f32`.
+///
+/// Used by the multimodal chat path: the chat template emits one
+/// `<|image|>` placeholder token per image, the handler expands it into
+/// `N_image_tokens` consecutive positions, runs the ViT + projector to
+/// obtain `[N_image_tokens, hidden_size]` projected vision embeddings,
+/// then attaches `SoftTokenInjection { range: image_range, embeddings:
+/// projected_vision_embeddings }` to the prefill call.  At each
+/// `pos ∈ image_range`, the model sees the projected-vision row instead
+/// of the language-model embedding for whatever placeholder token id
+/// was emitted by the tokenizer.
+///
+/// **Pre-scaling contract.**  Gemma-family text inputs go through
+/// `embedding_gather_scale_f32` which multiplies the looked-up row by
+/// `sqrt(hidden_size)`.  The standard multimodal projector output is
+/// already in the model's hidden-state space (no additional scaling) —
+/// the soft-token path therefore copies the override row VERBATIM.
+/// Other model families that DON'T pre-scale text embeddings are
+/// equivalent (no-op scaling either way).
+///
+/// **Range vs. token-id contract.**  The placeholder token IDs at
+/// `prompt_tokens[range]` are IGNORED — the override completely
+/// replaces the embed step at those positions.  Callers should
+/// nevertheless place the same special-token id (e.g. Gemma's
+/// `<|image|>`, id=...) at those positions because (a) it provides
+/// a clean fallback when the soft-tokens slice is empty, (b) it
+/// makes the request token-counting consistent with the OpenAI
+/// usage shape.
+pub struct SoftTokenInjection<'a> {
+    /// Half-open position range within the prompt: `[start, end)`.
+    pub range: Range<usize>,
+    /// Replacement embeddings, shape `[range.len(), hidden_size]` F32,
+    /// row-major.  Buffer outlives this `SoftTokenInjection` (lifetime
+    /// `'a`).  Caller is responsible for ensuring the row count
+    /// matches `range.len()` and the column count matches the model's
+    /// `hidden_size` — `forward_prefill` validates and errors clean
+    /// on mismatch.
+    pub embeddings: &'a MlxBuffer,
+}
 use super::forward_mlx::{
     MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
     dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
@@ -57,9 +106,39 @@ impl MlxModelWeights {
     /// TQ quantization noise during prompt ingestion.
     ///
     /// Returns the first decode token (greedy argmax of last-row logits).
+    /// Existing-API thin wrapper: prefill with no soft-token overrides.
+    /// All pre-iter-97 callers (warmup, generate, embed_last) use this.
     pub fn forward_prefill(
         &mut self,
         prompt_tokens: &[u32],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<u32> {
+        self.forward_prefill_with_soft_tokens(prompt_tokens, &[], max_decode_tokens, gpu)
+    }
+
+    /// Soft-token-aware prefill (Phase 2c Task #17, iter-97).
+    ///
+    /// Same semantics as `forward_prefill` except that for any prompt
+    /// position `p` that lies within a `SoftTokenInjection.range`, the
+    /// per-token embed step is replaced by a buffer-copy from the
+    /// override embeddings instead of dispatching the standard
+    /// `embedding_gather_scale_f32` against `embed_weight[token_id]`.
+    /// The placeholder token IDs at those positions are ignored (the
+    /// language-model lookup is fully bypassed).
+    ///
+    /// See the `SoftTokenInjection` struct doc for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// In addition to the base `forward_prefill` error set:
+    ///   * `SoftTokenInjection.range` extends past `prompt_tokens.len()`.
+    ///   * Two `SoftTokenInjection` ranges overlap (ambiguous override).
+    ///   * `embeddings.byte_len()` is too small for `range.len() × hidden_size × 4`.
+    pub fn forward_prefill_with_soft_tokens(
+        &mut self,
+        prompt_tokens: &[u32],
+        soft_tokens: &[SoftTokenInjection<'_>],
         max_decode_tokens: usize,
         gpu: &mut GpuContext,
     ) -> Result<u32> {
@@ -68,6 +147,43 @@ impl MlxModelWeights {
             anyhow::bail!("forward_prefill: empty prompt");
         }
         let hs = self.hidden_size;
+        // Validate soft-token ranges + embedding sizes upfront so we
+        // fail before the (expensive) prefill loop starts.
+        for (i, st) in soft_tokens.iter().enumerate() {
+            if st.range.end > seq_len {
+                anyhow::bail!(
+                    "forward_prefill: soft_tokens[{}].range {:?} extends past prompt_tokens.len()={}",
+                    i, st.range, seq_len
+                );
+            }
+            if st.range.start >= st.range.end {
+                anyhow::bail!(
+                    "forward_prefill: soft_tokens[{}].range {:?} is empty or reversed",
+                    i, st.range
+                );
+            }
+            let needed_bytes = st.range.len() * hs * 4;
+            if st.embeddings.byte_len() < needed_bytes {
+                anyhow::bail!(
+                    "forward_prefill: soft_tokens[{}].embeddings byte_len={} < required {} \
+                     ({} positions × {} hidden × 4 bytes)",
+                    i, st.embeddings.byte_len(), needed_bytes, st.range.len(), hs
+                );
+            }
+        }
+        // Reject overlapping ranges (ambiguous which embedding wins).
+        for i in 0..soft_tokens.len() {
+            for j in (i + 1)..soft_tokens.len() {
+                let a = &soft_tokens[i].range;
+                let b = &soft_tokens[j].range;
+                if a.start < b.end && b.start < a.end {
+                    anyhow::bail!(
+                        "forward_prefill: soft_tokens ranges overlap — [{}]={:?} vs [{}]={:?}",
+                        i, a, j, b
+                    );
+                }
+            }
+        }
         let num_layers = self.layers.len();
         let vocab_size = self.vocab_size;
         let eps = self.rms_norm_eps;
@@ -362,14 +478,45 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("prefill session T{tok_i}: {e}"))?;
 
                 // --- 1. Embedding ---
-                mlx_native::ops::elementwise::embedding_gather_scale_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.embed_weight,
-                    &self.activations.hidden,
-                    tok, hs,
-                    (hs as f32).sqrt(),
-                ).map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
-                s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
+                //
+                // Soft-token override path (Phase 2c Task #17, iter-97):
+                // when this position lies within any soft-token range,
+                // the standard embedding-table lookup is replaced by an
+                // on-GPU buffer copy from the override embeddings.
+                // Branch matches the placeholder token id at
+                // `prompt_tokens[tok_i]` against soft_tokens; on hit,
+                // dispatch_copy_f32 copies row `(tok_i - range.start)`
+                // (= `hs` consecutive F32s) from `embeddings` into
+                // `self.activations.hidden`.  Otherwise the standard
+                // language-model `embedding_gather_scale_f32` runs.
+                let soft_override = soft_tokens
+                    .iter()
+                    .find(|st| st.range.contains(&tok_i));
+                if let Some(st) = soft_override {
+                    let row_idx = tok_i - st.range.start;
+                    let src_offset = row_idx * hs;
+                    mlx_native::ops::copy::dispatch_copy_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        st.embeddings,
+                        &self.activations.hidden,
+                        src_offset,
+                        0,
+                        hs,
+                    ).map_err(|e| anyhow::anyhow!(
+                        "prefill soft-token copy T{tok_i} (range {:?}, row {}): {e}",
+                        st.range, row_idx
+                    ))?;
+                    s.track_dispatch(&[st.embeddings], &[&self.activations.hidden]);
+                } else {
+                    mlx_native::ops::elementwise::embedding_gather_scale_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.embed_weight,
+                        &self.activations.hidden,
+                        tok, hs,
+                        (hs as f32).sqrt(),
+                    ).map_err(|e| anyhow::anyhow!("prefill embed T{tok_i}: {e}"))?;
+                    s.track_dispatch(&[&self.embed_weight], &[&self.activations.hidden]);
+                }
 
                 // --- 2. Transformer layers ---
                 for layer_idx in 0..num_layers {
