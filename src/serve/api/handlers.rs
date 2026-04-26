@@ -1514,7 +1514,32 @@ pub async fn embeddings(
     State(state): State<AppState>,
     Json(req): Json<EmbeddingRequest>,
 ) -> Response {
-    // --- Validate the embedding model is loaded ---
+    // --- Chat-model embeddings fast path (Phase 2a Task #8, iter-92) ---
+    //
+    // When no `--embedding-model` was supplied at startup but a chat
+    // model is loaded AND the request's `model` matches the chat
+    // engine's id, route through `Engine::embed` (Last pooling on the
+    // chat-model's last-layer hidden state).  This lets users embed
+    // through the SAME loaded model they chat with — the standard
+    // OpenAI-compatible workflow for any client that wants embeddings
+    // and doesn't carry a separate embedding model.
+    //
+    // Order matters: the dedicated `--embedding-model` path takes
+    // precedence when present (it's a purpose-built BERT/nomic-bert
+    // encoder, faster + more accurate than chat-model Last pool).  The
+    // chat-model path is the fallback for users who only loaded a chat
+    // model.
+    if state.embedding_config.is_none() {
+        if let Some(engine) = state.engine.as_ref() {
+            if req.model == engine.model_id() {
+                return chat_model_embeddings(engine.clone(), req).await;
+            }
+            return ApiError::model_not_loaded(&req.model).into_response();
+        }
+        return ApiError::model_not_loaded(&req.model).into_response();
+    }
+
+    // --- Dedicated embedding model path (--embedding-model) ---
     let em = match state.embedding_config.as_ref() {
         Some(em) => em.clone(),
         None => {
@@ -1756,6 +1781,164 @@ pub async fn embeddings(
                 .into_response()
         }
     }
+}
+
+/// Chat-model pooled-embedding handler — invoked from `embeddings` when
+/// no `--embedding-model` is loaded but the request's `model` matches
+/// the chat engine's id.  Phase 2a Task #8 (iter-92).
+///
+/// Pooling: **Last** (final-token hidden state, post-final-RMS-norm,
+/// L2-normalized).  Chat models use causal attention, so the last
+/// token's hidden state is a function of the entire sequence — the
+/// natural pooling for autoregressive embedders.  See
+/// `MlxModelWeights::forward_embed_last` for the GPU-side semantics.
+///
+/// Mean / CLS pooling is intentionally NOT supported on the chat-model
+/// path; users who need those should load a dedicated BERT-family
+/// encoder via `--embedding-model`.
+///
+/// Tokenization uses the chat model's own tokenizer (`engine.tokenizer()`).
+/// Inputs run sequentially through the engine's FIFO worker queue —
+/// concurrent embedding requests get the same 429 + Retry-After
+/// behaviour as concurrent chat completions when the queue fills.
+async fn chat_model_embeddings(
+    engine: super::engine::Engine,
+    req: EmbeddingRequest,
+) -> Response {
+    let want_base64 = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return ApiError::invalid_request(
+                format!("encoding_format='{other}' not supported (only 'float' or 'base64')"),
+                Some("encoding_format".into()),
+            )
+            .into_response();
+        }
+    };
+
+    // OpenAI's `dimensions` parameter is only valid for Matryoshka-trained
+    // models (text-embedding-3 family). Chat models are not Matryoshka;
+    // accept dimensions == hidden_size as a no-op, reject any other value.
+    let hidden_size = engine.hidden_size();
+    if let Some(d) = req.dimensions {
+        if d != hidden_size {
+            return ApiError::invalid_request(
+                format!(
+                    "model '{}' does not support custom output dimensions (native dim is {}; \
+                     only the text-embedding-3 family supports `dimensions`)",
+                    engine.model_id(),
+                    hidden_size
+                ),
+                Some("dimensions".into()),
+            )
+            .into_response();
+        }
+    }
+
+    let inputs = req.input.into_vec();
+    if inputs.is_empty() {
+        return ApiError::invalid_request(
+            "input must be a non-empty string or array of strings".to_string(),
+            Some("input".into()),
+        )
+        .into_response();
+    }
+
+    let model_id = engine.model_id().to_string();
+    let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
+    let mut total_tokens: usize = 0;
+
+    for (i, input) in inputs.into_iter().enumerate() {
+        // Tokenize with the chat model's tokenizer.  `add_special_tokens=true`
+        // applies any bos/eos the model normally sees — chat models embed
+        // the same prompt-shape they decode from.  An empty token sequence
+        // is rejected here rather than at the engine boundary so the error
+        // path is unambiguous.
+        let encoded = match engine.tokenizer().encode(input.as_str(), true) {
+            Ok(e) => e,
+            Err(e) => {
+                return ApiError::invalid_request(
+                    format!("input[{i}] tokenization failed: {e}"),
+                    Some("input".into()),
+                )
+                .into_response();
+            }
+        };
+        let prompt_tokens: Vec<u32> = encoded.get_ids().to_vec();
+        if prompt_tokens.is_empty() {
+            return ApiError::invalid_request(
+                format!("input[{i}] tokenized to zero tokens (empty after preprocessing)"),
+                Some("input".into()),
+            )
+            .into_response();
+        }
+        total_tokens += prompt_tokens.len();
+
+        // Dispatch through the engine's FIFO worker queue.  queue_full
+        // maps to 429 + Retry-After in the same convention as chat
+        // completions.
+        let embedding: Vec<f32> = match engine.embed(prompt_tokens).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("queue_full") {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "1")],
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "engine queue full; retry shortly",
+                                "type": "rate_limit_exceeded",
+                                "param": null,
+                                "code": "queue_full"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                return ApiError::generation_error(format!("chat-model embedding: {e:#}"))
+                    .into_response();
+            }
+        };
+
+        if embedding.len() != hidden_size {
+            return ApiError::generation_error(format!(
+                "chat-model embedding length {} != hidden_size {}",
+                embedding.len(),
+                hidden_size
+            ))
+            .into_response();
+        }
+
+        let payload = if want_base64 {
+            let mut bytes = Vec::with_capacity(embedding.len() * 4);
+            for v in &embedding {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            use base64::Engine;
+            EmbeddingPayload::Base64(base64::engine::general_purpose::STANDARD.encode(&bytes))
+        } else {
+            EmbeddingPayload::Float(embedding)
+        };
+
+        data.push(EmbeddingObject {
+            object: "embedding",
+            embedding: payload,
+            index: i,
+        });
+    }
+
+    let resp = EmbeddingResponse {
+        object: "list",
+        data,
+        model: model_id,
+        usage: EmbeddingUsage {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    };
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------

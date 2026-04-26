@@ -168,6 +168,11 @@ struct EngineInner {
     model_id: String,
     context_length: Option<usize>,
     quant_type: Option<String>,
+    /// Hidden-state dimensionality of the loaded model.  Surfaced to the
+    /// `/v1/embeddings` handler when the chat model is used as an
+    /// embedder (Phase 2a Task #8) — used to validate the OpenAI
+    /// `dimensions` parameter and to size the response payload.
+    hidden_size: usize,
     eos_token_ids: Vec<u32>,
     /// Tokenizer cloned per-request so handlers can tokenize without a lock.
     tokenizer: Arc<Tokenizer>,
@@ -203,6 +208,18 @@ enum Request {
         params: SamplingParams,
         events: mpsc::Sender<super::sse::GenerationEvent>,
         cancellation_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    },
+    /// Pooled-embedding request (ADR-005 Phase 2a Task #8 / iter-92).
+    ///
+    /// Runs the chat model's prefill forward pass and returns the
+    /// L2-normalized last-token hidden state — the natural "Last" pooling
+    /// for autoregressive (causal-attention) chat models.  Used by the
+    /// `/v1/embeddings` handler when no `--embedding-model` is loaded but
+    /// the chat model is.  See
+    /// `MlxModelWeights::forward_embed_last` for the GPU-side semantics.
+    Embed {
+        prompt_tokens: Vec<u32>,
+        reply: oneshot::Sender<Result<Vec<f32>>>,
     },
     /// Graceful-shutdown sentinel.
     Shutdown,
@@ -372,6 +389,7 @@ impl Engine {
         let model_id = loaded.model_id.clone();
         let context_length = loaded.context_length;
         let quant_type = loaded.quant_type.clone();
+        let hidden_size = loaded.weights.hidden_size;
         let eos_token_ids = loaded.eos_token_ids.clone();
         let tokenizer = Arc::new(loaded.tokenizer.clone());
         let chat_template = Arc::new(loaded.chat_template.clone());
@@ -404,6 +422,7 @@ impl Engine {
                 model_id,
                 context_length,
                 quant_type,
+                hidden_size,
                 eos_token_ids,
                 tokenizer,
                 chat_template,
@@ -420,6 +439,11 @@ impl Engine {
     }
     pub fn quant_type(&self) -> Option<&str> {
         self.inner.quant_type.as_deref()
+    }
+    /// Hidden-state dimensionality.  Used by the `/v1/embeddings` handler
+    /// when the chat model is the embedder (Phase 2a Task #8).
+    pub fn hidden_size(&self) -> usize {
+        self.inner.hidden_size
     }
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.inner.tokenizer
@@ -501,6 +525,30 @@ impl Engine {
             Err(mpsc::error::TrySendError::Full(_)) => anyhow::bail!("queue_full"),
             Err(mpsc::error::TrySendError::Closed(_)) => anyhow::bail!("engine worker is gone"),
         }
+    }
+
+    /// Enqueue a pooled-embedding request (ADR-005 Task #8, iter-92).
+    ///
+    /// Returns the L2-normalized last-token hidden state as a `Vec<f32>`
+    /// of length `hidden_size`.  Uses the same FIFO queue + 429 semantics
+    /// as `generate`: a full queue maps to `queue_full` (handler maps to
+    /// HTTP 429 + Retry-After).
+    pub async fn embed(&self, prompt_tokens: Vec<u32>) -> Result<Vec<f32>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = Request::Embed {
+            prompt_tokens,
+            reply: reply_tx,
+        };
+        match self.inner.tx.try_send(req) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                anyhow::bail!("queue_full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("engine worker is gone");
+            }
+        }
+        reply_rx.await.context("embedding reply dropped")?
     }
 
     /// Request a clean shutdown of the worker. Drains in-flight + queued work
@@ -596,6 +644,20 @@ fn worker_run(
                     registration.as_ref(),
                     cancellation_counter.as_deref(),
                 );
+            }
+            Request::Embed {
+                prompt_tokens,
+                reply,
+            } => {
+                // Single-shot pooled embedding (Last pooling).  The
+                // worker holds &mut LoadedModel, so prefill's mutation of
+                // self.activations + self.dense_kvs is fine here — it
+                // can't race with a concurrent generate call because the
+                // worker is serial.
+                let result = loaded
+                    .weights
+                    .forward_embed_last(&prompt_tokens, &mut loaded.ctx);
+                let _ = reply.send(result);
             }
             Request::Shutdown => {
                 tracing::info!("hf2q-engine worker received Shutdown; exiting");
@@ -1337,6 +1399,7 @@ assistant:
                 model_id: "test-model".into(),
                 context_length: None,
                 quant_type: None,
+                hidden_size: 0,
                 eos_token_ids: vec![],
                 tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
                 chat_template: Arc::new(String::new()),

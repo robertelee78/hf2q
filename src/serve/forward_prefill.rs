@@ -72,6 +72,44 @@ impl MlxModelWeights {
         let vocab_size = self.vocab_size;
         let eps = self.rms_norm_eps;
 
+        // Reset per-layer KV cache write positions before this prefill.
+        //
+        // The TQ-packed `MlxKvCache` (allocated once at model load with
+        // capacity = max_position_embeddings for full layers, sliding_window
+        // for sliding layers) accumulates `write_pos` + `seq_len` across
+        // every prefill / decode step.  In a single-request lifecycle that's
+        // correct: prefill writes positions 0..N, decode appends N..N+M.  But
+        // hf2q's serialized worker handles multiple requests on the same
+        // `LoadedModel` — each fresh request needs to OVERWRITE the cache
+        // from position 0, not append.
+        //
+        // This was a latent bug in the chat-only path that worked in practice
+        // because:
+        //   * Full-attention layers have huge capacity (max_position_embeddings,
+        //     262144 for Gemma 4) — many requests fit before overflow.
+        //   * Sliding-window layers wrap via `(write_pos % sliding_window)` so
+        //     buffer accesses stayed in-bounds — but `seq_len` (passed to
+        //     flash-attention as the count of valid KV positions) kept growing
+        //     unboundedly, making the kernel attend to "valid" positions that
+        //     in fact contained stale data from prior requests.
+        //
+        // Iter-92 (Phase 2a Task #8) surfaced the bug via the embedding path:
+        // many embed requests + a chat completion drove sliding-layer
+        // `seq_len` past the sliding_window capacity → the dispatcher's
+        // `kv_capacity (sw) < kv_seq_len` guard fired with a hard error.
+        //
+        // The fix: reset `write_pos` + `seq_len` to 0 here so every prefill
+        // starts with an empty KV cache, regardless of prior state.  Each
+        // OpenAI `/v1/chat/completions` and `/v1/embeddings` request is
+        // semantically independent (multi-turn chat is handled by the client
+        // sending full history), so wholesale reset is the correct semantics.
+        // When prompt-cache lands (Phase 2a Task #7) it'll need to revisit
+        // this and reset only positions past the cached prefix length.
+        for cache in self.kv_caches.iter_mut() {
+            cache.write_pos = 0;
+            cache.seq_len = 0;
+        }
+
         let (exec, reg) = gpu.split();
         let dev = exec.device();
         let metal_dev = dev.metal_device();
@@ -208,29 +246,47 @@ impl MlxModelWeights {
             }
             self.leg_hb_encoded = Some(leg_hb_vec);
 
-            // Also ensure leg_f_kvs shadow (F32) is allocated for the dequant→SDPA step.
-            if self.leg_f_kvs.is_none() {
-                let mut leg_f_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-                for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    let nkv = layer.num_kv_heads;
-                    let hd = layer.head_dim;
-                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                    let capacity = if layer_is_ring { sw } else { linear_capacity };
-                    let n = nkv * capacity * hd;
-                    let k = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_f hb-path K L{layer_idx}: {e}"))?;
-                    let v = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_f hb-path V L{layer_idx}: {e}"))?;
-                    leg_f_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
-                }
-                let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
-                    max_nh as u32, max_hd as u32);
-                let leg_f_sdpa_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
-                    vec![tmp_bytes / 4])
-                    .map_err(|e| anyhow::anyhow!("leg_f hb-path sdpa_tmp: {e}"))?;
-                self.leg_f_kvs = Some(leg_f_vec);
-                self.leg_f_sdpa_tmp = Some(leg_f_sdpa_tmp);
+            // Allocate leg_f_kvs shadow (F32) for the dequant→SDPA step.
+            //
+            // Iter-92 fix: previously gated on `if self.leg_f_kvs.is_none()`
+            // which made the allocation persist across calls.  That's
+            // unsound when consecutive prefills have different
+            // `linear_capacity` requirements: the first call sized cache
+            // for its own `seq_len + max_decode_tokens` budget; subsequent
+            // calls with a larger budget would underflow the cache and
+            // crash inside `flash_attn_vec_tq_hb` with `kv_capacity
+            // (small) < kv_seq_len (large)`.  In the chat-only path the
+            // bug stayed latent because chat's `max_decode_tokens` is
+            // always large enough to hide it.  Embedding mode (Phase 2a
+            // Task #8 / iter-92) runs `max_decode_tokens=0`, exposing the
+            // bug as soon as a chat call follows an embed call (or vice
+            // versa with a longer prompt).
+            //
+            // Now we reallocate every prefill — same behaviour as the
+            // unconditional `dense_kvs` allocation above (which has no
+            // measurable cost: alloc_buffer on Apple Silicon's unified
+            // memory is sub-millisecond and amortised by the prefill's
+            // ~10-100 ms layer-stack forward).
+            let mut leg_f_vec: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                let capacity = if layer_is_ring { sw } else { linear_capacity };
+                let n = nkv * capacity * hd;
+                let k = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("leg_f hb-path K L{layer_idx}: {e}"))?;
+                let v = dev.alloc_buffer(n * 4, mlx_native::DType::F32, vec![nkv, capacity, hd])
+                    .map_err(|e| anyhow::anyhow!("leg_f hb-path V L{layer_idx}: {e}"))?;
+                leg_f_vec.push(DenseKvBuffers { k, v, capacity, is_sliding: layer_is_ring });
             }
+            let tmp_bytes = mlx_native::ops::flash_attn_vec::tmp_buffer_bytes(
+                max_nh as u32, max_hd as u32);
+            let leg_f_sdpa_tmp = dev.alloc_buffer(tmp_bytes, mlx_native::DType::F32,
+                vec![tmp_bytes / 4])
+                .map_err(|e| anyhow::anyhow!("leg_f hb-path sdpa_tmp: {e}"))?;
+            self.leg_f_kvs = Some(leg_f_vec);
+            self.leg_f_sdpa_tmp = Some(leg_f_sdpa_tmp);
             eprintln!("[iter-21 Track B] leg_hb_encoded + leg_f_kvs ready ({} layers)", num_layers);
         }
 
@@ -1270,5 +1326,107 @@ impl MlxModelWeights {
         // per-token populate block can write into it during prefill.
 
         Ok(last_token)
+    }
+
+    /// Last-pool chat-model embedding (ADR-005 Phase 2a, Task #8, iter-92).
+    ///
+    /// Runs `forward_prefill` with `max_decode_tokens = 0` (i.e. no decode
+    /// budget — KV-cache buffers are sized to seq_len exactly), then reads
+    /// the last token's RMS-normed hidden state from `self.activations.norm_out`
+    /// (already populated as the last side-effect of the per-token loop's
+    /// final-norm dispatch — see ~line 1186 in `forward_prefill`), L2-normalizes
+    /// the vector, and returns it as `Vec<f32>` of length `hidden_size`.
+    ///
+    /// # Pooling: Last
+    ///
+    /// "Last" pooling takes the final token's hidden state. For autoregressive
+    /// chat models (Gemma, Llama, Mistral, Qwen — anything with causal
+    /// attention) this is the natural pooling because the causal mask makes
+    /// the last token's hidden state a function of the entire sequence.
+    /// Mean pooling on a chat model would average over a sequence whose
+    /// earlier tokens have NOT seen the later context — semantically a
+    /// less-informative aggregation than Last.
+    ///
+    /// Mean / CLS pooling for chat models is intentionally NOT supported
+    /// here.  If the user wants different pooling semantics, they should
+    /// load a dedicated BERT-family encoder model (`--embedding-model`)
+    /// which the dedicated lane consumes via `apply_bert_full_forward_gpu`
+    /// or `apply_nomic_bert_full_forward_gpu`.
+    ///
+    /// # Cost
+    ///
+    /// Same prefill compute as a 1-token-decode-budget `forward_prefill`
+    /// minus 0 (no decode runs).  The per-token lm_head + softcap + argmax
+    /// dispatches that the prefill loop runs are wasted work for embedding
+    /// (we discard logits / argmax_index), but the cost is small relative
+    /// to the layer-stack forward.  Iter-93+ candidate: a dedicated
+    /// `forward_embed_last_minimal` that skips the lm_head/softcap/argmax
+    /// per-token dispatches via a `compute_lm_head: bool` flag plumbed
+    /// through `forward_prefill`.
+    ///
+    /// # Returns
+    ///
+    /// L2-normalized embedding vector of length `self.hidden_size`.
+    pub fn forward_embed_last(
+        &mut self,
+        prompt_tokens: &[u32],
+        gpu: &mut GpuContext,
+    ) -> Result<Vec<f32>> {
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("forward_embed_last: empty prompt");
+        }
+
+        // Reset per-prefill cache state.  forward_prefill gates the
+        // leg_f_kvs / leg_f_sdpa_tmp re-allocation on `is_none()` (see
+        // `forward_prefill.rs:212`) — a latent quirk that's harmless for
+        // chat (where the first allocation's capacity covers later calls)
+        // but BREAKS embedding mode: embeds run with `max_decode_tokens=0`
+        // so `linear_capacity = prompt_len`, and the first embedding's
+        // tiny cache poisons every subsequent call (embed OR chat) with
+        // a capacity-too-small fault inside `flash_attn_vec_tq_hb`.  We
+        // force-clear before re-entering prefill so it re-allocates fresh
+        // buffers sized for THIS call's seq_len.  dense_kvs is overwritten
+        // unconditionally inside prefill so it doesn't strictly need
+        // clearing, but we do it for symmetry + future-proofing.
+        self.dense_kvs = None;
+        self.dense_sdpa_tmp = None;
+        self.leg_f_kvs = None;
+        self.leg_f_sdpa_tmp = None;
+        self.leg_hb_encoded = None;
+
+        // Run prefill with no decode budget. The per-token loop populates
+        // self.activations.norm_out with the last token's RMS-normed
+        // hidden state as part of its final_norm dispatch (~line 1186).
+        // Discard the returned argmax token — embedding doesn't decode.
+        let _ = self
+            .forward_prefill(prompt_tokens, 0, gpu)
+            .map_err(|e| anyhow::anyhow!("forward_embed_last prefill: {e}"))?;
+
+        // Read the [hidden_size] f32 hidden state.  norm_out is sized
+        // [1 row * hidden_size] — the per-token reuse of the buffer means
+        // it always holds exactly one row's worth of data.
+        let view: &[f32] = self
+            .activations
+            .norm_out
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("forward_embed_last read norm_out: {e}"))?;
+        let hs = self.hidden_size;
+        if view.len() < hs {
+            anyhow::bail!(
+                "forward_embed_last: norm_out has {} f32 elements, expected at least {}",
+                view.len(),
+                hs
+            );
+        }
+        let mut out: Vec<f32> = view[..hs].to_vec();
+
+        // L2 normalize so consumers can compute cosine similarity by dot product.
+        // 1e-12 floor matches the BERT-lane bert_l2_normalize_gpu epsilon.
+        let norm: f32 = out.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let denom = if norm < 1e-12 { 1e-12 } else { norm };
+        for v in out.iter_mut() {
+            *v /= denom;
+        }
+        Ok(out)
     }
 }
