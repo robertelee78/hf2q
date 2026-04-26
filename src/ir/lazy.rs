@@ -389,6 +389,25 @@ impl LazyTensorMap {
         self.inner.into_iter()
     }
 
+    /// Construct a [`LazyTensorMap`] from an eager [`TensorMap`] —
+    /// every tensor's bytes are already resident, so each entry becomes
+    /// a [`LazyTensor::from_bytes`] (Materialized variant) at insertion.
+    ///
+    /// **No streaming benefit on this path.** Callers should use
+    /// [`crate::input::safetensors::read_tensors_lazy`] for the streaming
+    /// path; `from_eager` is the bridge for cases where a
+    /// `TensorMap` already exists (e.g. ADR-014 P2 iter-2's transitional
+    /// wiring of `quantize_streaming` into `cmd_convert` paths whose
+    /// upstream still produces eager `TensorMap`).
+    pub fn from_eager(tensor_map: TensorMap) -> Self {
+        let mut out = Self::new();
+        for (_, tref) in tensor_map.tensors.into_iter() {
+            let meta = LazyMeta::new(tref.name.clone(), tref.shape.clone(), tref.dtype);
+            out.insert(LazyTensor::from_bytes(meta, tref.data));
+        }
+        out
+    }
+
     /// Materialise every tensor and produce an eager [`TensorMap`].
     ///
     /// **Bridge for P0**. ADR-014 Decision 2 specifies this as the
