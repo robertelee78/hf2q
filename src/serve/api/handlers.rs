@@ -302,62 +302,80 @@ async fn prepare_chat_generation(
         .into_response());
     }
 
-    // --- Multimodal content pipeline (Phase 2c — Decision #1) ---
+    // --- Multimodal content pipeline (Phase 2c — Decision #1, iter-99) ---
     // Scan messages for `image_url` content parts; if any are present,
     // require a mmproj, parse each URL, load the bytes, and preprocess
-    // (resize/normalize/CHW) to a ViT-ready pixel tensor. Full error
-    // taxonomy:
-    //   images absent                     → Ok(empty), text-only flow
-    //   images present, mmproj missing    → 400 no_mmproj_loaded
-    //   image URL malformed               → 400 invalid_request (per part)
-    //   image load/decode/preprocess fails→ 400 invalid_request (per part)
-    //   all images preprocessed OK        → 501 ViT forward pending
-    // (The 501 is because the forward-pass path lands in Task #15. When
-    // that lands, the preprocessed tensors get threaded into generate().)
+    // (resize/normalize/CHW) to a ViT-ready pixel tensor. Error taxonomy:
+    //   images absent                       → text-only flow (no soft-tokens)
+    //   images present, mmproj missing      → 400 no_mmproj_loaded
+    //   image URL malformed                 → 400 invalid_request (per part)
+    //   image load/decode/preprocess fails  → 400 invalid_request (per part)
+    //   ViT GPU forward fails               → 500 generation_error
+    //   embedding row count not multiple of hidden → 500 generation_error
+    //
+    // On success we hold `Vec<Vec<f32>>` projected embeddings (one
+    // tensor per image) plus a rewritten messages vector with one
+    // `<|image|>` placeholder text token inserted in place of each
+    // image content part.  The actual soft-token expansion (placeholder
+    // → N image tokens + MlxBuffer alloc + range computation) runs
+    // after the standard render/tokenize/overflow pipeline so its
+    // inputs are exactly the prompt tokens the engine sees.
     let preprocessed_images =
         match process_multimodal_content(&req.messages, state.mmproj.as_ref()) {
             Ok(imgs) => imgs,
             Err(resp) => return Err(resp),
         };
-    if !preprocessed_images.is_empty() {
-        // Iter 52: run the GPU ViT forward end-to-end per image. Even
-        // though the engine can't consume the resulting [49, 2816]
-        // embeddings yet (iter 53 wires that), we exercise the full
-        // production GPU path so the timing + correctness are
-        // verifiable on every multimodal request.
-        let mmproj = state.mmproj.as_ref().expect("mmproj checked in process_multimodal_content");
-        let head_dim_f = (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
-        let scale = 1.0f32 / head_dim_f.sqrt();
-        let t0 = std::time::Instant::now();
-        let vision_result =
-            crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu(
-                &preprocessed_images,
-                &mmproj.weights,
-                &mmproj.config,
-                scale,
+    let (messages_for_render, vision_embeddings, vit_forward_ms_v, vit_images_v) =
+        if preprocessed_images.is_empty() {
+            (req.messages.clone(), Vec::new(), None, None)
+        } else {
+            let n_images = preprocessed_images.len();
+            let mmproj = state
+                .mmproj
+                .as_ref()
+                .expect("mmproj checked in process_multimodal_content");
+            let head_dim_f =
+                (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
+            let scale = 1.0f32 / head_dim_f.sqrt();
+            let t0 = std::time::Instant::now();
+            let embeddings =
+                match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu(
+                    &preprocessed_images,
+                    &mmproj.weights,
+                    &mmproj.config,
+                    scale,
+                ) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return Err(ApiError::generation_error(format!(
+                            "ViT forward failed: {e}"
+                        ))
+                        .into_response());
+                    }
+                };
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            tracing::info!(
+                n_images,
+                embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
+                forward_ms = elapsed_ms,
+                "Vision embeddings computed via GPU ViT forward"
             );
-        let elapsed = t0.elapsed();
-        match vision_result {
-            Ok(embeddings) => {
-                tracing::info!(
-                    n_images = embeddings.len(),
-                    embed_dim = embeddings.first().map(|e| e.len()).unwrap_or(0),
-                    forward_ms = elapsed.as_millis() as u64,
-                    "Vision embeddings computed via GPU ViT forward"
-                );
-                return Err(vit_engine_integration_pending_response(
-                    embeddings.len(),
-                    elapsed.as_millis() as u64,
-                ));
+            // Validate every embedding's element count is a positive
+            // multiple of the chat-model hidden size so the soft-token
+            // expansion has a unique answer for `N_image_tokens`.
+            let hidden = engine.hidden_size();
+            for (i, e) in embeddings.iter().enumerate() {
+                if hidden == 0 || e.is_empty() || e.len() % hidden != 0 {
+                    return Err(ApiError::generation_error(format!(
+                        "vision embedding [{i}] length {} is not a positive multiple of hidden_size {hidden}",
+                        e.len()
+                    ))
+                    .into_response());
+                }
             }
-            Err(e) => {
-                return Err(ApiError::generation_error(format!(
-                    "ViT forward failed: {e}"
-                ))
-                .into_response());
-            }
-        }
-    }
+            let rewritten = rewrite_messages_for_vision_placeholders(&req.messages);
+            (rewritten, embeddings, Some(elapsed_ms), Some(n_images))
+        };
 
     // Compile the response_format grammar (Decision #6).  Iter-95 wires
     // the parsed grammar into `SamplingParams.grammar` so the decode loop

@@ -773,6 +773,32 @@ oracles used by P9b.  See ffn.rs.
 
 Tests: 9 new tests in `activation_capture_real::tests` — all passing (`dense_capture_returns_correct_shape`, `dense_layer_input_zero_equals_post_embedding`, `moe_unquantized_capture_returns_correct_shape`, `moe_quantized_returns_typed_forward_pass_error`, `empty_tokens_returns_error`, `real_activation_capture_wrapper_delegates_to_model`, `not_ready_shim_returns_not_ready_error`, `error_display_for_load_includes_path`, `forward_pass_error_carries_layer_and_reason`). Stale "P11 follow-up" notes in `activation_capture.rs` updated to point at the real impl.
 
+### P14 — MTP speculative-decoding execution (planned, blocked on ADR-012 P11)
+
+**Status:** planned (entry committed alongside ADR-012 P11's roundtrip gate, 2026-04-25).
+
+**Scope:** Implement the MTP draft/accept loop:
+- Draft N tokens via the loaded `MtpWeights` block (live in `src/inference/models/qwen35/mtp.rs`).
+- Verify each draft token against the main-stack forward pass.
+- Reject + replay on mismatch (DeepSeek-V3-style speculative decoding).
+
+**Dependency:** **ADR-012 P11 must be green** before P14 starts.  P11
+(`tests/convert_qwen35_mtp_roundtrip.rs`) proves the conversion-side emits
+MTP tensors at the GGUF names this loader expects (`blk.{num_hidden_layers}.nextn.*`,
+post-Decision-19 resolver).  Without P11, every MTP tensor in our shipped
+GGUFs would silently mis-name and the speculative loop would have no weights
+to draft from.  P11 catches that failure mode at convert time, before
+P14 ever runs.
+
+**Cross-ADR contract:** ADR-012 owns the conversion-side tensor naming
+(Decision 11) + the round-trip integrity gate (Decision 19).  This entry
+exists so P14 has a documented blocker that prevents the contract from
+silently rotting.  When P11 lands and goes green, P14 may begin.  If P11
+ever regresses (a future tensor-naming change breaks the roundtrip), P14
+work pauses until P11 is green again — fix the blocker, don't route around.
+
+**Estimated LOC:** ~600 (draft loop + verification + per-token reject/replay).
+
 ### P13 — Correctness gate: sourdough + bench + integration tests + docs
 
 **Scope:** Decisions 17, 18.

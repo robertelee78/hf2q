@@ -235,7 +235,11 @@ impl OutputBackend for GgufBackend {
 
         for name in &tensor_names {
             let qt = &model.tensors[*name];
-            let gguf_name = hf_name_to_gguf(name, &resolved_arch_for_tensors);
+            let raw_gguf_name = hf_name_to_gguf(name, &resolved_arch_for_tensors);
+            // ADR-012 Decision 19: resolve the MTP placeholder using the
+            // model's main-stack layer count.  Non-MTP names pass through.
+            let gguf_name =
+                resolve_mtp_block_index(&raw_gguf_name, model.metadata.num_layers);
             let mut ggml_type = quant_info_to_ggml_type(&qt.quant_info);
 
             // 1D scale/scalar tensors must be F32 — llama.cpp's Metal kernels
@@ -1493,11 +1497,44 @@ fn layer_map_for_arch(arch: &str) -> Vec<(&'static str, &'static str)> {
     map
 }
 
+/// Resolve the `blk.mtp{idx}.…` placeholder emitted by [`hf_name_to_gguf`]
+/// for qwen35/qwen35moe MTP tensors into the real block index
+/// `blk.{num_hidden_layers + idx}.…` (ADR-012 Decision 11 + 19).
+///
+/// Returns the input unchanged when no MTP placeholder is present, so this
+/// is safe to call for every tensor in the production write path.
+///
+/// # Why not inline this in `hf_name_to_gguf`
+///
+/// `hf_name_to_gguf(hf_name, arch)` doesn't have `num_hidden_layers` in
+/// scope and threading it through every test caller would balloon the diff.
+/// Instead the placeholder is emitted there, and resolved here from the
+/// `ModelMetadata` the production caller already holds.
+pub(crate) fn resolve_mtp_block_index(gguf_name: &str, num_hidden_layers: u32) -> String {
+    if let Some(rest) = gguf_name.strip_prefix("blk.mtp") {
+        if let Some(dot_pos) = rest.find('.') {
+            let idx_str = &rest[..dot_pos];
+            if let Ok(idx) = idx_str.parse::<u32>() {
+                let suffix = &rest[dot_pos + 1..];
+                return format!("blk.{}.{}", num_hidden_layers + idx, suffix);
+            }
+        }
+    }
+    gguf_name.to_string()
+}
+
 /// Convert a HuggingFace tensor name to its GGUF equivalent.
 ///
 /// `arch` is the model architecture string (e.g. "llama", "gemma4", "qwen3")
 /// from `model.metadata.model_type`. Different architectures use different
 /// GGUF names for the same HF tensor suffixes.
+///
+/// # MTP placeholder
+///
+/// For qwen35/qwen35moe `mtp.layers.{idx}.*` inputs this function emits a
+/// **placeholder** `blk.mtp{idx}.nextn.*` that the production write path
+/// resolves via [`resolve_mtp_block_index`] using `metadata.num_layers`.
+/// Test callers that don't go through the write path see the placeholder.
 fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
     // Strip language_model. prefix (Gemma4 conditional-generation models)
     let hf_name = hf_name.replace("language_model.", "");
@@ -1579,7 +1616,7 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
         }
     }
 
-    // ADR-012 Decision 11: MTP (Multi-Token Prediction) tensor mapping for qwen35/qwen35moe.
+    // ADR-012 Decision 11 + 19: MTP (Multi-Token Prediction) tensor mapping for qwen35/qwen35moe.
     //
     // HF naming: "mtp.layers.{mtp_idx}.{suffix}"
     // GGUF naming: "blk.{num_hidden_layers + mtp_idx}.nextn.{gguf_suffix}"
@@ -1590,14 +1627,16 @@ fn hf_name_to_gguf(hf_name: &str, arch: &str) -> String {
     //   LLM_TENSOR_NEXTN_ENORM         → "blk.%d.nextn.enorm"
     //   LLM_TENSOR_NEXTN_HNORM         → "blk.%d.nextn.hnorm"
     //
-    // The MTP block index in GGUF = num_hidden_layers (e.g. 40 for qwen35moe, 64 for qwen35 dense).
-    // This is stored in num_layers from config.json "num_hidden_layers".
-    // Callers that handle MTP tensors must pass the num_hidden_layers context; for the generic
-    // hf_name_to_gguf path we cannot know num_layers, so we use a sentinel prefix "mtp.blk.N."
-    // and resolve the block index in the caller's pipeline.
+    // The MTP block index in GGUF = num_hidden_layers (e.g. 40 for qwen35moe, 64 for
+    // qwen35 dense), stored in `metadata.num_layers` from config.json.
     //
-    // For now: emit "mtp.layers.{mtp_idx}.{suffix}" → "blk.mtp{mtp_idx}.nextn.{gguf_suffix}"
-    // The dispatch path that handles qwen35 conversion resolves the real block number.
+    // `hf_name_to_gguf` does not have num_hidden_layers context, so we emit a
+    // sentinel prefix `blk.mtp{mtp_idx}.nextn.…` here and resolve it to the real
+    // block index in [`resolve_mtp_block_index`] via the production write path
+    // (`write_gguf` at the call site that has metadata in scope).  P11's
+    // `convert_qwen35_mtp_roundtrip` integration test asserts the resolved name
+    // is what the inference loader at
+    // `src/inference/models/qwen35/mtp.rs::load_mtp_weights_if_present` expects.
     if (arch == "qwen35" || arch == "qwen35moe") && hf_name.starts_with("mtp.layers.") {
         // Strip "mtp.layers." prefix
         if let Some(rest) = hf_name.strip_prefix("mtp.layers.") {
@@ -3232,29 +3271,64 @@ mod tests {
         }
     }
 
-    /// Decision 11: MTP tensors map to blk.mtpN.nextn.* for qwen35/qwen35moe.
-    /// llama-arch.cpp:447-450 LLM_TENSOR_NEXTN_*.
+    /// Decision 11 + 19: MTP tensors map to `blk.mtpN.nextn.*` (placeholder)
+    /// then resolve to `blk.{num_hidden_layers + N}.nextn.*` in the production
+    /// write path.  `hf_name_to_gguf` itself emits the placeholder; the test
+    /// here pins both halves of the contract.  llama-arch.cpp:447-450
+    /// LLM_TENSOR_NEXTN_*.
     #[test]
     fn test_qwen35_mtp_tensor_mapping() {
+        // Placeholder shape (Decision 11).
         assert_eq!(
             hf_name_to_gguf("mtp.layers.0.enorm.weight", "qwen35moe"),
             "blk.mtp0.nextn.enorm.weight",
-            "MTP enorm must map to nextn.enorm (llama-arch.cpp:449)"
+            "MTP enorm must map to placeholder nextn.enorm (llama-arch.cpp:449)"
         );
         assert_eq!(
             hf_name_to_gguf("mtp.layers.0.hnorm.weight", "qwen35"),
             "blk.mtp0.nextn.hnorm.weight",
-            "MTP hnorm must map to nextn.hnorm (llama-arch.cpp:450)"
+            "MTP hnorm must map to placeholder nextn.hnorm (llama-arch.cpp:450)"
         );
         assert_eq!(
             hf_name_to_gguf("mtp.layers.0.embed_tokens.weight", "qwen35moe"),
             "blk.mtp0.nextn.embed_tokens.weight",
-            "MTP embed_tokens must map to nextn.embed_tokens (llama-arch.cpp:448)"
+            "MTP embed_tokens must map to placeholder nextn.embed_tokens (llama-arch.cpp:448)"
         );
         assert_eq!(
             hf_name_to_gguf("mtp.layers.0.eh_proj.weight", "qwen35moe"),
             "blk.mtp0.nextn.eh_proj.weight",
-            "MTP eh_proj must map to nextn.eh_proj (llama-arch.cpp:447)"
+            "MTP eh_proj must map to placeholder nextn.eh_proj (llama-arch.cpp:447)"
         );
+    }
+
+    /// Decision 19: the production write path resolves the placeholder using
+    /// `num_hidden_layers`.  This test pins the resolver in isolation; the
+    /// end-to-end roundtrip is in `tests/convert_qwen35_mtp_roundtrip.rs`.
+    #[test]
+    fn test_qwen35_mtp_resolved_block_index() {
+        // qwen35moe apex: num_layers=40 → MTP block lands at blk.40.
+        assert_eq!(
+            resolve_mtp_block_index("blk.mtp0.nextn.enorm.weight", 40),
+            "blk.40.nextn.enorm.weight",
+        );
+        // qwen35 dense 27B: num_layers=64 → MTP block lands at blk.64.
+        assert_eq!(
+            resolve_mtp_block_index("blk.mtp0.nextn.embed_tokens.weight", 64),
+            "blk.64.nextn.embed_tokens.weight",
+        );
+        // mtp_num_hidden_layers > 1: each MTP block gets its own offset.
+        assert_eq!(
+            resolve_mtp_block_index("blk.mtp1.nextn.eh_proj.weight", 40),
+            "blk.41.nextn.eh_proj.weight",
+        );
+        // Non-MTP names pass through unchanged (no false positives).
+        for unaffected in &[
+            "blk.0.attn_norm.weight",
+            "blk.39.ssm_a",
+            "blk.mtpfoo.weight",  // not parseable as u32 → unchanged
+            "token_embd.weight",
+        ] {
+            assert_eq!(resolve_mtp_block_index(unaffected, 40), *unaffected);
+        }
     }
 }
