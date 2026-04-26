@@ -3182,8 +3182,10 @@ pub fn gemma4v_clippable_linear_gpu(
 /// resized image dims to multiples of `patch_size * n_merge = 16 * 3
 /// = 48` so the post-pool grid is exact.
 ///
-/// Caller registers shaders before dispatch (see
-/// `compute_vision_embeddings_gpu` for the canonical setup):
+/// Caller registers the SigLIP-shared shaders before dispatch (the
+/// gemma4v-specific shaders — `vision_2d_rope`, `gelu`, `gather` — are
+/// self-registered below; see `compute_vision_embeddings_gpu` for the
+/// canonical SigLIP-shared setup):
 /// ```
 /// mlx_native::ops::softmax::register(&mut registry);
 /// mlx_native::ops::sigmoid_mul::register(&mut registry);
@@ -3209,6 +3211,19 @@ pub fn gemma4v_apply_full_forward_gpu(
     n_x: u32,
     n_y: u32,
 ) -> Result<MlxBuffer> {
+    // Self-register gemma4v-specific shaders. `register_source` is
+    // idempotent (overwrites prior registration), so re-calling here is
+    // safe even if a caller already registered them. This closes the
+    // W25 iter-115 omission where the new gemma4v full-forward and
+    // dispatch entry points landed without registering vision_2d_rope
+    // (and the GELU + gather kernels reached transitively via
+    // `gemma4v_block_forward_gpu`). The `vit_vision_2d_rope_gpu` call
+    // inside the per-block forward used to panic with `Kernel not
+    // found: vision_2d_rope_f32`.
+    mlx_native::ops::vision_2d_rope::register(registry);
+    mlx_native::ops::gelu::register(registry);
+    mlx_native::ops::gather::register(registry);
+
     if n_x == 0 || n_y == 0 {
         return Err(anyhow!(
             "gemma4v_apply_full_forward_gpu: n_x ({n_x}) and n_y ({n_y}) must be > 0"
