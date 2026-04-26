@@ -645,6 +645,16 @@ fn openwebui_tools_streaming_scenario_2() {
     // turn 1's SSE wire shape (chunk count, frame boundaries, content
     // sequence) at temperature=0 so downstream refactors regress
     // loudly even when high-level assertions still pass.
+    //
+    // **Iter B-2 W66 note**: W65's pre-iter-B-2 fixture (which captured
+    // the bug — raw `<|tool_call>` text in `delta.content`) was deleted
+    // alongside this iter's commit because its wire shape is no longer
+    // representative of correct behavior. The first post-iter-B-2 live
+    // run will re-record a structured-tool-call fixture (`delta.tool_calls`
+    // chunks; no raw marker text) via `HF2Q_OPENWEBUI_E2E=1
+    // HF2Q_OPENWEBUI_E2E_RECORD=1`. Until that record runs, the "no
+    // fixture" branch below logs the missing-baseline warning instead of
+    // failing.
     // -----------------------------------------------------------------
     let record = std::env::var(ENV_RECORD).as_deref() == Ok("1");
     let fp = fixture_path();
