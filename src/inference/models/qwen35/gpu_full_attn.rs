@@ -319,15 +319,14 @@ pub fn apply_q_or_k_per_head_rms_norm(
 ) -> Result<MlxBuffer> {
     let rows = seq_len * n_heads;
     let dim = head_dim;
-    let out = device
-        .alloc_buffer(
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             (rows * dim) as usize * 4,
             DType::F32,
             vec![rows as usize, dim as usize],
         )
         .map_err(|e| anyhow!("alloc out: {e}"))?;
-    let mut params = device
-        .alloc_buffer(8, DType::F32, vec![2])
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
         let s = params
@@ -425,15 +424,14 @@ pub fn apply_sigmoid_gate_multiply(
     gate: &MlxBuffer,
     n_elements: u32,
 ) -> Result<MlxBuffer> {
-    let out = device
-        .alloc_buffer(
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             n_elements as usize * 4,
             DType::F32,
             vec![n_elements as usize],
         )
         .map_err(|e| anyhow!("alloc sigmoid-mul out: {e}"))?;
-    let mut params = device
-        .alloc_buffer(4, DType::U32, vec![1])
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     params
         .as_mut_slice::<u32>()
@@ -476,15 +474,14 @@ pub fn apply_pre_attn_rms_norm(
     eps: f32,
 ) -> Result<MlxBuffer> {
     // Allocate output + params.
-    let out = device
-        .alloc_buffer(
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             (seq_len * hidden_size) as usize * 4,
             DType::F32,
             vec![seq_len as usize, hidden_size as usize],
         )
         .map_err(|e| anyhow!("alloc out: {e}"))?;
-    let mut params = device
-        .alloc_buffer(8, DType::F32, vec![2])
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
         let s = params
@@ -549,6 +546,15 @@ pub fn apply_linear_projection_f32(
     out_features: u32,
 ) -> Result<MlxBuffer> {
     // Allocate output buffer (same for all paths).
+    //
+    // NOTE: NOT pooled — `apply_linear_projection_f32` is shared between
+    // prefill (downloads via `download_f32` → `as_slice` → reads full
+    // `byte_len()`) and decode.  The pool's power-of-two bucket rounding
+    // would inflate `byte_len()` to the bucket size, causing prefill's
+    // logits-shape sanity check (`prefill_logits.len() == prompt_len * vocab`)
+    // to fail.  Decode hot-path lm_head goes through `apply_output_head_gpu`
+    // which uses the pre-allocated `logits_buf` from `DecodeBuffers` (not
+    // this code path), so leaving this device-allocated has no decode cost.
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
         .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
@@ -688,6 +694,59 @@ pub fn apply_linear_projection_f32_into(
     Ok(())
 }
 
+/// Pool-aware variant of [`apply_linear_projection_f32`] for the decode
+/// hot path (`seq_len == 1`).  Falls back to the unpooled
+/// `apply_linear_projection_f32` for prefill (`seq_len > 1`) because some
+/// prefill consumers (notably `apply_sdpa_with_kv_cache` for K/V) call
+/// `download_f32` → `as_slice` which reads the buffer's raw `byte_len()`;
+/// the pool's power-of-two bucket rounding would inflate `byte_len()`
+/// beyond the requested shape.
+///
+/// For decode (seq_len=1) the dispatch path keeps Q/K/V/gate/O entirely
+/// on GPU (rope → SDPA → residual), so the pool is safe.  This closes
+/// the alloc-overhead budget for attention Q/K/V/O = 4 projections × 10
+/// full-attn layers per forward = 40 allocs/token previously hitting
+/// Metal's `newBuffer` directly.
+///
+/// **Caller contract:** when `seq_len == 1`, the returned `MlxBuffer`
+/// must NOT be downloaded to CPU via `as_slice` / `download_f32`.  When
+/// `seq_len > 1`, this function delegates to the unpooled variant so
+/// CPU downloads remain safe.
+///
+/// For the lm_head logits output (downloaded after prefill at any
+/// `seq_len`), keep using the unpooled [`apply_linear_projection_f32`]
+/// directly — that signal is shape-significant for the prefill sanity
+/// check on `prefill_logits.len()`.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_linear_projection_f32_pooled(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    if seq_len != 1 {
+        // Prefill — fall back to unpooled to keep `download_f32` callers
+        // (e.g. K/V in `apply_sdpa_with_kv_cache` prefill branch) safe.
+        return apply_linear_projection_f32(
+            encoder, registry, device, input, weight,
+            seq_len, in_features, out_features,
+        );
+    }
+    let out_bytes = (seq_len * out_features) as usize * 4;
+    let mut dst = super::decode_pool::pooled_alloc_buffer(
+            device, out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
+        .map_err(|e| anyhow!("alloc projection output (pooled): {e}"))?;
+    apply_linear_projection_f32_into(
+        encoder, registry, device, input, weight, &mut dst,
+        seq_len, in_features, out_features,
+    )?;
+    Ok(dst)
+}
+
 // ================================================================
 // SDPA — causal, GQA, prefill
 // ================================================================
@@ -736,8 +795,8 @@ pub fn apply_sdpa_causal(
     n_kv_heads: u32,
     head_dim: u32,
 ) -> Result<MlxBuffer> {
-    let out = device
-        .alloc_buffer(
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             (n_heads * seq_len * head_dim) as usize * 4,
             DType::F32,
             vec![1, n_heads as usize, seq_len as usize, head_dim as usize],
@@ -888,8 +947,8 @@ pub fn apply_sdpa_with_kv_cache(
     //   Single commit_and_wait for both K/V cache write + SDPA.
     //
     // For seq > 1 (prefill): CPU K/V permute is required for head-major layout.
-    let out_buf = device
-        .alloc_buffer(nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
+    let out_buf = super::decode_pool::pooled_alloc_buffer(
+            device, nh * seq * d * 4, DType::F32, vec![1, nh, seq, d])
         .map_err(|e| anyhow!("alloc sdpa kv-cache output: {e}"))?;
 
     if seq == 1 && head_dim % 32 == 0 {
@@ -1063,20 +1122,23 @@ pub fn build_gated_attn_layer(
         // Barrier: ops 2 read from x_norm written above.
         enc.memory_barrier();
 
-        // Op 2: Q/K/V/G projections (all read from x_norm)
-        let q_flat = apply_linear_projection_f32(
+        // Op 2: Q/K/V/G projections (all read from x_norm).
+        // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
+        // (prefill) auto-falls-back to unpooled inside the helper because some
+        // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
+        let q_flat = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &x_norm,
             &weights_gpu.wq, seq_len, hidden_size, q_total,
         )?;
-        let k_flat = apply_linear_projection_f32(
+        let k_flat = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &x_norm,
             &weights_gpu.wk, seq_len, hidden_size, kv_total,
         )?;
-        let v_flat = apply_linear_projection_f32(
+        let v_flat = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &x_norm,
             &weights_gpu.wv, seq_len, hidden_size, kv_total,
         )?;
-        let gate_flat = apply_linear_projection_f32(
+        let gate_flat = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &x_norm,
             &weights_gpu.w_gate, seq_len, hidden_size, q_total,
         )?;
@@ -1150,18 +1212,19 @@ pub fn build_gated_attn_layer(
         let gated = apply_sigmoid_gate_multiply(
             &mut enc, registry, device, &attn_out, &gate_flat, n_elem,
         )?;
-        let out = apply_linear_projection_f32(
+        let out = apply_linear_projection_f32_pooled(
             &mut enc, registry, device, &gated,
             &weights_gpu.wo, seq_len, q_total, hidden_size,
         )?;
-        // Decode fast path (seq=1): commit() without wait.
+        // Decode fast path (seq=1): commit() without wait, and `out` is pooled.
         // The caller (forward_gpu) feeds `out` into dispatch_fused_residual_norm_f32
         // via a new encoder on the same Metal serial queue, so the GPU will
         // execute ops6-7 before fused_residual_norm without a CPU sync.
         //
-        // Prefill (seq>1): commit_and_wait() because dump_hidden_stats in
-        // forward_gpu may do a CPU read of the returned buffer, and because
-        // prefill throughput is not the hot path.
+        // Prefill (seq>1): pooled helper falls back to unpooled internally;
+        // commit_and_wait() because dump_hidden_stats in forward_gpu may do a
+        // CPU read of the returned buffer, and because prefill throughput is
+        // not the hot path.
         if seq_len == 1 {
             enc.commit();
         } else {

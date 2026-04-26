@@ -388,6 +388,12 @@ fn proj(
         &weight_bf16_owned
     };
 
+    // NOT pooled — `proj` is called from both `build_moe_ffn_layer_gpu` (the
+    // unquantized path, which downloads router logits via `download_f32` →
+    // `as_slice` → reads full `byte_len()`) AND `build_moe_ffn_layer_gpu_q`
+    // (the quantized path, which keeps the buffer on GPU).  The pool's
+    // power-of-two bucket rounding would inflate `byte_len()` beyond the
+    // requested shape and break the unquantized path.
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
         .alloc_buffer(
@@ -931,11 +937,10 @@ pub fn build_moe_ffn_layer_gpu(
 // Quantized MoE GPU forward pass
 // ================================================================
 
-/// Upload a u32 slice as a Metal buffer.
+/// Upload a u32 slice as a Metal buffer (pooled — used per decode token).
 fn upload_u32(data: &[u32], device: &MlxDevice) -> Result<MlxBuffer> {
     let byte_len = data.len() * 4;
-    let mut buf = device
-        .alloc_buffer(byte_len, DType::U32, vec![data.len()])
+    let mut buf = super::decode_pool::pooled_alloc_buffer(device, byte_len, DType::U32, vec![data.len()])
         .map_err(|e| anyhow!("alloc u32 buf: {e}"))?;
     {
         let s = buf.as_mut_slice::<u32>().map_err(|e| anyhow!("u32 mut_slice: {e}"))?;
@@ -1020,45 +1025,47 @@ pub fn build_moe_ffn_layer_gpu_q(
     //   BARRIER
     //   F. moe_weighted_reduce(w,y_all,sh_logit,y_s → out [+residual])
     //   commit_and_wait() — single GPU sync per MoE layer
+    // ADR-012 §Optimize / Task #15: route every per-token MoE FFN scratch
+    // allocation through the thread-local arena pool.  These buffers' lifetimes
+    // are bounded by `build_moe_ffn_layer_gpu_q`; `forward_gpu_greedy`'s
+    // top-of-token `reset_decode_pool` recycles them on the next token.
     let total_rows = seq * topk;
-    let ids_buf = device
-        .alloc_buffer(total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
+    let ids_buf = super::decode_pool::pooled_alloc_buffer(
+            device, total_rows * DType::U32.size_of(), DType::U32, vec![total_rows])
         .map_err(|e| anyhow!("alloc ids_buf: {e}"))?;
-    let weights_buf = device
-        .alloc_buffer(total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
+    let weights_buf = super::decode_pool::pooled_alloc_buffer(
+            device, total_rows * DType::F32.size_of(), DType::F32, vec![total_rows])
         .map_err(|e| anyhow!("alloc weights_buf: {e}"))?;
     let gate_all_bytes = total_rows * m_moe * 4;
-    let mut gate_all_buf = device
-        .alloc_buffer(gate_all_bytes, DType::F32, vec![total_rows, m_moe])
+    let mut gate_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, gate_all_bytes, DType::F32, vec![total_rows, m_moe])
         .map_err(|e| anyhow!("alloc gate_all: {e}"))?;
     let up_all_bytes = total_rows * m_moe * 4;
-    let mut up_all_buf = device
-        .alloc_buffer(up_all_bytes, DType::F32, vec![total_rows, m_moe])
+    let mut up_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, up_all_bytes, DType::F32, vec![total_rows, m_moe])
         .map_err(|e| anyhow!("alloc up_all: {e}"))?;
     let n_h_all = (total_rows * m_moe) as u32;
-    let h_all_buf = device
-        .alloc_buffer(n_h_all as usize * 4, DType::F32, vec![total_rows, m_moe])
+    let h_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h_all as usize * 4, DType::F32, vec![total_rows, m_moe])
         .map_err(|e| anyhow!("alloc h_all: {e}"))?;
     let y_all_bytes = total_rows * h * 4;
-    let mut y_all_buf = device
-        .alloc_buffer(y_all_bytes, DType::F32, vec![total_rows, h])
+    let mut y_all_buf = super::decode_pool::pooled_alloc_buffer(
+            device, y_all_bytes, DType::F32, vec![total_rows, h])
         .map_err(|e| anyhow!("alloc y_all: {e}"))?;
     let m_sh = m_sh32 as usize;
     let n_h_s = (seq * m_sh) as u32;
-    let h_s_buf = device
-        .alloc_buffer(n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
+    let h_s_buf = super::decode_pool::pooled_alloc_buffer(
+            device, n_h_s as usize * 4, DType::F32, vec![seq, m_sh])
         .map_err(|e| anyhow!("alloc h_s: {e}"))?;
     let out_bytes = seq * h * 4;
-    let mut out_buf = device
-        .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+    let mut out_buf = super::decode_pool::pooled_alloc_buffer(
+            device, out_bytes, DType::F32, vec![seq, h])
         .map_err(|e| anyhow!("alloc output: {e}"))?;
     // params_buf for silu_mul (holds n as u32, must outlive the encoder)
-    let mut silu_params_buf = device
-        .alloc_buffer(4, DType::U32, vec![1])
+    let mut silu_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc silu params: {e}"))?;
     silu_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_all;
-    let mut silu_sh_params_buf = device
-        .alloc_buffer(4, DType::U32, vec![1])
+    let mut silu_sh_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
         .map_err(|e| anyhow!("alloc silu_sh params: {e}"))?;
     silu_sh_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?[0] = n_h_s;
 
@@ -1068,8 +1075,7 @@ pub fn build_moe_ffn_layer_gpu_q(
     let residual_ref: &MlxBuffer = match add_residual {
         Some(buf) => buf,
         None => {
-            dummy_residual_buf = device
-                .alloc_buffer(4, DType::F32, vec![1])
+            dummy_residual_buf = super::decode_pool::pooled_alloc_buffer(device, 4, DType::F32, vec![1])
                 .map_err(|e| anyhow!("alloc dummy residual: {e}"))?;
             &dummy_residual_buf
         }

@@ -272,15 +272,16 @@ pub fn apply_pre_norm(
     hidden_size: u32,
     eps: f32,
 ) -> Result<MlxBuffer> {
-    let out = device
-        .alloc_buffer(
+    // ADR-012 §Optimize / Task #15: route per-decode-token scratch allocations
+    // through the thread-local arena pool to amortize Metal `newBuffer` overhead.
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             (seq_len * hidden_size) as usize * 4,
             DType::F32,
             vec![seq_len as usize, hidden_size as usize],
         )
         .map_err(|e| anyhow!("alloc pre_norm out: {e}"))?;
-    let mut params = device
-        .alloc_buffer(8, DType::F32, vec![2])
+    let mut params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc params: {e}"))?;
     {
         let s = params.as_mut_slice::<f32>().map_err(|e| anyhow!("{e}"))?;
@@ -322,8 +323,8 @@ pub fn apply_proj(
     out_features: u32,
 ) -> Result<MlxBuffer> {
     let out_bytes = (seq_len * out_features) as usize * 4;
-    let mut dst = device
-        .alloc_buffer(
+    let mut dst = super::decode_pool::pooled_alloc_buffer(
+            device,
             out_bytes,
             DType::F32,
             vec![seq_len as usize, out_features as usize],
@@ -517,15 +518,14 @@ pub fn apply_l2_norm_per_head(
 ) -> Result<MlxBuffer> {
     let rows = seq_len * n_heads;
     let dim = head_dim;
-    let out = device
-        .alloc_buffer(
+    let out = super::decode_pool::pooled_alloc_buffer(
+            device,
             (rows * dim) as usize * 4,
             DType::F32,
             vec![rows as usize, dim as usize],
         )
         .map_err(|e| anyhow!("alloc l2_norm out: {e}"))?;
-    let mut params_buf = device
-        .alloc_buffer(8, DType::F32, vec![2])
+    let mut params_buf = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc l2_norm params: {e}"))?;
     {
         let s = params_buf
@@ -818,39 +818,44 @@ pub fn build_delta_net_layer(
     // Pre-allocate ssm_conv output (qkv_conv) and params buffers.
     // conv_state_in/conv_state_out are passed directly from the kv_cache
     // (GPU ping-pong buffers in kernel-native layout) — no upload/download needed.
-    let qkv_conv = device
-        .alloc_buffer(
+    //
+    // ADR-012 §Optimize / Task #15: route every per-token scratch allocation
+    // through the thread-local arena pool (`pooled_alloc_buffer`).  These
+    // buffers' lifetimes are bounded by `build_delta_net_layer` itself; the
+    // forward pass `reset_decode_pool` at the top of `forward_gpu_greedy`
+    // recycles them on the next token.
+    let qkv_conv = super::decode_pool::pooled_alloc_buffer(
+            device,
             (seq_len * qkv_channels) as usize * 4,
             DType::F32,
             vec![seq as usize, qkv_ch],
         )
         .map_err(|e| anyhow!("alloc qkv_conv: {e}"))?;
-    let mut ssm_params_buf = device
-        .alloc_buffer(4 * 4, DType::U32, vec![4])
+    let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4 * 4, DType::U32, vec![4])
         .map_err(|e| anyhow!("alloc ssm params: {e}"))?;
     {
         let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
         s[0] = qkv_channels; s[1] = seq_len; s[2] = 1; s[3] = k_width;
     }
     let ssm_conv_params = SsmConvParams { channels: qkv_channels, n_tokens: seq_len, n_seqs: 1, k_width };
-    let q_scaled = device.alloc_buffer(n_q_elems * 4, DType::F32, vec![n_q_elems])
+    let q_scaled = super::decode_pool::pooled_alloc_buffer(device, n_q_elems * 4, DType::F32, vec![n_q_elems])
         .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
-    let g_buf = device.alloc_buffer(g_n * 4, DType::F32, vec![g_n])
+    let g_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
         .map_err(|e| anyhow!("alloc g_buf: {e}"))?;
-    let beta_buf = device.alloc_buffer(g_n * 4, DType::F32, vec![g_n])
+    let beta_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
         .map_err(|e| anyhow!("alloc beta_buf: {e}"))?;
-    let mut g_params_buf = device.alloc_buffer(8, DType::U32, vec![2])
+    let mut g_params_buf = super::decode_pool::pooled_alloc_buffer(device, 8, DType::U32, vec![2])
         .map_err(|e| anyhow!("alloc g_params: {e}"))?;
     {
         let s = g_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
         s[0] = n_v_heads;
         s[1] = seq_len;
     }
-    let gated_buf = device.alloc_buffer(gated_elems * 4, DType::F32, vec![gated_elems])
+    let gated_buf = super::decode_pool::pooled_alloc_buffer(device, gated_elems * 4, DType::F32, vec![gated_elems])
         .map_err(|e| anyhow!("alloc op8 gated: {e}"))?;
     let op8_params = build_ssm_norm_gate_params(device, rms_norm_eps, d_v)
         .map_err(|e| anyhow!("op8 params: {e}"))?;
-    let attn_out_buf = device.alloc_buffer(out_elems * 4, DType::F32, vec![out_elems])
+    let attn_out_buf = super::decode_pool::pooled_alloc_buffer(device, out_elems * 4, DType::F32, vec![out_elems])
         .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
     // state_in and state_out are caller-provided buffers (ping-pong).
     // Metal requires distinct buffers for read and write bindings.

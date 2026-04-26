@@ -1076,6 +1076,14 @@ impl Qwen35Model {
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu_greedy: tokens must be non-empty"));
         }
+        // Reset the thread-local arena pool at the top of every decode token.
+        // Layer dispatch helpers (build_delta_net_layer, build_moe_ffn_layer_gpu_q,
+        // build_gated_attn_layer + their helpers) allocate scratch buffers from
+        // the pool via `pooled_alloc_buffer`; the locals fall out of scope at
+        // function exit, and this reset moves the pool's ARC clones back to
+        // the free list for the next token's reuse.  Closes the ADR-012
+        // §Optimize / Task #15 MoE dwq46 0.90× decode parity gap.
+        super::decode_pool::reset_decode_pool();
         let seq_len = tokens.len() as u32;
         let expected_pos_len = 4 * seq_len as usize;
         if positions_flat.len() != expected_pos_len {
