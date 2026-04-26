@@ -749,4 +749,244 @@ mod tests {
             );
         }
     }
+
+    // ─────────────── End-to-end integration tests (iter-3k) ───────────────
+
+    /// Deterministic LCG-based F32 generator for reproducible test
+    /// inputs. Output values are roughly in `[-1, 1]`.
+    fn synth_row(seed: u64, n: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bits = (state >> 33) as u32;
+                (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn rmse_pair(a: &[f32], b: &[f32]) -> f64 {
+        let mut sse = 0.0_f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (*x as f64) - (*y as f64);
+            sse += d * d;
+        }
+        (sse / a.len() as f64).sqrt()
+    }
+
+    fn decode_via_codec_format(
+        target: KQuantTarget,
+        bytes: &[u8],
+        n: usize,
+    ) -> Vec<f32> {
+        use crate::quantize::k_quant::{
+            dequantize_row_q4_k_bytes, dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+        };
+        use crate::quantize::q_legacy::{
+            dequantize_row_q4_0_bytes, dequantize_row_q5_0_bytes, dequantize_row_q5_1_bytes,
+            dequantize_row_q8_0_bytes,
+        };
+
+        let mut out = vec![0.0_f32; n];
+        match target {
+            KQuantTarget::Q4K => {
+                dequantize_row_q4_k_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q5K => {
+                dequantize_row_q5_k_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q6K => {
+                dequantize_row_q6_k_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q4Legacy => {
+                dequantize_row_q4_0_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q5Legacy0 => {
+                dequantize_row_q5_0_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q5Legacy1 => {
+                dequantize_row_q5_1_bytes(bytes, &mut out).unwrap();
+            }
+            KQuantTarget::Q8Legacy => {
+                dequantize_row_q8_0_bytes(bytes, &mut out).unwrap();
+            }
+        }
+        out
+    }
+
+    fn rmse_bound_for(target: KQuantTarget) -> f64 {
+        match target {
+            KQuantTarget::Q4K => 0.05,
+            KQuantTarget::Q5K => 0.025,
+            KQuantTarget::Q6K => 0.012,
+            KQuantTarget::Q4Legacy => 0.05,
+            KQuantTarget::Q5Legacy0 => 0.025,
+            KQuantTarget::Q5Legacy1 => 0.025,
+            KQuantTarget::Q8Legacy => 0.005,
+        }
+    }
+
+    /// 4096-element row (typical attention Q-projection inner dim)
+    /// round-trip for each of the 7 codec targets within RMSE bound.
+    #[test]
+    fn integration_round_trip_4096_all_formats() {
+        let n = 4096;
+        let row = synth_row(0xCAFE_BABE, n);
+
+        for target in [
+            KQuantTarget::Q4K,
+            KQuantTarget::Q5K,
+            KQuantTarget::Q6K,
+            KQuantTarget::Q4Legacy,
+            KQuantTarget::Q5Legacy0,
+            KQuantTarget::Q5Legacy1,
+            KQuantTarget::Q8Legacy,
+        ] {
+            let bytes =
+                quantize_row_to_bytes(&row, target, &CalibrationData::None, "weight").unwrap();
+            let n_blocks = n / target.elements_per_block();
+            let expected_bytes = n_blocks * target.bytes_per_block();
+            assert_eq!(
+                bytes.len(),
+                expected_bytes,
+                "{target:?}: produced {} bytes, expected {expected_bytes}",
+                bytes.len()
+            );
+
+            let decoded = decode_via_codec_format(target, &bytes, n);
+            let r = rmse_pair(&row, &decoded);
+            let bound = rmse_bound_for(target);
+            assert!(
+                r < bound,
+                "{target:?} 4096-elem RMSE {r} > bound {bound}"
+            );
+        }
+    }
+
+    /// 16384-element row (typical FFN gate-projection output dim).
+    #[test]
+    fn integration_round_trip_16384_all_formats() {
+        let n = 16384;
+        let row = synth_row(0xDEAD_BEEF, n);
+
+        for target in [
+            KQuantTarget::Q4K,
+            KQuantTarget::Q5K,
+            KQuantTarget::Q6K,
+            KQuantTarget::Q4Legacy,
+            KQuantTarget::Q5Legacy0,
+            KQuantTarget::Q5Legacy1,
+            KQuantTarget::Q8Legacy,
+        ] {
+            let bytes =
+                quantize_row_to_bytes(&row, target, &CalibrationData::None, "weight").unwrap();
+            let decoded = decode_via_codec_format(target, &bytes, n);
+            let r = rmse_pair(&row, &decoded);
+            let bound = rmse_bound_for(target);
+            assert!(
+                r < bound,
+                "{target:?} 16K-elem RMSE {r} > bound {bound}"
+            );
+        }
+    }
+
+    /// Bit-budget verification — output bytes × 8 / element-count
+    /// matches `bpw()` within 5%. Catches drift in
+    /// bytes_per_block / elements_per_block accounting.
+    #[test]
+    fn integration_bpw_matches_on_disk_size() {
+        let n = 4096;
+        let row = vec![0.5_f32; n];
+
+        for target in [
+            KQuantTarget::Q4K,
+            KQuantTarget::Q5K,
+            KQuantTarget::Q6K,
+            KQuantTarget::Q4Legacy,
+            KQuantTarget::Q5Legacy0,
+            KQuantTarget::Q5Legacy1,
+            KQuantTarget::Q8Legacy,
+        ] {
+            let bytes =
+                quantize_row_to_bytes(&row, target, &CalibrationData::None, "weight").unwrap();
+            let measured_bpw = (bytes.len() as f32 * 8.0) / n as f32;
+            let documented_bpw = target.bpw();
+            let pct_diff = ((measured_bpw - documented_bpw) / documented_bpw).abs();
+            assert!(
+                pct_diff < 0.05,
+                "{target:?}: measured bpw {measured_bpw:.4} != documented {documented_bpw:.4}"
+            );
+        }
+    }
+
+    /// **Imatrix path actually fires for K-family** — biased weights
+    /// produce different bytes than uniform / None for Q4_K/Q5_K/Q6_K.
+    /// Ensures the dispatch branch isn't accidentally falling through.
+    #[test]
+    fn integration_imatrix_changes_k_family_bytes() {
+        let n = 4096;
+        let row = synth_row(0xAA55_AA55, n);
+
+        let mut weights_map = HashMap::new();
+        let mut w = vec![1.0_f32; n];
+        for v in w.iter_mut().take(256) {
+            *v = 100.0;
+        }
+        weights_map.insert("weight".to_string(), w);
+        let imatrix = CalibrationData::Imatrix(weights_map);
+
+        for target in [KQuantTarget::Q4K, KQuantTarget::Q5K, KQuantTarget::Q6K] {
+            let bytes_imatrix =
+                quantize_row_to_bytes(&row, target, &imatrix, "weight").unwrap();
+            let bytes_ref =
+                quantize_row_to_bytes(&row, target, &CalibrationData::None, "weight").unwrap();
+            assert_eq!(bytes_imatrix.len(), bytes_ref.len());
+            assert_ne!(
+                bytes_imatrix, bytes_ref,
+                "{target:?}: imatrix path produced byte-identical output to _ref"
+            );
+        }
+    }
+
+    /// Resolution ordering — Q8_0 > Q6_K > Q5_K > Q5_0 > Q4_K > Q4_0
+    /// in accuracy. Verifies the bpw vs RMSE curve holds end-to-end.
+    /// Q5_1 ordering vs Q5_0 is data-dependent (asymmetry helps when
+    /// distribution is shifted), so not asserted here.
+    #[test]
+    fn integration_resolution_ordering() {
+        let n = 4096;
+        let row = synth_row(0xFEED_FACE, n);
+
+        let mut rmses: Vec<(KQuantTarget, f64)> = Vec::new();
+        for target in [
+            KQuantTarget::Q4Legacy,
+            KQuantTarget::Q4K,
+            KQuantTarget::Q5Legacy0,
+            KQuantTarget::Q5K,
+            KQuantTarget::Q6K,
+            KQuantTarget::Q8Legacy,
+        ] {
+            let bytes =
+                quantize_row_to_bytes(&row, target, &CalibrationData::None, "weight").unwrap();
+            let decoded = decode_via_codec_format(target, &bytes, n);
+            rmses.push((target, rmse_pair(&row, &decoded)));
+        }
+
+        let r = |t: KQuantTarget| rmses.iter().find(|(x, _)| *x == t).unwrap().1;
+
+        let r_q40 = r(KQuantTarget::Q4Legacy);
+        let r_q4k = r(KQuantTarget::Q4K);
+        let r_q50 = r(KQuantTarget::Q5Legacy0);
+        let r_q5k = r(KQuantTarget::Q5K);
+        let r_q6k = r(KQuantTarget::Q6K);
+        let r_q80 = r(KQuantTarget::Q8Legacy);
+
+        assert!(r_q50 < r_q40, "Q5_0 RMSE {r_q50} should be < Q4_0 {r_q40}");
+        assert!(r_q5k < r_q50, "Q5_K {r_q5k} should be < Q5_0 {r_q50}");
+        assert!(r_q6k < r_q5k, "Q6_K {r_q6k} should be < Q5_K {r_q5k}");
+        assert!(r_q80 < r_q6k, "Q8_0 {r_q80} should be < Q6_K {r_q6k}");
+        assert!(r_q4k < r_q40, "Q4_K {r_q4k} should be < Q4_0 {r_q40}");
+    }
 }
