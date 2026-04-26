@@ -3086,7 +3086,27 @@ impl MlxModelWeights {
             let vocab = logits.len().min(vocab_size);
             let mut indexed: Vec<(usize, f32)> = logits[..vocab]
                 .iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // Sort descending by logit.  NaN logits would crash
+            // `partial_cmp().unwrap()` — sort them as the smallest
+            // possible value (they land at the end of the descending
+            // sort so the top-10 print stays useful) and surface a
+            // separate NaN-count line below so the operator can see
+            // the model is producing garbage logits without losing
+            // the diagnostic itself.  Surfaced 2026-04-25 by the
+            // ADR-005 iter-103 vision smoke test (mmproj load was
+            // making warmup logits NaN; the diagnostic block crashed
+            // before printing anything).
+            indexed.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n_nan = indexed.iter().filter(|(_, v)| v.is_nan()).count();
+            if n_nan > 0 {
+                eprintln!(
+                    "[PAD-DIAG] WARNING: {} of {} logits are NaN — model produced garbage; \
+                     pad-win is a downstream symptom",
+                    n_nan, vocab
+                );
+            }
             eprintln!("\n[PAD-DIAG] <pad> won at seq_pos={} (rerank={}). Top 10 Q8 logits:",
                 seq_pos, if rerank_active { "on" } else { "off" });
             for (tok_id, logit) in indexed.iter().take(10) {

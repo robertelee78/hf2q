@@ -996,6 +996,37 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         };
         let loaded = api::engine::LoadedModel::load(&load_opts)?;
         let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
+        // Warm up the engine SYNCHRONOUSLY here, BEFORE any other Metal
+        // device activity (mmproj load, embedding-model load, ViT
+        // warmup) happens.  This is iter-103's fix for the
+        // chat-warmup-logits-go-NaN bug surfaced when `--mmproj` is
+        // supplied: bisection showed loading the mmproj weights
+        // (~1 GB of fresh F16-→F32 dequant'd Metal buffers) corrupts
+        // the chat-model's pre-warmup state somehow (likely Metal-
+        // driver buffer interleaving on Apple Silicon unified memory),
+        // making every chat-model logit NaN at first decode.  Running
+        // the chat warmup BEFORE any other Metal work is a structural
+        // fix: the chat-model's GPU state is fully exercised + stable
+        // by the time the mmproj load adds buffers.  As a happy side
+        // effect, /readyz returns 200 immediately upon serving instead
+        // of after the previously-async warmup completed.
+        //
+        // Uses a temp tokio runtime to drive the async API.  The
+        // serve-time runtime is built later and is independent of
+        // this one.
+        let warmup_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for synchronous engine warmup")?;
+        let warmup_started = std::time::Instant::now();
+        warmup_rt
+            .block_on(engine.warmup())
+            .context("synchronous engine warmup")?;
+        tracing::info!(
+            elapsed_ms = warmup_started.elapsed().as_millis() as u64,
+            "Engine warmed up synchronously (pre-mmproj order — iter-103 fix)"
+        );
+        drop(warmup_rt);
         Some(engine)
     } else {
         None
@@ -1150,13 +1181,30 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         }
         // Load every tensor onto the Metal device. For Gemma 4 this is
         // ~400MB / 356 tensors / ~10s cold-cache on M5 Max.
+        //
+        // Iter-103 added the `HF2Q_SKIP_MMPROJ_LOAD=1` escape hatch
+        // for bisecting the chat-warmup-logits-go-NaN bug: if
+        // skipping the mmproj weight load (just keep the config +
+        // arch detection) makes chat warmup produce valid logits,
+        // the bug is in `LoadedMmprojWeights::load`'s buffer-alloc
+        // / dequant path; if NaN persists, the bug is somewhere
+        // earlier (the GGUF mmap itself).
+        let skip_mmproj_load =
+            std::env::var("HF2Q_SKIP_MMPROJ_LOAD").as_deref() == Ok("1");
         let device = mlx_native::MlxDevice::new()
             .map_err(|e| anyhow::anyhow!("create MlxDevice for mmproj load: {e}"))?;
-        let mmp_weights =
+        let mmp_weights = if skip_mmproj_load {
+            tracing::warn!(
+                "HF2Q_SKIP_MMPROJ_LOAD=1 — using empty mmproj weights; \
+                 vision requests will 500 on first forward attempt"
+            );
+            crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device)
+        } else {
             crate::inference::vision::mmproj_weights::LoadedMmprojWeights::load(
                 &gguf, &mmp_config, device,
             )
-            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("mmproj weight load: {e}"))?
+        };
         let model_id = mmp_path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1176,16 +1224,32 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         // to trigger Metal kernel pipeline compilation. Drops first
         // user-visible multimodal request from ~5–10s (cold compile)
         // to ~1.3s (steady-state) on M5 Max.
-        let warmup_t0 = std::time::Instant::now();
-        match crate::inference::vision::vit_gpu::warmup_vit_gpu(&mmp_weights, &mmp_config) {
-            Ok(()) => tracing::info!(
-                elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
-                "ViT GPU warmup complete"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "ViT GPU warmup failed; first multimodal request will pay kernel-compile cost"
-            ),
+        //
+        // Iter-103 added the `HF2Q_SKIP_VIT_WARMUP=1` escape hatch
+        // for bisecting the chat-warmup-logits-go-NaN bug: if
+        // skipping the ViT warmup makes chat warmup produce valid
+        // logits, the bug lives in `warmup_vit_gpu`'s leftover GPU
+        // state; if NaN persists, the bug lives in
+        // `LoadedMmprojWeights::load`.
+        let skip_vit_warmup =
+            std::env::var("HF2Q_SKIP_VIT_WARMUP").as_deref() == Ok("1");
+        if skip_vit_warmup {
+            tracing::warn!(
+                "HF2Q_SKIP_VIT_WARMUP=1 — skipping ViT GPU warmup; first \
+                 multimodal request will pay kernel-compile cost"
+            );
+        } else {
+            let warmup_t0 = std::time::Instant::now();
+            match crate::inference::vision::vit_gpu::warmup_vit_gpu(&mmp_weights, &mmp_config) {
+                Ok(()) => tracing::info!(
+                    elapsed_ms = warmup_t0.elapsed().as_millis() as u64,
+                    "ViT GPU warmup complete"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "ViT GPU warmup failed; first multimodal request will pay kernel-compile cost"
+                ),
+            }
         }
         Some(api::state::LoadedMmproj {
             gguf_path: mmp_path.clone(),
@@ -1240,25 +1304,22 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         );
         eprintln!("hf2q serving on http://{}", bind);
 
-        // Dispatch warmup in the background if an engine was spawned.
-        // /readyz returns 503 while this runs; it flips to 200 when the
-        // warmup Reply arrives. Done in a spawn so the server can already
-        // accept non-generation endpoints (health/models) during warmup.
-        if let Some(engine) = state_for_warmup.engine.clone() {
-            let ready_flag = state_for_warmup.ready_for_gen.clone();
-            tokio::spawn(async move {
-                match engine.warmup().await {
-                    Ok(()) => {
-                        ready_flag.store(true, std::sync::atomic::Ordering::Release);
-                        tracing::info!("hf2q engine warmup complete; /readyz now 200");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "engine warmup failed");
-                        // Leave ready_for_gen false — /readyz stays 503 so
-                        // orchestrators don't route traffic.
-                    }
-                }
-            });
+        // Engine warmup ran SYNCHRONOUSLY before mmproj load (iter-103
+        // fix — see the warmup_rt block above).  Just flip
+        // ready_for_gen so /readyz returns 200 immediately upon
+        // serving.  The previous design ran warmup in a tokio::spawn
+        // here so /v1/models could serve while warmup ran, but
+        // (a) warmup is fast enough (~10–60 s on M5 Max) that no
+        //     orchestrator times out waiting, and
+        // (b) running warmup AFTER mmproj load triggered the
+        //     iter-103 NaN-logits bug.
+        if state_for_warmup.engine.is_some() {
+            state_for_warmup
+                .ready_for_gen
+                .store(true, std::sync::atomic::Ordering::Release);
+            tracing::info!(
+                "hf2q engine ready_for_gen=true (warmup ran synchronously pre-mmproj)"
+            );
         }
 
         axum::serve(listener, router)
