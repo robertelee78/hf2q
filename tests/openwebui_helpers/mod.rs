@@ -595,6 +595,11 @@ pub fn assert_nonstreaming_invariants(resp: &serde_json::Value) {
 /// time (see `src/serve/api/handlers.rs:135-136`); they MUST differ
 /// between recording and replay. Everything else (object, model,
 /// system_fingerprint, choices) is request-stable at temperature=0.
+///
+/// Iter B-2 W66 extension: also normalize the per-tool-call wall-clock
+/// `id` (`call_hf2q_<16hex>`) which the engine synthesizes from
+/// `SystemTime::now()` on each emission. Same OpenAI-style ephemeral
+/// shape as `chatcmpl-<uuid>`; same normalization treatment.
 pub fn normalize_chunk_for_replay(s: &str) -> String {
     if s == "[DONE]" {
         return s.to_string();
@@ -608,6 +613,28 @@ pub fn normalize_chunk_for_replay(s: &str) -> String {
         }
         if obj.contains_key("created") {
             obj.insert("created".into(), serde_json::json!(0));
+        }
+    }
+    // Iter B-2 W66: walk choices[*].delta.tool_calls[*] and
+    // normalize per-call ids. The engine synthesizes
+    // `call_hf2q_<UNIX_EPOCH-ns ^ index-mix>` so each fresh run varies.
+    if let Some(choices) = v.pointer_mut("/choices").and_then(|c| c.as_array_mut()) {
+        for ch in choices {
+            if let Some(tcs) = ch
+                .pointer_mut("/delta/tool_calls")
+                .and_then(|t| t.as_array_mut())
+            {
+                for tc in tcs {
+                    if let Some(obj) = tc.as_object_mut() {
+                        if obj.contains_key("id") && !obj["id"].is_null() {
+                            obj.insert(
+                                "id".into(),
+                                serde_json::json!("<tool-call-id>"),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     serde_json::to_string(&v).unwrap_or_else(|_| s.to_string())
