@@ -1003,6 +1003,97 @@ fn cmd_generate_qwen35(
     Ok(())
 }
 
+/// ADR-005 Phase 4 iter-208 (W76): callable engine loader extracted from
+/// `cmd_serve` so the [`multi_model::HotSwapManager`] can dispatch against
+/// the same load path the single-model startup uses.
+///
+/// **Pure refactor.**  The body of this function is the byte-identical
+/// sequence that previously lived inline in `cmd_serve` (header validate
+/// → `LoadedModel::load` → `Engine::spawn` → optional synchronous warmup
+/// on a one-shot tokio runtime).  `cmd_serve` now calls this for the
+/// existing single-model startup path; iter-209 will plumb it through
+/// `HotSwapManager::load_or_get` so a second model load mid-process is
+/// possible without re-implementing the load.
+///
+/// **Why synchronous warmup.**  Iter-103 (`8109954`) fixed the
+/// chat-warmup-logits-go-NaN bug surfaced when `--mmproj` is supplied:
+/// running the chat warmup BEFORE any other Metal device activity (mmproj
+/// load, embedding-model load, ViT warmup) keeps the chat-model GPU
+/// state stable.  The hot-swap orchestrator preserves that ordering by
+/// running each engine's warmup synchronously inside `load_engine` so
+/// the engine returned to the caller is fully primed.
+///
+/// **Errors** propagate from header parse, weights load, tokenizer parse,
+/// chat-template resolution, or warmup — every failure is fatal to the
+/// load attempt.  Caller decides how to surface it (cmd_serve aborts the
+/// boot; HotSwapManager will return the error to the request handler).
+pub fn load_engine(
+    path: &Path,
+    config: &multi_model::EngineConfig,
+) -> Result<api::engine::Engine> {
+    anyhow::ensure!(
+        path.exists(),
+        "Model not found: {}",
+        path.display()
+    );
+    // Header-only parse surfaces bad magic immediately without loading
+    // any tensor data.
+    {
+        let gguf = mlx_native::gguf::GgufFile::open(path)
+            .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
+        tracing::info!(
+            path = %path.display(),
+            tensors = gguf.tensor_count(),
+            metadata = gguf.metadata_count(),
+            "Validated GGUF header"
+        );
+    }
+
+    let load_opts = api::engine::LoadOptions {
+        model_path: path.to_path_buf(),
+        tokenizer_path: config.tokenizer_path.clone(),
+        config_path: config.config_path.clone(),
+    };
+    let loaded = api::engine::LoadedModel::load(&load_opts)?;
+    let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
+
+    if config.warmup_synchronously {
+        // Warm up the engine SYNCHRONOUSLY here, BEFORE any other Metal
+        // device activity (mmproj load, embedding-model load, ViT
+        // warmup) happens.  This is iter-103's fix for the
+        // chat-warmup-logits-go-NaN bug surfaced when `--mmproj` is
+        // supplied: bisection showed loading the mmproj weights
+        // (~1 GB of fresh F16-→F32 dequant'd Metal buffers) corrupts
+        // the chat-model's pre-warmup state somehow (likely Metal-
+        // driver buffer interleaving on Apple Silicon unified memory),
+        // making every chat-model logit NaN at first decode.  Running
+        // the chat warmup BEFORE any other Metal work is a structural
+        // fix: the chat-model's GPU state is fully exercised + stable
+        // by the time the mmproj load adds buffers.  As a happy side
+        // effect, /readyz returns 200 immediately upon serving instead
+        // of after the previously-async warmup completed.
+        //
+        // Uses a temp tokio runtime to drive the async API.  The
+        // serve-time runtime is built later and is independent of
+        // this one.
+        let warmup_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime for synchronous engine warmup")?;
+        let warmup_started = std::time::Instant::now();
+        warmup_rt
+            .block_on(engine.warmup())
+            .context("synchronous engine warmup")?;
+        tracing::info!(
+            elapsed_ms = warmup_started.elapsed().as_millis() as u64,
+            "Engine warmed up synchronously (pre-mmproj order — iter-103 fix)"
+        );
+        drop(warmup_rt);
+    }
+
+    Ok(engine)
+}
+
 /// Run the `serve` subcommand — start the OpenAI-compatible HTTP API server.
 ///
 /// ADR-005 Phase 2a iter-2 backbone: exposes `/health`, `/readyz`,
@@ -1100,67 +1191,25 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
 
     // --- Optionally load the model + spawn the engine ---
     // When --model is supplied, we eagerly load (Decision #15 fail-fast) and
-    // spawn the serialized-FIFO worker thread. Warmup runs on the worker
-    // thread (dispatched via Engine::warmup) and once it completes we flip
-    // `ready_for_gen` on the AppState so /readyz returns 200 and
-    // /v1/chat/completions accepts requests.
+    // spawn the serialized-FIFO worker thread.  Warmup runs synchronously
+    // BEFORE any other Metal device activity (iter-103 fix — see
+    // [`load_engine`] doc).  Once `load_engine` returns the engine is fully
+    // primed; `ready_for_gen` is flipped after the listener binds so
+    // `/readyz` reports the server status, not the load status.
+    //
+    // ADR-005 Phase 4 iter-208 (W76): the load path now flows through the
+    // shared [`load_engine`] callable so the [`multi_model::HotSwapManager`]
+    // (iter-209) can dispatch the same load logic for second-model swaps
+    // without re-implementing it.  This is a pure refactor — the existing
+    // single-model startup behaviour is byte-identical.
     let engine_opt = if let Some(model_path) = resolved_model_path.as_ref() {
-        anyhow::ensure!(
-            model_path.exists(),
-            "Model not found: {}",
-            model_path.display()
-        );
-        // Header-only parse surfaces bad magic immediately without loading
-        // any tensor data.
-        {
-            let gguf = mlx_native::gguf::GgufFile::open(model_path)
-                .map_err(|e| anyhow::anyhow!("GGUF header parse failed: {e}"))?;
-            tracing::info!(
-                path = %model_path.display(),
-                tensors = gguf.tensor_count(),
-                metadata = gguf.metadata_count(),
-                "Validated GGUF header"
-            );
-        }
-
-        let load_opts = api::engine::LoadOptions {
-            model_path: model_path.clone(),
+        let engine_config = multi_model::EngineConfig {
             tokenizer_path: args.tokenizer.clone(),
             config_path: args.config.clone(),
+            queue_capacity: config.queue_capacity,
+            warmup_synchronously: true,
         };
-        let loaded = api::engine::LoadedModel::load(&load_opts)?;
-        let engine = api::engine::Engine::spawn(loaded, config.queue_capacity);
-        // Warm up the engine SYNCHRONOUSLY here, BEFORE any other Metal
-        // device activity (mmproj load, embedding-model load, ViT
-        // warmup) happens.  This is iter-103's fix for the
-        // chat-warmup-logits-go-NaN bug surfaced when `--mmproj` is
-        // supplied: bisection showed loading the mmproj weights
-        // (~1 GB of fresh F16-→F32 dequant'd Metal buffers) corrupts
-        // the chat-model's pre-warmup state somehow (likely Metal-
-        // driver buffer interleaving on Apple Silicon unified memory),
-        // making every chat-model logit NaN at first decode.  Running
-        // the chat warmup BEFORE any other Metal work is a structural
-        // fix: the chat-model's GPU state is fully exercised + stable
-        // by the time the mmproj load adds buffers.  As a happy side
-        // effect, /readyz returns 200 immediately upon serving instead
-        // of after the previously-async warmup completed.
-        //
-        // Uses a temp tokio runtime to drive the async API.  The
-        // serve-time runtime is built later and is independent of
-        // this one.
-        let warmup_rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build tokio runtime for synchronous engine warmup")?;
-        let warmup_started = std::time::Instant::now();
-        warmup_rt
-            .block_on(engine.warmup())
-            .context("synchronous engine warmup")?;
-        tracing::info!(
-            elapsed_ms = warmup_started.elapsed().as_millis() as u64,
-            "Engine warmed up synchronously (pre-mmproj order — iter-103 fix)"
-        );
-        drop(warmup_rt);
+        let engine = load_engine(model_path, &engine_config)?;
         Some(engine)
     } else {
         None

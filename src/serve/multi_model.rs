@@ -89,9 +89,43 @@
 //! - Plan: line 5354 (Phase 4 audit + iter-by-iter plan, iter 206 row).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::intelligence::hardware::HardwareProfile;
+
+/// Configuration consumed by [`crate::serve::load_engine`] (and by extension
+/// the [`ModelLoader`] trait that the [`HotSwapManager`] dispatches against).
+///
+/// Mirrors the per-load fields previously inlined in `cmd_serve`'s
+/// model-load block (`src/serve/mod.rs`, pre-iter-208 lines 1107–1167):
+/// the optional sidecar paths the operator supplied via `--tokenizer` /
+/// `--config`, the FIFO queue capacity used by `Engine::spawn`, and a
+/// `warmup_synchronously` knob that preserves the iter-103 ordering
+/// (chat-warmup BEFORE any other Metal device activity).
+///
+/// Held by-value because every field is small and the loader closure runs
+/// once per load (no hot-path concern with cloning).  The `PathBuf` fields
+/// are `Option<_>` because `--tokenizer` / `--config` default to a
+/// next-to-the-GGUF lookup performed inside `LoadedModel::load`.
+#[derive(Debug, Clone, Default)]
+pub struct EngineConfig {
+    /// Optional explicit `tokenizer.json` path.  `None` ⇒ auto-resolve
+    /// via `find_tokenizer` in `engine.rs` (sidecar lookup).
+    pub tokenizer_path: Option<PathBuf>,
+    /// Optional explicit `config.json` path.  `None` ⇒ auto-resolve via
+    /// `find_config`.
+    pub config_path: Option<PathBuf>,
+    /// FIFO queue capacity passed to `Engine::spawn`.  Bounded backpressure
+    /// surface (Decision #19): when full, handlers see `queue_full` and
+    /// map to 429 + Retry-After.
+    pub queue_capacity: usize,
+    /// When `true`, run `Engine::warmup()` on a temporary tokio runtime
+    /// before returning.  The hot-swap orchestrator and the existing
+    /// `cmd_serve` startup both pass `true` so the returned engine is
+    /// fully primed; tests using a `MockLoader` can pass `false`.
+    pub warmup_synchronously: bool,
+}
 
 /// Default pool capacity per ADR-005 Phase 4 narrative (line 929).
 /// Configurable via [`LoadedPool::with_capacity_and_budget`].
