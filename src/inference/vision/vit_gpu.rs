@@ -2163,7 +2163,8 @@ pub fn compute_vision_embeddings_gpu_gemma4v(
 
         // After GPU finish: shared-memory buffers are safe to read on
         // CPU. Write each collected stage to the dump dir. CPU mirrors
-        // (00_preprocess) are drained from a parallel thread-local.
+        // (00_pre_patchify, 00_post_patchify) are drained from a
+        // parallel thread-local.
         if let Some(ref dir) = dump_dir {
             let img_dir = if images.len() > 1 {
                 dir.join(format!("image_{}", idx))
@@ -3453,14 +3454,58 @@ pub fn gemma4v_apply_full_forward_gpu(
         dst.copy_from_slice(pos_y);
     }
 
-    // ADR-005 iter 124 (W55): record the preprocessed CPU input as
-    // stage `00_preprocess`. The collector is a no-op when the
-    // `HF2Q_VIT_DUMP` env is unset — see `vit_dump.rs`.
+    // ADR-005 iter 124 (W55) + iter 126 (W57): record the preprocessed
+    // CPU input as TWO probe stages so the diff harness can compare
+    // hf2q ↔ peer at the SAME memory layout.
+    //
+    // Stage `00_post_patchify` — `[N_patches, P²·3]` flat, hf2q's native
+    // layout after `preprocess_gemma4v`'s patchify (HWC `(dy, dx, c)`
+    // per row). hf2q-only; the peer (llama.cpp's `inp_raw_scaled`) is
+    // captured pre-patchify so there's no peer counterpart at this
+    // point. Useful for self-consistency checks across iters.
+    //
+    // Stage `00_pre_patchify` — `[3, H, W]` planar CHW (W fastest,
+    // matching ggml ne ordering), reconstructed from the patchified
+    // tensor by inverting the (py, px, dy, dx, c) permutation. This
+    // matches peer's `inp_raw_scaled` byte-for-byte modulo the
+    // bilinear-resize/uint8-cast rounding noise that's inherent to the
+    // independent preprocessing pipelines. The diff harness can now
+    // pair these element-wise without layout-induced false positives.
     if super::vit_dump::is_armed() {
         super::vit_dump::record_f32(
-            "00_preprocess",
+            "00_post_patchify",
             patches,
             vec![n_patches as usize, inner as usize],
+        );
+        // De-patchify into planar [C, H, W] = [3, n_y*P, n_x*P].
+        // `patches` row `(py, px)` holds inner[(dy*P + dx)*3 + c]; we
+        // scatter to planar[c, py*P+dy, px*P+dx] = patches[…]. This is
+        // a pure index permutation (no FP arithmetic) so byte-exact.
+        let p = patch_size as usize;
+        let h = (n_y as usize) * p;
+        let w = (n_x as usize) * p;
+        let mut planar = vec![0f32; 3 * h * w];
+        for py in 0..(n_y as usize) {
+            for px in 0..(n_x as usize) {
+                let patch_idx = py * (n_x as usize) + px;
+                let row_base = patch_idx * (inner as usize);
+                for dy in 0..p {
+                    for dx in 0..p {
+                        let inner_base = (dy * p + dx) * 3;
+                        let yy = py * p + dy;
+                        let xx = px * p + dx;
+                        for c in 0..3 {
+                            planar[c * h * w + yy * w + xx] =
+                                patches[row_base + inner_base + c];
+                        }
+                    }
+                }
+            }
+        }
+        super::vit_dump::record_f32(
+            "00_pre_patchify",
+            &planar,
+            vec![3, h, w],
         );
     }
 

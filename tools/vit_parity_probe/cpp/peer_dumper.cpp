@@ -26,7 +26,21 @@
 //
 //   hf2q                    | llama.cpp tensor name
 //   ────────────────────── ─|──────────────────────
-//   00_preprocess           | inp_raw_scaled
+//   00_pre_patchify         | inp_raw_scaled        — [3, H, W] planar CHW,
+//                                                     post the two-step
+//                                                     scale-bias chain
+//                                                     (`4x − 3`); iter-126
+//                                                     rename of the prior
+//                                                     `00_preprocess` stage
+//                                                     so the diff harness
+//                                                     can compare element-
+//                                                     wise at matching
+//                                                     layout (iter-125
+//                                                     dumped post-patchify
+//                                                     hf2q vs pre-patchify
+//                                                     peer → layout-induced
+//                                                     `max_abs=3.69` false
+//                                                     positive).
 //   01_patch_embd           | inp
 //   02_pos_embd             | pos_embd
 //   03_block_NN             | layer_out-NN  (NN = layer index)
@@ -301,7 +315,7 @@ int main(int argc, char ** argv) {
     capture_state st;
     st.dump_dir = A.dump_dir;
     st.name_map = {
-        { "inp_raw_scaled", "00_preprocess"      },
+        { "inp_raw_scaled", "00_pre_patchify"    },
         { "inp",            "01_patch_embd"      },
         { "pos_embd",       "02_pos_embd"        },
         // 03_block_NN handled by prefix match in map_to_stage().

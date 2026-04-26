@@ -38,7 +38,11 @@
 //! # Stages dumped
 //!
 //! ```text
-//!  00_preprocess          — CPU input tensor (post preprocess_gemma4v)
+//!  00_pre_patchify        — CPU input tensor [3, H, W] planar CHW
+//!                            (matches peer's `inp_raw_scaled`; iter-126)
+//!  00_post_patchify       — CPU input tensor [N_patches, P²·3] HWC
+//!                            (hf2q-native; pre-iter-126 was named
+//!                             `00_preprocess`)
 //!  01_patch_embd          — patch_embed Linear output
 //!  02_pos_embd            — post 2D pos_embd dual-table add
 //!  03_block_NN            — output of ViT block NN, NN ∈ [0, num_layers)
@@ -150,8 +154,9 @@ pub fn is_armed() -> bool {
 }
 
 /// Record a CPU-side `&[f32]` slice as a synthetic stage. Used for the
-/// `00_preprocess` dump (the input tensor that's a CPU `Vec<f32>` from
-/// `preprocess_gemma4v`, never lives on the device).
+/// `00_pre_patchify` / `00_post_patchify` dumps (input tensors that are
+/// CPU `Vec<f32>` derived from `preprocess_gemma4v`, never live on the
+/// device).
 ///
 /// We allocate a one-off f32 byte buffer in a side-store and stash it
 /// alongside the GPU buffers. Same on-disk format as GPU dumps.
