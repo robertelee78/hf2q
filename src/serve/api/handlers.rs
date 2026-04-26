@@ -337,16 +337,16 @@ async fn prepare_chat_generation(
     // → N image tokens + MlxBuffer alloc + range computation) runs
     // after the standard render/tokenize/overflow pipeline so its
     // inputs are exactly the prompt tokens the engine sees.
-    let preprocessed_images =
+    let preprocessed_inputs =
         match process_multimodal_content(&req.messages, state.mmproj.as_ref()) {
             Ok(imgs) => imgs,
             Err(resp) => return Err(resp),
         };
     let (messages_for_render, vision_embeddings, vit_forward_ms_v, vit_images_v) =
-        if preprocessed_images.is_empty() {
+        if preprocessed_inputs.is_empty() {
             (req.messages.clone(), Vec::new(), None, None)
         } else {
-            let n_images = preprocessed_images.len();
+            let n_images = preprocessed_inputs.len();
             let mmproj = state
                 .mmproj
                 .as_ref()
@@ -355,9 +355,17 @@ async fn prepare_chat_generation(
                 (mmproj.config.hidden_size / mmproj.config.num_attention_heads) as f32;
             let scale = 1.0f32 / head_dim_f.sqrt();
             let t0 = std::time::Instant::now();
+            // ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
+            // through `compute_vision_embeddings_gpu_dispatch` (W25) which
+            // partitions the heterogeneous input slice into homogeneous
+            // batches per `ArchProfile` and runs the matching forward.
+            // For `ClipClassic` mmprojs the dispatch is a thin wrapper
+            // around `compute_vision_embeddings_gpu`; for `Gemma4Siglip`
+            // it routes to `compute_vision_embeddings_gpu_gemma4v`.
             let embeddings =
-                match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu(
-                    &preprocessed_images,
+                match crate::inference::vision::vit_gpu::compute_vision_embeddings_gpu_dispatch(
+                    &preprocessed_inputs,
+                    mmproj.arch,
                     &mmproj.weights,
                     &mmproj.config,
                     scale,
@@ -1380,8 +1388,10 @@ mod truncate_tests {
 fn process_multimodal_content(
     messages: &[super::schema::ChatMessage],
     mmproj: Option<&super::state::LoadedMmproj>,
-) -> std::result::Result<Vec<crate::inference::vision::PreprocessedImage>, Response> {
+) -> std::result::Result<Vec<crate::inference::vision::vit_gpu::VisionInput>, Response> {
     use super::schema::{ContentPart, MessageContent};
+    use crate::inference::vision::mmproj::ArchProfile;
+    use crate::inference::vision::vit_gpu::{Gemma4vPreprocessedImage, VisionInput};
     // Pass 1: gather (msg_idx, part_idx, &ImageUrl) refs without parsing.
     // A separate pass keeps the early-exit policy decisions (mmproj absent)
     // from wasting work on the load/decode pipeline.
@@ -1403,10 +1413,37 @@ fn process_multimodal_content(
         Some(m) => m,
         None => return Err(ApiError::no_mmproj_loaded().into_response()),
     };
-    let preprocess_cfg = mmproj.config.preprocess_config();
 
-    let mut out: Vec<crate::inference::vision::PreprocessedImage> =
-        Vec::with_capacity(image_refs.len());
+    // ADR-005 Phase 2c iter-116a: arch-profile dispatch.
+    //
+    // Two preprocessing pipelines live downstream:
+    //   - `ArchProfile::ClipClassic`  → `preprocess_rgb_chw` (square fixed
+    //     `image_size × image_size`) → `VisionInput::Siglip49`.
+    //   - `ArchProfile::Gemma4Siglip` → `preprocess_gemma4v` (variable-
+    //     resolution patch grid + per-patch 2D position arrays) →
+    //     `VisionInput::Gemma4v`.
+    //   - `ArchProfile::Unknown`      → 400; the mmproj loader already
+    //     emitted a load-time error, but we re-fail-loud here so a
+    //     server with a degraded-load mmproj never silently routes to
+    //     the wrong forward.
+    //
+    // The post-preprocess GPU dispatch lives in
+    // `compute_vision_embeddings_gpu_dispatch` (W25 / iter-116) — this
+    // function's only job is to produce the homogeneous `Vec<VisionInput>`
+    // it consumes.
+    if !mmproj.arch.is_supported() {
+        return Err(ApiError::invalid_request(
+            format!(
+                "mmproj arch profile is '{}' — supported profiles: 'gemma4_siglip', \
+                 'clip_classic'.  Reload server with a compatible mmproj GGUF.",
+                mmproj.arch.as_str()
+            ),
+            Some("messages".into()),
+        )
+        .into_response());
+    }
+
+    let mut out: Vec<VisionInput> = Vec::with_capacity(image_refs.len());
     for (mi, pi, image_url) in image_refs {
         // Parse the URL (data URI / file:// / bare path / http).
         let parsed = crate::inference::vision::parse_image_url(&image_url.url)
@@ -1441,26 +1478,63 @@ fn process_multimodal_content(
             )
             .into_response()
         })?;
-        // Decode + resize + normalize + CHW. This is CPU-heavy per image
-        // (896×896 bilinear resize + 2.4M float normalizes); future work
-        // can move it to a rayon pool if a multi-image request becomes a
-        // hot path.
-        let pixel_values = crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
-            .map_err(|e| {
-                ApiError::invalid_request(
-                    format!(
-                        "messages[{}].content[{}].image_url preprocess failed: {}",
-                        mi, pi, e
-                    ),
-                    Some(format!("messages[{}].content[{}]", mi, pi)),
-                )
-                .into_response()
-            })?;
-        out.push(crate::inference::vision::PreprocessedImage {
-            pixel_values,
-            target_size: preprocess_cfg.target_size,
-            source_label,
-        });
+
+        match mmproj.arch {
+            ArchProfile::ClipClassic => {
+                // SigLIP-49 / classic-CLIP: square fixed-size pixels.
+                let preprocess_cfg = mmproj.config.preprocess_config();
+                let pixel_values =
+                    crate::inference::vision::preprocess_rgb_chw(&bytes, &preprocess_cfg)
+                        .map_err(|e| {
+                            ApiError::invalid_request(
+                                format!(
+                                    "messages[{}].content[{}].image_url preprocess failed: {}",
+                                    mi, pi, e
+                                ),
+                                Some(format!("messages[{}].content[{}]", mi, pi)),
+                            )
+                            .into_response()
+                        })?;
+                out.push(VisionInput::Siglip49(
+                    crate::inference::vision::PreprocessedImage {
+                        pixel_values,
+                        target_size: preprocess_cfg.target_size,
+                        source_label,
+                    },
+                ));
+            }
+            ArchProfile::Gemma4Siglip => {
+                // Variable-resolution patches + per-patch 2D pos arrays.
+                let cfg = &crate::inference::vision::preprocess::GEMMA4V_PREPROCESS_DEFAULT;
+                let preprocessed =
+                    crate::inference::vision::preprocess::preprocess_gemma4v(&bytes, cfg)
+                        .map_err(|e| {
+                            ApiError::invalid_request(
+                                format!(
+                                    "messages[{}].content[{}].image_url gemma4v preprocess failed: {}",
+                                    mi, pi, e
+                                ),
+                                Some(format!("messages[{}].content[{}]", mi, pi)),
+                            )
+                            .into_response()
+                        })?;
+                out.push(VisionInput::Gemma4v(Gemma4vPreprocessedImage {
+                    patches: preprocessed.patches,
+                    pos_x: preprocessed.pos_x,
+                    pos_y: preprocessed.pos_y,
+                    n_x: preprocessed.n_x,
+                    n_y: preprocessed.n_y,
+                    source_label,
+                }));
+            }
+            ArchProfile::Unknown => {
+                // Guarded above; preserved so the match is exhaustive.
+                unreachable!(
+                    "process_multimodal_content: ArchProfile::Unknown should have been \
+                     rejected by `is_supported` check above"
+                );
+            }
+        }
     }
     Ok(out)
 }
@@ -2899,11 +2973,19 @@ mod multimodal_tests {
         format!("data:image/png;base64,{b64}")
     }
 
-    /// Build a synthetic `LoadedMmproj` matching a shrunken 8×8 Gemma-4
+    /// Build a synthetic `LoadedMmproj` matching a shrunken 8×8 SigLIP
     /// vision tower for cheap preprocess in tests. `target_size` is 8
     /// so the 4×4 synthetic PNGs resize cheaply. Uses the empty
     /// `LoadedMmprojWeights` — multimodal tests here only exercise
     /// preprocessing + config routing, not forward-pass weight math.
+    ///
+    /// ADR-005 Phase 2c iter-116a: the `arch` is `ClipClassic` so the
+    /// preprocess dispatch routes through `preprocess_rgb_chw` (square
+    /// fixed-size pixels).  A separate `synthetic_mmproj_gemma4v` would
+    /// exercise the variable-resolution branch — out of scope for this
+    /// iter since the gemma4v branch is unit-tested at the GPU layer
+    /// (`compute_vision_embeddings_gpu_dispatch_gemma4v_routes_correctly`)
+    /// and lacks a SigLIP-shaped synthetic-PNG fixture today.
     fn synthetic_mmproj() -> LoadedMmproj {
         use std::sync::Arc;
         let cfg = MmprojConfig {
@@ -2924,7 +3006,7 @@ mod multimodal_tests {
         LoadedMmproj {
             gguf_path: "/tmp/synthetic-mmproj.gguf".into(),
             config: cfg,
-            arch: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            arch: crate::inference::vision::mmproj::ArchProfile::ClipClassic,
             weights: Arc::new(weights),
             model_id: "synthetic-mmproj".into(),
         }
@@ -2979,15 +3061,20 @@ mod multimodal_tests {
 
     #[test]
     fn single_image_preprocesses_to_chw_f32_tensor() {
+        use crate::inference::vision::vit_gpu::VisionInput;
         // With a synthetic 8×8 mmproj, a 4×4 PNG resizes to 8×8 → 3×8×8
         // f32 = 192 floats. Normalized with mean/std = 0.5 → values in
-        // [-1, 1] ish range.
+        // [-1, 1] ish range.  ArchProfile::ClipClassic routes through
+        // `preprocess_rgb_chw` → `VisionInput::Siglip49`.
         let uri = synthetic_png_data_uri();
         let msgs = vec![user_with_image("describe", &uri)];
         let mmproj = synthetic_mmproj();
         let got = process_multimodal_content(&msgs, Some(&mmproj)).expect("ok");
         assert_eq!(got.len(), 1);
-        let img = &got[0];
+        let img = match &got[0] {
+            VisionInput::Siglip49(img) => img,
+            VisionInput::Gemma4v(_) => panic!("expected Siglip49 variant for ClipClassic mmproj"),
+        };
         assert_eq!(img.target_size, 8);
         assert_eq!(img.pixel_values.len(), 3 * 8 * 8);
         assert_eq!(img.source_label, "image/png");
@@ -3007,6 +3094,7 @@ mod multimodal_tests {
 
     #[test]
     fn multiple_images_preserve_message_order() {
+        use crate::inference::vision::vit_gpu::VisionInput;
         let uri = synthetic_png_data_uri();
         let msgs = vec![
             user_with_image("first", &uri),
@@ -3018,8 +3106,12 @@ mod multimodal_tests {
         assert_eq!(got.len(), 2);
         // Both from the same PNG source, so source_label is identical —
         // what we care about is ordering survived the scan→preprocess split.
-        assert_eq!(got[0].source_label, "image/png");
-        assert_eq!(got[1].source_label, "image/png");
+        for input in &got {
+            match input {
+                VisionInput::Siglip49(img) => assert_eq!(img.source_label, "image/png"),
+                VisionInput::Gemma4v(_) => panic!("expected Siglip49 variant"),
+            }
+        }
     }
 
     #[test]
@@ -3029,6 +3121,86 @@ mod multimodal_tests {
         let resp = process_multimodal_content(&msgs, Some(&mmproj))
             .expect_err("bad URL should 400");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Build a synthetic gemma4v `LoadedMmproj` for the variable-resolution
+    /// preprocess dispatch. ADR-005 Phase 2c iter-116a.
+    fn synthetic_mmproj_gemma4v() -> LoadedMmproj {
+        use std::sync::Arc;
+        let cfg = MmprojConfig {
+            image_size: 896,
+            patch_size: 16,
+            num_patches_side: 56,
+            hidden_size: 1152,
+            intermediate_size: 4304,
+            num_attention_heads: 16,
+            num_hidden_layers: 27,
+            layer_norm_eps: 1e-6,
+            projector: ProjectorType::Mlp,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+        };
+        let device = mlx_native::MlxDevice::new().expect("create device");
+        let weights = crate::inference::vision::mmproj_weights::LoadedMmprojWeights::empty(device);
+        LoadedMmproj {
+            gguf_path: "/tmp/synthetic-mmproj-gemma4v.gguf".into(),
+            config: cfg,
+            arch: crate::inference::vision::mmproj::ArchProfile::Gemma4Siglip,
+            weights: Arc::new(weights),
+            model_id: "synthetic-mmproj-gemma4v".into(),
+        }
+    }
+
+    /// Encode a solid-color PNG large enough to satisfy the gemma4v
+    /// patcher's `patch_size = 16` minimum.  256×256 → 16×16 = 256
+    /// patches, comfortably inside the [252, 280] token budget.
+    fn synthetic_gemma4v_png_data_uri() -> String {
+        use base64::Engine;
+        use image::{ImageBuffer, ImageFormat, Rgb, RgbImage};
+        use std::io::Cursor;
+        let img: RgbImage = ImageBuffer::from_fn(256, 256, |_x, _y| Rgb([200u8, 100, 50]));
+        let mut buf: Vec<u8> = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .expect("encode png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        format!("data:image/png;base64,{b64}")
+    }
+
+    /// ADR-005 Phase 2c iter-116a: arch-profile dispatch routes
+    /// `Gemma4Siglip` mmprojs through `preprocess_gemma4v` and emits
+    /// `VisionInput::Gemma4v` carrying patch + 2D-pos arrays.  Sibling
+    /// guard to `single_image_preprocesses_to_chw_f32_tensor` which
+    /// covers the `ClipClassic` branch.
+    #[test]
+    fn gemma4v_arch_routes_through_variable_resolution_preprocess() {
+        use crate::inference::vision::vit_gpu::VisionInput;
+        let uri = synthetic_gemma4v_png_data_uri();
+        let msgs = vec![user_with_image("describe", &uri)];
+        let mmproj = synthetic_mmproj_gemma4v();
+        let got = process_multimodal_content(&msgs, Some(&mmproj)).expect("ok");
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            VisionInput::Gemma4v(g) => {
+                // 256×256 input @ patch_size=16 → 16×16=256 patches; this
+                // sits inside the [252, 280] budget so the patcher
+                // accepts it without rescale.
+                assert_eq!(g.n_x, 16);
+                assert_eq!(g.n_y, 16);
+                let n = (g.n_x as usize) * (g.n_y as usize);
+                assert_eq!(g.patches.len(), n * 16 * 16 * 3);
+                assert_eq!(g.pos_x.len(), n);
+                assert_eq!(g.pos_y.len(), n);
+                // Pos indices form a dense row-major grid.
+                assert_eq!(g.pos_x[0], 0);
+                assert_eq!(g.pos_y[0], 0);
+                assert_eq!(g.pos_x[n - 1], g.n_x - 1);
+                assert_eq!(g.pos_y[n - 1], g.n_y - 1);
+                assert_eq!(g.source_label, "image/png");
+            }
+            VisionInput::Siglip49(_) => {
+                panic!("expected Gemma4v variant for Gemma4Siglip mmproj");
+            }
+        }
     }
 
     #[test]
