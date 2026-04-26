@@ -75,7 +75,30 @@ pub struct RealSmokeEnv {
 
 impl SmokeEnv for RealSmokeEnv {
     fn hf_token(&self) -> Option<String> {
-        std::env::var("HF_TOKEN").ok().filter(|s| !s.is_empty())
+        // Auth-resolution priority matches the rest of the HF ecosystem
+        // (huggingface_hub, hf-hub crate, hf CLI):
+        //   1. HF_TOKEN env var (highest precedence — explicit override)
+        //   2. ~/.cache/huggingface/token  (where `hf auth login` writes)
+        // This is NOT a fallback in the no-shortcuts sense — it's the
+        // standard auth-resolution chain.  A user who has logged in via
+        // `hf auth login` (no env var) is unambiguously "HF auth available".
+        // Without this, the smoke preflight would reject every Robert-style
+        // logged-in workstation that doesn't also export HF_TOKEN.
+        if let Ok(t) = std::env::var("HF_TOKEN") {
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let p = Path::new(&home).join(".cache/huggingface/token");
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
     }
 
     fn free_disk_gb(&self, path: &Path) -> Option<u32> {
@@ -743,6 +766,82 @@ pub fn normalize_quant_label<S: AsRef<OsStr>>(s: S) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialize HF_TOKEN env-var manipulation across tests in this module.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `RealSmokeEnv::hf_token` resolves the cached `~/.cache/huggingface/token`
+    /// when `HF_TOKEN` is unset — the standard auth-resolution chain.  Without
+    /// this, every workstation running `hf auth login` (no env var) would
+    /// fail the smoke preflight despite being unambiguously authenticated.
+    #[test]
+    fn hf_token_falls_back_to_huggingface_cache_file() {
+        let _g = env_lock();
+        let prev_token = std::env::var("HF_TOKEN").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tmp.path().join(".cache/huggingface");
+        std::fs::create_dir_all(&cache_dir).expect("mkdir");
+        std::fs::write(cache_dir.join("token"), "hf_cached_token_xyz\n")
+            .expect("write token");
+
+        std::env::remove_var("HF_TOKEN");
+        std::env::set_var("HOME", tmp.path());
+
+        let env = RealSmokeEnv { convert_dir: tmp.path().to_path_buf() };
+        let resolved = env.hf_token();
+        assert_eq!(resolved.as_deref(), Some("hf_cached_token_xyz"));
+
+        // Env var wins over cache when both are set.
+        std::env::set_var("HF_TOKEN", "hf_env_wins");
+        assert_eq!(env.hf_token().as_deref(), Some("hf_env_wins"));
+
+        // Empty env var falls through to cache (matches HF tools behaviour).
+        std::env::set_var("HF_TOKEN", "");
+        assert_eq!(env.hf_token().as_deref(), Some("hf_cached_token_xyz"));
+
+        // Restore.
+        match prev_token {
+            Some(v) => std::env::set_var("HF_TOKEN", v),
+            None => std::env::remove_var("HF_TOKEN"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// Cache file empty → no token (consistent with empty env var semantics).
+    #[test]
+    fn hf_token_empty_cache_file_returns_none() {
+        let _g = env_lock();
+        let prev_token = std::env::var("HF_TOKEN").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache_dir = tmp.path().join(".cache/huggingface");
+        std::fs::create_dir_all(&cache_dir).expect("mkdir");
+        std::fs::write(cache_dir.join("token"), "   \n  ").expect("write empty");
+
+        std::env::remove_var("HF_TOKEN");
+        std::env::set_var("HOME", tmp.path());
+
+        let env = RealSmokeEnv { convert_dir: tmp.path().to_path_buf() };
+        assert_eq!(env.hf_token(), None);
+
+        match prev_token {
+            Some(v) => std::env::set_var("HF_TOKEN", v),
+            None => std::env::remove_var("HF_TOKEN"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     /// Mock env that can be tuned per-test to exercise each exit code.
     struct MockEnv {

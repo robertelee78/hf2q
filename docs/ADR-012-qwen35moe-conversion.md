@@ -1,10 +1,26 @@
 # ADR-012: Qwen3.5 / Qwen3.5-MoE (qwen35 + qwen35moe) Conversion Support — Pure-Rust HF → DWQ GGUF
 
-**Status:** 🟢 **ENGINEERING COMPLETE — REAL-MODEL ARTIFACTS DELIVERED** (2026-04-25, post-merge `da030a5`).
+**Status:** 🟡 **IN PROGRESS** — engineering pipeline complete, **shipped artifact regression discovered 2026-04-25**.
 
-P0–P11 all shipped; 19 of 20 decisions complete; 4 real-model DWQ GGUFs produced (Qwen3.6-27B dwq46/dwq48 + apex MoE dwq46/dwq48 — see worktree commits `337f66f`, `0937f66`, `e2a6938`, `36a70d9`).  1176 unit tests + ~113 integration tests green across the consolidated main branch.  Worktree branch `worktree-adr-012-p8-p11` (76 commits) merged into main (commit `da030a5`).  Post-merge cleanup `229b2e1` deduped legacy P8 SmokeArgs (kept the worktree's superset surface) and bumped 6 quantize-test fixture shapes to satisfy the P9b `is_weight()` invariant (inner dim ≥ 32 = Q4_0 block alignment, commit `436b923`).
+P0–P11 all shipped on main (post-merge `da030a5`).  1185 unit + ~117 integration tests green.
 
-Per mantra (`~/Documents/mantra.txt`, 2026-04-07): no deferred work, no stubs, no fallback, optimize for best outcomes — every requirement met.  **Decision 17's real-model PPL/KL gate** runs once Robert points the harness at a release build with `HF_TOKEN` + ≥ 150 GB disk; the engineering pipeline is end-to-end ready and the same environment gate also unblocks P8's committed `tests/fixtures/smoke-transcripts/{qwen35,qwen35moe}-q4_0.txt` real-model transcripts.
+**Real-model audit 2026-04-25 (post-cron-iteration end-gate sweep) discovered every previously-"shipped" DWQ GGUF in `models/qwen3.6-{27b,35b-a3b-abliterix-ega-abliterated}-dwq{46,48}/` fails to load in `llama-cli`:**
+
+```
+gguf_init_from_file_ptr: tensor 'blk.0.ssm_conv1d.weight' of type 2 (q4_0) has 4 elements per row,
+                         not a multiple of block size (32)
+```
+
+This is exactly the failure mode the **post-shipment** P9b commit `436b923` ("`is_weight()` preserves small-row tensors") was designed to prevent.  The four "ship" commits (`337f66f`, `0937f66`, `e2a6938`, `36a70d9`) ran the convert pipeline **before** the `is_weight()` guard landed, so every ssm_conv1d tensor was Q4_0-quantized into the GGUF and llama.cpp's loader (correctly) rejects them at file-open.  The 27B-dwq46 GGUF appears to have been deleted entirely.
+
+**Independent additional bug surfaced by the same sweep:** the smoke convert path (`hf2q smoke --arch qwen35 --quant q4_0 --local-dir <hf-cache-snapshot>`) hits a vocab-padding mismatch — `tensor 'token_embd.weight' has wrong shape; expected 5120, 248044, got 5120, 248320` — meaning the convert side emits the padded `vocab_size=248320` from `config.json` but the loader expects the de-padded 248044 unique tokens.  The worktree's `b35aa9f` ("qwen35 load_from_gguf accepts physically-padded vocab") fixed this **inference-side only**; the emit side still bakes the padding into the file.
+
+**This ADR closes only when:**
+1. The four real-model DWQ GGUFs (qwen35/qwen35moe × dwq46/dwq48) are re-emitted through the **post-fix** convert pipeline.
+2. Each loads in `llama-cli --model <path>` without error, emits 8 deterministic tokens at `--seed 42 --temp 0`, and produces the committed transcript under `tests/fixtures/smoke-transcripts/`.
+3. The vocab-padding emit-side fix lands so the convert pipeline can emit a llama.cpp-loadable file from the canonical Qwen/Qwen3.6-27B safetensors snapshot in `~/.cache/huggingface/hub/`.
+
+Per mantra: no fallback, no stubs.  The post-merge "🟢 ENGINEERING COMPLETE" header (commit `38d2f3c`) was based on the worktree's claim of four shipped DWQ GGUFs without independent llama.cpp load verification.  This addendum reverts that claim with the verification evidence and names the remaining work explicitly.
 **Decision Makers:** Robert, Claude
 **Related ADRs:** ADR-004 (GGUF compatibility), ADR-006 (mlx-native GPU backend), ADR-008 (candle divorce)
 
