@@ -111,22 +111,29 @@ echo
 # floor (102.9-103.4 tok/s on M5 Max) was measured under dense; mixing
 # regimes would compare apples to oranges.
 
-# --- Gate 1: parity suite (Gates C/E + F) ---
-echo "--- Gate 1/4: parity suite ---"
-if ! "$SCRIPT_DIR/parity_check.sh" "$GGUF_PATH"; then
-  echo "FAIL: parity gate tripped. See output above." >&2
-  exit 2
-fi
+# Gate ordering rationale (iter-110 W20 methodology fix):
+# Gate B (decode median-of-3 perf) runs FIRST while the SoC is in cold/idle
+# thermal state — matching the real-world `hf2q generate` invocation pattern
+# (cold process, cold cache). W19's iter-108-closure run measured the prior
+# parity-first ordering's 12-min sustained parity compute thermally pre-
+# loading the SoC, dropping subsequent perf samples from the cold-envelope
+# ~101.8 tok/s (W18 5-sample characterization, all 5 samples >= 101.6) to
+# ~92 tok/s — a methodology artifact, not a real regression. Reordering
+# perf-first restores the real-world envelope without lowering the floor or
+# weakening the gate; parity (Gate C/D/E/F) is byte-equality and thermally
+# insensitive, so deferring it is safe. Per feedback_no_vw_cheating.md:
+# optimize for real-world perf, not for benchmark-favorable conditions.
+# Gate-letter labels (B, C/D/E/F, A, G) remain stable; only execution order
+# changes. set -euo pipefail preserves fail-fast semantics either way.
 
-# --- Gate 2: perf sanity on the sourdough prompt (median of 3 runs) ---
+# --- Gate B: perf sanity on the sourdough prompt (median of 3 runs) ---
 # Single-sample decode tok/s is thermal-jitter sensitive on M5 Max: a
 # 1000-token decode sustains GPU load long enough that the chip throttles
 # intermittently, dropping tok/s ~5 below steady-state. Median of 3 runs
 # encodes the ADR Gate B intent "within measurement variance of peer
 # median" — resilient to a single thermal dip, still tight enough to flag
 # real regressions.
-echo
-echo "--- Gate 2/4: perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
+echo "--- Gate 1/4 (Gate B): perf sanity (median-of-3 decode tok/s >= $MIN_DECODE_TPS) ---"
 PERF_SAMPLES=()
 for run in 1 2 3; do
   if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS HF2Q_USE_DENSE=1 \
@@ -160,6 +167,14 @@ if [[ "$PASS_PERF" != "1" ]]; then
   exit 2
 fi
 
+# --- Gate C/D/E/F: parity suite ---
+echo
+echo "--- Gate 2/4 (Gates C/D/E/F): parity suite ---"
+if ! "$SCRIPT_DIR/parity_check.sh" "$GGUF_PATH"; then
+  echo "FAIL: parity gate tripped. See output above." >&2
+  exit 2
+fi
+
 
 # --- Gate 3: prefill tok/s on a ≥2048-token prompt (batched path) ---
 # ADR-005 Closeout Amendment Gate A: prefill tok/s parity vs llama.cpp on
@@ -181,7 +196,7 @@ PREFILL_2048_PROMPT="tests/evals/prompts/prefill_2048.txt"
 MIN_PREFILL_TPS="130"
 if [[ -f "$PREFILL_2048_PROMPT" ]]; then
   echo
-  echo "--- Gate 3/4: prefill perf on ≥2048-token prompt (batched) ---"
+  echo "--- Gate 3/4 (Gate A): prefill perf on ≥2048-token prompt (batched) ---"
   PREFILL_LOG="/tmp/release_check_prefill.log"
   if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
         HF2Q_USE_DENSE=1 HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1 \
@@ -230,7 +245,7 @@ fi
 #   dispatches/decode_tok <= 1300 (20% headroom above steady-state)
 #   total syncs <= 60 (tolerates prefill per-token syncs at 22 + headroom)
 echo
-echo "--- Gate 4/4: mlx-native counter thresholds (Gate G) ---"
+echo "--- Gate 4/4 (Gate G): mlx-native counter thresholds ---"
 COUNTER_LOG="/tmp/release_check_counters.log"
 COUNTER_PROMPT="Complrehensive instructions for making sourdough bread."
 if ! env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
