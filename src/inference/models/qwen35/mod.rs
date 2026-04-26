@@ -43,6 +43,8 @@ pub mod kv_cache;
 pub mod model;
 pub mod moe;
 pub mod mtp;
+pub mod mtp_weights_load;
+pub mod spec_decode;
 pub mod weight_loader;
 
 /// `general.architecture` value for the dense variant.
@@ -287,7 +289,7 @@ impl Qwen35Config {
     /// Optional keys (fallback to Qwen3.5 documented defaults if absent):
     ///
     /// ```text
-    /// {prefix}.mtp.num_hidden_layers                  u32   default 0
+    /// {prefix}.nextn_predict_layers                  u32   default 0
     /// {prefix}.attention.output_gate                  bool  default true
     /// ```
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
@@ -306,7 +308,19 @@ impl Qwen35Config {
 
         let p = variant.key_prefix();
 
-        let num_hidden_layers = required_u32(gguf, &format!("{p}.block_count"))?;
+        let total_block_count = required_u32(gguf, &format!("{p}.block_count"))?;
+        let mtp_num_hidden_layers = gguf
+            .metadata_u32(&format!("{p}.nextn_predict_layers"))
+            .or_else(|| gguf.metadata_u32(&format!("{p}.mtp.num_hidden_layers")))
+            .unwrap_or(0);
+        if mtp_num_hidden_layers > total_block_count {
+            bail!(
+                "qwen35 config: {p}.nextn_predict_layers ({}) exceeds {p}.block_count ({})",
+                mtp_num_hidden_layers,
+                total_block_count
+            );
+        }
+        let num_hidden_layers = total_block_count - mtp_num_hidden_layers;
         let hidden_size = required_u32(gguf, &format!("{p}.embedding_length"))?;
         let num_attention_heads = required_u32(gguf, &format!("{p}.attention.head_count"))?;
         let num_key_value_heads = required_u32(gguf, &format!("{p}.attention.head_count_kv"))?;
@@ -350,9 +364,6 @@ impl Qwen35Config {
         let linear_num_value_heads = ssm_inner_size / ssm_state_size;
 
         // Optional keys.
-        let mtp_num_hidden_layers = gguf
-            .metadata_u32(&format!("{p}.mtp.num_hidden_layers"))
-            .unwrap_or(0);
         let attn_output_gate = gguf
             .metadata(&format!("{p}.attention.output_gate"))
             .and_then(|v| match v {

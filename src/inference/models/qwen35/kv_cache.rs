@@ -14,6 +14,7 @@
 //!     ┌─ k: MlxBuffer [head_dim, n_kv, max_seq_len, n_seqs]  f32
 //!     ├─ v: MlxBuffer [head_dim, n_kv, max_seq_len, n_seqs]  f32
 //!     └─ current_len:  Vec<u32>        one per seq
+//!   mtp_slot: Option<FullAttnKvSlot>   present when nextn_predict_layers > 0
 //!   linear_attn: Vec<LinearAttnStateSlot>  len = # linear-attention layers
 //!     ├─ conv_state:         MlxBuffer [conv_channels, K-1, n_seqs] f32 (kernel native)
 //!     ├─ conv_state_scratch: MlxBuffer [conv_channels, K-1, n_seqs] f32 (ping-pong)
@@ -105,6 +106,9 @@ impl LinearAttnStateSlot {
 /// per-layer state.
 pub struct HybridKvCache {
     pub full_attn: Vec<FullAttnKvSlot>,
+    /// Full-attention KV slot for the appended MTP block at
+    /// `layer_idx == cfg.num_hidden_layers`; absent for non-MTP GGUFs.
+    pub mtp_slot: Option<FullAttnKvSlot>,
     pub linear_attn: Vec<LinearAttnStateSlot>,
     /// Maximum tokens the full-attn K/V buffers can hold per sequence.
     pub max_seq_len: u32,
@@ -202,8 +206,18 @@ impl HybridKvCache {
             }
         }
 
+        let mtp_slot = if cfg.mtp_num_hidden_layers > 0 {
+            Some(
+                alloc_full_attn_slot(cfg, device, max_seq_len, n_seqs)
+                    .context("alloc MTP full-attn slot")?,
+            )
+        } else {
+            None
+        };
+
         Ok(HybridKvCache {
             full_attn,
+            mtp_slot,
             linear_attn,
             max_seq_len,
             n_seqs,
@@ -223,6 +237,11 @@ impl HybridKvCache {
     /// tokens).
     pub fn reset(&mut self) {
         for slot in self.full_attn.iter_mut() {
+            for c in slot.current_len.iter_mut() {
+                *c = 0;
+            }
+        }
+        if let Some(slot) = self.mtp_slot.as_mut() {
             for c in slot.current_len.iter_mut() {
                 *c = 0;
             }
@@ -257,6 +276,9 @@ impl HybridKvCache {
     pub fn total_bytes(&self) -> usize {
         let mut n = 0usize;
         for s in &self.full_attn {
+            n += s.k.element_count() * 4 + s.v.element_count() * 4;
+        }
+        if let Some(s) = &self.mtp_slot {
             n += s.k.element_count() * 4 + s.v.element_count() * 4;
         }
         for s in &self.linear_attn {

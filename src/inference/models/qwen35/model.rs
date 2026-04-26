@@ -1,19 +1,13 @@
 //! Top-level `Qwen35Model` struct — the load target for Qwen3.5 / Qwen3.5-MoE
-//! GGUFs (ADR-013 P11 scaffold).
+//! GGUFs.
 //!
 //! Ties together every component that preceding phases delivered:
 //!
 //! - [`Qwen35Config`](super::Qwen35Config) from the GGUF metadata parser.
 //! - Per-layer weights: `Qwen35LayerWeights` enum (FullAttn or LinearAttn).
 //! - FFN variant: `Qwen35FfnWeights` enum (dense SwiGLU or MoE).
-//! - Optional [`MtpWeights`](super::mtp::MtpWeights) for speculative decoding
-//!   (load-only until a follow-up ADR).
+//! - Optional [`MtpWeights`](super::mtp::MtpWeights) for MTP speculative decoding.
 //! - Global tensors: `token_embd`, `output_weight`, `output_norm`.
-//!
-//! This module is a **scaffold**: the struct layout is final, but `load()`
-//! and `forward()` currently return partial / stubbed implementations.
-//! Phases P11 (end-to-end forward wire-up) and P5-tail (GGUF → MlxBuffer
-//! weight upload) complete the real paths.
 
 use anyhow::{anyhow, Context, Result};
 
@@ -109,7 +103,8 @@ pub struct Qwen35Model {
     pub output_weight: Vec<f32>,
     /// Final-layer RMSNorm weight, shape `[hidden_size]`.
     pub output_norm: Vec<f32>,
-    /// Optional MTP scaffold. Never executed in the main forward.
+    /// Optional MTP draft block. Executed only by speculative decoding, never
+    /// by the verifier's main layer loop.
     pub mtp: Option<MtpWeights>,
 }
 
@@ -171,7 +166,6 @@ impl Qwen35Model {
     /// to f32 via [`weight_loader::load_layer`].
     pub fn load_from_gguf(gguf: &GgufFile) -> Result<Self> {
         let mut cfg = Self::load_config_only(gguf)?;
-        let mtp = load_mtp_weights_if_present(gguf, cfg.num_hidden_layers)?;
 
         let device = MlxDevice::new()
             .map_err(|e| anyhow!("MlxDevice::new for weight loading: {e}"))?;
@@ -202,6 +196,9 @@ impl Qwen35Model {
                 cfg.vocab_size = physical_vocab as u32;
             }
         }
+
+        let mtp = load_mtp_weights_if_present(gguf, &cfg, &device)
+            .context("load_mtp_weights_if_present")?;
 
         // ADR-012 item-2 architectural fix (2026-04-25): MoE experts MUST
         // be loaded as native ggml-quantized blocks (`MoeQ`). The previous
@@ -558,6 +555,10 @@ mod tests {
         );
         if !path.exists() {
             eprintln!("skipping: apex GGUF not at expected path");
+            return;
+        }
+        if let Err(e) = MlxDevice::new() {
+            eprintln!("skipping: no Metal device: {e}");
             return;
         }
         let gguf = match GgufFile::open(&path) {
