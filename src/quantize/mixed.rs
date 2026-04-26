@@ -401,7 +401,10 @@ mod tests {
         )
         .unwrap();
 
-        let tensor = make_f16_tensor("model.layers.0.self_attn.q_proj.weight", vec![8, 8]);
+        // ADR-012 P9b is_weight() invariant: inner_dim ≥ 32 required for the
+        // tensor to be classified as a weight (Q4_0 block alignment).  Shape
+        // bumped from [8,8] → [32,32] post-2026-04-25 ir.rs change.
+        let tensor = make_f16_tensor("model.layers.0.self_attn.q_proj.weight", vec![32, 32]);
         let config = LayerQuantConfig {
             bits: 4,
             group_size: 64,
@@ -423,7 +426,10 @@ mod tests {
         )
         .unwrap();
 
-        let tensor = make_f16_tensor("model.layers.0.self_attn.q_proj.weight", vec![8, 8]);
+        // ADR-012 P9b is_weight() invariant: inner_dim ≥ 32 required for the
+        // tensor to be classified as a weight (Q4_0 block alignment).  Shape
+        // bumped from [8,8] → [32,32] post-2026-04-25 ir.rs change.
+        let tensor = make_f16_tensor("model.layers.0.self_attn.q_proj.weight", vec![32, 32]);
         let config = LayerQuantConfig {
             bits: 4,
             group_size: 64,

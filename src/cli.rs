@@ -460,54 +460,8 @@ pub struct ParityArgs {
     pub command: ParityCommand,
 }
 
-/// Arguments for `hf2q smoke`.
-#[derive(clap::Args, Debug)]
-pub struct SmokeArgs {
-    /// Arch to smoke-test (`qwen35`, `qwen35moe`).  Unknown arches return a
-    /// uniform error listing the registered set.
-    #[arg(long)]
-    pub arch: String,
-
-    /// Quantization to convert + smoke at.
-    #[arg(long, value_enum, default_value = "q4_0")]
-    pub quant: SmokeQuantArg,
-
-    /// Also exercise the paired vision tower (mmproj).  Errors uniformly when
-    /// the requested arch reports `has_vision: false`.
-    #[arg(long)]
-    pub with_vision: bool,
-
-    /// Skip the convert step (assume the GGUF is already on disk).
-    #[arg(long)]
-    pub skip_convert: bool,
-
-    /// Run preflight only; do not convert or invoke `llama-cli`.
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Override path to `llama-cli` (default: `/opt/llama.cpp/build/bin/llama-cli`).
-    #[arg(long)]
-    pub llama_cli: Option<PathBuf>,
-
-    /// Override path to `hf2q` binary (default: `./target/release/hf2q`).
-    #[arg(long)]
-    pub hf2q_binary: Option<PathBuf>,
-
-    /// Directory to write committed smoke transcripts.
-    #[arg(long)]
-    pub transcript_dir: Option<PathBuf>,
-}
-
-/// CLI surface for [`crate::arch::SmokeQuant`].
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmokeQuantArg {
-    #[value(name = "q4_0")]
-    Q4_0,
-    #[value(name = "dwq-mixed-4-6")]
-    DwqMixed46,
-    #[value(name = "dwq-mixed-4-8")]
-    DwqMixed48,
-}
+// (legacy ADR-012 P8 SmokeArgs removed during worktree merge — the canonical
+// definition lives at line 95 with the worktree's superset surface.)
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputFormat {

@@ -769,11 +769,12 @@ mod tests {
         };
         let quantizer = DwqQuantizer::new(config).unwrap();
 
+        // ADR-012 P9b is_weight() invariant: inner_dim ≥ 32 required (Q4_0 block alignment).
         let tensor = TensorRef {
             name: "model.layers.0.self_attn.q_proj.weight".to_string(),
-            shape: vec![8, 8],
+            shape: vec![32, 32],
             dtype: DType::F16,
-            data: vec![0u8; 128],
+            data: vec![0u8; 32 * 32 * 2],
         };
 
         let config = LayerQuantConfig {

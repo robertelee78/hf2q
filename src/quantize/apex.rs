@@ -435,23 +435,27 @@ mod tests {
     fn make_test_tensor_map() -> TensorMap {
         let mut map = TensorMap::new();
 
-        // High-magnitude weight (should be more important)
+        // ADR-012 P9b is_weight() invariant: inner_dim ≥ 32 required for the
+        // tensor to be classified as a weight (Q4_0 block alignment).  Tests
+        // use [1, 32] shape so they remain quantizable post-2026-04-25.
+
+        // High-magnitude weight (should be more important): [10..40] descending
+        let high_vals: Vec<f32> = (0..32).map(|i| if i % 2 == 0 { 10.0 - i as f32 * 0.1 } else { -(8.0 - i as f32 * 0.1) }).collect();
         map.insert(make_f16_tensor(
             "model.layers.0.self_attn.q_proj.weight",
-            vec![4, 4],
-            &[10.0, -8.0, 5.0, -3.0, 7.0, -6.0, 4.0, -2.0,
-              9.0, -7.0, 6.0, -4.0, 8.0, -5.0, 3.0, -1.0],
+            vec![1, 32],
+            &high_vals,
         ));
 
-        // Low-magnitude weight (should be less important)
+        // Low-magnitude weight (should be less important): [0.1, -0.05, ...]
+        let low_vals: Vec<f32> = (0..32).map(|i| if i % 2 == 0 { 0.1 - i as f32 * 0.001 } else { -(0.05 - i as f32 * 0.0005) }).collect();
         map.insert(make_f16_tensor(
             "model.layers.1.mlp.down_proj.weight",
-            vec![4, 4],
-            &[0.1, -0.05, 0.02, -0.01, 0.08, -0.04, 0.03, -0.02,
-              0.06, -0.03, 0.01, -0.005, 0.04, -0.02, 0.01, -0.005],
+            vec![1, 32],
+            &low_vals,
         ));
 
-        // Non-weight tensor (should be preserved)
+        // Non-weight tensor (should be preserved) — 1D layernorm always preserved.
         map.insert(TensorRef {
             name: "model.layers.0.input_layernorm.weight".to_string(),
             shape: vec![4],
@@ -459,11 +463,11 @@ mod tests {
             data: vec![0u8; 8],
         });
 
-        // Embedding (special rule: always gets max type)
+        // Embedding (special rule: always gets max type, preserved by is_weight() name match).
         map.insert(make_f16_tensor(
             "model.embed_tokens.weight",
-            vec![4, 4],
-            &[1.0; 16],
+            vec![1, 32],
+            &[1.0; 32],
         ));
 
         map
