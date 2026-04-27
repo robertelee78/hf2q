@@ -5900,3 +5900,35 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **Commits:** `71eafea` (tool_call_gbnf emitters), `2d2f242` (compile_tool_grammar + wiring), `537de40` (unit tests), `fb6626b` (integration test).
   - **Tests total:** 47 registry tests (was 34), 302 serve::api tests (was 300), 2 new integration test entries.
   - **Fence respected.** Edits in `src/serve/api/registry.rs`, `src/serve/api/handlers.rs`, `tests/tool_call_grammar_live.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
+- **2026-04-27 wave-2.5 Worker W-β (session cfa-20260427-adr005-wave2.5, commit `e4dd044`) — registry.rs cluster: B1/B3/B6/D1 Codex REJECT remediation.**
+  - **Context:** Codex audit verdict REJECT (7 HIGH findings) on the wave-2 W-4 tool-call grammar emitters. Parallel workers W-α2 (engine.rs + handlers.rs cluster), W-γ2 (namespace + any-position keys), W-δ (tests). This worker owned the registry.rs cluster only.
+  - **B1 — Required parameter enforcement (HIGH-4):**
+    - Added `required` array extraction from `params_schema` in both `gemma4_tool_call_gbnf` and `qwen35_tool_call_gbnf`.
+    - Required keys enforced via permutation grammar (inline `build_gemma4_required_permutation` / `build_qwen35_required_permutation`, mirroring `json_schema::build_required_permutation`): all required keys MUST appear in any order; omitting one causes the grammar stack to die. Optional keys follow in Kleene-star suffix.
+    - Hard cap `MAX_REQUIRED_KEYS = 16` → `EmitterError::TooManyRequiredKeys { fn_name, count }` to prevent O(N!) grammar blowup.
+    - 8 new tests: `b1_{gemma4,qwen35}_{required_present_accept, required_missing_reject, required_permuted_accept, too_many_required_keys_err}`.
+  - **B3 — Reject nested schemas at compile time (HIGH-5):**
+    - Added `EmitterError` enum (`TooManyRequiredKeys` + `UnsupportedSchema { fn_name, param_name, schema_type }`).
+    - `gemma4_value_gbnf` and `qwen35_value_rule` both return `Result<String, EmitterError>`.
+    - `array` and `object` parameter types → `EmitterError::UnsupportedSchema` (error message: "function 'X' parameter 'Y' uses unsupported schema type 'array'; ADR-005 wave-2.5 limits tool args to scalars; remove or convert to JSON-encoded string").
+    - Removed silent string-fallback for nested types (Chesterton: was masking schema mismatches at grammar layer while allowing the model to emit malformed output).
+    - Public `tool_call_gbnf` API stays `Result<String, String>`; `EmitterError` converted via `.to_string()` at the `impl ModelRegistration` boundary.
+    - 5 new tests: `b3_{gemma4,qwen35}_{array_param_returns_err, nested_object_returns_err}` + `b3_scalar_params_unaffected`.
+  - **B6 — str-char + trailing-newline audit (HIGH-6 Chesterton):**
+    - Audited `gemma4-str-char` rule `[^<\\] | [\\] [^\x00-\x1F]` against `chat_template.jinja:113` (`format_argument` macro). Template emits `<|"|>` + raw argument string + `<|"|>` with no JSON escaping. Rule is correct: `[^<\\]` excludes `<` (start of `<|"|>` close marker); `[\\] [^\x00-\x1F]` handles backslash sequences the model may emit in e.g. file paths. Confirmed: no code change needed.
+    - Audited `qwen35-str-char` — same pattern, same conclusion.
+    - Audited Qwen trailing `\n` on `</parameter>`: confirmed from `tokenizer_config.json` chat_template that `{{- '\n</parameter>\n' }}` is emitted unconditionally for EVERY parameter block, including the last one before `</function>`. Current grammar `block_body` = `param_open_lit newline_lit val_rule newline_lit param_close_lit newline_lit` is correct. No code change needed.
+    - 3 new tests: `b6_gemma4_str_char_accepts_backslash_sequence`, `b6_qwen35_trailing_newline_on_last_param_required`, `b6_qwen35_no_trailing_newline_rejected`.
+  - **D1 — ModelRegistration marker-shape contract doc:**
+    - Added comprehensive doc-comment block on `tool_open`/`tool_close` fields of `ModelRegistration`.
+    - Documents that markers MUST be byte sequences the tokenizer's special tokens decode to; not arbitrary strings.
+    - Cites Gemma 4 `stc_token` / `<|tool_call>` (chat_template.jinja:192/203) and Qwen token ids 248058 (`<tool_call>`) / 248059 (`</tool_call>`).
+    - Documents the failure mode from iter B-2: using `<|think|>` (prompt-side hint) instead of `<|channel>` (runtime boundary) caused `ReasoningSplitter` to never fire.
+    - No code change needed; doc-only.
+  - **B3 EmitterError type signature:** `pub enum EmitterError { TooManyRequiredKeys { fn_name: String, count: usize }, UnsupportedSchema { fn_name: String, param_name: String, schema_type: String } }`
+  - **Tests total:** 63 registry tests (was 47), all passing.
+  - **LOC delta:** +308 / -74 in `registry.rs`.
+  - **Chesterton notes B6:** str-char escape alternation is load-bearing for backslash sequences in string values; Qwen trailing `\n` is load-bearing (template emits it unconditionally); both confirmed against live template files before any edit decisions.
+  - **Open followups:** B3 `handlers.rs` 400 message propagation (W-γ2 zone); B5 PromptCache key (W-α2 zone); A3 `tool_calls:null` fix (W-α2); A1 conditional grammar wire (W-α2); B2 namespace function rules (W-γ2); B4 any-position keys (W-γ2).
+  - **Fence respected.** Edits in `src/serve/api/registry.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/serve/api/handlers.rs`, `src/serve/api/grammar/json_schema.rs`.
