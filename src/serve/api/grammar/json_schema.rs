@@ -177,15 +177,59 @@ pub fn format_literal(literal: &str) -> String {
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Structured error returned by `schema_to_gbnf` (→ HTTP 400).
+///
+/// # Variants
+///
+/// - `TooManyRequiredKeys` — the object's `required` array exceeds
+///   `ANY_ORDER_MAX_REQUIRED` (8).  Carries the function/path name, the
+///   actual count, and the cap so callers can format a precise 400 body.
+///   Introduced in ADR-005 W-ζ (wave-2.7) to replace the generic struct
+///   that the audit (commit 5110dc0) implied but never created.
+///
+/// - `Generic` — all other schema errors; preserves the pre-W-ζ
+///   `{ path, message }` structure so no existing call-site is broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaError {
-    pub path: String,
-    pub message: String,
+pub enum SchemaError {
+    /// Object schema has more required properties than the any-order
+    /// grammar supports (> `ANY_ORDER_MAX_REQUIRED` = 8).
+    TooManyRequiredKeys {
+        /// Dot-path of the offending object in the schema (empty = root).
+        fn_name: String,
+        /// Number of required keys found.
+        count: usize,
+        /// The cap that was exceeded.
+        max: usize,
+    },
+    /// Any other schema error: unsupported feature, malformed schema, etc.
+    Generic {
+        /// Dot-path of the offending node in the JSON Schema.
+        path: String,
+        /// Human-readable description of what went wrong.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "json-schema-to-grammar error at {}: {}", self.path, self.message)
+        match self {
+            SchemaError::TooManyRequiredKeys { fn_name, count, max } => write!(
+                f,
+                "json-schema-to-grammar error at {}: object has {} required \
+                 properties; ADR-005 grammar enforcement supports at most {} \
+                 required properties per object (CFG-for-permutation is \
+                 provably exponential per Moshier & Rounds ACL 1987). \
+                 Reduce required properties or split the schema.",
+                if fn_name.is_empty() { "root" } else { fn_name },
+                count,
+                max,
+            ),
+            SchemaError::Generic { path, message } => write!(
+                f,
+                "json-schema-to-grammar error at {}: {}",
+                path, message
+            ),
+        }
     }
 }
 impl std::error::Error for SchemaError {}
@@ -256,7 +300,7 @@ impl Converter {
         let obj = match schema.as_object() {
             Some(o) => o,
             None => {
-                return Err(SchemaError {
+                return Err(SchemaError::Generic {
                     path: path.to_string(),
                     message: "schema must be a JSON object".into(),
                 });
@@ -266,7 +310,7 @@ impl Converter {
         // enum: alternation of literal strings.
         if let Some(Value::Array(values)) = obj.get("enum") {
             if values.is_empty() {
-                return Err(SchemaError {
+                return Err(SchemaError::Generic {
                     path: path.to_string(),
                     message: "enum cannot be empty".into(),
                 });
@@ -278,7 +322,7 @@ impl Converter {
                         // Literal string value in JSON → double-quoted literal
                         // in the emitted JSON. The grammar must match the
                         // quoted form, so embed `"value"` literally.
-                        let quoted_value = serde_json::to_string(s).map_err(|e| SchemaError {
+                        let quoted_value = serde_json::to_string(s).map_err(|e| SchemaError::Generic {
                             path: path.to_string(),
                             message: format!("enum serialize: {e}"),
                         })?;
@@ -286,14 +330,14 @@ impl Converter {
                     }
                     Value::Number(_) | Value::Bool(_) | Value::Null => {
                         // Non-string enum — serialize to JSON text.
-                        let text = serde_json::to_string(v).map_err(|e| SchemaError {
+                        let text = serde_json::to_string(v).map_err(|e| SchemaError::Generic {
                             path: path.to_string(),
                             message: format!("enum serialize: {e}"),
                         })?;
                         alts.push(format_literal(&text));
                     }
                     Value::Array(_) | Value::Object(_) => {
-                        return Err(SchemaError {
+                        return Err(SchemaError::Generic {
                             path: format!("{}/enum", path),
                             message: "enum values must be scalars (string/number/bool/null)"
                                 .into(),
@@ -322,7 +366,7 @@ impl Converter {
                 // Union type — emit an alternation.
                 let mut alts: Vec<String> = Vec::with_capacity(types.len());
                 for (i, t) in types.iter().enumerate() {
-                    let tstr = t.as_str().ok_or_else(|| SchemaError {
+                    let tstr = t.as_str().ok_or_else(|| SchemaError::Generic {
                         path: format!("{}/type/{}", path, i),
                         message: "type array entries must be strings".into(),
                     })?;
@@ -334,7 +378,7 @@ impl Converter {
                 return Ok(alts.join(" | "));
             }
             Some(other) => {
-                return Err(SchemaError {
+                return Err(SchemaError::Generic {
                     path: format!("{}/type", path),
                     message: format!(
                         "type must be a string or array of strings, got {:?}",
@@ -367,7 +411,7 @@ impl Converter {
             }
             "object" => self.visit_object(obj, path),
             "array" => self.visit_array(obj, path),
-            other => Err(SchemaError {
+            other => Err(SchemaError::Generic {
                 path: format!("{}/type", path),
                 message: format!("unsupported type '{}'", other),
             }),
@@ -483,7 +527,7 @@ impl Converter {
         // generating an exponentially large (or infinite) grammar.
         let n_total = required_keys.len() + optional_keys.len();
         if n_total > 32 {
-            return Err(SchemaError {
+            return Err(SchemaError::Generic {
                 path: path.to_string(),
                 message: format!(
                     "object schema has {} properties (required={} + optional={}); \
@@ -572,18 +616,10 @@ impl Converter {
             // Hard error.  Operator must reduce required parameters or split the
             // function.  The threshold is ANY_ORDER_MAX_REQUIRED = 8 (256 rules
             // worst-case — practical and fast).  Propagates as HTTP 400.
-            return Err(SchemaError {
-                path: path.to_string(),
-                message: format!(
-                    "object at '{}' has {} required properties; \
-                     ADR-005 grammar enforcement supports at most {} required \
-                     properties per object (CFG-for-permutation is provably \
-                     exponential per Moshier & Rounds ACL 1987). \
-                     Reduce required properties or split the schema.",
-                    if path.is_empty() { "root" } else { path },
-                    required_keys.len(),
-                    ANY_ORDER_MAX_REQUIRED,
-                ),
+            return Err(SchemaError::TooManyRequiredKeys {
+                fn_name: path.to_string(),
+                count: required_keys.len(),
+                max: ANY_ORDER_MAX_REQUIRED,
             });
         };
 
@@ -809,13 +845,13 @@ impl Converter {
             }
             Some(Value::Object(_)) => self.visit(item_schema.unwrap(), &format!("{}/items", path))?,
             Some(Value::Array(_)) => {
-                return Err(SchemaError {
+                return Err(SchemaError::Generic {
                     path: format!("{}/items", path),
                     message: "tuple-form arrays (items: [...]) not yet supported".into(),
                 });
             }
             _ => {
-                return Err(SchemaError {
+                return Err(SchemaError::Generic {
                     path: format!("{}/items", path),
                     message: "items must be an object schema".into(),
                 });
@@ -1069,7 +1105,7 @@ mod tests {
         let schema: Value =
             serde_json::from_str(r#"{"type":"notathing"}"#).unwrap();
         let err = schema_to_gbnf(&schema).unwrap_err();
-        assert!(err.message.contains("unsupported type"));
+        assert!(err.to_string().contains("unsupported type"));
     }
 
     #[test]
@@ -1601,10 +1637,11 @@ mod tests {
         });
 
         let err = schema_to_gbnf(&schema).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.message.contains("33") || err.message.contains("max supported"),
+            msg.contains("33") || msg.contains("max supported"),
             "expected error mentioning property count or 'max supported'; got: {:?}",
-            err.message
+            msg
         );
     }
 
@@ -1681,22 +1718,30 @@ mod tests {
         });
 
         let err = schema_to_gbnf(&schema).unwrap_err();
-        // Message must be operator-actionable: cite the count, the limit, and
-        // the theoretical justification.
+        // W-ζ LOW: assert the typed TooManyRequiredKeys variant is returned.
+        match &err {
+            SchemaError::TooManyRequiredKeys { count, max, .. } => {
+                assert_eq!(*count, 9, "variant must carry count=9");
+                assert_eq!(*max, 8_usize, "variant must carry max=8");
+            }
+            other => panic!("expected TooManyRequiredKeys variant; got {:?}", other),
+        }
+        // Display must be operator-actionable: count, limit, citation, action.
+        let msg = err.to_string();
         assert!(
-            err.message.contains("9") && err.message.contains("8"),
+            msg.contains("9") && msg.contains("8"),
             "expected error mentioning count=9 and limit=8; got: {:?}",
-            err.message
+            msg
         );
         assert!(
-            err.message.contains("Moshier") || err.message.contains("ADR-005"),
+            msg.contains("Moshier") || msg.contains("ADR-005"),
             "expected operator-actionable citation; got: {:?}",
-            err.message
+            msg
         );
         assert!(
-            err.message.contains("Reduce") || err.message.contains("split"),
+            msg.contains("Reduce") || msg.contains("split"),
             "expected actionable instruction; got: {:?}",
-            err.message
+            msg
         );
     }
 
@@ -1794,5 +1839,64 @@ mod tests {
             "multiple extras in no-required-keys object were rejected"
         );
         assert!(rt.is_accepted());
+    }
+
+    // -----------------------------------------------------------------------
+    // W-ζ LOW — SchemaError typed variant tests
+    //
+    // The wave-2.7 audit found that commit 5110dc0 implied a typed
+    // SchemaError::TooManyRequiredKeys variant but only had a generic struct.
+    // These tests assert:
+    //   1. Existing error paths still produce well-formed Display output.
+    //   2. The >8-required-keys path emits the new typed variant carrying
+    //      fn_name + count (+ max), not the old Generic { message } form.
+    // -----------------------------------------------------------------------
+
+    /// W-ζ LOW: existing SchemaError for unsupported type still formats correctly.
+    #[test]
+    fn schema_error_generic_variant_displays_correctly() {
+        let schema: Value = serde_json::from_str(r#"{"type":"notathing"}"#).unwrap();
+        let err = schema_to_gbnf(&schema).unwrap_err();
+        // Must be Generic variant.
+        assert!(
+            matches!(&err, SchemaError::Generic { message, .. } if message.contains("unsupported type")),
+            "unsupported-type error must be SchemaError::Generic; got {:?}", err
+        );
+        // Display must include the path and message.
+        let s = err.to_string();
+        assert!(s.contains("json-schema-to-grammar error"), "Display must contain prefix: {}", s);
+        assert!(s.contains("unsupported type"), "Display must contain message: {}", s);
+    }
+
+    /// W-ζ LOW: >8-required-keys path emits TooManyRequiredKeys variant
+    /// carrying fn_name + count.
+    #[test]
+    fn too_many_required_keys_variant_carries_fn_name_and_count() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..9usize {
+            let k = format!("field{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let err = schema_to_gbnf(&schema).unwrap_err();
+        match &err {
+            SchemaError::TooManyRequiredKeys { fn_name, count, max } => {
+                // fn_name holds the path (empty = root in schema_to_gbnf context).
+                let _ = fn_name; // path is empty string at root; just assert presence
+                assert_eq!(*count, 9, "TooManyRequiredKeys must carry count=9");
+                assert_eq!(*max, 8, "TooManyRequiredKeys must carry max=8");
+            }
+            other => panic!("expected SchemaError::TooManyRequiredKeys; got {:?}", other),
+        }
+        // Display must be actionable.
+        let s = err.to_string();
+        assert!(s.contains("9"), "Display must mention count: {}", s);
+        assert!(s.contains("8"), "Display must mention cap: {}", s);
     }
 }
