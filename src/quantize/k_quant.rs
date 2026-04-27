@@ -78,6 +78,14 @@ pub const BLOCK_Q5_K_SIZE: usize = 2 * 2 + 12 + QK_K / 8 + QK_K / 2;
 /// signed scales + 1 × f16 d = 210 bytes.
 pub const BLOCK_Q6_K_SIZE: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
 
+/// `block_q3_K` size on disk (matches `sizeof(block_q3_K)` in C).
+/// 32 byte hmask (high bit) + 64 byte qs (low 2 bits) + 12 byte
+/// packed-6-bit scales + 1 × f16 d = 110 bytes.
+///
+/// Per `ggml-common.h:301-311` (effective 3.4375 bpw, 16 sub-blocks
+/// of 16 elements each).
+pub const BLOCK_Q3_K_SIZE: usize = QK_K / 8 + QK_K / 4 + 12 + 2;
+
 /// Errors from k-quant operations.
 #[derive(Error, Debug)]
 pub enum KQuantError {
@@ -633,6 +641,240 @@ pub fn dequantize_row_q6_k_bytes(
         blocks.push(block);
     }
     dequantize_row_q6_k(&blocks, out)
+}
+
+// ────────────────────────── Q3_K block + dequantize ──────────────────────────
+
+/// `block_q3_K` (110 bytes). Pure-Rust mirror of
+/// `ggml-common.h:301-311`:
+///
+/// ```text
+/// uint8_t  hmask[QK_K/8];   // 32 bytes — high bit of each 3-bit quant
+/// uint8_t  qs[QK_K/4];      // 64 bytes — low 2 bits of each 3-bit quant
+/// uint8_t  scales[12];      // 16 sub-block scales packed at 6 bits each
+/// ggml_half d;              // 2 bytes — super-block scale (f16)
+/// ```
+///
+/// Each weight is 3 bits — high bit from `hmask[]`, low 2 bits from
+/// `qs[]`. The decoded value `Q ∈ [-4, +3]` is mapped:
+/// - hmask bit set:   `Q = (qs low 2 bits)`         ∈ {0, 1, 2, 3}
+/// - hmask bit clear: `Q = (qs low 2 bits) - 4`     ∈ {-4, -3, -2, -1}
+///
+/// Per-sub-block scales unpack from the 12 packed bytes into 16
+/// 6-bit values (range -32..31 after sign-cast as i8); see
+/// [`unpack_q3_k_scales`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ3K {
+    /// 32 bytes — high bit of each 3-bit quant.
+    pub hmask: [u8; QK_K / 8],
+    /// 64 bytes — low 2 bits of each 3-bit quant (4 elements / byte).
+    pub qs: [u8; QK_K / 4],
+    /// 12 bytes — 16 sub-block scales packed at 6 bits each.
+    pub scales: [u8; 12],
+    /// Super-block scale `d` (f16 bits).
+    pub d_bits: u16,
+}
+
+impl BlockQ3K {
+    /// Read a `BlockQ3K` from a 110-byte buffer (little-endian).
+    /// Returns `None` if the buffer is shorter than `BLOCK_Q3_K_SIZE`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < BLOCK_Q3_K_SIZE {
+            return None;
+        }
+        let mut hmask = [0u8; QK_K / 8];
+        hmask.copy_from_slice(&bytes[0..QK_K / 8]);
+        let mut qs = [0u8; QK_K / 4];
+        qs.copy_from_slice(&bytes[QK_K / 8..QK_K / 8 + QK_K / 4]);
+        let mut scales = [0u8; 12];
+        scales.copy_from_slice(&bytes[QK_K / 8 + QK_K / 4..QK_K / 8 + QK_K / 4 + 12]);
+        let d_off = QK_K / 8 + QK_K / 4 + 12;
+        let d_bits = u16::from_le_bytes([bytes[d_off], bytes[d_off + 1]]);
+        Some(Self {
+            hmask,
+            qs,
+            scales,
+            d_bits,
+        })
+    }
+
+    /// Serialise to 110-byte little-endian buffer (matches the C
+    /// memory layout on `aarch64-apple-darwin`).
+    pub fn to_bytes(&self) -> [u8; BLOCK_Q3_K_SIZE] {
+        let mut out = [0u8; BLOCK_Q3_K_SIZE];
+        out[0..QK_K / 8].copy_from_slice(&self.hmask);
+        out[QK_K / 8..QK_K / 8 + QK_K / 4].copy_from_slice(&self.qs);
+        out[QK_K / 8 + QK_K / 4..QK_K / 8 + QK_K / 4 + 12].copy_from_slice(&self.scales);
+        let d_off = QK_K / 8 + QK_K / 4 + 12;
+        out[d_off..d_off + 2].copy_from_slice(&self.d_bits.to_le_bytes());
+        out
+    }
+
+    /// Super-block scale `d` as F32.
+    pub fn d(&self) -> f32 {
+        half::f16::from_bits(self.d_bits).to_f32()
+    }
+}
+
+/// Unpack the 12 packed bytes of `block_q3_K::scales` into 16 6-bit
+/// signed values (range -32..31 after the i8 cast in dequantize).
+/// Pure-Rust port of the kmask manipulation at `ggml-quants.c:1247-1266`:
+///
+/// ```c
+/// const uint32_t kmask1 = 0x03030303;
+/// const uint32_t kmask2 = 0x0f0f0f0f;
+/// uint32_t aux[4];
+/// memcpy(aux, x.scales, 12);
+/// uint32_t tmp = aux[2];
+/// aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+/// aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+/// aux[0] =  (aux[0]       & kmask2) | (((tmp >> 0) & kmask1) << 4);
+/// aux[1] =  (aux[1]       & kmask2) | (((tmp >> 2) & kmask1) << 4);
+/// scales = (int8_t*)aux;
+/// ```
+///
+/// The result is 16 bytes (4 × u32 reinterpreted as 16 × i8). The
+/// 6-bit values pre-`(scale - 32)`-offset are therefore in range
+/// `[0, 63]`; after the offset they map to `[-32, +31]`.
+///
+/// Returned as a 16-element `i8` array so callers don't have to
+/// re-cast.
+#[inline]
+pub fn unpack_q3_k_scales(packed: &[u8; 12]) -> [i8; 16] {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let mut aux = [0u32; 4];
+    for i in 0..3 {
+        aux[i] = u32::from_le_bytes([
+            packed[i * 4],
+            packed[i * 4 + 1],
+            packed[i * 4 + 2],
+            packed[i * 4 + 3],
+        ]);
+    }
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | (((tmp >> 0) & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+
+    let mut out = [0i8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let word = aux[i / 4];
+        let byte = ((word >> ((i % 4) * 8)) & 0xff) as u8;
+        *slot = byte as i8;
+    }
+    out
+}
+
+/// Dequantize a sequence of `block_q3_K` blocks to F32. Pure-Rust
+/// port of `dequantize_row_q3_K` (`ggml-quants.c:1243-1291`).
+///
+/// For each super-block `[256 elements]`:
+/// 1. Decode super-block scale `d_all` from F16 → F32.
+/// 2. [`unpack_q3_k_scales`] yields 16 sub-block i8 scales.
+/// 3. Walk in 128-element halves (`n = 0`, then `n = 128`):
+///    - 4 j-iterations over `shift ∈ {0, 2, 4, 6}` and `m = 1 << j`
+///    - per j: 2 sub-blocks of 16 elements each, advancing the scale
+///      index `is`
+///    - per element: `q = (qs[l] >> shift) & 3` then `Q = q -
+///      (hmask[l] & m == 0 ? 4 : 0)` ∈ [-4, +3]
+///    - `dl = d_all * (scales[is] - 32)`
+///    - `y[…] = dl * Q`
+///    - after 4 j-iterations: `qs += 32` (next 32 input bytes), `m`
+///      cycles back to 1 for the next outer half (NB: `m` at line
+///      1259 of `ggml-quants.c` is set OUTSIDE the `n` loop, so the
+///      shift bits `m = 1, 2, 4, 8` are reused for both halves, but
+///      hmask is shared bytewise, so the `n=128` half indexes
+///      `hmask[16..32]` via the offset addition `l + 0` / `l + 16`
+///      where `l ∈ [0, 16)`).
+pub fn dequantize_row_q3_k(
+    blocks: &[BlockQ3K],
+    out: &mut [f32],
+) -> Result<usize, KQuantError> {
+    let expected = blocks.len() * QK_K;
+    if out.len() < expected {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: out.len(),
+            n_blocks: blocks.len(),
+            bytes_per_block: QK_K,
+        });
+    }
+
+    let mut yi = 0usize;
+    for block in blocks {
+        let d_all = block.d();
+        let scales = unpack_q3_k_scales(&block.scales);
+
+        // q (qs cursor) and m (hmask bit) reset per block.
+        // n loops over [0, 128, 256), but only [0, 128] within QK_K=256.
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+
+        // halves: n = 0 and n = 128
+        for _half in 0..2 {
+            // 4 j-iterations: shift = 0, 2, 4, 6; m doubles each
+            for j in 0..4 {
+                let shift: u32 = (j as u32) * 2;
+
+                // 2 sub-blocks of 16 each (a: l ∈ [0,16), b: l ∈ [16, 32))
+                let dl_a = d_all * ((scales[is] as f32) - 32.0);
+                is += 1;
+                for l in 0..16 {
+                    let q_low = ((block.qs[q_off + l] >> shift) & 3) as i8;
+                    let h_off_minus = if (block.hmask[l] & m) != 0 { 0 } else { 4 };
+                    let qq = (q_low as i32) - (h_off_minus as i32);
+                    out[yi] = dl_a * (qq as f32);
+                    yi += 1;
+                }
+
+                let dl_b = d_all * ((scales[is] as f32) - 32.0);
+                is += 1;
+                for l in 0..16 {
+                    let q_low = ((block.qs[q_off + 16 + l] >> shift) & 3) as i8;
+                    let h_off_minus = if (block.hmask[16 + l] & m) != 0 { 0 } else { 4 };
+                    let qq = (q_low as i32) - (h_off_minus as i32);
+                    out[yi] = dl_b * (qq as f32);
+                    yi += 1;
+                }
+
+                m <<= 1;
+            }
+            q_off += 32; // next 32 bytes of qs[] for the second half
+        }
+    }
+
+    Ok(expected)
+}
+
+/// Dequantize Q3_K from a flat byte buffer. Convenience wrapper
+/// around [`BlockQ3K::from_bytes`] + [`dequantize_row_q3_k`].
+pub fn dequantize_row_q3_k_bytes(
+    data: &[u8],
+    out: &mut [f32],
+) -> Result<usize, KQuantError> {
+    if data.len() % BLOCK_Q3_K_SIZE != 0 {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: data.len(),
+            n_blocks: data.len() / BLOCK_Q3_K_SIZE,
+            bytes_per_block: BLOCK_Q3_K_SIZE,
+        });
+    }
+    let n_blocks = data.len() / BLOCK_Q3_K_SIZE;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let start = i * BLOCK_Q3_K_SIZE;
+        let block = BlockQ3K::from_bytes(&data[start..start + BLOCK_Q3_K_SIZE])
+            .ok_or(KQuantError::BlockSizeMismatch {
+                actual: data.len(),
+                n_blocks,
+                bytes_per_block: BLOCK_Q3_K_SIZE,
+            })?;
+        blocks.push(block);
+    }
+    dequantize_row_q3_k(&blocks, out)
 }
 
 // ────────────────────────── Quantize side ──────────────────────────
@@ -3813,5 +4055,213 @@ mod tests {
         }
         let rmse = (sse / row.len() as f64).sqrt();
         assert!(rmse < 0.05, "multi-block RMSE {rmse} > 0.05");
+    }
+
+    // ────────────── Q3_K (iter-6) ──────────────
+
+    /// `BLOCK_Q3_K_SIZE` matches the C `sizeof(block_q3_K)` static_assert.
+    #[test]
+    fn block_q3_k_size_matches_c_static_assert() {
+        // Per `ggml-common.h:311`: sizeof(block_q3_K) ==
+        //   sizeof(ggml_half) + QK_K/4 + QK_K/8 + 12
+        // = 2 + 64 + 32 + 12 = 110 bytes.
+        assert_eq!(BLOCK_Q3_K_SIZE, 2 + QK_K / 4 + QK_K / 8 + 12);
+        assert_eq!(BLOCK_Q3_K_SIZE, 110);
+    }
+
+    /// Round-trip BlockQ3K via to_bytes / from_bytes preserves the
+    /// struct byte-for-byte. Field order must match C layout exactly
+    /// (hmask first, then qs, scales, d_bits).
+    #[test]
+    fn block_q3_k_byte_round_trip() {
+        let block = BlockQ3K {
+            hmask: {
+                let mut a = [0u8; QK_K / 8];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = ((i * 7 + 11) & 0xFF) as u8;
+                }
+                a
+            },
+            qs: {
+                let mut a = [0u8; QK_K / 4];
+                for (i, slot) in a.iter_mut().enumerate() {
+                    *slot = ((i * 13 + 5) & 0xFF) as u8;
+                }
+                a
+            },
+            scales: [
+                0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
+                0xbc, 0xde, 0xf0, 0x12,
+            ],
+            d_bits: 0xCAFE,
+        };
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), BLOCK_Q3_K_SIZE);
+        let decoded = BlockQ3K::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.hmask, block.hmask);
+        assert_eq!(decoded.qs, block.qs);
+        assert_eq!(decoded.scales, block.scales);
+        assert_eq!(decoded.d_bits, block.d_bits);
+    }
+
+    /// Field offsets in the serialised buffer match the C layout order.
+    /// Catches a regression where the struct field order is reordered.
+    #[test]
+    fn block_q3_k_byte_layout_field_order() {
+        let block = BlockQ3K {
+            hmask: [0xAA; QK_K / 8],         // bytes [0, 32)
+            qs: [0xBB; QK_K / 4],             // bytes [32, 96)
+            scales: [0xCC; 12],               // bytes [96, 108)
+            d_bits: 0xDDEE,                   // bytes [108, 110), LE
+        };
+        let bytes = block.to_bytes();
+
+        for &b in &bytes[0..QK_K / 8] {
+            assert_eq!(b, 0xAA, "hmask region should be 0xAA");
+        }
+        for &b in &bytes[QK_K / 8..QK_K / 8 + QK_K / 4] {
+            assert_eq!(b, 0xBB, "qs region should be 0xBB");
+        }
+        for &b in &bytes[QK_K / 8 + QK_K / 4..QK_K / 8 + QK_K / 4 + 12] {
+            assert_eq!(b, 0xCC, "scales region should be 0xCC");
+        }
+        let d_off = QK_K / 8 + QK_K / 4 + 12;
+        assert_eq!(bytes[d_off], 0xEE, "d_bits LE byte 0");
+        assert_eq!(bytes[d_off + 1], 0xDD, "d_bits LE byte 1");
+    }
+
+    /// `unpack_q3_k_scales` on all-zero input → all-zero output.
+    #[test]
+    fn unpack_q3_k_scales_all_zero() {
+        let scales = unpack_q3_k_scales(&[0u8; 12]);
+        assert_eq!(scales, [0i8; 16]);
+    }
+
+    /// `unpack_q3_k_scales` on all-0xFF input → all-0x3F output.
+    /// Hand-computed: aux[0..3] all 0xFFFFFFFF, tmp = 0xFFFFFFFF.
+    /// `(aux >> 4) & 0x0F0F0F0F = 0x0F0F0F0F`
+    /// `((tmp >> *) & 0x03030303) << 4 = 0x30303030` for any shift in {0,2,4,6}
+    /// → final = 0x3F3F3F3F per word → 16 bytes of 0x3F = 63
+    /// (i8 cast: 63, since 0x3F < 128).
+    #[test]
+    fn unpack_q3_k_scales_all_ones() {
+        let scales = unpack_q3_k_scales(&[0xFFu8; 12]);
+        for (i, &s) in scales.iter().enumerate() {
+            assert_eq!(s, 63, "scale[{i}] should be 0x3F (63), got {s}");
+        }
+    }
+
+    /// `unpack_q3_k_scales` round-trip through known-bytes is
+    /// reproducible across calls (function is pure).
+    #[test]
+    fn unpack_q3_k_scales_deterministic() {
+        let packed: [u8; 12] = [
+            0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xde, 0xf0, 0x12,
+        ];
+        let s1 = unpack_q3_k_scales(&packed);
+        let s2 = unpack_q3_k_scales(&packed);
+        assert_eq!(s1, s2);
+        // Extracted scales must be in [-32, 31] after the (s - 32)
+        // dequant offset; before the offset they're [0, 63].  Since
+        // `unpack_q3_k_scales` returns the i8 value pre-offset, the
+        // valid range is `[0, 63]` reinterpreted as signed: `[0, 63]`
+        // (since the high bit is never set in 6-bit packed values).
+        for (i, &s) in s1.iter().enumerate() {
+            assert!(s >= 0 && s <= 63, "scale[{i}] = {s} outside [0, 63]");
+        }
+    }
+
+    /// All-zero block (d=0, all qs=0, all hmask=0xFF, all scales=0)
+    /// → all-zero output.  hmask=0xFF means every quant decodes as
+    /// `(qs & 3) - 0 = 0`.  dl = 0 * (0 - 32) = 0.  y = 0 * 0 = 0.
+    #[test]
+    fn dequantize_q3_k_d_zero_yields_zero_output() {
+        let block = BlockQ3K {
+            hmask: [0xFFu8; QK_K / 8],
+            qs: [0u8; QK_K / 4],
+            scales: [0u8; 12],
+            d_bits: half::f16::from_f32(0.0).to_bits(),
+        };
+        let mut out = vec![1.0_f32; QK_K]; // pre-fill with non-zero to verify overwrite
+        let n = dequantize_row_q3_k(std::slice::from_ref(&block), &mut out).unwrap();
+        assert_eq!(n, QK_K);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// d=1, scales=0 (→ -32 after offset), qs=0 (q_low=0),
+    /// hmask=0 (h_off_minus=4, qq=-4): every output element is
+    /// `dl * Q = (1.0 * -32) * (-4) = 128`.
+    /// Locks the dequant arithmetic + the hmask=0 → quant=-4 mapping.
+    #[test]
+    fn dequantize_q3_k_known_fixture_yields_128() {
+        let block = BlockQ3K {
+            hmask: [0u8; QK_K / 8],         // every hmask bit clear → quant - 4
+            qs: [0u8; QK_K / 4],             // every q_low = 0
+            scales: [0u8; 12],               // every sub-scale 0 → dl = -32
+            d_bits: half::f16::from_f32(1.0).to_bits(),
+        };
+        let mut out = vec![0.0_f32; QK_K];
+        let n = dequantize_row_q3_k(std::slice::from_ref(&block), &mut out).unwrap();
+        assert_eq!(n, QK_K);
+        for (i, &v) in out.iter().enumerate() {
+            assert_eq!(v, 128.0, "out[{i}] = {v}, expected 128.0");
+        }
+    }
+
+    /// d=1, scales=0, qs=0, hmask=0xFF → every quant = 0, output 0.
+    /// Complements the previous fixture to lock the hmask=set →
+    /// quant=0 mapping.
+    #[test]
+    fn dequantize_q3_k_known_fixture_hmask_set_yields_zero() {
+        let block = BlockQ3K {
+            hmask: [0xFFu8; QK_K / 8],      // every hmask bit set → quant - 0
+            qs: [0u8; QK_K / 4],             // every q_low = 0
+            scales: [0u8; 12],
+            d_bits: half::f16::from_f32(1.0).to_bits(),
+        };
+        let mut out = vec![123.0_f32; QK_K]; // pre-fill non-zero
+        let n = dequantize_row_q3_k(std::slice::from_ref(&block), &mut out).unwrap();
+        assert_eq!(n, QK_K);
+        for &v in &out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    /// `dequantize_row_q3_k_bytes` matches the in-memory dispatch on
+    /// the same data.
+    #[test]
+    fn dequantize_q3_k_bytes_matches_blocks() {
+        let block = BlockQ3K {
+            hmask: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 4],
+            scales: [0u8; 12],
+            d_bits: half::f16::from_f32(1.0).to_bits(),
+        };
+        let bytes = block.to_bytes();
+        let mut from_blocks = vec![0.0_f32; QK_K];
+        let mut from_bytes = vec![0.0_f32; QK_K];
+
+        dequantize_row_q3_k(std::slice::from_ref(&block), &mut from_blocks).unwrap();
+        dequantize_row_q3_k_bytes(&bytes, &mut from_bytes).unwrap();
+
+        assert_eq!(from_blocks, from_bytes,
+            "bytes path diverged from blocks path");
+    }
+
+    /// Misaligned input bytes (length not a multiple of 110) returns
+    /// a `BlockSizeMismatch` error rather than panicking.
+    #[test]
+    fn dequantize_q3_k_bytes_misaligned_errors() {
+        let bytes = vec![0u8; BLOCK_Q3_K_SIZE + 7]; // 117 bytes — not a multiple
+        let mut out = vec![0.0_f32; QK_K];
+        let err = dequantize_row_q3_k_bytes(&bytes, &mut out)
+            .expect_err("expected BlockSizeMismatch");
+        match err {
+            KQuantError::BlockSizeMismatch { .. } => {} // ok
+            other => panic!("expected BlockSizeMismatch, got {other:?}"),
+        }
     }
 }
