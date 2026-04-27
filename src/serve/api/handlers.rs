@@ -3910,10 +3910,21 @@ mod grammar_kind_selection_tests {
             super::compile_response_format(&rf_tool).expect("compile schema");
         assert!(tool_grammar.is_some());
 
-        // Snapshot the tool grammar's first-rule fingerprint so we can
-        // assert it survived the helper.  We compare via the parser's
-        // `rule_id` lookup which is stable for the same source.
-        let tool_g_clone = tool_grammar.clone().unwrap();
+        // Serialize both grammars to stable GBNF text BEFORE passing them
+        // into the helper.  After the helper returns we compare the chosen
+        // output against the tool_grammar serialization — not merely "has a
+        // root rule" (which the response grammar also has).  This closes the
+        // wave-2.9 W-ι audit gap: the previous assertion would pass even if
+        // select_effective_grammar erroneously returned the response grammar
+        // with ToolCallBodyRequired kind, because BOTH grammars have a root
+        // rule.  Serializing before the move and comparing after is the
+        // strongest identity proof available without a stable hash on Grammar.
+        let tool_gbnf = super::grammar::serialize::serialize(tool_grammar.as_ref().unwrap());
+        let resp_gbnf = super::grammar::serialize::serialize(resp_grammar.as_ref().unwrap());
+        assert_ne!(
+            tool_gbnf, resp_gbnf,
+            "test fixture broken: tool and response grammars must be distinct"
+        );
 
         let (effective, kind) =
             super::select_effective_grammar(tool_grammar, resp_grammar);
@@ -3924,19 +3935,24 @@ mod grammar_kind_selection_tests {
             "tool grammar MUST win and yield GrammarKind::ToolCallBodyRequired \
              through the PRODUCTION helper (not a stand-in match)."
         );
-        // Light fingerprint check: the chosen grammar must rule-id
-        // back to the same first rule the tool grammar held. The
-        // `Grammar` type doesn't expose a stable hash, but rule_id
-        // lookup of a known rule name (`root`) is stable across cheap
-        // clones — both must succeed.
+        // Prove the SELECTED grammar is the tool grammar, not the response
+        // grammar.  We compare serialized GBNF text: if the helper returned
+        // the response grammar, `chosen_gbnf == resp_gbnf` would be true and
+        // `chosen_gbnf == tool_gbnf` would be false — the assertion catches
+        // the wrong-grammar-returned bug that the previous root-rule check
+        // missed.
         let chosen = effective.expect("Some");
-        assert!(
-            chosen.rule_id("root").is_some(),
-            "chosen grammar must have a `root` rule"
+        let chosen_gbnf = super::grammar::serialize::serialize(&chosen);
+        assert_eq!(
+            chosen_gbnf, tool_gbnf,
+            "select_effective_grammar MUST return the tool grammar, not the \
+             response grammar. chosen_gbnf differs from tool_gbnf.\n\
+             chosen:\n{chosen_gbnf}\ntool:\n{tool_gbnf}\nresp:\n{resp_gbnf}"
         );
-        assert!(
-            tool_g_clone.rule_id("root").is_some(),
-            "tool grammar (clone) must have a `root` rule"
+        assert_ne!(
+            chosen_gbnf, resp_gbnf,
+            "select_effective_grammar returned the response grammar \
+             (chosen == resp_gbnf); tool grammar must win."
         );
     }
 
