@@ -1,0 +1,65 @@
+{
+  "_doc": "ADR-015 hypothesis register — canonical frames for the H1..H5 register plus Wave 2b apex MoE additions.  scripts/aggregate_decode.py consumes this.  ONE canonical frame per hypothesis (no overlapping-inclusive sums per AF3).  Static estimates from Wave 1; live measured numbers land in ADR-015 §P3a' / §P3b after each Wave runs.",
+  "hypotheses": [
+    {
+      "id": "H1",
+      "description": "ADR-015 H1 — proj allocation in `fn proj` at gpu_ffn.rs:397-404 (literal site) — Wave 2a verdict on dense fixture: NOT FOUND AT LITERAL SITE; Wave 2b apex MoE re-measurement HARD GATE.",
+      "canonical_frame_regex": "qwen35::gpu_ffn::proj::",
+      "subcomponent_regexes": {
+        "build_dense_ffn_layer_gpu_q": "qwen35::gpu_ffn::build_dense_ffn_layer_gpu_q",
+        "build_moe_ffn_layer_gpu_q": "qwen35::gpu_ffn::build_moe_ffn_layer_gpu_q"
+      },
+      "static_estimate_us_per_token": 100
+    },
+    {
+      "id": "H2",
+      "description": "ADR-015 H2 — apply_imrope per-call build_rope_multi_buffers; Wave 2a measured 464 µs/token (208 µs in build_rope_multi_buffers).  Closed by P3b iter1 hoist (mlx-native@a50c224).",
+      "canonical_frame_regex": "qwen35::gpu_full_attn::apply_imrope::",
+      "subcomponent_regexes": {
+        "build_rope_multi_buffers": "rope_multi::build_rope_multi_buffers",
+        "dispatch_rope_multi_cached": "rope_multi::dispatch_rope_multi_cached",
+        "dispatch_rope_multi": "rope_multi::dispatch_rope_multi(?!_cached)"
+      },
+      "static_estimate_us_per_token": 80
+    },
+    {
+      "id": "H3",
+      "description": "ADR-015 H3 — MlxDevice::command_encoder() churn, ~104 calls/token; Wave 2a measured 724 µs/token; closes under P3 single-CB rewrite.",
+      "canonical_frame_regex": "MlxDevice::command_encoder::",
+      "subcomponent_regexes": {
+        "computeCommandEncoderWithDispatchType": "computeCommandEncoderWithDispatchType:",
+        "ComputeContext_init": "ComputeContext.*initWithCommandBuffer"
+      },
+      "static_estimate_us_per_token": 55
+    },
+    {
+      "id": "H4",
+      "description": "ADR-015 H4 — memory_barrier ~440x/token.  Wave 2a TimeProfiler at 1ms could not resolve the literal frame.  Wave 2b uses BARRIER_COUNT/BARRIER_NS atomics from mlx-native@19f5569 (env-gated under MLX_PROFILE_BARRIERS=1) — this row's TimeProfiler regex is now backstopped by counter resolution, not relied on as primary.",
+      "canonical_frame_regex": "issue_metal_buffer_barrier",
+      "subcomponent_regexes": {
+        "memory_barrier_wrapper": "CommandEncoder::memory_barrier"
+      },
+      "static_estimate_us_per_token": 35
+    },
+    {
+      "id": "H5",
+      "description": "ADR-015 H5 — `with_context(|| format!(...))` String allocation.  Wave 2a falsified at 5 µs/token; closure-built format! never invoked on success path.  Kept here for regression detection.",
+      "canonical_frame_regex": "anyhow::Context::with_context",
+      "subcomponent_regexes": {
+        "fmt_format": "core::fmt::format"
+      },
+      "static_estimate_us_per_token": 25
+    },
+    {
+      "id": "H6-Wave2b-AllocBuffer",
+      "description": "Wave 2b rank-1 lever (P3b alloc_buffer pool target).  MlxDevice::alloc_buffer Mach-IPC chain: 3719 µs/token measured on dense Wave 2a (3063 µs without trial-3 outlier).  Apex MoE re-measurement required before P3b reduction lands.",
+      "canonical_frame_regex": "MlxDevice::alloc_buffer::",
+      "subcomponent_regexes": {
+        "IOGPUResourceCreate": "IOGPUResourceCreate",
+        "mach_msg2_trap": "mach_msg2_trap",
+        "IOConnectCallMethod": "IOConnectCallMethod"
+      },
+      "static_estimate_us_per_token": null
+    }
+  ]
+}

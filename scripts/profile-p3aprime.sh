@@ -53,7 +53,11 @@
 #   - 60-second sleep between trials (queen recommendation).
 #   - `pmset -g therm` snapshot captured pre-trial → if CPU_Speed_Limit < 100,
 #     the trial is rejected and the script aborts with status 2.
-#   - 3 trials minimum.
+#   - 5 trials default (Wave 2b methodology fix: median over 5 trials makes
+#     the headline robust against single-trial outliers like the Wave 2a
+#     trial-3 1.8× outlier that inflated the rank-1 figure by 21 %).  Wave 2a
+#     ran 3 trials with mean — that bias is now disclosed in ADR-015 §P3a'
+#     and the methodology updated here.
 #
 # Outputs:
 #   /tmp/cfa-adr015-wave2a-p3a-prime/trace-<trial>-<date>.trace
@@ -68,9 +72,18 @@
 # ADR-015 §P3a' rather than committed to git.
 #
 # Usage:
-#   scripts/profile-p3aprime.sh                # 3 trials, 64 decode tokens
-#   N_TOKENS=128 N_TRIALS=5 scripts/profile-p3aprime.sh
-#   SKIP_THERMAL_GATE=1 scripts/profile-p3aprime.sh   # CI / quick smoke only
+#   scripts/profile-p3aprime.sh                # 5 trials, 64 decode tokens
+#   N_TOKENS=128 N_TRIALS=3 scripts/profile-p3aprime.sh   # smaller for quick smoke
+#   SKIP_THERMAL_GATE=1 scripts/profile-p3aprime.sh       # CI / quick smoke only
+#
+# Wave 2b downstream: feed the produced topcalls-*.txt files into
+# scripts/aggregate_decode.py with --hypothesis-config scripts/aggregate_hypotheses.json
+# for canonical-frame median aggregation.  Example:
+#   scripts/aggregate_decode.py \
+#     --trials /tmp/cfa-adr015-wave2a-p3a-prime/topcalls-*.txt \
+#     --tokens-per-trial $N_TOKENS \
+#     --hypothesis-config scripts/aggregate_hypotheses.json \
+#     --output-md /tmp/wave2b-aggregate.md
 
 set -euo pipefail
 
@@ -81,7 +94,7 @@ HF2Q_BIN="${HF2Q_BIN:-/opt/hf2q/target/release/hf2q}"
 FIXTURE="${FIXTURE:-/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf}"
 PROMPT="${PROMPT:-Hello, my name is}"
 N_TOKENS="${N_TOKENS:-64}"
-N_TRIALS="${N_TRIALS:-3}"
+N_TRIALS="${N_TRIALS:-5}"
 THERMAL_SETTLE_SEC="${THERMAL_SETTLE_SEC:-60}"
 OUT_DIR="${OUT_DIR:-/tmp/cfa-adr015-wave2a-p3a-prime}"
 DATE_TAG="$(date -u +%Y%m%dT%H%M%SZ)"
