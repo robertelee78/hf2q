@@ -34,6 +34,7 @@ pub mod dwq_activation;
 pub mod dwq_calibrator;
 pub mod imatrix;
 pub mod imatrix_calibrator;
+pub mod imatrix_xvalidate;
 pub mod sensitivity;
 
 #[cfg(test)]
