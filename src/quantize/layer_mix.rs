@@ -119,6 +119,28 @@ impl KQuantVariant {
             Self::Q6_K => "Q6_K",
         }
     }
+
+    /// Enumerate every supported variant in canonical order. Used by
+    /// the P8 CLI to register the variant menu and by integration
+    /// tests to exercise every policy end-to-end without re-listing
+    /// the variants by hand.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Q4_K_S,
+            Self::Q4_K_M,
+            Self::Q5_K_S,
+            Self::Q5_K_M,
+            Self::Q6_K,
+        ]
+    }
+}
+
+impl std::fmt::Display for KQuantVariant {
+    /// Display matches the canonical name (e.g. `"Q4_K_M"`). Round-trips
+    /// through [`KQuantVariant::parse`].
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Tensor category — coarse classification of GGUF weight tensors,
@@ -768,6 +790,28 @@ mod tests {
                 KQuantTarget::Q5K,
                 "{name} target_for Q5_K_S"
             );
+        }
+    }
+
+    /// `KQuantVariant::all()` enumerates every variant in canonical
+    /// order; round-trips through `name()` and `parse()`.
+    #[test]
+    fn variant_all_round_trips_through_name_and_parse() {
+        let all = KQuantVariant::all();
+        assert_eq!(all.len(), 5, "exactly 5 supported variants");
+        // canonical order matches the enum declaration
+        assert_eq!(all[0], KQuantVariant::Q4_K_S);
+        assert_eq!(all[1], KQuantVariant::Q4_K_M);
+        assert_eq!(all[2], KQuantVariant::Q5_K_S);
+        assert_eq!(all[3], KQuantVariant::Q5_K_M);
+        assert_eq!(all[4], KQuantVariant::Q6_K);
+        // every variant round-trips through its name string
+        for v in all {
+            let parsed = KQuantVariant::parse(v.name())
+                .unwrap_or_else(|e| panic!("parse({}) failed: {e:?}", v.name()));
+            assert_eq!(parsed, *v, "round-trip name for {}", v.name());
+            // Display matches name
+            assert_eq!(format!("{v}"), v.name(), "Display matches name for {}", v.name());
         }
     }
 

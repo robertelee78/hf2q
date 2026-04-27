@@ -938,6 +938,76 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
+    /// non-empty quantized output through the streaming pipeline with
+    /// the correct ggml_type tag and block-size byte count for the
+    /// variant's base target.  Future-proofs P8 CLI registration: if
+    /// a new variant is added to `KQuantVariant::all()`, this smoke
+    /// test exercises it without code changes here.
+    #[test]
+    fn variant_menu_smoke_through_streaming() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        // single Q4_K-eligible tensor at a non-bumping layer (5 of 32)
+        // so the base target — not an upgrade — fires.
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        for variant in KQuantVariant::all() {
+            // expected block size from the variant's base target
+            let (expected_type, expected_bytes): (&str, usize) = match variant.base_target() {
+                crate::quantize::k_quant_codec::KQuantTarget::Q4K => ("Q4_K", 144),
+                crate::quantize::k_quant_codec::KQuantTarget::Q5K => ("Q5_K", 176),
+                crate::quantize::k_quant_codec::KQuantTarget::Q6K => ("Q6_K", 210),
+                _ => unreachable!("only K-family base targets supported"),
+            };
+
+            let mut lazy_map = LazyTensorMap::new();
+            let name = "blk.5.attn_q.weight"; // attn_q never bumps → base
+            let data = make_f16_payload(0.0, QK_K);
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), vec![1, QK_K], DType::F16),
+                data,
+            ));
+
+            let q = VariantKQuantizer::new(*variant, CalibrationData::None, N_LAYERS);
+            let out = quantize_streaming(
+                lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
+            )
+            .unwrap_or_else(|e| panic!("streaming failed for {variant}: {e}"));
+
+            assert_eq!(out.tensors.len(), 1, "{variant}: tensor count");
+            let t = out.tensors.get(name).unwrap();
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                Some(expected_type),
+                "{variant}: ggml_type"
+            );
+            assert_eq!(
+                t.data.len(), expected_bytes,
+                "{variant}: emitted block size"
+            );
+            assert_eq!(out.quant_method, variant.name(),
+                "{variant}: quant_method tag");
+        }
+    }
+
     /// ADR-014 P7 iter-3u — `VariantKQuantizer` honors the
     /// `should_skip_quantization` rule for `ffn_gate_inp.weight` AND
     /// the new MoE-aware classification (`*_exps`, `*_shexp`) through
