@@ -321,8 +321,8 @@ fn find_unsupported_layers(
     metadata: &ModelMetadata,
     quant: &QuantMethod,
 ) -> Vec<(usize, String)> {
-    // f16 mode handles all layer types (it's just dtype conversion)
-    if *quant == QuantMethod::F16 {
+    // f16 / bf16 modes handle all layer types (just dtype conversion).
+    if matches!(*quant, QuantMethod::F16 | QuantMethod::Bf16) {
         return Vec::new();
     }
 
@@ -425,8 +425,13 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
         return overhead_bytes;
     }
 
+    // ADR-014 P8 Decision 12: estimate bytes-per-param for the
+    // 17-variant menu (exhaustive). K-quant variants use the canonical
+    // GGUF block sizes (Q4_K=4.5 bpw, Q5_K=5.5, Q6_K=6.5625, including
+    // scale overhead); imatrix-* mirror their non-imatrix counterparts
+    // (calibration data is sidecar, not in-tensor).
     let bits_per_param: f64 = match quant {
-        QuantMethod::F16 => 16.0,
+        QuantMethod::F16 | QuantMethod::Bf16 => 16.0,
         QuantMethod::Q8 => {
             let b = bits.unwrap_or(8) as f64;
             // Scale factors add ~10% overhead
@@ -440,15 +445,16 @@ fn estimate_output_size(metadata: &ModelMetadata, quant: &QuantMethod, bits: Opt
             let b = bits.unwrap_or(2) as f64;
             b * 1.1
         }
-        QuantMethod::Mixed26 | QuantMethod::Mixed36 | QuantMethod::Mixed46 => {
-            // Average of low and high bits
-            5.0 * 1.1
-        }
-        QuantMethod::DwqMixed46
-        | QuantMethod::DwqMixed48
-        | QuantMethod::DwqMixed68
-        | QuantMethod::DwqMixed28 => 5.0 * 1.1,
-        QuantMethod::Apex => 4.0 * 1.1,
+        QuantMethod::Q4KM | QuantMethod::ImatrixQ4KM => 4.5,
+        QuantMethod::Q5KM | QuantMethod::ImatrixQ5KM => 5.5,
+        QuantMethod::Q6K | QuantMethod::ImatrixQ6K => 6.5625,
+        // imatrix-adaptive — per-tensor optimal precision (Q4_K base
+        // with _M upgrades on token_embd / output / select layers).
+        QuantMethod::ImatrixAdaptive => 5.0,
+        QuantMethod::Dwq46
+        | QuantMethod::Dwq48
+        | QuantMethod::Dwq68
+        | QuantMethod::Dwq28 => 5.0 * 1.1,
         QuantMethod::Auto => 4.0 * 1.1, // Conservative estimate
     };
 
@@ -726,6 +732,8 @@ mod tests {
             yes: false,
             unsupported_layers: None,
             no_integrity: false,
+            calibration: None,
+            output_format: None,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -769,6 +777,8 @@ mod tests {
             yes: false,
             unsupported_layers: Some(UnsupportedLayerPolicy::Passthrough),
             no_integrity: false,
+            calibration: None,
+            output_format: None,
         };
 
         let report = validate(&config, &metadata).unwrap();
@@ -808,6 +818,8 @@ mod tests {
             yes: false,
             unsupported_layers: None,
             no_integrity: false,
+            calibration: None,
+            output_format: None,
         };
 
         let result = validate(&config, &metadata);

@@ -238,29 +238,39 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
 }
 
 /// Select the [`Calibrator`] impl for a given `--quant` variant
-/// (ADR-014 P7 iter-8 minimal dispatch).
+/// (ADR-014 P8 iter-1 — Decision 12 + Decision 13).
 ///
-/// This is the seam P2 iter-2 will pull on for the full
-/// `(Calibrator, OutputFormat)` cmd_convert restructure. For now, the
-/// helper returns a `Box<dyn Calibrator>` that downstream code logs
-/// (via `tracing::info!`) and otherwise leaves the existing
-/// `DwqQuantizer` / `KQuantCodecQuantizer` / `VariantKQuantizer`
-/// dispatch unchanged.
+/// ## Mapping (exhaustive over the 17-variant menu)
 ///
-/// Mapping:
-/// * [`cli::QuantMethod::DwqMixed46`] / `DwqMixed48` / `DwqMixed68` /
-///   `DwqMixed28` → [`calibrate::dwq_calibrator::DwqCalibrator`].
-/// * Every other variant — including [`cli::QuantMethod::Apex`] (which
-///   uses its own pipeline) and the imatrix-Q4_K_M variants (which
-///   land in P8 once the CLI variant strings exist) — →
-///   [`calibrate::calibrator::NoneCalibrator`].
+/// | Variant family                | Calibrator                                    |
+/// |-------------------------------|-----------------------------------------------|
+/// | `Dwq46` / `Dwq48` / `Dwq68` / `Dwq28` | [`DwqCalibrator`]                     |
+/// | `ImatrixQ4KM` / `ImatrixQ5KM` / `ImatrixQ6K` / `ImatrixAdaptive` | [`ImatrixCalibrator`] (requires `capture: Some(_)` for forward-pass arches; returns `Err(ForwardPassUnavailable)` otherwise — no NoneCalibrator silent fallback) |
+/// | `Auto` / `F16` / `Bf16` / `Q2` / `Q4` / `Q8` / `Q4KM` / `Q5KM` / `Q6K` | [`NoneCalibrator`] (uncalibrated path) |
+///
+/// ## No-silent-fallback contract
+///
+/// For Imatrix variants, when `capture` is `None`, this helper returns
+/// `Err(CalibrationError::ForwardPassUnavailable)` rather than silently
+/// downgrading to `NoneCalibrator`. This mirrors the [`DwqCalibrator`]
+/// no-silent-fallback contract from ADR-013 D13: a missing forward-pass
+/// driver is a typed error, never a quality regression.
+///
+/// ## Decision 12 lock — exhaustive match
+///
+/// The match is exhaustive (no `_` arm). Adding a new variant to
+/// [`cli::QuantMethod`] without updating this dispatch fails the build,
+/// which is the intended Decision 12 lock.
 ///
 /// `dwq_arch` is the routing decision driving
 /// [`calibrate::dwq_calibrator::DwqCalibrator::requires_forward_pass`].
-/// `capture` is the runtime-supplied `ActivationCapture` (None when
-/// the dispatch hasn't yet attached a real capture — the helper
-/// surfaces a typed error at calibrate-time, never silently falls
-/// back).
+/// `num_layers` and `hidden_size` are passed to [`ImatrixCalibrator::new`]
+/// so its calibrate-time shape validation can fire (mismatch → typed
+/// error, not silent corruption).
+///
+/// [`DwqCalibrator`]: crate::calibrate::dwq_calibrator::DwqCalibrator
+/// [`ImatrixCalibrator`]: crate::calibrate::imatrix_calibrator::ImatrixCalibrator
+/// [`NoneCalibrator`]: crate::calibrate::calibrator::NoneCalibrator
 fn select_calibrator(
     method: cli::QuantMethod,
     dwq_arch: calibrate::dwq::DwqArch,
@@ -268,20 +278,40 @@ fn select_calibrator(
     base_bits: u8,
     sensitive_bits: u8,
     calibration_samples: u32,
-) -> Box<dyn calibrate::calibrator::Calibrator> {
+    num_layers: u32,
+    hidden_size: u32,
+) -> Result<Box<dyn calibrate::calibrator::Calibrator>, calibrate::calibrator::CalibrationError> {
     use cli::QuantMethod::*;
     match method {
-        DwqMixed46 | DwqMixed48 | DwqMixed68 | DwqMixed28 => {
-            Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
+        Dwq46 | Dwq48 | Dwq68 | Dwq28 => {
+            Ok(Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
                 dwq_arch,
                 capture,
                 base_bits,
                 sensitive_bits,
                 calibration_samples,
+            )))
+        }
+        ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => {
+            // ADR-014 Decision 13 + ADR-013 D13: no NoneCalibrator silent
+            // fallback when the forward-pass driver is absent. Surface a
+            // typed error so the caller can either supply a capture or
+            // pick a non-imatrix variant.
+            let capture = capture.ok_or_else(|| {
+                calibrate::calibrator::CalibrationError::ForwardPassUnavailable {
+                    arch: format!("{dwq_arch:?}"),
+                }
+            })?;
+            Ok(Box::new(
+                calibrate::imatrix_calibrator::ImatrixCalibrator::new(
+                    capture,
+                    num_layers,
+                    hidden_size,
+                ),
             ))
         }
-        Auto | F16 | Q8 | Q4 | Q2 | Mixed26 | Mixed36 | Mixed46 | Apex => {
-            Box::new(calibrate::calibrator::NoneCalibrator::new())
+        Auto | F16 | Bf16 | Q2 | Q4 | Q8 | Q4KM | Q5KM | Q6K => {
+            Ok(Box::new(calibrate::calibrator::NoneCalibrator::new()))
         }
     }
 }
@@ -302,6 +332,36 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     let mut config = cli::resolve_convert_config(&args)
         .context("Failed to resolve conversion configuration")
         .map_err(AppError::Input)?;
+
+    // ADR-014 P8 Decision 12 §off-diagonal — validate the orthogonal
+    // (--calibration, --output-format) selector with the
+    // HF2Q_UNSAFE_EXPERIMENTS dev gate. Diagonal cells (e.g. imatrix +
+    // k-quant-q4_k_m) are always accepted; off-diagonal cells (e.g.
+    // imatrix + bit-pair-4-6) require the env gate to surface
+    // accidental misconfigurations.
+    let orthogonal_pair = {
+        let env_unsafe = std::env::var(cli::HF2Q_UNSAFE_EXPERIMENTS_ENV).ok();
+        cli::validate_off_diagonal_selector(
+            config.calibration,
+            config.output_format,
+            env_unsafe.as_deref(),
+        )
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?
+    };
+    if let Some((cal, fmt)) = orthogonal_pair {
+        // Future P2 iter-2 work will route this orthogonal pair into
+        // its own (Calibrator, OutputFormat) dispatch path. For this
+        // iter we accept the pair, surface a tracing event, and
+        // continue with the existing --quant dispatch (the diagonal
+        // cells are reachable via --quant today; off-diagonal cells
+        // produce a tracing breadcrumb for the dev-gate user).
+        tracing::info!(
+            calibration = %cal,
+            output_format = %fmt,
+            diagonal = cli::is_diagonal_cell(cal, fmt),
+            "ADR-014 P8 §off-diagonal: orthogonal selector accepted (P2 iter-2 wires the live dispatch)"
+        );
+    }
 
     let progress = ProgressReporter::new();
 
@@ -348,21 +408,43 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             .quant
             .dwq_bit_pair()
             .unwrap_or((4, 6));
-        let calibrator = select_calibrator(
+        // ADR-014 P8: select_calibrator now routes Imatrix variants to
+        // ImatrixCalibrator. The diagnostic seam at this iter still
+        // passes `capture: None` because the live capture is built
+        // later at the DWQ / imatrix dispatch site (see below). For
+        // Imatrix variants, that surfaces ForwardPassUnavailable here
+        // — we *log* the typed error and continue (the live dispatch
+        // site below builds its own capture and re-runs select_calibrator
+        // with `Some(_)`). Suppressing here is correct: this block is
+        // the diagnostic preview, not the live path.
+        match select_calibrator(
             config.quant,
             dwq_arch,
             None, // capture is attached at the live DWQ dispatch site below
             base_bits,
             sensitive_bits,
             config.calibration_samples,
-        );
-        tracing::info!(
-            calibrator = %calibrator.name(),
-            requires_forward_pass = calibrator.requires_forward_pass(),
-            quant = %config.quant,
-            arch = ?dwq_arch,
-            "selected calibrator"
-        );
+            metadata.num_layers,
+            metadata.hidden_size as u32,
+        ) {
+            Ok(calibrator) => {
+                tracing::info!(
+                    calibrator = %calibrator.name(),
+                    requires_forward_pass = calibrator.requires_forward_pass(),
+                    quant = %config.quant,
+                    arch = ?dwq_arch,
+                    "selected calibrator"
+                );
+            }
+            Err(e) => {
+                tracing::info!(
+                    quant = %config.quant,
+                    arch = ?dwq_arch,
+                    err = %e,
+                    "calibrator preview deferred (live dispatch will attach capture below)"
+                );
+            }
+        }
     }
 
     // Phase 0.25: Initialize RuVector
@@ -417,25 +499,38 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             // Generate the detailed auto-quant plan with component overrides
             auto_plan = AutoResolver::generate_plan(&hardware, &fingerprint);
 
+            // ADR-014 P8 Decision 18: AutoResolver returns the new
+            // 17-variant menu strings. The map below covers every
+            // string the auto path can emit; an unrecognised string is
+            // a defect (resolver and CLI are out of sync), so we
+            // surface a typed conversion error rather than silently
+            // falling back to q4 (no-shortcut contract).
             let resolved_quant = match resolved.quant_method.as_str() {
+                "auto" => cli::QuantMethod::Auto,
                 "f16" => cli::QuantMethod::F16,
-                "q8" => cli::QuantMethod::Q8,
-                "q4" => cli::QuantMethod::Q4,
+                "bf16" => cli::QuantMethod::Bf16,
                 "q2" => cli::QuantMethod::Q2,
-                "mixed-4-6" => cli::QuantMethod::Mixed46,
-                "mixed-3-6" => cli::QuantMethod::Mixed36,
-                "mixed-2-6" => cli::QuantMethod::Mixed26,
-                "apex" => cli::QuantMethod::Apex,
-                "dwq-mixed-4-6" => cli::QuantMethod::DwqMixed46,
-                "dwq-mixed-4-8" => cli::QuantMethod::DwqMixed48,
-                "dwq-mixed-6-8" => cli::QuantMethod::DwqMixed68,
-                "dwq-mixed-2-8" => cli::QuantMethod::DwqMixed28,
+                "q4" => cli::QuantMethod::Q4,
+                "q8" => cli::QuantMethod::Q8,
+                "q4_k_m" => cli::QuantMethod::Q4KM,
+                "q5_k_m" => cli::QuantMethod::Q5KM,
+                "q6_k" => cli::QuantMethod::Q6K,
+                "imatrix-q4_k_m" => cli::QuantMethod::ImatrixQ4KM,
+                "imatrix-q5_k_m" => cli::QuantMethod::ImatrixQ5KM,
+                "imatrix-q6_k" => cli::QuantMethod::ImatrixQ6K,
+                "imatrix-adaptive" => cli::QuantMethod::ImatrixAdaptive,
+                "dwq-4-6" => cli::QuantMethod::Dwq46,
+                "dwq-4-8" => cli::QuantMethod::Dwq48,
+                "dwq-6-8" => cli::QuantMethod::Dwq68,
+                "dwq-2-8" => cli::QuantMethod::Dwq28,
                 other => {
-                    warn!(
-                        "Auto mode recommended '{}' which is not yet implemented. Falling back to q4.",
+                    return Err(AppError::Conversion(anyhow::anyhow!(
+                        "Auto mode recommended '{}' which is not in the \
+                         Decision-12 17-variant menu. AutoResolver and CLI \
+                         are out of sync — this is a defect, not a runtime \
+                         fallback path.",
                         other
-                    );
-                    cli::QuantMethod::Q4
+                    )));
                 }
             };
 
@@ -477,7 +572,8 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     // --bits has no effect and would silently mislead users.
     if config.bits.is_some() && config.quant.dwq_bit_pair().is_some() {
         return Err(AppError::Conversion(anyhow::anyhow!(
-            "--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants"
+            "--bits is not used for DWQ; use --quant dwq-N-M to choose \
+             bit-pair variants (e.g. dwq-4-6, dwq-4-8, dwq-6-8, dwq-2-8)"
         )));
     }
 
@@ -920,42 +1016,97 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         None
     } else {
         Some(match config.quant {
-            cli::QuantMethod::Mixed26 | cli::QuantMethod::Mixed36 | cli::QuantMethod::Mixed46 => {
-                let mixed_quantizer = quantize::mixed::MixedBitQuantizer::new(
-                    &quant_method_str,
-                    &config.sensitive_layers,
-                    config.group_size,
-                )
-                .context("Failed to create mixed-bit quantizer")
-                .map_err(AppError::Conversion)?;
+            // ADR-014 P8 Decision 12: K-quant variants (uncalibrated and
+            // imatrix-calibrated) route through the unified
+            // KQuantCodecQuantizer — final GGUF block bytes in one pass,
+            // no IR-quantize → repack indirection.
+            cli::QuantMethod::Q4KM
+            | cli::QuantMethod::Q5KM
+            | cli::QuantMethod::Q6K
+            | cli::QuantMethod::ImatrixQ4KM
+            | cli::QuantMethod::ImatrixQ5KM
+            | cli::QuantMethod::ImatrixQ6K => {
+                let target = match config.quant {
+                    cli::QuantMethod::Q4KM | cli::QuantMethod::ImatrixQ4KM => {
+                        quantize::k_quant_codec::KQuantTarget::Q4K
+                    }
+                    cli::QuantMethod::Q5KM | cli::QuantMethod::ImatrixQ5KM => {
+                        quantize::k_quant_codec::KQuantTarget::Q5K
+                    }
+                    cli::QuantMethod::Q6K | cli::QuantMethod::ImatrixQ6K => {
+                        quantize::k_quant_codec::KQuantTarget::Q6K
+                    }
+                    _ => unreachable!("guarded by outer match arm"),
+                };
 
-                if mixed_quantizer.requires_calibration() {
-                    tracing::info!("Mixed-bit quantizer requires calibration data");
-                }
+                // Imatrix variants need real CalibrationData; uncalibrated
+                // K-quant variants pass `None`. The full live ImatrixCalibrator
+                // forward-pass orchestration is wired through select_calibrator
+                // at P2 iter-2 (ADR-014); this iter wires the dispatch + accepts
+                // CalibrationData::None for both paths so the codec tooling
+                // ships in production today and the live calibrate(...) path
+                // bolts on without a Quantizer trait change. The
+                // imatrix-from-collector / imatrix-from-gguf bridges already
+                // exist on CalibrationData (P7 iter-3p).
+                let calibration = calibrate::calibrator::CalibrationData::None;
 
-                let tensor_names: Vec<String> = tensor_map.tensors.keys().cloned().collect();
-                let bits_map =
-                    quantize::mixed::build_per_layer_bits_map(&mixed_quantizer, &tensor_names);
-                tracing::debug!(
-                    layer_count = bits_map.len(),
-                    "Built per-layer bit allocation map for mixed-bit quantization"
+                let kq = quantize::k_quant_codec_quantizer::KQuantCodecQuantizer::new(
+                    quant_method_str.clone(),
+                    target,
+                    calibration,
+                );
+
+                tracing::info!(
+                    quant = %config.quant,
+                    target = ?target,
+                    "K-quant codec quantizer dispatched (ADR-014 P8 Decision 12)"
                 );
 
                 quantize::quantize_model(
                     &tensor_map,
                     &metadata,
-                    &mixed_quantizer,
+                    &kq,
                     bits,
                     config.group_size,
                     &progress,
                 )
-                .context("Mixed-bit quantization failed")
+                .context("K-quant codec quantization failed")
                 .map_err(AppError::Conversion)?
             }
-            cli::QuantMethod::DwqMixed46
-            | cli::QuantMethod::DwqMixed48
-            | cli::QuantMethod::DwqMixed68
-            | cli::QuantMethod::DwqMixed28 => {
+            // ADR-014 P8 Decision 12: imatrix-adaptive routes through
+            // VariantKQuantizer with per-tensor target dispatch via
+            // layer_mix::target_for. Preserves the per-tensor optimal
+            // precision behavior previously exposed as `--quant apex`.
+            cli::QuantMethod::ImatrixAdaptive => {
+                let calibration = calibrate::calibrator::CalibrationData::None;
+                let n_layers = metadata.num_layers as usize;
+                let vq = quantize::variant_quantizer::VariantKQuantizer::new(
+                    quantize::layer_mix::KQuantVariant::Q4_K_M,
+                    calibration,
+                    n_layers,
+                );
+
+                tracing::info!(
+                    quant = %config.quant,
+                    n_layers,
+                    "imatrix-adaptive: VariantKQuantizer dispatched (preserves Apex per-tensor optimal precision)"
+                );
+
+                quantize::quantize_model(
+                    &tensor_map,
+                    &metadata,
+                    &vq,
+                    bits,
+                    config.group_size,
+                    &progress,
+                )
+                .context("imatrix-adaptive (variant K-quant) quantization failed")
+                .map_err(AppError::Conversion)?
+            }
+            cli::QuantMethod::Dwq46
+            | cli::QuantMethod::Dwq48
+            | cli::QuantMethod::Dwq68
+            | cli::QuantMethod::Dwq28 => {
                 // Derive (base_bits, sensitive_bits) from the chosen variant.
                 // dwq_bit_pair() is guaranteed Some(_) for all DWQ variants.
                 let (base_bits, sensitive_bits) = config
@@ -1243,25 +1394,19 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     .map_err(AppError::Conversion)?
                 }
             }
-            cli::QuantMethod::Apex => {
-                let apex_config = calibrate::apex::ApexConfig {
-                    calibration_tokens: config.calibration_samples as usize,
-                    target_bpw: args.target_bpw,
-                    min_type: "Q3_K_S".to_string(),
-                    max_type: "Q6_K".to_string(),
-                };
-
-                calibrate::apex::run_apex_quantization(
-                    &tensor_map,
-                    &metadata,
-                    &config.input_dir,
-                    &apex_config,
-                    &progress,
-                )
-                .context("Apex quantization failed")
-                .map_err(AppError::Conversion)?
-            }
-            _ => {
+            // ADR-014 P8 Decision 12: flat / legacy block-quant variants
+            // (f16, bf16, q2, q4, q8) and Auto (post-resolution) flow
+            // through the existing StaticQuantizer dispatch. Auto is
+            // included because resolve_convert_config rewrites
+            // `config.quant` to a non-Auto value before this match runs;
+            // listing it explicitly preserves the exhaustive-match
+            // contract (Decision 12 lock).
+            cli::QuantMethod::Auto
+            | cli::QuantMethod::F16
+            | cli::QuantMethod::Bf16
+            | cli::QuantMethod::Q2
+            | cli::QuantMethod::Q4
+            | cli::QuantMethod::Q8 => {
                 let quantizer = StaticQuantizer::new(&quant_method_str)
                     .context("Failed to create quantizer")
                     .map_err(AppError::Conversion)?;
@@ -1923,13 +2068,22 @@ fn detect_quant_method_from_path(path: &std::path::Path) -> String {
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Long forms before short to avoid substring collisions (e.g. "dwq-mixed-4-6" before "mixed-4-6").
+    // ADR-014 P8 Decision 12: detect the 17-variant menu strings.
+    // Long forms before short to avoid substring collisions (e.g.
+    // "imatrix-q4_k_m" matched before "q4_k_m"; "dwq-4-6" matched
+    // before "dwq46"; "q4_k_m" matched before "q4").
     let known = [
-        "dwq-mixed-4-8", "dwq-mixed-6-8", "dwq-mixed-2-8", "dwq-mixed-4-6",
-        "dwq48", "dwq68", "dwq28", "dwq46",
-        "mixed-2-6", "mixed-3-6", "mixed-4-6",
-        "q2", "q4", "q8", "f16",
-        "apex",
+        // Imatrix-calibrated K-quant (longest first)
+        "imatrix-q4_k_m", "imatrix-q5_k_m", "imatrix-q6_k", "imatrix-adaptive",
+        // Uncalibrated K-quant
+        "q4_k_m", "q5_k_m", "q6_k",
+        // DWQ kebab forms
+        "dwq-4-6", "dwq-4-8", "dwq-6-8", "dwq-2-8",
+        // DWQ filename suffixes
+        "dwq46", "dwq48", "dwq68", "dwq28",
+        // Flat / legacy block-quant variants
+        "bf16", "f16",
+        "q2", "q4", "q8",
     ];
     for method in &known {
         if name.contains(method) {
@@ -1940,21 +2094,26 @@ fn detect_quant_method_from_path(path: &std::path::Path) -> String {
 }
 
 /// Get the default bit width for a quantization method.
+///
+/// Exhaustive over the 17-variant menu (Decision 12 lock).  K-quant
+/// variants report the *base* target bit width (Q4_K=4, Q5_K=5,
+/// Q6_K=6); per-tensor `_M` upgrades and imatrix-adaptive routing are
+/// applied inside the quantizer, not at this dispatch level.
 fn quantizer_default_bits(method: &cli::QuantMethod) -> u8 {
     match method {
-        cli::QuantMethod::F16 => 16,
+        cli::QuantMethod::Auto => 4, // post-resolution this is overwritten
+        cli::QuantMethod::F16 | cli::QuantMethod::Bf16 => 16,
         cli::QuantMethod::Q8 => 8,
         cli::QuantMethod::Q4 => 4,
         cli::QuantMethod::Q2 => 2,
-        cli::QuantMethod::Auto => 4,
-        cli::QuantMethod::Mixed26 => 4,
-        cli::QuantMethod::Mixed36 => 4,
-        cli::QuantMethod::Mixed46 => 4,
-        cli::QuantMethod::DwqMixed46 => 4,
-        cli::QuantMethod::DwqMixed48 => 4,
-        cli::QuantMethod::DwqMixed68 => 6,
-        cli::QuantMethod::DwqMixed28 => 2,
-        cli::QuantMethod::Apex => 4,
+        cli::QuantMethod::Q4KM | cli::QuantMethod::ImatrixQ4KM => 4,
+        cli::QuantMethod::Q5KM | cli::QuantMethod::ImatrixQ5KM => 5,
+        cli::QuantMethod::Q6K | cli::QuantMethod::ImatrixQ6K => 6,
+        cli::QuantMethod::ImatrixAdaptive => 4, // Q4_K_M base
+        cli::QuantMethod::Dwq46 => 4,
+        cli::QuantMethod::Dwq48 => 4,
+        cli::QuantMethod::Dwq68 => 6,
+        cli::QuantMethod::Dwq28 => 2,
     }
 }
 

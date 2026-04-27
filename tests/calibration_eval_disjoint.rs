@@ -74,13 +74,14 @@ fn calibration_corpus_source_is_documented_in_adr012() {
     // removes the file, the ADR reference breaks silently.
     let calib = repo_root().join("src/quantize/calibration");
     if !calib.exists() {
-        // Pre-P9 state: the calibration module is at src/quantize/
-        // under a different name. Document the expected location for
-        // the moment ADR-013 P12 lands.
-        let dwq = repo_root().join("src/quantize/dwq.rs");
+        // Pre-P9 state: the calibration module is at src/calibrate/
+        // (moved by ADR-014 P7 iter-8 Layout A migration from
+        // src/quantize/dwq.rs → src/calibrate/dwq.rs). Document the
+        // expected location for the moment ADR-013 P12 lands.
+        let dwq = repo_root().join("src/calibrate/dwq.rs");
         assert!(
             dwq.exists(),
-            "src/quantize/dwq.rs is the calibration-aware entry point per ADR-012 Decision 13"
+            "src/calibrate/dwq.rs is the calibration-aware entry point per ADR-012 Decision 13 (post-Layout-A)"
         );
     }
 }

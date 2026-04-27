@@ -151,7 +151,7 @@ fn setup(dir: &Path) {
     fs::write(dir.join("model.safetensors"), build_safetensors_bytes(tensors)).unwrap();
 }
 
-/// `hf2q convert --quant dwq-mixed-N-M` on qwen35 with a synthetic
+/// `hf2q convert --quant dwq-N-M` on qwen35 with a synthetic
 /// fixture MUST fail with a structured ActivationCapture-named error
 /// for EVERY DWQ variant, NOT fall back to weight-space silently.
 ///
@@ -160,11 +160,12 @@ fn setup(dir: &Path) {
 /// variant, the other three would silently accept DWQ with weight-
 /// space — the exact antipattern Decision 13 rejects.
 ///
-/// Post-P9b.2/3b (this iteration): the failure surface has shifted
-/// from the P9b-pending guard to `RealActivationCapture::new` →
-/// `Qwen35Model::load_from_gguf` rejecting the synthetic fixture.
-/// The contract — error names ActivationCapture, no output GGUF —
-/// is unchanged.
+/// Post-P9b.2/3b: the failure surface shifted from the P9b-pending
+/// guard to `RealActivationCapture::new` → `Qwen35Model::load_from_gguf`
+/// rejecting the synthetic fixture. Post-P8 iter-1 (ADR-014 Decision
+/// 13): the variant strings rename from `dwq-mixed-N-M` →
+/// `dwq-N-M`. The contract — error names ActivationCapture, no
+/// output GGUF — is unchanged.
 ///
 /// The real-model green-path test (Task #16) is gated on HF_TOKEN +
 /// ~30 GB disk; this test stays at the synthetic-fail-fast tier.
@@ -174,7 +175,7 @@ fn dwq_on_qwen35_surfaces_not_ready_not_fallback() {
     let input = tmp.path().join("qwen35-dwq-in");
     setup(&input);
 
-    for variant in ["dwq-mixed-2-8", "dwq-mixed-4-6", "dwq-mixed-4-8", "dwq-mixed-6-8"] {
+    for variant in ["dwq-2-8", "dwq-4-6", "dwq-4-8", "dwq-6-8"] {
         let output = tmp.path().join(format!("out-{variant}.gguf"));
         let out = Command::cargo_bin("hf2q")
             .unwrap()

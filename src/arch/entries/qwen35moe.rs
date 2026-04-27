@@ -236,6 +236,9 @@ pub const ENTRY: ArchEntry = ArchEntry {
     quality_thresholds: QualityThresholds::ADR_012_DEFAULT,
     disk_floor_gb: 150, // src/input/hf_download.rs Decision 14 floor for MoE
     hf_repos: &["jenerallee78/Qwen3.6-35B-A3B-Abliterix-EGA-abliterated"],
+    // ADR-014 P8 Decision 18: no per-arch override yet — fall through
+    // to the Decision-18 routing table (MoE → dwq-4-{6,8} based on RAM).
+    auto_override: None,
 };
 
 #[cfg(test)]

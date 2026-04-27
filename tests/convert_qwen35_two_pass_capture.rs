@@ -48,14 +48,14 @@
 // internal types.
 //
 // Acceptance for P9b.6 is therefore split:
-// - The full CLI integration ("hf2q convert --quant dwq-mixed-4-6"
+// - The full CLI integration ("hf2q convert --quant dwq-4-6"
 //   on real qwen35 safetensors) is covered by P9b.7's test refresh
 //   + the existing `convert_qwen35_real_activation_capture.rs`.
 // - The function-level test (real Qwen35Model + run_dwq_activation_
 //   calibration) lives at `src/quantize/dwq_activation.rs` tests.
 //
 // This file holds a CLI-level smoke check that the two-pass path
-// is reachable: drive `hf2q convert --quant dwq-mixed-4-6` on a
+// is reachable: drive `hf2q convert --quant dwq-4-6` on a
 // synthetic qwen35 safetensors and verify the conversion attempt
 // reaches the activation-capture stage (vs. failing at the P9b
 // guard which was removed in P9b.2).
@@ -224,7 +224,7 @@ fn two_pass_branch_is_reached_on_qwen35_dwq() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-mixed-4-6",
+            "dwq-4-6",
             "--output",
             output.to_str().unwrap(),
             "--yes",

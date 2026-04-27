@@ -19,10 +19,22 @@ impl StaticQuantizer {
     /// Create a new static quantizer for the given method.
     pub fn new(method: &str) -> Result<Self, QuantizeError> {
         let default_bits = match method {
-            "f16" => 16,
+            // ADR-014 P8 Decision 12: `bf16` is treated as f16 emission
+            // here because the convert pipeline runs `convert_bf16_to_f16`
+            // before this dispatch site (see cmd_convert in main.rs);
+            // by the time StaticQuantizer sees a tensor, BF16 has been
+            // collapsed to F16. The variant name is preserved on the
+            // CLI surface so users can request "bf16" semantics for
+            // input passthrough; the on-disk codec is identical to f16.
+            "f16" | "bf16" => 16,
             "q8" => 8,
             "q4" => 4,
             "q2" => 2,
+            // `auto` only reaches here when AutoResolver mapped to it
+            // explicitly; treat it as f16 (the safest passthrough).
+            // In practice resolve_auto_plan rewrites config.quant before
+            // the StaticQuantizer dispatch, so this arm is defensive.
+            "auto" => 16,
             _ => {
                 return Err(QuantizeError::UnsupportedMethod {
                     method: method.to_string(),

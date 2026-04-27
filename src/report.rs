@@ -526,7 +526,7 @@ mod tests {
             "/input".to_string(),
             "/output".to_string(),
             make_metadata(),
-            "mixed-4-6".to_string(),
+            "imatrix-q4_k_m".to_string(), // ADR-014 P8 Decision 12 menu
             4,
             64,
         )

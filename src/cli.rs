@@ -203,9 +203,39 @@ pub struct ConvertArgs {
     #[arg(long, value_enum)]
     pub format: OutputFormat,
 
-    /// Quantization method (default: auto)
-    #[arg(long, value_enum, default_value = "auto")]
+    /// Quantization method (default: auto). Mutually exclusive with the
+    /// orthogonal `--calibration` / `--output-format` pair (Decision 12
+    /// §off-diagonal).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        conflicts_with = "calibration",
+        conflicts_with = "output_format",
+    )]
     pub quant: QuantMethod,
+
+    /// Calibrator axis for the orthogonal off-diagonal selector
+    /// (ADR-014 Decision 12 §off-diagonal). Must be supplied together
+    /// with `--output-format`. Off-diagonal pairs (e.g. `imatrix` +
+    /// `bit-pair-4-6`) require `HF2Q_UNSAFE_EXPERIMENTS=1`.
+    #[arg(
+        long,
+        value_enum,
+        requires = "output_format",
+    )]
+    pub calibration: Option<CalibrationFlag>,
+
+    /// OutputFormat axis for the orthogonal off-diagonal selector
+    /// (ADR-014 Decision 12 §off-diagonal). Must be supplied together
+    /// with `--calibration`. Off-diagonal pairs (e.g. `imatrix` +
+    /// `bit-pair-4-6`) require `HF2Q_UNSAFE_EXPERIMENTS=1`.
+    #[arg(
+        long = "output-format",
+        value_enum,
+        requires = "calibration",
+    )]
+    pub output_format: Option<OutputFormatFlag>,
 
     /// Layer ranges to protect at higher precision (e.g., "13-24", "1,5,13-24")
     #[arg(long)]
@@ -617,36 +647,108 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Quantization method — the 17-variant Decision-12 menu (ADR-014 P8).
+///
+/// ## Cells
+///
+/// The menu spans the diagonal of the (Calibrator × OutputFormat) matrix
+/// from ADR-014 Decision 9.  Off-diagonal cells (e.g. `dwq` calibrator
+/// with K-quant output) are reachable only via the orthogonal
+/// `--calibration` + `--output-format` flags, gated by
+/// `HF2Q_UNSAFE_EXPERIMENTS=1` (Decision 12 §off-diagonal).
+///
+/// | Variant            | Calibrator   | OutputFormat   | Notes                                 |
+/// |--------------------|--------------|----------------|---------------------------------------|
+/// | `auto`             | (resolved)   | (resolved)     | AutoResolver Decision 18 routing      |
+/// | `f16` / `bf16`     | none         | flat           | Passthrough float                     |
+/// | `q2` / `q4` / `q8` | none         | flat           | Legacy IR-quantize (Q2_K/Q4_0/Q8_0)   |
+/// | `q4_k_m`           | none         | k-quant Q4_K   | Uncalibrated K-quant (community-std)  |
+/// | `q5_k_m`           | none         | k-quant Q5_K   |                                       |
+/// | `q6_k`             | none         | k-quant Q6_K   |                                       |
+/// | `imatrix-q4_k_m`   | imatrix      | k-quant Q4_K   | llama.cpp-style importance matrix     |
+/// | `imatrix-q5_k_m`   | imatrix      | k-quant Q5_K   |                                       |
+/// | `imatrix-q6_k`     | imatrix      | k-quant Q6_K   |                                       |
+/// | `imatrix-adaptive` | imatrix      | k-quant adapt  | Per-tensor optimal precision (apex)   |
+/// | `dwq-4-6`          | dwq          | bit-pair (4,6) | Apple/MLX distilled weight quant      |
+/// | `dwq-4-8`          | dwq          | bit-pair (4,8) |                                       |
+/// | `dwq-6-8`          | dwq          | bit-pair (6,8) |                                       |
+/// | `dwq-2-8`          | dwq          | bit-pair (2,8) |                                       |
+///
+/// ## Decision 13 — clean cut, no aliases
+///
+/// The pre-P8 variants (`apex`, `mixed-2-6`, `mixed-3-6`, `mixed-4-6`,
+/// `dwq-mixed-N-M`) are deleted with no aliases.  Old user scripts MUST
+/// fail with a helpful "did you mean" error mapped via
+/// [`map_deleted_quant_hint`].  The renames are:
+///
+/// - `apex` → `imatrix-adaptive` (preserves per-tensor optimal precision)
+/// - `mixed-N-M` → `q4_k_m` (uncalibrated K-quant is the modern equivalent)
+/// - `dwq-mixed-N-M` → `dwq-N-M` (cosmetic rename, same algorithm)
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuantMethod {
+    /// `auto` — AutoResolver Decision 18 routing table picks the cell
+    /// based on dense/MoE classification + hardware (memory, bandwidth).
     Auto,
+    /// `f16` — flat float-16 passthrough.
     F16,
-    #[value(alias = "q8_0")]
-    Q8,
+    /// `bf16` — flat bfloat-16 passthrough (preserves the source dtype
+    /// for HF models exported as bf16; no precision loss vs f16 cast).
+    Bf16,
+    /// `q2` — flat 2-bit (Q2_K block format).
+    Q2,
+    /// `q4` — flat 4-bit (Q4_0 / Q4_K block format depending on output).
     /// `q4_0` is accepted as an alias — the smoke harness's default
     /// (`hf2q smoke --arch ... --quant q4_0` per Decision 16 §3) was
-    /// previously rejected by clap because only the bare `q4` form
-    /// was registered. Both names refer to the same bit-identical
-    /// 4-bit emission.
+    /// previously rejected by clap because only the bare `q4` form was
+    /// registered. Both names refer to the same bit-identical 4-bit
+    /// emission.
     #[value(alias = "q4_0")]
     Q4,
-    Q2,
-    #[value(name = "mixed-2-6")]
-    Mixed26,
-    #[value(name = "mixed-3-6")]
-    Mixed36,
-    #[value(name = "mixed-4-6")]
-    Mixed46,
-    #[value(name = "dwq-mixed-4-6")]
-    DwqMixed46,
-    #[value(name = "dwq-mixed-4-8")]
-    DwqMixed48,
-    #[value(name = "dwq-mixed-6-8")]
-    DwqMixed68,
-    #[value(name = "dwq-mixed-2-8")]
-    DwqMixed28,
-    /// Apex: imatrix-calibrated, per-tensor optimal precision (requires Phase 2 GPU support)
-    Apex,
+    /// `q8` — flat 8-bit (Q8_0).
+    #[value(alias = "q8_0")]
+    Q8,
+    /// `q4_k_m` — uncalibrated K-quant Q4_K with per-tensor `_M`
+    /// upgrades (output/token_embd → Q6_K, attn_v / ffn_down on
+    /// `use_more_bits` layers).
+    #[value(name = "q4_k_m")]
+    Q4KM,
+    /// `q5_k_m` — uncalibrated K-quant Q5_K (`_M` variant).
+    #[value(name = "q5_k_m")]
+    Q5KM,
+    /// `q6_k` — uncalibrated K-quant Q6_K.
+    #[value(name = "q6_k")]
+    Q6K,
+    /// `imatrix-q4_k_m` — K-quant Q4_K (`_M` variant) with imatrix-
+    /// weighted codebook search (llama.cpp PR #4861 / commit `ec893798`).
+    #[value(name = "imatrix-q4_k_m")]
+    ImatrixQ4KM,
+    /// `imatrix-q5_k_m` — K-quant Q5_K (`_M` variant) with imatrix-
+    /// weighted codebook search.
+    #[value(name = "imatrix-q5_k_m")]
+    ImatrixQ5KM,
+    /// `imatrix-q6_k` — K-quant Q6_K with imatrix-weighted codebook
+    /// search.
+    #[value(name = "imatrix-q6_k")]
+    ImatrixQ6K,
+    /// `imatrix-adaptive` — imatrix-calibrated, per-tensor optimal
+    /// precision K-quant (replaces the deleted `apex` variant).
+    /// Routes through [`crate::quantize::variant_quantizer::VariantKQuantizer`]
+    /// with `layer_mix::target_for` per-tensor target dispatch.
+    #[value(name = "imatrix-adaptive")]
+    ImatrixAdaptive,
+    /// `dwq-4-6` — Apple/MLX distilled weight quantization with
+    /// (base=4, sensitive=6) bit pair.
+    #[value(name = "dwq-4-6")]
+    Dwq46,
+    /// `dwq-4-8` — DWQ with (base=4, sensitive=8) bit pair.
+    #[value(name = "dwq-4-8")]
+    Dwq48,
+    /// `dwq-6-8` — DWQ with (base=6, sensitive=8) bit pair.
+    #[value(name = "dwq-6-8")]
+    Dwq68,
+    /// `dwq-2-8` — DWQ with (base=2, sensitive=8) bit pair.
+    #[value(name = "dwq-2-8")]
+    Dwq28,
 }
 
 impl std::fmt::Display for QuantMethod {
@@ -654,17 +756,21 @@ impl std::fmt::Display for QuantMethod {
         match self {
             Self::Auto => write!(f, "auto"),
             Self::F16 => write!(f, "f16"),
-            Self::Q8 => write!(f, "q8"),
-            Self::Q4 => write!(f, "q4"),
+            Self::Bf16 => write!(f, "bf16"),
             Self::Q2 => write!(f, "q2"),
-            Self::Mixed26 => write!(f, "mixed-2-6"),
-            Self::Mixed36 => write!(f, "mixed-3-6"),
-            Self::Mixed46 => write!(f, "mixed-4-6"),
-            Self::DwqMixed46 => write!(f, "dwq-mixed-4-6"),
-            Self::DwqMixed48 => write!(f, "dwq-mixed-4-8"),
-            Self::DwqMixed68 => write!(f, "dwq-mixed-6-8"),
-            Self::DwqMixed28 => write!(f, "dwq-mixed-2-8"),
-            Self::Apex => write!(f, "apex"),
+            Self::Q4 => write!(f, "q4"),
+            Self::Q8 => write!(f, "q8"),
+            Self::Q4KM => write!(f, "q4_k_m"),
+            Self::Q5KM => write!(f, "q5_k_m"),
+            Self::Q6K => write!(f, "q6_k"),
+            Self::ImatrixQ4KM => write!(f, "imatrix-q4_k_m"),
+            Self::ImatrixQ5KM => write!(f, "imatrix-q5_k_m"),
+            Self::ImatrixQ6K => write!(f, "imatrix-q6_k"),
+            Self::ImatrixAdaptive => write!(f, "imatrix-adaptive"),
+            Self::Dwq46 => write!(f, "dwq-4-6"),
+            Self::Dwq48 => write!(f, "dwq-4-8"),
+            Self::Dwq68 => write!(f, "dwq-6-8"),
+            Self::Dwq28 => write!(f, "dwq-2-8"),
         }
     }
 }
@@ -674,10 +780,10 @@ impl QuantMethod {
     /// Returns None for non-DWQ variants.
     pub fn dwq_bit_pair(self) -> Option<(u8, u8)> {
         match self {
-            Self::DwqMixed46 => Some((4, 6)),
-            Self::DwqMixed48 => Some((4, 8)),
-            Self::DwqMixed68 => Some((6, 8)),
-            Self::DwqMixed28 => Some((2, 8)),
+            Self::Dwq46 => Some((4, 6)),
+            Self::Dwq48 => Some((4, 8)),
+            Self::Dwq68 => Some((6, 8)),
+            Self::Dwq28 => Some((2, 8)),
             _ => None,
         }
     }
@@ -685,14 +791,170 @@ impl QuantMethod {
     /// Return the default output filename suffix for this quant method.
     ///
     /// DWQ variants produce compact suffixes like "dwq46", "dwq48", etc.
-    /// All other variants return their Display string unchanged (e.g. "mixed-4-6", "q4").
+    /// All other variants return their Display string unchanged (e.g.
+    /// "imatrix-q4_k_m", "q4_k_m", "q4").
     pub fn default_filename_suffix(self) -> String {
         match self {
-            Self::DwqMixed46 => "dwq46".to_string(),
-            Self::DwqMixed48 => "dwq48".to_string(),
-            Self::DwqMixed68 => "dwq68".to_string(),
-            Self::DwqMixed28 => "dwq28".to_string(),
+            Self::Dwq46 => "dwq46".to_string(),
+            Self::Dwq48 => "dwq48".to_string(),
+            Self::Dwq68 => "dwq68".to_string(),
+            Self::Dwq28 => "dwq28".to_string(),
             other => other.to_string(),
+        }
+    }
+}
+
+/// Map a deleted (Decision 13) `--quant` string to a "did you mean"
+/// hint for the user-facing error message.
+///
+/// Returns `Some(hint)` for the deleted variants (`apex`, `mixed-N-M`,
+/// `dwq-mixed-N-M`) and `None` for any other unknown string (in which
+/// case clap's default `possible values` rendering is sufficient).
+///
+/// This is consulted at convert-dispatch time after `Cli::try_parse`
+/// fails on a deleted variant — the helper is also exposed publicly so
+/// the integration tests can assert the mapping table without re-deriving
+/// it.
+pub fn map_deleted_quant_hint(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_lowercase();
+    match lowered.as_str() {
+        "apex" => Some(
+            "`--quant apex` was removed in ADR-014 P8 (Decision 13). \
+             Use `--quant imatrix-adaptive` for imatrix-calibrated \
+             per-tensor optimal precision (preserves apex's behavior)."
+                .to_string(),
+        ),
+        "mixed-2-6" | "mixed-3-6" | "mixed-4-6" => Some(format!(
+            "`--quant {raw}` was removed in ADR-014 P8 (Decision 13). \
+             Use `--quant q4_k_m` for uncalibrated K-quant (the modern \
+             equivalent), or `--quant imatrix-q4_k_m` for the \
+             imatrix-calibrated path."
+        )),
+        "dwq-mixed-4-6" => Some(
+            "`--quant dwq-mixed-4-6` was renamed in ADR-014 P8 \
+             (Decision 13). Use `--quant dwq-4-6` (same algorithm, \
+             cosmetic rename)."
+                .to_string(),
+        ),
+        "dwq-mixed-4-8" => Some(
+            "`--quant dwq-mixed-4-8` was renamed in ADR-014 P8 \
+             (Decision 13). Use `--quant dwq-4-8` (same algorithm, \
+             cosmetic rename)."
+                .to_string(),
+        ),
+        "dwq-mixed-6-8" => Some(
+            "`--quant dwq-mixed-6-8` was renamed in ADR-014 P8 \
+             (Decision 13). Use `--quant dwq-6-8` (same algorithm, \
+             cosmetic rename)."
+                .to_string(),
+        ),
+        "dwq-mixed-2-8" => Some(
+            "`--quant dwq-mixed-2-8` was renamed in ADR-014 P8 \
+             (Decision 13). Use `--quant dwq-2-8` (same algorithm, \
+             cosmetic rename)."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Calibrator axis for the orthogonal `--calibration` flag (ADR-014
+/// Decision 12 §off-diagonal). Pairs with [`OutputFormatFlag`].
+///
+/// When both flags are supplied, the convert dispatch builds the
+/// corresponding (Calibrator, OutputFormat) pair — including off-
+/// diagonal cells reachable only when `HF2Q_UNSAFE_EXPERIMENTS=1`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibrationFlag {
+    /// `none` — no calibration (NoneCalibrator).
+    None,
+    /// `imatrix` — llama.cpp-style importance matrix
+    /// (ImatrixCalibrator).
+    Imatrix,
+    /// `dwq` — Apple/MLX distilled weight quantization
+    /// (DwqCalibrator).
+    Dwq,
+}
+
+impl std::fmt::Display for CalibrationFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Imatrix => write!(f, "imatrix"),
+            Self::Dwq => write!(f, "dwq"),
+        }
+    }
+}
+
+/// OutputFormat axis for the orthogonal `--output-format` flag
+/// (ADR-014 Decision 12 §off-diagonal). Pairs with [`CalibrationFlag`].
+///
+/// The variant naming uses kebab-form `flat-*` / `k-quant-*` /
+/// `bit-pair-N-M` so the on-disk codec is unambiguous.
+///
+/// **Note**: This is distinct from the existing [`OutputFormat`]
+/// (gguf / safetensors), which selects the *container* format. This
+/// enum picks the per-tensor *codec* used inside that container.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputFormatFlag {
+    /// `flat-f16` — flat float-16 (no quantization).
+    #[value(name = "flat-f16")]
+    FlatF16,
+    /// `flat-bf16` — flat bfloat-16.
+    #[value(name = "flat-bf16")]
+    FlatBf16,
+    /// `flat-q2` — flat 2-bit (Q2_K).
+    #[value(name = "flat-q2")]
+    FlatQ2,
+    /// `flat-q4` — flat 4-bit (Q4_0).
+    #[value(name = "flat-q4")]
+    FlatQ4,
+    /// `flat-q8` — flat 8-bit (Q8_0).
+    #[value(name = "flat-q8")]
+    FlatQ8,
+    /// `k-quant-q4_k_m` — K-quant Q4_K (`_M` variant).
+    #[value(name = "k-quant-q4_k_m")]
+    KQuantQ4KM,
+    /// `k-quant-q5_k_m` — K-quant Q5_K (`_M` variant).
+    #[value(name = "k-quant-q5_k_m")]
+    KQuantQ5KM,
+    /// `k-quant-q6_k` — K-quant Q6_K.
+    #[value(name = "k-quant-q6_k")]
+    KQuantQ6K,
+    /// `k-quant-adaptive` — per-tensor optimal precision K-quant
+    /// (apex's behavior).
+    #[value(name = "k-quant-adaptive")]
+    KQuantAdaptive,
+    /// `bit-pair-4-6` — DWQ-style (base=4, sensitive=6) bit pair.
+    #[value(name = "bit-pair-4-6")]
+    BitPair46,
+    /// `bit-pair-4-8` — DWQ-style (base=4, sensitive=8) bit pair.
+    #[value(name = "bit-pair-4-8")]
+    BitPair48,
+    /// `bit-pair-6-8` — DWQ-style (base=6, sensitive=8) bit pair.
+    #[value(name = "bit-pair-6-8")]
+    BitPair68,
+    /// `bit-pair-2-8` — DWQ-style (base=2, sensitive=8) bit pair.
+    #[value(name = "bit-pair-2-8")]
+    BitPair28,
+}
+
+impl std::fmt::Display for OutputFormatFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlatF16 => write!(f, "flat-f16"),
+            Self::FlatBf16 => write!(f, "flat-bf16"),
+            Self::FlatQ2 => write!(f, "flat-q2"),
+            Self::FlatQ4 => write!(f, "flat-q4"),
+            Self::FlatQ8 => write!(f, "flat-q8"),
+            Self::KQuantQ4KM => write!(f, "k-quant-q4_k_m"),
+            Self::KQuantQ5KM => write!(f, "k-quant-q5_k_m"),
+            Self::KQuantQ6K => write!(f, "k-quant-q6_k"),
+            Self::KQuantAdaptive => write!(f, "k-quant-adaptive"),
+            Self::BitPair46 => write!(f, "bit-pair-4-6"),
+            Self::BitPair48 => write!(f, "bit-pair-4-8"),
+            Self::BitPair68 => write!(f, "bit-pair-6-8"),
+            Self::BitPair28 => write!(f, "bit-pair-2-8"),
         }
     }
 }
@@ -761,6 +1023,12 @@ pub struct ConvertConfig {
     /// `x-linked-etag`. Default `false` (integrity ON). ADR-005 Phase 3
     /// item 3/4.
     pub no_integrity: bool,
+    /// Orthogonal Calibrator selector (ADR-014 Decision 12 §off-diagonal).
+    /// `Some` → caller supplied `--calibration X --output-format Y`;
+    /// `None` → caller used `--quant`.
+    pub calibration: Option<CalibrationFlag>,
+    /// Orthogonal OutputFormat selector (ADR-014 Decision 12 §off-diagonal).
+    pub output_format: Option<OutputFormatFlag>,
 }
 
 #[allow(dead_code)]
@@ -882,24 +1150,35 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         }
     };
 
-    // Validate quant method is implemented
+    // Validate quant method is implemented (exhaustive — Decision 12 lock).
     match args.quant {
         QuantMethod::Auto => {
-            // Auto mode — resolve at conversion time
+            // Auto mode — resolve at conversion time via AutoResolver Decision 18.
         }
-        QuantMethod::Mixed26 | QuantMethod::Mixed36 | QuantMethod::Mixed46 => {
-            // Mixed-bit quantization
+        QuantMethod::F16
+        | QuantMethod::Bf16
+        | QuantMethod::Q2
+        | QuantMethod::Q4
+        | QuantMethod::Q8 => {
+            // Flat float / legacy block-quant variants.
         }
-        QuantMethod::DwqMixed46
-        | QuantMethod::DwqMixed48
-        | QuantMethod::DwqMixed68
-        | QuantMethod::DwqMixed28 => {
-            // DWQ weight-space calibration (no inference needed)
+        QuantMethod::Q4KM | QuantMethod::Q5KM | QuantMethod::Q6K => {
+            // Uncalibrated K-quant (NoneCalibrator + KQuantCodecQuantizer).
         }
-        QuantMethod::Apex => {
-            // Apex: imatrix-calibrated, per-tensor optimal precision quantization
+        QuantMethod::ImatrixQ4KM
+        | QuantMethod::ImatrixQ5KM
+        | QuantMethod::ImatrixQ6K => {
+            // imatrix-calibrated K-quant (ImatrixCalibrator + KQuantCodecQuantizer).
         }
-        QuantMethod::F16 | QuantMethod::Q8 | QuantMethod::Q4 | QuantMethod::Q2 => {}
+        QuantMethod::ImatrixAdaptive => {
+            // imatrix-calibrated per-tensor optimal precision (replaces former Apex).
+        }
+        QuantMethod::Dwq46
+        | QuantMethod::Dwq48
+        | QuantMethod::Dwq68
+        | QuantMethod::Dwq28 => {
+            // DWQ weight/activation calibration → bit-pair output.
+        }
     }
 
     // Both output formats are implemented
@@ -923,7 +1202,128 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         yes: args.yes,
         unsupported_layers: args.unsupported_layers,
         no_integrity: args.no_integrity,
+        calibration: args.calibration,
+        output_format: args.output_format,
     })
+}
+
+/// Environment-variable name for the off-diagonal dev-gate
+/// (ADR-014 Decision 12 §off-diagonal). Setting `HF2Q_UNSAFE_EXPERIMENTS=1`
+/// unlocks `--calibration X --output-format Y` cells that aren't part
+/// of the validated 17-variant menu.
+pub const HF2Q_UNSAFE_EXPERIMENTS_ENV: &str = "HF2Q_UNSAFE_EXPERIMENTS";
+
+/// Errors from the off-diagonal `--calibration` / `--output-format`
+/// validator.
+#[derive(Debug, thiserror::Error)]
+pub enum OffDiagonalError {
+    /// Both `--calibration` and `--output-format` were supplied but
+    /// `HF2Q_UNSAFE_EXPERIMENTS` is unset (or not equal to `"1"`).
+    #[error(
+        "off-diagonal cells require {env}=1; the requested pair \
+         (--calibration {cal} --output-format {fmt}) is not a validated \
+         cell in the Decision 12 menu. See docs/converting-a-model.md \
+         §maintainers, or use one of the 17 `--quant` variants instead."
+    )]
+    DevGateRequired {
+        env: &'static str,
+        cal: String,
+        fmt: String,
+    },
+
+    /// One of the orthogonal flags was supplied without the other.
+    /// clap's `requires` already catches this, but the helper has its
+    /// own pure check so library callers get the typed error too.
+    #[error(
+        "--calibration and --output-format must be supplied together \
+         (got --calibration={cal:?} --output-format={fmt:?}). \
+         Use --quant for the validated 17-variant menu, or supply \
+         both flags for off-diagonal cells (with {env}=1)."
+    )]
+    PartialOrthogonalSelector {
+        env: &'static str,
+        cal: Option<CalibrationFlag>,
+        fmt: Option<OutputFormatFlag>,
+    },
+}
+
+/// Decide whether a given `(--calibration, --output-format)` pair is
+/// "diagonal" (matches one of the 17 `--quant` variants — no dev-gate
+/// needed) or "off-diagonal" (requires `HF2Q_UNSAFE_EXPERIMENTS=1`).
+///
+/// Returns `true` for diagonal cells (e.g. `imatrix` + `k-quant-q4_k_m`
+/// is the same as `--quant imatrix-q4_k_m`).
+pub fn is_diagonal_cell(cal: CalibrationFlag, fmt: OutputFormatFlag) -> bool {
+    use CalibrationFlag::*;
+    use OutputFormatFlag::*;
+    matches!(
+        (cal, fmt),
+        // none × flat-* / k-quant-* (uncalibrated cells)
+        (None, FlatF16)
+            | (None, FlatBf16)
+            | (None, FlatQ2)
+            | (None, FlatQ4)
+            | (None, FlatQ8)
+            | (None, KQuantQ4KM)
+            | (None, KQuantQ5KM)
+            | (None, KQuantQ6K)
+            // imatrix × k-quant-* (calibrated K-quant cells)
+            | (Imatrix, KQuantQ4KM)
+            | (Imatrix, KQuantQ5KM)
+            | (Imatrix, KQuantQ6K)
+            | (Imatrix, KQuantAdaptive)
+            // dwq × bit-pair-* (DWQ cells)
+            | (Dwq, BitPair46)
+            | (Dwq, BitPair48)
+            | (Dwq, BitPair68)
+            | (Dwq, BitPair28)
+    )
+}
+
+/// Validate the orthogonal `(--calibration, --output-format)` selector
+/// per ADR-014 Decision 12 §off-diagonal.
+///
+/// - Both flags `None` → caller is using `--quant`; returns `Ok(None)`.
+/// - One flag `Some`, the other `None` → returns
+///   [`OffDiagonalError::PartialOrthogonalSelector`] (also caught by
+///   clap's `requires`, but the typed error here is the library
+///   contract).
+/// - Both flags `Some` AND diagonal cell → returns `Ok(Some((cal, fmt)))`
+///   with no env-gate check (a diagonal cell is just a verbose `--quant`).
+/// - Both flags `Some` AND off-diagonal cell AND env unset → returns
+///   [`OffDiagonalError::DevGateRequired`].
+/// - Both flags `Some` AND off-diagonal cell AND `HF2Q_UNSAFE_EXPERIMENTS=1`
+///   → returns `Ok(Some((cal, fmt)))`.
+pub fn validate_off_diagonal_selector(
+    cal: Option<CalibrationFlag>,
+    fmt: Option<OutputFormatFlag>,
+    env_unsafe_experiments: Option<&str>,
+) -> Result<Option<(CalibrationFlag, OutputFormatFlag)>, OffDiagonalError> {
+    match (cal, fmt) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(OffDiagonalError::PartialOrthogonalSelector {
+                env: HF2Q_UNSAFE_EXPERIMENTS_ENV,
+                cal,
+                fmt,
+            })
+        }
+        (Some(c), Some(f)) => {
+            if is_diagonal_cell(c, f) {
+                return Ok(Some((c, f)));
+            }
+            // Off-diagonal cell — env gate required.
+            if env_unsafe_experiments == Some("1") {
+                Ok(Some((c, f)))
+            } else {
+                Err(OffDiagonalError::DevGateRequired {
+                    env: HF2Q_UNSAFE_EXPERIMENTS_ENV,
+                    cal: c.to_string(),
+                    fmt: f.to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -969,33 +1369,46 @@ mod tests {
 
     #[test]
     fn test_dwq_bit_pair_dispatch_table() {
-        assert_eq!(QuantMethod::DwqMixed46.dwq_bit_pair(), Some((4, 6)));
-        assert_eq!(QuantMethod::DwqMixed48.dwq_bit_pair(), Some((4, 8)));
-        assert_eq!(QuantMethod::DwqMixed68.dwq_bit_pair(), Some((6, 8)));
-        assert_eq!(QuantMethod::DwqMixed28.dwq_bit_pair(), Some((2, 8)));
+        assert_eq!(QuantMethod::Dwq46.dwq_bit_pair(), Some((4, 6)));
+        assert_eq!(QuantMethod::Dwq48.dwq_bit_pair(), Some((4, 8)));
+        assert_eq!(QuantMethod::Dwq68.dwq_bit_pair(), Some((6, 8)));
+        assert_eq!(QuantMethod::Dwq28.dwq_bit_pair(), Some((2, 8)));
     }
 
     #[test]
     fn test_non_dwq_variants_return_none_for_bit_pair() {
-        assert_eq!(QuantMethod::Auto.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::F16.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Q8.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Q4.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Q2.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Mixed26.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Mixed36.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Mixed46.dwq_bit_pair(), None);
-        assert_eq!(QuantMethod::Apex.dwq_bit_pair(), None);
+        // Every non-DWQ variant in the 17-variant menu returns None.
+        for m in [
+            QuantMethod::Auto,
+            QuantMethod::F16,
+            QuantMethod::Bf16,
+            QuantMethod::Q2,
+            QuantMethod::Q4,
+            QuantMethod::Q8,
+            QuantMethod::Q4KM,
+            QuantMethod::Q5KM,
+            QuantMethod::Q6K,
+            QuantMethod::ImatrixQ4KM,
+            QuantMethod::ImatrixQ5KM,
+            QuantMethod::ImatrixQ6K,
+            QuantMethod::ImatrixAdaptive,
+        ] {
+            assert_eq!(
+                m.dwq_bit_pair(),
+                None,
+                "non-DWQ variant {m:?} must return None for dwq_bit_pair"
+            );
+        }
     }
 
     // ---- Default filename suffix helper ----
 
     #[test]
     fn test_dwq_default_filename_suffix() {
-        assert_eq!(QuantMethod::DwqMixed46.default_filename_suffix(), "dwq46");
-        assert_eq!(QuantMethod::DwqMixed48.default_filename_suffix(), "dwq48");
-        assert_eq!(QuantMethod::DwqMixed68.default_filename_suffix(), "dwq68");
-        assert_eq!(QuantMethod::DwqMixed28.default_filename_suffix(), "dwq28");
+        assert_eq!(QuantMethod::Dwq46.default_filename_suffix(), "dwq46");
+        assert_eq!(QuantMethod::Dwq48.default_filename_suffix(), "dwq48");
+        assert_eq!(QuantMethod::Dwq68.default_filename_suffix(), "dwq68");
+        assert_eq!(QuantMethod::Dwq28.default_filename_suffix(), "dwq28");
     }
 
     #[test]
@@ -1004,13 +1417,17 @@ mod tests {
         for m in [
             QuantMethod::Auto,
             QuantMethod::F16,
-            QuantMethod::Q8,
-            QuantMethod::Q4,
+            QuantMethod::Bf16,
             QuantMethod::Q2,
-            QuantMethod::Mixed26,
-            QuantMethod::Mixed36,
-            QuantMethod::Mixed46,
-            QuantMethod::Apex,
+            QuantMethod::Q4,
+            QuantMethod::Q8,
+            QuantMethod::Q4KM,
+            QuantMethod::Q5KM,
+            QuantMethod::Q6K,
+            QuantMethod::ImatrixQ4KM,
+            QuantMethod::ImatrixQ5KM,
+            QuantMethod::ImatrixQ6K,
+            QuantMethod::ImatrixAdaptive,
         ] {
             assert_eq!(
                 m.default_filename_suffix(),
@@ -1025,31 +1442,373 @@ mod tests {
 
     #[test]
     fn test_dwq_display_strings() {
-        assert_eq!(QuantMethod::DwqMixed46.to_string(), "dwq-mixed-4-6");
-        assert_eq!(QuantMethod::DwqMixed48.to_string(), "dwq-mixed-4-8");
-        assert_eq!(QuantMethod::DwqMixed68.to_string(), "dwq-mixed-6-8");
-        assert_eq!(QuantMethod::DwqMixed28.to_string(), "dwq-mixed-2-8");
+        assert_eq!(QuantMethod::Dwq46.to_string(), "dwq-4-6");
+        assert_eq!(QuantMethod::Dwq48.to_string(), "dwq-4-8");
+        assert_eq!(QuantMethod::Dwq68.to_string(), "dwq-6-8");
+        assert_eq!(QuantMethod::Dwq28.to_string(), "dwq-2-8");
     }
 
     // ---- Gemma-4 regression snapshot guard ----
-    // Asserts that the DwqMixed46 dispatch path continues to produce
+    // Asserts that the Dwq46 dispatch path continues to produce
     // (base_bits=4, sensitive_bits=6) — byte-identical to pre-change behaviour.
     // This guard will fail if any future refactor silently changes the Gemma-4
     // quantization parameters.
 
     #[test]
-    fn test_gemma4_regression_dwq_mixed46_dispatch_unchanged() {
+    fn test_gemma4_regression_dwq46_dispatch_unchanged() {
         // Dispatch table entry must still be (4, 6).
         assert_eq!(
-            QuantMethod::DwqMixed46.dwq_bit_pair(),
+            QuantMethod::Dwq46.dwq_bit_pair(),
             Some((4, 6)),
-            "Gemma-4 regression: DwqMixed46 must dispatch to (base=4, sensitive=6)"
+            "Gemma-4 regression: Dwq46 must dispatch to (base=4, sensitive=6)"
         );
         // Default filename suffix (new behaviour per ADR Decision 10(c)).
         assert_eq!(
-            QuantMethod::DwqMixed46.default_filename_suffix(),
+            QuantMethod::Dwq46.default_filename_suffix(),
             "dwq46",
-            "Gemma-4 regression: DwqMixed46 filename suffix must be 'dwq46'"
+            "Gemma-4 regression: Dwq46 filename suffix must be 'dwq46'"
+        );
+    }
+
+    // ---- ADR-014 P8 Decision 12: 17-variant menu unit tests ----
+
+    /// S1 test (a): every Decision-12 variant string parses through
+    /// `Cli::parse_from` and resolves to the expected `QuantMethod`
+    /// variant. Drives the clap value-parser table for every menu cell.
+    #[test]
+    fn test_every_decision12_variant_parses() {
+        // (CLI string, expected variant)
+        let cases: &[(&str, QuantMethod)] = &[
+            ("auto", QuantMethod::Auto),
+            ("f16", QuantMethod::F16),
+            ("bf16", QuantMethod::Bf16),
+            ("q2", QuantMethod::Q2),
+            ("q4", QuantMethod::Q4),
+            ("q8", QuantMethod::Q8),
+            ("q4_k_m", QuantMethod::Q4KM),
+            ("q5_k_m", QuantMethod::Q5KM),
+            ("q6_k", QuantMethod::Q6K),
+            ("imatrix-q4_k_m", QuantMethod::ImatrixQ4KM),
+            ("imatrix-q5_k_m", QuantMethod::ImatrixQ5KM),
+            ("imatrix-q6_k", QuantMethod::ImatrixQ6K),
+            ("imatrix-adaptive", QuantMethod::ImatrixAdaptive),
+            ("dwq-4-6", QuantMethod::Dwq46),
+            ("dwq-4-8", QuantMethod::Dwq48),
+            ("dwq-6-8", QuantMethod::Dwq68),
+            ("dwq-2-8", QuantMethod::Dwq28),
+        ];
+        assert_eq!(
+            cases.len(),
+            17,
+            "Decision-12 menu must enumerate exactly 17 variants"
+        );
+        for (s, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "hf2q",
+                "convert",
+                "--input",
+                "/tmp/x",
+                "--format",
+                "gguf",
+                "--quant",
+                s,
+            ])
+            .unwrap_or_else(|e| {
+                panic!("variant {s} must parse, but clap rejected it: {e}")
+            });
+            let Command::Convert(args) = cli.command else {
+                panic!("expected Convert subcommand");
+            };
+            assert_eq!(
+                args.quant, *expected,
+                "variant {s} parsed to {:?} but expected {:?}",
+                args.quant, expected,
+            );
+        }
+    }
+
+    /// S1 test (b): `apex` is rejected by clap; the deletion-hint mapper
+    /// produces a useful "did you mean imatrix-adaptive" message.
+    #[test]
+    fn test_apex_string_rejected_with_hint() {
+        let result = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "--input",
+            "/tmp/x",
+            "--format",
+            "gguf",
+            "--quant",
+            "apex",
+        ]);
+        assert!(result.is_err(), "apex must be rejected by clap");
+
+        let hint = map_deleted_quant_hint("apex").expect("apex must have a hint");
+        assert!(
+            hint.contains("imatrix-adaptive"),
+            "apex hint must suggest imatrix-adaptive, got: {hint}"
+        );
+    }
+
+    /// S1 test (c): each of the deleted `mixed-N-M` variants is rejected
+    /// by clap and the hint mapper points at `q4_k_m` / `imatrix-q4_k_m`.
+    #[test]
+    fn test_mixed_4_6_rejected_with_hint() {
+        for raw in ["mixed-2-6", "mixed-3-6", "mixed-4-6"] {
+            let result = Cli::try_parse_from([
+                "hf2q",
+                "convert",
+                "--input",
+                "/tmp/x",
+                "--format",
+                "gguf",
+                "--quant",
+                raw,
+            ]);
+            assert!(result.is_err(), "{raw} must be rejected by clap");
+
+            let hint = map_deleted_quant_hint(raw)
+                .unwrap_or_else(|| panic!("{raw} must have a hint"));
+            assert!(
+                hint.contains("q4_k_m"),
+                "{raw} hint must suggest q4_k_m / imatrix-q4_k_m, got: {hint}"
+            );
+        }
+    }
+
+    /// S1 test (d): each of the renamed `dwq-mixed-N-M` variants is
+    /// rejected by clap and the hint mapper points at `dwq-N-M`.
+    #[test]
+    fn test_dwq_mixed_4_6_rejected_with_hint() {
+        let cases = [
+            ("dwq-mixed-4-6", "dwq-4-6"),
+            ("dwq-mixed-4-8", "dwq-4-8"),
+            ("dwq-mixed-6-8", "dwq-6-8"),
+            ("dwq-mixed-2-8", "dwq-2-8"),
+        ];
+        for (raw, expected_suggest) in cases {
+            let result = Cli::try_parse_from([
+                "hf2q",
+                "convert",
+                "--input",
+                "/tmp/x",
+                "--format",
+                "gguf",
+                "--quant",
+                raw,
+            ]);
+            assert!(result.is_err(), "{raw} must be rejected by clap");
+
+            let hint = map_deleted_quant_hint(raw)
+                .unwrap_or_else(|| panic!("{raw} must have a hint"));
+            assert!(
+                hint.contains(expected_suggest),
+                "{raw} hint must suggest {expected_suggest}, got: {hint}"
+            );
+        }
+    }
+
+    /// S1 test (e): every variant Display string round-trips through
+    /// the clap value parser back to the same enum variant. Catches any
+    /// drift between `#[value(name = ...)]` and `Display`.
+    #[test]
+    fn test_display_round_trip_for_all_17() {
+        let all_variants = [
+            QuantMethod::Auto,
+            QuantMethod::F16,
+            QuantMethod::Bf16,
+            QuantMethod::Q2,
+            QuantMethod::Q4,
+            QuantMethod::Q8,
+            QuantMethod::Q4KM,
+            QuantMethod::Q5KM,
+            QuantMethod::Q6K,
+            QuantMethod::ImatrixQ4KM,
+            QuantMethod::ImatrixQ5KM,
+            QuantMethod::ImatrixQ6K,
+            QuantMethod::ImatrixAdaptive,
+            QuantMethod::Dwq46,
+            QuantMethod::Dwq48,
+            QuantMethod::Dwq68,
+            QuantMethod::Dwq28,
+        ];
+        assert_eq!(all_variants.len(), 17, "expected 17 variants");
+        for v in all_variants {
+            let s = v.to_string();
+            let cli = Cli::try_parse_from([
+                "hf2q",
+                "convert",
+                "--input",
+                "/tmp/x",
+                "--format",
+                "gguf",
+                "--quant",
+                &s,
+            ])
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Display->parse round trip failed for {v:?} (\"{s}\"): {e}"
+                )
+            });
+            let Command::Convert(args) = cli.command else {
+                panic!("expected Convert");
+            };
+            assert_eq!(
+                args.quant, v,
+                "Display->parse round trip resolved \"{s}\" to {:?}, expected {v:?}",
+                args.quant,
+            );
+        }
+    }
+
+    // ---- ADR-014 P8 Decision 12 §off-diagonal: --calibration / --output-format ----
+
+    /// S4 test (a): supplying `--calibration` alone (without
+    /// `--output-format`) is rejected by clap's `requires`.
+    #[test]
+    fn calibration_flag_alone_without_env_rejected() {
+        let result = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "--input",
+            "/tmp/x",
+            "--format",
+            "gguf",
+            "--calibration",
+            "imatrix",
+        ]);
+        assert!(
+            result.is_err(),
+            "--calibration without --output-format must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("output-format") || err_msg.contains("output_format"),
+            "error must cite --output-format requirement, got: {err_msg}"
+        );
+    }
+
+    /// S4 test (b): both flags supplied with an off-diagonal cell and
+    /// no env var is rejected with a doc pointer.
+    #[test]
+    fn both_flags_without_env_rejected_with_doc_pointer() {
+        // imatrix + bit-pair-4-6 is OFF-diagonal (DWQ codec with imatrix calibrator).
+        let err = validate_off_diagonal_selector(
+            Some(CalibrationFlag::Imatrix),
+            Some(OutputFormatFlag::BitPair46),
+            None, // env unset
+        )
+        .expect_err("off-diagonal cell without env must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HF2Q_UNSAFE_EXPERIMENTS"),
+            "error must mention HF2Q_UNSAFE_EXPERIMENTS, got: {msg}"
+        );
+        assert!(
+            msg.contains("docs/converting-a-model.md"),
+            "error must include doc pointer, got: {msg}"
+        );
+    }
+
+    /// S4 test (c): both flags supplied with an off-diagonal cell and
+    /// `HF2Q_UNSAFE_EXPERIMENTS=1` is accepted.
+    #[test]
+    fn both_flags_with_env_accepted_off_diagonal() {
+        // Off-diagonal: dwq calibrator with k-quant-q4_k_m output.
+        let pair = validate_off_diagonal_selector(
+            Some(CalibrationFlag::Dwq),
+            Some(OutputFormatFlag::KQuantQ4KM),
+            Some("1"),
+        )
+        .expect("off-diagonal cell with env=1 must be accepted");
+        assert_eq!(
+            pair,
+            Some((CalibrationFlag::Dwq, OutputFormatFlag::KQuantQ4KM))
+        );
+
+        // Diagonal cells don't need the env at all.
+        let pair2 = validate_off_diagonal_selector(
+            Some(CalibrationFlag::Imatrix),
+            Some(OutputFormatFlag::KQuantQ4KM),
+            None,
+        )
+        .expect("diagonal cell must be accepted without env");
+        assert_eq!(
+            pair2,
+            Some((CalibrationFlag::Imatrix, OutputFormatFlag::KQuantQ4KM))
+        );
+    }
+
+    /// S4 test (d): supplying `--quant` with `--calibration` is
+    /// mutually exclusive (clap's conflicts_with). Note: clap rejects
+    /// the combo even when `--quant` is just defaulted, because
+    /// `conflicts_with` triggers when both are SUPPLIED via flags;
+    /// hence the test passes both explicitly.
+    #[test]
+    fn calibration_conflicts_with_quant_clap_rejects() {
+        let result = Cli::try_parse_from([
+            "hf2q",
+            "convert",
+            "--input",
+            "/tmp/x",
+            "--format",
+            "gguf",
+            "--quant",
+            "q4_k_m",
+            "--calibration",
+            "imatrix",
+            "--output-format",
+            "k-quant-q4_k_m",
+        ]);
+        assert!(
+            result.is_err(),
+            "--quant + --calibration must be mutually exclusive"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.to_lowercase().contains("conflict")
+                || err_msg.contains("cannot be used"),
+            "error must indicate conflict, got: {err_msg}"
+        );
+    }
+
+    /// Diagonal-cell helper coverage: every diagonal cell in
+    /// [`is_diagonal_cell`] must be reachable without the env gate.
+    #[test]
+    fn is_diagonal_cell_covers_documented_cells() {
+        use CalibrationFlag::*;
+        use OutputFormatFlag::*;
+        let diagonal_cells: &[(CalibrationFlag, OutputFormatFlag)] = &[
+            // none × flat / k-quant
+            (None, FlatF16),
+            (None, FlatBf16),
+            (None, FlatQ2),
+            (None, FlatQ4),
+            (None, FlatQ8),
+            (None, KQuantQ4KM),
+            (None, KQuantQ5KM),
+            (None, KQuantQ6K),
+            // imatrix × k-quant
+            (Imatrix, KQuantQ4KM),
+            (Imatrix, KQuantQ5KM),
+            (Imatrix, KQuantQ6K),
+            (Imatrix, KQuantAdaptive),
+            // dwq × bit-pair
+            (Dwq, BitPair46),
+            (Dwq, BitPair48),
+            (Dwq, BitPair68),
+            (Dwq, BitPair28),
+        ];
+        for (c, f) in diagonal_cells {
+            assert!(
+                is_diagonal_cell(*c, *f),
+                "diagonal cell ({c:?}, {f:?}) must be recognised"
+            );
+        }
+        // A representative off-diagonal cell.
+        assert!(
+            !is_diagonal_cell(Imatrix, BitPair46),
+            "imatrix + bit-pair-4-6 must be off-diagonal"
         );
     }
 
@@ -1114,6 +1873,8 @@ mod tests {
             repo: None,
             format: OutputFormat::Gguf,
             quant: QuantMethod::Q4,
+            calibration: None,
+            output_format: None,
             sensitive_layers: None,
             calibration_samples: 1024,
             target_bpw: 4.5,
@@ -1141,6 +1902,8 @@ mod tests {
             repo: None,
             format: OutputFormat::Gguf,
             quant: QuantMethod::Q4,
+            calibration: None,
+            output_format: None,
             sensitive_layers: None,
             calibration_samples: 1024,
             target_bpw: 4.5,

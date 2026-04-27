@@ -295,7 +295,8 @@ fn test_dry_run_safetensors_format() {
 
 #[test]
 fn test_convert_help_lists_all_four_dwq_variants() {
-    // --help must list all 4 DWQ quant variants.
+    // ADR-014 P8 Decision 13: --help must list all 4 renamed DWQ quant
+    // variants (dwq-N-M; the legacy dwq-mixed-N-M aliases are deleted).
     let output = Command::cargo_bin("hf2q")
         .unwrap()
         .args(["convert", "--help"])
@@ -303,31 +304,20 @@ fn test_convert_help_lists_all_four_dwq_variants() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("dwq-mixed-4-6"),
-        "--help must list dwq-mixed-4-6"
-    );
-    assert!(
-        stdout.contains("dwq-mixed-4-8"),
-        "--help must list dwq-mixed-4-8"
-    );
-    assert!(
-        stdout.contains("dwq-mixed-6-8"),
-        "--help must list dwq-mixed-6-8"
-    );
-    assert!(
-        stdout.contains("dwq-mixed-2-8"),
-        "--help must list dwq-mixed-2-8"
-    );
+    for variant in ["dwq-4-6", "dwq-4-8", "dwq-6-8", "dwq-2-8"] {
+        assert!(
+            stdout.contains(variant),
+            "--help must list {variant} (Decision 12 menu)"
+        );
+    }
 }
 
 #[test]
 fn test_bits_with_dwq_variant_errors_with_exact_message() {
-    // --bits combined with any DWQ variant must produce the exact
-    // documented error. Decision 10c AC — all four dwq-mixed-N-M
+    // --bits combined with any DWQ variant must produce the documented
+    // error. ADR-014 P8 Decision 13: all four renamed `dwq-N-M`
     // variants must trip it; narrowing the check to only one variant
-    // (e.g. `quant == "dwq-mixed-4-6"` instead of `dwq_bit_pair()
-    // .is_some()`) would silently accept `--bits` on the other three.
+    // would silently accept `--bits` on the other three.
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
 
@@ -347,7 +337,7 @@ fn test_bits_with_dwq_variant_errors_with_exact_message() {
     .unwrap();
     std::fs::write(input_dir.join("model.safetensors"), [0u8; 16]).unwrap();
 
-    for variant in ["dwq-mixed-2-8", "dwq-mixed-4-6", "dwq-mixed-4-8", "dwq-mixed-6-8"] {
+    for variant in ["dwq-2-8", "dwq-4-6", "dwq-4-8", "dwq-6-8"] {
         Command::cargo_bin("hf2q")
             .unwrap()
             .args([
@@ -364,14 +354,14 @@ fn test_bits_with_dwq_variant_errors_with_exact_message() {
             .assert()
             .failure()
             .stderr(predicate::str::contains(
-                "--bits is not used for DWQ; use --quant dwq-mixed-N-M to choose bit-pair variants",
+                "--bits is not used for DWQ; use --quant dwq-N-M to choose bit-pair variants",
             ));
     }
 }
 
 #[test]
 fn test_dwq_mixed48_dry_run_succeeds() {
-    // dwq-mixed-4-8 must be accepted by clap and reach the dry-run path.
+    // dwq-4-8 must be accepted by clap and reach the dry-run path.
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
 
@@ -400,7 +390,7 @@ fn test_dwq_mixed48_dry_run_succeeds() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-mixed-4-8",
+            "dwq-4-8",
             "--dry-run",
         ])
         .assert()
@@ -431,7 +421,7 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
     .unwrap();
     std::fs::write(input46.join("model.safetensors"), [0u8; 16]).unwrap();
 
-    // dwq-mixed-4-6 should produce *-dwq46.gguf
+    // dwq-4-6 should produce *-dwq46.gguf
     let out46 = Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -441,7 +431,7 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-mixed-4-6",
+            "dwq-4-6",
             "--dry-run",
         ])
         .output()
@@ -449,15 +439,15 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
     let stderr46 = String::from_utf8_lossy(&out46.stderr);
     assert!(
         stderr46.contains("dwq46"),
-        "dwq-mixed-4-6 dry-run output should mention 'dwq46' suffix; stderr={}",
+        "dwq-4-6 dry-run output should mention 'dwq46' suffix; stderr={}",
         stderr46
     );
     assert!(
         !stderr46.contains("dwq48"),
-        "dwq-mixed-4-6 must not mention 'dwq48'"
+        "dwq-4-6 must not mention 'dwq48'"
     );
 
-    // dwq-mixed-4-8 should produce *-dwq48.gguf
+    // dwq-4-8 should produce *-dwq48.gguf
     let out48 = Command::cargo_bin("hf2q")
         .unwrap()
         .args([
@@ -467,7 +457,7 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
             "--format",
             "gguf",
             "--quant",
-            "dwq-mixed-4-8",
+            "dwq-4-8",
             "--dry-run",
         ])
         .output()
@@ -475,11 +465,11 @@ fn test_dwq46_and_dwq48_default_filenames_do_not_collide() {
     let stderr48 = String::from_utf8_lossy(&out48.stderr);
     assert!(
         stderr48.contains("dwq48"),
-        "dwq-mixed-4-8 dry-run output should mention 'dwq48' suffix; stderr={}",
+        "dwq-4-8 dry-run output should mention 'dwq48' suffix; stderr={}",
         stderr48
     );
     assert!(
         !stderr48.contains("dwq46"),
-        "dwq-mixed-4-8 must not mention 'dwq46'"
+        "dwq-4-8 must not mention 'dwq46'"
     );
 }

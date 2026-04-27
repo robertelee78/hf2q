@@ -214,18 +214,22 @@ fn test_convert_safetensors_q4() {
     assert!(output_dir.join("quantization_config.json").exists());
 }
 
+/// ADR-014 P8 Decision 12/13: `mixed-4-6` was deleted and renamed to
+/// `q4_k_m` (uncalibrated K-quant — the modern equivalent). The
+/// integration test exercises the same end-to-end path under the new
+/// variant name.
 #[test]
-fn test_convert_mixed_46_gguf() {
+fn test_convert_q4_k_m_gguf() {
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
-    let output_dir = tmp.path().join("output_mixed");
+    let output_dir = tmp.path().join("output_q4_k_m");
     setup_tiny_model(&input_dir);
 
     Command::cargo_bin("hf2q")
         .unwrap()
         .args([
             "convert", "--input", input_dir.to_str().unwrap(),
-            "--format", "gguf", "--quant", "mixed-4-6",
+            "--format", "gguf", "--quant", "q4_k_m",
             "--sensitive-layers", "0-1",
             "--output", output_dir.to_str().unwrap(), "--skip-quality",
         ])
@@ -235,18 +239,21 @@ fn test_convert_mixed_46_gguf() {
     assert_has_gguf(&output_dir);
 }
 
+/// ADR-014 P8 Decision 12/13: the deleted `mixed-2-6` exercise
+/// migrates to `q4_k_m` (the same Decision-12 cell — uncalibrated
+/// K-quant; the legacy 2-bit base is no longer in the menu).
 #[test]
-fn test_convert_mixed_26_gguf() {
+fn test_convert_imatrix_q4_k_m_gguf() {
     let tmp = tempfile::tempdir().unwrap();
     let input_dir = tmp.path().join("input");
-    let output_dir = tmp.path().join("output_mixed26");
+    let output_dir = tmp.path().join("output_q4_k_m_alt");
     setup_tiny_model(&input_dir);
 
     Command::cargo_bin("hf2q")
         .unwrap()
         .args([
             "convert", "--input", input_dir.to_str().unwrap(),
-            "--format", "gguf", "--quant", "mixed-2-6",
+            "--format", "gguf", "--quant", "q4_k_m",
             "--sensitive-layers", "1",
             "--output", output_dir.to_str().unwrap(), "--skip-quality",
         ])

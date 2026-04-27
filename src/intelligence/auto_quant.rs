@@ -392,7 +392,7 @@ pub fn resolve_auto_plan(
             base_bits: forced,
             group_size: 64,
             component_overrides: overrides,
-            quant_method: plan_to_quant_method(forced, arch_family, fingerprint),
+            quant_method: plan_to_quant_method(forced, arch_family, fingerprint, hardware),
             estimated_size_bytes: total_bytes,
             estimated_tok_per_sec: est_tok_s,
             reasoning: format!(
@@ -483,7 +483,7 @@ pub fn resolve_auto_plan(
 
     // Step 4: Build the final plan
     let overrides = build_component_overrides(arch_family, fingerprint, base_bits);
-    let quant_method = plan_to_quant_method(base_bits, arch_family, fingerprint);
+    let quant_method = plan_to_quant_method(base_bits, arch_family, fingerprint, hardware);
 
     // Compute confidence based on how well we meet the target
     let confidence = if est_tok_s >= target_tok_s * 1.2 {
@@ -799,51 +799,85 @@ fn next_valid_bits(base: u8, steps: u8) -> u8 {
     8
 }
 
-/// Map a (base_bits, arch_family) pair to the appropriate CLI quant method name.
-fn plan_to_quant_method(base_bits: u8, _arch_family: ArchFamily, fingerprint: &ModelFingerprint) -> String {
-    // If there are component overrides that differ from base, use mixed-bit
-    let has_elevated = fingerprint.is_moe() || base_bits <= 4;
-
-    match base_bits {
-        8 => {
-            if fingerprint.is_moe() {
-                // MoE at 8-bit with router protection = still q8 with overrides
-                "q8".to_string()
-            } else {
-                "q8".to_string()
-            }
-        }
-        6 => {
-            if has_elevated {
-                "mixed-4-6".to_string() // Use 4-6 mixed as the closest preset
-            } else {
-                "q8".to_string() // q6 not a standard method; round up
-            }
-        }
-        4 => {
-            if has_elevated {
-                "mixed-4-6".to_string()
-            } else {
-                "q4".to_string()
-            }
-        }
-        3 => {
-            if has_elevated {
-                "mixed-3-6".to_string()
-            } else {
-                "q4".to_string() // q3 not a standard method; round up
-            }
-        }
-        2 => {
-            if has_elevated {
-                "mixed-2-6".to_string()
-            } else {
-                "q2".to_string()
-            }
-        }
-        16 => "f16".to_string(),
-        _ => format!("q{}", base_bits),
+/// Map a (base_bits, arch_family, hardware) tuple to the appropriate
+/// CLI quant method name (ADR-014 P8 Decision 18 routing table).
+///
+/// ## Decision 18 routing table
+///
+/// | Model class | RAM       | → Variant          |
+/// |-------------|-----------|--------------------|
+/// | Dense ≤30B  | any       | `imatrix-q4_k_m`   |
+/// | Dense >30B  | <64 GB    | `imatrix-q4_k_m`   |
+/// | Dense >30B  | ≥64 GB    | `imatrix-q5_k_m`   |
+/// | MoE any     | <96 GB    | `dwq-4-6`          |
+/// | MoE any     | ≥96 GB    | `dwq-4-8`          |
+///
+/// `base_bits` is consulted only as a tiebreaker for the legacy
+/// flat / passthrough cells (16 → `f16`, 8 → `q8`, etc.); when an
+/// override-aware K-quant or DWQ cell applies, the table above wins.
+///
+/// ## ArchEntry::auto_override
+///
+/// When the model's [`ArchEntry`] (looked up via the registry by HF
+/// architecture string) carries an `auto_override = Some(v)`, that
+/// string wins over the table — used for arches that have empirically
+/// validated a non-default cell. Per spec, this iter scopes the
+/// auto_override enforcement to AutoResolver only; the field itself
+/// landing on `ArchEntry` is documented as a follow-up if not present.
+///
+/// [`ArchEntry`]: crate::arch::registry::ArchEntry
+fn plan_to_quant_method(
+    base_bits: u8,
+    _arch_family: ArchFamily,
+    fingerprint: &ModelFingerprint,
+    hardware: &HardwareProfile,
+) -> String {
+    // -----------------------------------------------------------------
+    // Step 1: ArchEntry::auto_override (per-arch override wins).
+    //
+    // We consult the registry at runtime via fingerprint.architecture.
+    // If the entry exists AND carries an auto_override, that string
+    // wins over the Decision-18 table. Missing entry / missing override
+    // → fall through to the table.
+    // -----------------------------------------------------------------
+    if let Some(entry_override) =
+        crate::arch::registry::lookup_auto_override(&fingerprint.architecture)
+    {
+        return entry_override;
     }
+
+    // -----------------------------------------------------------------
+    // Step 2: Decision-18 routing table.
+    // -----------------------------------------------------------------
+    let total_gb = hardware.total_memory_gb();
+
+    if fingerprint.is_moe() {
+        if total_gb >= 96.0 {
+            return "dwq-4-8".to_string();
+        }
+        return "dwq-4-6".to_string();
+    }
+
+    // Dense path.
+    let params_b = fingerprint.total_params as f64 / 1e9;
+    if params_b > 30.0 && total_gb >= 64.0 {
+        return "imatrix-q5_k_m".to_string();
+    }
+    // Dense ≤30B (any RAM) OR dense >30B with <64 GB RAM.
+    if params_b <= 30.0 || total_gb < 64.0 {
+        // Use the imatrix Q4_K_M default unless the bit search demands
+        // a flat cell (the cells below cover f16 / q8 forced-by-search
+        // outcomes; the Decision-18 default is imatrix-q4_k_m).
+        match base_bits {
+            16 => return "f16".to_string(),
+            8 => return "q8".to_string(),
+            _ => return "imatrix-q4_k_m".to_string(),
+        }
+    }
+
+    // Defensive default — every (params_b, total_gb) combination is
+    // handled above, but Rust's exhaustiveness checker can't see it.
+    "imatrix-q4_k_m".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,12 +1396,131 @@ mod tests {
 
     #[test]
     fn test_plan_to_quant_method() {
+        let hw = make_hardware("Apple M5 Max", 128);
         let fp_dense = make_dense_fingerprint(8.0);
         let fp_moe = make_moe_fingerprint();
 
-        assert_eq!(plan_to_quant_method(4, ArchFamily::DenseDecoder, &fp_dense), "mixed-4-6");
-        assert_eq!(plan_to_quant_method(8, ArchFamily::DenseDecoder, &fp_dense), "q8");
-        assert_eq!(plan_to_quant_method(2, ArchFamily::GemmaMoE, &fp_moe), "mixed-2-6");
-        assert_eq!(plan_to_quant_method(16, ArchFamily::DenseDecoder, &fp_dense), "f16");
+        // ADR-014 P8 Decision 18 routing — Dense ≤30B → imatrix-q4_k_m
+        assert_eq!(
+            plan_to_quant_method(4, ArchFamily::DenseDecoder, &fp_dense, &hw),
+            "imatrix-q4_k_m"
+        );
+        // base_bits=8 forces a flat passthrough cell.
+        assert_eq!(
+            plan_to_quant_method(8, ArchFamily::DenseDecoder, &fp_dense, &hw),
+            "q8"
+        );
+        // base_bits=16 → f16 passthrough.
+        assert_eq!(
+            plan_to_quant_method(16, ArchFamily::DenseDecoder, &fp_dense, &hw),
+            "f16"
+        );
+        // MoE on 128 GB → dwq-4-8 (≥96 GB).
+        assert_eq!(
+            plan_to_quant_method(2, ArchFamily::GemmaMoE, &fp_moe, &hw),
+            "dwq-4-8"
+        );
+    }
+
+    // ─── ADR-014 P8 Decision 18 routing-table tests (S5) ───
+
+    /// Decision 18 row 1: Dense ≤30B → `imatrix-q4_k_m` (any RAM).
+    #[test]
+    fn test_decision18_dense_27b_resolves_to_imatrix_q4_k_m() {
+        let hw = make_hardware("Apple M5 Max", 128);
+        let mut fp = make_dense_fingerprint(27.0);
+        fp.architecture = "LlamaForCausalLM".to_string();
+        let result = plan_to_quant_method(4, ArchFamily::DenseDecoder, &fp, &hw);
+        assert_eq!(
+            result, "imatrix-q4_k_m",
+            "Dense 27B (≤30B) on any RAM → imatrix-q4_k_m, got: {result}"
+        );
+    }
+
+    /// Decision 18 row 3: Dense >30B AND ≥64 GB → `imatrix-q5_k_m`.
+    #[test]
+    fn test_decision18_dense_70b_64gb_resolves_to_imatrix_q5_k_m() {
+        let hw = make_hardware("Apple M5 Max", 64);
+        let mut fp = make_dense_fingerprint(70.0);
+        fp.architecture = "LlamaForCausalLM".to_string();
+        let result = plan_to_quant_method(4, ArchFamily::DenseDecoder, &fp, &hw);
+        assert_eq!(
+            result, "imatrix-q5_k_m",
+            "Dense 70B with 64 GB RAM → imatrix-q5_k_m, got: {result}"
+        );
+    }
+
+    /// Decision 18 row 2: Dense >30B AND <64 GB → `imatrix-q4_k_m`.
+    #[test]
+    fn test_decision18_dense_70b_below_64gb_resolves_to_imatrix_q4_k_m() {
+        let hw = make_hardware("Apple M4", 32);
+        let mut fp = make_dense_fingerprint(70.0);
+        fp.architecture = "LlamaForCausalLM".to_string();
+        let result = plan_to_quant_method(4, ArchFamily::DenseDecoder, &fp, &hw);
+        assert_eq!(
+            result, "imatrix-q4_k_m",
+            "Dense 70B with 32 GB RAM → imatrix-q4_k_m, got: {result}"
+        );
+    }
+
+    /// Decision 18 row 4: MoE any AND <96 GB → `dwq-4-6`.
+    #[test]
+    fn test_decision18_moe_apex_64gb_resolves_to_dwq_4_6() {
+        let hw = make_hardware("Apple M5 Max", 64);
+        let fp = make_moe_fingerprint();
+        let result = plan_to_quant_method(4, ArchFamily::GemmaMoE, &fp, &hw);
+        assert_eq!(
+            result, "dwq-4-6",
+            "MoE with 64 GB RAM (<96 GB) → dwq-4-6, got: {result}"
+        );
+    }
+
+    /// Decision 18 row 5: MoE any AND ≥96 GB → `dwq-4-8`.
+    #[test]
+    fn test_decision18_moe_apex_128gb_resolves_to_dwq_4_8() {
+        let hw = make_hardware("Apple M5 Max", 128);
+        let fp = make_moe_fingerprint();
+        let result = plan_to_quant_method(4, ArchFamily::GemmaMoE, &fp, &hw);
+        assert_eq!(
+            result, "dwq-4-8",
+            "MoE with 128 GB RAM (≥96 GB) → dwq-4-8, got: {result}"
+        );
+    }
+
+    /// Decision 18: ArchEntry::auto_override (when set) wins over the
+    /// routing table. With the current registry shipping
+    /// `auto_override: None` for both qwen35 and qwen35moe, this test
+    /// verifies the lookup mechanism: an unknown HF architecture falls
+    /// through to the table (returns None), and a registered arch with
+    /// no override behaves identically to the table.
+    #[test]
+    fn test_decision18_arch_override_lookup_falls_through_when_none() {
+        // Registered arch with no auto_override → lookup returns None.
+        let lookup =
+            crate::arch::registry::lookup_auto_override("Qwen3_5ForCausalLM");
+        assert!(
+            lookup.is_none(),
+            "qwen35 ArchEntry has auto_override = None → lookup must return None, \
+             got: {lookup:?}"
+        );
+
+        // Unregistered arch → lookup returns None (falls through to table).
+        let lookup =
+            crate::arch::registry::lookup_auto_override("CompletelyUnknownArch");
+        assert!(
+            lookup.is_none(),
+            "Unknown arch must return None (falls through to table)"
+        );
+
+        // The table-driven path then applies — confirm it lands on the
+        // expected Decision-18 row for a known dense arch.
+        let hw = make_hardware("Apple M5 Max", 128);
+        let mut fp = make_qwen35_dense_fingerprint();
+        fp.total_params = 27_000_000_000; // dense ≤30B
+        let result = plan_to_quant_method(4, ArchFamily::Qwen35Dense, &fp, &hw);
+        assert_eq!(
+            result, "imatrix-q4_k_m",
+            "qwen35 dense 27B with no override → imatrix-q4_k_m"
+        );
     }
 }

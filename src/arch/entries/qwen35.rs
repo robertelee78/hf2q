@@ -209,6 +209,9 @@ pub const ENTRY: ArchEntry = ArchEntry {
     quality_thresholds: QualityThresholds::ADR_012_DEFAULT,
     disk_floor_gb: 100, // src/input/hf_download.rs Decision 14 floor
     hf_repos: &["Qwen/Qwen3.6-27B"],
+    // ADR-014 P8 Decision 18: no per-arch override yet — fall through
+    // to the Decision-18 routing table (dense ≤30B → imatrix-q4_k_m).
+    auto_override: None,
 };
 
 #[cfg(test)]

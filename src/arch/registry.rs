@@ -75,6 +75,12 @@ pub struct ArchEntry {
     pub disk_floor_gb: u32,
     /// HF repos this arch's smoke path expects to resolve.
     pub hf_repos: &'static [&'static str],
+    /// ADR-014 P8 Decision 18 — per-arch override for AutoResolver.
+    /// When `Some(s)`, AutoResolver uses `s` as the auto-quant variant
+    /// instead of consulting the Decision-18 routing table. Used for
+    /// arches that have empirically validated a non-default cell.
+    /// `None` (default) → fall through to the Decision-18 table.
+    pub auto_override: Option<&'static str>,
 }
 
 impl ArchEntry {
@@ -171,6 +177,22 @@ impl ArchRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &&'static ArchEntry> {
         self.entries.iter()
     }
+}
+
+/// Look up the [`ArchEntry::auto_override`] for an HF architecture
+/// string (ADR-014 P8 Decision 18 — per-arch AutoResolver override).
+///
+/// Returns `Some(variant_name)` when the registry carries an
+/// `auto_override`, `None` otherwise (including unknown arches —
+/// AutoResolver falls through to the Decision-18 table).
+///
+/// This is the public entry point used by
+/// [`crate::intelligence::auto_quant::plan_to_quant_method`].
+pub fn lookup_auto_override(hf_architecture: &str) -> Option<String> {
+    ArchRegistry::global()
+        .get_by_hf_architecture(hf_architecture)
+        .ok()
+        .and_then(|e| e.auto_override.map(|s| s.to_string()))
 }
 
 /// Process-global singleton. Exactly two entries — Gemma4, Ministral,
