@@ -4849,6 +4849,13 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Tests.** `cargo test --release --bin hf2q -- serve::api::` 282/282 pass.
   - **Fence respected.** Edits in `src/serve/api/{handlers,engine,mod}.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
 
+- **2026-04-27 wave-1 Worker B (session cfa-20260426-adr005-wave1, commit `4d41aca`) — T1.2: promote 8 per-token env::var reads in `forward_mlx.rs` to INVESTIGATION_ENV LazyLock.**
+  - **What changed.** Added 6 new fields to `InvestigationEnv` in `src/debug/investigation_env.rs`: `tq_codebook_bits` (u32), `dump_sliding_layer_0` (bool), `dump_run_name` (Option<String>), `debug_tq_rms` (bool), `use_dense` (bool), `layer_policy` (Option<String>). Migrated the 8 per-token `std::env::var` callsites in `src/serve/forward_mlx.rs` to field reads on `INVESTIGATION_ENV`.
+  - **Chesterton notes.** USE_DENSE + LAYER_POLICY were added inline by iter-108a-fix (W15, 2026-04-25) which deliberately restored the "pre-iter-108a env-var-only path" verbatim to fix a 5.6% decode regression. The comment at that site explicitly named this as the source of regression. INVESTIGATION_ENV LazyLock is the correct fix: same read-once semantics, zero per-token syscall cost. The remaining four vars (TQ_CODEBOOK_BITS, DUMP_SLIDING_LAYER_0, DUMP_RUN_NAME, DEBUG_TQ_RMS) were added inline in iter-18/21 before investigation_env.rs had a TQ/S2C section.
+  - **Cold-SoC perf measurement** (per `feedback_perf_gate_thermal_methodology`). Model: `qwen3.6-35b-a3b-abliterix-ega-abliterated-apex` (35B-A3B MoE). Command: `hf2q generate --model <gguf> --max-tokens 128 --benchmark`. PRE (HEAD baseline): **103.0 tok/s decode**. POST (T1.2): **106.0 tok/s decode**. Delta: **+2.9%**. No regression; per-token syscall elimination yields positive delta as expected.
+  - **Tests.** `cargo test --release --bin hf2q` 1658/1658 pass (0 failed).
+  - **Fence respected.** Edits in `src/debug/investigation_env.rs` + `src/serve/forward_mlx.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
 - **2026-04-26 loop iter 73 — Phase 2a Task #9 summarize-overflow path implemented end-to-end. The 501 stub is gone; Decision #23 contract met.**
   - **What changed.** Iter 62-66 wired the `OverflowPolicy::Summarize` enum + transparency-header plumbing but left the actual summarize branch returning `501 Not Implemented`. The user's mantra ("no stubs, no fallback") makes that unacceptable. Iter 73 ships the real path.
   - **New pure helpers** in `src/serve/api/handlers.rs`:
