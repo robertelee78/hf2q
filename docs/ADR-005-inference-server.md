@@ -6432,7 +6432,7 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
 
   - **Fence respected (W-B2, 2 commits at `addb68c..b1b9fb4`).** Edits confined to `src/serve/api/handlers.rs`, `src/serve/api/engine.rs`, and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
 
-- **2026-04-27 wave-3 W-B3 — T2.3 incremental `delta.tool_calls` argument streaming (commit `<adr-entry>`)**
+- **2026-04-27 wave-3 W-B3 — T2.3 incremental `delta.tool_calls` argument streaming (commit `13e71ce`)**
 
   - **Context.** Wave-2 audit (cfa-20260426-adr005-research) flagged that the streaming engine emits `delta.tool_calls[N].function.{name, arguments}` as a single chunk on `ToolCallClose` rather than streaming the arguments string incrementally. Per OpenAI Chat Completions spec, `function.arguments` is a *string accumulator* on the client side — clients append each delta and JSON-parse the result once `finish_reason="tool_calls"` arrives. One big chunk is spec-valid but blocks progressive UI updates while the model is still generating. W-B3 lands the incremental shape so OpenWebUI / OpenAI clients can show argument JSON building character-by-character (kv-by-kv, in our boundary semantics).
 
