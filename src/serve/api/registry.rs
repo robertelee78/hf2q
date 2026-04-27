@@ -840,23 +840,22 @@ pub fn split_full_output(
 /// public API surface (`Result<String, String>`) is unchanged.
 ///
 /// Variants:
-/// - `TooManyRequiredKeys` — schema's `required` array exceeds the 16-key
+/// - `TooManyRequiredKeys` — schema's `required` array exceeds the 8-key
 ///   cap; the O(2^N) permutation grammar would be unreasonably large.
 /// - `UnsupportedSchema` — parameter schema uses `array` or `object` type,
 ///   which the wave-2.5 emitter does not support.  The caller should either
 ///   remove the parameter or convert it to a JSON-encoded string.
 ///
-/// # ADR-005 Wave-2.5 design note
-/// The 16-key cap is a deliberate performance guard: each required key adds
-/// one level of alternation depth to the permutation grammar (the
-/// `build_required_permutation` algorithm is O(N!) in rule count for N
-/// required keys, bounded here to 16! = 20,922,789,888,000 rules — still
-/// far too many at the ceiling, so in practice schemas with > 8–10 required
-/// keys should be flagged long before hitting 16). The cap rejects the
-/// pathological case early with a diagnostic message.
+/// # ADR-005 Wave-2.7 design note
+/// The 8-key cap is the SOTA hard bound established by json_schema.rs
+/// (ANY_ORDER_MAX_REQUIRED = 8, 256 rules worst-case — practical and fast).
+/// The previous 16-key cap in this file was misaligned: json_schema.rs
+/// hard-errors at >8, so a tool with 9–16 required keys would slip through
+/// registry.rs and be silently exposed to O(2^N) grammar growth before
+/// json_schema.rs caught it.  Both caps are now 8 — Q3 audit finding fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitterError {
-    /// `required` array length exceeds `MAX_REQUIRED_KEYS` (16).
+    /// `required` array length exceeds `MAX_REQUIRED_KEYS` (8).
     TooManyRequiredKeys {
         fn_name: String,
         count: usize,
@@ -871,17 +870,19 @@ pub enum EmitterError {
 }
 
 /// Hard cap on the number of required keys for the permutation grammar.
+/// Aligned with json_schema.rs ANY_ORDER_MAX_REQUIRED = 8 (ADR-005 W-ζ).
 /// Larger schemas return `EmitterError::TooManyRequiredKeys`.
-const MAX_REQUIRED_KEYS: usize = 16;
+const MAX_REQUIRED_KEYS: usize = 8;
 
 impl std::fmt::Display for EmitterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EmitterError::TooManyRequiredKeys { fn_name, count } => write!(
                 f,
-                "function '{}' has {} required parameters; ADR-005 wave-2.5 \
-                 limits required keys to {} to prevent O(2^N) grammar blowup; \
-                 reduce the required set or split the tool",
+                "function '{}' has {} required parameters; ADR-005 wave-2.7 \
+                 limits required keys to {} (SOTA bound: O(2^N) permutation \
+                 grammar, 256 rules worst-case); reduce the required set or \
+                 split the tool",
                 fn_name, count, MAX_REQUIRED_KEYS
             ),
             EmitterError::UnsupportedSchema {
@@ -1025,7 +1026,7 @@ fn gemma4_value_gbnf(
 /// If `params_schema` has a `required` array those keys are enforced via a
 /// permutation grammar: required keys MUST all appear in any order; omitting
 /// one causes the grammar stack to die.  Optional keys follow in a
-/// Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (16) prevents O(N!)
+/// Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8) prevents O(2^N)
 /// grammar blowup.
 ///
 /// # Nested schema rejection (Wave 2.5 B3)
@@ -1277,7 +1278,7 @@ fn build_gemma4_required_permutation(
 /// # Required parameter enforcement (Wave 2.5 B1)
 ///
 /// Same as Gemma 4: required keys enforced via permutation grammar; optional
-/// keys in Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (16).
+/// keys in Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8).
 ///
 /// # Nested schema rejection (Wave 2.5 B3)
 ///
@@ -2442,13 +2443,14 @@ mod tests {
         assert!(rt.is_accepted());
     }
 
-    /// B1 Gemma4: schema with 17 required keys → EmitterError::TooManyRequiredKeys.
+    /// B1 Gemma4: schema with 9 required keys → EmitterError::TooManyRequiredKeys.
+    /// W-ζ: cap lowered from 16 to 8 to match json_schema.rs ANY_ORDER_MAX_REQUIRED.
     #[test]
     fn b1_gemma4_too_many_required_keys_err() {
-        // Build a schema with 17 required keys (> MAX_REQUIRED_KEYS = 16).
+        // Build a schema with 9 required keys (> MAX_REQUIRED_KEYS = 8).
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..17usize {
+        for i in 0..9usize {
             let k = format!("key{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -2459,10 +2461,52 @@ mod tests {
             "required": required
         });
         let result = GEMMA4.tool_call_gbnf("f", &schema);
-        assert!(result.is_err(), "17 required keys must return Err");
+        assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
-        assert!(msg.contains("17"), "error message should mention count: {}", msg);
-        assert!(msg.contains("16"), "error message should mention cap: {}", msg);
+        assert!(msg.contains("9"), "error message should mention count: {}", msg);
+        assert!(msg.contains("8"), "error message should mention cap: {}", msg);
+    }
+
+    /// W-ζ HIGH-2: Gemma4 boundary — exactly 8 required keys compiles OK.
+    #[test]
+    fn nine_required_keys_in_gemma_tool_call_gbnf_returns_too_many_required_keys() {
+        // 9 keys — must be rejected (boundary at 8).
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..9usize {
+            let k = format!("p{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "integer"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = GEMMA4.tool_call_gbnf("tool9", &schema);
+        assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("9"), "error must mention count 9: {}", msg);
+        assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
+    }
+
+    /// W-ζ HIGH-2: Gemma4 boundary — exactly 8 required keys compiles OK.
+    #[test]
+    fn eight_required_keys_in_gemma_tool_call_gbnf_compiles_ok() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..8usize {
+            let k = format!("p{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "integer"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = GEMMA4.tool_call_gbnf("tool8", &schema);
+        assert!(result.is_ok(), "8 required keys must compile without error");
     }
 
     /// B1 Qwen35: required key present → accept.
@@ -2518,12 +2562,13 @@ mod tests {
         assert!(rt.is_accepted());
     }
 
-    /// B1 Qwen35: 17 required keys → EmitterError::TooManyRequiredKeys.
+    /// B1 Qwen35: 9 required keys → EmitterError::TooManyRequiredKeys.
+    /// W-ζ: cap lowered from 16 to 8 to match json_schema.rs ANY_ORDER_MAX_REQUIRED.
     #[test]
     fn b1_qwen35_too_many_required_keys_err() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..17usize {
+        for i in 0..9usize {
             let k = format!("key{}", i);
             props.insert(k.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(k));
@@ -2534,10 +2579,51 @@ mod tests {
             "required": required
         });
         let result = QWEN35.tool_call_gbnf("f", &schema);
-        assert!(result.is_err(), "17 required keys must return Err");
+        assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
-        assert!(msg.contains("17"), "error message should mention count: {}", msg);
-        assert!(msg.contains("16"), "error message should mention cap: {}", msg);
+        assert!(msg.contains("9"), "error message should mention count: {}", msg);
+        assert!(msg.contains("8"), "error message should mention cap: {}", msg);
+    }
+
+    /// W-ζ HIGH-2: Qwen35 boundary — 9 required keys returns TooManyRequiredKeys.
+    #[test]
+    fn nine_required_keys_in_qwen35_tool_call_gbnf_returns_too_many_required_keys() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..9usize {
+            let k = format!("q{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = QWEN35.tool_call_gbnf("qtool9", &schema);
+        assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("9"), "error must mention count 9: {}", msg);
+        assert!(msg.contains("8"), "error must mention cap 8: {}", msg);
+    }
+
+    /// W-ζ HIGH-2: Qwen35 boundary — exactly 8 required keys compiles OK.
+    #[test]
+    fn eight_required_keys_in_qwen35_tool_call_gbnf_compiles_ok() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..8usize {
+            let k = format!("q{}", i);
+            props.insert(k.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(k));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let result = QWEN35.tool_call_gbnf("qtool8", &schema);
+        assert!(result.is_ok(), "8 required keys must compile without error");
     }
 
     // -----------------------------------------------------------------------
