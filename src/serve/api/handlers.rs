@@ -2910,6 +2910,48 @@ mod compile_tool_grammar_precondition_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Function + no tools (tools=None) → hard 400.
+    ///
+    /// Wave 2.9 W-ι: audit matrix explicitly covers both Required and Function
+    /// for the no-tools branch. Required is covered above; this adds Function
+    /// so the matrix is complete. Both choices share the same early-exit branch
+    /// in `compile_tool_grammar` (the `Some(t) if !t.is_empty()` guard).
+    #[test]
+    fn compile_tool_grammar_function_with_no_tools_returns_error() {
+        let req = req_with("gemma4-27b-it", None);
+        let res = compile_tool_grammar(
+            &req,
+            &ToolChoiceValue::Function("get_weather".to_string()),
+        );
+        let resp = res.expect_err("Function + no tools MUST hard-error (400)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "must be 400 — silent Ok(None) here would let the engine \
+             run unconstrained under tool_choice=function (no grammar guard)"
+        );
+    }
+
+    /// Function + empty tools[] (Some(Vec::new())) → hard 400.
+    ///
+    /// Wave 2.9 W-ι: mirrors the Required + empty tools test; both choices
+    /// must reject an empty tools list under the constrained branch.
+    #[test]
+    fn compile_tool_grammar_function_with_empty_tools_returns_error() {
+        let req = req_with("gemma4-27b-it", Some(Vec::new()));
+        let res = compile_tool_grammar(
+            &req,
+            &ToolChoiceValue::Function("get_weather".to_string()),
+        );
+        let resp = res.expect_err("Function + empty tools[] MUST hard-error (400)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "must be 400 — silent Ok(None) re-opens the wave-2.6 \
+             'Required/Function enforcement before ToolCallOpen' divergence"
+        );
+    }
+
     /// Function + unknown model family → hard 400 (was silent Ok(None)
     /// before W-θ). Uses an obviously-unregistered model id; if the registry
     /// ever picks this up, swap to another unique fake id.
