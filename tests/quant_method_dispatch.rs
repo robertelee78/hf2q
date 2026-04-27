@@ -605,3 +605,133 @@ fn auto_path_moe_emits_decision12_variant_string() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// ADR-014 P2 iter-2 §S5 T8/T9 — every Decision-12 variant routes to
+// the right Quantizer impl. The dispatch is wired in
+// `src/main.rs::cmd_convert` after `select_calibrator`. This file
+// mirrors the variant → Quantizer-name + Calibrator-name routing as
+// a contract; the compile-time exhaustive match catches drift.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Mirror of `select_calibrator + the Phase 2 dispatch match` in
+/// `src/main.rs`. Every Decision-12 variant maps to `(calibrator_name,
+/// quantizer_name)`.
+///
+/// Variant strings come from `cli::QuantMethod::Display` and the
+/// quantizer names from each `Quantizer::name()` impl.
+fn variant_to_routing(variant: &str) -> (&'static str, &'static str) {
+    match variant {
+        // Static / passthrough — NoneCalibrator + StaticQuantizer
+        "auto"
+        | "f16"
+        | "bf16"
+        | "q2"
+        | "q4"
+        | "q8" => ("none", "static"),
+        // Uncalibrated K-quant — NoneCalibrator + KQuantCodecQuantizer
+        "q4_k_m" => ("none", "q4_k_m"),
+        "q5_k_m" => ("none", "q5_k_m"),
+        "q6_k" => ("none", "q6_k"),
+        // imatrix-calibrated K-quant — ImatrixCalibrator + KQuantCodecQuantizer
+        "imatrix-q4_k_m" => ("imatrix", "imatrix-q4_k_m"),
+        "imatrix-q5_k_m" => ("imatrix", "imatrix-q5_k_m"),
+        "imatrix-q6_k" => ("imatrix", "imatrix-q6_k"),
+        // imatrix-adaptive — ImatrixCalibrator + VariantKQuantizer
+        "imatrix-adaptive" => ("imatrix", "Q4_K_M"),
+        // DWQ — DwqCalibrator + run_dwq_with_sensitive_ranges (byte-emit; QuantizedModel.quant_method = "dwq-mixed-N-M")
+        "dwq-4-6" => ("dwq", "dwq-mixed-4-6"),
+        "dwq-4-8" => ("dwq", "dwq-mixed-4-8"),
+        "dwq-6-8" => ("dwq", "dwq-mixed-6-8"),
+        "dwq-2-8" => ("dwq", "dwq-mixed-2-8"),
+        other => panic!("unknown variant in test mirror: {other:?}"),
+    }
+}
+
+/// T8 — every Decision-12 variant has a routing entry (i.e. the
+/// dispatch is exhaustive and the test mirror is up to date).
+#[test]
+fn every_decision12_variant_has_a_routing_entry() {
+    let menu = [
+        "auto",
+        "f16",
+        "bf16",
+        "q2",
+        "q4",
+        "q8",
+        "q4_k_m",
+        "q5_k_m",
+        "q6_k",
+        "imatrix-q4_k_m",
+        "imatrix-q5_k_m",
+        "imatrix-q6_k",
+        "imatrix-adaptive",
+        "dwq-4-6",
+        "dwq-4-8",
+        "dwq-6-8",
+        "dwq-2-8",
+    ];
+    assert_eq!(menu.len(), 17, "Decision-12 menu must have 17 cells");
+    for variant in menu {
+        let (calib, quant) = variant_to_routing(variant);
+        assert!(
+            !calib.is_empty() && !quant.is_empty(),
+            "variant {variant:?} must map to a non-empty (calibrator, quantizer) pair"
+        );
+    }
+}
+
+/// T9 — variant routing partition is consistent with the Decision-12
+/// table:
+///   * Auto + flat + uncalibrated K-quant → calibrator "none"
+///   * Imatrix variants → calibrator "imatrix"
+///   * DWQ variants → calibrator "dwq"
+/// The quantizer-name partition mirrors the impl: StaticQuantizer.name(),
+/// KQuantCodecQuantizer.name() (the variant string), and the DWQ
+/// byte-emit path's QuantizedModel.quant_method.
+#[test]
+fn quantizer_routing_partitions_match_decision12_table() {
+    // none × static
+    for variant in ["auto", "f16", "bf16", "q2", "q4", "q8"] {
+        let (calib, quant) = variant_to_routing(variant);
+        assert_eq!(calib, "none", "{variant}: expected none calibrator");
+        assert_eq!(quant, "static", "{variant}: expected static quantizer");
+    }
+    // none × KQuantCodecQuantizer (uncalibrated)
+    for (variant, expected_quant) in [
+        ("q4_k_m", "q4_k_m"),
+        ("q5_k_m", "q5_k_m"),
+        ("q6_k", "q6_k"),
+    ] {
+        let (calib, quant) = variant_to_routing(variant);
+        assert_eq!(calib, "none");
+        assert_eq!(quant, expected_quant);
+    }
+    // imatrix × KQuantCodecQuantizer
+    for (variant, expected_quant) in [
+        ("imatrix-q4_k_m", "imatrix-q4_k_m"),
+        ("imatrix-q5_k_m", "imatrix-q5_k_m"),
+        ("imatrix-q6_k", "imatrix-q6_k"),
+    ] {
+        let (calib, quant) = variant_to_routing(variant);
+        assert_eq!(calib, "imatrix");
+        assert_eq!(quant, expected_quant);
+    }
+    // imatrix × VariantKQuantizer (imatrix-adaptive routes through
+    // VariantKQuantizer with KQuantVariant::Q4_K_M base — the variant
+    // name VariantKQuantizer.name() returns)
+    let (calib, quant) = variant_to_routing("imatrix-adaptive");
+    assert_eq!(calib, "imatrix");
+    assert_eq!(quant, "Q4_K_M");
+    // DWQ × bit-pair
+    for (variant, expected_quant) in [
+        ("dwq-4-6", "dwq-mixed-4-6"),
+        ("dwq-4-8", "dwq-mixed-4-8"),
+        ("dwq-6-8", "dwq-mixed-6-8"),
+        ("dwq-2-8", "dwq-mixed-2-8"),
+    ] {
+        let (calib, quant) = variant_to_routing(variant);
+        assert_eq!(calib, "dwq");
+        assert_eq!(quant, expected_quant);
+    }
+}

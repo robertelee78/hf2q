@@ -34,6 +34,7 @@
 //! capture-derived sensitivity).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use tracing::{debug, info, warn};
 
@@ -82,21 +83,50 @@ pub const SENSITIVITY_TENSOR_SUFFIX: &str = "sensitivity";
 /// * `calibration_samples` — number of tokens to feed through the
 ///   capture (matches the DWQ default of 1024).
 pub struct DwqCalibrator {
-    capture: Option<Box<dyn ActivationCapture + Send + Sync>>,
+    capture: CaptureSource,
     arch: DwqArch,
     base_bits: u8,
     sensitive_bits: u8,
     calibration_samples: u32,
 }
 
+/// How the calibrator obtains its [`ActivationCapture`] impl.
+///
+/// `Eager` carries an already-built capture (used by tests with
+/// `MockActivationCapture` and by callers that share a model with an
+/// inference session). `Deferred` carries the paths needed to build a
+/// `RealActivationCapture` lazily inside [`Calibrator::calibrate`] —
+/// the production path used by `cmd_convert` after intermediate-F16
+/// GGUF emission. `None` is the explicit "no capture" state for
+/// `DwqArch::Other`.
+///
+/// Deferred construction lets `cmd_convert` keep the
+/// `RealActivationCapture::new` call out of its dispatch arm
+/// (greppable invariant, ADR-014 P2 iter-2 §S3).
+enum CaptureSource {
+    None,
+    Eager(Box<dyn ActivationCapture + Send + Sync>),
+    Deferred {
+        intermediate_gguf: PathBuf,
+        tokenizer_json: PathBuf,
+    },
+}
+
 impl std::fmt::Debug for DwqCalibrator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_capture = !matches!(self.capture, CaptureSource::None);
+        let capture_kind = match &self.capture {
+            CaptureSource::None => "none",
+            CaptureSource::Eager(_) => "eager",
+            CaptureSource::Deferred { .. } => "deferred",
+        };
         f.debug_struct("DwqCalibrator")
             .field("arch", &self.arch)
             .field("base_bits", &self.base_bits)
             .field("sensitive_bits", &self.sensitive_bits)
             .field("calibration_samples", &self.calibration_samples)
-            .field("has_capture", &self.capture.is_some())
+            .field("has_capture", &has_capture)
+            .field("capture_kind", &capture_kind)
             .finish()
     }
 }
@@ -118,8 +148,50 @@ impl DwqCalibrator {
         sensitive_bits: u8,
         calibration_samples: u32,
     ) -> Self {
+        let capture = match capture {
+            Some(c) => CaptureSource::Eager(c),
+            None => CaptureSource::None,
+        };
         Self {
             capture,
+            arch,
+            base_bits,
+            sensitive_bits,
+            calibration_samples,
+        }
+    }
+
+    /// Construct a `DwqCalibrator` that builds its
+    /// [`crate::inference::models::qwen35::activation_capture_real::RealActivationCapture`]
+    /// lazily inside [`Calibrator::calibrate`] — the production path used by
+    /// `cmd_convert` after the caller has emitted an intermediate-F16 GGUF
+    /// (so the capture can `Qwen35Model::load_from_gguf` without holding the
+    /// converter's `tensor_map` resident at the same time, the OOM
+    /// mitigation pattern documented in `dwq_activation::capture_activations_to_sensitive_ranges`).
+    ///
+    /// The `RealActivationCapture::new` call is delayed to
+    /// `calibrate(...)` time so the intermediate-GGUF + tokenizer paths
+    /// can be passed in early (before `cmd_convert` drops `tensor_map`)
+    /// while the heavyweight `Qwen35Model::load_from_gguf` (~128 GB
+    /// peak for apex MoE) doesn't run until after `tensor_map` is freed.
+    ///
+    /// ADR-014 P2 iter-2 §S3: this is the path that lets `cmd_convert`
+    /// hold zero direct `RealActivationCapture::new` /
+    /// `capture_activations_to_sensitive_ranges` callers — the
+    /// orchestration moves entirely into [`Calibrator::calibrate`].
+    pub fn with_activation_capture(
+        arch: DwqArch,
+        intermediate_gguf: PathBuf,
+        tokenizer_json: PathBuf,
+        base_bits: u8,
+        sensitive_bits: u8,
+        calibration_samples: u32,
+    ) -> Self {
+        Self {
+            capture: CaptureSource::Deferred {
+                intermediate_gguf,
+                tokenizer_json,
+            },
             arch,
             base_bits,
             sensitive_bits,
@@ -134,7 +206,7 @@ impl DwqCalibrator {
     /// `select_calibrator` + logs the selection — the calibrate path
     /// is exercised by the unit tests).
     #[allow(dead_code)]
-    fn sensitivity_tensor_name(layer_idx: usize) -> String {
+    pub fn sensitivity_tensor_name(layer_idx: usize) -> String {
         format!(
             "{}.{}.{}",
             SENSITIVITY_TENSOR_PREFIX, layer_idx, SENSITIVITY_TENSOR_SUFFIX
@@ -173,25 +245,67 @@ impl Calibrator for DwqCalibrator {
             return Ok(CalibrationData::Dwq(HashMap::new()));
         }
 
-        // ─────────── No-fallback guard ───────────
-        // arch.requires_activation_capture() == true → capture MUST
-        // be Some(...). Bail with a typed error otherwise.
-        let capture =
-            self.capture
-                .as_mut()
-                .ok_or_else(|| CalibrationError::ForwardPassUnavailable {
-                    arch: format!("{:?}", self.arch),
-                })?;
-
         // The corpus is informational for DWQ — calibration tokens
         // are derived from `meta.vocab_size` inside
         // `capture_activations_to_sensitive_ranges`. Reject an
         // explicitly-empty corpus to keep the contract symmetric with
         // `ImatrixCalibrator` (it costs nothing and surfaces a
-        // misuse early).
+        // misuse early). Validated BEFORE the (potentially expensive)
+        // deferred capture build so a misuse fails fast.
         if corpus.is_empty() {
             return Err(CalibrationError::EmptyCorpus);
         }
+
+        // ─────────── No-fallback guard + deferred capture build ───────────
+        // arch.requires_activation_capture() == true → capture MUST
+        // be available (either eagerly attached, or constructible from
+        // the deferred paths). Bail with a typed error otherwise.
+        // The deferred build runs `RealActivationCapture::new` here,
+        // intentionally — `cmd_convert` no longer calls it directly
+        // (ADR-014 P2 iter-2 §S3 greppable invariant).
+        //
+        // Materialise any deferred capture in-place so the subsequent
+        // borrow yields a long-lived `&mut dyn ActivationCapture` from
+        // the same `CaptureSource::Eager` slot (no `.expect()` shenanigans
+        // and no holding two mutable borrows).
+        if let CaptureSource::Deferred {
+            intermediate_gguf,
+            tokenizer_json,
+        } = &self.capture
+        {
+            let real =
+                crate::inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
+                    intermediate_gguf,
+                    tokenizer_json,
+                )
+                .map_err(|e| CalibrationError::Other {
+                    message: format!(
+                        "DwqCalibrator deferred capture build failed for arch {:?} \
+                         (intermediate_gguf={}, tokenizer={}): {e}",
+                        self.arch,
+                        intermediate_gguf.display(),
+                        tokenizer_json.display()
+                    ),
+                })?;
+            self.capture = CaptureSource::Eager(Box::new(real));
+        }
+        let capture: &mut dyn ActivationCapture = match &mut self.capture {
+            CaptureSource::None => {
+                return Err(CalibrationError::ForwardPassUnavailable {
+                    arch: format!("{:?}", self.arch),
+                });
+            }
+            CaptureSource::Eager(boxed) => boxed.as_mut(),
+            CaptureSource::Deferred { .. } => {
+                // Unreachable: just transitioned Deferred → Eager above.
+                // Use a typed error rather than `unreachable!()` to
+                // honor the no-panic contract added by ADR-014 P2 iter-2.
+                return Err(CalibrationError::Other {
+                    message: "DwqCalibrator: internal capture-state transition failed"
+                        .to_string(),
+                });
+            }
+        };
 
         let cache_key = SensitivityCacheKey::with_algorithm_version(
             model_fingerprint(model, meta),
@@ -258,7 +372,7 @@ impl Calibrator for DwqCalibrator {
         };
 
         let sensitive_ranges =
-            capture_activations_to_sensitive_ranges(meta, &dwq_config, capture.as_mut()).map_err(
+            capture_activations_to_sensitive_ranges(meta, &dwq_config, capture).map_err(
                 |e| CalibrationError::Other {
                     message: format!("dwq activation capture failed: {e}"),
                 },

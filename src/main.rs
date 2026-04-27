@@ -237,15 +237,41 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
     }
 }
 
+/// How to source the [`crate::inference::models::qwen35::activation_capture::ActivationCapture`]
+/// for calibrators that need a forward pass.
+///
+/// `None` is the explicit "no capture" state — used by uncalibrated
+/// variants and by `DwqArch::Other` (weight-space DWQ).
+///
+/// `Eager` carries an already-built capture (used by tests and by
+/// callers that share a model with a live inference session).
+///
+/// `Deferred` carries the paths the calibrator needs to build a
+/// `RealActivationCapture` lazily inside `calibrate(...)`. The
+/// production `cmd_convert` path uses this so it can keep the
+/// `RealActivationCapture::new` call OUT of the dispatch arm
+/// (greppable invariant, ADR-014 P2 iter-2 §S3) — the heavyweight
+/// `Qwen35Model::load_from_gguf` then runs inside `calibrate(...)`,
+/// after `cmd_convert` has dropped its `tensor_map` for OOM mitigation.
+enum CaptureSpec {
+    None,
+    #[allow(dead_code)] // exercised by the test path; production uses Deferred
+    Eager(Box<dyn crate::inference::models::qwen35::activation_capture::ActivationCapture + Send + Sync>),
+    Deferred {
+        intermediate_gguf: PathBuf,
+        tokenizer_json: PathBuf,
+    },
+}
+
 /// Select the [`Calibrator`] impl for a given `--quant` variant
-/// (ADR-014 P8 iter-1 — Decision 12 + Decision 13).
+/// (ADR-014 P8 iter-1 — Decision 12 + Decision 13; P2 iter-2 — Deferred capture build).
 ///
 /// ## Mapping (exhaustive over the 17-variant menu)
 ///
 /// | Variant family                | Calibrator                                    |
 /// |-------------------------------|-----------------------------------------------|
 /// | `Dwq46` / `Dwq48` / `Dwq68` / `Dwq28` | [`DwqCalibrator`]                     |
-/// | `ImatrixQ4KM` / `ImatrixQ5KM` / `ImatrixQ6K` / `ImatrixAdaptive` | [`ImatrixCalibrator`] (requires `capture: Some(_)` for forward-pass arches; returns `Err(ForwardPassUnavailable)` otherwise — no NoneCalibrator silent fallback) |
+/// | `ImatrixQ4KM` / `ImatrixQ5KM` / `ImatrixQ6K` / `ImatrixAdaptive` | [`ImatrixCalibrator`] (requires capture for forward-pass arches; returns `Err(ForwardPassUnavailable)` otherwise — no NoneCalibrator silent fallback) |
 /// | `Auto` / `F16` / `Bf16` / `Q2` / `Q4` / `Q8` / `Q4KM` / `Q5KM` / `Q6K` | [`NoneCalibrator`] (uncalibrated path) |
 ///
 /// ## No-silent-fallback contract
@@ -274,7 +300,7 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
 fn select_calibrator(
     method: cli::QuantMethod,
     dwq_arch: calibrate::dwq::DwqArch,
-    capture: Option<Box<dyn crate::inference::models::qwen35::activation_capture::ActivationCapture + Send + Sync>>,
+    capture: CaptureSpec,
     base_bits: u8,
     sensitive_bits: u8,
     calibration_samples: u32,
@@ -284,27 +310,62 @@ fn select_calibrator(
     use cli::QuantMethod::*;
     match method {
         Dwq46 | Dwq48 | Dwq68 | Dwq28 => {
-            Ok(Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
-                dwq_arch,
-                capture,
-                base_bits,
-                sensitive_bits,
-                calibration_samples,
-            )))
+            // P2 iter-2: route through DwqCalibrator. For arches that
+            // require the activation capture, prefer the Deferred build
+            // path so RealActivationCapture::new runs INSIDE the
+            // calibrator (greppable invariant: 0 callers in main.rs).
+            match capture {
+                CaptureSpec::Deferred {
+                    intermediate_gguf,
+                    tokenizer_json,
+                } => Ok(Box::new(
+                    calibrate::dwq_calibrator::DwqCalibrator::with_activation_capture(
+                        dwq_arch,
+                        intermediate_gguf,
+                        tokenizer_json,
+                        base_bits,
+                        sensitive_bits,
+                        calibration_samples,
+                    ),
+                )),
+                CaptureSpec::Eager(c) => {
+                    Ok(Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
+                        dwq_arch,
+                        Some(c),
+                        base_bits,
+                        sensitive_bits,
+                        calibration_samples,
+                    )))
+                }
+                CaptureSpec::None => {
+                    Ok(Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
+                        dwq_arch,
+                        None,
+                        base_bits,
+                        sensitive_bits,
+                        calibration_samples,
+                    )))
+                }
+            }
         }
         ImatrixQ4KM | ImatrixQ5KM | ImatrixQ6K | ImatrixAdaptive => {
             // ADR-014 Decision 13 + ADR-013 D13: no NoneCalibrator silent
             // fallback when the forward-pass driver is absent. Surface a
             // typed error so the caller can either supply a capture or
-            // pick a non-imatrix variant.
-            let capture = capture.ok_or_else(|| {
-                calibrate::calibrator::CalibrationError::ForwardPassUnavailable {
-                    arch: format!("{dwq_arch:?}"),
+            // pick a non-imatrix variant. ImatrixCalibrator itself only
+            // accepts an eagerly-built capture today; the deferred path
+            // is DWQ-only (qwen35 intermediate-GGUF flow).
+            let real_capture = match capture {
+                CaptureSpec::Eager(c) => c,
+                CaptureSpec::None | CaptureSpec::Deferred { .. } => {
+                    return Err(calibrate::calibrator::CalibrationError::ForwardPassUnavailable {
+                        arch: format!("{dwq_arch:?}"),
+                    });
                 }
-            })?;
+            };
             Ok(Box::new(
                 calibrate::imatrix_calibrator::ImatrixCalibrator::new(
-                    capture,
+                    real_capture,
                     num_layers,
                     hidden_size,
                 ),
@@ -314,6 +375,205 @@ fn select_calibrator(
             Ok(Box::new(calibrate::calibrator::NoneCalibrator::new()))
         }
     }
+}
+
+/// Build a [`crate::calibrate::calibrator::CalibrationCorpus`] for the
+/// `cmd_convert` Phase 2 dispatch (ADR-014 P2 iter-2 §S1).
+///
+/// **Why colocated in main.rs**: this helper exists to bridge the
+/// converter's `metadata.vocab_size + calibration_samples` configuration
+/// into the [`crate::calibrate::calibrator::Calibrator`] trait's
+/// arch-agnostic corpus shape. It is *not* a general-purpose corpus
+/// builder — the per-arch tokenizer-driven corpus (e.g. wikitext-2 for
+/// imatrix) belongs with the calibrator itself once it lands.
+///
+/// The returned corpus is a single chunk of synthetic tokens — the
+/// exact same shape that
+/// [`crate::calibrate::dwq_activation::capture_activations_to_sensitive_ranges`]
+/// generates internally via `generate_calibration_tokens`. The
+/// [`crate::calibrate::dwq_calibrator::DwqCalibrator`] consumes the
+/// corpus only as a cache-key contributor; the real tokens are derived
+/// by `capture_activations_to_sensitive_ranges` so this corpus shape is
+/// informational for DWQ. For `ImatrixCalibrator`, the corpus chunks
+/// drive the forward-pass loop directly (one chunk = one capture call).
+fn build_calibration_corpus(
+    samples: u32,
+    vocab_size: u64,
+    name: &str,
+) -> calibrate::calibrator::CalibrationCorpus {
+    // Mirror `dwq_activation::generate_calibration_tokens` — deterministic
+    // synthetic tokens drawn from `[0, vocab_size)` at sample positions.
+    // The exact distribution is unimportant because DwqCalibrator's cache
+    // key consumes corpus_sha (the SHA over the produced tokens), and
+    // ImatrixCalibrator's mock-test path uses MockActivationCapture's
+    // monotonic formula. Real wikitext-2 corpora live one layer up and
+    // pre-tokenize before reaching this builder.
+    let chunk_len = samples as usize;
+    let v = vocab_size.max(1) as u32;
+    let mut chunk = Vec::with_capacity(chunk_len);
+    for i in 0..chunk_len {
+        chunk.push((i as u32) % v);
+    }
+    calibrate::calibrator::CalibrationCorpus {
+        chunks: if chunk_len == 0 { vec![] } else { vec![chunk] },
+        name: name.to_string(),
+    }
+}
+
+/// Convert a [`crate::calibrate::calibrator::CalibrationData::Dwq`]
+/// per-layer flag map (the [`crate::calibrate::dwq_calibrator::DwqCalibrator`]
+/// output shape) back into the
+/// [`crate::calibrate::dwq::DwqConfig::sensitive_layers`] range list
+/// shape that the downstream byte-emit consumes (ADR-014 P2 iter-2 §S2).
+///
+/// The map's keys are `blk.<i>.sensitivity` synthetic tensor names; each
+/// value is a single-element `Vec<f32>` carrying `1.0` (sensitive) or
+/// `0.0` (base). Adjacent sensitive indices are coalesced into ranges
+/// for compactness — the same minimisation
+/// [`crate::calibrate::dwq_activation::indices_to_ranges`] applies.
+///
+/// Returns an empty `Vec` for `CalibrationData::Dwq(empty)` (the
+/// `DwqArch::Other` weight-space contract) and for `CalibrationData::None`.
+fn dwq_calibration_to_sensitive_ranges(
+    data: &calibrate::calibrator::CalibrationData,
+) -> Vec<std::ops::RangeInclusive<usize>> {
+    let map = match data {
+        calibrate::calibrator::CalibrationData::Dwq(m) => m,
+        _ => return Vec::new(),
+    };
+    let prefix = calibrate::dwq_calibrator::SENSITIVITY_TENSOR_PREFIX;
+    let suffix = calibrate::dwq_calibrator::SENSITIVITY_TENSOR_SUFFIX;
+    let mut indices: Vec<usize> = Vec::new();
+    for (key, value) in map.iter() {
+        let is_sensitive = value.first().map(|v| *v >= 0.5).unwrap_or(false);
+        if !is_sensitive {
+            continue;
+        }
+        // Parse "blk.<N>.sensitivity" → N
+        let stripped = match key.strip_prefix(&format!("{prefix}.")) {
+            Some(s) => s,
+            None => continue,
+        };
+        let idx_str = match stripped.strip_suffix(&format!(".{suffix}")) {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Ok(idx) = idx_str.parse::<usize>() {
+            indices.push(idx);
+        }
+    }
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    let mut ranges = Vec::new();
+    let mut start = indices[0];
+    let mut end = indices[0];
+    for &i in &indices[1..] {
+        if i == end + 1 {
+            end = i;
+        } else {
+            ranges.push(start..=end);
+            start = i;
+            end = i;
+        }
+    }
+    ranges.push(start..=end);
+    ranges
+}
+
+/// Re-read the safetensors model + reapply the qwen35 normalization +
+/// transform phases (Phases 1.4 + 1.45 + 1.6 + 1.7 + ADR-012 Bug 6/7
+/// re-applications) — the post-capture rebuild path used by the DWQ
+/// qwen35 / qwen35moe arm of `cmd_convert`.
+///
+/// **Why a helper**: the qwen35 DWQ flow drops the in-memory `tensor_map`
+/// before the activation capture (~70 GB OOM mitigation, ADR-012 P9b cost
+/// model #3) and rebuilds it after the capture is dropped (~128 GB peak
+/// avoided). The transforms are byte-equivalent to the first-pass output
+/// because the input safetensors are unchanged. Extracted into this helper
+/// in ADR-014 P2 iter-2 §S3 so the cmd_convert DWQ arm collapses from
+/// ~280 LOC of inline orchestration to a single call.
+///
+/// **Mutates `metadata.vocab_size`** indirectly via `truncate_padded_vocab`.
+fn reread_qwen35_tensor_map_after_capture(
+    config: &cli::ConvertConfig,
+    metadata: &mut crate::ir::ModelMetadata,
+    progress: &progress::ProgressReporter,
+) -> Result<crate::ir::TensorMap, AppError> {
+    tracing::info!("ADR-012 P9b: re-reading tensor_map for DWQ pass after capture");
+    let (_, mut tensor_map_re) = input::read_model(&config.input_dir, progress)
+        .context("ADR-012 P9b: re-read of model after capture failed")
+        .map_err(AppError::Conversion)?;
+
+    {
+        let renames: Vec<(String, String)> = tensor_map_re
+            .tensors
+            .keys()
+            .filter(|n| n.contains("language_model."))
+            .map(|n| (n.clone(), n.replace("language_model.", "")))
+            .collect();
+        for (old_name, new_name) in renames {
+            if let Some(mut tensor) = tensor_map_re.tensors.remove(&old_name) {
+                tensor.name = new_name.clone();
+                tensor_map_re.tensors.insert(new_name, tensor);
+            }
+        }
+    }
+    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(&mut tensor_map_re, metadata)
+        .context("ADR-012 P9b: re-read fused gate_up split failed")
+        .map_err(AppError::Conversion)?;
+    models::qwen35::moe::merge_moe_experts_in_tensor_map(&mut tensor_map_re, metadata)
+        .context("ADR-012 P9b: re-read MoE expert merge failed")
+        .map_err(AppError::Conversion)?;
+    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(&mut tensor_map_re, metadata)
+        .context("ADR-012 P9b: re-read RMS+1 transform failed")
+        .map_err(AppError::Conversion)?;
+    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(&mut tensor_map_re, metadata)
+        .context("ADR-012 P9b: re-read linear-attn transforms failed")
+        .map_err(AppError::Conversion)?;
+
+    // ADR-012 Bug 7: re-apply HF2Q_QWEN35_DROP_MTP=1 to the re-read
+    // tensor_map so MTP tensors stay dropped through the second pass.
+    {
+        let drop_mtp = std::env::var("HF2Q_QWEN35_DROP_MTP")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if drop_mtp {
+            let mtp_keys: Vec<String> = tensor_map_re
+                .tensors
+                .keys()
+                .filter(|n| n.starts_with("mtp."))
+                .cloned()
+                .collect();
+            if !mtp_keys.is_empty() {
+                tracing::warn!(
+                    dropped = mtp_keys.len(),
+                    "ADR-012 P9b Bug 7: HF2Q_QWEN35_DROP_MTP=1 re-applied on re-read; dropping {} mtp.* tensors",
+                    mtp_keys.len()
+                );
+                for key in mtp_keys {
+                    tensor_map_re.tensors.remove(&key);
+                }
+            }
+        }
+    }
+
+    // ADR-012 Bug 6: re-apply Phase 1.8 vocab-pad de-pad symmetrically
+    // on the re-read tensor_map so the final DWQ GGUF carries the same
+    // de-padded embed/lm_head rows as the metadata advertises.
+    let de_padded_vocab = metadata.vocab_size;
+    let truncated = input::truncate_padded_vocab(&mut tensor_map_re, metadata, de_padded_vocab);
+    if truncated > 0 {
+        tracing::info!(
+            truncated_tensors = truncated,
+            de_padded_vocab,
+            "ADR-012 P9b Bug 6: re-applied vocab-pad fix to re-read tensor_map"
+        );
+    }
+
+    Ok(tensor_map_re)
 }
 
 /// Handle the `convert` subcommand.
@@ -327,7 +587,6 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use intelligence::AutoResolver;
     use progress::ProgressReporter;
     use quantize::static_quant::StaticQuantizer;
-    use quantize::Quantizer;
 
     let mut config = cli::resolve_convert_config(&args)
         .context("Failed to resolve conversion configuration")
@@ -420,7 +679,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         match select_calibrator(
             config.quant,
             dwq_arch,
-            None, // capture is attached at the live DWQ dispatch site below
+            CaptureSpec::None, // capture is attached at the live DWQ dispatch site below
             base_bits,
             sensitive_bits,
             config.calibration_samples,
@@ -1011,6 +1270,165 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     let quant_method_str = config.quant.to_string();
     let bits = config.bits.unwrap_or(quantizer_default_bits(&config.quant));
 
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-014 P2 iter-2 §S1 — Calibrator-first dispatch shell.
+    //
+    // Build the right `Calibrator` for the chosen `--quant` variant
+    // BEFORE the per-quantizer match. For DWQ on `Qwen35Dense`/
+    // `Qwen35MoE`, we emit an intermediate F16 GGUF + drop `tensor_map`
+    // first so the capture can load the F32-expanded `Qwen35Model`
+    // (~128 GB peak for apex MoE) without coexisting with `tensor_map`
+    // (~70 GB BF16). The deferred-build path on `DwqCalibrator` keeps
+    // `RealActivationCapture::new` out of this dispatch arm — the
+    // greppable invariant from §S3.
+    //
+    // For Imatrix variants, this iter routes through select_calibrator
+    // with `CaptureSpec::None`; the typed `ForwardPassUnavailable` error
+    // surfaces if a real capture impl is unavailable for the arch (no
+    // silent NoneCalibrator fallback). Per-arch imatrix capture wiring
+    // lands in a follow-up iter.
+    // ──────────────────────────────────────────────────────────────────
+    let dwq_arch_for_dispatch = calibrate::dwq::DwqArch::from_hf_architecture(
+        &metadata.architecture,
+        metadata.is_moe(),
+    );
+    let (cal_base_bits, cal_sensitive_bits) = config.quant.dwq_bit_pair().unwrap_or((4, 6));
+
+    // For DWQ + qwen35 arches, emit the intermediate F16 GGUF up front
+    // and pass paths to the deferred capture builder on DwqCalibrator.
+    // The TempDir lives until calibrate() returns so the file remains on
+    // disk for the capture's `Qwen35Model::load_from_gguf`. After
+    // calibrate(), main.rs re-reads `tensor_map` via the helper.
+    //
+    // `intermediate_dir_holder` keeps the `TempDir` alive across the
+    // calibrate call; it is dropped after `calibrate()` returns.
+    let needs_dwq_deferred_capture = matches!(
+        config.quant,
+        cli::QuantMethod::Dwq46
+            | cli::QuantMethod::Dwq48
+            | cli::QuantMethod::Dwq68
+            | cli::QuantMethod::Dwq28
+    ) && dwq_arch_for_dispatch.requires_activation_capture()
+        && !backend.requires_native_quantization();
+
+    let mut intermediate_dir_holder: Option<tempfile::TempDir> = None;
+    let capture_spec = if needs_dwq_deferred_capture {
+        let tokenizer_json = config.input_dir.join("tokenizer.json");
+        if !tokenizer_json.exists() {
+            return Err(AppError::Conversion(anyhow::anyhow!(
+                "ADR-012 P9b / ADR-014 P2 iter-2: qwen35/qwen35moe DWQ requires \
+                 tokenizer.json in {}; not found. No weight-space \
+                 fallback per Decision 13.",
+                config.input_dir.display()
+            )));
+        }
+        let tmp = tempfile::tempdir()
+            .context("ADR-012 P9b: failed to create tempdir for intermediate GGUF")
+            .map_err(AppError::Conversion)?;
+        let intermediate_path = tmp.path().join("intermediate-f16.gguf");
+        tracing::info!(
+            path = %intermediate_path.display(),
+            "ADR-012 P9b: emitting intermediate F16 GGUF for activation capture (calibrator-driven)"
+        );
+        backends::gguf::emit_gguf_from_tensor_map(
+            &tensor_map,
+            &metadata,
+            &config.input_dir,
+            &intermediate_path,
+            &progress,
+        )
+        .context("ADR-012 P9b: intermediate F16 GGUF emission failed")
+        .map_err(AppError::Conversion)?;
+        intermediate_dir_holder = Some(tmp);
+        CaptureSpec::Deferred {
+            intermediate_gguf: intermediate_path,
+            tokenizer_json,
+        }
+    } else {
+        CaptureSpec::None
+    };
+
+    let mut calibrator = if backend.requires_native_quantization() {
+        // Native-backend path skips IR quantization entirely; no
+        // calibrator needed. Use a NoneCalibrator stub to keep the type
+        // uniform — it is never invoked.
+        Box::new(calibrate::calibrator::NoneCalibrator::new()) as Box<dyn calibrate::calibrator::Calibrator>
+    } else {
+        select_calibrator(
+            config.quant,
+            dwq_arch_for_dispatch,
+            capture_spec,
+            cal_base_bits,
+            cal_sensitive_bits,
+            config.calibration_samples,
+            metadata.num_layers,
+            metadata.hidden_size as u32,
+        )
+        .map_err(|e| {
+            AppError::Conversion(anyhow::anyhow!(
+                "ADR-014 P2 iter-2: select_calibrator failed for --quant {}: {e:#}",
+                config.quant
+            ))
+        })?
+    };
+
+    // Drop tensor_map BEFORE running calibrate() for the deferred-DWQ
+    // path so the heavyweight `Qwen35Model` (~128 GB peak for apex MoE)
+    // never coexists with the in-memory tensor_map (~70 GB). The
+    // post-calibrate re-read helper restores tensor_map for the
+    // downstream byte-emit + Phase 4.x write path.
+    //
+    // For other paths, tensor_map stays resident — the calibrate(...)
+    // call is a no-op (NoneCalibrator) or an in-place imatrix
+    // accumulation (no extra memory pressure).
+    if needs_dwq_deferred_capture {
+        let _drop_for_capture = std::mem::replace(&mut tensor_map, ir::TensorMap::new());
+        drop(_drop_for_capture);
+    }
+
+    let calibration_data = if calibrator.requires_forward_pass() {
+        // Metadata-only LazyTensorMap view — never materialises (the
+        // calibrator only walks `iter()` for `model_fingerprint`).
+        // For the deferred-DWQ qwen35 path, `tensor_map` was already
+        // dropped above so the view is inherently empty (the
+        // fingerprint is then a constant; that's fine — the cache key
+        // also depends on `corpus_sha`).
+        let lazy_view = ir::lazy::LazyTensorMap::from_eager_borrowed(&tensor_map);
+        let corpus = build_calibration_corpus(
+            config.calibration_samples,
+            metadata.vocab_size,
+            "hf2q-cmd-convert-synthetic",
+        );
+        tracing::info!(
+            calibrator = %calibrator.name(),
+            n_chunks = corpus.n_chunks(),
+            tokens = corpus.total_tokens(),
+            "ADR-014 P2 iter-2: running calibrator.calibrate()"
+        );
+        let data = calibrator
+            .calibrate(&lazy_view, &metadata, &corpus, &progress)
+            .map_err(|e| {
+                AppError::Conversion(anyhow::anyhow!(
+                    "ADR-014 P2 iter-2: calibrator.calibrate() failed for --quant {}: {e:#}",
+                    config.quant
+                ))
+            })?;
+        // Drop the intermediate GGUF + tempdir as soon as calibrate
+        // returns — the capture's Qwen35Model is dropped inside
+        // calibrate() (no longer holds the file). Free disk + FD
+        // immediately for the re-read step.
+        drop(intermediate_dir_holder.take());
+        data
+    } else {
+        drop(intermediate_dir_holder.take());
+        calibrate::calibrator::CalibrationData::None
+    };
+
+    // Re-read tensor_map for the qwen35 DWQ post-capture rebuild.
+    if needs_dwq_deferred_capture {
+        tensor_map = reread_qwen35_tensor_map_after_capture(&config, &mut metadata, &progress)?;
+    }
+
     let quantized_model = if backend.requires_native_quantization() {
         tracing::info!("Skipping IR quantization (native backend handles quantization)");
         None
@@ -1036,30 +1454,36 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     cli::QuantMethod::Q6K | cli::QuantMethod::ImatrixQ6K => {
                         quantize::k_quant_codec::KQuantTarget::Q6K
                     }
-                    _ => unreachable!("guarded by outer match arm"),
+                    _ => {
+                        // Outer match arm guarantees one of the cases
+                        // above. Use a typed AppError rather than
+                        // `unreachable!()` to honour the no-panic
+                        // contract added by ADR-014 P2 iter-2.
+                        return Err(AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P2 iter-2: K-quant codec target dispatch \
+                             reached unreachable arm for --quant {}",
+                            config.quant
+                        )));
+                    }
                 };
 
-                // Imatrix variants need real CalibrationData; uncalibrated
-                // K-quant variants pass `None`. The full live ImatrixCalibrator
-                // forward-pass orchestration is wired through select_calibrator
-                // at P2 iter-2 (ADR-014); this iter wires the dispatch + accepts
-                // CalibrationData::None for both paths so the codec tooling
-                // ships in production today and the live calibrate(...) path
-                // bolts on without a Quantizer trait change. The
-                // imatrix-from-collector / imatrix-from-gguf bridges already
-                // exist on CalibrationData (P7 iter-3p).
-                let calibration = calibrate::calibrator::CalibrationData::None;
-
+                // ADR-014 P2 iter-2 §S2: feed real CalibrationData from the
+                // calibrator into the codec. For uncalibrated K-quant
+                // variants the calibrator was NoneCalibrator, returning
+                // CalibrationData::None — preserving the uncalibrated
+                // codec path (byte-identical to iter-1 for Q4KM/Q5KM/Q6K
+                // — see §T6 byte-identity gate).
                 let kq = quantize::k_quant_codec_quantizer::KQuantCodecQuantizer::new(
                     quant_method_str.clone(),
                     target,
-                    calibration,
+                    calibration_data.clone(),
                 );
 
                 tracing::info!(
                     quant = %config.quant,
                     target = ?target,
-                    "K-quant codec quantizer dispatched (ADR-014 P8 Decision 12)"
+                    calibration = ?calibration_data.is_some(),
+                    "K-quant codec quantizer dispatched (ADR-014 P8 Decision 12 + P2 iter-2)"
                 );
 
                 quantize::quantize_model(
@@ -1078,17 +1502,17 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             // layer_mix::target_for. Preserves the per-tensor optimal
             // precision behavior previously exposed as `--quant apex`.
             cli::QuantMethod::ImatrixAdaptive => {
-                let calibration = calibrate::calibrator::CalibrationData::None;
                 let n_layers = metadata.num_layers as usize;
                 let vq = quantize::variant_quantizer::VariantKQuantizer::new(
                     quantize::layer_mix::KQuantVariant::Q4_K_M,
-                    calibration,
+                    calibration_data.clone(),
                     n_layers,
                 );
 
                 tracing::info!(
                     quant = %config.quant,
                     n_layers,
+                    calibration = ?calibration_data.is_some(),
                     "imatrix-adaptive: VariantKQuantizer dispatched (preserves Apex per-tensor optimal precision)"
                 );
 
@@ -1107,292 +1531,68 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             | cli::QuantMethod::Dwq48
             | cli::QuantMethod::Dwq68
             | cli::QuantMethod::Dwq28 => {
-                // Derive (base_bits, sensitive_bits) from the chosen variant.
-                // dwq_bit_pair() is guaranteed Some(_) for all DWQ variants.
-                let (base_bits, sensitive_bits) = config
-                    .quant
-                    .dwq_bit_pair()
-                    .expect("DWQ variant must have a valid bit pair");
-
-                // Try loading tokenizer for activation-based calibration
-                let has_tokenizer = config.input_dir.join("tokenizer.json").exists();
-
-                // Resolve the DWQ architecture for routing (ADR-012 Decision 13).
-                // qwen35 / qwen35moe MUST use ActivationCapture — no weight-space fallback.
-                let dwq_arch = calibrate::dwq::DwqArch::from_hf_architecture(
-                    &metadata.architecture,
-                    metadata.is_moe(),
-                );
-
+                // ADR-014 P2 iter-2 §S2/§S3: DWQ arm collapses from
+                // ~280 LOC of inline capture-orchestration to a single
+                // calibrator-driven byte-emit. The intermediate-GGUF
+                // emission + RealActivationCapture::new + activation
+                // capture + tensor_map drop/re-read all happen above
+                // (driven by `select_calibrator` returning a deferred
+                // DwqCalibrator + `calibrator.calibrate()` running the
+                // capture inside its own scope). Here we just convert
+                // the calibrator's `CalibrationData::Dwq` per-layer flag
+                // map into the `DwqConfig.sensitive_layers` shape and
+                // dispatch the byte-emit through
+                // `run_dwq_with_sensitive_ranges`.
+                let (base_bits, sensitive_bits) =
+                    config.quant.dwq_bit_pair().ok_or_else(|| {
+                        AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P2 iter-2: dwq_bit_pair() returned None for \
+                             DWQ variant {}; cli::QuantMethod and dwq_bit_pair are \
+                             out of sync (defect, not a runtime fallback path)",
+                            config.quant
+                        ))
+                    })?;
+                let derived_ranges = dwq_calibration_to_sensitive_ranges(&calibration_data);
+                // Activation-derived ranges win over CLI --sensitive-layers
+                // when the calibrator returned non-empty data (qwen35*
+                // path); otherwise (DwqArch::Other / weight-space) we
+                // honour the CLI selection so existing behaviour for
+                // non-qwen35 DWQ is preserved bit-for-bit.
+                let final_sensitive_ranges = if !derived_ranges.is_empty() {
+                    derived_ranges
+                } else {
+                    config.sensitive_layers.clone()
+                };
                 let dwq_config = calibrate::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
-                    sensitive_layers: config.sensitive_layers.clone(),
+                    sensitive_layers: final_sensitive_ranges.clone(),
                     group_size: config.group_size,
                     base_bits,
                     sensitive_bits,
-                    use_activations: has_tokenizer,
-                    arch: dwq_arch,
+                    use_activations: dwq_arch_for_dispatch.requires_activation_capture(),
+                    arch: dwq_arch_for_dispatch,
                     ..calibrate::dwq::DwqConfig::default()
                 };
-
-                let dwq_quantizer = calibrate::dwq::DwqQuantizer::new(dwq_config.clone())
-                    .context("Failed to create DWQ quantizer")
-                    .map_err(AppError::Conversion)?;
                 tracing::info!(
-                    calibration = dwq_quantizer.requires_calibration(),
-                    max_iterations = dwq_quantizer.config().max_iterations,
-                    use_activations = dwq_config.use_activations,
-                    "DWQ quantizer initialized: {}",
-                    dwq_quantizer.name()
+                    quant = %config.quant,
+                    arch = ?dwq_arch_for_dispatch,
+                    sensitive_ranges = final_sensitive_ranges.len(),
+                    base_bits,
+                    sensitive_bits,
+                    "DWQ byte-emit via calibrator-driven dispatch (ADR-014 P2 iter-2)"
                 );
-
-                if dwq_arch.requires_activation_capture() {
-                    // ADR-012 P9b.2/3b — qwen35 / qwen35moe two-pass conversion.
-                    //
-                    // Decision 13 mandates ActivationCapture for these arches; no
-                    // weight-space fallback. Steps:
-                    //   1. Tokenizer.json is mandatory (capture tokenization
-                    //      contract) — error if missing.
-                    //   2. Emit an intermediate F16 GGUF from the in-memory
-                    //      tensor_map via `emit_gguf_from_tensor_map` (P9b.1).
-                    //      `tensor_map` is held in scope for the subsequent
-                    //      DWQ pass — no double-read from safetensors (P9b.4).
-                    //   3. Construct a `RealActivationCapture` from the
-                    //      intermediate GGUF + tokenizer (P9b.3b). This loads
-                    //      the model into RAM; the file is no longer needed
-                    //      after the constructor returns.
-                    //   4. Run activation-aware DWQ via
-                    //      `run_dwq_activation_calibration` (P9b.3a — the real
-                    //      impl that consumes a `&mut dyn ActivationCapture`).
-                    //   5. The `tempfile::TempDir` is dropped at the end of
-                    //      this scope, removing the intermediate GGUF — RAII
-                    //      cleanup (P9b.5).
-                    let tokenizer_json = config.input_dir.join("tokenizer.json");
-                    if !tokenizer_json.exists() {
-                        return Err(AppError::Conversion(anyhow::anyhow!(
-                            "ADR-012 P9b: qwen35/qwen35moe DWQ requires \
-                             tokenizer.json in {}; not found. No weight-space \
-                             fallback per Decision 13.",
-                            config.input_dir.display()
-                        )));
-                    }
-
-                    let intermediate_dir = tempfile::tempdir()
-                        .context("ADR-012 P9b: failed to create tempdir for intermediate GGUF")
-                        .map_err(AppError::Conversion)?;
-                    let intermediate_path =
-                        intermediate_dir.path().join("intermediate-f16.gguf");
-
-                    tracing::info!(
-                        path = %intermediate_path.display(),
-                        "ADR-012 P9b: emitting intermediate F16 GGUF for activation capture"
-                    );
-                    backends::gguf::emit_gguf_from_tensor_map(
-                        &tensor_map,
-                        &metadata,
-                        &config.input_dir,
-                        &intermediate_path,
-                        &progress,
-                    )
-                    .context("ADR-012 P9b: intermediate F16 GGUF emission failed")
-                    .map_err(AppError::Conversion)?;
-
-                    // ADR-012 P9b apex MoE OOM mitigation (cost-model
-                    // candidate #3, 2026-04-25): swap tensor_map out for an
-                    // empty placeholder across the capture call so the
-                    // F32-expanded Qwen35Model (~128 GB MoE params) doesn't
-                    // have to coexist with tensor_map (~70 GB BF16) on a
-                    // 128 GB system. Re-read the safetensors after capture
-                    // (~30s I/O cost) and re-apply Phases 1.4 + 1.45 + 1.6 +
-                    // 1.7 transforms (idempotent — same input produces same
-                    // tensor_map). The placeholder lets `tensor_map` stay
-                    // in-scope for the downstream Phase 4.x usage.
-                    let _drop_for_capture = std::mem::replace(
-                        &mut tensor_map,
-                        ir::TensorMap::new(),
-                    );
-                    drop(_drop_for_capture);
-
-                    let mut capture =
-                        inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
-                            &intermediate_path,
-                            &tokenizer_json,
-                        )
-                        .map_err(|e| {
-                            AppError::Conversion(anyhow::anyhow!(
-                                "ADR-012 P9b: RealActivationCapture::new failed: {e}"
-                            ))
-                        })?;
-
-                    tracing::info!(
-                        "ADR-012 P9b: capturing activations from intermediate F16 GGUF"
-                    );
-                    let derived_sensitive_ranges =
-                        calibrate::dwq_activation::capture_activations_to_sensitive_ranges(
-                            &metadata,
-                            &dwq_config,
-                            &mut capture,
-                        )
-                        .context(
-                            "ADR-012 P9b: activation capture / sensitivity derivation failed",
-                        )
-                        .map_err(AppError::Conversion)?;
-
-                    drop(capture); // release Qwen35Model (~128 GB for apex MoE) ASAP
-                    drop(intermediate_dir); // RAII cleanup of tempdir
-
-                    // Re-read tensor_map from safetensors and re-apply the
-                    // qwen35 normalization + transform phases. All
-                    // transforms are idempotent (input safetensors haven't
-                    // changed), so the result is byte-equivalent to the
-                    // tensor_map we just dropped.
-                    tracing::info!(
-                        "ADR-012 P9b: re-reading tensor_map for DWQ pass after capture"
-                    );
-                    let (_, mut tensor_map_re) =
-                        input::read_model(&config.input_dir, &progress)
-                            .context("ADR-012 P9b: re-read of model after capture failed")
-                            .map_err(AppError::Conversion)?;
-
-                    // Re-apply the same qwen35 normalization the original
-                    // tensor_map went through (Phases 1.4 + 1.45 + 1.6 + 1.7).
-                    {
-                        let renames: Vec<(String, String)> = tensor_map_re
-                            .tensors
-                            .keys()
-                            .filter(|n| n.contains("language_model."))
-                            .map(|n| (n.clone(), n.replace("language_model.", "")))
-                            .collect();
-                        for (old_name, new_name) in renames {
-                            if let Some(mut tensor) = tensor_map_re.tensors.remove(&old_name) {
-                                tensor.name = new_name.clone();
-                                tensor_map_re.tensors.insert(new_name, tensor);
-                            }
-                        }
-                    }
-                    models::qwen35::moe::split_and_rename_fused_gate_up_in_tensor_map(
-                        &mut tensor_map_re,
-                        &metadata,
-                    )
-                    .context("ADR-012 P9b: re-read fused gate_up split failed")
-                    .map_err(AppError::Conversion)?;
-                    models::qwen35::moe::merge_moe_experts_in_tensor_map(
-                        &mut tensor_map_re,
-                        &metadata,
-                    )
-                    .context("ADR-012 P9b: re-read MoE expert merge failed")
-                    .map_err(AppError::Conversion)?;
-                    models::qwen35::apply_rms_norm_plus_one_in_tensor_map(
-                        &mut tensor_map_re,
-                        &metadata,
-                    )
-                    .context("ADR-012 P9b: re-read RMS+1 transform failed")
-                    .map_err(AppError::Conversion)?;
-                    models::qwen35::apply_qwen35_linear_attn_transforms_in_tensor_map(
-                        &mut tensor_map_re,
-                        &metadata,
-                    )
-                    .context("ADR-012 P9b: re-read linear-attn transforms failed")
-                    .map_err(AppError::Conversion)?;
-
-                    // ADR-012 Bug 7 (2026-04-26): re-apply HF2Q_QWEN35_DROP_MTP=1
-                    // MTP-tensor drop to the re-read tensor_map.  The first-pass
-                    // call (main.rs:543-559) dropped 15 `mtp.*` tensors from the
-                    // initial tensor_map, but the freshly-re-read safetensors
-                    // still contain them.  Without this re-application, DWQ
-                    // calibrates + emits 866 tensors total (851 base + 15 MTP)
-                    // while the metadata's `block_count = 64` (no MTP) tells
-                    // llama.cpp to expect 851; load fails with
-                    //   done_getting_tensors: wrong number of tensors;
-                    //   expected 866, got 851
-                    // because the 15 MTP tensors have names llama.cpp doesn't
-                    // recognize for a 64-block qwen35 model.  Mirror the
-                    // first-pass drop here for re-read symmetry.  Same env-var
-                    // gate as the first-pass branch; same removal condition
-                    // (when llama.cpp gains qwen35 MTP loading OR 2026-Q4).
-                    {
-                        let drop_mtp = std::env::var("HF2Q_QWEN35_DROP_MTP")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        if drop_mtp {
-                            let mtp_keys: Vec<String> = tensor_map_re
-                                .tensors
-                                .keys()
-                                .filter(|n| n.starts_with("mtp."))
-                                .cloned()
-                                .collect();
-                            if !mtp_keys.is_empty() {
-                                tracing::warn!(
-                                    dropped = mtp_keys.len(),
-                                    "ADR-012 P9b Bug 7: HF2Q_QWEN35_DROP_MTP=1 re-applied on re-read; dropping {} mtp.* tensors",
-                                    mtp_keys.len()
-                                );
-                                for key in mtp_keys {
-                                    tensor_map_re.tensors.remove(&key);
-                                }
-                            }
-                        }
-                    }
-
-                    // ADR-012 Bug 6 (2026-04-26): re-apply Phase 1.8 vocab-pad
-                    // de-pad to the re-read tensor_map.  The first-pass call
-                    // already updated `metadata.vocab_size` to the de-padded
-                    // value (e.g. 248044 for Qwen3.6-27B), but the freshly-
-                    // re-read safetensors still have the padded
-                    // model.embed_tokens.weight + lm_head.weight rows
-                    // (248320).  Without this re-application, the final DWQ
-                    // GGUF embeds at 248320 rows and llama.cpp rejects with
-                    //   tensor 'token_embd.weight' has wrong shape;
-                    //   expected H, 248044, got H, 248320
-                    // The refactored `truncate_padded_vocab` detects padded
-                    // rows from `tensor_map` itself, so calling with
-                    // `true_vocab = metadata.vocab_size` is a no-op when the
-                    // tensor_map is already aligned and an active truncate
-                    // when the re-read produced padded rows.
-                    let de_padded_vocab = metadata.vocab_size;
-                    let truncated = input::truncate_padded_vocab(
-                        &mut tensor_map_re,
-                        &mut metadata,
-                        de_padded_vocab,
-                    );
-                    if truncated > 0 {
-                        tracing::info!(
-                            truncated_tensors = truncated,
-                            de_padded_vocab,
-                            "ADR-012 P9b Bug 6: re-applied vocab-pad fix to re-read tensor_map"
-                        );
-                    }
-
-                    tracing::info!(
-                        "ADR-012 P9b: running DWQ scale calibration with {} activation-derived sensitive layer ranges",
-                        derived_sensitive_ranges.len()
-                    );
-                    let model = calibrate::dwq_activation::run_dwq_with_sensitive_ranges(
-                        &tensor_map_re,
-                        &metadata,
-                        &dwq_config,
-                        derived_sensitive_ranges,
-                        &progress,
-                    )
-                    .context("ADR-012 P9b: DWQ scale calibration failed")
-                    .map_err(AppError::Conversion)?;
-                    // Re-bind tensor_map to the re-read version for the
-                    // downstream Phase 4.x bit-overrides + write path.
-                    tensor_map = tensor_map_re;
-                    model
-                } else {
-                    tracing::info!(
-                        "Using DWQ weight-space calibration (non-qwen35 arch)"
-                    );
-                    calibrate::dwq::run_dwq_calibration(
-                        &tensor_map,
-                        &metadata,
-                        &dwq_config,
-                        &progress,
-                    )
-                    .context("DWQ calibration failed")
-                    .map_err(AppError::Conversion)?
-                }
+                calibrate::dwq_activation::run_dwq_with_sensitive_ranges(
+                    &tensor_map,
+                    &metadata,
+                    &dwq_config,
+                    final_sensitive_ranges,
+                    &progress,
+                )
+                .map_err(|e| {
+                    AppError::Conversion(anyhow::anyhow!(
+                        "ADR-014 P2 iter-2: DWQ byte-emit failed: {e:#}"
+                    ))
+                })?
             }
             // ADR-014 P8 Decision 12: flat / legacy block-quant variants
             // (f16, bf16, q2, q4, q8) and Auto (post-resolution) flow

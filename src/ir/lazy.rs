@@ -408,6 +408,46 @@ impl LazyTensorMap {
         out
     }
 
+    /// Construct a metadata-only [`LazyTensorMap`] view of an eager
+    /// [`TensorMap`] by reference — every entry becomes a
+    /// [`LazyTensor::from_closure`] backed by a closure that *would*
+    /// re-clone the bytes if asked, but only the metadata (shape,
+    /// dtype, name) is needed for the calibrator-fingerprint
+    /// downstream. The source `tensor_map` retains ownership and no
+    /// bytes are allocated unless `materialize()` is called.
+    ///
+    /// **When to use over `from_eager`**: this method is the bridge
+    /// when the caller wants to feed [`crate::calibrate::calibrator::Calibrator::calibrate`]
+    /// a `LazyTensorMap` view (for the `model_fingerprint` cache key)
+    /// without consuming or duplicating the source `tensor_map`. The
+    /// fingerprint walks `iter()` (metadata-only) so the closure body
+    /// is never invoked in the production calibrate path. ADR-014 P2
+    /// iter-2 §S1: used by `cmd_convert` to drive the calibrator
+    /// without consuming `tensor_map`.
+    ///
+    /// **Memory cost**: zero — closures capture nothing because the
+    /// production calibrator never materialises this view. If a future
+    /// caller does materialise (e.g. a calibrator that itself reads
+    /// weight bytes), the closure surfaces a typed
+    /// [`MaterializeError::Transform`] rather than silently allocating
+    /// — that's a contract change, not a runtime path.
+    pub fn from_eager_borrowed(tensor_map: &TensorMap) -> Self {
+        let mut out = Self::new();
+        for (_, tref) in tensor_map.tensors.iter() {
+            let meta = LazyMeta::new(tref.name.clone(), tref.shape.clone(), tref.dtype);
+            let name_for_err = tref.name.clone();
+            out.insert(LazyTensor::from_closure(meta, move || {
+                Err(MaterializeError::Transform {
+                    name: name_for_err.clone(),
+                    reason: "from_eager_borrowed view is metadata-only; \
+                             source tensor_map owns the bytes (ADR-014 P2 iter-2 §S1)"
+                        .to_string(),
+                })
+            }));
+        }
+        out
+    }
+
     /// Materialise every tensor and produce an eager [`TensorMap`].
     ///
     /// **Bridge for P0**. ADR-014 Decision 2 specifies this as the
