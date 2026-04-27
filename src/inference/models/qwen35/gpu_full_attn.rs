@@ -380,17 +380,24 @@ pub fn apply_imrope(
         mode: RopeMultiMode::Imrope,
         sections: mrope_section,
     };
-    let out = device
-        .alloc_buffer(
-            (seq_len * n_heads * head_dim) as usize * 4,
-            DType::F32,
-            vec![
-                seq_len as usize,
-                n_heads as usize,
-                head_dim as usize,
-            ],
-        )
-        .map_err(|e| anyhow!("alloc imrope out: {e}"))?;
+    // ADR-015 iter7a (P3b alloc_buffer pool, sub-iter 7a): pooled.
+    // The output flows into dispatch_sdpa_decode → SDPA kernel which
+    // uses `element_count()` (logical shape product), NOT `byte_len()`.
+    // Pool's bucket-rounded byte_len is therefore safe here — the
+    // §P3a' Codex Q3 hazard about CPU-read byte_len mismatch does
+    // not apply (the q_rope / k_rope buffers are GPU-only on the
+    // kv_cache_slot=Some branch which is the apex production path).
+    let out = super::decode_pool::pooled_alloc_buffer(
+        device,
+        (seq_len * n_heads * head_dim) as usize * 4,
+        DType::F32,
+        vec![
+            seq_len as usize,
+            n_heads as usize,
+            head_dim as usize,
+        ],
+    )
+    .map_err(|e| anyhow!("alloc imrope out (pooled): {e}"))?;
 
     // ADR-015 P3b rank-4: the three small (16-byte) param/rope_params/
     // sections buffers were previously rebuilt on every call (32×/token
