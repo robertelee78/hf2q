@@ -495,6 +495,109 @@ note for traceability.
    **Track B for iter5/iter6: port the rope_multi cache to gemma's
    `forward_mlx.rs` rope call sites.**
 
+### 2026-04-27 — §P3a''' apex MoE live profile pass (iter6, Wave 2b hard gate #1 CLOSED)
+
+**Provenance.**  Same xctrace TimeProfiler harness as §P3a' / §P3a''
+(`scripts/profile-p3aprime.sh`) with `FIXTURE` overridden to the apex
+35B-A3B fixture: `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46`.
+**5 cold-SoC trials × 64 decode tokens** at hf2q@`e6a531f` /
+mlx-native@`19f5569` (post-iter1 — `dispatch_rope_multi_cached` now in
+the build).  Aggregated via `aggregate_decode.py` with the qwen35
+hypothesis register + `--decode-filter 'forward_gpu_greedy'` (the
+qwen35 decode entry — same filter §P3a' used).  No thermal warning
+recorded any trial.  Raw artifacts at `/tmp/adr015-apex-p3a/`.
+
+**Closes Wave 2b hard gate #1** (the apex 35B-A3B MoE re-measurement
+gate from §"Codex review acceptance — Wave 2a P3a' rev1") — every
+table cell below is from the apex MoE fixture, the dense-fixture
+extrapolation problem from Wave 2a is gone.  5-trial median
+aggregation (Wave 2b methodology fix #5) replaces the 3-trial mean
+that exposed the 21% trial-3 outlier-bias on dense.
+
+**Per-trial decode CPU wall.**
+
+| Trial | decode-filtered samples | CPU ms attributed | µs/token (CPU only) |
+|---|---:|---:|---:|
+| 1 | 104 | 104 | 1625 |
+| 2 | 123 | 123 | 1922 |
+| 3 | 115 | 115 | 1797 |
+| 4 | 113 | 113 | 1766 |
+| 5 | 108 | 108 | 1688 |
+
+Median: **113 ms / 64 = 1766 µs/token CPU**.  Apex MoE total decode
+wall ≈ 9.16 ms/token (per ADR-012 closure).  CPU share ≈ **19 %**,
+GPU share ≈ **81 %**.  Substantially more CPU-bound than gemma
+(5.7 %) but still GPU-dominant — both families need GPU-side work
+to fully clear D4.
+
+**Per-hypothesis live measurements (5-trial median µs/token, 64
+tokens/trial, decode-filtered):**
+
+| ID | canonical frame | static est | live (5-trial median) | per-trial µs/token | verdict |
+|---|---|---:|---:|---|---|
+| **H1** | `qwen35::gpu_ffn::proj::` (literal `fn proj` site) | 100 | **375** | 297 / 406 / 375 / 375 / 297 | **CONFIRMED at literal site on apex MoE.**  Subcomponent: `build_dense_ffn_layer_gpu_q` = 0 (correct — apex doesn't exercise it); `build_moe_ffn_layer_gpu_q` = 578 µs/token (37 ms median × 1000/64).  **Wave 2b hard gate #1 (a) — H1 literal site sized: ✅** |
+| **H2** | `qwen35::gpu_full_attn::apply_imrope::` | 80 | **63** | 16 / 63 / 63 / 16 / 63 | **iter1 IMPACT MEASURED on apex.**  `build_rope_multi_buffers` subcomponent = 0 µs/token (cache-hit path).  Apex post-iter1 vs Wave 2a dense (464 µs/token) = **−401 µs/token / −86 %**.  iter1 confirmed effective on the apex production fixture, not just dense. |
+| **H3** | `MlxDevice::command_encoder::` | 55 | **125** | 94 / 125 / 125 / 94 / 172 | **Lower than dense (724 µs/token).**  Apex's MoE wrapper opens fewer encoders/token than dense's per-stage encoder pattern.  Single-CB (P3) still removes most of this. |
+| **H4** | `issue_metal_buffer_barrier` | 35 | **0** | all 0 | **Sub-1ms TimeProfiler resolution** — same status as §P3a'/§P3a''.  `BARRIER_COUNT` / `BARRIER_NS` (iter2) ARE the right tool; rerun under `MLX_PROFILE_BARRIERS=1` if needed. |
+| **H5** | `anyhow::Context::with_context` | 25 | **0** | all 0 | **Confirmed FALSIFIED on apex too** — closure-built `format!` is lazy on success. |
+| **H6** | `MlxDevice::alloc_buffer::` (Wave 2b new entry) | — | **344** | 297 / 359 / 281 / 375 / 344 | **Wave 2b hard gate #1 (b) — H6 sized for apex: ✅**.  Subcomponents: `IOGPUResourceCreate` = 203 µs/token; `mach_msg2_trap` = 156 µs/token; `IOConnectCallMethod` = 172 µs/token.  About **9× smaller than dense Wave 2a's 3063 µs/token (without trial 3).**  Apex MoE's call pattern is fundamentally different from dense Q4_0: MoE expert dispatch reuses fewer fresh buffers per layer.  Pool migration on apex still recovers a real ~344 µs/token; just not the dominant lever it was on dense. |
+
+**Wave 2a static-suspect-list re-scoping (final).**
+
+The original Wave 1 P3b suspect list (helper-function indirection,
+buffer-pool acquisition, barrier bookkeeping, KV-cursor updates) has
+now been measured on the actual apex MoE fixture.  The §P3a'
+supersession note observed this list was falsified for **dense**;
+the apex re-measurement now sizes its rows at ranked priority for
+the qwen35 family:
+
+1. **H1 literal `fn proj`**: 375 µs/token primary, 578 µs/token in
+   `build_moe_ffn_layer_gpu_q` parent — the dominant lever.
+2. **H6 alloc_buffer**: 344 µs/token (overlaps with H1 since H1
+   inclusive contains alloc descendants — see Codex Q3 caveat).
+3. **H3 command_encoder**: 125 µs/token — closes under P3.
+4. **H2 apply_imrope** post-iter1: 63 µs/token — already nearly closed.
+
+H1 + H6 + H3 sum (with overlap caveat) ≈ 844 µs/token nominal — but
+Codex Q3 / AF3 says don't sum overlapping inclusive frames; the
+real recovery upper bound is bounded by the **non-overlapping CPU
+total of 1766 µs/token median**.  Per the §P3a''' total-CPU
+constraint: **even closing all listed CPU levers to 0 saves at most
+1.77 ms/token of the ~9.16 ms apex MoE decode wall (~19 % of wall)**.
+
+**iter1 cumulative impact (apex MoE).**
+
+H2 was 464 µs/token (Wave 2a dense static-estimate inflation × 5.8)
+and is now 63 µs/token on apex.  Conservatively crediting only the
+delta we directly measured (Wave 2a was a different fixture; treat
+the comparison as a sanity check, not arithmetic): iter1 measurably
+closed the literal H2 site on apex.  ADR-012 closure pre-iter1 gap
+was 540 µs/token (1/109.1 − 1/116.0 t/s).  A fresh apex bench is
+running concurrently to capture the post-iter1 ratio in numbers
+rather than estimates.
+
+**iter7 plan refined by §P3a'''.**
+
+Per the discovery in iter6 prep that `decode_pool::pooled_alloc_buffer`
+infrastructure already exists in the codebase (`MlxBufferPool` with
+arena lifecycle + `reset_decode_pool` between tokens), iter7 is a
+**migration**, not a build.  Target sites (`grep device.alloc_buffer`
+in qwen35 with /test/load filtered out):
+
+- `gpu_full_attn.rs:384` `apply_imrope` output buffer (32 calls/token
+  on apex MoE FullAttn = 16 layers × 2 = 32; per-call ~16 KB Q + ~4 KB K).
+- `forward_gpu.rs:295/302/448/651/861/868/1183/1186/1189/1194/1226`
+  decode-hot output / argmax / position scratch.
+- `gpu_full_attn.rs:565/1687/1779/1845` projection helpers /
+  positions / argmax index — verify each is on the production
+  decode hot path before migrating.
+
+Hazards re-confirmed from §P3a' Codex Q3 still apply: CB lifetime
+fence (already provided by `reset_decode_pool` at top-of-token);
+byte_len / shape correctness for any CPU-read buffer (preserve
+`gpu_ffn.rs:391-396` `proj()` carve-out semantics — the existing
+pool already preserves exact byte_len); peak working-set caps.
+
 ### 2026-04-27 — §P3a'' gemma live profile pass (iter5)
 
 **Provenance.** Same xctrace TimeProfiler harness as §P3a' (`scripts/profile-p3aprime.sh`) with `FIXTURE` and `OUT_DIR` overridden for gemma.  5 cold-SoC trials × 64 decode tokens on `gemma-4-26B-A4B-it-ara-abliterated-dwq` at hf2q@`675c83c` / mlx-native@`19f5569`.  No thermal warning recorded any trial.  Aggregated by `scripts/aggregate_decode.py --decode-filter 'forward_decode(?!_kernel_profile)'` (newly added decode-filter scopes aggregation to samples whose backtrace contains the gemma decode entry, mirroring the §P3a' filter on `forward_gpu_greedy`).
@@ -1269,6 +1372,7 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
 - **2026-04-27 — §"P3a' live profile pass" infused (CFA Wave 2a, `cfa-20260426-adr015-wave2a-p3aprime`).** xctrace TimeProfiler captured 3 cold-SoC trials × 64 decode tokens on macOS 26.4.1 / M5 Max with the qwen3.6-27b-dwq46 dense fixture.  Decode-only stack filtering (`forward_gpu_greedy`) yields the live ranked residual: rank 1 is `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` at 3719 µs/token (Mach-IPC kernel-call dominated, ~1 IPC per GPU resource × ~hundreds of decode-token allocations); rank 3 is `command_encoder()` churn at 724 µs/token (closes under P3 single-CB); rank 4's `build_rope_multi_buffers` at 208 µs/token is independently fixable by hoisting per-call rope-params buffers to model-load time.  Hypothesis register: H1 (`gpu_ffn.rs:397-404` proj alloc) NOT FOUND at literal site (dense path doesn't call proj()) but the underlying *category* CONFIRMED at 37× the static estimate via the rank-1 alloc_buffer chain; H2 (apply_imrope) CONFIRMED 5.8× larger than estimated; H3 (command_encoder churn) CONFIRMED 13× larger; H4 (memory_barrier) FALSIFIED at literal site (sub-1ms-sample at 1ms granularity); H5 (with_context allocation) FALSIFIED — confirms Codex Wave 1 prior (`format!` lazy via closure).  Coverage gap flagged: dense fixture does not exercise the apex MoE expert proj path; Wave 2b must re-validate H1's literal site against the apex 35B-A3B fixture before committing P3b reductions to MoE-specific call sites.  Supersession note added to §Diagnosis pointing at §P3a'.  NAX questions Q-NAX-1, Q-NAX-3, Q-NAX-4 received in-row updates where the trace informed them (Q-NAX-3: confirmed macOS 26.4.1 ≥ 26.2 NAX threshold; Q-NAX-1, Q-NAX-4: noted that decode-only TimeProfiler trace cannot inform GPU-counter / long-K-prefill questions, both remain open).  Trace artifacts referenced by absolute path (not committed); only `scripts/profile-p3aprime.sh`, this ADR section, and `docs/perf-traces/.gitkeep` land in git.  The 9th static-evidence kernel hypothesis class (Wave 1 P3b suspect list) joins the falsified-by-live-evidence list per `project_metal_compiler_auto_optimizes_static_levers` — the Mach-IPC / IOGPU-resource-creation overhead was not on Wave 1's static suspect list because grep against Rust source can't see kernel boundary crossings.
+- **2026-04-27 — §P3a''' apex MoE live profile (iter6) + Wave 2b hard gate #1 CLOSED.**  5-cold-trial xctrace TimeProfiler against `qwen3.6-35b-a3b-abliterix-ega-abliterated-dwq46` post-iter1.  Decode-filtered aggregation via `aggregate_decode.py --decode-filter forward_gpu_greedy --hypothesis-config aggregate_hypotheses.json`.  **H1 literal `fn proj` site CONFIRMED at 375 µs/token on apex** (dense fixture had it as NOT FOUND); subcomponent `build_moe_ffn_layer_gpu_q` 578 µs/token.  **H6 alloc_buffer = 344 µs/token on apex** (vs §P3a' dense 3063 — different call pattern; MoE expert dispatch reuses more buffers per layer).  **H2 apply_imrope = 63 µs/token** (was 464 µs/token Wave 2a dense; iter1 cache effective on apex too — `build_rope_multi_buffers` subcomponent = 0 µs/token).  **H3 command_encoder = 125 µs/token** (lower than dense's 724; closes under P3).  H4 / H5 same FALSIFIED / sub-1ms verdicts.  Median per-trial CPU wall: 1766 µs/token on apex (19% of 9.16 ms decode wall); CPU-side levers bounded above by 1766 µs/token recovery.  Wave 2b hard gates #1 (a) literal H1 sized + (b) H6 sized for apex: ✅.  iter7 alloc_buffer pool plan refined: target list = decode-hot direct `device.alloc_buffer` sites in qwen35 (apply_imrope output, forward_gpu projections + argmax + positions); existing `decode_pool::pooled_alloc_buffer` infrastructure handles bucketing + reset.  Raw artifacts at `/tmp/adr015-apex-p3a/` (5 traces + 5 topcalls XML + aggregate-decode.{md,json}).  Apex bench post-iter1 runs concurrently to capture the live ratio against llama.cpp.
 - **2026-04-27 — §P3a'' gemma live profile pass (iter5).**  5-cold-trial xctrace TimeProfiler capture aggregated via `aggregate_decode.py --decode-filter forward_decode`.  Headline: **gemma decode is GPU-BOUND, not CPU-bound.**  Median per-trial CPU wall = 656 µs/token (5.7% of 11.4 ms decode wall); GPU = 94.3%.  G5 alloc_buffer = **0 µs/token** on gemma (qwen35 §P3a' rank-1 lever does NOT exist here).  G6 GraphSession bookkeeping = 219 µs/token (largest CPU contributor; bounded by 656 µs/token total).  Pre-iter5 "shared P3b lever" hypothesis FALSIFIED for gemma; the 19% gap to llama.cpp lives in GPU compute.  Aggregator gained `--decode-filter <regex>` option to scope per-token aggregation (mirrors §P3a' on `forward_gpu_greedy`).  New Wave 2c hard gates introduced: Metal System Trace + kernel comparison vs llama.cpp; P3c scope may need to extend to decode mat-vec NAX routing if data supports.  iter6 / iter7 plans rescoped: alloc_buffer pool is qwen35-only; gemma's lever is GPU-side.  Raw artifacts at `/tmp/adr015-gemma-p3aprime/` (traces + topcalls XML + aggregate.md).
 - **2026-04-27 — P0 gemma baseline measured (iter4).**  hf2q `35fdcc8` / mlx-native `19f5569` measured against same-day llama-bench on `gemma-4-26B-A4B-it-ara-abliterated-dwq` n=256 cold-SoC: hf2q **87.8 t/s** (per-trial 87.7 / 87.8 / 88.0; σ ≈ 0.15) vs llama-bench **104.52 t/s** (per-trial 103.96 / 104.58 / 104.52) = **0.840×**, recovery required **+19.0%**.  Fills D4 second-bullet placeholder + closes Phasing P0 row.  Bench harness `scripts/bench-baseline.sh` lands alongside (RAM-headroom precheck + thermal-gate + JSON metadata + tee summary).  Two harness bugs caught + fixed in the follow-up commit (`run_*_trial` progress echo bled into captured stdout; llama-bench awk grabbed std-dev not median).  New diagnosis subsection ("2026-04-27 — P0 Gemma baseline (iter4) reshapes the phasing budget") captures the implications: gemma gap is structurally larger than qwen35 ADR-012 baseline (0.840× vs 0.94×) AND lives entirely outside CB-count (gemma is already at 1-2 CBs/token), so D1's gemma half is refactor-for-uniformity not perf lever; the lever is shared P3b orchestration, particularly rank-1 alloc_buffer pool which can apply to both families.  Adds a Track B for iter5/iter6: port the iter1 rope_multi cache pattern to gemma's `forward_mlx.rs` rope call sites.
 - **2026-04-27 — Wave 2b iter3 landed (aggregate_decode.py rewrite + 5-trial median harness).**  hf2q @ `bcd08dd` lands `scripts/aggregate_decode.py` + `scripts/aggregate_hypotheses.json` + `scripts/profile-p3aprime.sh` (default `N_TRIALS=5`).  Replaces the volatile `/tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py` working-copy that had AF3 (overlapping-inclusive-frame double-count) + AF4 (rank-stability split-on-tuple) bugs and used 3-trial mean instead of 5-trial median.  The new aggregator: (a) reports ONE canonical frame per hypothesis via the regex in `scripts/aggregate_hypotheses.json`, (b) lists named subcomponents side-by-side without summing them into the primary, (c) keeps frame names as `str` end-to-end with a typed dataclass for trial state, (d) defaults to 5-trial median (outlier-absorbing without silent discard).  Hypothesis register includes the new H6-Wave2b-AllocBuffer entry pointing at `MlxDevice::alloc_buffer::` for the rank-1 P3b lever.  H4's regex now targets `issue_metal_buffer_barrier` (the new `#[inline(never)]` frame from iter2) so TimeProfiler can attribute it; the `BARRIER_COUNT`/`BARRIER_NS` counters from iter2 provide the authoritative number.  Smoke-tested on synthetic xctrace XML — correct per-trial totals, median, subcomponent isolation, rank-stability table.  Closes Wave 2b hard gates #3, #4, #5.  Remaining Wave 2b hard gates: #1 (apex 35B-A3B MoE 5-cold-trial × 64-decode-token re-measurement) and #2 (already closed by iter2 BARRIER counters).
