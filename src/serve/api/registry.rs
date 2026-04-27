@@ -209,6 +209,39 @@ impl ModelRegistration {
             _ => "",
         }
     }
+
+    /// Wave 3.5 HIGH-1 — Auto-lazy multi-function parallel inter-call
+    /// sequence.  Used by `combine_function_grammars` when wiring up
+    /// `tool_choice = auto` with multiple registered functions and
+    /// `parallel_tool_calls = true`.
+    ///
+    /// Unlike `parallel_call_separator()`, this string includes the
+    /// **open marker** because the per-function alts under Auto-lazy
+    /// are body-only (`OneOrMoreCallsBodyOnly { parallel: false }` =
+    /// `body close`).  Inserting the open marker as part of the
+    /// inter-call sequence reconstructs the correct chat-template
+    /// emission shape WITHOUT requiring the FIRST open marker (which
+    /// the splitter consumes via the awaiting_trigger gate before the
+    /// grammar is engaged).
+    ///
+    /// * Gemma 4: `"<|tool_call>"` — no whitespace, just the open
+    ///   marker (chat_template.jinja:189-205 emits calls back-to-back
+    ///   with the next call's `<|tool_call>` immediately after the
+    ///   previous `<tool_call|>`).
+    /// * Qwen 3.5/3.6: `"\n<tool_call>\n"` — `\n` separator + open
+    ///   marker + `\n` (mirrors the chat_template loop's
+    ///   `\n<tool_call>\n...\n</tool_call>` per-call pattern; the
+    ///   trailing `\n</tool_call>` is provided by the per-fn body-only
+    ///   shape).
+    /// * Unknown families: empty string (combiner rejects unknown
+    ///   families before this method is called).
+    pub fn auto_lazy_multi_fn_inter_call(&self) -> &'static str {
+        match self.family {
+            "gemma4" => "<|tool_call>",
+            "qwen35" => "\n<tool_call>\n",
+            _ => "",
+        }
+    }
 }
 
 /// Root-rule shape selector for `tool_call_gbnf`.
@@ -235,6 +268,49 @@ pub enum GrammarShape {
     ///   * Qwen 3.5/3.6: `call ("\n" call)*` (template separates calls
     ///     2+ with literal `\n`; tokenizer_config.json:285+).
     OneOrMoreCalls { parallel: bool },
+    /// Wave 3.5 HIGH-1 — body-only multi-call root with the **first** open
+    /// marker stripped.  Used exclusively by `tool_choice = auto` paired
+    /// with `GrammarKind::ToolCallBodyAuto` (lazy / awaiting_trigger).
+    ///
+    /// Production-order rationale (audit
+    /// /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt divergence
+    /// "W-B2 Auto lazy grammar production correctness"):  the engine's
+    /// decode loop calls `runtime.accept_bytes(token_bytes)` on every
+    /// sampled token BEFORE the splitter's marker boundary fires.  While
+    /// `awaiting_trigger=true` (Auto-lazy), `accept_bytes` is a no-op.
+    /// The splitter then sees the per-model open marker as a special
+    /// single-token emission (see the marker-shape contract on
+    /// `tool_open` / `tool_close` above), fires `ToolCallOpen`, and the
+    /// engine calls `runtime.trigger()` flipping the gate false.  The
+    /// FIRST open marker has already been consumed (as no-op) at this
+    /// point — replaying it into the now-eager grammar would distort
+    /// the byte stream.
+    ///
+    /// Required/Function uses `OneOrMoreCalls` because no splitter
+    /// precedes the eager grammar; the marker IS part of the body
+    /// grammar from byte 0.  Auto uses this variant because the FIRST
+    /// open marker is consumed by the awaiting_trigger gate before the
+    /// grammar is engaged.  Subsequent markers (close marker after this
+    /// call's body, AND any inter-call open markers under
+    /// `parallel = true`) ARE in the grammar — those bytes flow through
+    /// `accept_bytes` while the runtime is eager.
+    ///
+    /// Concrete shape:
+    ///   * `parallel = false`:
+    ///       Gemma 4: `body close_marker space`
+    ///       Qwen 3.5/3.6: `body \n close_marker space` (mirrors the
+    ///         chat_template's `\n</tool_call>` close form)
+    ///   * `parallel = true`:
+    ///       Gemma 4: `body close_marker ( open_marker body close_marker )* space`
+    ///       Qwen 3.5/3.6: `body \n close_marker ( \n open_marker \n body \n close_marker )* space`
+    ///
+    /// Audit recommendation reference (research-report.md §Q1+§Q2): the
+    /// canonical Wave 2.6 architecture is "grammar = body validator;
+    /// splitter = boundary detector".  For Auto-lazy the FIRST marker is
+    /// the splitter's responsibility (it's what triggers the grammar);
+    /// thereafter the grammar accepts everything including any closing
+    /// and re-opening markers.
+    OneOrMoreCallsBodyOnly { parallel: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,14 +1331,22 @@ fn gemma4_tool_call_gbnf(
         format!("{} {} gemma4-any-kv-char* {}", prefix_lit, open_lit, close_lit)
     };
 
-    // Wave 2.7 W-η: select root rule per `shape`.
+    // Wave 2.7 W-η + Wave 3.5 HIGH-1: select root rule per `shape`.
     //
-    //   * `SingleBody`         → body-only root (legacy lazy path).
-    //   * `OneOrMoreCalls{p}`  → wrap body with Gemma 4 marker pair
-    //     `<|tool_call>` / `<tool_call|>` (verbatim from
+    //   * `SingleBody`                       → body-only root (single
+    //     call, no markers; legacy lazy path).
+    //   * `OneOrMoreCalls{p}`                → wrap body with Gemma 4
+    //     marker pair `<|tool_call>` / `<tool_call|>` (verbatim from
     //     models/gemma4/chat_template.jinja:189-205) and repeat per
     //     `parallel`.  No separator: chat_template emits calls 2+
     //     immediately after the previous call's close marker.
+    //   * `OneOrMoreCallsBodyOnly{p}`        → Wave 3.5 HIGH-1 Auto-lazy
+    //     variant.  Strips the FIRST open marker (consumed by the
+    //     awaiting_trigger no-op gate before the grammar is engaged).
+    //     Single: `body close_marker`; parallel:
+    //     `body close_marker ( open_marker body close_marker )* space`.
+    //     See `GrammarShape::OneOrMoreCallsBodyOnly` doc-comment for the
+    //     production-order rationale.
     let root_body = match shape {
         GrammarShape::SingleBody => format!("{} space", single_body),
         GrammarShape::OneOrMoreCalls { parallel } => {
@@ -1280,6 +1364,30 @@ fn gemma4_tool_call_gbnf(
                 format!("{} {}* space", g4_call_rule, g4_call_rule)
             } else {
                 format!("{} space", g4_call_rule)
+            }
+        }
+        GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
+            // Wave 3.5 HIGH-1: leading open marker is stripped (consumed
+            // by the awaiting_trigger gate before the grammar fires).
+            // The trailing close marker IS in the grammar — those bytes
+            // flow through `accept_bytes` once the runtime is eager.
+            let open_marker = gbnf_literal("<|tool_call>");
+            let close_marker = gbnf_literal("<tool_call|>");
+            if parallel {
+                // First call: body close — no leading open.  Subsequent
+                // calls: full open+body+close, no inter-call separator
+                // (chat_template.jinja:189-205 emits calls back-to-back).
+                let g4_call_rule = "gemma4-call".to_string();
+                rules.push((
+                    g4_call_rule.clone(),
+                    format!("{} {} {}", open_marker, single_body, close_marker),
+                ));
+                format!(
+                    "{} {} {}* space",
+                    single_body, close_marker, g4_call_rule
+                )
+            } else {
+                format!("{} {} space", single_body, close_marker)
             }
         }
     };
@@ -1534,15 +1642,24 @@ fn qwen35_tool_call_gbnf(
         format!("{} qwen35-inner-char* {}", func_open_lit, func_close_lit)
     };
 
-    // Wave 2.7 W-η: select root rule per `shape`.
+    // Wave 2.7 W-η + Wave 3.5 HIGH-1: select root rule per `shape`.
     //
-    //   * `SingleBody`         → body-only root (legacy lazy path).
-    //   * `OneOrMoreCalls{p}`  → wrap body with Qwen 3.5/3.6 marker pair
-    //     `<tool_call>\n` / `\n</tool_call>` (verbatim from
+    //   * `SingleBody`                       → body-only root (single
+    //     call, no markers; legacy lazy path).
+    //   * `OneOrMoreCalls{p}`                → wrap body with Qwen
+    //     3.5/3.6 marker pair `<tool_call>\n` / `\n</tool_call>`
+    //     (verbatim from
     //     models/qwen3.6-27b-dwq46/tokenizer_config.json:285+) and
     //     repeat per `parallel`.  Calls 2+ are separated by a literal
     //     `\n` per the chat_template's `{%- else %}{{- '\n<tool_call>\n...
     //     ' }}` branch.
+    //   * `OneOrMoreCallsBodyOnly{p}`        → Wave 3.5 HIGH-1 Auto-lazy
+    //     variant.  Strips the FIRST open marker (consumed by the
+    //     awaiting_trigger no-op gate before the grammar is engaged).
+    //     Single: `body \n close_marker`; parallel:
+    //     `body \n close_marker ( \n open_marker \n body \n close_marker )* space`.
+    //     See `GrammarShape::OneOrMoreCallsBodyOnly` doc-comment for the
+    //     production-order rationale.
     let root_body = match shape {
         GrammarShape::SingleBody => format!("{} space", single_body),
         GrammarShape::OneOrMoreCalls { parallel } => {
@@ -1570,6 +1687,40 @@ fn qwen35_tool_call_gbnf(
                 )
             } else {
                 format!("{} space", qwen_call_rule)
+            }
+        }
+        GrammarShape::OneOrMoreCallsBodyOnly { parallel } => {
+            // Wave 3.5 HIGH-1: leading open marker is stripped (consumed
+            // by the awaiting_trigger gate before the grammar fires).
+            // The trailing close marker IS in the grammar — those bytes
+            // flow through `accept_bytes` once the runtime is eager.
+            let open_marker = gbnf_literal("<tool_call>");
+            let close_marker = gbnf_literal("</tool_call>");
+            if parallel {
+                // First call: `body \n close_marker` (no leading
+                // `<tool_call>\n`).  Subsequent calls: full
+                // `\n <tool_call> \n body \n </tool_call>` (matches the
+                // chat_template loop's `\n<tool_call>\n...\n</tool_call>`
+                // separator pattern).
+                let qwen_call_rule = "qwen35-call".to_string();
+                rules.push((
+                    qwen_call_rule.clone(),
+                    format!(
+                        "{} {} {} {} {}",
+                        open_marker, newline_lit, single_body, newline_lit, close_marker
+                    ),
+                ));
+                format!(
+                    "{} {} {} ( {} {} )* space",
+                    single_body, newline_lit, close_marker, newline_lit, qwen_call_rule
+                )
+            } else {
+                // Single call: body + `\n</tool_call>` (close marker
+                // preceded by `\n` per the template emission pattern).
+                format!(
+                    "{} {} {} space",
+                    single_body, newline_lit, close_marker
+                )
             }
         }
     };

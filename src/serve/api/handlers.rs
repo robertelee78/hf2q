@@ -2913,8 +2913,28 @@ fn compile_tool_grammar(
     // split keeps the per-function repetition coherent for the common
     // single-tool path while letting the combiner pick the family
     // separator for multi-tool requests.
+    //
+    // Wave 3.5 HIGH-1 — Auto vs Required shape selection:
+    //   * Required / Function: marker-wrapped (`OneOrMoreCalls`).  No
+    //     splitter precedes the eager grammar — the marker IS part of
+    //     the body grammar from byte 0.
+    //   * Auto:                body-only (`OneOrMoreCallsBodyOnly`).
+    //     The first open marker is consumed by the awaiting_trigger
+    //     no-op gate BEFORE the grammar is engaged; replaying it into
+    //     the now-eager grammar would distort the byte stream.  See
+    //     `registry::GrammarShape::OneOrMoreCallsBodyOnly` doc-comment
+    //     and audit divergence "W-B2 Auto lazy grammar production
+    //     correctness" in
+    //     /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt.
+    let auto_lazy = matches!(tool_choice, ToolChoiceValue::Auto);
     let per_fn_shape = if matching_tools.len() == 1 {
-        registry::GrammarShape::OneOrMoreCalls { parallel }
+        if auto_lazy {
+            registry::GrammarShape::OneOrMoreCallsBodyOnly { parallel }
+        } else {
+            registry::GrammarShape::OneOrMoreCalls { parallel }
+        }
+    } else if auto_lazy {
+        registry::GrammarShape::OneOrMoreCallsBodyOnly { parallel: false }
     } else {
         registry::GrammarShape::OneOrMoreCalls { parallel: false }
     };
@@ -2943,10 +2963,27 @@ fn compile_tool_grammar(
     // Each grammar has `root ::= ...` as its first rule. We rename function
     // grammars to `fn-0`, `fn-1`, ... then emit a combined root that
     // alternates them.
+    //
+    // Wave 3.5 HIGH-1 — separator selection:
+    //   * Required/Function multi-fn parallel: separator =
+    //     `parallel_call_separator()` (`""` Gemma, `"\n"` Qwen).  Each
+    //     per-fn alt is a full call (`open body close`), so the
+    //     between-call sequence is just whitespace (or empty).
+    //   * Auto multi-fn parallel: separator =
+    //     `auto_lazy_multi_fn_inter_call()` (`"<|tool_call>"` Gemma,
+    //     `"\n<tool_call>\n"` Qwen).  Each per-fn alt is body-only
+    //     (`body close`), so the inter-call separator must include
+    //     the open marker to reconstruct the chat-template emission
+    //     shape — except for the FIRST call, where the splitter has
+    //     already consumed the open marker (awaiting_trigger gate).
     let combined_gbnf = if fn_gbnfs.len() == 1 {
         fn_gbnfs.into_iter().next().unwrap()
     } else {
-        let separator = reg.parallel_call_separator();
+        let separator = if auto_lazy {
+            reg.auto_lazy_multi_fn_inter_call()
+        } else {
+            reg.parallel_call_separator()
+        };
         combine_function_grammars(fn_gbnfs, parallel, separator)
     };
 
@@ -3229,12 +3266,28 @@ mod compile_tool_grammar_precondition_tests {
     }
 
     /// Auto + tools[] + registered family + parallel_tool_calls=true
-    /// produces the SAME grammar shape as Required + same flags
-    /// (proves the lazy / eager decision is purely a runtime flag flip,
-    /// not a grammar-shape divergence).  This is the "Auto compiles the
-    /// same body grammar as Required" canonical-llama.cpp invariant.
+    /// produces a grammar that DIFFERS from Required at exactly one
+    /// well-defined boundary: the FIRST open marker is stripped under
+    /// Auto.  This is the Wave 3.5 HIGH-1 production-correctness fix.
+    ///
+    /// Pre-Wave 3.5 invariant (W-B2): Auto and Required compiled the
+    /// SAME grammar; the lazy/eager decision was purely a runtime flag
+    /// flip.  But the audit at
+    /// `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`
+    /// proved that invariant was production-broken: under Auto, the
+    /// engine's `accept_bytes` is a no-op while `awaiting_trigger=true`,
+    /// so the FIRST open marker is consumed (no-op) before the splitter
+    /// fires `ToolCallOpen` and the engine calls `runtime.trigger()`.
+    /// The grammar then begins enforcing on body bytes — but the root
+    /// still expects the open marker, which is no longer in the stream.
+    ///
+    /// Post-Wave 3.5 invariant: Auto compiles a body-only root
+    /// (`OneOrMoreCallsBodyOnly`) that strips the FIRST open marker;
+    /// Required keeps the marker-wrapped root (`OneOrMoreCalls`).  The
+    /// grammars share all per-function body rules verbatim and differ
+    /// ONLY in the top-level call shape.
     #[test]
-    fn compile_tool_grammar_auto_grammar_bytes_match_required() {
+    fn compile_tool_grammar_auto_strips_first_open_marker_relative_to_required() {
         if registry::find_for("gemma4-27b-it").is_none() {
             return;
         }
@@ -3253,13 +3306,85 @@ mod compile_tool_grammar_precondition_tests {
 
         let auto_gbnf = grammar::serialize::serialize(&g_auto);
         let req_gbnf = grammar::serialize::serialize(&g_req);
-        assert_eq!(
+
+        // The grammars MUST differ — Auto strips the first open marker.
+        assert_ne!(
             auto_gbnf, req_gbnf,
-            "Wave 3 W-B2 invariant: Auto and Required produce byte-identical \
-             grammars on the same registered family + same tools[]; the only \
-             distinction is the GrammarKind discriminant set by \
-             tool_grammar_kind_for(&tool_choice) at the call site.\n\
-             Auto:\n{auto_gbnf}\nRequired:\n{req_gbnf}"
+            "Wave 3.5 HIGH-1 invariant: Auto and Required produce DIFFERENT \
+             grammars; Auto's body-only root is the production-correct match \
+             for the awaiting_trigger swallow-then-trigger byte-stream order. \
+             A regression that re-equates them would re-open the audit's \
+             'W-B2 Auto lazy grammar production correctness' divergence."
+        );
+
+        // The KEY structural divergence: Required's `root` rule begins
+        // with the encoded open marker (eager grammar — every call,
+        // including the first, is wrapped); Auto's `root` rule begins
+        // with the encoded body opener `call:` (Wave 3.5 HIGH-1 — first
+        // call's open marker is stripped because the splitter consumes
+        // it before the grammar is engaged).
+        //
+        // Both grammars contain the open marker as a character-literal
+        // sequence (Required: at the start of every call; Auto: only
+        // in the inter-call `gemma4-call` rule used for calls 2+ under
+        // parallel=true).  The cleanest invariant to pin is what
+        // `root` STARTS with.
+        let open_marker_encoded = "[<] [|] [t] [o] [o] [l] [_] [c] [a] [l] [l] [>]";
+        let body_opener_encoded = "[c] [a] [l] [l] [:]"; // `call:` is the Gemma 4 body prefix
+        assert!(
+            req_gbnf.contains(open_marker_encoded),
+            "Required grammar MUST contain the encoded open marker; \
+             grammar:\n{req_gbnf}"
+        );
+        assert!(
+            auto_gbnf.contains(open_marker_encoded),
+            "Auto grammar with parallel=true MUST still contain the open \
+             marker for inter-call positions (calls 2+); only the FIRST \
+             open marker is stripped.  grammar:\n{auto_gbnf}"
+        );
+
+        // The Required call rule starts with the open marker; the Auto
+        // root expands to body bytes BEFORE any open marker appears.
+        // Find the first occurrence of each encoded literal in `root ::=`
+        // expansion and assert their relative order:
+        //   * In Required's serialized output, `root ::= gemma4-call ...`
+        //     — root expands via gemma4-call which starts with open marker.
+        //   * In Auto's serialized output, `root ::= [c] [a] [l] [l] [:]
+        //     ... [<] [|] [t] [o] [o] [l] [_] [c] [a] [l] [l] [|] [>]
+        //     gemma4-call* ...` — root expands BODY FIRST, then trailing
+        //     close marker, then OPTIONAL gemma4-call repetition.
+        //
+        // Concretely: Auto's `root` line MUST contain `body_opener_encoded`
+        // (`[c] [a] [l] [l] [:]`) inline (not just in a referenced rule).
+        let auto_root_line = auto_gbnf
+            .lines()
+            .find(|l| l.starts_with("root ::= "))
+            .expect("Auto grammar must have a root rule");
+        assert!(
+            auto_root_line.contains(body_opener_encoded),
+            "Wave 3.5 HIGH-1 invariant: Auto's `root` rule MUST inline the \
+             body opener (encoded `call:`) directly (the body-only shape \
+             produces `body close space` for parallel=false or \
+             `body close call_rule* space` for parallel=true at the root \
+             level).  A regression to the old marker-wrapped grammar \
+             would put `gemma4-call` at the root and hide the body inline. \
+             root line: {auto_root_line}"
+        );
+
+        // Required's `root` rule, by contrast, MUST NOT inline the body
+        // opener — it expands via `gemma4-call` which itself starts with
+        // the open marker.
+        let req_root_line = req_gbnf
+            .lines()
+            .find(|l| l.starts_with("root ::= "))
+            .expect("Required grammar must have a root rule");
+        assert!(
+            !req_root_line.contains(body_opener_encoded),
+            "Wave 3.5 HIGH-1 control: Required's `root` rule MUST NOT inline \
+             the body opener — it expands via `gemma4-call` which has the \
+             open marker at its start.  A regression that put body bytes \
+             directly in Required's root would break eager enforcement. \
+             root line: {req_root_line}"
         );
     }
 
@@ -3326,18 +3451,21 @@ mod compile_tool_grammar_precondition_tests {
 
     /// Auto-lazy runtime: AFTER the trigger fires (simulating the
     /// `ToolCallSplitter` reporting ToolCallOpen and the production code
-    /// at engine.rs:2577-2579 / engine.rs:1640-1642 calling
-    /// `runtime.trigger()`), the runtime begins constraining the body
-    /// shape — bytes that DON'T match the per-model call body drive the
-    /// runtime dead.  This proves the lazy-grammar wiring is real
-    /// (constructor mocks would not catch a regression that flipped
-    /// the wrong flag).
+    /// at engine.rs:3266-3284 calling `runtime.trigger()`), the runtime
+    /// begins constraining the body shape — bytes that DON'T match the
+    /// per-model call body drive the runtime dead.  This proves the
+    /// lazy-grammar wiring is real (constructor mocks would not catch a
+    /// regression that flipped the wrong flag).
+    ///
+    /// Wave 3.5 HIGH-1 update: the body-only grammar
+    /// (`OneOrMoreCallsBodyOnly`) starts with the body bytes, NOT the
+    /// open marker — the splitter has already swallowed the first open
+    /// marker via the awaiting_trigger no-op gate before this point.
     #[test]
     fn auto_lazy_grammar_constrains_body_after_marker() {
-        let reg = match registry::find_for("gemma4-27b-it") {
-            Some(r) => r,
-            None => return,
-        };
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
         let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
         let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
             .expect("Auto compile")
@@ -3348,7 +3476,7 @@ mod compile_tool_grammar_precondition_tests {
             .expect("GrammarRuntime::new must succeed");
         rt.set_awaiting_trigger(true);
 
-        // Simulate the production trigger pattern at engine.rs:2577-2579:
+        // Simulate the production trigger pattern at engine.rs:3266-3284:
         // ToolCallSplitter sees the open marker → engine flips the trigger.
         rt.trigger();
         assert!(
@@ -3367,19 +3495,20 @@ mod compile_tool_grammar_precondition_tests {
             !alive,
             "post-trigger lazy Auto runtime MUST drive its stacks dead on \
              non-call bytes — the grammar is now enforcing the per-model \
-             body shape (gemma4: <|tool_call>call:NAME{{...}}<tool_call|>)"
+             body shape (gemma4: call:NAME{{...}}<tool_call|>)"
         );
         assert!(
             rt.is_dead(),
             "post-trigger lazy Auto runtime that consumed invalid body bytes \
              MUST report dead so the engine's defensive 500 + streaming \
-             error event fires (engine.rs:1554, 2195 dead-check global)"
+             error event fires (engine.rs:3673 dead-check global)"
         );
 
-        // Sanity-control: a fresh runtime, triggered, then fed the OPEN
-        // MARKER + body prefix, must STAY ALIVE (proves the dead result
-        // above came from grammar enforcement, not a wiring bug that
-        // marks every post-trigger feed dead).
+        // Sanity-control: a fresh runtime, triggered, then fed the BODY
+        // prefix (NO open marker — the splitter swallowed it before
+        // trigger fired), must STAY ALIVE (proves the dead result above
+        // came from grammar enforcement, not a wiring bug that marks
+        // every post-trigger feed dead).
         //
         // We re-build the runtime to avoid sharing state.
         let g2 = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
@@ -3390,23 +3519,162 @@ mod compile_tool_grammar_precondition_tests {
         rt2.set_awaiting_trigger(true);
         rt2.trigger();
 
-        // Real Gemma4 body shape — open marker + `call:` prefix + name.
-        // This is a valid prefix but not a complete call (no close marker
-        // yet); the runtime must still be alive because more body bytes
-        // are expected.
-        let open = reg.tool_open.expect("gemma4 has tool_open");
-        let valid_prefix = format!("{open}call:get_weather{{q:");
-        let alive2 = rt2.accept_bytes(valid_prefix.as_bytes());
+        // Real Gemma4 BODY shape AFTER the splitter consumed the open
+        // marker — `call:` prefix + name.  The body-only grammar
+        // (Wave 3.5 HIGH-1) starts here, NOT at the open marker.
+        // This is a valid prefix but not a complete call (no close
+        // marker yet); the runtime must still be alive because more
+        // body bytes are expected.
+        let valid_prefix = b"call:get_weather{q:";
+        let alive2 = rt2.accept_bytes(valid_prefix);
         assert!(
             alive2,
             "post-trigger runtime MUST stay alive on valid Gemma4 body prefix \
-             ({}); a regression that marks all post-trigger feeds dead would \
-             trip this control",
-            valid_prefix
+             (no leading open marker — splitter swallowed it); a regression \
+             that marks all post-trigger feeds dead would trip this control"
         );
         assert!(
             !rt2.is_dead(),
-            "post-trigger runtime fed valid prefix bytes MUST NOT report dead"
+            "post-trigger runtime fed valid body prefix bytes MUST NOT report dead"
+        );
+    }
+
+    /// Wave 3.5 HIGH-1 — production-order regression test.
+    ///
+    /// Reproduces the exact byte-stream order the engine produces in
+    /// production for `tool_choice=auto`:
+    ///
+    ///   1. Runtime built with `awaiting_trigger=true` (lazy mode).
+    ///   2. Open-marker token bytes flow through `accept_bytes` BEFORE
+    ///      the splitter fires `ToolCallOpen`.  While awaiting,
+    ///      `accept_bytes` is a no-op returning `true` (alive,
+    ///      sampler.rs:511).  The bytes are effectively swallowed.
+    ///   3. The splitter fires `ToolCallOpen` once it has seen the
+    ///      complete marker, and the engine calls `runtime.trigger()`
+    ///      (engine.rs:3283-3284).
+    ///   4. Subsequent body-byte tokens flow through `accept_bytes`
+    ///      with the runtime now eager.  These are the bytes the
+    ///      grammar must accept — and there is NO OPEN MARKER at the
+    ///      head of this stream.
+    ///   5. Finally the close-marker token bytes flow through
+    ///      `accept_bytes` and must drive the grammar to `is_accepted()`.
+    ///
+    /// This test FAILS on the pre-Wave-3.5 grammar shape
+    /// (`OneOrMoreCalls` for Auto) because the grammar root expects
+    /// `<|tool_call>` first but the splitter has already consumed it.
+    /// It PASSES on the Wave 3.5 body-only shape
+    /// (`OneOrMoreCallsBodyOnly`) which starts with the body and only
+    /// the trailing close marker.
+    ///
+    /// Audit citation
+    /// (/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt
+    /// divergence "W-B2 Auto lazy grammar production correctness"):
+    ///   "After trigger, the grammar is still at root expecting the
+    ///    already-consumed open marker. The W-B2 test hides this by
+    ///    triggering and then feeding open+body at handlers.rs:3379-3399."
+    /// The pre-Wave-3.5 test fed `{open}call:...` AFTER trigger; this
+    /// test feeds `{open}` BEFORE trigger (as no-op), then `call:...`
+    /// AFTER trigger — matching production order.
+    #[test]
+    fn auto_lazy_grammar_accepts_production_order_byte_stream() {
+        let reg = match registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => return,
+        };
+        let open = reg.tool_open.expect("gemma4 has tool_open");
+        let close = reg.tool_close.expect("gemma4 has tool_close");
+
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("Auto compile must succeed")
+            .expect("Auto must return Some(grammar)");
+
+        let root_id = g.rule_id("root").expect("compiled grammar has root");
+        let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+            .expect("GrammarRuntime::new must succeed");
+
+        // Step 1 — production setup: arm awaiting_trigger because the
+        // engine builds Auto runtimes with `set_awaiting_trigger(true)`
+        // (engine.rs:3447-3449 streaming, :1549-1551 non-streaming).
+        rt.set_awaiting_trigger(true);
+
+        // Step 2 — open-marker token's bytes flow through accept_bytes
+        // BEFORE the splitter fires ToolCallOpen.  While awaiting,
+        // accept_bytes is a no-op returning `true` (sampler.rs:511).
+        // This is the byte-stream order the engine produces at
+        // engine.rs:3617-3625 (decode loop accept) → :3266-3284
+        // (splitter route triggers grammar).
+        let pre_trigger_alive = rt.accept_bytes(open.as_bytes());
+        assert!(
+            pre_trigger_alive,
+            "while awaiting_trigger=true, accept_bytes MUST be a no-op \
+             returning true regardless of input bytes — the lazy gate \
+             prevents the open marker from advancing the grammar; \
+             this is the apply+accept atomicity invariant from \
+             research-report.md Q2"
+        );
+        assert!(
+            rt.is_awaiting_trigger(),
+            "open-marker bytes MUST NOT flip the trigger; only the engine \
+             explicitly calling rt.trigger() in response to the splitter's \
+             ToolCallOpen event should flip the gate"
+        );
+
+        // Step 3 — splitter has now seen the complete open marker and
+        // the engine calls runtime.trigger() (engine.rs:3283-3284).
+        rt.trigger();
+        assert!(
+            !rt.is_awaiting_trigger(),
+            "post-trigger the gate MUST be flipped false"
+        );
+
+        // Step 4 — subsequent body-byte tokens flow through accept_bytes
+        // with the runtime now eager.  Critically: NO leading open
+        // marker bytes — those were swallowed in step 2.
+        //
+        // Pre-Wave-3.5 (OneOrMoreCalls grammar): root expects the open
+        // marker first.  These body bytes would drive stacks dead.
+        //
+        // Post-Wave-3.5 (OneOrMoreCallsBodyOnly grammar): root expects
+        // the body first.  These bytes are accepted.
+        let body = b"call:get_weather{q:<|\"|>SF<|\"|>}";
+        let body_alive = rt.accept_bytes(body);
+        assert!(
+            body_alive,
+            "production-order regression: body-only grammar MUST accept \
+             body bytes after trigger.  A regression to the old marker- \
+             wrapped grammar (OneOrMoreCalls) would mark the runtime dead \
+             because root would still expect the (already-consumed) open \
+             marker.  This is the exact divergence the Wave 3.5 audit \
+             caught at /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt \
+             ('W-B2 Auto lazy grammar production correctness')."
+        );
+        assert!(
+            !rt.is_dead(),
+            "production-order body bytes MUST NOT drive the runtime dead \
+             on a body-only Auto-lazy grammar"
+        );
+
+        // Step 5 — close-marker token bytes flow through accept_bytes
+        // and the runtime should reach is_accepted() (single-call body
+        // grammar = `body close space`).
+        let close_alive = rt.accept_bytes(close.as_bytes());
+        assert!(
+            close_alive,
+            "close marker bytes MUST be accepted by the body-only grammar — \
+             the close marker IS in the grammar (only the FIRST open \
+             marker is stripped)"
+        );
+        assert!(
+            rt.is_accepted(),
+            "after body + close marker the runtime MUST be in accepting \
+             state (single-call body-only grammar = `body close space`); \
+             the engine's is_accepted check at engine.rs:3678 then drives \
+             early termination"
+        );
+        assert!(
+            !rt.is_dead(),
+            "an accepted runtime MUST NOT also be dead"
         );
     }
 
