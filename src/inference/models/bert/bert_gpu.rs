@@ -3646,10 +3646,11 @@ mod tests {
     /// Last pooling on a padded input must return row `valid_token_count-1`,
     /// NOT row `seq_len-1`.
     ///
-    /// Layout: seq_len=8, valid_token_count=5.
+    /// Layout: seq_len=8, valid_token_count=5, hidden=4.
     /// input[s, h] = s * hidden + h  (distinct per-row values so any
     /// wrong row is immediately detectable).
-    /// Expected output = row 4 = [32, 33, 34, 35] for hidden=4.
+    /// Expected output = row 4 = [16, 17, 18, 19] (= [4*4+0, 4*4+1, 4*4+2, 4*4+3]).
+    /// The buggy seq_len-1 row would be row 7 = [28, 29, 30, 31].
     #[test]
     fn pool_last_padded_returns_valid_last_row_not_seq_len_minus_one() {
         if MlxDevice::new().is_err() {
