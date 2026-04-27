@@ -2569,13 +2569,26 @@ ws ::= | " " | "\n" [ \t]{0,20}
 /// / tool_choice=function is used), the grammar physically prevents malformed
 /// wrapper output. `engine.rs:1615-1629`'s silent parse-failure-fallback can
 /// then be safely replaced with `GenerationEvent::Error(...)` because the
-/// fallback can only trigger for:
-///   - unregistered model families (no grammar → no constraint, T2.4 still
-///     handles them)
-///   - tool_choice=auto (grammar not applied → parse failure is still possible)
-/// For the constrained paths (Required + Function), the grammar guarantees
-/// the body is parseable by `parse_tool_call_body`. Wave 3 can audit each
-/// path and remove the fallback from the constrained ones.
+/// fallback can only trigger for `tool_choice=auto` (grammar not applied →
+/// parse failure is still possible) — wave 2.8 W-θ closes the no-tools and
+/// unknown-family fallbacks below.
+///
+/// Wave 2.8 W-θ MED — fallback shape per `tool_choice`:
+///
+/// | tool_choice           | tools[]      | model registration | result            |
+/// |-----------------------|--------------|--------------------|-------------------|
+/// | None / Auto           | any          | any                | Ok(None)          |
+/// | Required / Function   | empty / None | any                | Err(400)          |
+/// | Required / Function   | nonempty     | unknown            | Err(400)          |
+/// | Required / Function   | nonempty     | known              | Ok(Some(grammar)) |
+///
+/// The two `Err(400)` branches are wave-2.7 audit MED closures: the
+/// preconditions for grammar emission failed under a strict tool_choice, so
+/// we MUST hard-fail rather than silently fall back to no-grammar (which
+/// would re-introduce the wave-2.6 audit divergence "Required/Function
+/// enforcement before ToolCallOpen" via the unregistered path). Auto +
+/// no-tools / unknown-family still returns `Ok(None)` — Auto allows no-call
+/// and grammar is optional under Auto.
 fn compile_tool_grammar(
     req: &super::schema::ChatCompletionRequest,
     tool_choice: &super::schema::ToolChoiceValue,
@@ -2589,23 +2602,73 @@ fn compile_tool_grammar(
         return Ok(None);
     }
 
-    // No tools declared → nothing to constrain.
+    // Wave 2.8 W-θ MED — hard-error when tool_choice=required/function but
+    // the request has no tools[] declared. Silently returning Ok(None)
+    // here would compile no grammar and let the engine fall through to
+    // the unconstrained path, exactly the silent fallback pattern the
+    // wave-2.7 audit flagged. The operator-actionable answer is a 400.
     let tools = match req.tools.as_deref() {
         Some(t) if !t.is_empty() => t,
-        _ => return Ok(None),
+        _ => {
+            let label = match tool_choice {
+                ToolChoiceValue::Required => "required",
+                ToolChoiceValue::Function(_) => "function",
+                _ => unreachable!("constrain gated above"),
+            };
+            tracing::error!(
+                model = %req.model,
+                tool_choice = label,
+                "tool_choice_constrained_without_tools: tool_choice={} but \
+                 request has no tools[] defined; rejecting with 400 (silent \
+                 Ok(None) fallback would re-open the wave-2.6 \
+                 'Required/Function enforcement before ToolCallOpen' divergence)",
+                label
+            );
+            return Err(ApiError::invalid_request(
+                format!(
+                    "tool_choice={} but request has no tools[] defined; \
+                     declare at least one tool or use tool_choice=auto/none",
+                    label
+                ),
+                Some("tool_choice".into()),
+            )
+            .into_response());
+        }
     };
 
-    // Resolve the model registration. If unknown, skip grammar enforcement
-    // (T2.4 fallback covers this case).
+    // Wave 2.8 W-θ MED — hard-error when tool_choice=required/function but
+    // the model has no registered tool_call_gbnf emitter. Same rationale
+    // as the no-tools branch: silent Ok(None) re-opens the wave-2.6
+    // divergence. Operator-actionable answer is a 400.
     let reg = match registry::find_for(&req.model) {
         Some(r) => r,
         None => {
-            tracing::warn!(
+            let label = match tool_choice {
+                ToolChoiceValue::Required => "required",
+                ToolChoiceValue::Function(_) => "function",
+                _ => unreachable!("constrain gated above"),
+            };
+            tracing::error!(
                 model = %req.model,
-                "compile_tool_grammar: no registry entry for model; \
-                 grammar constraint skipped (T2.4 fallback applies)"
+                tool_choice = label,
+                "tool_choice_constrained_unknown_model: tool_choice={} but \
+                 model '{}' has no registered tool_call_gbnf emitter; rejecting \
+                 with 400 (silent Ok(None) fallback would re-open the wave-2.6 \
+                 'Required/Function enforcement before ToolCallOpen' divergence)",
+                label,
+                req.model
             );
-            return Ok(None);
+            return Err(ApiError::invalid_request(
+                format!(
+                    "tool_choice={} but model '{}' has no registered \
+                     tool_call_gbnf emitter; use a registered model \
+                     (e.g. gemma4-27b-it, qwen3.6-27b-dwq46) or \
+                     tool_choice=auto/none",
+                    label, req.model
+                ),
+                Some("tool_choice".into()),
+            )
+            .into_response());
         }
     };
 
@@ -2688,6 +2751,181 @@ fn compile_tool_grammar(
             e
         ))
         .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2.8 W-θ MED — compile_tool_grammar precondition tests.
+//
+// Audit closure: tool_choice=required/function with no tools[] OR unknown
+// model registration must hard-error (400), not silently return Ok(None)
+// (the wave-2.6 audit divergence "Required/Function enforcement before
+// ToolCallOpen" via the silent-fallback path). Auto + same conditions
+// MUST keep returning Ok(None) (regression-preserve).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod compile_tool_grammar_precondition_tests {
+    use super::*;
+    use super::super::schema::{
+        ChatCompletionRequest, ChatMessage, MessageContent, Tool, ToolChoiceValue, ToolFunction,
+    };
+
+    /// Build a minimal `ChatCompletionRequest` with overridable model + tools.
+    fn req_with(model: &str, tools: Option<Vec<Tool>>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("call a tool".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            stop: None,
+            tools,
+            tool_choice: None,
+            response_format: None,
+            top_p: None,
+            seed: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stream_options: None,
+            top_k: None,
+            repetition_penalty: None,
+            min_p: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            parallel_tool_calls: None,
+            hf2q_overflow_policy: None,
+            hf2q_enable_thinking: None,
+        }
+    }
+
+    fn one_scalar_tool(name: &str) -> Vec<Tool> {
+        vec![Tool {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"]
+                })),
+            },
+        }]
+    }
+
+    /// Required + no tools → hard 400 (was silent Ok(None) before W-θ).
+    #[test]
+    fn compile_tool_grammar_required_with_no_tools_returns_error() {
+        let req = req_with("gemma4-27b-it", None);
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Required);
+        let resp = res.expect_err("Required + no tools MUST hard-error (400)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "must be 400 — silent Ok(None) re-opens the wave-2.6 \
+             'Required/Function enforcement before ToolCallOpen' divergence"
+        );
+    }
+
+    /// Required + empty tools[] (Some(Vec::new())) → also hard 400.
+    #[test]
+    fn compile_tool_grammar_required_with_empty_tools_returns_error() {
+        let req = req_with("gemma4-27b-it", Some(Vec::new()));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Required);
+        let resp = res.expect_err("Required + empty tools[] MUST hard-error (400)");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Function + unknown model family → hard 400 (was silent Ok(None)
+    /// before W-θ). Uses an obviously-unregistered model id; if the registry
+    /// ever picks this up, swap to another unique fake id.
+    #[test]
+    fn compile_tool_grammar_function_with_unknown_family_returns_error() {
+        assert!(
+            registry::find_for("unknown-fake-model-zzzz").is_none(),
+            "test fixture must use an unregistered model id; \
+             update if registry adds a 'unknown-fake-model-zzzz' family"
+        );
+        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("get_weather")));
+        let res = compile_tool_grammar(
+            &req,
+            &ToolChoiceValue::Function("get_weather".to_string()),
+        );
+        let resp = res.expect_err("Function + unknown model MUST hard-error (400)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "must be 400 — silent Ok(None) here would let the engine \
+             run unconstrained under tool_choice=function (no grammar guard)"
+        );
+    }
+
+    /// Required + unknown model family → also hard 400 (mirrors Function
+    /// path; both Constrained branches must close the silent fallback).
+    #[test]
+    fn compile_tool_grammar_required_with_unknown_family_returns_error() {
+        assert!(registry::find_for("unknown-fake-model-zzzz").is_none());
+        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Required);
+        let resp = res.expect_err("Required + unknown model MUST hard-error (400)");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Auto + no tools → MUST keep returning Ok(None) (regression-preserve;
+    /// Auto allows no-call and grammar is optional under Auto).
+    #[test]
+    fn compile_tool_grammar_auto_with_no_tools_returns_ok_none() {
+        let req = req_with("gemma4-27b-it", None);
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
+        let g = res.expect("Auto + no tools MUST stay Ok(None)");
+        assert!(g.is_none(), "Auto policy is allowed to compile no grammar");
+    }
+
+    /// Auto + unknown model family → MUST keep returning Ok(None)
+    /// (regression-preserve).
+    #[test]
+    fn compile_tool_grammar_auto_with_unknown_family_returns_ok_none() {
+        let req = req_with("unknown-fake-model-zzzz", Some(one_scalar_tool("foo")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
+        let g = res.expect("Auto + unknown model MUST stay Ok(None)");
+        assert!(g.is_none());
+    }
+
+    /// None choice → MUST keep returning Ok(None) (regression-preserve).
+    #[test]
+    fn compile_tool_grammar_none_choice_returns_ok_none() {
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("foo")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::None);
+        let g = res.expect("None choice MUST stay Ok(None)");
+        assert!(g.is_none());
+    }
+
+    /// Required + valid tools + registered model → grammar compiles
+    /// (positive control: hard-error branches don't accidentally also
+    /// reject the happy path).
+    #[test]
+    fn compile_tool_grammar_required_happy_path_compiles() {
+        // Skip if gemma4 is not registered in the test environment (e.g.
+        // a downstream embedding that disables default registrations).
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Required);
+        let g = res.expect("Required + valid tools + registered model MUST compile");
+        assert!(
+            g.is_some(),
+            "happy path MUST return Some(grammar); got None"
+        );
     }
 }
 
