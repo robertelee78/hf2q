@@ -2626,278 +2626,140 @@ fn compile_tool_grammar(
 /// Combine multiple per-function GBNF grammars into a single grammar whose
 /// root accepts any of the individual function wrappers.
 ///
-/// # Algorithm (B2 fix — full namespace isolation)
+/// # Algorithm (Wave 2.6 W-γ5b — AST-based, audit HIGH B2 closed)
 ///
-/// 1. For each grammar *i*, rename every rule `X` → `fn-{i}-X` (including root
-///    → `fn-{i}-root`). Rewrite every reference inside rule bodies to use the
-///    new namespaced names.  This prevents rule-name collisions when two
-///    functions share a parameter name with different types: both grammars may
-///    contain a rule called e.g. `root-q-kv`; namespacing gives
-///    `fn-0-root-q-kv` (string) and `fn-1-root-q-kv` (integer), which are
-///    distinct and can coexist.
+/// The wave-2.5 implementation was a token-scanning rewriter that inserted
+/// whitespace boundaries around `[`, `]`, `(`, `)`, etc.  This corrupted GBNF
+/// negated character classes such as `[^<\\]` (the Gemma `gemma4-str-char`
+/// rule from registry.rs:1051): the parser treats `^` as the negation marker
+/// only when it appears IMMEDIATELY after `[` (parser.rs:317-324), so token-
+/// scanning rewriters that inject a space turned `[^<\\]` (negated) into
+/// `[ ^<\\]` (positive class containing `^`, `<`, `\`), inverting the
+/// semantics of every Gemma string rule.
 ///
-/// 2. Deduplication of identical rules.  Shared primitive rules (e.g. `space`,
-///    `string`, `char`) are generated identically by every per-function grammar.
-///    After namespacing they appear as `fn-0-space`, `fn-1-space`, … with equal
-///    bodies.  We fold them back to a single un-prefixed name (`space`) and
-///    rewrite all references accordingly.  This keeps the combined grammar
-///    compact and satisfies the invariant that shared primitives appear once.
+/// The wave-2.6 fix per goalie research §Q4 is "parse-to-AST + serialize-with-
+/// renames": delegate text manipulation to the GBNF parser/serializer pair so
+/// character-class boundaries are decided by the AST (which already encodes
+/// them via `GretType::CharNot` / `CharAlt` / `CharRngUpper`) rather than by
+/// regex over the source bytes.
 ///
-/// 3. The combined root is `fn-0-root | fn-1-root | … | fn-N-root`.
+/// # Steps
 ///
-/// # Reference rewriting
+/// 1. For each input grammar at index *i*:
+///    a. Parse via `grammar::parser::parse` into a `Grammar` AST.
+///    b. Rename every rule `X` → `fn-{i}-X` via `grammar::serialize::rename_rules`
+///       (a pure AST op — symbol_ids map is rewritten, RuleRef ids are
+///       unchanged because they reference rules by id, not by name).
+///    c. Serialize back to GBNF text via `grammar::serialize::serialize`.
+/// 2. Concatenate a synthetic combined-root header
+///    (`root ::= fn-0-root | fn-1-root | ...`) with the renamed grammar texts.
+/// 3. Re-parse the combined text through `grammar::parser::parse` to allocate
+///    a single contiguous rule-id space and validate the result.  The output
+///    of this function is the combined GBNF string; the caller re-parses it
+///    via the same path.
 ///
-/// Rule names in GBNF bodies are whitespace/paren-delimited tokens.  We use
-/// a simple whole-token replacement walk: split the body on ASCII whitespace
-/// and brackets, rename matching tokens, rejoin.  This avoids a full GBNF
-/// parse (mechanical string rewriting per task spec).
+/// # Why no deduplication of shared primitives
+///
+/// The wave-2.5 impl folded shared primitive rules (e.g. `space`, `string`)
+/// to a single un-prefixed copy.  The wave-2.6 impl does not:
+///   - It is not necessary for correctness — the GBNF parser and runtime
+///     handle duplicate-bodied rules under different names without issue.
+///   - Deduplication requires a body-equality test that's awkward at the AST
+///     level (rule-id renumbering across grammars makes byte-identity
+///     comparison unreliable).
+///   - The size hit is negligible (each shared primitive is a few rules);
+///     correctness > compactness.
+///
+/// # Single-function shortcut
+///
+/// When `gbnfs.len() == 1`, the function still namespaces (renames `X` →
+/// `fn-0-X`) and prepends `root ::= fn-0-root`.  This keeps the combiner's
+/// output shape uniform regardless of arity, so the caller's `parse` path is
+/// always exercising the same grammar topology.
+///
+/// # Panics
+///
+/// Panics if any input GBNF string fails to parse, or if the combined output
+/// fails to re-parse.  Inputs come from the per-model emitters in
+/// `registry.rs` (Gemma 4 + Qwen 3.5/3.6) which are exercised by their own
+/// unit tests — a parse failure here is a logic bug, not user input.
 fn combine_function_grammars(gbnfs: Vec<String>) -> String {
-    use std::collections::BTreeMap;
+    use grammar::parser::parse;
+    use grammar::serialize::{rename_rules, serialize};
 
-    // Step 1 — parse each grammar into (name → body) maps and collect the
-    // full set of rule names per grammar.
-    let parsed: Vec<Vec<(String, String)>> = gbnfs
-        .iter()
-        .map(|gbnf| {
-            gbnf.lines()
-                .filter_map(|line| {
-                    let line = line.trim();
-                    let pos = line.find(" ::= ")?;
-                    Some((line[..pos].to_string(), line[pos + 5..].to_string()))
-                })
-                .collect()
-        })
-        .collect();
+    let mut combined = String::with_capacity(gbnfs.iter().map(|g| g.len()).sum::<usize>() + 64);
 
-    // Step 2 — build namespace mappings for each grammar.
-    // Every rule name `X` in grammar i → `fn-{i}-X`.
-    let ns_maps: Vec<BTreeMap<String, String>> = parsed
-        .iter()
-        .enumerate()
-        .map(|(i, rules)| {
-            rules
-                .iter()
-                .map(|(name, _)| (name.clone(), format!("fn-{}-{}", i, name)))
-                .collect()
-        })
-        .collect();
-
-    // Step 3 — rewrite rule bodies.  Replace each token that matches a rule
-    // name in the local grammar with its namespaced equivalent.
-    // "Token" in GBNF: a contiguous run of alphanumeric / '-' / '_' characters
-    // that is not inside a double-quoted literal.
-    let mut namespaced: Vec<BTreeMap<String, String>> = Vec::with_capacity(parsed.len());
-    for (i, rules) in parsed.iter().enumerate() {
-        let ns_map = &ns_maps[i];
-        let mut renamed: BTreeMap<String, String> = BTreeMap::new();
-        for (name, body) in rules {
-            let new_name = ns_map.get(name).cloned().unwrap_or_else(|| name.clone());
-            let new_body = rewrite_gbnf_references(body, ns_map);
-            renamed.insert(new_name, new_body);
+    // Step 1 — synthetic combined-root header: `root ::= fn-0-root | fn-1-root | …`.
+    combined.push_str("root ::= ");
+    for i in 0..gbnfs.len() {
+        if i > 0 {
+            combined.push_str(" | ");
         }
-        namespaced.push(renamed);
+        combined.push_str(&format!("fn-{}-root", i));
+    }
+    combined.push('\n');
+
+    // Step 2 — for each input grammar, parse → rename → serialize.
+    for (i, gbnf) in gbnfs.iter().enumerate() {
+        let parsed = parse(gbnf).unwrap_or_else(|e| {
+            panic!(
+                "combine_function_grammars: per-function GBNF #{} from emitter \
+                 failed to parse — this is a registry.rs emitter bug: {}\n\
+                 grammar:\n{}",
+                i, e, gbnf
+            )
+        });
+        let renamed = rename_rules(&parsed, |name| format!("fn-{}-{}", i, name));
+        combined.push_str(&serialize(&renamed));
     }
 
-    // Step 4 — deduplicate: for each base name `X`, check whether all grammars
-    // that have `fn-N-X` agree on the body.  If so, collapse to a single `X`.
-    //
-    // Build a reverse map: base_name → Vec<(ns_name, body)> across all grammars.
-    let mut base_bodies: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for ns_rules in &namespaced {
-        for (ns_name, body) in ns_rules {
-            // Recover the base name: strip leading `fn-{digits}-`.
-            let base = strip_fn_prefix(ns_name);
-            base_bodies
-                .entry(base.to_string())
-                .or_default()
-                .push((ns_name.clone(), body.clone()));
-        }
+    // Step 3 — validate the combined output round-trips through the parser.
+    // This is the audit-driving guarantee: if the AST-based combiner ever
+    // produces output that doesn't re-parse, we want the failure to surface
+    // immediately at this assertion rather than at the caller's parse site
+    // (where the error message would lose the combiner-internal context).
+    if let Err(e) = parse(&combined) {
+        panic!(
+            "combine_function_grammars: combined output failed to re-parse — \
+             this is an AST combiner invariant violation: {}\n\
+             combined grammar was:\n{}",
+            e, combined
+        );
     }
 
-    // Rules where all copies have identical bodies → shared; collapse to base name.
-    let mut shared: BTreeMap<String, String> = BTreeMap::new(); // base → body
-    let mut ns_to_canonical: BTreeMap<String, String> = BTreeMap::new(); // fn-i-X → canonical
-    for (base, copies) in &base_bodies {
-        if base == "root" {
-            // root is always namespaced (fn-N-root).
-            for (ns, body) in copies {
-                ns_to_canonical.insert(ns.clone(), ns.clone());
-                // Store each fn-N-root separately (bodies differ per function).
-                let _ = body; // will be inserted below
-            }
-            continue;
-        }
-        let all_same = copies.windows(2).all(|w| w[0].1 == w[1].1);
-        if all_same {
-            let body = copies[0].1.clone();
-            shared.insert(base.clone(), body.clone());
-            for (ns, _) in copies {
-                ns_to_canonical.insert(ns.clone(), base.clone());
-            }
-        } else {
-            // Distinct bodies — each copy keeps its namespaced name.
-            for (ns, _) in copies {
-                ns_to_canonical.insert(ns.clone(), ns.clone());
-            }
-        }
-    }
-
-    // Step 5 — assemble combined rule map.
-    // First, insert all namespaced rules (only those whose canonical is themselves).
-    // For shared rules, insert under the base name with collapsed body.
-    let mut combined: BTreeMap<String, String> = BTreeMap::new();
-
-    // Insert shared (collapsed) rules.
-    for (base, body) in &shared {
-        // Rewrite any remaining fn-N-X references in the body to their canonical names.
-        let canonical_body = rewrite_gbnf_references(body, &ns_to_canonical);
-        combined.insert(base.clone(), canonical_body);
-    }
-
-    // Insert non-shared namespaced rules.
-    for ns_rules in &namespaced {
-        for (ns_name, body) in ns_rules {
-            let canonical = ns_to_canonical.get(ns_name).cloned().unwrap_or_else(|| ns_name.clone());
-            if canonical == *ns_name {
-                // Not shared — insert under namespaced name with rewritten body.
-                let canonical_body = rewrite_gbnf_references(body, &ns_to_canonical);
-                combined.insert(ns_name.clone(), canonical_body);
-            }
-            // If canonical != ns_name, the rule was collapsed to `canonical` above.
-        }
-    }
-
-    // Step 6 — combined root: alternation of fn-0-root | fn-1-root | …
-    let fn_roots: Vec<String> = (0..parsed.len())
-        .map(|i| format!("fn-{}-root", i))
-        .collect();
-    let root_alts = fn_roots.join(" | ");
-    combined.insert("root".to_string(), root_alts);
-
-    // Serialize: root first, then alpha.
-    let mut out = String::new();
-    if let Some(body) = combined.get("root") {
-        out.push_str(&format!("root ::= {}\n", body));
-    }
-    for (name, body) in &combined {
-        if name != "root" {
-            out.push_str(&format!("{} ::= {}\n", name, body));
-        }
-    }
-    out
-}
-
-/// Rewrite GBNF rule references in `body` using `map`.
-///
-/// Scans the body text token by token (splitting on ASCII whitespace and GBNF
-/// structural characters: `(`, `)`, `|`, `?`, `*`, `+`, `[`, `]`).  Any token
-/// that exactly matches a key in `map` is replaced by the corresponding value.
-/// Quoted literals (between `"…"`) are left untouched.
-///
-/// The reconstruction preserves the original whitespace as single spaces
-/// between tokens; this is safe for GBNF which treats whitespace as
-/// insignificant between tokens.
-fn rewrite_gbnf_references(body: &str, map: &std::collections::BTreeMap<String, String>) -> String {
-    if map.is_empty() {
-        return body.to_string();
-    }
-
-    let mut out = String::with_capacity(body.len() + 16);
-    let mut in_quote = false;
-    let mut token = String::new();
-    let mut first = true;
-
-    let flush = |token: &mut String, out: &mut String, map: &std::collections::BTreeMap<String, String>, first: &mut bool| {
-        if token.is_empty() {
-            return;
-        }
-        if !*first {
-            out.push(' ');
-        }
-        *first = false;
-        if let Some(replacement) = map.get(token.as_str()) {
-            out.push_str(replacement);
-        } else {
-            out.push_str(token);
-        }
-        token.clear();
-    };
-
-    let chars: Vec<char> = body.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_quote {
-            // Inside a double-quoted literal: pass through verbatim.
-            token.push(c);
-            if c == '"' && (i == 0 || chars[i - 1] != '\\') {
-                in_quote = false;
-                flush(&mut token, &mut out, map, &mut first);
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '"' => {
-                // Start of a quoted literal.
-                flush(&mut token, &mut out, map, &mut first);
-                token.push(c);
-                in_quote = true;
-            }
-            ' ' | '\t' | '\n' => {
-                flush(&mut token, &mut out, map, &mut first);
-            }
-            '(' | ')' | '|' | '?' | '*' | '+' | '[' | ']' | '{' | '}' => {
-                flush(&mut token, &mut out, map, &mut first);
-                if !first {
-                    out.push(' ');
-                }
-                first = false;
-                out.push(c);
-            }
-            _ => {
-                token.push(c);
-            }
-        }
-        i += 1;
-    }
-    flush(&mut token, &mut out, map, &mut first);
-    out
-}
-
-/// Strip the `fn-{digits}-` prefix from a namespaced rule name.
-/// Returns the original base name (without the fn-N- prefix).
-fn strip_fn_prefix(name: &str) -> &str {
-    // Match `fn-` followed by one or more digits followed by `-`.
-    if let Some(rest) = name.strip_prefix("fn-") {
-        if let Some(dash_pos) = rest.find('-') {
-            let digits = &rest[..dash_pos];
-            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                return &rest[dash_pos + 1..];
-            }
-        }
-    }
-    name
+    combined
 }
 
 // ---------------------------------------------------------------------------
-// Wave-2.5 W-δ C2 — combine_function_grammars unit tests
+// Wave-2.6 W-γ5b — combine_function_grammars AST-based unit tests
 // ---------------------------------------------------------------------------
 //
-// T1.8 multi-tool shared-param: two tools that share a parameter name with
-// different types must produce a combined grammar whose root is an alternation
-// between both function roots. The shared primitive rules (space, string, …)
-// are merged; each function root is namespaced as fn-0-root / fn-1-root so
-// the alternation dispatches to the correct per-function rule.
+// The wave-2.5 token-scanning rewriter (replaced in W-γ5b) corrupted GBNF
+// negated character classes such as `[^<\\]` by injecting whitespace
+// boundaries around `[`, `]`, etc.  These tests exercise the AST-based
+// replacement at the runtime level — the audit-driving guarantee is that the
+// combiner's output, when fed through `GrammarRuntime`, ACCEPTS / REJECTS the
+// same byte sequences as each per-function input grammar (modulo namespace).
 //
-// T1.8 wiring: response_format AND tool_choice both set.
-// Current behaviour (handlers.rs:751-752): `tool_grammar.or(response_grammar)`.
-// This means tool_grammar wins when both are set. The test documents and
-// validates that choice — no silent discard, no panic.
+// The tests are runtime tests (not string-inspection): we compile the combined
+// grammar, run candidate byte sequences through `accept_bytes`, and assert on
+// `is_accepted()` / `is_dead()`.  This is what proves the negated-class
+// preservation property — any string-level inspection would miss the
+// `[^<\\]` → `[<\\]` corruption since both forms re-parse cleanly.
 
 #[cfg(test)]
 mod combine_function_grammars_tests {
     use super::*;
+    use super::grammar::parser::parse;
+    use super::grammar::sampler::GrammarRuntime;
+
+    /// Build a runtime from a GBNF string.  Helper that centralizes the
+    /// parse + GrammarRuntime::new pattern.
+    fn runtime_from_gbnf(gbnf: &str) -> GrammarRuntime {
+        let g = parse(gbnf).expect("parse combined grammar");
+        let rid = g.rule_id("root").expect("root rule exists");
+        GrammarRuntime::new(g, rid).expect("runtime init")
+    }
 
     /// Two GBNF strings that share the rule name `space` (a primitive).
     /// Merging them must produce exactly one `space` rule (first-occurrence wins).
@@ -2924,81 +2786,64 @@ mod combine_function_grammars_tests {
         .to_string()
     }
 
-    /// T1.8 multi-tool shared-param: two tools with shared param name `q`
-    /// but different types (string vs integer).
+    /// Two tools with shared param name `q` but different types (string vs
+    /// integer).  Expected: the combined grammar accepts both shapes.
     ///
-    /// Expected: combined grammar root = `fn-0-root | fn-1-root` so the
-    /// sampler can dispatch to either tool-specific rule.
+    /// AST-level invariants checked:
+    ///   - The combined output re-parses cleanly.
+    ///   - It contains the expected namespaced rule names (`fn-0-root`,
+    ///     `fn-1-root`).
+    ///   - Runtime accepts a tool_a string-shape call.
+    ///   - Runtime accepts a tool_b integer-shape call.
     #[test]
     fn multi_tool_shared_param_name_different_types() {
         let combined = combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()]);
 
-        // The combined root must be an alternation of both function roots.
-        let root_line = combined
-            .lines()
-            .find(|l| l.starts_with("root ::="))
-            .unwrap_or_else(|| panic!("combined grammar has no root rule:\n{combined}"));
+        // 1. Round-trip through the parser must succeed (the combiner already
+        //    asserts this, but we duplicate the check at the test boundary).
+        let g = parse(&combined).expect("combined grammar must re-parse");
 
+        // 2. Both function roots must exist as named rules.
         assert!(
-            root_line.contains("fn-0-root") && root_line.contains("fn-1-root"),
-            "combined root must reference both fn-0-root and fn-1-root; got: {root_line:?}"
+            g.rule_id("fn-0-root").is_some(),
+            "combined grammar missing fn-0-root: {combined}"
         );
         assert!(
-            root_line.contains('|'),
-            "combined root must be an alternation ('|'); got: {root_line:?}"
-        );
-
-        // `fn-0-root` must reference the tool_a body.
-        let fn0_line = combined
-            .lines()
-            .find(|l| l.starts_with("fn-0-root ::="))
-            .unwrap_or_else(|| panic!("combined grammar missing fn-0-root:\n{combined}"));
-        assert!(
-            fn0_line.contains("tool_a"),
-            "fn-0-root should derive from tool_a grammar; got: {fn0_line:?}"
+            g.rule_id("fn-1-root").is_some(),
+            "combined grammar missing fn-1-root: {combined}"
         );
 
-        // `fn-1-root` must reference the tool_b body.
-        let fn1_line = combined
-            .lines()
-            .find(|l| l.starts_with("fn-1-root ::="))
-            .unwrap_or_else(|| panic!("combined grammar missing fn-1-root:\n{combined}"));
-        assert!(
-            fn1_line.contains("tool_b"),
-            "fn-1-root should derive from tool_b grammar; got: {fn1_line:?}"
-        );
+        // 3. Runtime semantics: string-shape tool_a call accepted.
+        let mut rt_a = runtime_from_gbnf(&combined);
+        let alive = rt_a.accept_bytes(b"call:tool_a{\"q\":\"hi\"}");
+        assert!(alive, "tool_a string call rejected by combined grammar: {combined}");
+        assert!(rt_a.is_accepted(), "tool_a string call not in accepting state");
 
-        // `space` must appear exactly once — shared primitive rules are merged.
-        let space_rule_count = combined
-            .lines()
-            .filter(|l| l.starts_with("space ::="))
-            .count();
-        assert_eq!(
-            space_rule_count, 1,
-            "shared 'space' rule must appear exactly once in combined grammar; \
-             got {space_rule_count} occurrences:\n{combined}"
-        );
+        // 4. Runtime semantics: integer-shape tool_b call accepted.
+        let mut rt_b = runtime_from_gbnf(&combined);
+        let alive = rt_b.accept_bytes(b"call:tool_b{\"q\":42}");
+        assert!(alive, "tool_b integer call rejected by combined grammar: {combined}");
+        assert!(rt_b.is_accepted(), "tool_b integer call not in accepting state");
     }
 
-    /// T1.8 single-tool combine is a pass-through: combine_function_grammars
-    /// with one function grammar must produce a root that's exactly that
-    /// function's root body (fn-0-root with the original root body).
+    /// Single-tool combine: combine_function_grammars with one function
+    /// grammar must produce a grammar whose `root` references `fn-0-root`,
+    /// and whose runtime accepts the same outputs as the un-combined source.
     #[test]
     fn single_tool_combine_roundtrip() {
         let combined = combine_function_grammars(vec![gbnf_for_tool_a()]);
-        let root_line = combined
-            .lines()
-            .find(|l| l.starts_with("root ::="))
-            .unwrap_or_else(|| panic!("no root rule:\n{combined}"));
-        // Single function → root is just fn-0-root (no alternation needed).
+        let g = parse(&combined).expect("combined re-parses");
+
         assert!(
-            root_line.contains("fn-0-root"),
-            "single-tool combine root must reference fn-0-root; got: {root_line:?}"
+            g.rule_id("fn-0-root").is_some(),
+            "single-tool combine missing fn-0-root: {combined}"
         );
-        assert!(
-            !root_line.contains('|'),
-            "single-tool combine root must NOT be an alternation; got: {root_line:?}"
-        );
+
+        // Runtime accepts a valid tool_a call.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"call:tool_a{\"q\":\"hi\"}");
+        assert!(alive, "single-tool combine rejected valid tool_a call: {combined}");
+        assert!(rt.is_accepted(), "single-tool combine not accepting valid call");
     }
 
     /// T1.8 wiring: response_format AND tool_choice both set.
@@ -3050,6 +2895,226 @@ mod combine_function_grammars_tests {
             none_a.or(none_b).is_none(),
             "no tool_grammar + no response_grammar must produce no constraint"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave 2.6 W-γ5b — AST combiner audit-driving runtime tests
+    // -------------------------------------------------------------------
+    //
+    // These exercise the combined grammar through `GrammarRuntime` to prove
+    // properties no string-inspection assertion can prove:
+    //   - Negated character classes survive the combine (audit HIGH B2).
+    //   - Qwen-shape tool calls round-trip end-to-end.
+    //   - Namespace isolation gives shared parameter names different
+    //     value-rules (audit HIGH-6 case).
+    //   - Single-function combine is functionally equivalent to its source.
+
+    /// Build two synthetic per-function grammars that include the Gemma
+    /// `[^<\\]` string-char rule (registry.rs:1051), combine them, then
+    /// assert that the runtime REJECTS a `<` byte through the combined
+    /// grammar.  The wave-2.5 token-scanning rewriter would have inserted
+    /// whitespace around `[`, turning `[^<\\]` (negated) into `[ ^<\\]`
+    /// (positive) — under that bug the runtime would ACCEPT a `<` byte.
+    /// This is the audit-driver from cfa-20260427 W-γ5b: it MUST fail under
+    /// the old combiner and pass under the new AST combiner.
+    #[test]
+    fn combine_two_gemma_grammars_preserves_negated_char_class() {
+        // Two minimal grammars that each contain `[^<\\]+` directly under root.
+        // Distinct prefix literals so the two roots are distinguishable.
+        let gbnf_a = "root ::= \"A\" [^<\\\\]+\n".to_string();
+        let gbnf_b = "root ::= \"B\" [^<\\\\]+\n".to_string();
+
+        let combined = combine_function_grammars(vec![gbnf_a.clone(), gbnf_b.clone()]);
+
+        // Re-parse must succeed.
+        parse(&combined).expect("combined grammar must re-parse");
+
+        // 1. `<` must be REJECTED via the fn-0 path (corruption check).
+        //    Old token-scanning rewriter turned [^<\\] into [<\\] (positive
+        //    class), which would ACCEPT `<`.  We assert the opposite.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"A<");
+        assert!(
+            !alive,
+            "negated char class `[^<\\\\]` was corrupted by combine: \
+             a `<` byte was ACCEPTED through the fn-0 (gemma_a) path, but \
+             the source grammar should REJECT it.\nCombined grammar:\n{combined}"
+        );
+
+        // 2. `<` must be REJECTED via the fn-1 path too.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"B<");
+        assert!(
+            !alive,
+            "negated char class corrupted on fn-1 (gemma_b) path: \
+             `<` ACCEPTED. Combined grammar:\n{combined}"
+        );
+
+        // 3. A normal string (no `<`) MUST be ACCEPTED via fn-0.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"Ahello");
+        assert!(
+            alive,
+            "valid string `Ahello` rejected through combined grammar (fn-0): \
+             combined output corrupted in a non-negation way.\nCombined:\n{combined}"
+        );
+        assert!(
+            rt.is_accepted(),
+            "valid string `Ahello` consumed but runtime not in accepting state \
+             (fn-0). Combined:\n{combined}"
+        );
+
+        // 4. Normal string accepted via fn-1.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"Bworld");
+        assert!(alive, "valid string `Bworld` rejected (fn-1): {combined}");
+        assert!(rt.is_accepted(), "valid string `Bworld` not in accepting state (fn-1): {combined}");
+    }
+
+    /// Two Qwen-shape grammars combine into a working alternation.  Each
+    /// grammar uses the `<parameter=KEY>VAL</parameter>` Qwen syntax.  The
+    /// combined output must:
+    ///   - Round-trip through parse + serialize cleanly.
+    ///   - Accept canonical Qwen tool-call output via the runtime.
+    #[test]
+    fn combine_two_qwen_grammars_round_trips() {
+        // Minimal Qwen-shape per-function grammars.  The string-char rule
+        // mirrors registry.rs:1298 (`[^<\\] | [\\] [^\x00-\x1F]`), which is
+        // the key audit-failing shape (negated class with backslash).
+        let gbnf_a = concat!(
+            "root ::= \"<function=fa>\\n<parameter=q>\\n\" qstr \"\\n</parameter>\\n</function>\"\n",
+            "qstr ::= qchar*\n",
+            "qchar ::= [^<\\\\] | [\\\\] [^\\x00-\\x1F]\n",
+        )
+        .to_string();
+        let gbnf_b = concat!(
+            "root ::= \"<function=fb>\\n<parameter=q>\\n\" qstr \"\\n</parameter>\\n</function>\"\n",
+            "qstr ::= qchar*\n",
+            "qchar ::= [^<\\\\] | [\\\\] [^\\x00-\\x1F]\n",
+        )
+        .to_string();
+
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b]);
+
+        // Round-trip: combined re-parses cleanly.
+        let g = parse(&combined).expect("combined re-parses");
+
+        // Sanity: namespaced root names exist.
+        assert!(g.rule_id("fn-0-root").is_some(), "fn-0-root missing: {combined}");
+        assert!(g.rule_id("fn-1-root").is_some(), "fn-1-root missing: {combined}");
+
+        // Runtime: canonical Qwen tool-call output for fa accepted.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(
+            b"<function=fa>\n<parameter=q>\nhello\n</parameter>\n</function>",
+        );
+        assert!(alive, "canonical Qwen call (fa) rejected: {combined}");
+        assert!(rt.is_accepted(), "canonical Qwen call (fa) not accepting: {combined}");
+
+        // Runtime: canonical Qwen tool-call output for fb accepted.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(
+            b"<function=fb>\n<parameter=q>\nworld\n</parameter>\n</function>",
+        );
+        assert!(alive, "canonical Qwen call (fb) rejected: {combined}");
+        assert!(rt.is_accepted(), "canonical Qwen call (fb) not accepting: {combined}");
+    }
+
+    /// Audit HIGH-6 case: two functions both have a parameter named `q`
+    /// BUT with different value rules (one string, one number).  The
+    /// combined grammar must:
+    ///   - Accept fn-0 with a string `q` (e.g. `A"hello"`).
+    ///   - Accept fn-1 with a numeric `q` (e.g. `B42`).
+    ///   - REJECT the cross: fn-0 with a numeric `q` (`A42`) — proving that
+    ///     namespace isolation prevented fn-1's number rule from leaking
+    ///     into fn-0.
+    ///   - REJECT the cross: fn-1 with a string `q` (`B"hello"`).
+    #[test]
+    fn combine_namespacing_isolates_shared_param_names() {
+        // fn-0: q is a string (must be quoted).
+        let gbnf_a = concat!(
+            "root ::= \"A\" qval\n",
+            "qval ::= \"\\\"\" qchar* \"\\\"\"\n",
+            "qchar ::= [^\"\\\\]\n",
+        )
+        .to_string();
+        // fn-1: q is a number (must be digits).
+        let gbnf_b = concat!(
+            "root ::= \"B\" qval\n",
+            "qval ::= [0-9]+\n",
+        )
+        .to_string();
+
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b]);
+        parse(&combined).expect("combined re-parses");
+
+        // fn-0 string-shape ACCEPTED.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"A\"hello\"");
+        assert!(alive, "fn-0 string call rejected: {combined}");
+        assert!(rt.is_accepted(), "fn-0 string call not accepting: {combined}");
+
+        // fn-1 number-shape ACCEPTED.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"B42");
+        assert!(alive, "fn-1 number call rejected: {combined}");
+        assert!(rt.is_accepted(), "fn-1 number call not accepting: {combined}");
+
+        // Cross: fn-0 with a number — MUST be rejected (namespace isolated).
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"A42");
+        assert!(
+            !alive || !rt.is_accepted(),
+            "namespace isolation broken: fn-0 (A) accepted a numeric `q` value, \
+             but fn-0's `qval` rule is string-only.  This means fn-1's number \
+             rule leaked into fn-0's namespace.\nCombined:\n{combined}"
+        );
+
+        // Cross: fn-1 with a string — MUST be rejected.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"B\"hello\"");
+        assert!(
+            !alive || !rt.is_accepted(),
+            "namespace isolation broken: fn-1 (B) accepted a string `q` value, \
+             but fn-1's `qval` rule is numeric-only.\nCombined:\n{combined}"
+        );
+    }
+
+    /// Single-function combine MUST produce a grammar functionally
+    /// equivalent to the source: `root ::= fn-0-root` (single alternative,
+    /// no `|`), and the runtime accepts the same outputs as the
+    /// un-combined source.
+    #[test]
+    fn combine_single_function_yields_only_root_alternative() {
+        let src = "root ::= \"X\" [a-z]+\n".to_string();
+        let combined = combine_function_grammars(vec![src.clone()]);
+        let g = parse(&combined).expect("combined re-parses");
+
+        // The combined grammar's `root` rule body should be exactly a
+        // single RuleRef to `fn-0-root` followed by End — no Alt elements.
+        let root_id = g.rule_id("root").expect("root exists");
+        let root_rule = &g.rules[root_id as usize];
+        let alt_count = root_rule
+            .iter()
+            .filter(|e| e.ty == grammar::parser::GretType::Alt)
+            .count();
+        assert_eq!(
+            alt_count, 0,
+            "single-function combine root should have no Alt elements (no `|`); \
+             got {alt_count}.\nCombined:\n{combined}"
+        );
+
+        // Runtime equivalence: accept the source grammar's canonical output.
+        let mut rt = runtime_from_gbnf(&combined);
+        let alive = rt.accept_bytes(b"Xhello");
+        assert!(alive, "single-function combine rejected `Xhello`: {combined}");
+        assert!(rt.is_accepted(), "single-function combine not accepting `Xhello`: {combined}");
+
+        // And the source grammar's runtime accepts the same input.
+        let mut src_rt = runtime_from_gbnf(&src);
+        let alive = src_rt.accept_bytes(b"Xhello");
+        assert!(alive, "source grammar disagrees on `Xhello`");
+        assert!(src_rt.is_accepted(), "source grammar disagrees on `Xhello`");
     }
 }
 
