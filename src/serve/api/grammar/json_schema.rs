@@ -530,11 +530,16 @@ impl Converter {
             format!("( {} )?", chain)
         } else {
             // Full initial bitmasks: all bits set for all required / optional keys.
-            let req_full: u32 = (1u32 << required_keys.len()) - 1;
+            // Use `u32::MAX >> (32 - n)` to avoid overflow when n == 32.
+            // This is well-defined: `u32::MAX >> 0 = u32::MAX` for n=32, and
+            // `u32::MAX >> (32 - n)` has exactly n bits set for any n in 1..=32.
+            let n_req = required_keys.len(); // 1..=32 (non-empty branch)
+            let req_full: u32 = u32::MAX >> (32 - n_req);
             let opt_full: u32 = if optional_keys.is_empty() {
                 0
             } else {
-                (1u32 << optional_keys.len()) - 1
+                let n_opt = optional_keys.len(); // 1..=32
+                u32::MAX >> (32 - n_opt)
             };
             self.build_unified_inner(
                 &slug,
