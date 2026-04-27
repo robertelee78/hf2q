@@ -3948,6 +3948,101 @@ mod readiness_guard_tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().contains_key(RETRY_AFTER));
     }
+
+    /// ADR-005 wave-1.5 Codex fix T1.3 — real `prepare_chat_generation` call.
+    ///
+    /// The previous tests (above) only exercised `ApiError::not_ready()` and
+    /// `AppState::mark_not_ready()` directly.  Codex flagged that as a
+    /// shortcut: a bug in the wiring between `is_ready_for_gen()` and the
+    /// early-return in `prepare_chat_generation` would be invisible.
+    ///
+    /// This test calls `prepare_chat_generation_core` with:
+    ///   - `state.mark_not_ready()` → `is_ready_for_gen() == false`
+    ///   - a resolver closure that would panic if ever invoked
+    ///   - a minimal (but structurally valid) `ChatCompletionRequest`
+    ///
+    /// Assertions:
+    ///   1. The response is HTTP 503 + `Retry-After: 1` — the not-ready code.
+    ///   2. The resolver closure is NEVER called — proven by the `unreachable!()`
+    ///      inside it.  If the readiness guard were removed or reordered after
+    ///      the resolver call, this test would panic rather than silently pass.
+    ///
+    /// Note on "true no-resolve proof" without trait injection: the resolver
+    /// parameter IS the inject point.  Passing `unreachable!()` is stronger
+    /// than a counter because it fails immediately and loudly on misuse,
+    /// rather than requiring a post-assertion check.
+    #[tokio::test]
+    async fn chat_completions_returns_503_before_resolve_when_not_ready() {
+        let state = AppState::new(ServerConfig::default());
+        state.mark_not_ready();
+        assert!(!state.is_ready_for_gen());
+
+        // Minimal structurally-valid request.  The fields beyond `model` +
+        // `messages` are irrelevant — the readiness guard fires first.
+        let req = super::super::schema::ChatCompletionRequest {
+            model: "any-model".to_string(),
+            messages: vec![super::super::schema::ChatMessage {
+                role: "user".to_string(),
+                content: Some(super::super::schema::MessageContent::Text(
+                    "hello".to_string(),
+                )),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            top_p: None,
+            seed: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stream_options: None,
+            top_k: None,
+            repetition_penalty: None,
+            min_p: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            parallel_tool_calls: None,
+            hf2q_overflow_policy: None,
+            hf2q_enable_thinking: None,
+        };
+
+        // The resolver must never be called — the readiness guard returns
+        // before reaching the resolver call-site.  `unreachable!()` here is
+        // a stronger proof than a call-count counter: if the guard ordering
+        // were broken, the test panics loudly instead of silently succeeding.
+        let resolver = |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
+            unreachable!(
+                "resolver must not be called when is_ready_for_gen() == false; \
+                 the readiness guard at prepare_chat_generation_core should have \
+                 returned early with 503 before reaching this call-site"
+            )
+        };
+
+        let resp = match prepare_chat_generation_core(&state, &req, resolver).await {
+            Err(r) => r,
+            Ok(_) => panic!("not-ready state must return Err(503 response), got Ok"),
+        };
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not-ready must yield 503 SERVICE_UNAVAILABLE"
+        );
+        let ra = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After header must be present on not-ready 503");
+        assert_eq!(ra, "1", "not-ready Retry-After must be 1 second");
+    }
 }
 
 // ---------------------------------------------------------------------------
