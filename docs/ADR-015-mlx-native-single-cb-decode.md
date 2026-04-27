@@ -228,6 +228,76 @@ lever is wrong; fix it, don't gate the primary path off (per
 - **Option C: source-level kernel fusion (combine adjacent compute kernels into one shader).** *Falsified 9× in the M5 Max static-evidence kernel-hypothesis register* — most recent: `swiglu` Q4_0 `mv_id` (mlx-native@`4efeec0`, hf2q@`502364d`, −1.5%). The Metal compiler hoists what llama.cpp hand-tunes (`project_metal_compiler_auto_optimizes_static_levers`). Not a productive lever on M5 Max for current workloads.
 - **Option D: keep status quo at 0.94×.** *Rejected.* Per `feedback_shippability_standing_directive` and `feedback_no_shortcuts`, "as fast as our peers" is the standing exit bar. 0.94× is not shippable.
 
+## Literature foundations
+
+The architectural choices below draw from the following primary
+sources, each fetched and read directly via WebFetch against
+arxiv.org.  Each citation is verified pre-training-cutoff
+(no Perplexity-summary or post-cutoff claims included).  Most LLM
+inference research is CUDA-centric; the §Apple-Silicon-applicability
+note after each grouping calls out where Metal / unified-memory
+porting changes the equation.
+
+### Kernel-level performance — informs P3 inner loop kernel correctness + adjacent fusion candidates
+
+- **Dao et al. (2022).** *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.* arXiv:2205.14135.  Establishes IO-awareness — accounting for reads/writes between GPU memory tiers — as the canonical principle behind fast attention.  Tiling reduces HBM↔SRAM traffic, achieving up to 3× speedup on GPT-2.  Apple Silicon applicability: principle is universal; M-series GPU's unified memory removes the HBM/SRAM dichotomy but preserves the L2/threadgroup-memory hierarchy.  mlx-native already implements `flash_attn_prefill` + `flash_attn_vec` analogues with M5-tuned block sizes.
+- **Dao (2023).** *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.* arXiv:2307.08691.  Refines work partitioning across thread blocks and warps; reaches 50–73 % of A100 theoretical FLOPs/s.  Apple Silicon applicability: NVIDIA-warp-specific tactics (e.g. `swizzle` patterns) translate imperfectly to Metal SIMD-groups; the *parallel-decomposition* insight (single-head splits across thread blocks for occupancy) maps directly and is already echoed in our MoE-routed mat-vec kernels.
+
+### System architecture — informs P3b orchestration sweep, KV-cache management
+
+- **Kwon et al. (2023).** *Efficient Memory Management for Large Language Model Serving with PagedAttention.* arXiv:2309.06180 (SOSP 2023, **vLLM**).  Treats KV cache as paged virtual memory; achieves "near-zero waste" + 2–4× throughput vs FasterTransformer / Orca.  Apple Silicon applicability: portable.  `mlx_native::ops::kv_cache_copy` + the per-slot abstraction in `inference/models/qwen35/kv_cache.rs` is a related but coarser allocation strategy.  PagedAttention-style block reuse remains an open lever for our serve path (orthogonal to ADR-015 decode-perf scope).
+- **Zheng et al. (2023).** *SGLang: Efficient Execution of Structured Language Model Programs.* arXiv:2312.07104.  Introduces `RadixAttention` for KV reuse across requests + compressed FSMs for structured output; up to 6.4× throughput vs prior systems.  Applicability: cross-request KV reuse is a serve-side concern (ADR-005 territory), not single-request decode latency.
+- **Agrawal et al. (2024).** *Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve.* arXiv:2403.02310.  Chunked-prefill scheduling: splits prefill into near-equal chunks so the queue admits new requests without pausing ongoing decodes; 2.6× higher serving capacity vs vLLM on Mistral-7B.  Applicability: directly relevant to our `project_long_prefill_parity_inverts` open question (Non-Goal 1 today, future ADR).  Confirms prefill chunking is a multiplier orthogonal to single-CB decode.
+
+### Decode acceleration alternatives — informs §Alternatives Option B (speculative pipelining)
+
+- **Leviathan et al. (2022).** *Fast Inference from Transformers via Speculative Decoding.* arXiv:2211.17192 (ICML 2023 Oral).  Foundational paper: small draft model proposes K tokens; large model verifies in parallel.  2–3× speedup with identical output distribution.  Applicability: portable; the verification-step parallelism is what mlx-native would need to support batched K-token forward.
+- **Cai et al. (2024).** *Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.* arXiv:2401.10774.  Avoids the separate-draft-model burden by adding multiple decoding heads to the existing model + tree-attention verification.  2.2–3.6× speedup.  Applicability: `Qwen3.5-MoE`'s **MTP** (multi-token prediction) head per `convert_hf_to_gguf.py:Qwen3NextModel` (ADR-012 Decision 11) is precisely a Medusa-shaped feature; ADR-013 P14 owns the inference-side execution.  ADR-015 P3 single-CB rewrite is therefore *complementary* to Medusa-style decode — they compose multiplicatively.
+- **Li et al. (2024).** *EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty.* arXiv:2401.15077.  Operates at the second-to-top-layer feature level rather than token level; 2.7–3.5× speedup on LLaMA2-Chat 70B.  Applicability: portable; informs the design choice of *what* to predict in our future MTP path.
+- **Fu et al. (2024).** *Break the Sequential Dependency of LLM Inference Using Lookahead Decoding.* arXiv:2402.02057.  *Exact, parallel* decoding without any auxiliary draft model — Jacobi-iteration style.  Up to 1.8× MT-Bench, 4× with multi-GPU.  Applicability: M5 Max single-device, so the multi-GPU number doesn't apply, but the no-draft-model property is attractive given how much surface a draft-model path adds.
+
+### Graph compilation — informs the single-CB rewrite framing (P3 architecture)
+
+- **Chen et al. (2018).** *TVM: An Automated End-to-End Optimizing Compiler for Deep Learning.* arXiv:1802.04799 (OSDI 2018).  Establishes the graph-level + operator-level optimization layering that lets a single high-level forward pass compile to a hardware-specific dispatch sequence.  Applicability: TVM has limited Metal support; the *layering principle* informs whether mlx-native's `GraphSession` should grow toward graph-compile semantics or stay eager-with-explicit-barriers.  ADR-015 P3 takes the latter (explicit barriers within one encoder); a successor ADR could revisit the graph-compile path.
+- **Ding et al. (2023).** *Hidet: Task-Mapping Programming Paradigm for Deep Learning Tensor Programs.* arXiv:2210.09603 (ASPLOS 2023).  Embeds scheduling directly into tensor programs via "task mappings"; introduces post-scheduling fusion that automates operator fusion after individual scheduling.  1.48× over ONNX Runtime / TVM-AutoTVM.  Applicability: post-scheduling fusion is the formal version of what our 9× falsified manual-fusion experiments were trying to discover empirically.  The data point that automated fusion still struggles to beat hand-tuned BLAS suggests that *simple* compile-time fusion isn't the lever for our 0.94×→1.00× workload — it would need to capture the *runtime* memory pattern that the M5 Max compiler already auto-hoists (per `project_metal_compiler_auto_optimizes_static_levers`).
+
+### Apple Silicon literature gap — honest acknowledgement
+
+Searches for arxiv work specifically on Apple Silicon LLM inference perf
+returned nothing pre-cutoff that I could verify by direct fetch.  The
+M-series GPU is academically under-studied compared to NVIDIA datacenter
+parts.  This is itself a data point: bleeding-edge M5 Max optimization
+has no published roadmap to copy from; the lever space we explore in
+ADR-015 is one we have to discover empirically.  See P2 + P3a measured
+data above.
+
+## Architectural implications given full-stack ownership
+
+We own both `/opt/mlx-native` (kernel + dispatch substrate) and
+`/opt/hf2q` (forward orchestration + serving).  That gives ADR-015
+a strictly larger option space than any consumer of an upstream
+inference framework:
+
+1. **No API stability constraint.**  Single-CB rewrite can change
+   `mlx_native::CommandEncoder` signatures freely; consumers are
+   only us.
+2. **Persistent / megakernel options open.**  An mlx-native ADR
+   succeeding ADR-015 can investigate a persistent-thread Metal
+   kernel that loops *internally* over decode tokens — the literature
+   above (FlashAttention's tiling principle + Hidet's task-mapping
+   compositionality) sketches the design space.  Single-CB is the
+   conservative first lever; megakernel is the next-octave lever.
+3. **Shader-level cross-token pipelining.**  Lookahead Decoding
+   (2402.02057) and Medusa-style MTP (2401.10774) both decompose to
+   "more dispatches per wall-clock token" — a regime where the per-
+   dispatch overhead measured in P3a starts mattering more, but the
+   speedup more than compensates.  ADR-013 P14 is the consumer side;
+   mlx-native's role would be to expose efficient batched-K forward.
+4. **The ground truth is what we measure.**  Per `feedback_ground_truth_is_what_we_can_measure_now`,
+   any literature claim that doesn't survive a P2-style cold-SoC bench
+   on M5 Max is irrelevant to shippability.  ADR-015 commits to
+   measure-3x discipline at every phase gate.
+
 ## References
 
 - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:448-614` — main encode loop; `:550` `dispatch_apply`; `:458` "optimal n_cb is 1 or 2"
@@ -236,7 +306,8 @@ lever is wrong; fix it, don't gate the primary path off (per
 - `/opt/hf2q/src/inference/models/qwen35/forward_gpu.rs` — current per-layer-encoder qwen35 forward (target of P3 rewrite)
 - `/opt/hf2q/src/serve/forward_mlx.rs:1309` — Gemma's "one GraphSession per layer" baseline (30 CBs / pass)
 - mlx-native: `mlx_native::GraphSession`, `mlx_native::CommandEncoder::memory_barrier()`
-- Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`
+- mlx-native examples: `cb_cost_calibration.rs`, `dispatch_cost_calibration.rs` (P2 + P3a empirical benches)
+- Memory pins: `feedback_perf_gate_thermal_methodology`, `feedback_shippability_standing_directive`, `feedback_never_ship_fallback_without_rootcause`, `feedback_no_broken_windows`, `project_metal_compiler_auto_optimizes_static_levers`, `project_end_gate_reality_check`, `feedback_ground_truth_is_what_we_can_measure_now`
 
 ## Changelog
 
@@ -244,3 +315,4 @@ lever is wrong; fix it, don't gate the primary path off (per
 - **2026-04-26 — Title broadened to "general decode-path speed improvements" + scope extended to gemma family** per standing directive *"we need this coherence and speed for qwen and gemma families of models"*.
 - **2026-04-26 — P2 calibration empirical:** `async µs/CB ≈ 1.6 µs` (3.1× lower than working assumption).  Single-CB recovers ~32% of the 500 µs gap, not ~100%.  Plan revised: P3a per-dispatch cost calibration inserted before P3; P4 added as a second-lever phase whose target is determined by P3a.  Title kept "single-CB" because that's still the first lever; scope is honestly "general decode speed improvements" with the single-CB rewrite as Phase 1 of N.
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
+- **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
