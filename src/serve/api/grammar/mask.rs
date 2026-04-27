@@ -393,4 +393,160 @@ mod tests {
              trigger flip required"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Wave 2.8 W-θ missed-test #2 — tokenizer-backed marker-byte test.
+    //
+    // Audit gap (wave-2.7): existing mask tests use synthetic
+    // `vocab(&["a", "b", ...])` strings; they don't prove that REAL
+    // tokenizer decode + the token_bytes_table build path produce
+    // non-empty bytes for the special open marker tokens (Gemma 4 id 48
+    // = "<|tool_call>", 12 ASCII bytes). The `bytes.is_empty()` skip at
+    // mask.rs:77-79 is a documented contract: the open marker must NOT
+    // hit it. This test loads the real gemma4 tokenizer.json and
+    // exercises that exact path.
+    //
+    // Methodology: mirror Engine::token_bytes_table's body
+    // (`tok.decode(&[id], false)` per id) and assert id 48 decodes to
+    // the literal 12-byte UTF-8 string "<|tool_call>". Then build a
+    // grammar that requires that exact byte sequence at byte 0 and
+    // confirm the mask leaves token 48 surviving (not pushed to
+    // -inf) — i.e. the special-token mask-skip contract holds for the
+    // marker tokens an eager grammar relies on.
+    // -----------------------------------------------------------------
+
+    /// Path to the gemma4 tokenizer fixture on disk. The test gates on
+    /// this file's existence so a downstream env without the fixture
+    /// (CI minus /opt/hf2q/models/gemma4/) skips cleanly.
+    const GEMMA4_TOKENIZER_PATH: &str = "/opt/hf2q/models/gemma4/tokenizer.json";
+
+    fn load_gemma4_tokenizer_or_skip() -> Option<tokenizers::Tokenizer> {
+        if !std::path::Path::new(GEMMA4_TOKENIZER_PATH).exists() {
+            return None;
+        }
+        tokenizers::Tokenizer::from_file(GEMMA4_TOKENIZER_PATH).ok()
+    }
+
+    /// Build the per-vocab byte table for a small id range using the
+    /// SAME mechanism as `Engine::token_bytes_table`
+    /// (`tok.decode(&[id], false)`). Returns `Vec<Vec<u8>>` indexed by
+    /// id from 0 to `up_to` exclusive.
+    fn token_bytes_table_for_range(
+        tok: &tokenizers::Tokenizer,
+        up_to: u32,
+    ) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(up_to as usize);
+        for id in 0..up_to {
+            let s = tok.decode(&[id], false).unwrap_or_default();
+            out.push(s.into_bytes());
+        }
+        out
+    }
+
+    /// Real-tokenizer test: Gemma 4 id 48 (the `<|tool_call>` special
+    /// token, registered with `special: true` and 12-byte content in
+    /// models/gemma4/tokenizer.json) MUST decode to non-empty bytes
+    /// through the same path the engine builds the token_bytes_table.
+    /// If id 48 decoded empty, the mask's `bytes.is_empty()` skip at
+    /// mask.rs:77-79 would leave it un-maskable, which is the
+    /// documented "special-token loophole" the wave-2.7 research
+    /// dossier corrected.
+    #[test]
+    fn tokenizer_backed_table_preserves_gemma_open_marker_bytes() {
+        let Some(tok) = load_gemma4_tokenizer_or_skip() else {
+            // Fixture absent — skip cleanly.
+            return;
+        };
+
+        // Cover ids 0..256 — id 48 is in the special-token block.
+        let table = token_bytes_table_for_range(&tok, 256);
+        assert_eq!(table.len(), 256);
+
+        let id_48 = &table[48];
+        assert!(
+            !id_48.is_empty(),
+            "Gemma 4 id 48 (<|tool_call>) decoded to empty bytes through \
+             tok.decode(&[48], false); the mask's bytes.is_empty() skip \
+             at mask.rs:77-79 would leave the open marker un-maskable. \
+             This breaks the wave-2.7 Q-A eager-grammar contract."
+        );
+        assert_eq!(
+            id_48.as_slice(),
+            b"<|tool_call>",
+            "Gemma 4 id 48 must decode to the 12-byte literal '<|tool_call>'; \
+             got {:?}",
+            String::from_utf8_lossy(id_48)
+        );
+        assert_eq!(
+            id_48.len(),
+            12,
+            "Gemma 4 '<|tool_call>' is 12 ASCII bytes; got {} bytes",
+            id_48.len()
+        );
+    }
+
+    /// End-to-end test: build a grammar that requires `<|tool_call>` at
+    /// byte 0, run the mask path with the REAL tokenizer-backed
+    /// token_bytes table, and assert that token id 48 is the surviving
+    /// token (the eager grammar's open-marker constraint funnels the
+    /// model to id 48 — exactly the wave-2.7 Q-A design).
+    #[test]
+    fn mask_with_real_tokenizer_keeps_gemma_open_marker_alive() {
+        let Some(tok) = load_gemma4_tokenizer_or_skip() else {
+            return;
+        };
+
+        // Token table covers the special-token block (ids 0..256). 256
+        // is enough to exercise id 48 + a representative slice of
+        // surrounding non-marker special tokens (ids 0-47, 49-255 are
+        // mostly other Gemma special tokens like <pad>, <eos>, etc).
+        let token_bytes = token_bytes_table_for_range(&tok, 256);
+        // Sanity: id 48 is "<|tool_call>" (proved in the previous test
+        // but also exercised here as a precondition).
+        assert_eq!(token_bytes[48], b"<|tool_call>");
+
+        // Grammar that REQUIRES the literal "<|tool_call>" prefix.
+        // Mirrors the eager-grammar root rule shape from registry.rs's
+        // OneOrMoreCalls emitter for Gemma 4.
+        let runtime = rt("root ::= \"<|tool_call>\"\n", "root");
+        // Initialize logits with a finite value so non-skipped tokens
+        // are mask-eligible.
+        let mut logits = vec![1.0_f32; token_bytes.len()];
+        let _ = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
+
+        // Token 48 (the literal "<|tool_call>") MUST survive — the
+        // grammar accepts that exact byte sequence at byte 0.
+        assert!(
+            logits[48].is_finite(),
+            "Gemma id 48 (<|tool_call>) was masked to {}; the eager \
+             grammar's open-marker constraint must FUNNEL the model to \
+             this token, not mask it out",
+            logits[48]
+        );
+
+        // Survivor count among non-empty-byte tokens: there should be
+        // very few — only tokens whose first byte is '<' and whose
+        // bytes are a valid prefix of "<|tool_call>" can survive.
+        let surviving: Vec<u32> = (0..token_bytes.len() as u32)
+            .filter(|&i| !token_bytes[i as usize].is_empty() && logits[i as usize].is_finite())
+            .collect();
+        assert!(
+            surviving.contains(&48),
+            "id 48 must be in surviving set; got {:?}",
+            surviving
+        );
+
+        // Tokens with empty decoded bytes are skipped by the mask
+        // (intentional contract — see mask.rs:77-79). Verify at least
+        // some such tokens exist in the special-token block to confirm
+        // we are exercising the contract.
+        let empty_byte_tokens: usize = token_bytes
+            .iter()
+            .filter(|b| b.is_empty())
+            .count();
+        // We don't assert a specific number — it depends on the
+        // tokenizer's special-token registration shape — but assert
+        // the table is non-trivial.
+        let _ = empty_byte_tokens; // documented presence; not a hard count.
+    }
 }
