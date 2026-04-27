@@ -765,11 +765,18 @@ impl Converter {
         self.rules.insert(rule_name.clone(), String::new());
 
         let mut alts: Vec<String> = Vec::new();
-        for (i, (kv, _is_wildcard)) in entries.iter().enumerate() {
+        for (i, (kv, is_wildcard)) in entries.iter().enumerate() {
+            // For non-wildcard entries: remove this entry from remaining so
+            // declared optional keys appear at most once (no duplicate keys).
+            // For wildcard entries (extra-kv, `is_wildcard == true`): keep
+            // the wildcard in remaining so the emitted rule is self-referential
+            // and accepts multiple extra keys (Kleene-star semantics via GBNF
+            // optional recursion).
+            let keep_self = *is_wildcard; // wildcard stays in remaining; non-wildcard is removed
             let remaining: Vec<(String, bool)> = entries
                 .iter()
                 .enumerate()
-                .filter(|(j, _)| *j != i)
+                .filter(|(j, _)| *j != i || keep_self)
                 .map(|(_, e)| e.clone())
                 .collect();
             let alt = if remaining.is_empty() {
@@ -1733,5 +1740,59 @@ mod tests {
             "8-key schema rejected reversed-order input (any-position not enforced)"
         );
         assert!(rt.is_accepted(), "8-key schema not accepted after reversed input");
+    }
+
+    // -----------------------------------------------------------------
+    // B4-extras — additionalProperties: multiple trailing extras (Wave 2.6 W-β2)
+    //
+    // Audit finding: extra wildcard was one-shot in build_optional_chain because
+    // _is_wildcard was ignored — the wildcard entry was removed from `remaining`
+    // just like a declared optional key.  Fix: when is_wildcard == true, keep
+    // the wildcard in remaining so the emitted rule is self-referential (Kleene
+    // star via GBNF optional recursion).
+    // -----------------------------------------------------------------
+
+    /// When additionalProperties is permissive, a JSON object with multiple
+    /// extra keys after the required key(s) must be accepted.
+    /// Before W-β2 the wildcard was one-shot; this test fails on the old code.
+    #[test]
+    fn additional_properties_permissive_accepts_multiple_extras() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"]
+        }"#;
+
+        // Three extra keys after the required key.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"name":"Alice","x1":"v1","x2":"v2","x3":"v3"}"#),
+            "three trailing extra keys were rejected (additionalProperties permissive)"
+        );
+        assert!(rt.is_accepted());
+
+        // Extra keys before and after the required key.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"before":"b","name":"Alice","after1":"a1","after2":"a2"}"#),
+            "extra keys surrounding required key were rejected"
+        );
+        assert!(rt.is_accepted());
+
+        // Only extra keys in an optional-only object (no required fields).
+        let schema_no_req = r#"{
+            "type": "object",
+            "properties": {
+                "opt": {"type": "string"}
+            }
+        }"#;
+        let mut rt = runtime(schema_no_req);
+        assert!(
+            rt.accept_bytes(br#"{"opt":"v","extra1":"e1","extra2":"e2"}"#),
+            "multiple extras in no-required-keys object were rejected"
+        );
+        assert!(rt.is_accepted());
     }
 }
