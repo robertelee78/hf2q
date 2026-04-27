@@ -54,7 +54,7 @@ use mlx_native::ops::quantized_matmul_ggml::{
 };
 use mlx_native::ops::rms_norm;
 use mlx_native::ops::rope_multi::{
-    build_rope_multi_buffers, dispatch_rope_multi, RopeMultiMode, RopeMultiParams,
+    dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams,
 };
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
@@ -391,22 +391,27 @@ pub fn apply_imrope(
             ],
         )
         .map_err(|e| anyhow!("alloc imrope out: {e}"))?;
-    let (params_buf, rope_params, sections_buf) =
-        build_rope_multi_buffers(device, params).map_err(|e| anyhow!("rope bufs: {e}"))?;
 
-    dispatch_rope_multi(
+    // ADR-015 P3b rank-4: the three small (16-byte) param/rope_params/
+    // sections buffers were previously rebuilt on every call (32×/token
+    // on the apex 35B-A3B FullAttn pattern, 208 µs/token measured on the
+    // qwen3.6-27b-dwq46 dense fixture in the Wave 2a TimeProfiler trace).
+    // dispatch_rope_multi_cached reuses them via a per-thread cache
+    // keyed by (device, head_dim, rope_dim, n_heads, seq_len, freq_base,
+    // mode, sections); the qwen35 decode hot path hits 2 stable entries
+    // (Q-config + K-config, seq_len=1) and amortizes the alloc cost
+    // across all decode tokens.  Bit-exact: same kernel, same dispatch,
+    // only the param triplet is sourced from the cache.
+    dispatch_rope_multi_cached(
         encoder,
         registry,
-        device.metal_device(),
+        device,
         input,
         &out,
         positions,
-        &params_buf,
-        &rope_params,
-        &sections_buf,
         params,
     )
-    .context("dispatch_rope_multi")?;
+    .context("dispatch_rope_multi_cached")?;
 
     Ok(out)
 }
