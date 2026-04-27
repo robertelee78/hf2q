@@ -2700,7 +2700,7 @@ fn defensive_no_call_under_constrained(
 /// | tool_choice          | behavior                                          |
 /// |----------------------|---------------------------------------------------|
 /// | `None`               | No constraint — tools suppressed at render time.  |
-/// | `Auto` (default)     | LAZY constraint when `tools[]` non-empty AND model registered. Same per-model body grammar shape as Required, but enforcement is gated by the runtime `awaiting_trigger` flag (flipped by `ToolCallSplitter` on `ToolCallOpen`). Until the model emits the open marker, decoding is unconstrained (preamble freedom). |
+/// | `Auto` (default)     | LAZY constraint when `tools[]` non-empty AND model registered. Uses `GrammarShape::OneOrMoreCallsBodyOnly`: the FIRST open marker is stripped from the root rule because the splitter consumes it (no-op while `awaiting_trigger=true`) before `runtime.trigger()` fires. Enforcement starts at the body bytes. Until the open marker arrives, decoding is unconstrained (preamble freedom). |
 /// | `Required`           | EAGER grammar = alternation of ALL function grammars. |
 /// | `Function(name)`     | EAGER grammar = that function's grammar only.     |
 ///
@@ -2744,14 +2744,25 @@ fn defensive_no_call_under_constrained(
 /// | Required / Function   | nonempty     | unknown            | Err(400)          |
 /// | Required / Function   | nonempty     | known              | Ok(Some(grammar)) — EAGER |
 ///
-/// The eager-vs-lazy distinction is NOT carried in the returned grammar —
-/// the grammar bytes are identical between Required-with-tools-and-family
-/// and Auto-with-tools-and-family on the same registration.  The
-/// distinction is encoded by `select_effective_grammar` in the
-/// `GrammarKind` discriminant (`ToolCallBodyRequired` vs
-/// `ToolCallBodyAuto`), which the engine reads to arm
-/// `awaiting_trigger=true` for the lazy path. See engine.rs:1496-1498
-/// and engine.rs:2724-2726 for the arming sites.
+/// The eager-vs-lazy distinction IS reflected in the returned grammar bytes
+/// (Wave 3.5 HIGH-1 fix):
+///
+/// * `Required` / `Function` compile `GrammarShape::OneOrMoreCalls` — the
+///   root rule begins with the encoded open marker, so every call (including
+///   the first) is marker-wrapped.  Grammar enforces from byte 0 (eager).
+///
+/// * `Auto` compiles `GrammarShape::OneOrMoreCallsBodyOnly` — the root rule
+///   begins with the body bytes; the first open marker is absent from the
+///   root because the splitter already consumed it via the `awaiting_trigger`
+///   no-op gate before `runtime.trigger()` fires.  Subsequent calls 2+
+///   (under `parallel_tool_calls=true`) still include the open marker in the
+///   inter-call rule.  Grammar enforces from the body onwards (lazy, post-
+///   trigger).
+///
+/// The `GrammarKind` discriminant (`ToolCallBodyRequired` vs
+/// `ToolCallBodyAuto`) is set by `select_effective_grammar`; the engine reads
+/// it to arm `awaiting_trigger=true` for the lazy path.  See
+/// engine.rs:1496-1498 and engine.rs:2724-2726 for the arming sites.
 ///
 /// Mirrors llama.cpp `grammar_lazy = (tool_choice == AUTO)` /
 /// `grammar_lazy = false` for Required at common/chat.cpp:898-913,
@@ -2768,10 +2779,13 @@ fn compile_tool_grammar(
         return Ok(None);
     }
 
-    // Required / Function compile EAGER; Auto compiles LAZY (same grammar
-    // shape, kind discriminant flips at select_effective_grammar so the
-    // engine arms `awaiting_trigger=true`).  The distinction matters only
-    // for precondition strictness:
+    // Required / Function compile EAGER (GrammarShape::OneOrMoreCalls —
+    // marker-wrapped from byte 0); Auto compiles LAZY
+    // (GrammarShape::OneOrMoreCallsBodyOnly — first open marker stripped,
+    // body-only root).  Wave 3.5 HIGH-1: the grammar bytes DIFFER between
+    // Auto and Required.  The kind discriminant at select_effective_grammar
+    // arms `awaiting_trigger=true` for the lazy path.  The distinction
+    // also matters for precondition strictness:
     //   * Required/Function: missing tools[] OR unknown family ⇒ Err(400)
     //   * Auto              : missing tools[] OR unknown family ⇒ Ok(None)
     let constrain =
