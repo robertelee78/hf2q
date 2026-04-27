@@ -470,20 +470,44 @@ pub struct LoadedModel {
 /// newtype makes all generation-affecting fields part of the equality
 /// check.
 ///
-/// Only fields that affect greedy-decode (T=0) output are included:
+/// Wave-2.6 W-ε (B5 honest closure): wave-2.5 commit overstated B5
+/// closure.  The key still excluded `frequency_penalty`, `presence_penalty`,
+/// `min_p`, `grammar_kind`, `tool_call_policy`, `logprobs`,
+/// `top_logprobs`, and `parallel_tool_calls`.  Option A (mantra): every
+/// generation-affecting parameter is included in the key — even parameters
+/// not yet wired into the sampler — so that future wiring never introduces
+/// a silent stale-replay bug.
+///
+/// Inventory of ALL `SamplingParams` fields and their cache treatment:
+///
+/// **Excluded (bypass gate already handles these):**
+/// - `temperature` — non-zero bypasses cache; never reaches key check
+/// - `top_p` — < 1.0 bypasses cache
+/// - `top_k` — > 0 bypasses cache
+/// - `repetition_penalty` — ≠ 1.0 bypasses cache
+/// - `seed` — Some(_) bypasses cache
+/// - `token_bytes` — derived from `grammar`; identical iff `grammar` is identical
+///
+/// **Included (affect model output or response shape):**
 /// - `max_tokens` — early-stop trigger
 /// - `stop_strings` — early-stop trigger
-/// - `logit_bias` — additive shift applied before greedy argmax
-/// - `grammar` — token-validity mask applied before argmax
-///
-/// Fields that are irrelevant to greedy decode (temperature=0,
-/// top_p=1, top_k=0, repetition_penalty=1, seed=None) are deliberately
-/// excluded — the existing sampling-bypass gate in `lookup`/`store`
-/// already ensures those requests never reach the cache.
-///
-/// `frequency_penalty` and `presence_penalty` are plumbed but currently
-/// not wired into the greedy path; they are excluded here and will be
-/// added when they become effective.
+/// - `logit_bias` — additive shift applied before argmax (wired)
+/// - `grammar` — token-validity mask (wired)
+/// - `grammar_kind` — ResponseFormat vs ToolCallBody changes enforcement
+///   timing; wired in wave-2.6 W-α5 (same grammar, different kind →
+///   completely different output for tool-call vs. unconditional paths)
+/// - `frequency_penalty` — penalty applied to sampler (plumbed, not yet wired
+///   into greedy path; included now so future wiring is safe)
+/// - `presence_penalty` — same as frequency_penalty
+/// - `min_p` — min-p sampling cutoff (plumbed, not yet wired; included for
+///   forward-compatibility)
+/// - `tool_call_policy` — Auto vs Constrained changes error-promotion on
+///   parse failure; a cached Auto replay served to a Constrained caller
+///   would silently suppress error signalling
+/// - `logprobs` — changes response shape (logprob data in choices)
+/// - `top_logprobs` — changes response shape (number of top alternatives)
+/// - `parallel_tool_calls` — plumbed, not yet wired; included for
+///   forward-compatibility
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptCacheKey {
     pub max_tokens: usize,
@@ -499,6 +523,28 @@ pub struct PromptCacheKey {
     /// `None` means no grammar constraint; `Some(g)` means the entire
     /// GBNF rule set must match.
     pub grammar: Option<super::grammar::Grammar>,
+    /// ResponseFormat vs ToolCallBody — same Grammar but different kind
+    /// produces different enforcement timing and therefore different output.
+    /// Wired in wave-2.6 W-α5.
+    pub grammar_kind: GrammarKind,
+    /// Stored as bit-pattern to allow structural equality without f32 surprises.
+    /// Default 0.0 → 0u32. Plumbed but not yet wired into greedy path;
+    /// included now for forward-safe wiring.
+    pub frequency_penalty_bits: u32,
+    /// Same treatment as `frequency_penalty_bits`.
+    pub presence_penalty_bits: u32,
+    /// Min-p sampling cutoff bit-pattern. 0.0 → 0u32.
+    pub min_p_bits: u32,
+    /// Auto vs Constrained — affects error-promotion on parse failure.
+    pub tool_call_policy: ToolCallPolicy,
+    /// `true` = include per-token logprob data in response. Changes response
+    /// shape; different callers expect different response structures.
+    pub logprobs: bool,
+    /// Number of top-alternatives to report per token. Changes response shape.
+    pub top_logprobs: u32,
+    /// Multi-tool-call flag. Plumbed, not yet wired; included for
+    /// forward-safe wiring.
+    pub parallel_tool_calls: bool,
 }
 
 impl PromptCacheKey {
@@ -515,6 +561,14 @@ impl PromptCacheKey {
             stop_strings: params.stop_strings.clone(),
             logit_bias_sorted: bias_sorted,
             grammar: params.grammar.clone(),
+            grammar_kind: params.grammar_kind,
+            frequency_penalty_bits: params.frequency_penalty.to_bits(),
+            presence_penalty_bits: params.presence_penalty.to_bits(),
+            min_p_bits: params.min_p.to_bits(),
+            tool_call_policy: params.tool_call_policy,
+            logprobs: params.logprobs,
+            top_logprobs: params.top_logprobs,
+            parallel_tool_calls: params.parallel_tool_calls,
         }
     }
 }
@@ -612,6 +666,14 @@ impl PromptCache {
                 stop_strings: Vec::new(),
                 logit_bias_sorted: Vec::new(),
                 grammar: None,
+                grammar_kind: GrammarKind::default(),
+                frequency_penalty_bits: 0u32,
+                presence_penalty_bits: 0u32,
+                min_p_bits: 0u32,
+                tool_call_policy: ToolCallPolicy::Auto,
+                logprobs: false,
+                top_logprobs: 0,
+                parallel_tool_calls: true,
             },
             text: String::new(),
             reasoning_text: None,
@@ -625,12 +687,14 @@ impl PromptCache {
     /// `prompt_tokens` exactly equals the cached prompt, the caller
     /// is in greedy decode mode (temperature = 0, no sampling-only
     /// fields set), AND all generation-affecting params match the
-    /// cached key (max_tokens, stop_strings, logit_bias, grammar).
+    /// cached key.
     ///
-    /// Wave-2.5 B5: added `PromptCacheKey` comparison to prevent
-    /// silent-correctness bugs where same prompt + different max_tokens,
-    /// stops, logit_bias, or grammar would incorrectly replay a stale
-    /// cached response.
+    /// Wave-2.5 B5 / Wave-2.6 W-ε: `PromptCacheKey` now covers the
+    /// complete inventory of generation-affecting params:
+    /// `max_tokens`, `stop_strings`, `logit_bias`, `grammar`,
+    /// `grammar_kind`, `frequency_penalty`, `presence_penalty`,
+    /// `min_p`, `tool_call_policy`, `logprobs`, `top_logprobs`,
+    /// `parallel_tool_calls`.  See `PromptCacheKey` doc for rationale.
     pub fn lookup(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Option<GenerationResult> {
         // Bypass for any non-greedy mode.  These all introduce per-call
         // variance that a cached replay would silently erase.
@@ -3431,6 +3495,206 @@ assistant:
             "identical prompt + identical params must hit cache"
         );
         assert_eq!(hit.unwrap().text, "cached text");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-2.6 W-ε — honest B5 closure: tests for newly-keyed params
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn prompt_cache_miss_on_different_grammar_kind() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use std::collections::HashMap;
+
+        // Build a trivial grammar used by both base and req.
+        let grammar = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'x' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: { let mut m = HashMap::new(); m.insert("root".to_string(), 0u32); m },
+        };
+
+        let mut base = SamplingParams::default();
+        base.grammar = Some(grammar.clone());
+        base.grammar_kind = GrammarKind::ResponseFormat;
+        let cache = make_cached(&tokens, &base, "x");
+
+        // Same grammar, but ToolCallBody kind — enforcement timing differs → MISS.
+        let mut req = SamplingParams::default();
+        req.grammar = Some(grammar);
+        req.grammar_kind = GrammarKind::ToolCallBody;
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same grammar + different grammar_kind must not hit cache \
+             (ResponseFormat enforces unconditionally; ToolCallBody is trigger-gated)"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_frequency_penalty() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.frequency_penalty = 0.0;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.frequency_penalty = 0.5; // non-default — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different frequency_penalty must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_presence_penalty() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.presence_penalty = 0.0;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.presence_penalty = 0.3; // non-default — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different presence_penalty must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_min_p() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.min_p = 0.0;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.min_p = 0.1; // non-default — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different min_p must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_tool_call_policy() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.tool_call_policy = ToolCallPolicy::Auto;
+        let cache = make_cached(&tokens, &base, r#"{"name":"fn"}"#);
+
+        let mut req = SamplingParams::default();
+        req.tool_call_policy = ToolCallPolicy::Constrained; // different policy — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different tool_call_policy must not hit cache \
+             (Constrained promotes parse failures; Auto falls back to content)"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_logprobs() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.logprobs = false;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.logprobs = true; // logprob data requested — different response shape → MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + logprobs=true vs false must not hit cache \
+             (response shape differs: logprob entries present vs absent)"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_top_logprobs() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.logprobs = true;
+        base.top_logprobs = 2;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.logprobs = true;
+        req.top_logprobs = 5; // different number of alternatives — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different top_logprobs must not hit cache \
+             (response shape differs: number of top alternatives)"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_parallel_tool_calls() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.parallel_tool_calls = true;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.parallel_tool_calls = false; // non-default — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different parallel_tool_calls must not hit cache"
+        );
+    }
+
+    /// Full-inventory hit test: all generation-affecting params identical
+    /// including the wave-2.6 W-ε additions.
+    #[test]
+    fn prompt_cache_hit_full_inventory_equal() {
+        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use std::collections::HashMap;
+
+        let tokens: Vec<u32> = vec![10, 20, 30];
+
+        let grammar = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'z' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: { let mut m = HashMap::new(); m.insert("root".to_string(), 0u32); m },
+        };
+
+        let mut params = SamplingParams::default();
+        params.max_tokens = 64;
+        params.stop_strings = vec!["END".to_string()];
+        params.logit_bias.insert(99, -1.0);
+        params.grammar = Some(grammar.clone());
+        params.grammar_kind = GrammarKind::ResponseFormat;
+        params.frequency_penalty = 0.1;
+        params.presence_penalty = 0.2;
+        params.min_p = 0.05;
+        params.tool_call_policy = ToolCallPolicy::Auto;
+        params.logprobs = true;
+        params.top_logprobs = 3;
+        params.parallel_tool_calls = false;
+        let cache = make_cached(&tokens, &params, "full-inventory-hit");
+
+        // Identical params → must HIT.
+        let mut same = SamplingParams::default();
+        same.max_tokens = 64;
+        same.stop_strings = vec!["END".to_string()];
+        same.logit_bias.insert(99, -1.0);
+        same.grammar = Some(grammar);
+        same.grammar_kind = GrammarKind::ResponseFormat;
+        same.frequency_penalty = 0.1;
+        same.presence_penalty = 0.2;
+        same.min_p = 0.05;
+        same.tool_call_policy = ToolCallPolicy::Auto;
+        same.logprobs = true;
+        same.top_logprobs = 3;
+        same.parallel_tool_calls = false;
+
+        let hit = cache.lookup(&tokens, &same);
+        assert!(
+            hit.is_some(),
+            "identical full-inventory params must hit cache"
+        );
+        assert_eq!(hit.unwrap().text, "full-inventory-hit");
     }
 }
 

@@ -6015,3 +6015,31 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - W-γ5 owns the GBNF combiner correctness fix (research-report.md Q4) — parse-to-AST + serialize-with-renames replacing the lexer rewriter. Foundation tests don't depend on combiner output.
     - W-ε owns the bounded-state object grammar work (research-report.md Q3) — hard 400 at >8 required keys, removing the sequential fallback.
   - **Fence respected.** W-α5 edits in `src/serve/api/engine.rs`, `src/serve/api/handlers.rs`, `src/serve/api/grammar/sampler.rs`, `src/serve/api/grammar/mask.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
+- **2026-04-27 wave-2.6 Worker W-ε (session cfa-20260427-adr005-wave2.6, item B5 honest closure) — PromptCacheKey full-inventory expansion.**
+  - **Audit finding (cfa-20260427-adr005-wave2.5/codex-review-last.txt §B5, severity LOW → mantra-promoted):**
+    Wave-2.5 commit message overstated B5 closure. `PromptCacheKey` included only `max_tokens`, `stop_strings`, `logit_bias`, `grammar` — excluding all of: `frequency_penalty`, `presence_penalty`, `min_p`, `grammar_kind`, `tool_call_policy`, `logprobs`, `top_logprobs`, `parallel_tool_calls`. A partial cache key is a stub-by-omission: when any excluded param is wired into the sampler in a future iteration, the cache silently replays stale results.
+  - **Option A chosen (mantra: no stubs).** Every generation-affecting `SamplingParams` field is included in the key — even those not yet wired — so future wiring never introduces a stale-replay bug. Option B (bypass on non-default) was rejected: it would require remembering to update the bypass gate each time a param is wired, which is the exact same deferred-work anti-pattern.
+  - **Full inventory of all `SamplingParams` fields and their cache treatment:**
+    - `temperature`, `top_p`, `top_k`, `repetition_penalty`, `seed` — **excluded**: sampling-bypass gate already ensures these never reach the key check (non-greedy requests are never cached).
+    - `token_bytes` — **excluded**: derived from `grammar`; identical iff `grammar` matches.
+    - `max_tokens`, `stop_strings`, `logit_bias`, `grammar` — **in key** (wave-2.5, retained).
+    - `grammar_kind` — **added to key**: `ResponseFormat` enforces unconditionally; `ToolCallBody` is trigger-gated. Same grammar + different kind → completely different output. Wired today (W-α5).
+    - `frequency_penalty`, `presence_penalty` — **added to key**: plumbed, not yet wired into greedy path. Included now so future wiring is safe.
+    - `min_p` — **added to key**: plumbed, not yet wired. Included for forward-compatibility.
+    - `tool_call_policy` — **added to key**: `Auto` vs `Constrained` affects error-promotion on parse failure. Wired today; a cached Auto replay served to a Constrained caller suppresses error signalling.
+    - `logprobs`, `top_logprobs` — **added to key**: affect response shape (logprob entries in choices). Different callers expect different response structures.
+    - `parallel_tool_calls` — **added to key**: plumbed, not yet wired. Included for forward-compatibility.
+  - **Tests added (9 new + 1 full-inventory hit, all pass):**
+    - `prompt_cache_miss_on_different_grammar_kind`
+    - `prompt_cache_miss_on_different_frequency_penalty`
+    - `prompt_cache_miss_on_different_presence_penalty`
+    - `prompt_cache_miss_on_different_min_p`
+    - `prompt_cache_miss_on_different_tool_call_policy`
+    - `prompt_cache_miss_on_different_logprobs`
+    - `prompt_cache_miss_on_different_top_logprobs`
+    - `prompt_cache_miss_on_different_parallel_tool_calls`
+    - `prompt_cache_hit_full_inventory_equal` (exhaustive same-config hit across all new fields)
+    - Existing wave-2.5 tests (`max_tokens`, `stops`, `logit_bias`, `response_format`, `tool_choice`, `hit_requires_all_params_equal`) all continue to pass. Total: 33 pass.
+  - **Chesterton block:** The wave-2.5 commit rationale said "frequency_penalty and presence_penalty are plumbed but currently not wired; they are excluded here and will be added when they become effective." This logic is precisely the fence that was supposed to be torn down — it pushes the responsibility to whoever wires the param to also remember to update the cache key, which is non-local and easy to forget. The correct invariant is: the cache key is always a superset of generation-affecting params. Including params early costs only comparison bytes, never a stale replay.
+  - **Fence respected.** W-ε edits in `src/serve/api/engine.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
