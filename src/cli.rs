@@ -261,6 +261,18 @@ pub struct ConvertArgs {
     #[arg(long, short)]
     pub output: Option<PathBuf>,
 
+    /// Target shard size in GB for the safetensors directory layout
+    /// (ADR-014 P9 iter-1 §S5). Default 5.0 GB matches the mlx-lm /
+    /// HuggingFace community convention. Range: 0.5..=50.0. Ignored
+    /// for `--format gguf` and for the single-file `--quant f16` /
+    /// `--quant bf16` safetensors path (Decision 17 byte-identity).
+    #[arg(
+        long = "shard-size-gb",
+        default_value_t = 5.0,
+        value_parser = parse_shard_size_gb,
+    )]
+    pub shard_size_gb: f64,
+
     /// Emit structured JSON report for CI/automation
     #[arg(long)]
     pub json_report: bool,
@@ -788,6 +800,41 @@ impl QuantMethod {
         }
     }
 
+    /// True when this method actually quantizes weights (anything other
+    /// than the float-passthrough variants `f16` / `bf16`).
+    ///
+    /// Used by the safetensors backend (ADR-014 P9 iter-1 §S2) to pick
+    /// between the single-file float emission and the mlx-lm-style
+    /// directory layout with sharded `model-NNNNN-of-MMMMM.safetensors`
+    /// + `model.safetensors.index.json` + `config.json` injection.
+    ///
+    /// `Auto` returns `true` because once `resolve_convert_config`
+    /// resolves it to a concrete variant the dispatch needs the same
+    /// quantized-path treatment; the resolver replaces `Auto` with a
+    /// concrete variant before this predicate is consulted by the
+    /// safetensors emit path, but defaulting to `true` here is the
+    /// conservative no-shortcut answer (mantra).
+    pub fn is_quantized(self) -> bool {
+        match self {
+            Self::F16 | Self::Bf16 => false,
+            Self::Auto
+            | Self::Q2
+            | Self::Q4
+            | Self::Q8
+            | Self::Q4KM
+            | Self::Q5KM
+            | Self::Q6K
+            | Self::ImatrixQ4KM
+            | Self::ImatrixQ5KM
+            | Self::ImatrixQ6K
+            | Self::ImatrixAdaptive
+            | Self::Dwq46
+            | Self::Dwq48
+            | Self::Dwq68
+            | Self::Dwq28 => true,
+        }
+    }
+
     /// Return the default output filename suffix for this quant method.
     ///
     /// DWQ variants produce compact suffixes like "dwq46", "dwq48", etc.
@@ -1029,6 +1076,28 @@ pub struct ConvertConfig {
     pub calibration: Option<CalibrationFlag>,
     /// Orthogonal OutputFormat selector (ADR-014 Decision 12 §off-diagonal).
     pub output_format: Option<OutputFormatFlag>,
+    /// ADR-014 P9 iter-1 §S5 — target shard size in GB for the
+    /// safetensors directory layout. Default 5.0; range 0.5..=50.0.
+    pub shard_size_gb: f64,
+}
+
+/// Custom value parser for `--shard-size-gb` (ADR-014 P9 iter-1 §S5).
+/// Validates the 0.5..=50.0 GB range up front so an out-of-range flag
+/// fails clap parsing rather than producing a malformed shard layout
+/// downstream.
+fn parse_shard_size_gb(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|e| format!("`--shard-size-gb` must be a decimal number: {e}"))?;
+    if !value.is_finite() {
+        return Err("`--shard-size-gb` must be finite (no NaN / Infinity)".to_string());
+    }
+    if !(0.5..=50.0).contains(&value) {
+        return Err(format!(
+            "`--shard-size-gb` must be in the range 0.5..=50.0 (got {value})"
+        ));
+    }
+    Ok(value)
 }
 
 #[allow(dead_code)]
@@ -1204,6 +1273,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
         no_integrity: args.no_integrity,
         calibration: args.calibration,
         output_format: args.output_format,
+        shard_size_gb: args.shard_size_gb,
     })
 }
 
@@ -1889,6 +1959,7 @@ mod tests {
             unsupported_layers: None,
             emit_vision_tower: false,
             no_integrity: true,
+            shard_size_gb: 5.0,
         };
         let cfg = resolve_convert_config(&args).unwrap();
         assert!(cfg.no_integrity);
@@ -1918,8 +1989,53 @@ mod tests {
             unsupported_layers: None,
             emit_vision_tower: false,
             no_integrity: false,
+            shard_size_gb: 5.0,
         };
         let cfg = resolve_convert_config(&args).unwrap();
         assert!(!cfg.no_integrity);
+    }
+
+    /// ADR-014 P9 iter-1 §S5 — `--shard-size-gb` parses, validates the
+    /// 0.5..=50.0 range, and propagates into ConvertConfig.
+    #[test]
+    fn shard_size_gb_flag_parses_and_propagates() {
+        // Default value when not set on the CLI surface.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = ConvertArgs {
+            input: Some(tmp.path().to_path_buf()),
+            repo: None,
+            format: OutputFormat::Safetensors,
+            quant: QuantMethod::Dwq46,
+            calibration: None,
+            output_format: None,
+            sensitive_layers: None,
+            calibration_samples: 1024,
+            target_bpw: 4.5,
+            bits: None,
+            group_size: None,
+            output: None,
+            json_report: false,
+            skip_quality: false,
+            quality_gate: false,
+            dry_run: false,
+            yes: false,
+            unsupported_layers: None,
+            emit_vision_tower: false,
+            no_integrity: false,
+            shard_size_gb: 2.5,
+        };
+        let cfg = resolve_convert_config(&args).unwrap();
+        assert!((cfg.shard_size_gb - 2.5).abs() < 1e-9);
+
+        // Explicit parser exercise — out-of-range must error.
+        assert!(parse_shard_size_gb("0.4").is_err());
+        assert!(parse_shard_size_gb("50.5").is_err());
+        assert!(parse_shard_size_gb("not-a-number").is_err());
+        assert!(parse_shard_size_gb("inf").is_err());
+
+        // Boundary values must parse.
+        assert!((parse_shard_size_gb("0.5").unwrap() - 0.5).abs() < 1e-9);
+        assert!((parse_shard_size_gb("50").unwrap() - 50.0).abs() < 1e-9);
+        assert!((parse_shard_size_gb("5.0").unwrap() - 5.0).abs() < 1e-9);
     }
 }

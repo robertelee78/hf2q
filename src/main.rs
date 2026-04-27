@@ -1159,9 +1159,15 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     );
 
     // Phase 2: Create output backend
+    //
+    // ADR-014 P9 iter-1 §S5 — propagate `--shard-size-gb` (default 5.0)
+    // into the safetensors emit path. The flag is ignored by the GGUF
+    // backend (which writes a single .gguf file regardless of size).
     let backend: Box<dyn OutputBackend> = match config.format {
         cli::OutputFormat::Gguf => Box::new(GgufBackend::new()),
-        cli::OutputFormat::Safetensors => Box::new(SafetensorsBackend::new()),
+        cli::OutputFormat::Safetensors => {
+            Box::new(SafetensorsBackend::with_shard_size_gb(config.shard_size_gb))
+        }
     };
 
     if !backend.requires_native_quantization() {
@@ -2088,6 +2094,20 @@ fn copy_sidecars(src_dir: &std::path::Path, dst_dir: &std::path::Path) {
             continue;
         }
         let dst = dst_dir.join(filename);
+        // ADR-014 P9 iter-1 §S2 — the safetensors backend owns the
+        // mutation of `config.json` (mlx-lm `quantization` injection
+        // per `mlx_lm.utils.save_config:912-913`). When the backend
+        // already produced a file at this path, do not clobber it
+        // with a byte-copy from the source — the injected config is
+        // load-bearing for downstream mlx-lm consumers.
+        if dst.exists() {
+            tracing::debug!(
+                file = %filename,
+                "Sidecar already present at destination — skipping copy \
+                 (backend-written file takes precedence)"
+            );
+            continue;
+        }
         match std::fs::copy(&src, &dst) {
             Ok(bytes) => {
                 tracing::info!(

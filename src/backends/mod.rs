@@ -89,7 +89,57 @@ pub trait OutputBackend: Send + Sync {
 
     /// Whether this backend requires native quantization (quantize_and_write)
     /// rather than receiving pre-quantized IR.
+    ///
+    /// ADR-014 P9 iter-1: the default is `false` and **no shipped backend**
+    /// overrides it any more.  Both [`gguf::GgufBackend`] and
+    /// [`safetensors_out::SafetensorsBackend`] now flow through the
+    /// Calibrator → Quantizer → `QuantizedModel` → `write` chain so the
+    /// IR-level quantize loop is the single dispatch path.
+    ///
+    /// The trait method itself is retained so future backends that *do*
+    /// own a non-IR algorithm (e.g. an MLX-Python emitter) can still opt
+    /// in.  Until such a backend lands, every call site in
+    /// `cmd_convert` (the ~6 sites below the Phase 2 dispatch) takes the
+    /// `false` branch — Chesterton's fence on the dead arms is
+    /// intentional.
     fn requires_native_quantization(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::gguf::GgufBackend;
+    use crate::backends::safetensors_out::SafetensorsBackend;
+
+    /// ADR-014 P9 iter-1 §S1 — `SafetensorsBackend` no longer overrides
+    /// `requires_native_quantization`; it inherits the trait default
+    /// (`false`) so the cmd_convert dispatch routes safetensors through
+    /// the same Calibrator → Quantizer chain as GGUF.
+    #[test]
+    fn safetensors_backend_does_not_require_native_quantization() {
+        let backend = SafetensorsBackend::new();
+        assert!(
+            !backend.requires_native_quantization(),
+            "SafetensorsBackend must inherit the trait default \
+             `requires_native_quantization() = false` (ADR-014 P9 iter-1 §S1)"
+        );
+    }
+
+    /// ADR-014 P9 iter-1 §S1 — the trait default is `false`. Codified so
+    /// future backend authors aren't surprised by the dispatch behaviour.
+    /// Uses `GgufBackend` (also no override) as the default-witness; if
+    /// either backend ever regains a native-quant override the assert
+    /// must move first.
+    #[test]
+    fn output_backend_default_requires_native_quantization_is_false() {
+        let backend = GgufBackend::new();
+        assert!(
+            !backend.requires_native_quantization(),
+            "OutputBackend trait default (and GgufBackend inherit) must \
+             remain `requires_native_quantization() = false` until a \
+             future backend deliberately opts in"
+        );
     }
 }
