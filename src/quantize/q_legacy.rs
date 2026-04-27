@@ -45,6 +45,14 @@ pub const BLOCK_Q8_0_SIZE: usize = 2 + QK8_0;
 /// Matches `sizeof(block_q4_0)` per `ggml-common.h:189`.
 pub const BLOCK_Q4_0_SIZE: usize = 2 + QK4_0 / 2;
 
+/// Block size for Q4_1 (32-element block).
+pub const QK4_1: usize = 32;
+
+/// Block size in bytes — F16 d (2) + F16 m (2) + 16 packed nibbles
+/// (`QK4_1/2`) = 20 bytes. Matches `sizeof(block_q4_1)` per
+/// `ggml-common.h:202`.
+pub const BLOCK_Q4_1_SIZE: usize = 2 + 2 + QK4_1 / 2;
+
 /// Block size for Q5_0 / Q5_1 (32-element blocks).
 pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
@@ -438,6 +446,202 @@ pub fn dequantize_row_q4_0_bytes(data: &[u8], out: &mut [f32]) -> Result<usize, 
         blocks.push(block);
     }
     dequantize_row_q4_0(&blocks, out)
+}
+
+// ────────────────────────── Q4_1 ──────────────────────────
+
+/// Q4_1 block — 32 elements at 5 bpw (4-bit nibbles + per-block min)
+/// + per-block F16 scale and F16 min.
+///
+/// Layout matches `block_q4_1` in `/opt/llama.cpp/ggml/src/ggml-common.h:198`
+/// byte-for-byte. Asymmetric (with min term) — quants live in
+/// `[0, 15]` and dequantize as `q × d + m`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_1 {
+    /// Block scale `d = (max - min) / 15`. F16, always non-negative.
+    pub d_bits: u16,
+    /// Block min. F16.
+    pub m_bits: u16,
+    /// 16 bytes packing 32 × 4-bit low-nibbles (same packing as Q4_0).
+    pub qs: [u8; QK4_1 / 2],
+}
+
+impl BlockQ4_1 {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < BLOCK_Q4_1_SIZE {
+            return None;
+        }
+        let d_bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let m_bits = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let mut qs = [0u8; QK4_1 / 2];
+        qs.copy_from_slice(&bytes[4..4 + QK4_1 / 2]);
+        Some(Self {
+            d_bits,
+            m_bits,
+            qs,
+        })
+    }
+
+    pub fn to_bytes(&self) -> [u8; BLOCK_Q4_1_SIZE] {
+        let mut out = [0u8; BLOCK_Q4_1_SIZE];
+        out[0..2].copy_from_slice(&self.d_bits.to_le_bytes());
+        out[2..4].copy_from_slice(&self.m_bits.to_le_bytes());
+        out[4..4 + QK4_1 / 2].copy_from_slice(&self.qs);
+        out
+    }
+
+    pub fn d(&self) -> f32 {
+        half::f16::from_bits(self.d_bits).to_f32()
+    }
+
+    pub fn m(&self) -> f32 {
+        half::f16::from_bits(self.m_bits).to_f32()
+    }
+}
+
+/// Quantize F32 row to `BlockQ4_1` blocks. Pure-Rust port of
+/// `quantize_row_q4_1_ref` (`ggml-quants.c:108`).
+///
+/// Per-block:
+/// 1. Track `(min, max)` over the 32 elements.
+/// 2. `d = (max - min) / 15`.
+/// 3. `id = 1/d` (or 0 if `d == 0`).
+/// 4. For each `j ∈ [0, qk/2)`:
+///    - `xi0 = clamp((x[j] - min) × id + 0.5, 0, 15) as u8`
+///    - `xi1 = clamp((x[j + qk/2] - min) × id + 0.5, 0, 15) as u8`
+///    - `qs[j] = xi0 | (xi1 << 4)`
+pub fn quantize_row_q4_1(row: &[f32], blocks: &mut [BlockQ4_1]) -> Result<(), QLegacyError> {
+    if !row.len().is_multiple_of(QK4_1) {
+        return Err(QLegacyError::NotBlockAligned {
+            actual: row.len(),
+            qk: QK4_1,
+        });
+    }
+    let nb = row.len() / QK4_1;
+    if blocks.len() < nb {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: BLOCK_Q4_1_SIZE,
+        });
+    }
+
+    for i in 0..nb {
+        let x = &row[i * QK4_1..(i + 1) * QK4_1];
+        let mut min = f32::MAX;
+        let mut max = f32::MIN;
+        for &v in x.iter() {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+        }
+        let d = (max - min) / 15.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let d_bits = half::f16::from_f32(d).to_bits();
+        let m_bits = half::f16::from_f32(min).to_bits();
+
+        let mut qs = [0u8; QK4_1 / 2];
+        for j in 0..(QK4_1 / 2) {
+            let x0 = (x[j] - min) * id;
+            let x1 = (x[j + QK4_1 / 2] - min) * id;
+            // C: `MIN(15, (int8_t)(x0 + 0.5f))` — i8 truncation
+            // toward zero, then min with 15. We replicate via
+            // `as i32` then clamp.
+            let xi0 = ((x0 + 0.5) as i32).clamp(0, 15) as u8;
+            let xi1 = ((x1 + 0.5) as i32).clamp(0, 15) as u8;
+            qs[j] = xi0 | (xi1 << 4);
+        }
+
+        blocks[i] = BlockQ4_1 {
+            d_bits,
+            m_bits,
+            qs,
+        };
+    }
+    Ok(())
+}
+
+/// Dequantize `BlockQ4_1` blocks. Pure-Rust port of
+/// `dequantize_row_q4_1` (`ggml-quants.c:417`).
+///
+/// Per-block: for each `j ∈ [0, qk/2)`:
+/// - `y[j]      = (qs[j] & 0xF) × d + m`
+/// - `y[j+qk/2] = (qs[j] >> 4)  × d + m`
+pub fn dequantize_row_q4_1(blocks: &[BlockQ4_1], out: &mut [f32]) -> Result<usize, QLegacyError> {
+    let expected = blocks.len() * QK4_1;
+    if out.len() < expected {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: out.len(),
+            n_blocks: blocks.len(),
+            bytes_per_block: QK4_1,
+        });
+    }
+    for (i, block) in blocks.iter().enumerate() {
+        let d = block.d();
+        let m = block.m();
+        for j in 0..(QK4_1 / 2) {
+            let x0 = (block.qs[j] & 0x0F) as i32;
+            let x1 = (block.qs[j] >> 4) as i32;
+            out[i * QK4_1 + j] = (x0 as f32) * d + m;
+            out[i * QK4_1 + j + QK4_1 / 2] = (x1 as f32) * d + m;
+        }
+    }
+    Ok(blocks.len() * QK4_1)
+}
+
+/// Quantize F32 to flat Q4_1 block bytes.
+pub fn quantize_row_q4_1_to_bytes(row: &[f32]) -> Result<Vec<u8>, QLegacyError> {
+    if !row.len().is_multiple_of(QK4_1) {
+        return Err(QLegacyError::NotBlockAligned {
+            actual: row.len(),
+            qk: QK4_1,
+        });
+    }
+    let nb = row.len() / QK4_1;
+    let mut blocks = vec![
+        BlockQ4_1 {
+            d_bits: 0,
+            m_bits: 0,
+            qs: [0u8; QK4_1 / 2],
+        };
+        nb
+    ];
+    quantize_row_q4_1(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q4_1_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Decode flat Q4_1 block bytes to F32.
+pub fn dequantize_row_q4_1_bytes(data: &[u8], out: &mut [f32]) -> Result<usize, QLegacyError> {
+    if data.len() % BLOCK_Q4_1_SIZE != 0 {
+        return Err(QLegacyError::BlockSizeMismatch {
+            actual: data.len(),
+            n_blocks: data.len() / BLOCK_Q4_1_SIZE,
+            bytes_per_block: BLOCK_Q4_1_SIZE,
+        });
+    }
+    let n_blocks = data.len() / BLOCK_Q4_1_SIZE;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for i in 0..n_blocks {
+        let start = i * BLOCK_Q4_1_SIZE;
+        let end = start + BLOCK_Q4_1_SIZE;
+        let block = BlockQ4_1::from_bytes(&data[start..end]).ok_or(
+            QLegacyError::BlockSizeMismatch {
+                actual: data.len(),
+                n_blocks,
+                bytes_per_block: BLOCK_Q4_1_SIZE,
+            },
+        )?;
+        blocks.push(block);
+    }
+    dequantize_row_q4_1(&blocks, out)
 }
 
 // ────────────────────────── Q5_0 ──────────────────────────
@@ -1402,6 +1606,136 @@ mod tests {
         }
         let rmse = (sse / row.len() as f64).sqrt();
         assert!(rmse < 0.04, "Q5_1 bytes round-trip RMSE {rmse} > 0.04");
+    }
+
+    // ─────────────────── Q4_1 tests (iter-3n) ───────────────────
+
+    /// Block size matches llama.cpp's static_assert
+    /// `sizeof(block_q4_1) == 2*sizeof(ggml_half) + QK4_1/2`.
+    #[test]
+    fn block_q4_1_size_matches_c_struct() {
+        assert_eq!(BLOCK_Q4_1_SIZE, 2 + 2 + 16);
+        assert_eq!(BLOCK_Q4_1_SIZE, 20);
+    }
+
+    /// Round-trip BlockQ4_1.
+    #[test]
+    fn block_q4_1_byte_round_trip() {
+        let block = BlockQ4_1 {
+            d_bits: 0xCAFE,
+            m_bits: 0xBEEF,
+            qs: [
+                0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55,
+                0x66, 0x77, 0x88,
+            ],
+        };
+        let bytes = block.to_bytes();
+        assert_eq!(bytes.len(), BLOCK_Q4_1_SIZE);
+        let decoded = BlockQ4_1::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.d_bits, block.d_bits);
+        assert_eq!(decoded.m_bits, block.m_bits);
+        assert_eq!(decoded.qs, block.qs);
+    }
+
+    /// Q4_1 round-trip on asymmetric ramp [0, 1] — Q4_1's strength.
+    /// 4-bit codebook over `[min, max]` with 16 levels gives step
+    /// = 1/15 ≈ 0.067, so RMSE ~ 0.067/sqrt(12) ≈ 0.019.
+    #[test]
+    fn quantize_q4_1_round_trip_asymmetric() {
+        let row: Vec<f32> = (0..QK4_1)
+            .map(|i| (i as f32) / ((QK4_1 - 1) as f32))
+            .collect();
+        let mut blocks = vec![BlockQ4_1 {
+            d_bits: 0,
+            m_bits: 0,
+            qs: [0u8; QK4_1 / 2],
+        }; 1];
+        quantize_row_q4_1(&row, &mut blocks).unwrap();
+        let mut decoded = vec![0.0_f32; QK4_1];
+        dequantize_row_q4_1(&blocks, &mut decoded).unwrap();
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.025, "Q4_1 asymmetric RMSE {rmse} > 0.025");
+    }
+
+    /// Q4_1 vs Q4_0 on asymmetric input [0, 2]: Q4_1's min term gives
+    /// it an advantage when the distribution is shifted from zero.
+    #[test]
+    fn quantize_q4_1_lower_rmse_than_q4_0_on_asymmetric() {
+        let row: Vec<f32> = (0..QK4_0)
+            .map(|i| 2.0 * (i as f32) / ((QK4_0 - 1) as f32))
+            .collect();
+        let mut q40 = vec![BlockQ4_0 {
+            d_bits: 0,
+            qs: [0u8; QK4_0 / 2],
+        }; 1];
+        let mut q41 = vec![BlockQ4_1 {
+            d_bits: 0,
+            m_bits: 0,
+            qs: [0u8; QK4_1 / 2],
+        }; 1];
+        quantize_row_q4_0(&row, &mut q40).unwrap();
+        quantize_row_q4_1(&row, &mut q41).unwrap();
+        let mut d40 = vec![0.0_f32; QK4_0];
+        let mut d41 = vec![0.0_f32; QK4_1];
+        dequantize_row_q4_0(&q40, &mut d40).unwrap();
+        dequantize_row_q4_1(&q41, &mut d41).unwrap();
+        let rmse = |a: &[f32], b: &[f32]| -> f64 {
+            let mut sse = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = (*x as f64) - (*y as f64);
+                sse += d * d;
+            }
+            (sse / a.len() as f64).sqrt()
+        };
+        let r40 = rmse(&row, &d40);
+        let r41 = rmse(&row, &d41);
+        assert!(
+            r41 <= r40,
+            "Q4_1 RMSE {r41} should be ≤ Q4_0 RMSE {r40} on asymmetric input"
+        );
+    }
+
+    /// Q4_1 flat-bytes round-trip.
+    #[test]
+    fn quantize_q4_1_to_bytes_round_trip() {
+        let row: Vec<f32> = (0..2 * QK4_1)
+            .map(|i| (i as f32) / 32.0)
+            .collect();
+        let bytes = quantize_row_q4_1_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), 2 * BLOCK_Q4_1_SIZE);
+        let mut decoded = vec![0.0_f32; 2 * QK4_1];
+        dequantize_row_q4_1_bytes(&bytes, &mut decoded).unwrap();
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(rmse < 0.07, "Q4_1 bytes round-trip RMSE {rmse} > 0.07");
+    }
+
+    /// Q4_1 rejects misaligned input.
+    #[test]
+    fn quantize_q4_1_rejects_misaligned() {
+        let bad = vec![0.0_f32; QK4_1 + 7];
+        let mut blocks = vec![BlockQ4_1 {
+            d_bits: 0,
+            m_bits: 0,
+            qs: [0u8; QK4_1 / 2],
+        }; 2];
+        let err = quantize_row_q4_1(&bad, &mut blocks).unwrap_err();
+        match err {
+            QLegacyError::NotBlockAligned { actual, qk } => {
+                assert_eq!(actual, QK4_1 + 7);
+                assert_eq!(qk, QK4_1);
+            }
+            _ => panic!("expected NotBlockAligned"),
+        }
     }
 
     /// Q4_0 vs Q8_0 RMSE on the same input: Q8_0 (8-bit) should be
