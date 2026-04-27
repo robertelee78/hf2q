@@ -31,6 +31,7 @@ pub mod grammar;
 pub mod registry;
 pub mod handlers;
 pub mod router;
+pub mod embedding_pool;
 
 pub use router::build_router;
 #[allow(unused_imports)]
