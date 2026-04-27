@@ -1025,6 +1025,67 @@ Re-blessed snapshots for calibrated paths (recorded as new SHA in the closing co
 
 ---
 
+## Discovered defect — DWQ 4-bit base emits Q4_0 (legacy), not Q4_K_M (modern) [2026-04-27, ADR-015 cross-ref]
+
+**Origin:** ADR-015 iter8c-prep bench-matrix sweep + tensor-type audit, 2026-04-27.  Localized at hf2q@`a7d01ef`.
+
+### Defect
+
+`src/backends/gguf.rs::quant_info_to_ggml_type` (lines 1666-1680) maps DWQ's 4-bit-base output to **`GGML_TYPE_Q4_0`** (legacy, 32-element blocks, single F16 scale per block):
+
+```rust
+// src/backends/gguf.rs:1666-1680
+match info.bits {
+    16 => GGML_TYPE_F16,
+    8  => GGML_TYPE_Q8_0,
+    6  => GGML_TYPE_Q6_K,        // ← 6-bit correctly uses K-quant
+    4  => GGML_TYPE_Q4_0,        // ← 4-bit uses LEGACY Q4_0, NOT Q4_K
+    2  => GGML_TYPE_Q4_0,
+    _  => GGML_TYPE_F16,
+}
+```
+
+The comment at lines 1635-1636 — *"K-quant types from Apex cannot be honored because hf2q does not produce K-quant super-block data; we map to the closest simple block type instead"* — is **stale**.  P7 iter-3a/b1/c (commits `ac3ebf2`, `ebee4e6`, `ade910c`, `6440b4e`, `1c37488`, `b27afa7`, `93415ad`) shipped the full Q4_K + Q5_K + Q6_K codebook ports including imatrix-weighted variants; `KQuantCodecQuantizer` produces real Q4_K_M super-block data today (144 bytes per super-block of 256 elements: F16 super-scale + F16 super-min + 12 bytes of 6-bit sub-scales/sub-mins for 8 sub-blocks).
+
+### Evidence (ADR-015 bench matrix at hf2q@`a7d01ef`)
+
+| Fixture | Heavy weight quants (counts) | hf2q decode vs llama.cpp same-day |
+|---|---|---:|
+| `qwen3.6-35b-a3b-...-dwq46.gguf` | **487 Q4_0** + 24 Q6_K | **0.9327× LOSS** (recovery 7.2%) |
+| `qwen3.6-35b-a3b-...-dwq48.gguf` | 232 Q4_0 + 279 Q8_0 | 1.0324× WIN |
+| `qwen3.6-35b-a3b-...-apex.gguf` (Q5_K_M) | 370 Q5_K + 60 Q6_K | 1.0356× WIN (5-trial validation) |
+| `qwen3.6-27b-dwq46.gguf` (dense, BW-bound) | Q4_0 dominant | 0.9888× TIE |
+| `qwen3.6-27b-dwq48.gguf` (dense, BW-bound) | 459 Q4_0 + 38 Q8_0 | 1.0173× WIN |
+| `gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf` | **240 Q4_0** + 48 Q6_K | **0.8303× LOSS** (recovery 20.4%) |
+
+**Pattern**: hf2q's `kernel_mul_mv_q4_0_f32` underperforms llama.cpp's same-named kernel on M5 Max despite byte-equivalent shader source (verified ADR-015 commit `6818884`, identical `N_R0_Q4_0=4`, identical two-accumulator sumy pattern).  9 confirmed M5 Max static-evidence kernel hypotheses for closing the Q4_0 gap have been falsified per ADR-012 §"Final closure verdict" + `project_metal_compiler_auto_optimizes_static_levers`.  Conversely, hf2q's K-quant kernels (`kernel_mul_mv_q4_K_f32`, `kernel_mul_mv_q5_K_f32`, `kernel_mul_mv_q6_K_f32`) are **faster than llama.cpp's** on M5 Max for the same workloads — apex Q5_K_M wins 1.04×, dwq48 (Q4_0+Q8_0 mix) wins 1.03×.
+
+Switching DWQ's 4-bit base output from Q4_0 to Q4_K_M is therefore expected to:
+
+1. **Close the ADR-015 D4 first-bullet gap on dwq46** (~+7%) and **second-bullet gap on gemma** (~+20%) by routing the dominant tensor type through the K-quant kernel family that hf2q wins on.
+2. **Improve quantization quality** — Q4_K_M's grouped 6-bit sub-scales preserve more dynamic range than Q4_0's single F16 scale (canonical evidence: SqueezeLLM, Q4_K_M is industry standard for 4-bit since llama.cpp 2024-Q1).
+3. **Match peer convention** — `mlx_lm.convert --quantize` produces Q4-equivalent grouped layouts; llama.cpp's recommended 4-bit is `q4_k_m`.  Q4_0 is largely deprecated for modern inference.
+
+### Fix scope
+
+The K-quant codec exists; the fix is wiring DWQ's emit path through it.  Concretely:
+
+1. **`src/backends/gguf.rs::quant_info_to_ggml_type`**: change the `4 => GGML_TYPE_Q4_0` branch to `4 => GGML_TYPE_Q4_K`, gated on calibration availability.  Update the stale comment at lines 1635-1636 to reflect that K-quant production is supported.
+2. **DWQ emit path** (`src/calibrate/dwq_calibrator.rs` + `src/calibrate/dwq_activation::run_dwq_with_sensitive_ranges`): when emitting a 4-bit DWQ tensor, route through `KQuantCodecQuantizer::new(KQuantTarget::Q4K, calibration_data)` (the same codec ADR-014 P7 wired into `imatrix-q4_k_m`).  The DWQ sensitivity vector becomes the per-column importance weights consumed by `quantize_row_q4_k_imatrix` (`src/quantize/k_quant.rs`).
+3. **CLI variant naming** (Decision 12): `dwq46` becomes a logical name for "Q4_K_M base + Q6_K sensitive", `dwq48` becomes "Q4_K_M base + Q8_0 sensitive".  Old Q4_0-base GGUFs from the pre-fix pipeline remain readable but should be treated as deprecated; a future cron iter regenerates the four shipped artefacts.
+4. **Re-emit gate** (P11): the four production GGUFs (`qwen3.6-35b-a3b-...-dwq{46,48}.gguf`, `qwen3.6-27b-dwq{46,48}.gguf`, plus `gemma-4-26B-A4B-...-dwq.gguf`) are regenerated through the post-fix pipeline; ADR-015 D4 same-day bench is re-run; both bullets gate on ≥ 1.00× ratio.
+5. **Coherence gate** (ADR-014 P10/P11 cross-ref + ADR-015 task #20): post-fix Q4_K_M base must score ≥ pre-fix Q4_0 base on PPL on wikitext-2 (Decision 16 methodology).  Should improve, not just match — Q4_K_M is canonically better quality at 4-bit.
+
+### Phase placement
+
+This is **a P11 prerequisite, not a new phase**.  P11's "Re-emit ADR-012's four DWQ GGUFs + measured gate close" is what shipped the buggy Q4_0-base artefacts; landing this fix before P11 close means the re-emitted GGUFs incorporate the K-quant base from the start.  Estimated scope: ~50-200 LOC (wiring), no new algorithm work — the K-quant codebook ports landed in P7.
+
+### Cross-ADR effects
+
+- **ADR-015 D4 exit criteria**: both bullets become achievable without iter8c shader-level kernel work.  iter8c can close as "lever moved to ADR-014 P11 fix" pending the re-bench measurement.
+- **ADR-012 P9 final close**: the four re-emitted DWQ GGUFs must still load in llama.cpp without error, must still reach the canonical-pangram smoke gate, and must satisfy the same byte-of-disk + PPL gates ADR-012 P11 anchored.  No regression expected since Q4_K_M is the format llama.cpp ships native support for.
+- **`feedback_dispatch_count_not_wall_time`** memory: dispatch-count was a misleading signal.  The actual lever is the kernel-FAMILY hf2q runs; switching from Q4_0-family kernel to K-quant-family kernel changes which path executes, which closes the wall-time gap.
+
 ## Open questions
 
 These are tracked here, not deferred. Each gets resolved during the Phase that touches it; no question survives this ADR's close.
