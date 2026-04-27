@@ -798,4 +798,143 @@ mod tests {
             "Regular weight tensor should be quantized, not preserved"
         );
     }
+
+    /// ADR-014 P7 iter-3t — `VariantKQuantizer` end-to-end through
+    /// `quantize_streaming(LazyTensorMap, ...)` on canonical GGUF tensor
+    /// names: confirms the per-tensor target dispatch (`layer_mix`
+    /// policy → `k_quant_codec` block format) flows through the streaming
+    /// loop intact, and produces a `QuantizedModel` byte-identical to the
+    /// eager `quantize_model(&TensorMap, ...)` path on the same input.
+    ///
+    /// This is the production-shape test that would catch any future
+    /// regression coupling P0 (LazyTensorMap), P2 (streaming loop), P3
+    /// (BTreeMap iteration determinism), and P7 (variant Quantizer trait
+    /// impl). Existing `variant_end_to_end_pipeline` covered the
+    /// `quantize_tensor`-direct surface — this covers the streaming
+    /// surface that production cmd_convert will call.
+    #[test]
+    fn variant_streaming_byte_identical_to_eager() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        // F16 fixtures using a deterministic ramp per tensor (varying
+        // seed offset so quantized bytes differ across tensors — catches
+        // any swap or cache bug).
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // Four canonical tensor names spanning all four `Q4_K_M` policy
+        // branches in `layer_mix::target_for`:
+        //   1. output.weight       → Q6_K bump (M variant)
+        //   2. blk.0.attn_v.weight → Q6_K (use_more_bits at layer 0)
+        //   3. blk.5.attn_q.weight → Q4_K (attn_q never bumps)
+        //   4. blk.10.ffn_down.weight → Q4_K (use_more_bits=false at
+        //      layer 10 of 32: 10 ≥ n/8=4, 10 < 7n/8=28, (10-4)%3=0)
+        let fixtures: Vec<(&str, Vec<usize>, &str, usize)> = vec![
+            ("output.weight",            vec![1, QK_K], "Q6_K", 210),
+            ("blk.0.attn_v.weight",      vec![1, QK_K], "Q6_K", 210),
+            ("blk.5.attn_q.weight",      vec![1, QK_K], "Q4_K", 144),
+            ("blk.10.ffn_down.weight",   vec![1, QK_K], "Q4_K", 144),
+        ];
+
+        let mut tensor_map = TensorMap::new();
+        let mut lazy_map = LazyTensorMap::new();
+
+        for (i, (name, shape, _expected_type, _expected_bytes)) in fixtures.iter().enumerate() {
+            let len: usize = shape.iter().product();
+            let data = make_f16_payload(i as f32, len);
+            tensor_map.insert(TensorRef {
+                name: name.to_string(),
+                shape: shape.clone(),
+                dtype: DType::F16,
+                data: data.clone(),
+            });
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
+                data,
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let quantizer = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let progress = crate::progress::ProgressReporter::new();
+
+        // Eager and streaming paths against same input.
+        let eager =
+            quantize_model(&tensor_map, &metadata, &quantizer, 0, 0, &progress).unwrap();
+        let streaming = quantize_streaming(
+            lazy_map, &metadata, &quantizer, 0, 0, &progress, /* bf16_to_f16 */ false,
+        )
+        .unwrap();
+
+        // Per-tensor structural + policy + byte-identity checks.
+        assert_eq!(eager.tensors.len(), 4);
+        assert_eq!(streaming.tensors.len(), 4);
+        for (name, _shape, expected_type, expected_bytes) in &fixtures {
+            let e = eager.tensors.get(*name).expect("eager tensor missing");
+            let s = streaming.tensors.get(*name).expect("streaming tensor missing");
+
+            // Policy branch: per-tensor target picked correctly.
+            assert_eq!(
+                e.quant_info.ggml_type.as_deref(),
+                Some(*expected_type),
+                "eager {name} ggml_type mismatch"
+            );
+            assert_eq!(
+                s.quant_info.ggml_type.as_deref(),
+                Some(*expected_type),
+                "streaming {name} ggml_type mismatch"
+            );
+
+            // Codec path: bytes-per-block emitted by the codec match the
+            // target's canonical block size.
+            assert_eq!(
+                e.data.len(), *expected_bytes,
+                "eager {name} block size mismatch"
+            );
+            assert_eq!(
+                s.data.len(), *expected_bytes,
+                "streaming {name} block size mismatch"
+            );
+
+            // Byte-identity: streaming and eager produce literally
+            // identical output bytes for the same Quantizer + input.
+            assert_eq!(e.data, s.data, "streaming/eager byte mismatch on {name}");
+            assert_eq!(e.shape, s.shape, "{name} shape diverged");
+            assert_eq!(e.original_dtype, s.original_dtype, "{name} dtype diverged");
+            assert_eq!(
+                e.quant_info.method, s.quant_info.method,
+                "{name} method diverged"
+            );
+            assert_eq!(
+                e.quant_info.method,
+                crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT,
+                "{name} method should be k_quant_codec_direct (production codec path)"
+            );
+            assert_eq!(
+                e.quant_info.preserved, false,
+                "{name} should be quantized, not preserved"
+            );
+        }
+
+        // Top-level QuantizedModel metadata: name() reports the variant.
+        assert_eq!(eager.quant_method, "Q4_K_M");
+        assert_eq!(streaming.quant_method, "Q4_K_M");
+    }
 }
