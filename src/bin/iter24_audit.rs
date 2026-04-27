@@ -263,7 +263,7 @@ fn main() -> Result<()> {
                 (
                     "ACCEPT",
                     Some(bw),
-                    format!("4-bit TQ passes all 3 gates — ADR-007 closes as shippable at 4-bit."),
+                    "4-bit TQ passes all 3 gates — ADR-007 closes as shippable at 4-bit.".to_string(),
                 )
             } else {
                 (
@@ -825,7 +825,7 @@ fn parse_cosine_json(stdout: &str) -> Result<GateAResult> {
     let json_line = stdout
         .lines()
         .filter(|l| l.trim().starts_with('{'))
-        .last()
+        .next_back()
         .ok_or_else(|| anyhow::anyhow!("No JSON output from cosine_sim.py"))?;
     let v: serde_json::Value =
         serde_json::from_str(json_line).context("parse cosine_sim.py JSON")?;

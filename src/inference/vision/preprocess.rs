@@ -380,12 +380,20 @@ pub fn preprocess_gemma4v(
                     // parity probe (W55, 625f94a) showed hf2q was one full
                     // `2x − 1` step short, producing the algebraic identity
                     // hf2q = (peer + 1) / 2; i.e. peer = 2*hf2q + 1.
-                    patches[row_base + 0 * p2 + pos_in_plane] =
-                        (pix[0] as f32 / 255.0) * 4.0 - 3.0;
-                    patches[row_base + 1 * p2 + pos_in_plane] =
-                        (pix[1] as f32 / 255.0) * 4.0 - 3.0;
-                    patches[row_base + 2 * p2 + pos_in_plane] =
-                        (pix[2] as f32 / 255.0) * 4.0 - 3.0;
+                    //
+                    // `0 * p2` is intentional symmetry with the `1 * p2` /
+                    // `2 * p2` lines below — visually parallel CHW layout
+                    // makes the channel-stride pattern obvious. Clippy's
+                    // `erasing_op` is a false positive here.
+                    #[allow(clippy::erasing_op, clippy::identity_op)]
+                    {
+                        patches[row_base + 0 * p2 + pos_in_plane] =
+                            (pix[0] as f32 / 255.0) * 4.0 - 3.0;
+                        patches[row_base + 1 * p2 + pos_in_plane] =
+                            (pix[1] as f32 / 255.0) * 4.0 - 3.0;
+                        patches[row_base + 2 * p2 + pos_in_plane] =
+                            (pix[2] as f32 / 255.0) * 4.0 - 3.0;
+                    }
                 }
             }
         }

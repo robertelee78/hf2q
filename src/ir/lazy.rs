@@ -308,7 +308,7 @@ impl LazyTensor {
 /// must be `Send`, and the materialised payload (`Vec<u8>`) is
 /// inherently `Send`. Verified at compile time by
 /// [`tests::test_send_bound`].
-//
+///
 // SAFETY: `LazyState::Materialized(Vec<u8>)` is Send. `LazyState::Pending`
 // stores a `Box<dyn FnOnce(...) + Send + 'static>` whose `Send` bound is
 // declared in the trait object — the auto-trait derivation already covers

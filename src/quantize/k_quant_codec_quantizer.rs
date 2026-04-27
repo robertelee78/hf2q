@@ -38,8 +38,6 @@
 //! pass**, no intermediate IR-quantize step. This is the path P4
 //! enables.
 
-use std::collections::HashMap;
-
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
@@ -238,6 +236,7 @@ impl Quantizer for KQuantCodecQuantizer {
 mod tests {
     use super::*;
     use crate::ir::DType;
+    use std::collections::HashMap;
 
     fn make_f32_tensor(name: &str, shape: Vec<usize>, values: &[f32]) -> TensorRef {
         let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();

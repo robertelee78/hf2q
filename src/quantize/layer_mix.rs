@@ -67,7 +67,14 @@ pub enum LayerMixError {
 
 /// User-facing K-quant policy variants. Maps to llama.cpp's
 /// `LLAMA_FTYPE_MOSTLY_Q*_K_*` enum values.
+///
+/// `non_camel_case_types` is allowed because the variant names are the
+/// canonical wire/CLI strings (`Q4_K_M`, `Q5_K_S`, etc.) — they show up
+/// in `--quant` arguments and quant_info.method strings; renaming them
+/// to UpperCamel would diverge from llama.cpp's published nomenclature
+/// and force a translation layer in `parse()` and `name()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum KQuantVariant {
     /// `Q4_K_S` — base Q4_K, minimal upgrades.
     Q4_K_S,

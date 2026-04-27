@@ -238,6 +238,7 @@ fn run_gate_a(
     parse_cosine_json(&py_stdout)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hf2q_sdpa_dump(
     hf2q: &Path,
     model: &Path,
@@ -271,6 +272,7 @@ fn run_hf2q_sdpa_dump(
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hf2q_sdpa_dump_replay(
     hf2q: &Path,
     model: &Path,
@@ -433,7 +435,7 @@ fn parse_cosine_json(stdout: &str) -> Result<CosineGateResult> {
     // Find the last JSON line.
     let json_line = stdout.lines()
         .filter(|l| l.trim().starts_with('{'))
-        .last()
+        .next_back()
         .ok_or_else(|| anyhow::anyhow!("No JSON output from cosine_sim.py"))?;
     let v: serde_json::Value = serde_json::from_str(json_line)
         .context("parse cosine_sim.py JSON")?;

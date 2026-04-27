@@ -1085,7 +1085,6 @@ pub fn apply_sdpa_with_kv_cache(
 /// GGUF-quantised weights, the caller should use `quantized_matmul_ggml`
 /// directly and integrate with the KV-cache path.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_gated_attn_layer(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
