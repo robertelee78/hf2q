@@ -476,10 +476,9 @@ impl Converter {
             return Ok(r#""{" space "}" space"#.into());
         }
 
-        // Cap: true any-position interleaving encodes state as a bitmask of
-        // (required_remaining, optional_remaining) — O(2^N_req * 2^N_opt) rules.
-        // Reject schemas that would generate more state than the grammar engine
-        // can reasonably compile.
+        // Cap: total properties (required + optional) capped at 32.
+        // For schemas > 32 properties, return a clear error rather than
+        // generating an exponentially large (or infinite) grammar.
         let n_total = required_keys.len() + optional_keys.len();
         if n_total > 32 {
             return Err(SchemaError {
@@ -494,6 +493,20 @@ impl Converter {
             });
         }
 
+        // Any-order threshold for required keys.
+        //
+        // The bitmask-based any-order algorithm generates O(2^N_req) unique
+        // grammar rules — one per subset of remaining required keys.  This is
+        // practical for small N_req but becomes intractable at N_req > ~16.
+        // Threshold = 8 keeps the worst-case to 2^8 = 256 rules, which compiles
+        // in microseconds while covering the common case (tools schemas rarely
+        // have more than 8 required keys at the same level).
+        //
+        // For N_req > threshold we fall back to sequential (sorted) required-key
+        // order — the same behaviour as llama.cpp's json-schema-to-grammar.cpp.
+        // Optional keys still accept any order via the opt-chain.
+        const ANY_ORDER_MAX_REQUIRED: usize = 8;
+
         // Build extra-kv wildcard rule (shared across all states if allowed).
         if !additional_closed {
             let extra_kv_name = format!("{}-extra-kv", slug);
@@ -502,13 +515,6 @@ impl Converter {
                 .or_insert_with(|| "string \":\" space value".to_string());
         }
 
-        // Unified any-position inner rule.  State = (req_remaining_bitmask,
-        // opt_remaining_bitmask).  At each position the grammar may emit any
-        // not-yet-emitted required key, any not-yet-emitted optional key, or
-        // any extra key (if additionalProperties is permissive).  All required
-        // keys must appear exactly once; optional keys at most once; extra keys
-        // may repeat.
-        //
         // Compute the inner rule reference (the first key-value pair and all
         // subsequent ones).
         let inner = if required_keys.is_empty() {
@@ -528,12 +534,12 @@ impl Converter {
             }
             let chain = self.build_optional_chain(&slug, &entries);
             format!("( {} )?", chain)
-        } else {
-            // Full initial bitmasks: all bits set for all required / optional keys.
-            // Use `u32::MAX >> (32 - n)` to avoid overflow when n == 32.
-            // This is well-defined: `u32::MAX >> 0 = u32::MAX` for n=32, and
-            // `u32::MAX >> (32 - n)` has exactly n bits set for any n in 1..=32.
-            let n_req = required_keys.len(); // 1..=32 (non-empty branch)
+        } else if required_keys.len() <= ANY_ORDER_MAX_REQUIRED {
+            // Few required keys: use bitmask any-order (full permutation grammar).
+            //
+            // Bitmask seeds — exactly n bits set for n keys in 1..=32.
+            // Use `u32::MAX >> (32 - n)` to avoid shift-by-32 UB.
+            let n_req = required_keys.len(); // 1..=ANY_ORDER_MAX_REQUIRED
             let req_full: u32 = u32::MAX >> (32 - n_req);
             let opt_full: u32 = if optional_keys.is_empty() {
                 0
@@ -545,6 +551,21 @@ impl Converter {
                 &slug,
                 req_full,
                 opt_full,
+                &required_keys,
+                &optional_keys,
+                &kv_rule_name,
+                !additional_closed,
+            )
+        } else {
+            // Many required keys: fall back to sequential (sorted) order.
+            //
+            // Required keys are emitted in sorted order (deterministic).
+            // Optional keys still accept any order via the opt-chain.
+            // Extra keys are accepted before any required key, between required
+            // keys, and after the last required key — provided
+            // additionalProperties is permissive.
+            self.build_sequential_required(
+                &slug,
                 &required_keys,
                 &optional_keys,
                 &kv_rule_name,
@@ -749,6 +770,83 @@ impl Converter {
         let body = alts.join(" | ");
         self.rules.insert(rule_name.clone(), body);
         rule_name
+    }
+
+    /// Build a sequential (fixed-order) required-key inner rule for schemas
+    /// with many required keys where the bitmask any-order algorithm would
+    /// produce an exponentially large grammar.
+    ///
+    /// Required keys are emitted in the sorted order they were passed.
+    /// Optional keys still accept any order via `build_optional_suffix_masked`.
+    /// Extra keys (when `allow_extra_kv`) may appear before any required key
+    /// and between consecutive required keys — via a recursive `extra-star`
+    /// rule — as well as after the last required key via the opt-suffix.
+    ///
+    /// Returns a GBNF inline fragment (not a separate named rule) because the
+    /// body is uniquely determined by the key list and has exactly one call site.
+    fn build_sequential_required(
+        &mut self,
+        slug: &str,
+        required_keys: &[String],
+        optional_keys: &[String],
+        kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
+    ) -> String {
+        // n_opt bitmask seed for the optional suffix (all optional keys remain).
+        let opt_full: u32 = if optional_keys.is_empty() {
+            0
+        } else {
+            let n_opt = optional_keys.len();
+            u32::MAX >> (32 - n_opt)
+        };
+
+        // Optional tail after all required keys have been emitted.
+        let opt_suffix = self.build_optional_suffix_masked(
+            slug,
+            opt_full,
+            optional_keys,
+            kv_rule_name,
+            allow_extra_kv,
+        );
+
+        // Zero-or-more extra keys (if additionalProperties is permissive):
+        // `extra-star` is a recursive GBNF rule that matches
+        // (extra-kv "," space)* — i.e., any number of extra key-value pairs
+        // each followed by a mandatory comma before the next required key.
+        let extra_star_prefix: String = if allow_extra_kv {
+            let extra_kv_name = format!("{}-extra-kv", slug);
+            let star_name = format!("{}-extra-star", slug);
+            self.rules.entry(star_name.clone()).or_insert_with(|| {
+                // star ::= ( extra-kv "," space star )?
+                format!(r#"( {} "," space {} )?"#, extra_kv_name, star_name)
+            });
+            // Include a trailing space so the prefix can be directly
+            // concatenated with the kv rule name.
+            format!("{} ", star_name)
+        } else {
+            String::new()
+        };
+
+        // Build the body as a flat string:
+        //   extra-star? req0-kv "," space extra-star? req1-kv ... reqN-1-kv opt-suffix?
+        let mut body = String::new();
+        for (idx, k) in required_keys.iter().enumerate() {
+            let kv = &kv_rule_name[k];
+            if idx > 0 {
+                // Mandatory comma between required keys.
+                body.push_str(" \",\" space ");
+            }
+            // Optional run of extra keys before this required key.
+            body.push_str(&extra_star_prefix);
+            body.push_str(kv);
+        }
+
+        if !opt_suffix.is_empty() {
+            body.push(' ');
+            body.push_str(&opt_suffix);
+        }
+
+        body
     }
 
     fn visit_array(
