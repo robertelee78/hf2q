@@ -98,6 +98,12 @@ pub enum KQuantError {
         n_blocks: usize,
         bytes_per_block: usize,
     },
+
+    #[error("k-quant: imatrix weights length {weights_len} != row length {row_len}")]
+    WeightsLengthMismatch {
+        row_len: usize,
+        weights_len: usize,
+    },
 }
 
 /// Q4_K super-block — 256 elements stored at 4.5 bpw.
@@ -2364,6 +2370,270 @@ pub fn quantize_row_q6_k_imatrix_to_bytes(
     Ok(out)
 }
 
+// ────────────────────────── Q3_K quantize (iter-7) ──────────────────────────
+
+/// Pure-Rust port of `quantize_row_q3_K_impl` from
+/// `ggml-quants.c:1293-1374`. Quantizes `row` (a multiple of 256
+/// F32 elements) into `blocks` (one BlockQ3K per 256-element
+/// super-block).
+///
+/// `quant_weights = None` matches the `_ref` path (no imatrix); each
+/// 16-element sub-block is weighted by `x[l]^2` (line 1314).
+/// `quant_weights = Some(qw)` matches the imatrix path: weight =
+/// `qw[l] * sqrt(sigma2 + x[l]^2)` (line 1312).
+///
+/// Algorithm:
+///
+/// 1. Per super-block:
+///    - `sigma2 = 2 * sum(x^2) / QK_K` (noise variance estimate;
+///      only consumed by the imatrix path).
+///    - For each of 16 sub-blocks (16 elements each):
+///      a. Build the per-element weight vector.
+///      b. `scales[j] = make_qx_quants(16, 4, x_sub, L_sub, 1, weight)`
+///         — float scale value; `L_sub` populated as a side effect
+///         is discarded (re-computed at step 3).
+///      c. `sw[j] = sum(weight[l])`.
+///    - Quantize the array of 16 sub-block scales itself:
+///      `d_block = make_qx_quants(16, 32, scales, Ls, 1, sw)`.
+///      `Ls[j] ∈ [0, 63]` (nmax=32 → range [0, 2*nmax-1]).
+///    - Pack `Ls[]` into the 12-byte `block.scales[]`:
+///      - bytes 0..7: low 4 bits of `Ls[j]` for `j < 8` in the low
+///        nibble, `j >= 8` in the high nibble of byte `j-8`.
+///      - bytes 8..11: high 2 bits of `Ls[j]` packed at bit position
+///        `2*(j/4)` in byte `8 + j%4`.
+///    - Store `d_block` as f16 → `block.d_bits`.
+/// 2. Re-quantize per-element using the now-locked sub-block scales:
+///    - Read sc from packed scales (line 1342 reverse).
+///    - `d = d_block * (sc - 32)`.
+///    - `L[16*j + ii] = clamp(round(x[16*j + ii] / d), -4, 3) + 4`
+///      → `L ∈ [0, 7]`.
+/// 3. Pack high bits: for any `L[j] > 3`, set `hmask[j%32]` bit
+///    `j/32` and subtract 4 from `L[j]` → `L ∈ [0, 3]`.
+/// 4. Pack low 2 bits: `qs[j/4 + l] = L[j+l] | (L[j+l+32] << 2) |
+///    (L[j+l+64] << 4) | (L[j+l+96] << 6)` for the two halves
+///    `j ∈ {0, 128}`.
+///
+/// Returns the number of blocks written.
+pub fn quantize_row_q3_k(row: &[f32], blocks: &mut [BlockQ3K]) -> Result<usize, KQuantError> {
+    quantize_row_q3_k_inner(row, blocks, None)
+}
+
+/// Imatrix-weighted variant: `quant_weights[k]` is the per-column
+/// importance for super-block `k / QK_K`, sub-block element `k % QK_K`.
+/// Length must equal `row.len()`.
+pub fn quantize_row_q3_k_imatrix(
+    row: &[f32],
+    blocks: &mut [BlockQ3K],
+    quant_weights: &[f32],
+) -> Result<usize, KQuantError> {
+    if quant_weights.len() != row.len() {
+        return Err(KQuantError::WeightsLengthMismatch {
+            row_len: row.len(),
+            weights_len: quant_weights.len(),
+        });
+    }
+    quantize_row_q3_k_inner(row, blocks, Some(quant_weights))
+}
+
+fn quantize_row_q3_k_inner(
+    row: &[f32],
+    blocks: &mut [BlockQ3K],
+    quant_weights: Option<&[f32]>,
+) -> Result<usize, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    if blocks.len() < nb {
+        return Err(KQuantError::BlockSizeMismatch {
+            actual: blocks.len(),
+            n_blocks: nb,
+            bytes_per_block: QK_K,
+        });
+    }
+
+    for i in 0..nb {
+        let x_block = &row[i * QK_K..(i + 1) * QK_K];
+
+        // Per-block scratch.
+        let mut l_arr = [0i32; QK_K];          // per-element quants, eventual range [0, 7] then [0, 3]
+        let mut scales_f = [0.0f32; QK_K / 16]; // float per-sub-block scales
+        let mut sw = [0.0f32; QK_K / 16];       // sum-of-weights per sub-block
+        let mut weight = [0.0f32; 16];          // sub-block weight scratch
+
+        // 1. sigma2 (only consumed by imatrix path, but always cheap to compute)
+        let mut sumx2 = 0.0f32;
+        for &v in x_block {
+            sumx2 += v * v;
+        }
+        let sigma2 = 2.0 * sumx2 / (QK_K as f32);
+
+        // Per-sub-block: build weight vector + run make_qx_quants(nmax=4).
+        for j in 0..QK_K / 16 {
+            let x_sub = &x_block[16 * j..16 * j + 16];
+            match quant_weights {
+                Some(qw) => {
+                    let qw_block = &qw[i * QK_K + 16 * j..i * QK_K + 16 * j + 16];
+                    for l in 0..16 {
+                        weight[l] = qw_block[l] * (sigma2 + x_sub[l] * x_sub[l]).sqrt();
+                    }
+                }
+                None => {
+                    for l in 0..16 {
+                        weight[l] = x_sub[l] * x_sub[l];
+                    }
+                }
+            }
+            let mut sumw = 0.0f32;
+            for &w in &weight {
+                sumw += w;
+            }
+            sw[j] = sumw;
+
+            let mut l_sub = [0i8; 16];
+            scales_f[j] = make_qx_quants(16, 4, x_sub, &mut l_sub, 1, Some(&weight));
+            // l_sub discarded — re-quantized at step 2.
+        }
+
+        // 2. Quantize the per-sub-block scales themselves to 6-bit:
+        //    Ls[j] ∈ [0, 63] (nmax=32 → range [0, 2*nmax-1]).
+        let mut ls = [0i8; QK_K / 16];
+        let d_block = make_qx_quants(QK_K / 16, 32, &scales_f, &mut ls, 1, Some(&sw));
+
+        // 3. Pack Ls into the 12-byte scales[] field.
+        let block = &mut blocks[i];
+        block.scales = [0u8; 12];
+        for j in 0..QK_K / 16 {
+            let ls_j = ls[j] as i32;
+            // Low 4 bits → bytes 0..7.
+            if j < 8 {
+                block.scales[j] = (ls_j & 0xF) as u8;
+            } else {
+                block.scales[j - 8] |= ((ls_j & 0xF) << 4) as u8;
+            }
+            // High 2 bits → bytes 8..11 at bit position 2*(j/4) in byte 8 + j%4.
+            // Ls[j] is in [0, 63] so `>> 4` yields [0, 3] — fits in 2 bits.
+            let high2 = (ls_j >> 4) & 0x3;
+            block.scales[j % 4 + 8] |= (high2 << (2 * (j / 4))) as u8;
+        }
+        block.d_bits = half::f16::from_f32(d_block).to_bits();
+
+        // 4. Re-quantize each element using the now-fixed packed scales.
+        //    Reverse the packing to get sc per sub-block.
+        for j in 0..QK_K / 16 {
+            let sc_low = if j < 8 {
+                (block.scales[j] & 0xF) as i32
+            } else {
+                ((block.scales[j - 8] >> 4) & 0xF) as i32
+            };
+            let sc_high = ((block.scales[8 + j % 4] >> (2 * (j / 4))) & 0x3) as i32;
+            let sc6 = sc_low | (sc_high << 4); // 6-bit unsigned [0, 63]
+            // The dequant subtracts 32 to get signed [-32, 31] (i8 cast).
+            let sc_signed = sc6 - 32;
+            let d = d_block * (sc_signed as f32);
+            if d == 0.0 {
+                // All elements quantize to L = 0 + 4 = 4 (representing zero).
+                for l in 0..16 {
+                    l_arr[16 * j + l] = 4;
+                }
+                continue;
+            }
+            for ii in 0..16 {
+                let mut l = nearest_int(x_block[16 * j + ii] / d);
+                if l < -4 {
+                    l = -4;
+                }
+                if l > 3 {
+                    l = 3;
+                }
+                l_arr[16 * j + ii] = l + 4; // L ∈ [0, 7]
+            }
+        }
+
+        // 5. Pack high bits → hmask, then strip from L.
+        block.hmask = [0u8; QK_K / 8];
+        let mut m = 0usize;
+        let mut hm: u8 = 1;
+        for j in 0..QK_K {
+            if l_arr[j] > 3 {
+                block.hmask[m] |= hm;
+                l_arr[j] -= 4;
+            }
+            m += 1;
+            if m == QK_K / 8 {
+                m = 0;
+                hm <<= 1;
+            }
+        }
+
+        // 6. Pack low 2 bits into qs[].
+        block.qs = [0u8; QK_K / 4];
+        let mut j = 0usize;
+        while j < QK_K {
+            for l in 0..32 {
+                let v = (l_arr[j + l] as u8)
+                    | ((l_arr[j + l + 32] as u8) << 2)
+                    | ((l_arr[j + l + 64] as u8) << 4)
+                    | ((l_arr[j + l + 96] as u8) << 6);
+                block.qs[j / 4 + l] = v;
+            }
+            j += 128;
+        }
+    }
+
+    Ok(nb)
+}
+
+/// Flat-bytes wrapper for [`quantize_row_q3_k`]. Returns `n_blocks ×
+/// BLOCK_Q3_K_SIZE` bytes ready for direct GGUF emission.
+pub fn quantize_row_q3_k_to_bytes(row: &[f32]) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ3K {
+            hmask: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 4],
+            scales: [0u8; 12],
+            d_bits: 0,
+        };
+        nb
+    ];
+    quantize_row_q3_k(row, &mut blocks)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q3_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
+/// Imatrix-weighted variant of [`quantize_row_q3_k_to_bytes`].
+pub fn quantize_row_q3_k_imatrix_to_bytes(
+    row: &[f32],
+    quant_weights: &[f32],
+) -> Result<Vec<u8>, KQuantError> {
+    if !row.len().is_multiple_of(QK_K) {
+        return Err(KQuantError::NotBlockAligned { actual: row.len() });
+    }
+    let nb = row.len() / QK_K;
+    let mut blocks = vec![
+        BlockQ3K {
+            hmask: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 4],
+            scales: [0u8; 12],
+            d_bits: 0,
+        };
+        nb
+    ];
+    quantize_row_q3_k_imatrix(row, &mut blocks, quant_weights)?;
+    let mut out = Vec::with_capacity(nb * BLOCK_Q3_K_SIZE);
+    for b in &blocks {
+        out.extend_from_slice(&b.to_bytes());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4263,5 +4533,227 @@ mod tests {
             KQuantError::BlockSizeMismatch { .. } => {} // ok
             other => panic!("expected BlockSizeMismatch, got {other:?}"),
         }
+    }
+
+    // ────────── Q3_K quantize-side (iter-7) ──────────
+
+    /// All-zero input → zero output round-trip. The all-zero short
+    /// circuit at make_qx_quants and make_qkx2_quants kicks in.
+    #[test]
+    fn quantize_q3_k_zero_input_round_trip() {
+        let row = [0.0f32; QK_K];
+        let mut blocks = vec![
+            BlockQ3K {
+                hmask: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 4],
+                scales: [0u8; 12],
+                d_bits: 0,
+            };
+            1
+        ];
+        let nb = quantize_row_q3_k(&row, &mut blocks).unwrap();
+        assert_eq!(nb, 1);
+        let mut decoded = vec![0.0f32; QK_K];
+        dequantize_row_q3_k(&blocks, &mut decoded).unwrap();
+        for &v in &decoded {
+            assert_eq!(v, 0.0, "zero input should round-trip to zero");
+        }
+    }
+
+    /// Q3_K round-trip RMSE bound on a smooth ramp [-1, 1].  Q3_K's
+    /// 3.4375 bpw codebook has higher quantization noise than Q4_K
+    /// (4.5 bpw); empirically RMSE is bounded by ≈ 0.10 on a smooth
+    /// ramp.
+    #[test]
+    fn quantize_q3_k_round_trip_smooth_ramp_rmse() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -1.0 + 2.0 * t
+            })
+            .collect();
+
+        let mut blocks = vec![
+            BlockQ3K {
+                hmask: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 4],
+                scales: [0u8; 12],
+                d_bits: 0,
+            };
+            1
+        ];
+        quantize_row_q3_k(&row, &mut blocks).unwrap();
+
+        let mut decoded = vec![0.0f32; QK_K];
+        dequantize_row_q3_k(&blocks, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / row.len() as f64).sqrt();
+        assert!(
+            rmse < 0.10,
+            "Q3_K round-trip RMSE {rmse} > 0.10 threshold for smooth ramp"
+        );
+    }
+
+    /// Q3_K vs Q4_K: on the same input, Q4_K must produce strictly
+    /// lower RMSE than Q3_K (more bits → less error).  Catches a
+    /// regression where Q3_K is silently using a bigger codebook.
+    #[test]
+    fn quantize_q3_k_higher_rmse_than_q4_k() {
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| {
+                let t = (i as f32) / (QK_K as f32 - 1.0);
+                -2.0 + 4.0 * t
+            })
+            .collect();
+
+        let mut q3 = vec![
+            BlockQ3K {
+                hmask: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 4],
+                scales: [0u8; 12],
+                d_bits: 0,
+            };
+            1
+        ];
+        let mut q4 = vec![
+            BlockQ4K {
+                d_bits: 0,
+                dmin_bits: 0,
+                scales: [0u8; 12],
+                qs: [0u8; QK_K / 2],
+            };
+            1
+        ];
+        quantize_row_q3_k(&row, &mut q3).unwrap();
+        quantize_row_q4_k(&row, &mut q4).unwrap();
+
+        let mut q3_decoded = vec![0.0f32; QK_K];
+        let mut q4_decoded = vec![0.0f32; QK_K];
+        dequantize_row_q3_k(&q3, &mut q3_decoded).unwrap();
+        dequantize_row_q4_k(&q4, &mut q4_decoded).unwrap();
+
+        let rmse = |a: &[f32], b: &[f32]| -> f64 {
+            let mut sse = 0.0;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = (*x as f64) - (*y as f64);
+                sse += d * d;
+            }
+            (sse / a.len() as f64).sqrt()
+        };
+        let r3 = rmse(&row, &q3_decoded);
+        let r4 = rmse(&row, &q4_decoded);
+        assert!(
+            r4 < r3,
+            "Q4_K RMSE {r4} should be < Q3_K RMSE {r3} (more bits → less error)"
+        );
+    }
+
+    /// Round-trip via flat bytes wrapper matches the in-memory dispatch.
+    #[test]
+    fn quantize_q3_k_to_bytes_round_trip() {
+        let row: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) / 64.0).collect();
+        let bytes = quantize_row_q3_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), BLOCK_Q3_K_SIZE);
+
+        let mut decoded_bytes = vec![0.0f32; QK_K];
+        dequantize_row_q3_k_bytes(&bytes, &mut decoded_bytes).unwrap();
+
+        // also via in-memory blocks
+        let mut blocks = vec![
+            BlockQ3K {
+                hmask: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 4],
+                scales: [0u8; 12],
+                d_bits: 0,
+            };
+            1
+        ];
+        quantize_row_q3_k(&row, &mut blocks).unwrap();
+        let mut decoded_blocks = vec![0.0f32; QK_K];
+        dequantize_row_q3_k(&blocks, &mut decoded_blocks).unwrap();
+
+        for (i, (a, b)) in decoded_bytes.iter().zip(decoded_blocks.iter()).enumerate() {
+            assert_eq!(a, b, "bytes path diverged from blocks path at i={i}");
+        }
+    }
+
+    /// Imatrix-weighted Q3_K vs uncalibrated produces different bytes
+    /// when the importance vector is non-uniform.  Mirrors iter-3w's
+    /// gate for Q4_K_M but at the codebook level.
+    #[test]
+    fn quantize_q3_k_imatrix_diverges_from_none() {
+        let row: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) / 64.0).collect();
+
+        // 100x boost on first 16 cols, 0.01x rest.
+        let qw: Vec<f32> = (0..QK_K)
+            .map(|c| if c < 16 { 100.0 } else { 0.01 })
+            .collect();
+
+        let bytes_none = quantize_row_q3_k_to_bytes(&row).unwrap();
+        let bytes_imatrix = quantize_row_q3_k_imatrix_to_bytes(&row, &qw).unwrap();
+
+        assert_eq!(bytes_none.len(), bytes_imatrix.len(),
+            "block size should match");
+        assert_ne!(bytes_none, bytes_imatrix,
+            "Q3_K imatrix-weighted output must differ from uncalibrated \
+             when importance is non-uniform");
+    }
+
+    /// Imatrix Q3_K rejects a length-mismatched weights vector.
+    #[test]
+    fn quantize_q3_k_imatrix_length_mismatch_errors() {
+        let row = vec![0.0f32; QK_K];
+        let qw = vec![1.0f32; QK_K - 1]; // off by one
+        let mut blocks = vec![
+            BlockQ3K {
+                hmask: [0u8; QK_K / 8],
+                qs: [0u8; QK_K / 4],
+                scales: [0u8; 12],
+                d_bits: 0,
+            };
+            1
+        ];
+        let err = quantize_row_q3_k_imatrix(&row, &mut blocks, &qw)
+            .expect_err("expected WeightsLengthMismatch");
+        match err {
+            KQuantError::WeightsLengthMismatch { row_len, weights_len } => {
+                assert_eq!(row_len, QK_K);
+                assert_eq!(weights_len, QK_K - 1);
+            }
+            other => panic!("expected WeightsLengthMismatch, got {other:?}"),
+        }
+    }
+
+    /// Multi-block Q3_K quantize handles 4 super-blocks (1024
+    /// elements) end-to-end without state leakage between blocks.
+    #[test]
+    fn quantize_q3_k_multi_block_round_trip() {
+        const N_BLOCKS: usize = 4;
+        let total = N_BLOCKS * QK_K;
+        let row: Vec<f32> = (0..total)
+            .map(|i| {
+                let t = (i as f32) / (total as f32 - 1.0);
+                -1.0 + 2.0 * t
+            })
+            .collect();
+
+        let bytes = quantize_row_q3_k_to_bytes(&row).unwrap();
+        assert_eq!(bytes.len(), N_BLOCKS * BLOCK_Q3_K_SIZE);
+
+        let mut decoded = vec![0.0f32; total];
+        dequantize_row_q3_k_bytes(&bytes, &mut decoded).unwrap();
+
+        let mut sse = 0.0_f64;
+        for (a, b) in row.iter().zip(decoded.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sse += d * d;
+        }
+        let rmse = (sse / total as f64).sqrt();
+        assert!(rmse < 0.10, "multi-block Q3_K RMSE {rmse} > 0.10");
     }
 }
