@@ -5951,3 +5951,67 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - Full 1815-test suite clean, 0 failures.
   - **Wave-2.5 closure summary:** All Codex REJECT findings addressed. Items landed across 5 workers: W-α2 (B5 PromptCache key, A3+A4 non-stream tool_calls + Required error promotion, A1 conditional grammar wire), W-β (B1/B3/B6/D1 registry.rs cluster), W-γ3 partial (bitmask overflow fix), W-δ (C1 integration tests + C2 unit tests), W-γ4 (B4 any-position keys, B2 namespace isolation). All HIGH findings resolved; Codex audit loop closed.
   - **Fence respected.** W-γ4 edits in `src/serve/api/grammar/json_schema.rs` (B4) and `src/serve/api/handlers.rs` (B2) only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-2.6 Worker W-α5 (session cfa-20260427-adr005-wave2.6, commits `e3241df` Q1 + `49b904e` Q2) — FOUNDATION refit: SamplingParams.grammar_kind + GrammarRuntime.awaiting_trigger. Collapses 4 wave-2.5 audit divergences into ONE architectural fix. Unblocks W-β2 / W-γ5 / W-ε.**
+  - **Context:** Wave 2.5 audit re-ran by Codex (cfa-20260427-adr005-wave2.5/codex-review-last.txt) returned REJECT with 5 HIGH severity items. Goalie research surfaced that 4 of those (A1 main divergence at engine.rs:1401/1489/2041/2145, A1 dead-check at :1554/2195, A1 missing reset for re-entry, A1 response_format regression) collapse into ONE architectural bug: the wave-2.5 `Arc<AtomicBool> grammar_active` sibling-state pattern. Canonical fix is in llama.cpp PR #9639 lazy-grammar at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1439`. Research dossier: `/tmp/cfa-cfa-20260427-adr005-wave2.6/research-report.md` Q1 + Q2.
+  - **Q1 — `SamplingParams.grammar_kind: GrammarKind` discriminant (commit `e3241df`):**
+    - Added `pub enum GrammarKind { ResponseFormat, ToolCallBody }` to `engine.rs`. Mirrors llama.cpp `enum common_grammar_type` at `/opt/llama.cpp/common/common.h:171-176`. `Default = ResponseFormat` so any caller that constructs `SamplingParams` without setting the field gets pre-wave-2.5 unconditional-enforcement behaviour (the safe default that prevents silent regressions).
+    - Wired in `prepare_chat_generation_core`: a single match block selects `(effective_grammar, grammar_kind)` from the (tool, response) precedence pair. `compile_tool_grammar` output → `ToolCallBody`; `compile_response_format` output → `ResponseFormat`; neither set → default + `None` grammar (kind never read).
+    - Tests added (2 in `handlers.rs::grammar_kind_selection_tests`):
+      - `default_grammar_kind_is_response_format` — Default safety property.
+      - `tool_choice_required_yields_tool_call_body_kind` — exact match-block replication; verifies tool wins precedence AND yields ToolCallBody, response-only yields ResponseFormat (the audit divergence A1/response_format-regression fix).
+    - **Signature surface:**
+      - Enum: `pub enum GrammarKind { ResponseFormat /* default */, ToolCallBody }`
+      - Field: `pub grammar_kind: GrammarKind` on `SamplingParams`
+  - **Q2 — `GrammarRuntime.awaiting_trigger` self-gate (commit `49b904e`):**
+    - Added `awaiting_trigger: bool` field to `GrammarRuntime` in `src/serve/api/grammar/sampler.rs`. Default `false` (eager). API:
+      - `is_awaiting_trigger() -> bool` — read.
+      - `set_awaiting_trigger(value: bool)` — explicit setter, called once at construction for `ToolCallBody`-kind runtimes.
+      - `trigger()` — flips to `false`; called by the engine when `ToolCallSplitter` reports `ToolCallOpen`.
+    - **Single-boolean atomicity (the architectural insight):** four call sites self-gate on the SAME boolean — there is no split-state window where mask says "off" but advance/dead-check says "on":
+      - `mask::mask_invalid_tokens` — early-return 0 when awaiting_trigger.
+      - `accept_bytes` — no-op returning `true` (alive) when awaiting_trigger.
+      - `is_dead` — returns `false` when awaiting_trigger (suspended ≠ dead).
+      - `is_accepted` — returns `false` when awaiting_trigger (suspended ≠ accepted).
+    - **engine.rs production wiring removed:**
+      - The wave-2.5 `Arc<AtomicBool> grammar_active` sibling-state pattern at engine.rs:1721-1729 is DELETED. Verification: `grep -nE 'Arc.*AtomicBool.*grammar_active|grammar_active = std::sync::Arc' src/serve/api/engine.rs` returns zero production hits (only doc-comment context references survive).
+      - Both `generate_once` (non-streaming) and `generate_stream_once` (streaming) call `mask::mask_invalid_tokens` / `accept_bytes` / `is_dead` UNCONDITIONALLY. The runtime self-gates internally.
+      - `route_content`'s ToolCallOpen handler calls `runtime.trigger()` directly (replacing the AtomicBool store). `route_content` and `emit_fragment` closures gained a `&mut Option<GrammarRuntime>` parameter for this.
+      - ToolCallClose does NOT reset — multi-call grammars carry through via `(call)+` shape (research-report.md Q2 anti-finding citing `/opt/llama.cpp/docs/function-calling.md` Hermes 2 Pro template + PR #9639).
+    - **Per-kind init at construction** (both paths):
+      - `GrammarKind::ToolCallBody` → `set_awaiting_trigger(true)` immediately after `GrammarRuntime::new`. Trigger fires when splitter sees the per-model open marker (Gemma 4 `call:`, Qwen 3.5 `<function=`).
+      - `GrammarKind::ResponseFormat` → no setter call; runtime is eager from token 0. **This is the audit fix for divergence "A1 / response_format regression"**: without per-kind init, every grammar would be lazy and `response_format=json_schema` would silently disable on registered Gemma/Qwen models (the splitter never fires for non-tool requests).
+    - **Tests added (8 new, 2 retired):**
+      - `runtime_apply_noops_when_awaiting_trigger` (mask self-gate) — `mask.rs`
+      - `runtime_apply_active_after_trigger` (gate transitions) — `mask.rs`
+      - `runtime_response_format_never_awaits` (default contract) — `mask.rs`
+      - `runtime_accept_noops_when_awaiting_trigger` (advance self-gate) — `sampler.rs`
+      - `runtime_is_dead_returns_false_while_awaiting_trigger` (audit fix at :1554/:2195) — `sampler.rs`
+      - `runtime_is_accepted_returns_false_while_awaiting_trigger` (symmetric) — `sampler.rs`
+      - `runtime_default_is_eager_not_awaiting_trigger` (Default safety) — `sampler.rs`
+      - `runtime_set_then_trigger_restores_eager_enforcement` (round-trip) — `sampler.rs`
+      - `multi_tool_call_grammar_continues_across_close_marker` (no-reset contract; `(call)+` shape) — `sampler.rs`
+      - `tool_call_open_triggers_grammar_runtime` (production wiring; real Gemma4 splitter + real GrammarRuntime + production trigger pattern) — `engine.rs::test_a1_conditional_grammar_wire`
+      - **Retired (2 obsolete; tested removed AtomicBool):**
+        - `grammar_active_atomic_bool_transitions`
+        - `no_tool_splitter_grammar_active_defaults_true`
+    - **API signatures (for downstream workers):**
+      - Enum: `pub enum GrammarKind { ResponseFormat, ToolCallBody }` (Default = ResponseFormat).
+      - Field: `pub grammar_kind: GrammarKind` on `SamplingParams`.
+      - Methods: `GrammarRuntime::is_awaiting_trigger(&self) -> bool`, `GrammarRuntime::set_awaiting_trigger(&mut self, value: bool)`, `GrammarRuntime::trigger(&mut self)`.
+      - Closure signatures (engine.rs streaming): `route_content` and `emit_fragment` both gained `grammar_runtime: &mut Option<GrammarRuntime>` parameter (passed at all call sites).
+  - **Audit divergences resolved (4 of the 5 HIGH; B2/B4 closed at wave-2.5):**
+    - `A1` main (advance unconditionally outside gated region) — runtime self-gates; gate is unified.
+    - `A1` response_format regression — kind-aware init; ResponseFormat runtimes never wait.
+    - `A1` missing reset for re-entry — N/A by canonical pattern; multi-call handled by grammar shape, not runtime reset (handed off to W-β2 to make `(call)+` the default tool-grammar root shape when `parallel_tool_calls=true`).
+    - `A1` dead-check global — `is_dead()` returns false while suspended; safe to call unconditionally.
+  - **Verification matrix:** `grep -nE 'Arc.*AtomicBool.*grammar_active|grammar_active = std::sync::Arc' src/serve/api/engine.rs` → 0 production hits. `cargo check --bins` → clean. Tests: 29 sampler + 13 mask + 24 engine + 62 handlers + 103 grammar + 536 serve all pass; integration test `tool_call_grammar_constrained` compiles and passes (env-gated). LOC: +636/-139 in Q2; +184/-1 in Q1; net **+680 LOC** for the foundation refit (mostly tests + doc-comments).
+  - **Chesterton notes:**
+    - The wave-2.5 `Arc<AtomicBool>` was correct in spirit (gate the mask) but architecturally wrong (sibling state created split-state hazard). The fix is to import the canonical pattern from llama.cpp, not to fortify the outlier. Audit caught it precisely because divergences span all 4 call sites (mask, advance, dead-check) — exactly the cells where state can drift.
+    - `Default = ResponseFormat` (not `None` or `ToolCallBody`) is load-bearing safety. Any caller that constructs `SamplingParams` without setting `grammar_kind` gets eager enforcement. If we'd defaulted to `ToolCallBody`, every existing test path that passes a JSON grammar without setting kind would silently regress to the lazy path and never enforce.
+    - ToolCallClose does NOT reset the runtime. This is the OPPOSITE of what the wave-2.5 audit suggested ("ToolCallOpen does not reset a fresh runtime for re-entry"). Research-report.md Q2 anti-finding documents that no production engine resets per call; multi-call lives in grammar shape `(call)+`. Resetting per close would be the wrong direction even though the audit asked for it — the canonical pattern is one runtime, one trigger, one (or many) calls.
+  - **Open followups (handed off to W-β2 / W-γ5 / W-ε):**
+    - W-β2 owns `compile_tool_grammar` shape work (parallel_tool_calls=true producing `(call)+` root rules so re-entry works without runtime reset). The runtime contract here makes that change possible without touching the runtime.
+    - W-γ5 owns the GBNF combiner correctness fix (research-report.md Q4) — parse-to-AST + serialize-with-renames replacing the lexer rewriter. Foundation tests don't depend on combiner output.
+    - W-ε owns the bounded-state object grammar work (research-report.md Q3) — hard 400 at >8 required keys, removing the sequential fallback.
+  - **Fence respected.** W-α5 edits in `src/serve/api/engine.rs`, `src/serve/api/handlers.rs`, `src/serve/api/grammar/sampler.rs`, `src/serve/api/grammar/mask.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
