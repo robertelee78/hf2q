@@ -307,6 +307,8 @@ pub async fn chat_completions(
         vit_soft_tokens_total,
     } = prepared;
     let engine: &Engine = &loaded_engine.engine;
+    // Wave-2.5 A4: save policy before params is moved into the engine call.
+    let tool_call_policy = params.tool_call_policy;
 
     // --- Generate (non-streaming) ---
     // Snapshot mlx-native process-global GPU counters pre-generation so we
@@ -382,12 +384,29 @@ pub async fn chat_completions(
     // when the model has no reasoning markers registered.
     let reasoning_tokens = result.reasoning_tokens;
 
-    // Wave-2.5 A3: run the ToolCallSplitter chain over result.text to extract
-    // any structured tool calls.  The streaming path does this token-by-token
-    // inside generate_stream_once; for the non-streaming path we post-process
-    // the fully decoded text here, mirroring the same splitter logic.
+    // Wave-2.5 A3+A4: run the ToolCallSplitter chain over result.text to
+    // extract any structured tool calls.  The streaming path does this
+    // token-by-token inside generate_stream_once; for the non-streaming path
+    // we post-process the fully decoded text here, mirroring the same splitter
+    // logic.  A4 passes the tool_call_policy so Constrained parse failures
+    // surface as 500 errors instead of silently falling back to Content.
     let registration = engine.registration();
-    let extracted = extract_tool_calls_from_text(&result.text, registration);
+    let extracted = extract_tool_calls_from_text(
+        &result.text,
+        registration,
+        tool_call_policy,
+    );
+
+    // A4: promote Constrained parse failure to 500.
+    if let Some(failed_body) = extracted.constrained_parse_failure {
+        tracing::error!(
+            body = %failed_body,
+            "tool_call_parse_failure: Constrained tool_choice but model emitted unparseable body"
+        );
+        return ApiError::generation_error("tool_call_parse_failure".to_string())
+            .into_response();
+    }
+
     let (message_content, message_tool_calls, effective_finish_reason) =
         if extracted.tool_calls.is_empty() {
             // No tool calls: preserve original text and finish_reason.
@@ -458,6 +477,9 @@ pub async fn chat_completions(
 /// Wave-2.5 A3: the non-streaming path previously hardcoded `tool_calls: None`
 /// because the ToolCallSplitter only ran inside the streaming worker.  This
 /// struct carries the post-extraction content text and any parsed tool calls.
+/// Wave-2.5 A4 extends this with a `parse_failed` flag: when `Constrained`
+/// policy is active and a body fails to parse, the caller promotes the result
+/// to an HTTP 500 rather than falling back to Content.
 struct ExtractedToolCalls {
     /// Content text with tool-call marker spans removed.  When the full output
     /// consisted of one or more tool calls with no leading/trailing content,
@@ -467,6 +489,10 @@ struct ExtractedToolCalls {
     /// Parsed tool calls in emission order.  Empty when the model produced
     /// plain text without any tool-call markers.
     pub tool_calls: Vec<super::schema::ToolCall>,
+    /// Wave-2.5 A4: set to `Some(body)` when a tool-call body failed to parse
+    /// under `Constrained` policy.  The caller should treat this as a
+    /// `500 tool_call_parse_failure` response.
+    pub constrained_parse_failure: Option<String>,
 }
 
 /// Run `text` through the ReasoningSplitter → ToolCallSplitter chain and
@@ -477,33 +503,40 @@ struct ExtractedToolCalls {
 /// non-streaming `chat_completions` handler to populate `message.tool_calls`
 /// (wave-2.5 A3 fix — previously hardcoded to `None`).
 ///
-/// The function is infallible: if parsing a tool-call body fails it falls back
-/// to emitting the raw body as content, matching the streaming path's behavior
-/// (a parse failure is a model quality issue, not a server error).
+/// Wave-2.5 A4: when `policy == Constrained` (tool_choice = required /
+/// function), a parse failure is promoted to an internal error signal
+/// (`constrained_parse_failure = Some(body)`) instead of falling back to
+/// Content. The streaming path emits `GenerationEvent::Error`; the
+/// non-streaming path returns a 500 response to the client.
+///
+/// `Auto` policy keeps the Content fallback — the model may legitimately
+/// produce partial/malformed syntax without a grammar guard, and re-emitting
+/// the raw body as content lets the client see what the model produced.
 fn extract_tool_calls_from_text(
     text: &str,
     registration: Option<&registry::ModelRegistration>,
+    policy: engine::ToolCallPolicy,
 ) -> ExtractedToolCalls {
     // If there's no model registration or the registration has no tool markers,
     // there can't be any tool calls — return the text unchanged.
     let Some(reg) = registration else {
-        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new() };
+        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new(), constrained_parse_failure: None };
     };
     let Some(mut tool_splitter) = registry::ToolCallSplitter::from_registration(reg) else {
-        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new() };
+        return ExtractedToolCalls { content: text.to_string(), tool_calls: Vec::new(), constrained_parse_failure: None };
     };
 
     let mut content = String::new();
     let mut tool_calls: Vec<super::schema::ToolCall> = Vec::new();
     let mut tc_body = String::new();
     let mut tc_index: usize = 0;
+    let mut parse_failure: Option<String> = None;
 
-    let process_events = |events: Vec<registry::ToolCallEvent>,
-                          content: &mut String,
-                          tc_body: &mut String,
-                          tc_index: &mut usize,
-                          tool_calls: &mut Vec<super::schema::ToolCall>| {
+    let mut process_events = |events: Vec<registry::ToolCallEvent>| {
         for ev in events {
+            if parse_failure.is_some() {
+                break; // already failed under Constrained — drain remainder
+            }
             match ev {
                 registry::ToolCallEvent::Content(t) => {
                     content.push_str(&t);
@@ -515,7 +548,7 @@ fn extract_tool_calls_from_text(
                     tc_body.push_str(&t);
                 }
                 registry::ToolCallEvent::ToolCallClose => {
-                    let body = std::mem::take(tc_body);
+                    let body = std::mem::take(&mut tc_body);
                     match registry::parse_tool_call_body(reg, &body) {
                         Some(parsed) => {
                             let id = format!(
@@ -524,7 +557,7 @@ fn extract_tool_calls_from_text(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_nanos() as u64)
                                     .unwrap_or(0)
-                                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                                    ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
                             );
                             tool_calls.push(super::schema::ToolCall {
                                 id,
@@ -534,16 +567,26 @@ fn extract_tool_calls_from_text(
                                     arguments: parsed.arguments_json,
                                 },
                             });
-                            *tc_index += 1;
+                            tc_index += 1;
                         }
                         None => {
-                            // Parse failure: emit raw body as content (same
-                            // fallback as the streaming path).
-                            tracing::warn!(
-                                body = %body,
-                                "non-stream tool-call body unparseable; emitting as content"
-                            );
-                            content.push_str(&body);
+                            // Wave-2.5 A4: for Constrained mode, signal failure
+                            // instead of falling back to Content.
+                            if policy == engine::ToolCallPolicy::Constrained {
+                                tracing::error!(
+                                    body = %body,
+                                    "non-stream tool-call parse failure under Constrained \
+                                     policy (tool_choice=required/function)"
+                                );
+                                parse_failure = Some(body);
+                            } else {
+                                tracing::warn!(
+                                    body = %body,
+                                    "non-stream tool-call body unparseable; emitting as \
+                                     content (tool_choice=auto)"
+                                );
+                                content.push_str(&body);
+                            }
                         }
                     }
                 }
@@ -552,22 +595,24 @@ fn extract_tool_calls_from_text(
     };
 
     let events = tool_splitter.feed(text);
-    process_events(events, &mut content, &mut tc_body, &mut tc_index, &mut tool_calls);
+    process_events(events);
 
     // Drain any remaining tail (same as streaming path).
-    if let Some(tail_ev) = tool_splitter.finish() {
-        match tail_ev {
-            registry::ToolCallEvent::Content(t) => content.push_str(&t),
-            registry::ToolCallEvent::ToolCallText(t) => {
-                // Mid-call truncation: emit residual as content.
-                let prefix = reg.tool_open.unwrap_or("");
-                content.push_str(&format!("{prefix}{t}"));
+    if parse_failure.is_none() {
+        if let Some(tail_ev) = tool_splitter.finish() {
+            match tail_ev {
+                registry::ToolCallEvent::Content(t) => content.push_str(&t),
+                registry::ToolCallEvent::ToolCallText(t) => {
+                    // Mid-call truncation: emit residual as content.
+                    let prefix = reg.tool_open.unwrap_or("");
+                    content.push_str(&format!("{prefix}{t}"));
+                }
+                registry::ToolCallEvent::ToolCallOpen | registry::ToolCallEvent::ToolCallClose => {}
             }
-            registry::ToolCallEvent::ToolCallOpen | registry::ToolCallEvent::ToolCallClose => {}
         }
     }
 
-    ExtractedToolCalls { content, tool_calls }
+    ExtractedToolCalls { content, tool_calls, constrained_parse_failure: parse_failure }
 }
 
 /// Apply Decision #23 transparency headers on a chat-completion response.
@@ -949,6 +994,16 @@ where
     } else {
         None
     };
+    // Wave-2.5 A4: derive ToolCallPolicy from tool_choice.  Required and
+    // Function modes use grammar-constrained decoding; parse failures on those
+    // paths are server bugs, not graceful-degradation opportunities.  Auto
+    // (and None, which suppresses tools entirely) keeps the content fallback.
+    let tc_policy = match &tool_choice {
+        super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_) => {
+            engine::ToolCallPolicy::Constrained
+        }
+        _ => engine::ToolCallPolicy::Auto,
+    };
     let params = SamplingParams {
         temperature: req.temperature.unwrap_or(0.0),
         top_p: req.top_p.unwrap_or(1.0),
@@ -966,6 +1021,7 @@ where
         parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
         grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
+        tool_call_policy: tc_policy,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
     // the multimodal preflight produced ViT embeddings, locate the
@@ -4729,7 +4785,7 @@ mod pool_error_tests {
 
 #[cfg(test)]
 mod test_a3_tool_call_extraction {
-    use super::{extract_tool_calls_from_text, registry};
+    use super::{extract_tool_calls_from_text, registry, engine};
 
     /// Build a minimal ModelRegistration with Gemma4 tool markers so tests
     /// can exercise the splitter without a live model.
@@ -4743,9 +4799,14 @@ mod test_a3_tool_call_extraction {
     #[test]
     fn extract_no_tool_calls_returns_text_unchanged() {
         let reg = gemma4_reg();
-        let result = extract_tool_calls_from_text("Hello, world!", Some(&reg));
+        let result = extract_tool_calls_from_text(
+            "Hello, world!",
+            Some(&reg),
+            engine::ToolCallPolicy::Auto,
+        );
         assert!(result.tool_calls.is_empty(), "no tool calls in plain text");
         assert_eq!(result.content, "Hello, world!", "content must be preserved");
+        assert!(result.constrained_parse_failure.is_none());
     }
 
     #[test]
@@ -4765,7 +4826,11 @@ mod test_a3_tool_call_extraction {
         // Build a synthetic tool-call body in Gemma4 format: call:NAME{k:v}
         let body = "call:get_weather{location:<|\"|>Paris<|\"|>}";
         let full_text = format!("Here is the weather: {open}{body}{close}");
-        let result = extract_tool_calls_from_text(&full_text, Some(&reg));
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::Auto,
+        );
         assert_eq!(
             result.tool_calls.len(), 1,
             "exactly one tool call must be extracted"
@@ -4786,8 +4851,82 @@ mod test_a3_tool_call_extraction {
 
     #[test]
     fn extract_no_registration_returns_text_unchanged() {
-        let result = extract_tool_calls_from_text("plain text", None);
+        let result = extract_tool_calls_from_text(
+            "plain text",
+            None,
+            engine::ToolCallPolicy::Auto,
+        );
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.content, "plain text");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave-2.5 A4 — ToolCallPolicy / parse failure promotion unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test_a4_tool_call_policy {
+    use super::{extract_tool_calls_from_text, registry, engine};
+
+    fn gemma4_reg() -> registry::ModelRegistration {
+        registry::find_for("gemma4-27b-it").expect("gemma4 registration must exist")
+    }
+
+    /// Auto mode: unparseable body must fall back to Content, NOT set
+    /// constrained_parse_failure.
+    #[test]
+    fn auto_parse_failure_fallback_to_content() {
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return, // no tool markers → skip
+        };
+        // Deliberately malformed body (no `call:` prefix).
+        let bad_body = "garbage{}";
+        let full_text = format!("{open}{bad_body}{close}");
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::Auto,
+        );
+        assert!(
+            result.constrained_parse_failure.is_none(),
+            "Auto mode must NOT set constrained_parse_failure"
+        );
+        assert!(
+            result.tool_calls.is_empty(),
+            "Auto mode parse failure must produce no tool calls"
+        );
+        // The raw body should be emitted as content.
+        assert!(
+            result.content.contains(bad_body),
+            "Auto mode must re-emit bad body as content, got: {:?}", result.content
+        );
+    }
+
+    /// Constrained mode: unparseable body must set constrained_parse_failure.
+    #[test]
+    fn constrained_parse_failure_signals_error() {
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return, // no tool markers → skip
+        };
+        let bad_body = "garbage{}";
+        let full_text = format!("{open}{bad_body}{close}");
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::Constrained,
+        );
+        assert!(
+            result.constrained_parse_failure.is_some(),
+            "Constrained mode must set constrained_parse_failure on parse failure"
+        );
+        assert!(
+            result.tool_calls.is_empty(),
+            "Constrained mode parse failure must produce no tool calls"
+        );
     }
 }

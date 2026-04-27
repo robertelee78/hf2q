@@ -75,6 +75,35 @@ use crate::serve::sampler_pure::{
 /// - `min_p` — Tier 3 llama.cpp extension.
 /// - `seed` — RNG seeding (sampler_pure uses a thread-local RNG today).
 /// - `logprobs`, `top_logprobs` — Tier 4 response shape; surface only.
+/// Tool-call enforcement policy derived from the request's `tool_choice`.
+///
+/// Wave-2.5 A4: the streaming worker's `route_content` fallback silently
+/// emitted unparseable tool-call bodies as plain Content for ALL tool_choice
+/// modes, including `Required` and explicit `Function`.  For constrained
+/// modes the model is supposed to emit a valid call (the grammar guarantees
+/// it structurally), so a parse failure is a server-side bug — not a
+/// graceful-degradation scenario.  `Auto` genuinely needs the fallback
+/// because there is no grammar constraint and a partial/malformed tool call
+/// is recoverable by the client as plain text.
+///
+/// # Why not derive from `schema::ToolChoiceValue` here
+///
+/// `SamplingParams` is an engine-layer type; it must not import from
+/// `schema` (HTTP-layer).  This enum re-expresses only the
+/// policy-relevant distinctions (Auto vs Constrained).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolCallPolicy {
+    /// `tool_choice = "auto"` (or absent).  The model may or may not call a
+    /// tool; parse failures fall back to Content (existing behavior).
+    #[default]
+    Auto,
+    /// `tool_choice = "required"` or `tool_choice = {type: "function", ...}`.
+    /// Grammar guarantees well-formed output; a parse failure is promoted to
+    /// `GenerationEvent::Error` with `finish_reason = "error"` on the
+    /// streaming path, and an HTTP 500 on the non-streaming path.
+    Constrained,
+}
+
 /// - `parallel_tool_calls` — Tier 4; lands with the tool-call path
 ///   referenced at the worker dispatch site (see Decision #21 in the
 ///   registration block).
@@ -137,6 +166,13 @@ pub struct SamplingParams {
     /// (lazily built + cached on the Engine).  Cheap to attach: an
     /// Arc clone (no copy of the underlying vector).
     pub token_bytes: Option<Arc<Vec<Vec<u8>>>>,
+
+    // --- Wave-2.5 A4 — Tool-call parse-failure policy ---
+    /// Policy for handling tool-call body parse failures.  Set from
+    /// `tool_choice` by `handlers.rs::prepare_chat_generation_core`.
+    /// Defaults to `Auto` (content fallback) so the pre-wave-2.5
+    /// behavior is preserved for all callers that don't set this field.
+    pub tool_call_policy: ToolCallPolicy,
 }
 
 impl Default for SamplingParams {
@@ -161,6 +197,7 @@ impl Default for SamplingParams {
             parallel_tool_calls: true,
             grammar: None,
             token_bytes: None,
+            tool_call_policy: ToolCallPolicy::Auto,
         }
     }
 }
@@ -1615,6 +1652,10 @@ fn generate_stream_once(
     // path).
     let mut saw_tool_call: bool = false;
 
+    // Wave-2.5 A4: capture the policy so the route_content closure can branch
+    // on Constrained vs Auto when a tool-call body fails to parse.
+    let tool_call_policy = params.tool_call_policy;
+
     // Helper: for a Content-classified text run, route through the
     // ToolCallSplitter (if any) and emit the appropriate
     // GenerationEvent. When ToolCallSplitter is None, route every byte to
@@ -1721,9 +1762,29 @@ fn generate_stream_once(
                             *saw_tc = true;
                         }
                         None => {
+                            // Wave-2.5 A4: promote parse failure to error for
+                            // Constrained mode (Required / Function).  For
+                            // Auto mode keep the existing Content fallback —
+                            // the model may legitimately emit partial /
+                            // malformed syntax when unconstrained (no grammar
+                            // guard), and re-emitting the body as Content lets
+                            // the client see what the model intended rather
+                            // than silently discarding output.
+                            if tool_call_policy == ToolCallPolicy::Constrained {
+                                tracing::error!(
+                                    body = %body_dump,
+                                    "tool-call body unparseable under Constrained policy \
+                                     (tool_choice=required/function); promoting to error"
+                                );
+                                let _ = events.blocking_send(GenerationEvent::Error(
+                                    "tool_call_parse_failure".into(),
+                                ));
+                                return Err(());
+                            }
                             tracing::warn!(
                                 body = %body_dump,
-                                "tool-call body unparseable; emitting as content fallback"
+                                "tool-call body unparseable; emitting as content fallback \
+                                 (tool_choice=auto)"
                             );
                             if events
                                 .blocking_send(GenerationEvent::Delta {
