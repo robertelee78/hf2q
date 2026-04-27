@@ -938,6 +938,121 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-3x — round-trip dequant RMSE bound on
+    /// `VariantKQuantizer` output, exercised through `quantize_streaming`.
+    /// Closes the quantize→dequantize loop end-to-end via the variant
+    /// dispatch (rather than `quantize_row_q4_k`/`dequantize_row_q4_k`
+    /// in isolation, which `k_quant.rs::tests` already covers).
+    ///
+    /// Why this matters: a regression in `quantize_tensor_2d_to_bytes`
+    /// (the multi-row helper) or `target_to_ggml_name` (which sets the
+    /// downstream dequant dispatch tag) would produce bytes that pass
+    /// every existing structural test (right size, right tag) but
+    /// would round-trip to garbage.  Locking RMSE proves the bytes are
+    /// numerically meaningful Q4_K blocks, not just well-shaped opaque
+    /// data.
+    ///
+    /// Bound matches the `quantize_row_q4_k_round_trip_smooth_ramp_rmse`
+    /// gate in `k_quant.rs::tests` (≤ 0.05 on a smooth [-1, 1] ramp).
+    /// We use the same input pattern so any divergence between the
+    /// streaming path's RMSE and the isolated codec path's RMSE
+    /// indicates a layering bug.
+    #[test]
+    fn variant_streaming_q4km_round_trip_rmse_bound() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
+
+        // Use multiple super-blocks (4 × QK_K = 1024 elements) so RMSE
+        // averages over enough samples to be statistically meaningful
+        // and not dominated by edge artefacts.
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 4;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const TENSOR: &str = "blk.5.attn_q.weight"; // attn_q never bumps; stays at Q4_K base
+
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| (i as f32 / TOTAL as f32) * 2.0 - 1.0)
+            .collect();
+
+        // F16 input (matches mainline streaming path: cmd_convert
+        // converts BF16→F16 before the streaming quantize loop).
+        let f16_bytes: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        assert_eq!(f16_bytes.len(), TOTAL * 2);
+
+        let mut lazy_map = LazyTensorMap::new();
+        lazy_map.insert(LazyTensor::from_bytes(
+            LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+            f16_bytes,
+        ));
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            32,
+        );
+
+        let out = quantize_streaming(
+            lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
+        )
+        .unwrap();
+
+        let t = out.tensors.get(TENSOR).expect("missing tensor");
+        // structural sanity: 4 super-blocks × 144 bytes = 576 bytes Q4_K
+        assert_eq!(t.data.len(), N_BLOCKS * 144,
+            "Q4_K bytes count mismatch: {} blocks × 144", N_BLOCKS);
+        assert_eq!(t.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+
+        // Dequantize back to F32 via the same flat-bytes path the GGUF
+        // backend (and downstream consumers) will use.
+        let mut decoded = vec![0.0_f32; TOTAL];
+        let n_decoded = dequantize_row_q4_k_bytes(&t.data, &mut decoded)
+            .expect("dequantize_row_q4_k_bytes failed");
+        assert_eq!(n_decoded, TOTAL,
+            "dequant should populate every element");
+
+        // The F16 cast at input introduces ~6e-4 RMSE at most — well
+        // below the Q4_K bound — so we compare decoded vs the F16-cast
+        // value for an apples-to-apples comparison (matching what the
+        // codec actually saw).
+        let expected_post_f16: Vec<f32> = original_f32
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let sse: f64 = decoded
+            .iter()
+            .zip(expected_post_f16.iter())
+            .map(|(d, e)| {
+                let diff = (*d as f64) - (*e as f64);
+                diff * diff
+            })
+            .sum();
+        let rmse = (sse / TOTAL as f64).sqrt();
+
+        // Bound ≤ 0.05 matches `k_quant.rs::tests` direct-codec gate.
+        assert!(
+            rmse <= 0.05,
+            "Q4_K round-trip RMSE {rmse:.6} exceeds 0.05 bound — \
+             quantize→dequantize chain through VariantKQuantizer is \
+             producing numerically wrong blocks (was a structural-only \
+             test pre-iter-3x)"
+        );
+
+        // Sanity: decoded values are not all-zero (catches a bytes-tag
+        // mismatch where dequant treats the buffer as zeros).
+        let nonzero_count = decoded.iter().filter(|v| v.abs() > 1e-6).count();
+        assert!(nonzero_count > TOTAL / 2,
+            "decoded output is mostly zero — likely a target/tag mismatch");
+    }
+
     /// ADR-014 P7 iter-3w — proves the imatrix calibration path is
     /// genuinely end-to-end functional through `VariantKQuantizer` +
     /// `quantize_streaming`: imatrix-weighted quantization produces a
