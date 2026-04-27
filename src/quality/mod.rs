@@ -7,6 +7,7 @@
 pub mod cosine_sim;
 pub mod kl_divergence;
 pub mod perplexity;
+pub mod ppl_driver;
 pub mod regression;
 
 use std::path::Path;

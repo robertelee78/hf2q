@@ -38,6 +38,126 @@
 
 mod common;
 
+// ---------------------------------------------------------------------
+// iter-2b: hf2q-side PPL driver wiring
+// ---------------------------------------------------------------------
+//
+// The hf2q driver lives at `src/quality/ppl_driver.rs` and depends on
+// `src/quality/perplexity.rs` + the `Qwen35Model` public API in
+// `src/inference/models/qwen35/`. hf2q is a binary crate (no `[lib]`
+// target — confirmed at Cargo.toml:1-160), so `tests/*.rs` cannot say
+// `use hf2q::quality::ppl_driver::measure_ppl_qwen35_dense`. The
+// established pattern (see `tests/imatrix_xvalidation.rs:48-52`) is
+// `#[path]`-include of the production source files; we follow that
+// pattern here.
+//
+// `ppl_driver.rs` references the `Qwen35Model` public API via
+// `use crate::inference::models::qwen35::...` paths. Those modules
+// belong to ADR-013 and form a deeply-interconnected web (model.rs,
+// forward_cpu.rs, ffn.rs, full_attn.rs, delta_net.rs, weight_loader.rs,
+// kernels.rs, …) — `#[path]`-mirroring the whole tree into this test
+// crate is impractical. Instead we provide minimal type-stubs in the
+// `inference::models::qwen35` namespace below: the public-API surface
+// `ppl_driver` calls (`Qwen35Model::load_from_gguf`,
+// `Qwen35Model::forward_cpu`, `Qwen35Variant::Dense`, the
+// `text_positions` helper) is enough to make the include compile.
+//
+// The 4 dense `#[ignore]`-gated cells in this binary use sentinel
+// model paths (`/var/empty/...gguf`) that don't exist on disk, so
+// `GgufFile::open` short-circuits with `MlxError::IoError` long before
+// the driver would ever reach the stubbed `Qwen35Model::load_from_gguf`.
+// The cells therefore exercise the GGUF-error path of the driver
+// honestly; the stubs are dead code at runtime in this test binary.
+// P11 swaps the sentinel paths for real 27B-dense GGUFs and adds a
+// `[lib]` target (or moves the wiring into `src/main.rs`'s test
+// scaffolding) so the real-model load is invoked through the
+// production qwen35 code, not these stubs.
+
+#[path = "../src/quality/perplexity.rs"]
+pub mod perplexity;
+
+#[path = "../src/quality/ppl_driver.rs"]
+mod ppl_driver;
+
+mod quality {
+    pub use super::perplexity;
+}
+
+mod inference {
+    pub mod models {
+        pub mod qwen35 {
+            //! Type-stubs sufficient to satisfy `ppl_driver.rs`'s
+            //! `use crate::inference::models::qwen35::...` lines. NEVER
+            //! invoked at runtime by the smoke tests in this binary —
+            //! every cell uses a sentinel `/var/empty/...gguf` path so
+            //! the driver fails at `GgufFile::open` long before it
+            //! would touch this stubbed surface.
+
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub enum Qwen35Variant {
+                Dense,
+                Moe,
+            }
+
+            pub mod forward_cpu {
+                /// Mirror of `src/inference/models/qwen35/forward_cpu.rs::text_positions`
+                /// — kept identical (text-convention `[i, i, i, i]`) so a
+                /// future change to the production helper trips a divergence
+                /// test rather than silently desyncing.
+                pub fn text_positions(seq_len: u32) -> Vec<[i32; 4]> {
+                    (0..seq_len as i32).map(|i| [i, i, i, i]).collect()
+                }
+            }
+
+            pub mod model {
+                use super::Qwen35Variant;
+                use anyhow::{anyhow, Result};
+                use mlx_native::gguf::GgufFile;
+
+                /// Stub of `Qwen35Config`. Only the fields ppl_driver
+                /// reads are populated.
+                pub struct Qwen35Config {
+                    pub vocab_size: u32,
+                    pub max_position_embeddings: u32,
+                    pub variant: Qwen35Variant,
+                }
+
+                /// Stub of `Qwen35Model`. `load_from_gguf` and
+                /// `forward_cpu` always error: this binary's smoke
+                /// tests never reach them (sentinel-path GGUFs fail at
+                /// open). Real-model wiring is P11 territory.
+                pub struct Qwen35Model {
+                    pub cfg: Qwen35Config,
+                }
+
+                impl Qwen35Model {
+                    pub fn load_from_gguf(_gguf: &GgufFile) -> Result<Self> {
+                        Err(anyhow!(
+                            "tests/peer_parity_gates.rs: stubbed Qwen35Model::load_from_gguf \
+                             — production driver lives at src/quality/ppl_driver.rs and \
+                             reaches the real Qwen35Model only when wired through a \
+                             [lib] target (deferred to P11)"
+                        ))
+                    }
+
+                    pub fn forward_cpu(
+                        &self,
+                        _tokens: &[u32],
+                        _positions: &[[i32; 4]],
+                    ) -> Result<Vec<f32>> {
+                        Err(anyhow!(
+                            "tests/peer_parity_gates.rs: stubbed Qwen35Model::forward_cpu \
+                             — see load_from_gguf comment"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+use ppl_driver::measure_ppl_qwen35_dense;
+
 use std::fmt;
 use std::sync::Mutex;
 
@@ -630,14 +750,66 @@ fn smoke_corpus_path() -> std::path::PathBuf {
         .join("wikitext2-smoke.tokens")
 }
 
-/// Run a single gate cell end-to-end. iter-2a wires the peer-side
-/// PPL via `run_llama_perplexity` against the smoke fixture; the
-/// hf2q side stays sentinel (driver lands at iter-2b). Wall + RSS
-/// stay sentinel for both sides this iter (real-model wiring lands
-/// in P11). The verdict therefore resolves to `NotMeasured` —
-/// `from_measurements` routes that honestly through the
-/// `hf2q.is_missing_binary()` arm.
+/// Read the iter-2a smoke fixture into a `Vec<u32>`. Returns `None`
+/// if the file is missing or has the wrong byte length. Used by both
+/// the peer-side wrapper (which passes the file path directly to
+/// `llama-perplexity`) and the hf2q-side driver (which needs the
+/// tokens in memory).
+///
+/// The fixture is documented at
+/// `tests/fixtures/ppl-corpus/README.md`: 512 little-endian u32s
+/// generated by `(i * 17 + 3) % 32000`. iter-2a's
+/// `wikitext2_smoke_fixture_loads_to_512_tokens` test pins this.
+fn load_smoke_corpus_tokens() -> Option<Vec<u32>> {
+    let path = smoke_corpus_path();
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() != 512 * 4 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Resolve the hf2q-side model path for a gate cell. P11 swaps these
+/// sentinel paths for real model artifacts staged on disk; iter-2b
+/// uses sentinels so `GgufFile::open` short-circuits the driver with
+/// `PplDriverError::Gguf` without touching the stubbed
+/// `Qwen35Model::load_from_gguf`. The path encoding is mechanical
+/// (model + backend + calibrator) so the harness's per-cell error
+/// surface names the cell that produced it.
+fn hf2q_model_path(cell: &GateCell) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/var/empty/{}-{}-{}-deferred.gguf",
+        cell.model_id.replace(' ', "-"),
+        cell.backend,
+        cell.calibrator_variant.replace(' ', "-"),
+    ))
+}
+
+/// Run a single gate cell end-to-end. iter-2a wired the peer-side
+/// PPL via `run_llama_perplexity` against the smoke fixture; iter-2b
+/// (this file) wires the hf2q-side PPL via
+/// [`measure_ppl_qwen35_dense`] for the **4 dense cells (0-3)**. The
+/// 4 MoE cells (4-7) keep `hf2q_ppl = None` until iter-2c lands a
+/// MoE driver. Wall + RSS stay sentinel for both sides this iter —
+/// real-model wiring lands in P11.
+///
+/// Cell-routing rules:
+/// - `cell.model_id == "27B dense"` ⇒ call
+///   [`measure_ppl_qwen35_dense`] with the cell's hf2q model path
+///   and the smoke corpus. With sentinel paths the driver returns
+///   `PplDriverError::Gguf` ⇒ `hf2q_ppl = None` ⇒ verdict
+///   `NotMeasured`. The wiring is exercised; P11 swaps real paths.
+/// - `cell.model_id == "apex MoE"` ⇒ keep `hf2q_ppl = None` (MoE
+///   driver lands at iter-2c).
 fn run_cell(cell: GateCell) -> CellResult {
+    let corpus_path = smoke_corpus_path();
+    let model_path = hf2q_model_path(&cell);
+
     // Peer-side PPL: invoke the wrapper. The model path is
     // intentionally a sentinel (no real models present yet — P11);
     // the binary will fail to load it, exit non-zero, and the
@@ -645,13 +817,6 @@ fn run_cell(cell: GateCell) -> CellResult {
     // observable: peer wrapper present, but PPL un-measured because
     // the model wasn't loadable. Once P11 wires real GGUF paths,
     // this same call site starts producing real PPL values.
-    let model_path = std::path::PathBuf::from(format!(
-        "/var/empty/{}-{}-{}-deferred.gguf",
-        cell.model_id.replace(' ', "-"),
-        cell.backend,
-        cell.calibrator_variant.replace(' ', "-"),
-    ));
-    let corpus_path = smoke_corpus_path();
     let (peer_metrics, peer_ppl) = if corpus_path.is_file() {
         llama_cpp_runner::run_llama_perplexity(&model_path, &corpus_path)
     } else {
@@ -661,9 +826,23 @@ fn run_cell(cell: GateCell) -> CellResult {
         (RunMetrics::missing_binary("smoke fixture"), None)
     };
 
-    // hf2q-side stays sentinel: driver lands at iter-2b.
-    let hf2q_metrics = RunMetrics::missing_binary("hf2q (iter-2b deferred)");
-    let hf2q_ppl: Option<f32> = None;
+    // hf2q-side PPL: dense cells route through `measure_ppl_qwen35_dense`;
+    // MoE cells stay None pending iter-2c.
+    let hf2q_ppl: Option<f32> = if cell.model_id == "27B dense" {
+        match load_smoke_corpus_tokens() {
+            Some(tokens) => match measure_ppl_qwen35_dense(&model_path, &tokens, None) {
+                Ok(ppl) => Some(ppl),
+                Err(_) => None,
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // Wall + RSS for hf2q stay sentinel this iter (real-model
+    // forward-pass timing lands in P11 alongside the real GGUFs).
+    let hf2q_metrics = RunMetrics::missing_binary("hf2q (iter-2b: PPL via driver; wall+RSS pending P11)");
 
     CellResult::from_measurements(cell, hf2q_metrics, peer_metrics, hf2q_ppl, peer_ppl)
 }
@@ -1181,28 +1360,28 @@ fn markdown_table_renders_full_ppl_row_when_both_measured() {
 // =====================================================================
 
 #[test]
-#[ignore = "P11 hardware gate: needs apex MoE GPU + ~150GB disk"]
+#[ignore = "P11 hardware gate: needs 27B-dense GGUF + ~100GB disk + Qwen35Model forward_cpu warm"]
 fn cell_0_27b_dense_gguf_uncalibrated_q4km() {
     let r = run_cell(GATE_CELLS[0]);
     assert!(matches!(r.verdict, Verdict::NotMeasured { .. }));
 }
 
 #[test]
-#[ignore = "P11 hardware gate: needs apex MoE GPU + ~150GB disk"]
+#[ignore = "P11 hardware gate: needs 27B-dense GGUF + ~100GB disk + Qwen35Model forward_cpu warm"]
 fn cell_1_27b_dense_gguf_imatrix_q4km() {
     let r = run_cell(GATE_CELLS[1]);
     assert!(matches!(r.verdict, Verdict::NotMeasured { .. }));
 }
 
 #[test]
-#[ignore = "P11 hardware gate: needs apex MoE GPU + ~150GB disk"]
+#[ignore = "P11 hardware gate: needs 27B-dense GGUF + ~100GB disk + Qwen35Model forward_cpu warm"]
 fn cell_2_27b_dense_safetensors_dwq46() {
     let r = run_cell(GATE_CELLS[2]);
     assert!(matches!(r.verdict, Verdict::NotMeasured { .. }));
 }
 
 #[test]
-#[ignore = "P11 hardware gate: needs apex MoE GPU + ~150GB disk"]
+#[ignore = "P11 hardware gate: needs 27B-dense GGUF + ~100GB disk + Qwen35Model forward_cpu warm"]
 fn cell_3_27b_dense_gguf_dwq46_vs_current_pipeline() {
     let r = run_cell(GATE_CELLS[3]);
     assert!(matches!(r.verdict, Verdict::NotMeasured { .. }));
