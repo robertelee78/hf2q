@@ -1198,6 +1198,19 @@ pub fn build_moe_ffn_layer_gpu_q_into(
         enc.memory_barrier();
 
         // ---- Phase D: h_all = silu(gate_all) * up_all ----
+        //
+        // 2026-04-26: tested fusing silu_mul into a swiglu-fused Q4_0
+        // mv_id kernel (`quantized_matmul_id_swiglu_q4_0`, mlx-native
+        // commit `4efeec0`).  Eliminates 1 dispatch + 1 memory_barrier per
+        // MoE layer.  Wire-up on dwq46 (Q4_0 expert_down): 110.5 t/s
+        // → 108.0 t/s = REGRESS −1.5% on n=256 cold-run median.  Per-CB
+        // GPU time unchanged (96µs/cb), but wall regressed — likely
+        // doubled input bandwidth (read gate AND up directly) plus
+        // increased ALU pressure (16 silu evals per simdthread inner
+        // loop) saturate something on M5 Max.  The fused kernel + test
+        // remain in mlx-native for future re-evaluation but are NOT
+        // wired here.  9th confirmed M5 Max static-evidence kernel
+        // hypothesis falsified.
         dispatch_silu_mul(
             enc, registry, device.metal_device(),
             &gate_all_buf, &up_all_buf, &h_all_buf, &silu_params_buf, n_h_all,
