@@ -2072,61 +2072,114 @@ mod tests {
         assert_eq!(chunk_out_cpu.len(), n_out, "chunk output length");
 
         // Guard: parallel test runs share the Metal device; a contended command
-        // buffer may return all-zero. Skip rather than fail (matches existing
-        // parity-test pattern at line ~1240).
+        // buffer may return all-zero on BOTH paths. Skip with warning when
+        // both produce zero (likely device contention), but FAIL if only one
+        // does — that's a real path divergence, not a flake. Codex iter-5
+        // audit (2026-04-27 MED) flagged the prior `||` skip masking single-
+        // path stub-outputs.
         let auto_all_zero = auto_out_cpu.iter().all(|&v| v == 0.0);
         let chunk_all_zero = chunk_out_cpu.iter().all(|&v| v == 0.0);
-        if auto_all_zero || chunk_all_zero {
+        if auto_all_zero && chunk_all_zero {
             eprintln!(
                 "chunk_path_first_token_matches_autoregressive_at_seq128: \
-                 GPU output all-zero under parallel test contention — skipping \
-                 (auto_zero={auto_all_zero}, chunk_zero={chunk_all_zero})"
+                 BOTH paths returned all-zero — likely parallel-contention flake; \
+                 re-run in isolation with --test-threads=1 to confirm."
             );
             return;
         }
+        assert!(
+            !auto_all_zero,
+            "autoregressive path returned all-zero while chunk path did not — \
+             real divergence, not contention; chunk_first_8={:?}",
+            &chunk_out_cpu[..8.min(chunk_out_cpu.len())]
+        );
+        assert!(
+            !chunk_all_zero,
+            "chunk path returned all-zero while autoregressive path did not — \
+             real divergence, not contention; auto_first_8={:?}",
+            &auto_out_cpu[..8.min(auto_out_cpu.len())]
+        );
 
-        // Compare the first-token slice (t=0) across all v_heads.
-        // Output layout: `[n_v_heads, seq_len, d_v]` (v_head outer, t middle,
-        // d_v inner) — see `apply_gated_delta_net` allocation. The first-token
-        // slice for head h is therefore `out[h * seq_len * d_v .. h * seq_len * d_v + d_v]`.
-        const FIRST_TOKEN_TOL: f32 = 1.0e-2;
+        // Output layout is TOKEN-MAJOR `[seq_len, n_v_heads, d_v]` per the
+        // autoregressive kernel write at /opt/mlx-native/src/shaders/
+        // gated_delta_net.metal:178: `out_base = t * (H*V) + h * V + tid`.
+        // Iter 5 audit (Codex 2026-04-27 MED) caught the prior test using
+        // head-major indexing `h*T*V` which sampled only 4 tokens (0/32/64/96
+        // of head 0) labeled as 4 heads. The path-vs-path parity claim was
+        // still valid (same offsets in both buffers) but the slice labels
+        // were wrong and coverage was 0.78% (512/65536 elements).
+        //
+        // Fix: scan ALL elements of the FULL output buffer at every (t,h,v)
+        // — chunk vs autoregressive should agree everywhere, not just t=0.
+        //
+        // Tolerance: 5e-2 atol. The autoregressive (per-token, F32 state) and
+        // chunk (chunk-parallel, BF16 staging) paths implement the same
+        // mathematical recurrence but with different reduction order and
+        // different bf16 cast schedules. EACH path matches FLA spec at much
+        // tighter bounds (chunk: 3.8e-6 end-to-end max_o_err per the W-5b
+        // iter-4 oracle test); cross-path divergence accumulates across the
+        // T-token recurrence and is bounded above by sum-of-per-path-budgets.
+        // Empirically observed max ~1.6e-2 at t=109 with seq_len=128. This
+        // bar is the cross-path consistency budget, NOT the per-path spec-
+        // compliance bar (which is enforced separately).
+        const FULL_BUFFER_TOL: f32 = 5.0e-2;
         let mut max_diff: f32 = 0.0;
+        let mut argmax_t: u32 = 0;
         let mut argmax_h: u32 = 0;
         let mut argmax_v: u32 = 0;
-        for h in 0..n_v_heads {
-            let head_base = (h * seq_len * d_v) as usize;
-            for v_idx in 0..d_v {
-                let i = head_base + v_idx as usize; // t=0 within head h
-                let diff = (auto_out_cpu[i] - chunk_out_cpu[i]).abs();
-                if diff > max_diff {
-                    max_diff = diff;
-                    argmax_h = h;
-                    argmax_v = v_idx;
+        for t in 0..seq_len {
+            let token_base = (t * n_v_heads * d_v) as usize;
+            for h in 0..n_v_heads {
+                let head_base = token_base + (h * d_v) as usize;
+                for v_idx in 0..d_v {
+                    let i = head_base + v_idx as usize;
+                    let diff = (auto_out_cpu[i] - chunk_out_cpu[i]).abs();
+                    if diff > max_diff {
+                        max_diff = diff;
+                        argmax_t = t;
+                        argmax_h = h;
+                        argmax_v = v_idx;
+                    }
                 }
             }
         }
+        // Preserve old name for the observed-value field (used in the
+        // assertion message below) so nothing else regresses.
+        const FIRST_TOKEN_TOL: f32 = FULL_BUFFER_TOL;
+        let _ = argmax_t; // retained for the eprintln below
 
+        let argmax_idx =
+            (argmax_t * n_v_heads * d_v) as usize + (argmax_h * d_v) as usize + argmax_v as usize;
         eprintln!(
-            "chunk_path_first_token_matches_autoregressive_at_seq128: \
-             max_diff={:.4e} at (h={}, v={}), tol={:.0e}",
-            max_diff, argmax_h, argmax_v, FIRST_TOKEN_TOL
+            "chunk_path_full_buffer_matches_autoregressive_at_seq128: \
+             max_diff={:.4e} at (t={}, h={}, v={}), tol={:.0e}, \
+             total_elements_compared={}",
+            max_diff,
+            argmax_t,
+            argmax_h,
+            argmax_v,
+            FIRST_TOKEN_TOL,
+            n_out
         );
 
         assert!(
             max_diff < FIRST_TOKEN_TOL,
-            "first-token output diverges between autoregressive and chunk paths: \
-             max_diff={:.4e} at (h={}, v={}), tol={:.0e}. \
-             auto[h={},t=0,v={}]={:.6}, chunk[h={},t=0,v={}]={:.6}",
+            "full-buffer output diverges between autoregressive and chunk paths: \
+             max_diff={:.4e} at (t={}, h={}, v={}), tol={:.0e}. \
+             auto[t={},h={},v={}]={:.6}, chunk[t={},h={},v={}]={:.6}",
             max_diff,
+            argmax_t,
             argmax_h,
             argmax_v,
             FIRST_TOKEN_TOL,
+            argmax_t,
             argmax_h,
             argmax_v,
-            auto_out_cpu[(argmax_h * seq_len * d_v) as usize + argmax_v as usize],
+            auto_out_cpu[argmax_idx],
+            argmax_t,
             argmax_h,
             argmax_v,
-            chunk_out_cpu[(argmax_h * seq_len * d_v) as usize + argmax_v as usize],
+            chunk_out_cpu[argmax_idx],
         );
     }
 
