@@ -6114,3 +6114,55 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - Round-trip via `parse → serialize → parse` is not free: the serializer emits literal characters as `[c]` single-char brackets (because the AST stores literals as `Char` element sequences inside brackets, never as `"..."` quoted form). String-substring assertions like `combined.contains("tool_a")` no longer work — but they shouldn't, because they were inspecting the surface syntax instead of the runtime semantics. The wave-2.5 tests' shape was the wrong shape; rewriting them to be runtime-based is the correct direction even independent of the audit fix.
     - The `is_word_char += '_'` parser change (Q4-A) is a one-byte divergence from llama.cpp. It's load-bearing: llama.cpp synthesizes rule names with `_` (e.g. `root_1` for `?`/`*`/`+` expansions, parser.rs:421-424) but its `is_word_char` doesn't accept `_`. llama.cpp gets away with the inconsistency because it never round-trips parsed grammars through its own parser — `print` is a debug-only sink. hf2q's combiner NEEDS the round-trip, so the parser/emitter must agree on the word set.
   - **Fence respected.** W-γ5 edits in `src/serve/api/grammar/serialize.rs` (new), `src/serve/api/grammar/parser.rs` (`is_word_char` +1 byte), `src/serve/api/grammar/mod.rs` (re-exports), and `src/serve/api/handlers.rs` (combiner replacement). No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
+- **2026-04-26 wave-2.7 W-ζ mechanical fixes (session cfa-20260427-adr005-wave2.7, 3 items) — closes 3 of 5 wave-2.6 Codex REJECT divergences.**
+
+  Wave-2.6 Codex audit (`/tmp/cfa-cfa-20260427-adr005-wave2.6/codex-review-last.txt`) returned REJECT with 5 divergences.  The goalie scout handles the 2 HIGH design items (T2.4 Required/Function enforcement; multi-tool re-entry grammar shape).  This session closes the 3 mechanical items.
+
+  - **HIGH-2 (commit `b8568c8`) — align MAX_REQUIRED_KEYS in registry.rs from 16 → 8:**
+    - **Audit finding:** `json_schema.rs` hard-errors at >8 required keys (ANY_ORDER_MAX_REQUIRED=8) but `registry.rs` tool-call emitters for Gemma4 and Qwen35 only fired `EmitterError::TooManyRequiredKeys` at >16.  A schema with 9–16 required keys would slip through registry.rs and silently build the O(2^N) permutation grammar that Q3 was supposed to prevent.
+    - **Fix:** `MAX_REQUIRED_KEYS: usize = 8` in `registry.rs`.  `EmitterError::TooManyRequiredKeys` doc, Display message, and `gemma4_tool_call_gbnf` / `qwen35_tool_call_gbnf` doc comments updated to reference "SOTA bound / W-ζ".
+    - **Tests updated:** existing `b1_gemma4_too_many_required_keys_err` and `b1_qwen35_too_many_required_keys_err` updated from 17-key / cap-16 assertions to 9-key / cap-8.
+    - **Tests added (4 new, audit-named):**
+      - `nine_required_keys_in_gemma_tool_call_gbnf_returns_too_many_required_keys` — boundary at 9
+      - `eight_required_keys_in_gemma_tool_call_gbnf_compiles_ok` — boundary at 8
+      - `nine_required_keys_in_qwen35_tool_call_gbnf_returns_too_many_required_keys` — boundary at 9
+      - `eight_required_keys_in_qwen35_tool_call_gbnf_compiles_ok` — boundary at 8
+    - **Chesterton:** The 16-key cap was wave-2.5's initial rough guard before json_schema.rs established the SOTA 8-key bound in commit 5110dc0.  The cap in registry.rs was never updated.  The fix is mechanical: one constant change + matching test boundary update.
+
+  - **MED Q4-A (commit `6c97d6a`) — fix CharAny bracket-close suppression in serialize.rs:**
+    - **Audit finding:** `serialize_rule()` included `CharAny` in the `inside_class_continues` lookahead (`GretType::CharAlt | GretType::CharRngUpper | GretType::CharAny`).  When a char class (`[a]` or `[^a]`) was immediately followed by a `.` element, the bracket-close `] ` was suppressed — producing `[a.` instead of `[a] .`.  `parse(serialize(parse("root ::= [a] .")))` failed.
+    - **Fix:** remove `GretType::CharAny` from `inside_class_continues`.  `CharAny` is a top-level atom (`.`), never a char-class continuation; only `CharAlt` and `CharRngUpper` continue an open bracket.  The existing guard `if elem.ty != GretType::CharAny` that suppresses bracket-close for the *current* CharAny element is correct and untouched.
+    - **Tests added (3 new, audit-named):**
+      - `parser_round_trip_char_any_after_quoted_literal` — `root ::= "a" .`
+      - `parser_round_trip_char_any_after_class` — `root ::= [a] .`
+      - `parser_round_trip_char_any_after_negated_class` — `root ::= [^a] .`
+    - **Chesterton:** The faulty lookahead was a direct port of the llama.cpp comment that listed CharAny as a char-element; the comment was correct (CharAny IS a char-element for `is_char_element()`), but the `inside_class_continues` set is narrower — it is the set of elements that continue an *open bracket*, and `.` never does.
+
+  - **LOW (commit `90ac4e2`) — convert SchemaError from generic struct to typed enum:**
+    - **Audit finding:** Commit 5110dc0's message implied a `SchemaError::TooManyRequiredKeys` variant but only a generic `struct SchemaError { path, message }` existed.  Callers cannot distinguish the >8-required-keys case from other errors without string-parsing.
+    - **Fix:** `SchemaError` is now an enum:
+      - `TooManyRequiredKeys { fn_name: String, count: usize, max: usize }` — carries structured data for the >8-required-keys case.
+      - `Generic { path: String, message: String }` — preserves existing behavior for all other call sites.
+    - **5110dc0 >8-key site:** now emits `SchemaError::TooManyRequiredKeys { fn_name: path, count, max: ANY_ORDER_MAX_REQUIRED }` instead of formatting into a `Generic` message.
+    - **All other SchemaError construction sites (11):** updated to `SchemaError::Generic { .. }`.
+    - **Display:** both variants format to `to_string()`-accessible strings; `TooManyRequiredKeys` Display includes citation + actionable instruction.
+    - **Tests updated:** all `err.message.contains(...)` assertions updated to `err.to_string().contains(...)`.
+    - **`nine_required_keys_returns_too_many_required_keys`:** now pattern-matches the enum variant to assert `count=9` and `max=8` in addition to Display assertions.
+    - **Tests added (2 new):**
+      - `schema_error_generic_variant_displays_correctly` — existing Generic path still formats correctly.
+      - `too_many_required_keys_variant_carries_fn_name_and_count` — typed variant carries count + max.
+    - **Chesterton:** `SchemaError` was a struct because the first error type in json_schema.rs predates the Q3 SOTA-bound work; converting to enum is the correct direction for distinguishing HTTP-400 causes without string parsing.
+
+  - **Validation (W-ζ HEAD `90ac4e2`):**
+    - `cargo check` → clean (156 pre-existing warnings).
+    - `cargo test --release -- registry::tests:: json_schema::tests:: serialize::tests::` → 157 passed, 0 failed.
+    - Wave-2.6 fixes verified intact: Q1 GrammarKind, Q2 awaiting_trigger, Q3 json_schema cap, Q4-A/B AST combiner all pass their named tests.
+  - **LOC delta:**
+    - HIGH-2: `registry.rs` +113/-27.
+    - MED Q4-A: `serialize.rs` +56/-13.
+    - LOW: `json_schema.rs` +142/-38.
+  - **Open followups (goalie scout):**
+    - HIGH T2.4: Required/Function produces no error if no ToolCallOpen appears before EOS.
+    - MED multi-tool re-entry: no `(call)+` grammar shape emitted; `parallel_tool_calls` not wired.
+  - **Fence respected.** W-ζ edits in `src/serve/api/registry.rs`, `src/serve/api/grammar/serialize.rs`, `src/serve/api/grammar/json_schema.rs`.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
