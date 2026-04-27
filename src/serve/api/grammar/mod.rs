@@ -32,8 +32,11 @@ pub mod parser;
 pub mod sampler;
 pub mod json_schema;
 pub mod mask;
+pub mod serialize;
 
 #[allow(unused_imports)]
 pub use parser::{parse, Grammar, GretElement, GretType, ParseError};
 #[allow(unused_imports)]
 pub use sampler::{GrammarRuntime, PartialUtf8, Pos, Stack, Stacks};
+#[allow(unused_imports)]
+pub use serialize::{rename_rules, serialize};

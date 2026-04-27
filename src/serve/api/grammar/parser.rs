@@ -598,7 +598,24 @@ fn is_digit(c: u8) -> bool {
 }
 
 fn is_word_char(c: u8) -> bool {
-    (b'a'..=b'z').contains(&c) || (b'A'..=b'Z').contains(&c) || c == b'-' || is_digit(c)
+    // llama.cpp's `is_word_char` (src/llama-grammar.cpp:98) does NOT include
+    // `_`, but its `generate_symbol_id` (src/llama-grammar.cpp:421-424)
+    // synthesizes rule names like `root_1` for `?`/`*`/`+`/`{n,m}`/`(...)`
+    // expansions.  llama.cpp gets away with the inconsistency because it
+    // never round-trips parsed grammars through its own parser — `print`
+    // is a debug-only sink there.
+    //
+    // hf2q's `combine_function_grammars` (handlers.rs) NEEDS the round-trip:
+    // parse user grammars → rename via `serialize::rename_rules` → serialize
+    // → re-parse the combined output.  Without `_` in the word set, every
+    // synthesized subrule name fails to re-parse.  We diverge from llama.cpp
+    // by one byte to keep the parser self-consistent with its own emitter.
+    // Wave 2.6 W-γ5a (Q4-A) — see /opt/hf2q/src/serve/api/grammar/serialize.rs.
+    (b'a'..=b'z').contains(&c)
+        || (b'A'..=b'Z').contains(&c)
+        || c == b'-'
+        || c == b'_'
+        || is_digit(c)
 }
 
 /// Skip whitespace / comments starting at `pos`. `#` to end-of-line is a
