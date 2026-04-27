@@ -149,6 +149,49 @@ impl CalibrationData {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Construct [`CalibrationData::ImatrixWithStats`] from a
+    /// llama.cpp-compatible GGUF imatrix file (per the schema landed
+    /// in PR #9400 / commit `90083283` / 2025-07-19).
+    ///
+    /// This is the bridge consumers use to plug a pre-computed
+    /// imatrix.gguf into the codec's per-row imatrix-weighted dispatch:
+    ///
+    /// ```ignore
+    /// let calib = CalibrationData::from_imatrix_gguf(&path)?;
+    /// let bytes = quantize_row_to_bytes(
+    ///     &row, KQuantTarget::Q4K, &calib, "blk.0.attn_q.weight",
+    /// )?;
+    /// ```
+    ///
+    /// The returned data uses [`Self::ImatrixWithStats`] (preserves
+    /// per-expert counts exactly — the property the GGUF format was
+    /// introduced to provide). The codec's
+    /// [`crate::quantize::k_quant_codec::quantize_row_to_bytes`]
+    /// reads `stats.values.as_slice()` for the imatrix-weighted
+    /// codebook search; counts are preserved for round-trip but not
+    /// consumed at row-quantize time.
+    pub fn from_imatrix_gguf(
+        path: &std::path::Path,
+    ) -> Result<Self, super::imatrix::ImatrixError> {
+        let (collector, _datasets) = super::imatrix::ImatrixCollector::load_imatrix_gguf(path)?;
+        Ok(Self::from_imatrix_collector(&collector))
+    }
+
+    /// Construct [`CalibrationData::ImatrixWithStats`] from an in-memory
+    /// [`super::imatrix::ImatrixCollector`] (e.g. one freshly built via
+    /// the `accumulate_*` methods, before saving to disk).
+    ///
+    /// `stats` is cloned from the collector's internal map so the
+    /// collector remains usable post-call.
+    pub fn from_imatrix_collector(collector: &super::imatrix::ImatrixCollector) -> Self {
+        let stats: HashMap<String, ImatrixStats> = collector
+            .stats()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        Self::ImatrixWithStats(stats)
+    }
 }
 
 /// Calibrator trait — produces [`CalibrationData`] from a model +
@@ -381,5 +424,137 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<NoneCalibrator>();
         assert_send_sync::<Box<dyn Calibrator>>();
+    }
+
+    // ─────────── from_imatrix_collector / from_imatrix_gguf bridge ───────────
+
+    /// `from_imatrix_collector` clones every entry's `Stats` exactly,
+    /// produces `CalibrationData::ImatrixWithStats`.
+    #[test]
+    fn from_imatrix_collector_preserves_stats() {
+        use crate::calibrate::imatrix::ImatrixCollector;
+
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0, 3.0, 4.0], 4, 1)
+            .unwrap();
+        col.record_chunk();
+
+        let calib = CalibrationData::from_imatrix_collector(&col);
+        assert!(calib.is_some());
+        match &calib {
+            CalibrationData::ImatrixWithStats(map) => {
+                let stats = map.get("blk.0.attn_q.weight").unwrap();
+                let orig = col.stats().get("blk.0.attn_q.weight").unwrap();
+                assert_eq!(stats.values, orig.values);
+                assert_eq!(stats.counts, orig.counts);
+            }
+            other => panic!("expected ImatrixWithStats, got {other:?}"),
+        }
+    }
+
+    /// **Full bridge round trip**: build an ImatrixCollector → save
+    /// to GGUF → `CalibrationData::from_imatrix_gguf` → verify the
+    /// resulting `ImatrixWithStats` matches the original collector
+    /// stats byte-for-byte.
+    #[test]
+    fn from_imatrix_gguf_save_load_round_trip() {
+        use crate::calibrate::imatrix::ImatrixCollector;
+
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0, 3.0, 4.0], 4, 1)
+            .unwrap();
+        col.accumulate_dense("blk.1.ffn_down.weight", &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 6, 1)
+            .unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-calibration-bridge-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["wikitext-2.txt"])
+            .unwrap();
+
+        let calib = CalibrationData::from_imatrix_gguf(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        match calib {
+            CalibrationData::ImatrixWithStats(map) => {
+                assert_eq!(map.len(), 2);
+                let q_stats = map.get("blk.0.attn_q.weight").unwrap();
+                let q_orig = col.stats().get("blk.0.attn_q.weight").unwrap();
+                assert_eq!(q_stats.values, q_orig.values);
+                assert_eq!(q_stats.counts, q_orig.counts);
+
+                let ffn_stats = map.get("blk.1.ffn_down.weight").unwrap();
+                let ffn_orig = col.stats().get("blk.1.ffn_down.weight").unwrap();
+                assert_eq!(ffn_stats.values, ffn_orig.values);
+                assert_eq!(ffn_stats.counts, ffn_orig.counts);
+            }
+            other => panic!("expected ImatrixWithStats, got {other:?}"),
+        }
+    }
+
+    /// `from_imatrix_gguf` on a missing file surfaces the underlying
+    /// I/O error wrapped in `ImatrixError::Io`.
+    #[test]
+    fn from_imatrix_gguf_missing_file_errors() {
+        let path = std::env::temp_dir().join("hf2q-bridge-nonexistent.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+        let err = CalibrationData::from_imatrix_gguf(&path).unwrap_err();
+        match err {
+            crate::calibrate::imatrix::ImatrixError::Io(_) => {}
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    /// `CalibrationData` round-tripped through the GGUF bridge can be
+    /// passed directly to `quantize_row_to_bytes` and produce the
+    /// imatrix-weighted bytes (not the `_ref` bytes). Verifies the
+    /// codec's `lookup_imatrix_weights` reads `stats.values` correctly.
+    #[test]
+    fn from_imatrix_gguf_bridges_to_codec() {
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::quantize::k_quant_codec::{quantize_row_to_bytes, KQuantTarget};
+
+        const QK_K: usize = 256;
+
+        // Build calibration with biased weights (100× emphasis on first 64 cols).
+        let mut col = ImatrixCollector::new();
+        let mut activations = vec![0.5_f32; QK_K];
+        // Repeated values ensure the imatrix weights = activations²
+        // gives a clear bias signal.
+        for v in activations.iter_mut().take(64) {
+            *v = 10.0;
+        }
+        col.accumulate_dense("test.weight", &activations, 1, QK_K).unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-bridge-codec-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+        col.save_imatrix_gguf(&path, 512, &["test.txt"]).unwrap();
+
+        let calib = CalibrationData::from_imatrix_gguf(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Quantize the same input row through the codec via the imatrix path.
+        let row: Vec<f32> = (0..QK_K)
+            .map(|i| (i as f32 - 128.0) / 128.0)
+            .collect();
+        let bytes_imatrix =
+            quantize_row_to_bytes(&row, KQuantTarget::Q4K, &calib, "test.weight").unwrap();
+        let bytes_ref =
+            quantize_row_to_bytes(&row, KQuantTarget::Q4K, &CalibrationData::None, "test.weight")
+                .unwrap();
+
+        assert_eq!(bytes_imatrix.len(), bytes_ref.len(), "same on-disk size");
+        // The imatrix-weighted codebook search differs from _ref on
+        // biased input → bytes must differ.
+        assert_ne!(
+            bytes_imatrix, bytes_ref,
+            "imatrix path produced byte-identical output to _ref via the bridge"
+        );
     }
 }
