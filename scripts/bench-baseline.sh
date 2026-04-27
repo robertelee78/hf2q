@@ -241,14 +241,28 @@ extract_llama_tps() {
   echo "${val:-0.0}"
 }
 
+# Capture pre-bench process audit — top non-system CPU consumers.
+# Wrote 2026-04-27 after iter8c-prep discovered mcp-brain-server at 18% CPU
+# polluted the apex same-day morning bench. Per `feedback_bench_process_audit`,
+# any non-OS process > 5% sustained CPU is a contamination warning.
+capture_process_audit() {
+  local outpath="$1"
+  ps -eo user,pid,%cpu,%mem,comm \
+    | sort -rn -k3 \
+    | head -15 \
+    > "$outpath" 2>/dev/null || true
+}
+
 # Run a single hf2q cold trial.
 run_hf2q_trial() {
   local trial="$1"
   local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stdout"
   local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stderr"
+  local audit_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.process-audit"
   # Progress messages to STDERR — function's stdout must contain ONLY
   # the parsed tok/s value, since the caller captures it via $().
   echo "  hf2q trial $trial → $stdout_out" >&2
+  capture_process_audit "$audit_out"
   set +e
   "$HF2Q_BIN" generate \
     --model "$MODEL" \
@@ -270,9 +284,11 @@ run_llama_trial() {
   local trial="$1"
   local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stdout"
   local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stderr"
+  local audit_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.process-audit"
   # Progress messages to STDERR — function's stdout must contain ONLY
   # the parsed tok/s value (caller captures via $()).
   echo "  llama-bench trial $trial → $stdout_out" >&2
+  capture_process_audit "$audit_out"
   set +e
   "$LLAMA_BENCH_BIN" \
     -m "$MODEL" \
