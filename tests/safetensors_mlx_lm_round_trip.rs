@@ -22,11 +22,15 @@
 //! All fixtures are synthetic 4-layer Gemma-4-shaped tensors built
 //! programmatically (no HF download); each test runs in <100 ms.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use assert_cmd::Command;
+
+use common::mlx_lm_runner;
 
 // ---------------------------------------------------------------------
 // Synthetic fixture builders
@@ -512,25 +516,25 @@ fn safetensors_directory_loads_in_mlx_lm() {
 
     run_convert(&input_dir, &output_dir, "dwq-4-6");
 
-    // Subprocess: `python3 -c 'from mlx_lm import load; ...'`. The
-    // intent is "loader doesn't crash" — we accept any successful
-    // exit. A real mlx-lm install at the system Python is required;
-    // CI gating is the P10 harness's responsibility.
-    let py_script = format!(
-        "from mlx_lm import load\n\
-         model, tokenizer = load('{}')\n\
-         print('mlx_lm.load OK')\n",
-        output_dir.display()
-    );
-    let out = std::process::Command::new("python3")
-        .args(["-c", &py_script])
-        .output()
-        .expect("python3 must be available for the P10 mlx-lm gate");
+    // P10 iter-1 wiring: route through `tests/common/mlx_lm_runner.rs`
+    // so the missing-binary contract is honoured (Decision 21 — no
+    // link to mlx-lm at build time, runtime subprocess only). If
+    // `mlx_lm` is absent the runner returns the missing-binary
+    // sentinel + tracing::warn; we treat that as a soft skip via
+    // early-return because this gate is `#[ignore]`-only and the
+    // operator is already opting in to the real-peer side.
+    let (metrics, ok) = mlx_lm_runner::run_mlx_lm_load(&output_dir);
+    if metrics.is_missing_binary() {
+        tracing::warn!(
+            "mlx-lm load gate skipped: {} (run again with mlx-lm installed)",
+            metrics.stderr_tail
+        );
+        return;
+    }
     assert!(
-        out.status.success(),
-        "mlx_lm.load failed for hf2q DWQ output:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        ok,
+        "mlx_lm.load failed for hf2q DWQ output: exit_code={} stderr_tail=`{}`",
+        metrics.exit_code, metrics.stderr_tail,
     );
 }
 
@@ -559,14 +563,43 @@ fn safetensors_dwq46_cosine_similarity_above_99_9_percent() {
 
     run_convert(&input_dir, &output_dir, "dwq-4-6");
 
-    // The harness will compute logits via mlx-lm load + forward pass
-    // on a 16-prompt deterministic batch and compare against the
-    // reference. Until the reference is wired up (P10) this test
-    // simply asserts the directory exists; it stays `#[ignore]`-gated
-    // so CI does not accidentally count an under-defined check as
-    // green.
+    // P10 iter-1 wiring: the reference DWQ is materialised by the
+    // operator (P11 swaps in real qwen3.6 reference DWQ artefacts);
+    // the operator points `HF2Q_REFERENCE_DWQ_DIR` at the reference
+    // directory and re-runs with `--ignored`. If the env-var is
+    // unset, the gate skips (this iter's synthetic fixture is too
+    // small for a meaningful cosine — Decision 15 row 3 + 7 land
+    // the real comparison in P11).
+    let reference_dir = match std::env::var_os("HF2Q_REFERENCE_DWQ_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            tracing::warn!(
+                "cosine gate skipped: HF2Q_REFERENCE_DWQ_DIR unset; P11 wires the real reference DWQ"
+            );
+            assert!(
+                output_dir.join("model.safetensors").exists(),
+                "DWQ output must at least exist before cosine gate is wired up in P11"
+            );
+            return;
+        }
+    };
+
+    let (metrics, cosine) = mlx_lm_runner::run_mlx_lm_cosine_check(&output_dir, &reference_dir, 16);
+    if metrics.is_missing_binary() {
+        tracing::warn!(
+            "cosine gate skipped: {} (run again with mlx-lm installed)",
+            metrics.stderr_tail
+        );
+        return;
+    }
+    let cos = cosine.unwrap_or_else(|| {
+        panic!(
+            "cosine output not parseable from mlx-lm subprocess; exit_code={} stderr_tail=`{}`",
+            metrics.exit_code, metrics.stderr_tail,
+        )
+    });
     assert!(
-        output_dir.join("model.safetensors").exists(),
-        "DWQ output must exist before cosine gate runs"
+        cos >= 0.999,
+        "cosine similarity {cos:.6} below 0.999 gate (Decision 15 row 3/7)",
     );
 }
