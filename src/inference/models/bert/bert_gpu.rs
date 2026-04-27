@@ -2061,9 +2061,27 @@ pub fn apply_bert_full_forward_gpu(
     }
 
     // --- Pool ---
-    let pooled =
-        bert_pool_gpu(encoder, registry, device, &hidden_states, pool_kind, seq_len, hidden)
-            .context("full forward: pool")?;
+    //
+    // Pass `valid_token_count` (not `seq_len`) so:
+    //   - Last pooling reads row `valid_token_count - 1` (the actual last
+    //     real token), not row `seq_len - 1` which may be a padding row.
+    //   - Mean pooling divides by `valid_token_count` (the correct
+    //     denominator); padding rows are already zero so the sum is
+    //     unaffected, but the divisor was too large when seq_len was used.
+    //   - Cls (row 0) is unaffected by this argument; the fix is a no-op
+    //     for CLS-pool models.
+    //
+    // Parity fix: mirrors nomic_bert lane iter-90 fix (forward.rs:997-1019).
+    let pooled = bert_pool_gpu(
+        encoder,
+        registry,
+        device,
+        &hidden_states,
+        pool_kind,
+        valid_token_count,
+        hidden,
+    )
+    .context("full forward: pool")?;
     encoder.memory_barrier();
 
     // --- L2 normalize ---
@@ -3612,6 +3630,177 @@ mod tests {
                 h,
                 got[h],
                 expected
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // bert_pool_gpu — padded-input regression (wave-3 W-A1, iter-92)
+    //
+    // These three tests verify that bert_pool_gpu correctly handles
+    // inputs where valid_token_count < seq_len (i.e. padded batches).
+    // They are the unit-level contract for the fix at apply_bert_full_forward_gpu
+    // that changed `seq_len` → `valid_token_count` in the pool call.
+    // -----------------------------------------------------------------
+
+    /// Last pooling on a padded input must return row `valid_token_count-1`,
+    /// NOT row `seq_len-1`.
+    ///
+    /// Layout: seq_len=8, valid_token_count=5.
+    /// input[s, h] = s * hidden + h  (distinct per-row values so any
+    /// wrong row is immediately detectable).
+    /// Expected output = row 4 = [32, 33, 34, 35] for hidden=4.
+    #[test]
+    fn pool_last_padded_returns_valid_last_row_not_seq_len_minus_one() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq_len: usize = 8;
+        let valid: usize = 5;
+        let hidden: usize = 4;
+        // input[s, h] = (s * hidden + h) as f32
+        let input: Vec<f32> = (0..seq_len * hidden).map(|i| i as f32).collect();
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq_len, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        // Pass valid_token_count, NOT seq_len — this is the fixed call pattern.
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Last,
+            valid as u32,
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        // Row 4 (valid_token_count-1 = 4): values are [4*4, 4*4+1, 4*4+2, 4*4+3] = [16,17,18,19].
+        for h in 0..hidden {
+            let expected = ((valid - 1) * hidden + h) as f32;
+            assert!(
+                (got[h] - expected).abs() < 1e-6,
+                "Last padded h={h}: got {}, want {} (row {}); \
+                 if got {} that is the buggy seq_len-1 row",
+                got[h],
+                expected,
+                valid - 1,
+                ((seq_len - 1) * hidden + h) as f32,
+            );
+        }
+    }
+
+    /// Mean pooling on a padded input must divide by `valid_token_count`,
+    /// not `seq_len`.
+    ///
+    /// Layout: seq_len=8, valid_token_count=5.
+    /// Pad rows [5..8] are zero (as the GPU kernel would see them after
+    /// the attention mask zeroes out contributions).
+    /// Expected mean[h] = sum_{s=0}^{4}(s * hidden + h) / 5.
+    /// If the old bug were present (dividing by 8) the result would be
+    /// 5/8 of the correct value.
+    #[test]
+    fn pool_mean_padded_divides_by_valid_not_seq_len() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq_len: usize = 8;
+        let valid: usize = 5;
+        let hidden: usize = 4;
+        // Rows [0..valid) have real data; rows [valid..seq_len) are zero (padding).
+        let mut input = vec![0.0f32; seq_len * hidden];
+        for s in 0..valid {
+            for h in 0..hidden {
+                input[s * hidden + h] = (s * hidden + h) as f32;
+            }
+        }
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq_len, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        // Pass valid_token_count so the kernel divides by 5, not 8.
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Mean,
+            valid as u32,
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        for h in 0..hidden {
+            // sum over real rows / valid
+            let sum: f32 = (0..valid).map(|s| (s * hidden + h) as f32).sum();
+            let expected = sum / valid as f32;
+            // Buggy value would be sum / seq_len = 5/8 * expected
+            let buggy = sum / seq_len as f32;
+            assert!(
+                (got[h] - expected).abs() < 1e-5,
+                "Mean padded h={h}: got {:.6}, want {:.6} (buggy would be {:.6})",
+                got[h],
+                expected,
+                buggy,
+            );
+        }
+    }
+
+    /// Cls pooling on a padded input must still return row 0 unchanged.
+    /// valid_token_count does not affect Cls semantics — this is a
+    /// regression guard ensuring the fix didn't break Cls.
+    #[test]
+    fn pool_cls_padded_still_returns_row_zero() {
+        if MlxDevice::new().is_err() {
+            eprintln!("skipping: no Metal device available");
+            return;
+        }
+        let seq_len: usize = 8;
+        let valid: usize = 5;
+        let hidden: usize = 4;
+        // input[s, h] = s * hidden + h
+        let input: Vec<f32> = (0..seq_len * hidden).map(|i| i as f32).collect();
+        let device = MlxDevice::new().unwrap();
+        let executor = GraphExecutor::new(device);
+        let device_ref: *const MlxDevice = executor.device() as *const _;
+        let device: &MlxDevice = unsafe { &*device_ref };
+        let in_buf = upload_f32(device, &input, vec![seq_len, hidden]);
+        let mut session = executor.begin().expect("begin");
+        let mut registry = KernelRegistry::new();
+        register_bert_custom_shaders(&mut registry);
+        let out = bert_pool_gpu(
+            session.encoder_mut(),
+            &mut registry,
+            device,
+            &in_buf,
+            BertPoolKind::Cls,
+            valid as u32, // pass valid_token_count — must not affect Cls
+            hidden as u32,
+        )
+        .expect("dispatch");
+        session.finish().expect("finish");
+        let got = readback_f32(&out, hidden);
+        // Row 0: [0, 1, 2, 3]
+        for h in 0..hidden {
+            let expected = h as f32; // row 0: s=0, so value = 0*hidden+h = h
+            assert!(
+                (got[h] - expected).abs() < 1e-6,
+                "Cls padded h={h}: got {}, want {}",
+                got[h],
+                expected,
             );
         }
     }
