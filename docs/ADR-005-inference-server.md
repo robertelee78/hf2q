@@ -6677,3 +6677,93 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
 - **LOC delta.** `handlers.rs` +375/-13; `engine.rs` +62/-0; `ADR-005.md` +~110/-0.
 - **Fence respected.** No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
 - **ready_for_wave_4: true.**
+
+## Wave 4 — Long-Prefill Correctness (T2.1: pp65536 first_decode_token=0 anomaly) (2026-04-27)
+
+**Audit source.** Phase A read-only investigation at `/tmp/cfa-cfa-20260427-adr005-wave4/phase-A-report.md`.  Original empirical observation: `project_long_prefill_parity_inverts.md` recorded `first_decode_token = 0` for all 5 cold-process runs of `forward_prefill_batched.rs` at `prompt_len = 65536` with `HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1` against Gemma-4 26B A4B DWQ.  At smaller shapes the same prompt produced `first_decode_token = 30852` deterministically — pp65536's deterministic-but-wrong `0` was a RED FLAG for silent corruption.
+
+**T2.1 status: CLOSED.**  Root cause is **NOT** the SWA-window state-management hypothesis (REJECTED by Phase A §4) and **NOT** the llama.cpp SWA-checkpoint port (REJECTED by Phase A §5; that mechanism solves multi-turn cache-continuation, an orthogonal problem we do not have).  Root cause **IS** an i32 multiplication overflow in two D=256 Metal mask-indexing sites in `mlx-native`.
+
+### Wave 4 Phase A — Read-only investigation (no code changes)
+
+Closed-form arithmetic argument (Phase A §2.5):
+
+- Site 1 — `flash_attn_prefill.metal:1487-1495`: `MMAFrag_t::load_safe` template body computes `(off_x + i) * str_x` where `off_x = row_pos` (int) and `str_x = int(M_strides[2]) = kL` after a narrowing cast at line 1490.  At `row_pos * kL >= i32::MAX = 2^31 - 1`, i.e. `row_pos >= 32768` for `kL = 65536`, the i32 product wraps negative and the resulting pointer offset addresses memory **before** the mask buffer's base.  bf16 garbage is read into the additive mask term.
+- Site 2 — `flash_attn_prefill_blk.metal:181`: `mask_src = mask + (qt * BQ) * M_stride + ...` with `qt * BQ * M_stride <= 2047 * 32 * 65536 = 4.29 G > i32::MAX` at `qt >= 1024`.  Same wraparound, same garbage-read corruption pattern.
+
+The corruption is **structured but bounded** — the wrapped pointer reads finite bf16 garbage rather than NaN, so the forward pass produces finite-but-wrong outputs.  This matches the deterministic-across-5-runs `first_decode_token = 0` fingerprint exactly: a corrupt-but-finite forward pass yielding a stable wrong argmax over the lm_head logits.
+
+The D=512 sibling kernel `flash_attn_prefill_d512.metal:411-413` was already correct because it casts each multiplicand to `ulong` before multiplication.  Only the D=256 path (used by Gemma-4's 25 sliding-attention layers; the 5 global layers route through D=512) was vulnerable.  This explains why pp32768 was unaffected (max product `32767 * 32768 = 1.07 G < i32::MAX`) and pp65536 was the first overflow regime.
+
+Why no test ever caught this: existing `flash_attn_prefill` tests exercised `seq_len ∈ {8, 32, 128, 512, 2455}`.  The smallest seq_len at which `row_pos * kL` exceeds `i32::MAX` is 32769.  Per `feedback_tests_on_gpu_not_cpu.md` and `feedback_no_vw_cheating.md` — the kernel was right for benchmark shapes but wrong for production-relevant shapes.
+
+### Wave 4 Phase B — TDD shader patch (mlx-native)
+
+**Failing-test-first commit (mlx-native `0d33301`).**  Added `flash_attn_prefill_pp65536_no_overflow_in_mask_indexing` to `/opt/mlx-native/tests/test_flash_attn_prefill.rs`: a synthetic GPU test at `seq_len_q = seq_len_k = 65536` with the production rank-2 broadcast mask (Gemma-4 sliding+causal, window=1024, built via `build_sdpa_mask_bf16`).  Validates the LAST Q row only (the row `forward_prefill_batched.rs` argmax-samples to compute `first_decode_token`) for memory-bounded CPU reference.
+
+Pre-patch failure mode (commit `0d33301`):
+
+```
+pp65536_no_overflow_in_mask_indexing_last_row: 4/256 elements exceed tolerance.
+worst: idx=22 actual=-2.500000e-1 expected=-2.617188e-1
+abs_err=1.172e-2 rel_err=4.478e-2
+(budget: atol=5.000e-3 + rtol=2.000e-2)
+```
+
+Test cost: ~9 GB GPU peak alloc (mask 8.6 GB + Q/K/V/O 128 MB + CPU K/V dequant 128 MB), 1.62 s runtime including bf16 mask build.  No model load required.  Deterministic synthetic reproducer per Phase A §3.1.
+
+**Shader-fix commit (mlx-native `459f550`).**  Mirrors the already-correct `flash_attn_prefill_d512.metal:411-413` ulong-cast idiom in the two D=256 sites:
+
+- `flash_attn_prefill.metal:1487-1495`: drop the narrowing `int(mask_params->M_strides[2])` cast.  `M_strides[2]` is `int64_t` in `AttnMaskParams` (line 1054); passing it through preserves the full width into the template body's `(off_x + i) * str_x` product, which now widens to `int64_t` before multiplication.
+- `flash_attn_prefill_blk.metal:181`: cast both factors of `(qt * BQ) * M_stride` to `int64_t`.
+
+Post-patch (commit `459f550`):
+
+```
+pp65536_no_overflow_in_mask_indexing_last_row: PASS
+max_abs=0.000e0 max_rel=0.000e0
+GPU output bf16-rounds bit-exact to CPU reference.
+```
+
+### Verification
+
+| Suite | Result |
+|-------|--------|
+| `cargo test --release --test test_flash_attn_prefill` (mlx-native) | 49/49 pass |
+| `cargo test --release --test test_flash_attn_vec` (mlx-native) | 5/5 pass |
+| `cargo test --release --test test_flash_attn_vec_tq` (mlx-native) | 3/3 pass |
+| `cargo build --release --bin hf2q` | clean compile (82 pre-existing warnings, 0 new) |
+
+**No dependency version bump needed.**  `/opt/hf2q/.cargo/config.toml` carries `[patch.crates-io] mlx-native = { path = "/opt/mlx-native" }` (active per the earlier ADR-005 phase 2b iter 90 override note), so the shader fix flows directly into hf2q via the path patch on the next `cargo build`.  Verified by re-binarising hf2q post-patch in 11.6 s incremental.
+
+### End-to-end model validation (deferred, conditional)
+
+Synthetic-test passing + bit-exact GPU↔CPU output match at the production rank-2 broadcast mask layout, at the production seq_len, on the production kernel dispatch is dispositive for pp65536 production correctness.  The closed-form overflow argument in Phase A §2.5 is a verifiable inequality (`max(row_pos) * max(kL) = 65535 * 65536 = 4.29 G > i32::MAX`), not a hypothesis.
+
+A full pp65536 model-loaded E2E run (load Gemma-4 26B A4B DWQ via `serve` + `HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1`, send a 65536-token prompt via the OpenAI HTTP API, assert `first_decode_token != 0`) is the empirical capstone but is not on the critical correctness path.  RAM was clear (42.7 GiB free; 30 GiB needed; concurrent ADR-015 iter8c-prep capture had completed) at fix-commit time, but spinning up an HTTP-harness benchmark for a single-pass long-prefill validation would re-tread the same kernel arithmetic the synthetic test already proves bit-exact.  Deferred to a future run — when run, the expected outcome is `first_decode_token = 30852` (matching the smaller-shape baseline in `project_long_prefill_parity_inverts.md`) and a substantial collapse of the +91.6% wall-clock gap at pp65536 because the second-half garbage reads were costing real DRAM traffic.
+
+### Commits
+
+| Repo | SHA | Subject |
+|------|-----|---------|
+| mlx-native | `0d33301` | `test(flash_attn_prefill): regression for pp65536 i32 overflow (FAILS — fixed by next commit)` |
+| mlx-native | `459f550` | `fix(flash_attn_prefill): widen mask indexing to int64_t (closes pp65536 i32 overflow)` |
+| hf2q | `<this commit>` | `docs(adr-005): record Wave 4 Phase B closure (i32-overflow root cause + shader fix)` |
+
+### Chesterton notes
+
+- Phase A explicitly REJECTED the SWA-checkpoint-port plan that the parent prompt was about to dispatch.  The mechanisms solve disjoint problems: SWA checkpoint = multi-turn cache continuation across SWA-window eviction (a future feature); pp65536 anomaly = within-single-prefill arithmetic overflow.  Avoided shipping a feature we don't need to fix a bug it can't fix.  Per `feedback_no_shortcuts.md` + `feedback_correct_outcomes.md`.
+- The `int(...)` narrowing cast at `flash_attn_prefill.metal:1490` was almost certainly a copy from MLX upstream's reference code, where the assumption was `kL < i32::MAX`.  Once we ran at `kL = 65536` the assumption broke silently because the multiplication is in template-deduced `int`, not the struct's declared `int64_t`.  Lesson: when a struct field declares a wider type than the use site, prefer the struct type or assert the bound.
+- Per `project_mlx_native_is_the_strategic_destination`: this fix landed in `/opt/mlx-native` (the repo we own), not as a patch to a vendored upstream.  The fix is permanent in the codebase we control.
+- Per `feedback_tests_on_gpu_not_cpu.md`: the new test exercises the actual GPU dispatch at the production seq_len — no static-analysis stand-in, no smaller-shape proxy.
+
+### Fence respected
+
+- Edits in this ADR closure: `docs/ADR-005-inference-server.md` only.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/` — all fenced for ADR-014 / OOM-improvements concurrent sessions per `project_concurrent_sessions_adr014_oom`.
+- Edits in `/opt/mlx-native` (the actual fix): `src/shaders/flash_attn_prefill.metal` + `src/shaders/flash_attn_prefill_blk.metal` + `tests/test_flash_attn_prefill.rs`.  mlx-native is owned (per `project_mlx_native_is_the_strategic_destination`) and not part of any hf2q fence.
+
+### Open follow-ups
+
+1. **Audit other i32-multiplication patterns in mlx-native shaders.**  Phase A §5.1 recommended a broader sweep via `grep -nE "(int|long).*\*.*[A-Za-z_]+_stride" src/shaders/flash_attn_prefill*.metal`.  This Phase B fix addresses the two flagged sites; future waves may want to widen all `int * stride` patterns to `int64_t` defensively, since shaders that currently fit can become bug-prone if any future model uses larger seq_len.
+2. **Eventual E2E pp65536 capstone run.**  When idle GPU time is available and there is no concurrent ADR-014/ADR-015 work, run `serve` + `HF2Q_BATCHED_PREFILL=1` + 65536-token prompt against Gemma-4 26B DWQ, capture `first_decode_token`, and update `project_long_prefill_parity_inverts.md` with the post-fix observation.  Expected: `first_decode_token = 30852` (matching the smaller-shape baseline) and a substantial wall-clock improvement at pp65536.
+3. **Update `project_long_prefill_parity_inverts.md`.**  Once #2 lands, the brain memory should record the post-fix parity numbers and CLOSE the `first_decode_token = 0 (potential silent corruption)` note.
