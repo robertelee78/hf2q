@@ -23,17 +23,31 @@
 #     CARGO_PROFILE_RELEASE_DEBUG=true flamegraph -o flame.svg --root -- <cmd>
 #   That fallback is documented but not used by default.
 #
-# Fixture decision (queen-prescribed, accepted by perf-engineer 2026-04-26):
+# Fixture decision (queen-prescribed, accepted by perf-engineer 2026-04-26;
+# corrected per Codex review AF2, applied 2026-04-27):
 #   /opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf
 #     - qwen35 dense (Qwen3.5-derivative)
-#     - exercises forward_gpu.rs + gpu_full_attn.rs + gpu_ffn.rs proj path
+#     - exercises forward_gpu.rs + gpu_full_attn.rs + the dense-quantized
+#       FFN path (`build_dense_ffn_layer_gpu_q` at gpu_ffn.rs:578), which
+#       calls `quantized_matmul_ggml` directly — it does NOT call the
+#       `fn proj` helper at gpu_ffn.rs:347-423. Earlier iterations of this
+#       comment incorrectly claimed the dense fixture exercises the
+#       `gpu_ffn proj path`; ADR-015 §P3a' Q4 (Codex review) corrects this.
 #     - fits comfortably in 128 GB unified, no OOM
-#     - shares ~95% of the hot-path call graph with the apex 35B-A3B MoE model
+#     - shares the encoder + alloc_buffer + apply_imrope + DeltaNet hot
+#       frames with the apex 35B-A3B MoE; does NOT share the MoE expert
+#       routing path (`build_moe_ffn_layer_gpu_q`) or the literal
+#       unquantized `fn proj` allocation.
 #   Coverage gap (documented in ADR-015 §P3a'):
-#     - dense FFN proj is exercised; MoE expert proj path (build_moe_ffn_*_q)
-#       is NOT — H1's per-token proj-call count comes from MoE expert paths
-#       too. Wave 2b must re-validate H1 against the production MoE fixture
-#       before committing P3b reductions to MoE-specific sites.
+#     - The literal `fn proj` site (gpu_ffn.rs:397-404) is NOT exercised
+#       by this dense fixture. H1's literal-site verdict is therefore
+#       LITERAL SITE NOT MEASURED on this fixture; the dense-FFN-Q alloc
+#       category analog (5-6 intermediate alloc_buffer calls per FFN
+#       layer at gpu_ffn.rs:592-606) IS exercised and is the dense
+#       analog measured here.
+#     - MoE literal H1 + apex-MoE 288 µs residual decomposition remain
+#       Wave 2b. Wave 2b must run the apex 35B-A3B MoE fixture before
+#       any P3b reduction lands at the literal `fn proj` site.
 #
 # Cold-SoC methodology (per feedback_perf_gate_thermal_methodology):
 #   - 60-second sleep between trials (queen recommendation).

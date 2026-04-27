@@ -16,22 +16,34 @@ gap is **CPU-side encoding/scheduling overhead**.
 
 ### The structural diagnosis
 
-> **§Supersession note (Wave 2a, 2026-04-26 / 2026-04-27 UTC):** the
-> P3b suspect list inside §"Budget reconciliation" below — items 1–4
-> (helper-function indirection, buffer-pool acquisition, barrier
-> bookkeeping, KV-cursor updates) — was a **static-evidence** prediction
-> drawn from grep against the qwen35 hot-path files, not from a live
-> trace.  §"P3a' live profile pass" below replaces those static rows
-> with **xctrace TimeProfiler measurements** captured from a 3-trial
-> cold-SoC run on M5 Max (macOS 26.4.1, qwen3.6-27b-dwq46 fixture, 64
-> decode tokens / trial).  When the live trace and the static suspect
-> list disagree, the live trace wins per
+> **§Supersession note (Wave 2a, 2026-04-26 / 2026-04-27 UTC; rev1
+> after Codex review 2026-04-27):** the P3b suspect list inside
+> §"Budget reconciliation" below — items 1–4 (helper-function
+> indirection, buffer-pool acquisition, barrier bookkeeping, KV-cursor
+> updates) — was a **static-evidence** prediction drawn from grep
+> against the qwen35 hot-path files, not from a live trace.  §"P3a'
+> live profile pass" below replaces those static rows with **xctrace
+> TimeProfiler measurements** captured from a 3-trial cold-SoC run on
+> M5 Max (macOS 26.4.1, qwen3.6-27b-dwq46 fixture, 64 decode tokens
+> / trial).  When the live trace and the static suspect list disagree,
+> the live trace wins per
 > `feedback_ground_truth_is_what_we_can_measure_now` and
-> `project_metal_compiler_auto_optimizes_static_levers`.  The headline
-> shift: the dominant residual contributor is **`MlxDevice::alloc_buffer`
-> hitting `IOGPUResourceCreate` → `mach_msg2_trap`** (Mach-IPC kernel
-> call per GPU resource), not helper-function indirection or barrier
-> bookkeeping.
+> `project_metal_compiler_auto_optimizes_static_levers`.
+>
+> **Scope of supersession (rev1):** §P3a' identifies dense-fixture
+> levers (rank-1 `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` →
+> `mach_msg2_trap` Mach-IPC chain; rank-3 `command_encoder()` churn;
+> rank-4 `build_rope_multi_buffers` per-call alloc) and falsifies the
+> Wave-1 static-evidence suspect list as the lever ranking for the
+> qwen35 family.  It does **NOT** decompose the apex-MoE 288 µs/token
+> residual — the dense fixture's per-token wall (~30 ms) is ~3.3× the
+> apex MoE workload (~9 ms/token), so absolute µs/token from this run
+> cannot be credited against the 288 µs apex residual.  The
+> apex-MoE 288 µs residual decomposition **stands OPEN until Wave 2b
+> apex 35B-A3B re-measurement** (5 cold trials, median aggregation,
+> H1 literal `fn proj` site sized, H4 counter-based barrier accounting
+> landed).  See §"Codex review acceptance — Wave 2a P3a' rev1" below
+> for the full Wave 2b hard-gate list.
 
 | Path | CBs / decode token | CPU encode overhead at ~5µs/CB |
 |---|---:|---:|
@@ -229,6 +241,35 @@ by path):
   hypothesis-frame aggregation; reproducible by
   `python3 /tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py`)
 
+**Trace provenance — pinned to reviewed commit.** The 3 traces under
+`/tmp/cfa-adr015-wave2a-p3a-prime/` were captured against `/opt/hf2q`
+at parent commit **b7a01cc** (recorded in
+`run-20260427T030903Z.metadata.json:16-17` as `hf2q_git_head`).  The
+delta from `b7a01cc` to the reviewed commit `9e6a462` is
+**docs-only + harness + .gitkeep** (verified: `git diff --stat
+b7a01cc..9e6a462` lists `docs/ADR-015-mlx-native-single-cb-decode.md`,
+`docs/perf-traces/.gitkeep`, `scripts/profile-p3aprime.sh` — no edits
+to `src/`, `mlx-native/`, or any hot-path crate).  No re-run is
+required to re-pin the traces to `9e6a462`; the trace data faithfully
+represents the reviewed commit's runtime behavior.
+
+**Aggregation methodology caveat (Codex AF3, accepted 2026-04-27).**
+Hypothesis-frame inclusive ms in `aggregate-decode.txt:192-212` are
+**summed across multiple needle patterns per hypothesis** — e.g. H1's
+needles are `('gpu_ffn::proj', 'gpu_ffn::build_dense_ffn', 'alloc proj
+dst')`.  Because Time Profiler inclusive frames nest (a
+`build_dense_ffn` frame contains its child `alloc proj dst` frame),
+summing them double-counts the inner frame.  This **inflates the H1
+inclusive figure** in `aggregate-decode.txt` and contributes to the
+"NOT FOUND at literal site, but category at 37×" framing being
+overstated.  Wave 2b must rewrite the script to **report one canonical
+frame per hypothesis plus named subcomponents** rather than summing
+overlapping inclusive frames.  This fix lives in the `/tmp/` working
+copy (`/tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py:129-132`);
+since `/tmp/` is outside the repo, the fix is queued to Wave 2b along
+with the 5-trial median aggregation and the H4 counter-based
+accounting — not back-applied to the §P3a' tables here.
+
 **Trial-to-trial variance.**
 
 | Trial | decode samples | wall ms attributed | µs/token (decode-only) |
@@ -239,12 +280,35 @@ by path):
 
 Trials 1 and 2 agree within 4 %.  Trial 3 is a 1.8× outlier despite
 identical pre-trial `pmset -g therm` (no thermal warning recorded).
-This is unexplained system noise; the **rank order of top
-contributors is stable across all 3 trials** (alloc_buffer + AGX
-init-with-device + mach_msg2_trap dominate every trial; ranks of
-H1/H2/H3 hot frames identical), so cross-trial means are reported.
-Trial-3 wall is reported as-is rather than discarded — discarding
-would be selection bias.
+This is unexplained system noise.
+
+**Outlier-bias disclosure (Codex review Q1, accepted 2026-04-27).** The
+absolute µs/token figures reported in this section are 3-trial mean
+(sum / 192).  Without trial 3, the rank-1 alloc_buffer chain shrinks
+from **3719 µs/token → 3063 µs/token** — a **21 % outlier-bias** on the
+headline number.  The qualitative finding (alloc_buffer + AGX init +
+mach_msg2_trap dominate) holds in every individual trial and is not
+sensitive to this bias, but the absolute sizing is.
+
+**Rank-stability claim — scoped.** What is empirically supported across
+all 3 trials is that the **rank-1 contributor (alloc_buffer chain)
+appears in the top-3 frames every trial** (manual cross-reference of
+per-trial `topcalls-{1,2,3}-*.txt` files).  The earlier wording
+"rank order stable across all 3 trials" was overclaimed: per-trial
+inclusive ms for H2 are [35, 42, 57] ms and for H3 are [40, 35, 72] ms
+(see `aggregate-decode.txt:192-204`), which are not identical — only
+the *contributor set* and rank-1 identity are stable.  The
+`aggregate.py:160-168` rank-stability section is also broken (stores
+tuples then calls `.split()` on them — Codex AF4); the supported claim
+above is from manual cross-reference of the per-trial topcalls
+exports, not from that script.
+
+**Wave 2b methodology fix.** Re-run as **5 cold trials with median**
+(not mean of 3) to make the headline robust against single-trial
+outliers.  The Wave 2a numbers below are reported as-is for
+forward-compatibility, with the 21 % bias disclosed.  Trial-3 is NOT
+discarded silently — discarding would be selection bias; instead, the
+without-trial-3 number is reported alongside.
 
 **Coverage gap.** This fixture is **dense Qwen3.5 with quantized
 `build_dense_ffn_layer_gpu_q`**, not the apex 35B-A3B MoE.  Implications:
@@ -272,7 +336,7 @@ xctrace frame name; "Fix proposal" / "Risk" are P3b candidate landings.
 
 | Rank | Call site (file:line) | µs/token (LIVE) | profile-source-line | Fix proposal | Risk |
 |---:|---|---:|---|---|---|
-| 1 | `mlx_native::device::MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` | **3719** | `mlx_native::device::MlxDevice::alloc_buffer::he10f952fea8b1eef` (714 ms over 192 tokens); leaf is `mach_msg2_trap` (612 ms / 3187 µs/token) inside `IOConnectCallMethod` | **Pool every per-decode-token GPU buffer** (DeltaNet conv/recurrent scratch, FullAttn KV-shape staging, FFN gate/up/hidden/down_out/silu_params, residual-sum). Each `alloc_buffer` today incurs one Mach IPC roundtrip via `IOGPUResourceCreate`. A bucketed pool reused across decode tokens removes ~3.7 ms/token of Mach-trap latency. | M (R2: pool may inflate peak working set; mitigate with bucket-size cap + LRU eviction). |
+| 1 | `mlx_native::device::MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` (**dominant low-level fixable contributor in dense-FFN-Q decode**; **with trial 3:** 3719 µs/token; **without trial 3:** 3063 µs/token, 21 % outlier-bias) | **3719** (mean) / **3063** (mean ex-T3) | `mlx_native::device::MlxDevice::alloc_buffer::he10f952fea8b1eef` (714 ms over 192 tokens); leaf is `mach_msg2_trap` (612 ms / 3187 µs/token) inside `IOConnectCallMethod`. Attribution = synchronous CPU time in Metal/IOGPU resource creation; mach_msg2_trap is the sampled leaf. | **Pool every per-decode-token GPU buffer** (DeltaNet conv/recurrent scratch, FullAttn KV-shape staging, FFN gate/up/hidden/down_out/silu_params, residual-sum). Each `alloc_buffer` today incurs one Mach IPC roundtrip via `IOGPUResourceCreate`. A bucketed pool reused across decode tokens removes ~3.7 ms/token of Mach-trap latency on this dense fixture. **Hazards (Codex review Q3, accepted 2026-04-27)** — pooling is sound only with: (a) **strict CB lifetime fences** (no buffer returned to pool until its consuming command buffer reaches `MTLCommandBuffer.status == .completed`); (b) **no `reset` before all users complete**; (c) **byte_len/shape correctness** for any CPU-read buffer (the existing `proj()` carve-out at `gpu_ffn.rs:391-396` exists precisely because power-of-two bucket rounding inflates `byte_len()` — pool MUST preserve exact requested length for `download_f32`/`as_slice` paths); (d) **peak working-set caps** + **LRU eviction** to bound RSS. | M (R2: pool may inflate peak working set; mitigate per (d)). |
 | 2 | `gpu_ffn::build_dense_ffn_layer_gpu_q` (gpu_ffn.rs:578-680) | **4078** | `hf2q::inference::models::qwen35::gpu_ffn::build_dense_ffn_layer_gpu_q::hbb763b35a276433b` (783 ms / 192 tokens) | Inclusive — most of the cost (≥3300 µs) is the rank-1 alloc_buffer chain (5–6 allocs per FFN layer × 64 FFN layers / token = 320–384 allocs / token). The remainder (~780 µs) is encoder construction + barrier + kernel dispatch. **Same fix as rank 1** + collapse ops 1+2 (gate/up) into a single batched `quantized_matmul_ggml` (B=2) so 1 dispatch instead of 2. | M (batched mv-mul kernel exists upstream; verify M5 perf is at parity). |
 | 3 | `mlx_native::device::MlxDevice::command_encoder()` (~104 calls/token; see P1 audit) | **724** | `mlx_native::device::MlxDevice::command_encoder::hb128148f75021861` (139 ms / 192 tokens). Leaf chain includes `-[AGXG17XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]` and `-[AGXG17XFamilyComputeContext initWithCommandBuffer:config:]` (252 ms + 240 ms inclusive over the same 192-token window). | **P3 single-CB rewrite** is the structural fix. With ≥100 of the 104 encoder constructions collapsed into one, this entire 724 µs/token bucket should drop to <100 µs/token. | L (already the planned P3 lever; this is the live measurement that confirms its size). |
 | 4 | `gpu_full_attn::apply_imrope` (gpu_full_attn.rs:361-412) — 32 calls/token (16 FullAttn layers × 2 for Q+K) | **464** | `hf2q::inference::models::qwen35::gpu_full_attn::apply_imrope::h9a36ffd998e736b0` (89 ms / 192 tokens) inclusive. **Of this, 208 µs/token is `mlx_native::ops::rope_multi::build_rope_multi_buffers`** (40 ms / 192 tokens) — params + sections buffers re-allocated on every call. | **Hoist `build_rope_multi_buffers` out of the per-call path**: the rope params + sections vary only with layer-id (constant within a model), so build once at model-load and reuse. Eliminates ~32 alloc_buffer calls/token plus the inclusive 208 µs/token. | L (sections array is a few i32s; trivial to pre-bake; bit-exact). |
@@ -286,34 +350,90 @@ values are reported with the µs/token already divided by 192:
 
 | ID | Site | Static estimate (Wave 1) | Live measured | Verdict |
 |---|---|---:|---:|---|
-| **H1** | `gpu_ffn.rs:397-404` proj unpooled dst alloc | 100 µs/token | **NOT FOUND IN TRACE** at the cited site (`fn proj`). Dense fixture's hot path is `build_dense_ffn_layer_gpu_q` which does **not** call `proj()`; its 5–6 intermediate `alloc_buffer` calls per FFN layer × 64 layers/token aggregate as the rank-1 contributor at **3719 µs/token** (Mach IPC dominated). | **NOT FOUND at H1's specific site** — but H1's underlying *category* (per-decode-token unpooled GPU buffer alloc) is **CONFIRMED at much larger magnitude** (3719 µs/token vs the 100 µs/token static estimate, 37×). The MoE expert proj path was not exercised; Wave 2b must re-validate the literal H1 site against the apex MoE fixture. |
+| **H1** | `gpu_ffn.rs:397-404` proj unpooled dst alloc | 100 µs/token | **NOT FOUND IN TRACE** at the cited site (`fn proj`). Dense fixture's hot path is `build_dense_ffn_layer_gpu_q` (`gpu_ffn.rs:578`) which does **not** call `proj()` (line 347–423); it calls `quantized_matmul_ggml` directly at lines 626–629. Its 5–6 intermediate `alloc_buffer` calls per FFN layer × 64 layers/token aggregate as the rank-1 contributor at **3719 µs/token** (Mach IPC dominated). | **LITERAL SITE NOT MEASURED on this dense fixture; dense-FFN-Q alloc category analog CONFIRMED.** (Codex review Q4, accepted 2026-04-27 — the prior wording "category CONFIRMED at much larger magnitude" was a goalpost shift.) The literal `proj()` site at `gpu_ffn.rs:397-404` is exercised by the unquantized `build_moe_ffn_layer_gpu` (router-logits download path) and by MoE expert paths, **not** by the dense-quantized `build_dense_ffn_layer_gpu_q` exercised here. **HARD GATE for Wave 2b:** apex 35B-A3B MoE fixture re-measurement is required before any P3b reduction lands at the literal H1 site (`fn proj` allocation at line 397-404). The dense-FFN-Q alloc category result is sufficient justification for pooling the **dense intermediate-buffer set** (lines 592–606); it is **not** sufficient justification for changes to the literal `fn proj` allocation pattern, which must be measured on its actual exercising fixture (apex MoE). |
 | **H2** | `gpu_full_attn.rs:383-395` + `mlx-native/rope_multi.rs:215-244` apply_imrope | 80 µs/token | **464 µs/token** inclusive on `apply_imrope`; **208 µs/token** of that is `build_rope_multi_buffers` per-call alloc. Searched: `apply_imrope`, `rope_multi`, `dispatch_rope_multi`, `build_rope_multi_buffers`. | **CONFIRMED, larger than estimated.** Live cost is ~5.8× the static estimate.  build_rope_multi_buffers hoisting (rank-4 fix) closes ≥208 µs/token by itself. |
 | **H3** | `MlxDevice::command_encoder()` ~120×/token churn | 55 µs/token | **724 µs/token** inclusive on `mlx_native::device::MlxDevice::command_encoder`. Adjacent AGX leaf time (`computeCommandEncoderWithDispatchType:` + `ComputeContext::initWithCommandBuffer`) is +492 ms/192 tokens = +2562 µs/token but partly overlaps with H1's IOGPU init.  Treating only the directly-named Rust frame: **724 µs/token, ~13× the static estimate**. | **CONFIRMED, much larger than estimated.** P3 single-CB rewrite is the structural fix; this row goes to <100 µs/token after P3 lands. |
-| **H4** | `enc.memory_barrier()` ~440×/token + ~35 µs | 35 µs/token | **NOT FOUND IN TRACE** for the literal frame name `memory_barrier`. Searched: `memory_barrier`, `enc.memory_barrier`. The `mlx_native::encoder::CommandEncoder::*` symbols are present (commit, commit_labeled at 8 ms / 192 tokens = 42 µs/token total) but `memory_barrier` does not appear as a sampled stack frame at 1 ms granularity. | **FALSIFIED at the literal site.** Either the function is fully inlined into call-sites and its body is too cheap to land a 1 ms sample, or its actual cost is materially below the 35 µs/token static estimate (sub-1 µs per call × ~440 calls = sub-440 µs total — still below detection). H4's "barrier coalescing" lever is unsupported by live evidence on this fixture; deferred unless Wave 2b counter-evidence emerges. |
+| **H4** | `enc.memory_barrier()` ~440×/token + ~35 µs | 35 µs/token | **NOT FOUND IN TRACE** for the literal frame name `memory_barrier`. Searched: `memory_barrier`, `enc.memory_barrier`. The `mlx_native::encoder::CommandEncoder::*` symbols are present (commit, commit_labeled at 8 ms / 192 tokens = 42 µs/token total) but `memory_barrier` does not appear as a sampled stack frame at 1 ms granularity. | **NOT OBSERVED — BELOW TIMEPROFILER 1 ms RESOLUTION.** Absence of a literal `memory_barrier` frame at 1 ms sampling is **not a falsification** of barrier coalescing (Codex review Q2, accepted 2026-04-27). The body at `/opt/mlx-native/src/encoder.rs:498-512` is an `objc::msg_send![encoder, memoryBarrierWithScope: ...]` call which can be inlined or attributed under sibling Objective-C/AGX frames. Methodology fix queued to **Wave 2b**: counter-based per-barrier accounting via temporary `#[inline(never)]` wrapper around the `objc::msg_send!` site, paired with an atomic call counter and `Instant`/`mach_absolute_time` total. H4 stays **OPEN** until per-barrier count and total time are measured at counter resolution (not 1 ms statistical sampling). |
 | **H5** | `with_context(\|\| format!(...))` String allocation on success path | 25 µs/token | **5 µs/token** total `with_context` inclusive (1 ms / 192 tokens). No `fmt::format` frames in decode-only stacks. | **FALSIFIED (confirms Codex Wave 1 prior).** `with_context` takes a closure; `format!` only runs on Err.  On the success path, the closure is constructed but never invoked.  Sampled time is dominated by trait-call overhead, not allocation.  Expected from source review; live trace confirms. |
 
-**Top-contributor sum vs the 288 µs/token residual.** The acceptance bar
-required ≥150 µs of the residual to be accounted for in §P3a'.  Live
-measurement on this dense fixture shows the residual is **larger than
-the 288 µs framing** (which was derived from the apex MoE 540 µs/token
-gap at ADR-012 closure):
+**Dense-fixture levers vs the apex-MoE 288 µs/token residual — credited
+zero until Wave 2b.** The acceptance bar at the top of §"Budget
+reconciliation" specifies a **288 µs/token residual against the
+apex-MoE 540 µs/token gap at ADR-012 closure** (1/109.1 − 1/116.0 t/s,
+`dwq46` `n=256`).  This §P3a' run was on **dense Qwen3.5
+qwen3.6-27b-dwq46** with ≈30 ms/token decode wall — a different
+fixture, a different workload, and ~3.3× the wall time.  Comparing the
+dense per-token µs to the apex 288 µs is a **category error** (Codex
+review Q5, accepted 2026-04-27).
 
-- Rank 1 alone (`alloc_buffer` Mach-IPC chain): **3719 µs/token**.
-- Rank 3 (`command_encoder()` churn): **724 µs/token** (collapses
-  under P3 single-CB).
-- Rank 4 component (`build_rope_multi_buffers` hoist): **208 µs/token**
-  (independent fix).
+**Honest accounting:**
 
-Sum of independently-fixable contributors (rank 1 + rank 4 = 3927 µs/tok)
-**13.6× exceeds** the 288 µs residual bar.  Caveat: the absolute
-µs/token on this fixture (≈30 ms/token wall) is much larger than the
-apex MoE workload (≈9 ms/token wall) — the same call-graph hot frames
-appear, but their per-token aggregate µs is inflated because dense
-Q4_0 mat-vec for 17408 intermediate × 5120 hidden has more compute and
-more buffer turnover than MoE 8-of-256 expert routing at the same
-hidden size.  **Wave 2b must re-measure on the apex MoE fixture** to
-size the absolute µs/token reduction; the relative ranking (rank 1
-dominates) is expected to hold.
+- **Dense-fixture identifies candidate levers** — rank-1 `alloc_buffer`
+  Mach-IPC chain, rank-3 `command_encoder()` churn, rank-4
+  `build_rope_multi_buffers` hoist.  These are real, measured, and
+  worth pursuing for the dense Qwen3.5 path itself (which is also a
+  shipped family per `feedback_shippability_standing_directive`).
+- **Apex-MoE residual decomposition remains OPEN** — no µs of the
+  dense-fixture savings can be credited toward the apex MoE 288 µs
+  residual until the same call-graph hot frames are re-measured on the
+  apex 35B-A3B MoE fixture.  The relative ranking is *expected* to
+  hold; that expectation is not data.
+- **HARD GATE — Wave 2b apex MoE re-measurement gates P3b.** No P3b
+  reduction may land on a "MoE-specific" or apex-residual basis until:
+  (a) 5 cold trials × 64 decode tokens on the apex MoE fixture with
+  median aggregation; (b) literal `fn proj` site (H1, `gpu_ffn.rs:397-404`)
+  appears in the apex trace and its per-token µs is sized; (c) H4
+  counter-based barrier accounting lands and falsifies-or-confirms the
+  barrier-coalescing lever; (d) `aggregate_decode.py` double-count
+  caveat (Codex AF3) is fixed.
+
+**Wave 2a P3a' contributes 0 credited µs toward the apex-MoE 288 µs
+residual.**  It contributes a measured candidate-lever shortlist for
+the dense Qwen3.5 family and a falsified Wave-1 static-evidence
+suspect list — both useful, neither sufficient to satisfy the acceptance
+bar in §"Budget reconciliation".  The acceptance-bar status is
+reflected in the supersession note at line 19: "§P3a' identifies
+dense-fixture levers; the apex-MoE 288 µs residual decomposition
+stands open until Wave 2b."
+
+**Codex review acceptance — Wave 2a P3a' rev1 (2026-04-27).**
+
+This subsection records the Phase-3 queen reconciliation of the
+Codex read-only review against the implementer's commit `9e6a462`.
+Full Codex JSON verdict is preserved at
+`/tmp/cfa-cfa-20260426-adr015-wave2a-p3aprime/codex-review-last.txt`.
+
+| Codex finding | Verdict | Revision applied |
+|---|---|---|
+| **Q1** trial-3 1.8× outlier inflates absolute µs/token | ACCEPT | Disclosed 21 % outlier-bias (3719 → 3063 µs/token without trial 3); rank-1 row now reports both means; "rank order stable across all 3 trials" replaced with the supported "rank-1 contributor appears in top-3 every trial" claim, sourced from manual cross-reference of per-trial topcalls (not the broken `aggregate.py:160-168` rank-stability section). 5-trial median methodology queued to Wave 2b. |
+| **Q2** H4 "FALSIFIED" overclaimed at 1 ms TimeProfiler resolution | ACCEPT | H4 verdict changed to **NOT OBSERVED — BELOW TIMEPROFILER 1 ms RESOLUTION**. Counter-based per-barrier accounting (`#[inline(never)]` wrapper + atomic counter + `Instant`/`mach_absolute_time` total around `/opt/mlx-native/src/encoder.rs:498-512`) queued to Wave 2b. H4 stays OPEN. |
+| **Q3** rank-1 wording "dominant inclusive frame" → "dominant low-level fixable contributor" | ACCEPT | Rank-1 row reworded; pooling hazard list added (CB lifetime fences, no reset before completion, byte_len/shape correctness for CPU-read buffers — referencing the existing `gpu_ffn.rs:391-396` carve-out for `proj()` — peak working-set caps + LRU eviction). |
+| **Q4** H1 goalpost shift from literal site to "category" | ACCEPT | H1 verdict changed to **LITERAL SITE NOT MEASURED on this dense fixture; dense-FFN-Q alloc category analog confirmed**. Apex 35B-A3B MoE re-measurement marked HARD GATE before any P3b reduction lands at the literal `fn proj` site (`gpu_ffn.rs:397-404`). |
+| **Q5** 13.6× headline is dense-vs-MoE category error | ACCEPT | 13.6× headline removed; replaced with explicit "dense-fixture identifies candidate levers; apex-MoE residual decomposition remains OPEN; Wave 2a P3a' contributes 0 credited µs toward the 288 µs apex residual" framing. |
+| **AF1** trace provenance not pinned to reviewed commit | ACCEPT | Provenance paragraph added: traces taken at parent `b7a01cc`; delta to reviewed `9e6a462` is docs+harness+.gitkeep only (verified by `git diff --stat`); no re-run required. |
+| **AF2** harness comment misstates dense fixture exercises `proj()` | ACCEPT | `scripts/profile-p3aprime.sh:29-35` updated in this commit to match the ADR. |
+| **AF3** `aggregate_decode.py:129-132` double-counts overlapping inclusive frames | ACCEPT | Caveat added to aggregation-methodology paragraph; one-canonical-frame-plus-named-subcomponents fix queued to Wave 2b. Script lives in `/tmp/` so cannot be fixed in-repo. |
+| **AF4** `aggregate.py:160-168` rank-stability section is broken (split on tuple) | ACCEPT | Documented in the rank-stability scoping paragraph; the supported claim came from manual cross-reference of per-trial topcalls files, not the broken script section. Script fix queued to Wave 2b. |
+
+**Wave 2b hard gates** (must all clear before P3b reductions land):
+
+1. Apex 35B-A3B MoE fixture re-measurement (5 cold trials × 64 decode
+   tokens, median aggregation) with literal H1 `fn proj` site sized.
+2. H4 counter-based barrier accounting wired around
+   `/opt/mlx-native/src/encoder.rs:498-512` `objc::msg_send!`.
+3. `aggregate_decode.py` rewritten to report one canonical frame per
+   hypothesis plus named subcomponents (no overlapping-inclusive sums).
+4. `aggregate.py:160-168` rank-stability section fixed (no `.split()`
+   on tuples).
+5. 5-trial median methodology applied to all absolute-µs/token claims
+   (replaces the 3-trial mean used here).
+
+**Verdict:** ACCEPT_WITH_REVISIONS.  The dense-fixture xctrace
+artifacts are real and useful; the falsification of the Wave 1
+static-evidence suspect list (item 1–4 in §"Budget reconciliation")
+holds.  The acceptance-criterion ≥150 µs of the **apex-MoE 288 µs
+residual** is **NOT MET** by this run; it is re-scoped as a Wave 2b
+gate per the supersession note at line 19.
 
 ### Phase plan implication
 
