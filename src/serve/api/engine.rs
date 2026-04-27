@@ -381,6 +381,31 @@ pub struct LoadedModel {
 /// cache hit; sampling = cache bypass.  The grammar runtime state
 /// at the end of generation is NOT cached (would over-constrain a
 /// future hit if the cached grammar differed from the new request's).
+///
+/// # Design invariants (DO NOT re-create a separate prompt_cache module)
+///
+/// A simpler `PromptCache` with only `lcp_len` / `update` / `clear` methods
+/// was prototyped in `src/serve/api/prompt_cache.rs` (ADR-005 Task #7 first
+/// cut) and deleted in wave-1 (2026-04-26) because:
+///
+/// 1. **Full-equality is the shipped contract.**  The iter-96 cache fires
+///    only when `new_prompt == cached_prompt` exactly.  The prototype's
+///    LCP algorithm is correct but belongs to the iter-97+ scope (LCP-based
+///    partial-prefill resume) which needs a `forward_decode` refactor to
+///    expose the KV write position — that refactor is deferred.
+///
+/// 2. **Full-response-replay, not partial-skip.**  On a cache hit the
+///    worker returns the complete cached `GenerationResult` (`text`,
+///    `reasoning_text`, `completion_tokens`, `finish_reason`, …) without
+///    running the decoder at all.  `cached_tokens = prompt_len` surfaces
+///    in the OpenAI usage shape per the spec.
+///
+/// 3. **Owned by the worker thread.**  `PromptCache` lives inside
+///    `LoadedModel` (field `prompt_cache`), which is exclusive to the
+///    single worker thread; no synchronization needed.  Moving it to a
+///    shared module would require Arc/Mutex overhead without benefit.
+///
+/// Future LCP-based work belongs here, extending `lookup`/`store`.
 #[derive(Debug, Clone, Default)]
 pub struct PromptCache {
     /// The previous request's prompt token sequence (post-rendering,

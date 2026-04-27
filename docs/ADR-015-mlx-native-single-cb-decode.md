@@ -298,6 +298,16 @@ has no published roadmap to copy from; the lever space we explore in
 ADR-015 is one we have to discover empirically.  See P2 + P3a measured
 data above.
 
+## Why ADR-015 stays in mlx-native (and what coreml-native would be for)
+
+We also own [`/opt/coreml-native`](https://github.com/robertelee78/coreml-native) — a sibling pure-Rust crate exposing CoreML inference (CPU/GPU/ANE).  ADR-015 stays in `mlx-native` rather than pivoting to CoreML for three concrete reasons grounded in our actual workload, not in framework preference:
+
+1. **DWQ-mixed-4-6 tensor data is not a CoreML quant scheme.**  Both `hf2q` and `llama.cpp` consume identical `dwq46` GGUF tensors via their own Metal-GPU `quantized_matmul_*` kernels.  Routing through CoreML would force re-quantization through `coremltools`' API, losing our DWQ calibration and breaking the apples-to-apples bench against `llama.cpp`.
+2. **MoE expert routing + Gated DeltaNet are not standard CoreML ops.**  CoreML's compiler maps a fixed op set to ANE / GPU / CPU; novel architectures (Qwen3.5-MoE's hybrid 3:1 DeltaNet:FullAttn, our 256-expert + custom router) fall back to CPU.  ANE acceleration evaporates exactly where our hot path lives.
+3. **The 0.94× gap is not a runtime-choice problem.**  Per ADR-012 §Optimize, hf2q's GPU compute (8.45 ms) ≈ llama.cpp's (8.38 ms) — the gap is in CPU-side encoding/orchestration on **the same Metal substrate**.  Switching to CoreML wouldn't address that; it would replace the lever space with a different one whose ceilings on our model class are unknown and uncontrolled.
+
+CoreML/ANE *is* the right tool for adjacent workloads where ADR-015 doesn't apply: standard ViT prefill (mmproj on Gemma-4V / Qwen vision), BERT-style embeddings (the `bert-test` target), Whisper if we ever pick that up.  The mlx-vs-CoreML strategic comparison for a possible Qwen3.5-MoE-on-ANE hybrid is its own ADR worth of work — see [ADR-016](./ADR-016-mlx-vs-coreml-strategic-comparison.md) (stub, 2026-04-26).
+
 ## Architectural implications given full-stack ownership
 
 We own both `/opt/mlx-native` (kernel + dispatch substrate) and
