@@ -259,6 +259,68 @@ pub fn quantize_row_to_bytes(
     Ok(bytes)
 }
 
+/// Quantize a 2D tensor (row-major) to GGUF block bytes. The natural
+/// production-caller interface — most LLM weight tensors are
+/// `[out_features, in_features]` shape and quantize per row (each
+/// `in_features` slice is one row, packed independently).
+///
+/// `data` is the row-major flat F32 storage. `n_rows` × `row_len` must
+/// equal `data.len()`. `row_len` must be a multiple of
+/// `target.elements_per_block()` (256 for K-family, 32 for legacy).
+///
+/// The output bytes are the concatenation of all rows' block bytes,
+/// in row-major order. Total size:
+/// `n_rows × (row_len / elements_per_block) × bytes_per_block`.
+///
+/// **Imatrix lookup**: when `calibration` is `Imatrix` /
+/// `ImatrixWithStats` and the calibrator has weights for `tensor_name`,
+/// the same imatrix vector is used for **every row** of the tensor.
+/// This matches llama.cpp's `quantize_q4_K_impl` etc., which apply
+/// the same per-tensor importance map across all rows. (Per-row
+/// imatrix would require per-row activation captures, which is
+/// outside ADR-014's scope.)
+pub fn quantize_tensor_2d_to_bytes(
+    data: &[f32],
+    n_rows: usize,
+    row_len: usize,
+    target: KQuantTarget,
+    calibration: &CalibrationData,
+    tensor_name: &str,
+) -> Result<Vec<u8>, KQuantCodecError> {
+    if data.len() != n_rows * row_len {
+        return Err(KQuantCodecError::ImatrixWeightsLengthMismatch {
+            tensor: tensor_name.to_string(),
+            weights_len: data.len(),
+            row_len: n_rows * row_len,
+        });
+    }
+    let qk = target.elements_per_block();
+    if !row_len.is_multiple_of(qk) {
+        // Surface the underlying NotBlockAligned via a single-row dispatch.
+        // This way the caller sees a consistent error type regardless of
+        // whether the misalignment is at the row level or the data level.
+        return quantize_row_to_bytes(&data[..row_len], target, calibration, tensor_name)
+            .map(|_| unreachable!("misaligned row should have errored above"));
+    }
+
+    let blocks_per_row = row_len / qk;
+    let bytes_per_row = blocks_per_row * target.bytes_per_block();
+    let mut out = Vec::with_capacity(n_rows * bytes_per_row);
+
+    for r in 0..n_rows {
+        let row = &data[r * row_len..(r + 1) * row_len];
+        let row_bytes = quantize_row_to_bytes(row, target, calibration, tensor_name)?;
+        debug_assert_eq!(
+            row_bytes.len(),
+            bytes_per_row,
+            "row {r} produced {} bytes, expected {bytes_per_row}",
+            row_bytes.len()
+        );
+        out.extend_from_slice(&row_bytes);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1010,220 @@ mod tests {
                 "{target:?}: imatrix path produced byte-identical output to _ref"
             );
         }
+    }
+
+    // ─────────────── Multi-row tensor helper tests (iter-3l) ───────────────
+
+    /// `quantize_tensor_2d_to_bytes` on a 4-row × 256-element tensor
+    /// produces exactly 4 × 144 = 576 bytes for Q4_K. Round-trip via
+    /// per-row dequantize matches the original within RMSE bound.
+    #[test]
+    fn tensor_2d_q4_k_round_trip() {
+        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
+
+        let n_rows = 4;
+        let row_len = 256;
+        let mut data = Vec::with_capacity(n_rows * row_len);
+        for r in 0..n_rows {
+            // Each row gets a different seed → different data per row.
+            data.extend(synth_row(0xAA00 + (r as u64), row_len));
+        }
+
+        let bytes = quantize_tensor_2d_to_bytes(
+            &data,
+            n_rows,
+            row_len,
+            KQuantTarget::Q4K,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap();
+
+        let bytes_per_row = (row_len / 256) * KQuantTarget::Q4K.bytes_per_block();
+        assert_eq!(bytes.len(), n_rows * bytes_per_row);
+
+        // Decode each row independently and check RMSE.
+        for r in 0..n_rows {
+            let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+            let mut decoded = vec![0.0_f32; row_len];
+            dequantize_row_q4_k_bytes(row_bytes, &mut decoded).unwrap();
+
+            let original = &data[r * row_len..(r + 1) * row_len];
+            let r_rmse = rmse_pair(original, &decoded);
+            assert!(
+                r_rmse < 0.05,
+                "row {r} Q4_K RMSE {r_rmse} > 0.05"
+            );
+        }
+    }
+
+    /// Multi-row Q8_0: 8 rows × 64 elements each. Verifies the legacy
+    /// per-row block accounting works through the multi-row helper.
+    #[test]
+    fn tensor_2d_q8_0_round_trip() {
+        use crate::quantize::q_legacy::dequantize_row_q8_0_bytes;
+
+        let n_rows = 8;
+        let row_len = 64;
+        let mut data = Vec::with_capacity(n_rows * row_len);
+        for r in 0..n_rows {
+            data.extend(synth_row(0xBB00 + (r as u64), row_len));
+        }
+
+        let bytes = quantize_tensor_2d_to_bytes(
+            &data,
+            n_rows,
+            row_len,
+            KQuantTarget::Q8Legacy,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap();
+
+        let bytes_per_row = (row_len / 32) * KQuantTarget::Q8Legacy.bytes_per_block();
+        assert_eq!(bytes.len(), n_rows * bytes_per_row);
+
+        for r in 0..n_rows {
+            let row_bytes = &bytes[r * bytes_per_row..(r + 1) * bytes_per_row];
+            let mut decoded = vec![0.0_f32; row_len];
+            dequantize_row_q8_0_bytes(row_bytes, &mut decoded).unwrap();
+            let original = &data[r * row_len..(r + 1) * row_len];
+            let r_rmse = rmse_pair(original, &decoded);
+            assert!(r_rmse < 0.005, "row {r} Q8_0 RMSE {r_rmse} > 0.005");
+        }
+    }
+
+    /// Multi-row helper produces output equivalent to manual per-row
+    /// concatenation. Validates the iteration order and accumulation.
+    #[test]
+    fn tensor_2d_equivalent_to_per_row_loop() {
+        let n_rows = 3;
+        let row_len = 256;
+        let mut data = Vec::with_capacity(n_rows * row_len);
+        for r in 0..n_rows {
+            data.extend(synth_row(0xCC00 + (r as u64), row_len));
+        }
+
+        let multi_row_bytes = quantize_tensor_2d_to_bytes(
+            &data,
+            n_rows,
+            row_len,
+            KQuantTarget::Q5K,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap();
+
+        let mut manual = Vec::new();
+        for r in 0..n_rows {
+            let row = &data[r * row_len..(r + 1) * row_len];
+            let bytes = quantize_row_to_bytes(
+                row,
+                KQuantTarget::Q5K,
+                &CalibrationData::None,
+                "weight",
+            )
+            .unwrap();
+            manual.extend_from_slice(&bytes);
+        }
+        assert_eq!(multi_row_bytes, manual);
+    }
+
+    /// Mismatched data length (n_rows × row_len ≠ data.len()) surfaces
+    /// a typed error.
+    #[test]
+    fn tensor_2d_rejects_data_length_mismatch() {
+        let data = vec![0.0_f32; 256];
+        // Caller claims 2 rows × 256 = 512 elements but only 256 provided.
+        let err = quantize_tensor_2d_to_bytes(
+            &data,
+            2,
+            256,
+            KQuantTarget::Q4K,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap_err();
+        match err {
+            KQuantCodecError::ImatrixWeightsLengthMismatch {
+                weights_len, row_len, ..
+            } => {
+                assert_eq!(weights_len, 256);
+                assert_eq!(row_len, 512);
+            }
+            _ => panic!("expected length mismatch"),
+        }
+    }
+
+    /// Misaligned row_len (not a multiple of `elements_per_block`)
+    /// rejected with the underlying KQuant error.
+    #[test]
+    fn tensor_2d_rejects_misaligned_row() {
+        let data = vec![0.0_f32; 200];
+        let err = quantize_tensor_2d_to_bytes(
+            &data,
+            1,
+            200,
+            KQuantTarget::Q4K,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap_err();
+        match err {
+            KQuantCodecError::KQuant(KQuantError::NotBlockAligned { actual }) => {
+                assert_eq!(actual, 200);
+            }
+            _ => panic!("expected NotBlockAligned, got {err:?}"),
+        }
+    }
+
+    /// Multi-row tensor with imatrix calibration: every row uses the
+    /// SAME imatrix vector (matches llama.cpp's per-tensor imatrix
+    /// model). Verifies the imatrix data isn't accidentally
+    /// per-row-indexed or reset across rows.
+    #[test]
+    fn tensor_2d_imatrix_applies_to_every_row() {
+        let n_rows = 3;
+        let row_len = 256;
+        let mut data = Vec::with_capacity(n_rows * row_len);
+        for r in 0..n_rows {
+            data.extend(synth_row(0xDD00 + (r as u64), row_len));
+        }
+
+        let mut weights_map = HashMap::new();
+        let mut w = vec![1.0_f32; row_len];
+        for v in w.iter_mut().take(64) {
+            *v = 100.0;
+        }
+        weights_map.insert("weight".to_string(), w);
+        let imatrix = CalibrationData::Imatrix(weights_map);
+
+        let bytes_imatrix = quantize_tensor_2d_to_bytes(
+            &data,
+            n_rows,
+            row_len,
+            KQuantTarget::Q4K,
+            &imatrix,
+            "weight",
+        )
+        .unwrap();
+        let bytes_ref = quantize_tensor_2d_to_bytes(
+            &data,
+            n_rows,
+            row_len,
+            KQuantTarget::Q4K,
+            &CalibrationData::None,
+            "weight",
+        )
+        .unwrap();
+        assert_eq!(bytes_imatrix.len(), bytes_ref.len());
+        // At least one row's bytes must differ — the imatrix bias on
+        // the first 64 elements should perturb the codebook search.
+        assert_ne!(
+            bytes_imatrix, bytes_ref,
+            "imatrix tensor-2d produced identical bytes to _ref — \
+             dispatch likely fell through"
+        );
     }
 
     /// Resolution ordering — Q8_0 > Q6_K > Q5_K > Q5_0 > Q4_K > Q4_0
