@@ -1061,6 +1061,49 @@ fn repack_to_ggml_blocks(
         return Ok(qt.data.clone());
     }
 
+    // ADR-014 P11-prereq Iter A (2026-04-27): codec-direct fast-path. Tensors
+    // produced by `KQuantCodecQuantizer` / `VariantKQuantizer` carry
+    // `method == METHOD_K_QUANT_CODEC_DIRECT`; their `data` is ALREADY in the
+    // target GGUF block format (see `k_quant_codec::quantize_tensor_2d_to_bytes`).
+    // Return unchanged with NO warn (this is the intended path now, not a
+    // code smell — pre-Iter A this fell through to the warn-and-return-raw
+    // branch below by accident). Validate block-size alignment so a future
+    // codec or shape regression surfaces here as a typed `Err` rather than a
+    // silent half-block corruption downstream.
+    if info.method == crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT {
+        let expected_block_size = match ggml_type {
+            GGML_TYPE_Q4_K => crate::quantize::k_quant::BLOCK_Q4_K_SIZE,
+            GGML_TYPE_Q5_K => crate::quantize::k_quant::BLOCK_Q5_K_SIZE,
+            GGML_TYPE_Q6_K => BLOCK_Q6_K_BYTES,
+            GGML_TYPE_Q3_K => crate::quantize::k_quant::BLOCK_Q3_K_SIZE,
+            GGML_TYPE_Q4_0 => BLOCK_Q4_0_BYTES,
+            GGML_TYPE_Q8_0 => BLOCK_Q8_0_BYTES,
+            _ => {
+                return Err(BackendError::WriteFailed {
+                    reason: format!(
+                        "codec-direct tensor '{}' has unsupported target ggml_type {} \
+                         (no known block size); refusing to write potentially-corrupt bytes",
+                        qt.name, ggml_type
+                    ),
+                });
+            }
+        };
+        if qt.data.len() % expected_block_size != 0 {
+            return Err(BackendError::WriteFailed {
+                reason: format!(
+                    "codec-direct tensor '{}': data length {} is not a multiple of \
+                     block size {} for ggml_type {} — bytes are misaligned and would \
+                     corrupt the output",
+                    qt.name,
+                    qt.data.len(),
+                    expected_block_size,
+                    ggml_type
+                ),
+            });
+        }
+        return Ok(qt.data.clone());
+    }
+
     // Only repack if we have scales (quantized tensors)
     let scales_bytes = match &info.scales {
         Some(s) if !s.is_empty() => s,
@@ -1626,8 +1669,46 @@ fn generate_synthetic_tensors(
 /// quantizer produces simple per-group scales + packed values (not K-quant super-block
 /// format), we can only write Q4_0 / Q8_0 / F16 / F32 block formats. Apex K-quant
 /// type overrides are mapped back to the corresponding simple type.
+///
+/// **Codec-direct fast-path** (ADR-014 P11-prereq Iter A, 2026-04-27): when
+/// `info.method == METHOD_K_QUANT_CODEC_DIRECT` the tensor data is already in
+/// the target K-quant block format and the IR has set `bits = 0` (sentinel).
+/// Route via `info.ggml_type` BEFORE the bits-fallback fires; otherwise the
+/// `bits = 0` sentinel hits the `_ =>` arm and silently emits an `F16`-header
+/// GGUF atop K-quant bytes (the LIVE `--quant q4_k_m` malformed-GGUF defect
+/// recorded in the ADR-014 audit revision dated 2026-04-27).
 fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
     if info.preserved {
+        return GGML_TYPE_F16;
+    }
+
+    // ADR-014 P11-prereq Iter A: codec-direct fast-path. `KQuantCodecQuantizer`
+    // (`src/quantize/k_quant_codec_quantizer.rs:114,222`) and `VariantKQuantizer`
+    // (`src/quantize/variant_quantizer.rs:42,225`) both set
+    // `method = METHOD_K_QUANT_CODEC_DIRECT` + `bits = 0` + `ggml_type = Some(<canonical>)`
+    // when their `data` is already in target GGUF block format. Honor that
+    // contract here so the type-code in the GGUF header matches the on-disk
+    // bytes; on unknown name return the bits-fallback's `F16`-shaped error
+    // is wrong because the bytes are NOT F16 — fail loud via warn, then route
+    // to F16 only because the fallback contract is that we must always return
+    // *some* type code from this fn signature. (A future iter can change
+    // `quant_info_to_ggml_type` to `Result<u32, _>`.)
+    if info.method == crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT {
+        if let Some(ref type_name) = info.ggml_type {
+            if let Some(code) = ggml_type_from_name(type_name) {
+                return code;
+            }
+            warn!(
+                "codec-direct sentinel set on tensor with unknown ggml_type '{}'; \
+                 the on-disk bytes are NOT F16 — this is a quantizer bug",
+                type_name
+            );
+            return GGML_TYPE_F16;
+        }
+        warn!(
+            "codec-direct sentinel set without ggml_type field; \
+             the on-disk bytes are NOT F16 — this is a quantizer bug"
+        );
         return GGML_TYPE_F16;
     }
 
@@ -1641,7 +1722,8 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
             return GGML_TYPE_Q6_K;
         }
         // Other K-quant types get mapped to simple types based on ir_bits
-        // (hf2q does not produce Q2_K-Q5_K super-block data)
+        // (hf2q does not produce Q2_K-Q5_K super-block data via this path; the
+        // codec-direct path above handles tensors that ARE Q2_K-Q5_K bytes).
         if upper.starts_with("Q2_K")
             || upper.starts_with("Q3_K")
             || upper.starts_with("Q4_K")
@@ -3376,7 +3458,11 @@ mod tests {
     #[test]
     fn test_ggml_type_override_in_quant_info() {
         // K-quant types from Apex are mapped to the corresponding simple block type
-        // because hf2q doesn't produce K-quant super-block data.
+        // because hf2q doesn't produce K-quant super-block data via the Apex path
+        // (method == "apex"). The CODEC-DIRECT path (method ==
+        // METHOD_K_QUANT_CODEC_DIRECT, bits = 0) DOES produce K-quant super-block
+        // bytes and is locked separately by `kquant_codec_direct_*_returns_*`
+        // below + `tests/codec_direct_type_code.rs` (ADR-014 P11-prereq Iter A).
         let qi_override = TensorQuantInfo {
             method: "apex".into(), bits: 4, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
@@ -3424,6 +3510,188 @@ mod tests {
         assert_eq!(quant_info_to_ggml_type(&qi(4)), GGML_TYPE_Q4_0);
         // 2-bit maps to Q4_0 (we can't produce Q2_K super-block format)
         assert_eq!(quant_info_to_ggml_type(&qi(2)), GGML_TYPE_Q4_0);
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-014 P11-prereq Iter A — codec-direct fast-path regression tests.
+    // ---------------------------------------------------------------------
+    //
+    // Pre-Iter A: `KQuantCodecQuantizer` and `VariantKQuantizer` set
+    // `bits = 0` + `method = "k_quant_codec_direct"` + `ggml_type =
+    // Some("Q4_K"|"Q5_K"|"Q6_K"|...)`. The K-quant fall-through arm at
+    // `gguf.rs:1645-1649` matched `Q4_K`/`Q5_K`/`Q3_K`/`Q2_K` but did
+    // NOT return; control fell through to the bits-fallback `_ =>` arm
+    // at `gguf.rs:1672-1677` which returned `GGML_TYPE_F16` (1) for
+    // `bits = 0`. So GGUFs from `--quant q4_k_m` / `--quant
+    // imatrix-q4_k_m` / `--quant imatrix-adaptive` shipped with header
+    // type **F16** atop on-disk **Q4_K** bytes — MALFORMED for
+    // llama.cpp.
+    //
+    // Post-Iter A: `quant_info_to_ggml_type`'s codec-direct fast-path
+    // recognises the sentinel + routes via `ggml_type_from_name` BEFORE
+    // the bits-fallback fires. `repack_to_ggml_blocks`'s matching
+    // codec-direct fast-path returns the raw bytes unchanged with
+    // block-size validation (so a future codec or shape regression
+    // surfaces as a typed `Err` rather than silent half-block
+    // corruption).
+
+    fn qi_codec_direct(ggml_name: &str) -> TensorQuantInfo {
+        TensorQuantInfo {
+            method: crate::quantize::k_quant_codec_quantizer::METHOD_K_QUANT_CODEC_DIRECT
+                .to_string(),
+            bits: 0,
+            group_size: 0,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: Some(ggml_name.to_string()),
+        }
+    }
+
+    #[test]
+    fn codec_direct_q4_k_returns_q4_k_type_code() {
+        let qi = qi_codec_direct("Q4_K");
+        assert_eq!(
+            quant_info_to_ggml_type(&qi),
+            GGML_TYPE_Q4_K,
+            "codec-direct Q4_K must return GGML_TYPE_Q4_K (12), not GGML_TYPE_F16 (1)"
+        );
+    }
+
+    #[test]
+    fn codec_direct_q5_k_returns_q5_k_type_code() {
+        let qi = qi_codec_direct("Q5_K");
+        assert_eq!(quant_info_to_ggml_type(&qi), GGML_TYPE_Q5_K);
+    }
+
+    #[test]
+    fn codec_direct_q6_k_returns_q6_k_type_code() {
+        let qi = qi_codec_direct("Q6_K");
+        assert_eq!(quant_info_to_ggml_type(&qi), GGML_TYPE_Q6_K);
+    }
+
+    #[test]
+    fn codec_direct_q4_0_legacy_returns_q4_0_type_code() {
+        // KQuantTarget::Q4Legacy maps to ggml_name "Q4_0" per
+        // `KQuantCodecQuantizer::target_to_ggml_name` — locks the
+        // legacy-target leg of the codec-direct sentinel routing.
+        let qi = qi_codec_direct("Q4_0");
+        assert_eq!(quant_info_to_ggml_type(&qi), GGML_TYPE_Q4_0);
+    }
+
+    #[test]
+    fn codec_direct_q8_0_legacy_returns_q8_0_type_code() {
+        let qi = qi_codec_direct("Q8_0");
+        assert_eq!(quant_info_to_ggml_type(&qi), GGML_TYPE_Q8_0);
+    }
+
+    #[test]
+    fn codec_direct_unknown_ggml_name_returns_f16_with_warn() {
+        // Defensive: a codec-direct sentinel with an UNKNOWN ggml_type
+        // name is a quantizer bug. We warn and return F16 (the only
+        // safe response within the current `fn -> u32` signature). If
+        // the signature is ever changed to `Result`, this should
+        // become an `Err`.
+        let qi = qi_codec_direct("Q99_NOPE");
+        assert_eq!(quant_info_to_ggml_type(&qi), GGML_TYPE_F16);
+    }
+
+    #[test]
+    fn codec_direct_repack_q4_k_returns_raw_bytes_unchanged() {
+        // Synthetic "Q4_K block bytes": the contents are arbitrary —
+        // we're locking the no-repack fast-path. Length must be a
+        // multiple of BLOCK_Q4_K_SIZE (144) so the block-size
+        // alignment check passes.
+        let block_size = crate::quantize::k_quant::BLOCK_Q4_K_SIZE;
+        let bytes: Vec<u8> = (0..block_size * 4).map(|i| (i & 0xFF) as u8).collect();
+        let qt = QuantizedTensor {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![4, 256],
+            original_dtype: DType::F16,
+            data: bytes.clone(),
+            quant_info: qi_codec_direct("Q4_K"),
+        };
+        let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_K).expect("repack must succeed");
+        assert_eq!(
+            out, bytes,
+            "codec-direct repack must return input bytes byte-identically (no repack)"
+        );
+    }
+
+    #[test]
+    fn codec_direct_repack_q5_k_returns_raw_bytes_unchanged() {
+        let block_size = crate::quantize::k_quant::BLOCK_Q5_K_SIZE;
+        let bytes: Vec<u8> = (0..block_size * 2).map(|i| ((i * 7) & 0xFF) as u8).collect();
+        let qt = QuantizedTensor {
+            name: "blk.0.attn_v.weight".into(),
+            shape: vec![2, 256],
+            original_dtype: DType::F16,
+            data: bytes.clone(),
+            quant_info: qi_codec_direct("Q5_K"),
+        };
+        let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q5_K).expect("repack must succeed");
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn codec_direct_repack_q6_k_returns_raw_bytes_unchanged() {
+        let bytes: Vec<u8> = (0..BLOCK_Q6_K_BYTES).map(|i| (i & 0xFF) as u8).collect();
+        let qt = QuantizedTensor {
+            name: "output.weight".into(),
+            shape: vec![1, 256],
+            original_dtype: DType::F16,
+            data: bytes.clone(),
+            quant_info: qi_codec_direct("Q6_K"),
+        };
+        let out = repack_to_ggml_blocks(&qt, GGML_TYPE_Q6_K).expect("repack must succeed");
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn codec_direct_repack_rejects_misaligned_bytes() {
+        // 144 + 1 bytes is NOT a multiple of BLOCK_Q4_K_SIZE = 144;
+        // must fail loud (typed Err) rather than silently writing
+        // half-block-aligned corruption to disk.
+        let block_size = crate::quantize::k_quant::BLOCK_Q4_K_SIZE;
+        let bytes = vec![0u8; block_size + 1];
+        let qt = QuantizedTensor {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![1, 257],
+            original_dtype: DType::F16,
+            data: bytes,
+            quant_info: qi_codec_direct("Q4_K"),
+        };
+        let err = repack_to_ggml_blocks(&qt, GGML_TYPE_Q4_K).expect_err(
+            "misaligned codec-direct bytes must surface as Err (not panic, not silent corruption)",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a multiple of") && msg.contains("misaligned"),
+            "Err message should name the misalignment; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn codec_direct_repack_unsupported_target_type_errors() {
+        // Codec-direct sentinel paired with a target type the codec
+        // never produces (e.g. F32) is a routing bug. Refuse to write
+        // potentially-corrupt bytes.
+        let bytes = vec![0u8; 144];
+        let qt = QuantizedTensor {
+            name: "blk.0.weird.weight".into(),
+            shape: vec![1, 256],
+            original_dtype: DType::F16,
+            data: bytes,
+            quant_info: qi_codec_direct("Q4_K"),
+        };
+        let err = repack_to_ggml_blocks(&qt, GGML_TYPE_F32).expect_err(
+            "codec-direct + unsupported target ggml_type must surface as Err",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported target ggml_type") && msg.contains("refusing"),
+            "Err message should name the unsupported routing; got: {msg}"
+        );
     }
 
     #[test]
