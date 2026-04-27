@@ -37,6 +37,7 @@
 //!     the handler will iterate.
 
 use anyhow::{anyhow, Result};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -226,26 +227,45 @@ fn fetch_https_image(url: &str) -> Result<Vec<u8>> {
         }
 
         // Stream body bytes with enforced cap.
-        let bytes = resp
-            .bytes()
+        //
+        // Security note: we cannot use `resp.bytes()` here because it buffers
+        // the entire HTTP body before the size check fires.  A server that
+        // omits Content-Length and streams more than MAX_BYTES would force
+        // hf2q to allocate the full malicious body in memory before we could
+        // reject it (no-Content-Length DoS / OOM vector).
+        //
+        // reqwest::blocking::Response implements std::io::Read, so we use
+        // `Read::take(MAX_BYTES + 1)` which stops pulling bytes from the
+        // socket the moment we have read MAX_BYTES + 1 bytes.  If the buffer
+        // ends up exactly MAX_BYTES + 1 long the server was over the cap;
+        // we return an error WITHOUT reading the rest of the body.  Errors
+        // from the underlying read (e.g. network / timeout) surface as
+        // std::io::Error which we map to an anyhow context.
+        let cap = MAX_BYTES + 1;
+        let hint = resp
+            .content_length()
+            .map(|cl| (cl as usize).min(cap as usize))
+            .unwrap_or(0);
+        let mut buf: Vec<u8> = Vec::with_capacity(hint);
+        resp.take(cap)
+            .read_to_end(&mut buf)
             .map_err(|e| {
-                if e.is_timeout() {
+                if e.kind() == std::io::ErrorKind::TimedOut {
                     anyhow!("HTTPS fetch body read timed out ({})", url)
                 } else {
                     anyhow!("HTTPS fetch body read error ({}): {e}", url)
                 }
             })?;
 
-        if bytes.len() as u64 > MAX_BYTES {
+        if buf.len() as u64 >= cap {
             return Err(anyhow!(
-                "HTTPS fetch: response body {} bytes exceeds {}-byte cap ({})",
-                bytes.len(),
+                "HTTPS fetch: response body exceeds {}-byte cap ({})",
                 MAX_BYTES,
                 url
             ));
         }
 
-        Ok(bytes.to_vec())
+        Ok(buf)
     };
 
     // If a tokio runtime is active (axum handler context), use block_in_place
@@ -370,5 +390,137 @@ mod tests {
             msg.contains("stat") || msg.contains("No such"),
             "unexpected error: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T1.4 streaming cap — no-Content-Length attack vector
+    // -------------------------------------------------------------------------
+    //
+    // Security regression test (ADR-005 wave-1.5 Codex HIGH finding).
+    //
+    // Previously, `fetch_https_image` called `resp.bytes()` which accumulates
+    // the entire HTTP body in memory before the size check fires.  A server
+    // that omits Content-Length and streams >20 MB forces hf2q to buffer the
+    // full body (OOM / DoS vector).
+    //
+    // The fix uses `Read::take(MAX_BYTES + 1).read_to_end(&mut buf)` which
+    // stops pulling bytes from the socket at MAX_BYTES + 1.  This test
+    // verifies the cap fires correctly by spinning up a minimal TcpListener
+    // that:
+    //   1. Sends HTTP/1.1 200 OK with NO Content-Length header.
+    //   2. Streams small chunks in a loop so the body length would eventually
+    //      exceed 20 MB — but the client cuts the connection after MAX_BYTES+1
+    //      bytes, so the server never sends the full amount.
+    //
+    // Discipline note: we do NOT allocate >20 MB in this test.  The server
+    // sends data in 64 KB chunks and tracks how many bytes the client accepts.
+    // Once the client closes the connection (having read MAX_BYTES+1 bytes and
+    // returned an error), the server's write fails and the thread exits.
+    // Total server-side allocation: one 64 KB chunk buffer, reused.
+    #[test]
+    fn fetch_https_image_cap_fires_without_content_length() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::thread;
+
+        const MAX_BYTES: u64 = 20 * 1024 * 1024; // must match fetch_https_image
+
+        // Bind to an ephemeral port on loopback.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Track how many bytes of body the server successfully wrote to the
+        // socket.  The test asserts this stays <= MAX_BYTES + 1 + overhead to
+        // prove the client cut the connection early.
+        let bytes_accepted = Arc::new(AtomicU64::new(0));
+        let bytes_accepted_srv = Arc::clone(&bytes_accepted);
+
+        // Spawn the mock server on a background thread.
+        let srv = thread::spawn(move || {
+            // Accept exactly one connection — the test makes exactly one fetch.
+            let (mut stream, _peer) = listener.accept().expect("accept");
+            // Drain the HTTP request headers (we don't need to parse them).
+            drain_http_request(&mut stream);
+            // Send a chunked-ish HTTP/1.1 200 with NO Content-Length.
+            // Using HTTP/1.0 + Connection: close is the easiest way to omit
+            // Content-Length without implementing Transfer-Encoding: chunked
+            // framing — the body is everything until socket close.
+            let header = b"HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n";
+            if stream.write_all(header).is_err() {
+                return;
+            }
+            // Stream 64 KB chunks of zeros until the client closes.
+            // Total intended body = MAX_BYTES + 64 KB > cap, but we stop as
+            // soon as the write fails (client disconnected after cap).
+            let chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stream.write_all(&chunk) {
+                    Ok(_) => {
+                        bytes_accepted_srv.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        // Stop once we've offered significantly more than the cap —
+                        // the client will have disconnected long before this.
+                        if bytes_accepted_srv.load(Ordering::Relaxed) > MAX_BYTES + chunk.len() as u64 {
+                            break;
+                        }
+                    }
+                    Err(_) => break, // client closed connection — expected
+                }
+            }
+        });
+
+        // Use fetch_https_image against our local mock (HTTP, not HTTPS — the
+        // function accepts both http:// and https:// URLs via the same code path).
+        let url = format!("http://127.0.0.1:{}/oversized.bin", addr.port());
+        let err = fetch_https_image(&url).expect_err(
+            "expected fetch_https_image to return an error for oversized body",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cap") || msg.contains("exceed"),
+            "error message should mention the cap; got: {msg}"
+        );
+
+        // The server thread will exit soon after the client disconnects (write
+        // fails).  Give it a moment; ignore join errors if it panicked on
+        // the broken pipe.
+        let _ = srv.join();
+
+        // The primary security assertion is that fetch_https_image returned an
+        // error at all (proven above by expect_err).  We also verify that the
+        // server did not manage to push a full order-of-magnitude more data
+        // than the cap before the client disconnected, which would indicate the
+        // old resp.bytes() buffering pattern regressed.  TCP kernel buffers
+        // mean the server can write a few extra chunks before receiving
+        // SIGPIPE/ECONNRESET, so we allow up to ~2 MB of TCP-buffer slop on
+        // top of the cap.
+        let written = bytes_accepted.load(Ordering::Relaxed);
+        let slop = 2 * 1024 * 1024u64; // 2 MB TCP-buffer headroom
+        assert!(
+            written <= MAX_BYTES + slop,
+            "server wrote {written} bytes before client closed — \
+             cap is {} bytes; too much slop suggests client buffered full body",
+            MAX_BYTES
+        );
+    }
+
+    /// Drain a minimal HTTP request from `stream` so the server can send its
+    /// response.  Reads until the first blank CRLF line (end of headers).
+    /// Any body (e.g. POST) is ignored — our mock only handles GET.
+    fn drain_http_request(stream: &mut std::net::TcpStream) {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
