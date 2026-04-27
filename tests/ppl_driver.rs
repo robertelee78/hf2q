@@ -1,9 +1,21 @@
-//! ADR-014 P10 iter-2b — integration smoke tests for
-//! `src/quality/ppl_driver.rs::measure_ppl_qwen35_dense`.
+//! ADR-014 P10 iter-2c — integration smoke tests for
+//! `src/quality/ppl_driver.rs::measure_ppl_qwen35`.
 //!
-//! Five always-on tests exercise the driver's input validation,
-//! GGUF error path (missing file + invalid magic), the public
-//! `chunk_count` arithmetic, and the `seq_len` override surface.
+//! Six always-on tests exercise the driver's input validation, GGUF
+//! error path (missing file + invalid magic), the public `chunk_count`
+//! arithmetic, the `seq_len` override surface, and (new at iter-2c)
+//! the variant-agnostic guarantee that the driver's input-validation
+//! surface fires before the GGUF load regardless of which variant the
+//! would-be-loaded model is.
+//!
+//! ## Iter-2c rename
+//!
+//! `measure_ppl_qwen35` → `measure_ppl_qwen35`. The function was
+//! always variant-agnostic (`Qwen35Model::load_from_gguf` and
+//! `forward_cpu` both dispatch on `cfg.variant` internally — see
+//! `src/quality/ppl_driver.rs` module doc); iter-2b's
+//! `Variant::Dense`-only gate was a forward-looking guard removed at
+//! iter-2c. One driver, both Dense + MoE GGUFs.
 //!
 //! ## Why `#[path]`-include rather than `use hf2q::...`
 //!
@@ -115,7 +127,7 @@ mod inference {
     }
 }
 
-use ppl_driver::{chunk_count, measure_ppl_qwen35_dense, PplDriverError};
+use ppl_driver::{chunk_count, measure_ppl_qwen35, PplDriverError};
 
 use std::io::Write;
 use std::path::Path;
@@ -137,7 +149,7 @@ fn ppl_driver_returns_invalid_on_empty_token_slice() {
     let any_path = Path::new("/nonexistent/whatever.gguf");
 
     // Empty slice ⇒ Invalid.
-    let result = measure_ppl_qwen35_dense(any_path, &[], None);
+    let result = measure_ppl_qwen35(any_path, &[], None);
     match result {
         Err(PplDriverError::Invalid(msg)) => {
             assert!(
@@ -150,7 +162,7 @@ fn ppl_driver_returns_invalid_on_empty_token_slice() {
 
     // Length-1 slice ⇒ also Invalid (no prediction possible —
     // `logits[0]` would predict `tokens[1]` which doesn't exist).
-    let result = measure_ppl_qwen35_dense(any_path, &[42u32], None);
+    let result = measure_ppl_qwen35(any_path, &[42u32], None);
     match result {
         Err(PplDriverError::Invalid(msg)) => {
             assert!(
@@ -170,7 +182,7 @@ fn ppl_driver_returns_invalid_on_empty_token_slice() {
 fn ppl_driver_returns_gguf_error_on_missing_path() {
     let missing = Path::new("/nonexistent/path/that/cannot/exist/qwen35.gguf");
     let tokens = [1u32, 2, 3, 4];
-    let result = measure_ppl_qwen35_dense(missing, &tokens, Some(2));
+    let result = measure_ppl_qwen35(missing, &tokens, Some(2));
     match result {
         Err(PplDriverError::Gguf { path, source }) => {
             assert_eq!(
@@ -208,7 +220,7 @@ fn ppl_driver_returns_gguf_error_on_invalid_magic() {
         f.sync_all().expect("sync");
     }
     let tokens = [1u32, 2, 3, 4];
-    let result = measure_ppl_qwen35_dense(tmp.path(), &tokens, Some(2));
+    let result = measure_ppl_qwen35(tmp.path(), &tokens, Some(2));
     match result {
         Err(PplDriverError::Gguf { path, source: _ }) => {
             assert_eq!(
@@ -237,7 +249,7 @@ fn ppl_driver_seq_len_override_is_respected() {
     let tokens = [10u32, 20, 30, 40];
 
     // seq_len = Some(0) ⇒ Invalid (named in the message).
-    let result = measure_ppl_qwen35_dense(any_path, &tokens, Some(0));
+    let result = measure_ppl_qwen35(any_path, &tokens, Some(0));
     match result {
         Err(PplDriverError::Invalid(msg)) => {
             assert!(
@@ -251,7 +263,7 @@ fn ppl_driver_seq_len_override_is_respected() {
     // seq_len = Some(2) on a missing path ⇒ still Gguf (validation
     // passes; open fails). Demonstrates the override is accepted at
     // validation but the file-open failure preempts any chunking.
-    let result = measure_ppl_qwen35_dense(any_path, &tokens, Some(2));
+    let result = measure_ppl_qwen35(any_path, &tokens, Some(2));
     assert!(
         matches!(result, Err(PplDriverError::Gguf { .. })),
         "seq_len = Some(2) with missing path must surface Gguf, not Invalid; got {result:?}"
@@ -283,4 +295,36 @@ fn ppl_driver_chunk_count_for_512_tokens_with_seq_len_128_is_4() {
     // Wait: 511 = 3*128 + 127 ⇒ ceil(511/128) = 4. Correct.
     assert_eq!(chunk_count(512, 256), 2);
     assert_eq!(chunk_count(511, 128), 4);
+}
+
+/// Test 6 (iter-2c): variant-agnostic API surface. The driver's
+/// input validation (`tokens.len() < 2 ⇒ Invalid`) fires BEFORE the
+/// GGUF load, regardless of which variant the would-be-loaded model
+/// is. This is the simplest variant-agnostic assertion we can land
+/// without a real model on disk: the same code path that returns
+/// `Invalid` for an empty corpus is the one that would later route
+/// through the variant-aware `Qwen35Model::load_from_gguf` →
+/// `forward_cpu` chain — both arms of which dispatch on
+/// `cfg.variant` internally (see `src/quality/ppl_driver.rs` module
+/// doc for the audit). The `/var/empty/never.gguf` sentinel path is
+/// never opened; the driver short-circuits at validation. A
+/// regression that re-introduced a variant-specific gate before the
+/// `tokens.len()` check would surface here as a `Gguf` or
+/// `Invalid("variant ...")` error rather than the canonical
+/// `Invalid("tokens.len() ...")`.
+#[test]
+fn ppl_driver_rejects_invalid_for_both_variants() {
+    let err = measure_ppl_qwen35(Path::new("/var/empty/never.gguf"), &[], None)
+        .expect_err("must reject empty tokens before any variant inspection");
+    match err {
+        PplDriverError::Invalid(msg) => {
+            assert!(
+                msg.contains("tokens.len()"),
+                "Invalid message must name `tokens.len()` (variant-agnostic precondition); got `{msg}`"
+            );
+        }
+        other => panic!(
+            "expected Err(Invalid(\"tokens.len() ...\")) regardless of would-be variant; got {other:?}"
+        ),
+    }
 }

@@ -1,4 +1,4 @@
-//! ADR-014 P10 iter-2b — hf2q-side PPL driver for Qwen3.5-dense GGUFs.
+//! ADR-014 P10 iter-2c — hf2q-side PPL driver for Qwen3.5 GGUFs.
 //!
 //! Wraps the EXISTING public API of [`Qwen35Model`] (`load_from_gguf`
 //! plus `forward_cpu`) and routes the produced logits through
@@ -8,9 +8,37 @@
 //! fence intact: ppl_driver only READS the engine's public API; never
 //! modifies it.
 //!
+//! # Variant-agnostic by construction
+//!
+//! Iter-2c (rename + wire) renamed `measure_ppl_qwen35_dense` →
+//! [`measure_ppl_qwen35`] after a Chesterton's-fence audit confirmed
+//! the dense-only gate at iter-2b was a forward-looking guard, NOT a
+//! correctness invariant. The driver's API surface
+//! (`Path → tokens → f32 PPL`) is variant-agnostic because:
+//!
+//! 1. [`Qwen35Model::load_from_gguf`]
+//!    (`src/inference/models/qwen35/model.rs:172`) inspects
+//!    `cfg.variant` (`model.rs:265`) and constructs the appropriate
+//!    layer weights internally — `Variant::Moe` ⇒
+//!    `load_moe_ffn_quantized` returning `Qwen35FfnWeights::MoeQ`
+//!    (`model.rs:282-307`); `Variant::Dense` ⇒ `load_layer`
+//!    (`model.rs:308-311`).
+//! 2. [`Qwen35Model::forward_cpu`]
+//!    (`src/inference/models/qwen35/forward_cpu.rs:75`) dispatches on
+//!    `Qwen35FfnWeights::{Dense, Moe, DenseQ, MoeQ}` (`forward_cpu.rs:152-192`)
+//!    inside the per-layer FFN block — a single function handles
+//!    every variant the GGUF loader can produce.
+//!
+//! Therefore one driver entry point handles both `Variant::Dense` and
+//! `Variant::Moe` GGUFs. Quantized-FFN GGUFs (`DenseQ` and `MoeQ`,
+//! both produced by `load_from_gguf` for production GGUFs) error
+//! honestly through `forward_cpu` regardless of variant; the driver
+//! surfaces those as [`PplDriverError::Forward`] without silently
+//! falling back. P11 wires `forward_gpu` for the real-model path.
+//!
 //! # Public surface
 //!
-//! - [`measure_ppl_qwen35_dense`] — the entry point.
+//! - [`measure_ppl_qwen35`] — the entry point (variant-agnostic).
 //! - [`PplDriverError`] — the typed error enum.
 //! - [`chunk_count`] — small pure helper exposed for unit tests in
 //!   [`crate::quality::ppl_driver`] and in the integration crate at
@@ -52,8 +80,8 @@
 //! `forward_cpu` is deterministic for the same model + same tokens
 //! (the engine's own `forward_cpu_deterministic` test pins this).
 //! `compute_perplexity` is a pure reduction over the logits. Therefore
-//! `measure_ppl_qwen35_dense` is deterministic for the same model
-//! file + same token slice + same `seq_len`.
+//! [`measure_ppl_qwen35`] is deterministic for the same model file +
+//! same token slice + same `seq_len`.
 
 use std::path::{Path, PathBuf};
 
@@ -64,14 +92,14 @@ use mlx_native::MlxError;
 
 use crate::inference::models::qwen35::forward_cpu::text_positions;
 use crate::inference::models::qwen35::model::Qwen35Model;
-use crate::inference::models::qwen35::Qwen35Variant;
 use crate::quality::perplexity::{compute_perplexity, PerplexityError};
 
-/// Errors surfaced by [`measure_ppl_qwen35_dense`]. Every failure mode
-/// — IO, GGUF parse, model load, forward pass, perplexity compute,
+/// Errors surfaced by [`measure_ppl_qwen35`]. Every failure mode —
+/// IO, GGUF parse, model load, forward pass, perplexity compute,
 /// invalid input — lands in a discriminated variant so callers
-/// (`tests/peer_parity_gates.rs::run_cell` for the dense cells) can
-/// route on the cause without inspecting strings.
+/// (`tests/peer_parity_gates.rs::run_cell` for all 8 Decision-15
+/// cells, both dense and MoE) can route on the cause without
+/// inspecting strings.
 #[derive(Debug, Error)]
 pub enum PplDriverError {
     /// `GgufFile::open` failed (file missing, bad magic, truncated
@@ -115,10 +143,12 @@ pub enum PplDriverError {
     Perplexity(#[from] PerplexityError),
 
     /// Caller-supplied input violates the driver's preconditions:
-    /// fewer than 2 tokens (no prediction possible), an explicit
-    /// `seq_len = Some(0)`, or a non-Dense GGUF (the driver is
-    /// dense-only this iter — MoE lands at iter-2c when the public
-    /// API for a quantized-MoE forward pass is wired).
+    /// fewer than 2 tokens (no prediction possible) or an explicit
+    /// `seq_len = Some(0)`. As of iter-2c the variant gate (formerly
+    /// rejecting `Variant::Moe`) is removed — the driver is
+    /// variant-agnostic and dispatches both dense and MoE GGUFs
+    /// through the same code path; see the module-level doc for the
+    /// audit that established this.
     #[error("invalid input: {0}")]
     Invalid(String),
 }
@@ -138,19 +168,29 @@ pub fn chunk_count(n_tokens: usize, seq_len: usize) -> usize {
     n_tokens.div_ceil(seq_len)
 }
 
-/// Measure the perplexity of a Qwen3.5-dense GGUF model against a
-/// `u32` token corpus.
+/// Measure the perplexity of a Qwen3.5 GGUF model against a `u32`
+/// token corpus.
+///
+/// **Variant-agnostic**: handles both `Qwen35Variant::Dense` and
+/// `Qwen35Variant::Moe`. [`Qwen35Model::load_from_gguf`]
+/// (`src/inference/models/qwen35/model.rs:172`) inspects
+/// `cfg.variant` (`model.rs:265`) and constructs the appropriate
+/// per-layer FFN weights internally; [`Qwen35Model::forward_cpu`]
+/// (`src/inference/models/qwen35/forward_cpu.rs:75`) dispatches on
+/// `Qwen35FfnWeights::{Dense, Moe, DenseQ, MoeQ}` (`forward_cpu.rs:152-192`).
+/// One driver, both variants — see the module-level doc for the
+/// Chesterton's-fence audit that justified removing the iter-2b
+/// `Variant::Dense`-only gate.
 ///
 /// # Arguments
 ///
-/// * `model` — path to a Qwen3.5-dense GGUF (architecture
-///   `qwen35`). MoE variants are rejected with
-///   [`PplDriverError::Invalid`] until iter-2c lands a MoE driver.
-///   Quantized-FFN dense GGUFs (`DenseQ`) are loadable but
+/// * `model` — path to a Qwen3.5 GGUF (architecture `qwen35`).
+///   Quantized-FFN GGUFs (`DenseQ` for dense, `MoeQ` for MoE — what
+///   real production GGUFs always load to) are loadable but
 ///   `forward_cpu` errors on them; that error flows through
 ///   [`PplDriverError::Forward`] and is surfaced honestly to the
 ///   caller (the driver does NOT silently fall back to a different
-///   path).
+///   path). P11 wires `forward_gpu` for the real-model path.
 /// * `tokens` — corpus tokens. Must contain at least 2 tokens
 ///   (one prediction = one logits row + one target).
 /// * `seq_len` — optional override for the per-chunk window size.
@@ -178,7 +218,7 @@ pub fn chunk_count(n_tokens: usize, seq_len: usize) -> usize {
 /// PPL bit pattern. Inherits determinism from `forward_cpu`
 /// (validated by the engine's `forward_cpu_deterministic` test) and
 /// the pure-reduction nature of `compute_perplexity`.
-pub fn measure_ppl_qwen35_dense(
+pub fn measure_ppl_qwen35(
     model: &Path,
     tokens: &[u32],
     seq_len: Option<usize>,
@@ -203,17 +243,16 @@ pub fn measure_ppl_qwen35_dense(
     })?;
 
     // --- 3. Load the model ----------------------------------------
+    //
+    // Variant-agnostic: `Qwen35Model::load_from_gguf` inspects
+    // `cfg.variant` and constructs the appropriate per-layer FFN
+    // weights internally (model.rs:265-312). The iter-2b
+    // `Variant::Dense`-only gate that lived here was removed at
+    // iter-2c after the Chesterton's-fence audit confirmed it was a
+    // forward-looking guard, not a correctness invariant — see the
+    // module-level doc.
     let qwen = Qwen35Model::load_from_gguf(&gguf)
         .map_err(|e| PplDriverError::Load(format!("{e:#}")))?;
-
-    // Variant gate: dense-only this iter. MoE driver lands at iter-2c.
-    if qwen.cfg.variant != Qwen35Variant::Dense {
-        return Err(PplDriverError::Invalid(format!(
-            "model variant is {:?}; measure_ppl_qwen35_dense only supports Dense \
-             (MoE driver lands at iter-2c)",
-            qwen.cfg.variant
-        )));
-    }
 
     let vocab_size = qwen.cfg.vocab_size as usize;
     if vocab_size == 0 {
@@ -408,14 +447,14 @@ mod tests {
     #[test]
     fn measure_ppl_returns_invalid_on_short_input() {
         // < 2 tokens ⇒ Invalid (no prediction possible).
-        let result = measure_ppl_qwen35_dense(
+        let result = measure_ppl_qwen35(
             std::path::Path::new("/nonexistent/model.gguf"),
             &[],
             None,
         );
         assert!(matches!(result, Err(PplDriverError::Invalid(_))));
 
-        let result = measure_ppl_qwen35_dense(
+        let result = measure_ppl_qwen35(
             std::path::Path::new("/nonexistent/model.gguf"),
             &[42u32],
             None,
@@ -425,7 +464,7 @@ mod tests {
 
     #[test]
     fn measure_ppl_returns_invalid_on_zero_seq_len_override() {
-        let result = measure_ppl_qwen35_dense(
+        let result = measure_ppl_qwen35(
             std::path::Path::new("/nonexistent/model.gguf"),
             &[1u32, 2, 3, 4],
             Some(0),
@@ -440,7 +479,7 @@ mod tests {
     fn measure_ppl_returns_gguf_on_missing_path() {
         let missing =
             std::path::Path::new("/nonexistent/path/that/cannot/exist/qwen35-dense.gguf");
-        let result = measure_ppl_qwen35_dense(missing, &[1u32, 2, 3, 4], Some(2));
+        let result = measure_ppl_qwen35(missing, &[1u32, 2, 3, 4], Some(2));
         match result {
             Err(PplDriverError::Gguf { path, source: _ }) => {
                 assert_eq!(path, missing.to_path_buf());
