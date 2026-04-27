@@ -335,6 +335,87 @@ inference framework:
    on M5 Max is irrelevant to shippability.  ADR-015 commits to
    measure-3x discipline at every phase gate.
 
+## Capturing M5's GPU Neural Accelerators (Metal 4 TensorOps + NAX)
+
+Source for this section: deep technical brief at `/tmp/cfa-adr016/research-metal4-tensorops.md` (also stored at memory key `swarm-cfa-adr016/deep-research/metal4-tensorops`, 2026-04-26).  All API signatures and file:line citations were verified against Apple developer docs, MLX source (`github.com/ml-explore/mlx`) and `/opt/mlx-native` source — no training-data recall used.
+
+### The path Apple is publicly accelerating
+
+Apple's M5 generation publishes a measured **3.33–4.06× faster TTFT vs M4** and **1.19–1.27× decode** across Qwen 1.7B / 8B / 14B / 30B-A3B-MoE / GPT OSS 20B at prompt=4096 / generation=128 ([Apple ML Research M5/MLX post](https://machinelearning.apple.com/research/exploring-llms-mlx-m5)).  The 4× lives in **GPU-integrated Neural Accelerators (NAX)** — per-GPU-core matrix-multiplication units accessed via **Metal Performance Primitives (MPP) TensorOps** at the `metal4.0` shader standard.  M5 Max (40-core GPU) = 40 × 1,024 FP16 FMA / cycle.  This is the substrate `mlx-native` already targets — but only partially.  The 1.19–1.27× decode boost is bandwidth-bound (460 → 614 GB/s); ADR-015 P2 + P3 + P3b own that axis.  The TTFT axis is compute-bound and is the new lever introduced here.
+
+The standalone 16-core ANE is **not** the path that captures Apple's headline numbers.  CoreML / ANE work is opportunistic encoder offload (ADR-016 territory), not LLM-body acceleration.
+
+### mlx-native current state — gap analysis
+
+`mlx-native` already uses `mpp::tensor_ops::matmul2d` in four `*_tensor.metal` GEMM kernels, with correct `get_destination_cooperative_tensor` output stores.  That part is shipping correctly.  Verified gaps vs MLX's NAX path:
+
+| Lever | mlx-native today | MLX NAX path | Source |
+|---|---|---|---|
+| Inner MMA descriptor | `matmul2d_descriptor(NR1=32, NR0=64, NK=32, …)` | `matmul2d_descriptor(16, 32, 16, …)` | `quantized_matmul_mm_tensor.metal:185-231` vs `mlx/.../steel/gemm/nax.h` |
+| MMA scope | `execution_simdgroups<4>` | `execution_simdgroup` (single, 32 lanes) | same |
+| `reduced_precision` flag | `false` everywhere | not explicitly false in NAX path | `*_tensor.metal` files |
+| Outer tile sizes (M5 Max) | NR0=64, NR1=32 | bm=64, bn=128 or 256, swizzle=2 | MLX `matmul.cpp` commit `0879a6a` |
+| Morton/Hilbert dispatch order | absent (raster order) | swizzle=2 / Morton for large GEMM | grep mlx-native: zero matches |
+| macOS 26.2 / arch-gen ≥ 17 runtime gate | absent (`probe_tensor_mm()` is M3+ compile probe only) | `is_nax_available()` at runtime | `quantized_matmul_ggml.rs:155-169` vs MLX `device.cpp` |
+| Attention kernel TensorOps | **absent** — `flash_attn_prefill.metal:621-754` uses M1-era `simdgroup_matrix` + `simdgroup_multiply_accumulate` | `steel_attention_nax` (commit `b41b349`) | `flash_attn_prefill.metal:621-754` |
+| Split-K NAX | absent | `steel_gemm_splitk_nax` for large K | grep mlx-native: zero matches |
+
+Per ADR-015 §"Prefill kernel breakdown (measured)" memory pin: MoE 39 %, MM 25 %, FA 16 %.  The single biggest unrouted lever is **flash-attention prefill** (16 % of compute) running on the M1-era simdgroup path.  GEMM kernels are partially routed through TensorOps but with non-NAX-tuned tile sizes and no Morton-order dispatch.
+
+### P3c — three concrete actions to capture the 3.3–4.1× TTFT speedup
+
+**P3c is a new sub-phase orthogonal to P3 (single-CB rewrite) and P3b (Rust-orchestration sweep).**  All three are shader-internal changes; none affect command-buffer lifecycle, encoder lifetime, barrier bookkeeping, or Rust orchestration cost.
+
+| Action | File | Today | Change | Expected lever | Risk |
+|---|---|---|---|---|---|
+| **P3c.1 — Morton/Z-order dispatch for large prefill GEMM** | `quantized_matmul_mm_tensor.metal`, `dense_mm_bf16_tensor.metal`, `dense_mm_f16_tensor.metal` | Standard 2D raster grid (`tgpig`) | Map flat dispatch index to Morton coordinates before tile-offset calc | **1.5–2× on large-K GEMM** (seq ≥ 1024); per Tech Talk 111432, alone is the difference between ~50 % and ~100 % NAX utilization on a 4K×4K matmul (~6× speedup demo) | Tile-boundary tail handling for non-power-of-2 `ne0`/`ne1`; ~20 lines per kernel, shader-only |
+| **P3c.2 — NAX-tuned outer tile sizes + macOS 26.2 / arch-gen ≥ 17 runtime gate** | `quantized_matmul_ggml.rs` (gate logic), new `quantized_matmul_mm_nax.metal` instantiation | NR0=64, NR1=32 always; M3+ compile probe only | Add `is_nax_available_m5()` Rust gate (mirror MLX `device.cpp`); on M5+macOS 26.2, dispatch new variant with bm=64, bn=128, swizzle=2 | **10–20 % on prefill GEMM** | Existing tensor path stays as M3/M4 fallback; no breakage |
+| **P3c.3 — Port `flash_attn_prefill` inner matmul from `simdgroup_matrix` to `mpp::tensor_ops::matmul2d` + Morton dispatch** | New `flash_attn_prefill_nax.metal` (gate behind `is_nax_available_m5()`); existing kept as M3/M4 fallback | Lines 621–754 use `metal::simdgroup_matrix<T>` + `simdgroup_multiply_accumulate` | Replace inner QK^T and scores×V matmul loops with `mpp::tensor_ops::matmul2d` (16×32×16 fragments per MLX NAX); preserve online-softmax tile state | **2–3× on TTFT for long prefill** (seq ≥ 2048); attention is 16 % of prefill compute — this is the largest single lever for the TTFT headline | Non-trivial port — `flash_attn_prefill` is a fully fused SDPA with online softmax, sliding-window masking, and partial-output reduction.  MLX's `steel_attention_nax` (`b41b349`) is the reference port. |
+
+The 3.33–4.06× Apple-measured TTFT speedup is achievable only if **all three** actions land — GEMM Morton + tile-sizing alone covers ~64 % of prefill compute (MoE 39 % + MM 25 %), but the remaining 16 % attention prefill is the bottleneck if it stays on `simdgroup_matrix`.  P3c.3 is the highest-impact and highest-effort of the three.
+
+**Optional P3c.4 — `reduced_precision = true` for BF16 prefill attention scores** (5–15 % additional lever on attention GEMM): permits internal FP16 accumulation on Neural Accelerators.  *Numerically risky* per memory pin `project_vit_attention_bf16_softmax_drift` (BF16 cast in attention K already causes ~0.68 logit perturbation on saturated-softmax winners).  Gate behind sourdough parity check (ADR-015 D3).  Do not enable for weight-dequant matmuls (Q4_0, Q6_K) — accumulation precision directly impacts model quality.
+
+### OS / version constraints
+
+| Requirement | Value | Source |
+|---|---|---|
+| Minimum macOS for NAX hardware activation | **26.2** | MLX `device.cpp` `is_nax_available()` |
+| Metal shader standard | `-std=metal4.0` | MLX CMake, commit `54f1cc6` |
+| GPU architecture generation | **≥ 17** (non-phone) / ≥ 18 (phone) | MLX `device.cpp` |
+| M5 Max architecture char | `'s'` (Max) / `'c'` (Pro) / `'d'` (Ultra) | MLX `matmul.cpp` commit `0879a6a` |
+| BF16 tensor support | macOS 26.1 | Apple Tech Talk 111432 |
+| 4-bit / 8-bit integer tensors | macOS 26.4 | Apple Tech Talk 111432 |
+| Cooperative tensors as matmul inputs | macOS 26.3 | Apple Tech Talk 111432 |
+| `MLX_METAL_NO_NAX` escape hatch | env var, runtime force-fallback | MLX `device.cpp` |
+
+**Hard implication:** M4 (gen 16) does NOT have NAX hardware.  The 3.3–4.1× TTFT speedup is exclusively M5+ + macOS 26.2+.  P3c gates must bottom out to the existing `*_tensor.metal` simdgroup-matrix path on M3/M4 and on M5 with macOS < 26.2.  ADR-015's bench methodology (`feedback_perf_gate_thermal_methodology`) already requires documenting the macOS version for every bench run; that documentation now becomes load-bearing — same kernels, different hardware activation.
+
+### Composition with P3 + P3b — strict orthogonality
+
+| Aspect | P3 (single-CB) | P3b (Rust orchestration sweep) | P3c (NAX kernels) |
+|---|---|---|---|
+| What changes | Command-buffer lifecycle (102 → 1 CB / token) | Helper-function indirection, buffer pool, barriers, KV cursor | Shader-internal MMA descriptor, Morton order, attention port |
+| Where | Rust host-side `forward_gpu` / `forward_decode` | Rust host-side `apply_*` helpers | Metal shader `*_tensor.metal`, `flash_attn_prefill*.metal` |
+| Affects | CB encode time, encoder lifetime | CPU-side per-dispatch overhead | GPU-side compute throughput |
+| Composes with others how | Removes 100 of the 102 encoder lifetimes | Removes ~140 µs of the ~288 µs/token Rust residual | Multiplies prefill TTFT independently |
+
+P3c is **fully orthogonal** to P3 and P3b.  Single-CB removes encoder boundaries; orchestration sweep removes CPU overhead; NAX kernels increase per-dispatch GPU throughput.  Order-of-operations recommendation: **land P3 + P3b first** (they target the existing 540 µs/token decode gap and clear ADR-015 D4 ≥ 1.00× of llama.cpp); **open P3c only after ADR-015 P6 bench gate clears**.  Reasoning: avoid stacking shader-level complexity on top of an unmeasured decode-path baseline.  Once decode is at 1.00×, P3c becomes a TTFT-only lever measured against Apple's own MLX numbers, not against llama.cpp.
+
+P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in ADR-015 §"Budget reconciliation".  However once P3c lands, faster TTFT compounds with faster decode multiplicatively at the user-perceived end-gate (time to complete a response): TTFT improvement + decode improvement = total response-time improvement.
+
+### Open questions — to refine before P3c opens
+
+| ID | Question | Resolution |
+|---|---|---|
+| **Q-NAX-1** | Does mlx-native's existing `matmul2d_descriptor(32, 64, 32, …)` already activate NAX hardware on M5 Max, or stay on simdgroup-matrix? | Profile via Instruments "Metal System Trace" + GPU counter `gpu.counters.neuralAcceleratorUtilization` (if exposed) on M5 Max with a prefill workload.  If activation is already happening, P3c.2 inner-tile changes are moot; P3c.1 (Morton) and P3c.3 (attention port) remain. |
+| **Q-NAX-2** | What is the actual TTFT baseline for mlx-native vs mlx-lm on M5 Max at pp=4096?  ADR-015 D4 baseline is decode-only (n=256). | Measure before P3c sized.  Add TTFT bar to D4 exit criteria when P3c opens.  Reference: Apple's MLX/M5 post = 3.3–4.1× over M4 across Qwen 1.7B–30B-MoE. |
+| **Q-NAX-3** | What macOS version is the M5 Max benchmark machine running? | Document explicitly in every cold-SoC bench log; NAX requires 26.2+.  If on 26.1 or 15, P3c lever is unavailable. |
+| **Q-NAX-4** | Is `execution_simdgroups<4>` causing NAX stalls on long K-loops? | Profile with Instruments' Metal GPU Counter `ShaderOccupancy` and (if exposed) `NeuralAcceleratorUtil` on a 4096-token prefill.  If stalls are present, restructure to `execution_simdgroup` with 4× more threadgroups per launch. |
+| **Q-NAX-5** | Does `swizzle=2` in MLX's M5 tuning mean Morton/Z-order, column-first, or something device-specific? | Read MLX `matmul.cpp` swizzle implementation directly before implementing P3c.1; `swizzle=0` is raster, `=1` is column-first per common convention but verify. |
+| **Q-NAX-6** | Does `reduced_precision = false` affect decode-path throughput on M5? | Decode is bandwidth-bound (SqueezeLLM canonical statement, confirmed by ADR-015 P2 / P3a data).  For decode-path weight-dequant matmuls (m=1), compute is not the bottleneck.  The flag has no effect on bandwidth-bound ops — confirm empirically before spending time on precision-flag experiments for decode. |
+| **Q-NAX-7** | Does porting `flash_attn_prefill` require a new file or modify the existing one? | Recommend: new `flash_attn_prefill_nax.metal` gated behind `is_nax_available_m5()`, keeping existing simdgroup path as M3/M4 fallback.  Two-variant pattern matches MLX's own approach. |
+
 ## References
 
 - `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:448-614` — main encode loop; `:550` `dispatch_apply`; `:458` "optimal n_cb is 1 or 2"
@@ -353,3 +434,4 @@ inference framework:
 - **2026-04-26 — P2 calibration empirical:** `async µs/CB ≈ 1.6 µs` (3.1× lower than working assumption).  Single-CB recovers ~32% of the 500 µs gap, not ~100%.  Plan revised: P3a per-dispatch cost calibration inserted before P3; P4 added as a second-lever phase whose target is determined by P3a.  Title kept "single-CB" because that's still the first lever; scope is honestly "general decode speed improvements" with the single-CB rewrite as Phase 1 of N.
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
+- **2026-04-26 — §"Capturing M5's GPU Neural Accelerators (Metal 4 TensorOps + NAX)" infused.**  Per ADR-016 research dossier graduation: Apple's measured 3.33–4.06× TTFT vs M4 (1.19–1.27× decode bandwidth-bound) lives in per-GPU-core Neural Accelerators via Metal 4 TensorOps, **not** standalone ANE.  mlx-native already partially routes through `mpp::tensor_ops::matmul2d` in four `*_tensor.metal` kernels but is missing: (a) Morton/Z-order dispatch for large prefill GEMM (Tech Talk 111432: ~50 → ~100 % NAX utilization on 4K×4K matmul); (b) NAX-tuned outer tile sizes + macOS 26.2 / arch-gen ≥ 17 runtime gate (mirroring MLX's `is_nax_available()`); (c) `flash_attn_prefill` inner matmul still on M1-era `simdgroup_matrix` / `simdgroup_multiply_accumulate` — biggest unrouted lever (16 % of prefill compute).  Added new sub-phase **P3c — M5 Neural Accelerator prefill kernels** with three actions; P3c is shader-internal only and **fully orthogonal** to P3 (single-CB) and P3b (orchestration sweep) — opens only after P6 bench gate clears.  All API claims verified against Apple developer docs, MLX commits (`54f1cc6` 2025-11-19 NAX support, `b41b349` 2026-03-18 NAX refactor, `0879a6a` 2026-03-11 M5 tuning), and `/opt/mlx-native` source by direct file:line read — no training-data recall used.  Source brief: `/tmp/cfa-adr016/research-metal4-tensorops.md` + memory key `swarm-cfa-adr016/deep-research/metal4-tensorops`.
