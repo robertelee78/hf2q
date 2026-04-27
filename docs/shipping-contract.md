@@ -89,6 +89,7 @@ operator-facing; loaded through `src/debug/investigation_env.rs`
 | `HF2Q_PREFILL_DUMP`, `HF2Q_BATCHED_DUMP`, `HF2Q_BATCHED_LAYER_SCAN`, `HF2Q_DUMP_LAYERS`, `HF2Q_DUMP_BOUNDARY`, `HF2Q_DUMP_ALL_CACHE`, `HF2Q_DUMP_LAYER_DETAIL`, `HF2Q_DUMP_NORM_WEIGHT`, `HF2Q_DUMP_DIR` | Hidden-state / cache dumps; output-only, cannot affect decode. |
 | `HF2Q_DUMP_RENDERED_PROMPT`, `HF2Q_DUMP_PROMPT_TOKENS` | Prompt-path diagnostics. |
 | `HF2Q_MLX_TIMING`, `HF2Q_SPLIT_TIMING`, `HF2Q_MLX_KERNEL_PROFILE`, `HF2Q_MLX_PROFILE` | Timing / kernel-attribution diagnostics. |
+| `HF2Q_QWEN36_AUTOREG` | Wave 5a opt-in: when `=1`, dispatch Qwen3.6 GGUFs (`general.name` substring `qwen3.6`) through the existing autoregressive Qwen3.5 forward path (`inference::models::qwen35::*`). When unset, Qwen3.6 GGUFs soft-error with operator-actionable bail. Dispatch gate only — does not modify forward-pass math; no `HF2Q_UNSAFE_EXPERIMENTS` ack required. Removed once Wave 5b chunk-scan kernel lands (long-prefill SOTA path covers all Qwen3.x without env gate). |
 
 ---
 
