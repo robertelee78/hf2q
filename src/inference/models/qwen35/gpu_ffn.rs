@@ -422,6 +422,104 @@ fn proj(
     Ok(dst)
 }
 
+/// Pooled-output variant of [`proj`] for callers whose proj output flows
+/// only into downstream GPU kernels (no `as_slice` / `as_mut_slice` /
+/// `download_f32`).
+///
+/// ADR-015 iter7b (P3b alloc_buffer pool) — the dominant H1 lever per
+/// §P3a''' (375 µs/token apex MoE).  The original [`proj`] cannot be
+/// pool-migrated because it is shared with the unquantized
+/// `build_moe_ffn_layer_gpu` path which downloads router logits via
+/// `download_f32` → `as_slice` (reads `byte_len()`, which the pool's
+/// bucket rounding inflates).  Splitting into two functions preserves
+/// the carve-out for the unquantized path while letting the quantized
+/// production path (`build_moe_ffn_layer_gpu_q_into`) reap the savings.
+///
+/// Caller contract — verified for build_moe_ffn_layer_gpu_q_into 2026-04-27:
+///   - logits_buf  → dispatch_moe_softmax_topk     (byte_len validation only;
+///                                                   inflated bucket size passes)
+///   - sh_logit_buf → dispatch_moe_weighted_reduce (same)
+///   - a_s_buf      → dispatch_silu_mul            (byte_len validation only)
+///   - b_s_buf      → dispatch_silu_mul            (same)
+///   - y_s_buf      → dispatch_moe_weighted_reduce (same)
+///   - none of these are downloaded to CPU on the q_into path.
+///
+/// Bit-exact to [`proj`] except for the underlying `MlxBuffer`'s
+/// physical byte_len (bucket-rounded for pool reuse).  The kernel
+/// dispatches use `element_count` / explicit `n` parameters, not
+/// `byte_len`, so the bucket-rounded tail is never read.  The pool's
+/// per-token arena lifecycle (reset_decode_pool at top of decode token)
+/// keeps the safety contract.
+#[allow(clippy::too_many_arguments)]
+fn proj_pooled(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    let n_w = (out_features * in_features) as usize;
+
+    // Same weight-bf16 cast logic as `proj`.  In apex production the
+    // weight is pre-cast to BF16 at model load (per
+    // `MoeFfnWeightsGpuQ::from_cpu` line 309-327 — `upload_bf16_from_f32`),
+    // so this branch never fires for the q_into callers; we keep it for
+    // call-site flexibility with non-production fixtures (tests / CI).
+    let weight_bf16_owned: MlxBuffer;
+    let weight_bf16: &MlxBuffer = if weight.dtype() == DType::BF16 {
+        weight
+    } else {
+        let buf = super::decode_pool::pooled_alloc_buffer(
+            device,
+            n_w * 2,
+            DType::BF16,
+            vec![out_features as usize, in_features as usize],
+        )
+        .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+        cast(
+            encoder,
+            registry,
+            device.metal_device(),
+            weight,
+            &buf,
+            n_w,
+            CastDirection::F32ToBF16,
+        )
+        .context("cast weight F32→BF16")?;
+        encoder.memory_barrier();
+        weight_bf16_owned = buf;
+        &weight_bf16_owned
+    };
+
+    let out_bytes = (seq_len * out_features) as usize * 4;
+    let mut dst = super::decode_pool::pooled_alloc_buffer(
+        device,
+        out_bytes,
+        DType::F32,
+        vec![seq_len as usize, out_features as usize],
+    )
+    .map_err(|e| anyhow!("alloc proj dst (pooled): {e}"))?;
+
+    let params = DenseMmBf16F32Params {
+        m: seq_len,
+        n: out_features,
+        k: in_features,
+        src0_batch: 1,
+        src1_batch: 1,
+    };
+    if seq_len == 1 {
+        dense_gemv_bf16_f32(encoder, registry, device, weight_bf16, input, &mut dst, &params)
+            .context("dense_gemv_bf16_f32 proj_pooled M=1")?;
+    } else {
+        dense_matmul_bf16_f32_tensor(encoder, registry, device, weight_bf16, input, &mut dst, &params)
+            .context("dense_matmul_bf16_f32_tensor")?;
+    }
+    Ok(dst)
+}
+
 // ================================================================
 // CPU SiLU helper
 // ================================================================
@@ -1143,10 +1241,15 @@ pub fn build_moe_ffn_layer_gpu_q_into(
 
     {
         // ---- Phase A: router + shared expert projections (all read from x, concurrent) ----
-        let logits_buf   = proj(enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
-        let sh_logit_buf = proj(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
-        let a_s_buf      = proj(enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
-        let b_s_buf      = proj(enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
+        // ADR-015 iter7b — pool proj outputs for the apex production path.
+        // All four buffers flow into GPU kernels (dispatch_moe_softmax_topk,
+        // dispatch_silu_mul, dispatch_moe_weighted_reduce); no CPU
+        // download/as_slice path on q_into.  See proj_pooled doc-comment
+        // for the full caller-contract verification.
+        let logits_buf   = proj_pooled(enc, registry, device, x, &weights.router,          seq_len, h32, ne32)?;
+        let sh_logit_buf = proj_pooled(enc, registry, device, x, &weights.shared_gate_inp, seq_len, h32, 1)?;
+        let a_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_gate,     seq_len, h32, m_sh32)?;
+        let b_s_buf      = proj_pooled(enc, registry, device, x, &weights.shared_up,       seq_len, h32, m_sh32)?;
 
         // Barrier A→B: softmax_topk reads logits_buf; silu_mul reads a_s/b_s.
         enc.memory_barrier();
@@ -1192,7 +1295,9 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 ggml_type: weights.ggml_type_gate_up,
             },
         ).map_err(|e| anyhow!("up_all qmatmul_id: {e}"))?;
-        let y_s_buf = proj(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
+        // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
+        // dispatch_moe_weighted_reduce, no CPU download).
+        let y_s_buf = proj_pooled(enc, registry, device, &h_s_buf, &weights.shared_down, seq_len, m_sh32, h32)?;
 
         // Barrier C→D: silu_mul reads gate_all/up_all.
         enc.memory_barrier();
