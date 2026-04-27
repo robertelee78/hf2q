@@ -6736,11 +6736,36 @@ GPU output matches CPU reference within tolerance (observed max_abs=0 in this ru
 
 **No dependency version bump needed.**  `/opt/hf2q/.cargo/config.toml` carries `[patch.crates-io] mlx-native = { path = "/opt/mlx-native" }` (active per the earlier ADR-005 phase 2b iter 90 override note), so the shader fix flows directly into hf2q via the path patch on the next `cargo build`.  Verified by re-binarising hf2q post-patch in 11.6 s incremental.
 
-### End-to-end model validation (deferred, conditional)
+### Wave 4 closure scope — synthetic kernel closure only
 
-Synthetic-test passing (tolerance-based assertion: `BF16_GPU_ATOL=5e-3`, `BF16_GPU_RTOL=2e-2`; observed `max_abs=0` in the post-patch run) at the production rank-2 broadcast mask layout, at the production seq_len, on the production kernel dispatch is dispositive for pp65536 production correctness.  The closed-form overflow argument in Phase A §2.5 is a verifiable inequality (`max(row_pos) * max(kL) = 65535 * 65536 = 4.29 G > i32::MAX`), not a hypothesis.  The `assert_close_gpu` assertion is tolerance-based, not byte-exact; "bit-exact" language in the run log refers to the observation that `max_abs=0` on that hardware run, not to a byte-level comparison invariant.
+**Wave 4 is closed as a SYNTHETIC KERNEL CLOSURE, not a full E2E closure.**
 
-A full pp65536 model-loaded E2E run (load Gemma-4 26B A4B DWQ via `serve` + `HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1`, send a 65536-token prompt via the OpenAI HTTP API, assert `first_decode_token != 0`) is the empirical capstone but is not on the critical correctness path.  RAM was clear (42.7 GiB free; 30 GiB needed; concurrent ADR-015 iter8c-prep capture had completed) at fix-commit time, but spinning up an HTTP-harness benchmark for a single-pass long-prefill validation would re-tread the same kernel arithmetic the synthetic test already proves bit-exact.  Deferred to a future run — when run, the expected outcome is `first_decode_token = 30852` (matching the smaller-shape baseline in `project_long_prefill_parity_inverts.md`) and a substantial collapse of the +91.6% wall-clock gap at pp65536 because the second-half garbage reads were costing real DRAM traffic.
+The following are closed:
+
+- Shader root cause identified: i32 multiplication overflow at two D=256 mask-indexing sites in `flash_attn_prefill.metal` and `flash_attn_prefill_blk.metal` (Phase A §2.5; verifiable closed-form inequality).
+- Shader fix verified: i64/int64_t widening at both sites (commit `459f550`), mirroring the already-correct D=512 idiom.
+- Regression test suite: 49/49 mlx-native flash-attn tests pass post-patch (including the new pp65536 test at `0d33301`).
+- Tolerance-based GPU↔CPU match at pp65536 with observed `max_abs=0` in the post-patch run (`assert_close_gpu` with `BF16_GPU_ATOL=5e-3`, `BF16_GPU_RTOL=2e-2`).
+
+### Deferred E2E validation gate
+
+The following are **NOT** closed by Wave 4 and are explicitly deferred:
+
+1. **hf2q serve+HTTP capstone at pp65536.** A full model-loaded E2E run — load Gemma-4 26B A4B DWQ via `hf2q serve`, send a 65536-token prompt via the OpenAI HTTP API with `HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_BATCHED_PREFILL=1`, and assert `first_decode_token != 0` (and matches the `30852` baseline from smaller shapes in `project_long_prefill_parity_inverts.md`).
+
+2. **mask-fill ceiling audit.** `flash_attn_prefill_mask.metal:93` uses `uint row_offset = q_row * seq_len_k`.  This is safe at `q_row = 65535`, `seq_len_k = 65536` (`65535 * 65536 = 4 294 836 224 < UINT_MAX = 4 294 967 295`), but becomes the next overflow point for any future `seq_len > 65536`.  No fix required before pp65536 production; audit recommended before supporting >64k masks.
+
+**Exit conditions for deferred E2E gate:**
+
+- RAM budget available: Gemma-4 26B A4B DWQ requires ~30 GiB; no concurrent ADR-014/ADR-015 model-loading session active.
+- `hf2q generate --ignore-eos` or equivalent must land (see `project_hf2q_generate_chat_template_stop.md`) so the 65536-token prompt can be served without the `<turn|>` early-stop at ~978 tokens.
+- ADR-014 P7 DWQ re-emit session freeing the 128 GiB unified memory budget is the practical trigger for this run.
+
+When the gate runs and `first_decode_token = 30852` is confirmed, update `project_long_prefill_parity_inverts.md` and mark this note CLOSED.
+
+### End-to-end model validation context
+
+Synthetic-test passing (tolerance-based assertion: `BF16_GPU_ATOL=5e-3`, `BF16_GPU_RTOL=2e-2`; observed `max_abs=0` in the post-patch run) at the production rank-2 broadcast mask layout, at the production seq_len, on the production kernel dispatch is the primary correctness evidence.  The closed-form overflow argument in Phase A §2.5 is a verifiable inequality (`max(row_pos) * max(kL) = 65535 * 65536 = 4.29 G > i32::MAX`), not a hypothesis.  The `assert_close_gpu` assertion is tolerance-based, not byte-exact; "bit-exact" language in the original run log referred to the observation that `max_abs=0` on that hardware run, not to a byte-level comparison invariant (corrected in wave4.5 item-2).
 
 ### Commits
 
