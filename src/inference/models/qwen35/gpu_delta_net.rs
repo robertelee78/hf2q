@@ -79,6 +79,41 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_q4_0_from_f32};
+use crate::debug::INVESTIGATION_ENV;
+
+/// Wave 5b iter 5 — chunk-pipeline prefill threshold.
+///
+/// Prefill seq_lens strictly greater than this value (and a multiple of
+/// `mlx_native::ops::chunk_gated_delta_rule::FIXED_BT = 64`) are eligible
+/// to dispatch through the chunk-parallel delta-rule pipeline when
+/// `HF2Q_CHUNK_SCAN_PREFILL=1` (with `HF2Q_UNSAFE_EXPERIMENTS=1` ack) is
+/// set. Below this threshold the autoregressive per-token path always
+/// runs (the chunk pipeline's setup cost is not amortized).
+///
+/// Equal to `FIXED_BT` so that "strictly greater" implies "at least one
+/// full chunk past the chunk-1 boundary", giving the chunk pipeline the
+/// minimum 2-chunk shape (T=128) where its parallelism wins.
+pub const CHUNK_THRESHOLD: u32 = 64;
+
+/// Wave 5b iter 5 — chunk-pipeline eligibility predicate for the Qwen3.6
+/// delta-net forward path.
+///
+/// Returns `true` when:
+/// - `HF2Q_CHUNK_SCAN_PREFILL=1` is set (with `HF2Q_UNSAFE_EXPERIMENTS=1` ack), AND
+/// - `seq_len > CHUNK_THRESHOLD` (more than one full chunk past the boundary), AND
+/// - `seq_len % FIXED_BT == 0` (chunk pipeline requires `t % bt == 0`), AND
+/// - `d_k == 128` (chunk pipeline's MAX_K is a hard equality at iter 4 — see
+///   `mlx_native::ops::chunk_gated_delta_rule` doc).
+///
+/// All four must hold; any single failure routes to the autoregressive path.
+/// The d_k=128 gate is an iter-4 limitation that future iters will lift via
+/// FLA's b_h1..b_h4 bank-split (see `chunk_gated_delta_rule.rs:113`).
+fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
+    INVESTIGATION_ENV.chunk_scan_prefill
+        && seq_len > CHUNK_THRESHOLD
+        && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0
+        && d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K
+}
 
 // ================================================================
 // GPU weight container
@@ -1282,7 +1317,162 @@ pub fn build_delta_net_layer(
         let k_gpu = upload_f32(&k_cpu, device)?;
         let v_gpu = upload_f32(&v_cpu, device)?;
 
-        let output = {
+        // Wave 5b iter 5 — chunk-pipeline prefill route.
+        //
+        // When `HF2Q_CHUNK_SCAN_PREFILL=1` is acked AND `seq_len > 64` AND
+        // `seq_len % 64 == 0` AND `d_k == 128`, dispatch the chunk-parallel
+        // delta-rule pipeline instead of the autoregressive per-token GDN.
+        // ALL OTHER PATHS (autoregressive, decode seq=1) keep their iter-4
+        // contract verbatim.
+        let chunk_route = chunk_path_eligible(seq_len, d_k);
+
+        let output = if chunk_route {
+            // ---- CHUNK PREFILL (3-encoder split) ----
+            //
+            // The chunk wrapper opens its own command encoder + commits, so we
+            // split the existing single-encoder ops5-9 prefill into:
+            //   E1: ops 5+6 (l2_norm, alpha, beta, q_scale, g_beta) — produces
+            //       q_scaled / k_normed / g_buf / beta_buf.
+            //   chunk: apply_gated_delta_net_chunk() — its own encoder; produces
+            //       chunk_attn_out (F32, same shape as the autoregressive
+            //       attn_out_buf) and chunk_final_state (F32, same shape as
+            //       state_out's contract).
+            //   E2: ops 8+9 (ssm_norm_gate, out_proj).
+            //
+            // After the chunk dispatch we copy `chunk_final_state` into the
+            // caller-provided `state_out` buffer (unified-memory slice copy)
+            // so the ping-pong contract at `forward_gpu.rs:818-823` keeps
+            // working unchanged.
+            let k_normed_buf = {
+                let mut enc = device.command_encoder().context("enc chunk-prep prefill")?;
+                let q_l2 = apply_l2_norm_per_head(
+                    &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                )?;
+                let k_normed = apply_l2_norm_per_head(
+                    &mut enc, registry, device, &k_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
+                )?;
+                let alpha_logit_buf = apply_proj(
+                    &mut enc, registry, device, &x_norm,
+                    &weights.ssm_alpha, seq_len, hidden_size, n_v_heads,
+                )?;
+                let beta_logit_buf = apply_proj(
+                    &mut enc, registry, device, &x_norm,
+                    &weights.ssm_beta, seq_len, hidden_size, n_v_heads,
+                )?;
+                enc.memory_barrier();
+                scalar_mul_f32(
+                    &mut enc, registry, device.metal_device(),
+                    &q_l2, &q_scaled, n_q_elems, q_scale_val,
+                ).context("scalar_mul_f32 q_scale chunk prefill")?;
+                dispatch_compute_g_beta(
+                    &mut enc, registry, device.metal_device(),
+                    &alpha_logit_buf, &beta_logit_buf,
+                    &weights.ssm_dt_bias, &weights.ssm_a,
+                    &g_buf, &beta_buf, &g_params_buf,
+                    seq_len, n_v_heads,
+                ).context("dispatch_compute_g_beta chunk prefill")?;
+                enc.commit_and_wait()
+                    .context("commit chunk-prep prefill")?;
+                // q_scaled is the outer-scope pooled buffer (already populated
+                // by `scalar_mul_f32` above); k_normed is the local l2-norm
+                // output we just produced.
+                k_normed
+            };
+
+            // Stage: chunk-parallel delta-rule pipeline (own encoder).
+            let (chunk_attn_out, chunk_final_state) = apply_gated_delta_net_chunk(
+                device,
+                registry,
+                &q_scaled,
+                &k_normed_buf,
+                &v_gpu,
+                &g_buf,
+                &beta_buf,
+                state_in,
+                seq_len,
+                n_k_heads,
+                n_v_heads,
+                d_k,
+                d_v,
+                /* use_qk_l2norm = */ false,
+            )
+            .context("apply_gated_delta_net_chunk prefill")?;
+
+            // Copy chunk-pipeline `final_state` into the caller-provided
+            // `state_out` ping-pong buffer. Apple unified memory: the
+            // backing pages are CPU-accessible after the chunk wrapper's
+            // commit_and_wait, so this is a plain memcpy on the same
+            // physical address space — no GPU round-trip.
+            //
+            // We write through `contents_ptr()` (raw `*mut c_void`) because
+            // `state_out` is `&MlxBuffer` (shared by the autoregressive
+            // contract that lets dispatch_gated_delta_net write through a
+            // `&` reference via the Metal kernel binding). The autoregressive
+            // path mutates state_out the same way, just on the GPU side.
+            {
+                let src = chunk_final_state.as_slice::<f32>().map_err(|e| {
+                    anyhow!("apply_gated_delta_net_chunk: read final_state: {e}")
+                })?;
+                let n_state = (d_k * d_v * n_v_heads) as usize;
+                if src.len() < n_state {
+                    return Err(anyhow!(
+                        "chunk_final_state len {} < expected n_state {}",
+                        src.len(),
+                        n_state
+                    ));
+                }
+                let bytes_needed = n_state * std::mem::size_of::<f32>();
+                if state_out.byte_len() < bytes_needed {
+                    return Err(anyhow!(
+                        "state_out byte_len {} < required {}",
+                        state_out.byte_len(),
+                        bytes_needed
+                    ));
+                }
+                // SAFETY:
+                // - `state_out.contents_ptr()` is a valid CPU-accessible
+                //   pointer to `state_out.byte_len()` bytes (Apple unified
+                //   memory, MlxBuffer doc-comment §"contents_ptr").
+                // - `chunk_final_state` was just produced by the chunk
+                //   wrapper's `enc.commit_and_wait()` — no concurrent GPU
+                //   writers.
+                // - `state_out` has no concurrent GPU writers in this scope:
+                //   the autoregressive `dispatch_gated_delta_net` is the
+                //   only in-flight writer in this function and it is gated
+                //   behind the `else` branch (chunk path is exclusive).
+                //   Ops 8+9 below do not touch state_out.
+                // - Source and destination cannot alias: `chunk_final_state`
+                //   is a fresh wrapper-owned allocation distinct from the
+                //   caller-provided `state_out`.
+                // - Element type matches: both buffers carry F32 state of
+                //   length `n_state` per the validated shape contracts.
+                unsafe {
+                    let dst_ptr = state_out.contents_ptr() as *mut f32;
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, n_state);
+                }
+            }
+
+            // E2: ops 8+9 (ssm_norm_gate, out_proj). Reads chunk_attn_out
+            // (the F32 attention output from the chunk pipeline) instead of
+            // the autoregressive attn_out_buf.
+            let mut enc = device
+                .command_encoder()
+                .context("enc chunk ops8-9 prefill")?;
+            dispatch_ssm_norm_gate(
+                &mut enc, registry, device.metal_device(),
+                &chunk_attn_out, &weights.ssm_norm, &z,
+                &gated_buf, &op8_params,
+                rows_op8, d_v,
+            ).context("dispatch_ssm_norm_gate chunk prefill")?;
+            enc.memory_barrier();
+            let output = apply_proj(
+                &mut enc, registry, device, &gated_buf,
+                &weights.ssm_out, seq_len, z_channels, hidden_size,
+            )?;
+            enc.commit_and_wait().context("commit chunk ops8-9 prefill")?;
+            output
+        } else {
+            // ---- AUTOREGRESSIVE PREFILL (iter-4 unchanged path) ----
             let mut enc = device.command_encoder().context("enc ops5-9 prefill")?;
             let q_l2 = apply_l2_norm_per_head(
                 &mut enc, registry, device, &q_gpu, seq_len, n_k_heads, d_k, rms_norm_eps,
