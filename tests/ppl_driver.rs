@@ -328,3 +328,59 @@ fn ppl_driver_rejects_invalid_for_both_variants() {
         ),
     }
 }
+
+fn read_tokens_for_corpus_loader_test(path: &Path) -> Option<Vec<u32>> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+fn load_preferred_corpus_tokens_for_test(dir: &Path) -> Option<Vec<u32>> {
+    let full = dir.join("wikitext2-full.tokens");
+    if full.is_file() {
+        let tokens = read_tokens_for_corpus_loader_test(&full)?;
+        let byte_len = tokens.len().saturating_mul(4);
+        if tokens.len() >= 280_000 && byte_len >= 1_048_576 {
+            return Some(tokens);
+        }
+    }
+
+    let smoke = dir.join("wikitext2-smoke.tokens");
+    let tokens = read_tokens_for_corpus_loader_test(&smoke)?;
+    if tokens.len() == 512 {
+        Some(tokens)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn corpus_loader_falls_back_to_smoke_when_full_absent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let smoke_path = tmp.path().join("wikitext2-smoke.tokens");
+    let mut smoke = std::fs::File::create(&smoke_path).expect("create smoke fixture");
+    for i in 0..512u32 {
+        let token = (i * 17 + 3) % 32000;
+        smoke
+            .write_all(&token.to_le_bytes())
+            .expect("write smoke token");
+    }
+    smoke.sync_all().expect("sync smoke fixture");
+
+    assert!(
+        !tmp.path().join("wikitext2-full.tokens").exists(),
+        "test precondition: full corpus must be absent"
+    );
+    let tokens = load_preferred_corpus_tokens_for_test(tmp.path())
+        .expect("loader must fall back to smoke when full is absent");
+    assert_eq!(tokens.len(), 512);
+    assert_eq!(&tokens[..4], &[3, 20, 37, 54]);
+    assert_eq!(&tokens[508..], &[8639, 8656, 8673, 8690]);
+}

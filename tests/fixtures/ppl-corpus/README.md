@@ -1,9 +1,9 @@
 # `tests/fixtures/ppl-corpus/` — perplexity smoke corpus
 
-ADR-014 P10 iter-2a: peer-side `llama-perplexity` subprocess wrapper +
-smoke-tier fixture for the harness plumbing only. Production parity
-gates run against the **full** ~280 k-token wikitext-2 split (Decision
-16, fetched at iter-3 / P11 close).
+ADR-014 P10: peer-side `llama-perplexity` subprocess wrapper +
+smoke-tier fixture for harness plumbing, plus the iter-3 fetcher for
+the production parity corpus. P11 parity gates run against the
+**full** wikitext-2 raw test split (Decision 16), not the smoke fixture.
 
 ## Files
 
@@ -40,6 +40,39 @@ gates run against the **full** ~280 k-token wikitext-2 split (Decision
   walks the residue class deterministically without trivial repeats
   inside the 512-token window.
 
+### `wikitext2-full.tokens`
+
+- **Format:** same as the smoke fixture: raw little-endian `u32`
+  stream, no header, no delimiters.
+- **Source:** Stephen Merity/Salesforce `wikitext-2-raw-v1.zip`
+  artifact, downloaded by `scripts/fetch_wikitext2.sh` from the
+  llama.cpp CI HuggingFace mirror:
+  `https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip`.
+  The script locks the zip SHA-256 to
+  `ef7edb566e3e2b2d31b29c1fdb0c89a4cc683597484c3dc2517919c615435a11`
+  and extracts `wikitext-2-raw/wiki.test.raw`.
+- **Generation:** `llama-tokenize --model <gguf> --file <wiki.test.raw>
+  --no-bos --ids --log-disable`, parsed to little-endian `u32`.
+  The installed llama.cpp tokenizer uses `--file`; it does not expose
+  a `--prompt-file` alias.
+- **Validation:** token count must be at least 280,000 and binary
+  file size must be at least 1 MiB. SHA mismatch, tokenizer failure,
+  or undersized output aborts the script.
+- **Git:** `*.tokens` is ignored in this directory, with
+  `!wikitext2-smoke.tokens` preserving the checked-in smoke fixture.
+  Do not commit `wikitext2-full.tokens`.
+
+One-line fetch example:
+
+```bash
+HF2Q_QWEN_VOCAB_GGUF=/path/to/qwen-tokenizer.gguf bash scripts/fetch_wikitext2.sh
+```
+
+The default cache is
+`${XDG_CACHE_HOME:-$HOME/.cache}/hf2q/wikitext2`; override with
+`--cache-dir <path>`. Use `--force` to redownload and rebuild after
+inspecting a failed or stale cache entry.
+
 ## Role
 
 This fixture exists **only** to exercise the iter-2a harness plumbing:
@@ -56,13 +89,15 @@ This fixture exists **only** to exercise the iter-2a harness plumbing:
 It is **not** a parity-grade corpus. The 512-token window is too
 short for statistically meaningful PPL — Decision 16 (lines ~602 of
 `docs/ADR-014-streaming-convert-pipeline.md`) locks the gate corpus
-to wikitext-2 full test split (~280 k tokens), which iter-3 fetches
-via a checked-in fetch script (deferred to iter-3 + P11 close).
+to the full wikitext-2 raw test split. The peer-parity loader now
+prefers `wikitext2-full.tokens` when present and valid, and logs a
+fallback to `wikitext2-smoke.tokens` otherwise.
 
 ## What lands when
 
 | Iter | Lands |
 |------|-------|
-| **iter-2a** (this) | Peer-side `run_llama_perplexity` wrapper + this 512-token smoke fixture + 3 PPL columns in `emit_markdown_table` + 4 always-on smoke tests. The 8 `#[ignore]`-gated cells now record `peer_ppl` for real; hf2q-side stays `Verdict::NotMeasured`. |
-| **iter-2b** (next) | hf2q-side `measure_ppl_qwen35_dense_gguf(model, tokens) -> f32` driver wrapping `Qwen35Dense::from_gguf` + chunked forward-pass + `compute_perplexity`. Flips the 8 cells to record hf2q PPL too. |
-| **iter-3** (after P11) | Full wikitext-2 ~280 k token split fetched via fetch script + the 8 cells run end-to-end on real models per Decision 15. |
+| **iter-2a** | Peer-side `run_llama_perplexity` wrapper + this 512-token smoke fixture + 3 PPL columns in `emit_markdown_table` + 4 always-on smoke tests. |
+| **iter-2b** | hf2q-side `measure_ppl_qwen35_dense_gguf(model, tokens) -> f32` driver wrapping `Qwen35Dense::from_gguf` + chunked forward-pass + `compute_perplexity`. |
+| **iter-2c** | Renamed the driver to variant-agnostic `measure_ppl_qwen35`; all 8 cells route through it. |
+| **iter-3** (this) | `scripts/fetch_wikitext2.sh` builds `wikitext2-full.tokens`; `.gitignore` keeps generated corpora out of git; the corpus loader auto-picks full when present and falls back to smoke otherwise. |
