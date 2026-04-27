@@ -4448,6 +4448,22 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
 - **Chesterton fence findings.**  GPU pooling for Phase 2b was ALREADY fully implemented in `apply_bert_full_forward_gpu` (`bert_gpu.rs:1929-2071`) and `apply_nomic_bert_full_forward_gpu` (`nomic_bert/forward.rs:854-1033`).  Both functions read `cfg.pooling_type` from GGUF metadata and dispatch `bert_pool_gpu` with the appropriate `BertPoolKind`.  `EosLastToken` (Qwen3-Embedding) = `PoolingType::Last` = `BertPoolKind::Last` — dispatched by the existing GPU path without any code change.  The nomic-bert path already passes `valid_token_count` (not padded `seq_len`) to the pool kernel, so Last pooling picks the correct non-padding row.  T1.9's contribution is (a) documentation of the dispatch rules in a user-visible module, (b) CPU reference functions for testing and future kernel validation, and (c) this ADR entry.
 - **MTEB harness status.** The MTEB AC (`[ ]` at line 3162) remains open — no Python harness exists.  The pooling compute is correct; the gap is an ops-level harness that runs the MTEB evaluation suite against the `/v1/embeddings` endpoint.
 
+#### Phase 2b wave-3 W-A1 — BERT-lane valid_token_count pool fix (2026-04-27, wave-3 W-A1)
+
+- **Bug.** `apply_bert_full_forward_gpu` (`bert_gpu.rs`) passed `seq_len` to `bert_pool_gpu` at the pool call site (~:2065).  For padded inputs this caused two correctness errors:
+  - **Last pooling:** row index = `seq_len - 1`, but the last real token is at row `valid_token_count - 1`.  Any padding row returned instead of the final real-token hidden state.
+  - **Mean pooling:** divisor = `seq_len` (too large).  Padding rows are zeroed by the attention mask so the sum is correct, but the mean is diluted by `valid_token_count / seq_len`.  At the K=32 seq_len floor with a typical 4-token input the mean is off by 4/32 = 87.5%.
+  - **Cls pooling:** unaffected (always reads row 0).
+- **Fix.** One-line change: `seq_len` → `valid_token_count` at the `bert_pool_gpu` call site in `apply_bert_full_forward_gpu`.  A 12-line explanatory comment was added documenting each pooling kind's sensitivity, mirroring the comment at `nomic_bert/forward.rs:997-1011` (iter-90 fix).
+- **Chesterton fence.** `valid_token_count` is already a parameter of `apply_bert_full_forward_gpu` (line 1925).  The attention mask is built correctly using `valid_token_count` at line 2023.  Only the pool call site had not been updated — it predated the iter-90 nomic_bert parity fix.
+- **Tests added (3 new GPU unit tests, `bert_gpu.rs::tests`):**
+  - `pool_last_padded_returns_valid_last_row_not_seq_len_minus_one` — seq_len=8 / valid=5; asserts output = row 4, not row 7.
+  - `pool_mean_padded_divides_by_valid_not_seq_len` — seq_len=8 / valid=5; padding rows explicitly zero; asserts mean = sum/5, not sum/8.
+  - `pool_cls_padded_still_returns_row_zero` — same shape; asserts Cls is unaffected by `valid_token_count`.
+  - All three pass.  All six existing `bert_pool_gpu` unit tests continue to pass.
+- **Commit.** `9272949` — `fix(adr-005 wave-3 W-A1 BERT-lane): pass valid_token_count to bert_pool_gpu (parity with nomic_bert iter-90 fix)`.
+- **LOC delta.** +192 / −3 (fix = 3 lines changed; 189 lines are test additions and inline comments).
+
 - **2026-04-25 loop iter 90 — Flash Attention port for nomic-bert (head_dim=64). New mlx-native v0.4.5 dispatcher `flash_attn_prefill_bf16_d64` with `FlashAttnPrefillLayout::SeqMajor` consumes the BERT-family seq-major Q/K/V layout directly (no host-side transpose). Replaces the 8-stage `bert_attention_with_mask_gpu` chain with `cast_F32→BF16(Q,K,V) + flash_attn + cast_BF16→F32(O)` = 5 dispatches per layer (was 8). Cooled 3-run avg: HTTP `/v1/embeddings` mean **5.69 ms**, min **5.01 ms** vs llama.cpp `prompt_eval` 4.25 ms — ratio **1.34×** (was 1.45×). Cosine parity holds: bge 0.999985, mxbai 0.999988, nomic 0.999960.**
   - **What landed (mlx-native v0.4.5).**
     - `src/shaders/flash_attn_prefill.metal` — added 4 D=64 instantiations (`bf16/f16` × `additive/boolmask`) using the same BQ=32 / BK=16 / WM=4 / WN=1 geometry as D=256. Threadgroup memory at bf16 ≈ 7.7 KB (vs 32 KB cap), well under budget. Static asserts pass: `BQ ≥ kNWarps×kFragSize = 32`, `TQ = 1`, `TD = 64/8 = 8`, `TK = 16/8 = 2`.
