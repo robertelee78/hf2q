@@ -1405,18 +1405,16 @@ impl MlxModelWeights {
 
         // iter-21 Track B: lazy allocation of leg_hb_encoded and leg_f_kvs on first decode.
         // forward_prefill may have already allocated these; if not, do it here.
-        // We can only check the env var once (OnceLock), so read it directly to match.
+        // We read from the INVESTIGATION_ENV LazyLock (parsed once at process start).
         {
             // ADR-007 post-close correction 2026-04-24: TQ-8-bit is the default when
             // env is unset. Explicit HF2Q_TQ_CODEBOOK_BITS=4 selects the legacy 4-bit
             // native flash_attn_vec_tq path (127-byte sourdough ceiling, not shippable
             // as default). Explicit =5/=6 select intermediate HB-SDPA. This MUST match
             // the primary gate at tq_codebook_bits below.
-            let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
-                Ok("4") => 0,  // legacy 4-bit (non-HB) path
-                Ok("5") => 5, Ok("6") => 6, Ok("8") => 8,
-                _ => 8,        // DEFAULT: 8-bit native HB SDPA
-            };
+            // ADR-005 wave-1 T1.2: read from INVESTIGATION_ENV LazyLock (parsed once at
+            // process start) instead of calling std::env::var per forward_decode call.
+            let cb_bits: u32 = INVESTIGATION_ENV.tq_codebook_bits;
             if cb_bits >= 5 && self.leg_hb_encoded.is_none() {
                 let (exec, _reg) = gpu.split();
                 let dev = exec.device();
@@ -1630,8 +1628,9 @@ impl MlxModelWeights {
             let dump_detail_layer: Option<usize> = INVESTIGATION_ENV.dump_layer_detail;
             // iter-18 S2C: first-divergence dump for layer 0 (sliding, hd=256), decode positions 1..=10.
             // Gate: HF2Q_DUMP_SLIDING_LAYER_0=1 env var. Run name: HF2Q_DUMP_RUN_NAME (dense|tq).
-            let dump_sliding_l0: bool = std::env::var("HF2Q_DUMP_SLIDING_LAYER_0").ok().as_deref() == Some("1");
-            let dump_run_name: Option<String> = std::env::var("HF2Q_DUMP_RUN_NAME").ok();
+            // ADR-005 wave-1 T1.2: read from INVESTIGATION_ENV LazyLock (parsed once at process start).
+            let dump_sliding_l0: bool = INVESTIGATION_ENV.dump_sliding_layer_0;
+            let dump_run_name: Option<&str> = INVESTIGATION_ENV.dump_run_name.as_deref();
 
             for layer_idx in 0..num_layers {
                 let hd = self.layers[layer_idx].head_dim;
@@ -1940,7 +1939,8 @@ impl MlxModelWeights {
                 //   4. Probing via scratch buffer (16 samples/block) for empirical verification.
                 //
                 // Reports both SLIDING (hd=256) and GLOBAL (hd=512) — spec AC-1 requires both.
-                if std::env::var("HF2Q_DEBUG_TQ_RMS").ok().as_deref() == Some("1") {
+                // ADR-005 wave-1 T1.2: read from INVESTIGATION_ENV LazyLock.
+                if INVESTIGATION_ENV.debug_tq_rms {
                     // iter-19 A1: Fixed RMS probe (catalog #21 — write ALL EPT samples per lane).
                     // Previous iter-18 bug: scratch=[nkv, norms_per_pos, 16], only 8 values written
                     // for D=256 (EPT=8), rest zeros; host divided by 16 → RMS ≈ sqrt(0.5) * true_RMS.
@@ -2220,19 +2220,24 @@ impl MlxModelWeights {
                 // consulted as before. Per-layer = ~30× per token; the saved
                 // enum-field load + match across the layer loop is the bulk of
                 // the W14b 5.6% regression.
+                // ADR-005 wave-1 T1.2: HF2Q_USE_DENSE and HF2Q_LAYER_POLICY read from
+                // INVESTIGATION_ENV LazyLock (parsed once at process start) instead of
+                // calling std::env::var per-token per-layer. Behavior is bit-identical:
+                // `use_dense` mirrors `== Ok("1")`; `layer_policy.as_deref()` mirrors
+                // `as_deref()` on the Result, with None mapping to the former Err(_) arm.
                 let use_dense_sdpa = if self.dense_kvs.is_none() {
                     false
                 } else if self.gate_h_inactive {
-                    // Pre-iter-108a path: env-var-only. Bit-identical to base.
-                    if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
+                    // Pre-iter-108a path: LazyLock-cached env values. Bit-identical to base.
+                    if INVESTIGATION_ENV.use_dense {
                         true
                     } else {
-                        match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
-                            Ok("dense_all") => true,
-                            Ok("tq_all") | Err(_) => false,
-                            Ok("tq_slide_dense_global") => !kv_is_sliding,
-                            Ok("dense_slide_tq_global") => kv_is_sliding,
-                            Ok(other) => {
+                        match INVESTIGATION_ENV.layer_policy.as_deref() {
+                            Some("dense_all") => true,
+                            Some("tq_all") | None => false,
+                            Some("tq_slide_dense_global") => !kv_is_sliding,
+                            Some("dense_slide_tq_global") => kv_is_sliding,
+                            Some(other) => {
                                 static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                                     eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
@@ -2246,15 +2251,15 @@ impl MlxModelWeights {
                         DecodeRegime::ForceDense => true,
                         DecodeRegime::ForceTq => false,
                         DecodeRegime::Default => {
-                            if std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1") {
+                            if INVESTIGATION_ENV.use_dense {
                                 true
                             } else {
-                                match std::env::var("HF2Q_LAYER_POLICY").as_deref() {
-                                    Ok("dense_all") => true,
-                                    Ok("tq_all") | Err(_) => false,
-                                    Ok("tq_slide_dense_global") => !kv_is_sliding,
-                                    Ok("dense_slide_tq_global") => kv_is_sliding,
-                                    Ok(other) => {
+                                match INVESTIGATION_ENV.layer_policy.as_deref() {
+                                    Some("dense_all") => true,
+                                    Some("tq_all") | None => false,
+                                    Some("tq_slide_dense_global") => !kv_is_sliding,
+                                    Some("dense_slide_tq_global") => kv_is_sliding,
+                                    Some(other) => {
                                         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                                         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                                             eprintln!("[HF2Q_LAYER_POLICY] unknown value {:?}; defaulting to tq_all", other);
@@ -2778,14 +2783,14 @@ impl MlxModelWeights {
                 // kv_seq_len=23 = first decode step (prompt len 22 + 1), so steps 1..10 = seq_len 23..32.
                 let s2c_step = if kv_seq_len >= 23 && kv_seq_len <= 32 { kv_seq_len - 22 } else { 0 };
                 if dump_sliding_l0 && layer_idx == 0 && kv_is_sliding && s2c_step >= 1 {
-                    if let Some(ref run_name) = dump_run_name {
+                    if let Some(run_name) = dump_run_name {
                         s.finish()
                             .map_err(|e| anyhow::anyhow!("S2C dump finish step={s2c_step}: {e}"))?;
                         let dump_base = "/tmp/cfa-iter18/dumps";
                         std::fs::create_dir_all(dump_base)
                             .map_err(|e| anyhow::anyhow!("S2C mkdir: {e}"))?;
                         let p = s2c_step;
-                        let run = run_name.as_str();
+                        let run = run_name;
                         // Q (post-RoPE): [nh, hd] f32
                         {
                             let q_raw: &[f32] = self.activations.attn_q_normed.as_slice()

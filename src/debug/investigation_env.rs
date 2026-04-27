@@ -173,6 +173,66 @@ pub struct InvestigationEnv {
     pub dump_prompt_tokens: bool,
 
     // ========================================================================
+    // Category 4 — TurboQuant codebook selection (ADR-007 / iter-21 Track B).
+    // Read-once; hot-path alloc gate and SDPA dispatch use the cached value.
+    // ========================================================================
+    /// `HF2Q_TQ_CODEBOOK_BITS` — KV codebook width selector.
+    ///   - unset / "8": 8-bit native HB SDPA (DEFAULT, shippable).
+    ///   - "4": legacy 4-bit `flash_attn_vec_tq` path (127-byte sourdough
+    ///     ceiling; not shippable as default; opt-in only).
+    ///   - "5" / "6": intermediate higher-bit HB SDPA (Lloyd-Max native).
+    ///
+    /// Stored as `u32` (0 = 4-bit legacy, 5/6/8 = the literal bit width).
+    /// Original parse:
+    ///   `match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() { Ok("4")=>0, Ok("5")=>5, ... _ => 8 }`.
+    pub tq_codebook_bits: u32,
+
+    // ========================================================================
+    // Category 4 — iter-18 S2C sliding-layer-0 first-divergence dump.
+    // Gate + run-name for diagnostic decode dumps at layer 0 (hd=256,
+    // sliding), positions 1..=10. Silent; no effect on forward-pass math.
+    // ========================================================================
+    /// `HF2Q_DUMP_SLIDING_LAYER_0=1` — enable first-divergence dump at
+    /// layer 0 (sliding, hd=256) for decode positions 1..=10.
+    /// Original parse: `std::env::var(...).ok().as_deref() == Some("1")`.
+    pub dump_sliding_layer_0: bool,
+
+    /// `HF2Q_DUMP_RUN_NAME` — run identifier string written into dump
+    /// filenames so dense vs TQ passes can be distinguished.
+    /// Original parse: `std::env::var(...).ok()` → `Option<String>`.
+    pub dump_run_name: Option<String>,
+
+    // ========================================================================
+    // Category 4 — iter-18 S2A post-scale RMS probe (DEBUG_TQ_RMS).
+    // Commits the encode command buffer and reads back block norms for
+    // empirical RMS verification. Read-only; never alters forward math.
+    // ========================================================================
+    /// `HF2Q_DEBUG_TQ_RMS=1` — enable post-scale RMS probe for TQ encode.
+    /// Commits the encode CB and reads back k_norms/v_norms for empirical
+    /// verification of the [0.8, 1.2] RMS band (iter-19 A2 fix).
+    /// Original parse: `std::env::var(...).ok().as_deref() == Some("1")`.
+    pub debug_tq_rms: bool,
+
+    // ========================================================================
+    // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
+    // These two vars select per-layer dense vs TQ SDPA dispatch.
+    // Read per-token per-layer in the decode loop when gate_h_inactive and
+    // when DecodeRegime::Default is active. LazyLock is the correct home.
+    // ========================================================================
+    /// `HF2Q_USE_DENSE=1` — force all layers to dense SDPA (ADR-009 Track 3).
+    /// Original parse: `std::env::var("HF2Q_USE_DENSE").as_deref() == Ok("1")`.
+    pub use_dense: bool,
+
+    /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.
+    ///   - "dense_all": all layers dense.
+    ///   - "tq_all" / unset: all layers TQ (default).
+    ///   - "tq_slide_dense_global": TQ for sliding, dense for global.
+    ///   - "dense_slide_tq_global": dense for sliding, TQ for global.
+    ///   - other: logs warning, defaults to `tq_all`.
+    /// Original parse: `std::env::var("HF2Q_LAYER_POLICY").as_deref()` match.
+    pub layer_policy: Option<String>,
+
+    // ========================================================================
     // Category 4 — Gate H release-check companion plumbing (ADR-007 §853-866).
     // Three env vars that the audit binaries (iter23/24/25_audit.rs) set on
     // the hf2q child process; iter-108a wires them through the production
@@ -316,6 +376,32 @@ impl InvestigationEnv {
             dump_tq_layers_list: env_usize_list("HF2Q_DUMP_LAYERS_LIST"),
             dump_rendered_prompt: env::var("HF2Q_DUMP_RENDERED_PROMPT").ok(),
             dump_prompt_tokens: env::var("HF2Q_DUMP_PROMPT_TOKENS").is_ok(),
+
+            // TurboQuant codebook width (ADR-007 / iter-21 Track B).
+            tq_codebook_bits: match env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+                Ok("4") => 0u32,
+                Ok("5") => 5u32,
+                Ok("6") => 6u32,
+                Ok("8") | Err(_) => 8u32,
+                Ok(_other) => 8u32,
+            },
+
+            // iter-18 S2C sliding-layer-0 dump gate + run name.
+            dump_sliding_layer_0: matches!(
+                env::var("HF2Q_DUMP_SLIDING_LAYER_0").as_deref(),
+                Ok("1")
+            ),
+            dump_run_name: env::var("HF2Q_DUMP_RUN_NAME").ok(),
+
+            // iter-18 S2A post-scale RMS probe.
+            debug_tq_rms: matches!(
+                env::var("HF2Q_DEBUG_TQ_RMS").as_deref(),
+                Ok("1")
+            ),
+
+            // SDPA regime selectors.
+            use_dense: matches!(env::var("HF2Q_USE_DENSE").as_deref(), Ok("1")),
+            layer_policy: env::var("HF2Q_LAYER_POLICY").ok(),
 
             // Gate H release-check plumbing (ADR-007 §853-866; iter-108a).
             emit_nll: env_eq_one("HF2Q_EMIT_NLL"),
@@ -491,6 +577,28 @@ impl InvestigationEnv {
         }
         if self.dump_prompt_tokens {
             diagnostics.push("HF2Q_DUMP_PROMPT_TOKENS".into());
+        }
+        if self.tq_codebook_bits != 8 {
+            diagnostics.push(format!(
+                "HF2Q_TQ_CODEBOOK_BITS={} ({})",
+                if self.tq_codebook_bits == 0 { 4 } else { self.tq_codebook_bits },
+                if self.tq_codebook_bits == 0 { "legacy 4-bit TQ" } else { "HB SDPA" }
+            ));
+        }
+        if self.dump_sliding_layer_0 {
+            diagnostics.push("HF2Q_DUMP_SLIDING_LAYER_0=1".into());
+        }
+        if let Some(ref name) = self.dump_run_name {
+            diagnostics.push(format!("HF2Q_DUMP_RUN_NAME={name}"));
+        }
+        if self.debug_tq_rms {
+            diagnostics.push("HF2Q_DEBUG_TQ_RMS=1".into());
+        }
+        if self.use_dense {
+            diagnostics.push("HF2Q_USE_DENSE=1".into());
+        }
+        if let Some(ref policy) = self.layer_policy {
+            diagnostics.push(format!("HF2Q_LAYER_POLICY={policy}"));
         }
         if self.mlx_timing {
             diagnostics.push("HF2Q_MLX_TIMING".into());
