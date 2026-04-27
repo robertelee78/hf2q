@@ -2065,6 +2065,576 @@ fn finalize_streaming_tool_state(
     FinalizeStreamingAction::Continue
 }
 
+/// Wave 3 W-B3 — T2.3 incremental tool-call argument streaming.
+///
+/// Per OpenAI Chat Completions streaming spec, `delta.tool_calls[N].function.arguments`
+/// is a *string accumulator* on the client side — clients append each arg-delta to
+/// the previous, then `JSON.parse(accumulated)` once the chunk with `finish_reason ==
+/// "tool_calls"` arrives. Pre-W-B3, the streaming engine accumulated the entire
+/// per-family body (Gemma `<|tool_call>...<tool_call|>`, Qwen `<tool_call>...</tool_call>`)
+/// into `tool_call_body`, then on `ToolCallClose` parsed it and emitted a SINGLE
+/// arguments delta carrying the full JSON. Spec-valid, but a UI cannot show
+/// progressive tool-call args while the model is still emitting them.
+///
+/// The emitter wires in three places inside the `route_content` closure:
+///
+///   - **`ToolCallOpen`**: construct a fresh `ToolCallStreamEmitter` for this call.
+///   - **`ToolCallText(t)`**: after appending `t` to `tool_call_body`, call
+///     `emitter.advance(body, events)` which:
+///       1. Emits the **first chunk** as soon as the function name is parseable
+///          from the body prefix (`{index, id, type:"function", function:{name}}`).
+///       2. After the first chunk fires, emits the JSON args opening `{` as the
+///          first `arguments` delta — clients begin accumulating the JSON string.
+///       3. For each newly-closed kv pair (Gemma: top-level `,` or `}`; Qwen:
+///          `</parameter>` block boundary), emits `,"key":<jsonval>` as a fresh
+///          `arguments` delta (no leading `,` for the first kv).
+///   - **`ToolCallClose`**: call `emitter.finalize(body, events, ...)` which:
+///       - On the happy path (incremental emission started + body re-parses),
+///         emits any tail kvs that the streaming scanner missed (last one before
+///         the closer) and the closing `}`. `tc_index` increments here.
+///       - On the fallback path (incremental emission never started — body parsed
+///         OK but arrived in one fragment short of name extraction; OR the family
+///         has no streaming converter; OR partial extraction failed mid-stream),
+///         delegates to `emit_streaming_tool_call_close` which preserves the
+///         pre-W-B3 close-buffered shape AND the policy-enforced loud-error
+///         branches.
+///
+/// # Tail-parser design
+///
+/// The streaming scanner walks `body[scan_cursor..]` and extracts kv pairs at
+/// JSON-syntactically-meaningful boundaries — closed string values, terminated
+/// bare numerics, closed `<parameter>` blocks. It NEVER emits mid-string or
+/// mid-key. The grammar runtime (eager from W-η for Constrained / lazy from
+/// W-B2 for AutoLazyGrammar) physically guarantees the body bytes are
+/// well-formed at every prefix the scanner inspects, so partial-prefix parse
+/// failures inside the scanner are a grammar-engine bug — surfaced by leaving
+/// `kvs_emitted` short, which forces the close-time `finalize` to fall through
+/// to the close-buffered path and trigger the existing loud-error branch.
+///
+/// # Why NOT add a "speculative close + diff" approach
+///
+/// Considered: append the family's expected closer to `body`, re-parse with
+/// `parse_tool_call_body`, diff against the last successful args-JSON, emit
+/// the new tail. Rejected because:
+///   - String values would emit STALE partials. `body = "call:f{loc:<|\"|>San Fra"`
+///     speculatively closes to `{"loc":"San Fra"}`; clients would see `"San Fra"`
+///     which then disagrees with the final `"San Francisco"`. OpenAI clients
+///     concatenate without dedup — they would receive `"San FraSan Francisco"`.
+///   - The closed-kv scanner is structurally simpler AND emits only at boundaries
+///     that JSON treats as values committed (the previous kv + comma terminator).
+///
+/// # Backward compatibility
+///
+/// Single-chunk emission still works: clients that don't care about progressive
+/// UI updates simply concatenate any number of `arguments` deltas and JSON-parse
+/// the result. The spec does not bound how many deltas a server emits per call.
+/// The first-chunk-has-name + finish_reason="tool_calls"-on-terminal contract
+/// is preserved on both shapes.
+struct ToolCallStreamEmitter {
+    /// `gemma4` / `qwen35` / unknown. Unknown families skip the streaming path
+    /// (the close-time fallback handles them).
+    family: Option<&'static str>,
+    /// `delta.tool_calls[N].index` — pre-incremented from the per-stream counter
+    /// at construction. Stable across all chunks for THIS call.
+    index: usize,
+    /// Synthesized opaque identifier emitted in the first chunk. Cached so
+    /// `finalize` can reuse it on the close-buffered fallback if the streaming
+    /// path never fired (we never emitted the first chunk under that branch
+    /// either, so the cached id stays unused — kept for symmetry).
+    id: String,
+    /// Whether the first chunk (id+type+name) has been emitted. Latched true.
+    name_emitted: bool,
+    /// Whether the args opening `{` has been emitted as the first arguments
+    /// delta. Latched true after `name_emitted` flips and the first kv-emit
+    /// or `finalize` runs (clients need the `{` before any kv content).
+    args_open_emitted: bool,
+    /// Number of top-level kv pairs already emitted to the client. Drives the
+    /// leading-comma decision (no comma for the first kv).
+    kvs_emitted: usize,
+    /// Byte cursor into `tool_call_body` — bytes < cursor have been scanned
+    /// for kv-emission. Bytes >= cursor are unscanned (may contain a
+    /// completed-but-not-yet-emitted kv OR a partial kv in progress).
+    scan_cursor: usize,
+}
+
+impl ToolCallStreamEmitter {
+    /// Construct an emitter for a tool-call span starting at `tc_index`. The
+    /// caller is responsible for passing the SAME `tc_index` to `finalize`'s
+    /// fallback path so the close-buffered shape stays aligned when the
+    /// streaming converter declines.
+    fn new(family: Option<&'static str>, tc_index: usize) -> Self {
+        let id = format!(
+            "call_hf2q_{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ (tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
+        );
+        Self {
+            family,
+            index: tc_index,
+            id,
+            name_emitted: false,
+            args_open_emitted: false,
+            kvs_emitted: 0,
+            scan_cursor: 0,
+        }
+    }
+
+    /// Advance the emitter against the current `body` after a `ToolCallText`
+    /// fragment has been appended. Emits any newly-extractable name / kv
+    /// fragments. Idempotent on repeated calls with the same body — safe to
+    /// invoke even when no new bytes arrived.
+    fn advance(
+        &mut self,
+        body: &str,
+        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Result<(), ()> {
+        use super::sse::GenerationEvent;
+
+        // Step 1: emit the name + opening chunk if not yet done.
+        if !self.name_emitted {
+            let name = match self.family {
+                Some("gemma4") => extract_gemma4_name_prefix(body),
+                Some("qwen35") => extract_qwen35_name_prefix(body),
+                _ => None,
+            };
+            let Some((name, header_end)) = name else {
+                return Ok(());
+            };
+            // First chunk: index + id + type + name. arguments omitted —
+            // clients see `function.name` complete on chunk 1 per spec.
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: self.index,
+                    id: Some(self.id.clone()),
+                    call_type: Some("function".into()),
+                    name: Some(name),
+                    arguments: None,
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            self.name_emitted = true;
+            self.scan_cursor = header_end;
+        }
+
+        // Step 2: emit the opening `{` of the args object (once).
+        if !self.args_open_emitted {
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: self.index,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some("{".into()),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            self.args_open_emitted = true;
+        }
+
+        // Step 3: scan body[scan_cursor..] for newly-closed kv pairs.
+        match self.family {
+            Some("gemma4") => self.scan_emit_gemma4_kvs(body, events)?,
+            Some("qwen35") => self.scan_emit_qwen35_kvs(body, events)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Scan-and-emit closed Gemma 4 kvs from `body[scan_cursor..]`. A kv is
+    /// "closed" when we observe its terminator at top level — `,` for
+    /// non-final kvs, `}` for the final one. We emit only on `,` boundaries
+    /// during streaming; the trailing `}` is finalize's job (the last kv
+    /// before `}` may not yet be in the body, so we can't speculate).
+    fn scan_emit_gemma4_kvs(
+        &mut self,
+        body: &str,
+        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Result<(), ()> {
+        use super::sse::GenerationEvent;
+        // Walk from scan_cursor, tracking `<|"|>` string state. On a top-level
+        // `,` after `scan_cursor`, parse the kv span [scan_cursor..comma] and
+        // emit. Advance scan_cursor past the comma.
+        let bytes = body.as_bytes();
+        let mut in_str = false;
+        let mut i = self.scan_cursor;
+        let kv_start = self.scan_cursor;
+        let mut last_kv_start = kv_start;
+        while i < bytes.len() {
+            if !in_str && bytes[i..].starts_with(b"<|\"|>") {
+                in_str = true;
+                i += 5;
+                continue;
+            }
+            if in_str && bytes[i..].starts_with(b"<|\"|>") {
+                in_str = false;
+                i += 5;
+                continue;
+            }
+            if !in_str && bytes[i] == b',' {
+                let kv = &body[last_kv_start..i];
+                if let Some(json) = gemma4_kv_to_json(kv) {
+                    let prefix = if self.kvs_emitted == 0 { "" } else { "," };
+                    let frag = format!("{prefix}{json}");
+                    if events
+                        .blocking_send(GenerationEvent::ToolCallDelta {
+                            index: self.index,
+                            id: None,
+                            call_type: None,
+                            name: None,
+                            arguments: Some(frag),
+                        })
+                        .is_err()
+                    {
+                        return Err(());
+                    }
+                    self.kvs_emitted += 1;
+                    last_kv_start = i + 1;
+                    self.scan_cursor = i + 1;
+                }
+                i += 1;
+                continue;
+            }
+            // `}` at top level marks the args object's close. Stop scanning —
+            // finalize will emit the trailing kv (if any) + `}`. Don't
+            // speculatively emit on `}` because the body may still gain bytes
+            // (sticky tool_close marker streamed separately).
+            if !in_str && bytes[i] == b'}' {
+                break;
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// Scan-and-emit closed Qwen 3.5/3.6 `<parameter=KEY>VAL</parameter>`
+    /// blocks from `body[scan_cursor..]`. A block is "closed" when we observe
+    /// `</parameter>` after its opening tag. Emits one delta per closed block.
+    fn scan_emit_qwen35_kvs(
+        &mut self,
+        body: &str,
+        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Result<(), ()> {
+        use super::sse::GenerationEvent;
+        loop {
+            // Locate the next `<parameter=` in body[scan_cursor..].
+            let rest = &body[self.scan_cursor..];
+            let Some(rel_open) = rest.find("<parameter=") else { break };
+            let p_open = self.scan_cursor + rel_open;
+            let key_start = p_open + "<parameter=".len();
+            let Some(rel_gt) = body[key_start..].find('>') else { break };
+            let key_end = key_start + rel_gt;
+            let val_start = key_end + 1;
+            let Some(rel_close) = body[val_start..].find("</parameter>") else {
+                break;
+            };
+            let val_end = val_start + rel_close;
+            let after_close = val_end + "</parameter>".len();
+            let key = body[key_start..key_end].trim();
+            let val_raw = body[val_start..val_end].trim();
+            if key.is_empty() {
+                // Malformed — leave scan_cursor where it is so finalize can
+                // exercise the close-buffered loud-error branch under
+                // policy.enforces_body_grammar(). Stop streaming this block.
+                break;
+            }
+            let json_val: serde_json::Value = match serde_json::from_str(val_raw) {
+                Ok(v) => v,
+                Err(_) => serde_json::Value::String(val_raw.to_string()),
+            };
+            let key_json = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
+            let val_json = serde_json::to_string(&json_val)
+                .unwrap_or_else(|_| "null".to_string());
+            let prefix = if self.kvs_emitted == 0 { "" } else { "," };
+            let frag = format!("{prefix}{key_json}:{val_json}");
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: self.index,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some(frag),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            self.kvs_emitted += 1;
+            self.scan_cursor = after_close;
+        }
+        Ok(())
+    }
+
+    /// Emit the close-time tail. Two routes:
+    ///
+    ///   - **Streaming path was active** (`name_emitted == true`): re-parse
+    ///     the full body to recover the last (un-streamed) kv plus the args
+    ///     close. Emit the residual JSON tail and the closing `}` as one
+    ///     final arguments delta. Increment `tc_index` and set `saw_tc`.
+    ///     Returns `Ok(())`.
+    ///
+    ///   - **Streaming path never fired** (`name_emitted == false`): the
+    ///     emitter declined the body (unknown family, OR name didn't appear
+    ///     in any prefix). Delegate to `emit_streaming_tool_call_close` so
+    ///     the close-buffered shape AND the policy-enforced loud-error
+    ///     branches stay byte-for-byte identical to pre-W-B3 behaviour.
+    fn finalize(
+        &mut self,
+        body: String,
+        registration: Option<&super::registry::ModelRegistration>,
+        policy: ToolCallPolicy,
+        tc_index: &mut usize,
+        saw_tc: &mut bool,
+        events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    ) -> Result<(), ()> {
+        use super::sse::GenerationEvent;
+
+        if !self.name_emitted {
+            // Fallback: streaming path never fired. Use the legacy close-
+            // buffered emit so policy-enforced loud-error branches and the
+            // single-chunk shape both stay intact.
+            let parsed = registration
+                .and_then(|r| super::registry::parse_tool_call_body(r, &body));
+            return emit_streaming_tool_call_close(
+                parsed, body, policy, tc_index, saw_tc, events,
+            );
+        }
+
+        // Streaming path was active. Re-parse the now-complete body and emit
+        // the tail (last kv we couldn't stream because we couldn't
+        // distinguish "final kv" from "next kv arriving later") + the
+        // closing `}`.
+        let parsed = registration
+            .and_then(|r| super::registry::parse_tool_call_body(r, &body));
+        let Some(pc) = parsed else {
+            // Body failed parse despite streaming having extracted the name.
+            // Under policy.enforces_body_grammar(), this means the grammar
+            // engine produced bytes the per-family parser can't reassemble —
+            // an unreachable-fallback regression. Promote to loud Error.
+            // Under Auto (no grammar), preserve content fallback semantics
+            // by closing the streaming JSON args we already emitted with `}`
+            // (so the client's accumulator is at least valid JSON for the
+            // partial it received) and then NOT emitting the residue as a
+            // re-content delta — the partial args we streamed are the
+            // semantically-faithful slice we managed to extract.
+            if policy.enforces_body_grammar() {
+                tracing::error!(
+                    body = %body,
+                    "tool_call_unreachable_fallback_required: body unparseable \
+                     after streaming name extraction; per-family grammar bug"
+                );
+                let _ = events.blocking_send(GenerationEvent::Error(
+                    "tool_call_unreachable_fallback_required".into(),
+                ));
+                return Err(());
+            }
+            // Auto-no-grammar: close the streaming JSON args we already
+            // committed to so client accumulators land on valid JSON.
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: self.index,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some("}".into()),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            *tc_index += 1;
+            *saw_tc = true;
+            return Ok(());
+        };
+
+        // Reconstruct the exact JSON args string emitted so far ( = `{` plus
+        // each kv-comma-separated ) and compute the residual tail by
+        // diffing against `pc.arguments_json`. This is robust to:
+        //   - emitter scanned 0 kvs (whole args arrived in the close fragment)
+        //   - emitter scanned all-but-last kv (typical streaming case)
+        //   - emitter scanned all kvs (rare: comma after final kv would have
+        //     to appear in body, which Gemma's template doesn't emit; Qwen
+        //     trailing `</parameter>` followed by `</function>` does mean
+        //     scan_cursor is past the last kv before finalize)
+        let so_far = self.reconstruct_emitted_args_prefix(&pc.arguments_json);
+        let tail = pc.arguments_json[so_far.len()..].to_string();
+        if !tail.is_empty() {
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: self.index,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some(tail),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+        }
+        *tc_index += 1;
+        *saw_tc = true;
+        Ok(())
+    }
+
+    /// Reconstruct the JSON-args string the streaming emitter has *already*
+    /// sent to the client, so `finalize` can compute the residual tail by
+    /// suffix-diff against the full `arguments_json` returned by
+    /// `parse_tool_call_body`.
+    ///
+    /// Strategy: walk `full_args_json` (which is well-formed `{...}`) and
+    /// take the longest prefix that contains exactly `kvs_emitted` top-level
+    /// kvs. The streaming emitter always emits `{`, then for kv #1 just the
+    /// raw kv JSON, then for kv #2..N a leading `,`. Therefore the prefix
+    /// we already emitted ends RIGHT BEFORE the start of kv #(kvs_emitted+1)
+    /// — i.e. before the comma preceding it (or before the `}` if all kvs
+    /// were streamed).
+    fn reconstruct_emitted_args_prefix<'a>(&self, full_args_json: &'a str) -> &'a str {
+        // Walk the JSON object counting kv-pairs at depth 1. We can use a
+        // simple state machine: track `{}` depth and `"` string state, count
+        // commas at depth 1 (each comma = boundary between two kvs).
+        let bytes = full_args_json.as_bytes();
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut commas_at_depth_1 = 0usize;
+        // Number of kvs in the prefix we've sent = self.kvs_emitted.
+        // Number of commas in that prefix = max(0, kvs_emitted - 1) + (1 if
+        // kvs_emitted > 0 we've emitted up to and including kv #N, NOT
+        // beyond it). So we want the longest prefix ending RIGHT BEFORE
+        // `,` #(kvs_emitted) or, if we've emitted 0 kvs, right after the
+        // opening `{`.
+        if self.kvs_emitted == 0 {
+            // Emitted only `{`. Prefix is `{`.
+            // Find the first `{` (well-formed JSON starts with it).
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'{' {
+                    return &full_args_json[..=i];
+                }
+            }
+            return "";
+        }
+        // We need to find the position of the (kvs_emitted)th comma at
+        // depth 1, OR the closing `}` at depth 1 if no further comma exists
+        // — and return the prefix ending just before it.
+        for (i, &b) in bytes.iter().enumerate() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 && commas_at_depth_1 + 1 == self.kvs_emitted {
+                        // No further comma — we've streamed every kv. The
+                        // prefix is everything up to (not including) `}`.
+                        return &full_args_json[..i];
+                    }
+                }
+                b',' => {
+                    if depth == 1 {
+                        commas_at_depth_1 += 1;
+                        if commas_at_depth_1 == self.kvs_emitted {
+                            // The Nth comma at depth 1 separates kv #N from
+                            // kv #(N+1). The prefix we've emitted ends
+                            // RIGHT BEFORE this comma (since kv #(N+1) hasn't
+                            // been streamed; finalize will emit `,kv#(N+1)`
+                            // — so the residue must include the comma).
+                            return &full_args_json[..i];
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Defensive: malformed input — return full string so tail is empty.
+        full_args_json
+    }
+}
+
+/// Extract the function name from a Gemma 4 body prefix `call:NAME{`. Returns
+/// `Some((name, header_end))` where `header_end` is the byte offset of the
+/// `{` (so `body[header_end+1..]` is the kv-list region the streaming
+/// scanner walks). Returns `None` if the `{` hasn't arrived yet.
+fn extract_gemma4_name_prefix(body: &str) -> Option<(String, usize)> {
+    let trimmed_offset = body.len() - body.trim_start().len();
+    let after_ws = &body[trimmed_offset..];
+    let after_call = after_ws.strip_prefix("call:")?;
+    let brace_rel = after_call.find('{')?;
+    let name = after_call[..brace_rel].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let absolute_brace = trimmed_offset + "call:".len() + brace_rel;
+    Some((name, absolute_brace + 1))
+}
+
+/// Extract the function name from a Qwen 3.5/3.6 body prefix
+/// `<function=NAME>`. Returns `Some((name, header_end))` where `header_end`
+/// is the byte offset just past `>` (so the streaming scanner walks
+/// `body[header_end..]` for `<parameter>` blocks). Returns `None` if the
+/// closing `>` hasn't arrived yet.
+fn extract_qwen35_name_prefix(body: &str) -> Option<(String, usize)> {
+    let trimmed_offset = body.len() - body.trim_start().len();
+    let after_ws = &body[trimmed_offset..];
+    let after_open = after_ws.strip_prefix("<function=")?;
+    let gt_rel = after_open.find('>')?;
+    let name = after_open[..gt_rel].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let absolute_gt = trimmed_offset + "<function=".len() + gt_rel;
+    Some((name, absolute_gt + 1))
+}
+
+/// Convert one Gemma 4 kv span `key:<jsonval>` into a JSON `"key":<json>`
+/// fragment. Mirrors the value-coercion logic in `parse_gemma4_tool_call`
+/// at registry.rs:737-768. Returns `None` on malformed kv (caller leaves
+/// scan_cursor untouched so finalize falls into the close-buffered path).
+fn gemma4_kv_to_json(kv: &str) -> Option<String> {
+    let (k, v) = kv.split_once(':')?;
+    let key = k.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let v = v.trim();
+    let json_val = if let Some(stripped) = v
+        .strip_prefix("<|\"|>")
+        .and_then(|s| s.strip_suffix("<|\"|>"))
+    {
+        serde_json::Value::String(stripped.to_string())
+    } else if let Ok(num) = v.parse::<i64>() {
+        serde_json::Value::from(num)
+    } else if let Ok(num) = v.parse::<f64>() {
+        serde_json::Value::from(num)
+    } else if v == "true" {
+        serde_json::Value::Bool(true)
+    } else if v == "false" {
+        serde_json::Value::Bool(false)
+    } else if v == "null" {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(v.to_string())
+    };
+    let key_json = serde_json::to_string(key).ok()?;
+    let val_json = serde_json::to_string(&json_val).ok()?;
+    Some(format!("{key_json}:{val_json}"))
+}
+
 /// Dispatch the close-time tool-call body after `ToolCallClose` fires in the
 /// streaming `route_content` closure.
 ///
@@ -2597,6 +3167,24 @@ fn generate_stream_once(
     // path).
     let mut saw_tool_call: bool = false;
 
+    // Wave 3 W-B3 — T2.3 incremental tool-call argument streaming.
+    //
+    // Per-call streaming-emit state. `Some(...)` between `ToolCallOpen` and
+    // `ToolCallClose`; `None` otherwise. `ToolCallText` fragments call
+    // `emitter.advance(body, events)` to flush newly-extractable name + kv
+    // fragments immediately rather than waiting for `ToolCallClose` to
+    // emit one big arguments delta. `ToolCallClose` calls
+    // `emitter.finalize(...)` which either:
+    //   - emits the closing `}` + any tail kvs (streaming path was active), or
+    //   - delegates to `emit_streaming_tool_call_close` (streaming path
+    //     declined, falling back to pre-W-B3 close-buffered shape).
+    //
+    // Cache replay keeps the close-buffered path — see `route_replay_fragment`.
+    // Incremental emission has zero benefit for cache hits (the full text is
+    // available synchronously) and would force two divergent SSE shapes for
+    // identical `cached.text` content.
+    let mut tool_call_emitter: Option<ToolCallStreamEmitter> = None;
+
     // Wave-2.5 A4: capture the policy so the route_content closure can branch
     // on Constrained vs Auto when a tool-call body fails to parse.
     let tool_call_policy = params.tool_call_policy;
@@ -2639,6 +3227,7 @@ fn generate_stream_once(
                          body: &mut String,
                          tc_index: &mut usize,
                          saw_tc: &mut bool,
+                         emitter: &mut Option<ToolCallStreamEmitter>,
                          grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
                          events: &mpsc::Sender<GenerationEvent>,
                          text: &str,
@@ -2676,6 +3265,15 @@ fn generate_stream_once(
                 }
                 super::registry::ToolCallEvent::ToolCallOpen => {
                     body.clear();
+                    // Wave 3 W-B3 — T2.3 incremental: construct a fresh
+                    // emitter for this call. Family from registration; an
+                    // unregistered family yields an emitter that declines
+                    // (its `advance` is a no-op and `finalize` falls back
+                    // to `emit_streaming_tool_call_close`).
+                    *emitter = Some(ToolCallStreamEmitter::new(
+                        reg.map(|r| r.family),
+                        *tc_index,
+                    ));
                     // Wave 2.6 W-α5 Q2: entering a tool-call body — flip
                     // the grammar runtime's trigger so subsequent decode
                     // steps enforce the body grammar.  No-op when the
@@ -2688,6 +3286,14 @@ fn generate_stream_once(
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
                     body.push_str(&t);
+                    // Wave 3 W-B3 — T2.3 incremental: drive the per-call
+                    // emitter to flush newly-extractable name + kv
+                    // fragments. No-op when the family is unregistered
+                    // (`advance` returns Ok(()) without sending anything,
+                    // leaving finalize to use the close-buffered fallback).
+                    if let Some(em) = emitter.as_mut() {
+                        em.advance(body, events)?;
+                    }
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
                     // Wave 2.6 W-α5 Q2: leaving a tool-call body.  The
@@ -2700,20 +3306,26 @@ fn generate_stream_once(
                     // termination via the unconditional is_dead check
                     // in the decode loop).
                     //
-                    // Wave 3 W-A3: dispatch delegated to
+                    // Wave 3 W-A3: close-time dispatch delegated to
                     // `emit_streaming_tool_call_close` so the parse-failure
                     // branch can be audit-driver tested independently.
-                    let parsed = reg
-                        .and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    //
+                    // Wave 3 W-B3: if the per-call emitter activated mid-
+                    // stream (name was emitted), finalize emits the
+                    // closing `}` + tail kvs and increments `tc_index`.
+                    // Otherwise finalize delegates to the legacy
+                    // `emit_streaming_tool_call_close` so the close-
+                    // buffered shape AND policy-enforced loud-error
+                    // branches stay byte-for-byte identical.
                     let body_dump = std::mem::take(body);
-                    emit_streaming_tool_call_close(
-                        parsed,
-                        body_dump,
-                        tool_call_policy,
-                        tc_index,
-                        saw_tc,
-                        events,
-                    )?;
+                    let mut em = emitter.take().unwrap_or_else(|| {
+                        // Defensive — ToolCallOpen always precedes Close,
+                        // but if a buggy splitter ever emits Close-without-
+                        // Open we still want the legacy close-buffered
+                        // semantics to fire.
+                        ToolCallStreamEmitter::new(reg.map(|r| r.family), *tc_index)
+                    });
+                    em.finalize(body_dump, reg, tool_call_policy, tc_index, saw_tc, events)?;
                 }
             }
         }
@@ -2729,6 +3341,7 @@ fn generate_stream_once(
                          body: &mut String,
                          tc_index: &mut usize,
                          saw_tc: &mut bool,
+                         emitter: &mut Option<ToolCallStreamEmitter>,
                          grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
                          events: &mpsc::Sender<GenerationEvent>,
                          fragment: &str,
@@ -2758,6 +3371,7 @@ fn generate_stream_once(
                             body,
                             tc_index,
                             saw_tc,
+                            emitter,
                             grammar_runtime,
                             events,
                             &text,
@@ -2773,6 +3387,7 @@ fn generate_stream_once(
                 body,
                 tc_index,
                 saw_tc,
+                emitter,
                 grammar_runtime,
                 events,
                 fragment,
@@ -2932,6 +3547,7 @@ fn generate_stream_once(
             &mut tool_call_body,
             &mut tool_call_index,
             &mut saw_tool_call,
+            &mut tool_call_emitter,
             &mut grammar_runtime,
             events,
             &first_text,
@@ -3030,6 +3646,7 @@ fn generate_stream_once(
                 &mut tool_call_body,
                 &mut tool_call_index,
                 &mut saw_tool_call,
+                &mut tool_call_emitter,
                 &mut grammar_runtime,
                 events,
                 &fragment,
@@ -3096,6 +3713,7 @@ fn generate_stream_once(
                         &mut tool_call_body,
                         &mut tool_call_index,
                         &mut saw_tool_call,
+                        &mut tool_call_emitter,
                         &mut grammar_runtime,
                         events,
                         &tail,
@@ -5414,6 +6032,464 @@ mod emit_streaming_tool_call_close_tests {
                 );
             }
             other => panic!("expected Content delta, got: {:?}", other),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3 W-B3 — T2.3 incremental tool-call argument streaming.
+//
+// Audit-driver tests for `ToolCallStreamEmitter`: they feed body fragments
+// through `advance` and `finalize` directly, then assert the emitted SSE
+// shape exactly matches the OpenAI Chat Completions streaming spec:
+//
+//   - Chunk 1: function.name complete, no arguments.
+//   - Chunks 2..N-1: arguments fragments that concatenate to valid JSON.
+//   - Final chunk: closing `}` (and any kv tail the streaming scanner
+//     deferred). On the streaming-driver side `finish_reason="tool_calls"`
+//     fires from the terminating `Done` event after `saw_tool_call` is
+//     latched true by `finalize`.
+//
+// All tests drive the emitter directly with hand-crafted body fragments
+// (rather than through the full `ToolCallSplitter` + `route_content`
+// pipeline) so the tail-parser + chunk-emit logic is isolated from
+// splitter / grammar / sampler concerns.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tool_call_stream_emitter_tests {
+    use super::*;
+    use crate::serve::api::sse::GenerationEvent;
+    use tokio::sync::mpsc;
+
+    fn drain(rx: &mut mpsc::Receiver<GenerationEvent>) -> Vec<GenerationEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Collapse a sequence of `ToolCallDelta` events into the (name, args_string)
+    /// pair the OpenAI client would reconstruct: name from the first chunk that
+    /// carries it, args from the concatenation of every chunk's `arguments`.
+    fn rebuild_call(events: &[GenerationEvent], expect_index: usize) -> (Option<String>, String) {
+        let mut name: Option<String> = None;
+        let mut args = String::new();
+        for ev in events {
+            if let GenerationEvent::ToolCallDelta {
+                index, name: n, arguments, ..
+            } = ev
+            {
+                if *index != expect_index {
+                    continue;
+                }
+                if let Some(nm) = n {
+                    name = Some(nm.clone());
+                }
+                if let Some(a) = arguments {
+                    args.push_str(a);
+                }
+            }
+        }
+        (name, args)
+    }
+
+    /// `streaming_tool_call_emits_name_in_first_chunk` — chunk 1 carries
+    /// `function.name` complete, with `arguments=None`. Subsequent chunks
+    /// stream `arguments` only (no `name` retransmission).
+    #[test]
+    fn streaming_tool_call_emits_name_in_first_chunk() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        // Feed a body prefix that contains the name + opening brace, plus
+        // a started kv. The first `advance` call MUST emit chunk 1
+        // (id+type+name) and chunk 2 (the args opening `{`).
+        let body = "call:get_weather{location:<|\"|>San Fra".to_string();
+        emitter.advance(&body, &tx).expect("advance ok");
+        drop(tx);
+        let events = drain(&mut rx);
+        // Chunk 1: name+id+type, no args.
+        match &events[0] {
+            GenerationEvent::ToolCallDelta {
+                index,
+                id,
+                call_type,
+                name,
+                arguments,
+            } => {
+                assert_eq!(*index, 0);
+                assert!(id.is_some(), "first chunk MUST carry id");
+                assert_eq!(call_type.as_deref(), Some("function"));
+                assert_eq!(name.as_deref(), Some("get_weather"));
+                assert!(
+                    arguments.is_none(),
+                    "first chunk MUST NOT carry arguments (name-only per spec)"
+                );
+            }
+            other => panic!("expected first ToolCallDelta with name; got {other:?}"),
+        }
+        // Chunk 2: args opening `{`, no name.
+        match &events[1] {
+            GenerationEvent::ToolCallDelta {
+                name, arguments, id, ..
+            } => {
+                assert!(id.is_none(), "subsequent chunks MUST NOT retransmit id");
+                assert!(
+                    name.is_none(),
+                    "subsequent chunks MUST NOT retransmit name"
+                );
+                assert_eq!(
+                    arguments.as_deref(),
+                    Some("{"),
+                    "second chunk MUST be the args opening `{{`"
+                );
+            }
+            other => panic!("expected ToolCallDelta with `{{` arg; got {other:?}"),
+        }
+    }
+
+    /// `streaming_tool_call_emits_arguments_incrementally` — feed a 3-fragment
+    /// body and assert at least 3 distinct `arguments` deltas fire (one per
+    /// closed-kv boundary).
+    #[test]
+    fn streaming_tool_call_emits_arguments_incrementally() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        let mut body = String::new();
+        // Fragment 1: header + first kv started, no closer.
+        body.push_str("call:get_weather{location:<|\"|>");
+        emitter.advance(&body, &tx).expect("frag1");
+        // Fragment 2: close first kv with `,` and start second kv.
+        body.push_str("San Francisco<|\"|>,");
+        emitter.advance(&body, &tx).expect("frag2");
+        // Fragment 3: second kv complete + closer.
+        body.push_str("units:<|\"|>celsius<|\"|>}");
+        emitter.advance(&body, &tx).expect("frag3");
+        // Close finalizes the last kv + `}`.
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        emitter
+            .finalize(
+                body,
+                Some(&super::super::registry::GEMMA4),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &tx,
+            )
+            .expect("finalize");
+        drop(tx);
+        let events = drain(&mut rx);
+        // Count `arguments`-bearing deltas. We expect at least:
+        //   chunk: `{`   (opening, from advance frag1)
+        //   chunk: `"location":"San Francisco"`  (frag2 closes first kv)
+        //   chunk: `,"units":"celsius"`  +  closing `}` (finalize)
+        //     OR finalize emits both as a single tail.
+        let arg_chunks: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| {
+                if let GenerationEvent::ToolCallDelta {
+                    arguments: Some(a), ..
+                } = ev
+                {
+                    Some(a.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            arg_chunks.len() >= 3,
+            "expected >=3 arguments deltas (incremental shape); got {arg_chunks:?}"
+        );
+        assert_eq!(tc_index, 1, "tc_index MUST be incremented on finalize");
+        assert!(saw_tc, "saw_tc MUST be latched true on finalize");
+    }
+
+    /// `streaming_tool_call_arguments_concatenate_to_valid_json` — collect
+    /// every `arguments` delta in stream order, concatenate them, JSON-parse
+    /// the result, and assert it equals the canonical `parse_tool_call_body`
+    /// args output.
+    #[test]
+    fn streaming_tool_call_arguments_concatenate_to_valid_json() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(64);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        // Feed body in 4 fragments that bisect the kv structure at
+        // non-boundary points.
+        let mut body = String::new();
+        let chunks = [
+            "call:get_weather{location:<|\"|>",
+            "San Francis",
+            "co<|\"|>,units:<|\"|>celsius<|\"|>",
+            "}",
+        ];
+        for c in &chunks {
+            body.push_str(c);
+            emitter.advance(&body, &tx).expect("advance");
+        }
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        emitter
+            .finalize(
+                body.clone(),
+                Some(&super::super::registry::GEMMA4),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &tx,
+            )
+            .expect("finalize");
+        drop(tx);
+        let events = drain(&mut rx);
+        let (name, args) = rebuild_call(&events, 0);
+        assert_eq!(name.as_deref(), Some("get_weather"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args).expect("args MUST be valid JSON");
+        // Canonical args from the existing parser:
+        let canonical = super::super::registry::parse_tool_call_body(
+            &super::super::registry::GEMMA4,
+            &body,
+        )
+        .expect("canonical parse");
+        let canonical_json: serde_json::Value =
+            serde_json::from_str(&canonical.arguments_json).expect("canonical json");
+        assert_eq!(
+            parsed, canonical_json,
+            "concatenated streaming args MUST equal canonical parse"
+        );
+    }
+
+    /// `streaming_tool_call_emits_finish_reason_tool_calls_terminal` — verify
+    /// `finalize` latches `saw_tc=true` so the Done event downstream picks
+    /// `finish_reason="tool_calls"`. The terminating `Done` is a downstream
+    /// concern (driven by the decode loop and `replay_cached_streaming_response`
+    /// branch); here we pin the contract that finalize-on-success MUST set
+    /// `saw_tc` so the Done-emit logic at engine.rs:2513 + replay.rs:2538 can
+    /// override the default `"stop"` to `"tool_calls"`.
+    #[test]
+    fn streaming_tool_call_emits_finish_reason_tool_calls_terminal() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        let body = "call:f{x:1}".to_string();
+        emitter.advance(&body, &tx).expect("advance");
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        emitter
+            .finalize(
+                body,
+                Some(&super::super::registry::GEMMA4),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &tx,
+            )
+            .expect("finalize");
+        drop(tx);
+        assert!(
+            saw_tc,
+            "finalize on success MUST latch saw_tc=true so the Done event \
+             picks finish_reason=\"tool_calls\""
+        );
+        assert_eq!(tc_index, 1, "tc_index MUST advance to 1");
+        let events = drain(&mut rx);
+        let last = events
+            .iter()
+            .rev()
+            .find_map(|ev| {
+                if let GenerationEvent::ToolCallDelta {
+                    arguments: Some(a), ..
+                } = ev
+                {
+                    Some(a.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("at least one arguments delta");
+        assert!(
+            last.ends_with('}'),
+            "the final arguments delta MUST close the JSON object with `}}`; \
+             got tail={last:?}"
+        );
+    }
+
+    /// `streaming_multiple_tool_calls_with_distinct_indices` — drive two
+    /// emitters in sequence (mirrors `parallel_tool_calls=true` where
+    /// the model emits two consecutive `<|tool_call>...<tool_call|>` spans),
+    /// and assert each call's deltas carry distinct `index` values.
+    #[test]
+    fn streaming_multiple_tool_calls_with_distinct_indices() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(64);
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+
+        // Call 0.
+        let mut em0 = ToolCallStreamEmitter::new(Some("gemma4"), tc_index);
+        let body0 = "call:f0{a:1}".to_string();
+        em0.advance(&body0, &tx).expect("advance0");
+        em0.finalize(
+            body0,
+            Some(&super::super::registry::GEMMA4),
+            ToolCallPolicy::Constrained,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        )
+        .expect("finalize0");
+        assert_eq!(tc_index, 1, "tc_index advances after call 0");
+
+        // Call 1.
+        let mut em1 = ToolCallStreamEmitter::new(Some("gemma4"), tc_index);
+        let body1 = "call:f1{b:2}".to_string();
+        em1.advance(&body1, &tx).expect("advance1");
+        em1.finalize(
+            body1,
+            Some(&super::super::registry::GEMMA4),
+            ToolCallPolicy::Constrained,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        )
+        .expect("finalize1");
+        assert_eq!(tc_index, 2, "tc_index advances after call 1");
+
+        drop(tx);
+        let events = drain(&mut rx);
+        let mut indices = std::collections::BTreeSet::new();
+        for ev in &events {
+            if let GenerationEvent::ToolCallDelta { index, .. } = ev {
+                indices.insert(*index);
+            }
+        }
+        assert!(
+            indices.contains(&0) && indices.contains(&1),
+            "both index=0 and index=1 MUST appear in the delta stream; got {indices:?}"
+        );
+    }
+
+    /// Regression preserve: when the entire body arrives in a single fragment
+    /// (no incremental opportunity), the emitter MUST fall back to the
+    /// close-buffered shape — exactly two chunks (id+name, full args) — so
+    /// clients that don't track incremental updates still receive the
+    /// pre-W-B3 SSE shape unchanged.
+    #[test]
+    fn streaming_single_fragment_falls_back_to_close_buffered_shape() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
+        let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
+        // A single fragment containing the FULL body. The emitter's first
+        // `advance` will see `call:f{...}` complete — name + opening `{`
+        // emit, then the kv-scanner (which only emits on `,`) sees one kv
+        // followed by `}` so it stops without emitting the kv. Finalize
+        // then emits the residual tail.
+        let body = "call:f{x:1}".to_string();
+        emitter.advance(&body, &tx).expect("advance");
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        emitter
+            .finalize(
+                body,
+                Some(&super::super::registry::GEMMA4),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &tx,
+            )
+            .expect("finalize");
+        drop(tx);
+        let events = drain(&mut rx);
+        // Concatenated args MUST be valid JSON {"x":1}.
+        let (name, args) = rebuild_call(&events, 0);
+        assert_eq!(name.as_deref(), Some("f"));
+        let v: serde_json::Value =
+            serde_json::from_str(&args).expect("args concatenate to valid JSON");
+        assert_eq!(v, serde_json::json!({"x": 1}));
+    }
+
+    /// Qwen 3.5/3.6 streaming — `<function=NAME>...<parameter=KEY>VAL</parameter>...</function>`
+    /// emits one delta per closed `<parameter>` block.
+    #[test]
+    fn streaming_qwen35_emits_per_parameter_block() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(32);
+        let mut emitter = ToolCallStreamEmitter::new(Some("qwen35"), 0);
+        let mut body = String::new();
+        body.push_str("<function=lookup>");
+        emitter.advance(&body, &tx).expect("frag1");
+        body.push_str("\n<parameter=q>\n\"hello\"\n</parameter>");
+        emitter.advance(&body, &tx).expect("frag2");
+        body.push_str("\n<parameter=k>\n5\n</parameter>\n</function>");
+        emitter.advance(&body, &tx).expect("frag3");
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        emitter
+            .finalize(
+                body.clone(),
+                Some(&super::super::registry::QWEN35),
+                ToolCallPolicy::Constrained,
+                &mut tc_index,
+                &mut saw_tc,
+                &tx,
+            )
+            .expect("finalize");
+        drop(tx);
+        let events = drain(&mut rx);
+        let (name, args) = rebuild_call(&events, 0);
+        assert_eq!(name.as_deref(), Some("lookup"));
+        let v: serde_json::Value =
+            serde_json::from_str(&args).expect("args concatenate to valid JSON");
+        let canonical = super::super::registry::parse_tool_call_body(
+            &super::super::registry::QWEN35,
+            &body,
+        )
+        .expect("canonical");
+        let cv: serde_json::Value = serde_json::from_str(&canonical.arguments_json).unwrap();
+        assert_eq!(
+            v, cv,
+            "Qwen 3.5/3.6 streaming args MUST equal canonical parse"
+        );
+    }
+
+    /// Unknown family — `advance` is a no-op (no `name_emitted`), and
+    /// `finalize` delegates to the legacy close-buffered path. Verify the
+    /// emitter never emits anything before finalize when the family lacks a
+    /// streaming converter, AND that the legacy `Auto` content fallback
+    /// fires when the body fails to parse.
+    #[test]
+    fn streaming_unknown_family_falls_back_to_legacy() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+        let mut emitter = ToolCallStreamEmitter::new(None, 0);
+        emitter
+            .advance("anything goes here", &tx)
+            .expect("advance no-op");
+        // No emissions yet — unknown family declined the streaming path.
+        let mid_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            mid_events.is_empty(),
+            "unknown family MUST NOT emit deltas during advance; got {mid_events:?}"
+        );
+        // Finalize under Auto policy with no registration — body is treated
+        // as malformed (no parser), legacy emit fires the content fallback.
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+        let result = emitter.finalize(
+            "anything goes here".to_string(),
+            None,
+            ToolCallPolicy::Auto,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        );
+        assert!(result.is_ok(), "Auto + unparseable MUST be Ok (content fallback)");
+        drop(tx);
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1, "exactly one Content delta expected");
+        match &events[0] {
+            GenerationEvent::Delta {
+                kind: super::super::sse::DeltaKind::Content,
+                text,
+            } => {
+                assert_eq!(text, "anything goes here");
+            }
+            other => panic!("expected Content delta, got {other:?}"),
         }
     }
 }
