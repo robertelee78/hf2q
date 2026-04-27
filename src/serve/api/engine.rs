@@ -1840,6 +1840,140 @@ fn infer_quant_type_from_gguf(gguf: &mlx_native::gguf::GgufFile) -> Option<Strin
         .map(|(k, _)| k.to_string())
 }
 
+/// Outcome of `finalize_streaming_tool_state` — tells the streaming
+/// driver whether to proceed to `Done`, abort silently (client gone),
+/// or skip `Done` because a structured `Error` event has already been
+/// emitted by the helper. Wave 2.8 W-θ HIGH-1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeStreamingAction {
+    /// Drain succeeded (or was a no-op). Caller proceeds to emit Done.
+    Continue,
+    /// `events.blocking_send` returned Err while emitting a tail Content
+    /// delta. SSE receiver is gone; caller should abort silently (no Done).
+    ClientDropped,
+    /// Helper emitted a `GenerationEvent::Error` (Constrained mid-call
+    /// truncation or no-call). Caller MUST skip Done — the SSE encoder
+    /// produces the final error chunk on receipt of Error.
+    ErrorEmitted,
+}
+
+/// Drain the tool-call splitter tail at end-of-stream and then enforce the
+/// Constrained-policy safety nets before the streaming `Done` event.
+///
+/// Wave 2.8 W-θ HIGH-1 — streaming companion to the non-streaming
+/// defensive 500 in `handlers.rs:410-444` (commit da545d5).
+///
+/// Behaviour matrix (`policy` = `tool_call_policy`):
+/// ```text
+///                       │ Auto                            │ Constrained
+/// ─────────────────────┼─────────────────────────────────┼────────────────────────────────
+/// finish() = Content   │ emit Content                    │ emit Content
+/// finish() = TC-text   │ emit Content (open-marker re-   │ emit GenerationEvent::Error
+///                       │   prepended for clarity)        │   "tool_call_truncated_under_constrained"
+///                       │                                 │   → ErrorEmitted
+/// post-drain no call   │ no action                       │ emit GenerationEvent::Error
+///                       │                                 │   "tool_call_no_call_under_constrained"
+///                       │                                 │   → ErrorEmitted
+/// ```
+///
+/// Both error branches should be unreachable when Q-A's eager grammar is
+/// correctly emitted and the decode loop ran to a normal stop — they are
+/// loud-failure safety nets so a regression surfaces as an SSE error
+/// chunk, not as silent content fallback (the wave-2.6 audit divergence
+/// "Required/Function enforcement before ToolCallOpen").
+///
+/// Extracted from the inline finalize block so the audit-driver test for
+/// HIGH-1 can exercise this exact code path. See
+/// `finalize_streaming_tool_state_tests` below.
+fn finalize_streaming_tool_state(
+    tool_splitter: Option<&mut super::registry::ToolCallSplitter>,
+    policy: ToolCallPolicy,
+    saw_tool_call: bool,
+    registration: Option<&super::registry::ModelRegistration>,
+    completion_tokens: usize,
+    accumulated_text_len: usize,
+    events: &mpsc::Sender<super::sse::GenerationEvent>,
+) -> FinalizeStreamingAction {
+    use super::sse::{DeltaKind, GenerationEvent};
+
+    let policy_constrained = matches!(policy, ToolCallPolicy::Constrained);
+
+    if let Some(tcs) = tool_splitter {
+        if let Some(ev) = tcs.finish() {
+            match ev {
+                super::registry::ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        return FinalizeStreamingAction::ClientDropped;
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) => {
+                    if policy_constrained {
+                        // HIGH-1 streaming companion to da545d5: emit a
+                        // structured error event INSTEAD of silently
+                        // re-emitting the residual as Content.
+                        tracing::error!(
+                            residual_len = t.len(),
+                            "tool_call_truncated_under_constrained: streaming \
+                             ended mid-tool-call (open marker observed, no close \
+                             marker) under tool_choice=required/function; eager \
+                             grammar should have prevented this"
+                        );
+                        let _ = events.blocking_send(GenerationEvent::Error(
+                            "tool_call_truncated_under_constrained".into(),
+                        ));
+                        return FinalizeStreamingAction::ErrorEmitted;
+                    }
+                    // Auto: legacy behaviour — emit residual body as
+                    // Content with the literal open marker re-prepended
+                    // for diagnostic clarity (the splitter swallowed the
+                    // open marker when it flipped state).
+                    let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
+                    let fallback = format!("{prefix}{t}");
+                    if !fallback.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: fallback,
+                            })
+                            .is_err()
+                    {
+                        return FinalizeStreamingAction::ClientDropped;
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen
+                | super::registry::ToolCallEvent::ToolCallClose => {
+                    // unreachable: finish() never emits Open/Close.
+                }
+            }
+        }
+    }
+
+    // Post-drain no-call check — streaming companion to handlers.rs:410-444.
+    if policy_constrained && !saw_tool_call {
+        tracing::error!(
+            completion_tokens = completion_tokens,
+            text_len = accumulated_text_len,
+            "tool_call_no_call_under_constrained: streaming ended with zero \
+             tool calls under tool_choice=required/function; eager grammar \
+             should have prevented this — either max_tokens cut a call \
+             mid-emission or the grammar emitter has a bug"
+        );
+        let _ = events.blocking_send(GenerationEvent::Error(
+            "tool_call_no_call_under_constrained".into(),
+        ));
+        return FinalizeStreamingAction::ErrorEmitted;
+    }
+
+    FinalizeStreamingAction::Continue
+}
+
 /// Streaming variant of `generate_once`. Sends `GenerationEvent::Delta` per
 /// decoded token, followed by a terminating `Done` (with finish_reason +
 /// usage) or `Error`. If the `events` receiver is dropped (SSE client
@@ -2502,53 +2636,34 @@ fn generate_stream_once(
             }
         }
     }
-    // Drain any tool-splitter tail. If the stream ended mid-tool-call (no
-    // close marker observed), the tail is ToolCallText: re-emit as plain
-    // Content so the partial body isn't silently dropped — the operator
-    // can see the truncation in `delta.content` and the test harness asserts
-    // SSE shape, not byte-perfect content.
-    if let Some(tcs) = tool_splitter.as_mut() {
-        if let Some(ev) = tcs.finish() {
-            match ev {
-                super::registry::ToolCallEvent::Content(t) => {
-                    if !t.is_empty()
-                        && events
-                            .blocking_send(GenerationEvent::Delta {
-                                kind: DeltaKind::Content,
-                                text: t,
-                            })
-                            .is_err()
-                    {
-                        tracing::info!("SSE stream dropped by client; aborting decode");
-                        return;
-                    }
-                }
-                super::registry::ToolCallEvent::ToolCallText(t) => {
-                    // Mid-call truncation. Emit residual body as Content
-                    // (open marker was already swallowed by the splitter,
-                    // but for diagnostic clarity we wrap with the literal
-                    // open marker so a stop-mid-call is still visible).
-                    let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
-                    let fallback = format!("{prefix}{t}");
-                    if !fallback.is_empty()
-                        && events
-                            .blocking_send(GenerationEvent::Delta {
-                                kind: DeltaKind::Content,
-                                text: fallback,
-                            })
-                            .is_err()
-                    {
-                        tracing::info!("SSE stream dropped by client; aborting decode");
-                        return;
-                    }
-                }
-                super::registry::ToolCallEvent::ToolCallOpen
-                | super::registry::ToolCallEvent::ToolCallClose => {
-                    // unreachable: finish() never emits Open/Close.
-                }
-            }
+    // Drain any tool-splitter tail and then enforce Constrained-policy
+    // safety nets before Done. The drain + check logic is factored into
+    // `finalize_streaming_tool_state` so the test harness can drive the
+    // exact production code path (audit-driver test for HIGH-1; do not
+    // duplicate this logic in a test stand-in).
+    match finalize_streaming_tool_state(
+        tool_splitter.as_mut(),
+        tool_call_policy,
+        saw_tool_call,
+        registration,
+        completion_tokens,
+        accumulated_text.len(),
+        events,
+    ) {
+        FinalizeStreamingAction::Continue => {}
+        FinalizeStreamingAction::ClientDropped => {
+            tracing::info!("SSE stream dropped by client; aborting decode");
+            return;
+        }
+        FinalizeStreamingAction::ErrorEmitted => {
+            // Mid-call truncation or no-call under Constrained already
+            // emitted GenerationEvent::Error — do NOT also emit Done. The
+            // SSE encoder closes the stream with a finish_reason="error"
+            // final chunk on receipt of Error (sse.rs:298-322).
+            return;
         }
     }
+
     // Override finish_reason to "tool_calls" per OpenAI spec when at least
     // one structured tool-call delta was emitted on this stream. Spec:
     // https://platform.openai.com/docs/guides/function-calling — when the
@@ -3886,6 +4001,269 @@ mod test_a1_conditional_grammar_wire {
             !runtime.is_awaiting_trigger(),
             "ToolCallClose MUST NOT re-arm the runtime trigger \
              (llama.cpp parity: PR #9639 lazy grammar is one-shot per request)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2.8 W-θ HIGH-1 — finalize_streaming_tool_state
+//
+// Audit-driver tests: exercise the EXACT streaming SSE event chain through
+// `tool_splitter.finish()` drain + post-drain Constrained no-call check.
+// Tests drive the production helper directly with a real `mpsc::channel`,
+// drain the receiver, and assert SSE event shape — NOT a stand-in
+// reconstruction (the wave-2 sham-test pattern Codex caught).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod finalize_streaming_tool_state_tests {
+    use super::*;
+    use crate::serve::api::registry::{self, ToolCallSplitter};
+    use crate::serve::api::sse::{DeltaKind, GenerationEvent};
+    use tokio::sync::mpsc;
+
+    fn gemma4_reg() -> registry::ModelRegistration {
+        registry::find_for("gemma4-27b-it").expect("gemma4 registration must exist")
+    }
+
+    /// Drain the receiver synchronously (we are inside a single-threaded
+    /// helper that uses `blocking_send`; the matching consumer is
+    /// `try_recv` after the helper returns).
+    fn drain_recv(rx: &mut mpsc::Receiver<GenerationEvent>) -> Vec<GenerationEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Streaming Constrained mid-call truncation: the splitter has seen the
+    /// open marker but not the close marker, so `finish()` returns
+    /// `ToolCallText(residual)`. Under Constrained policy the helper MUST
+    /// emit `GenerationEvent::Error("tool_call_truncated_under_constrained")`
+    /// and return `ErrorEmitted` (so the streaming driver skips Done). It
+    /// MUST NOT emit Content (the silent-fallback wave-2.6 audit divergence).
+    #[test]
+    fn streaming_constrained_mid_call_truncation_yields_error_event() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg)
+            .expect("gemma4 has tool markers, splitter must build");
+
+        // Drive the splitter the same way the engine does: feed bytes that
+        // include the open marker and a partial body (no close marker).
+        // After this, splitter.in_tool_call() == true and tail_buf holds
+        // the partial body.
+        let open = reg.tool_open.expect("gemma4 has tool_open");
+        let _ = splitter.feed(&format!("{open}call:get_weather{{"));
+        assert!(
+            splitter.in_tool_call(),
+            "splitter must be in_tool_call after open marker; finish() will \
+             then return ToolCallText (mid-call truncation)"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Constrained,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            /* completion_tokens */ 7,
+            /* accumulated_text_len */ 18,
+            &tx,
+        );
+
+        assert_eq!(
+            action,
+            FinalizeStreamingAction::ErrorEmitted,
+            "Constrained + ToolCallText residual MUST return ErrorEmitted"
+        );
+
+        // Close the sender so try_recv terminates cleanly.
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one error event expected, got: {:?}",
+            events
+        );
+        match &events[0] {
+            GenerationEvent::Error(code) => {
+                assert_eq!(
+                    code, "tool_call_truncated_under_constrained",
+                    "structured error code must match defensive 500 vocabulary"
+                );
+            }
+            other => panic!(
+                "expected GenerationEvent::Error, got: {:?} \
+                 (silent Content fallback would be the wave-2.6 audit divergence)",
+                other
+            ),
+        }
+    }
+
+    /// Streaming Constrained no-call: `saw_tool_call == false` and the
+    /// splitter has nothing buffered (decode finished without ever entering
+    /// a tool-call span). Under Constrained policy the helper MUST emit
+    /// `GenerationEvent::Error("tool_call_no_call_under_constrained")` and
+    /// return `ErrorEmitted` BEFORE Done. Mirrors the non-streaming check
+    /// in handlers.rs:410-444 (commit da545d5).
+    #[test]
+    fn streaming_constrained_no_call_yields_error_event() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg)
+            .expect("gemma4 has tool markers, splitter must build");
+        // No feed → splitter idle, finish() returns None.
+        assert!(
+            !splitter.in_tool_call(),
+            "splitter must be idle for the no-call test"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Constrained,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            /* completion_tokens */ 64,
+            /* accumulated_text_len */ 0,
+            &tx,
+        );
+
+        assert_eq!(
+            action,
+            FinalizeStreamingAction::ErrorEmitted,
+            "Constrained + saw_tool_call=false MUST return ErrorEmitted"
+        );
+
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(events.len(), 1, "exactly one error event expected");
+        match &events[0] {
+            GenerationEvent::Error(code) => {
+                assert_eq!(
+                    code, "tool_call_no_call_under_constrained",
+                    "structured error code must match defensive 500 vocabulary"
+                );
+            }
+            other => panic!("expected GenerationEvent::Error, got: {:?}", other),
+        }
+    }
+
+    /// Auto policy mid-call truncation: Auto allows partial / malformed
+    /// tool-call syntax. The helper MUST emit the residual as `Content`
+    /// (with the literal open marker re-prepended for diagnostic clarity)
+    /// and return `Continue` (caller emits Done normally). This is the
+    /// pre-2.8 behaviour we MUST preserve.
+    #[test]
+    fn streaming_auto_mid_call_truncation_emits_content_fallback() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg).unwrap();
+        let open = reg.tool_open.expect("gemma4 has tool_open");
+        let _ = splitter.feed(&format!("{open}call:get_weather{{"));
+        assert!(splitter.in_tool_call());
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Auto,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            /* completion_tokens */ 7,
+            /* accumulated_text_len */ 18,
+            &tx,
+        );
+        assert_eq!(
+            action,
+            FinalizeStreamingAction::Continue,
+            "Auto policy MUST preserve pre-2.8 Content-fallback behaviour"
+        );
+        drop(tx);
+        let events = drain_recv(&mut rx);
+        assert_eq!(events.len(), 1, "exactly one Content delta expected");
+        match &events[0] {
+            GenerationEvent::Delta { kind, text } => {
+                assert!(matches!(kind, DeltaKind::Content));
+                assert!(
+                    text.contains(open),
+                    "Auto fallback re-prepends the literal open marker for \
+                     diagnostic clarity (so the operator sees the truncation \
+                     in delta.content); got: {text:?}"
+                );
+            }
+            other => panic!("expected Content delta, got: {:?}", other),
+        }
+    }
+
+    /// Auto policy no-call: a turn that never produced a tool call is the
+    /// normal Auto outcome. The helper MUST return `Continue` and emit no
+    /// events.
+    #[test]
+    fn streaming_auto_no_call_emits_no_events() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg).unwrap();
+        // Idle splitter, no feed.
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Auto,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            64,
+            0,
+            &tx,
+        );
+        assert_eq!(action, FinalizeStreamingAction::Continue);
+        drop(tx);
+        let events = drain_recv(&mut rx);
+        assert!(
+            events.is_empty(),
+            "Auto + idle splitter must emit no finalize events; got {:?}",
+            events
+        );
+    }
+
+    /// Constrained policy with `saw_tool_call == true` (the model produced
+    /// at least one full call): no-call check MUST NOT fire even though
+    /// policy is Constrained. The helper returns `Continue`.
+    #[test]
+    fn streaming_constrained_saw_tool_call_continues_to_done() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg).unwrap();
+        // Drive a full call so splitter is idle and would have emitted a
+        // ToolCallClose during streaming. We only care that
+        // splitter.finish() returns None (no residual) and that the
+        // post-drain no-call check sees saw_tool_call=true.
+        let open = reg.tool_open.expect("open");
+        let close = reg.tool_close.expect("close");
+        let _ = splitter.feed(&format!("{open}call:foo{{}}{close}"));
+        assert!(!splitter.in_tool_call());
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::Constrained,
+            /* saw_tool_call */ true,
+            Some(&reg),
+            12,
+            18,
+            &tx,
+        );
+        assert_eq!(action, FinalizeStreamingAction::Continue);
+        drop(tx);
+        let events = drain_recv(&mut rx);
+        assert!(
+            events.is_empty(),
+            "Constrained + saw_tool_call=true must emit no finalize events; \
+             got {:?}",
+            events
         );
     }
 }
