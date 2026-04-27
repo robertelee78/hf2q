@@ -45,6 +45,13 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+
+/// Align `n` upward to a multiple of `to`. Used by the GGUF imatrix
+/// writer for tensor data section alignment.
+#[inline]
+fn align_up(n: u64, to: u64) -> u64 {
+    n.div_ceil(to) * to
+}
 use std::path::Path;
 
 use thiserror::Error;
@@ -528,6 +535,191 @@ impl ImatrixCollector {
         Ok(())
     }
 
+    /// Save an [`ImatrixCollector`] in the **GGUF imatrix format**
+    /// adopted by llama.cpp on 2025-07-19 (PR #9400, commit
+    /// `90083283`). This is the default `imatrix.gguf` output of
+    /// `tools/imatrix/imatrix.cpp::save_imatrix`.
+    ///
+    /// **Format vs the legacy `.dat`**: the GGUF format preserves
+    /// per-expert counts exactly (one F32 tensor per stat entry for
+    /// values, one for counts), whereas the legacy format collapses
+    /// counts into a single `ncall` integer with lossy per-expert
+    /// reconstruction on read.
+    ///
+    /// **Schema (matches `save_imatrix` byte-for-byte for the
+    /// metadata path; tensor data layout matches `gguf_write_to_file`
+    /// with `GGUF_DEFAULT_ALIGNMENT = 32`):**
+    ///
+    /// Header:
+    /// - magic `"GGUF"` (4 bytes)
+    /// - version `3` (u32)
+    /// - n_tensors (u64) — 2 per non-empty stat entry
+    /// - n_kv (u64) — 4
+    ///
+    /// KVs (in this order):
+    /// - `general.type` (string) = `"imatrix"`
+    /// - `imatrix.datasets` (array of strings) — calibration corpus paths
+    /// - `imatrix.chunk_count` (u32) — total chunks processed
+    /// - `imatrix.chunk_size` (u32) — `n_ctx / n_parallel` (typically 512)
+    ///
+    /// Tensor descriptors (sorted alphabetically by tensor name; two
+    /// per stat entry, with the `nval > 0 && nmat > 0` guard from
+    /// `imatrix.cpp:600`):
+    /// - `<name>.in_sum2`: F32, 2D, shape `[nval/nmat, nmat]`
+    /// - `<name>.counts`:  F32, 2D, shape `[1, nmat]`
+    ///
+    /// Tensor data: padded to GGUF default alignment (32 bytes); each
+    /// tensor's float bytes follow with per-tensor alignment.
+    ///
+    /// **Endianness**: little-endian, matching llama.cpp's native i/o
+    /// on `aarch64-apple-darwin` and `x86_64-linux-gnu`.
+    pub fn save_imatrix_gguf(
+        &self,
+        path: &Path,
+        chunk_size: u32,
+        datasets: &[&str],
+    ) -> Result<(), ImatrixError> {
+        const GGUF_MAGIC: [u8; 4] = *b"GGUF";
+        const GGUF_VERSION: u32 = 3;
+        const GGUF_TYPE_UINT32: u32 = 4;
+        const GGUF_TYPE_STRING: u32 = 8;
+        const GGUF_TYPE_ARRAY: u32 = 9;
+        const GGUF_TYPE_F32_TENSOR: u32 = 0;
+        const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+
+        // Build the entire file in an in-memory buffer for clean
+        // position tracking — the alignment padding before the data
+        // section depends on the descriptor section's exact byte length.
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Sorted tensor names, with the same nval > 0 && nmat > 0 guard as llama.cpp.
+        let mut to_store: Vec<&String> = self
+            .stats
+            .iter()
+            .filter(|(_, s)| !s.values.is_empty() && !s.counts.is_empty())
+            .map(|(k, _)| k)
+            .collect();
+        to_store.sort();
+
+        let n_tensors: u64 = (to_store.len() as u64) * 2;
+        let n_kv: u64 = 4;
+
+        // Header.
+        buf.extend_from_slice(&GGUF_MAGIC);
+        buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+        buf.extend_from_slice(&n_tensors.to_le_bytes());
+        buf.extend_from_slice(&n_kv.to_le_bytes());
+
+        // KV writers — local helpers operating on the buffer.
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+
+        // 1. general.type = "imatrix"
+        put_str(&mut buf, "general.type");
+        buf.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+        put_str(&mut buf, "imatrix");
+
+        // 2. imatrix.datasets = string array
+        put_str(&mut buf, "imatrix.datasets");
+        buf.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        buf.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+        buf.extend_from_slice(&(datasets.len() as u64).to_le_bytes());
+        for ds in datasets {
+            put_str(&mut buf, ds);
+        }
+
+        // 3. imatrix.chunk_count = u32
+        put_str(&mut buf, "imatrix.chunk_count");
+        buf.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+        let chunk_count: u32 = self.total_chunks.try_into().unwrap_or(u32::MAX);
+        buf.extend_from_slice(&chunk_count.to_le_bytes());
+
+        // 4. imatrix.chunk_size = u32
+        put_str(&mut buf, "imatrix.chunk_size");
+        buf.extend_from_slice(&GGUF_TYPE_UINT32.to_le_bytes());
+        buf.extend_from_slice(&chunk_size.to_le_bytes());
+
+        // Pre-compute per-tensor sizes and offsets relative to the
+        // start of the tensor data section.
+        let mut tensor_offsets: Vec<u64> = Vec::with_capacity(n_tensors as usize);
+        let mut data_offset: u64 = 0;
+        for name in &to_store {
+            let stat = &self.stats[*name];
+            let nval = stat.values.len() as u64;
+            let nmat = stat.counts.len() as u64;
+            tensor_offsets.push(data_offset);
+            data_offset = align_up(data_offset + nval * 4, GGUF_DEFAULT_ALIGNMENT);
+            tensor_offsets.push(data_offset);
+            data_offset = align_up(data_offset + nmat * 4, GGUF_DEFAULT_ALIGNMENT);
+        }
+
+        // Tensor descriptors.
+        let mut offset_idx = 0usize;
+        for name in &to_store {
+            let stat = &self.stats[*name];
+            let nval = stat.values.len() as u64;
+            let nmat = stat.counts.len() as u64;
+            let row_size = nval / nmat;
+
+            let sum_name = format!("{name}.in_sum2");
+            put_str(&mut buf, &sum_name);
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&row_size.to_le_bytes());
+            buf.extend_from_slice(&nmat.to_le_bytes());
+            buf.extend_from_slice(&GGUF_TYPE_F32_TENSOR.to_le_bytes());
+            buf.extend_from_slice(&tensor_offsets[offset_idx].to_le_bytes());
+            offset_idx += 1;
+
+            let cnt_name = format!("{name}.counts");
+            put_str(&mut buf, &cnt_name);
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            buf.extend_from_slice(&nmat.to_le_bytes());
+            buf.extend_from_slice(&GGUF_TYPE_F32_TENSOR.to_le_bytes());
+            buf.extend_from_slice(&tensor_offsets[offset_idx].to_le_bytes());
+            offset_idx += 1;
+        }
+
+        // Pad header+descriptors to alignment before the tensor data section.
+        let header_end = buf.len() as u64;
+        let pad =
+            (GGUF_DEFAULT_ALIGNMENT - (header_end % GGUF_DEFAULT_ALIGNMENT)) % GGUF_DEFAULT_ALIGNMENT;
+        buf.extend(std::iter::repeat(0u8).take(pad as usize));
+
+        // Tensor data — each tensor packed at its computed offset
+        // (offsets are relative to the start of this section, which is
+        // `buf.len()` right now post-alignment).
+        let data_start = buf.len() as u64;
+        for name in &to_store {
+            let stat = &self.stats[*name];
+            for &v in &stat.values {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            // Align to GGUF_DEFAULT_ALIGNMENT relative to data section start.
+            let written = buf.len() as u64 - data_start;
+            let pad = (GGUF_DEFAULT_ALIGNMENT - (written % GGUF_DEFAULT_ALIGNMENT))
+                % GGUF_DEFAULT_ALIGNMENT;
+            buf.extend(std::iter::repeat(0u8).take(pad as usize));
+
+            for &c in &stat.counts {
+                let cf = c as f32;
+                buf.extend_from_slice(&cf.to_le_bytes());
+            }
+            let written = buf.len() as u64 - data_start;
+            let pad = (GGUF_DEFAULT_ALIGNMENT - (written % GGUF_DEFAULT_ALIGNMENT))
+                % GGUF_DEFAULT_ALIGNMENT;
+            buf.extend(std::iter::repeat(0u8).take(pad as usize));
+        }
+
+        // Single atomic write.
+        let mut file = File::create(path)?;
+        file.write_all(&buf)?;
+        file.flush()?;
+        Ok(())
+    }
+
     /// Load an [`ImatrixCollector`] from a llama.cpp-compatible legacy
     /// `.imatrix` sidecar file.
     ///
@@ -998,5 +1190,134 @@ mod tests {
         let _ = std::any::type_name::<ImatrixCollector>();
         let _ = std::any::type_name::<Stats>();
         let _ = std::any::type_name::<ImatrixError>();
+    }
+
+    // ─────────────── GGUF imatrix format tests (P6 iter-3) ───────────────
+
+    #[test]
+    fn align_up_works() {
+        assert_eq!(align_up(0, 32), 0);
+        assert_eq!(align_up(1, 32), 32);
+        assert_eq!(align_up(31, 32), 32);
+        assert_eq!(align_up(32, 32), 32);
+        assert_eq!(align_up(33, 32), 64);
+    }
+
+    #[test]
+    fn gguf_imatrix_header_signature() {
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0, 3.0, 4.0], 4, 1)
+            .unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-header-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["wikitext-2.txt"]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(bytes.len() > 24);
+        assert_eq!(&bytes[0..4], b"GGUF");
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(version, 3);
+        let n_tensors = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        assert_eq!(n_tensors, 2);
+        let n_kv = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        assert_eq!(n_kv, 4);
+    }
+
+    #[test]
+    fn gguf_imatrix_metadata_keys_present() {
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("blk.0.attn_v.weight", &[0.5, 0.5], 2, 1)
+            .unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-meta-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["wikitext-2.txt", "calib.txt"])
+            .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("general.type"));
+        assert!(s.contains("imatrix.datasets"));
+        assert!(s.contains("imatrix.chunk_count"));
+        assert!(s.contains("imatrix.chunk_size"));
+        assert!(s.contains("wikitext-2.txt"));
+        assert!(s.contains("calib.txt"));
+    }
+
+    #[test]
+    fn gguf_imatrix_tensor_names_correct() {
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0], 2, 1)
+            .unwrap();
+        col.accumulate_dense("blk.1.ffn_down.weight", &[3.0, 4.0, 5.0, 6.0], 4, 1)
+            .unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-names-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["calib.txt"]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("blk.0.attn_q.weight.in_sum2"));
+        assert!(s.contains("blk.0.attn_q.weight.counts"));
+        assert!(s.contains("blk.1.ffn_down.weight.in_sum2"));
+        assert!(s.contains("blk.1.ffn_down.weight.counts"));
+    }
+
+    #[test]
+    fn gguf_imatrix_empty_collector() {
+        let col = ImatrixCollector::new();
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-empty-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["calib.txt"]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(&bytes[0..4], b"GGUF");
+        let n_tensors = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        assert_eq!(n_tensors, 0);
+        let n_kv = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        assert_eq!(n_kv, 4);
+    }
+
+    #[test]
+    fn gguf_imatrix_writes_in_sorted_name_order() {
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense("zzz.weight", &[1.0, 2.0], 2, 1).unwrap();
+        col.accumulate_dense("aaa.weight", &[3.0, 4.0], 2, 1).unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-sort-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["calib.txt"]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let s = String::from_utf8_lossy(&bytes);
+        let aaa_pos = s.find("aaa.weight.in_sum2").expect("aaa must appear");
+        let zzz_pos = s.find("zzz.weight.in_sum2").expect("zzz must appear");
+        assert!(aaa_pos < zzz_pos);
     }
 }
