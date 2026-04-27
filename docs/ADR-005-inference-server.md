@@ -6440,7 +6440,11 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
 
   - **Context.** Wave-2 audit (cfa-20260426-adr005-research) flagged that the streaming engine emits `delta.tool_calls[N].function.{name, arguments}` as a single chunk on `ToolCallClose` rather than streaming the arguments string incrementally. Per OpenAI Chat Completions spec, `function.arguments` is a *string accumulator* on the client side — clients append each delta and JSON-parse the result once `finish_reason="tool_calls"` arrives. One big chunk is spec-valid but blocks progressive UI updates while the model is still generating. W-B3 lands the incremental shape so OpenWebUI / OpenAI clients can show argument JSON building character-by-character (kv-by-kv, in our boundary semantics).
 
-  - **Chesterton note.** The pre-W-B3 close-buffered shape was deliberately preserved through W-A3 + W-B2 because both phases were focused on the policy-enforced loud-error contract, not on the streaming SSE shape. The single-chunk emit at `emit_streaming_tool_call_close` is well-tested + audit-driver-exercised; W-B3 augments rather than replaces it. The streaming path activates only when the per-call body emits enough bytes to extract the function name from a prefix; if the body arrives in one fragment (or the family lacks a streaming converter), `finalize` delegates back to `emit_streaming_tool_call_close` so the close-buffered shape AND the policy-enforced loud-error branches stay byte-for-byte identical to pre-W-B3 behaviour.
+  - **Chesterton note.** The pre-W-B3 close-buffered shape was deliberately preserved through W-A3 + W-B2 because both phases were focused on the policy-enforced loud-error contract, not on the streaming SSE shape. The single-chunk emit at `emit_streaming_tool_call_close` is well-tested + audit-driver-exercised; W-B3 augments rather than replaces it.
+
+    > **Wave 3.5 MED amendment (2026-04-27).** The original W-B3 entry below claimed `finalize` delegates to `emit_streaming_tool_call_close` "if the body arrives in one fragment (or the family lacks a streaming converter)".  That was an overclaim: for well-formed Gemma 4 / Qwen 3.5 single-fragment bodies, `advance`'s first call extracts the name (engine.rs:2196-2239), sets `name_emitted=true`, and `finalize` (engine.rs:2398-2406) takes the streaming-path branch — NOT the legacy fallback.  The legacy fallback fires ONLY when the family lacks a streaming converter (unknown family) OR the body never emits enough bytes to extract a name prefix (e.g. truncated bodies).  Single-fragment well-formed bodies emit the canonical incremental shape (chunk 1: id+name, chunk 2: `{`, finalize: tail).  Audit citation: `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt` divergence "W-B3 single-fragment fallback" severity MED.  Resolution per audit recommendation (ii) + worker prompt: the incremental shape IS the canonical OpenAI spec; the "single-fragment legacy fallback" was an unnecessary backwards-compat hack that was never actually wired up for well-formed bodies.  The test was renamed `streaming_single_fragment_emits_incremental_shape` and strengthened to assert event count + chunk-1/chunk-2 shape (not just concatenated JSON).
+
+    The streaming path activates whenever `advance` can extract the function name from a prefix; for well-formed bodies that's typically immediate.  When the family lacks a streaming converter (unknown family) or the body never reaches a name-extractable prefix (truncated body), `finalize` delegates back to `emit_streaming_tool_call_close` so the close-buffered shape AND the policy-enforced loud-error branches stay byte-for-byte identical to pre-W-B3 behaviour.
 
   - **Tail-parser design.** Introduced `ToolCallStreamEmitter` struct (engine.rs, near `emit_streaming_tool_call_close`). Per-family streaming converters walk the body at JSON-syntactically-meaningful boundaries — never mid-string, never mid-key. `Gemma4`: scan top-level `,`-separated kvs in the `{...}` region; emit each closed kv as a JSON fragment delta. `Qwen35`: scan for closed `<parameter=KEY>VAL</parameter>` blocks; emit one delta per block. The closing `}` + any tail kv the streaming scanner deferred (because `}` came before another `,`) are emitted by `finalize` after the body parses. Rejected alternative: speculative-close + diff against last-successful args JSON. That approach would emit STALE partials inside in-progress strings (`"San Fra"` then `"San Francisco"` would concatenate to `"San FraSan Francisco"` on OpenAI clients that don't dedup). The closed-kv scanner is structurally simpler AND only emits at boundaries the JSON treats as values committed.
 
@@ -6458,7 +6462,7 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - `streaming_tool_call_arguments_concatenate_to_valid_json`: feeds 4 fragments bisecting kvs at non-boundary points; concatenates every `arguments` delta + JSON-parses; asserts equal to `parse_tool_call_body`'s canonical `arguments_json`.
     - `streaming_tool_call_emits_finish_reason_tool_calls_terminal`: pins the `saw_tc=true` latch contract that drives `finish_reason="tool_calls"` on the terminating Done event. Also asserts the final args delta ends with `}` (closed JSON object).
     - `streaming_multiple_tool_calls_with_distinct_indices`: drives two emitters in sequence (mirrors `parallel_tool_calls=true`); asserts `index=0` AND `index=1` appear in the delta stream + `tc_index` advances correctly per-call.
-    - `streaming_single_fragment_falls_back_to_close_buffered_shape`: regression-preserve — entire body in one fragment still produces valid JSON args via `finalize`'s diff-emit.
+    - `streaming_single_fragment_falls_back_to_close_buffered_shape`: REPLACED at Wave 3.5 MED with the honestly-named `streaming_single_fragment_emits_incremental_shape` — the original test name promised legacy two-chunk fallback but the production code emits the incremental shape (chunks 1+2 from `advance`, plus finalize tail).  See Wave 3.5 MED entry below for the rename + strengthened assertions.
     - `streaming_qwen35_emits_per_parameter_block`: Qwen 3.5/3.6 body fragments emit one delta per closed `<parameter>` block; concatenated args equal canonical parse.
     - `streaming_unknown_family_falls_back_to_legacy`: unknown family — `advance` is a no-op (no name to extract); `finalize` delegates to legacy `emit_streaming_tool_call_close`, which emits a single Content delta under `Auto` policy (regression-preserve).
 
@@ -6544,3 +6548,38 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **Open followups.**  None — the silent-data-loss gap is closed.
 
   - **Fence respected (Wave 3.5 HIGH-2).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-3.5 MED — single-fragment test/doc honesty (no legacy fallback for well-formed bodies)**
+
+  - **Context.** Wave 3 audit divergence "W-B3 single-fragment fallback" severity MED at `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`:
+
+    > "advance emits name and the arguments opening as soon as it sees `call:f{` at engine.rs:2196-2239; finalize delegates to legacy only if name_emitted is false at engine.rs:2398-2406. The test named `streaming_single_fragment_falls_back_to_close_buffered_shape` only checks concatenated JSON, not event count or legacy shape."
+
+    The test name and the W-B3 doc claim both promised a "single-fragment legacy fallback" — i.e. that single-fragment well-formed bodies would emit the pre-W-B3 two-chunk close-buffered shape (chunk 1 = id+name+full-args, chunk 2 = close).  In reality, `advance`'s first call already emits chunk 1 (id+name) + chunk 2 (`{` opening) when it sees a complete `call:NAME{` prefix.  `finalize` then emits the tail.  The legacy fallback (delegating to `emit_streaming_tool_call_close`) only fires when `name_emitted == false` — i.e. when the family lacks a streaming converter (unknown family) OR the body never emitted enough bytes for the name extractor to fire.
+
+  - **Audit recommendation.** Two options:
+    - (i) Implement the legacy fallback honestly: detect "single fragment" before advance starts emitting; route to legacy shape entirely.
+    - (ii) Update docs/tests to state that single-fragment calls may still stream name + opening args before final tail, AND fix the test to assert the actual emitted shape (not just concatenated JSON).
+
+    Wave 3.5 MED chose (ii) per the worker prompt's mantra directive: "The incremental shape IS the canonical OpenAI spec; 'single-fragment legacy fallback' was an unnecessary backwards-compat hack."  No legacy fallback for fallback's sake; the production code is correct as-is, only the test name + doc claim were misleading.
+
+  - **Code changes (`src/serve/api/engine.rs`).**
+    - Renamed `streaming_single_fragment_falls_back_to_close_buffered_shape` → `streaming_single_fragment_emits_incremental_shape`.
+    - Strengthened the test assertions: event count ≥ 2; chunk 1 carries id+type+name with `arguments=None`; chunk 2 carries `arguments=Some("{")` with no id/type/name retransmission; concatenated arguments parse to valid JSON; `tc_index` advances to 1; `saw_tc` latches.  This is the canonical OpenAI streaming shape — NOT the pre-W-B3 two-chunk close-buffered shape.
+    - Updated `ToolCallStreamEmitter::finalize`'s rustdoc to add a "Wave 3.5 MED honesty note" explaining when the streaming-path branch fires (any well-formed body where `advance` could extract the name from a prefix, including single-fragment bodies) vs. when the legacy fallback fires (unknown family or never-name-extractable body).
+
+  - **Doc changes (`docs/ADR-005-inference-server.md`).**
+    - Added a "Wave 3.5 MED amendment" callout to the W-B3 Chesterton note that explicitly corrects the overclaim "if the body arrives in one fragment ... `finalize` delegates back to `emit_streaming_tool_call_close`".  The corrected statement: the streaming path activates whenever `advance` can extract the name from a prefix (typically immediate for well-formed bodies); legacy fallback fires ONLY for unknown families or never-name-extractable bodies.
+    - Updated the W-B3 test list entry for `streaming_single_fragment_falls_back_to_close_buffered_shape` to point to the renamed test.
+
+  - **Tests.** `cargo test --release --bin hf2q -- streaming_single_fragment`: passes with the new name and stronger assertions.  No other tests broke (the `streaming_unknown_family_falls_back_to_legacy` test continues to exercise the TRUE legacy fallback branch — unknown family).
+
+  - **LOC delta.** `src/serve/api/engine.rs` +120/-25 across the test rename + strengthening + finalize doc-comment update.
+
+  - **Mantra notes.**
+    - No fallback for fallback's sake: the unnecessary backwards-compat "single-fragment legacy fallback" was never actually wired up for well-formed bodies.  Removing the misleading claim is honest; adding a real fallback would be backwards-compat busywork with no client benefit (OpenAI spec accepts any `arguments` chunking).
+    - Code-is-truth: the test was renamed because the old name was a lie about what the production code did.
+
+  - **Open followups.**  None — the test/doc honesty gap is closed.
+
+  - **Fence respected (Wave 3.5 MED).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.

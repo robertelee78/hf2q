@@ -2379,11 +2379,29 @@ impl ToolCallStreamEmitter {
     ///     final arguments delta. Increment `tc_index` and set `saw_tc`.
     ///     Returns `Ok(())`.
     ///
+    ///     Wave 3.5 MED honesty note: this branch fires for any
+    ///     well-formed body whose first `advance` call could extract
+    ///     the function name from a prefix — INCLUDING single-fragment
+    ///     bodies where the entire `call:NAME{...}` (Gemma 4) or
+    ///     `<function=NAME>...</function>` (Qwen 3.5/3.6) arrived in
+    ///     one fragment.  The audit at
+    ///     `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`
+    ///     (divergence "W-B3 single-fragment fallback" severity MED)
+    ///     correctly observed that no "single-fragment legacy
+    ///     fallback" exists for well-formed bodies — `advance` always
+    ///     emits chunk 1 (id+name) + chunk 2 (`{`) immediately on
+    ///     well-formed input.  The incremental shape IS the canonical
+    ///     OpenAI streaming contract; there is no client-visible
+    ///     "two-chunk close-buffered" shape for well-formed
+    ///     single-fragment bodies under Wave 3 W-B3 + later.
+    ///
     ///   - **Streaming path never fired** (`name_emitted == false`): the
     ///     emitter declined the body (unknown family, OR name didn't appear
     ///     in any prefix). Delegate to `emit_streaming_tool_call_close` so
     ///     the close-buffered shape AND the policy-enforced loud-error
     ///     branches stay byte-for-byte identical to pre-W-B3 behaviour.
+    ///     This branch is exercised by
+    ///     `streaming_unknown_family_falls_back_to_legacy`.
     fn finalize(
         &mut self,
         body: String,
@@ -6724,20 +6742,65 @@ mod tool_call_stream_emitter_tests {
         );
     }
 
-    /// Regression preserve: when the entire body arrives in a single fragment
-    /// (no incremental opportunity), the emitter MUST fall back to the
-    /// close-buffered shape — exactly two chunks (id+name, full args) — so
-    /// clients that don't track incremental updates still receive the
-    /// pre-W-B3 SSE shape unchanged.
+    /// Wave 3.5 MED — `streaming_single_fragment_emits_incremental_shape`.
+    ///
+    /// Honest replacement for the misnamed
+    /// `streaming_single_fragment_falls_back_to_close_buffered_shape`
+    /// test (Wave 3 W-B3).  The previous name promised a "legacy
+    /// fallback" to the pre-W-B3 two-chunk close-buffered shape, but
+    /// the actual `advance` + `finalize` flow emits MORE than two
+    /// chunks even for a single-fragment body:
+    ///
+    ///   * `advance(body)` sees `call:f{` complete in the FIRST call
+    ///     (engine.rs:2196-2239) and immediately emits chunk 1
+    ///     (id+name, no arguments) and chunk 2 (`{` opening).
+    ///   * `finalize` then emits the residual tail
+    ///     (`"x":1` + closing `}`) as additional chunks.
+    ///
+    /// `finalize` only delegates to the legacy
+    /// `emit_streaming_tool_call_close` when `name_emitted == false`
+    /// (engine.rs:2398-2406) — i.e. when `advance` couldn't extract
+    /// the name from any prefix (unknown family OR the single
+    /// fragment didn't contain enough to find the name).  For a
+    /// well-formed Gemma 4 single-fragment body like `call:f{x:1}`,
+    /// `advance` extracts `f` immediately, sets `name_emitted=true`,
+    /// and the legacy fallback is NEVER taken.
+    ///
+    /// Wave 3 audit divergence "W-B3 single-fragment fallback"
+    /// severity MED at
+    /// `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`:
+    ///
+    ///   "advance emits name and the arguments opening as soon as it
+    ///    sees call:f{ at engine.rs:2196-2239; finalize delegates to
+    ///    legacy only if name_emitted is false at engine.rs:2398-2406.
+    ///    The test named streaming_single_fragment_falls_back_to_
+    ///    close_buffered_shape only checks concatenated JSON, not
+    ///    event count or legacy shape."
+    ///
+    /// Resolution per audit recommendation (ii) + worker prompt
+    /// directive: the incremental shape IS the canonical OpenAI
+    /// spec; the "single-fragment legacy fallback" was an unnecessary
+    /// backwards-compat hack that was never actually wired up for
+    /// well-formed bodies.  Update test to assert the true shape:
+    /// chunk 1 has id+name, chunk 2 has `{` opening, finalize emits
+    /// the tail (multiple kv chunks possible if the kv-scanner ran;
+    /// or one tail chunk if it didn't).  Concatenated arguments MUST
+    /// be valid JSON.  No legacy two-chunk shape is preserved or
+    /// expected.
+    ///
+    /// The TRUE legacy fallback (delegating to
+    /// `emit_streaming_tool_call_close`) is exercised by
+    /// `streaming_unknown_family_falls_back_to_legacy` (unknown
+    /// family → `advance` is a no-op → `finalize` delegates).
     #[test]
-    fn streaming_single_fragment_falls_back_to_close_buffered_shape() {
+    fn streaming_single_fragment_emits_incremental_shape() {
         let (tx, mut rx) = mpsc::channel::<GenerationEvent>(16);
         let mut emitter = ToolCallStreamEmitter::new(Some("gemma4"), 0);
-        // A single fragment containing the FULL body. The emitter's first
-        // `advance` will see `call:f{...}` complete — name + opening `{`
-        // emit, then the kv-scanner (which only emits on `,`) sees one kv
-        // followed by `}` so it stops without emitting the kv. Finalize
-        // then emits the residual tail.
+        // A single fragment containing the FULL body.  The emitter's
+        // first `advance` extracts the name `f` and emits:
+        //   chunk 1: id + type + name (no arguments)
+        //   chunk 2: arguments=`{`
+        // Then finalize emits the residual tail.
         let body = "call:f{x:1}".to_string();
         emitter.advance(&body, &tx).expect("advance");
         let mut tc_index: usize = 0;
@@ -6754,12 +6817,77 @@ mod tool_call_stream_emitter_tests {
             .expect("finalize");
         drop(tx);
         let events = drain(&mut rx);
-        // Concatenated args MUST be valid JSON {"x":1}.
+
+        // Honest event-shape assertion (audit-driven).  All emitted
+        // events MUST be ToolCallDelta with the canonical incremental
+        // shape — NOT the legacy two-chunk close-buffered shape.
+        assert!(
+            events.iter().all(|e| matches!(e, GenerationEvent::ToolCallDelta { .. })),
+            "all events MUST be ToolCallDelta (no Content fallback for \
+             well-formed Gemma 4 body); got {events:?}"
+        );
+
+        // Chunk 1 MUST carry id+type+name (no arguments).  This is the
+        // canonical OpenAI streaming first-chunk shape.
+        let chunk1 = events.first().expect("at least one event");
+        match chunk1 {
+            GenerationEvent::ToolCallDelta {
+                index, id, call_type, name, arguments,
+            } => {
+                assert_eq!(*index, 0, "chunk 1 index MUST be 0");
+                assert!(id.is_some(), "chunk 1 MUST carry id (canonical OpenAI shape)");
+                assert_eq!(call_type.as_deref(), Some("function"));
+                assert_eq!(name.as_deref(), Some("f"), "chunk 1 MUST carry function name");
+                assert!(arguments.is_none(), "chunk 1 MUST NOT carry arguments");
+            }
+            other => panic!("chunk 1 must be ToolCallDelta with id+name; got {other:?}"),
+        }
+
+        // Chunk 2 MUST be the `{` opening (advance step 2).  No id, no
+        // name retransmission.
+        let chunk2 = events.get(1).expect("at least two events");
+        match chunk2 {
+            GenerationEvent::ToolCallDelta {
+                index, id, call_type, name, arguments,
+            } => {
+                assert_eq!(*index, 0);
+                assert!(id.is_none(), "chunk 2 MUST NOT retransmit id");
+                assert!(call_type.is_none(), "chunk 2 MUST NOT retransmit type");
+                assert!(name.is_none(), "chunk 2 MUST NOT retransmit name");
+                assert_eq!(
+                    arguments.as_deref(),
+                    Some("{"),
+                    "chunk 2 MUST be the args opening `{{`"
+                );
+            }
+            other => panic!("chunk 2 must be ToolCallDelta with `{{`; got {other:?}"),
+        }
+
+        // Event count MUST be at least 2 (chunks 1 and 2 from advance).
+        // The pre-W-B3 legacy two-chunk close-buffered shape would have
+        // been: chunk 1 (id+name+full args), chunk 2 (close).  The
+        // Wave 3 W-B3 incremental shape is strictly different and
+        // typically emits more chunks (one per closed kv + a tail).
+        assert!(
+            events.len() >= 2,
+            "incremental shape emits at least 2 chunks (id+name then `{{`); \
+             got {} events: {events:?}",
+            events.len()
+        );
+
+        // Concatenated args across all chunks MUST be valid JSON
+        // matching the input body.  This is the canonical OpenAI
+        // accumulator-on-the-client contract.
         let (name, args) = rebuild_call(&events, 0);
         assert_eq!(name.as_deref(), Some("f"));
         let v: serde_json::Value =
             serde_json::from_str(&args).expect("args concatenate to valid JSON");
         assert_eq!(v, serde_json::json!({"x": 1}));
+
+        // tc_index MUST advance and saw_tc latch — these are the
+        // contracts the live decode loop relies on.
+        assert_eq!(tc_index, 1, "tc_index MUST advance to 1 after finalize");
+        assert!(saw_tc, "saw_tc MUST latch true after finalize");
     }
 
     /// Qwen 3.5/3.6 streaming — `<function=NAME>...<parameter=KEY>VAL</parameter>...</function>`
