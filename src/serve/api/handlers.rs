@@ -959,22 +959,24 @@ where
     // discriminant so the engine knows whether to enforce
     // unconditionally (`ResponseFormat`, mask + advance every token),
     // trigger-gated (`ToolCallBodyAuto`, no-op until the per-model open
-    // marker fires — forward-looking, not reachable through this path),
-    // or EAGERLY for tool calls (`ToolCallBodyRequired`, mask + advance
-    // every token starting at byte 0; the grammar root already wraps
-    // the body in open/close markers).  Mirrors llama.cpp
-    // `enum common_grammar_type` + `bool grammar_lazy` selection in
-    // `tools/server/server-task.cpp:381-403` and `common/chat.cpp:898-913,
-    // 1177-1200, 1399-1416`.
+    // marker fires — Wave 3 W-B2 wires this for tool_choice=auto with
+    // tools[] non-empty AND a registered family), or EAGERLY for tool
+    // calls (`ToolCallBodyRequired`, mask + advance every token starting
+    // at byte 0; the grammar root already wraps the body in open/close
+    // markers).  Mirrors llama.cpp `enum common_grammar_type` + `bool
+    // grammar_lazy` selection in `tools/server/server-task.cpp:381-403`
+    // and `common/chat.cpp:898-913, 1177-1200, 1399-1416, 1626-1628`.
     //
-    // `compile_tool_grammar` only returns `Some` for
-    // `tool_choice = required / function`, so the tool branch always
-    // resolves to `ToolCallBodyRequired`.  When neither grammar is
-    // set, the kind is `ResponseFormat` (the `Default`) but it is
-    // never read because `effective_grammar == None` short-circuits
-    // the runtime entirely.
+    // The tool-grammar kind is derived from `tool_choice` upstream of
+    // the grammar-vs-no-grammar decision: under `tool_choice=auto` the
+    // compiled grammar (when one exists) is tagged
+    // `ToolCallBodyAuto`; under Required/Function it is
+    // `ToolCallBodyRequired`.  When `compile_tool_grammar` returns
+    // `Ok(None)` (Auto without tools / unregistered family, or the None
+    // tool_choice), the kind is unused because the tool slot is empty.
+    let tool_grammar_kind = tool_grammar_kind_for(&tool_choice);
     let (effective_grammar, effective_grammar_kind) =
-        select_effective_grammar(tool_grammar, response_grammar);
+        select_effective_grammar(tool_grammar, tool_grammar_kind, response_grammar);
     // ADR-005 Phase 2a iter-133 Iter D (W67): per-request thinking mode
     // override. Default off keeps every legacy / non-thinking-aware
     // caller's rendered prompt byte-identical; Open WebUI's panel UX
@@ -2523,13 +2525,30 @@ ws ::= | " " | "\n" [ \t]{0,20}
 /// production selection test" can exercise the EXACT production code path
 /// (not the wave-2 sham `Option<u32>` stand-in pattern Codex flagged).
 ///
-/// Selection rules:
+/// Wave 3 W-B2 — `tool_grammar_kind` parameter added so the helper carries
+/// the eager-vs-lazy distinction the caller derived from `tool_choice`:
+///
+/// | tool_choice          | tool_grammar | tool_grammar_kind            |
+/// |----------------------|--------------|------------------------------|
+/// | None                 | always None  | n/a (caller sets to default) |
+/// | Auto                 | maybe Some   | `ToolCallBodyAuto` (lazy)    |
+/// | Required / Function  | usually Some | `ToolCallBodyRequired` (eager) |
+///
+/// The kind discriminant flips runtime behaviour at engine.rs:1496-1498
+/// and engine.rs:2724-2726: `ToolCallBodyAuto` arms
+/// `awaiting_trigger=true` so decoding is unconstrained until the
+/// `ToolCallSplitter` reports a `ToolCallOpen` event;
+/// `ToolCallBodyRequired` leaves the gate disarmed for eager enforcement
+/// from byte 0.
+///
+/// Selection rules (Wave 3 W-B2 update — `kind` parameter passed through
+/// the tool slot, response slot still hard-codes `ResponseFormat`):
 ///
 /// | tool grammar | response grammar | result                                       |
 /// |--------------|-------------------|----------------------------------------------|
-/// | `Some(t)`    | any               | `(Some(t), GrammarKind::ToolCallBodyRequired)` — eager from token 0 |
-/// | `None`       | `Some(r)`         | `(Some(r), GrammarKind::ResponseFormat)`     — eager (default behaviour) |
-/// | `None`       | `None`            | `(None,    GrammarKind::default())`          — kind is never read |
+/// | `Some(t)`    | any               | `(Some(t), tool_grammar_kind)`               |
+/// | `None`       | `Some(r)`         | `(Some(r), GrammarKind::ResponseFormat)`     |
+/// | `None`       | `None`            | `(None,    GrammarKind::default())`          |
 ///
 /// Precedence: tool grammar wins over response_format grammar — a request
 /// cannot simultaneously enforce response_format=json_schema AND
@@ -2542,12 +2561,38 @@ ws ::= | " " | "\n" [ \t]{0,20}
 /// `OUTPUT_FORMAT` wins over `NONE`.
 fn select_effective_grammar(
     tool_grammar: Option<grammar::Grammar>,
+    tool_grammar_kind: engine::GrammarKind,
     response_grammar: Option<grammar::Grammar>,
 ) -> (Option<grammar::Grammar>, engine::GrammarKind) {
     match (tool_grammar, response_grammar) {
-        (Some(g), _) => (Some(g), engine::GrammarKind::ToolCallBodyRequired),
+        (Some(g), _) => (Some(g), tool_grammar_kind),
         (None, Some(g)) => (Some(g), engine::GrammarKind::ResponseFormat),
         (None, None) => (None, engine::GrammarKind::default()),
+    }
+}
+
+/// Map `tool_choice` to the `GrammarKind` that should tag a successfully-
+/// compiled tool grammar.
+///
+/// Wave 3 W-B2 — extracted so the compile call site, the tests, and the
+/// post-W-B2 ADR-005 entry all reference the same single source of truth
+/// for the eager-vs-lazy decision.  The mapping is intentionally total
+/// over `ToolChoiceValue`: `None` returns the `Default`
+/// (`ResponseFormat`) which is never read because no tool grammar is
+/// produced under `tool_choice=none`.
+fn tool_grammar_kind_for(
+    tool_choice: &super::schema::ToolChoiceValue,
+) -> engine::GrammarKind {
+    use super::schema::ToolChoiceValue;
+    match tool_choice {
+        // Auto with a compiled grammar = lazy (awaiting_trigger=true).
+        ToolChoiceValue::Auto => engine::GrammarKind::ToolCallBodyAuto,
+        // Required/Function = eager (awaiting_trigger=false).
+        ToolChoiceValue::Required | ToolChoiceValue::Function(_) => {
+            engine::GrammarKind::ToolCallBodyRequired
+        }
+        // None never produces a tool grammar — the kind is not read.
+        ToolChoiceValue::None => engine::GrammarKind::default(),
     }
 }
 
@@ -2608,17 +2653,18 @@ fn defensive_no_call_under_constrained(
 ///
 /// | tool_choice          | behavior                                          |
 /// |----------------------|---------------------------------------------------|
-/// | `Auto` (default)     | No constraint — model decides whether to call.    |
 /// | `None`               | No constraint — tools suppressed at render time.  |
-/// | `Required`           | Grammar = alternation of ALL function grammars.   |
-/// | `Function(name)`     | Grammar = that function's grammar only.           |
+/// | `Auto` (default)     | LAZY constraint when `tools[]` non-empty AND model registered. Same per-model body grammar shape as Required, but enforcement is gated by the runtime `awaiting_trigger` flag (flipped by `ToolCallSplitter` on `ToolCallOpen`). Until the model emits the open marker, decoding is unconstrained (preamble freedom). |
+/// | `Required`           | EAGER grammar = alternation of ALL function grammars. |
+/// | `Function(name)`     | EAGER grammar = that function's grammar only.     |
 ///
-/// Returns `Ok(None)` when no grammar constraint applies (`tool_choice=auto`
-/// or `tool_choice=none`). Returns `Err(Response)` with a 400
-/// `invalid_request` envelope when preconditions for a constrained grammar
-/// cannot be met (`tool_choice=required/function` with empty/missing
-/// `tools[]` or with an unregistered model). Returns `Err(Response)` with
-/// a 400 `grammar_error` when preconditions pass but the emitter fails.
+/// Returns `Ok(None)` when no grammar constraint applies (`tool_choice=none`,
+/// or `tool_choice=auto` without tools / on an unregistered model — Auto
+/// allows no-call and grammar is optional). Returns `Err(Response)` with a
+/// 400 `invalid_request` envelope when preconditions for a constrained
+/// grammar cannot be met (`tool_choice=required/function` with empty/missing
+/// `tools[]` or with an unregistered model). Returns `Err(Response)` with a
+/// 400 `grammar_error` when preconditions pass but the emitter fails.
 ///
 /// WHY we need a model registration to emit the grammar:
 /// Each model emits tool calls in a model-specific wrapper format (Gemma 4 uses
@@ -2629,52 +2675,81 @@ fn defensive_no_call_under_constrained(
 /// When no registration is found under `tool_choice=required/function`, we
 /// hard-error with 400 — silently returning `Ok(None)` here would re-open the
 /// wave-2.6 audit divergence (unconstrained engine path for Required/Function).
+/// Under `tool_choice=auto` we tolerate `Ok(None)` because Auto explicitly
+/// permits no-call — there is no contract to constrain.
 ///
-/// T2.4 unblock evidence: once this function is wired (and tool_choice=required
-/// / tool_choice=function is used), the grammar physically prevents malformed
-/// wrapper output. `engine.rs:1615-1629`'s silent parse-failure-fallback can
-/// then be safely replaced with `GenerationEvent::Error(...)` because the
-/// fallback can only trigger for `tool_choice=auto` (grammar not applied →
-/// parse failure is still possible) — wave 2.8 W-θ closes the no-tools and
-/// unknown-family fallbacks below.
+/// T2.4 closure: under any branch that returns `Ok(Some(grammar))`, the
+/// grammar physically constrains the body — for Required/Function from
+/// byte 0 (eager), for Auto from `ToolCallOpen` onwards (lazy). The
+/// streaming `emit_streaming_tool_call_close` and non-streaming
+/// `extract_tool_calls_from_text` body-parse-failure branches become
+/// unreachable on registered families regardless of `tool_choice`. Wave 3
+/// W-B2 closes the Auto branch; W-A3 already closed Constrained.
 ///
-/// Wave 2.8 W-θ MED — fallback shape per `tool_choice`:
+/// Wave 3 W-B2 — return-shape matrix:
 ///
 /// | tool_choice           | tools[]      | model registration | result            |
 /// |-----------------------|--------------|--------------------|-------------------|
-/// | None / Auto           | any          | any                | Ok(None)          |
+/// | None                  | any          | any                | Ok(None)          |
+/// | Auto                  | empty / None | any                | Ok(None)          |
+/// | Auto                  | nonempty     | unknown            | Ok(None)          |
+/// | Auto                  | nonempty     | known              | Ok(Some(grammar)) — LAZY |
 /// | Required / Function   | empty / None | any                | Err(400)          |
 /// | Required / Function   | nonempty     | unknown            | Err(400)          |
-/// | Required / Function   | nonempty     | known              | Ok(Some(grammar)) |
+/// | Required / Function   | nonempty     | known              | Ok(Some(grammar)) — EAGER |
 ///
-/// The two `Err(400)` branches are wave-2.7 audit MED closures: the
-/// preconditions for grammar emission failed under a strict tool_choice, so
-/// we MUST hard-fail rather than silently fall back to no-grammar (which
-/// would re-introduce the wave-2.6 audit divergence "Required/Function
-/// enforcement before ToolCallOpen" via the unregistered path). Auto +
-/// no-tools / unknown-family still returns `Ok(None)` — Auto allows no-call
-/// and grammar is optional under Auto.
+/// The eager-vs-lazy distinction is NOT carried in the returned grammar —
+/// the grammar bytes are identical between Required-with-tools-and-family
+/// and Auto-with-tools-and-family on the same registration.  The
+/// distinction is encoded by `select_effective_grammar` in the
+/// `GrammarKind` discriminant (`ToolCallBodyRequired` vs
+/// `ToolCallBodyAuto`), which the engine reads to arm
+/// `awaiting_trigger=true` for the lazy path. See engine.rs:1496-1498
+/// and engine.rs:2724-2726 for the arming sites.
+///
+/// Mirrors llama.cpp `grammar_lazy = (tool_choice == AUTO)` /
+/// `grammar_lazy = false` for Required at common/chat.cpp:898-913,
+/// 1177-1200, 1399-1416, 1626-1628 and `grammar_triggers` registration
+/// for the per-model open marker.
 fn compile_tool_grammar(
     req: &super::schema::ChatCompletionRequest,
     tool_choice: &super::schema::ToolChoiceValue,
 ) -> std::result::Result<Option<grammar::Grammar>, Response> {
     use super::schema::ToolChoiceValue;
 
-    // Only Required and Function(name) apply grammar enforcement.
-    // Auto and None produce no constraint.
-    let constrain = matches!(tool_choice, ToolChoiceValue::Required | ToolChoiceValue::Function(_));
-    if !constrain {
+    // None never produces a grammar (tools are suppressed at render).
+    if matches!(tool_choice, ToolChoiceValue::None) {
         return Ok(None);
     }
+
+    // Required / Function compile EAGER; Auto compiles LAZY (same grammar
+    // shape, kind discriminant flips at select_effective_grammar so the
+    // engine arms `awaiting_trigger=true`).  The distinction matters only
+    // for precondition strictness:
+    //   * Required/Function: missing tools[] OR unknown family ⇒ Err(400)
+    //   * Auto              : missing tools[] OR unknown family ⇒ Ok(None)
+    let constrain =
+        matches!(tool_choice, ToolChoiceValue::Required | ToolChoiceValue::Function(_));
 
     // Wave 2.8 W-θ MED — hard-error when tool_choice=required/function but
     // the request has no tools[] declared. Silently returning Ok(None)
     // here would compile no grammar and let the engine fall through to
     // the unconstrained path, exactly the silent fallback pattern the
     // wave-2.7 audit flagged. The operator-actionable answer is a 400.
+    //
+    // Wave 3 W-B2: under Auto, missing tools[] is benign — Auto explicitly
+    // allows no-call.  Returning Ok(None) here mirrors the pre-W-B2
+    // contract; the engine then runs without grammar constraints (model
+    // is free to emit content or — if some other unrelated chat path
+    // injected a tool marker — produce a malformed call that the
+    // body-parse-failure → content fallback handles).
     let tools = match req.tools.as_deref() {
         Some(t) if !t.is_empty() => t,
         _ => {
+            if !constrain {
+                // Auto + no tools: no grammar to compile. Auto allows no-call.
+                return Ok(None);
+            }
             let label = match tool_choice {
                 ToolChoiceValue::Required => "required",
                 ToolChoiceValue::Function(_) => "function",
@@ -2705,9 +2780,23 @@ fn compile_tool_grammar(
     // the model has no registered tool_call_gbnf emitter. Same rationale
     // as the no-tools branch: silent Ok(None) re-opens the wave-2.6
     // divergence. Operator-actionable answer is a 400.
+    //
+    // Wave 3 W-B2: under Auto, missing registration is benign — we have
+    // no per-model tool-call format to constrain, so the engine runs
+    // unconstrained (same effective behaviour as pre-W-B2 Auto).  Auto's
+    // body-parse-failure → content fallback remains the safety net for
+    // unregistered families; the new Auto-lazy path only activates on
+    // registered ones.
     let reg = match registry::find_for(&req.model) {
         Some(r) => r,
         None => {
+            if !constrain {
+                // Auto + unknown family: no per-model grammar to compile.
+                // Auto allows no-call; the unconstrained engine path is
+                // safe because the post-decode body-parse-failure fallback
+                // handles malformed output as content.
+                return Ok(None);
+            }
             let label = match tool_choice {
                 ToolChoiceValue::Required => "required",
                 ToolChoiceValue::Function(_) => "function",
@@ -2750,8 +2839,14 @@ fn compile_tool_grammar(
             }
             found
         }
-        ToolChoiceValue::Required => tools.iter().collect(),
-        _ => unreachable!("already checked above"),
+        // Required: alternation across ALL declared tools.
+        // Auto    : same — under Auto the model picks which tool (or none)
+        //           to call, but if it emits the open marker the body must
+        //           match SOME declared tool.  Mirrors llama.cpp's Auto
+        //           grammar shape (common/chat.cpp:898-913 — same per-model
+        //           call alternation as Required, just `lazy=true`).
+        ToolChoiceValue::Required | ToolChoiceValue::Auto => tools.iter().collect(),
+        _ => unreachable!("None gated above"),
     };
 
     // Wave 2.7 W-η Q-B: read `parallel_tool_calls` (OpenAI default = true,
@@ -3032,6 +3127,240 @@ mod compile_tool_grammar_precondition_tests {
         assert!(
             g.is_some(),
             "happy path MUST return Some(grammar); got None"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 3 W-B2 — Auto-mode lazy grammar wiring tests.
+    //
+    // Pre-W-B2: `compile_tool_grammar(Auto, ...)` short-circuited to
+    // `Ok(None)` regardless of tools[] / registration state — the
+    // `ToolCallBodyAuto` discriminant existed but was unreachable from the
+    // chat-completions handler.
+    //
+    // Post-W-B2: Auto + tools[] non-empty + registered family compiles the
+    // SAME per-model body grammar as Required, and the call site tags it
+    // with `GrammarKind::ToolCallBodyAuto` (via `tool_grammar_kind_for`)
+    // so the engine arms `awaiting_trigger=true`.  Auto + missing tools[]
+    // OR unknown family STILL returns `Ok(None)` — the regression-preserve
+    // tests at `compile_tool_grammar_auto_with_no_tools_returns_ok_none`
+    // and `compile_tool_grammar_auto_with_unknown_family_returns_ok_none`
+    // pin those branches.  These tests close the third branch.
+    //
+    // The tests below drive the helper directly (`compile_tool_grammar`
+    // returns the grammar; `tool_grammar_kind_for` returns the kind); the
+    // production call site at line 952-980 wires both into
+    // `select_effective_grammar` which exits with the lazy-tagged pair.
+    // ---------------------------------------------------------------------
+
+    /// Auto + tools[] non-empty + registered family → `Ok(Some(grammar))`.
+    /// Mirrors `compile_tool_grammar_required_happy_path_compiles` but
+    /// with `tool_choice=Auto`.  Pre-W-B2 this returned `Ok(None)`.
+    #[test]
+    fn compile_tool_grammar_auto_with_tools_compiles_lazy_grammar() {
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        let res = compile_tool_grammar(&req, &ToolChoiceValue::Auto);
+        let g = res.expect(
+            "Auto + tools[] + registered family MUST compile a grammar (W-B2 lazy wiring); \
+             previously short-circuited to Ok(None) before W-B2",
+        );
+        let g = g.expect(
+            "Auto + tools[] + registered family MUST return Some(grammar) — the Auto \
+             branch now compiles the same per-model body grammar as Required, \
+             tagged with GrammarKind::ToolCallBodyAuto by the caller",
+        );
+
+        // Sanity: the compiled grammar must expose the per-model body shape
+        // (root rule + namespaced fn-0 root because the combiner runs
+        // unconditionally even for single-function inputs).
+        assert!(
+            g.rule_id("root").is_some(),
+            "Auto-mode compiled grammar MUST have a root rule (combiner output)"
+        );
+    }
+
+    /// Auto + tools[] + registered family + parallel_tool_calls=true
+    /// produces the SAME grammar shape as Required + same flags
+    /// (proves the lazy / eager decision is purely a runtime flag flip,
+    /// not a grammar-shape divergence).  This is the "Auto compiles the
+    /// same body grammar as Required" canonical-llama.cpp invariant.
+    #[test]
+    fn compile_tool_grammar_auto_grammar_bytes_match_required() {
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let req = req_with_parallel(
+            "gemma4-27b-it",
+            Some(one_scalar_tool("get_weather")),
+            /* parallel */ true,
+        );
+
+        let g_auto = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("Auto compile must succeed")
+            .expect("Auto must return Some(grammar) under W-B2");
+        let g_req = compile_tool_grammar(&req, &ToolChoiceValue::Required)
+            .expect("Required compile must succeed")
+            .expect("Required must return Some(grammar)");
+
+        let auto_gbnf = grammar::serialize::serialize(&g_auto);
+        let req_gbnf = grammar::serialize::serialize(&g_req);
+        assert_eq!(
+            auto_gbnf, req_gbnf,
+            "Wave 3 W-B2 invariant: Auto and Required produce byte-identical \
+             grammars on the same registered family + same tools[]; the only \
+             distinction is the GrammarKind discriminant set by \
+             tool_grammar_kind_for(&tool_choice) at the call site.\n\
+             Auto:\n{auto_gbnf}\nRequired:\n{req_gbnf}"
+        );
+    }
+
+    /// Auto-lazy runtime: BEFORE the trigger fires, the mask is a no-op so
+    /// the model is free to emit ANY preamble token.  This exercises the
+    /// `awaiting_trigger == true` short-circuit in `accept_bytes` /
+    /// `mask::mask_invalid_tokens` (sampler.rs:511 / mask.rs).
+    ///
+    /// Production setup matches `engine.rs:1496-1498` and
+    /// `engine.rs:2724-2726`: build the runtime, immediately call
+    /// `set_awaiting_trigger(true)` because the kind is
+    /// `GrammarKind::ToolCallBodyAuto`.  Then feed a preamble byte stream
+    /// that does NOT contain the open marker — the runtime must remain
+    /// alive (return `true`) and stay in `awaiting_trigger=true`.
+    #[test]
+    fn auto_lazy_grammar_allows_preamble_content() {
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("Auto compile")
+            .expect("Auto must return Some(grammar)");
+
+        let root_id = g.rule_id("root").expect("compiled grammar has root");
+        let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+            .expect("GrammarRuntime::new must succeed");
+        // Production arming for ToolCallBodyAuto.
+        rt.set_awaiting_trigger(true);
+        assert!(
+            rt.is_awaiting_trigger(),
+            "lazy Auto runtime starts in awaiting_trigger=true"
+        );
+
+        // Feed preamble that the eager (Required) runtime would REJECT —
+        // arbitrary content that doesn't begin with the gemma4 open
+        // marker `<|tool_call>`.  A bunch of natural-language bytes:
+        let preamble: &[u8] =
+            b"Sure! Let me think about whether this needs a tool call. ";
+        let alive = rt.accept_bytes(preamble);
+        assert!(
+            alive,
+            "lazy Auto runtime MUST accept (return true) for preamble bytes \
+             before the trigger fires — the awaiting_trigger gate makes \
+             accept_bytes a no-op returning true"
+        );
+        assert!(
+            rt.is_awaiting_trigger(),
+            "preamble feed MUST NOT advance the runtime nor flip the trigger; \
+             trigger only flips when the engine calls runtime.trigger() in \
+             response to ToolCallSplitter's ToolCallOpen event"
+        );
+        assert!(
+            !rt.is_dead(),
+            "suspended (awaiting_trigger) runtime MUST never report dead — \
+             this is the wave-2.5 audit-divergence-A1 fix at sampler.rs:611"
+        );
+        assert!(
+            !rt.is_accepted(),
+            "suspended runtime is also NOT in accepting state — the gate \
+             is symmetric on both ends (sampler.rs:595)"
+        );
+    }
+
+    /// Auto-lazy runtime: AFTER the trigger fires (simulating the
+    /// `ToolCallSplitter` reporting ToolCallOpen and the production code
+    /// at engine.rs:2577-2579 / engine.rs:1640-1642 calling
+    /// `runtime.trigger()`), the runtime begins constraining the body
+    /// shape — bytes that DON'T match the per-model call body drive the
+    /// runtime dead.  This proves the lazy-grammar wiring is real
+    /// (constructor mocks would not catch a regression that flipped
+    /// the wrong flag).
+    #[test]
+    fn auto_lazy_grammar_constrains_body_after_marker() {
+        let reg = match registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => return,
+        };
+        let req = req_with("gemma4-27b-it", Some(one_scalar_tool("get_weather")));
+        let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("Auto compile")
+            .expect("Auto must return Some(grammar)");
+
+        let root_id = g.rule_id("root").expect("compiled grammar has root");
+        let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+            .expect("GrammarRuntime::new must succeed");
+        rt.set_awaiting_trigger(true);
+
+        // Simulate the production trigger pattern at engine.rs:2577-2579:
+        // ToolCallSplitter sees the open marker → engine flips the trigger.
+        rt.trigger();
+        assert!(
+            !rt.is_awaiting_trigger(),
+            "post-trigger the gate MUST be flipped false so subsequent \
+             mask + accept calls enforce the body grammar"
+        );
+
+        // Feed garbage bytes that cannot possibly be a valid Gemma4 tool
+        // call body (no `call:` prefix, no `{` etc.).  An EAGER grammar
+        // would reject this immediately at byte 0; the lazy grammar
+        // post-trigger is identical in enforcement.
+        let garbage: &[u8] = b"this is not a tool call body";
+        let alive = rt.accept_bytes(garbage);
+        assert!(
+            !alive,
+            "post-trigger lazy Auto runtime MUST drive its stacks dead on \
+             non-call bytes — the grammar is now enforcing the per-model \
+             body shape (gemma4: <|tool_call>call:NAME{{...}}<tool_call|>)"
+        );
+        assert!(
+            rt.is_dead(),
+            "post-trigger lazy Auto runtime that consumed invalid body bytes \
+             MUST report dead so the engine's defensive 500 + streaming \
+             error event fires (engine.rs:1554, 2195 dead-check global)"
+        );
+
+        // Sanity-control: a fresh runtime, triggered, then fed the OPEN
+        // MARKER + body prefix, must STAY ALIVE (proves the dead result
+        // above came from grammar enforcement, not a wiring bug that
+        // marks every post-trigger feed dead).
+        //
+        // We re-build the runtime to avoid sharing state.
+        let g2 = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("compile")
+            .expect("Some");
+        let rid2 = g2.rule_id("root").expect("root");
+        let mut rt2 = grammar::sampler::GrammarRuntime::new(g2, rid2).expect("rt");
+        rt2.set_awaiting_trigger(true);
+        rt2.trigger();
+
+        // Real Gemma4 body shape — open marker + `call:` prefix + name.
+        // This is a valid prefix but not a complete call (no close marker
+        // yet); the runtime must still be alive because more body bytes
+        // are expected.
+        let open = reg.tool_open.expect("gemma4 has tool_open");
+        let valid_prefix = format!("{open}call:get_weather{{q:");
+        let alive2 = rt2.accept_bytes(valid_prefix.as_bytes());
+        assert!(
+            alive2,
+            "post-trigger runtime MUST stay alive on valid Gemma4 body prefix \
+             ({}); a regression that marks all post-trigger feeds dead would \
+             trip this control",
+            valid_prefix
+        );
+        assert!(
+            !rt2.is_dead(),
+            "post-trigger runtime fed valid prefix bytes MUST NOT report dead"
         );
     }
 
@@ -3979,7 +4308,16 @@ mod grammar_kind_selection_tests {
         );
 
         // Drive the production selection helper.
-        let (effective, kind) = super::select_effective_grammar(None, response_grammar);
+        // Tool slot empty ⇒ tool_grammar_kind is unused (response branch fires).
+        let (effective, kind) = super::select_effective_grammar(
+            None,
+            // Wave 3 W-B2: kind is irrelevant when tool_grammar is None, but
+            // the helper still requires an explicit value.  ToolCallBodyAuto
+            // (the lazy variant) is passed deliberately so a regression that
+            // wires the kind through the wrong slot would be caught.
+            GrammarKind::ToolCallBodyAuto,
+            response_grammar,
+        );
         assert!(
             effective.is_some(),
             "select_effective_grammar must propagate response grammar when tool=None"
@@ -4046,13 +4384,20 @@ mod grammar_kind_selection_tests {
             "test fixture broken: tool and response grammars must be distinct"
         );
 
-        let (effective, kind) =
-            super::select_effective_grammar(tool_grammar, resp_grammar);
+        let (effective, kind) = super::select_effective_grammar(
+            tool_grammar,
+            // Wave 3 W-B2: caller-provided tool kind is what the helper
+            // propagates; the test simulates the Required/Function call
+            // site that derives this from `tool_grammar_kind_for(&choice)`.
+            GrammarKind::ToolCallBodyRequired,
+            resp_grammar,
+        );
         assert!(effective.is_some(), "helper must propagate the tool grammar");
         assert_eq!(
             kind,
             GrammarKind::ToolCallBodyRequired,
-            "tool grammar MUST win and yield GrammarKind::ToolCallBodyRequired \
+            "tool grammar MUST win and yield the caller-provided kind \
+             (here ToolCallBodyRequired, mirroring tool_choice=required) \
              through the PRODUCTION helper (not a stand-in match)."
         );
         // Prove the SELECTED grammar is the tool grammar, not the response
@@ -4080,12 +4425,83 @@ mod grammar_kind_selection_tests {
     /// Production helper, real types.
     #[test]
     fn no_grammar_yields_default_kind_through_production_helper() {
-        let (effective, kind) = super::select_effective_grammar(None, None);
+        // tool_grammar_kind is unused when tool_grammar is None; pass
+        // ToolCallBodyAuto deliberately to assert the helper does NOT
+        // smuggle the caller-provided kind through the empty branch.
+        let (effective, kind) = super::select_effective_grammar(
+            None,
+            GrammarKind::ToolCallBodyAuto,
+            None,
+        );
         assert!(effective.is_none(), "no grammar means no constraint");
         assert_eq!(
             kind,
             GrammarKind::default(),
-            "kind defaults to ResponseFormat when grammar is None"
+            "kind defaults to ResponseFormat when both grammars are None \
+             (caller-provided tool kind is dropped because no tool grammar exists)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 3 W-B2 — `tool_grammar_kind_for` mapping tests.
+    //
+    // The mapping is the single source of truth for the eager-vs-lazy
+    // decision.  These tests pin every `ToolChoiceValue` arm so any
+    // future re-routing is caught at the helper level rather than
+    // surfacing as a behavioural drift in the engine.
+    // ---------------------------------------------------------------------
+
+    /// Auto + tools[] non-empty + registered family: caller will pass
+    /// `tool_grammar_kind_for(&Auto) == ToolCallBodyAuto` so the engine
+    /// arms `awaiting_trigger=true`.  Mirrors llama.cpp `grammar_lazy=true`.
+    #[test]
+    fn tool_grammar_kind_for_auto_is_lazy() {
+        use super::super::schema::ToolChoiceValue;
+        assert_eq!(
+            super::tool_grammar_kind_for(&ToolChoiceValue::Auto),
+            GrammarKind::ToolCallBodyAuto,
+            "Auto must produce the LAZY tool-call body kind \
+             (engine arms awaiting_trigger=true on construction)"
+        );
+    }
+
+    /// Required: caller will pass
+    /// `tool_grammar_kind_for(&Required) == ToolCallBodyRequired` so the
+    /// engine leaves `awaiting_trigger=false` for byte-0 enforcement.
+    #[test]
+    fn tool_grammar_kind_for_required_is_eager() {
+        use super::super::schema::ToolChoiceValue;
+        assert_eq!(
+            super::tool_grammar_kind_for(&ToolChoiceValue::Required),
+            GrammarKind::ToolCallBodyRequired,
+            "Required must produce the EAGER tool-call body kind \
+             (engine leaves awaiting_trigger=false on construction)"
+        );
+    }
+
+    /// Function(name): same as Required.
+    #[test]
+    fn tool_grammar_kind_for_function_is_eager() {
+        use super::super::schema::ToolChoiceValue;
+        assert_eq!(
+            super::tool_grammar_kind_for(&ToolChoiceValue::Function("get_weather".into())),
+            GrammarKind::ToolCallBodyRequired,
+            "Function(name) must produce the EAGER tool-call body kind"
+        );
+    }
+
+    /// None: no tool grammar will be compiled, so the kind is unused.
+    /// Returning `Default` (= `ResponseFormat`) is the safe sentinel —
+    /// any path that wires this kind through to a runtime would land in
+    /// eager response-format enforcement, not a tool-call lazy gate.
+    #[test]
+    fn tool_grammar_kind_for_none_is_default() {
+        use super::super::schema::ToolChoiceValue;
+        assert_eq!(
+            super::tool_grammar_kind_for(&ToolChoiceValue::None),
+            GrammarKind::default(),
+            "None must produce the Default kind (ResponseFormat); \
+             this branch is never read because tool_grammar is also None"
         );
     }
 }
