@@ -208,17 +208,35 @@ extract_hf2q_tps() {
   echo "${val:-0.0}"
 }
 
-# Extract decode tok/s from llama-bench output.  It prints a table
-# row like "tg256 ... <X> ± <Y>".
+# Extract decode tok/s from llama-bench output.
+#
+# Table row format (llama-bench tg<N>):
+#   | model | size | params | backend | threads | test  | t/s              |
+#   | ...   | ...  | ...    | ...     | ...     | tg256 | 103.96 ± 1.45    |
+#
+# We need the median (left of `±`), NOT the std-dev (right of `±`).
+# Grab the first decimal that immediately precedes ` ± `.
 extract_llama_tps() {
   local stdout_file="$1"
-  # llama-bench tg256 row, format like "...   tg256   ...   100.12 ± 0.45"
   local val
-  val="$(awk '/tg'"$NGEN"'/ {for (i=NF; i>=1; i--) if ($i ~ /^[0-9]+\.[0-9]+$/) {print $i; exit}}' "$stdout_file")"
+  # Primary: in the tg<NGEN> row, the value left of ` ± ` is the median.
+  val="$(awk -v ngen="tg$NGEN" '
+    $0 ~ ngen {
+      n = split($0, parts, /\| */)
+      for (i = 1; i <= n; i++) {
+        if (match(parts[i], /[0-9]+\.[0-9]+ *± *[0-9]+\.[0-9]+/)) {
+          v = substr(parts[i], RSTART, RLENGTH)
+          sub(/ *±.*/, "", v)
+          print v
+          exit
+        }
+      }
+    }
+  ' "$stdout_file")"
   if [[ -z "$val" ]]; then
-    # Fallback: any decimal followed by ± in the table.
-    val="$(grep -Eo '[0-9]+\.[0-9]+ ± [0-9]+\.[0-9]+' "$stdout_file" \
-              | tail -1 | awk '{print $1}')"
+    # Fallback: any "<X> ± <Y>" anywhere; take the X half of the first.
+    val="$(grep -Eo '[0-9]+\.[0-9]+ *± *[0-9]+\.[0-9]+' "$stdout_file" \
+              | head -1 | awk -F' *± *' '{print $1}')"
   fi
   echo "${val:-0.0}"
 }
@@ -228,7 +246,9 @@ run_hf2q_trial() {
   local trial="$1"
   local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stdout"
   local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.hf2q.trial-${trial}.stderr"
-  echo "  hf2q trial $trial → $stdout_out"
+  # Progress messages to STDERR — function's stdout must contain ONLY
+  # the parsed tok/s value, since the caller captures it via $().
+  echo "  hf2q trial $trial → $stdout_out" >&2
   set +e
   "$HF2Q_BIN" generate \
     --model "$MODEL" \
@@ -250,7 +270,9 @@ run_llama_trial() {
   local trial="$1"
   local stdout_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stdout"
   local stderr_out="$OUT_DIR/baseline-${LABEL}-${DATE_TAG}.llama.trial-${trial}.stderr"
-  echo "  llama-bench trial $trial → $stdout_out"
+  # Progress messages to STDERR — function's stdout must contain ONLY
+  # the parsed tok/s value (caller captures via $()).
+  echo "  llama-bench trial $trial → $stdout_out" >&2
   set +e
   "$LLAMA_BENCH_BIN" \
     -m "$MODEL" \
