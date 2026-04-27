@@ -1724,4 +1724,388 @@ mod tests {
             pool.memory_budget_bytes()
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-005 Wave 3 W-B1 (T1.11) — hot-swap LRU evict gap-test enforcement.
+    //
+    // Context:  the eviction *loop* (`LoadedPool::insert` capacity + budget
+    // two-pass) and its `HotSwapManager::load_or_get` driver shipped at
+    // iter-208 / iter-210 (W76 + W78) and closed AC 5467 ("Cached pool
+    // holds up to 3 loaded models with LRU eviction bounded by 80% of
+    // system unified memory").  The four tests below close the testing
+    // *gap* the W-B1 audit surfaced — production behavior under memory
+    // pressure WAS exercised at the pool-primitive level, but four
+    // manager-surface invariants the Wave-2 W-2 llama.cpp reference
+    // (server-models.cpp:498-549) calls out were not asserted through
+    // `HotSwapManager`'s public API:
+    //
+    //   1. **Multi-evict-in-one-load** (`hotswap_chains_multiple_evictions_in_one_load`):
+    //      a single `load_or_get` may need to evict TWO OR MORE LRU
+    //      entries to fit the new model — the chained-budget pass at
+    //      `LoadedPool::insert` lines 434-447 already does this, but no
+    //      manager-level test asserts the chain.
+    //
+    //   2. **Oversized-with-prior-pool** (`hotswap_oversized_handle_preserves_existing_entries`):
+    //      `LoadedPool::insert` pre-checks `handle.bytes > budget` at
+    //      line 377 *before* any eviction runs.  The existing
+    //      `hotswap_errors_when_no_evictable_fits` test only exercises
+    //      the empty-pool case; this new test asserts that an oversized
+    //      load against a *populated* pool refuses cleanly without
+    //      touching the existing residents.
+    //
+    //   3. **Cache-hit-promotes-LRU** (`hotswap_load_or_get_promotes_on_cache_hit`):
+    //      the fast path at `HotSwapManager::load_or_get` line 789 calls
+    //      `self.pool.touch(&k)` on cache hit.  The existing
+    //      `hotswap_try_get_does_not_touch_lru` test asserts the
+    //      *inverse* (the diagnostic surface `try_get` MUST NOT touch);
+    //      this new test asserts the request-path symmetric: a second
+    //      `load_or_get` for an already-pooled repo SHOULD touch and
+    //      thereby protect the entry from being evicted as LRU.
+    //
+    //   4. **TOCTOU-safe under shared lock** (`hotswap_concurrent_load_or_get_serializes_under_mutex`):
+    //      `HotSwapManager` itself is not internally synchronized
+    //      (struct doc lines 676-681 + AppState line 202 wrap it in
+    //      `Arc<RwLock<...>>`).  llama.cpp's
+    //      `server_models.cpp::load` (lines 545-558) re-checks capacity
+    //      under the load-lock to defeat the
+    //      check-budget → release-lock → load → re-acquire window.
+    //      Our wrapper holds a single std::sync RwLock write-guard for
+    //      the entire `load_or_get` call (file-stat + loader invoke +
+    //      pool insert), so the budget-check → admit sequence is
+    //      atomic by construction.  This regression test wraps the
+    //      manager in the same `Arc<Mutex<...>>` shape and spawns N
+    //      concurrent threads; it asserts (a) the loader is called
+    //      exactly N times (no double-load on the same key + no missed
+    //      load), (b) the final pool state respects capacity, and (c)
+    //      `total_resident_bytes <= memory_budget_bytes` holds at every
+    //      observable point post-join (the budget invariant never tears).
+    //
+    // Reference:  `/opt/llama.cpp/tools/server/server-models.cpp:498-549`
+    // (the canonical LRU+TOCTOU pattern; our equivalent is the
+    // single-lock-guard wrapping the entire `load_or_get` call).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// W-B1 test 1/4: a single `load_or_get` can evict multiple LRU
+    /// entries when one eviction is insufficient to fit the new model.
+    /// Capacity 5 (no capacity pressure); budget 1500.  Load A=500,
+    /// B=500, C=500 sequentially → total 1500 (= budget, no eviction).
+    /// Load D=1000: 1500+1000=2500>1500 → evict A → 1000+1000=2000>1500
+    /// → evict B → 500+1000=1500 ≤ 1500.  Stop.  D evicts A AND B in a
+    /// single `load_or_get` call.
+    #[test]
+    fn hotswap_chains_multiple_evictions_in_one_load() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(5, 1_500);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f_small = synthetic_gguf(500);
+        let f_big = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Three 500-byte loads — pool fills exactly at budget.
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("a");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("b");
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("c");
+        assert_eq!(mgr.pool_stats().loaded_count, 3);
+        assert_eq!(mgr.pool_stats().total_resident_bytes, 1_500);
+
+        // 1000-byte load forces TWO evictions in one call.
+        let _ = mgr
+            .load_or_get("d/4", QuantType::Q4_K_M, f_big.path(), &cfg)
+            .expect("d");
+
+        // A and B (the two LRU entries) both evicted; C survives;
+        // D resident.  total = 500 (C) + 1000 (D) = 1500.
+        assert!(
+            mgr.try_get("a/1", QuantType::Q4_K_M).is_none(),
+            "A (LRU) must be evicted"
+        );
+        assert!(
+            mgr.try_get("b/2", QuantType::Q4_K_M).is_none(),
+            "B (second-LRU) must also be evicted — single eviction insufficient"
+        );
+        assert!(
+            mgr.try_get("c/3", QuantType::Q4_K_M).is_some(),
+            "C (MRU before D) must survive — eviction stops as soon as budget fits"
+        );
+        assert!(
+            mgr.try_get("d/4", QuantType::Q4_K_M).is_some(),
+            "D (newly admitted) must be resident"
+        );
+        let stats = mgr.pool_stats();
+        assert_eq!(stats.loaded_count, 2);
+        assert_eq!(stats.total_resident_bytes, 1_500);
+        assert!(
+            stats.total_resident_bytes <= stats.memory_budget_bytes,
+            "post-eviction budget invariant must hold: total={} budget={}",
+            stats.total_resident_bytes,
+            stats.memory_budget_bytes
+        );
+    }
+
+    /// W-B1 test 2/4: an oversized handle (`bytes > budget`) is refused
+    /// cleanly without touching ANY existing pooled entries.  Mirrors
+    /// `LoadedPool::insert`'s pre-check semantics at the manager surface
+    /// (the existing `hotswap_errors_when_no_evictable_fits` only
+    /// exercises the empty-pool branch).
+    #[test]
+    fn hotswap_oversized_handle_preserves_existing_entries() {
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(3, 1_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f_small = synthetic_gguf(300);
+        let f_oversized = synthetic_gguf(1_500); // > budget 1000
+        let cfg = empty_config();
+
+        // Pre-populate with two well-formed entries.
+        let arc_a = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("a admit");
+        let arc_b = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f_small.path(), &cfg)
+            .expect("b admit");
+        assert_eq!(mgr.pool_stats().loaded_count, 2);
+        let bytes_before = mgr.pool_stats().total_resident_bytes;
+
+        // Attempt to load an oversized model.  Must refuse with
+        // OversizedHandle WITHOUT evicting A or B (the pre-check at
+        // `LoadedPool::insert` line 377 fires before the eviction
+        // passes — no partial mutation).
+        let err = mgr
+            .load_or_get("huge/1", QuantType::Q4_K_M, f_oversized.path(), &cfg)
+            .expect_err("oversized must refuse");
+        match err {
+            HotSwapError::PoolRefused(PoolError::OversizedHandle {
+                repo_id,
+                handle_bytes,
+                budget_bytes,
+            }) => {
+                assert_eq!(repo_id, "huge/1@Q4_K_M");
+                assert_eq!(handle_bytes, 1_500);
+                assert_eq!(budget_bytes, 1_000);
+            }
+            other => panic!("expected OversizedHandle, got: {other:?}"),
+        }
+
+        // Pool state UNCHANGED — A and B both still resident with
+        // identical Arc identities (cache hit on follow-up read).
+        assert_eq!(
+            mgr.pool_stats().loaded_count,
+            2,
+            "oversized refusal must not change loaded_count"
+        );
+        assert_eq!(
+            mgr.pool_stats().total_resident_bytes,
+            bytes_before,
+            "oversized refusal must not change total_resident_bytes"
+        );
+        let arc_a_after = mgr
+            .try_get("a/1", QuantType::Q4_K_M)
+            .expect("A must remain resident");
+        let arc_b_after = mgr
+            .try_get("b/2", QuantType::Q4_K_M)
+            .expect("B must remain resident");
+        assert!(
+            Arc::ptr_eq(&arc_a, &arc_a_after),
+            "A's Arc identity must be preserved across refused oversized load"
+        );
+        assert!(
+            Arc::ptr_eq(&arc_b, &arc_b_after),
+            "B's Arc identity must be preserved across refused oversized load"
+        );
+        // Loader was invoked once for the oversized attempt (the
+        // manager admits the file-stat + load before pool insert);
+        // the freshly-produced engine drops on PoolRefused.
+        // Total calls: 2 (a, b admits) + 1 (huge attempt) = 3.
+        assert_eq!(loader.call_count(), 3);
+    }
+
+    /// W-B1 test 3/4: a `load_or_get` cache hit promotes the entry to
+    /// MRU (the symmetric path to `try_get`'s "must NOT touch" — the
+    /// request path SHOULD touch).  Without this promotion, a steady
+    /// stream of requests against entry A would leave A as LRU and let
+    /// it be evicted under cap pressure even though it is the actively-
+    /// served model.
+    #[test]
+    fn hotswap_load_or_get_promotes_on_cache_hit() {
+        let loader = Arc::new(MockLoader::new());
+        // Capacity 2 so the third load forces exactly one eviction.
+        let pool = LoadedPool::with_capacity_and_budget(2, 1_000_000);
+        let mut mgr = HotSwapManager::<MockEngine>::new(pool, loader.clone());
+        let f = synthetic_gguf(1_000);
+        let cfg = empty_config();
+
+        // Initial state: A is LRU, B is MRU.
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a admit");
+        let _ = mgr
+            .load_or_get("b/2", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("b admit");
+
+        // Cache-hit `load_or_get` against A → A promotes to MRU, B
+        // becomes LRU.  Loader call count must NOT advance (cache hit).
+        let calls_before = loader.call_count();
+        let _ = mgr
+            .load_or_get("a/1", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("a cache-hit");
+        assert_eq!(
+            loader.call_count(),
+            calls_before,
+            "cache-hit must not invoke the loader"
+        );
+
+        // Third distinct load: B (now LRU after A's promotion) evicts,
+        // A survives.  This is the load-bearing assertion: without the
+        // `pool.touch(&k)` call at HotSwapManager::load_or_get line 789,
+        // A would be the LRU and would be the evictee here.
+        let _ = mgr
+            .load_or_get("c/3", QuantType::Q4_K_M, f.path(), &cfg)
+            .expect("c admit");
+
+        assert!(
+            mgr.try_get("a/1", QuantType::Q4_K_M).is_some(),
+            "A must SURVIVE — cache-hit promoted it to MRU"
+        );
+        assert!(
+            mgr.try_get("b/2", QuantType::Q4_K_M).is_none(),
+            "B must EVICT — it became LRU after A's promotion"
+        );
+        assert!(
+            mgr.try_get("c/3", QuantType::Q4_K_M).is_some(),
+            "C must be resident (newly admitted)"
+        );
+    }
+
+    /// W-B1 test 4/4: TOCTOU regression.  Concurrent `load_or_get`
+    /// calls under the production-shape `Arc<Mutex<HotSwapManager<E>>>`
+    /// wrapper (mirrors `AppState::pool` at `src/serve/api/state.rs:202`,
+    /// which uses `Arc<RwLock<...>>` — Mutex is conceptually the same
+    /// for the write-only path `load_or_get` exercises) must NOT race
+    /// past the budget gate.  llama.cpp's reference at
+    /// `server-models.cpp:545-558` re-checks capacity under the load-lock
+    /// for the same reason; our defense is structural — a single lock
+    /// guard wraps file-stat + loader invocation + pool insert.
+    ///
+    /// Invariants asserted post-join:
+    ///   - exactly N loader invocations (no double-load + no missed load)
+    ///   - `pool_stats().loaded_count == capacity_models`
+    ///     (capacity strictly enforced under contention)
+    ///   - `total_resident_bytes <= memory_budget_bytes` (budget never
+    ///     exceeds — the post-condition the entire eviction-loop exists
+    ///     to maintain)
+    #[test]
+    fn hotswap_concurrent_load_or_get_serializes_under_mutex() {
+        use std::sync::Mutex;
+
+        // Capacity = 3, budget large enough that the budget pass never
+        // fires — we want the capacity LRU eviction to be the load-
+        // bearing critical section under contention.
+        const CAPACITY: usize = 3;
+        const N_THREADS: usize = 8;
+        let loader = Arc::new(MockLoader::new());
+        let pool = LoadedPool::with_capacity_and_budget(CAPACITY, 1_000_000);
+        let mgr = Arc::new(Mutex::new(HotSwapManager::<MockEngine>::new(
+            pool,
+            loader.clone(),
+        )));
+
+        // Pre-create per-thread synthetic GGUFs so each thread has a
+        // distinct (repo, file) pair; tempfile lifetimes outlive the
+        // join via the outer-scope Vec.
+        let fixtures: Vec<tempfile::NamedTempFile> =
+            (0..N_THREADS).map(|_| synthetic_gguf(500)).collect();
+        let paths: Vec<PathBuf> = fixtures.iter().map(|f| f.path().to_path_buf()).collect();
+
+        let cfg = empty_config();
+        let cfg = Arc::new(cfg);
+
+        // Spawn N threads, each loading a distinct repo.  They contend
+        // on the Mutex-wrapped manager; the lock guarantees the
+        // file-stat → loader invoke → pool insert sequence is atomic
+        // per thread.
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for i in 0..N_THREADS {
+            let mgr = Arc::clone(&mgr);
+            let path = paths[i].clone();
+            let cfg = Arc::clone(&cfg);
+            let repo = format!("repo/{i}");
+            handles.push(std::thread::spawn(move || {
+                let mut guard = mgr.lock().expect("lock manager");
+                let _ = guard
+                    .load_or_get(&repo, QuantType::Q4_K_M, &path, &cfg)
+                    .expect("load_or_get");
+                // Snapshot under the same lock the load happened under
+                // — no observer can ever see the budget torn open.
+                let stats = guard.pool_stats();
+                assert!(
+                    stats.total_resident_bytes <= stats.memory_budget_bytes,
+                    "budget invariant violated under contention: \
+                     total={} budget={} thread={}",
+                    stats.total_resident_bytes,
+                    stats.memory_budget_bytes,
+                    i,
+                );
+                assert!(
+                    stats.loaded_count <= stats.capacity_models,
+                    "capacity invariant violated under contention: \
+                     loaded={} capacity={} thread={}",
+                    stats.loaded_count,
+                    stats.capacity_models,
+                    i,
+                );
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        // Post-join invariants:
+        // (a) exactly N loader invocations — every thread admitted its
+        //     distinct repo cleanly, no duplicates, none lost to a race.
+        assert_eq!(
+            loader.call_count(),
+            N_THREADS as u64,
+            "expected exactly {N_THREADS} loader calls under Mutex serialization; \
+             got {} (TOCTOU: duplicate load OR missed load)",
+            loader.call_count()
+        );
+
+        let final_mgr = mgr.lock().expect("lock manager final");
+        let stats = final_mgr.pool_stats();
+        // (b) capacity strictly enforced — exactly capacity_models
+        //     entries resident even though N > capacity threads ran.
+        assert_eq!(
+            stats.loaded_count, CAPACITY,
+            "capacity must hold post-join: loaded={} capacity={}",
+            stats.loaded_count, CAPACITY
+        );
+        // (c) budget invariant holds.
+        assert!(
+            stats.total_resident_bytes <= stats.memory_budget_bytes,
+            "budget invariant violated post-join: total={} budget={}",
+            stats.total_resident_bytes,
+            stats.memory_budget_bytes
+        );
+        // The final 3 surviving entries are deterministically the
+        // last-3 to acquire the lock, but threads have nondeterministic
+        // scheduling — assert structurally that *some* 3-of-N survived.
+        let survivors: usize = (0..N_THREADS)
+            .filter(|i| {
+                final_mgr
+                    .try_get(&format!("repo/{i}"), QuantType::Q4_K_M)
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            survivors, CAPACITY,
+            "exactly CAPACITY={CAPACITY} survivors expected post-join; got {survivors}"
+        );
+    }
 }
