@@ -156,6 +156,24 @@ impl KQuantTarget {
             Self::Q8Legacy => 8.5,
         }
     }
+
+    /// Enumerate every supported codec target in canonical order
+    /// (K-family first, then the legacy fallback chain). Used by
+    /// codec-coverage smoke tests so that adding a new target to the
+    /// enum automatically extends test coverage without touching the
+    /// test fixtures.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Q4K,
+            Self::Q5K,
+            Self::Q6K,
+            Self::Q4Legacy,
+            Self::Q4Legacy1,
+            Self::Q5Legacy0,
+            Self::Q5Legacy1,
+            Self::Q8Legacy,
+        ]
+    }
 }
 
 /// Errors from the k-quant codec dispatch.
@@ -1293,5 +1311,92 @@ mod tests {
         assert!(r_q6k < r_q5k, "Q6_K {r_q6k} should be < Q5_K {r_q5k}");
         assert!(r_q80 < r_q6k, "Q8_0 {r_q80} should be < Q6_K {r_q6k}");
         assert!(r_q4k < r_q40, "Q4_K {r_q4k} should be < Q4_0 {r_q40}");
+    }
+
+    /// ADR-014 P7 iter-5 — `KQuantTarget::all()` enumeration round-trips
+    /// through `ggml_type` / `from_ggml_type` and the metadata methods
+    /// (`bytes_per_block`, `elements_per_block`) reflect the expected
+    /// layout for every supported codec target.
+    ///
+    /// Future-proofs codec coverage: a new target added to the enum
+    /// must also be added to `all()`, `ggml_type` round-trip, the
+    /// metadata methods, and `quantize_row_to_bytes` dispatch.  This
+    /// test fails on the second of those omissions; the
+    /// `dispatch_all_targets_smoke` test below catches the third.
+    #[test]
+    fn target_all_round_trips_metadata() {
+        let all = KQuantTarget::all();
+        assert_eq!(all.len(), 8, "exactly 8 supported codec targets");
+
+        // canonical order: K-family first, then legacy
+        assert_eq!(all[0], KQuantTarget::Q4K);
+        assert_eq!(all[1], KQuantTarget::Q5K);
+        assert_eq!(all[2], KQuantTarget::Q6K);
+        assert_eq!(all[3], KQuantTarget::Q4Legacy);
+        assert_eq!(all[4], KQuantTarget::Q4Legacy1);
+        assert_eq!(all[5], KQuantTarget::Q5Legacy0);
+        assert_eq!(all[6], KQuantTarget::Q5Legacy1);
+        assert_eq!(all[7], KQuantTarget::Q8Legacy);
+
+        // every target round-trips through ggml_type
+        for &target in all {
+            let g = target.ggml_type();
+            let recovered = KQuantTarget::from_ggml_type(g)
+                .unwrap_or_else(|| panic!("from_ggml_type({g}) returned None"));
+            assert_eq!(recovered, target,
+                "ggml_type round-trip diverged for {target:?}");
+
+            // bytes_per_block / elements_per_block are non-zero and
+            // bpw matches the documented bits-per-weight value.
+            assert!(target.bytes_per_block() > 0, "{target:?}: bytes_per_block == 0");
+            assert!(target.elements_per_block() > 0, "{target:?}: elements_per_block == 0");
+            assert!(target.bpw() > 0.0, "{target:?}: bpw <= 0");
+
+            // K-family supports imatrix; legacy doesn't.
+            let expected_imatrix = matches!(target,
+                KQuantTarget::Q4K | KQuantTarget::Q5K | KQuantTarget::Q6K);
+            assert_eq!(
+                target.supports_imatrix(), expected_imatrix,
+                "{target:?}: supports_imatrix mismatch"
+            );
+        }
+    }
+
+    /// ADR-014 P7 iter-5 — `quantize_row_to_bytes` dispatch covers
+    /// every target in `KQuantTarget::all()` end-to-end on a smooth
+    /// ramp.  Each target produces non-empty output sized to the
+    /// target's `bytes_per_block`.
+    ///
+    /// Catches a regression where a new target is added to the enum
+    /// + `all()` but a `match target` arm in `quantize_row_to_bytes`
+    /// is missed (would compile if the match is non-exhaustive on the
+    /// new variant via a `_ =>` fallback).  Also locks the contract
+    /// "every codec target produces bytes whose length is a multiple
+    /// of `bytes_per_block`" — required for downstream dequant.
+    #[test]
+    fn dispatch_all_targets_smoke() {
+        for &target in KQuantTarget::all() {
+            // pick a row whose length aligns to this target's block size
+            let n = target.elements_per_block();
+            let row = smooth_ramp(n);
+
+            let bytes = quantize_row_to_bytes(
+                &row, target, &CalibrationData::None, "blk.5.attn_q.weight",
+            )
+            .unwrap_or_else(|e| panic!("{target:?}: dispatch failed: {e}"));
+
+            assert!(!bytes.is_empty(), "{target:?}: empty output");
+            assert_eq!(
+                bytes.len() % target.bytes_per_block(), 0,
+                "{target:?}: output bytes ({}) not a multiple of bytes_per_block ({})",
+                bytes.len(), target.bytes_per_block()
+            );
+            // exactly one block emitted (n == elements_per_block)
+            assert_eq!(
+                bytes.len(), target.bytes_per_block(),
+                "{target:?}: expected exactly 1 block, got {} bytes",
+                bytes.len()
+            );
+        }
     }
 }
