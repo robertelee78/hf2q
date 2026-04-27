@@ -1974,6 +1974,403 @@ fn finalize_streaming_tool_state(
     FinalizeStreamingAction::Continue
 }
 
+/// Dispatch the close-time tool-call body after `ToolCallClose` fires in the
+/// streaming `route_content` closure.
+///
+/// Wave 3 W-A3 — T2.4 partial removal (body-parse-failure case).
+///
+/// ## Behaviour matrix
+///
+/// ```text
+///                       │ Constrained                     │ Auto
+/// ─────────────────────┼─────────────────────────────────┼────────────────────────────────
+/// parse OK              │ emit ToolCallDelta ×2           │ emit ToolCallDelta ×2
+/// parse FAILURE         │ emit GenerationEvent::Error     │ emit delta.content fallback
+///                       │   "tool_call_unreachable_       │   (tracing::warn)
+///                       │    fallback_required"           │
+///                       │ + tracing::error! (grammar bug) │
+///                       │ → Err(())                       │ → Ok(())  [or Err if send fails]
+/// ```
+///
+/// **Why Auto preserves the content fallback**: under Auto there is no grammar
+/// enforcing body shape. A model can legitimately emit malformed / partial
+/// tool-call syntax and the caller should still see the raw bytes rather than
+/// losing them silently. The content fallback is NOT a correctness hole here —
+/// it is the defined behaviour for the unconstrained path. Auto will get full
+/// T2.4 closure when Wave 3 Phase B lazy Auto-mode grammar lands.
+///
+/// **Why Constrained errors loudly**: since wave-2.7 W-η da545d5 the eager
+/// grammar physically constrains every token in the body. A parse failure
+/// therefore means the grammar engine produced structurally invalid output —
+/// this is a server-side regression, not a model quality issue. Surfacing it
+/// as a loud error (rather than a silent content fallback) makes the regression
+/// immediately visible to operators.
+///
+/// Extracted from the `route_content` closure so audit-driver tests can
+/// exercise this exact code path directly (same extraction pattern as
+/// `finalize_streaming_tool_state` for HIGH-1).
+fn emit_streaming_tool_call_close(
+    parsed: Option<super::registry::ParsedToolCall>,
+    body_dump: String,
+    policy: ToolCallPolicy,
+    tc_index: &mut usize,
+    saw_tc: &mut bool,
+    events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+) -> Result<(), ()> {
+    use super::sse::{DeltaKind, GenerationEvent};
+
+    match parsed {
+        Some(pc) => {
+            // First chunk: id + type + name. The id is a synthesized opaque
+            // identifier; clients echo it in their `tool_call_id` follow-up
+            // message. Format mirrors OpenAI's `call_<24hex>` shape.
+            let id = format!(
+                "call_hf2q_{:016x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
+            );
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: *tc_index,
+                    id: Some(id),
+                    call_type: Some("function".into()),
+                    name: Some(pc.name),
+                    arguments: None,
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            // Second chunk: full arguments JSON string. OpenAI clients
+            // accumulate `function.arguments` deltas; one chunk is spec-valid.
+            if events
+                .blocking_send(GenerationEvent::ToolCallDelta {
+                    index: *tc_index,
+                    id: None,
+                    call_type: None,
+                    name: None,
+                    arguments: Some(pc.arguments_json),
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            *tc_index += 1;
+            *saw_tc = true;
+            Ok(())
+        }
+        None => {
+            // Wave 3 W-A3 — T2.4 partial removal.
+            //
+            // Constrained (Required / Function): the eager grammar installed
+            // by wave-2.7 W-η da545d5 physically constrains every body token.
+            // A parse failure here is unreachable in correct operation — it
+            // means the grammar engine has a bug and let through malformed
+            // output.  Promote to a loud structured error so the regression
+            // surfaces immediately rather than being silently swallowed by the
+            // content fallback.
+            //
+            // Auto: no grammar enforcement is active. The model may legitimately
+            // emit partial / malformed tool-call syntax; re-emitting the body
+            // as Content lets the client see what the model intended.  Full T2.4
+            // closure for Auto deferred to Wave 3 Phase B (lazy Auto grammar).
+            if matches!(policy, ToolCallPolicy::Constrained) {
+                tracing::error!(
+                    body = %body_dump,
+                    "tool_call_unreachable_fallback_required: tool-call body \
+                     unparseable under Constrained policy \
+                     (tool_choice=required/function); eager grammar (wave-2.7 \
+                     W-η da545d5) should have prevented this — grammar engine bug"
+                );
+                let _ = events.blocking_send(GenerationEvent::Error(
+                    "tool_call_unreachable_fallback_required".into(),
+                ));
+                return Err(());
+            }
+            // Auto path: preserve the pre-wave-2.5 content fallback.
+            // (See function doc above for the rationale.)
+            tracing::warn!(
+                body = %body_dump,
+                "tool-call body unparseable; emitting as content fallback \
+                 (tool_choice=auto — no grammar enforcement on body shape)"
+            );
+            if events
+                .blocking_send(GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: body_dump,
+                })
+                .is_err()
+            {
+                return Err(());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Replay a cached `GenerationResult` as a sequence of SSE events.
+///
+/// Wave 3 W-A2 — closes the asymmetry documented at the iter-96 streaming
+/// store-only callsite.  Pre-W-A2 the streaming path stored to
+/// `PromptCache` on every successful completion but never consulted the
+/// cache on input, so most clients (which use streaming) never benefited
+/// from cache hits.  This helper lets `generate_stream_once` short-circuit
+/// when `PromptCache::lookup` returns `Some(...)`: emit the cached text as
+/// SSE deltas (re-classified through the same Reasoning + ToolCall splitter
+/// pipeline the live decode uses), then emit `Done` with zero timings and
+/// `cached_prompt_tokens = Some(prompt_len)` so the client surfaces
+/// `usage.prompt_tokens_details.cached_tokens` exactly like a non-streaming
+/// hit.
+///
+/// # Cache-shape decision (deliberate, surfaced in commit body)
+///
+/// `PromptCache` stores text only — no token sequence — so the replay
+/// CANNOT preserve original token boundaries (one delta per cached token).
+/// Two designs were considered:
+///
+/// 1. **Single big content delta.** Simple. Loses tool-call shape if the
+///    cached response was a tool call: the open/close markers would arrive
+///    inside `delta.content` instead of producing structured
+///    `delta.tool_calls[*]` events.  Spec-violating for tool-call replays.
+///
+/// 2. **Re-route through the live splitter pipeline (chosen).** Build a
+///    fresh `ReasoningSplitter` + `ToolCallSplitter` from the model
+///    registration (same factory the live decode uses), feed the cached
+///    `text` in once, and dispatch the resulting events through the same
+///    `route_content` / `emit_streaming_tool_call_close` helpers.  When
+///    the cached text contains tool-call markers, the splitter emits
+///    structured `ToolCallDelta` events identical to a fresh decode.
+///    When the text is plain content, the splitter emits a single
+///    `Content` delta.  When `reasoning_text` is `Some(...)` (cached from
+///    a non-streaming completion that already split reasoning out), it is
+///    emitted first as a `Reasoning` delta so the SSE response shape
+///    matches the original.
+///
+/// Per-cached-token replay (preserve TTFT-like incremental UX) requires
+/// extending `PromptCache` to store the per-token Delta sequence rather
+/// than the assembled text.  That is a real shape extension; documented as
+/// a follow-up rather than shoehorned into this iter.
+///
+/// # Why pass `tool_call_policy`
+///
+/// Tool-call body parse failures branch on policy (Constrained → loud
+/// `GenerationEvent::Error`; Auto → silent content fallback).  The cache
+/// key includes `tool_call_policy`, so a hit guarantees the policy
+/// matches the original request — but `emit_streaming_tool_call_close`
+/// still requires it as an argument to make the branch explicit.
+///
+/// # Why `grammar_runtime: None`
+///
+/// `route_content`'s `ToolCallOpen` branch flips
+/// `runtime.is_awaiting_trigger()` so subsequent decode-loop mask calls
+/// fire.  In replay there is NO decode loop — the runtime is irrelevant.
+/// Pass `None` so the branch is a no-op (matches the no-grammar live
+/// path).  This is sound because the trigger is purely a live-decode
+/// gating mechanism, not part of the SSE event shape.
+///
+/// Returns `Ok(())` if the full cached response (Reasoning? + content
+/// events + Done) was emitted; `Err(())` if any send failed (client
+/// disconnected mid-replay) — caller bumps the cancellation counter and
+/// returns, mirroring the live-decode disconnect path.
+fn replay_cached_streaming_response(
+    cached: &GenerationResult,
+    registration: Option<&super::registry::ModelRegistration>,
+    tool_call_policy: ToolCallPolicy,
+    events: &mpsc::Sender<super::sse::GenerationEvent>,
+) -> Result<(), ()> {
+    use super::sse::{DeltaKind, GenerationEvent, StreamStats};
+
+    // ── 1. Reasoning replay ─────────────────────────────────────────────
+    //
+    // Non-streaming-origin cache entries store reasoning_text separately
+    // (split out of the assembled text via `split_full_output` in
+    // `generate_once_with_soft_tokens`).  Streaming-origin entries store
+    // reasoning_text == None because the live splitter routed reasoning
+    // fragments into Reasoning deltas as decoded; the assembled text
+    // contains the full pre-split stream.  Either way: emit the
+    // explicit reasoning_text first (if any), then route the text through
+    // the splitter to handle the streaming-origin embedded-marker case.
+    if let Some(reasoning) = cached.reasoning_text.as_deref() {
+        if !reasoning.is_empty()
+            && events
+                .blocking_send(GenerationEvent::Delta {
+                    kind: DeltaKind::Reasoning,
+                    text: reasoning.to_string(),
+                })
+                .is_err()
+        {
+            return Err(());
+        }
+    }
+
+    // ── 2. Content / tool-call replay ───────────────────────────────────
+    //
+    // Build fresh splitters mirroring the `generate_stream_once` setup
+    // (lines below the lookup).  The ReasoningSplitter handles any
+    // embedded reasoning markers (streaming-origin entries).  The
+    // ToolCallSplitter handles embedded tool-call markers regardless of
+    // origin (neither streaming nor non-streaming strips them).
+    let mut reasoning_splitter = registration
+        .and_then(|r| super::registry::ReasoningSplitter::from_registration(r));
+    let mut tool_splitter = registration
+        .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
+
+    let mut tool_call_body: String = String::new();
+    let mut tool_call_index: usize = 0;
+    let mut saw_tool_call: bool = false;
+
+    // Replay-side fragment routing.  Mirrors `route_content` minus
+    // grammar plumbing (no decode loop ⇒ no runtime to trigger).  Inline
+    // here rather than reusing the closure because the closure captures
+    // generate_stream_once-local state we don't have in this free fn —
+    // duplicating the ~30-line dispatch is cheaper than threading a
+    // borrow web across a closure parameter list.  Architecturally this
+    // is the same pattern as `emit_streaming_tool_call_close` (extracted
+    // for the close-branch) and `finalize_streaming_tool_state` (extracted
+    // for the end-of-stream drain).
+    let route_replay_fragment =
+        |tcs: &mut Option<super::registry::ToolCallSplitter>,
+         body: &mut String,
+         tc_index: &mut usize,
+         saw_tc: &mut bool,
+         events: &mpsc::Sender<GenerationEvent>,
+         text: &str|
+         -> Result<(), ()> {
+            if text.is_empty() {
+                return Ok(());
+            }
+            let Some(tcs) = tcs.as_mut() else {
+                if events
+                    .blocking_send(GenerationEvent::Delta {
+                        kind: DeltaKind::Content,
+                        text: text.to_string(),
+                    })
+                    .is_err()
+                {
+                    return Err(());
+                }
+                return Ok(());
+            };
+            for ev in tcs.feed(text) {
+                match ev {
+                    super::registry::ToolCallEvent::Content(t) => {
+                        if !t.is_empty()
+                            && events
+                                .blocking_send(GenerationEvent::Delta {
+                                    kind: DeltaKind::Content,
+                                    text: t,
+                                })
+                                .is_err()
+                        {
+                            return Err(());
+                        }
+                    }
+                    super::registry::ToolCallEvent::ToolCallOpen => {
+                        body.clear();
+                        // Replay: no grammar_runtime to trigger.
+                    }
+                    super::registry::ToolCallEvent::ToolCallText(t) => {
+                        body.push_str(&t);
+                    }
+                    super::registry::ToolCallEvent::ToolCallClose => {
+                        let parsed = registration
+                            .and_then(|r| super::registry::parse_tool_call_body(r, body));
+                        let body_dump = std::mem::take(body);
+                        emit_streaming_tool_call_close(
+                            parsed,
+                            body_dump,
+                            tool_call_policy,
+                            tc_index,
+                            saw_tc,
+                            events,
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        };
+
+    // Feed the cached text through the reasoning splitter first, then
+    // route Content-classified spans through the tool-call splitter.
+    // Mirrors `emit_fragment` in generate_stream_once.
+    if let Some(rs) = reasoning_splitter.as_mut() {
+        for (slot, text) in rs.feed(&cached.text) {
+            match slot {
+                super::registry::SplitSlot::Reasoning => {
+                    if !text.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Reasoning,
+                                text,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::SplitSlot::Content => {
+                    route_replay_fragment(
+                        &mut tool_splitter,
+                        &mut tool_call_body,
+                        &mut tool_call_index,
+                        &mut saw_tool_call,
+                        events,
+                        &text,
+                    )?;
+                }
+            }
+        }
+    } else {
+        route_replay_fragment(
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            events,
+            &cached.text,
+        )?;
+    }
+
+    // ── 3. Done event ───────────────────────────────────────────────────
+    //
+    // `cached_prompt_tokens = Some(prompt_len)` so the SSE final-chunk
+    // usage surfaces `prompt_tokens_details.cached_tokens` identically to
+    // the non-streaming hit path (engine.rs:752-754).  Zero timings
+    // because prefill+decode were skipped — same convention as the
+    // non-streaming GenerationResult on hit.
+    let stats = StreamStats {
+        prefill_time_secs: Some(0.0),
+        decode_time_secs: Some(0.0),
+        total_time_secs: Some(0.0),
+        time_to_first_token_ms: Some(0.0),
+        prefill_tokens_per_sec: None,
+        decode_tokens_per_sec: None,
+        gpu_sync_count: None,
+        gpu_dispatch_count: None,
+        cached_prompt_tokens: Some(cached.cached_tokens),
+        reasoning_tokens: cached.reasoning_tokens,
+    };
+
+    if events
+        .blocking_send(GenerationEvent::Done {
+            // Tool-call replays must override finish_reason so clients see
+            // `tool_calls` (OpenAI spec). The splitter sets `saw_tool_call`
+            // when a ToolCallClose fires.
+            finish_reason: if saw_tool_call { "tool_calls" } else { cached.finish_reason },
+            prompt_tokens: cached.prompt_tokens,
+            completion_tokens: cached.completion_tokens,
+            stats,
+        })
+        .is_err()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Streaming variant of `generate_once`. Sends `GenerationEvent::Delta` per
 /// decoded token, followed by a terminating `Done` (with finish_reason +
 /// usage) or `Error`. If the `events` receiver is dropped (SSE client
@@ -2148,98 +2545,21 @@ fn generate_stream_once(
                     // will simply die on the next mask step (graceful
                     // termination via the unconditional is_dead check
                     // in the decode loop).
-                    // Parse the accumulated body. On parse failure, log +
-                    // re-emit the body as Content so the user still sees
-                    // something (the per-model parser is best-effort
-                    // fallback; well-formed output is the common case
-                    // because the in-template syntax is fixed).
+                    //
+                    // Wave 3 W-A3: dispatch delegated to
+                    // `emit_streaming_tool_call_close` so the parse-failure
+                    // branch can be audit-driver tested independently.
                     let parsed = reg
                         .and_then(|r| super::registry::parse_tool_call_body(r, body));
                     let body_dump = std::mem::take(body);
-                    match parsed {
-                        Some(pc) => {
-                            // First chunk: id + type + name. The id is a
-                            // synthesized opaque identifier; clients echo
-                            // it in their `tool_call_id` follow-up message.
-                            // Format mirrors OpenAI's `call_<24hex>` shape.
-                            let id = format!(
-                                "call_hf2q_{:016x}",
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_nanos() as u64)
-                                    .unwrap_or(0)
-                                    ^ (*tc_index as u64).wrapping_mul(0x9e3779b97f4a7c15)
-                            );
-                            if events
-                                .blocking_send(
-                                    GenerationEvent::ToolCallDelta {
-                                        index: *tc_index,
-                                        id: Some(id),
-                                        call_type: Some("function".into()),
-                                        name: Some(pc.name),
-                                        arguments: None,
-                                    },
-                                )
-                                .is_err()
-                            {
-                                return Err(());
-                            }
-                            // Second chunk: full arguments JSON string.
-                            // OpenAI clients accumulate `function.arguments`
-                            // deltas; one chunk is spec-valid.
-                            if events
-                                .blocking_send(
-                                    GenerationEvent::ToolCallDelta {
-                                        index: *tc_index,
-                                        id: None,
-                                        call_type: None,
-                                        name: None,
-                                        arguments: Some(pc.arguments_json),
-                                    },
-                                )
-                                .is_err()
-                            {
-                                return Err(());
-                            }
-                            *tc_index += 1;
-                            *saw_tc = true;
-                        }
-                        None => {
-                            // Wave-2.5 A4: promote parse failure to error for
-                            // Constrained mode (Required / Function).  For
-                            // Auto mode keep the existing Content fallback —
-                            // the model may legitimately emit partial /
-                            // malformed syntax when unconstrained (no grammar
-                            // guard), and re-emitting the body as Content lets
-                            // the client see what the model intended rather
-                            // than silently discarding output.
-                            if tool_call_policy == ToolCallPolicy::Constrained {
-                                tracing::error!(
-                                    body = %body_dump,
-                                    "tool-call body unparseable under Constrained policy \
-                                     (tool_choice=required/function); promoting to error"
-                                );
-                                let _ = events.blocking_send(GenerationEvent::Error(
-                                    "tool_call_parse_failure".into(),
-                                ));
-                                return Err(());
-                            }
-                            tracing::warn!(
-                                body = %body_dump,
-                                "tool-call body unparseable; emitting as content fallback \
-                                 (tool_choice=auto)"
-                            );
-                            if events
-                                .blocking_send(GenerationEvent::Delta {
-                                    kind: DeltaKind::Content,
-                                    text: body_dump,
-                                })
-                                .is_err()
-                            {
-                                return Err(());
-                            }
-                        }
-                    }
+                    emit_streaming_tool_call_close(
+                        parsed,
+                        body_dump,
+                        tool_call_policy,
+                        tc_index,
+                        saw_tc,
+                        events,
+                    )?;
                 }
             }
         }
@@ -4265,5 +4585,178 @@ mod finalize_streaming_tool_state_tests {
              got {:?}",
             events
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3 W-A3 — emit_streaming_tool_call_close (T2.4 partial removal)
+//
+// Audit-driver tests for the body-parse-failure branches of
+// `emit_streaming_tool_call_close`.  Two scenarios required:
+//
+//   1. `required_body_parse_failure_yields_error_not_content` — Constrained
+//      policy + parse failure → GenerationEvent::Error("tool_call_unreachable_
+//      fallback_required").  MUST NOT emit Content.
+//
+//   2. `auto_body_parse_failure_preserves_content_fallback` — Auto policy +
+//      parse failure → GenerationEvent::Delta{Content, body_dump}.  This is
+//      the regression-preserve test; the content fallback for Auto is the
+//      defined behaviour and MUST NOT regress.
+//
+// Both tests drive `emit_streaming_tool_call_close` directly with
+// `parsed = None` (simulating a malformed body after ToolCallClose fires).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod emit_streaming_tool_call_close_tests {
+    use super::*;
+    use crate::serve::api::sse::{DeltaKind, GenerationEvent};
+    use tokio::sync::mpsc;
+
+    fn drain_recv(rx: &mut mpsc::Receiver<GenerationEvent>) -> Vec<GenerationEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// T2.4 partial removal — Required path.
+    ///
+    /// Simulates: ToolCallText has accumulated malformed JSON ("garbage{{}}")
+    /// into `body`, then ToolCallClose fires. `parse_tool_call_body` returns
+    /// None.  Under Constrained policy `emit_streaming_tool_call_close` MUST:
+    ///   - return `Err(())`
+    ///   - emit exactly one `GenerationEvent::Error` with code
+    ///     `"tool_call_unreachable_fallback_required"`
+    ///   - NOT emit any `GenerationEvent::Delta { kind: Content, … }`
+    ///
+    /// This branch should be unreachable in correct operation (the eager
+    /// grammar from wave-2.7 W-η da545d5 physically prevents a bad body).
+    /// If it fires, it is a grammar-engine regression and must be loud.
+    #[test]
+    fn required_body_parse_failure_yields_error_not_content() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+
+        let result = emit_streaming_tool_call_close(
+            None, // parsed = None: simulates a body that failed parse_tool_call_body
+            "garbage{{}}".to_string(),
+            ToolCallPolicy::Constrained,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        );
+
+        assert!(
+            result.is_err(),
+            "Constrained + parse failure MUST return Err(()) \
+             (streaming driver aborts decode loop)"
+        );
+        assert_eq!(
+            tc_index, 0,
+            "tc_index must not be incremented on parse failure"
+        );
+        assert!(!saw_tc, "saw_tc must remain false on parse failure");
+
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one GenerationEvent::Error expected; got: {:?}",
+            events
+        );
+        match &events[0] {
+            GenerationEvent::Error(code) => {
+                assert_eq!(
+                    code, "tool_call_unreachable_fallback_required",
+                    "error code MUST be 'tool_call_unreachable_fallback_required' \
+                     (wave 3 W-A3 T2.4 partial removal); old 'tool_call_parse_failure' \
+                     code would indicate a regression to wave-2.5 A4 vocabulary"
+                );
+            }
+            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                panic!(
+                    "REGRESSION: Constrained parse failure emitted Content fallback \
+                     (text={text:?}); this is the T2.4 silent-fallback that W-A3 removes"
+                );
+            }
+            other => panic!(
+                "expected GenerationEvent::Error, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// T2.4 regression-preserve — Auto path.
+    ///
+    /// Simulates the same malformed body under tool_choice=Auto.
+    /// `emit_streaming_tool_call_close` MUST:
+    ///   - return `Ok(())`
+    ///   - emit exactly one `GenerationEvent::Delta { kind: Content, text: body_dump }`
+    ///   - NOT emit `GenerationEvent::Error`
+    ///
+    /// Under Auto there is no grammar enforcement.  The model may legitimately
+    /// emit partial / malformed tool-call syntax; preserving the content
+    /// fallback lets the client see the raw bytes rather than losing them.
+    /// This test MUST pass for the lifetime of the codebase until Wave 3
+    /// Phase B Auto lazy grammar replaces this path.
+    #[test]
+    fn auto_body_parse_failure_preserves_content_fallback() {
+        let body = "some malformed body text".to_string();
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+
+        let result = emit_streaming_tool_call_close(
+            None, // parsed = None: simulates a body that failed parse_tool_call_body
+            body.clone(),
+            ToolCallPolicy::Auto,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Auto + parse failure MUST return Ok(()) \
+             (content fallback is the defined Auto behaviour, not an error)"
+        );
+        assert_eq!(tc_index, 0, "tc_index must not be incremented on parse failure");
+        assert!(!saw_tc, "saw_tc must remain false on parse failure");
+
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one Content delta expected for Auto fallback; got: {:?}",
+            events
+        );
+        match &events[0] {
+            GenerationEvent::Delta { kind, text } => {
+                assert!(
+                    matches!(kind, DeltaKind::Content),
+                    "Auto parse-failure delta MUST be DeltaKind::Content; got: {:?}",
+                    kind
+                );
+                assert_eq!(
+                    text, &body,
+                    "Auto fallback MUST re-emit the original body_dump verbatim; \
+                     got: {text:?}"
+                );
+            }
+            GenerationEvent::Error(code) => {
+                panic!(
+                    "REGRESSION: Auto parse failure promoted to GenerationEvent::Error \
+                     (code={code:?}); Auto MUST preserve content fallback until \
+                     Wave 3 Phase B lazy grammar lands"
+                );
+            }
+            other => panic!("expected Content delta, got: {:?}", other),
+        }
     }
 }

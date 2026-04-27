@@ -6295,3 +6295,25 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **Fence respected (W-ι 6 commits at `3b65416^..HEAD`).** W-ι edits in `src/serve/api/handlers.rs`, `src/serve/api/grammar/mask.rs`, `docs/ADR-005-inference-server.md`.  No W-ι touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
   - **Audit range bookkeeping (corrected post-audit per `cfa-20260427-adr005-wave2.9` Codex divergence #item-8).** The full `163d698..HEAD` range contains 8 commits: the 6 W-ι commits above PLUS 2 unrelated concurrent ADR-014 P8 commits (`8e590e1` + `5c69311`) that touch `src/quantize/static_quant.rs`. Those concurrent commits are NOT a W-ι fence violation — the W-ι work itself stayed clean. Future audit-range citations should use `<first-W-ι-commit>^..<last-W-ι-commit>` rather than the broader `<prev-wave-tail>..HEAD` window to avoid this concurrent-session contamination.
   - **T2.4 unblock confirmation (per Codex audit final).** All 4 paths verified correct: Required, Function, Auto, unknown_family. Caveat per audit: "Wave 3 should wait on the range/fence bookkeeping correction, NOT on another code change."
+
+- **2026-04-26 wave-3 W-A3 — T2.4 partial removal: Constrained body-parse-failure → Error (Auto preserved)**
+
+  - **Context.** Wave-2.9 audit verified all 4 paths (Required/Function/Auto/unknown-family) unblocked for T2.4. Wave 3 Phase A worker A3 executes the Constrained-path removal. The Auto content-fallback is preserved; full T2.4 Auto closure deferred to Wave 3 Phase B (lazy Auto-mode grammar).
+
+  - **Chesterton note.** Wave-2.5 A4 already introduced `ToolCallPolicy::Constrained` vs Auto branching at the `ToolCallClose` parse-failure site (streaming `route_content` closure). The existing Constrained error key was `"tool_call_parse_failure"` with a generic message. Wave-2.7 W-η da545d5 then landed eager grammar enforcement, making the Constrained parse-failure branch structurally unreachable under correct operation. W-A3 upgrades the error key and message to reflect this: the branch is now a loud grammar-regression alarm, not a routine error path.
+
+  - **Code changes (`src/serve/api/engine.rs`).**
+    - Extracted the `ToolCallClose` dispatch (success + failure paths) from the inline `route_content` closure into a new free function `emit_streaming_tool_call_close`. Pattern mirrors `finalize_streaming_tool_state` (wave-2.8 W-θ HIGH-1 extraction). Extraction enables direct audit-driver testing without spinning up a full `generate_stream_once` call.
+    - Constrained parse-failure branch: error key upgraded from `"tool_call_parse_failure"` → `"tool_call_unreachable_fallback_required"`; `tracing::error!` message now reads "eager grammar (wave-2.7 W-η da545d5) should have prevented this — grammar engine bug".
+    - Auto parse-failure branch: unchanged (content fallback preserved). Inline comment updated to explain why Auto defers to Wave 3 Phase B.
+    - `route_content` closure `ToolCallClose` arm: replaces ~70 lines of inline logic with a `emit_streaming_tool_call_close(parsed, body_dump, tool_call_policy, tc_index, saw_tc, events)?` delegation call.
+
+  - **Tests added (`emit_streaming_tool_call_close_tests` module).**
+    - `required_body_parse_failure_yields_error_not_content`: Constrained + `parsed=None` → `GenerationEvent::Error("tool_call_unreachable_fallback_required")` + `Err(())`. Asserts the old `"tool_call_parse_failure"` code does NOT appear (regression guard against wave-2.5 vocabulary).
+    - `auto_body_parse_failure_preserves_content_fallback`: Auto + `parsed=None` → `GenerationEvent::Delta{Content, body_dump}` + `Ok(())`. Regression-preserve; must pass for the lifetime of the codebase until Wave 3 Phase B.
+
+  - **Test results.** 40/40 `serve::api::engine` tests pass; 2 new tests pass; 0 regressions.
+  - **LOC delta.** `src/serve/api/engine.rs` +173/-68 (net +105).
+  - **Open followups.**
+    - Auto body-parse-failure → full T2.4 closure (requires Wave 3 Phase B lazy Auto-mode grammar via `GrammarShape::SingleBody` + `ToolCallBodyAuto`).
+  - **Fence respected (W-A3).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
