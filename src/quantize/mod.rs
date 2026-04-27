@@ -9,6 +9,7 @@
 //! migrated to [`crate::calibrate`] (Layout A) — calibrators belong with
 //! their orchestration shell, not with the static quantizer hierarchy.
 
+pub mod dwq_k_quantizer;
 pub mod k_quant;
 pub mod k_quant_codec;
 pub mod k_quant_codec_quantizer;
