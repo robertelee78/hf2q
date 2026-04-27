@@ -6229,3 +6229,51 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - T2.4 fallback removal: with Q-A + Q-B + defensive-500 in place, the three preconditions the audit cited (no-call enforcement, multi-call grammar shape, unknown-registration handling) are all addressed.  The remaining unknown-family-fallback in `compile_tool_grammar` (returns `Ok(None)` with a warning) is the one open T2.4 path; converting to hard-error is on the Wave 3 table.
 
   - **Fence respected.** W-η edits in `src/serve/api/engine.rs`, `src/serve/api/grammar/sampler.rs`, `src/serve/api/handlers.rs`, `src/serve/api/registry.rs`, `docs/ADR-005-inference-server.md`.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/k_quant.rs` (concurrent ADR-014 P7 worker territory).
+
+- **2026-04-27 wave-2.8 W-θ (session cfa-20260427-adr005-wave2.8, commits `d95e7ae` + `460b993` + `163d698`) — compile_tool_grammar hard-error + tokenizer-backed mask + handler-level audit tests; closes MED T2.4 fallback for Required/Function; wave-2.7 audit gap "streaming residual" + 4 missed tests closed.**
+  - **Context:** Wave-2.7 Codex audit (cfa-20260427-adr005-wave2.7) returned REJECT with 1 HIGH streaming item and 5 missed-test gaps. Wave-2.8 closed all of them in 4 commits (d13dc60 + d95e7ae + 460b993 + 163d698). Note: commit 8e590e1 (ADR-014 P8 iter-1) was also present in the HEAD range; that commit is a fence violation in the Wave-2.8 review window (touches `src/quantize/`) but is unrelated to ADR-005 and was identified by the Wave-2.8 auditor as a contamination issue.
+  - **Commit `d95e7ae` — compile_tool_grammar MED T2.4 closure:**
+    - `compile_tool_grammar` now hard-errors (400 `invalid_request`) when `tool_choice=Required/Function` and (a) `tools[]` is empty/None or (b) the model has no registered emitter. Auto + same conditions preserve `Ok(None)`.
+    - Behavior table: `None/Auto + any → Ok(None)`; `Required/Function + empty → Err(400)`; `Required/Function + nonempty + unknown-family → Err(400)`; `Required/Function + nonempty + known → Ok(Some(grammar))`.
+    - Wired through `handlers.rs:952-955` so both stream and non-stream paths see the 400 before generation.
+    - Tests added: `compile_tool_grammar_function_with_unknown_family_returns_error`, `compile_tool_grammar_required_with_unknown_family_returns_error`, `compile_tool_grammar_auto_with_no_tools_returns_ok_none`, `compile_tool_grammar_auto_with_unknown_family_returns_ok_none`, `compile_tool_grammar_none_choice_returns_ok_none`.
+  - **Commit `460b993` — tokenizer-backed marker-byte mask test:**
+    - Added `tokenizer_backed_table_preserves_gemma_open_marker_bytes`: loads `/opt/hf2q/models/gemma4/tokenizer.json` (skips cleanly if absent), decodes id 48 via `tok.decode(&[id], false)`, asserts 12-byte `<|tool_call>` output, builds a grammar requiring that sequence at byte 0, runs the mask, asserts id 48 survives (not pushed to -inf).
+    - Load-gated on file existence: absent fixture → graceful skip; present fixture → live tokenizer exercise.
+  - **Commit `163d698` — handler-level audit-driving tests (missed-tests #1 + #3 + #4 + #5):**
+    - `parallel_multi_tool_runtime_accepts_alternating_calls_gemma_separator` + `_qwen_separator`: two DIFFERENT tools, `parallel=true`, `combine_function_grammars` + GrammarRuntime alternating fn-0/fn-1 calls.
+    - `defensive_no_call_constrained_under_constrained_yields_500`: asserts `defensive_no_call_under_constrained` returns a 500 `generation_error` body containing `tool_call_no_call_under_constrained`.
+    - `tool_grammar_wins_over_response_format_through_production_helper`: calls the extracted `select_effective_grammar` production helper with real `compile_response_format` outputs; asserts `ToolCallBodyRequired` kind.
+    - `auto_no_call_returns_none_for_defensive_helper` (missed-test #5): asserts the defensive helper returns `None` under Auto no-call (regression-preserve).
+  - **Wave-2.8 audit (cfa-20260427-adr005-wave2.8/codex-review-last.txt) verdict:** REJECT — T2.4 unblock verified TRUE on all 4 paths, but 4 residual hygiene gaps remained: (1) stale rustdoc, (2) Function + no/empty tools tests missing from matrix, (3) weak tool-over-response identity assertion, (4) present-but-corrupt tokenizer fixture silently skips. Plus fence contamination from 8e590e1 ADR-014 commit.
+  - **Fence respected** (W-θ ADR-005 commits). The 8e590e1 fence contamination is an artifact of the review window; the ADR-005 commits themselves do not touch fenced files.
+
+- **2026-04-27 wave-2.9 W-ι (session cfa-20260427-adr005-wave2.9, commits `3b65416` + `29db743` + `35766a4` + `4725228` + `f74cc86`) — mechanical hygiene closure; wave-2.8 audit REJECT items fully addressed.**
+  - **Context:** Wave-2.8 audit returned REJECT with 4 hygiene gaps (stale rustdoc, missing Function matrix tests, weak identity assertion, silent corrupt-fixture skip). All 5 items are pure hygiene — no behavior changes, only doc + test fixes.
+  - **Item 1 — commit `3b65416`: fix stale compile_tool_grammar rustdoc.**
+    - The wave-2.8 d95e7ae behavior change made Required/Function + no-tools and Required/Function + unknown-model return 400, but the Returns paragraph still described the old `Ok(None)` fallback for those cases.
+    - Updated Returns paragraph and unknown-registration rationale to accurately reflect: Auto/None → `Ok(None)` preserved; constrained + failed preconditions → `Err(400)`; the rationale explains why `Ok(None)` here would re-open the wave-2.6 unconstrained-engine divergence.
+  - **Item 2 — commit `29db743`: add Function + no-tools and empty-tools tests.**
+    - Audit matrix covered Required + no-tools and Required + empty-tools (and Function + unknown-family) but not Function + no-tools or Function + empty-tools.
+    - Added `compile_tool_grammar_function_with_no_tools_returns_error` and `compile_tool_grammar_function_with_empty_tools_returns_error`, mirroring the Required-variant shape. Both assertions cite the wave-2.6 fallback divergence.
+  - **Item 3 — commit `35766a4`: strengthen tool-over-response identity assertion.**
+    - Previous test at handlers.rs:3886-3893 only checked both grammars have a root rule — would pass even if `select_effective_grammar` erroneously returned the response grammar with `ToolCallBodyRequired` kind.
+    - Serialize both grammars to GBNF text before calling the helper; assert `chosen_gbnf == tool_gbnf` AND `chosen_gbnf != resp_gbnf`. This proves the correct grammar object was returned, not just that the returned object is structurally valid.
+  - **Item 4 — commit `4725228`: parallel two-real-tools via compile_tool_grammar.**
+    - Audit gap: existing parallel tests drove `combine_function_grammars` with synthetic GBNF strings, bypassing the production `compile_tool_grammar` → registered emitter → combiner → parser path.
+    - Added `compile_tool_grammar_parallel_two_real_tools_alternates`: two real Tool entries (`search(query: string)` + `add_numbers(x: integer, y: integer)`), gemma4-27b-it, `parallel_tool_calls=Some(true)`, `ToolChoiceValue::Required`. Asserts `fn-0-root` + `fn-1-root` exist; builds GrammarRuntime; feeds real Gemma4-format payload `<|tool_call>call:search{...}<tool_call|><|tool_call>call:add_numbers{...}<tool_call|>` and asserts acceptance.
+  - **Item 5 — commit `f74cc86`: fatal error on corrupt tokenizer fixture.**
+    - `load_gemma4_tokenizer_or_skip` previously returned `None` on `Tokenizer::from_file` failure regardless of whether the file existed — a present-but-corrupt fixture would silently pass the test while exercising nothing.
+    - Now distinguishes: file absent → `return None` (graceful skip); file exists + load failed → `panic!` with diagnostic. The fixture file is present in the dev environment and loads correctly (test passes).
+  - **Validation (W-ι HEAD `f74cc86`):**
+    - `cargo check` → clean (90 existing warnings, no new errors).
+    - `cargo test --release compile_tool_grammar_function` → 3 passed (2 new + existing).
+    - `cargo test --release tool_grammar_wins_over_response_format` → 1 passed (strengthened).
+    - `cargo test --release compile_tool_grammar_parallel_two_real_tools` → 1 passed (new).
+    - `cargo test --release tokenizer_backed` → 1 passed (existing, now with fatal-on-corrupt guard).
+  - **LOC delta:** `src/serve/api/handlers.rs` +202/-20, `src/serve/api/grammar/mask.rs` +12/-0.
+  - **Open followups (none HIGH).**
+    - Streaming-path defensive 500 for no-call under Constrained (Wave 3 candidate).
+    - AUTO lazy-grammar wiring via `GrammarShape::SingleBody` + `ToolCallBodyAuto` (Wave 3).
+    - T2.4 full closure: the `compile_tool_grammar` unknown-family Err(400) paths are now in place; the remaining T2.4 work is removing the `engine.rs` silent parse-failure-to-content fallback for AUTO (requires the AUTO lazy-grammar wiring first).
+  - **Fence respected.** W-ι edits in `src/serve/api/handlers.rs`, `src/serve/api/grammar/mask.rs`, `docs/ADR-005-inference-server.md`.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
