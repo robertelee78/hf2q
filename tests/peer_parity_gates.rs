@@ -1,4 +1,4 @@
-//! ADR-014 P10 iter-1 — peer-parity benchmark harness skeleton.
+//! ADR-014 P10 iter-1 + iter-2a — peer-parity benchmark harness.
 //!
 //! This crate orchestrates the eight Decision-15 gate cells (lines
 //! 575–582 of `docs/ADR-014-streaming-convert-pipeline.md`) that
@@ -6,26 +6,35 @@
 //! mlx-lm peers across 27B-dense + apex-MoE × {GGUF None, GGUF
 //! Imatrix, safetensors DWQ, GGUF DWQ vs current pipeline}.
 //!
-//! Test inventory (14 tests total):
+//! iter-2a lands the **peer-side** half of PPL: a
+//! `tests/common/llama_cpp_runner.rs::run_llama_perplexity` wrapper
+//! around `/opt/homebrew/bin/llama-perplexity`, a 512-token smoke
+//! fixture at `tests/fixtures/ppl-corpus/wikitext2-smoke.tokens`,
+//! and three new columns in `emit_markdown_table` (`hf2q PPL`,
+//! `peer PPL`, `PPL ratio`). The 8 `#[ignore]`-gated cells now
+//! record `peer_ppl` via the wrapper; hf2q-side stays
+//! `Verdict::NotMeasured` until iter-2b lands the hf2q-side driver.
 //!
-//! Always-on smoke (6 tests, run by default):
-//! 1. `harness_compiles_and_emits_table_skeleton`
-//! 2. `gate_cell_speed_tolerance_check`
-//! 3. `gate_cell_rss_tolerance_check`
-//! 4. `gate_cell_ppl_tolerance_check`
-//! 5. `subprocess_wrapper_handles_missing_binary`
-//! 6. `subprocess_wrapper_handles_missing_python_module`
+//! Test inventory (now 23 always-on + 8 ignored = 31 total):
+//!
+//! Always-on smoke + structural (run by default):
+//!  - iter-1 baseline: 19 tests covering markdown empty-input,
+//!    speed/RSS/PPL tolerance predicates, missing-binary sentinel,
+//!    GATE_CELLS Decision-15 verbatim audit.
+//!  - iter-2a additions (4 tests):
+//!    1. `wikitext2_smoke_fixture_loads_to_512_tokens`
+//!    2. `peer_perplexity_wrapper_handles_missing_binary`
+//!    3. `markdown_table_renders_ppl_columns`
+//!    4. `markdown_table_renders_full_ppl_row_when_both_measured`
 //!
 //! `#[ignore]`-gated (8 tests, one per Decision-15 cell, P11
 //! territory — needs apex MoE GPU + ~150 GB disk):
-//! 7-14: `cell_<idx>_<model>_<backend>_<calibrator>` — each runs the
+//! `cell_<idx>_<model>_<backend>_<calibrator>` — each runs the
 //! corresponding `GateCell` end-to-end against the real peer; this
-//! iter returns `Verdict::NotMeasured` because no real models are
-//! present.
-//!
-//! PPL columns are deferred to iter-2 (no wikitext-2 fixture or
-//! `ppl_kl_eval` driver exists in the repo today; iter-2 lands them
-//! when P6 closes).
+//! iter routes the peer side through `run_llama_perplexity` against
+//! the 512-token smoke fixture so the wiring is exercised, and
+//! returns `Verdict::NotMeasured` because hf2q-side PPL is deferred
+//! to iter-2b and no real models are present yet.
 
 mod common;
 
@@ -335,6 +344,113 @@ impl CellResult {
             ratios: Ratios::not_measured(),
         }
     }
+
+    /// Build a `CellResult` from raw measurements (iter-2a entry
+    /// point — the always-on suite drives this directly to verify
+    /// verdict logic, and `run_cell` calls it after invoking the
+    /// peer wrapper).
+    ///
+    /// Verdict semantics (iter-2a):
+    /// - If **either** side's wall_s is the missing-binary sentinel
+    ///   (`-1.0`) **or** hf2q_ppl is `None` (hf2q-side driver lands
+    ///   at iter-2b), the cell is `Verdict::NotMeasured` — never
+    ///   fake-green and never fake-red. The `reason` field carries
+    ///   the disqualifier so the markdown table surfaces *why*.
+    /// - Otherwise (all three signals measured on both sides) the
+    ///   verdict is `Pass` iff every gate passes:
+    ///   - speed: `hf2q_wall ≤ tolerance × peer_wall`
+    ///   - RSS:   `hf2q_rss  ≤ tolerance × peer_rss`
+    ///   - PPL:   `hf2q_ppl  ≤ tolerance × peer_ppl`
+    ///
+    ///   Any gate failure produces `Fail { reason }` naming the
+    ///   first failing gate.
+    pub fn from_measurements(
+        cell: GateCell,
+        hf2q: RunMetrics,
+        peer: RunMetrics,
+        ppl_hf2q: Option<f32>,
+        ppl_peer: Option<f32>,
+    ) -> Self {
+        // Compute ratios up front — `NaN` for the dimensions that
+        // can't be ratio'd (sentinel inputs / missing PPL).
+        let speed_ratio = if peer.wall_s > 0.0 && hf2q.wall_s >= 0.0 {
+            hf2q.wall_s / peer.wall_s
+        } else {
+            f64::NAN
+        };
+        let rss_ratio = if peer.peak_rss_bytes > 0
+            && peer.peak_rss_bytes != u64::MAX
+            && hf2q.peak_rss_bytes != u64::MAX
+        {
+            (hf2q.peak_rss_bytes as f64) / (peer.peak_rss_bytes as f64)
+        } else {
+            f64::NAN
+        };
+        let ppl_ratio = match (ppl_hf2q, ppl_peer) {
+            (Some(h), Some(p)) if p > 0.0 && h.is_finite() && p.is_finite() => {
+                (h as f64) / (p as f64)
+            }
+            _ => f64::NAN,
+        };
+
+        let ratios = Ratios {
+            speed: speed_ratio,
+            rss: rss_ratio,
+            ppl: ppl_ratio,
+        };
+
+        // Verdict: NotMeasured if any input is missing; else gate.
+        let verdict = if hf2q.is_missing_binary() {
+            Verdict::NotMeasured {
+                reason: "hf2q-side measurement missing (driver lands at iter-2b)".to_string(),
+            }
+        } else if peer.is_missing_binary() {
+            Verdict::NotMeasured {
+                reason: format!("peer binary missing: {}", peer.stderr_tail),
+            }
+        } else if ppl_hf2q.is_none() {
+            Verdict::NotMeasured {
+                reason: "hf2q PPL not measured (iter-2b deferred)".to_string(),
+            }
+        } else if ppl_peer.is_none() {
+            Verdict::NotMeasured {
+                reason: "peer PPL not parsed from llama-perplexity stderr".to_string(),
+            }
+        } else if !cell.passes_speed(hf2q.wall_s, peer.wall_s) {
+            Verdict::Fail {
+                reason: format!(
+                    "speed gate: {:.3}× > {:.2}× tolerance",
+                    speed_ratio, cell.speed_tolerance
+                ),
+            }
+        } else if !cell.passes_rss(hf2q.peak_rss_bytes, peer.peak_rss_bytes) {
+            Verdict::Fail {
+                reason: format!(
+                    "RSS gate: {:.3}× > {:.2}× tolerance",
+                    rss_ratio, cell.rss_tolerance
+                ),
+            }
+        } else if !cell.passes_ppl(ppl_hf2q, ppl_peer) {
+            Verdict::Fail {
+                reason: format!(
+                    "PPL gate: {:.4}× > {:.2}× tolerance",
+                    ppl_ratio, cell.ppl_tolerance
+                ),
+            }
+        } else {
+            Verdict::Pass
+        };
+
+        Self {
+            cell,
+            hf2q,
+            peer,
+            ppl_hf2q,
+            ppl_peer,
+            verdict,
+            ratios,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -344,12 +460,23 @@ impl CellResult {
 /// Pure function — produces the full markdown document from a slice
 /// of `CellResult`s plus a hardware fingerprint and git SHA. No I/O.
 ///
-/// Header columns (PPL deferred to iter-2):
-///   `Model | Backend | Calibrator | Peer | hf2q wall | peer wall |
-///    speed ratio | hf2q RSS | peer RSS | RSS ratio | Verdict`
+/// Header columns (iter-2a appends `hf2q PPL`, `peer PPL`,
+/// `PPL ratio` at the **end** so the iter-1 column order is preserved
+/// and the iter-1 always-on tests pass unchanged):
+///   `Model | Backend | Calibrator | Peer | hf2q wall (s) |
+///    peer wall (s) | speed ratio | hf2q RSS (B) | peer RSS (B) |
+///    RSS ratio | Verdict | hf2q PPL | peer PPL | PPL ratio`
+///
+/// PPL cells render `f32` to 4 decimal places; un-measured PPLs
+/// (Option::None) render as the em-dash `—` so the deferred state
+/// is visually distinct from a real `0.0000`. The PPL ratio is
+/// `hf2q_ppl / peer_ppl` to 4 decimals when both sides are measured,
+/// `—` when either is missing.
 ///
 /// On empty input the table reports the header followed by a single
-/// `No results — harness ran with empty input.` line.
+/// `No results — harness ran with empty input.` line, with the
+/// pipe-count matching the 14-column header so downstream
+/// markdown-table consumers don't choke.
 pub fn emit_markdown_table(
     results: &[CellResult],
     hardware_fingerprint: &str,
@@ -360,23 +487,28 @@ pub fn emit_markdown_table(
     out.push_str(&format!("## Hardware: {hardware_fingerprint}\n"));
     out.push_str(&format!("## SHA: {sha}\n\n"));
     out.push_str(
-        "**Note**: PPL columns deferred to ADR-014 P10 iter-2 \
-         (no wikitext-2 fixture or `ppl_kl_eval` driver exists in repo today; \
-         iter-2 lands them when P6 closes).\n\n",
+        "**Note (iter-2a)**: peer-side PPL is wired via \
+         `tests/common/llama_cpp_runner.rs::run_llama_perplexity`; \
+         hf2q-side PPL stays `NotMeasured` until iter-2b lands the \
+         hf2q-side driver wrapping `Qwen35Dense::from_gguf` + \
+         chunked forward-pass + `compute_perplexity`.\n\n",
     );
 
     out.push_str(
         "| Model | Backend | Calibrator | Peer | hf2q wall (s) | peer wall (s) | \
-         speed ratio | hf2q RSS (B) | peer RSS (B) | RSS ratio | Verdict |\n",
+         speed ratio | hf2q RSS (B) | peer RSS (B) | RSS ratio | Verdict | \
+         hf2q PPL | peer PPL | PPL ratio |\n",
     );
     out.push_str(
         "|-------|---------|------------|------|---------------|---------------|\
-         -------------|--------------|--------------|-----------|---------|\n",
+         -------------|--------------|--------------|-----------|---------|\
+         ----------|----------|-----------|\n",
     );
 
     if results.is_empty() {
+        // 14 columns ⇒ 15 pipes (one before each cell + one trailing).
         out.push_str(
-            "| _No results — harness ran with empty input._ | | | | | | | | | | |\n",
+            "| _No results — harness ran with empty input._ | | | | | | | | | | | | | |\n",
         );
         return out;
     }
@@ -388,8 +520,11 @@ pub fn emit_markdown_table(
         let peer_wall = format_metric_f64(r.peer.wall_s);
         let hf2q_rss = format_metric_u64(r.hf2q.peak_rss_bytes);
         let peer_rss = format_metric_u64(r.peer.peak_rss_bytes);
+        let hf2q_ppl = format_ppl(r.ppl_hf2q);
+        let peer_ppl = format_ppl(r.ppl_peer);
+        let ppl_ratio = format_ppl_ratio(r.ppl_hf2q, r.ppl_peer);
         out.push_str(&format!(
-            "| {model} | {backend} | {calibrator} | {peer} | {hw} | {pw} | {sr} | {hr} | {pr} | {rr} | {v} |\n",
+            "| {model} | {backend} | {calibrator} | {peer} | {hw} | {pw} | {sr} | {hr} | {pr} | {rr} | {v} | {hp} | {pp} | {pr2} |\n",
             model = r.cell.model_id,
             backend = r.cell.backend,
             calibrator = r.cell.calibrator_variant,
@@ -401,6 +536,9 @@ pub fn emit_markdown_table(
             pr = peer_rss,
             rr = rss_ratio,
             v = r.verdict,
+            hp = hf2q_ppl,
+            pp = peer_ppl,
+            pr2 = ppl_ratio,
         ));
     }
     out
@@ -430,6 +568,29 @@ fn format_metric_u64(v: u64) -> String {
     }
 }
 
+/// Renders a measured PPL to 4 decimal places, or the em-dash when
+/// the cell is unmeasured (PPL was deferred or peer binary missing).
+/// The em-dash keeps `0.0000` visually distinct from "no measurement".
+fn format_ppl(v: Option<f32>) -> String {
+    match v {
+        Some(p) => format!("{p:.4}"),
+        None => "—".to_string(),
+    }
+}
+
+/// Renders the hf2q/peer PPL ratio to 4 decimals when both sides are
+/// measured. Missing on either side → em-dash. A non-positive peer
+/// PPL would yield ±inf so we route that through the em-dash too —
+/// the harness does not surface fake ratios.
+fn format_ppl_ratio(hf2q: Option<f32>, peer: Option<f32>) -> String {
+    match (hf2q, peer) {
+        (Some(h), Some(p)) if p > 0.0 && h.is_finite() && p.is_finite() => {
+            format!("{:.4}", (h as f64) / (p as f64))
+        }
+        _ => "—".to_string(),
+    }
+}
+
 /// Persist the harness's markdown output to
 /// `docs/peer-parity-results-<YYYY-MM-DD>.md`. **Only** callable from
 /// `#[ignore]`-gated tests (mutating `docs/` from the always-on suite
@@ -455,17 +616,56 @@ pub fn write_results_to_dated_doc(
 // run_cell — the per-#[ignore]-test entry point
 // ---------------------------------------------------------------------
 
-/// Run a single gate cell end-to-end. This iter every call returns
-/// `Verdict::NotMeasured` (no real models present); P11 swaps in the
-/// real-model wiring. We still touch the subprocess wrappers via the
-/// runner modules' missing-binary path so the integration is exercised
-/// at the type level (the always-on smoke tests below cover the
-/// behavioural contract).
+/// Resolves the iter-2a smoke fixture path
+/// (`tests/fixtures/ppl-corpus/wikitext2-smoke.tokens`) relative to
+/// `CARGO_MANIFEST_DIR`. The fixture is committed to the repo (2 KB
+/// deterministic ramp — see the sibling README); this resolver
+/// avoids hard-coding `/opt/hf2q` so the harness works from any
+/// worktree.
+fn smoke_corpus_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("ppl-corpus")
+        .join("wikitext2-smoke.tokens")
+}
+
+/// Run a single gate cell end-to-end. iter-2a wires the peer-side
+/// PPL via `run_llama_perplexity` against the smoke fixture; the
+/// hf2q side stays sentinel (driver lands at iter-2b). Wall + RSS
+/// stay sentinel for both sides this iter (real-model wiring lands
+/// in P11). The verdict therefore resolves to `NotMeasured` —
+/// `from_measurements` routes that honestly through the
+/// `hf2q.is_missing_binary()` arm.
 fn run_cell(cell: GateCell) -> CellResult {
-    CellResult::not_measured(
-        cell,
-        "P11 territory — needs real apex MoE GPU + ~150 GB disk per ADR-014 R13",
-    )
+    // Peer-side PPL: invoke the wrapper. The model path is
+    // intentionally a sentinel (no real models present yet — P11);
+    // the binary will fail to load it, exit non-zero, and the
+    // parser will return None for the PPL. That's the correct
+    // observable: peer wrapper present, but PPL un-measured because
+    // the model wasn't loadable. Once P11 wires real GGUF paths,
+    // this same call site starts producing real PPL values.
+    let model_path = std::path::PathBuf::from(format!(
+        "/var/empty/{}-{}-{}-deferred.gguf",
+        cell.model_id.replace(' ', "-"),
+        cell.backend,
+        cell.calibrator_variant.replace(' ', "-"),
+    ));
+    let corpus_path = smoke_corpus_path();
+    let (peer_metrics, peer_ppl) = if corpus_path.is_file() {
+        llama_cpp_runner::run_llama_perplexity(&model_path, &corpus_path)
+    } else {
+        // Fixture missing (should never happen — it's checked in)
+        // but stay safe rather than panic. The verdict will surface
+        // the missing-fixture state via the peer sentinel.
+        (RunMetrics::missing_binary("smoke fixture"), None)
+    };
+
+    // hf2q-side stays sentinel: driver lands at iter-2b.
+    let hf2q_metrics = RunMetrics::missing_binary("hf2q (iter-2b deferred)");
+    let hf2q_ppl: Option<f32> = None;
+
+    CellResult::from_measurements(cell, hf2q_metrics, peer_metrics, hf2q_ppl, peer_ppl)
 }
 
 // =====================================================================
@@ -474,15 +674,32 @@ fn run_cell(cell: GateCell) -> CellResult {
 
 /// Smoke 1: harness compiles and the markdown emitter produces a
 /// well-formed table on empty input (header + the empty-input line).
+/// iter-2a updates the inline note to advertise the peer-side PPL
+/// wiring (the iter-1 "deferred" note is gone now that
+/// `run_llama_perplexity` exists and the 3 PPL columns are present).
 #[test]
 fn harness_compiles_and_emits_table_skeleton() {
     let md = emit_markdown_table(&[], "M5 Max, 128 GB", "abc1234");
     assert!(md.contains("# ADR-014 P10 Peer-Parity Results"));
     assert!(md.contains("## Hardware: M5 Max, 128 GB"));
     assert!(md.contains("## SHA: abc1234"));
-    // PPL deferral note must be surfaced inline.
-    assert!(md.contains("PPL columns deferred"));
-    // Header row must contain every column the harness reports.
+    // iter-2a inline note: peer-side PPL wired; hf2q-side deferred
+    // to iter-2b. The iter-1 "PPL columns deferred" string is gone —
+    // those columns are now present.
+    assert!(
+        md.contains("peer-side PPL is wired"),
+        "iter-2a inline note must advertise peer-side PPL wiring"
+    );
+    assert!(
+        md.contains("iter-2b"),
+        "iter-2a inline note must point forward to iter-2b for hf2q-side"
+    );
+    assert!(
+        !md.contains("PPL columns deferred"),
+        "iter-1 deferral language must NOT survive into iter-2a output"
+    );
+    // Header row must contain every column the harness reports
+    // (iter-1 columns + iter-2a's three PPL columns).
     for col in [
         "Model",
         "Backend",
@@ -495,6 +712,9 @@ fn harness_compiles_and_emits_table_skeleton() {
         "peer RSS (B)",
         "RSS ratio",
         "Verdict",
+        "hf2q PPL",
+        "peer PPL",
+        "PPL ratio",
     ] {
         assert!(md.contains(col), "header missing column `{col}`:\n{md}");
     }
@@ -707,6 +927,251 @@ fn emit_markdown_table_with_one_synthetic_result_round_trips_columns() {
     assert!(md.contains("None (q4_k_m)"));
     assert!(md.contains("llama.cpp uncalibrated Q4_K_M"));
     assert!(md.contains("NOT MEASURED"));
+}
+
+// =====================================================================
+// iter-2a always-on smoke tests (4) — peer-side PPL plumbing
+// =====================================================================
+
+/// iter-2a #1: the 512-token deterministic smoke fixture loads off
+/// disk, has the documented byte length, and the parsed u32 stream
+/// matches the documented generation rule `(i * 17 + 3) % 32000`.
+/// This guards (a) the fixture survived git, (b) the format pledge
+/// in the sibling README is honoured, and (c) iter-2b's hf2q-side
+/// driver will read exactly the bytes it expects.
+#[test]
+fn wikitext2_smoke_fixture_loads_to_512_tokens() {
+    let path = smoke_corpus_path();
+    assert!(
+        path.is_file(),
+        "smoke fixture missing at {:?} — must be checked in to git",
+        path
+    );
+    let bytes = std::fs::read(&path).expect("read smoke fixture");
+    assert_eq!(
+        bytes.len(),
+        512 * 4,
+        "smoke fixture must be exactly 512 little-endian u32s ⇒ 2048 bytes; got {}",
+        bytes.len()
+    );
+
+    let tokens: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(tokens.len(), 512);
+
+    // Verify the generation rule end-to-end: every token must equal
+    // `(i * 17 + 3) % 32000` per README. This is the byte-identity
+    // check iter-2b relies on.
+    for (i, &tok) in tokens.iter().enumerate() {
+        let expected = ((i as u32) * 17 + 3) % 32000;
+        assert_eq!(
+            tok, expected,
+            "token at index {i} must satisfy the documented ramp formula"
+        );
+    }
+
+    // Sanity boundaries called out verbatim in the README.
+    assert_eq!(&tokens[..4], &[3, 20, 37, 54]);
+    assert_eq!(&tokens[508..], &[8639, 8656, 8673, 8690]);
+}
+
+/// iter-2a #2: the peer-side PPL wrapper handles a missing binary
+/// the same way every other peer wrapper does — tracing::warn +
+/// `RunMetrics::missing_binary` sentinel + `None` PPL. Routes via
+/// `HF2Q_LLAMA_PERPLEXITY_BIN` set to a guaranteed-absent path. The
+/// `is_missing_binary()` accessor (already on `RunMetrics` from
+/// iter-1, lines 51–55 of `tests/common/metrics.rs`) is the
+/// canonical sentinel detector — no duck-typing against `wall_s`.
+///
+/// `ENV_LOCK` is held for the duration to serialise against any
+/// other test in this binary that touches the same env var.
+#[test]
+fn peer_perplexity_wrapper_handles_missing_binary() {
+    let _guard = ENV_LOCK.lock().expect("ENV_LOCK poisoned");
+    // SAFETY: ENV_LOCK serialises every env-mutating test in this
+    // binary; the unsafe set/remove calls are bounded to this
+    // critical section.
+    unsafe {
+        std::env::set_var(
+            "HF2Q_LLAMA_PERPLEXITY_BIN",
+            "/nonexistent/llama-perplexity-test-stub",
+        );
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (m, ppl) = llama_cpp_runner::run_llama_perplexity(
+        &tmp.path().join("model.gguf"),
+        &tmp.path().join("corpus.tokens"),
+    );
+    // Restore env BEFORE assertions so a panic doesn't leak the
+    // override into siblings waiting on the mutex.
+    unsafe {
+        std::env::remove_var("HF2Q_LLAMA_PERPLEXITY_BIN");
+    }
+    assert!(
+        m.is_missing_binary(),
+        "missing binary must surface sentinel; got {m:?}"
+    );
+    assert!(
+        ppl.is_none(),
+        "missing binary must yield None ppl (no fake-green); got {ppl:?}"
+    );
+    assert_eq!(m.exit_code, -1);
+    assert_eq!(m.wall_s, -1.0);
+    assert_eq!(m.peak_rss_bytes, u64::MAX);
+    assert!(
+        m.stderr_tail.contains("llama-perplexity"),
+        "stderr_tail must name the missing binary; got `{}`",
+        m.stderr_tail
+    );
+}
+
+/// iter-2a #3: the markdown table emits the three new PPL columns
+/// in their documented header order, and a half-measured row
+/// (hf2q PPL = NotMeasured, peer PPL = Some(5.42)) renders as
+/// "—" + "5.4200" + "—" — the em-dash distinguishes deferred from
+/// real `0.0000`.
+#[test]
+fn markdown_table_renders_ppl_columns() {
+    // Build a synthetic CellResult with peer PPL measured + hf2q
+    // PPL deferred. Wall/RSS sentinels drive the verdict to
+    // NotMeasured (hf2q-side missing) per from_measurements.
+    let result = CellResult {
+        cell: GATE_CELLS[0],
+        hf2q: RunMetrics::missing_binary("hf2q (iter-2b deferred)"),
+        peer: RunMetrics {
+            wall_s: 12.345,
+            peak_rss_bytes: 1_024 * 1_024 * 1_024,
+            exit_code: 0,
+            stderr_tail: "Final estimate: PPL = 5.4200 +/- 0.05000\n".to_string(),
+        },
+        ppl_hf2q: None,
+        ppl_peer: Some(5.42),
+        verdict: Verdict::NotMeasured {
+            reason: "iter-2a smoke".to_string(),
+        },
+        ratios: Ratios::not_measured(),
+    };
+    let md = emit_markdown_table(&[result], "M5 Max, 128 GB", "iter2a01");
+
+    // Header columns added in order at the END of the row.
+    for col in ["hf2q PPL", "peer PPL", "PPL ratio"] {
+        assert!(md.contains(col), "header missing PPL column `{col}`:\n{md}");
+    }
+
+    // Header pipe count must equal data-row pipe count (15 each
+    // for 14 columns).
+    let header_pipes = md
+        .lines()
+        .find(|l| l.starts_with("| Model "))
+        .map(|l| l.matches('|').count())
+        .expect("header present");
+    assert_eq!(
+        header_pipes, 15,
+        "iter-2a header must have 15 pipes (14 columns); got {header_pipes}"
+    );
+    let data_pipes = md
+        .lines()
+        .find(|l| l.starts_with("| 27B dense "))
+        .map(|l| l.matches('|').count())
+        .expect("data row present");
+    assert_eq!(
+        header_pipes, data_pipes,
+        "data row pipe count must match header"
+    );
+
+    // Half-measured row: hf2q PPL "—", peer PPL "5.4200", ratio "—".
+    let data_line = md
+        .lines()
+        .find(|l| l.starts_with("| 27B dense "))
+        .expect("data row");
+    let cells: Vec<&str> = data_line.split('|').map(str::trim).collect();
+    // cells[0] is empty (leading pipe) and cells[15] is empty
+    // (trailing pipe); the 14 real cells live at indices 1..=14.
+    assert_eq!(cells[12], "—", "hf2q PPL must render as em-dash; got `{}`", cells[12]);
+    assert_eq!(cells[13], "5.4200", "peer PPL must render to 4 dp; got `{}`", cells[13]);
+    assert_eq!(cells[14], "—", "PPL ratio must em-dash when hf2q missing; got `{}`", cells[14]);
+}
+
+/// iter-2a #4: when both PPLs are measured, the row renders the
+/// ratio to 4 decimals AND the verdict logic on `ppl_tolerance`
+/// fires — `from_measurements` builds Pass when within tolerance
+/// and Fail when over. We exercise both branches.
+#[test]
+fn markdown_table_renders_full_ppl_row_when_both_measured() {
+    // Within tolerance: 27B dense | None | llama.cpp uncalibrated
+    // (ppl_tolerance = 1.02). Pick hf2q = 5.50, peer = 5.45 ⇒
+    // ratio 1.00917… which is ≤ 1.02 ⇒ Pass (provided speed + RSS
+    // also pass — we set both to identity 1.0× / 1.0×).
+    let happy_hf2q = RunMetrics {
+        wall_s: 10.0,
+        peak_rss_bytes: 1_000_000_000,
+        exit_code: 0,
+        stderr_tail: String::new(),
+    };
+    let happy_peer = RunMetrics {
+        wall_s: 10.0,
+        peak_rss_bytes: 1_000_000_000,
+        exit_code: 0,
+        stderr_tail: "Final estimate: PPL = 5.4500 +/- 0.05000\n".to_string(),
+    };
+    let pass_result = CellResult::from_measurements(
+        GATE_CELLS[0],
+        happy_hf2q.clone(),
+        happy_peer.clone(),
+        Some(5.50),
+        Some(5.45),
+    );
+    assert!(
+        matches!(pass_result.verdict, Verdict::Pass),
+        "full-measurement within tolerance must Pass; got {:?}",
+        pass_result.verdict
+    );
+    let pass_md =
+        emit_markdown_table(std::slice::from_ref(&pass_result), "M5 Max, 128 GB", "iter2a02");
+    let pass_line = pass_md
+        .lines()
+        .find(|l| l.starts_with("| 27B dense "))
+        .expect("data row");
+    let pass_cells: Vec<&str> = pass_line.split('|').map(str::trim).collect();
+    assert_eq!(pass_cells[12], "5.5000", "hf2q PPL must render to 4 dp");
+    assert_eq!(pass_cells[13], "5.4500", "peer PPL must render to 4 dp");
+    // ratio = 5.50 / 5.45 ≈ 1.0091743 ⇒ "1.0092" at 4 dp.
+    assert_eq!(
+        pass_cells[14], "1.0092",
+        "PPL ratio must render to 4 dp; got `{}`",
+        pass_cells[14]
+    );
+    assert!(pass_line.contains("PASS"), "verdict cell must say PASS");
+
+    // Over tolerance: hf2q = 5.60, peer = 5.45 ⇒ ratio 1.02752 > 1.02 ⇒ Fail.
+    // Reasoning: 5.60 / 5.45 = 1.027523 which exceeds the 1.02 ppl_tolerance
+    // for row 0; speed + RSS gates still pass at 1.0× each.
+    let fail_result = CellResult::from_measurements(
+        GATE_CELLS[0],
+        happy_hf2q,
+        happy_peer,
+        Some(5.60),
+        Some(5.45),
+    );
+    assert!(
+        matches!(fail_result.verdict, Verdict::Fail { .. }),
+        "full-measurement over tolerance must Fail; got {:?}",
+        fail_result.verdict
+    );
+    if let Verdict::Fail { ref reason } = fail_result.verdict {
+        assert!(
+            reason.contains("PPL gate"),
+            "Fail reason must name PPL gate; got `{reason}`"
+        );
+    }
+    let fail_md = emit_markdown_table(&[fail_result], "M5 Max, 128 GB", "iter2a03");
+    assert!(fail_md.contains("FAIL"), "verdict must surface FAIL");
+    assert!(
+        fail_md.contains("PPL gate"),
+        "FAIL reason must mention PPL gate"
+    );
 }
 
 // =====================================================================

@@ -1,7 +1,7 @@
-//! ADR-014 P10 iter-1 — subprocess wrappers for llama.cpp peer-parity
-//! gates.
+//! ADR-014 P10 iter-1 + iter-2a — subprocess wrappers for llama.cpp
+//! peer-parity gates.
 //!
-//! Three entry points (one per Decision 15 gate column):
+//! Four entry points (one per Decision 15 gate column):
 //! - [`run_llama_quantize`]: invokes `llama-quantize <input> <output>
 //!   <variant>` to produce the peer's Q4_K_M GGUF for the
 //!   uncalibrated cell.
@@ -11,6 +11,14 @@
 //! - [`run_llama_imatrix`]: invokes `llama-imatrix` to produce the
 //!   peer's importance-matrix .dat file for the imatrix-q4_k_m cell
 //!   (then `run_llama_quantize` consumes it via `--imatrix`).
+//! - [`run_llama_perplexity`] (iter-2a): invokes `llama-perplexity
+//!   --model <model> --file <corpus>` and parses the upstream
+//!   `Final estimate: PPL = <f32> +/- <f32>` line from stderr (per
+//!   `/opt/llama.cpp/tools/perplexity/perplexity.cpp:654`); returns
+//!   `(RunMetrics, Option<f32>)` so the harness can populate the
+//!   peer-side PPL column. The line is emitted via `LOG_INF` which
+//!   `common/log.cpp:88` routes to **stderr** for non-NONE log levels;
+//!   the parser tolerates the `\x1b[32mI \x1b[0m` ANSI color prefix.
 //!
 //! Every wrapper:
 //! 1. resolves the binary via env-var override → `$PATH` walk;
@@ -28,6 +36,7 @@
 //! - `HF2Q_LLAMA_QUANTIZE_BIN`        → overrides `llama-quantize`
 //! - `HF2Q_LLAMA_CONVERT_HF_BIN`      → overrides `convert_hf_to_gguf.py`
 //! - `HF2Q_LLAMA_IMATRIX_BIN`         → overrides `llama-imatrix`
+//! - `HF2Q_LLAMA_PERPLEXITY_BIN`      → overrides `llama-perplexity`
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -243,6 +252,88 @@ pub fn run_llama_imatrix(
     spawn_and_measure(&bin, &args)
 }
 
+/// Runs `llama-perplexity --model <model> --file <corpus>` and
+/// returns `(RunMetrics, Option<f32>)`.
+///
+/// On binary-missing the wrapper emits the canonical
+/// `RunMetrics::missing_binary` sentinel + `None` PPL; the harness
+/// routes that through `Verdict::NotMeasured`.
+///
+/// On real invocation the parser scans stderr for the upstream line
+/// `Final estimate: PPL = <f32> +/- <f32>` (emitted via `LOG_INF`,
+/// which `common/log.cpp:88` routes to stderr for non-NONE log
+/// levels; emitted from `tools/perplexity/perplexity.cpp:654`).
+/// `Some(ppl)` is returned on parse success, `None` on parse miss
+/// (so the harness can distinguish "binary ran but didn't print PPL"
+/// — e.g., the operator passed wrong flags or the binary crashed
+/// after the warmup — from "binary missing entirely").
+///
+/// Wall-clock is timed via `Instant::now`; `peak_rss_bytes` is parsed
+/// from the `/usr/bin/time -l` BSD wrapper if the operator drove the
+/// invocation through the cold-cache shell harness, otherwise `0` —
+/// matching the sibling [`run_llama_quantize`] / [`run_llama_imatrix`]
+/// /  [`run_convert_hf_to_gguf`] convention. The dedicated
+/// `getrusage(RUSAGE_CHILDREN)` accumulator the spec mentions is
+/// **not** used here because under cargo's multi-threaded test
+/// runner that counter is process-cumulative across siblings (every
+/// other test's child contributes), which would over-report — the
+/// `time -l` parse stays the canonical RSS source per the existing
+/// runner's Chesterton's-fence convention.
+pub fn run_llama_perplexity(model: &Path, corpus: &Path) -> (RunMetrics, Option<f32>) {
+    let bin = match resolve_binary("HF2Q_LLAMA_PERPLEXITY_BIN", "llama-perplexity") {
+        Some(b) => b,
+        None => {
+            tracing::warn!(
+                "llama-perplexity not found on $PATH and HF2Q_LLAMA_PERPLEXITY_BIN unset (or override invalid); peer PPL cell will report Verdict::NotMeasured"
+            );
+            return (RunMetrics::missing_binary("llama-perplexity"), None);
+        }
+    };
+
+    let m_str = model.to_string_lossy();
+    let c_str = corpus.to_string_lossy();
+    let args = ["--model", m_str.as_ref(), "--file", c_str.as_ref()];
+    let metrics = spawn_and_measure(&bin, &args);
+    // Parse only when the spawn actually executed the binary — for the
+    // missing-binary sentinel the stderr_tail is the synthetic
+    // `missing: <name>` string and contains no PPL line.
+    if metrics.is_missing_binary() {
+        return (metrics, None);
+    }
+    let ppl = parse_llama_perplexity_final_estimate(&metrics.stderr_tail);
+    (metrics, ppl)
+}
+
+/// Parses the upstream `Final estimate: PPL = <f32> +/- <f32>` line
+/// from `llama-perplexity` stderr.
+///
+/// Tolerates the ANSI color prefix `LOG_INF` emits at info level
+/// (e.g., `\x1b[32mI \x1b[0mFinal estimate: PPL = 5.4200 +/- 0.05000`)
+/// by anchoring on the literal substring `Final estimate: PPL =`
+/// rather than line-start. Returns the first `f32` after the `=`
+/// (the +/- standard error is intentionally discarded — the harness
+/// gates on the point estimate per Decision 15).
+///
+/// Returns `None` if the line is absent (binary crashed before
+/// finishing) or the post-`=` token does not parse as `f32`.
+pub(crate) fn parse_llama_perplexity_final_estimate(stderr: &str) -> Option<f32> {
+    const NEEDLE: &str = "Final estimate: PPL =";
+    for line in stderr.lines() {
+        if let Some(rest) = line.find(NEEDLE).map(|idx| &line[idx + NEEDLE.len()..]) {
+            // After `=` we expect optional whitespace then the
+            // estimate (e.g., ` 5.4200 +/- 0.05000` or ` nan +/- nan`).
+            let token = rest.split_whitespace().next()?;
+            if let Ok(v) = token.parse::<f32>() {
+                return Some(v);
+            }
+            // Token present but not parseable — return None rather
+            // than guess; the harness surfaces NotMeasured.
+            return None;
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------
 // Internal helpers for unit-testable behaviour that does not touch
 // process-global env (env-var mutation across parallel tests is
@@ -325,5 +416,87 @@ mod tests {
     fn bsd_time_parser_returns_none_when_label_missing() {
         let stderr = "no time-l output here\n";
         assert!(parse_bsd_time_peak_rss(stderr).is_none());
+    }
+
+    /// `parse_llama_perplexity_final_estimate` extracts the point
+    /// estimate from the canonical upstream line shape (no ANSI
+    /// prefix).
+    #[test]
+    fn perplexity_parser_extracts_plain_final_estimate() {
+        let stderr = "perplexity: 1.23 seconds per pass\nFinal estimate: PPL = 5.4200 +/- 0.05000\n";
+        let v = parse_llama_perplexity_final_estimate(stderr);
+        assert_eq!(v, Some(5.42));
+    }
+
+    /// `parse_llama_perplexity_final_estimate` tolerates the ANSI
+    /// color prefix LOG_INF emits when stderr is a TTY (the binary
+    /// emits `\x1b[32mI \x1b[0m` before each info-level line per
+    /// `common/log.cpp:105`).
+    #[test]
+    fn perplexity_parser_tolerates_ansi_color_prefix() {
+        let stderr = "\x1b[32mI \x1b[0mFinal estimate: PPL = 7.1234 +/- 0.04567\n";
+        let v = parse_llama_perplexity_final_estimate(stderr);
+        assert_eq!(v, Some(7.1234));
+    }
+
+    /// `parse_llama_perplexity_final_estimate` returns `None` when
+    /// the line is absent (binary crashed before final estimate or
+    /// operator passed unsupported flags).
+    #[test]
+    fn perplexity_parser_returns_none_when_line_missing() {
+        let stderr = "perplexity: tokenizing the input\n";
+        assert!(parse_llama_perplexity_final_estimate(stderr).is_none());
+    }
+
+    /// `parse_llama_perplexity_final_estimate` returns `None` when
+    /// the post-`=` token is not parseable as f32 (defensive — the
+    /// upstream binary always emits a number, but a future format
+    /// drift must surface as NotMeasured rather than fake-green).
+    #[test]
+    fn perplexity_parser_returns_none_on_unparseable_token() {
+        let stderr = "Final estimate: PPL = not_a_number +/- nan\n";
+        assert!(parse_llama_perplexity_final_estimate(stderr).is_none());
+    }
+
+    /// `run_llama_perplexity` honours the env-var override and
+    /// returns the missing-binary sentinel + `None` PPL when the
+    /// override points at a guaranteed-absent path. Direct
+    /// invocation through the resolver is unit-test territory; the
+    /// integration test in `tests/peer_parity_gates.rs` exercises
+    /// the public API end-to-end.
+    #[test]
+    fn perplexity_wrapper_missing_binary_returns_sentinel_and_none() {
+        // We drive through the public API but mutate the env-var
+        // through a dedicated mutex so we don't race the harness's
+        // own env-touching tests in this same crate.
+        use std::sync::Mutex;
+        static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = TEST_ENV_LOCK.lock().expect("TEST_ENV_LOCK poisoned");
+        // SAFETY: TEST_ENV_LOCK serialises every env-mutating test
+        // in this `#[cfg(test)] mod tests` block; the unsafe call is
+        // bounded to this critical section, so no other Rust thread
+        // can observe a partial state.
+        unsafe {
+            std::env::set_var(
+                "HF2Q_LLAMA_PERPLEXITY_BIN",
+                "/nonexistent/llama-perplexity-test-stub",
+            );
+        }
+        let (metrics, ppl) = run_llama_perplexity(
+            Path::new("/nonexistent/model.gguf"),
+            Path::new("/nonexistent/corpus.tokens"),
+        );
+        // Restore env BEFORE the assertions so a panic during
+        // assertion doesn't leak the override into siblings waiting
+        // on the mutex.
+        unsafe {
+            std::env::remove_var("HF2Q_LLAMA_PERPLEXITY_BIN");
+        }
+        assert!(
+            metrics.is_missing_binary(),
+            "missing binary must surface sentinel; got {metrics:?}"
+        );
+        assert!(ppl.is_none(), "missing binary must yield None ppl; got {ppl:?}");
+        assert!(metrics.stderr_tail.contains("llama-perplexity"));
     }
 }
