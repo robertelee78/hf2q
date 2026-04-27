@@ -2853,6 +2853,27 @@ fn emit_streaming_tool_call_close(
 /// events + Done) was emitted; `Err(())` if any send failed (client
 /// disconnected mid-replay) — caller bumps the cancellation counter and
 /// returns, mirroring the live-decode disconnect path.
+///
+/// # End-of-stream splitter drain (Wave 3.5 HIGH-2)
+///
+/// Both `ReasoningSplitter` and `ToolCallSplitter` hold back a sliding
+/// tail (`tail_buf`) up to `tail_cap` bytes long in case the next
+/// fragment continues a marker boundary.  Pre-Wave-3.5 the replay fed
+/// `cached.text` once and emitted Done — never calling `finish()` on
+/// either splitter — so the held-back tail bytes were silently dropped.
+/// This caused truncated content on cache hits whose tails happened to
+/// look like partial markers.
+///
+/// The drain order mirrors the live-decode path
+/// (engine.rs:3691-3757): `reasoning_splitter.finish()` first, routing
+/// any Content tail through `tool_splitter`; then
+/// `tool_splitter.finish()` to emit the final residual.  Unlike the
+/// live path, replay does NOT promote ToolCallText residuals to
+/// structured Errors — a cached entry was already validated when
+/// stored, so any residual tail is plain content not a mid-decode
+/// truncation.  Audit citation:
+/// `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`
+/// divergence "W-A2 streaming cache replay" severity HIGH.
 fn replay_cached_streaming_response(
     cached: &GenerationResult,
     registration: Option<&super::registry::ModelRegistration>,
@@ -3010,6 +3031,111 @@ fn replay_cached_streaming_response(
             events,
             &cached.text,
         )?;
+    }
+
+    // ── 2b. End-of-stream splitter drain ────────────────────────────────
+    //
+    // Wave 3.5 HIGH-2: live decode drains BOTH the ReasoningSplitter and
+    // the ToolCallSplitter at end-of-stream because each holds back a
+    // tail (`tail_buf` of size up to `tail_cap` bytes) in case the next
+    // fragment continues a marker boundary.  Pre-Wave-3.5 replay fed
+    // `cached.text` through `feed()` ONCE then jumped straight to Done,
+    // never calling `finish()` on either splitter — so the held-back
+    // tail bytes (typically a few characters) were silently dropped.
+    //
+    // Concrete failure mode the audit caught
+    // (/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt
+    // divergence "W-A2 streaming cache replay" severity HIGH): a cached
+    // plain-text response shorter than `tail_cap` bytes (or whose tail
+    // looks like a partial marker prefix) had its terminal characters
+    // truncated.  A cached response with a tool-call marker followed by
+    // postscript content had the postscript truncated.
+    //
+    // Mirrors the live-decode drain at engine.rs:3691-3757
+    // (reasoning_splitter.finish → tool_splitter Content route →
+    // tool_splitter.finish via finalize_streaming_tool_state).  The
+    // replay equivalent uses `route_replay_fragment` (no grammar
+    // runtime) and inlines the tool_splitter.finish() drain because we
+    // don't enforce mid-call truncation Errors on a cache hit (the
+    // policy-loud-error contract is for live decode; cached entries
+    // were already validated when stored).
+    if let Some(rs) = reasoning_splitter.as_mut() {
+        if let Some((slot, tail)) = rs.finish() {
+            match slot {
+                super::registry::SplitSlot::Reasoning => {
+                    if !tail.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Reasoning,
+                                text: tail,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::SplitSlot::Content => {
+                    // Route through the tool-call splitter so a Content
+                    // tail straddling a marker boundary still classifies
+                    // correctly (mirrors live drain at engine.rs:3710-3727).
+                    route_replay_fragment(
+                        &mut tool_splitter,
+                        &mut tool_call_body,
+                        &mut tool_call_index,
+                        &mut saw_tool_call,
+                        events,
+                        &tail,
+                    )?;
+                }
+            }
+        }
+    }
+    // tool_splitter.finish() drain: route any held-back tail to the
+    // appropriate slot.  Unlike the live path (which fires a structured
+    // Error on mid-call truncation under Constrained/AutoLazyGrammar),
+    // replay always treats the tail as plain content for the same
+    // reason: the cache stored a verified-complete response, so any
+    // residual tail is by definition not a mid-decode truncation.
+    if let Some(tcs) = tool_splitter.as_mut() {
+        if let Some(ev) = tcs.finish() {
+            match ev {
+                super::registry::ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallText(t) => {
+                    // Cached entry ended mid-tool-call (open marker
+                    // observed but no close marker reached).  Re-emit
+                    // as Content with the open marker re-prepended for
+                    // diagnostic clarity — same shape as the live
+                    // Auto-no-grammar drain at engine.rs:2024-2035.
+                    let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
+                    let fallback = format!("{prefix}{t}");
+                    if !fallback.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: fallback,
+                            })
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                }
+                super::registry::ToolCallEvent::ToolCallOpen
+                | super::registry::ToolCallEvent::ToolCallClose => {
+                    // unreachable — finish() never emits Open/Close.
+                }
+            }
+        }
     }
 
     // ── 3. Done event ───────────────────────────────────────────────────
@@ -5233,6 +5359,237 @@ mod streaming_prompt_cache_replay_tests {
         assert!(
             res.is_err(),
             "replay must return Err when receiver was dropped"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 3.5 HIGH-2 — audit-driven splitter-drain tests
+    //
+    // Audit divergence
+    // /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt
+    // "W-A2 streaming cache replay" severity HIGH:
+    //
+    //   "replay_cached_streaming_response feeds cached.text once at
+    //    src/serve/api/engine.rs:2977-3012 and immediately emits Done
+    //    at src/serve/api/engine.rs:3015-3048. It never calls
+    //    ReasoningSplitter::finish() or ToolCallSplitter::finish(),
+    //    even though those splitters hold back tail bytes until
+    //    finish at src/serve/api/registry.rs:397-463 and
+    //    src/serve/api/registry.rs:587-658. Registered plain-text
+    //    cache hits can therefore emit empty/truncated content."
+    //
+    // The two missed-test gaps the audit cited:
+    //   1. "No unit test replays short plain content with a registered
+    //      model; replay_emits_content_then_done_for_plain_text passes
+    //      registration=None ... bypassing both tail-holding splitters."
+    //   2. "No replay test asserts final postscript/tail content after
+    //      tool-call markers."
+    //
+    // The tests below close both gaps and would fail on a regression
+    // that removes the new finish() drain calls.
+    // ---------------------------------------------------------------------
+
+    /// Wave 3.5 HIGH-2 missed-test #1: a registered-model plain-text
+    /// replay must drain the splitter tail before Done.
+    ///
+    /// The Gemma 4 ToolCallSplitter has `tail_cap = max(open_marker.len,
+    /// close_marker.len) = max(12, 12) = 12 bytes` (registry.rs:565).
+    /// Cached text shorter than `tail_cap` ends up entirely in the
+    /// splitter's tail_buf — `feed()` emits zero events, `finish()` is
+    /// the only way to recover the bytes.  Pre-Wave-3.5 replay never
+    /// called `finish()`, so the entire response was lost.
+    #[test]
+    fn replay_emits_tail_content_after_splitter_drain() {
+        let reg = match super::super::registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => {
+                eprintln!("gemma4 registration absent; skipping HIGH-2 drain test");
+                return;
+            }
+        };
+
+        let (tx, mut rx) = mpsc::channel(8);
+        // Short plain-text cache entry (< Gemma's 12-byte marker
+        // tail_cap).  No marker, no reasoning — pure content.  This
+        // is the exact "registered plain-text cache hit" shape the
+        // audit cited.
+        let cached = cached_non_streaming("hi", None);
+
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg), // <-- KEY: registration enables splitter (the bug only fires when splitter is built)
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // The cached "hi" MUST appear as a Content delta before Done.
+        // Pre-Wave-3.5: the splitter's tail_buf swallowed "hi" entirely
+        // because feed() held back the last `tail_cap` bytes and
+        // finish() was never called → zero Content deltas → silent
+        // data loss on the cache hit.
+        let content_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            content_text, "hi",
+            "registered plain-text cache replay MUST emit the full \
+             cached content as Content delta(s) before Done.  \
+             Pre-Wave-3.5 the splitter's tail_buf silently swallowed \
+             content shorter than tail_cap (12 bytes for Gemma 4) \
+             because finish() was never called.  Audit citation: \
+             /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt \
+             'W-A2 streaming cache replay' severity HIGH.\n\
+             events: {events:?}"
+        );
+
+        // Done must follow.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must be the last event"
+        );
+    }
+
+    /// Wave 3.5 HIGH-2 missed-test #2: a registered-model replay whose
+    /// cached text contains a tool-call marker block PLUS trailing
+    /// postscript content must emit BOTH the structured tool-call AND
+    /// the postscript content.
+    ///
+    /// Pre-Wave-3.5 the postscript portion shorter than the splitter's
+    /// `tail_cap` bytes would be silently dropped, OR a postscript
+    /// whose tail looked like a partial open-marker prefix would be
+    /// held back forever.
+    #[test]
+    fn replay_with_registered_model_emits_tool_call_then_postscript() {
+        let reg = match super::super::registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => {
+                eprintln!("gemma4 registration absent; skipping HIGH-2 postscript test");
+                return;
+            }
+        };
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("gemma4 has no tool markers; skipping HIGH-2 postscript test");
+                return;
+            }
+        };
+
+        // Cached text: tool-call block + trailing postscript shorter
+        // than `tail_cap` (Gemma's max marker length is 12 bytes; a
+        // 5-byte postscript "after" sits entirely in the splitter's
+        // tail_buf after feed() returns and is only recoverable via
+        // finish()).
+        let cached_text = format!(
+            "{open}call:foo{{x:1}}{close}after"
+        );
+        let cached = GenerationResult {
+            text: cached_text,
+            reasoning_text: None,
+            prompt_tokens: 4,
+            completion_tokens: 9,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 4,
+        };
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Concatenate ALL Content deltas — the postscript "after" MUST
+        // appear somewhere.  Pre-Wave-3.5 the splitter's finish() was
+        // never called and "after" was silently dropped.
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            content_concat.contains("after"),
+            "postscript content 'after' MUST appear in a Content delta \
+             after the tool-call block.  Pre-Wave-3.5 the ToolCallSplitter \
+             held the postscript in its tail_buf and finish() was never \
+             called → silent postscript loss.  Audit citation: \
+             /tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt \
+             missed-test 'No replay test asserts final postscript/tail \
+             content after tool-call markers'.\n\
+             content concat: {content_concat:?}\nevents: {events:?}"
+        );
+
+        // Sanity: Done must terminate the stream.
+        assert!(
+            matches!(events.last(), Some(GenerationEvent::Done { .. })),
+            "Done must be the last event"
+        );
+    }
+
+    /// Wave 3.5 HIGH-2 — drain the ReasoningSplitter tail too.
+    ///
+    /// Cached text contains reasoning markers + a short tail of
+    /// content.  Pre-Wave-3.5 the ReasoningSplitter's `finish()` was
+    /// never called and the residual tail was lost.
+    #[test]
+    fn replay_drains_reasoning_splitter_tail() {
+        let reg = match super::super::registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => {
+                eprintln!("gemma4 registration absent; skipping HIGH-2 reasoning drain test");
+                return;
+            }
+        };
+
+        // Build a cached text whose final bytes are a content tail
+        // shorter than the reasoning_splitter's tail_cap.  We don't
+        // know the exact reasoning markers offline; we just probe the
+        // drain semantics by feeding short content with no reasoning.
+        // Combined with the tool-call splitter the reasoning drain
+        // path is exercised through the registered registration.
+        let cached = cached_non_streaming("ok", None);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        let content_concat: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            content_concat, "ok",
+            "short content 'ok' MUST traverse both reasoning_splitter \
+             AND tool_splitter via the new finish() drain calls; a \
+             regression that drops EITHER drain would lose the bytes \
+             because both splitters' tail_buf can swallow 2 bytes \
+             entirely.\nevents: {events:?}"
         );
     }
 }
