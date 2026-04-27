@@ -1035,6 +1035,17 @@ These are tracked here, not deferred. Each gets resolved during the Phase that t
 
 ---
 
+## SOTA scan (2026-04-27, goalie research log)
+
+Mid-iter-3o, goalie was asked whether ADR-014's imatrix/DWQ/k-quant ports cover techniques published after the implementation's training-corpus cutoff. Findings (full log at `memory/project_adr014_sota_research_2026_04_27.md`):
+
+- **llama.cpp imatrix file format migrated `.dat` → GGUF on 2025-07-19** (commit `90083283`, PR #9400). New metadata fields: `imatrix.{chunk_count,chunk_size,datasets}`. 3D tensor support for MoE expert-routing imatrix calibration. Backward-compat preserved via `--output-format dat`. **Implication:** P6 iter-3 GGUF imatrix I/O is no longer a TBD schema — it's a concrete documented format, becomes implementable. Our pure-Rust legacy `.dat` writer continues to be compatible-by-default; modern llama.cpp output reading needs the GGUF parser.
+- **MLX DWQ is gradient distillation, not importance reweighting.** Dual loss (KL on logits + MAE on hidden states) vs FP16 teacher; Adam + gradient accumulation on scales/biases; off-policy calibration corpus (tulu-3-sft-mixture) outperforms on-policy. Our existing `DwqQuantizer` is sensitivity-based bit allocation — closer to imatrix in spirit. Closing the gap would mean a new `DwqDistillationCalibrator` impl (substantial; needs ADR-013 ActivationCapture forward-pass infra). Decision: documented as a future direction, not closure-gating.
+- **Rotation-based pre-quant transforms** (QuaRot arxiv 2404.00456, ButterflyQuant arxiv 2509.09679 Sep-2025, AQLM 2025-11-30, QTIP arxiv 2406.11235, QuIP arxiv 2307.13304). All target sub-3-bit and require activation captures or Hessian estimates. Out of ADR-014 scope (we ship Q4_K_M / Q5_K_M / Q6_K). Decision: noted here, not in scope.
+- **At 4-bit the format wars are overstated.** Production blogs Jan-Mar 2026 report well-calibrated GPTQ/AWQ/GGUF Q4_K_M differ by 1–3% on standard benchmarks. Our existing imatrix-q4_k_m path is competitive with the SOTA. Effort is better spent on closing P11 measured gates than chasing new codebooks.
+
+---
+
 ## Dependencies on other work (cross-ADR)
 
 - **ADR-005 (inference server):** unchanged. ADR-014 produces artefacts that ADR-005's serve loads; the load path is downstream.
