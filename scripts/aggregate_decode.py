@@ -111,14 +111,43 @@ class HypothesisSpec:
     static_estimate_us_per_token: float | None = None
 
 
-def parse_xctrace_topcalls(path: Path, trial_id: int) -> TrialFrames:
-    """Walk the xctrace TimeProfiler XML export and accumulate leaf ms
-    per frame name.
+def parse_xctrace_topcalls(
+    path: Path,
+    trial_id: int,
+    decode_filter_re: re.Pattern[str] | None = None,
+) -> TrialFrames:
+    """Walk the xctrace TimeProfiler XML export and accumulate
+    INCLUSIVE ms per frame name across all sampled stacks.
 
-    The export's row schema varies slightly between Xcode versions; we
-    walk all `<row>` elements and pull the most-specific frame in each
-    backtrace.  If a row has no parseable backtrace we count it under
-    `<unknown>` so the total is conserved.
+    xctrace XML uses an id/ref dictionary pattern: any element with
+    `id="N"` defines a value (a weight, a frame name, etc.); subsequent
+    occurrences appear as `<tag ref="N"/>` and inherit that value.
+    Refs only point backwards within the document, so a single forward
+    pass that records definitions as they are encountered resolves all
+    refs lazily.
+
+    Inclusive aggregation: for each row's backtrace, the row's weight
+    is added to every frame in the backtrace (the frame plus all its
+    callers).  This is the standard "inclusive time" aggregation
+    Instruments displays — the canonical-frame design relies on it
+    because the canonical frame for a hypothesis is typically a
+    high-level Rust function that contains many leaf samples.
+
+    Weight is in nanoseconds (xctrace text content; the `fmt`
+    attribute is a display string like "1.00 ms").  Converted to ms
+    (÷ 1_000_000) at accumulation time.
+
+    Leaf frame note: in xctrace's <tagged-backtrace>, frames appear in
+    LEAF→ROOT order — the FIRST `<frame>` is the most-specific (the
+    deepest active call site at sample time), the LAST is `start` /
+    `dyld_start`.  We do not single out the leaf for canonical
+    aggregation — every frame in the backtrace receives the weight.
+
+    Decode-filter: if `decode_filter_re` is given, only samples whose
+    backtrace contains a frame matching the regex are counted.  This
+    isolates the decode loop from model-load / tokenizer / cleanup
+    samples that share the trace.  Wave 2a §P3a' used this pattern with
+    `forward_gpu_greedy` for qwen35; gemma uses `forward_decode`.
     """
     frames = TrialFrames(trial_id=trial_id, source=path)
     try:
@@ -129,60 +158,81 @@ def parse_xctrace_topcalls(path: Path, trial_id: int) -> TrialFrames:
 
     root = tree.getroot()
 
+    # ID→name dictionary for frames; ID→ns dictionary for weights.
+    # xctrace defines each value once (with id=N) then references it
+    # via ref=N in subsequent occurrences.
+    frame_name_by_id: dict[str, str] = {}
+    weight_ns_by_id: dict[str, int] = {}
+
+    def resolve_weight(elem: ET.Element) -> int | None:
+        rid = elem.get("ref")
+        if rid is not None:
+            return weight_ns_by_id.get(rid)
+        eid = elem.get("id")
+        text = (elem.text or "").strip()
+        if not text:
+            return None
+        try:
+            ns = int(text)
+        except ValueError:
+            return None
+        if eid is not None:
+            weight_ns_by_id[eid] = ns
+        return ns
+
+    def resolve_frame(elem: ET.Element) -> str | None:
+        rid = elem.get("ref")
+        if rid is not None:
+            return frame_name_by_id.get(rid)
+        eid = elem.get("id")
+        name = elem.get("name")
+        if name and eid is not None:
+            frame_name_by_id[eid] = name
+        return name
+
     for row in root.iter("row"):
-        # Sample weight is in `sample-time` (ms) per Apple's schema.
-        # Defensively try several attribute names.
-        weight_ms = _row_weight_ms(row)
-        if weight_ms is None:
+        weight_elem = row.find("weight")
+        if weight_elem is None:
             continue
-        frame_name = _row_leaf_frame(row)
+        ns = resolve_weight(weight_elem)
+        if ns is None:
+            continue
+        ms = ns / 1_000_000.0
+
+        backtrace = row.find("tagged-backtrace")
+        if backtrace is None:
+            backtrace = row.find("backtrace")
+        if backtrace is None:
+            continue
+        # `backtrace` is now a non-None Element; safe to iter().
+
+        # First pass: resolve all frame names so the decode-filter can
+        # match on any of them.  The aggregation pass below dedupes
+        # within the row.
+        names: list[str] = []
+        for frame_elem in backtrace.iter("frame"):
+            name = resolve_frame(frame_elem)
+            if name:
+                names.append(name)
+
+        if decode_filter_re is not None:
+            if not any(decode_filter_re.search(n) for n in names):
+                # Sample is from outside the decode loop (model load,
+                # tokenizer init, cleanup).  Skip — not part of the
+                # per-token aggregate.
+                continue
+
         frames.samples += 1
-        frames.total_ms += weight_ms
-        frames.leaf_ms_by_frame[frame_name] += weight_ms
+        frames.total_ms += ms
+
+        seen_in_row: set[str] = set()
+        for name in names:
+            if name in seen_in_row:
+                continue
+            seen_in_row.add(name)
+            frames.leaf_ms_by_frame[name] += ms
 
     return frames
-
-
-def _row_weight_ms(row: ET.Element) -> float | None:
-    """Pull the sample weight from a row element.  Returns None if no
-    weight attribute is parseable (row should be skipped)."""
-    for attr in ("sample-time", "weight", "duration"):
-        v = row.get(attr)
-        if v is None:
-            continue
-        try:
-            ms = float(v)
-            return ms
-        except ValueError:
-            continue
-    # Some schemas put weight in a child element.
-    for tag in ("sample-time", "weight", "duration"):
-        child = row.find(tag)
-        if child is not None and child.text:
-            try:
-                return float(child.text)
-            except ValueError:
-                continue
-    return None
-
-
-def _row_leaf_frame(row: ET.Element) -> str:
-    """Pull the most-specific (deepest) frame name from a row's
-    backtrace.  Returns `<unknown>` if no frame is parseable."""
-    # Try the simple `frame` attribute first.
-    f = row.get("frame")
-    if f:
-        return f
-    # Fall back to walking children for a frame element / backtrace.
-    for child_path in (".//backtrace//frame", ".//frame", ".//symbol"):
-        leaves = list(row.findall(child_path))
-        if leaves:
-            # The deepest frame is the last one in document order.
-            for leaf in reversed(leaves):
-                name = leaf.get("name") or (leaf.text or "").strip()
-                if name:
-                    return name
-    return "<unknown>"
 
 
 def aggregate_canonical(
@@ -438,6 +488,17 @@ def main(argv: list[str]) -> int:
         help="Top-N frames to consider for rank-stability analysis.",
     )
     parser.add_argument(
+        "--decode-filter",
+        type=str,
+        default=None,
+        help="Regex; only samples whose backtrace contains a matching "
+        "frame are counted.  Use to isolate decode-loop samples from "
+        "model-load / tokenizer init / cleanup samples that share the "
+        "trace.  qwen35: 'forward_gpu_greedy'.  gemma: 'forward_decode' "
+        "(but NOT forward_decode_kernel_profile).  Recommended: "
+        "'qwen35::forward_gpu::.*forward_gpu_greedy|forward_mlx::.*forward_decode(?!_kernel_profile)'.",
+    )
+    parser.add_argument(
         "--output-md",
         type=Path,
         default=None,
@@ -461,12 +522,24 @@ def main(argv: list[str]) -> int:
             f"median methodology (ADR-015 Wave 2b Q1 outlier-bias fix)\n"
         )
 
+    decode_filter_re: re.Pattern[str] | None = None
+    if args.decode_filter is not None:
+        try:
+            decode_filter_re = re.compile(args.decode_filter)
+        except re.error as e:
+            sys.stderr.write(f"ERROR: invalid --decode-filter regex: {e}\n")
+            return 2
+
     trials: list[TrialFrames] = []
     for i, path in enumerate(args.trials, start=1):
         if not path.exists():
             sys.stderr.write(f"ERROR: trial {i} file not found: {path}\n")
             return 2
-        trials.append(parse_xctrace_topcalls(path, trial_id=i))
+        trials.append(
+            parse_xctrace_topcalls(
+                path, trial_id=i, decode_filter_re=decode_filter_re
+            )
+        )
 
     hypotheses_specs = load_hypothesis_config(args.hypothesis_config)
     hypotheses_results: list[dict[str, object]] = []
