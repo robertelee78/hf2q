@@ -407,6 +407,43 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Wave 2.7 W-η defensive 500: under Constrained policy
+    // (tool_choice = required / function), the eager grammar
+    // (`GrammarKind::ToolCallBodyRequired`) PHYSICALLY constrains the model
+    // to emit a tool call from byte 0 — the grammar root requires the
+    // open marker and `min=1` complete calls.  If we reach this point with
+    // `extracted.tool_calls.is_empty()`, either:
+    //
+    //   * the request hit max_tokens / a stop string mid-call (the
+    //     grammar runtime is neither `is_accepted()` nor `is_dead()` —
+    //     a partial-call truncation we cannot finalise as a tool_calls
+    //     response), OR
+    //   * a grammar-emitter bug let through a no-call run.  Either way
+    //     the contract is violated and the safe answer is a 500 — silently
+    //     promoting the partial body to plain content is exactly the
+    //     wave-2.6 audit divergence "Required/Function enforcement before
+    //     ToolCallOpen" we're closing.
+    //
+    // This check should NEVER fire if the eager grammar is correctly emitted
+    // and the decode loop ran to a normal stop.  Logged at error level so a
+    // production firing surfaces as a regression alert.
+    if matches!(tool_call_policy, engine::ToolCallPolicy::Constrained)
+        && extracted.tool_calls.is_empty()
+    {
+        tracing::error!(
+            finish_reason = %result.finish_reason,
+            completion_tokens = result.completion_tokens,
+            text_len = result.text.len(),
+            "tool_call_no_call_under_constrained: eager grammar should have prevented \
+             this — either max_tokens cut a call mid-emission or the grammar emitter \
+             has a bug"
+        );
+        return ApiError::generation_error(
+            "tool_call_no_call_under_constrained".to_string(),
+        )
+        .into_response();
+    }
+
     let (message_content, message_tool_calls, effective_finish_reason) =
         if extracted.tool_calls.is_empty() {
             // No tool calls: preserve original text and finish_reason.
@@ -5330,6 +5367,40 @@ mod test_a3_tool_call_extraction {
         );
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.content, "plain text");
+    }
+
+    /// Wave 2.7 W-η defensive 500: under `ToolCallPolicy::Constrained` with
+    /// the eager grammar in place, the model is structurally unable to emit
+    /// non-call output — but if max_tokens cuts a call mid-emission OR a
+    /// grammar-emitter bug lets a no-call run through, the handler MUST 500
+    /// rather than silently demote the partial body to plain content.
+    ///
+    /// This test asserts the predicate the handler uses
+    /// (`policy == Constrained && extracted.tool_calls.is_empty()`) — i.e.
+    /// `extract_tool_calls_from_text` returns an empty `tool_calls` vector
+    /// when no marker spans are present, even under Constrained policy.
+    /// The actual 500 response shaping happens inline in
+    /// `chat_completions_with_state` (the test is on the load-bearing
+    /// invariant, not on the response wire format).
+    #[test]
+    fn no_marker_under_constrained_yields_empty_tool_calls() {
+        let reg = gemma4_reg();
+        let result = extract_tool_calls_from_text(
+            "I will call the weather tool but I forgot how.",
+            Some(&reg),
+            engine::ToolCallPolicy::Constrained,
+        );
+        assert!(
+            result.tool_calls.is_empty(),
+            "no marker span ⇒ no tool calls, even under Constrained policy"
+        );
+        // No parse failure either — we never entered a tool-call body.
+        assert!(
+            result.constrained_parse_failure.is_none(),
+            "constrained_parse_failure only set when a body was parsed and failed"
+        );
+        // The handler will see (policy == Constrained && tool_calls.is_empty())
+        // and return ApiError::generation_error("tool_call_no_call_under_constrained").
     }
 }
 
