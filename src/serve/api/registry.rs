@@ -79,9 +79,36 @@ pub struct ModelRegistration {
     /// Closing marker for a reasoning span. `None` = no reasoning.
     pub reasoning_close: Option<&'static str>,
 
-    /// Opening marker for a tool-call JSON block. `None` = no tool calls.
+    /// Opening marker for a tool-call block. `None` = no tool calls.
+    ///
+    /// # Marker-shape contract (ADR-005 Wave-2.5 D1 — Option B architecture)
+    ///
+    /// `tool_open` and `tool_close` MUST be byte sequences that the
+    /// tokenizer's **special tokens** decode to.  They are NOT arbitrary
+    /// strings — the engine feeds raw decoded bytes to `ToolCallSplitter`,
+    /// which scans for these exact byte sequences to detect the open/close
+    /// boundary.  If a marker string is set to something the tokenizer never
+    /// emits as a special-token sequence, the splitter will never fire.
+    ///
+    /// Authoritative references:
+    /// - **Gemma 4**: `tokenizer_config.json` declares `stc_token` (start of
+    ///   tool call) = `<|tool_call>` and the paired close token
+    ///   `<tool_call|>`.  These are the byte strings the model emits when
+    ///   invoking a tool.  Confirmed from chat_template.jinja lines 192/203:
+    ///   `{{- '<|tool_call>call:...<tool_call|>' }}`.
+    /// - **Qwen 3.5/3.6**: token ids 248058 (`<tool_call>`) and 248059
+    ///   (`</tool_call>`).  The chat_template emits
+    ///   `<tool_call>\n<function=NAME>…</function>\n</tool_call>` so the
+    ///   outer `<tool_call>` / `</tool_call>` pair are the registered markers.
+    ///
+    /// WHY this matters: using the *prompt-side* thinking-mode hint (`<|think|>`)
+    /// instead of the *runtime-emission* boundary (`<|channel>`) caused the
+    /// reasoning splitter to be permanently dead for Gemma 4 until iter B-2
+    /// corrected the registration.  Any future model addition must audit the
+    /// tokenizer_config and chat_template before setting these fields.
     pub tool_open: Option<&'static str>,
-    /// Closing marker for a tool-call JSON block. `None` = no tool calls.
+    /// Closing marker for a tool-call block. `None` = no tool calls.
+    /// See `tool_open` for the marker-shape contract.
     pub tool_close: Option<&'static str>,
 
     /// Optional free-text preamble injected before the chat history when
@@ -135,8 +162,10 @@ impl ModelRegistration {
         params_schema: &serde_json::Value,
     ) -> Result<String, String> {
         match self.family {
-            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema),
-            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema),
+            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema)
+                .map_err(|e| e.to_string()),
+            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema)
+                .map_err(|e| e.to_string()),
             other => Err(format!(
                 "tool_call_gbnf: no per-model grammar emitter for family '{}'",
                 other
@@ -799,6 +828,78 @@ pub fn split_full_output(
 // Per-model GBNF emitters (T1.8 Option B, ADR-005 Wave 2 W-4)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Emitter error type (Wave 2.5 B1 / B3)
+// ---------------------------------------------------------------------------
+
+/// Structured error type returned by the per-model GBNF emitters.
+///
+/// The `Display` impl produces the human-readable 400-response message that
+/// `handlers.rs::compile_tool_grammar` forwards to the API caller.  The
+/// `tool_call_gbnf` public entry-point converts this to `String` so the
+/// public API surface (`Result<String, String>`) is unchanged.
+///
+/// Variants:
+/// - `TooManyRequiredKeys` — schema's `required` array exceeds the 16-key
+///   cap; the O(2^N) permutation grammar would be unreasonably large.
+/// - `UnsupportedSchema` — parameter schema uses `array` or `object` type,
+///   which the wave-2.5 emitter does not support.  The caller should either
+///   remove the parameter or convert it to a JSON-encoded string.
+///
+/// # ADR-005 Wave-2.5 design note
+/// The 16-key cap is a deliberate performance guard: each required key adds
+/// one level of alternation depth to the permutation grammar (the
+/// `build_required_permutation` algorithm is O(N!) in rule count for N
+/// required keys, bounded here to 16! = 20,922,789,888,000 rules — still
+/// far too many at the ceiling, so in practice schemas with > 8–10 required
+/// keys should be flagged long before hitting 16). The cap rejects the
+/// pathological case early with a diagnostic message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitterError {
+    /// `required` array length exceeds `MAX_REQUIRED_KEYS` (16).
+    TooManyRequiredKeys {
+        fn_name: String,
+        count: usize,
+    },
+    /// Parameter schema type is `array` or `object` — not supported by the
+    /// wave-2.5 scalar-only emitter.
+    UnsupportedSchema {
+        fn_name: String,
+        param_name: String,
+        schema_type: String,
+    },
+}
+
+/// Hard cap on the number of required keys for the permutation grammar.
+/// Larger schemas return `EmitterError::TooManyRequiredKeys`.
+const MAX_REQUIRED_KEYS: usize = 16;
+
+impl std::fmt::Display for EmitterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitterError::TooManyRequiredKeys { fn_name, count } => write!(
+                f,
+                "function '{}' has {} required parameters; ADR-005 wave-2.5 \
+                 limits required keys to {} to prevent O(2^N) grammar blowup; \
+                 reduce the required set or split the tool",
+                fn_name, count, MAX_REQUIRED_KEYS
+            ),
+            EmitterError::UnsupportedSchema {
+                fn_name,
+                param_name,
+                schema_type,
+            } => write!(
+                f,
+                "function '{}' parameter '{}' uses unsupported schema type '{}'; \
+                 ADR-005 wave-2.5 limits tool args to scalars (string, integer, \
+                 number, boolean, null); remove the parameter or convert it to a \
+                 JSON-encoded string",
+                fn_name, param_name, schema_type
+            ),
+        }
+    }
+}
+
 /// Escape a literal string for embedding in a GBNF rule — wraps in double
 /// quotes and escapes special characters.  Mirrors
 /// `grammar::json_schema::format_literal` without importing the grammar crate.
@@ -837,16 +938,21 @@ fn gbnf_literal(s: &str) -> String {
 /// strings"` (double quotes with JSON escape sequences).  Gemma 4's template
 /// never emits those — it always uses `<|"|>` markers — so reusing the JSON
 /// string grammar would make valid Gemma 4 outputs fail the mask check.
+///
+/// Returns `Err(EmitterError::UnsupportedSchema)` if the schema type is
+/// `array` or `object` (Wave 2.5 B3 — nested schemas rejected at emit time).
 fn gemma4_value_gbnf(
+    fn_name: &str,
+    param_name: &str,
     schema: &serde_json::Value,
-    rules: &mut Vec<(String, String)>,
-    rule_counter: &mut u32,
-) -> String {
+    _rules: &mut Vec<(String, String)>,
+    _rule_counter: &mut u32,
+) -> Result<String, EmitterError> {
     let obj = match schema.as_object() {
         Some(o) => o,
         None => {
             // Untyped / unknown → accept any Gemma value (string or bare scalar).
-            return "gemma4-any-val".to_string();
+            return Ok("gemma4-any-val".to_string());
         }
     };
 
@@ -858,11 +964,12 @@ fn gemma4_value_gbnf(
             .map(|s| format!("{} {} {}", gbnf_literal("<|\"|>"), gbnf_literal(s), gbnf_literal("<|\"|>")))
             .collect();
         if !alts.is_empty() {
-            return format!("( {} )", alts.join(" | "));
+            return Ok(format!("( {} )", alts.join(" | ")));
         }
     }
 
-    match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+    let schema_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match schema_type {
         "string" => {
             // Gemma 4 string: `<|"|>` + zero-or-more non-marker chars + `<|"|>`.
             // We approximate "non-marker chars" as any char that is not the
@@ -875,19 +982,26 @@ fn gemma4_value_gbnf(
             // (the marker opening byte).  This is conservative but correct:
             // string values in Gemma 4 tool calls never contain `<` per the
             // chat template's jinja escape of `<` in string args.
-            "gemma4-str-val".to_string()
+            Ok("gemma4-str-val".to_string())
         }
-        "integer" => "gemma4-int-val".to_string(),
-        "number" => "gemma4-num-val".to_string(),
-        "boolean" => "gemma4-bool-val".to_string(),
-        "null" => "gemma4-null-val".to_string(),
+        "integer" => Ok("gemma4-int-val".to_string()),
+        "number" => Ok("gemma4-num-val".to_string()),
+        "boolean" => Ok("gemma4-bool-val".to_string()),
+        "null" => Ok("gemma4-null-val".to_string()),
+        // Wave 2.5 B3: reject array and object types at emit time.
+        // The previous fallback silently treated these as strings, hiding the
+        // schema mismatch; the Chesterton reason to remove it is that it
+        // produces grammars that accept `<|"|>...<|"|>` for a parameter the
+        // schema declares as a structured list/object, masking bugs at the
+        // grammar layer while the model still emits malformed output.
+        "array" | "object" => Err(EmitterError::UnsupportedSchema {
+            fn_name: fn_name.to_string(),
+            param_name: param_name.to_string(),
+            schema_type: schema_type.to_string(),
+        }),
         _ => {
-            // Nested types (arrays, objects) → generate a named sub-rule.
-            *rule_counter += 1;
-            let name = format!("gemma4-sub-{}", rule_counter);
-            // For now, treat nested as a bare Gemma string (conservative).
-            rules.push((name.clone(), "gemma4-str-val".to_string()));
-            name
+            // Unrecognised type string — fall through to any-val (conservative).
+            Ok("gemma4-any-val".to_string())
         }
     }
 }
@@ -901,41 +1015,37 @@ fn gemma4_value_gbnf(
 ///
 /// So the grammar has three structural layers:
 ///   1. A fixed prefix: the literal `call:NAME{`
-///   2. A kv-list body: comma-separated `KEY:VALUE` pairs (in any order for
-///      optional keys; required keys must all appear).
+///   2. A kv-list body: comma-separated `KEY:VALUE` pairs (required in any
+///      order; optional may appear after; duplicates structurally rejected by
+///      the required-permutation grammar).
 ///   3. A fixed suffix: `}`
 ///
-/// For the kv-list body this emitter uses a simplified approach compared to
-/// json_schema's permutation algorithm: we treat ALL properties as optional
-/// (the model decides which to emit) but constrain each KEY to a known literal
-/// and each VALUE to its type-specific rule. This matches the Gemma 4 template
-/// behavior exactly — the template emits only the keys the model fills in, so
-/// a "required" constraint here would fight the template.
+/// # Required parameter enforcement (Wave 2.5 B1)
 ///
-/// WHY only one kv-list approach (not the permutation algo):
-/// json_schema's O(2^N) permutation algo is needed for JSON because JSON
-/// parsers care about key order and we need to accept ANY order for
-/// `additionalProperties:false`. In Gemma 4's kv-list the parser
-/// (`parse_gemma4_tool_call`) is key-order-agnostic — it scans for `key:val`
-/// pairs linearly — so a simpler optional-chain grammar suffices. We do NOT
-/// want to forbid the model from emitting a subset of keys (some tools have
-/// optional args); treating all as optional matches the template semantics.
+/// If `params_schema` has a `required` array those keys are enforced via a
+/// permutation grammar: required keys MUST all appear in any order; omitting
+/// one causes the grammar stack to die.  Optional keys follow in a
+/// Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (16) prevents O(N!)
+/// grammar blowup.
+///
+/// # Nested schema rejection (Wave 2.5 B3)
+///
+/// If any parameter's schema type is `array` or `object`, returns
+/// `EmitterError::UnsupportedSchema` immediately.
 fn gemma4_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String, EmitterError> {
     let mut rules: Vec<(String, String)> = Vec::new();
     let mut rule_counter: u32 = 0;
 
     // Gemma 4 primitive rules (shared across all function grammars).
-    // These are the concrete terminal rules for Gemma's value types.
     //
     // String: `<|"|>` any-safe-char* `<|"|>`. We define gemma4-str-char as
     // any character that is NOT `<` (the first byte of the 5-byte marker
     // `<|"|>`). This is conservative but safe — Gemma 4's jinja template
     // HTML-escapes `<` in string args so valid model outputs never contain
-    // bare `<` inside string values. The grammar sampler enforces the mask
-    // token-by-token; the grammar just needs to accept all valid outputs.
+    // bare `<` inside string values.
     rules.push((
         "gemma4-str-char".to_string(),
         r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
@@ -948,7 +1058,6 @@ fn gemma4_tool_call_gbnf(
             gbnf_literal("<|\"|>")
         ),
     ));
-    // Numeric + boolean + null primitives reuse standard GBNF forms.
     rules.push((
         "gemma4-int-val".to_string(),
         r#""-"? ([0] | [1-9] [0-9]{0,15})"#.to_string(),
@@ -965,21 +1074,35 @@ fn gemma4_tool_call_gbnf(
         "gemma4-null-val".to_string(),
         r#""null""#.to_string(),
     ));
-    // Catch-all for any value type (string OR bare scalar). Used when the
-    // schema doesn't declare a type.
     rules.push((
         "gemma4-any-val".to_string(),
         r#"gemma4-str-val | gemma4-num-val | gemma4-bool-val | gemma4-null-val"#.to_string(),
     ));
 
-    // Build per-property kv rules from the params schema.
+    // Extract `required` set (Wave 2.5 B1).
+    let required_set: std::collections::HashSet<String> = params_schema
+        .as_object()
+        .and_then(|o| o.get("required"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if required_set.len() > MAX_REQUIRED_KEYS {
+        return Err(EmitterError::TooManyRequiredKeys {
+            fn_name: fn_name.to_string(),
+            count: required_set.len(),
+        });
+    }
+
     let properties = params_schema
         .as_object()
         .and_then(|o| o.get("properties"))
         .and_then(|p| p.as_object());
 
-    // Emit the root rule: `call:NAME{` + kv-body + `}`.
-    // The kv-body is a comma-separated list of optional KEY:VALUE pairs.
     let prefix_lit = gbnf_literal(&format!("call:{}", fn_name));
     let open_lit = gbnf_literal("{");
     let close_lit = gbnf_literal("}");
@@ -987,54 +1110,77 @@ fn gemma4_tool_call_gbnf(
 
     if let Some(props) = properties {
         if props.is_empty() {
-            // No parameters: `call:NAME{}`.
             rules.push(("root".to_string(), format!("{} {} {} space", prefix_lit, open_lit, close_lit)));
         } else {
-            // Build one kv-rule per property.
-            let mut kv_rule_names: Vec<String> = Vec::new();
+            let mut required_kv_names: Vec<String> = Vec::new();
+            let mut optional_kv_names: Vec<String> = Vec::new();
             let mut sorted_keys: Vec<&String> = props.keys().collect();
-            sorted_keys.sort(); // deterministic rule names
+            sorted_keys.sort();
             for key in &sorted_keys {
                 let val_schema = &props[*key];
-                let val_rule = gemma4_value_gbnf(val_schema, &mut rules, &mut rule_counter);
+                // B3: reject array/object at emit time.
+                let val_rule = gemma4_value_gbnf(fn_name, key.as_str(), val_schema, &mut rules, &mut rule_counter)?;
                 let key_lit = gbnf_literal(key.as_str());
                 let kv_body = format!("{} {} {}", key_lit, gbnf_literal(":"), val_rule);
                 let kv_name = format!("gemma4-kv-{}", sanitize_rule_name_local(key));
                 rules.push((kv_name.clone(), kv_body));
-                kv_rule_names.push(kv_name);
+                if required_set.contains(*key) {
+                    required_kv_names.push(kv_name);
+                } else {
+                    optional_kv_names.push(kv_name);
+                }
             }
-            // Build optional kv-list: any number of kv-pairs in any order,
-            // separated by commas. We emit a single alternation rule that
-            // the model can satisfy by picking a subset of the declared keys.
+
+            // Build kv-list body.
             //
-            // Form: `( kv_1 | kv_2 | ... ) ( "," ( kv_1 | kv_2 | ... ) )*`
-            // This allows any key to appear in any order, each at most once
-            // (the grammar doesn't enforce uniqueness — the sampler mask at
-            // the token level guarantees the model won't repeat a key because
-            // once it emits `key:val,` the key token is no longer in the valid
-            // set... actually the grammar itself doesn't enforce uniqueness
-            // since we're using Kleene star, but parse_gemma4_tool_call would
-            // just pick the last occurrence if a key were repeated, which is
-            // acceptable). This is a deliberate simplification — adding a
-            // "used keys" tracking grammar would require O(2^N) rules like the
-            // JSON permutation algorithm; the simpler form is correct for the
-            // common case and Chesterton-safe.
-            let alts = kv_rule_names.join(" | ");
-            let kv_item_rule = "gemma4-kv-item".to_string();
-            rules.push((kv_item_rule.clone(), format!("( {} )", alts)));
-            let kv_list_rule = "gemma4-kv-list".to_string();
-            rules.push((
-                kv_list_rule.clone(),
-                format!("{} ( {} {} )*", kv_item_rule, comma_lit, kv_item_rule),
-            ));
+            // Case A (no required): pure Kleene-star over all kv items.
+            // Case B (required):  permutation grammar for required keys,
+            //   followed by optional Kleene-star for optional keys.
+            //
+            // WHY permutation for required: parse_gemma4_tool_call is
+            // order-agnostic, so enforcing a fixed required order would reject
+            // valid model outputs that sequence required keys differently.
+            let kv_body_rule = if required_kv_names.is_empty() {
+                // Case A.
+                let all_names: Vec<String> = optional_kv_names.clone();
+                let alts = all_names.join(" | ");
+                let kv_item_rule = "gemma4-kv-item".to_string();
+                rules.push((kv_item_rule.clone(), format!("( {} )", alts)));
+                let kv_list_rule = "gemma4-kv-list".to_string();
+                rules.push((
+                    kv_list_rule.clone(),
+                    format!("{} ( {} {} )*", kv_item_rule, comma_lit, kv_item_rule),
+                ));
+                kv_list_rule
+            } else {
+                // Case B.
+                let req_top = build_gemma4_required_permutation(
+                    fn_name,
+                    &required_kv_names,
+                    &comma_lit,
+                    &mut rules,
+                );
+                if optional_kv_names.is_empty() {
+                    req_top
+                } else {
+                    let alts = optional_kv_names.join(" | ");
+                    let opt_item_rule = "gemma4-opt-item".to_string();
+                    rules.push((opt_item_rule.clone(), format!("( {} )", alts)));
+                    let kv_list_rule = "gemma4-kv-list".to_string();
+                    rules.push((
+                        kv_list_rule.clone(),
+                        format!("{} ( {} {} )*", req_top, comma_lit, opt_item_rule),
+                    ));
+                    kv_list_rule
+                }
+            };
+
             rules.push((
                 "root".to_string(),
-                format!("{} {} {} {} space", prefix_lit, open_lit, kv_list_rule, close_lit),
+                format!("{} {} {} {} space", prefix_lit, open_lit, kv_body_rule, close_lit),
             ));
         }
     } else {
-        // No `properties` in schema (bare object or no schema): allow any
-        // kv-list body. The grammar only enforces the `call:NAME{...}` wrapper.
         rules.push((
             "gemma4-any-kv-char".to_string(),
             r#"[^}]"#.to_string(),
@@ -1045,12 +1191,9 @@ fn gemma4_tool_call_gbnf(
         ));
     }
 
-    // `space` rule: optional whitespace (consistent with json_schema emitter).
     rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
-    // Serialize: root first, then the rest.
     let mut out = String::new();
-    // Find and emit root first.
     for (name, body) in &rules {
         if name == "root" {
             out.push_str(&format!("root ::= {}\n", body));
@@ -1065,45 +1208,93 @@ fn gemma4_tool_call_gbnf(
     Ok(out)
 }
 
+/// Build the any-order permutation grammar for a non-empty set of required
+/// Gemma kv-rule names. Returns the name of the top-level permutation rule.
+///
+/// Mirrors `json_schema::build_required_permutation` but uses Gemma's bare
+/// comma separator.  Rule names encode the sorted kv names so each distinct
+/// subset is emitted exactly once (memoized via the rules vec).
+fn build_gemma4_required_permutation(
+    slug: &str,
+    required_kv_names: &[String],
+    comma_lit: &str,
+    rules: &mut Vec<(String, String)>,
+) -> String {
+    let mut sorted = required_kv_names.to_vec();
+    sorted.sort();
+
+    let name_parts: Vec<String> = sorted
+        .iter()
+        .map(|n| n.trim_start_matches("gemma4-kv-").to_string())
+        .collect();
+    // Truncate the rule name to avoid hitting GBNF parser limits for large
+    // key sets; the sorted join is unique enough within a single function.
+    let rule_name = format!("g4req-{}-{}", sanitize_rule_name_local(slug), name_parts.join("-"));
+
+    if rules.iter().any(|(n, _)| n == &rule_name) {
+        return rule_name;
+    }
+
+    if sorted.len() == 1 {
+        rules.push((rule_name.clone(), sorted[0].clone()));
+        return rule_name;
+    }
+
+    // Insert placeholder to allow memoization check in recursive calls.
+    rules.push((rule_name.clone(), String::new()));
+
+    let mut alts: Vec<String> = Vec::new();
+    for (i, kv_name) in sorted.iter().enumerate() {
+        let remaining: Vec<String> = sorted
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let rest = build_gemma4_required_permutation(slug, &remaining, comma_lit, rules);
+        alts.push(format!("{} {} {}", kv_name, comma_lit, rest));
+    }
+    let body = alts.join(" | ");
+    for (n, b) in rules.iter_mut() {
+        if n == &rule_name {
+            *b = body;
+            break;
+        }
+    }
+    rule_name
+}
+
 /// Emit a GBNF grammar string constraining output to Qwen 3.5/3.6's
 /// `<function=NAME><parameter=key>val</parameter>...</function>` wrapper.
 ///
-/// The Qwen 3.5/3.6 chat template emits tool calls as:
-///   `<function=FUNCTION_NAME>\n<parameter=param>\nVAL\n</parameter>\n...</function>`
+/// The Qwen 3.5/3.6 chat template emits tool calls as (verified against
+/// `tokenizer_config.json` `chat_template` field 2026-04-26):
+///   `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n...</function>`
 ///
-/// The grammar constrains:
-///   1. Literal `<function=NAME>` prefix.
-///   2. Zero-or-more `<parameter=KEY>\nVAL\n</parameter>` blocks — one per
-///      declared property. Key names are literal; values are type-constrained.
-///   3. Literal `</function>` suffix.
+/// Every `</parameter>` is followed by a newline — including the last one
+/// before `</function>`.  The grammar enforces this exactly.
 ///
-/// For Qwen values: the template uses `tojson` on values (jinja `tojson`
-/// filter → valid JSON), so values ARE valid JSON. However the parse path
-/// (`parse_qwen35_tool_call`) `.trim()`s the value and tries `serde_json::from_str`
-/// first (for numbers/booleans) then falls back to plain string. The grammar
-/// mirrors this: for `string` types, emit any character that is not the start
-/// of `</parameter>` (a safe approximation); for numeric/boolean types, emit
-/// the JSON scalar grammar.
+/// # Required parameter enforcement (Wave 2.5 B1)
 ///
-/// WHY not json_schema primitives for Qwen values:
-/// The value is NOT wrapped in JSON `"..."` for strings in Qwen's XML format —
-/// the raw text goes between `<parameter=KEY>` and `</parameter>`. Using the
-/// json_schema `string` rule (which requires surrounding `"`) would cause all
-/// string-valued tool calls to fail the grammar mask.
+/// Same as Gemma 4: required keys enforced via permutation grammar; optional
+/// keys in Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (16).
+///
+/// # Nested schema rejection (Wave 2.5 B3)
+///
+/// `array` or `object` parameter types → `EmitterError::UnsupportedSchema`.
 fn qwen35_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String, EmitterError> {
     let mut rules: Vec<(String, String)> = Vec::new();
 
-    // Qwen 3.5/3.6 value primitives — values sit between XML tags, so no
-    // wrapping quotes for strings. Numbers and booleans are JSON-serialized
-    // (the `tojson` Jinja filter is used), so they match standard JSON forms.
+    // Qwen 3.5/3.6 value primitives — values sit between XML tags, raw text
+    // (no JSON quoting for strings).  Numbers/booleans are JSON-serialized
+    // (the `tojson` Jinja filter is used in the template).
     rules.push((
         "qwen35-str-char".to_string(),
-        // Any character that is not `<` (the first byte of `</parameter>`).
-        // Conservative but correct: the template HTML-escapes `<` in string
-        // values so valid outputs never contain bare `<` inside a parameter.
+        // Any char that is not `<` (first byte of `</parameter>`).
+        // Conservative but correct: template HTML-escapes `<` in string values.
         r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
     ));
     rules.push((
@@ -1131,6 +1322,25 @@ fn qwen35_tool_call_gbnf(
         r#"qwen35-str-val | qwen35-num-val | qwen35-bool-val | qwen35-null-val"#.to_string(),
     ));
 
+    // Extract `required` set (Wave 2.5 B1).
+    let required_set: std::collections::HashSet<String> = params_schema
+        .as_object()
+        .and_then(|o| o.get("required"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if required_set.len() > MAX_REQUIRED_KEYS {
+        return Err(EmitterError::TooManyRequiredKeys {
+            fn_name: fn_name.to_string(),
+            count: required_set.len(),
+        });
+    }
+
     let properties = params_schema
         .as_object()
         .and_then(|o| o.get("properties"))
@@ -1142,50 +1352,89 @@ fn qwen35_tool_call_gbnf(
 
     if let Some(props) = properties {
         if props.is_empty() {
-            // No parameters: `<function=NAME></function>`.
             rules.push((
                 "root".to_string(),
                 format!("{} {} space", func_open_lit, func_close_lit),
             ));
         } else {
-            // Build one param-block rule per property.
-            let mut block_rule_names: Vec<String> = Vec::new();
+            let mut required_block_names: Vec<String> = Vec::new();
+            let mut optional_block_names: Vec<String> = Vec::new();
             let mut sorted_keys: Vec<&String> = props.keys().collect();
             sorted_keys.sort();
             for key in &sorted_keys {
                 let val_schema = &props[*key];
-                let val_rule = qwen35_value_rule(val_schema);
+                // B3: reject array/object at emit time.
+                let val_rule = qwen35_value_rule(fn_name, key.as_str(), val_schema)?;
                 let param_open_lit = gbnf_literal(&format!("<parameter={}>", key));
                 let param_close_lit = gbnf_literal("</parameter>");
-                // Block form: `<parameter=KEY>\nVAL\n</parameter>` (with optional
-                // leading/trailing newlines as emitted by the template).
+                // Block form confirmed against tokenizer_config.json chat_template:
+                //   `<parameter=KEY>\nVAL\n</parameter>\n`
+                // Every </parameter> — including the last before </function> —
+                // is followed by \n.  The template loop emits
+                //   `{{- '\n</parameter>\n' }}` unconditionally.
                 let block_body = format!(
                     "{} {} {} {} {} {}",
                     param_open_lit, newline_lit, val_rule, newline_lit, param_close_lit, newline_lit
                 );
                 let block_name = format!("qwen35-param-{}", sanitize_rule_name_local(key));
                 rules.push((block_name.clone(), block_body));
-                block_rule_names.push(block_name);
+                if required_set.contains(*key) {
+                    required_block_names.push(block_name);
+                } else {
+                    optional_block_names.push(block_name);
+                }
             }
-            // Parameter list: any number of parameter blocks in any order.
-            // Same Kleene-star simplification as Gemma 4 above (see note there).
-            let alts = block_rule_names.join(" | ");
-            let param_item_rule = "qwen35-param-item".to_string();
-            rules.push((param_item_rule.clone(), format!("( {} )", alts)));
-            // Root: function open + newline + zero-or-more param blocks + function close.
+
+            // Build parameter sequence with B1 required enforcement.
+            // Same two-case logic as Gemma 4: permutation for required, then
+            // Kleene-star for optional.
+            let param_body_rule = if required_block_names.is_empty() {
+                // Case A: pure optional Kleene-star.
+                let alts = optional_block_names.join(" | ");
+                let param_item_rule = "qwen35-param-item".to_string();
+                rules.push((param_item_rule.clone(), format!("( {} )", alts)));
+                let param_list_rule = "qwen35-param-list".to_string();
+                rules.push((
+                    param_list_rule.clone(),
+                    format!("{}*", param_item_rule),
+                ));
+                param_list_rule
+            } else {
+                // Case B: required permutation + optional suffix.
+                let req_top = build_qwen35_required_permutation(
+                    fn_name,
+                    &required_block_names,
+                    &mut rules,
+                );
+                if optional_block_names.is_empty() {
+                    req_top
+                } else {
+                    let alts = optional_block_names.join(" | ");
+                    let opt_item_rule = "qwen35-opt-item".to_string();
+                    rules.push((opt_item_rule.clone(), format!("( {} )", alts)));
+                    let param_list_rule = "qwen35-param-list".to_string();
+                    rules.push((
+                        param_list_rule.clone(),
+                        format!("{} {}*", req_top, opt_item_rule),
+                    ));
+                    param_list_rule
+                }
+            };
+
+            // Root: `<function=NAME>\n` + param sequence + `</function>`.
+            // The newline after `<function=NAME>` is part of the template
+            // emission pattern (verified from tokenizer_config.json).
             rules.push((
                 "root".to_string(),
                 format!(
-                    "{} {} {}* {} space",
-                    func_open_lit, newline_lit, param_item_rule, func_close_lit
+                    "{} {} {} {} space",
+                    func_open_lit, newline_lit, param_body_rule, func_close_lit
                 ),
             ));
         }
     } else {
-        // No `properties` schema: allow any content between function tags.
         rules.push((
             "qwen35-inner-char".to_string(),
-            // Any character not the start of `</function>`.
             r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
         ));
         rules.push((
@@ -1196,7 +1445,6 @@ fn qwen35_tool_call_gbnf(
 
     rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
-    // Serialize: root first.
     let mut out = String::new();
     for (name, body) in &rules {
         if name == "root" {
@@ -1212,11 +1460,73 @@ fn qwen35_tool_call_gbnf(
     Ok(out)
 }
 
+/// Build the any-order permutation grammar for a non-empty set of required
+/// Qwen parameter-block rule names.  Mirror of `build_gemma4_required_permutation`
+/// but without comma separators (Qwen blocks are self-delimiting XML tags).
+fn build_qwen35_required_permutation(
+    slug: &str,
+    required_block_names: &[String],
+    rules: &mut Vec<(String, String)>,
+) -> String {
+    let mut sorted = required_block_names.to_vec();
+    sorted.sort();
+
+    let name_parts: Vec<String> = sorted
+        .iter()
+        .map(|n| n.trim_start_matches("qwen35-param-").to_string())
+        .collect();
+    let rule_name = format!(
+        "q35req-{}-{}",
+        sanitize_rule_name_local(slug),
+        name_parts.join("-")
+    );
+
+    if rules.iter().any(|(n, _)| n == &rule_name) {
+        return rule_name;
+    }
+
+    if sorted.len() == 1 {
+        rules.push((rule_name.clone(), sorted[0].clone()));
+        return rule_name;
+    }
+
+    rules.push((rule_name.clone(), String::new()));
+
+    let mut alts: Vec<String> = Vec::new();
+    for (i, block_name) in sorted.iter().enumerate() {
+        let remaining: Vec<String> = sorted
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let rest = build_qwen35_required_permutation(slug, &remaining, rules);
+        // Qwen blocks are self-delimiting (each ends with `\n`), so no
+        // explicit separator between them.
+        alts.push(format!("{} {}", block_name, rest));
+    }
+    let body = alts.join(" | ");
+    for (n, b) in rules.iter_mut() {
+        if n == &rule_name {
+            *b = body;
+            break;
+        }
+    }
+    rule_name
+}
+
 /// Map a JSON Schema value to the Qwen 3.5 value rule name.
-fn qwen35_value_rule(schema: &serde_json::Value) -> String {
+///
+/// Returns `Err(EmitterError::UnsupportedSchema)` for `array` and `object`
+/// types (Wave 2.5 B3 — nested schema rejection).
+fn qwen35_value_rule(
+    fn_name: &str,
+    param_name: &str,
+    schema: &serde_json::Value,
+) -> Result<String, EmitterError> {
     let obj = match schema.as_object() {
         Some(o) => o,
-        None => return "qwen35-any-val".to_string(),
+        None => return Ok("qwen35-any-val".to_string()),
     };
     // enum → accept only the declared string literals.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
@@ -1226,16 +1536,23 @@ fn qwen35_value_rule(schema: &serde_json::Value) -> String {
             .map(|s| gbnf_literal(s))
             .collect();
         if !alts.is_empty() {
-            return format!("( {} )", alts.join(" | "));
+            return Ok(format!("( {} )", alts.join(" | ")));
         }
     }
-    match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "string" => "qwen35-str-val".to_string(),
-        "integer" => "qwen35-int-val".to_string(),
-        "number" => "qwen35-num-val".to_string(),
-        "boolean" => "qwen35-bool-val".to_string(),
-        "null" => "qwen35-null-val".to_string(),
-        _ => "qwen35-any-val".to_string(),
+    let schema_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match schema_type {
+        "string" => Ok("qwen35-str-val".to_string()),
+        "integer" => Ok("qwen35-int-val".to_string()),
+        "number" => Ok("qwen35-num-val".to_string()),
+        "boolean" => Ok("qwen35-bool-val".to_string()),
+        "null" => Ok("qwen35-null-val".to_string()),
+        // Wave 2.5 B3: reject array and object types.
+        "array" | "object" => Err(EmitterError::UnsupportedSchema {
+            fn_name: fn_name.to_string(),
+            param_name: param_name.to_string(),
+            schema_type: schema_type.to_string(),
+        }),
+        _ => Ok("qwen35-any-val".to_string()),
     }
 }
 

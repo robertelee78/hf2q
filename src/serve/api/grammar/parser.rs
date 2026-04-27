@@ -69,7 +69,7 @@ impl GretElement {
 /// The full parsed grammar: a list of rules (each rule is a Vec of elements
 /// ending in `End`, with `Alt` separating alternatives) plus a name → rule-id
 /// map for lookup + printing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Grammar {
     pub rules: Vec<Vec<GretElement>>,
     pub symbol_ids: HashMap<String, u32>,

@@ -352,6 +352,64 @@ pub struct LoadedModel {
     pub prompt_cache: PromptCache,
 }
 
+/// Generation-affecting parameters that must all match for a cache hit.
+///
+/// Wave-2.5 B5 (HIGH-7): the iter-96 cache keyed only on prompt tokens,
+/// silently ignoring `max_tokens`, `stop_strings`, `logit_bias`, and
+/// `grammar`.  Two requests with the same prompt but different max_tokens
+/// would incorrectly replay a shorter (or longer) cached response.  This
+/// newtype makes all generation-affecting fields part of the equality
+/// check.
+///
+/// Only fields that affect greedy-decode (T=0) output are included:
+/// - `max_tokens` — early-stop trigger
+/// - `stop_strings` — early-stop trigger
+/// - `logit_bias` — additive shift applied before greedy argmax
+/// - `grammar` — token-validity mask applied before argmax
+///
+/// Fields that are irrelevant to greedy decode (temperature=0,
+/// top_p=1, top_k=0, repetition_penalty=1, seed=None) are deliberately
+/// excluded — the existing sampling-bypass gate in `lookup`/`store`
+/// already ensures those requests never reach the cache.
+///
+/// `frequency_penalty` and `presence_penalty` are plumbed but currently
+/// not wired into the greedy path; they are excluded here and will be
+/// added when they become effective.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptCacheKey {
+    pub max_tokens: usize,
+    pub stop_strings: Vec<String>,
+    /// Sorted key-value pairs from `logit_bias` so that two maps with
+    /// identical contents compare equal regardless of insertion order.
+    /// The bias values are stored as `f32` bit-patterns (via
+    /// `to_bits()`) to enable structural equality without floating-point
+    /// surprises.  Finite `f32` bias values are the only ones with
+    /// meaningful semantics; `f32::NAN` keys would be a caller bug.
+    pub logit_bias_sorted: Vec<(u32, u32)>,
+    /// Structural equality: `GretElement: PartialEq` + `Grammar: PartialEq`.
+    /// `None` means no grammar constraint; `Some(g)` means the entire
+    /// GBNF rule set must match.
+    pub grammar: Option<super::grammar::Grammar>,
+}
+
+impl PromptCacheKey {
+    /// Construct from a `SamplingParams`.
+    pub fn from_params(params: &SamplingParams) -> Self {
+        let mut bias_sorted: Vec<(u32, u32)> = params
+            .logit_bias
+            .iter()
+            .map(|(&tok, &bias)| (tok, bias.to_bits()))
+            .collect();
+        bias_sorted.sort_unstable_by_key(|&(tok, _)| tok);
+        Self {
+            max_tokens: params.max_tokens,
+            stop_strings: params.stop_strings.clone(),
+            logit_bias_sorted: bias_sorted,
+            grammar: params.grammar.clone(),
+        }
+    }
+}
+
 /// Single-slot prompt cache (Phase 2a Task #7, iter-96).
 ///
 /// **Iter-96 scope: full-equality + temperature=0 cache.**  When the
@@ -406,11 +464,15 @@ pub struct LoadedModel {
 ///    shared module would require Arc/Mutex overhead without benefit.
 ///
 /// Future LCP-based work belongs here, extending `lookup`/`store`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PromptCache {
     /// The previous request's prompt token sequence (post-rendering,
     /// post-tokenization).  Empty on a fresh worker (no prior request).
     pub tokens: Vec<u32>,
+    /// Wave-2.5 B5: all generation-affecting params from the previous
+    /// request.  A new request must match both `tokens` AND `key` to
+    /// get a cache hit.
+    pub key: PromptCacheKey,
     /// The text the previous request emitted (post reasoning-marker
     /// split).  This is what gets replayed on a cache hit.
     pub text: String,
@@ -425,11 +487,23 @@ pub struct PromptCache {
     pub finish_reason: &'static str,
 }
 
+impl Default for PromptCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptCache {
     /// Empty cache — initial state for a fresh worker.
     pub fn new() -> Self {
         Self {
             tokens: Vec::new(),
+            key: PromptCacheKey {
+                max_tokens: 0,
+                stop_strings: Vec::new(),
+                logit_bias_sorted: Vec::new(),
+                grammar: None,
+            },
             text: String::new(),
             reasoning_text: None,
             completion_tokens: 0,
@@ -438,10 +512,16 @@ impl PromptCache {
         }
     }
 
-    /// Iter-96 cache check: returns the cached result if and only if
-    /// `prompt_tokens` exactly equals the cached prompt AND the caller
+    /// Cache check: returns the cached result if and only if
+    /// `prompt_tokens` exactly equals the cached prompt, the caller
     /// is in greedy decode mode (temperature = 0, no sampling-only
-    /// fields set).  See struct doc for the full eligibility contract.
+    /// fields set), AND all generation-affecting params match the
+    /// cached key (max_tokens, stop_strings, logit_bias, grammar).
+    ///
+    /// Wave-2.5 B5: added `PromptCacheKey` comparison to prevent
+    /// silent-correctness bugs where same prompt + different max_tokens,
+    /// stops, logit_bias, or grammar would incorrectly replay a stale
+    /// cached response.
     pub fn lookup(&self, prompt_tokens: &[u32], params: &SamplingParams) -> Option<GenerationResult> {
         // Bypass for any non-greedy mode.  These all introduce per-call
         // variance that a cached replay would silently erase.
@@ -453,10 +533,12 @@ impl PromptCache {
         {
             return None;
         }
-        // logit_bias and grammar are deterministic given the prompt +
-        // greedy decode, so they DO cache (their effects are fully
-        // captured in the cached `text`).
         if self.tokens.is_empty() || self.tokens.as_slice() != prompt_tokens {
+            return None;
+        }
+        // Wave-2.5 B5: generation-affecting params must also match.
+        let request_key = PromptCacheKey::from_params(params);
+        if self.key != request_key {
             return None;
         }
         Some(GenerationResult {
@@ -475,8 +557,8 @@ impl PromptCache {
         })
     }
 
-    /// Iter-96 cache write: store this request's result so the next
-    /// equal-prompt + greedy request can short-circuit.
+    /// Cache write: store this request's result so the next
+    /// equal-prompt + greedy + equal-params request can short-circuit.
     ///
     /// Same eligibility gate as `lookup` — sampling-mode requests are
     /// not cached (storing them would mean a future greedy request
@@ -496,6 +578,7 @@ impl PromptCache {
             return;
         }
         self.tokens = prompt_tokens.to_vec();
+        self.key = PromptCacheKey::from_params(params);
         self.text = result.text.clone();
         self.reasoning_text = result.reasoning_text.clone();
         self.completion_tokens = result.completion_tokens;
@@ -2844,5 +2927,207 @@ assistant:
             msg.contains("panicked"),
             "shutdown error should name 'panicked', got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-2.5 B5 — PromptCache key expansion (HIGH-7 silent-correctness fix)
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a stored PromptCache that looks like a previous greedy
+    /// request completed with `result_text`.
+    fn make_cached(
+        tokens: &[u32],
+        params: &SamplingParams,
+        result_text: &str,
+    ) -> PromptCache {
+        let mut cache = PromptCache::new();
+        let result = GenerationResult {
+            text: result_text.to_string(),
+            reasoning_text: None,
+            prompt_tokens: tokens.len(),
+            completion_tokens: 5,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+        cache.store(tokens, params, &result);
+        cache
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_max_tokens() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.max_tokens = 100;
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.max_tokens = 200; // different max_tokens — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different max_tokens must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_stop_strings() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.stop_strings = vec!["STOP".to_string()];
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.stop_strings = vec!["END".to_string()]; // different stops — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different stop_strings must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_logit_bias() {
+        let tokens: Vec<u32> = vec![1, 2, 3];
+        let mut base = SamplingParams::default();
+        base.logit_bias.insert(42, 5.0);
+        let cache = make_cached(&tokens, &base, "hello");
+
+        let mut req = SamplingParams::default();
+        req.logit_bias.insert(42, 10.0); // different bias value — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different logit_bias must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_miss_on_different_response_format_grammar() {
+        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use std::collections::HashMap;
+
+        let tokens: Vec<u32> = vec![1, 2, 3];
+
+        // Build a trivial grammar A: single rule with one Char element + End.
+        let grammar_a = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'a' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
+        };
+        // Grammar B differs in the Char value.
+        let grammar_b = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'b' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
+        };
+
+        let mut base = SamplingParams::default();
+        base.grammar = Some(grammar_a);
+        let cache = make_cached(&tokens, &base, r#"{"ok":true}"#);
+
+        let mut req = SamplingParams::default();
+        req.grammar = Some(grammar_b); // different grammar — must MISS
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different grammar must not hit cache"
+        );
+    }
+
+    /// Wave-2.5 B5 — tool_choice key sensitivity.
+    ///
+    /// `tool_choice` is compiled to a `Grammar` (via `compile_tool_grammar`)
+    /// before being stored in `SamplingParams.grammar`. Two requests with the
+    /// same prompt but different tool grammars (different tool_choice values)
+    /// must produce a cache MISS. This test exercises the grammar arm of the
+    /// PromptCacheKey directly — the same code path that `tool_choice=function`
+    /// exercises at the end of `prepare_chat_completion_common`.
+    #[test]
+    fn prompt_cache_miss_on_different_tool_choice_grammar() {
+        use super::super::grammar::parser::{GretElement, GretType, Grammar};
+        use std::collections::HashMap;
+
+        let tokens: Vec<u32> = vec![1, 2, 3];
+
+        // Simulate grammar compiled for tool_choice=function{name:"tool_a"}.
+        let grammar_tool_a = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'a' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
+        };
+        // Simulate grammar compiled for tool_choice=function{name:"tool_b"}.
+        let grammar_tool_b = Grammar {
+            rules: vec![vec![
+                GretElement::new(GretType::Char, b'b' as u32),
+                GretElement::new(GretType::End, 0),
+            ]],
+            symbol_ids: {
+                let mut m = HashMap::new();
+                m.insert("root".to_string(), 0u32);
+                m
+            },
+        };
+
+        // Cache a response generated under tool_a grammar.
+        let mut base = SamplingParams::default();
+        base.grammar = Some(grammar_tool_a);
+        let cache = make_cached(&tokens, &base, r#"{"name":"tool_a"}"#);
+
+        // A subsequent request with tool_b grammar must MISS — it would
+        // produce different output under a different constraint.
+        let mut req = SamplingParams::default();
+        req.grammar = Some(grammar_tool_b);
+        assert!(
+            cache.lookup(&tokens, &req).is_none(),
+            "same prompt + different tool_choice grammar must not hit cache \
+             (would silently replay the wrong tool call)"
+        );
+
+        // A request with NO grammar (tool_choice absent / unconstrained) must
+        // also MISS — unconstrained decode differs from constrained decode.
+        let req_no_grammar = SamplingParams::default();
+        assert!(
+            cache.lookup(&tokens, &req_no_grammar).is_none(),
+            "same prompt + no grammar vs. tool grammar must not hit cache"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_hit_requires_all_params_equal() {
+        let tokens: Vec<u32> = vec![10, 20, 30];
+        let mut params = SamplingParams::default();
+        params.max_tokens = 64;
+        params.stop_strings = vec!["END".to_string()];
+        params.logit_bias.insert(99, -1.0);
+        let cache = make_cached(&tokens, &params, "cached text");
+
+        // Same params → must HIT
+        let mut same = SamplingParams::default();
+        same.max_tokens = 64;
+        same.stop_strings = vec!["END".to_string()];
+        same.logit_bias.insert(99, -1.0);
+        let hit = cache.lookup(&tokens, &same);
+        assert!(
+            hit.is_some(),
+            "identical prompt + identical params must hit cache"
+        );
+        assert_eq!(hit.unwrap().text, "cached text");
     }
 }
