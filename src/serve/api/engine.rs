@@ -5553,6 +5553,68 @@ mod streaming_prompt_cache_replay_tests {
              content concat: {content_concat:?}\nevents: {events:?}"
         );
 
+        // Wave 3.6 W-4 strengthening (audit gap from
+        // /tmp/cfa-cfa-20260427-adr005-wave3.5/codex-review-last.txt):
+        //
+        // "asserts postscript content and Done, but does not assert
+        //  ToolCallDelta or finish_reason=tool_calls for the parsed
+        //  marker block."
+        //
+        // The cached text is `{open}call:foo{{x:1}}{close}after`.
+        // The body `call:foo{{x:1}}` is parseable by parse_gemma4_tool_call
+        // → parse_tool_call_body returns Some(ParsedToolCall{name:"foo",
+        //   args:{"x":1}}).  emit_streaming_tool_call_close then emits
+        // two ToolCallDelta events (name chunk + args chunk) and sets
+        // saw_tool_call=true → Done gets finish_reason="tool_calls".
+        //
+        // The splitter chain must re-classify the marker block into
+        // structured ToolCallDelta events identical to a fresh decode.
+        let tool_call_deltas: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, GenerationEvent::ToolCallDelta { .. }))
+            .collect();
+        assert!(
+            !tool_call_deltas.is_empty(),
+            "Wave 3.6 W-4: MUST emit at least one ToolCallDelta for the \
+             parsed `call:foo{{x:1}}` body — the splitter chain re-classifies \
+             the marker block into structured ToolCall deltas.  \
+             events: {events:?}"
+        );
+
+        // The first ToolCallDelta MUST carry the function name (name chunk).
+        let has_name_delta = events.iter().any(|e| matches!(
+            e,
+            GenerationEvent::ToolCallDelta { name: Some(_), .. }
+        ));
+        assert!(
+            has_name_delta,
+            "Wave 3.6 W-4: the first ToolCallDelta MUST carry `name: Some(...)` \
+             (function name = \"foo\"); subsequent deltas carry arguments. \
+             tool_call_deltas: {tool_call_deltas:?}"
+        );
+
+        // The Done event MUST report finish_reason="tool_calls" because
+        // saw_tool_call is set by emit_streaming_tool_call_close when parse
+        // succeeds (engine.rs:3184: `if saw_tool_call { "tool_calls" } else ...`).
+        // Cached text has finish_reason="stop" but the replay overrides it.
+        let done_finish_reason = events
+            .iter()
+            .find_map(|e| match e {
+                GenerationEvent::Done { finish_reason, .. } => Some(*finish_reason),
+                _ => None,
+            })
+            .expect("Done event must be present");
+        assert_eq!(
+            done_finish_reason,
+            "tool_calls",
+            "Wave 3.6 W-4: finish_reason MUST be 'tool_calls' (not '{}') when \
+             a tool call was extracted from the cached text during replay. \
+             The replay overrides cached.finish_reason (='stop') with \
+             'tool_calls' when saw_tool_call=true (engine.rs:3184). \
+             events: {events:?}",
+            done_finish_reason
+        );
+
         // Sanity: Done must terminate the stream.
         assert!(
             matches!(events.last(), Some(GenerationEvent::Done { .. })),
