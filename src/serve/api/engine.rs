@@ -386,7 +386,7 @@ pub struct LoadedModel {
 ///
 /// A simpler `PromptCache` with only `lcp_len` / `update` / `clear` methods
 /// was prototyped in `src/serve/api/prompt_cache.rs` (ADR-005 Task #7 first
-/// cut) and deleted in wave-1 (2026-04-26) because:
+/// cut) and deleted in wave-1.5 (2026-04-26) because:
 ///
 /// 1. **Full-equality is the shipped contract.**  The iter-96 cache fires
 ///    only when `new_prompt == cached_prompt` exactly.  The prototype's
