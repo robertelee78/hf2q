@@ -5846,3 +5846,23 @@ Path 1 is the production-correct fix (gemma4v VLMs accept arbitrary image dimens
 - Unit tests updated: `load_gemma4_mmproj_populates_arch_tensors` now expects `attn_out.weight` (W42); `projector_supported_for_mlp_and_gemma4v` covers the new variant (W41).
 
 This commit unblocks every gate up to and including the ViT forward pass; the pool-kernel-divisibility blocker is left to iter-116j per the wave dispatch's "Don't widen scope" rule.
+
+- **2026-04-27 wave-2 Worker W3 (session cfa-20260426-adr005-wave2) — T1.8 PREREQ 1+2: json_schema grammar accepts object keys in any order; additionalProperties:false enforced.**
+  - **PREREQ 1 — Any-order key grammar (iter 75 fix).** `visit_object` previously emitted keys in strict alphabetical order — a coincidence of BTreeMap iteration that was labeled "deliberate simplification" in iter-8 but was in fact silently rejecting valid JSON from any model that emitted keys non-alphabetically. Any production tool-calling model emitting `{"b":..., "a":...}` would have its valid response killed by the grammar mask. Fixed by introducing two new methods:
+    - `build_required_permutation(slug, required_keys, kv_rule_name)` — generates one GBNF rule per non-empty subset of required keys using the "remaining subset" technique. Each rule is an alternation of "pick key K first, then accept the remaining keys in any order". O(2^N) rules for N required keys (N≤10 in practice; at most 1023 rules). Memoized: each distinct subset emits exactly one rule.
+    - `build_optional_chain(slug, entries)` — generates optional-key alternation rules so any subset of optional keys in any order is accepted. O(N^2) rules. Also used for the `additionalProperties` wildcard slot.
+  - **PREREQ 2 — additionalProperties:false (iter 75 new).** Previously `additionalProperties` was silently ignored (noted in wave-2 preflight audit). Now:
+    - `additionalProperties: false` → `additional_closed = true`: the `build_optional_suffix` call passes `allow_extra_kv = false`, so no wildcard `string ":" space value` rule is added to the optional chain. Only declared property keys survive in the grammar; extra keys cause the grammar stack to die.
+    - `additionalProperties: true` or unset → `allow_extra_kv = true`: a named `<slug>-extra-kv` rule is emitted (`string ":" space value`) and added as a wildcard entry in the optional chain. Unknown keys silently accepted — JSON Schema permissive default.
+    - `additionalProperties: {schema}` → deferred (treated as permissive). Documented in module docstring.
+  - **Tests added (26 total, was 22):**
+    - `object_keys_accepted_in_any_order_three_required` — all 6 permutations of {a,b,c} accepted; missing-required rejected.
+    - `additional_properties_false_rejects_extra_keys` — extra key rejected when false; both key orders of declared keys accepted.
+    - `additional_properties_true_accepts_extra_keys` — extra key accepted when true.
+    - `additional_properties_unset_accepts_extra_keys` — extra key accepted when unset (permissive default).
+    - Existing 5 production-shape tests extended to assert non-alphabetical key orders also accepted.
+  - **Chesterton note (alphabetical-key-order origin):** iter-8 iterated over `properties` via `BTreeMap` and sorted the key list `keys.sort()` — both produce alphabetical order. The comment said "deliberate simplification" but there was no reason to enforce alphabetical order; it was never a user-visible feature. Any-order acceptance is strictly more correct.
+  - **Pattern used:** permutation_based (remaining-subset memoized GBNF rules).
+  - **additionalProperties default:** permissive_true (allow_extra_kv=true when unset or true).
+  - **Open followups:** `additionalProperties: {schema}` deferred; `anyOf`/`oneOf`/`allOf` remain deferred.
+  - **Fence respected.** Edits in `src/serve/api/grammar/json_schema.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
