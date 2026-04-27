@@ -365,15 +365,23 @@ fn dwq_4_6_routes_through_dwq_calibrator() {
         .success();
     let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
 
-    // The new dispatch logs a "DWQ byte-emit via calibrator-driven
-    // dispatch (ADR-014 P2 iter-2)" line — verify the calibrator path
-    // ran (not the legacy direct-call path which would log a different
-    // message).
+    // The dispatch logs a calibrator-driven breadcrumb.  ADR-014 P11-
+    // prereq Iter C (2026-04-27) added a fourth accepted phrase
+    // ("DwqKQuantizer dispatch") because the default DWQ codec path
+    // switched from `MixedBitQuantizer` (Q4_0-family) to
+    // `DwqKQuantizer` (Q4_K_M-family) — the calibrator-driven seam
+    // upstream is unchanged, but the downstream emit log line moved
+    // to the new ADR-014 P11-prereq Iter C breadcrumb.  All four
+    // phrases stay accepted so the legacy escape-hatch path
+    // (`HF2Q_USE_LEGACY_DWQ_Q4_0=1`) and any future re-routing through
+    // `dwq_activation` still satisfies the assertion.
     assert!(
         stderr.contains("calibrator-driven dispatch")
             || stderr.contains("ADR-014 P2 iter-2")
-            || stderr.contains("dwq calibrator: arch is weight-space"),
-        "dwq-4-6 dispatch must log the calibrator-driven path, got: {stderr}"
+            || stderr.contains("dwq calibrator: arch is weight-space")
+            || stderr.contains("DwqKQuantizer dispatch"),
+        "dwq-4-6 dispatch must log the calibrator-driven path \
+         (or the Iter C DwqKQuantizer dispatch), got: {stderr}"
     );
 
     // Output GGUF must exist.

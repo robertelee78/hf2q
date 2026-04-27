@@ -1389,11 +1389,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             | cli::QuantMethod::Dwq28 => {
                 // ADR-014 P4: DWQ capture runs above through
                 // DwqCalibrator::with_activation_capture_lazy, directly
-                // from the resident tensor map. Here we just convert
-                // the calibrator's `CalibrationData::Dwq` per-layer flag
-                // map into the `DwqConfig.sensitive_layers` shape and
-                // dispatch the byte-emit through
-                // `run_dwq_with_sensitive_ranges`.
+                // from the resident tensor map. Convert the
+                // calibrator's `CalibrationData::Dwq` per-layer flag map
+                // into the `DwqConfig.sensitive_layers` shape so the
+                // downstream byte-emit knows which layers are sensitive.
                 let (base_bits, sensitive_bits) =
                     config.quant.dwq_bit_pair().ok_or_else(|| {
                         AppError::Conversion(anyhow::anyhow!(
@@ -1414,36 +1413,171 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 } else {
                     config.sensitive_layers.clone()
                 };
-                let dwq_config = calibrate::dwq::DwqConfig {
-                    calibration_samples: config.calibration_samples,
-                    sensitive_layers: final_sensitive_ranges.clone(),
-                    group_size: config.group_size,
-                    base_bits,
-                    sensitive_bits,
-                    use_activations: dwq_arch_for_dispatch.requires_activation_capture(),
-                    arch: dwq_arch_for_dispatch,
-                    ..calibrate::dwq::DwqConfig::default()
-                };
-                tracing::info!(
-                    quant = %config.quant,
-                    arch = ?dwq_arch_for_dispatch,
-                    sensitive_ranges = final_sensitive_ranges.len(),
-                    base_bits,
-                    sensitive_bits,
-                    "DWQ byte-emit via calibrator-driven dispatch (ADR-014 P2 iter-2)"
-                );
-                calibrate::dwq_activation::run_dwq_with_sensitive_ranges(
-                    &tensor_map,
-                    &metadata,
-                    &dwq_config,
-                    final_sensitive_ranges,
-                    &progress,
-                )
-                .map_err(|e| {
-                    AppError::Conversion(anyhow::anyhow!(
-                        "ADR-014 P2 iter-2: DWQ byte-emit failed: {e:#}"
-                    ))
-                })?
+
+                // ADR-014 P11-prereq Iter C (2026-04-27): default DWQ
+                // emit switches from the legacy `MixedBitQuantizer`
+                // (Q4_0-family bytes) to `DwqKQuantizer` (Q4_K_M-family
+                // bytes via `KQuantCodecQuantizer`).  The legacy path
+                // remains available via `HF2Q_USE_LEGACY_DWQ_Q4_0=1`
+                // for benchmarking comparison ONLY — no silent
+                // fallback; the env var is the single switch and is
+                // logged at INFO when set.  The replacement is
+                // in-place: the dispatch arm below preserves the
+                // resulting `QuantizedModel.quant_method` tag
+                // (`dwq-mixed-{base}-{sens}`) so downstream
+                // discriminators (`safetensors_out::is_dwq_method`,
+                // ADR-012 D22 ship list) keep matching exactly.
+                let use_legacy_dwq = std::env::var("HF2Q_USE_LEGACY_DWQ_Q4_0")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+
+                let legacy_quant_method =
+                    format!("dwq-mixed-{}-{}", base_bits, sensitive_bits);
+
+                if use_legacy_dwq {
+                    let dwq_config = calibrate::dwq::DwqConfig {
+                        calibration_samples: config.calibration_samples,
+                        sensitive_layers: final_sensitive_ranges.clone(),
+                        group_size: config.group_size,
+                        base_bits,
+                        sensitive_bits,
+                        use_activations: dwq_arch_for_dispatch
+                            .requires_activation_capture(),
+                        arch: dwq_arch_for_dispatch,
+                        ..calibrate::dwq::DwqConfig::default()
+                    };
+                    tracing::info!(
+                        quant = %config.quant,
+                        arch = ?dwq_arch_for_dispatch,
+                        sensitive_ranges = final_sensitive_ranges.len(),
+                        base_bits,
+                        sensitive_bits,
+                        "DWQ byte-emit via LEGACY MixedBitQuantizer (Q4_0-family) — \
+                         HF2Q_USE_LEGACY_DWQ_Q4_0=1 (ADR-014 P11-prereq Iter C \
+                         escape hatch; default switched to DwqKQuantizer \
+                         Q4_K_M-family)"
+                    );
+                    calibrate::dwq_activation::run_dwq_with_sensitive_ranges(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_config,
+                        final_sensitive_ranges,
+                        &progress,
+                    )
+                    .map_err(|e| {
+                        AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P2 iter-2: legacy DWQ byte-emit failed: {e:#}"
+                        ))
+                    })?
+                } else {
+                    // Default path (ADR-014 P11-prereq Iter C): route
+                    // through `DwqKQuantizer` so each tensor emits final
+                    // K-quant block bytes via `KQuantCodecQuantizer`.
+                    // The variant maps to (base, sensitive) targets
+                    // exactly per Iter B's `DwqKVariant`:
+                    //
+                    //   dwq46 → (Q4_K, Q6_K)
+                    //   dwq48 → (Q4_K, Q8_0)
+                    //   dwq68 → (Q6_K, Q8_0)
+                    //   dwq28 → (Q2_K [deferred], Q8_0)
+                    //
+                    // `dwq28` base-bucket tensors surface a typed
+                    // `QuantizeError::TensorQuantizeFailed` from the
+                    // codec until Q2_K codec lands; this propagates up
+                    // as `AppError::Conversion` — no panic, no silent
+                    // fallback (per Iter B's contract; `dwq28` users
+                    // wait for the codec port).
+                    let variant = match config.quant {
+                        cli::QuantMethod::Dwq46 => {
+                            quantize::dwq_k_quantizer::DwqKVariant::P46
+                        }
+                        cli::QuantMethod::Dwq48 => {
+                            quantize::dwq_k_quantizer::DwqKVariant::P48
+                        }
+                        cli::QuantMethod::Dwq68 => {
+                            quantize::dwq_k_quantizer::DwqKVariant::P68
+                        }
+                        cli::QuantMethod::Dwq28 => {
+                            quantize::dwq_k_quantizer::DwqKVariant::P28
+                        }
+                        // Outer match arm guarantees one of the four
+                        // DWQ variants. Surface a typed error rather
+                        // than `unreachable!()` to honour the no-panic
+                        // contract added by ADR-014 P2 iter-2.
+                        _ => {
+                            return Err(AppError::Conversion(anyhow::anyhow!(
+                                "ADR-014 P11-prereq Iter C: DwqKVariant \
+                                 dispatch reached unreachable arm for \
+                                 --quant {}",
+                                config.quant
+                            )));
+                        }
+                    };
+
+                    // ADR-014 P11-prereq Iter C — Sensitivity → Imatrix
+                    // wiring DEFERRED (documented in
+                    // `dwq_k_quantizer.rs` module doc + ADR-014 Iter C
+                    // closure section).  Reason: `DwqConfig` exposes
+                    // only a per-layer scalar sensitivity, while
+                    // `CalibrationData::Imatrix` requires per-column
+                    // vectors of length `row_len` — the two shapes are
+                    // dimensionally incompatible.  Bridging requires
+                    // either (a) a separate `ImatrixCollector` pass
+                    // alongside DWQ, or (b) upstream broadcast (which
+                    // degenerates to `_ref` since uniform weights ≡ no
+                    // weights).  Both push past the 250 LOC HARD-STOP
+                    // for this iter.  Passing `CalibrationData::None`
+                    // routes the codebook search through the `_ref`
+                    // (non-imatrix-weighted) path — same algorithmic
+                    // surface as today's `--quant q4_k_m` (uncalibrated
+                    // `KQuantCodecQuantizer` cell), which already
+                    // ships and is gate-locked by Iter A's regression
+                    // tests.  A future iter lands path (a).
+                    let dwq_k = quantize::dwq_k_quantizer::DwqKQuantizer::new(
+                        variant,
+                        &final_sensitive_ranges,
+                        calibrate::calibrator::CalibrationData::None,
+                    );
+
+                    tracing::info!(
+                        quant = %config.quant,
+                        arch = ?dwq_arch_for_dispatch,
+                        sensitive_ranges = final_sensitive_ranges.len(),
+                        base_bits,
+                        sensitive_bits,
+                        codec = "DwqKQuantizer (K-quant codec-direct)",
+                        "DWQ byte-emit via DwqKQuantizer dispatch \
+                         (ADR-014 P11-prereq Iter C — Q4_K_M-family default)"
+                    );
+
+                    // Drive `quantize::quantize_model` so per-tensor
+                    // preserve flags + vision-tensor handling stay
+                    // consistent with the K-quant uncalibrated cell
+                    // above.  Override the resulting `quant_method`
+                    // tag back to the legacy `dwq-mixed-{b}-{s}` form
+                    // so downstream consumers
+                    // (`safetensors_out::is_dwq_method`, ADR-012 D22
+                    // ship-list filename suffix at
+                    // `default_filename_suffix`) keep matching exactly
+                    // (Chesterton's fence — we replace the codec, not
+                    // the discriminator surface).
+                    let mut quantized = quantize::quantize_model(
+                        &tensor_map,
+                        &metadata,
+                        &dwq_k,
+                        bits,
+                        config.group_size,
+                        &progress,
+                    )
+                    .map_err(|e| {
+                        AppError::Conversion(anyhow::anyhow!(
+                            "ADR-014 P11-prereq Iter C: DwqKQuantizer \
+                             byte-emit failed: {e:#}"
+                        ))
+                    })?;
+                    quantized.quant_method = legacy_quant_method;
+                    quantized
+                }
             }
             // ADR-014 P8 Decision 12: flat / legacy block-quant variants
             // (f16, bf16, q2, q4, q8) and Auto (post-resolution) flow

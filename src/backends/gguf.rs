@@ -1712,36 +1712,78 @@ fn quant_info_to_ggml_type(info: &TensorQuantInfo) -> u32 {
         return GGML_TYPE_F16;
     }
 
-    // Map based on the actual bit width we can produce proper block format for.
-    // K-quant types from Apex cannot be honored because hf2q does not produce
-    // K-quant super-block data; we map to the closest simple block type instead.
+    // ADR-014 P11-prereq Iter C (2026-04-27): the Q2_K/Q3_K/Q4_K/Q5_K
+    // "fall through to bits-based mapping" swallow that lived here was
+    // removed.  Audit (Iter C, file fence: `quant_info_to_ggml_type`):
+    //   * The only production writers of `ggml_type = Some("Q[2-5]_K"…)`
+    //     are `KQuantCodecQuantizer` (`k_quant_codec_quantizer.rs:229`)
+    //     and `VariantKQuantizer` (`variant_quantizer.rs:231`) — both
+    //     unconditionally set `method = METHOD_K_QUANT_CODEC_DIRECT`,
+    //     which Iter A's fast-path above already routes via
+    //     `ggml_type_from_name` BEFORE this block fires.  After Iter C
+    //     wires DWQ through `DwqKQuantizer`, the same property holds
+    //     for every DWQ tensor that targets a K-quant block format
+    //     (`DwqKQuantizer` constructs a `KQuantCodecQuantizer` per-call;
+    //     see `dwq_k_quantizer.rs:280`).
+    //   * The legacy `--quant apex` writer that previously asked this
+    //     branch to "map K-quant override → bits-fallback Q4_0" was
+    //     deleted alongside the variant in Decision 12.  No remaining
+    //     production caller asks `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K` to fall
+    //     through to a different block type.
+    //   * The `bits = 0` sentinel that codec-direct quantizers set is
+    //     unsafe input for the bits-based table below (it returns F16
+    //     for any unknown bit width) — preserving the swallow would
+    //     silently re-introduce the malformed-GGUF defect Iter A closed.
+    //
+    // Q6_K override (no codec-direct sentinel) is still honored
+    // directly — it survives because `apex` was the *historical* writer
+    // of bare-`Q6_K`-named overrides, and the codec-direct fast-path
+    // above subsumes it for codec-direct callers; this branch keeps the
+    // bare-name path live for the remaining test surface
+    // (`gguf.rs::tests::test_ggml_type_override_in_quant_info` at
+    // `src/backends/gguf.rs:3473-3477`) without re-introducing the
+    // swallow on `Q[2-5]_K`.
     if let Some(ref type_name) = info.ggml_type {
         let upper = type_name.trim().to_uppercase();
-        // Q6_K can now be produced directly — honor it when explicitly requested
         if upper.starts_with("Q6_K") {
             return GGML_TYPE_Q6_K;
         }
-        // Other K-quant types get mapped to simple types based on ir_bits
-        // (hf2q does not produce Q2_K-Q5_K super-block data via this path; the
-        // codec-direct path above handles tensors that ARE Q2_K-Q5_K bytes).
         if upper.starts_with("Q2_K")
             || upper.starts_with("Q3_K")
             || upper.starts_with("Q4_K")
             || upper.starts_with("Q5_K")
         {
-            debug!(
-                "Apex requested '{}', mapping to simple block type for bits={}",
-                type_name, info.bits
-            );
-            // Fall through to bits-based mapping below
-        } else if let Some(code) = ggml_type_from_name(type_name) {
-            return code;
-        } else {
-            warn!(
-                "Unknown GGML type name '{}'; falling back to bits-based mapping",
+            // Reachable iff some non-codec-direct path sets the K-quant
+            // ggml_type without the codec-direct sentinel.  No such
+            // path exists in production today (audit above); this is a
+            // defence-in-depth guard against a future regression.
+            // Surface loudly — bytes are NOT necessarily K-quant block
+            // bytes here, so we cannot return the K-quant type code
+            // safely; F16 is the only response that cannot mis-frame
+            // the bytes (the same fall-back contract Iter A keeps for
+            // unknown codec-direct ggml_type names).
+            debug_assert!(
+                false,
+                "K-quant ggml_type '{}' set without METHOD_K_QUANT_CODEC_DIRECT \
+                 sentinel — non-codec-direct K-quant path is dead code; \
+                 if you hit this, file a bug (ADR-014 P11-prereq Iter C)",
                 type_name
             );
+            warn!(
+                "K-quant ggml_type '{}' set without codec-direct sentinel \
+                 (method = '{}'); cannot route to K-quant type code without \
+                 confirming on-disk byte format — falling back to F16",
+                type_name, info.method
+            );
+            return GGML_TYPE_F16;
         }
+        if let Some(code) = ggml_type_from_name(type_name) {
+            return code;
+        }
+        warn!(
+            "Unknown GGML type name '{}'; falling back to bits-based mapping",
+            type_name
+        );
     }
 
     // Generic bits-based mapping — only types we can produce proper block format for
@@ -3457,33 +3499,63 @@ mod tests {
 
     #[test]
     fn test_ggml_type_override_in_quant_info() {
-        // K-quant types from Apex are mapped to the corresponding simple block type
-        // because hf2q doesn't produce K-quant super-block data via the Apex path
-        // (method == "apex"). The CODEC-DIRECT path (method ==
-        // METHOD_K_QUANT_CODEC_DIRECT, bits = 0) DOES produce K-quant super-block
-        // bytes and is locked separately by `kquant_codec_direct_*_returns_*`
-        // below + `tests/codec_direct_type_code.rs` (ADR-014 P11-prereq Iter A).
-        let qi_override = TensorQuantInfo {
-            method: "apex".into(), bits: 4, group_size: 64, preserved: false,
-            scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
-        };
-        assert_eq!(quant_info_to_ggml_type(&qi_override), GGML_TYPE_Q4_0);
+        // ADR-014 P11-prereq Iter C (2026-04-27): the legacy `apex`
+        // `Q4_K_M` → `GGML_TYPE_Q4_0` swallow was REMOVED.  Apex itself
+        // was already deleted by Decision 12; the only remaining
+        // production writer of `ggml_type = Some("Q[2-5]_K"…)` is the
+        // codec-direct sentinel path (locked below by
+        // `codec_direct_*_returns_*`), which now routes via Iter A's
+        // fast-path BEFORE this branch fires.  See
+        // `quant_info_to_ggml_type`'s Iter C audit comment.
+        //
+        // The `qi_override` case below now exercises the
+        // defence-in-depth guard: a K-quant `ggml_type` set WITHOUT
+        // `METHOD_K_QUANT_CODEC_DIRECT` is unreachable in production
+        // (audit lives at the function); if a future regression ever
+        // re-introduces the path it surfaces loudly via
+        // `debug_assert!(false, ...)` in debug builds + `warn!` →
+        // `GGML_TYPE_F16` in release.  We test the release behaviour
+        // by walking the function body explicitly: the assertion
+        // panics in `cfg(debug_assertions)` so we route the test
+        // around the call when debug_assertions is on, locking only
+        // the release branch.  In release builds the function returns
+        // `GGML_TYPE_F16` without panicking.
+        #[cfg(not(debug_assertions))]
+        {
+            let qi_override = TensorQuantInfo {
+                method: "apex".into(), bits: 4, group_size: 64, preserved: false,
+                scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
+            };
+            assert_eq!(
+                quant_info_to_ggml_type(&qi_override),
+                GGML_TYPE_F16,
+                "Iter C: K-quant ggml_type without codec-direct sentinel falls \
+                 back to F16 in release (defence-in-depth, was Q4_0 pre-Iter C)"
+            );
+        }
 
-        // Q6_K override is now honored directly (we can produce Q6_K blocks)
+        // Q6_K override (no codec-direct sentinel) is still honored
+        // directly — this branch was preserved by Iter C because the
+        // bare-name path is exercised by this test and the Q6_K leg
+        // does not need the codec-direct sentinel to disambiguate
+        // bytes (Q6_K kernel + repack arms exist).
         let qi_q6k = TensorQuantInfo {
             method: "apex".into(), bits: 8, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q6_K".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_q6k), GGML_TYPE_Q6_K);
 
-        // Non-K-quant explicit type is still honored
+        // Non-K-quant explicit type is still honored.
         let qi_q4_0 = TensorQuantInfo {
             method: "custom".into(), bits: 4, group_size: 32, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q4_0".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_q4_0), GGML_TYPE_Q4_0);
 
-        // Unknown ggml_type falls back to bits-based mapping
+        // Unknown ggml_type falls back to bits-based mapping.  The
+        // `Q99_Z` name does NOT start with `Q[2-5]_K`, so it bypasses
+        // the Iter C defence-in-depth guard and lands in the
+        // bits-based table — same observable as pre-Iter C.
         let qi_unknown = TensorQuantInfo {
             method: "apex".into(), bits: 4, group_size: 64, preserved: false,
             scales: None, biases: None, ggml_type: Some("Q99_Z".into()),
@@ -3491,11 +3563,34 @@ mod tests {
         assert_eq!(quant_info_to_ggml_type(&qi_unknown), GGML_TYPE_Q4_0);
 
         // preserved=true always returns F16 regardless of ggml_type
+        // — short-circuits before the K-quant guard.
         let qi_preserved = TensorQuantInfo {
             method: "passthrough".into(), bits: 16, group_size: 0, preserved: true,
             scales: None, biases: None, ggml_type: Some("Q4_K_M".into()),
         };
         assert_eq!(quant_info_to_ggml_type(&qi_preserved), GGML_TYPE_F16);
+    }
+
+    /// ADR-014 P11-prereq Iter C: lock the defence-in-depth guard.  A
+    /// K-quant `ggml_type` set WITHOUT `METHOD_K_QUANT_CODEC_DIRECT`
+    /// must surface loudly in debug builds (`debug_assert!(false, ...)`
+    /// panics) — proves the swallow removal is real and a future
+    /// regression that re-introduces the apex-style path trips this
+    /// gate immediately.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "non-codec-direct K-quant path is dead code")]
+    fn iter_c_k_quant_without_codec_direct_sentinel_panics_in_debug() {
+        let qi = TensorQuantInfo {
+            method: "apex".into(),
+            bits: 4,
+            group_size: 64,
+            preserved: false,
+            scales: None,
+            biases: None,
+            ggml_type: Some("Q4_K_M".into()),
+        };
+        let _ = quant_info_to_ggml_type(&qi);
     }
 
     #[test]
