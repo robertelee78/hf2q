@@ -518,15 +518,18 @@ struct ExtractedToolCalls {
 /// non-streaming `chat_completions` handler to populate `message.tool_calls`
 /// (wave-2.5 A3 fix — previously hardcoded to `None`).
 ///
-/// Wave-2.5 A4: when `policy == Constrained` (tool_choice = required /
-/// function), a parse failure is promoted to an internal error signal
+/// Wave-2.5 A4 + Wave 3 W-B2: when the policy carries an active body
+/// grammar (`policy.enforces_body_grammar()` — `Constrained` for
+/// Required/Function, `AutoLazyGrammar` for Auto+tools+registered
+/// family), a parse failure is promoted to an internal error signal
 /// (`constrained_parse_failure = Some(body)`) instead of falling back to
 /// Content. The streaming path emits `GenerationEvent::Error`; the
 /// non-streaming path returns a 500 response to the client.
 ///
-/// `Auto` policy keeps the Content fallback — the model may legitimately
-/// produce partial/malformed syntax without a grammar guard, and re-emitting
-/// the raw body as content lets the client see what the model produced.
+/// `Auto` (no grammar) policy keeps the Content fallback — the model may
+/// legitimately produce partial/malformed syntax without a grammar guard,
+/// and re-emitting the raw body as content lets the client see what the
+/// model produced.
 fn extract_tool_calls_from_text(
     text: &str,
     registration: Option<&registry::ModelRegistration>,
@@ -585,20 +588,36 @@ fn extract_tool_calls_from_text(
                             tc_index += 1;
                         }
                         None => {
-                            // Wave-2.5 A4: for Constrained mode, signal failure
-                            // instead of falling back to Content.
-                            if policy == engine::ToolCallPolicy::Constrained {
+                            // Wave-2.5 A4 + Wave 3 W-B2: for any policy
+                            // carrying an active body grammar (Constrained
+                            // OR AutoLazyGrammar), signal failure instead
+                            // of falling back to Content.  The unified
+                            // gate is `policy.enforces_body_grammar()` —
+                            // single source of truth shared with the
+                            // streaming `emit_streaming_tool_call_close`.
+                            if policy.enforces_body_grammar() {
+                                let policy_label = match policy {
+                                    engine::ToolCallPolicy::Constrained => "required/function",
+                                    engine::ToolCallPolicy::AutoLazyGrammar => {
+                                        "auto (lazy grammar active)"
+                                    }
+                                    engine::ToolCallPolicy::Auto => {
+                                        unreachable!("enforces_body_grammar gate")
+                                    }
+                                };
                                 tracing::error!(
                                     body = %body,
-                                    "non-stream tool-call parse failure under Constrained \
-                                     policy (tool_choice=required/function)"
+                                    policy = policy_label,
+                                    "non-stream tool-call parse failure under {} policy \
+                                     — per-model body grammar should have prevented this",
+                                    policy_label
                                 );
                                 parse_failure = Some(body);
                             } else {
                                 tracing::warn!(
                                     body = %body,
                                     "non-stream tool-call body unparseable; emitting as \
-                                     content (tool_choice=auto)"
+                                     content (tool_choice=auto with no active grammar)"
                                 );
                                 content.push_str(&body);
                             }
@@ -1031,13 +1050,40 @@ where
     } else {
         None
     };
-    // Wave-2.5 A4: derive ToolCallPolicy from tool_choice.  Required and
-    // Function modes use grammar-constrained decoding; parse failures on those
-    // paths are server bugs, not graceful-degradation opportunities.  Auto
-    // (and None, which suppresses tools entirely) keeps the content fallback.
+    // Wave-2.5 A4 + Wave 3 W-B2: derive ToolCallPolicy from tool_choice
+    // AND the compile_tool_grammar outcome.  Three branches:
+    //
+    //   * Required / Function → `Constrained` (eager grammar from byte 0;
+    //     parse failures are server bugs, not graceful-degradation
+    //     opportunities).
+    //   * Auto + compiled grammar (W-B2: tools[] non-empty AND model
+    //     family registered) → `AutoLazyGrammar` (lazy grammar active
+    //     post-trigger; same loud-error semantics as Constrained for
+    //     mid-call truncation + body-parse failures).
+    //   * Auto without grammar (no tools[] OR unregistered family) +
+    //     None → `Auto` (no enforcement, content fallback preserved).
+    //
+    // The Auto branch's grammar-vs-no-grammar split mirrors llama.cpp's
+    // grammar_lazy gate at common/chat.cpp:898-913, 1177-1200,
+    // 1399-1416, 1626-1628 — when llama.cpp compiles an Auto grammar
+    // it equally treats body-parse failures as grammar-engine bugs.
     let tc_policy = match &tool_choice {
         super::schema::ToolChoiceValue::Required | super::schema::ToolChoiceValue::Function(_) => {
             engine::ToolCallPolicy::Constrained
+        }
+        super::schema::ToolChoiceValue::Auto if effective_grammar.is_some()
+            && matches!(effective_grammar_kind, engine::GrammarKind::ToolCallBodyAuto) =>
+        {
+            // Wave 3 W-B2: Auto with a compiled lazy grammar.  The
+            // `effective_grammar_kind == ToolCallBodyAuto` guard ensures
+            // we only flip to AutoLazyGrammar when the grammar slot is
+            // OUR Auto-lazy compile — NOT a response_format grammar that
+            // happened to land in the tool slot via the wave-2.6 W-α5
+            // selection rule (`select_effective_grammar` propagates the
+            // tool-grammar kind only when the tool slot won; if it's a
+            // response-format grammar the kind is `ResponseFormat` and
+            // we keep `Auto` semantics).
+            engine::ToolCallPolicy::AutoLazyGrammar
         }
         _ => engine::ToolCallPolicy::Auto,
     };
@@ -6556,6 +6602,101 @@ mod test_a3_tool_call_extraction {
         );
         // The handler will see (policy == Constrained && tool_calls.is_empty())
         // and return ApiError::generation_error("tool_call_no_call_under_constrained").
+    }
+
+    /// Wave 3 W-B2 — non-streaming T2.4 final closure for
+    /// AutoLazyGrammar.  Mirrors the Constrained `extract` parse-failure
+    /// promotion: under AutoLazyGrammar, a malformed body inside the
+    /// open/close markers MUST set `constrained_parse_failure = Some(body)`
+    /// (which the chat handler at handlers.rs:401-408 promotes to HTTP 500),
+    /// NOT silently demote to plain content.
+    ///
+    /// Pre-W-B2 this exact input under
+    /// `tool_choice=auto + tools[] + registered family` would have:
+    ///   * had `ToolCallPolicy::Auto` (the only Auto variant), and
+    ///   * the body would have been re-emitted as Content (silent fallback).
+    /// Post-W-B2 the handler sets `AutoLazyGrammar` for the
+    /// auto+tools+registered branch, and this branch promotes the parse
+    /// failure to a structured server-side error so the regression
+    /// (lazy grammar engine produced invalid output) surfaces as a 500.
+    #[test]
+    fn malformed_body_under_auto_lazy_grammar_yields_parse_failure() {
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return,
+        };
+
+        // Body shape that DOES NOT match the Gemma4 call grammar (no
+        // `call:NAME{}` prefix; `parse_tool_call_body` returns None).
+        let bad_body = "totally malformed body bytes — not a call";
+        let full_text = format!("preamble {open}{bad_body}{close}");
+
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::AutoLazyGrammar,
+        );
+
+        // Same assertions as the existing wave-2.5 A4 Constrained test:
+        assert!(
+            result.tool_calls.is_empty(),
+            "malformed body MUST NOT produce a parsed tool call"
+        );
+        assert!(
+            result.constrained_parse_failure.is_some(),
+            "AutoLazyGrammar parse failure MUST set constrained_parse_failure \
+             (loud-error promotion identical to Constrained); pre-W-B2 this \
+             would have demoted to Content"
+        );
+        let failed = result.constrained_parse_failure.unwrap();
+        assert_eq!(
+            failed, bad_body,
+            "constrained_parse_failure MUST carry the unparseable body bytes \
+             verbatim for the operator to inspect; got: {failed:?}"
+        );
+        // The handler will see Some(_) at handlers.rs:401-408 and respond
+        // with HTTP 500 + tool_call_parse_failure structured error.
+    }
+
+    /// Wave 3 W-B2 regression-preserve — Auto (no grammar) parse failure
+    /// MUST still demote the body to Content. The W-B2 narrowing only
+    /// affects the registered-family+tools path; the "vanilla Auto"
+    /// branch (no tools[] OR unknown family) keeps its content fallback.
+    #[test]
+    fn malformed_body_under_auto_no_grammar_demotes_to_content() {
+        let reg = gemma4_reg();
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => return,
+        };
+
+        let bad_body = "totally malformed body bytes — not a call";
+        let full_text = format!("{open}{bad_body}{close}");
+
+        let result = extract_tool_calls_from_text(
+            &full_text,
+            Some(&reg),
+            engine::ToolCallPolicy::Auto,
+        );
+
+        assert!(
+            result.tool_calls.is_empty(),
+            "malformed body MUST NOT produce a parsed tool call"
+        );
+        assert!(
+            result.constrained_parse_failure.is_none(),
+            "Auto (no grammar) MUST keep the content-fallback semantics — \
+             parse failure does NOT promote to constrained_parse_failure \
+             (W-B2 only narrowed the registered-family path; vanilla Auto \
+             remains unchanged)"
+        );
+        assert!(
+            result.content.contains(bad_body),
+            "Auto (no grammar) MUST re-emit the malformed body as Content; \
+             got content: {:?}",
+            result.content
+        );
     }
 }
 

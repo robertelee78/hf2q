@@ -86,22 +86,75 @@ use crate::serve::sampler_pure::{
 /// because there is no grammar constraint and a partial/malformed tool call
 /// is recoverable by the client as plain text.
 ///
+/// Wave 3 W-B2 — `AutoLazyGrammar` variant added.  Once the W-B2 lazy
+/// grammar wiring lands (`compile_tool_grammar` returns `Some(grammar)`
+/// for `tool_choice=auto` with tools[] non-empty AND a registered
+/// family), Auto becomes a constrained mode FROM `ToolCallOpen` ONWARDS.
+/// The model is free to emit preamble content; once the open marker
+/// fires the grammar enforces every body byte.  In that scenario a
+/// body-parse-failure is structurally impossible — exactly the same
+/// invariant that promotes Constrained's body-parse failure to a loud
+/// error.  `AutoLazyGrammar` carries that contract through to the
+/// streaming `emit_streaming_tool_call_close` and the non-streaming
+/// `extract_tool_calls_from_text` so the loud-error promotion fires
+/// equally on Required/Function AND Auto-with-grammar paths.
+///
+/// `Auto` (no grammar) keeps the content-fallback semantics — only fires
+/// when the request is Auto AND tools[] is empty OR the model family is
+/// unknown OR `tool_choice` was Auto and `compile_tool_grammar` returned
+/// `Ok(None)`.  Under that branch there is no grammar enforcement, the
+/// model may legitimately emit malformed syntax, and re-emitting the
+/// raw bytes as Content is the right semantics.
+///
 /// # Why not derive from `schema::ToolChoiceValue` here
 ///
 /// `SamplingParams` is an engine-layer type; it must not import from
 /// `schema` (HTTP-layer).  This enum re-expresses only the
-/// policy-relevant distinctions (Auto vs Constrained).
+/// policy-relevant distinctions (Auto / AutoLazyGrammar / Constrained).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolCallPolicy {
-    /// `tool_choice = "auto"` (or absent).  The model may or may not call a
-    /// tool; parse failures fall back to Content (existing behavior).
+    /// `tool_choice = "auto"` (or absent) AND no compiled grammar.  Grammar
+    /// is optional under Auto, so this branch fires when:
+    ///   * `tools[]` is empty / missing, OR
+    ///   * the model family has no registered tool-call emitter, OR
+    ///   * `tool_choice` was explicitly `"auto"` and the request never
+    ///     declared tools.
+    ///
+    /// Body-parse failures fall back to Content (existing wave-2.5
+    /// behaviour). Mirrors llama.cpp's unconstrained tool-call path.
     #[default]
     Auto,
+    /// Wave 3 W-B2 — `tool_choice = "auto"` AND a lazy grammar IS active.
+    /// `compile_tool_grammar` produced a `GrammarKind::ToolCallBodyAuto`
+    /// runtime that is suspended (`awaiting_trigger=true`) until the
+    /// `ToolCallSplitter` reports `ToolCallOpen`; from that point onwards
+    /// the grammar enforces every body byte exactly like the Constrained
+    /// path. A parse failure under this policy means the lazy grammar
+    /// engine produced structurally invalid output — same regression
+    /// signature as Constrained, same loud-error promotion required.
+    ///
+    /// Mirrors llama.cpp `grammar_lazy=true` at common/chat.cpp:898-913,
+    /// 1177-1200, 1399-1416, 1626-1628.
+    AutoLazyGrammar,
     /// `tool_choice = "required"` or `tool_choice = {type: "function", ...}`.
-    /// Grammar guarantees well-formed output; a parse failure is promoted to
-    /// `GenerationEvent::Error` with `finish_reason = "error"` on the
-    /// streaming path, and an HTTP 500 on the non-streaming path.
+    /// Grammar guarantees well-formed output FROM BYTE 0; a parse failure is
+    /// promoted to `GenerationEvent::Error` with `finish_reason = "error"`
+    /// on the streaming path, and an HTTP 500 on the non-streaming path.
     Constrained,
+}
+
+impl ToolCallPolicy {
+    /// `true` when the policy carries an active grammar that physically
+    /// constrains the tool-call body (Constrained from byte 0, or
+    /// AutoLazyGrammar from `ToolCallOpen` onwards).  Body-parse failures
+    /// under these policies are unreachable in correct operation and
+    /// promote to loud errors. Wave 3 W-B2 — single source of truth for
+    /// the loud-error decision used by both streaming
+    /// (`emit_streaming_tool_call_close`) and non-streaming
+    /// (`extract_tool_calls_from_text`) paths.
+    pub fn enforces_body_grammar(&self) -> bool {
+        matches!(self, ToolCallPolicy::Constrained | ToolCallPolicy::AutoLazyGrammar)
+    }
 }
 
 /// Kind discriminant for the grammar attached to a request.
@@ -1858,29 +1911,44 @@ enum FinalizeStreamingAction {
 }
 
 /// Drain the tool-call splitter tail at end-of-stream and then enforce the
-/// Constrained-policy safety nets before the streaming `Done` event.
+/// grammar-active-policy safety nets before the streaming `Done` event.
 ///
 /// Wave 2.8 W-θ HIGH-1 — streaming companion to the non-streaming
 /// defensive 500 in `handlers.rs:410-444` (commit da545d5).
+/// Wave 3 W-B2 — `AutoLazyGrammar` joins `Constrained` in the loud-error
+/// branch (mid-call truncation only; no-call check stays Constrained-only
+/// because Auto-lazy explicitly allows the model to emit zero calls).
 ///
 /// Behaviour matrix (`policy` = `tool_call_policy`):
 /// ```text
-///                       │ Auto                            │ Constrained
+///                       │ Auto (no grammar)              │ AutoLazyGrammar / Constrained
 /// ─────────────────────┼─────────────────────────────────┼────────────────────────────────
 /// finish() = Content   │ emit Content                    │ emit Content
 /// finish() = TC-text   │ emit Content (open-marker re-   │ emit GenerationEvent::Error
 ///                       │   prepended for clarity)        │   "tool_call_truncated_under_constrained"
 ///                       │                                 │   → ErrorEmitted
-/// post-drain no call   │ no action                       │ emit GenerationEvent::Error
+/// post-drain no call   │ no action                       │ Constrained ONLY: emit Error
 ///                       │                                 │   "tool_call_no_call_under_constrained"
-///                       │                                 │   → ErrorEmitted
+///                       │                                 │ AutoLazyGrammar: no action
+///                       │                                 │   (Auto explicitly allows no-call)
 /// ```
 ///
-/// Both error branches should be unreachable when Q-A's eager grammar is
-/// correctly emitted and the decode loop ran to a normal stop — they are
-/// loud-failure safety nets so a regression surfaces as an SSE error
-/// chunk, not as silent content fallback (the wave-2.6 audit divergence
-/// "Required/Function enforcement before ToolCallOpen").
+/// **Why mid-call truncation errors under both Constrained AND
+/// AutoLazyGrammar**: in either case the grammar is active inside the
+/// tool-call body. A truncation past the open marker but before the
+/// close marker means decoding stopped mid-grammar — the runtime is
+/// neither `is_accepted()` nor `is_dead()` and the body bytes captured
+/// so far cannot be parsed into a tool call. Same regression signature
+/// as Constrained truncation; same loud-error promotion.
+///
+/// **Why no-call check stays Constrained-only**: Auto explicitly permits
+/// the model to emit zero tool calls (preamble freedom — the whole
+/// point of lazy grammar). A streaming run that ended without ever
+/// firing `ToolCallOpen` is the legitimate Auto-no-call path, NOT a
+/// regression. Required/Function on the other hand mandate at least
+/// one call (the eager grammar root accepts only `OneOrMoreCalls`),
+/// so a no-call run there means max_tokens cut the call mid-emission
+/// or the grammar emitter has a bug.
 ///
 /// Extracted from the inline finalize block so the audit-driver test for
 /// HIGH-1 can exercise this exact code path. See
@@ -1896,6 +1964,13 @@ fn finalize_streaming_tool_state(
 ) -> FinalizeStreamingAction {
     use super::sse::{DeltaKind, GenerationEvent};
 
+    // Wave 3 W-B2: mid-call truncation fires for any policy carrying an
+    // active body grammar (Constrained from byte 0, AutoLazyGrammar from
+    // ToolCallOpen onwards). The single source of truth lives in
+    // `ToolCallPolicy::enforces_body_grammar`.
+    let body_grammar_active = policy.enforces_body_grammar();
+    // Wave 3 W-B2: no-call check stays Constrained-only; AutoLazyGrammar
+    // explicitly allows the model to emit zero calls (preamble freedom).
     let policy_constrained = matches!(policy, ToolCallPolicy::Constrained);
 
     if let Some(tcs) = tool_splitter {
@@ -1914,26 +1989,38 @@ fn finalize_streaming_tool_state(
                     }
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
-                    if policy_constrained {
-                        // HIGH-1 streaming companion to da545d5: emit a
-                        // structured error event INSTEAD of silently
-                        // re-emitting the residual as Content.
+                    if body_grammar_active {
+                        // HIGH-1 streaming companion to da545d5 + Wave 3
+                        // W-B2: emit a structured error event INSTEAD of
+                        // silently re-emitting the residual as Content.
+                        // Fires for Constrained AND AutoLazyGrammar.
+                        let policy_label = match policy {
+                            ToolCallPolicy::Constrained => "required/function",
+                            ToolCallPolicy::AutoLazyGrammar => {
+                                "auto (lazy grammar active)"
+                            }
+                            ToolCallPolicy::Auto => {
+                                unreachable!("body_grammar_active gate")
+                            }
+                        };
                         tracing::error!(
                             residual_len = t.len(),
+                            policy = policy_label,
                             "tool_call_truncated_under_constrained: streaming \
                              ended mid-tool-call (open marker observed, no close \
-                             marker) under tool_choice=required/function; eager \
-                             grammar should have prevented this"
+                             marker) under tool_choice={}; per-model body \
+                             grammar should have prevented this",
+                            policy_label
                         );
                         let _ = events.blocking_send(GenerationEvent::Error(
                             "tool_call_truncated_under_constrained".into(),
                         ));
                         return FinalizeStreamingAction::ErrorEmitted;
                     }
-                    // Auto: legacy behaviour — emit residual body as
-                    // Content with the literal open marker re-prepended
-                    // for diagnostic clarity (the splitter swallowed the
-                    // open marker when it flipped state).
+                    // Auto (no grammar): legacy behaviour — emit residual
+                    // body as Content with the literal open marker
+                    // re-prepended for diagnostic clarity (the splitter
+                    // swallowed the open marker when it flipped state).
                     let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
                     let fallback = format!("{prefix}{t}");
                     if !fallback.is_empty()
@@ -1956,6 +2043,10 @@ fn finalize_streaming_tool_state(
     }
 
     // Post-drain no-call check — streaming companion to handlers.rs:410-444.
+    // Constrained ONLY (Required/Function): grammar root mandates
+    // OneOrMoreCalls; a no-call run is a regression. AutoLazyGrammar
+    // explicitly permits no-call (the whole point of lazy grammar is
+    // preamble freedom + optional emission).
     if policy_constrained && !saw_tool_call {
         tracing::error!(
             completion_tokens = completion_tokens,
@@ -1977,12 +2068,14 @@ fn finalize_streaming_tool_state(
 /// Dispatch the close-time tool-call body after `ToolCallClose` fires in the
 /// streaming `route_content` closure.
 ///
-/// Wave 3 W-A3 — T2.4 partial removal (body-parse-failure case).
+/// Wave 3 W-A3 — T2.4 partial removal (Constrained body-parse-failure case).
+/// Wave 3 W-B2 — T2.4 final closure: `AutoLazyGrammar` joins `Constrained`
+/// in the loud-error branch.
 ///
 /// ## Behaviour matrix
 ///
 /// ```text
-///                       │ Constrained                     │ Auto
+///                       │ Constrained / AutoLazyGrammar   │ Auto (no grammar)
 /// ─────────────────────┼─────────────────────────────────┼────────────────────────────────
 /// parse OK              │ emit ToolCallDelta ×2           │ emit ToolCallDelta ×2
 /// parse FAILURE         │ emit GenerationEvent::Error     │ emit delta.content fallback
@@ -1992,19 +2085,28 @@ fn finalize_streaming_tool_state(
 ///                       │ → Err(())                       │ → Ok(())  [or Err if send fails]
 /// ```
 ///
-/// **Why Auto preserves the content fallback**: under Auto there is no grammar
-/// enforcing body shape. A model can legitimately emit malformed / partial
-/// tool-call syntax and the caller should still see the raw bytes rather than
-/// losing them silently. The content fallback is NOT a correctness hole here —
-/// it is the defined behaviour for the unconstrained path. Auto will get full
-/// T2.4 closure when Wave 3 Phase B lazy Auto-mode grammar lands.
+/// **Why Auto (no grammar) preserves the content fallback**: when the
+/// request is `tool_choice=auto` AND no grammar is active (no tools[]
+/// declared, OR an unregistered model family) there is no enforcement on
+/// body shape. A model can legitimately emit malformed / partial
+/// tool-call syntax and the caller should still see the raw bytes rather
+/// than losing them silently. The content fallback is the defined
+/// behaviour for this unconstrained branch.
 ///
-/// **Why Constrained errors loudly**: since wave-2.7 W-η da545d5 the eager
-/// grammar physically constrains every token in the body. A parse failure
-/// therefore means the grammar engine produced structurally invalid output —
-/// this is a server-side regression, not a model quality issue. Surfacing it
-/// as a loud error (rather than a silent content fallback) makes the regression
+/// **Why Constrained AND AutoLazyGrammar both error loudly**: under
+/// `Constrained` the wave-2.7 W-η da545d5 eager grammar constrains every
+/// token from byte 0. Under `AutoLazyGrammar` (wave 3 W-B2) the same
+/// per-model body grammar is active from `ToolCallOpen` onwards via the
+/// `awaiting_trigger` gate flip. In both cases the grammar physically
+/// constrains the body bytes, so a body-parse failure means the grammar
+/// engine produced structurally invalid output — a server-side
+/// regression, not a model quality issue. Surfacing it as a loud error
+/// (rather than a silent content fallback) makes the regression
 /// immediately visible to operators.
+///
+/// The unified gate is `policy.enforces_body_grammar()` — see
+/// `ToolCallPolicy::enforces_body_grammar` for the single source of
+/// truth.
 ///
 /// Extracted from the `route_content` closure so audit-driver tests can
 /// exercise this exact code path directly (same extraction pattern as
@@ -2063,39 +2165,45 @@ fn emit_streaming_tool_call_close(
             Ok(())
         }
         None => {
-            // Wave 3 W-A3 — T2.4 partial removal.
+            // Wave 3 W-A3 + W-B2 — T2.4 final closure on registered families.
             //
-            // Constrained (Required / Function): the eager grammar installed
-            // by wave-2.7 W-η da545d5 physically constrains every body token.
-            // A parse failure here is unreachable in correct operation — it
-            // means the grammar engine has a bug and let through malformed
-            // output.  Promote to a loud structured error so the regression
-            // surfaces immediately rather than being silently swallowed by the
-            // content fallback.
+            // Both Constrained AND AutoLazyGrammar carry an active grammar
+            // that physically constrains the body — Constrained from byte 0
+            // (eager), AutoLazyGrammar from `ToolCallOpen` onwards (lazy).
+            // A parse failure under either policy means the grammar engine
+            // produced structurally invalid output. Promote to a loud
+            // structured error so the regression surfaces immediately
+            // rather than being silently swallowed by the content fallback.
             //
-            // Auto: no grammar enforcement is active. The model may legitimately
-            // emit partial / malformed tool-call syntax; re-emitting the body
-            // as Content lets the client see what the model intended.  Full T2.4
-            // closure for Auto deferred to Wave 3 Phase B (lazy Auto grammar).
-            if matches!(policy, ToolCallPolicy::Constrained) {
+            // Auto (no grammar): legitimate parse-failure path. The model
+            // emitted malformed syntax with no grammar to constrain it;
+            // re-emit as content so the caller sees what the model intended.
+            if policy.enforces_body_grammar() {
+                let policy_label = match policy {
+                    ToolCallPolicy::Constrained => "constrained (required/function)",
+                    ToolCallPolicy::AutoLazyGrammar => "auto-lazy-grammar (wave-3 W-B2)",
+                    ToolCallPolicy::Auto => unreachable!("enforces_body_grammar gate"),
+                };
                 tracing::error!(
                     body = %body_dump,
+                    policy = policy_label,
                     "tool_call_unreachable_fallback_required: tool-call body \
-                     unparseable under Constrained policy \
-                     (tool_choice=required/function); eager grammar (wave-2.7 \
-                     W-η da545d5) should have prevented this — grammar engine bug"
+                     unparseable under {} policy; the per-model body grammar \
+                     should have prevented this — grammar engine bug",
+                    policy_label
                 );
                 let _ = events.blocking_send(GenerationEvent::Error(
                     "tool_call_unreachable_fallback_required".into(),
                 ));
                 return Err(());
             }
-            // Auto path: preserve the pre-wave-2.5 content fallback.
-            // (See function doc above for the rationale.)
+            // Auto (no grammar) path: preserve the pre-wave-2.5 content
+            // fallback. (See function doc above for the rationale.)
             tracing::warn!(
                 body = %body_dump,
                 "tool-call body unparseable; emitting as content fallback \
-                 (tool_choice=auto — no grammar enforcement on body shape)"
+                 (tool_choice=auto with no active grammar — no enforcement \
+                 on body shape; either tools[] empty or unregistered family)"
             );
             if events
                 .blocking_send(GenerationEvent::Delta {
@@ -4885,6 +4993,129 @@ mod finalize_streaming_tool_state_tests {
         );
     }
 
+    /// Wave 3 W-B2 — AutoLazyGrammar mid-call truncation MUST yield the
+    /// SAME loud-error event as Constrained.
+    ///
+    /// Under AutoLazyGrammar the per-model body grammar is active inside
+    /// the tool-call span (post-trigger). A truncation past ToolCallOpen
+    /// without ToolCallClose means decoding stopped mid-grammar — the
+    /// runtime is neither accepted nor dead. Same regression signature
+    /// as Constrained truncation; same `tool_call_truncated_under_constrained`
+    /// error code (preserves the structured-vocabulary single source of
+    /// truth so log/metrics matchers continue to work unchanged).
+    #[test]
+    fn streaming_auto_lazy_grammar_mid_call_truncation_yields_error_event() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg)
+            .expect("gemma4 has tool markers, splitter must build");
+
+        let open = reg.tool_open.expect("gemma4 has tool_open");
+        let _ = splitter.feed(&format!("{open}call:get_weather{{"));
+        assert!(
+            splitter.in_tool_call(),
+            "splitter must be in_tool_call after open marker; finish() will \
+             then return ToolCallText (mid-call truncation)"
+        );
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::AutoLazyGrammar,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            /* completion_tokens */ 7,
+            /* accumulated_text_len */ 18,
+            &tx,
+        );
+
+        assert_eq!(
+            action,
+            FinalizeStreamingAction::ErrorEmitted,
+            "AutoLazyGrammar + ToolCallText residual MUST return ErrorEmitted \
+             identically to Constrained — the lazy grammar IS active inside \
+             the body so a truncation is a regression"
+        );
+
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one error event expected, got: {:?}",
+            events
+        );
+        match &events[0] {
+            GenerationEvent::Error(code) => {
+                assert_eq!(
+                    code, "tool_call_truncated_under_constrained",
+                    "structured error code MUST match the unified vocabulary; \
+                     AutoLazyGrammar reuses the Constrained code so log/metrics \
+                     matchers continue to work unchanged"
+                );
+            }
+            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                panic!(
+                    "REGRESSION: AutoLazyGrammar mid-call truncation emitted \
+                     Content fallback (text={text:?}); the wave-3 W-B2 T2.4 \
+                     final closure MUST promote this to Error"
+                );
+            }
+            other => panic!(
+                "expected GenerationEvent::Error, got: {:?} \
+                 (silent Content fallback would be the wave-2.6 audit divergence)",
+                other
+            ),
+        }
+    }
+
+    /// Wave 3 W-B2 — AutoLazyGrammar with NO call must NOT trigger the
+    /// no-call check.
+    ///
+    /// Auto explicitly permits the model to emit zero tool calls
+    /// (preamble freedom — the whole point of lazy grammar). A streaming
+    /// run that ended without ever firing `ToolCallOpen` is the
+    /// legitimate Auto-no-call path under AutoLazyGrammar, NOT a
+    /// regression.  This is the key semantic distinction from
+    /// `ToolCallPolicy::Constrained` (where the eager grammar's
+    /// OneOrMoreCalls root mandates >= 1 call).
+    #[test]
+    fn streaming_auto_lazy_grammar_no_call_emits_no_events() {
+        let reg = gemma4_reg();
+        let mut splitter = ToolCallSplitter::from_registration(&reg).unwrap();
+        // Idle splitter, no feed.
+        assert!(!splitter.in_tool_call());
+
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+
+        let action = finalize_streaming_tool_state(
+            Some(&mut splitter),
+            ToolCallPolicy::AutoLazyGrammar,
+            /* saw_tool_call */ false,
+            Some(&reg),
+            64,
+            0,
+            &tx,
+        );
+        assert_eq!(
+            action,
+            FinalizeStreamingAction::Continue,
+            "AutoLazyGrammar + idle splitter MUST return Continue — Auto \
+             explicitly allows the model to emit zero tool calls (preamble \
+             freedom is the whole point of lazy grammar). The no-call check \
+             stays Constrained-only."
+        );
+        drop(tx);
+        let events = drain_recv(&mut rx);
+        assert!(
+            events.is_empty(),
+            "AutoLazyGrammar + idle splitter must emit no finalize events; \
+             got {:?}",
+            events
+        );
+    }
+
     /// Constrained policy with `saw_tool_call == true` (the model produced
     /// at least one full call): no-call check MUST NOT fire even though
     /// policy is Constrained. The helper returns `Continue`.
@@ -4926,20 +5157,29 @@ mod finalize_streaming_tool_state_tests {
 
 // ---------------------------------------------------------------------------
 // Wave 3 W-A3 — emit_streaming_tool_call_close (T2.4 partial removal)
+// Wave 3 W-B2 — emit_streaming_tool_call_close (T2.4 final closure on
+//               registered Auto-with-tools path)
 //
 // Audit-driver tests for the body-parse-failure branches of
-// `emit_streaming_tool_call_close`.  Two scenarios required:
+// `emit_streaming_tool_call_close`.  Three scenarios:
 //
-//   1. `required_body_parse_failure_yields_error_not_content` — Constrained
-//      policy + parse failure → GenerationEvent::Error("tool_call_unreachable_
-//      fallback_required").  MUST NOT emit Content.
+//   1. `required_body_parse_failure_yields_error_not_content` (W-A3) —
+//      Constrained policy + parse failure → GenerationEvent::Error
+//      ("tool_call_unreachable_fallback_required"). MUST NOT emit Content.
 //
-//   2. `auto_body_parse_failure_preserves_content_fallback` — Auto policy +
-//      parse failure → GenerationEvent::Delta{Content, body_dump}.  This is
-//      the regression-preserve test; the content fallback for Auto is the
-//      defined behaviour and MUST NOT regress.
+//   2. `auto_lazy_grammar_body_parse_failure_yields_error_not_content`
+//      (W-B2) — AutoLazyGrammar policy + parse failure →
+//      GenerationEvent::Error("tool_call_unreachable_fallback_required").
+//      MUST NOT emit Content.  Same loud-error promotion as Constrained
+//      because the lazy grammar IS active inside the body.
 //
-// Both tests drive `emit_streaming_tool_call_close` directly with
+//   3. `auto_body_parse_failure_preserves_content_fallback` (W-A3) —
+//      Auto (no grammar) policy + parse failure →
+//      GenerationEvent::Delta{Content, body_dump}.  Regression-preserve:
+//      the content fallback for unconstrained Auto (no tools[] / unknown
+//      family) is the defined behaviour and MUST NOT regress.
+//
+// All tests drive `emit_streaming_tool_call_close` directly with
 // `parsed = None` (simulating a malformed body after ToolCallClose fires).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -5026,19 +5266,100 @@ mod emit_streaming_tool_call_close_tests {
         }
     }
 
-    /// T2.4 regression-preserve — Auto path.
+    /// Wave 3 W-B2 — T2.4 FINAL closure for the registered-Auto path.
     ///
-    /// Simulates the same malformed body under tool_choice=Auto.
-    /// `emit_streaming_tool_call_close` MUST:
+    /// Simulates the same malformed body under
+    /// `ToolCallPolicy::AutoLazyGrammar` — the policy the handler sets
+    /// when `tool_choice=auto` AND the W-B2 lazy grammar IS active
+    /// (tools[] non-empty AND model family registered AND
+    /// `effective_grammar_kind == ToolCallBodyAuto`).
+    /// `emit_streaming_tool_call_close` MUST treat this branch
+    /// identically to Constrained:
+    ///   - return `Err(())`
+    ///   - emit exactly one `GenerationEvent::Error` with code
+    ///     `"tool_call_unreachable_fallback_required"`
+    ///   - NOT emit any `GenerationEvent::Delta { kind: Content, … }`
+    ///
+    /// Rationale: under AutoLazyGrammar the per-model body grammar is
+    /// active inside the tool-call span (the `awaiting_trigger` flag is
+    /// flipped by `route_content`'s ToolCallOpen handler before the
+    /// body bytes are accepted by the runtime). A parse failure
+    /// therefore means the lazy grammar engine produced structurally
+    /// invalid output — same regression signature as Constrained.
+    #[test]
+    fn auto_lazy_grammar_body_parse_failure_yields_error_not_content() {
+        let (tx, mut rx) = mpsc::channel::<GenerationEvent>(8);
+        let mut tc_index: usize = 0;
+        let mut saw_tc: bool = false;
+
+        let result = emit_streaming_tool_call_close(
+            None,
+            "garbage{{}}".to_string(),
+            ToolCallPolicy::AutoLazyGrammar,
+            &mut tc_index,
+            &mut saw_tc,
+            &tx,
+        );
+
+        assert!(
+            result.is_err(),
+            "AutoLazyGrammar + parse failure MUST return Err(()) \
+             (streaming driver aborts decode loop, identical to Constrained)"
+        );
+        assert_eq!(
+            tc_index, 0,
+            "tc_index must not be incremented on parse failure"
+        );
+        assert!(!saw_tc, "saw_tc must remain false on parse failure");
+
+        drop(tx);
+        let events = drain_recv(&mut rx);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one GenerationEvent::Error expected; got: {:?}",
+            events
+        );
+        match &events[0] {
+            GenerationEvent::Error(code) => {
+                assert_eq!(
+                    code, "tool_call_unreachable_fallback_required",
+                    "AutoLazyGrammar must emit the SAME error code as Constrained \
+                     (the unified loud-error vocabulary)"
+                );
+            }
+            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                panic!(
+                    "REGRESSION: AutoLazyGrammar parse failure emitted Content fallback \
+                     (text={text:?}); the wave-3 W-B2 T2.4 final closure MUST promote \
+                     this branch to Error identically to Constrained"
+                );
+            }
+            other => panic!(
+                "expected GenerationEvent::Error, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// T2.4 regression-preserve — Auto (no grammar) path.
+    ///
+    /// Simulates the same malformed body under
+    /// `ToolCallPolicy::Auto` — the policy the handler sets when
+    /// `tool_choice=auto` AND no grammar is active (no tools[] declared,
+    /// OR an unregistered model family). This branch MUST:
     ///   - return `Ok(())`
     ///   - emit exactly one `GenerationEvent::Delta { kind: Content, text: body_dump }`
     ///   - NOT emit `GenerationEvent::Error`
     ///
-    /// Under Auto there is no grammar enforcement.  The model may legitimately
-    /// emit partial / malformed tool-call syntax; preserving the content
-    /// fallback lets the client see the raw bytes rather than losing them.
-    /// This test MUST pass for the lifetime of the codebase until Wave 3
-    /// Phase B Auto lazy grammar replaces this path.
+    /// Under Auto-no-grammar there is no enforcement on body shape. The
+    /// model may legitimately emit partial / malformed tool-call syntax;
+    /// preserving the content fallback lets the client see the raw bytes
+    /// rather than losing them. Wave 3 W-B2 narrowed this branch (the
+    /// registered-family+tools path now uses `AutoLazyGrammar`), but the
+    /// remaining Auto-no-grammar slice still keeps the fallback — this
+    /// test pins it.
     #[test]
     fn auto_body_parse_failure_preserves_content_fallback() {
         let body = "some malformed body text".to_string();
