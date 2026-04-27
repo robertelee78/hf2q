@@ -188,6 +188,27 @@ impl ModelRegistration {
             )),
         }
     }
+
+    /// Per-family separator that appears between calls 2+ in a parallel
+    /// tool-call sequence.  Returned for the multi-function combiner case
+    /// (`combine_function_grammars`) so the alternated-across-functions
+    /// repetition uses the family-correct chat-template form.
+    ///
+    /// * Gemma 4: empty string — chat_template.jinja:189-205 emits calls
+    ///   back-to-back with no separator (`<|tool_call>...<tool_call|>`
+    ///   immediately followed by the next call's `<|tool_call>`).
+    /// * Qwen 3.5/3.6: `"\n"` — tokenizer_config.json:285+ chat_template's
+    ///   loop "else" branch prepends `\n` to calls 2+.
+    /// * Unknown families: empty string (no separator) is the safe
+    ///   default; the per-family emitter rejects unknown families before
+    ///   this method is called from `combine_function_grammars`.
+    pub fn parallel_call_separator(&self) -> &'static str {
+        match self.family {
+            "gemma4" => "",
+            "qwen35" => "\n",
+            _ => "",
+        }
+    }
 }
 
 /// Root-rule shape selector for `tool_call_gbnf`.
@@ -3078,6 +3099,96 @@ mod tests {
         assert!(
             !alive || rt.is_dead(),
             "second `<|tool_call>` must be rejected under parallel=false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 2.7 W-η Q-B — parallel_tool_calls grammar shape
+    //
+    // Audit-driving tests for the multi-call grammar shape per Codex audit
+    // divergence "Multi-tool re-entry" (severity med): the wave-2.6 worker
+    // landed the no-reset-on-close runtime semantics but kept the single-call
+    // grammar shape, so under `parallel_tool_calls=true` the model emitting a
+    // second open marker would silently drive the runtime dead.  Q-B emits
+    // `(call)+` (Gemma) and `call ("\n" call)*` (Qwen) so the runtime
+    // structurally accepts the natural multi-call template output.
+    // -----------------------------------------------------------------------
+
+    /// T-QB-1 (audit-driving): Gemma 4 parallel grammar accepts two
+    /// back-to-back calls with no separator (chat_template.jinja:189-205).
+    #[test]
+    fn gemma4_parallel_grammar_accepts_two_calls() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_required_runtime("get_weather", schema, true);
+        // Two back-to-back calls — Gemma chat_template emits with NO separator.
+        let input = b"<|tool_call>call:get_weather{location:<|\"|>SF<|\"|>}<tool_call|>\
+                     <|tool_call>call:get_weather{location:<|\"|>NYC<|\"|>}<tool_call|>";
+        assert!(
+            rt.accept_bytes(input),
+            "parallel Gemma 4 grammar must accept two back-to-back calls"
+        );
+        assert!(rt.is_accepted(), "two-call sequence not in accepting state");
+    }
+
+    /// T-QB-2 (audit-driving): Qwen 3.5/3.6 parallel grammar accepts two
+    /// calls separated by a literal `\n` (tokenizer_config.json:285+).
+    #[test]
+    fn qwen35_parallel_grammar_accepts_two_calls_separated_by_newline() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = qwen35_required_runtime("get_weather", schema, true);
+        // Two calls separated by literal `\n` per chat_template's `else` branch.
+        let input = b"<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>";
+        assert!(
+            rt.accept_bytes(input),
+            "parallel Qwen35 grammar must accept two calls with `\\n` separator"
+        );
+        assert!(rt.is_accepted(), "two-call sequence not accepted");
+    }
+
+    /// T-QB-3 (audit-driving): Qwen 3.5/3.6 parallel grammar REJECTS two
+    /// calls without the `\n` separator — the chat_template requires the
+    /// newline, so the grammar must too.
+    #[test]
+    fn qwen35_parallel_grammar_rejects_calls_without_newline_separator() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = qwen35_required_runtime("get_weather", schema, true);
+        // Two calls back-to-back with NO separator.  This violates the Qwen
+        // chat-template contract; the grammar must reject it.
+        let input = b"<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call><tool_call>\n<function=get_weather>\n<parameter=location>\nLondon\n</parameter>\n</function>\n</tool_call>";
+        let alive = rt.accept_bytes(input);
+        assert!(
+            !alive || !rt.is_accepted(),
+            "Qwen parallel grammar accepted two calls without `\\n` separator (should reject)"
+        );
+    }
+
+    /// T-QB-4: under `parallel = false`, Qwen 3.5/3.6 grammar REJECTS the
+    /// trailing `\n<tool_call>` of a second call.  Mirrors the Gemma 4
+    /// equivalent for Qwen's separator semantics.
+    #[test]
+    fn qwen35_required_grammar_rejects_second_call_when_parallel_false() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = qwen35_required_runtime("get_weather", schema, false);
+        let first = b"<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>";
+        assert!(rt.accept_bytes(first));
+        assert!(rt.is_accepted(), "first call must reach accepted state");
+        let second = b"\n<tool_call>";
+        let alive = rt.accept_bytes(second);
+        assert!(
+            !alive || rt.is_dead(),
+            "second call open must be rejected under parallel=false"
         );
     }
 }

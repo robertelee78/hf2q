@@ -2589,8 +2589,30 @@ fn compile_tool_grammar(
         _ => unreachable!("already checked above"),
     };
 
+    // Wave 2.7 W-η Q-B: read `parallel_tool_calls` (OpenAI default = true,
+    // matches Open WebUI default).  When the request supplies an explicit
+    // value we honor it; otherwise default to true so multi-call behaviour
+    // is enabled for clients that don't think about the flag.
+    let parallel = req.parallel_tool_calls.unwrap_or(true);
+
     // Emit per-function GBNF strings and combine into one grammar via
     // alternation. If only one function matches, no alternation is needed.
+    //
+    // Single-function case: per-function emitter handles the `(call)+`
+    // repetition (`OneOrMoreCalls{parallel}` directly).  Multi-function
+    // case: each per-function grammar is emitted as a SINGLE wrapped call
+    // (`parallel = false` at the per-function level) and the combiner
+    // glues them with alternation + family-correct repetition separator
+    // (`combine_function_grammars(parallel, separator)` below).  This
+    // split keeps the per-function repetition coherent for the common
+    // single-tool path while letting the combiner pick the family
+    // separator for multi-tool requests.
+    let per_fn_shape = if matching_tools.len() == 1 {
+        registry::GrammarShape::OneOrMoreCalls { parallel }
+    } else {
+        registry::GrammarShape::OneOrMoreCalls { parallel: false }
+    };
+
     let mut fn_gbnfs: Vec<String> = Vec::new();
     for tool in &matching_tools {
         let params_schema = tool
@@ -2599,13 +2621,7 @@ fn compile_tool_grammar(
             .as_ref()
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        // Wave 2.7 W-η Q-A: `compile_tool_grammar` only fires for
-        // `tool_choice = required / function`, so the emitter shape is
-        // always the eager full-call form.  `parallel` is wired to
-        // `false` here (Q-A scope); Wave 2.7 W-η Q-B extends this with
-        // `req.parallel_tool_calls`.
-        let shape = registry::GrammarShape::OneOrMoreCalls { parallel: false };
-        match reg.tool_call_gbnf(&tool.function.name, &params_schema, shape) {
+        match reg.tool_call_gbnf(&tool.function.name, &params_schema, per_fn_shape) {
             Ok(gbnf) => fn_gbnfs.push(gbnf),
             Err(e) => {
                 return Err(ApiError::grammar_error(format!(
@@ -2624,7 +2640,8 @@ fn compile_tool_grammar(
     let combined_gbnf = if fn_gbnfs.len() == 1 {
         fn_gbnfs.into_iter().next().unwrap()
     } else {
-        combine_function_grammars(fn_gbnfs)
+        let separator = reg.parallel_call_separator();
+        combine_function_grammars(fn_gbnfs, parallel, separator)
     };
 
     match grammar::parser::parse(&combined_gbnf) {
@@ -2697,21 +2714,79 @@ fn compile_tool_grammar(
 /// fails to re-parse.  Inputs come from the per-model emitters in
 /// `registry.rs` (Gemma 4 + Qwen 3.5/3.6) which are exercised by their own
 /// unit tests — a parse failure here is a logic bug, not user input.
-fn combine_function_grammars(gbnfs: Vec<String>) -> String {
+/// Combine multiple per-function GBNF grammars (Wave 2.7 W-η Q-B extension).
+///
+/// `parallel` and `separator_literal` control the multi-call repetition shape:
+///
+/// * `parallel = false` (or len == 1) — emit `root ::= fn-0-root | fn-1-root |
+///   ...`, the wave-2.6 single-call alternation behaviour.
+/// * `parallel = true` — emit `root ::= alt ( SEP alt )*` where `alt` is the
+///   alternation across functions and `SEP` is `separator_literal` (an empty
+///   string for Gemma 4, `"\n"` for Qwen 3.5/3.6 — see chat-template citations
+///   in `registry::GrammarShape::OneOrMoreCalls`).  When `separator_literal`
+///   is empty the GBNF reduces to `root ::= alt alt*` — the standard
+///   `alt+` idiom that mirrors llama.cpp's `p.repeat(call, 1, -1)` at
+///   common/chat.cpp:898-902.
+fn combine_function_grammars(
+    gbnfs: Vec<String>,
+    parallel: bool,
+    separator_literal: &str,
+) -> String {
     use grammar::parser::parse;
     use grammar::serialize::{rename_rules, serialize};
 
     let mut combined = String::with_capacity(gbnfs.iter().map(|g| g.len()).sum::<usize>() + 64);
 
-    // Step 1 — synthetic combined-root header: `root ::= fn-0-root | fn-1-root | …`.
-    combined.push_str("root ::= ");
-    for i in 0..gbnfs.len() {
-        if i > 0 {
-            combined.push_str(" | ");
+    // Step 1 — synthetic combined-root header.  Two shapes:
+    //
+    //   parallel=false                 → root ::= fn-0-root | fn-1-root | …
+    //   parallel=true,  no separator   → root ::= alt alt*
+    //                                    alt  ::= fn-0-root | fn-1-root | …
+    //   parallel=true,  with separator → root ::= alt ( "<sep>" alt )*
+    //                                    alt  ::= fn-0-root | fn-1-root | …
+    //
+    // The intermediate `alt` rule keeps the alternation a single GBNF
+    // production so the repetition operator binds correctly (an inline
+    // `(fn-0-root | fn-1-root)` would also work but introduces an extra
+    // parenthesized group the AST has to track).
+    if parallel {
+        combined.push_str("alt ::= ");
+        for i in 0..gbnfs.len() {
+            if i > 0 {
+                combined.push_str(" | ");
+            }
+            combined.push_str(&format!("fn-{}-root", i));
         }
-        combined.push_str(&format!("fn-{}-root", i));
+        combined.push('\n');
+        if separator_literal.is_empty() {
+            combined.push_str("root ::= alt alt*\n");
+        } else {
+            // GBNF literal needs string-escaping (mirrors registry::gbnf_literal).
+            // Only `\n` and `\\` matter for the separators we currently use.
+            let mut esc = String::with_capacity(separator_literal.len() + 2);
+            esc.push('"');
+            for c in separator_literal.chars() {
+                match c {
+                    '\n' => esc.push_str("\\n"),
+                    '\r' => esc.push_str("\\r"),
+                    '"' => esc.push_str("\\\""),
+                    '\\' => esc.push_str("\\\\"),
+                    _ => esc.push(c),
+                }
+            }
+            esc.push('"');
+            combined.push_str(&format!("root ::= alt ( {} alt )*\n", esc));
+        }
+    } else {
+        combined.push_str("root ::= ");
+        for i in 0..gbnfs.len() {
+            if i > 0 {
+                combined.push_str(" | ");
+            }
+            combined.push_str(&format!("fn-{}-root", i));
+        }
+        combined.push('\n');
     }
-    combined.push('\n');
 
     // Step 2 — for each input grammar, parse → rename → serialize.
     for (i, gbnf) in gbnfs.iter().enumerate() {
@@ -2811,7 +2886,13 @@ mod combine_function_grammars_tests {
     ///   - Runtime accepts a tool_b integer-shape call.
     #[test]
     fn multi_tool_shared_param_name_different_types() {
-        let combined = combine_function_grammars(vec![gbnf_for_tool_a(), gbnf_for_tool_b()]);
+        // Wave 2.7 W-η Q-B: legacy multi-tool combine test exercises the
+        // wave-2.6 single-call alternation behaviour (parallel=false).
+        let combined = combine_function_grammars(
+            vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
+            false,
+            "",
+        );
 
         // 1. Round-trip through the parser must succeed (the combiner already
         //    asserts this, but we duplicate the check at the test boundary).
@@ -2845,7 +2926,7 @@ mod combine_function_grammars_tests {
     /// and whose runtime accepts the same outputs as the un-combined source.
     #[test]
     fn single_tool_combine_roundtrip() {
-        let combined = combine_function_grammars(vec![gbnf_for_tool_a()]);
+        let combined = combine_function_grammars(vec![gbnf_for_tool_a()], false, "");
         let g = parse(&combined).expect("combined re-parses");
 
         assert!(
@@ -2938,7 +3019,7 @@ mod combine_function_grammars_tests {
         let gbnf_a = "root ::= \"A\" [^<\\\\]+\n".to_string();
         let gbnf_b = "root ::= \"B\" [^<\\\\]+\n".to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a.clone(), gbnf_b.clone()]);
+        let combined = combine_function_grammars(vec![gbnf_a.clone(), gbnf_b.clone()], false, "");
 
         // Re-parse must succeed.
         parse(&combined).expect("combined grammar must re-parse");
@@ -3008,7 +3089,7 @@ mod combine_function_grammars_tests {
         )
         .to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b]);
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "");
 
         // Round-trip: combined re-parses cleanly.
         let g = parse(&combined).expect("combined re-parses");
@@ -3059,7 +3140,7 @@ mod combine_function_grammars_tests {
         )
         .to_string();
 
-        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b]);
+        let combined = combine_function_grammars(vec![gbnf_a, gbnf_b], false, "");
         parse(&combined).expect("combined re-parses");
 
         // fn-0 string-shape ACCEPTED.
@@ -3101,7 +3182,7 @@ mod combine_function_grammars_tests {
     #[test]
     fn combine_single_function_yields_only_root_alternative() {
         let src = "root ::= \"X\" [a-z]+\n".to_string();
-        let combined = combine_function_grammars(vec![src.clone()]);
+        let combined = combine_function_grammars(vec![src.clone()], false, "");
         let g = parse(&combined).expect("combined re-parses");
 
         // The combined grammar's `root` rule body should be exactly a
