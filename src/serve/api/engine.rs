@@ -104,6 +104,64 @@ pub enum ToolCallPolicy {
     Constrained,
 }
 
+/// Kind discriminant for the grammar attached to a request.
+///
+/// Mirrors llama.cpp `enum common_grammar_type` at
+/// `/opt/llama.cpp/common/common.h:171-176`:
+///
+/// ```c++
+/// enum common_grammar_type {
+///     COMMON_GRAMMAR_TYPE_NONE,
+///     COMMON_GRAMMAR_TYPE_USER,
+///     COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT,
+///     COMMON_GRAMMAR_TYPE_TOOL_CALLS,
+/// };
+/// ```
+///
+/// Wave 2.6 W-α5 motivation (cfa-20260427-adr005-wave2.6 research-report.md
+/// Q1, audit `codex-review-last.txt` divergence "A1 / response_format
+/// regression" severity HIGH): without this kind, the wave-2.5 A1 fix
+/// gates **every** grammar on `ToolCallSplitter::in_tool_call()` — which
+/// silently disables `response_format=json_object` / `json_schema`
+/// enforcement on registered Gemma/Qwen models because the splitter never
+/// fires for non-tool requests.  The kind tells the runtime whether to
+/// enforce unconditionally (`ResponseFormat`) or to wait for a trigger
+/// before enforcing (`ToolCallBody`, the lazy-grammar pattern from
+/// llama.cpp PR #9639).
+///
+/// vLLM's `StructuredOutputsParams` and SGLang's mutually exclusive
+/// `json_schema` / `regex` / `ebnf` fields are the same shape — one
+/// constraint kind per request, asserted at request-parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrammarKind {
+    /// User-supplied or `response_format`-derived grammar.
+    /// Applies UNCONDITIONALLY for the entire generation, from the very
+    /// first token.  The grammar runtime never enters `awaiting_trigger`
+    /// state — the mask fires every step and `accept_bytes` advances
+    /// every step.  Pre-A1 (wave 2.4 and earlier) behavior.
+    ///
+    /// Mirrors `COMMON_GRAMMAR_TYPE_USER` + `COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT`
+    /// in llama.cpp.
+    ///
+    /// Default — preserves backward compatibility for any caller that
+    /// constructs `SamplingParams` without setting the field.
+    #[default]
+    ResponseFormat,
+    /// Tool-call body grammar (output of `compile_tool_grammar`).
+    /// Applies ONLY after the model emits the per-model open marker
+    /// (e.g. Gemma 4 `call:`, Qwen 3.5 `<function=`).  Until then, the
+    /// runtime sits in `awaiting_trigger == true`: `apply()` is a no-op
+    /// (no mask), `accept()` is a no-op (no advance, no
+    /// dead/accepted-state termination check).  When the
+    /// ToolCallSplitter sees the open marker, the engine calls
+    /// `runtime.trigger()` to flip the flag false; the runtime then
+    /// enforces every subsequent token through to the close marker.
+    ///
+    /// Mirrors `COMMON_GRAMMAR_TYPE_TOOL_CALLS` + `grammar_lazy=true`
+    /// in llama.cpp (`/opt/llama.cpp/src/llama-grammar.cpp:1287-1344`).
+    ToolCallBody,
+}
+
 /// - `parallel_tool_calls` — Tier 4; lands with the tool-call path
 ///   referenced at the worker dispatch site (see Decision #21 in the
 ///   registration block).
@@ -166,6 +224,19 @@ pub struct SamplingParams {
     /// (lazily built + cached on the Engine).  Cheap to attach: an
     /// Arc clone (no copy of the underlying vector).
     pub token_bytes: Option<Arc<Vec<Vec<u8>>>>,
+    /// Kind discriminant for the grammar attached above.
+    ///
+    /// Wave 2.6 W-α5 (research-report.md Q1, audit divergence "A1 /
+    /// response_format regression").  Decides whether the grammar runtime
+    /// is unconditionally enforcing (`ResponseFormat`, the default) or
+    /// trigger-gated (`ToolCallBody`).  Set by:
+    ///   * `compile_response_format` → `GrammarKind::ResponseFormat`
+    ///   * `compile_tool_grammar`    → `GrammarKind::ToolCallBody`
+    ///
+    /// Default = `ResponseFormat` so any caller that builds
+    /// `SamplingParams` without touching the field gets the
+    /// pre-wave-2.5 unconditional-enforcement behavior.
+    pub grammar_kind: GrammarKind,
 
     // --- Wave-2.5 A4 — Tool-call parse-failure policy ---
     /// Policy for handling tool-call body parse failures.  Set from
@@ -197,6 +268,7 @@ impl Default for SamplingParams {
             parallel_tool_calls: true,
             grammar: None,
             token_bytes: None,
+            grammar_kind: GrammarKind::default(),
             tool_call_policy: ToolCallPolicy::Auto,
         }
     }

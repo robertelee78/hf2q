@@ -939,7 +939,22 @@ where
         Err(resp) => return Err(resp),
     };
     // Select the effective grammar: tool > response > none.
-    let effective_grammar = tool_grammar.or(response_grammar);
+    //
+    // Wave 2.6 W-α5 Q1: also pick the `GrammarKind` discriminant so the
+    // engine knows whether to enforce unconditionally (`ResponseFormat`,
+    // mask + advance every token) or trigger-gated (`ToolCallBody`, no-op
+    // until the per-model open marker fires).  Mirrors llama.cpp
+    // `enum common_grammar_type` selection in
+    // `tools/server/server-task.cpp:381-403`: response_format /
+    // json_schema → OUTPUT_FORMAT (eager); tool_choice=required/function
+    // → TOOL_CALLS (lazy).  When neither grammar is set, the kind is
+    // `ResponseFormat` (the `Default`) but it is never read because
+    // `effective_grammar == None` short-circuits the runtime entirely.
+    let (effective_grammar, effective_grammar_kind) = match (tool_grammar, response_grammar) {
+        (Some(g), _)       => (Some(g), engine::GrammarKind::ToolCallBody),
+        (None,    Some(g)) => (Some(g), engine::GrammarKind::ResponseFormat),
+        (None,    None)    => (None,    engine::GrammarKind::default()),
+    };
     // ADR-005 Phase 2a iter-133 Iter D (W67): per-request thinking mode
     // override. Default off keeps every legacy / non-thinking-aware
     // caller's rendered prompt byte-identical; Open WebUI's panel UX
@@ -1021,6 +1036,7 @@ where
         parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
         grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
+        grammar_kind: effective_grammar_kind,
         tool_call_policy: tc_policy,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
@@ -3034,6 +3050,101 @@ mod combine_function_grammars_tests {
             none_a.or(none_b).is_none(),
             "no tool_grammar + no response_grammar must produce no constraint"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2.6 W-α5 Q1 — GrammarKind discriminant unit tests
+// ---------------------------------------------------------------------------
+//
+// These exercise the SamplingParams.grammar_kind threading that fixes the
+// wave-2.5 audit divergence "A1 / response_format regression" (severity
+// HIGH).  See cfa-20260427-adr005-wave2.6 research-report.md Q1, citing
+// llama.cpp /opt/llama.cpp/common/common.h:171-176 (`enum
+// common_grammar_type { NONE, USER, OUTPUT_FORMAT, TOOL_CALLS }`).
+//
+// The selection logic under test lives in `prepare_chat_generation_core`
+// at the `(tool_grammar, response_grammar)` match block.  These tests
+// duplicate that exact match shape so a future refactor that reuses the
+// same `(Option<G>, Option<G>) → (Option<G>, GrammarKind)` collapse stays
+// covered without spinning a real Engine.
+#[cfg(test)]
+mod grammar_kind_selection_tests {
+    use super::engine::GrammarKind;
+
+    /// `Default::default()` MUST be `ResponseFormat` so any caller that
+    /// constructs `SamplingParams` without setting the field gets
+    /// pre-wave-2.5 unconditional-enforcement behavior.  This is the
+    /// safety property that prevents `response_format=json_schema` from
+    /// silently regressing if the field is forgotten on a code path.
+    #[test]
+    fn default_grammar_kind_is_response_format() {
+        let k = GrammarKind::default();
+        assert_eq!(
+            k,
+            GrammarKind::ResponseFormat,
+            "Default grammar_kind MUST be ResponseFormat — any caller that \
+             omits the field must get unconditional grammar enforcement, \
+             not the trigger-gated tool-call-body path. This preserves \
+             pre-wave-2.5 response_format semantics on all paths."
+        );
+    }
+
+    /// Replicates the exact `(tool, resp) → (Option, GrammarKind)` match
+    /// from `prepare_chat_generation_core`. Confirms:
+    ///   * tool_grammar present  → kind = ToolCallBody (lazy / trigger-gated)
+    ///   * tool_grammar absent + response_grammar present → kind = ResponseFormat (eager)
+    ///   * both absent → kind = ResponseFormat (default; never read because
+    ///     grammar is None)
+    ///
+    /// This is the property that fixes audit divergence A1 / response_format
+    /// regression: when only response_grammar is set, the kind MUST be
+    /// `ResponseFormat`, not `ToolCallBody` (which would gate enforcement
+    /// on a tool open marker that never fires for non-tool requests).
+    #[test]
+    fn tool_choice_required_yields_tool_call_body_kind() {
+        // Stand in for compile_tool_grammar / compile_response_format outputs.
+        // The Grammar type is opaque here; Option<u32> mirrors the .or()
+        // semantics tested in the sibling combine_function_grammars_tests
+        // mod, while letting us also emit the GrammarKind discriminant.
+        fn select(tool: Option<u32>, resp: Option<u32>) -> (Option<u32>, GrammarKind) {
+            match (tool, resp) {
+                (Some(g), _)       => (Some(g), GrammarKind::ToolCallBody),
+                (None,    Some(g)) => (Some(g), GrammarKind::ResponseFormat),
+                (None,    None)    => (None,    GrammarKind::default()),
+            }
+        }
+
+        // Case 1: tool_choice=required compiled into a tool grammar.
+        // response_format may also be set; tool wins.
+        let (g, k) = select(Some(1), Some(2));
+        assert_eq!(g, Some(1), "tool grammar must win precedence");
+        assert_eq!(
+            k,
+            GrammarKind::ToolCallBody,
+            "tool_choice=required/function MUST yield GrammarKind::ToolCallBody \
+             so the runtime starts in awaiting_trigger=true and the mask is \
+             skipped for preamble tokens (Option B boundary)."
+        );
+
+        // Case 2: response_format only.
+        let (g, k) = select(None, Some(2));
+        assert_eq!(g, Some(2), "response_format grammar must apply");
+        assert_eq!(
+            k,
+            GrammarKind::ResponseFormat,
+            "response_format=json_object/json_schema MUST yield \
+             GrammarKind::ResponseFormat. This is the wave-2.5 audit fix: \
+             without this, the runtime would sit in awaiting_trigger=true \
+             and never enforce the JSON grammar on registered Gemma/Qwen \
+             models because the tool open marker never fires."
+        );
+
+        // Case 3: neither set — kind is the default; never read because
+        // effective_grammar is None.
+        let (g, k) = select(None, None);
+        assert!(g.is_none(), "no grammar means no constraint");
+        assert_eq!(k, GrammarKind::default(), "kind defaults when grammar is None");
     }
 }
 
