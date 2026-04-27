@@ -258,11 +258,9 @@ impl Qwen35Model {
         // `weight_loader::load_moe_ffn`) was peer-misaligned — peers
         // (mlx-lm, llama.cpp, AutoAWQ) never F32-expand MoE experts at load
         // time. Apex 35B-A3B at F32 is ~128 GB which doesn't fit on a
-        // 128 GB system; the convert pipeline now emits MoE experts at
-        // Q8_0 in the intermediate (see `quantize::intermediate_moe_q8`)
-        // so this branch is unreachable for production inputs. If a caller
-        // ever supplies F16/F32 experts (e.g. legacy GGUFs), we fail loud
-        // at load time rather than silently expanding.
+        // 128 GB system. If a caller ever supplies F16/F32 experts
+        // (e.g. legacy GGUFs), we fail loud at load time rather than
+        // silently expanding.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         if cfg.variant == Qwen35Variant::Moe {
             if let Some(info) = gguf.tensor_info("blk.0.ffn_gate_exps.weight") {

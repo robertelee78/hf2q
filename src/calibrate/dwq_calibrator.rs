@@ -34,8 +34,8 @@
 //! capture-derived sensitivity).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
+use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
 use super::cache::{
@@ -94,22 +94,14 @@ pub struct DwqCalibrator {
 ///
 /// `Eager` carries an already-built capture (used by tests with
 /// `MockActivationCapture` and by callers that share a model with an
-/// inference session). `Deferred` carries the paths needed to build a
-/// `RealActivationCapture` lazily inside [`Calibrator::calibrate`] —
-/// the production path used by `cmd_convert` after intermediate-F16
-/// GGUF emission. `None` is the explicit "no capture" state for
-/// `DwqArch::Other`.
-///
-/// Deferred construction lets `cmd_convert` keep the
-/// `RealActivationCapture::new` call out of its dispatch arm
-/// (greppable invariant, ADR-014 P2 iter-2 §S3).
+/// inference session). `Lazy` carries the tokenizer needed to build a
+/// `RealActivationCapture` directly from the `&LazyTensorMap` passed to
+/// [`Calibrator::calibrate`]. `None` is the explicit "no capture" state
+/// for `DwqArch::Other`.
 enum CaptureSource {
     None,
     Eager(Box<dyn ActivationCapture + Send + Sync>),
-    Deferred {
-        intermediate_gguf: PathBuf,
-        tokenizer_json: PathBuf,
-    },
+    Lazy { tokenizer: Box<Tokenizer> },
 }
 
 impl std::fmt::Debug for DwqCalibrator {
@@ -118,7 +110,7 @@ impl std::fmt::Debug for DwqCalibrator {
         let capture_kind = match &self.capture {
             CaptureSource::None => "none",
             CaptureSource::Eager(_) => "eager",
-            CaptureSource::Deferred { .. } => "deferred",
+            CaptureSource::Lazy { .. } => "lazy",
         };
         f.debug_struct("DwqCalibrator")
             .field("arch", &self.arch)
@@ -163,34 +155,18 @@ impl DwqCalibrator {
 
     /// Construct a `DwqCalibrator` that builds its
     /// [`crate::inference::models::qwen35::activation_capture_real::RealActivationCapture`]
-    /// lazily inside [`Calibrator::calibrate`] — the production path used by
-    /// `cmd_convert` after the caller has emitted an intermediate-F16 GGUF
-    /// (so the capture can `Qwen35Model::load_from_gguf` without holding the
-    /// converter's `tensor_map` resident at the same time, the OOM
-    /// mitigation pattern documented in `dwq_activation::capture_activations_to_sensitive_ranges`).
-    ///
-    /// The `RealActivationCapture::new` call is delayed to
-    /// `calibrate(...)` time so the intermediate-GGUF + tokenizer paths
-    /// can be passed in early (before `cmd_convert` drops `tensor_map`)
-    /// while the heavyweight `Qwen35Model::load_from_gguf` (~128 GB
-    /// peak for apex MoE) doesn't run until after `tensor_map` is freed.
-    ///
-    /// ADR-014 P2 iter-2 §S3: this is the path that lets `cmd_convert`
-    /// hold zero direct `RealActivationCapture::new` /
-    /// `capture_activations_to_sensitive_ranges` callers — the
-    /// orchestration moves entirely into [`Calibrator::calibrate`].
-    pub fn with_activation_capture(
+    /// lazily inside [`Calibrator::calibrate`] from the supplied
+    /// `LazyTensorMap`, with no temporary GGUF artifact.
+    pub fn with_activation_capture_lazy(
         arch: DwqArch,
-        intermediate_gguf: PathBuf,
-        tokenizer_json: PathBuf,
+        tokenizer: Tokenizer,
         base_bits: u8,
         sensitive_bits: u8,
         calibration_samples: u32,
     ) -> Self {
         Self {
-            capture: CaptureSource::Deferred {
-                intermediate_gguf,
-                tokenizer_json,
+            capture: CaptureSource::Lazy {
+                tokenizer: Box::new(tokenizer),
             },
             arch,
             base_bits,
@@ -256,35 +232,25 @@ impl Calibrator for DwqCalibrator {
             return Err(CalibrationError::EmptyCorpus);
         }
 
-        // ─────────── No-fallback guard + deferred capture build ───────────
+        // ─────────── No-fallback guard + lazy capture build ───────────
         // arch.requires_activation_capture() == true → capture MUST
         // be available (either eagerly attached, or constructible from
-        // the deferred paths). Bail with a typed error otherwise.
-        // The deferred build runs `RealActivationCapture::new` here,
-        // intentionally — `cmd_convert` no longer calls it directly
-        // (ADR-014 P2 iter-2 §S3 greppable invariant).
+        // the lazy tensor map). Bail with a typed error otherwise.
         //
-        // Materialise any deferred capture in-place so the subsequent
+        // Materialise any lazy capture in-place so the subsequent
         // borrow yields a long-lived `&mut dyn ActivationCapture` from
         // the same `CaptureSource::Eager` slot (no `.expect()` shenanigans
         // and no holding two mutable borrows).
-        if let CaptureSource::Deferred {
-            intermediate_gguf,
-            tokenizer_json,
-        } = &self.capture
-        {
+        if let CaptureSource::Lazy { tokenizer } = &self.capture {
             let real =
-                crate::inference::models::qwen35::activation_capture_real::RealActivationCapture::new(
-                    intermediate_gguf,
-                    tokenizer_json,
+                crate::inference::models::qwen35::activation_capture_real::RealActivationCapture::from_lazy_tensor_map(
+                    model,
+                    tokenizer,
                 )
                 .map_err(|e| CalibrationError::Other {
                     message: format!(
-                        "DwqCalibrator deferred capture build failed for arch {:?} \
-                         (intermediate_gguf={}, tokenizer={}): {e}",
-                        self.arch,
-                        intermediate_gguf.display(),
-                        tokenizer_json.display()
+                        "DwqCalibrator lazy capture build failed for arch {:?}: {e}",
+                        self.arch
                     ),
                 })?;
             self.capture = CaptureSource::Eager(Box::new(real));
@@ -296,8 +262,8 @@ impl Calibrator for DwqCalibrator {
                 });
             }
             CaptureSource::Eager(boxed) => boxed.as_mut(),
-            CaptureSource::Deferred { .. } => {
-                // Unreachable: just transitioned Deferred → Eager above.
+            CaptureSource::Lazy { .. } => {
+                // Unreachable: just transitioned Lazy → Eager above.
                 // Use a typed error rather than `unreachable!()` to
                 // honor the no-panic contract added by ADR-014 P2 iter-2.
                 return Err(CalibrationError::Other {

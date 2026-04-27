@@ -15,7 +15,6 @@ pub mod k_quant_codec_quantizer;
 pub mod layer_mix;
 pub mod q_legacy;
 pub mod variant_quantizer;
-pub mod intermediate_moe_q8;
 pub mod mixed;
 pub mod static_quant;
 

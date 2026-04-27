@@ -8,14 +8,11 @@
 //!
 //! The two-pass pipeline (`src/main.rs:601-704`) has these moving parts:
 //!
-//! 1. `emit_gguf_from_tensor_map` → intermediate F16 GGUF.
-//! 2. `RealActivationCapture::new(intermediate, tokenizer)` →
-//!    `Qwen35Model::load_from_gguf` round-trip.
-//! 3. `run_dwq_activation_calibration` → activation-driven DWQ.
+//! 1. Lazy tensor-map load into `RealActivationCapture`.
+//! 2. `run_dwq_activation_calibration` → activation-driven DWQ.
 //!
-//! Step 2 is the load-bearing roundtrip. Test (1) is covered by
-//! `backends::gguf::tests::test_emit_gguf_from_tensor_map_smoke`.
-//! Test (3) with **mock** activations is covered by 6 unit tests in
+//! The real-model load is the load-bearing path. The DWQ algorithm with
+//! **mock** activations is covered by 6 unit tests in
 //! `calibrate::dwq_activation::tests`.
 //!
 //! This test fills the remaining gap: step (3) with the **real**
@@ -257,7 +254,7 @@ fn two_pass_branch_is_reached_on_qwen35_dwq() {
             || stderr.contains("load_from_gguf")
             || stderr.contains("intermediate"),
         "two-pass branch marker missing — convert must reach the \
-         emit_gguf_from_tensor_map / RealActivationCapture::new stage. \
+         lazy RealActivationCapture construction stage. \
          stderr: {stderr}"
     );
 

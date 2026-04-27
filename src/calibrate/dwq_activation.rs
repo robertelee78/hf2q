@@ -48,22 +48,19 @@ use super::sensitivity::{allocate_bits_by_sensitivity, compute_layer_sensitivity
 /// Run activation-aware DWQ calibration.
 ///
 /// `capture` is the runtime-supplied [`ActivationCapture`] — typically a
-/// `RealActivationCapture` constructed from an intermediate F16 GGUF (per
-/// ADR-012 P9b two-pass conversion). For tests, `MockActivationCapture`
-/// works.
+/// `RealActivationCapture` built directly from the transformed qwen35 tensor
+/// map. For tests, `MockActivationCapture` works.
 ///
 /// **No fallback.** If capture, sensitivity, or downstream calibration
 /// fails, return the error. qwen35 / qwen35moe have no valid weight-space
 /// fallback per Decision 13.
 ///
-/// Wired through `src/main.rs` for qwen35/qwen35moe DWQ as of P9b.3b
-/// (commit landing this fn into the convert-pipeline two-pass branch).
+/// Wired through `src/main.rs` for qwen35/qwen35moe DWQ.
 ///
 /// Single-shot wrapper that captures activations + runs DWQ in one call.
 /// Convenient for unit tests; production main.rs uses the split helpers
 /// `capture_activations_to_sensitive_ranges` + `run_dwq_with_sensitive_ranges`
-/// to enable tensor_map drop+reread across the capture call (apex MoE
-/// OOM mitigation, cost-model candidate #3).
+/// to keep the capture and byte-emit orchestration separated.
 #[allow(dead_code)]
 pub fn run_dwq_activation_calibration(
     tensor_map: &TensorMap,
@@ -95,23 +92,12 @@ pub fn run_dwq_activation_calibration(
 }
 
 /// **Capture activations and derive sensitive layer ranges** — the
-/// memory-heavy half of activation calibration, split out so that the
-/// caller can drop the tensor_map across the capture call (cost-model
-/// OOM-mitigation candidate #3, required for apex MoE which needs F32-
-/// expanded `Moe` variant ~128 GB plus tensor_map ~70 GB > 128 GB
-/// system RAM).
+/// forward-pass half of activation calibration.
 ///
-/// Use pattern (apex MoE):
-///   - emit_gguf_from_tensor_map(&tensor_map, …)   // hold tensor_map
-///   - drop(tensor_map);                          // free ~70 GB
-///   - let ranges = capture_activations_to_sensitive_ranges(…)?;
-///   - drop(capture);                             // free ~128 GB Qwen35Model
-///   - re-read tensor_map from safetensors + reapply qwen35 transforms
-///   - run_dwq_with_sensitive_ranges(&tensor_map, …, ranges, …)
-///
-/// Memory peak bounded by `tensor_map.len() + Qwen35Model.len()` only
-/// during the capture phase — never both simultaneously with the held
-/// tensor_map.
+/// Use pattern:
+///   - build `RealActivationCapture` from the transformed tensor map
+///   - let ranges = capture_activations_to_sensitive_ranges(...)?
+///   - run_dwq_with_sensitive_ranges(&tensor_map, ..., ranges, ...)
 pub fn capture_activations_to_sensitive_ranges(
     metadata: &ModelMetadata,
     config: &DwqConfig,

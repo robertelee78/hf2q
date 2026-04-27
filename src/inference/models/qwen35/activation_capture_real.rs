@@ -60,10 +60,12 @@
 use anyhow::{Context, Result};
 use mlx_native::MlxDevice;
 use thiserror::Error;
+use tokenizers::Tokenizer;
 
 use super::activation_capture::{ActivationCapture, LayerActivations};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
+use crate::ir::lazy::LazyTensorMap;
 
 // ================================================================
 // Error type
@@ -221,6 +223,25 @@ impl RealActivationCapture {
         })
     }
 
+    /// Construct a real capture directly from a transformed lazy tensor map,
+    /// avoiding the ADR-012 P9b intermediate-GGUF round trip. `_tokenizer`
+    /// is reserved for parity with the disk constructor and future prompt
+    /// tokenization inside this wrapper.
+    pub fn from_lazy_tensor_map(
+        model: &LazyTensorMap,
+        _tokenizer: &Tokenizer,
+    ) -> std::result::Result<Self, RealActivationCaptureError> {
+        let loaded = Qwen35Model::load_from_lazy_tensor_map(model).map_err(|e| {
+            RealActivationCaptureError::Load {
+                path: "<lazy-tensor-map>".to_string(),
+                reason: format!("Qwen35Model::load_from_lazy_tensor_map: {e:#}"),
+            }
+        })?;
+        Ok(Self {
+            inner: RealCaptureBackend::Loaded(loaded),
+        })
+    }
+
     /// Construct directly from an already-loaded `Qwen35Model`. Useful for
     /// callers that share a model with an inference session.
     pub fn from_model(model: Qwen35Model) -> Self {
@@ -249,6 +270,8 @@ impl ActivationCapture for RealActivationCapture {
 mod tests {
     use super::*;
     use super::super::{Qwen35Config, Qwen35MoeConfig, Qwen35Variant};
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+    use crate::ir::DType;
 
     /// GPU-eligible tiny hybrid Qwen3.5 dense config (mirrors
     /// `forward_gpu::tests::tiny_hybrid_cfg`): `hidden_size = 64`
@@ -298,6 +321,45 @@ mod tests {
             shared_expert_intermediate_size: 32,
         });
         c
+    }
+
+    fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
+        values.flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn insert_f32(map: &mut LazyTensorMap, name: &str, shape: Vec<usize>) {
+        let numel: usize = shape.iter().product();
+        let data = f32_bytes((0..numel).map(|i| i as f32 * 0.001));
+        let meta = LazyMeta::new(name.to_string(), shape, DType::F32);
+        map.insert(LazyTensor::from_bytes(meta, data));
+    }
+
+    fn single_full_attention_lazy_map() -> LazyTensorMap {
+        let mut map = LazyTensorMap::new();
+        let h = 32usize;
+        let d = 8usize;
+        let q_heads = 2usize;
+        let kv_heads = 1usize;
+        let inter = 32usize;
+        insert_f32(&mut map, "token_embd.weight", vec![16, h]);
+        insert_f32(&mut map, "output.weight", vec![16, h]);
+        insert_f32(&mut map, "output_norm.weight", vec![h]);
+        insert_f32(&mut map, "blk.0.attn_norm.weight", vec![h]);
+        insert_f32(&mut map, "blk.0.post_attention_norm.weight", vec![h]);
+        insert_f32(&mut map, "blk.0.attn_q.weight", vec![2 * q_heads * d, h]);
+        insert_f32(&mut map, "blk.0.attn_k.weight", vec![kv_heads * d, h]);
+        insert_f32(&mut map, "blk.0.attn_v.weight", vec![kv_heads * d, h]);
+        insert_f32(&mut map, "blk.0.attn_q_norm.weight", vec![d]);
+        insert_f32(&mut map, "blk.0.attn_k_norm.weight", vec![d]);
+        insert_f32(&mut map, "blk.0.attn_output.weight", vec![h, q_heads * d]);
+        insert_f32(&mut map, "blk.0.ffn_gate.weight", vec![inter, h]);
+        insert_f32(&mut map, "blk.0.ffn_up.weight", vec![inter, h]);
+        insert_f32(&mut map, "blk.0.ffn_down.weight", vec![h, inter]);
+        map
+    }
+
+    fn dummy_tokenizer() -> Tokenizer {
+        Tokenizer::new(tokenizers::models::bpe::BPE::default())
     }
 
     #[test]
@@ -382,6 +444,34 @@ mod tests {
         let tokens: Vec<u32> = vec![0, 1];
         let acts = wrapper.run_calibration_prompt(&tokens).expect("delegated");
         assert_eq!(acts.num_layers, cfg.num_hidden_layers);
+    }
+
+    #[test]
+    fn real_activation_capture_from_lazy_tensor_map_loads_model() {
+        let map = single_full_attention_lazy_map();
+        let tokenizer = dummy_tokenizer();
+        let wrapper = match RealActivationCapture::from_lazy_tensor_map(&map, &tokenizer) {
+            Ok(wrapper) => wrapper,
+            Err(err) if format!("{err}").contains("No Metal GPU device found") => {
+                eprintln!("skipping GPU-backed lazy capture test: {err}");
+                return;
+            }
+            Err(err) => panic!("lazy capture loads: {err:#}"),
+        };
+        let dbg = format!("{wrapper:?}");
+        assert!(dbg.contains("num_hidden_layers"));
+        assert!(dbg.contains("Dense"));
+    }
+
+    #[test]
+    fn real_activation_capture_from_lazy_tensor_map_errors_on_empty_map() {
+        let map = LazyTensorMap::new();
+        let tokenizer = dummy_tokenizer();
+        let err = RealActivationCapture::from_lazy_tensor_map(&map, &tokenizer)
+            .expect_err("empty lazy map must fail");
+        let s = format!("{err}");
+        assert!(s.contains("<lazy-tensor-map>"));
+        assert!(s.contains("load_from_lazy_tensor_map"));
     }
 
     #[test]

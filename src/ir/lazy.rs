@@ -253,6 +253,42 @@ impl LazyTensor {
         })
     }
 
+    /// Materialise a by-reference copy of an already-resident tensor.
+    ///
+    /// This is intentionally narrower than [`Self::materialize`]: it only
+    /// supports [`LazyState::Materialized`] entries and returns a typed error
+    /// for pending `FnOnce` entries. The streaming contract remains intact for
+    /// mmap-backed tensors; this exists for bridge paths whose caller already
+    /// chose to keep bytes resident and must pass a `&LazyTensorMap` through an
+    /// existing trait surface.
+    pub fn materialize_cloned(&self) -> Result<TensorRef, MaterializeError> {
+        let bytes = match &self.state {
+            LazyState::Materialized(bytes) => bytes.clone(),
+            LazyState::Pending(_) => {
+                return Err(MaterializeError::Transform {
+                    name: self.meta.name.clone(),
+                    reason: "borrowed materialization is only available for already-resident tensors"
+                        .to_string(),
+                });
+            }
+        };
+
+        if bytes.len() != self.meta.byte_len {
+            return Err(MaterializeError::SizeMismatch {
+                name: self.meta.name.clone(),
+                expected: self.meta.byte_len,
+                actual: bytes.len(),
+            });
+        }
+
+        Ok(TensorRef {
+            name: self.meta.name.clone(),
+            shape: self.meta.shape.clone(),
+            dtype: self.meta.dtype,
+            data: bytes,
+        })
+    }
+
     /// Compose a shape- and dtype-preserving transform onto this lazy
     /// tensor. The transform runs at materialisation time, exactly once.
     ///
@@ -304,11 +340,10 @@ impl LazyTensor {
     }
 }
 
-/// Send-bound proof: any closure crossed via `.map()`/`.from_closure()`
-/// must be `Send`, and the materialised payload (`Vec<u8>`) is
-/// inherently `Send`. Verified at compile time by
-/// [`tests::test_send_bound`].
-///
+// Send-bound proof: any closure crossed via `.map()`/`.from_closure()`
+// must be `Send`, and the materialised payload (`Vec<u8>`) is
+// inherently `Send`. Verified at compile time by
+// [`tests::test_send_bound`].
 // SAFETY: `LazyState::Materialized(Vec<u8>)` is Send. `LazyState::Pending`
 // stores a `Box<dyn FnOnce(...) + Send + 'static>` whose `Send` bound is
 // declared in the trait object — the auto-trait derivation already covers

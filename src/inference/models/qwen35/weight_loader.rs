@@ -26,15 +26,22 @@
 //! tensors (norms, biases) are 1-D and drop in directly.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeMap;
 use mlx_native::gguf::GgufFile;
 use mlx_native::ops::quantized_matmul_ggml::GgmlType;
-use mlx_native::{MlxBuffer, MlxDevice};
+use mlx_native::{DType as MlxDType, MlxBuffer, MlxDevice};
+
+use crate::ir::lazy::{LazyTensor, LazyTensorMap};
+use crate::ir::{DType as IrDType, TensorRef};
 
 use super::delta_net::DeltaNetLayerWeights;
 use super::ffn::{DenseFfnWeights, MoeFfnWeights};
 use super::full_attn::FullAttnLayerWeights;
-use super::model::{Qwen35FfnWeights, Qwen35LayerWeights};
-use super::{Qwen35Config, Qwen35LayerKind, Qwen35Variant};
+use super::in_memory_loader::{
+    bf16_bytes_to_f32, f16_bytes_to_f32, f32_bytes_to_f32, quantize_f32_to_q8_0_buffer,
+};
+use super::model::{Qwen35FfnWeights, Qwen35LayerWeights, Qwen35Model};
+use super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant};
 
 // ============================================================================
 // Quantized MoE weight container
@@ -132,6 +139,573 @@ pub fn load_global_tensors(
     let output_norm = load_f32_tensor(gguf, "output_norm.weight", device)
         .context("output_norm.weight")?;
     Ok((token_embd, output_weight, output_norm))
+}
+
+// ============================================================================
+// LazyTensorMap-backed model load (ADR-014 P4)
+// ============================================================================
+
+struct LazyQwen35Lookup<'a> {
+    tensors: BTreeMap<String, &'a LazyTensor>,
+}
+
+impl<'a> LazyQwen35Lookup<'a> {
+    fn new(map: &'a LazyTensorMap) -> Self {
+        let mut tensors = BTreeMap::new();
+        for (name, lazy) in map.iter() {
+            let gguf_name = qwen35_lazy_name_to_gguf(name);
+            tensors.entry(gguf_name).or_insert(lazy);
+        }
+        Self { tensors }
+    }
+
+    fn get(&self, name: &str) -> Result<&'a LazyTensor> {
+        self.tensors
+            .get(name)
+            .copied()
+            .ok_or_else(|| anyhow!("lazy qwen35 load: tensor '{name}' not found"))
+    }
+
+    fn maybe(&self, name: &str) -> Option<&'a LazyTensor> {
+        self.tensors.get(name).copied()
+    }
+}
+
+fn qwen35_lazy_name_to_gguf(name: &str) -> String {
+    let name = name.replace("language_model.", "");
+    match name.as_str() {
+        "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+        "model.norm.weight" => return "output_norm.weight".to_string(),
+        "lm_head.weight" => return "output.weight".to_string(),
+        _ => {}
+    }
+
+    let Some(rest) = name.strip_prefix("model.layers.") else {
+        return name;
+    };
+    let Some(dot_pos) = rest.find('.') else {
+        return name;
+    };
+    let layer_num = &rest[..dot_pos];
+    if !layer_num.chars().all(|c| c.is_ascii_digit()) {
+        return name;
+    }
+    let suffix = &rest[dot_pos + 1..];
+    let mapped_suffix = match suffix {
+        "input_layernorm.weight" => "attn_norm.weight",
+        "post_attention_layernorm.weight" => "post_attention_norm.weight",
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        "linear_attn.in_proj_qkv.weight" => "attn_qkv.weight",
+        "linear_attn.in_proj_z.weight" => "attn_gate.weight",
+        "linear_attn.in_proj_a.weight" => "ssm_alpha.weight",
+        "linear_attn.in_proj_b.weight" => "ssm_beta.weight",
+        "linear_attn.out_proj.weight" => "ssm_out.weight",
+        "linear_attn.A_log" => "ssm_a",
+        "linear_attn.dt_bias" | "linear_attn.dt_proj.bias" => "ssm_dt.bias",
+        "linear_attn.conv1d.weight" => "ssm_conv1d.weight",
+        "linear_attn.norm.weight" => "ssm_norm.weight",
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        "mlp.gate.weight" => "ffn_gate_inp.weight",
+        "mlp.shared_expert_gate.weight" => "ffn_gate_inp_shexp.weight",
+        "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
+        "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
+        "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
+        "mlp.experts.gate_proj.weight" => "ffn_gate_exps.weight",
+        "mlp.experts.up_proj.weight" => "ffn_up_exps.weight",
+        "mlp.experts.down_proj.weight" => "ffn_down_exps.weight",
+        "eh_proj.weight" => "nextn.eh_proj.weight",
+        "enorm.weight" => "nextn.enorm.weight",
+        "hnorm.weight" => "nextn.hnorm.weight",
+        "embed_tokens.weight" => "nextn.embed_tokens.weight",
+        other => other,
+    };
+    format!("blk.{layer_num}.{mapped_suffix}")
+}
+
+fn parse_blk_tensor(name: &str) -> Option<(u32, &str)> {
+    let rest = name.strip_prefix("blk.")?;
+    let dot_pos = rest.find('.')?;
+    let layer = rest[..dot_pos].parse::<u32>().ok()?;
+    Some((layer, &rest[dot_pos + 1..]))
+}
+
+fn infer_lazy_qwen35_config(lookup: &LazyQwen35Lookup<'_>) -> Result<Qwen35Config> {
+    let hidden_size = lookup
+        .get("output_norm.weight")?
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("output_norm.weight has empty shape"))? as u32;
+    let vocab_size = lookup
+        .get("token_embd.weight")?
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("token_embd.weight has empty shape"))? as u32;
+
+    let mut max_layer = None::<u32>;
+    let mut has_moe = false;
+    for name in lookup.tensors.keys() {
+        if let Some((layer, suffix)) = parse_blk_tensor(name) {
+            if !suffix.starts_with("nextn.") {
+                max_layer = Some(max_layer.map_or(layer, |m| m.max(layer)));
+            }
+            if suffix == "ffn_gate_exps.weight" {
+                has_moe = true;
+            }
+        }
+    }
+    let num_hidden_layers = max_layer
+        .map(|layer| layer + 1)
+        .ok_or_else(|| anyhow!("lazy qwen35 load: no blk.<layer> tensors found"))?;
+
+    let mut layer_types = Vec::with_capacity(num_hidden_layers as usize);
+    for layer in 0..num_hidden_layers {
+        let full_name = format!("blk.{layer}.attn_q.weight");
+        let linear_name = format!("blk.{layer}.attn_qkv.weight");
+        let kind = if lookup.maybe(&full_name).is_some() {
+            Qwen35LayerKind::FullAttention
+        } else if lookup.maybe(&linear_name).is_some() {
+            Qwen35LayerKind::LinearAttention
+        } else {
+            return Err(anyhow!(
+                "lazy qwen35 load: layer {layer} has neither attn_q nor attn_qkv"
+            ));
+        };
+        layer_types.push(kind);
+    }
+
+    let full_attention_interval = layer_types
+        .iter()
+        .position(|kind| *kind == Qwen35LayerKind::FullAttention)
+        .map(|idx| idx as u32 + 1)
+        .unwrap_or(0);
+    let layer_types = if full_attention_interval > 0 {
+        default_layer_types(num_hidden_layers, full_attention_interval)
+    } else {
+        layer_types
+    };
+
+    let full_layer_idx = layer_types
+        .iter()
+        .position(|kind| *kind == Qwen35LayerKind::FullAttention)
+        .unwrap_or(0) as u32;
+    let head_dim = lookup
+        .maybe(&format!("blk.{full_layer_idx}.attn_q_norm.weight"))
+        .and_then(|t| t.shape().first().copied())
+        .or_else(|| lookup.maybe(&format!("blk.{full_layer_idx}.attn_k_norm.weight"))
+            .and_then(|t| t.shape().first().copied()))
+        .unwrap_or(32) as u32;
+    let attn_q_rows = lookup
+        .maybe(&format!("blk.{full_layer_idx}.attn_q.weight"))
+        .and_then(|t| t.shape().first().copied())
+        .unwrap_or(head_dim as usize * 2);
+    let q_rows = if attn_q_rows % 2 == 0 {
+        attn_q_rows / 2
+    } else {
+        attn_q_rows
+    };
+    let num_attention_heads = ((q_rows as u32) / head_dim).max(1);
+    let kv_rows = lookup
+        .maybe(&format!("blk.{full_layer_idx}.attn_k.weight"))
+        .and_then(|t| t.shape().first().copied())
+        .unwrap_or(head_dim as usize);
+    let num_key_value_heads = ((kv_rows as u32) / head_dim).max(1);
+
+    let linear_layer_idx = layer_types
+        .iter()
+        .position(|kind| *kind == Qwen35LayerKind::LinearAttention)
+        .unwrap_or(0) as u32;
+    let linear_value_head_dim = lookup
+        .maybe(&format!("blk.{linear_layer_idx}.ssm_norm.weight"))
+        .and_then(|t| t.shape().first().copied())
+        .unwrap_or(head_dim as usize) as u32;
+    let linear_key_head_dim = linear_value_head_dim;
+    let linear_num_value_heads = lookup
+        .maybe(&format!("blk.{linear_layer_idx}.ssm_a"))
+        .and_then(|t| t.shape().first().copied())
+        .unwrap_or(num_key_value_heads as usize) as u32;
+    let attn_qkv_rows = lookup
+        .maybe(&format!("blk.{linear_layer_idx}.attn_qkv.weight"))
+        .and_then(|t| t.shape().first().copied())
+        .unwrap_or((2 * num_key_value_heads * linear_key_head_dim
+            + linear_num_value_heads * linear_value_head_dim) as usize) as u32;
+    let v_rows = linear_num_value_heads * linear_value_head_dim;
+    let linear_num_key_heads = if attn_qkv_rows > v_rows && linear_key_head_dim > 0 {
+        ((attn_qkv_rows - v_rows) / (2 * linear_key_head_dim)).max(1)
+    } else {
+        num_key_value_heads.max(1)
+    };
+    let linear_conv_kernel_dim = lookup
+        .maybe(&format!("blk.{linear_layer_idx}.ssm_conv1d.weight"))
+        .and_then(|t| t.shape().last().copied())
+        .unwrap_or(4) as u32;
+
+    let variant = if has_moe {
+        Qwen35Variant::Moe
+    } else {
+        Qwen35Variant::Dense
+    };
+    let (intermediate_size, moe) = match variant {
+        Qwen35Variant::Dense => {
+            let m = lookup
+                .get("blk.0.ffn_gate.weight")?
+                .shape()
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow!("blk.0.ffn_gate.weight has empty shape"))? as u32;
+            (Some(m), None)
+        }
+        Qwen35Variant::Moe => {
+            let expert_shape = lookup.get("blk.0.ffn_gate_exps.weight")?.shape();
+            if expert_shape.len() < 3 {
+                return Err(anyhow!(
+                    "blk.0.ffn_gate_exps.weight shape {:?} is not [experts, inter, hidden]",
+                    expert_shape
+                ));
+            }
+            let shared_intermediate = lookup
+                .get("blk.0.ffn_gate_shexp.weight")?
+                .shape()
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow!("blk.0.ffn_gate_shexp.weight has empty shape"))?
+                as u32;
+            (
+                None,
+                Some(Qwen35MoeConfig {
+                    num_experts: expert_shape[0] as u32,
+                    moe_intermediate_size: expert_shape[1] as u32,
+                    num_experts_per_tok: 1,
+                    shared_expert_intermediate_size: shared_intermediate,
+                }),
+            )
+        }
+    };
+
+    let rotary_dim = head_dim / 2;
+    Ok(Qwen35Config {
+        variant,
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_conv_kernel_dim,
+        full_attention_interval,
+        layer_types,
+        partial_rotary_factor: if head_dim == 0 {
+            0.0
+        } else {
+            rotary_dim as f32 / head_dim as f32
+        },
+        rope_theta: 10_000_000.0,
+        rotary_dim,
+        mrope_section: [rotary_dim / 4, rotary_dim / 4, rotary_dim / 4, 0],
+        mrope_interleaved: true,
+        rms_norm_eps: 1e-6,
+        max_position_embeddings: 131_072,
+        vocab_size,
+        attn_output_gate: true,
+        mtp_num_hidden_layers: 0,
+        intermediate_size,
+        moe,
+    })
+}
+
+fn tensor_ref_to_f32(mut tensor: TensorRef) -> Result<Vec<f32>> {
+    let mut out = Vec::new();
+    match tensor.dtype {
+        IrDType::F32 => f32_bytes_to_f32(&tensor.data, &mut out),
+        IrDType::F16 => f16_bytes_to_f32(&tensor.data, &mut out),
+        IrDType::BF16 => bf16_bytes_to_f32(&tensor.data, &mut out),
+        other => {
+            return Err(anyhow!(
+                "tensor '{}' has dtype {:?}; expected F32/F16/BF16",
+                tensor.name,
+                other
+            ));
+        }
+    }
+    tensor.data.clear();
+    Ok(out)
+}
+
+fn load_lazy_f32(lookup: &LazyQwen35Lookup<'_>, name: &str) -> Result<Vec<f32>> {
+    let tensor = lookup
+        .get(name)?
+        .materialize_cloned()
+        .with_context(|| format!("materialize {name}"))?;
+    tensor_ref_to_f32(tensor).with_context(|| format!("convert {name} to f32"))
+}
+
+fn upload_lazy_raw_u8(
+    lookup: &LazyQwen35Lookup<'_>,
+    name: &str,
+    device: &MlxDevice,
+) -> Result<MlxBuffer> {
+    let tensor = lookup
+        .get(name)?
+        .materialize_cloned()
+        .with_context(|| format!("materialize {name}"))?;
+    if tensor.dtype != IrDType::U8 {
+        return Err(anyhow!(
+            "tensor '{}' has dtype {:?}; expected U8 GGML block bytes",
+            tensor.name,
+            tensor.dtype
+        ));
+    }
+    let mut buf = device
+        .alloc_buffer(tensor.data.len(), MlxDType::U8, tensor.shape.clone())
+        .map_err(|e| anyhow!("alloc U8 buffer for {name}: {e}"))?;
+    {
+        let dst: &mut [u8] = buf
+            .as_mut_slice()
+            .map_err(|e| anyhow!("as_mut_slice({name}): {e}"))?;
+        dst.copy_from_slice(&tensor.data);
+    }
+    Ok(buf)
+}
+
+fn load_lazy_expert_q8_0(
+    lookup: &LazyQwen35Lookup<'_>,
+    name: &str,
+    device: &MlxDevice,
+) -> Result<MlxBuffer> {
+    let lazy = lookup.get(name)?;
+    if lazy.dtype() == IrDType::U8 {
+        return upload_lazy_raw_u8(lookup, name, device);
+    }
+    let shape = lazy.shape().to_vec();
+    let f32_data = tensor_ref_to_f32(
+        lazy.materialize_cloned()
+            .with_context(|| format!("materialize {name}"))?,
+    )
+    .with_context(|| format!("convert {name} expert tensor to f32"))?;
+    quantize_f32_to_q8_0_buffer(&f32_data, shape, device)
+        .with_context(|| format!("Q8_0 upload for {name}"))
+}
+
+fn load_lazy_full_attn_layer(
+    lookup: &LazyQwen35Lookup<'_>,
+    cfg: &Qwen35Config,
+    layer_idx: u32,
+) -> Result<FullAttnLayerWeights> {
+    let p = format!("blk.{}", layer_idx);
+    let attn_norm = load_lazy_f32(lookup, &format!("{p}.attn_norm.weight"))?;
+    let q_fused = load_lazy_f32(lookup, &format!("{p}.attn_q.weight"))?;
+    let wk = load_lazy_f32(lookup, &format!("{p}.attn_k.weight"))?;
+    let wv = load_lazy_f32(lookup, &format!("{p}.attn_v.weight"))?;
+    let attn_q_norm = load_lazy_f32(lookup, &format!("{p}.attn_q_norm.weight"))?;
+    let attn_k_norm = load_lazy_f32(lookup, &format!("{p}.attn_k_norm.weight"))?;
+    let wo = load_lazy_f32(lookup, &format!("{p}.attn_output.weight"))?;
+    let post_attn_norm = load_lazy_f32(lookup, &format!("{p}.post_attention_norm.weight"))?;
+
+    let h = cfg.hidden_size as usize;
+    let nh = cfg.num_attention_heads as usize;
+    let nkv = cfg.num_key_value_heads as usize;
+    let d = cfg.head_dim as usize;
+    let q_total = nh * d;
+    let kv_total = nkv * d;
+    if q_fused.len() != 2 * q_total * h {
+        return Err(anyhow!(
+            "fused attn_q layer {layer_idx}: got {} floats, expected {}",
+            q_fused.len(),
+            2 * q_total * h
+        ));
+    }
+    if wk.len() != kv_total * h || wv.len() != kv_total * h {
+        return Err(anyhow!("layer {layer_idx}: K/V shape mismatch"));
+    }
+
+    let mut wq = vec![0.0f32; q_total * h];
+    let mut w_gate = vec![0.0f32; q_total * h];
+    for head_idx in 0..nh {
+        let src_q_start = (head_idx * 2 * d) * h;
+        let src_g_start = ((head_idx * 2 + 1) * d) * h;
+        let dst_start = head_idx * d * h;
+        wq[dst_start..dst_start + d * h]
+            .copy_from_slice(&q_fused[src_q_start..src_q_start + d * h]);
+        w_gate[dst_start..dst_start + d * h]
+            .copy_from_slice(&q_fused[src_g_start..src_g_start + d * h]);
+    }
+
+    Ok(FullAttnLayerWeights {
+        attn_norm,
+        post_attn_norm,
+        wq,
+        wk,
+        wv,
+        w_gate,
+        attn_q_norm,
+        attn_k_norm,
+        wo,
+    })
+}
+
+fn load_lazy_delta_net_layer(
+    lookup: &LazyQwen35Lookup<'_>,
+    cfg: &Qwen35Config,
+    layer_idx: u32,
+) -> Result<DeltaNetLayerWeights> {
+    let p = format!("blk.{}", layer_idx);
+    let attn_norm = load_lazy_f32(lookup, &format!("{p}.attn_norm.weight"))?;
+    let post_attn_norm = load_lazy_f32(lookup, &format!("{p}.post_attention_norm.weight"))?;
+    let attn_qkv = load_lazy_f32(lookup, &format!("{p}.attn_qkv.weight"))?;
+    let attn_gate = load_lazy_f32(lookup, &format!("{p}.attn_gate.weight"))?;
+    let ssm_conv1d_gguf = load_lazy_f32(lookup, &format!("{p}.ssm_conv1d.weight"))?;
+    let ssm_alpha = load_lazy_f32(lookup, &format!("{p}.ssm_alpha.weight"))?;
+    let ssm_dt_bias = load_lazy_f32(lookup, &format!("{p}.ssm_dt.bias"))?;
+    let ssm_beta = load_lazy_f32(lookup, &format!("{p}.ssm_beta.weight"))?;
+    let ssm_a = load_lazy_f32(lookup, &format!("{p}.ssm_a"))?;
+    let ssm_norm = load_lazy_f32(lookup, &format!("{p}.ssm_norm.weight"))?;
+    let ssm_out = load_lazy_f32(lookup, &format!("{p}.ssm_out.weight"))?;
+
+    let nk = cfg.linear_num_key_heads as usize;
+    let nv = cfg.linear_num_value_heads as usize;
+    let dk = cfg.linear_key_head_dim as usize;
+    let dv = cfg.linear_value_head_dim as usize;
+    let k_width = cfg.linear_conv_kernel_dim as usize;
+    let qkv_channels = 2 * nk * dk + nv * dv;
+    if ssm_conv1d_gguf.len() != qkv_channels * k_width {
+        return Err(anyhow!("layer {layer_idx}: ssm_conv1d shape mismatch"));
+    }
+    let mut ssm_conv1d = vec![0.0f32; k_width * qkv_channels];
+    for c in 0..qkv_channels {
+        for ki in 0..k_width {
+            ssm_conv1d[ki * qkv_channels + c] = ssm_conv1d_gguf[c * k_width + ki];
+        }
+    }
+
+    Ok(DeltaNetLayerWeights {
+        attn_norm,
+        post_attn_norm,
+        attn_qkv,
+        attn_gate,
+        ssm_conv1d,
+        ssm_alpha,
+        ssm_dt_bias,
+        ssm_beta,
+        ssm_a,
+        ssm_norm,
+        ssm_out,
+    })
+}
+
+fn load_lazy_dense_ffn(
+    lookup: &LazyQwen35Lookup<'_>,
+    layer_idx: u32,
+) -> Result<DenseFfnWeights> {
+    let p = format!("blk.{}", layer_idx);
+    Ok(DenseFfnWeights {
+        gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate.weight"))?,
+        up: load_lazy_f32(lookup, &format!("{p}.ffn_up.weight"))?,
+        down: load_lazy_f32(lookup, &format!("{p}.ffn_down.weight"))?,
+    })
+}
+
+fn load_lazy_moe_ffn_quantized(
+    lookup: &LazyQwen35Lookup<'_>,
+    layer_idx: u32,
+    device: &MlxDevice,
+) -> Result<MoeFfnWeightsQ> {
+    let p = format!("blk.{}", layer_idx);
+    Ok(MoeFfnWeightsQ {
+        router: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp.weight"))?,
+        expert_gate_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_gate_exps.weight"), device)?,
+        expert_up_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_up_exps.weight"), device)?,
+        expert_down_q: load_lazy_expert_q8_0(lookup, &format!("{p}.ffn_down_exps.weight"), device)?,
+        ggml_type_gate_up: GgmlType::Q8_0,
+        ggml_type_down: GgmlType::Q8_0,
+        shared_gate_logit: load_lazy_f32(lookup, &format!("{p}.ffn_gate_inp_shexp.weight"))?,
+        shared_gate: load_lazy_f32(lookup, &format!("{p}.ffn_gate_shexp.weight"))?,
+        shared_up: load_lazy_f32(lookup, &format!("{p}.ffn_up_shexp.weight"))?,
+        shared_down: load_lazy_f32(lookup, &format!("{p}.ffn_down_shexp.weight"))?,
+    })
+}
+
+impl Qwen35Model {
+    /// Load a complete Qwen3.5 model directly from a transformed lazy tensor
+    /// map, without emitting and re-reading an intermediate GGUF.
+    ///
+    /// The map may contain either post-transform HF tensor names or the GGUF
+    /// names used by the inference loader. Iteration is deterministic through
+    /// `LazyTensorMap`'s `BTreeMap`; each requested tensor is materialized,
+    /// converted/uploaded, and then dropped before the next tensor is loaded.
+    pub fn load_from_lazy_tensor_map(model: &LazyTensorMap) -> Result<Self> {
+        let lookup = LazyQwen35Lookup::new(model);
+        let mut cfg = infer_lazy_qwen35_config(&lookup)?;
+        let device = MlxDevice::new()
+            .map_err(|e| anyhow!("MlxDevice::new for lazy qwen35 loading: {e}"))?;
+
+        let mut token_embd = load_lazy_f32(&lookup, "token_embd.weight")?;
+        let output_weight = load_lazy_f32(&lookup, "output.weight")?;
+        let output_norm = load_lazy_f32(&lookup, "output_norm.weight")?;
+
+        let h = cfg.hidden_size as usize;
+        if h > 0 {
+            let physical_vocab = token_embd.len() / h;
+            if (physical_vocab as u32) != cfg.vocab_size {
+                cfg.vocab_size = physical_vocab as u32;
+            }
+        }
+
+        if h > 0 {
+            const QWEN35_FULL_VOCAB: u32 = 248_320;
+            let current_vocab = cfg.vocab_size;
+            if current_vocab < QWEN35_FULL_VOCAB
+                && (QWEN35_FULL_VOCAB - current_vocab) < 2048
+            {
+                token_embd.resize(QWEN35_FULL_VOCAB as usize * h, 0.0f32);
+            }
+        }
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers as usize);
+        for i in 0..cfg.num_hidden_layers {
+            let kind = cfg
+                .layer_types
+                .get(i as usize)
+                .copied()
+                .ok_or_else(|| anyhow!("layer_idx {i} out of range"))?;
+            let ffn = match cfg.variant {
+                Qwen35Variant::Dense => Qwen35FfnWeights::Dense(load_lazy_dense_ffn(&lookup, i)?),
+                Qwen35Variant::Moe => {
+                    Qwen35FfnWeights::MoeQ(load_lazy_moe_ffn_quantized(&lookup, i, &device)?)
+                }
+            };
+            let layer = match kind {
+                Qwen35LayerKind::FullAttention => Qwen35LayerWeights::FullAttn {
+                    attn: load_lazy_full_attn_layer(&lookup, &cfg, i)?,
+                    ffn,
+                },
+                Qwen35LayerKind::LinearAttention => Qwen35LayerWeights::LinearAttn {
+                    attn: load_lazy_delta_net_layer(&lookup, &cfg, i)?,
+                    ffn,
+                },
+            };
+            layers.push(layer);
+        }
+
+        Ok(Self {
+            cfg,
+            layers,
+            token_embd,
+            output_weight,
+            output_norm,
+            mtp: None,
+        })
+    }
 }
 
 /// Load a single full-attention layer's weights from the GGUF.
@@ -618,7 +1192,160 @@ pub fn load_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+    use crate::ir::DType;
     use crate::inference::models::qwen35::model::Qwen35Model;
+
+    fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
+        values.flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn insert_f32(map: &mut LazyTensorMap, name: &str, shape: Vec<usize>, base: f32) {
+        let numel: usize = shape.iter().product();
+        let data = f32_bytes((0..numel).map(|i| base + i as f32));
+        let meta = LazyMeta::new(name.to_string(), shape, DType::F32);
+        map.insert(LazyTensor::from_bytes(meta, data));
+    }
+
+    fn insert_zeros(map: &mut LazyTensorMap, name: &str, shape: Vec<usize>) {
+        insert_f32(map, name, shape, 0.0);
+    }
+
+    fn synthetic_four_layer_dense_map() -> LazyTensorMap {
+        let mut map = LazyTensorMap::new();
+        let h = 32usize;
+        let d = 8usize;
+        let q_heads = 2usize;
+        let kv_heads = 1usize;
+        let lin_k_heads = 1usize;
+        let lin_v_heads = 2usize;
+        let inter = 32usize;
+
+        insert_f32(&mut map, "token_embd.weight", vec![16, h], 100.0);
+        insert_f32(&mut map, "output.weight", vec![16, h], 200.0);
+        insert_f32(&mut map, "output_norm.weight", vec![h], 300.0);
+
+        for layer in 0..4 {
+            let p = format!("blk.{layer}");
+            insert_zeros(&mut map, &format!("{p}.attn_norm.weight"), vec![h]);
+            insert_zeros(&mut map, &format!("{p}.post_attention_norm.weight"), vec![h]);
+            if layer == 3 {
+                insert_f32(
+                    &mut map,
+                    &format!("{p}.attn_q.weight"),
+                    vec![2 * q_heads * d, h],
+                    1_000.0,
+                );
+                insert_zeros(&mut map, &format!("{p}.attn_k.weight"), vec![kv_heads * d, h]);
+                insert_zeros(&mut map, &format!("{p}.attn_v.weight"), vec![kv_heads * d, h]);
+                insert_zeros(&mut map, &format!("{p}.attn_q_norm.weight"), vec![d]);
+                insert_zeros(&mut map, &format!("{p}.attn_k_norm.weight"), vec![d]);
+                insert_zeros(&mut map, &format!("{p}.attn_output.weight"), vec![h, q_heads * d]);
+            } else {
+                let qkv_rows = 2 * lin_k_heads * d + lin_v_heads * d;
+                insert_zeros(&mut map, &format!("{p}.attn_qkv.weight"), vec![qkv_rows, h]);
+                insert_zeros(&mut map, &format!("{p}.attn_gate.weight"), vec![lin_v_heads * d, h]);
+                insert_zeros(&mut map, &format!("{p}.ssm_conv1d.weight"), vec![qkv_rows, 4]);
+                insert_zeros(&mut map, &format!("{p}.ssm_alpha.weight"), vec![lin_v_heads, h]);
+                insert_zeros(&mut map, &format!("{p}.ssm_dt.bias"), vec![lin_v_heads]);
+                insert_zeros(&mut map, &format!("{p}.ssm_beta.weight"), vec![lin_v_heads, h]);
+                insert_zeros(&mut map, &format!("{p}.ssm_a"), vec![lin_v_heads]);
+                insert_zeros(&mut map, &format!("{p}.ssm_norm.weight"), vec![d]);
+                insert_zeros(&mut map, &format!("{p}.ssm_out.weight"), vec![h, lin_v_heads * d]);
+            }
+            insert_zeros(&mut map, &format!("{p}.ffn_gate.weight"), vec![inter, h]);
+            insert_zeros(&mut map, &format!("{p}.ffn_up.weight"), vec![inter, h]);
+            insert_zeros(&mut map, &format!("{p}.ffn_down.weight"), vec![h, inter]);
+        }
+
+        map
+    }
+
+    fn synthetic_four_layer_moe_map() -> LazyTensorMap {
+        let mut map = synthetic_four_layer_dense_map();
+        for layer in 0..4 {
+            let p = format!("blk.{layer}");
+            map.remove(&format!("{p}.ffn_gate.weight"));
+            map.remove(&format!("{p}.ffn_up.weight"));
+            map.remove(&format!("{p}.ffn_down.weight"));
+            insert_zeros(&mut map, &format!("{p}.ffn_gate_inp.weight"), vec![2, 32]);
+            insert_f32(&mut map, &format!("{p}.ffn_gate_exps.weight"), vec![2, 16, 32], 10.0);
+            insert_f32(&mut map, &format!("{p}.ffn_up_exps.weight"), vec![2, 16, 32], 20.0);
+            insert_f32(&mut map, &format!("{p}.ffn_down_exps.weight"), vec![2, 32, 16], 30.0);
+            insert_zeros(&mut map, &format!("{p}.ffn_gate_inp_shexp.weight"), vec![32]);
+            insert_zeros(&mut map, &format!("{p}.ffn_gate_shexp.weight"), vec![16, 32]);
+            insert_zeros(&mut map, &format!("{p}.ffn_up_shexp.weight"), vec![16, 32]);
+            insert_zeros(&mut map, &format!("{p}.ffn_down_shexp.weight"), vec![32, 16]);
+        }
+        map
+    }
+
+    fn load_lazy_or_skip_without_metal(map: &LazyTensorMap) -> Option<Qwen35Model> {
+        match Qwen35Model::load_from_lazy_tensor_map(map) {
+            Ok(model) => Some(model),
+            Err(err) if format!("{err}").contains("No Metal GPU device found") => {
+                eprintln!("skipping GPU-backed lazy load test: {err}");
+                None
+            }
+            Err(err) => panic!("lazy load: {err:#}"),
+        }
+    }
+
+    #[test]
+    fn load_from_lazy_tensor_map_infers_four_layer_dense_config() {
+        let map = synthetic_four_layer_dense_map();
+        let Some(model) = load_lazy_or_skip_without_metal(&map) else {
+            return;
+        };
+        assert_eq!(model.cfg.variant, Qwen35Variant::Dense);
+        assert_eq!(model.cfg.num_hidden_layers, 4);
+        assert_eq!(model.cfg.hidden_size, 32);
+        assert_eq!(model.cfg.full_attention_interval, 4);
+        assert_eq!(model.cfg.num_attention_heads, 2);
+        assert_eq!(model.cfg.num_key_value_heads, 1);
+        assert_eq!(model.cfg.linear_num_key_heads, 1);
+        assert_eq!(model.cfg.linear_num_value_heads, 2);
+        assert_eq!(model.token_embd[0], 100.0);
+        assert_eq!(model.output_weight[0], 200.0);
+        assert_eq!(model.output_norm[0], 300.0);
+    }
+
+    #[test]
+    fn load_from_lazy_tensor_map_splits_fused_full_attention_q_gate() {
+        let map = synthetic_four_layer_dense_map();
+        let Some(model) = load_lazy_or_skip_without_metal(&map) else {
+            return;
+        };
+        let attn = match &model.layers[3] {
+            Qwen35LayerWeights::FullAttn { attn, .. } => attn,
+            _ => panic!("layer 3 should be full attention"),
+        };
+        let h = model.cfg.hidden_size as usize;
+        let d = model.cfg.head_dim as usize;
+        assert_eq!(attn.wq[0], 1_000.0);
+        assert_eq!(attn.w_gate[0], 1_000.0 + (d * h) as f32);
+        assert_eq!(attn.wq[d * h], 1_000.0 + (2 * d * h) as f32);
+        assert_eq!(attn.w_gate[d * h], 1_000.0 + (3 * d * h) as f32);
+    }
+
+    #[test]
+    fn load_from_lazy_tensor_map_quantizes_moe_experts_to_q8_0() {
+        let map = synthetic_four_layer_moe_map();
+        let Some(model) = load_lazy_or_skip_without_metal(&map) else {
+            return;
+        };
+        assert_eq!(model.cfg.variant, Qwen35Variant::Moe);
+        let ffn = model.layers[0].ffn();
+        let moe = match ffn {
+            Qwen35FfnWeights::MoeQ(moe) => moe,
+            other => panic!("expected MoeQ, got {}", other.variant()),
+        };
+        assert_eq!(moe.ggml_type_gate_up, GgmlType::Q8_0);
+        assert_eq!(moe.ggml_type_down, GgmlType::Q8_0);
+        assert_eq!(moe.expert_gate_q.dtype(), mlx_native::DType::U8);
+        let gate_bytes = moe.expert_gate_q.as_slice::<u8>().expect("gate bytes");
+        assert_eq!(gate_bytes.len(), (2 * 16 * 32 / 32) * 34);
+    }
 
     /// **Integration test**: load a single linear-attention layer (layer 0)
     /// from the real apex GGUF. Verifies:

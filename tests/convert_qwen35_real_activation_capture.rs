@@ -10,10 +10,8 @@
 //! Post-P9b.2/3b (this iteration): the P9b-pending guard is removed.
 //! The two-pass pipeline now executes:
 //!
-//!   1. `emit_gguf_from_tensor_map` writes an intermediate F16 GGUF.
-//!   2. `RealActivationCapture::new(intermediate, tokenizer)` calls
-//!      `Qwen35Model::load_from_gguf` to produce a live model.
-//!   3. `run_dwq_activation_calibration` drives DWQ via the real
+//!   1. `RealActivationCapture` loads from the transformed lazy tensor map.
+//!   2. `run_dwq_activation_calibration` drives DWQ via the real
 //!      forward pass.
 //!
 //! On the synthetic all-zero qwen35 fixture below, step (2) fails
