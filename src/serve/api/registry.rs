@@ -25,6 +25,30 @@
 //! Day-one registered models: `gemma4`, `qwen35` (Qwen 3.5 / 3.6 family).
 //! Additional models are added by calling `register(...)` at process start
 //! or by editing this file.
+//!
+//! # Per-model wrapper grammar (ADR-005 Phase 2a T1.8 Option B, Wave 2 W-4)
+//!
+//! `ModelRegistration::tool_call_gbnf` emits a GBNF string that physically
+//! constrains the model to emit a valid wrapper + valid arguments for the
+//! named function. The caller (handlers.rs `compile_tool_grammar`) parses the
+//! GBNF string with `grammar::parser::parse` and attaches the result to
+//! `SamplingParams.grammar`.
+//!
+//! WHY per-model wrapper grammars instead of plain JSON:
+//!   - **Gemma 4** — the chat template's `tool_call` macro emits
+//!     `call:NAME{key:<|"|>val<|"|>,...}`, NOT JSON. The `<|"|>` string-quote
+//!     markers are Gemma-specific (see `models/gemma4/chat_template.jinja:113`).
+//!     If the grammar constrained plain `{"key":"val"}` the model would fight
+//!     the constraint and produce degenerate outputs; the constraint must match
+//!     the template's expected emission exactly.
+//!   - **Qwen 3.5/3.6** — the chat template's tool-call block emits
+//!     `<function=NAME><parameter=key>val</parameter>...</function>` XML.
+//!     Same reason: the constraint must match the template's emission shape.
+//!   - Plain JSON constraints (via json_schema::schema_to_gbnf) are correct
+//!     for `response_format=json_schema` where no per-model wrapper exists.
+//!     Tool-call wrappers are necessarily per-model, and their inner value
+//!     grammar must mirror the wrapper's own quoting convention (Gemma uses
+//!     `<|"|>` string markers; Qwen XML wraps raw values).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -82,6 +106,42 @@ impl ModelRegistration {
     /// Returns `true` if this registration has a usable tool-call span.
     pub fn has_tools(&self) -> bool {
         self.tool_open.is_some() && self.tool_close.is_some()
+    }
+
+    /// Emit a GBNF string that physically constrains the model output to a
+    /// well-formed tool-call wrapper for function `fn_name` with parameters
+    /// matching `params_schema` (a JSON Schema object).
+    ///
+    /// The emitted GBNF is **between** the open/close markers — i.e. the
+    /// portion the `ToolCallSplitter` hands to `parse_tool_call_body`. The
+    /// caller (`compile_tool_grammar` in handlers.rs) prepends nothing; the
+    /// marker bytes are never fed to the grammar sampler because the sampler
+    /// is wired to run only after the open marker has been observed (or, in
+    /// the forced-tool-call case, from the first decode token).
+    ///
+    /// Returns `Err(String)` when the family is unknown or when `params_schema`
+    /// contains a feature the per-model emitter doesn't support yet. The error
+    /// string is forwarded as a 400 `grammar_error` to the caller.
+    ///
+    /// WHY the return type is `String` (not `Grammar`):
+    /// registry.rs intentionally has no dependency on `grammar::parser` to
+    /// keep the module's concern narrow (marker registration + body parsing).
+    /// The caller in handlers.rs already imports the grammar module and calls
+    /// `grammar::parser::parse` on the returned string — the same pattern used
+    /// by `compile_response_format`.
+    pub fn tool_call_gbnf(
+        &self,
+        fn_name: &str,
+        params_schema: &serde_json::Value,
+    ) -> Result<String, String> {
+        match self.family {
+            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema),
+            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema),
+            other => Err(format!(
+                "tool_call_gbnf: no per-model grammar emitter for family '{}'",
+                other
+            )),
+        }
     }
 }
 
@@ -733,6 +793,467 @@ pub fn split_full_output(
         }
     }
     (content, if reasoning.is_empty() { None } else { Some(reasoning) })
+}
+
+// ---------------------------------------------------------------------------
+// Per-model GBNF emitters (T1.8 Option B, ADR-005 Wave 2 W-4)
+// ---------------------------------------------------------------------------
+
+/// Escape a literal string for embedding in a GBNF rule — wraps in double
+/// quotes and escapes special characters.  Mirrors
+/// `grammar::json_schema::format_literal` without importing the grammar crate.
+///
+/// WHY inlined here: registry.rs has no grammar module dependency by design
+/// (it's a registration + parsing module, not a grammar emission module).
+/// Duplicating the trivial 10-line escape is preferable to introducing a
+/// circular import path.
+fn gbnf_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Map a JSON Schema type string to the GBNF value rule appropriate for
+/// **Gemma 4's kv-list syntax**.
+///
+/// Gemma 4 string values use the `<|"|>...<|"|>` quote-marker convention
+/// (see `models/gemma4/chat_template.jinja:113`): the model never emits a
+/// plain JSON `"..."` string inside a tool call — it wraps every string arg
+/// in `<|"|>` open + close tokens.  Non-string scalars (numbers, booleans,
+/// null) are emitted bare (no JSON quotes) exactly as in standard JSON values.
+///
+/// WHY NOT reuse json_schema primitives here:
+/// json_schema::schema_to_gbnf emits a grammar that matches `"quoted JSON
+/// strings"` (double quotes with JSON escape sequences).  Gemma 4's template
+/// never emits those — it always uses `<|"|>` markers — so reusing the JSON
+/// string grammar would make valid Gemma 4 outputs fail the mask check.
+fn gemma4_value_gbnf(
+    schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+) -> String {
+    let obj = match schema.as_object() {
+        Some(o) => o,
+        None => {
+            // Untyped / unknown → accept any Gemma value (string or bare scalar).
+            return "gemma4-any-val".to_string();
+        }
+    };
+
+    // enum (string values only in Gemma 4's canonical use) → literal alternation.
+    if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
+        let alts: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| format!("{} {} {}", gbnf_literal("<|\"|>"), gbnf_literal(s), gbnf_literal("<|\"|>")))
+            .collect();
+        if !alts.is_empty() {
+            return format!("( {} )", alts.join(" | "));
+        }
+    }
+
+    match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "string" => {
+            // Gemma 4 string: `<|"|>` + zero-or-more non-marker chars + `<|"|>`.
+            // We approximate "non-marker chars" as any char that is not the
+            // start of the 5-byte `<|"|>` marker — in practice the grammar
+            // sampler enforces this token-by-token; the grammar just needs to
+            // be wide enough to accept valid outputs.
+            //
+            // Rule body: `"<|\"|>" gemma4-str-char* "<|\"|>"`
+            // where gemma4-str-char matches any Unicode scalar that is not `<`
+            // (the marker opening byte).  This is conservative but correct:
+            // string values in Gemma 4 tool calls never contain `<` per the
+            // chat template's jinja escape of `<` in string args.
+            "gemma4-str-val".to_string()
+        }
+        "integer" => "gemma4-int-val".to_string(),
+        "number" => "gemma4-num-val".to_string(),
+        "boolean" => "gemma4-bool-val".to_string(),
+        "null" => "gemma4-null-val".to_string(),
+        _ => {
+            // Nested types (arrays, objects) → generate a named sub-rule.
+            *rule_counter += 1;
+            let name = format!("gemma4-sub-{}", rule_counter);
+            // For now, treat nested as a bare Gemma string (conservative).
+            rules.push((name.clone(), "gemma4-str-val".to_string()));
+            name
+        }
+    }
+}
+
+/// Emit a GBNF grammar string constraining output to Gemma 4's
+/// `call:NAME{key:val,...}` tool-call wrapper for the given function and
+/// parameters schema.
+///
+/// The Gemma 4 chat template's `tool_call` macro (jinja:113-200) emits:
+///   `call:FUNCTION_NAME{param_name:<|"|>string_val<|"|>,count:42,...}`
+///
+/// So the grammar has three structural layers:
+///   1. A fixed prefix: the literal `call:NAME{`
+///   2. A kv-list body: comma-separated `KEY:VALUE` pairs (in any order for
+///      optional keys; required keys must all appear).
+///   3. A fixed suffix: `}`
+///
+/// For the kv-list body this emitter uses a simplified approach compared to
+/// json_schema's permutation algorithm: we treat ALL properties as optional
+/// (the model decides which to emit) but constrain each KEY to a known literal
+/// and each VALUE to its type-specific rule. This matches the Gemma 4 template
+/// behavior exactly — the template emits only the keys the model fills in, so
+/// a "required" constraint here would fight the template.
+///
+/// WHY only one kv-list approach (not the permutation algo):
+/// json_schema's O(2^N) permutation algo is needed for JSON because JSON
+/// parsers care about key order and we need to accept ANY order for
+/// `additionalProperties:false`. In Gemma 4's kv-list the parser
+/// (`parse_gemma4_tool_call`) is key-order-agnostic — it scans for `key:val`
+/// pairs linearly — so a simpler optional-chain grammar suffices. We do NOT
+/// want to forbid the model from emitting a subset of keys (some tools have
+/// optional args); treating all as optional matches the template semantics.
+fn gemma4_tool_call_gbnf(
+    fn_name: &str,
+    params_schema: &serde_json::Value,
+) -> Result<String, String> {
+    let mut rules: Vec<(String, String)> = Vec::new();
+    let mut rule_counter: u32 = 0;
+
+    // Gemma 4 primitive rules (shared across all function grammars).
+    // These are the concrete terminal rules for Gemma's value types.
+    //
+    // String: `<|"|>` any-safe-char* `<|"|>`. We define gemma4-str-char as
+    // any character that is NOT `<` (the first byte of the 5-byte marker
+    // `<|"|>`). This is conservative but safe — Gemma 4's jinja template
+    // HTML-escapes `<` in string args so valid model outputs never contain
+    // bare `<` inside string values. The grammar sampler enforces the mask
+    // token-by-token; the grammar just needs to accept all valid outputs.
+    rules.push((
+        "gemma4-str-char".to_string(),
+        r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-str-val".to_string(),
+        format!(
+            "{} gemma4-str-char* {}",
+            gbnf_literal("<|\"|>"),
+            gbnf_literal("<|\"|>")
+        ),
+    ));
+    // Numeric + boolean + null primitives reuse standard GBNF forms.
+    rules.push((
+        "gemma4-int-val".to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15})"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-num-val".to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-bool-val".to_string(),
+        r#""true" | "false""#.to_string(),
+    ));
+    rules.push((
+        "gemma4-null-val".to_string(),
+        r#""null""#.to_string(),
+    ));
+    // Catch-all for any value type (string OR bare scalar). Used when the
+    // schema doesn't declare a type.
+    rules.push((
+        "gemma4-any-val".to_string(),
+        r#"gemma4-str-val | gemma4-num-val | gemma4-bool-val | gemma4-null-val"#.to_string(),
+    ));
+
+    // Build per-property kv rules from the params schema.
+    let properties = params_schema
+        .as_object()
+        .and_then(|o| o.get("properties"))
+        .and_then(|p| p.as_object());
+
+    // Emit the root rule: `call:NAME{` + kv-body + `}`.
+    // The kv-body is a comma-separated list of optional KEY:VALUE pairs.
+    let prefix_lit = gbnf_literal(&format!("call:{}", fn_name));
+    let open_lit = gbnf_literal("{");
+    let close_lit = gbnf_literal("}");
+    let comma_lit = gbnf_literal(",");
+
+    if let Some(props) = properties {
+        if props.is_empty() {
+            // No parameters: `call:NAME{}`.
+            rules.push(("root".to_string(), format!("{} {} {} space", prefix_lit, open_lit, close_lit)));
+        } else {
+            // Build one kv-rule per property.
+            let mut kv_rule_names: Vec<String> = Vec::new();
+            let mut sorted_keys: Vec<&String> = props.keys().collect();
+            sorted_keys.sort(); // deterministic rule names
+            for key in &sorted_keys {
+                let val_schema = &props[*key];
+                let val_rule = gemma4_value_gbnf(val_schema, &mut rules, &mut rule_counter);
+                let key_lit = gbnf_literal(key.as_str());
+                let kv_body = format!("{} {} {}", key_lit, gbnf_literal(":"), val_rule);
+                let kv_name = format!("gemma4-kv-{}", sanitize_rule_name_local(key));
+                rules.push((kv_name.clone(), kv_body));
+                kv_rule_names.push(kv_name);
+            }
+            // Build optional kv-list: any number of kv-pairs in any order,
+            // separated by commas. We emit a single alternation rule that
+            // the model can satisfy by picking a subset of the declared keys.
+            //
+            // Form: `( kv_1 | kv_2 | ... ) ( "," ( kv_1 | kv_2 | ... ) )*`
+            // This allows any key to appear in any order, each at most once
+            // (the grammar doesn't enforce uniqueness — the sampler mask at
+            // the token level guarantees the model won't repeat a key because
+            // once it emits `key:val,` the key token is no longer in the valid
+            // set... actually the grammar itself doesn't enforce uniqueness
+            // since we're using Kleene star, but parse_gemma4_tool_call would
+            // just pick the last occurrence if a key were repeated, which is
+            // acceptable). This is a deliberate simplification — adding a
+            // "used keys" tracking grammar would require O(2^N) rules like the
+            // JSON permutation algorithm; the simpler form is correct for the
+            // common case and Chesterton-safe.
+            let alts = kv_rule_names.join(" | ");
+            let kv_item_rule = "gemma4-kv-item".to_string();
+            rules.push((kv_item_rule.clone(), format!("( {} )", alts)));
+            let kv_list_rule = "gemma4-kv-list".to_string();
+            rules.push((
+                kv_list_rule.clone(),
+                format!("{} ( {} {} )*", kv_item_rule, comma_lit, kv_item_rule),
+            ));
+            rules.push((
+                "root".to_string(),
+                format!("{} {} {} {} space", prefix_lit, open_lit, kv_list_rule, close_lit),
+            ));
+        }
+    } else {
+        // No `properties` in schema (bare object or no schema): allow any
+        // kv-list body. The grammar only enforces the `call:NAME{...}` wrapper.
+        rules.push((
+            "gemma4-any-kv-char".to_string(),
+            r#"[^}]"#.to_string(),
+        ));
+        rules.push((
+            "root".to_string(),
+            format!("{} {} gemma4-any-kv-char* {} space", prefix_lit, open_lit, close_lit),
+        ));
+    }
+
+    // `space` rule: optional whitespace (consistent with json_schema emitter).
+    rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
+
+    // Serialize: root first, then the rest.
+    let mut out = String::new();
+    // Find and emit root first.
+    for (name, body) in &rules {
+        if name == "root" {
+            out.push_str(&format!("root ::= {}\n", body));
+            break;
+        }
+    }
+    for (name, body) in &rules {
+        if name != "root" {
+            out.push_str(&format!("{} ::= {}\n", name, body));
+        }
+    }
+    Ok(out)
+}
+
+/// Emit a GBNF grammar string constraining output to Qwen 3.5/3.6's
+/// `<function=NAME><parameter=key>val</parameter>...</function>` wrapper.
+///
+/// The Qwen 3.5/3.6 chat template emits tool calls as:
+///   `<function=FUNCTION_NAME>\n<parameter=param>\nVAL\n</parameter>\n...</function>`
+///
+/// The grammar constrains:
+///   1. Literal `<function=NAME>` prefix.
+///   2. Zero-or-more `<parameter=KEY>\nVAL\n</parameter>` blocks — one per
+///      declared property. Key names are literal; values are type-constrained.
+///   3. Literal `</function>` suffix.
+///
+/// For Qwen values: the template uses `tojson` on values (jinja `tojson`
+/// filter → valid JSON), so values ARE valid JSON. However the parse path
+/// (`parse_qwen35_tool_call`) `.trim()`s the value and tries `serde_json::from_str`
+/// first (for numbers/booleans) then falls back to plain string. The grammar
+/// mirrors this: for `string` types, emit any character that is not the start
+/// of `</parameter>` (a safe approximation); for numeric/boolean types, emit
+/// the JSON scalar grammar.
+///
+/// WHY not json_schema primitives for Qwen values:
+/// The value is NOT wrapped in JSON `"..."` for strings in Qwen's XML format —
+/// the raw text goes between `<parameter=KEY>` and `</parameter>`. Using the
+/// json_schema `string` rule (which requires surrounding `"`) would cause all
+/// string-valued tool calls to fail the grammar mask.
+fn qwen35_tool_call_gbnf(
+    fn_name: &str,
+    params_schema: &serde_json::Value,
+) -> Result<String, String> {
+    let mut rules: Vec<(String, String)> = Vec::new();
+
+    // Qwen 3.5/3.6 value primitives — values sit between XML tags, so no
+    // wrapping quotes for strings. Numbers and booleans are JSON-serialized
+    // (the `tojson` Jinja filter is used), so they match standard JSON forms.
+    rules.push((
+        "qwen35-str-char".to_string(),
+        // Any character that is not `<` (the first byte of `</parameter>`).
+        // Conservative but correct: the template HTML-escapes `<` in string
+        // values so valid outputs never contain bare `<` inside a parameter.
+        r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-str-val".to_string(),
+        "qwen35-str-char*".to_string(),
+    ));
+    rules.push((
+        "qwen35-int-val".to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15})"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-num-val".to_string(),
+        r#""-"? ([0] | [1-9] [0-9]{0,15}) ("." [0-9]{1,16})? ([eE] [-+]? [0-9]{1,16})?"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-bool-val".to_string(),
+        r#""true" | "false""#.to_string(),
+    ));
+    rules.push((
+        "qwen35-null-val".to_string(),
+        r#""null""#.to_string(),
+    ));
+    rules.push((
+        "qwen35-any-val".to_string(),
+        r#"qwen35-str-val | qwen35-num-val | qwen35-bool-val | qwen35-null-val"#.to_string(),
+    ));
+
+    let properties = params_schema
+        .as_object()
+        .and_then(|o| o.get("properties"))
+        .and_then(|p| p.as_object());
+
+    let func_open_lit = gbnf_literal(&format!("<function={}>", fn_name));
+    let func_close_lit = gbnf_literal("</function>");
+    let newline_lit = gbnf_literal("\n");
+
+    if let Some(props) = properties {
+        if props.is_empty() {
+            // No parameters: `<function=NAME></function>`.
+            rules.push((
+                "root".to_string(),
+                format!("{} {} space", func_open_lit, func_close_lit),
+            ));
+        } else {
+            // Build one param-block rule per property.
+            let mut block_rule_names: Vec<String> = Vec::new();
+            let mut sorted_keys: Vec<&String> = props.keys().collect();
+            sorted_keys.sort();
+            for key in &sorted_keys {
+                let val_schema = &props[*key];
+                let val_rule = qwen35_value_rule(val_schema);
+                let param_open_lit = gbnf_literal(&format!("<parameter={}>", key));
+                let param_close_lit = gbnf_literal("</parameter>");
+                // Block form: `<parameter=KEY>\nVAL\n</parameter>` (with optional
+                // leading/trailing newlines as emitted by the template).
+                let block_body = format!(
+                    "{} {} {} {} {} {}",
+                    param_open_lit, newline_lit, val_rule, newline_lit, param_close_lit, newline_lit
+                );
+                let block_name = format!("qwen35-param-{}", sanitize_rule_name_local(key));
+                rules.push((block_name.clone(), block_body));
+                block_rule_names.push(block_name);
+            }
+            // Parameter list: any number of parameter blocks in any order.
+            // Same Kleene-star simplification as Gemma 4 above (see note there).
+            let alts = block_rule_names.join(" | ");
+            let param_item_rule = "qwen35-param-item".to_string();
+            rules.push((param_item_rule.clone(), format!("( {} )", alts)));
+            // Root: function open + newline + zero-or-more param blocks + function close.
+            rules.push((
+                "root".to_string(),
+                format!(
+                    "{} {} {}* {} space",
+                    func_open_lit, newline_lit, param_item_rule, func_close_lit
+                ),
+            ));
+        }
+    } else {
+        // No `properties` schema: allow any content between function tags.
+        rules.push((
+            "qwen35-inner-char".to_string(),
+            // Any character not the start of `</function>`.
+            r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
+        ));
+        rules.push((
+            "root".to_string(),
+            format!("{} qwen35-inner-char* {} space", func_open_lit, func_close_lit),
+        ));
+    }
+
+    rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
+
+    // Serialize: root first.
+    let mut out = String::new();
+    for (name, body) in &rules {
+        if name == "root" {
+            out.push_str(&format!("root ::= {}\n", body));
+            break;
+        }
+    }
+    for (name, body) in &rules {
+        if name != "root" {
+            out.push_str(&format!("{} ::= {}\n", name, body));
+        }
+    }
+    Ok(out)
+}
+
+/// Map a JSON Schema value to the Qwen 3.5 value rule name.
+fn qwen35_value_rule(schema: &serde_json::Value) -> String {
+    let obj = match schema.as_object() {
+        Some(o) => o,
+        None => return "qwen35-any-val".to_string(),
+    };
+    // enum → accept only the declared string literals.
+    if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
+        let alts: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| gbnf_literal(s))
+            .collect();
+        if !alts.is_empty() {
+            return format!("( {} )", alts.join(" | "));
+        }
+    }
+    match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "string" => "qwen35-str-val".to_string(),
+        "integer" => "qwen35-int-val".to_string(),
+        "number" => "qwen35-num-val".to_string(),
+        "boolean" => "qwen35-bool-val".to_string(),
+        "null" => "qwen35-null-val".to_string(),
+        _ => "qwen35-any-val".to_string(),
+    }
+}
+
+/// Sanitize a property name for use as part of a GBNF rule name.
+/// Replaces non-alphanumeric/dash chars with `-`.
+fn sanitize_rule_name_local(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        out.push('x');
+    }
+    out
 }
 
 /// Silence the unused-import warning when the registry itself is only
