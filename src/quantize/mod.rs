@@ -938,6 +938,128 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-4 — `VariantKQuantizer` parallel-streaming
+    /// byte-identity gate. Extends iter-3t's serial-vs-eager check to
+    /// cover the rayon path: `quantize_streaming_parallel` + variant
+    /// dispatch must produce a `QuantizedModel` byte-equal to
+    /// `quantize_streaming` (serial) + variant dispatch on the same
+    /// fixture.
+    ///
+    /// Why: the existing `quantize_streaming_parallel_byte_identical_to_serial`
+    /// test only exercises `StaticQuantizer`.  A future regression
+    /// where the variant's per-tensor target dispatch (parsing
+    /// `blk.<N>` from tensor names + calling `layer_mix::target_for`)
+    /// developed thread-unsafe state would silently corrupt parallel
+    /// output without affecting serial output.  This gate locks the
+    /// invariant.
+    ///
+    /// Also adds a compile-time `Send + Sync` check on `VariantKQuantizer`
+    /// because `quantize_streaming_parallel` requires `&(dyn Quantizer
+    /// + Send + Sync)`.  If a future field addition (e.g. interior
+    /// mutability via `Cell<…>`) breaks this bound, the test fails to
+    /// compile rather than runs and produces garbage.
+    #[test]
+    fn variant_streaming_parallel_byte_identical_to_serial() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        // compile-time Send + Sync guard: this fn won't compile if
+        // VariantKQuantizer or CalibrationData lose Send+Sync.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VariantKQuantizer>();
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // 6 tensors covering 4 distinct policy branches, multiple
+        // layers, and a passthrough — exercises rayon work
+        // distribution across tensors with heterogeneous targets and
+        // confirms parallel dispatch handles each branch correctly.
+        let fixtures: Vec<(&str, Vec<usize>)> = vec![
+            ("output.weight",                vec![1, QK_K]),     // Q6_K bump
+            ("blk.0.attn_v.weight",          vec![1, QK_K]),     // Q6_K bump
+            ("blk.5.attn_q.weight",          vec![1, QK_K]),     // Q4_K base
+            ("blk.10.ffn_down.weight",       vec![1, QK_K]),     // Q4_K base
+            ("blk.20.ffn_down_exps.weight",  vec![1, QK_K]),     // Q4_K base (MoE)
+            ("blk.5.attn_norm.weight",       vec![16]),          // 1-D < 32 → preserve
+        ];
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            for (i, (name, shape)) in fixtures.iter().enumerate() {
+                let len: usize = shape.iter().product();
+                let data = make_f16_payload(i as f32, len);
+                m.insert(LazyTensor::from_bytes(
+                    LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
+                    data,
+                ));
+            }
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+        let q = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+
+        let serial = quantize_streaming(
+            make_lazy_map(), &metadata, &q, 0, 0, &progress, false,
+        )
+        .unwrap();
+
+        // Force >1 worker so rayon fan-out fires.  None defaults to
+        // num_cpus; passing Some(4) clamps for determinism.
+        let parallel = quantize_streaming_parallel(
+            make_lazy_map(), &metadata, &q, 0, 0, &progress, false, Some(4),
+        )
+        .unwrap();
+
+        assert_eq!(serial.tensors.len(), parallel.tensors.len(),
+            "tensor count diverged");
+        assert_eq!(serial.quant_method, parallel.quant_method);
+        assert_eq!(serial.bits, parallel.bits);
+        assert_eq!(serial.group_size, parallel.group_size);
+
+        for (name, _shape) in &fixtures {
+            let s = serial.tensors.get(*name)
+                .unwrap_or_else(|| panic!("serial missing {name}"));
+            let p = parallel.tensors.get(*name)
+                .unwrap_or_else(|| panic!("parallel missing {name}"));
+            assert_eq!(s.shape, p.shape, "{name} shape");
+            assert_eq!(s.original_dtype, p.original_dtype, "{name} dtype");
+            assert_eq!(s.quant_info.method, p.quant_info.method,
+                "{name} method");
+            assert_eq!(
+                s.quant_info.ggml_type.as_deref(),
+                p.quant_info.ggml_type.as_deref(),
+                "{name} ggml_type"
+            );
+            assert_eq!(s.quant_info.preserved, p.quant_info.preserved,
+                "{name} preserved");
+            // The actual byte-identity check.
+            assert_eq!(s.data, p.data,
+                "{name}: parallel bytes diverged from serial — \
+                 rayon work distribution is non-deterministic for \
+                 the variant Quantizer or VariantKQuantizer is not \
+                 thread-safe");
+        }
+    }
+
     /// ADR-014 P7 iter-3z — proves imatrix actually **improves** the
     /// importance-weighted error vs uncalibrated, not just produces
     /// different bytes (iter-3w).  Closes the divergence-direction
