@@ -5866,3 +5866,37 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **additionalProperties default:** permissive_true (allow_extra_kv=true when unset or true).
   - **Open followups:** `additionalProperties: {schema}` deferred; `anyOf`/`oneOf`/`allOf` remain deferred.
   - **Fence respected.** Edits in `src/serve/api/grammar/json_schema.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
+- **2026-04-27 wave-2 Worker W4 (session cfa-20260426-adr005-wave2) — T1.8 Option B CLOSED: per-model tool-call wrapper grammar enforcement (Gemma 4 + Qwen 3.5/3.6).**
+  - **W-3 → W-4 handoff:** W-3 landed the json_schema grammar prereqs (any-order keys + additionalProperties:false) needed to generate correct inner-value rules. W-4 builds the per-model wrapper grammar on top of those foundations.
+  - **Problem root cause (Chesterton note):** `engine.rs:1615-1629` had a silent parse-failure-fallback: when `parse_tool_call_body` returned `None`, the engine emitted `Content(raw_body)` instead of a structured tool-call event. This masked every model-output deviation from the expected wrapper format — wrong delimiter, wrong prefix, missing braces, etc. — and silently degraded the response into unstructured text. The fallback existed because the grammar sampler was not yet wired for tool calls, so any model output was possible; the fallback was the only defense. T1.8 Option B makes parse failures structurally impossible for constrained paths (tool_choice=required / function) so the fallback can be safely removed (wave 3 work item T2.4).
+  - **WHY per-model wrapper grammars (not plain JSON):**
+    - **Gemma 4** emits `call:NAME{key:<|"|>val<|"|>,...}` — Gemma's own kv-list convention (chat_template.jinja:113). String values are wrapped in `<|"|>` tokens, not JSON `"..."`. If we constrained plain JSON the grammar mask would kill every string-valued Gemma tool call.
+    - **Qwen 3.5/3.6** emits `<function=NAME><parameter=key>\nval\n</parameter>...</function>` XML. Same reason — the XML wrapper and raw (non-JSON-quoted) values are incompatible with a JSON grammar.
+    - Plain JSON constraints remain correct for `response_format=json_schema` (which is exactly what json_schema.rs implements). Tool-call wrappers are a separate surface.
+  - **Implementation:**
+    - `ModelRegistration::tool_call_gbnf(fn_name, params_schema) -> Result<String, String>` added to `registry.rs` (dispatches on `family` like `parse_tool_call_body`). Returns GBNF text; registry stays free of `grammar::parser` dependency.
+    - **Gemma 4 emitter** (`gemma4_tool_call_gbnf`): `"call:"` + literal fn_name + `"{"` + kv-list body + `"}"`. kv-list uses Kleene-star item alternation (`(kv_1 | kv_2 | ...) ("," (kv_1 | ...))*`) — key-order-agnostic and allows any subset (matches template semantics: only filled args are emitted). String values: `gemma4-str-val ::= "<|"|>" gemma4-str-char* "<|"|>"`. Non-strings: bare JSON scalar grammar (integer/number/boolean/null).
+    - **Qwen 3.5 emitter** (`qwen35_tool_call_gbnf`): `"<function=NAME>"` + newline + param-blocks + `"</function>"`. Each param-block: `"<parameter=KEY>\n" val "\n</parameter>\n"`. Same Kleene-star optional approach. String values: `qwen35-str-val ::= qwen35-str-char*` (raw, unquoted — XML wrapper replaces JSON quotes). Non-strings: standard JSON scalar grammar (template uses `tojson` filter).
+    - `compile_tool_grammar(req, tool_choice)` added to `handlers.rs` (mirrors `compile_response_format`):
+      - `Required` → alternation of ALL function grammars via `combine_function_grammars`.
+      - `Function(name)` → that function's grammar only.
+      - `Auto` / `None` → `Ok(None)` (no constraint).
+      - Unknown model family → `Ok(None)` with warning (T2.4 fallback covers this).
+    - Wired at the `tool_choice` parse site (handlers.rs line ~728): `effective_grammar = tool_grammar.or(response_grammar)` — tool grammar takes precedence when both are present. `grammar_token_bytes` attachment extended to cover `effective_grammar` (was `response_grammar`-only).
+  - **Tests added:**
+    - 13 unit tests in `registry.rs` exercising the full runtime path (emit GBNF → parse → GrammarRuntime → `accept_bytes`):
+      - Gemma 4: canonical emission accepted; reversed key order accepted; numeric/boolean args accepted; `call_:` prefix rejected; parenthesis delimiter rejected; empty args accepted; round-trip parse test (grammar-accepted → `parse_gemma4_tool_call` succeeds).
+      - Qwen 3.5: canonical emission accepted; reversed param order accepted; `[function=...]` rejected; empty params accepted; round-trip parse test.
+      - Cross: unknown family returns `Err`.
+    - Integration test `tests/tool_call_grammar_live.rs` (gated `HF2Q_TOOL_CALL_GRAMMAR_LIVE_TEST=1`):
+      - Port 52336 (distinct from other live tests).
+      - `tool_call_grammar_gemma4_live`: loads Gemma 4 abliterated DWQ, sends `tool_choice=required`, asserts `tool_calls` present + `arguments` is valid JSON with `location` field.
+      - `tool_call_grammar_qwen35_live`: same for Qwen 3.5 (gated additionally on `HF2Q_TOOL_GRAMMAR_QWEN_GGUF`; skips with "skipped-no-fixture" when absent).
+  - **T2.4 unblock evidence:**
+    - For `tool_choice=required` / `Function(name)` with a registered model, the grammar is now wired to `SamplingParams.grammar`. Every token the model emits is screened by the GBNF mask. Tokens that would produce malformed wrapper prefix/suffix or malformed kv-list/parameter-blocks are masked out at decode time — they cannot appear in the generated text. Therefore `parse_tool_call_body` on the body text between the open/close markers **cannot fail** for these paths.
+    - `engine.rs:1615-1629`'s silent `Content(raw_body)` fallback is now safe to remove for the constrained paths. Wave 3 work item T2.4: audit each of the four call sites (Required/Function/Auto/None × registered/unregistered), remove the fallback from the constrained+registered path, replace with `GenerationEvent::Error(...)` + `finish_reason='error'` + structured `tracing::error!`.
+    - `t2_4_unblocked: true`. Evidence: grammar mask + GBNF round-trip tests (unit test `gemma4_grammar_accepted_output_is_parseable` + `qwen35_grammar_accepted_output_is_parseable`) confirm that any grammar-accepted output is parseable.
+  - **Commits:** `71eafea` (tool_call_gbnf emitters), `2d2f242` (compile_tool_grammar + wiring), `537de40` (unit tests), `fb6626b` (integration test).
+  - **Tests total:** 47 registry tests (was 34), 302 serve::api tests (was 300), 2 new integration test entries.
+  - **Fence respected.** Edits in `src/serve/api/registry.rs`, `src/serve/api/handlers.rs`, `tests/tool_call_grammar_live.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
