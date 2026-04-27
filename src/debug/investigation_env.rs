@@ -708,3 +708,260 @@ fn env_pair(name: &str) -> Option<(usize, usize)> {
     }
     Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Tests — 6 new InvestigationEnv parse fields (wave-1.5 T1.2)
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Env-var mutation is process-wide; serialize all tests that touch it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Save+restore env vars around a test that mutates them.
+    struct EnvGuard {
+        snapshots: Vec<(String, Option<String>)>,
+    }
+    impl EnvGuard {
+        fn new(keys: &[&str]) -> Self {
+            let snapshots = keys
+                .iter()
+                .map(|k| (k.to_string(), std::env::var(k).ok()))
+                .collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { snapshots }
+        }
+        fn set(&self, k: &str, v: &str) {
+            std::env::set_var(k, v);
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.snapshots {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    // ── tq_codebook_bits ─────────────────────────────────────────────
+
+    #[test]
+    fn tq_codebook_bits_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_TQ_CODEBOOK_BITS"]);
+        drop(guard); // var removed by constructor
+        let env = InvestigationEnv::from_env();
+        assert_eq!(env.tq_codebook_bits, 8u32, "unset => default 8");
+    }
+
+    #[test]
+    fn tq_codebook_bits_parse_success_all_variants() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_TQ_CODEBOOK_BITS"]);
+
+        // "4" → sentinel 0 (legacy path).
+        guard.set("HF2Q_TQ_CODEBOOK_BITS", "4");
+        assert_eq!(InvestigationEnv::from_env().tq_codebook_bits, 0u32);
+
+        // "5" → 5.
+        guard.set("HF2Q_TQ_CODEBOOK_BITS", "5");
+        assert_eq!(InvestigationEnv::from_env().tq_codebook_bits, 5u32);
+
+        // "6" → 6.
+        guard.set("HF2Q_TQ_CODEBOOK_BITS", "6");
+        assert_eq!(InvestigationEnv::from_env().tq_codebook_bits, 6u32);
+
+        // "8" → 8.
+        guard.set("HF2Q_TQ_CODEBOOK_BITS", "8");
+        assert_eq!(InvestigationEnv::from_env().tq_codebook_bits, 8u32);
+    }
+
+    #[test]
+    fn tq_codebook_bits_unknown_value_falls_back_to_8() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_TQ_CODEBOOK_BITS"]);
+        guard.set("HF2Q_TQ_CODEBOOK_BITS", "99");
+        assert_eq!(
+            InvestigationEnv::from_env().tq_codebook_bits,
+            8u32,
+            "unrecognised value => 8"
+        );
+    }
+
+    // ── dump_sliding_layer_0 ─────────────────────────────────────────
+
+    #[test]
+    fn dump_sliding_layer_0_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_DUMP_SLIDING_LAYER_0"]);
+        assert!(!InvestigationEnv::from_env().dump_sliding_layer_0);
+    }
+
+    #[test]
+    fn dump_sliding_layer_0_enabled_by_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DUMP_SLIDING_LAYER_0"]);
+        guard.set("HF2Q_DUMP_SLIDING_LAYER_0", "1");
+        assert!(InvestigationEnv::from_env().dump_sliding_layer_0);
+    }
+
+    #[test]
+    fn dump_sliding_layer_0_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DUMP_SLIDING_LAYER_0"]);
+        for bad in &["0", "true", "yes", "2"] {
+            guard.set("HF2Q_DUMP_SLIDING_LAYER_0", bad);
+            assert!(
+                !InvestigationEnv::from_env().dump_sliding_layer_0,
+                "value {:?} must not enable the flag",
+                bad
+            );
+        }
+    }
+
+    // ── dump_run_name ────────────────────────────────────────────────
+
+    #[test]
+    fn dump_run_name_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_DUMP_RUN_NAME"]);
+        assert_eq!(InvestigationEnv::from_env().dump_run_name, None);
+    }
+
+    #[test]
+    fn dump_run_name_captures_arbitrary_string() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DUMP_RUN_NAME"]);
+        guard.set("HF2Q_DUMP_RUN_NAME", "dense-vs-tq-pass-01");
+        assert_eq!(
+            InvestigationEnv::from_env().dump_run_name.as_deref(),
+            Some("dense-vs-tq-pass-01")
+        );
+    }
+
+    #[test]
+    fn dump_run_name_empty_string_is_some() {
+        // env::var returns Ok("") for an empty var; .ok() => Some("").
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DUMP_RUN_NAME"]);
+        guard.set("HF2Q_DUMP_RUN_NAME", "");
+        assert_eq!(
+            InvestigationEnv::from_env().dump_run_name.as_deref(),
+            Some("")
+        );
+    }
+
+    // ── debug_tq_rms ─────────────────────────────────────────────────
+
+    #[test]
+    fn debug_tq_rms_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_DEBUG_TQ_RMS"]);
+        assert!(!InvestigationEnv::from_env().debug_tq_rms);
+    }
+
+    #[test]
+    fn debug_tq_rms_enabled_by_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DEBUG_TQ_RMS"]);
+        guard.set("HF2Q_DEBUG_TQ_RMS", "1");
+        assert!(InvestigationEnv::from_env().debug_tq_rms);
+    }
+
+    #[test]
+    fn debug_tq_rms_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_DEBUG_TQ_RMS"]);
+        for bad in &["0", "true", "on"] {
+            guard.set("HF2Q_DEBUG_TQ_RMS", bad);
+            assert!(
+                !InvestigationEnv::from_env().debug_tq_rms,
+                "value {:?} must not enable debug_tq_rms",
+                bad
+            );
+        }
+    }
+
+    // ── use_dense ────────────────────────────────────────────────────
+
+    #[test]
+    fn use_dense_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_USE_DENSE"]);
+        assert!(!InvestigationEnv::from_env().use_dense);
+    }
+
+    #[test]
+    fn use_dense_enabled_by_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_USE_DENSE"]);
+        guard.set("HF2Q_USE_DENSE", "1");
+        assert!(InvestigationEnv::from_env().use_dense);
+    }
+
+    #[test]
+    fn use_dense_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_USE_DENSE"]);
+        for bad in &["0", "true", "yes", "dense"] {
+            guard.set("HF2Q_USE_DENSE", bad);
+            assert!(
+                !InvestigationEnv::from_env().use_dense,
+                "value {:?} must not enable use_dense",
+                bad
+            );
+        }
+    }
+
+    // ── layer_policy ─────────────────────────────────────────────────
+
+    #[test]
+    fn layer_policy_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_LAYER_POLICY"]);
+        assert_eq!(InvestigationEnv::from_env().layer_policy, None);
+    }
+
+    #[test]
+    fn layer_policy_captures_known_policy_strings() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_LAYER_POLICY"]);
+
+        for policy in &[
+            "dense_all",
+            "tq_all",
+            "tq_slide_dense_global",
+            "dense_slide_tq_global",
+        ] {
+            guard.set("HF2Q_LAYER_POLICY", policy);
+            assert_eq!(
+                InvestigationEnv::from_env().layer_policy.as_deref(),
+                Some(*policy),
+                "policy {:?} should be captured verbatim",
+                policy
+            );
+        }
+    }
+
+    #[test]
+    fn layer_policy_captures_unknown_string_verbatim() {
+        // The policy selector deliberately accepts unknown strings (logs a
+        // warning at runtime; defaulting happens in the dispatch caller).
+        // The parse step must not filter them out.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_LAYER_POLICY"]);
+        guard.set("HF2Q_LAYER_POLICY", "some_future_policy");
+        assert_eq!(
+            InvestigationEnv::from_env().layer_policy.as_deref(),
+            Some("some_future_policy")
+        );
+    }
+}
