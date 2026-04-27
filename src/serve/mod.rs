@@ -352,8 +352,28 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         let gguf_peek = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open (arch peek): {e}"))?;
         if let Some(arch) = gguf_peek.metadata_string("general.architecture") {
-            use crate::inference::models::qwen35::{ARCH_QWEN35, ARCH_QWEN35MOE};
+            use crate::inference::models::qwen35::{
+                is_qwen36_gguf, ARCH_QWEN35, ARCH_QWEN35MOE,
+            };
             if arch == ARCH_QWEN35 || arch == ARCH_QWEN35MOE {
+                // Wave 5a (ADR-005 Phase 4 ACs 5468/5470 partial): the
+                // Qwen3.5 forward path is autoregressive-only (per-token
+                // DeltaNet state update; correct at short prefill, slow at
+                // long prefill until the W-5b chunk-scan kernel lands).
+                // Qwen3.6 GGUFs reuse the same `general.architecture`
+                // strings as Qwen3.5, so we must distinguish here via
+                // `general.name` and require explicit opt-in to avoid
+                // silently shipping a slow long-prefill path.
+                if is_qwen36_gguf(&gguf_peek) && !INVESTIGATION_ENV.qwen36_autoreg {
+                    anyhow::bail!(
+                        "Qwen3.6 GGUF detected (general.name contains 'qwen3.6'), but \
+                         autoregressive forward-path support is opt-in. Set \
+                         HF2Q_QWEN36_AUTOREG=1 to dispatch through the existing \
+                         autoregressive Qwen3.5 path (correct at short prefill; long-prefill \
+                         SOTA via chunk-scan kernel deferred to Wave 5b). Model: {}",
+                        model_path.display(),
+                    );
+                }
                 tracing::info!("Detected architecture '{}' → routing to Qwen3.5 path", arch);
                 return cmd_generate_qwen35(args, gguf_peek);
             }

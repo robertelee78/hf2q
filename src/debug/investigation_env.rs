@@ -214,6 +214,26 @@ pub struct InvestigationEnv {
     pub debug_tq_rms: bool,
 
     // ========================================================================
+    // Category 4 — Wave 5a: Qwen3.6 autoregressive forward-path opt-in.
+    // Qwen3.6 GGUFs are detected via `general.name` substring match. The
+    // existing Qwen3.5 forward path (`inference::models::qwen35::*`) is the
+    // autoregressive (per-token state-update) DeltaNet kernel; correctness
+    // is established at short prefill lengths but the SOTA chunk-scan kernel
+    // for long-prefill perf is deferred to W-5b. Until W-5b lands, Qwen3.6
+    // GGUFs require explicit opt-in via this env var to avoid silently
+    // shipping a slow long-prefill path.
+    // ========================================================================
+    /// `HF2Q_QWEN36_AUTOREG=1` — opt in to running Qwen3.6 GGUFs through the
+    /// existing autoregressive Qwen3.5 forward path. When unset and a
+    /// Qwen3.6 GGUF is detected, `cmd_generate` errors out with an
+    /// operator-actionable message rather than silently routing through
+    /// the slow autoregressive path. Wave 5a (ADR-005 Phase 4 ACs
+    /// 5468/5470 partial closure). Wave 5b will replace this gate with
+    /// a chunk-scan kernel for long-prefill SOTA perf.
+    /// Original parse (none — new field): `env_eq_one("HF2Q_QWEN36_AUTOREG")`.
+    pub qwen36_autoreg: bool,
+
+    // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
     // These two vars select per-layer dense vs TQ SDPA dispatch.
     // Read per-token per-layer in the decode loop when gate_h_inactive and
@@ -398,6 +418,10 @@ impl InvestigationEnv {
                 env::var("HF2Q_DEBUG_TQ_RMS").as_deref(),
                 Ok("1")
             ),
+
+            // Wave 5a Qwen3.6 autoregressive opt-in (no ack gate — does not
+            // alter forward-pass math, just unblocks dispatch).
+            qwen36_autoreg: env_eq_one("HF2Q_QWEN36_AUTOREG"),
 
             // SDPA regime selectors.
             use_dense: matches!(env::var("HF2Q_USE_DENSE").as_deref(), Ok("1")),
@@ -593,6 +617,12 @@ impl InvestigationEnv {
         }
         if self.debug_tq_rms {
             diagnostics.push("HF2Q_DEBUG_TQ_RMS=1".into());
+        }
+        if self.qwen36_autoreg {
+            diagnostics.push(
+                "HF2Q_QWEN36_AUTOREG=1 (Wave 5a opt-in: autoregressive only; long-prefill SOTA \
+                 deferred to W-5b chunk-scan kernel)".into(),
+            );
         }
         if self.use_dense {
             diagnostics.push("HF2Q_USE_DENSE=1".into());
@@ -919,6 +949,55 @@ mod tests {
                 bad
             );
         }
+    }
+
+    // ── qwen36_autoreg (Wave 5a) ─────────────────────────────────────
+
+    #[test]
+    fn qwen36_autoreg_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_QWEN36_AUTOREG"]);
+        assert!(
+            !InvestigationEnv::from_env().qwen36_autoreg,
+            "unset => default false (Qwen3.6 GGUF dispatch must error out without explicit opt-in)"
+        );
+    }
+
+    #[test]
+    fn qwen36_autoreg_enabled_by_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_QWEN36_AUTOREG"]);
+        guard.set("HF2Q_QWEN36_AUTOREG", "1");
+        assert!(InvestigationEnv::from_env().qwen36_autoreg);
+    }
+
+    #[test]
+    fn qwen36_autoreg_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_QWEN36_AUTOREG"]);
+        for bad in &["0", "true", "yes", "autoreg", ""] {
+            guard.set("HF2Q_QWEN36_AUTOREG", bad);
+            assert!(
+                !InvestigationEnv::from_env().qwen36_autoreg,
+                "value {:?} must not enable qwen36_autoreg",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn qwen36_autoreg_does_not_require_unsafe_ack() {
+        // Wave 5a: this is a category-4 dispatch gate, not a forward-pass-math
+        // toggle. Setting `HF2Q_QWEN36_AUTOREG=1` alone (no UNSAFE_EXPERIMENTS
+        // ack) MUST take effect. If the future moves it under the ack umbrella
+        // this test will catch the regression.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_QWEN36_AUTOREG", "HF2Q_UNSAFE_EXPERIMENTS"]);
+        guard.set("HF2Q_QWEN36_AUTOREG", "1");
+        // Note: HF2Q_UNSAFE_EXPERIMENTS deliberately not set.
+        let env = InvestigationEnv::from_env();
+        assert!(env.qwen36_autoreg);
+        assert!(!env.unsafe_experiments_acked);
     }
 
     // ── layer_policy ─────────────────────────────────────────────────

@@ -454,6 +454,37 @@ impl Qwen35Config {
     }
 }
 
+// ---------------------------------------------------------------------
+// Wave 5a — Qwen3.6 detection (separate from arch-string dispatch)
+// ---------------------------------------------------------------------
+
+/// True if a loaded GGUF's `general.name` metadata identifies it as a
+/// Qwen3.6-family model (substring match on `qwen3.6`, case-insensitive).
+///
+/// **Why a separate helper, not the arch string?** Qwen3.6 reuses the
+/// `general.architecture = "qwen35" | "qwen35moe"` metadata values from
+/// its Qwen3.5 ancestor (per `project_qwen36_architecture.md` and
+/// `arch/entries/qwen35{,moe}.rs`). The two families share ~all of the
+/// forward path (linear-attn + gated full-attn + MROPE + tokenizer); the
+/// only practical differentiator at GGUF level is the `general.name`
+/// string.
+///
+/// This is the gating signal for the Wave 5a `HF2Q_QWEN36_AUTOREG=1`
+/// opt-in: when this returns `true` and the env var is unset,
+/// `cmd_generate` errors out with an operator-actionable message rather
+/// than silently routing through the autoregressive path. Wave 5b will
+/// land a chunk-scan kernel for long-prefill SOTA perf and remove the
+/// gate.
+///
+/// Returns `false` if `general.name` is missing — the conservative
+/// default keeps known-good Qwen3.5 GGUFs on the existing path without
+/// requiring the new env var.
+pub fn is_qwen36_gguf(gguf: &mlx_native::gguf::GgufFile) -> bool {
+    gguf.metadata_string("general.name")
+        .map(|name| name.to_lowercase().contains("qwen3.6"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +539,123 @@ mod tests {
     fn layer_types_interval_zero_all_linear() {
         let lt = default_layer_types(8, 0);
         assert!(lt.iter().all(|k| *k == Qwen35LayerKind::LinearAttention));
+    }
+
+    // ------------------------------------------------------------------
+    // is_qwen36_gguf — Wave 5a Qwen3.6 detection (general.name substring)
+    // ------------------------------------------------------------------
+
+    /// Write a minimal GGUF file with a single string-typed metadata kv
+    /// pair and zero tensors. Used by the `is_qwen36_gguf` tests; the
+    /// GGUF parser only needs to walk the header + metadata to satisfy
+    /// `metadata_string("general.name")`. This mirrors the sibling
+    /// helper in `mtp_tests.rs::write_gguf` but adds metadata support
+    /// (the existing helper writes zero metadata kvs).
+    ///
+    /// On-disk layout:
+    /// ```text
+    /// magic   "GGUF"                 4 bytes
+    /// version 3                      u32
+    /// n_tensors 0                    u64
+    /// n_kv    1                      u64
+    /// key_len, key_bytes             u64 + bytes
+    /// value_type GGUF_TYPE_STRING(8) u32
+    /// value_len, value_bytes         u64 + bytes
+    /// (padding to 32-byte alignment) (none required for n_tensors=0)
+    /// ```
+    fn write_meta_only_gguf(path: &std::path::Path, name_value: Option<&str>) {
+        const GGUF_TYPE_STRING: u32 = 8;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+
+        let n_kv: u64 = if name_value.is_some() { 1 } else { 0 };
+        buf.extend_from_slice(&n_kv.to_le_bytes());
+
+        if let Some(value) = name_value {
+            let key = "general.name";
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&GGUF_TYPE_STRING.to_le_bytes());
+            buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        // Align to 32 bytes (alignment field is unset; default is 32 per
+        // the GGUF spec — `tensor_data_offset` parsing aligns the same).
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+
+        std::fs::write(path, &buf).expect("write meta-only gguf");
+    }
+
+    #[test]
+    fn is_qwen36_gguf_matches_canonical_name() {
+        // The real apex GGUF advertises:
+        //   general.name = "Qwen3.6 35B A3B Abliterix EGA Abliterated Apex"
+        // (per `general.name` from the post-fc85681 convert pipeline).
+        // The 27B sibling carries `Qwen3.6-27B`. Both must trigger the gate.
+        let tmp = std::env::temp_dir().join(format!("qwen36_pos_{}.gguf", std::process::id()));
+        write_meta_only_gguf(&tmp, Some("Qwen3.6 35B A3B Abliterix EGA Abliterated Apex"));
+        let gguf = mlx_native::gguf::GgufFile::open(&tmp).expect("open");
+        assert!(is_qwen36_gguf(&gguf));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn is_qwen36_gguf_case_insensitive() {
+        // Lowercase, uppercase, and mixed-case all trip the substring check.
+        for name in &["qwen3.6-27b", "QWEN3.6-27B", "Some Qwen3.6 model"] {
+            let tmp = std::env::temp_dir().join(format!(
+                "qwen36_case_{}_{}.gguf",
+                std::process::id(),
+                name.len()
+            ));
+            write_meta_only_gguf(&tmp, Some(name));
+            let gguf = mlx_native::gguf::GgufFile::open(&tmp).expect("open");
+            assert!(is_qwen36_gguf(&gguf), "name {:?} should match", name);
+            std::fs::remove_file(&tmp).ok();
+        }
+    }
+
+    #[test]
+    fn is_qwen36_gguf_rejects_qwen35_canonical_name() {
+        // Qwen3.5 (no "qwen3.6" substring) must NOT match — it stays on the
+        // existing path without the new env var.
+        let tmp = std::env::temp_dir().join(format!("qwen35_neg_{}.gguf", std::process::id()));
+        write_meta_only_gguf(&tmp, Some("Qwen3.5 27B"));
+        let gguf = mlx_native::gguf::GgufFile::open(&tmp).expect("open");
+        assert!(!is_qwen36_gguf(&gguf));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn is_qwen36_gguf_rejects_other_families() {
+        for name in &["Gemma 4 26B", "Llama 3 70B", "DeepSeek V3", ""] {
+            let tmp = std::env::temp_dir().join(format!(
+                "other_family_{}_{}.gguf",
+                std::process::id(),
+                name.len()
+            ));
+            write_meta_only_gguf(&tmp, Some(name));
+            let gguf = mlx_native::gguf::GgufFile::open(&tmp).expect("open");
+            assert!(!is_qwen36_gguf(&gguf), "name {:?} should not match", name);
+            std::fs::remove_file(&tmp).ok();
+        }
+    }
+
+    #[test]
+    fn is_qwen36_gguf_returns_false_when_name_missing() {
+        // No general.name metadata at all — the conservative default. Real
+        // Qwen3.5 GGUFs ship `general.name`, so a missing value is either a
+        // truncated test fixture or a non-Qwen file; either way the gate
+        // does NOT fire (the existing dispatch handles non-Qwen GGUFs).
+        let tmp = std::env::temp_dir().join(format!("no_name_{}.gguf", std::process::id()));
+        write_meta_only_gguf(&tmp, None);
+        let gguf = mlx_native::gguf::GgufFile::open(&tmp).expect("open");
+        assert!(!is_qwen36_gguf(&gguf));
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
