@@ -585,7 +585,7 @@ mod tests {
         // tokenizers crate correctly (integration of iter-20 tokenizer
         // builder with iter-21 state struct).
         use crate::inference::models::bert::{
-            build_wordpiece_tokenizer, BertConfig, BertSpecialTokens, BertVocab, PoolingType,
+            build_wordpiece_tokenizer, BertSpecialTokens, BertVocab,
         };
         // Synthetic vocab using llama.cpp's BERT-WPM convention:
         // word-starter tokens are prefixed with ▁ (U+2581). The
