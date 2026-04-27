@@ -6408,24 +6408,28 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
 
   - **T2.4 final closure status — by path:**
 
+    > **Wave 3.5 HIGH-1 amendment (2026-04-27, commit `9aba2c8`).** The "Auto + tools[] + known family" row below was originally claimed CLOSED at W-B2 final, but the wave-3 audit at `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt` proved this was production-broken: the W-B2 grammar shape (`OneOrMoreCalls`, marker-wrapped) was identical to Required's, but the engine's `accept_bytes` is a no-op while `awaiting_trigger=true` so the FIRST open marker was consumed BEFORE the splitter fired `ToolCallOpen` and the engine called `runtime.trigger()`.  The grammar then expected the open marker AGAIN at body bytes — rejecting valid Auto tool calls.  Wave 3.5 HIGH-1 closes this gap with a body-only grammar shape (`OneOrMoreCallsBodyOnly`).  See the Wave 3.5 W-B2′ entry below for the full closure detail.
+
     ```text
-    | tool_choice | tools[] | model family | T2.4 status                       |
-    |-------------|---------|--------------|-----------------------------------|
-    | Required    | yes     | known        | CLOSED (W-A3, eager grammar)      |
-    | Required    | yes/no  | unknown      | CLOSED (W-θ MED, 400)             |
-    | Required    | empty   | known        | CLOSED (W-θ MED, 400)             |
-    | Function    | yes     | known        | CLOSED (W-A3, eager grammar)      |
-    | Function    | yes/no  | unknown      | CLOSED (W-θ MED, 400)             |
-    | Function    | empty   | known        | CLOSED (W-θ MED, 400)             |
-    | Auto        | yes     | known        | CLOSED (W-B2 final, lazy grammar) |
-    | Auto        | empty   | any          | open by design (no grammar        |
-    |             |         |              |   contract; content fallback)     |
-    | Auto        | yes     | unknown      | open by design (no per-model      |
-    |             |         |              |   format to constrain)            |
-    | None        | any     | any          | not applicable (tools suppressed) |
+    | tool_choice | tools[] | model family | T2.4 status                                         |
+    |-------------|---------|--------------|-----------------------------------------------------|
+    | Required    | yes     | known        | CLOSED (W-A3, eager grammar)                        |
+    | Required    | yes/no  | unknown      | CLOSED (W-θ MED, 400)                               |
+    | Required    | empty   | known        | CLOSED (W-θ MED, 400)                               |
+    | Function    | yes     | known        | CLOSED (W-A3, eager grammar)                        |
+    | Function    | yes/no  | unknown      | CLOSED (W-θ MED, 400)                               |
+    | Function    | empty   | known        | CLOSED (W-θ MED, 400)                               |
+    | Auto        | yes     | known        | CLOSED (Wave 3.5 HIGH-1, body-only lazy grammar) †  |
+    | Auto        | empty   | any          | open by design (no grammar                          |
+    |             |         |              |   contract; content fallback)                       |
+    | Auto        | yes     | unknown      | open by design (no per-model                        |
+    |             |         |              |   format to constrain)                              |
+    | None        | any     | any          | not applicable (tools suppressed)                   |
     ```
 
-    T2.4 IS NOW FULLY CLOSED on all four registered-family paths. The two remaining "open by design" Auto branches are not regressions — they correctly preserve the content-fallback semantics for the unconstrained paths where no per-model grammar contract exists.
+    † The W-B2 closure (commits `81df9f2..b1b9fb4`, 2026-04-26) wired `compile_tool_grammar` to compile a grammar for Auto and tagged it `GrammarKind::ToolCallBodyAuto`, but the chosen grammar shape (`OneOrMoreCalls`) was production-broken — the FIRST open marker was consumed by the awaiting_trigger gate before the grammar was engaged, so the lazy-trigger byte-stream order rejected valid Auto calls.  Wave 3.5 HIGH-1 (commit `9aba2c8`, 2026-04-27) corrected this with `OneOrMoreCallsBodyOnly`, which strips the first open marker.  T2.4 closure on the Auto+known path is real as of Wave 3.5 HIGH-1; it was not real at W-B2.
+
+    T2.4 IS NOW FULLY CLOSED on all four registered-family paths.  The two remaining "open by design" Auto branches are not regressions — they correctly preserve the content-fallback semantics for the unconstrained paths where no per-model grammar contract exists.
 
   - **Open followups.**
     - End-to-end live test: streaming chat completion with `tool_choice=auto` + `tools=[real]` + Gemma4 model, asserting the model can emit content first, then optionally a constrained tool call. Currently exercised at unit level only (real GrammarRuntime + real registry); the live SSE harness extension is a sibling test-infra concern, not a W-B2 correctness gap.
@@ -6472,3 +6476,71 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - Streaming converter for additional registered families (Hermes 2 Pro, Mistral function-call) lands when those families register — no new infra needed beyond a per-family `extract_*_name_prefix` + `scan_emit_*_kvs` pair.
 
   - **Fence respected (W-B3).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-3.5 HIGH-1 — Auto-lazy grammar = body-only (production-order fix; commit `9aba2c8`)**
+
+  - **Context.** Wave 3 audit at `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt` returned REJECT with severity HIGH on the W-B2 closure of T2.4 for the `Auto+yes+known` path.  The audit divergence "W-B2 Auto lazy grammar production correctness" cited the exact byte-stream sequence: under `tool_choice=auto`, the engine builds a grammar runtime with `awaiting_trigger=true` (lazy gate, sampler.rs:476-478).  When the model emits the open-marker token (e.g. Gemma 4 `<|tool_call>`), the engine flow at engine.rs:3617-3625 calls `accept_bytes(token_bytes)` UNCONDITIONALLY — but accept_bytes self-gates and is a no-op while awaiting (sampler.rs:511).  Then engine.rs:3266-3284 routes the same token bytes through the splitter, fires `ToolCallOpen`, and calls `runtime.trigger()` to flip the gate false.  At this point the runtime is eager — but the FIRST open marker has already been consumed (as no-op) and is NOT replayed.  The W-B2 grammar shape was `OneOrMoreCalls` (marker-wrapped, identical to Required), so the now-eager grammar still expected `<|tool_call>` at root.  Subsequent body-byte tokens then drove the grammar dead — rejecting valid Auto tool calls.
+
+  - **Audit recommendation.** Three options:
+    - (a) Trigger BEFORE accepting the marker (engine reordering — invasive).
+    - (b) Replay marker bytes into grammar after trigger (splitter buffer — invasive).
+    - (c) Compile a body-only lazy grammar that does NOT include the outer FIRST marker (architecturally cleanest — matches Wave 2.6 research-report.md §Q1+§Q2 canonical architecture: "grammar = body validator; splitter = boundary detector").
+
+    Wave 3.5 HIGH-1 chose (c).  For Required/Function (eager from token 0) the marker IS part of the body grammar because no splitter precedes the grammar.  For Auto (lazy after marker), the splitter consumes the FIRST marker BEFORE the grammar fires — so the grammar is body-only.  The trailing close marker AND any inter-call open markers (parallel mode) ARE in the grammar because those bytes flow through accept_bytes while the runtime is eager.
+
+  - **Why the W-B2 test hid the bug.** The W-B2 test `auto_lazy_grammar_constrains_body_after_marker` triggered the runtime FIRST and THEN fed `{open}call:get_weather{...`.  Production order is the opposite: feed `{open}` while awaiting (no-op), then trigger, then feed body bytes.  Wave 3.5 added `auto_lazy_grammar_accepts_production_order_byte_stream` which exercises the EXACT engine byte-stream order — this test fails on the pre-Wave-3.5 marker-wrapped grammar and passes on the body-only shape.  Code-is-truth catch: the W-B2 test passed but did not exercise the production path.
+
+  - **Code changes (`src/serve/api/registry.rs`, `src/serve/api/handlers.rs`).**
+    - Added `GrammarShape::OneOrMoreCallsBodyOnly { parallel }`.  Strips the FIRST open marker; trailing close marker AND inter-call open markers (parallel mode) ARE in the grammar.
+      - Single call (parallel=false): Gemma `body close space`; Qwen `body \n close space`.
+      - Parallel (parallel=true): Gemma `body close (open body close)* space`; Qwen `body \n close (\n open \n body \n close)* space`.
+    - Wired both `gemma4_tool_call_gbnf` and `qwen35_tool_call_gbnf` to the new shape (mirrors the existing `OneOrMoreCalls` arm with the leading marker stripped).
+    - `compile_tool_grammar` (handlers.rs): branch on `tool_choice == Auto` to pick the body-only shape; Required/Function continues using the marker-wrapped shape.  Same change applies to single-fn and multi-fn cases.
+    - Added `ModelRegistration::auto_lazy_multi_fn_inter_call()` returning the per-family inter-call sequence WITH the open marker (Gemma `<|tool_call>`, Qwen `\n<tool_call>\n`).  Used by `compile_tool_grammar` when wiring multi-fn Auto-lazy parallel: each per-fn alt is body-only (`body close`), and the combiner glues them with the open-marker-bearing separator.
+
+  - **Tests added.**
+    - `auto_lazy_grammar_accepts_production_order_byte_stream` (handlers.rs) — production-order regression test.  Steps: arm awaiting_trigger=true; accept_bytes(open marker) [no-op]; trigger(); accept_bytes(body bytes) [must accept]; accept_bytes(close marker) [must accept]; assert is_accepted().  This test FAILS on the pre-Wave-3.5 grammar shape.
+    - Updated `compile_tool_grammar_auto_grammar_bytes_match_required` → `compile_tool_grammar_auto_strips_first_open_marker_relative_to_required`.  The pre-Wave-3.5 byte-identical invariant was production-broken; the new invariant pins the structural divergence (Auto's root inlines the body opener `[c] [a] [l] [l] [:]`; Required's root expands via `gemma4-call` which starts with the open marker).
+    - Updated `auto_lazy_grammar_constrains_body_after_marker` to feed body bytes (no leading open marker) post-trigger.
+
+  - **Test results.** `cargo test --release --bin hf2q -- serve::`: 672 passed, 0 failed.  All pre-Wave-3.5 W-B2 tests still pass with the updated assertions; the new production-order test passes.
+
+  - **LOC delta.** `src/serve/api/registry.rs` +89/-22 (net +67). `src/serve/api/handlers.rs` +172/-27 (net +145). Total: +261/-49 (net +212) across 2 files.
+
+  - **Mantra notes.**
+    - Code-is-truth: the W-B2 test passed but did not exercise the production path — exactly the "test-passing-but-not-exercising-path" antipattern the audit cited as a mantra violation.  The production-order regression test forces the byte stream to match what the engine actually emits.
+    - No fallback: option (c) is the architecturally correct fix per Wave 2.6 research-report.md, not a backwards-compat hack.  No `OneOrMoreCalls` legacy mode for Auto retained.
+    - No shortcuts: Auto multi-function parallel is the most complex case (body-only first call + open-marker-bearing inter-call separator + body-only subsequent calls).  Implemented in full rather than punting to a "deferred" follow-up.
+
+  - **Open followups.**  None — the production-correctness gap is closed.  The earlier W-B2 follow-up "live SSE harness E2E" remains valid as a sibling test-infra concern (not a Wave 3.5 correctness gap).
+
+  - **Fence respected (Wave 3.5 HIGH-1).** Edits confined to `src/serve/api/registry.rs`, `src/serve/api/handlers.rs`, and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-3.5 HIGH-2 — drain ReasoningSplitter + ToolCallSplitter on cache replay (commit `19f6f10`)**
+
+  - **Context.** Wave 3 audit divergence "W-A2 streaming cache replay" severity HIGH at `/tmp/cfa-cfa-20260427-adr005-wave3/codex-review-last.txt`: `replay_cached_streaming_response` fed `cached.text` once at `engine.rs:2977-3012` and immediately emitted `Done` at `engine.rs:3015-3048`, never calling `ReasoningSplitter::finish()` or `ToolCallSplitter::finish()`.  Both splitters hold back a sliding tail (`tail_buf` of size up to `tail_cap` bytes) until `finish()`.  On streaming cache hits where the cached text was shorter than `tail_cap` (Gemma 4: 12 bytes) — or whose tail looked like a partial marker prefix — the held-back tail was silently dropped.  Concrete failure modes: registered plain-text response "hi" → splitter swallows entirely → empty content emitted; tool-call block + 5-byte postscript "after" → postscript silently dropped after the tool-call.
+
+  - **Fix.** After feeding `cached.text` through the splitter chain in `replay_cached_streaming_response`, drain in the same order as the live-decode path (engine.rs:3691-3757):
+    1. `reasoning_splitter.finish()` → emit `Reasoning` delta if reasoning, OR route Content tail through `tool_splitter` so a marker straddling the cache boundary still classifies correctly.
+    2. `tool_splitter.finish()` → emit `Content` delta for plain residual; for `ToolCallText` residual (cached entry ended mid-tool-call), re-prepend the open marker for diagnostic clarity (mirrors live `Auto`-no-grammar drain at engine.rs:2024-2035).
+
+    Unlike the live path (which fires a structured `tool_call_truncated_under_constrained` Error on mid-call truncation under `Constrained`/`AutoLazyGrammar`), replay does NOT promote `ToolCallText` residuals to Errors.  The cache stored a verified-complete response when written, so any residual tail is by definition not a mid-decode truncation.
+
+  - **Tests added (3, all under `streaming_prompt_cache_replay_tests`).**
+    - `replay_emits_tail_content_after_splitter_drain`: registered Gemma 4 + cached text "hi" (2 bytes < 12-byte tail_cap).  Pre-Wave-3.5 the splitter's `tail_buf` swallowed "hi" entirely because `feed()` held back the last `tail_cap` bytes and `finish()` was never called → zero Content deltas → silent data loss on the cache hit.  This test asserts "hi" arrives intact in a Content delta before Done.  Closes audit missed-test #1: "No unit test replays short plain content with a registered model; replay_emits_content_then_done_for_plain_text passes registration=None ... bypassing both tail-holding splitters."
+    - `replay_with_registered_model_emits_tool_call_then_postscript`: registered Gemma 4 + cached text `<open>call:foo{x:1}<close>after` (5-byte postscript).  Asserts "after" appears in a Content delta after the tool-call block.  Closes audit missed-test #2: "No replay test asserts final postscript/tail content after tool-call markers."
+    - `replay_drains_reasoning_splitter_tail`: registered Gemma 4 + cached text "ok" (2 bytes).  Both splitters drain via `finish()` in sequence; this test would fail on a regression that drops EITHER drain because both splitters' `tail_buf` can swallow 2 bytes entirely.
+
+  - **Doc-comment update.** Extended `replay_cached_streaming_response`'s rustdoc with a new "End-of-stream splitter drain (Wave 3.5 HIGH-2)" section explaining the drain order + why we don't promote ToolCallText to Errors.
+
+  - **Test results.** `cargo test --release --bin hf2q -- serve::api::engine::streaming_prompt_cache_replay_tests`: 9 passed, 0 failed.  Full `cargo test --release --bin hf2q -- serve::`: 672 passed, 0 failed (3 new replay tests + 669 pre-existing).
+
+  - **LOC delta.** `src/serve/api/engine.rs` +357/-0 across drain logic + tests + doc-comment.  No other files touched.
+
+  - **Mantra notes.**
+    - Code-is-truth: the audit caught silent data loss on a real production path.  The pre-Wave-3.5 W-A2 unit test passed registration=None which bypassed both splitters — exactly the "test-passing-but-not-exercising-path" antipattern.  The new tests pass `Some(reg)` so the splitters are built and the drain bug fires.
+    - No fallback: the drain mirrors the live-decode end-of-stream path verbatim.  No conditional drain, no env-gated shortcut.
+
+  - **Open followups.**  None — the silent-data-loss gap is closed.
+
+  - **Fence respected (Wave 3.5 HIGH-2).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
