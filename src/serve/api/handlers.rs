@@ -3814,3 +3814,89 @@ mod multimodal_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// T1.3: early-503 readiness guard (is_ready_for_gen before pool resolution)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod readiness_guard_tests {
+    use super::*;
+    use super::super::state::{AppState, ServerConfig};
+    use axum::http::header::RETRY_AFTER;
+
+    /// Verify that `ApiError::not_ready()` (the error emitted by the early-503
+    /// guard) produces HTTP 503 + `Retry-After: 1`.  The guard in
+    /// `prepare_chat_generation` short-circuits before pool resolution when
+    /// `state.is_ready_for_gen()` returns false.
+    #[test]
+    fn not_ready_error_is_503_with_retry_after_1() {
+        let resp = ApiError::not_ready().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After must be set on not_ready");
+        assert_eq!(ra, "1");
+    }
+
+    /// The readiness flag starts true (server is ready after `AppState::new`)
+    /// and can be toggled to false.  Toggling it to false is what causes
+    /// `prepare_chat_generation` to fire the early-503 before trying to load
+    /// the model.  This test exercises that state transition directly so we
+    /// have a fast, no-model unit cover for the guard path.
+    #[test]
+    fn app_state_mark_not_ready_disables_gen() {
+        let state = AppState::new(ServerConfig::default());
+        assert!(state.is_ready_for_gen(), "should start ready");
+        state.mark_not_ready();
+        assert!(!state.is_ready_for_gen(), "should be not-ready after mark");
+        // Confirm the error produced is 503 + Retry-After: 1.
+        let resp = ApiError::not_ready().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(RETRY_AFTER));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T1.1: PoolError → 503 + Retry-After mapping tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pool_error_tests {
+    use super::*;
+    use axum::http::header::RETRY_AFTER;
+
+    /// `PoolError::OversizedHandle` must map to HTTP 503 with a `Retry-After: 5`
+    /// header so the client knows to back off rather than flood the server.
+    #[test]
+    fn oversized_handle_maps_to_503_with_retry_after() {
+        let err = HotSwapError::PoolRefused(PoolError::OversizedHandle {
+            repo_id: "acme/big-model".to_string(),
+            handle_bytes: 40_000_000_000,
+            budget_bytes: 20_000_000_000,
+        });
+        let resp = map_hotswap_error_to_response(err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After header must be set");
+        assert_eq!(ra, "5", "Retry-After should be 5 seconds for pool refusal");
+    }
+
+    /// `PoolError::ZeroCapacity` must also map to HTTP 503 + `Retry-After: 5`.
+    #[test]
+    fn zero_capacity_maps_to_503_with_retry_after() {
+        let err = HotSwapError::PoolRefused(PoolError::ZeroCapacity);
+        let resp = map_hotswap_error_to_response(err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ra = resp.headers().get(RETRY_AFTER).expect("Retry-After header must be set");
+        assert_eq!(ra, "5");
+    }
+
+    /// Loader failures are still 500 (not retryable in the same way as pool
+    /// capacity limits).
+    #[test]
+    fn loader_failed_maps_to_500() {
+        let err = HotSwapError::LoaderFailed(anyhow::anyhow!("tokenizer missing"));
+        let resp = map_hotswap_error_to_response(err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // No Retry-After on a hard loader failure.
+        assert!(resp.headers().get(RETRY_AFTER).is_none());
+    }
+}
