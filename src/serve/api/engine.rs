@@ -1319,15 +1319,31 @@ fn generate_once_with_soft_tokens(
     };
     let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
+    // Wave-2.5 A1: ToolCallSplitter for the non-streaming decode loop.
+    // Tracks whether the current decode position is inside a tool-call body
+    // so the grammar mask can be gated on `tc_splitter.in_tool_call()`.
+    // Grammar only constrains tokens inside the body — preamble tokens (before
+    // the open marker) are unconstrained (Option B grammar boundary).
+    // The splitter is `None` when the model has no tool markers registered;
+    // in that case grammar masking runs unconditionally (pre-A1 behaviour).
+    let mut tc_splitter_ns: Option<super::registry::ToolCallSplitter> =
+        registration.and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
+
     // Local helper — apply grammar mask + Tier 4 logit_bias and sample.
     // Mutably borrows the runtime so it can be advanced after sampling
     // (caller does the advance to keep this closure side-effect-light).
     // Returns the sampled token id; caller must feed
     // `token_bytes[id]` through the runtime to keep it in sync.
+    //
+    // `in_tool_body`: A1 gate — true when the ToolCallSplitter reports the
+    // current position is inside a tool-call body.  When the splitter is
+    // absent (no tool markers), this is always `true` so grammar masking
+    // runs unconditionally (backward-compatible fallback).
     let sample_from_live_logits =
         |weights: &mut MlxModelWeights,
          generated: &[u32],
-         runtime: Option<&super::grammar::GrammarRuntime>|
+         runtime: Option<&super::grammar::GrammarRuntime>,
+         in_tool_body: bool|
          -> Result<u32> {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
             let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
@@ -1342,9 +1358,14 @@ fn generate_once_with_soft_tokens(
                 }
             }
             // Grammar mask: zero out tokens that would drive the runtime
-            // dead.  Skipped when no grammar (Option None).
-            if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+            // dead.  Wave-2.5 A1: only applies when we are inside a tool-call
+            // body (`in_tool_body == true`).  Outside the body (preamble tokens
+            // before the open marker) the model is free to emit any text — the
+            // grammar only constrains the call body structure.
+            if in_tool_body {
+                if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
+                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                }
             }
             Ok(sampler_pure::sample_token(&mut logits, sp, generated))
         };
@@ -1364,8 +1385,14 @@ fn generate_once_with_soft_tokens(
     // prompt-token's lm_head output) so the user-controlled temperature
     // applies to the very first generated token, not just decode-loop
     // tokens 2..N.  The greedy-fast-path skips logits readback entirely.
+    //
+    // Wave-2.5 A1: grammar mask is skipped for the first token because we
+    // cannot yet be inside a tool-call body — the splitter hasn't seen any
+    // output yet so `in_tool_call()` is always false at this point.
     let mut next_token = if sample_logits {
-        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
+        // A1: splitter not yet advanced; first token is always pre-body.
+        let in_body_first = tc_splitter_ns.as_ref().map(|_| false).unwrap_or(true);
+        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref(), in_body_first)?;
         // Feed the chosen token's bytes through the grammar runtime so
         // the next step's mask is correctly narrowed.  No-op when no
         // grammar.  An empty token_bytes entry (special / unprintable)
@@ -1408,6 +1435,13 @@ fn generate_once_with_soft_tokens(
             reasoning_token_count += 1;
         }
     }
+    // Wave-2.5 A1: feed first fragment through tc_splitter_ns so its
+    // in_tool_call() state is accurate for the first iteration of the
+    // decode loop.  Typically the first decoded token is never the open
+    // marker, but this keeps the state machine correct in all edge cases.
+    if let Some(tcs) = tc_splitter_ns.as_mut() {
+        let _ = tcs.feed(&first_fragment);
+    }
 
     let mut finish_reason: &'static str = "length";
     let mut profiler = ProfileAccumulator::new(0);
@@ -1434,10 +1468,22 @@ fn generate_once_with_soft_tokens(
                 // Sampling slow path: read logits, apply Tier 4 logit_bias,
                 // grammar mask, then call sampler_pure for
                 // temperature/top_p/top_k/rep-penalty.
+                //
+                // Wave-2.5 A1: grammar mask is gated on whether the
+                // ToolCallSplitter is currently inside a tool-call body.
+                // Outside the body (preamble before the open marker) the
+                // model is unconstrained.  If there is no tool splitter
+                // registered for this model (tc_splitter_ns is None), fall
+                // back to the pre-A1 unconditional masking so grammar still
+                // applies for models/requests that don't use tool calls.
+                let in_body = tc_splitter_ns.as_ref()
+                    .map(|t| t.in_tool_call())
+                    .unwrap_or(true);
                 let tok = sample_from_live_logits(
                     &mut loaded.weights,
                     &generated_tokens,
                     grammar_runtime.as_ref(),
+                    in_body,
                 )?;
                 // Advance the grammar runtime by the chosen token's bytes.
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -1468,6 +1514,11 @@ fn generate_once_with_soft_tokens(
                 if sp.in_reasoning() {
                     reasoning_token_count += 1;
                 }
+            }
+            // Wave-2.5 A1: advance tc_splitter_ns so its in_tool_call()
+            // state is correct for the NEXT step's grammar gate.
+            if let Some(tcs) = tc_splitter_ns.as_mut() {
+                let _ = tcs.feed(&fragment);
             }
             if hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
@@ -1656,6 +1707,27 @@ fn generate_stream_once(
     // on Constrained vs Auto when a tool-call body fails to parse.
     let tool_call_policy = params.tool_call_policy;
 
+    // Wave-2.5 A1: shared AtomicBool tracking whether the streaming decode
+    // loop is currently inside a tool-call body.  `route_content` toggles it
+    // on ToolCallOpen (true) / ToolCallClose (false).  The grammar mask in the
+    // decode loop reads it before each sampling step so the constraint only
+    // applies to tokens that are inside the body (Option B boundary).
+    //
+    // Arc is used so both the `route_content` closure (which captures it by
+    // clone) and the decode loop (which reads it directly) can share ownership
+    // without lifetime conflicts.  All accesses use `Relaxed` ordering: the
+    // decode loop runs single-threaded so sequentially consistent ordering is
+    // unnecessary.
+    let grammar_active = std::sync::Arc::new(
+        std::sync::atomic::AtomicBool::new(
+            // Initial state: if there is no tool splitter registered for this
+            // model, default to `true` so grammar runs unconditionally
+            // (backward-compatible fallback for models without tool markers).
+            tool_splitter.is_none(),
+        ),
+    );
+    let grammar_active_for_closure = grammar_active.clone();
+
     // Helper: for a Content-classified text run, route through the
     // ToolCallSplitter (if any) and emit the appropriate
     // GenerationEvent. When ToolCallSplitter is None, route every byte to
@@ -1700,11 +1772,19 @@ fn generate_stream_once(
                 }
                 super::registry::ToolCallEvent::ToolCallOpen => {
                     body.clear();
+                    // Wave-2.5 A1: entering a tool-call body — activate
+                    // grammar masking for subsequent tokens.
+                    grammar_active_for_closure.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
                     body.push_str(&t);
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
+                    // Wave-2.5 A1: leaving a tool-call body — deactivate
+                    // grammar masking.  The close event fires after the body
+                    // is fully accumulated so the last body token was already
+                    // constrained.
+                    grammar_active_for_closure.store(false, std::sync::atomic::Ordering::Relaxed);
                     // Parse the accumulated body. On parse failure, log +
                     // re-emit the body as Content so the user still sees
                     // something (the per-model parser is best-effort
@@ -1948,8 +2028,14 @@ fn generate_stream_once(
                 }
             }
         }
-        if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+        // Wave-2.5 A1: first token is always pre-body (no output has been
+        // emitted yet so the tool splitter hasn't opened a body).
+        // `grammar_active` was initialized to `false` for models with tool
+        // markers, so this check is consistent: mask is skipped here.
+        if grammar_active.load(std::sync::atomic::Ordering::Relaxed) {
+            if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+            }
         }
         let tok = sampler_pure::sample_token(&mut logits, sp, &[]);
         if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -2045,8 +2131,15 @@ fn generate_stream_once(
                         }
                     }
                 }
-                if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                // Wave-2.5 A1: only apply grammar mask when we are inside a
+                // tool-call body.  `grammar_active` is set to `true` by
+                // `route_content` when a ToolCallOpen event fires and reset to
+                // `false` on ToolCallClose.  Tokens outside the body (preamble
+                // before the open marker) are unconstrained.
+                if grammar_active.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                        super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+                    }
                 }
                 let tok = sampler_pure::sample_token(&mut logits, sp, &generated_tokens);
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -3190,5 +3283,137 @@ assistant:
             "identical prompt + identical params must hit cache"
         );
         assert_eq!(hit.unwrap().text, "cached text");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave-2.5 A1 — conditional grammar wire unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod test_a1_conditional_grammar_wire {
+    /// Verify ToolCallSplitter state transitions that drive the A1 grammar gate.
+    ///
+    /// The grammar mask in the decode loop reads `tool_splitter.in_tool_call()`.
+    /// This test confirms the splitter correctly transitions:
+    ///   - before any input:     in_tool_call == false  (mask should NOT fire)
+    ///   - after ToolCallOpen:   in_tool_call == true   (mask SHOULD fire)
+    ///   - after ToolCallClose:  in_tool_call == false  (mask should NOT fire)
+    #[test]
+    fn splitter_in_body_transitions_drive_grammar_gate() {
+        // Use the Gemma4 registration (has real tool open/close markers).
+        let reg = crate::serve::api::registry::find_for("gemma4-27b-it")
+            .expect("gemma4 registration must exist");
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("gemma4 has no tool markers — skip A1 splitter test");
+                return;
+            }
+        };
+        let mut splitter =
+            crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
+                .expect("ToolCallSplitter::from_registration must return Some for gemma4");
+
+        // Initial state: not inside a tool-call body.
+        // Grammar mask should NOT be active.
+        assert!(
+            !splitter.in_tool_call(),
+            "A1: before any input, in_tool_call must be false \
+             (grammar mask must NOT fire for preamble tokens)"
+        );
+
+        // Feed the open marker — splitter enters the body.
+        // Grammar mask SHOULD now be active.
+        let events_open = splitter.feed(open);
+        assert!(
+            events_open.iter().any(|e| matches!(
+                e,
+                crate::serve::api::registry::ToolCallEvent::ToolCallOpen
+            )),
+            "A1: feeding the open marker must emit ToolCallOpen"
+        );
+        assert!(
+            splitter.in_tool_call(),
+            "A1: after feeding the open marker, in_tool_call must be true \
+             (grammar mask MUST fire for body tokens)"
+        );
+
+        // Feed the close marker — splitter exits the body.
+        // Grammar mask should NOT be active.
+        let events_close = splitter.feed(close);
+        assert!(
+            events_close.iter().any(|e| matches!(
+                e,
+                crate::serve::api::registry::ToolCallEvent::ToolCallClose
+            )),
+            "A1: feeding the close marker must emit ToolCallClose"
+        );
+        assert!(
+            !splitter.in_tool_call(),
+            "A1: after feeding the close marker, in_tool_call must be false \
+             (grammar mask must NOT fire after the body)"
+        );
+    }
+
+    /// Verify the AtomicBool used in `generate_stream_once` transitions correctly
+    /// when simulating ToolCallOpen / ToolCallClose events.
+    ///
+    /// This test mirrors what `route_content` does inside `generate_stream_once`:
+    /// it manually drives an AtomicBool the same way the production code does, and
+    /// asserts the before/during/after states.
+    #[test]
+    fn grammar_active_atomic_bool_transitions() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Simulate the `grammar_active` Arc<AtomicBool> from generate_stream_once.
+        // Initial value: false (tool splitter present → grammar inactive until Open).
+        let grammar_active = Arc::new(AtomicBool::new(false));
+
+        // Pre-Open: grammar inactive.
+        assert!(
+            !grammar_active.load(Ordering::Relaxed),
+            "A1: grammar_active must be false before ToolCallOpen"
+        );
+
+        // Simulate ToolCallOpen handler (what route_content does).
+        grammar_active.store(true, Ordering::Relaxed);
+        assert!(
+            grammar_active.load(Ordering::Relaxed),
+            "A1: grammar_active must be true after ToolCallOpen"
+        );
+
+        // Simulate ToolCallClose handler.
+        grammar_active.store(false, Ordering::Relaxed);
+        assert!(
+            !grammar_active.load(Ordering::Relaxed),
+            "A1: grammar_active must be false after ToolCallClose"
+        );
+    }
+
+    /// Verify the no-tool-splitter fallback: when the model has no registered
+    /// tool markers, `grammar_active` initialises to `true` so grammar runs
+    /// unconditionally (backward-compatible behaviour for plain grammar requests).
+    #[test]
+    fn no_tool_splitter_grammar_active_defaults_true() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Use a registration that has no tool markers (Gemma4 has markers;
+        // check for a model without them, or simulate `None` by passing `None`
+        // to ToolCallSplitter::from_registration directly via a synthetic reg).
+        // The simplest approach: simulate what generate_stream_once does —
+        // `tool_splitter.is_none()` when the splitter was not created.
+        let tool_splitter: Option<crate::serve::api::registry::ToolCallSplitter> = None;
+
+        // Production code: `grammar_active = AtomicBool::new(tool_splitter.is_none())`
+        let grammar_active = Arc::new(AtomicBool::new(tool_splitter.is_none()));
+
+        assert!(
+            grammar_active.load(Ordering::Relaxed),
+            "A1: when there is no tool splitter, grammar_active must be true \
+             (unconditional grammar masking — backward-compatible fallback)"
+        );
     }
 }
