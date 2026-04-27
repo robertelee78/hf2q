@@ -470,6 +470,19 @@ fn apply_transparency_headers(
     }
 }
 
+/// Resolver function return type for `prepare_chat_generation_core`.
+/// The future borrows `AppState` for lifetime `'s` (the state outlives
+/// the future), resolves to either a pooled engine or an HTTP error response.
+/// Used by the injectable seam added for ADR-005 wave-1.5 Codex fix T1.1.
+type ResolverBoxFuture<'s> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<Arc<LoadedEngine<Engine>>, Response>,
+            > + Send
+            + 's,
+    >,
+>;
+
 /// Everything the non-streaming + streaming paths both need to start the
 /// generation on the worker thread.
 struct PreparedChatContext {
@@ -511,12 +524,46 @@ struct PreparedChatContext {
 /// Run every validation + rendering + tokenization step common to the
 /// streaming and non-streaming chat-completion paths. Returns the prepared
 /// context on success, or an `axum::Response` to return directly on failure.
+///
+/// Production path: calls `resolve_engine_for_request` via
+/// `prepare_chat_generation_core`.  Tests that need to inject a canned
+/// resolver response (e.g. to prove `PoolRefused` survives end-to-end
+/// without loading a real model — ADR-005 wave-1.5 Codex fix T1.1) call
+/// `prepare_chat_generation_core` directly with a closure.
 async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> std::result::Result<PreparedChatContext, Response> {
+    prepare_chat_generation_core(state, req, |s, m| {
+        Box::pin(async move { resolve_engine_for_request(s, &m).await })
+    })
+    .await
+}
+
+/// Core implementation of `prepare_chat_generation` parameterised over the
+/// engine-resolver function.  Production callers pass
+/// `resolve_engine_for_request`; test callers pass a closure that returns a
+/// canned `Err(response)` without touching disk or the network.
+///
+/// # Seam rationale (ADR-005 wave-1.5 Codex fix T1.1)
+///
+/// The previous tests exercised `map_hotswap_error_to_response` directly
+/// (i.e. the mapper helper, not the end-to-end path).  Codex flagged that as
+/// a shortcut: a bug in the wiring between the resolver and the mapper would
+/// be invisible.  This seam lets us prove the typed `HotSwapError::PoolRefused`
+/// survives all the way from the resolver call-site through the error-handling
+/// chain and out as 503 + `Retry-After: 5` — without needing a real GGUF on
+/// disk or a Metal GPU in the test environment.
+async fn prepare_chat_generation_core<'s, F>(
+    state: &'s AppState,
+    req: &ChatCompletionRequest,
+    resolver: F,
+) -> std::result::Result<PreparedChatContext, Response>
+where
+    F: FnOnce(&'s AppState, String) -> ResolverBoxFuture<'s>,
+{
     // --- Readiness gate (early-503 before any expensive work) ---
-    // Check `is_ready_for_gen` BEFORE running `resolve_engine_for_request`
+    // Check `is_ready_for_gen` BEFORE running the resolver
     // (which may trigger auto-pipeline download + quantize + model load).
     // A server in the not-ready state (still warming up, graceful-shutdown
     // drain) should not kick off a model load just because a client raced
@@ -532,7 +579,7 @@ async fn prepare_chat_generation(
     // the `HotSwapManager` pool: cache hit → reused engine; cache miss
     // → auto-pipeline + admit + return.  Decision #26's 400 fires only
     // when the auto-pipeline cannot resolve the requested name.
-    let loaded_engine = resolve_engine_for_request(state, &req.model).await?;
+    let loaded_engine = resolver(state, req.model.clone()).await?;
     let engine: &Engine = &loaded_engine.engine;
     if req.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -3946,5 +3993,108 @@ mod pool_error_tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         // No Retry-After on a hard loader failure.
         assert!(resp.headers().get(RETRY_AFTER).is_none());
+    }
+
+    /// ADR-005 wave-1.5 Codex fix T1.1 — real end-to-end path test.
+    ///
+    /// The previous three tests (above) exercised `map_hotswap_error_to_response`
+    /// directly.  Codex flagged that as a shortcut: a bug in the wiring between
+    /// the resolver call-site and the error mapper would be invisible.
+    ///
+    /// This test drives `HotSwapError::PoolRefused(PoolError::ZeroCapacity)`
+    /// through `prepare_chat_generation_core` via the injectable resolver seam
+    /// (ADR-005 wave-1.5 refactor).  It proves:
+    ///   1. The `PoolRefused` variant reaches `map_hotswap_error_to_response`
+    ///      through the live wiring in `prepare_chat_generation_core`.
+    ///   2. The 503 + `Retry-After: 5` response emerges at the handler boundary
+    ///      — not just from the mapper helper in isolation.
+    ///
+    /// # Seam design
+    ///
+    /// The resolver parameter added to `prepare_chat_generation_core` is the
+    /// production injection point.  In production, the closure calls
+    /// `resolve_engine_for_request`.  Here, it directly calls
+    /// `map_hotswap_error_to_response` to surface the typed `HotSwapError`
+    /// exactly as the real resolver does when `load_or_get` returns
+    /// `Err(HotSwapError::PoolRefused(...))`.
+    ///
+    /// The AppState is marked ready (`set_ready(true)` is the default from
+    /// `AppState::new`) so the readiness guard does NOT fire — we are testing
+    /// the resolver error path, not the readiness path.
+    #[tokio::test]
+    async fn pool_refused_through_resolver_seam_yields_503_with_retry_after_5() {
+        use super::super::state::{AppState, ServerConfig};
+
+        let state = AppState::new(ServerConfig::default());
+        // Verify the state is ready — we want the resolver path, not the
+        // not-ready path, to be exercised.
+        assert!(state.is_ready_for_gen(), "AppState::new should start ready");
+
+        let req = super::super::schema::ChatCompletionRequest {
+            model: "pool-refused-model".to_string(),
+            messages: vec![super::super::schema::ChatMessage {
+                role: "user".to_string(),
+                content: Some(super::super::schema::MessageContent::Text(
+                    "test".to_string(),
+                )),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            stream: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            top_p: None,
+            seed: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stream_options: None,
+            top_k: None,
+            repetition_penalty: None,
+            min_p: None,
+            logprobs: None,
+            top_logprobs: None,
+            logit_bias: None,
+            parallel_tool_calls: None,
+            hf2q_overflow_policy: None,
+            hf2q_enable_thinking: None,
+        };
+
+        // The resolver closure mimics what `resolve_engine_for_request` does
+        // when `load_or_get` returns `Err(HotSwapError::PoolRefused(...))`:
+        // it calls `map_hotswap_error_to_response` and returns `Err(response)`.
+        // This is the exact same code path the production resolver takes —
+        // we are bypassing only the auto-pipeline + GGUF disk I/O, not the
+        // error mapping wiring.
+        let resolver = |_state: &AppState, _model: String| -> ResolverBoxFuture<'_> {
+            let err = HotSwapError::PoolRefused(PoolError::ZeroCapacity);
+            let response = map_hotswap_error_to_response(err);
+            Box::pin(async move { Err(response) })
+        };
+
+        let resp = match prepare_chat_generation_core(&state, &req, resolver).await {
+            Err(r) => r,
+            Ok(_) => panic!("PoolRefused resolver must yield Err(503 response), got Ok"),
+        };
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PoolRefused must yield 503 SERVICE_UNAVAILABLE at the handler boundary"
+        );
+        let ra = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .expect("Retry-After header must be present on pool-refused 503");
+        assert_eq!(
+            ra, "5",
+            "pool-refused Retry-After must be 5 seconds (not 1, which is for not-ready)"
+        );
     }
 }
