@@ -1436,6 +1436,43 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2a wave-2 T1.10 — PromptCache live-validation harness lands; cache confirmed already un-gated (2026-04-26, wave-2 W2, hf2q commits TBD)
+
+**Gate audit result: the cache was never gated.** Wave-2 T1.10 was framed as "un-gate iter-19 `a9eeb54` after live validation". The wave-2 W2 audit of `engine.rs:385-1431` found:
+
+* `PromptCache.lookup()` fires unconditionally at `engine.rs:1138` inside `generate_once_with_soft_tokens`.
+* `PromptCache.store()` fires unconditionally at `engine.rs:1428` (non-streaming) and `:2129` (streaming completion).
+* No `if false`, no `const PROMPT_CACHE_ENABLED: bool = false`, no `HF2Q_PROMPT_CACHE_DISABLED` env var. The cache has been live since iter-96.
+* The "live-validation-gated" label in the wave-1 hive-mind snapshot referred to the test proof, not a runtime gate.
+
+**Chesterton notes.** Why was the "live-validation-gated" framing used? The iter-19 comment (line 3417 in this doc) states "Integration into the engine worker deferred until the KV-replay path can be live-validated against a loaded model." The original `prompt_cache.rs` module used an LCP-based partial-skip approach; the iter-96 re-implementation (which replaced it) is a simpler full-equality + full-response-replay design that does not need a KV write-position refactor. The wave-1.5 design invariants comment at `engine.rs:385-408` documents this explicitly. The gate was conceptual, not code — the code was always active.
+
+**Dead module note (T0.3).** `src/serve/api/prompt_cache.rs` (the original LCP prototype, 286 lines, 13 tests) was deleted in wave-1.5 (2026-04-26) per the T0.3 directive. The live cache lives exclusively in `engine.rs`.
+
+**Live-validation test added.** `tests/prompt_cache_live.rs` — gated by `HF2Q_PROMPT_CACHE_LIVE_TEST=1` (default-off per the iter-101 env-gate pattern). The test:
+
+1. Spawns `hf2q serve` at port 52335 against the canonical Gemma 4 26B chat GGUF.
+2. Sends prompt A (greedy, `temperature=0`), asserts `cached_tokens=0` and `decode_time_secs>0` (cache MISS).
+3. Sends prompt A again, asserts `cached_tokens=prompt_len`, `decode_time_secs=0.0`, `prefill_time_secs=0.0`, content byte-identical (cache HIT).
+4. Sends prompt B, asserts `cached_tokens=0` (cache MISS — invalidation check).
+
+**Validation corpus** (wave-2 T1.10, 2026-04-26):
+* Prompt A: `"Say hello in one word."`
+* Prompt B: `"Say goodbye in one word."`
+* Model: Gemma 4 26B (gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf)
+
+**Cache hit vs miss shape:**
+* MISS: `usage.prompt_tokens_details.cached_tokens = 0`; `x_hf2q_timing.decode_time_secs > 0`
+* HIT: `usage.prompt_tokens_details.cached_tokens = prompt_len`; `x_hf2q_timing.decode_time_secs = 0.0`; `x_hf2q_timing.prefill_time_secs = 0.0`
+
+**Streaming note.** The streaming path stores to cache on every successful completion (`:2129`) but does NOT consult the cache on input (`:2109` comment: "would require fake-emitting Delta events from cached text — iter-97 follow-up"). Only non-streaming requests get the cache hit speedup today.
+
+**Cargo verify.** `cargo check --release` 0 errors; `cargo test --release --test prompt_cache_live` PASS (skips without gate set; 1 test added, 1 passing).
+
+**Files touched.** `tests/prompt_cache_live.rs` (NEW — live-validation harness), `docs/ADR-005-inference-server.md` (this entry).
+
+---
+
 #### Phase 2a iter-133 Iter D — Gemma 4 reasoning markers fixed + per-request `hf2q_enable_thinking` plumbed; AC 2509 CLOSED — Scenario 3 LIVE PASSes all 7 invariants on Gemma 4 (2026-04-26, W67, hf2q commits `c325d56` + `e44c1cf` + `95332d7` + `<adr-entry>`)
 
 **Why this iter exists.** W66 closed iter B-2 + iter C with `ToolCallSplitter` landed + reasoning-panel test infra wired, but **AC 2509 stayed `[ ]`** because Scenario 3 could not run live. W66 surfaced two blockers: (1) qwen3.6-27b serve-load failure (architectural — hybrid linear/full-attention arch needs delta-net tensor loading on the serve forward path, which is multi-day work, not iter-D scope); (2) Gemma 4 reasoning marker mismatch in registry — same bug-class as iter B-2's tool-call marker fix.
@@ -3159,7 +3196,7 @@ Phase 2 closes when 2a + 2b + 2c all pass.
 #### Phase 2b AC — Dedicated BERT-family embedding models
 - [x] `nomic-embed-text-v1.5`, `mxbai-embed-large-v1`, `bge-small-en-v1.5` each load and serve through `/v1/embeddings` **Closed iter-91 2026-04-25: all three day-one models load, tokenize, forward, pool, L2-normalize, and serve through /v1/embeddings; padding-invariance PASS across seq_lens 32-512; declared shippable at ADR line 4393 (commit 873eee5 final gate; cosine gates bge 0.999985, mxbai 0.999988, nomic 0.999960).**
 - [x] Per-model output matches `llama.cpp --embedding` byte-for-byte on identical GGUF **Closed iter-91 2026-04-25 (achieved as cosine ≥ 0.999 against llama-embedding — not literal byte-for-byte due to BF16 compute path; max-abs-diff ≤ 1.5e-3; BERT F32 lane: bge 0.999985, mxbai 0.999988; nomic BF16 FA: 0.999960; declared sufficient at ADR line 4393; commit 873eee5).**
-- [ ] MTEB 5-task sanity suite recovers published scores within ±1 pt per supported model **Blocker: no MTEB harness implementation exists; zero git commits against this AC; genuinely open.**
+- [ ] MTEB 5-task sanity suite recovers published scores within ±1 pt per supported model **Blocker: no MTEB harness implementation exists; zero git commits against this AC; genuinely open. Pooling forward pass landed wave-2 T1.9 (see below); MTEB harness still ops-deferred (no Python integration; needs separate harness implementation).**
 - [x] Unsupported embedding-model format → clear error naming the day-one supported list **Closed iter-81 2026-04-26 (src/serve/mod.rs:1352 emits "embedding GGUF general.architecture='{other}' is not supported. Phase 2b day-one models: 'bert' (bge / mxbai) and 'nomic-bert' (nomic-embed-text-v1.5)"; commit 3213d54).**
 
 #### Phase 2c AC — Vision (absorbed from old Phase 3, 2026-04-23)
@@ -4392,6 +4429,24 @@ Per-loop-iteration progress against Phase 2a/2b/2c. Mantra discipline: no stubs,
   - **Lane discipline.** Edits in two test sections only: `bert_gpu.rs::tests` (+ 201 LOC, two new tests for bge / mxbai) and `nomic_bert/forward.rs::tests` (+ ~150 LOC: one new padding-invariance test + 2 updated tests for iter-90's tightened preconditions).  Zero non-test code changed.
   - **Phase 2b status: SHIPPABLE.** All three day-one BERT-family models are correctness-validated at the seq_len=32 ground-truth gate AND padding-invariant across seq_lens 32-512.  Iter-90 perf delivered 1.34× HTTP ratio vs llama.cpp.  No known bugs.  The remaining "iter-92+ candidate" work (BF16-output matmul to drop Q/K/V casts, BERT-lane flash-attn port) are pure perf optimizations, not correctness blockers.
   - **Next (iter 92):** pivot from Phase 2b perf into the Phase 2a unblockers.  The chat-model lane refactor (forward_embed hook + worker channel + handler dispatch) opens task #8 (chat-model pooled embeddings) — and the same forward_embed hook is also the first step toward task #15 / #17 (vision soft-token injection).  Lower-risk first move: add a pooled embedding path to `MlxModelWeights` that does not require the full engine-channel refactor (i.e. `forward_embed(prompt_tokens, &mut GpuContext) -> Result<Vec<f32>>` as a peer of `forward_prefill`), then expose via a separate `EmbeddingArch::ChatModel` variant in state.rs.
+
+#### Phase 2b wave-2 T1.9 — PoolingStrategy enum + CPU reference pool functions (2026-04-27, CFA wave-2 W1)
+
+- **What landed.** New module `src/serve/api/embedding_pool.rs` (282 LOC + 12 unit tests, all passing).
+  - **`PoolingStrategy` enum** (`Mean`, `ClsToken`, `EosLastToken`) with a `from_pooling_type(PoolingType) -> Option<PoolingStrategy>` converter and `as_str()` accessor.  Maps the existing `PoolingType` values (already used by every GPU forward path) to the strategy names referenced in the literature and research W4 report.  `EosLastToken` documents that Qwen3-Embedding and E5-mistral-7b-instruct use GGUF `pooling_type = 3` (mapped to `BertPoolKind::Last`) — the existing GPU path already dispatches this correctly.  `from_pooling_type(None)` and `from_pooling_type(Rank)` return `None` (both are invalid for `/v1/embeddings`).
+  - **`pool_mean(hidden_states, seq_len, hidden, valid_token_count) -> Vec<f32>`** — CPU reference: mean over the first `valid_token_count` rows.  Masks padding positions (rows ≥ `valid_token_count`).
+  - **`pool_eos_last_token(hidden_states, seq_len, hidden, valid_token_count) -> Vec<f32>`** — CPU reference: picks row `valid_token_count - 1` (the EOS/last real token).
+  - **`l2_normalize(v: &mut [f32], eps: f32)`** — CPU reference: in-place row L2 normalize.
+  - These CPU functions serve as documentation of the GPU kernels (`bert_pool_mean_f32`, `bert_embed_gather_gpu`, `bert_l2_normalize_gpu`) and as a test oracle for future GPU-kernel additions.
+- **Strategy dispatch rules documented** (module-level doc-comment, table form):
+  | Strategy | Representative models | GGUF `pooling_type` |
+  |---|---|---|
+  | Mean | nomic-embed-text-v1.5, BGE-M3 dense, mxbai-embed-large | `1` |
+  | ClsToken | bge-small-en-v1.5, classic BERT-base | `2` |
+  | EosLastToken | Qwen3-Embedding, E5-mistral-7b-instruct | `3` (`Last`) |
+- **Unit tests (12/12 green):** `pool_mean_all_tokens_valid`, `pool_mean_masks_padding_rows`, `pool_mean_single_token`, `pool_eos_last_picks_last_valid_row`, `pool_eos_last_ignores_padding`, `pool_eos_last_single_token`, `l2_normalize_already_unit`, `l2_normalize_three_four`, `l2_normalize_all_zeros_no_panic`, `pooling_strategy_from_pooling_type_round_trips`, `pooling_strategy_as_str_stable`, `pool_mean_and_eos_last_agree_on_single_token`.
+- **Chesterton fence findings.**  GPU pooling for Phase 2b was ALREADY fully implemented in `apply_bert_full_forward_gpu` (`bert_gpu.rs:1929-2071`) and `apply_nomic_bert_full_forward_gpu` (`nomic_bert/forward.rs:854-1033`).  Both functions read `cfg.pooling_type` from GGUF metadata and dispatch `bert_pool_gpu` with the appropriate `BertPoolKind`.  `EosLastToken` (Qwen3-Embedding) = `PoolingType::Last` = `BertPoolKind::Last` — dispatched by the existing GPU path without any code change.  The nomic-bert path already passes `valid_token_count` (not padded `seq_len`) to the pool kernel, so Last pooling picks the correct non-padding row.  T1.9's contribution is (a) documentation of the dispatch rules in a user-visible module, (b) CPU reference functions for testing and future kernel validation, and (c) this ADR entry.
+- **MTEB harness status.** The MTEB AC (`[ ]` at line 3162) remains open — no Python harness exists.  The pooling compute is correct; the gap is an ops-level harness that runs the MTEB evaluation suite against the `/v1/embeddings` endpoint.
 
 - **2026-04-25 loop iter 90 — Flash Attention port for nomic-bert (head_dim=64). New mlx-native v0.4.5 dispatcher `flash_attn_prefill_bf16_d64` with `FlashAttnPrefillLayout::SeqMajor` consumes the BERT-family seq-major Q/K/V layout directly (no host-side transpose). Replaces the 8-stage `bert_attention_with_mask_gpu` chain with `cast_F32→BF16(Q,K,V) + flash_attn + cast_BF16→F32(O)` = 5 dispatches per layer (was 8). Cooled 3-run avg: HTTP `/v1/embeddings` mean **5.69 ms**, min **5.01 ms** vs llama.cpp `prompt_eval` 4.25 ms — ratio **1.34×** (was 1.45×). Cosine parity holds: bge 0.999985, mxbai 0.999988, nomic 0.999960.**
   - **What landed (mlx-native v0.4.5).**
