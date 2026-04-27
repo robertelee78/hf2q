@@ -30,14 +30,14 @@ use std::sync::Arc;
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
 use super::schema::{
-    ApiError, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-    EmbeddingObject, EmbeddingPayload, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    HealthResponse, MessageContent, ModelListResponse, ModelObject, PromptTokensDetails,
-    ReadyzResponse, ResponseFormat, UsageStats,
+    ApiError, ApiErrorBody, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessage, EmbeddingObject, EmbeddingPayload, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, HealthResponse, MessageContent, ModelListResponse, ModelObject,
+    PromptTokensDetails, ReadyzResponse, ResponseFormat, UsageStats,
 };
 use super::state::AppState;
 use crate::serve::auto_pipeline;
-use crate::serve::multi_model::{EngineConfig, LoadedEngine};
+use crate::serve::multi_model::{EngineConfig, HotSwapError, LoadedEngine, PoolError};
 use crate::serve::quant_select::QuantType;
 
 // ---------------------------------------------------------------------------
@@ -170,19 +170,23 @@ async fn resolve_engine_for_request(
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();
     let gguf_path = resolved.gguf_path.clone();
-    let load_outcome = tokio::task::spawn_blocking(move || {
+    // Two-level Result: outer = JoinError from spawn_blocking; inner = HotSwapError
+    // (typed, not anyhow-wrapped) so we can match on PoolRefused variants.
+    let load_outcome: Result<
+        Result<Arc<LoadedEngine<Engine>>, HotSwapError>,
+        tokio::task::JoinError,
+    > = tokio::task::spawn_blocking(move || {
         let mut w = pool_arc
             .write()
-            .map_err(|e| anyhow::anyhow!("pool rwlock poisoned: {e}"))?;
+            .map_err(|e| HotSwapError::LoaderFailed(anyhow::anyhow!("pool rwlock poisoned: {e}")))?;
         w.load_or_get(&pool_repo_blocking, pool_quant, &gguf_path, &engine_config)
-            .map_err(|e| anyhow::anyhow!("hot-swap: {e}"))
     })
     .await;
     match load_outcome {
         Ok(Ok(arc)) => Ok(arc),
         Ok(Err(e)) => {
             tracing::error!(model = %model_arg, error = %e, "hot-swap load failed");
-            Err(ApiError::generation_error(format!("model load failed: {e}")).into_response())
+            Err(map_hotswap_error_to_response(e))
         }
         Err(join_err) => {
             tracing::error!(error = %join_err, "hot-swap blocking task panicked");
@@ -191,11 +195,58 @@ async fn resolve_engine_for_request(
     }
 }
 
-// (HotSwapError → ApiError mapping is done inline inside the
-// spawn_blocking branch above; the manager's anyhow-wrapping is the
-// single error envelope today.  When iter-210 lands sharper
-// per-variant mapping — e.g. PoolRefused → 503 with Retry-After —
-// it will go here as a dedicated helper.)
+/// Map a [`HotSwapError`] to an HTTP [`Response`].
+///
+/// - [`HotSwapError::PoolRefused`] with [`PoolError::OversizedHandle`] or
+///   [`PoolError::ZeroCapacity`] → 503 `pool_refused` + `Retry-After: 5`.
+///   The 503 signals the pool cannot serve this model right now; the
+///   `Retry-After: 5` suggests the client back off before retrying (the
+///   operator may need to raise the memory budget, but transient eviction
+///   races also cause this and resolve on their own).
+/// - [`HotSwapError::LoaderFailed`] / [`HotSwapError::FileSize`] → 500.
+fn map_hotswap_error_to_response(e: HotSwapError) -> Response {
+    match e {
+        HotSwapError::PoolRefused(ref pool_err) => {
+            let detail = match pool_err {
+                PoolError::OversizedHandle { ref repo_id, .. } => format!(
+                    "model {repo_id} exceeds pool memory budget; \
+                     try a smaller quant or raise the budget"
+                ),
+                PoolError::ZeroCapacity => {
+                    "multi-model pool has capacity_models = 0; \
+                     operator must raise capacity"
+                        .to_string()
+                }
+            };
+            ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                retry_after_seconds: Some(5),
+                error: ApiErrorBody {
+                    message: detail,
+                    error_type: "server_error".to_string(),
+                    code: Some("pool_refused".to_string()),
+                    param: None,
+                },
+            }
+            .into_response()
+        }
+        HotSwapError::LoaderFailed(ref inner) => {
+            tracing::error!(error = %inner, "hot-swap loader failed");
+            ApiError::generation_error(format!("model load failed: {inner}")).into_response()
+        }
+        HotSwapError::FileSize { ref path, ref source } => {
+            tracing::error!(
+                path = %path.display(), error = %source,
+                "hot-swap file size read failed"
+            );
+            ApiError::generation_error(format!(
+                "cannot read GGUF size at {}: {source}",
+                path.display()
+            ))
+            .into_response()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // POST /v1/chat/completions (non-streaming)
@@ -464,6 +515,17 @@ async fn prepare_chat_generation(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> std::result::Result<PreparedChatContext, Response> {
+    // --- Readiness gate (early-503 before any expensive work) ---
+    // Check `is_ready_for_gen` BEFORE running `resolve_engine_for_request`
+    // (which may trigger auto-pipeline download + quantize + model load).
+    // A server in the not-ready state (still warming up, graceful-shutdown
+    // drain) should not kick off a model load just because a client raced
+    // the readiness flag.  The 503 here is the same `not_ready` that
+    // `/readyz` would return; clients should respect `Retry-After: 1`.
+    if !state.is_ready_for_gen() {
+        return Err(ApiError::not_ready().into_response());
+    }
+
     // --- Pool-routed engine resolution (iter-209) ---
     // Pre-iter-209: rejected with 400 `model_not_loaded` whenever
     // `state.engine.is_none()`.  Iter-209 routes `req.model` through
@@ -472,9 +534,6 @@ async fn prepare_chat_generation(
     // when the auto-pipeline cannot resolve the requested name.
     let loaded_engine = resolve_engine_for_request(state, &req.model).await?;
     let engine: &Engine = &loaded_engine.engine;
-    if !state.is_ready_for_gen() {
-        return Err(ApiError::not_ready().into_response());
-    }
     if req.messages.is_empty() {
         return Err(ApiError::invalid_request(
             "messages must contain at least one entry",
@@ -585,9 +644,15 @@ async fn prepare_chat_generation(
     //   Reject        → 400 context_length_exceeded when prompt ≥ ctx_len.
     //   TruncateLeft  → iteratively drop oldest non-system messages until
     //                   the prompt fits under ctx_len, then re-tokenize.
-    //   Summarize     → currently returns 501 (not implemented yet; needs
-    //                   internal engine recursion which lands when
-    //                   forward_decode is refactored for logit exposure).
+    //   Summarize     → splits messages into (system_prefix, summary_window,
+    //                   recent_window), runs a greedy forward pass on the
+    //                   summary_window at T=0 / max 160 tokens (see
+    //                   `SUMMARIZE_MAX_TOKENS` and `apply_summarize`), replaces
+    //                   the window with a synthetic "[Summary of prior
+    //                   conversation]: …" system message, and re-tokenizes.
+    //                   Falls through to TruncateLeft when the window is empty
+    //                   or the summary prompt itself doesn't fit.  Default
+    //                   policy is `OverflowPolicy::Summarize` (state.rs:105).
     // The 80% budget trigger from Decision #23 applies only to Summarize
     // (its whole point is to preemptively shrink the context so summary +
     // completion fit in the remaining 20%); Reject + TruncateLeft trigger
@@ -1029,9 +1094,17 @@ pub(crate) fn build_synthetic_summary_message(
 ///   - `Reject`        → 400 context_length_exceeded if `prompt ≥ ctx_len`.
 ///   - `TruncateLeft`  → drop oldest non-system messages until prompt fits
 ///                       (via the pure-compute `truncate_left` helper).
-///   - `Summarize`     → 501 not-implemented in this iter (needs internal
-///                       engine recursion; lands with forward_decode
-///                       refactor).
+///   - `Summarize`     → calls `apply_summarize` (see `:1160`+): splits the
+///                       message list into a system prefix, a summary window,
+///                       and a recent window (`SUMMARIZE_KEEP_RECENT_MSGS`
+///                       messages retained verbatim); runs a greedy T=0
+///                       forward pass of up to `SUMMARIZE_MAX_TOKENS` tokens
+///                       on the summary window; replaces that window with a
+///                       synthetic `"[Summary of prior conversation]: …"`
+///                       system message; re-tokenizes.  Falls back to
+///                       TruncateLeft when the window is empty or the summary
+///                       prompt itself exceeds `ctx_len`.  Default policy is
+///                       `OverflowPolicy::Summarize` (see `state.rs:105`).
 ///
 /// Returns `(prompt_tokens, prompt_len, summarized_messages_count,
 /// summary_tokens)` on success. The last two are `Some` only when the
@@ -1789,26 +1862,6 @@ fn process_multimodal_content(
         }
     }
     Ok(out)
-}
-
-/// Emit the 501 for "images preprocessed successfully, ViT forward pass
-/// not yet wired". Centralized so the streaming and non-streaming paths
-/// phrase it identically.
-fn vit_forward_pending_response(n_images: usize) -> Response {
-    let err = ApiError::invalid_request(
-        format!(
-            "Request carries {n} image(s); all parsed + preprocessed \
-             successfully into ViT pixel tensors. The ViT forward pass \
-             that consumes them lands in a later hf2q iter (ADR-005 \
-             Phase 2c, Task #15). Send a text-only message to exercise \
-             the chat path today.",
-            n = n_images
-        ),
-        Some("messages".into()),
-    );
-    let mut resp = err.into_response();
-    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    resp
 }
 
 /// Iter 52: 501 emitted AFTER the GPU ViT forward succeeded. Reports
@@ -3538,12 +3591,6 @@ mod multimodal_tests {
         let resp = process_multimodal_content(&msgs, Some(&mmproj))
             .expect_err("bad PNG payload should 400");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn vit_forward_pending_response_is_501_with_messages_param() {
-        let resp = vit_forward_pending_response(2);
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     // -----------------------------------------------------------------------
