@@ -60,6 +60,16 @@ pub fn mask_invalid_tokens(
     token_bytes: &[Vec<u8>],
     logits: &mut [f32],
 ) -> usize {
+    // Wave 2.6 W-α5 Q2: a suspended runtime (lazy-grammar awaiting its
+    // open-marker trigger) masks NOTHING — preamble tokens before the
+    // tool-call open marker are unconstrained.  Skip the per-token
+    // clone+accept loop entirely (it would also self-gate, but each
+    // clone is non-trivial).  This is the apply-half of the dual-gate
+    // pattern from /opt/llama.cpp/src/llama-grammar.cpp:1339-1344
+    // (`if (grammar.awaiting_trigger) return;`).
+    if grammar.is_awaiting_trigger() {
+        return 0;
+    }
     let mut masked = 0usize;
     let n = token_bytes.len().min(logits.len());
     for i in 0..n {
@@ -293,5 +303,94 @@ mod tests {
         let masked = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
         assert_eq!(masked, 2);
         assert_eq!(logits.len(), 3);
+    }
+
+    /// Wave 2.6 W-α5 Q2 — mask self-gates on awaiting_trigger.
+    ///
+    /// When the runtime is suspended (lazy grammar awaiting its
+    /// trigger), `mask_invalid_tokens` MUST mask zero tokens.  Every
+    /// preamble token (e.g. arbitrary text before the tool-call open
+    /// marker) stays at its original logit so the model is free to emit
+    /// any text up to the trigger.
+    ///
+    /// This is the apply-half of the dual-gate from
+    /// /opt/llama.cpp/src/llama-grammar.cpp:1339-1344
+    /// (`if (grammar.awaiting_trigger) return;`).  Together with
+    /// `accept_bytes` self-gating (sampler.rs::runtime_accept_noops_when_awaiting_trigger),
+    /// this proves the wave-2.5 audit divergence A1 cannot recur:
+    /// there is no split-state window where mask says "off" but
+    /// advance says "on" because BOTH gate the same boolean.
+    #[test]
+    fn runtime_apply_noops_when_awaiting_trigger() {
+        // Restrictive grammar: only "a" is valid.  Without the gate,
+        // 3 of 4 tokens would be masked.
+        let mut runtime = rt("root ::= \"a\"\n", "root");
+        runtime.set_awaiting_trigger(true);
+        let token_bytes = vocab(&["a", "b", "c", "x"]);
+        let mut logits = vec![1.0, 1.0, 1.0, 1.0];
+        let masked = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
+        assert_eq!(
+            masked, 0,
+            "suspended runtime MUST mask zero tokens (preamble freedom)"
+        );
+        // All logits MUST be unchanged — the model is unconstrained.
+        for (i, &l) in logits.iter().enumerate() {
+            assert_eq!(l, 1.0, "logit {i} must be unchanged while awaiting trigger");
+        }
+    }
+
+    /// Wave 2.6 W-α5 Q2 — mask resumes restrictive enforcement after
+    /// `trigger()` is called.  Companion to
+    /// `runtime_apply_noops_when_awaiting_trigger`: proves the gate is
+    /// the ONLY thing suppressing the mask, and that the underlying
+    /// grammar is intact.
+    #[test]
+    fn runtime_apply_active_after_trigger() {
+        let mut runtime = rt("root ::= \"a\"\n", "root");
+        runtime.set_awaiting_trigger(true);
+        runtime.trigger();
+        assert!(!runtime.is_awaiting_trigger());
+
+        let token_bytes = vocab(&["a", "b", "c", "x"]);
+        let mut logits = vec![1.0, 1.0, 1.0, 1.0];
+        let masked = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
+        assert_eq!(
+            masked, 3,
+            "post-trigger runtime masks the 3 invalid tokens (only 'a' survives)"
+        );
+        assert!(logits[0].is_finite(), "'a' survives");
+        assert!(logits[1].is_infinite(), "'b' masked");
+        assert!(logits[2].is_infinite(), "'c' masked");
+        assert!(logits[3].is_infinite(), "'x' masked");
+    }
+
+    /// Wave 2.6 W-α5 Q2 — `GrammarKind::ResponseFormat` runtimes (the
+    /// default) MUST never await a trigger.  This guards the audit
+    /// divergence "A1 / response_format regression" — any code path
+    /// that constructs a runtime without explicitly opting into
+    /// `set_awaiting_trigger(true)` must enforce eagerly from token 0.
+    ///
+    /// The test is a property check: a freshly-constructed runtime
+    /// reports `is_awaiting_trigger() == false`, and the mask fires
+    /// normally without any explicit `trigger()` call.
+    #[test]
+    fn runtime_response_format_never_awaits() {
+        // Default-constructed runtime — no `set_awaiting_trigger` call.
+        // This mirrors the engine's GrammarKind::ResponseFormat path.
+        let runtime = rt("root ::= \"a\"\n", "root");
+        assert!(
+            !runtime.is_awaiting_trigger(),
+            "default (ResponseFormat-equivalent) runtime MUST NOT await trigger"
+        );
+
+        // Mask fires immediately, no trigger needed.
+        let token_bytes = vocab(&["a", "b"]);
+        let mut logits = vec![1.0, 1.0];
+        let masked = mask_invalid_tokens(&runtime, &token_bytes, &mut logits);
+        assert_eq!(
+            masked, 1,
+            "ResponseFormat-kind runtime enforces from token 0 with no \
+             trigger flip required"
+        );
     }
 }

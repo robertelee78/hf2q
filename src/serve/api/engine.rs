@@ -1378,26 +1378,43 @@ fn generate_once_with_soft_tokens(
     // owns the clone + a small Vec<Stack> of in-flight positions.  We
     // mutate in place across decode steps (advance via accept_bytes
     // after each sampled token).
+    //
+    // Wave 2.6 W-α5 Q2: when `params.grammar_kind == ToolCallBody`, the
+    // runtime starts SUSPENDED via `set_awaiting_trigger(true)`.  The
+    // mask + accept calls below are unconditional — the runtime
+    // self-gates internally (mirrors llama.cpp lazy-grammar pattern at
+    // /opt/llama.cpp/src/llama-grammar.cpp:1287-1344, citation in
+    // research-report.md Q2).  The trigger flips when the
+    // `ToolCallSplitter` sees the per-model open marker (handler
+    // below).  For `GrammarKind::ResponseFormat` the runtime starts
+    // EAGER — enforcement from token 0, byte-identical to pre-A1
+    // behavior.  This is the wave-2.5 audit divergence A1 fix.
     let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
         Some(g) => {
             let start_rule_id = g
                 .rule_id("root")
                 .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
-            let rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
+            let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                 .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
+            if matches!(params.grammar_kind, GrammarKind::ToolCallBody) {
+                rt.set_awaiting_trigger(true);
+            }
             Some(rt)
         }
         None => None,
     };
     let token_bytes_ref: Option<&[Vec<u8>]> = params.token_bytes.as_deref().map(|v| &v[..]);
 
-    // Wave-2.5 A1: ToolCallSplitter for the non-streaming decode loop.
-    // Tracks whether the current decode position is inside a tool-call body
-    // so the grammar mask can be gated on `tc_splitter.in_tool_call()`.
-    // Grammar only constrains tokens inside the body — preamble tokens (before
-    // the open marker) are unconstrained (Option B grammar boundary).
-    // The splitter is `None` when the model has no tool markers registered;
-    // in that case grammar masking runs unconditionally (pre-A1 behaviour).
+    // Wave-2.5 A1 / Wave 2.6 W-α5 Q2: ToolCallSplitter for the
+    // non-streaming decode loop.  Used here ONLY to detect the per-model
+    // open marker so we can call `runtime.trigger()` on the grammar — the
+    // runtime then self-gates (no separate `in_body` boolean needed).
+    // For `GrammarKind::ResponseFormat` runtimes the trigger is a no-op
+    // because the runtime was constructed eager.  The splitter is `None`
+    // when the model has no tool markers registered; in that case the
+    // runtime never gets a trigger event but is also never suspended
+    // (ResponseFormat default, or ToolCallBody on an unregistered model
+    // which compile_tool_grammar refuses upstream).
     let mut tc_splitter_ns: Option<super::registry::ToolCallSplitter> =
         registration.and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
 
@@ -1407,15 +1424,17 @@ fn generate_once_with_soft_tokens(
     // Returns the sampled token id; caller must feed
     // `token_bytes[id]` through the runtime to keep it in sync.
     //
-    // `in_tool_body`: A1 gate — true when the ToolCallSplitter reports the
-    // current position is inside a tool-call body.  When the splitter is
-    // absent (no tool markers), this is always `true` so grammar masking
-    // runs unconditionally (backward-compatible fallback).
+    // Wave 2.6 W-α5 Q2: the mask call is UNCONDITIONAL.  The runtime
+    // self-gates via `is_awaiting_trigger()` inside
+    // `mask::mask_invalid_tokens` — when suspended (ToolCallBody
+    // pre-trigger), the function early-returns 0 and leaves logits
+    // untouched.  This removes the wave-2.5 `if in_tool_body { mask }`
+    // wrapper and the sibling `Arc<AtomicBool>` it implied — exactly
+    // the architecture the audit caught at engine.rs:1401, 1489, etc.
     let sample_from_live_logits =
         |weights: &mut MlxModelWeights,
          generated: &[u32],
-         runtime: Option<&super::grammar::GrammarRuntime>,
-         in_tool_body: bool|
+         runtime: Option<&super::grammar::GrammarRuntime>|
          -> Result<u32> {
             let sp = sampler_params.as_ref().expect("sample_logits gate");
             let mut logits: Vec<f32> = weights.logits_view()?.to_vec();
@@ -1430,14 +1449,11 @@ fn generate_once_with_soft_tokens(
                 }
             }
             // Grammar mask: zero out tokens that would drive the runtime
-            // dead.  Wave-2.5 A1: only applies when we are inside a tool-call
-            // body (`in_tool_body == true`).  Outside the body (preamble tokens
-            // before the open marker) the model is free to emit any text — the
-            // grammar only constrains the call body structure.
-            if in_tool_body {
-                if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
-                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-                }
+            // dead.  Self-gates on `runtime.is_awaiting_trigger()` —
+            // suspended runtimes mask zero tokens (preamble freedom for
+            // ToolCallBody-kind grammars before the open marker fires).
+            if let (Some(rt), Some(tb)) = (runtime, token_bytes_ref) {
+                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
             }
             Ok(sampler_pure::sample_token(&mut logits, sp, generated))
         };
@@ -1458,18 +1474,21 @@ fn generate_once_with_soft_tokens(
     // applies to the very first generated token, not just decode-loop
     // tokens 2..N.  The greedy-fast-path skips logits readback entirely.
     //
-    // Wave-2.5 A1: grammar mask is skipped for the first token because we
-    // cannot yet be inside a tool-call body — the splitter hasn't seen any
-    // output yet so `in_tool_call()` is always false at this point.
+    // Wave 2.6 W-α5 Q2: the mask + accept calls are UNCONDITIONAL.  For
+    // `GrammarKind::ToolCallBody` the runtime is suspended
+    // (`is_awaiting_trigger() == true`) so both calls are no-ops and the
+    // first token is naturally unconstrained — the same behavior the
+    // wave-2.5 explicit `in_body_first = false` short-circuit
+    // produced, but achieved structurally via the runtime self-gate.
+    // For `GrammarKind::ResponseFormat` the runtime enforces from token
+    // 0 (this fixes audit divergence A1 / response_format regression).
     let mut next_token = if sample_logits {
-        // A1: splitter not yet advanced; first token is always pre-body.
-        let in_body_first = tc_splitter_ns.as_ref().map(|_| false).unwrap_or(true);
-        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref(), in_body_first)?;
+        let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
         // Feed the chosen token's bytes through the grammar runtime so
         // the next step's mask is correctly narrowed.  No-op when no
-        // grammar.  An empty token_bytes entry (special / unprintable)
-        // is also a no-op since accept_bytes on an empty slice returns
-        // true with no state change.
+        // grammar OR when the runtime is awaiting trigger (suspended
+        // runtime self-gates).  Empty token_bytes (special/unprintable)
+        // is also skipped — accept_bytes on empty is a true no-op.
         if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
             let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
             if !bytes.is_empty() {
@@ -1507,12 +1526,22 @@ fn generate_once_with_soft_tokens(
             reasoning_token_count += 1;
         }
     }
-    // Wave-2.5 A1: feed first fragment through tc_splitter_ns so its
-    // in_tool_call() state is accurate for the first iteration of the
-    // decode loop.  Typically the first decoded token is never the open
-    // marker, but this keeps the state machine correct in all edge cases.
+    // Wave 2.6 W-α5 Q2: feed first fragment through the tool-call
+    // splitter; if it emits a `ToolCallOpen` event, trigger the grammar
+    // runtime so subsequent tokens are constrained by the body grammar.
+    // (Typically the first decoded token is never the open marker, but
+    // this keeps the state machine correct for any edge case where the
+    // chat template ends mid-marker.)  llama.cpp does NOT reset the
+    // trigger on close — multi-call support comes from the grammar
+    // shape `(call)+`.  See research-report.md Q2 anti-finding +
+    // /opt/llama.cpp/docs/function-calling.md.
     if let Some(tcs) = tc_splitter_ns.as_mut() {
-        let _ = tcs.feed(&first_fragment);
+        let events = tcs.feed(&first_fragment);
+        if let Some(rt) = grammar_runtime.as_mut() {
+            if events.iter().any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen)) {
+                rt.trigger();
+            }
+        }
     }
 
     let mut finish_reason: &'static str = "length";
@@ -1541,23 +1570,23 @@ fn generate_once_with_soft_tokens(
                 // grammar mask, then call sampler_pure for
                 // temperature/top_p/top_k/rep-penalty.
                 //
-                // Wave-2.5 A1: grammar mask is gated on whether the
-                // ToolCallSplitter is currently inside a tool-call body.
-                // Outside the body (preamble before the open marker) the
-                // model is unconstrained.  If there is no tool splitter
-                // registered for this model (tc_splitter_ns is None), fall
-                // back to the pre-A1 unconditional masking so grammar still
-                // applies for models/requests that don't use tool calls.
-                let in_body = tc_splitter_ns.as_ref()
-                    .map(|t| t.in_tool_call())
-                    .unwrap_or(true);
+                // Wave 2.6 W-α5 Q2: mask + accept calls are
+                // UNCONDITIONAL.  The runtime self-gates via
+                // `is_awaiting_trigger()`; suspended runtimes (lazy
+                // tool-call body grammar pre-trigger) mask zero tokens
+                // and ignore advance, so preamble emission is naturally
+                // unconstrained.  Eager runtimes (ResponseFormat)
+                // enforce every step.  This removes the wave-2.5 sibling
+                // `Arc<AtomicBool>` and the `if in_body { mask }` /
+                // `if in_body { accept }` split that the audit caught at
+                // engine.rs:1401, 1489.
                 let tok = sample_from_live_logits(
                     &mut loaded.weights,
                     &generated_tokens,
                     grammar_runtime.as_ref(),
-                    in_body,
                 )?;
                 // Advance the grammar runtime by the chosen token's bytes.
+                // Self-gates internally — see GrammarRuntime::accept_bytes.
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
                     let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
                     if !bytes.is_empty() {
@@ -1587,10 +1616,19 @@ fn generate_once_with_soft_tokens(
                     reasoning_token_count += 1;
                 }
             }
-            // Wave-2.5 A1: advance tc_splitter_ns so its in_tool_call()
-            // state is correct for the NEXT step's grammar gate.
+            // Wave 2.6 W-α5 Q2: feed the splitter; if it emits a
+            // ToolCallOpen on this fragment, trigger the grammar runtime
+            // so subsequent decode steps enforce the body grammar.
+            // ToolCallClose does NOT reset the trigger — multi-call
+            // grammars handle re-entry via `(call)+` shape (research-
+            // report.md Q2; /opt/llama.cpp/docs/function-calling.md).
             if let Some(tcs) = tc_splitter_ns.as_mut() {
-                let _ = tcs.feed(&fragment);
+                let events = tcs.feed(&fragment);
+                if let Some(rt) = grammar_runtime.as_mut() {
+                    if events.iter().any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen)) {
+                        rt.trigger();
+                    }
+                }
             }
             if hit_stop_string(&decoded_text, &params.stop_strings) {
                 finish_reason = "stop";
@@ -1779,35 +1817,45 @@ fn generate_stream_once(
     // on Constrained vs Auto when a tool-call body fails to parse.
     let tool_call_policy = params.tool_call_policy;
 
-    // Wave-2.5 A1: shared AtomicBool tracking whether the streaming decode
-    // loop is currently inside a tool-call body.  `route_content` toggles it
-    // on ToolCallOpen (true) / ToolCallClose (false).  The grammar mask in the
-    // decode loop reads it before each sampling step so the constraint only
-    // applies to tokens that are inside the body (Option B boundary).
+    // Wave 2.6 W-α5 Q2: the wave-2.5 `Arc<AtomicBool> grammar_active`
+    // sibling-state pattern is REMOVED.  The trigger gate now lives
+    // inside `GrammarRuntime` itself (`is_awaiting_trigger()`); the
+    // `route_content` closure flips it via `runtime.trigger()` on
+    // ToolCallOpen, and the decode loop calls `mask_invalid_tokens` /
+    // `accept_bytes` / `is_dead` UNCONDITIONALLY — all three self-gate
+    // on the SAME boolean, eliminating the split-state condition the
+    // wave-2.5 audit caught at engine.rs:1401, 1489, 1554, 2041, 2145,
+    // 2195.  See cfa-20260427-adr005-wave2.6 research-report.md Q2 +
+    // /opt/llama.cpp/src/llama-grammar.cpp:1287-1439 for the canonical
+    // pattern.
     //
-    // Arc is used so both the `route_content` closure (which captures it by
-    // clone) and the decode loop (which reads it directly) can share ownership
-    // without lifetime conflicts.  All accesses use `Relaxed` ordering: the
-    // decode loop runs single-threaded so sequentially consistent ordering is
-    // unnecessary.
-    let grammar_active = std::sync::Arc::new(
-        std::sync::atomic::AtomicBool::new(
-            // Initial state: if there is no tool splitter registered for this
-            // model, default to `true` so grammar runs unconditionally
-            // (backward-compatible fallback for models without tool markers).
-            tool_splitter.is_none(),
-        ),
-    );
-    let grammar_active_for_closure = grammar_active.clone();
+    // To call `runtime.trigger()` from the `route_content` closure, the
+    // closure needs mutable access to the runtime.  The runtime is
+    // owned by `generate_stream_once`, so we share it via
+    // `Rc<RefCell<...>>` — single-threaded, no atomics needed (the
+    // streaming worker is one OS thread).  When grammar is None,
+    // `grammar_runtime` is None and the trigger plumbing is a no-op.
+    // (We use `Rc<RefCell<...>>` instead of an `&mut` borrow because
+    // the closure outlives the borrow checker's view of the runtime
+    // through the decode loop — same shape used elsewhere in this
+    // function for shared mutable state.)
 
     // Helper: for a Content-classified text run, route through the
     // ToolCallSplitter (if any) and emit the appropriate
     // GenerationEvent. When ToolCallSplitter is None, route every byte to
     // `DeltaKind::Content` (current behavior pre-iter-B-2).
+    //
+    // Wave 2.6 W-α5 Q2: takes `grammar_runtime: &mut Option<GrammarRuntime>`
+    // so the ToolCallOpen branch can call `runtime.trigger()` — this is
+    // the splice point where the lazy-grammar awakens.  ToolCallClose
+    // does NOT reset (multi-call grammars rely on the grammar shape
+    // accepting `(call)+`; see research-report.md Q2 + llama.cpp PR
+    // #9639).
     let route_content = |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
                          body: &mut String,
                          tc_index: &mut usize,
                          saw_tc: &mut bool,
+                         grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
                          events: &mpsc::Sender<GenerationEvent>,
                          text: &str,
                          reg: Option<&super::registry::ModelRegistration>|
@@ -1844,19 +1892,29 @@ fn generate_stream_once(
                 }
                 super::registry::ToolCallEvent::ToolCallOpen => {
                     body.clear();
-                    // Wave-2.5 A1: entering a tool-call body — activate
-                    // grammar masking for subsequent tokens.
-                    grammar_active_for_closure.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Wave 2.6 W-α5 Q2: entering a tool-call body — flip
+                    // the grammar runtime's trigger so subsequent decode
+                    // steps enforce the body grammar.  No-op when the
+                    // runtime is None (no grammar request) or already
+                    // post-trigger (re-entry on a grammar without
+                    // explicit reset support — llama.cpp behavior).
+                    if let Some(rt) = grammar_runtime.as_mut() {
+                        rt.trigger();
+                    }
                 }
                 super::registry::ToolCallEvent::ToolCallText(t) => {
                     body.push_str(&t);
                 }
                 super::registry::ToolCallEvent::ToolCallClose => {
-                    // Wave-2.5 A1: leaving a tool-call body — deactivate
-                    // grammar masking.  The close event fires after the body
-                    // is fully accumulated so the last body token was already
-                    // constrained.
-                    grammar_active_for_closure.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Wave 2.6 W-α5 Q2: leaving a tool-call body.  The
+                    // grammar runtime is NOT reset — multi-call support
+                    // relies on the grammar root accepting `(call)+`
+                    // directly (Hermes 2 Pro template; research-report.md
+                    // Q2 anti-finding).  If the model attempts a second
+                    // call against a single-call grammar, the runtime
+                    // will simply die on the next mask step (graceful
+                    // termination via the unconditional is_dead check
+                    // in the decode loop).
                     // Parse the accumulated body. On parse failure, log +
                     // re-emit the body as Content so the user still sees
                     // something (the per-model parser is best-effort
@@ -1964,6 +2022,7 @@ fn generate_stream_once(
                          body: &mut String,
                          tc_index: &mut usize,
                          saw_tc: &mut bool,
+                         grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
                          events: &mpsc::Sender<GenerationEvent>,
                          fragment: &str,
                          reg: Option<&super::registry::ModelRegistration>|
@@ -1992,6 +2051,7 @@ fn generate_stream_once(
                             body,
                             tc_index,
                             saw_tc,
+                            grammar_runtime,
                             events,
                             &text,
                             reg,
@@ -2006,6 +2066,7 @@ fn generate_stream_once(
                 body,
                 tc_index,
                 saw_tc,
+                grammar_runtime,
                 events,
                 fragment,
                 reg,
@@ -2038,6 +2099,11 @@ fn generate_stream_once(
     } else {
         None
     };
+    // Wave 2.6 W-α5 Q2: arm the trigger gate when the request carries a
+    // tool-call body grammar (`GrammarKind::ToolCallBody`).  For
+    // `ResponseFormat`-kind runtimes the gate stays disarmed (eager
+    // enforcement from token 0 — fixes audit divergence A1 /
+    // response_format regression).
     let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
         Some(g) => {
             let start_rule_id = match g.rule_id("root") {
@@ -2048,7 +2114,12 @@ fn generate_stream_once(
                 }
             };
             match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
-                Some(rt) => Some(rt),
+                Some(mut rt) => {
+                    if matches!(params.grammar_kind, GrammarKind::ToolCallBody) {
+                        rt.set_awaiting_trigger(true);
+                    }
+                    Some(rt)
+                }
                 None => {
                     send!(GenerationEvent::Error("grammar runtime init failed".into()));
                     return;
@@ -2100,14 +2171,12 @@ fn generate_stream_once(
                 }
             }
         }
-        // Wave-2.5 A1: first token is always pre-body (no output has been
-        // emitted yet so the tool splitter hasn't opened a body).
-        // `grammar_active` was initialized to `false` for models with tool
-        // markers, so this check is consistent: mask is skipped here.
-        if grammar_active.load(std::sync::atomic::Ordering::Relaxed) {
-            if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-            }
+        // Wave 2.6 W-α5 Q2: mask + accept are UNCONDITIONAL.  For
+        // `ToolCallBody`-kind runtimes the gate is armed (no-op);
+        // for `ResponseFormat`-kind it enforces from token 0 — the
+        // wave-2.5 audit fix for the response_format regression.
+        if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+            super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
         }
         let tok = sampler_pure::sample_token(&mut logits, sp, &[]);
         if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -2149,6 +2218,7 @@ fn generate_stream_once(
             &mut tool_call_body,
             &mut tool_call_index,
             &mut saw_tool_call,
+            &mut grammar_runtime,
             events,
             &first_text,
             registration,
@@ -2203,15 +2273,19 @@ fn generate_stream_once(
                         }
                     }
                 }
-                // Wave-2.5 A1: only apply grammar mask when we are inside a
-                // tool-call body.  `grammar_active` is set to `true` by
-                // `route_content` when a ToolCallOpen event fires and reset to
-                // `false` on ToolCallClose.  Tokens outside the body (preamble
-                // before the open marker) are unconstrained.
-                if grammar_active.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
-                        super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
-                    }
+                // Wave 2.6 W-α5 Q2: mask + accept UNCONDITIONAL.  The
+                // runtime self-gates on `is_awaiting_trigger()`.  When
+                // suspended (ToolCallBody pre-trigger), mask is a no-op
+                // and the model emits preamble freely; once
+                // `route_content` sees the open marker and calls
+                // `runtime.trigger()`, every subsequent step enforces.
+                // ResponseFormat-kind runtimes were never suspended and
+                // enforce from the first token.  This collapses the
+                // wave-2.5 4-line `if grammar_active.load { mask }` /
+                // separate `accept` paired pattern into 2 lines that are
+                // structurally correct.
+                if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                    super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
                 }
                 let tok = sampler_pure::sample_token(&mut logits, sp, &generated_tokens);
                 if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
@@ -2242,6 +2316,7 @@ fn generate_stream_once(
                 &mut tool_call_body,
                 &mut tool_call_index,
                 &mut saw_tool_call,
+                &mut grammar_runtime,
                 events,
                 &fragment,
                 registration,
@@ -2307,6 +2382,7 @@ fn generate_stream_once(
                         &mut tool_call_body,
                         &mut tool_call_index,
                         &mut saw_tool_call,
+                        &mut grammar_runtime,
                         events,
                         &tail,
                         registration,
@@ -3428,64 +3504,82 @@ mod test_a1_conditional_grammar_wire {
         );
     }
 
-    /// Verify the AtomicBool used in `generate_stream_once` transitions correctly
-    /// when simulating ToolCallOpen / ToolCallClose events.
+    /// Wave 2.6 W-α5 Q2 — replacement for the wave-2.5
+    /// `grammar_active_atomic_bool_transitions` test.
     ///
-    /// This test mirrors what `route_content` does inside `generate_stream_once`:
-    /// it manually drives an AtomicBool the same way the production code does, and
-    /// asserts the before/during/after states.
+    /// The wave-2.5 architecture used a sibling `Arc<AtomicBool>
+    /// grammar_active` toggled by ToolCallOpen/Close.  The audit caught
+    /// it as architecturally wrong (mask + advance + dead-check could
+    /// disagree because they read different state).  Wave 2.6 moves the
+    /// gate INSIDE GrammarRuntime via `awaiting_trigger` — the production
+    /// streaming worker now wires `route_content`'s ToolCallOpen handler
+    /// to call `runtime.trigger()` directly.  This test exercises that
+    /// exact production path: a real registered tool-call splitter, a
+    /// real GrammarRuntime, and the same trigger-on-open pattern
+    /// `route_content` uses.
     #[test]
-    fn grammar_active_atomic_bool_transitions() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+    fn tool_call_open_triggers_grammar_runtime() {
+        use crate::serve::api::grammar::GrammarRuntime;
+        use crate::serve::api::grammar::parser::parse;
 
-        // Simulate the `grammar_active` Arc<AtomicBool> from generate_stream_once.
-        // Initial value: false (tool splitter present → grammar inactive until Open).
-        let grammar_active = Arc::new(AtomicBool::new(false));
+        // Real Gemma4 registration with real open/close markers.
+        let reg = crate::serve::api::registry::find_for("gemma4-27b-it")
+            .expect("gemma4 registration must exist");
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("gemma4 has no tool markers — skip Q2 trigger test");
+                return;
+            }
+        };
+        let mut splitter =
+            crate::serve::api::registry::ToolCallSplitter::from_registration(&reg)
+                .expect("ToolCallSplitter::from_registration must return Some for gemma4");
 
-        // Pre-Open: grammar inactive.
+        // Build a real GrammarRuntime in the lazy state, the way
+        // generate_stream_once does for `GrammarKind::ToolCallBody`.
+        let g = parse("root ::= \"x\"\n").expect("parse");
+        let rid = g.rule_id("root").expect("root rule");
+        let mut runtime = GrammarRuntime::new(g, rid).expect("runtime");
+        runtime.set_awaiting_trigger(true);
         assert!(
-            !grammar_active.load(Ordering::Relaxed),
-            "A1: grammar_active must be false before ToolCallOpen"
+            runtime.is_awaiting_trigger(),
+            "lazy-grammar runtime starts in awaiting_trigger=true (production setup for ToolCallBody-kind requests)"
         );
 
-        // Simulate ToolCallOpen handler (what route_content does).
-        grammar_active.store(true, Ordering::Relaxed);
+        // Pre-open: feeding splitter with content that doesn't include
+        // the open marker emits no ToolCallOpen and so the production
+        // code does NOT call runtime.trigger().  The runtime stays
+        // suspended.
+        let _events = splitter.feed("plain preamble text ");
         assert!(
-            grammar_active.load(Ordering::Relaxed),
-            "A1: grammar_active must be true after ToolCallOpen"
+            runtime.is_awaiting_trigger(),
+            "preamble fragments MUST NOT trigger the runtime"
         );
 
-        // Simulate ToolCallClose handler.
-        grammar_active.store(false, Ordering::Relaxed);
+        // Production trigger pattern (mirrors route_content's
+        // ToolCallOpen branch in generate_stream_once):
+        let events_open = splitter.feed(open);
+        if events_open.iter().any(|e| matches!(
+            e,
+            crate::serve::api::registry::ToolCallEvent::ToolCallOpen
+        )) {
+            runtime.trigger();
+        }
         assert!(
-            !grammar_active.load(Ordering::Relaxed),
-            "A1: grammar_active must be false after ToolCallClose"
+            !runtime.is_awaiting_trigger(),
+            "after ToolCallOpen the production code MUST flip the runtime trigger"
         );
-    }
 
-    /// Verify the no-tool-splitter fallback: when the model has no registered
-    /// tool markers, `grammar_active` initialises to `true` so grammar runs
-    /// unconditionally (backward-compatible behaviour for plain grammar requests).
-    #[test]
-    fn no_tool_splitter_grammar_active_defaults_true() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        // Use a registration that has no tool markers (Gemma4 has markers;
-        // check for a model without them, or simulate `None` by passing `None`
-        // to ToolCallSplitter::from_registration directly via a synthetic reg).
-        // The simplest approach: simulate what generate_stream_once does —
-        // `tool_splitter.is_none()` when the splitter was not created.
-        let tool_splitter: Option<crate::serve::api::registry::ToolCallSplitter> = None;
-
-        // Production code: `grammar_active = AtomicBool::new(tool_splitter.is_none())`
-        let grammar_active = Arc::new(AtomicBool::new(tool_splitter.is_none()));
-
+        // Post-open: feeding the close marker through the splitter
+        // does NOT reset the runtime — multi-call grammars handle
+        // re-entry via `(call)+` shape (research-report.md Q2 anti-
+        // finding; /opt/llama.cpp/docs/function-calling.md).
+        let _events_close = splitter.feed(close);
         assert!(
-            grammar_active.load(Ordering::Relaxed),
-            "A1: when there is no tool splitter, grammar_active must be true \
-             (unconditional grammar masking — backward-compatible fallback)"
+            !runtime.is_awaiting_trigger(),
+            "ToolCallClose MUST NOT re-arm the runtime trigger \
+             (llama.cpp parity: PR #9639 lazy grammar is one-shot per request)"
         );
     }
 }

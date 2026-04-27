@@ -342,11 +342,55 @@ pub fn accept_char(grammar: &Grammar, stacks: &Stacks, chr: u32) -> Stacks {
 /// Runtime grammar state — wraps the parsed grammar with the current stack
 /// set and partial-UTF-8 accumulator. Cheap to clone (the inner grammar is
 /// shared via `Arc` by callers; stacks copy explicitly).
+///
+/// # Trigger gate (Wave 2.6 W-α5 Q2)
+///
+/// The optional `awaiting_trigger` flag implements the **lazy grammar /
+/// trigger-activated FSM** pattern from llama.cpp PR #9639 (canonical
+/// implementation at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1439`):
+///
+/// * `apply` (mask) — `mask_invalid_tokens` short-circuits to 0 masked
+///   when `is_awaiting_trigger()` is true.  All preamble tokens stay
+///   live; the model can emit any text up to the open marker.
+/// * `accept` (advance) — `accept_bytes` is a no-op returning `true`
+///   (alive) while awaiting trigger.  No stacks advance, no UTF-8
+///   accumulator state changes.
+/// * `is_dead`     — returns `false` while awaiting trigger.  A
+///   suspended runtime never dies.
+/// * `is_accepted` — returns `false` while awaiting trigger.  A
+///   suspended runtime never reaches the accepting state.
+///
+/// All three short-circuits gate on the SAME boolean — no split-state
+/// window where mask says "off" but advance says "on".  This is the
+/// architectural property the wave-2.5 audit caught when the gate lived
+/// in a separate `Arc<AtomicBool>` outside the runtime
+/// (cfa-20260427-adr005-wave2.5/codex-review-last.txt divergence A1,
+/// citing `engine.rs:1401, 1489, 1554, 2041, 2145, 2195`).
+///
+/// The flag is set EXPLICITLY by the caller via
+/// [`GrammarRuntime::set_awaiting_trigger`] at construction time, and
+/// is flipped to false by [`GrammarRuntime::trigger`] when the engine's
+/// `ToolCallSplitter` sees the per-model open marker (e.g. Gemma 4
+/// `call:`, Qwen 3.5 `<function=`).  llama.cpp does NOT reset the flag
+/// per call — multi-tool support comes from the chat-template-rendered
+/// grammar accepting `(call)+` directly.  See PR #9639 / Hermes 2 Pro
+/// template in `/opt/llama.cpp/docs/function-calling.md`.
+///
+/// Default for new runtimes is `awaiting_trigger == false` so existing
+/// callers that don't opt in get the eager-enforcement behavior
+/// unchanged (the wave-2.4 baseline).
 #[derive(Debug, Clone)]
 pub struct GrammarRuntime {
     pub grammar: Grammar,
     pub stacks: Stacks,
     pub partial_utf8: PartialUtf8,
+    /// Trigger gate.  When `true`, `accept_bytes`/`is_dead`/`is_accepted`
+    /// all short-circuit so the runtime is functionally suspended.  Flipped
+    /// false either explicitly by [`GrammarRuntime::trigger`] (e.g. when
+    /// the engine's tool-call splitter sees the open marker) or implicitly
+    /// at construction (the default for `GrammarKind::ResponseFormat`
+    /// runtimes).
+    awaiting_trigger: bool,
 }
 
 impl GrammarRuntime {
@@ -397,7 +441,53 @@ impl GrammarRuntime {
             grammar,
             stacks,
             partial_utf8: PartialUtf8::default(),
+            awaiting_trigger: false,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2.6 W-α5 Q2 — trigger gate (lazy-grammar pattern)
+    // -----------------------------------------------------------------
+
+    /// Read the trigger gate.
+    ///
+    /// When `true`, the runtime is functionally suspended: `accept_bytes`
+    /// is a no-op, `is_dead`/`is_accepted` both return `false`, and
+    /// `mask::mask_invalid_tokens` short-circuits to 0 masked tokens.
+    pub fn is_awaiting_trigger(&self) -> bool {
+        self.awaiting_trigger
+    }
+
+    /// Explicitly set the trigger gate.  Engine callers wire this to
+    /// `true` for `GrammarKind::ToolCallBody` runtimes at construction;
+    /// `GrammarKind::ResponseFormat` runtimes leave the default
+    /// (`false`) so enforcement is eager.
+    ///
+    /// Mirrors llama.cpp's `lazy` parameter to `llama_grammar_init_impl`
+    /// at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1298`:
+    ///
+    /// ```c++
+    /// llama_grammar_init_impl(..., bool lazy, ...)
+    /// {
+    ///     ...
+    ///     grammar->awaiting_trigger = lazy;
+    /// }
+    /// ```
+    pub fn set_awaiting_trigger(&mut self, value: bool) {
+        self.awaiting_trigger = value;
+    }
+
+    /// Flip the trigger gate to `false`.  Called by the engine when the
+    /// `ToolCallSplitter` reports a `ToolCallOpen` event.  After this,
+    /// every subsequent `accept_bytes` / mask call enforces the grammar
+    /// normally.
+    ///
+    /// llama.cpp does NOT reset this flag back to `true` on the close
+    /// marker — multi-tool support comes from the chat-template-rendered
+    /// grammar shape accepting `(call)+` directly (Hermes 2 Pro).  See
+    /// research-report.md Q2 anti-finding + `/opt/llama.cpp/docs/function-calling.md`.
+    pub fn trigger(&mut self) {
+        self.awaiting_trigger = false;
     }
 
     /// Feed one Unicode code point. Returns `true` if any stacks remain
@@ -410,7 +500,22 @@ impl GrammarRuntime {
     /// Feed a byte string (e.g. a decoded token text). Partial UTF-8 bytes
     /// at the tail are carried in `self.partial_utf8`. Returns `true` if the
     /// grammar still has a valid continuation after consuming all the bytes.
+    ///
+    /// Wave 2.6 W-α5 Q2: when [`is_awaiting_trigger`] is `true`, this is
+    /// a no-op returning `true` (alive).  No stacks advance, no UTF-8
+    /// accumulator state changes.  The runtime is suspended until the
+    /// engine calls [`trigger`] (typically in the `ToolCallOpen`
+    /// handler).  Mirrors llama.cpp `llama_grammar_accept_impl` at
+    /// `/opt/llama.cpp/src/llama-grammar.cpp:1382-1439`.
     pub fn accept_bytes(&mut self, bytes: &[u8]) -> bool {
+        if self.awaiting_trigger {
+            // Self-gate: no advance while suspended.  Return `true`
+            // (alive) so callers that test the return value treat
+            // the runtime as still-viable.  This is the apply+accept
+            // single-boolean atomicity invariant from research-report.md
+            // Q2.
+            return true;
+        }
         let mut i = 0;
 
         // If there's an unfinished UTF-8 code point from the previous call,
@@ -481,12 +586,32 @@ impl GrammarRuntime {
 
     /// Returns `true` if the grammar is in an accepting state — i.e. any
     /// stack is empty (meaning the root rule has been fully matched).
+    ///
+    /// Wave 2.6 W-α5 Q2: a suspended runtime
+    /// (`is_awaiting_trigger() == true`) is NEVER in an accepting state.
+    /// Returning `false` here lets the engine call this method
+    /// unconditionally on every step (no separate gate around the call
+    /// site needed) — the trigger gate IS the gate.
     pub fn is_accepted(&self) -> bool {
+        if self.awaiting_trigger {
+            return false;
+        }
         self.stacks.iter().any(|s| s.is_empty())
     }
 
     /// Is the grammar dead? (no stacks remain; no continuation can satisfy it).
+    ///
+    /// Wave 2.6 W-α5 Q2: a suspended runtime
+    /// (`is_awaiting_trigger() == true`) is NEVER dead.  Returning
+    /// `false` here lets the engine call this method unconditionally on
+    /// every step — the wave-2.5 audit divergence at engine.rs:1554 +
+    /// :2195 ("dead-check global") is no longer a divergence because
+    /// the runtime self-gates instead of relying on a sibling
+    /// `Arc<AtomicBool>`.
     pub fn is_dead(&self) -> bool {
+        if self.awaiting_trigger {
+            return false;
+        }
         self.stacks.is_empty()
     }
 }
@@ -787,5 +912,184 @@ mod tests {
     fn partial_utf8_initial_state_is_clean() {
         let rt = runtime_from("root ::= \"a\"\n", "root");
         assert_eq!(rt.partial_utf8, PartialUtf8::default());
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2.6 W-α5 Q2 — trigger-gate (lazy grammar) contract tests
+    // -----------------------------------------------------------------
+    //
+    // These exercise the runtime self-gate that replaces the wave-2.5
+    // `Arc<AtomicBool>` sibling in engine.rs.  Each test is a direct
+    // expression of an audit divergence (cf. cfa-20260427-adr005-wave2.5
+    // /codex-review-last.txt) — together they prove the new contract
+    // makes the divergence structurally impossible.
+
+    /// Audit fix: `accept_bytes` is a no-op while
+    /// `is_awaiting_trigger()` is true.  This is the wave-2.5 audit
+    /// divergence "advance the grammar runtime unconditionally outside
+    /// the gated region" (engine.rs:1401, 1489, 2041, 2145) — moving
+    /// the gate INSIDE the runtime makes the unconditional advance
+    /// safe.
+    #[test]
+    fn runtime_accept_noops_when_awaiting_trigger() {
+        // Grammar that requires literal "abc"; if accept_bytes were
+        // NOT a no-op while suspended, feeding "xyz" would die.
+        let mut rt = runtime_from("root ::= \"abc\"\n", "root");
+        rt.set_awaiting_trigger(true);
+        // Snapshot pre-state for byte-exact equality check.
+        let pre_stacks = rt.stacks.clone();
+        let pre_partial = rt.partial_utf8;
+
+        // Feed garbage bytes.  Must NOT advance, must NOT clear stacks.
+        let alive = rt.accept_bytes(b"xyz");
+        assert!(
+            alive,
+            "suspended runtime must report alive=true (return value semantics)"
+        );
+        assert_eq!(
+            rt.stacks, pre_stacks,
+            "suspended runtime stacks MUST NOT change on accept_bytes"
+        );
+        assert_eq!(
+            rt.partial_utf8, pre_partial,
+            "suspended runtime partial_utf8 MUST NOT change on accept_bytes"
+        );
+        assert!(rt.is_awaiting_trigger(), "trigger gate stays armed");
+
+        // Now flip the gate; the original grammar should still be intact.
+        rt.trigger();
+        assert!(!rt.is_awaiting_trigger());
+        assert!(rt.accept_bytes(b"abc"), "post-trigger grammar accepts literal");
+        assert!(rt.is_accepted(), "literal fully matched");
+    }
+
+    /// Audit fix: `is_dead()` returns false while suspended.  This
+    /// kills the wave-2.5 audit divergence "src/serve/api/engine.rs:1554
+    /// and 2195 also terminate on dead grammar regardless of gate" —
+    /// the engine can call `is_dead()` unconditionally because the
+    /// runtime self-gates.
+    #[test]
+    fn runtime_is_dead_returns_false_while_awaiting_trigger() {
+        let mut rt = runtime_from("root ::= \"abc\"\n", "root");
+        rt.set_awaiting_trigger(true);
+
+        // Even if the underlying stacks were artificially cleared, the
+        // gate masks death.  Most natural pre-trigger state is the
+        // construction default (stacks non-empty), which would also
+        // report not-dead.  Force the worst case explicitly:
+        rt.stacks.clear();
+        assert!(
+            !rt.is_dead(),
+            "suspended runtime MUST NOT report dead even when stacks empty"
+        );
+        assert!(
+            !rt.is_accepted(),
+            "suspended runtime MUST NOT report accepted even when stacks empty"
+        );
+
+        // Triggering reveals the underlying state honestly.
+        rt.trigger();
+        assert!(
+            rt.is_dead(),
+            "post-trigger runtime with empty stacks IS dead"
+        );
+    }
+
+    /// Audit fix: `is_accepted()` returns false while suspended.
+    /// Symmetric to the dead-check fix; ensures the early-termination
+    /// branch in the streaming decode loop (engine.rs:2199-2208) is
+    /// safe to call unconditionally.
+    #[test]
+    fn runtime_is_accepted_returns_false_while_awaiting_trigger() {
+        // `"a"*` is in an accepting state immediately (zero
+        // occurrences satisfies the kleene star).
+        let mut rt = runtime_from("root ::= \"a\"*\n", "root");
+        assert!(rt.is_accepted(), "kleene star is accepted at zero occurrences");
+
+        rt.set_awaiting_trigger(true);
+        assert!(
+            !rt.is_accepted(),
+            "suspended runtime MUST NOT report accepted even when underlying \
+             grammar IS in an accepting state"
+        );
+
+        rt.trigger();
+        assert!(rt.is_accepted(), "post-trigger reveals the actual state");
+    }
+
+    /// Default for new runtimes is awaiting_trigger=false (eager
+    /// enforcement).  This is the contract that makes
+    /// `GrammarKind::ResponseFormat` safe — its runtime never waits.
+    /// Without this default, every existing caller of
+    /// `GrammarRuntime::new` would silently enter the lazy-grammar
+    /// state and break response_format=json_schema enforcement.
+    #[test]
+    fn runtime_default_is_eager_not_awaiting_trigger() {
+        let rt = runtime_from("root ::= \"abc\"\n", "root");
+        assert!(
+            !rt.is_awaiting_trigger(),
+            "default runtime MUST NOT await trigger (eager enforcement is the safe \
+             default; ResponseFormat-kind grammars rely on this)"
+        );
+    }
+
+    /// `set_awaiting_trigger(true)` then `trigger()` is the explicit
+    /// path used by the engine for `GrammarKind::ToolCallBody`
+    /// runtimes.  Verifies the round-trip restores normal enforcement.
+    #[test]
+    fn runtime_set_then_trigger_restores_eager_enforcement() {
+        let mut rt = runtime_from("root ::= \"abc\"\n", "root");
+        rt.set_awaiting_trigger(true);
+        assert!(rt.is_awaiting_trigger());
+
+        // Pre-trigger garbage MUST be ignored.
+        let _ = rt.accept_bytes(b"PREAMBLE-junk-blah");
+        assert!(rt.is_awaiting_trigger());
+
+        // Trigger.
+        rt.trigger();
+        assert!(!rt.is_awaiting_trigger());
+
+        // Post-trigger: the grammar is intact; the literal matches.
+        assert!(rt.accept_bytes(b"abc"));
+        assert!(rt.is_accepted());
+    }
+
+    /// Multi-tool-call regression guard.  llama.cpp does NOT reset
+    /// awaiting_trigger on the close marker — multi-call support comes
+    /// from the chat-template-rendered grammar accepting `(call)+`
+    /// directly.  This test verifies a `(call)+`-shaped grammar
+    /// continues to accept after a complete first call without any
+    /// runtime reset.
+    ///
+    /// See research-report.md Q2 anti-finding: "No production engine
+    /// implements parallel-tool-call as a multi-runtime architecture."
+    #[test]
+    fn multi_tool_call_grammar_continues_across_close_marker() {
+        // Two complete calls back-to-back, single grammar.  Models
+        // `<call>X</call><call>Y</call>` collapsed to two literals.
+        let src = "root ::= call+\ncall ::= \"<call>\" [a-z]+ \"</call>\"\n";
+        let mut rt = runtime_from(src, "root");
+        // Engine-equivalent: trigger fires once when the splitter sees
+        // the first `<call>`; that flip is permanent.
+        rt.set_awaiting_trigger(true);
+        rt.trigger();
+
+        // First complete call.
+        assert!(rt.accept_bytes(b"<call>foo</call>"));
+        assert!(
+            rt.is_accepted(),
+            "after first complete call, kleene + is in an accepting state"
+        );
+
+        // Second complete call WITHOUT any reset — proving the runtime
+        // carries state through naturally.  This is the canonical
+        // pattern from llama.cpp + Hermes 2 Pro template
+        // (/opt/llama.cpp/docs/function-calling.md).
+        assert!(
+            rt.accept_bytes(b"<call>bar</call>"),
+            "(call)+ grammar MUST accept a second complete call without runtime reset"
+        );
+        assert!(rt.is_accepted(), "still accepting after the second call");
     }
 }
