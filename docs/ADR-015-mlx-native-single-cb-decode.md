@@ -96,6 +96,67 @@ directly before P3 commits to the single-CB rewrite, so the upper bound
 on the rewrite's win is established empirically before multi-day
 implementation work is spent.
 
+### 2026-04-26 — P3a CALIBRATION DATA
+
+`mlx-native/examples/dispatch_cost_calibration.rs` measures per-dispatch
+encode cost using `scalar_mul_bf16` on a 1-element BF16 buffer (minimal
+GPU work; CPU encoding cost dominates):
+
+| N        | encode_ms (med of 5) | commit_ms (med of 5) | µs/dispatch |
+|---------:|---------------------:|---------------------:|------------:|
+|       10 |                0.006 |                0.189 |       0.629 |
+|       50 |                0.012 |                0.589 |       0.249 |
+|      100 |                0.018 |                0.198 |       0.185 |
+|      500 |                0.084 |                0.345 |       0.168 |
+|     1000 |                0.163 |                0.515 |       0.163 |
+|     5000 |                0.784 |                1.575 |       0.157 |
+
+**Steady-state µs/dispatch ≈ 0.16 µs** at N≥500 — within ±15% of
+llama.cpp's implied ~0.14 µs / dispatch (per ADR-012 §Optimize ~150 µs
+CPU encode for ~1070 dispatches).  hf2q's shader-launch path is **not
+materially slower** than llama.cpp's.
+
+### Budget reconciliation (P2 + P3a synthesized)
+
+| Component | hf2q | llama.cpp | Δ |
+|---|---:|---:|---:|
+| **GPU work** (per ADR-012 §Optimize) | 8.45 ms | 8.38 ms | **+70 µs** |
+| **CPU CB encode** (102 vs 1.5 CBs × 1.6 µs/CB) | 163 µs | 2 µs | **+161 µs** |
+| **CPU dispatch encode** (~1070 dispatches × 0.16 vs 0.14 µs) | 171 µs | 150 µs | **+21 µs** |
+| **Sub-total accountable** | | | **+252 µs** |
+| **Measured wall delta** (1/109.1 − 1/116.0 t/s) | 9.16 ms | 8.62 ms | **+540 µs** |
+| **Residual unaccounted** | | | **+288 µs** |
+
+**The biggest single lever is the residual ~288 µs (~53% of gap)**, not
+the CB-encode delta (~30%).  The residual cannot be CB or dispatch
+encoding — both are now measured.  Suspects (in priority order):
+
+1. **Helper-function indirection** — every `apply_*` helper in
+   `inference/models/qwen35/` does multiple short-lived allocations
+   (`MlxBuffer` for params, scratch shapes) and Result wrapping.  ~95
+   helpers per token × Rust function-prologue cost is plausibly
+   double-digit µs each.
+2. **Buffer pool acquisition** — `pooled_alloc_buffer` calls walk the
+   in-use list and bucket size on every call.
+3. **Memory barrier bookkeeping** — `enc.memory_barrier()` mutates
+   `pending_reads`/`pending_writes` Vecs (capture mode + RAW/WAR
+   tracking).
+4. **KV-cache cursor updates** — `slot.current_len[0] += 1` per
+   FullAttn / DeltaNet layer with the associated buffer fence.
+
+The **lever for closing the residual** is a Rust-orchestration sweep
+(profile guided), not architecture.  Single-CB still helps because it
+removes 100 of the encoder lifetimes plus barrier-bookkeeping
+state-machine transitions, but the orchestration sweep is the bigger
+chunk.
+
+### Phase plan implication
+
+Original P3 (qwen35 single-CB rewrite) recovers ~30% of the gap.
+**A new P3b (Rust-orchestration profiling sweep) is added** that targets
+the ~53% residual.  P3 and P3b can run in parallel; the P5 bench gate
+requires both wins to clear ≥1.00× of llama.cpp.
+
 ## Decision
 
 **D1.** Migrate **both** `qwen35` and `gemma` decode forward paths to a
@@ -135,9 +196,9 @@ lever is wrong; fix it, don't gate the primary path off (per
 | **P0 — Gemma baseline** | Same-day `gemma-4-26B-A4B-it-ara-abliterated-dwq` `n=256` decode median: 3 cold runs of `hf2q` + 3 of `llama-bench`. Establishes the gemma-side ratio. | Numbers recorded in this ADR as the baseline gemma-family bar. |
 | **P1 — Audit** | Map every cross-CB synchronization point in `forward_gpu` (qwen35) and `forward_decode` (Gemma) paths. List of `(commit/commit_and_wait → next encoder)` transitions and the buffer dependencies that justify each one. Output: a markdown table per family in this ADR. | Every CB boundary in each family's live path is annotated with the data dependency it protects, OR documented as legacy / removable. |
 | **P2 — Empty-CB cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/cb_cost_calibration.rs` measures async/sync/alloc-only µs/CB on M5 Max.  Result: **async µs/CB ≈ 1.6 µs at N≥100, NOT ~5 µs**.  Single-CB upper bound = ~160 µs / token of the ~500 µs gap (~32%). | Numbers published in §Diagnosis update above. |
-| **P3a — Per-dispatch cost calibration** ⬅ **NEW** | Stand-alone bench: encode N noop / 1-thread dispatches into 1 CB on M5 Max, measure µs/dispatch.  Compare hf2q's per-dispatch encoding cost to the per-dispatch budget llama.cpp implies (~150 µs CPU encode for ~1070 dispatches = ~0.14 µs/dispatch). | If hf2q per-dispatch ≈ llama.cpp per-dispatch, the 340 µs residual is orchestration / pool / barrier overhead → ADR-015 P4 picks "Rust-side orchestration sweep" as the second lever. If hf2q per-dispatch ≫ llama.cpp's, the lever is shader-launch overhead reduction. |
-| **P3 — Single-CB implementation (qwen35 first, gemma second)** | New `forward_gpu_single_cb` in `inference/models/qwen35/forward_gpu.rs` and `forward_decode_single_cb` in `serve/forward_mlx.rs`.  Each: one `GraphSession`, all dispatches encoded, explicit `memory_barrier()` for cross-stage dependencies, single `commit()` at end. | Builds in release.  No new `unsafe`. |
-| **P4 — Second-lever implementation** | Whichever lever P3a indicated (Rust-side orchestration sweep OR shader-launch overhead reduction).  Scope and approach defined post-P3a. | Lever's empirical win measured in isolation against the already-shipped P3 single-CB baseline. |
+| **P3a — Per-dispatch cost calibration** | ✅ **Done 2026-04-26** — `mlx-native/examples/dispatch_cost_calibration.rs` measures `scalar_mul_bf16` encode cost.  Result: **µs/dispatch ≈ 0.16 µs** at N≥500, within ±15% of llama.cpp's implied 0.14 µs/dispatch.  Shader-launch path is competitive; lever is Rust orchestration. | Numbers published in §P3a calibration data above. |
+| **P3 — Single-CB rewrite** (qwen35 first, gemma second) | New `forward_gpu_single_cb` in `inference/models/qwen35/forward_gpu.rs` and `forward_decode_single_cb` in `serve/forward_mlx.rs`.  Each: one `GraphSession`, all dispatches encoded, explicit `memory_barrier()` for cross-stage dependencies, single `commit()` at end. | Builds in release.  No new `unsafe`.  Recovers ~30% of the 540 µs gap (~161 µs). |
+| **P3b — Rust orchestration sweep** ⬅ **NEW (parallel to P3)** | Profile-guided reduction of the ~288 µs residual from helper-function indirection, buffer pool acquisition, barrier bookkeeping, KV-cursor updates.  Use `cargo flamegraph` or `instruments -t TimeProfiler` on a hot decode loop.  Target: shrink the residual by ≥50% (~140 µs). | At least 5 profile-driven specific reductions landed (each cited with profile evidence in the commit message).  Combined with P3, restores ≥0.99× ratio (one cold-run iteration). |
 | **P5 — Parity gate (per family)** | 16-prompt smoke on each family's new path produces logits within 1e-5 max-abs of legacy path. | Logged in commit message. |
 | **P6 — Bench gate (per family)** | 3 cold runs of `hf2q --benchmark` on `dwq46` and `gemma-4-26B-A4B-it-ara-abliterated-dwq` at `n=256` (cold SoC).  Same-day `llama-bench -p 0 -n 256 -r 3` on the same model.  Ratio computed per family. | Ratio ≥ 1.00× recorded for **both** families in ADR + commit message. |
 | **P7 — Default cut-over** | `HF2Q_LEGACY_PER_LAYER_CB=1` is the only way back to legacy.  Default = single-CB on both families. | Smoke + bench gate green on default-default settings. |
@@ -182,3 +243,4 @@ lever is wrong; fix it, don't gate the primary path off (per
 - **2026-04-26 — Proposed (initial).** Diagnosis pivot from ADR-012 §Optimize: gap is CB-count, not CB-encode-time. Single-CB forward pass selected over `dispatch_apply` based on llama.cpp's own n_cb data.
 - **2026-04-26 — Title broadened to "general decode-path speed improvements" + scope extended to gemma family** per standing directive *"we need this coherence and speed for qwen and gemma families of models"*.
 - **2026-04-26 — P2 calibration empirical:** `async µs/CB ≈ 1.6 µs` (3.1× lower than working assumption).  Single-CB recovers ~32% of the 500 µs gap, not ~100%.  Plan revised: P3a per-dispatch cost calibration inserted before P3; P4 added as a second-lever phase whose target is determined by P3a.  Title kept "single-CB" because that's still the first lever; scope is honestly "general decode speed improvements" with the single-CB rewrite as Phase 1 of N.
+- **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
