@@ -16,6 +16,23 @@ gap is **CPU-side encoding/scheduling overhead**.
 
 ### The structural diagnosis
 
+> **§Supersession note (Wave 2a, 2026-04-26 / 2026-04-27 UTC):** the
+> P3b suspect list inside §"Budget reconciliation" below — items 1–4
+> (helper-function indirection, buffer-pool acquisition, barrier
+> bookkeeping, KV-cursor updates) — was a **static-evidence** prediction
+> drawn from grep against the qwen35 hot-path files, not from a live
+> trace.  §"P3a' live profile pass" below replaces those static rows
+> with **xctrace TimeProfiler measurements** captured from a 3-trial
+> cold-SoC run on M5 Max (macOS 26.4.1, qwen3.6-27b-dwq46 fixture, 64
+> decode tokens / trial).  When the live trace and the static suspect
+> list disagree, the live trace wins per
+> `feedback_ground_truth_is_what_we_can_measure_now` and
+> `project_metal_compiler_auto_optimizes_static_levers`.  The headline
+> shift: the dominant residual contributor is **`MlxDevice::alloc_buffer`
+> hitting `IOGPUResourceCreate` → `mach_msg2_trap`** (Mach-IPC kernel
+> call per GPU resource), not helper-function indirection or barrier
+> bookkeeping.
+
 | Path | CBs / decode token | CPU encode overhead at ~5µs/CB |
 |---|---:|---:|
 | **llama.cpp** (`ggml-metal-context.m:458`) | 1–2 | ~5–10 µs |
@@ -165,6 +182,138 @@ The **lever for closing the residual** is a Rust-orchestration sweep
 removes 100 of the encoder lifetimes plus barrier-bookkeeping
 state-machine transitions, but the orchestration sweep is the bigger
 chunk.
+
+### P3a' live profile pass — Rust orchestration residual contributors (LIVE)
+
+**Provenance.** CFA session `cfa-20260426-adr015-wave2a-p3aprime`,
+review-only single-worker mode (perf-engineer + coder + tester +
+architect chain consolidated).  Tooling: **xctrace TimeProfiler**
+(Instruments, Xcode 16.0 17E202) — chosen over `cargo flamegraph` to
+avoid SIP-modification on macOS 26 / Apple Silicon and because xctrace
+symbolicates Rust release-mode frames cleanly without a special build.
+Harness: `scripts/profile-p3aprime.sh`.
+
+**Methodology.**
+
+- **Hardware:** M5 Max (Apple Silicon arm64), macOS 26.4.1 build 25E253,
+  Darwin 25.4.0.
+- **Fixture:** `/opt/hf2q/models/qwen3.6-27b-dwq46/qwen3.6-27b-dwq46.gguf`
+  (16 GB) — Qwen3_5ForConditionalGeneration, 64 layers
+  (48 `linear_attention` DeltaNet + 16 `full_attention` gated),
+  hidden=5120, intermediate=17408, head_dim=256.
+  Dense-FFN-Q hot path (`build_dense_ffn_layer_gpu_q`),
+  not the apex MoE expert-routing path.
+- **Workload:** `hf2q generate --prompt "Hello, my name is" --max-tokens 64
+  --temperature 0`.  64 greedy decode tokens.  Reported throughput:
+  ~33.5 tok/s (single-token decode wall ≈ 30 ms).
+- **Cold-SoC gate:** `pmset -g therm` snapshot before each trial;
+  no thermal/performance/CPU-power warning recorded any trial.  60 s
+  thermal settle between trials.
+- **Trial count:** 3.
+- **Sampling:** xctrace TimeProfiler default (1 ms per sample).
+- **Aggregation:** filter samples to stacks containing
+  `forward_gpu_greedy` (decode-only entry; excludes the cold prefill
+  and model-load segments that dominate the unfiltered trace).
+  Inclusive ms summed per frame across all 3 trials, then divided by
+  192 (= 3 trials × 64 tokens) to derive µs/token.
+
+**Run artifacts.** Live traces (large, **not committed** — referenced
+by path):
+
+- `/tmp/cfa-adr015-wave2a-p3a-prime/run-20260427T030903Z.metadata.json`
+  (run-wide hardware metadata)
+- `/tmp/cfa-adr015-wave2a-p3a-prime/trace-{1,2,3}-20260427T030903Z.trace`
+- `/tmp/cfa-adr015-wave2a-p3a-prime/topcalls-{1,2,3}-20260427T030903Z.txt`
+  (xctrace XML export)
+- `/tmp/cfa-adr015-wave2a-p3a-prime/aggregate-decode.txt` (full
+  hypothesis-frame aggregation; reproducible by
+  `python3 /tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py`)
+
+**Trial-to-trial variance.**
+
+| Trial | decode samples | wall ms attributed | µs/token (decode-only) |
+|---|---:|---:|---:|
+| 1 | 397 | 397 ms | 6203 |
+| 2 | 382 | 382 ms | 5969 |
+| 3 | 696 | 696 ms | 10875 |
+
+Trials 1 and 2 agree within 4 %.  Trial 3 is a 1.8× outlier despite
+identical pre-trial `pmset -g therm` (no thermal warning recorded).
+This is unexplained system noise; the **rank order of top
+contributors is stable across all 3 trials** (alloc_buffer + AGX
+init-with-device + mach_msg2_trap dominate every trial; ranks of
+H1/H2/H3 hot frames identical), so cross-trial means are reported.
+Trial-3 wall is reported as-is rather than discarded — discarding
+would be selection bias.
+
+**Coverage gap.** This fixture is **dense Qwen3.5 with quantized
+`build_dense_ffn_layer_gpu_q`**, not the apex 35B-A3B MoE.  Implications:
+
+- The MoE expert-routing path (`build_moe_ffn_layer_gpu_q`) is **not
+  exercised** here — H1's 200-call/token claim from Wave 1 was framed
+  partly against MoE expert proj calls; Wave 2b must re-validate the
+  H1 verdict against the apex MoE fixture before committing P3b
+  reductions to MoE-specific call sites.
+- The cited file:line for H1 (`gpu_ffn.rs:397-404`) is the unquantized
+  `proj()` helper (line 347–423); the dense-quantized hot path goes
+  through `build_dense_ffn_layer_gpu_q` (line 578) which **does not
+  call `proj()`** — it calls `quantized_matmul_ggml` directly.  H1's
+  proj-allocation hypothesis is therefore not exercised on this
+  fixture; we report what IS exercised (the 5–6 dense-Q
+  intermediate-buffer allocations per FFN layer at line 592–606) as
+  the dense-FFN analog.
+- The DeltaNet path (`build_delta_net_layer`) is exercised (48 layers
+  per token).  FullAttn `apply_imrope` is exercised (2 calls × 16
+  layers = 32 calls / token).
+
+**Top contributors — measured.** All values are **3-trial inclusive
+sum / 192 tokens** unless noted.  "profile-source-line" = the live
+xctrace frame name; "Fix proposal" / "Risk" are P3b candidate landings.
+
+| Rank | Call site (file:line) | µs/token (LIVE) | profile-source-line | Fix proposal | Risk |
+|---:|---|---:|---|---|---|
+| 1 | `mlx_native::device::MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` | **3719** | `mlx_native::device::MlxDevice::alloc_buffer::he10f952fea8b1eef` (714 ms over 192 tokens); leaf is `mach_msg2_trap` (612 ms / 3187 µs/token) inside `IOConnectCallMethod` | **Pool every per-decode-token GPU buffer** (DeltaNet conv/recurrent scratch, FullAttn KV-shape staging, FFN gate/up/hidden/down_out/silu_params, residual-sum). Each `alloc_buffer` today incurs one Mach IPC roundtrip via `IOGPUResourceCreate`. A bucketed pool reused across decode tokens removes ~3.7 ms/token of Mach-trap latency. | M (R2: pool may inflate peak working set; mitigate with bucket-size cap + LRU eviction). |
+| 2 | `gpu_ffn::build_dense_ffn_layer_gpu_q` (gpu_ffn.rs:578-680) | **4078** | `hf2q::inference::models::qwen35::gpu_ffn::build_dense_ffn_layer_gpu_q::hbb763b35a276433b` (783 ms / 192 tokens) | Inclusive — most of the cost (≥3300 µs) is the rank-1 alloc_buffer chain (5–6 allocs per FFN layer × 64 FFN layers / token = 320–384 allocs / token). The remainder (~780 µs) is encoder construction + barrier + kernel dispatch. **Same fix as rank 1** + collapse ops 1+2 (gate/up) into a single batched `quantized_matmul_ggml` (B=2) so 1 dispatch instead of 2. | M (batched mv-mul kernel exists upstream; verify M5 perf is at parity). |
+| 3 | `mlx_native::device::MlxDevice::command_encoder()` (~104 calls/token; see P1 audit) | **724** | `mlx_native::device::MlxDevice::command_encoder::hb128148f75021861` (139 ms / 192 tokens). Leaf chain includes `-[AGXG17XFamilyCommandBuffer computeCommandEncoderWithDispatchType:]` and `-[AGXG17XFamilyComputeContext initWithCommandBuffer:config:]` (252 ms + 240 ms inclusive over the same 192-token window). | **P3 single-CB rewrite** is the structural fix. With ≥100 of the 104 encoder constructions collapsed into one, this entire 724 µs/token bucket should drop to <100 µs/token. | L (already the planned P3 lever; this is the live measurement that confirms its size). |
+| 4 | `gpu_full_attn::apply_imrope` (gpu_full_attn.rs:361-412) — 32 calls/token (16 FullAttn layers × 2 for Q+K) | **464** | `hf2q::inference::models::qwen35::gpu_full_attn::apply_imrope::h9a36ffd998e736b0` (89 ms / 192 tokens) inclusive. **Of this, 208 µs/token is `mlx_native::ops::rope_multi::build_rope_multi_buffers`** (40 ms / 192 tokens) — params + sections buffers re-allocated on every call. | **Hoist `build_rope_multi_buffers` out of the per-call path**: the rope params + sections vary only with layer-id (constant within a model), so build once at model-load and reuse. Eliminates ~32 alloc_buffer calls/token plus the inclusive 208 µs/token. | L (sections array is a few i32s; trivial to pre-bake; bit-exact). |
+| 5 | `mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32` | **500** | `mlx_native::ops::fused_norm_add::dispatch_fused_residual_norm_f32::hc30d7605df331fcc` (96 ms / 192 tokens) inclusive | Already fused on disk. The 500 µs/token is mostly downstream of the encoder + alloc cost shared with rank 1 / rank 3; closing rank 1 + rank 3 will shrink this row to <100 µs/token. No standalone fix recommended. | L. |
+| 6 | `gpu_full_attn::build_gated_attn_layer` (gpu_full_attn.rs:1077+) | **1120** | `hf2q::inference::models::qwen35::gpu_full_attn::build_gated_attn_layer::h24b67219c7b61ab4` (215 ms / 192 tokens) inclusive | Inclusive — most cost is rank 1 + rank 3 + rank 4 already counted. Per-layer it is 16 × 70 µs/layer/token ≈ 1120 µs/token. **Coverage caveat:** part of this (apply_imrope, FullAttn proj allocs) is double-counted with rank 4. Track via single-CB end-to-end metric instead of stacking. | M (layer-wide refactor for single-CB). |
+
+**Hypothesis register verdicts.** Each cell cites
+`/tmp/cfa-adr015-wave2a-p3a-prime/aggregate-decode.txt`
+(`HYPOTHESIS-FRAME EVIDENCE` block) as the live evidence; trial-3-summed
+values are reported with the µs/token already divided by 192:
+
+| ID | Site | Static estimate (Wave 1) | Live measured | Verdict |
+|---|---|---:|---:|---|
+| **H1** | `gpu_ffn.rs:397-404` proj unpooled dst alloc | 100 µs/token | **NOT FOUND IN TRACE** at the cited site (`fn proj`). Dense fixture's hot path is `build_dense_ffn_layer_gpu_q` which does **not** call `proj()`; its 5–6 intermediate `alloc_buffer` calls per FFN layer × 64 layers/token aggregate as the rank-1 contributor at **3719 µs/token** (Mach IPC dominated). | **NOT FOUND at H1's specific site** — but H1's underlying *category* (per-decode-token unpooled GPU buffer alloc) is **CONFIRMED at much larger magnitude** (3719 µs/token vs the 100 µs/token static estimate, 37×). The MoE expert proj path was not exercised; Wave 2b must re-validate the literal H1 site against the apex MoE fixture. |
+| **H2** | `gpu_full_attn.rs:383-395` + `mlx-native/rope_multi.rs:215-244` apply_imrope | 80 µs/token | **464 µs/token** inclusive on `apply_imrope`; **208 µs/token** of that is `build_rope_multi_buffers` per-call alloc. Searched: `apply_imrope`, `rope_multi`, `dispatch_rope_multi`, `build_rope_multi_buffers`. | **CONFIRMED, larger than estimated.** Live cost is ~5.8× the static estimate.  build_rope_multi_buffers hoisting (rank-4 fix) closes ≥208 µs/token by itself. |
+| **H3** | `MlxDevice::command_encoder()` ~120×/token churn | 55 µs/token | **724 µs/token** inclusive on `mlx_native::device::MlxDevice::command_encoder`. Adjacent AGX leaf time (`computeCommandEncoderWithDispatchType:` + `ComputeContext::initWithCommandBuffer`) is +492 ms/192 tokens = +2562 µs/token but partly overlaps with H1's IOGPU init.  Treating only the directly-named Rust frame: **724 µs/token, ~13× the static estimate**. | **CONFIRMED, much larger than estimated.** P3 single-CB rewrite is the structural fix; this row goes to <100 µs/token after P3 lands. |
+| **H4** | `enc.memory_barrier()` ~440×/token + ~35 µs | 35 µs/token | **NOT FOUND IN TRACE** for the literal frame name `memory_barrier`. Searched: `memory_barrier`, `enc.memory_barrier`. The `mlx_native::encoder::CommandEncoder::*` symbols are present (commit, commit_labeled at 8 ms / 192 tokens = 42 µs/token total) but `memory_barrier` does not appear as a sampled stack frame at 1 ms granularity. | **FALSIFIED at the literal site.** Either the function is fully inlined into call-sites and its body is too cheap to land a 1 ms sample, or its actual cost is materially below the 35 µs/token static estimate (sub-1 µs per call × ~440 calls = sub-440 µs total — still below detection). H4's "barrier coalescing" lever is unsupported by live evidence on this fixture; deferred unless Wave 2b counter-evidence emerges. |
+| **H5** | `with_context(\|\| format!(...))` String allocation on success path | 25 µs/token | **5 µs/token** total `with_context` inclusive (1 ms / 192 tokens). No `fmt::format` frames in decode-only stacks. | **FALSIFIED (confirms Codex Wave 1 prior).** `with_context` takes a closure; `format!` only runs on Err.  On the success path, the closure is constructed but never invoked.  Sampled time is dominated by trait-call overhead, not allocation.  Expected from source review; live trace confirms. |
+
+**Top-contributor sum vs the 288 µs/token residual.** The acceptance bar
+required ≥150 µs of the residual to be accounted for in §P3a'.  Live
+measurement on this dense fixture shows the residual is **larger than
+the 288 µs framing** (which was derived from the apex MoE 540 µs/token
+gap at ADR-012 closure):
+
+- Rank 1 alone (`alloc_buffer` Mach-IPC chain): **3719 µs/token**.
+- Rank 3 (`command_encoder()` churn): **724 µs/token** (collapses
+  under P3 single-CB).
+- Rank 4 component (`build_rope_multi_buffers` hoist): **208 µs/token**
+  (independent fix).
+
+Sum of independently-fixable contributors (rank 1 + rank 4 = 3927 µs/tok)
+**13.6× exceeds** the 288 µs residual bar.  Caveat: the absolute
+µs/token on this fixture (≈30 ms/token wall) is much larger than the
+apex MoE workload (≈9 ms/token wall) — the same call-graph hot frames
+appear, but their per-token aggregate µs is inflated because dense
+Q4_0 mat-vec for 17408 intermediate × 5120 hidden has more compute and
+more buffer turnover than MoE 8-of-256 expert routing at the same
+hidden size.  **Wave 2b must re-measure on the apex MoE fixture** to
+size the absolute µs/token reduction; the relative ranking (rank 1
+dominates) is expected to hold.
 
 ### Phase plan implication
 
@@ -839,10 +988,10 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 
 | ID | Question | Resolution |
 |---|---|---|
-| **Q-NAX-1** | Does mlx-native's existing `matmul2d_descriptor(32, 64, 32, …)` already activate NAX hardware on M5 Max, or stay on simdgroup-matrix? | Profile via Instruments "Metal System Trace" + GPU counter `gpu.counters.neuralAcceleratorUtilization` (if exposed) on M5 Max with a prefill workload.  If activation is already happening, P3c.2 inner-tile changes are moot; P3c.1 (Morton) and P3c.3 (attention port) remain. |
+| **Q-NAX-1** | Does mlx-native's existing `matmul2d_descriptor(32, 64, 32, …)` already activate NAX hardware on M5 Max, or stay on simdgroup-matrix? | Profile via Instruments "Metal System Trace" + GPU counter `gpu.counters.neuralAcceleratorUtilization` (if exposed) on M5 Max with a prefill workload.  If activation is already happening, P3c.2 inner-tile changes are moot; P3c.1 (Morton) and P3c.3 (attention port) remain.  **§P3a' update (2026-04-27):** the Wave 2a TimeProfiler trace did NOT use Metal System Trace and did NOT capture GPU counters — it only resolves CPU-side frames.  Q-NAX-1 remains open; the answer requires a separate Metal System Trace run, not the same xctrace recipe. |
 | **Q-NAX-2** | What is the actual TTFT baseline for mlx-native vs mlx-lm on M5 Max at pp=4096?  ADR-015 D4 baseline is decode-only (n=256). | Measure before P3c sized.  Add TTFT bar to D4 exit criteria when P3c opens.  Reference: Apple's MLX/M5 post = 3.3–4.1× over M4 across Qwen 1.7B–30B-MoE. |
-| **Q-NAX-3** | What macOS version is the M5 Max benchmark machine running? | Document explicitly in every cold-SoC bench log; NAX requires 26.2+.  If on 26.1 or 15, P3c lever is unavailable. |
-| **Q-NAX-4** | Is `execution_simdgroups<4>` causing NAX stalls on long K-loops? | Profile with Instruments' Metal GPU Counter `ShaderOccupancy` and (if exposed) `NeuralAcceleratorUtil` on a 4096-token prefill.  If stalls are present, restructure to `execution_simdgroup` with 4× more threadgroups per launch. |
+| **Q-NAX-3** | What macOS version is the M5 Max benchmark machine running? | Document explicitly in every cold-SoC bench log; NAX requires 26.2+.  If on 26.1 or 15, P3c lever is unavailable.  **§P3a' update (2026-04-27):** Wave 2a benchmark machine is **macOS 26.4.1 build 25E253** (`run-20260427T030903Z.metadata.json`).  This is **above** the 26.2 NAX threshold; subsequent P3c work on this machine can assume NAX hardware is available. |
+| **Q-NAX-4** | Is `execution_simdgroups<4>` causing NAX stalls on long K-loops? | Profile with Instruments' Metal GPU Counter `ShaderOccupancy` and (if exposed) `NeuralAcceleratorUtil` on a 4096-token prefill.  If stalls are present, restructure to `execution_simdgroup` with 4× more threadgroups per launch.  **§P3a' update (2026-04-27):** the Wave 2a trace was a **decode** workload (1 token / forward pass, 64 tokens), not a long-K prefill — it cannot inform Q-NAX-4 in either direction.  Q-NAX-4 remains open and requires a dedicated long-K prefill trace. |
 | **Q-NAX-5** | Does `swizzle=2` in MLX's M5 tuning mean Morton/Z-order, column-first, or something device-specific? | Read MLX `matmul.cpp` swizzle implementation directly before implementing P3c.1; `swizzle=0` is raster, `=1` is column-first per common convention but verify. |
 | **Q-NAX-6** | Does `reduced_precision = false` affect decode-path throughput on M5? | Decode is bandwidth-bound (SqueezeLLM canonical statement, confirmed by ADR-015 P2 / P3a data).  For decode-path weight-dequant matmuls (m=1), compute is not the bottleneck.  The flag has no effect on bandwidth-bound ops — confirm empirically before spending time on precision-flag experiments for decode. |
 | **Q-NAX-7** | Does porting `flash_attn_prefill` require a new file or modify the existing one? | Recommend: new `flash_attn_prefill_nax.metal` gated behind `is_nax_available_m5()`, keeping existing simdgroup path as M3/M4 fallback.  Two-variant pattern matches MLX's own approach. |
@@ -865,4 +1014,5 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-26 — P2 calibration empirical:** `async µs/CB ≈ 1.6 µs` (3.1× lower than working assumption).  Single-CB recovers ~32% of the 500 µs gap, not ~100%.  Plan revised: P3a per-dispatch cost calibration inserted before P3; P4 added as a second-lever phase whose target is determined by P3a.  Title kept "single-CB" because that's still the first lever; scope is honestly "general decode speed improvements" with the single-CB rewrite as Phase 1 of N.
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
+- **2026-04-27 — §"P3a' live profile pass" infused (CFA Wave 2a, `cfa-20260426-adr015-wave2a-p3aprime`).** xctrace TimeProfiler captured 3 cold-SoC trials × 64 decode tokens on macOS 26.4.1 / M5 Max with the qwen3.6-27b-dwq46 dense fixture.  Decode-only stack filtering (`forward_gpu_greedy`) yields the live ranked residual: rank 1 is `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` at 3719 µs/token (Mach-IPC kernel-call dominated, ~1 IPC per GPU resource × ~hundreds of decode-token allocations); rank 3 is `command_encoder()` churn at 724 µs/token (closes under P3 single-CB); rank 4's `build_rope_multi_buffers` at 208 µs/token is independently fixable by hoisting per-call rope-params buffers to model-load time.  Hypothesis register: H1 (`gpu_ffn.rs:397-404` proj alloc) NOT FOUND at literal site (dense path doesn't call proj()) but the underlying *category* CONFIRMED at 37× the static estimate via the rank-1 alloc_buffer chain; H2 (apply_imrope) CONFIRMED 5.8× larger than estimated; H3 (command_encoder churn) CONFIRMED 13× larger; H4 (memory_barrier) FALSIFIED at literal site (sub-1ms-sample at 1ms granularity); H5 (with_context allocation) FALSIFIED — confirms Codex Wave 1 prior (`format!` lazy via closure).  Coverage gap flagged: dense fixture does not exercise the apex MoE expert proj path; Wave 2b must re-validate H1's literal site against the apex 35B-A3B fixture before committing P3b reductions to MoE-specific call sites.  Supersession note added to §Diagnosis pointing at §P3a'.  NAX questions Q-NAX-1, Q-NAX-3, Q-NAX-4 received in-row updates where the trace informed them (Q-NAX-3: confirmed macOS 26.4.1 ≥ 26.2 NAX threshold; Q-NAX-1, Q-NAX-4: noted that decode-only TimeProfiler trace cannot inform GPU-counter / long-K-prefill questions, both remain open).  Trace artifacts referenced by absolute path (not committed); only `scripts/profile-p3aprime.sh`, this ADR section, and `docs/perf-traces/.gitkeep` land in git.  The 9th static-evidence kernel hypothesis class (Wave 1 P3b suspect list) joins the falsified-by-live-evidence list per `project_metal_compiler_auto_optimizes_static_levers` — the Mach-IPC / IOGPU-resource-creation overhead was not on Wave 1's static suspect list because grep against Rust source can't see kernel boundary crossings.
 - **2026-04-26 — §"Capturing M5's GPU Neural Accelerators (Metal 4 TensorOps + NAX)" infused.**  Per ADR-016 research dossier graduation: Apple's measured 3.33–4.06× TTFT vs M4 (1.19–1.27× decode bandwidth-bound) lives in per-GPU-core Neural Accelerators via Metal 4 TensorOps, **not** standalone ANE.  mlx-native already partially routes through `mpp::tensor_ops::matmul2d` in four `*_tensor.metal` kernels but is missing: (a) Morton/Z-order dispatch for large prefill GEMM (Tech Talk 111432: ~50 → ~100 % NAX utilization on 4K×4K matmul); (b) NAX-tuned outer tile sizes + macOS 26.2 / arch-gen ≥ 17 runtime gate (mirroring MLX's `is_nax_available()`); (c) `flash_attn_prefill` inner matmul still on M1-era `simdgroup_matrix` / `simdgroup_multiply_accumulate` — biggest unrouted lever (16 % of prefill compute).  Added new sub-phase **P3c — M5 Neural Accelerator prefill kernels** with three actions; P3c is shader-internal only and **fully orthogonal** to P3 (single-CB) and P3b (orchestration sweep) — opens only after P6 bench gate clears.  All API claims verified against Apple developer docs, MLX commits (`54f1cc6` 2025-11-19 NAX support, `b41b349` 2026-03-18 NAX refactor, `0879a6a` 2026-03-11 M5 tuning), and `/opt/mlx-native` source by direct file:line read — no training-data recall used.  Source brief: `/tmp/cfa-adr016/research-metal4-tensorops.md` + memory key `swarm-cfa-adr016/deep-research/metal4-tensorops`.
