@@ -814,6 +814,241 @@ impl ImatrixCollector {
 
         Ok((col, dataset_filename))
     }
+
+    /// Load an [`ImatrixCollector`] from a GGUF-format `.imatrix.gguf`
+    /// file produced by either [`Self::save_imatrix_gguf`] or by
+    /// llama.cpp ≥2025-07-19 (PR #9400, commit `90083283`).
+    ///
+    /// The reader walks the metadata KV section once to extract the
+    /// imatrix-specific fields (`imatrix.datasets`, `imatrix.chunk_count`,
+    /// `imatrix.chunk_size`), walks the tensor descriptor section
+    /// pairing `<name>.in_sum2` with `<name>.counts`, then reads each
+    /// tensor's float bytes at the recorded offset.
+    ///
+    /// Returns the reconstructed collector plus the dataset list as
+    /// recorded in the file.
+    ///
+    /// **Robustness**: unknown metadata KV types are skipped (their
+    /// payload byte size is computed and the cursor advanced). Only
+    /// the four imatrix-specific KVs are read into typed fields.
+    /// Tensors whose names don't match the `<name>.{in_sum2,counts}`
+    /// suffix scheme are accepted but silently ignored.
+    pub fn load_imatrix_gguf(
+        path: &Path,
+    ) -> Result<(Self, Vec<String> /* datasets */), ImatrixError> {
+        // Read the entire file into memory — imatrix files are small
+        // (a few MB at most for a typical LLM). Cursor-based reads
+        // simplify offset tracking against the recorded tensor offsets.
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 24 {
+            return Err(ImatrixError::MalformedLegacy {
+                reason: format!("file too short for GGUF header ({} bytes)", bytes.len()),
+            });
+        }
+
+        // Header.
+        if &bytes[0..4] != b"GGUF" {
+            return Err(ImatrixError::MalformedLegacy {
+                reason: "missing GGUF magic".into(),
+            });
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != 3 {
+            return Err(ImatrixError::MalformedLegacy {
+                reason: format!("unsupported GGUF version {version} (expected 3)"),
+            });
+        }
+        let n_tensors = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let n_kv = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+
+        let mut cur = 24usize;
+
+        // ─── Walk metadata KVs ───
+        let mut datasets: Vec<String> = Vec::new();
+        let mut _chunk_count: u32 = 0;
+        let mut _chunk_size: u32 = 0;
+
+        for _ in 0..n_kv {
+            let (key, n) = gguf_read_string(&bytes, cur)?;
+            cur += n;
+            let kv_type = u32::from_le_bytes(read_4(&bytes, cur)?);
+            cur += 4;
+
+            match (key.as_str(), kv_type) {
+                ("imatrix.datasets", 9) => {
+                    // array of strings
+                    let elem_type = u32::from_le_bytes(read_4(&bytes, cur)?);
+                    cur += 4;
+                    if elem_type != 8 {
+                        return Err(ImatrixError::MalformedLegacy {
+                            reason: format!(
+                                "imatrix.datasets array element type {elem_type}, expected string (8)"
+                            ),
+                        });
+                    }
+                    let len = u64::from_le_bytes(read_8(&bytes, cur)?) as usize;
+                    cur += 8;
+                    for _ in 0..len {
+                        let (s, n) = gguf_read_string(&bytes, cur)?;
+                        cur += n;
+                        datasets.push(s);
+                    }
+                }
+                ("imatrix.chunk_count", 4) => {
+                    _chunk_count = u32::from_le_bytes(read_4(&bytes, cur)?);
+                    cur += 4;
+                }
+                ("imatrix.chunk_size", 4) => {
+                    _chunk_size = u32::from_le_bytes(read_4(&bytes, cur)?);
+                    cur += 4;
+                }
+                // Skip any other key (general.type, general.alignment, etc).
+                _ => {
+                    cur += skip_kv_value(&bytes, cur, kv_type)?;
+                }
+            }
+        }
+
+        // ─── Walk tensor descriptors ───
+        // Each descriptor: name (string), n_dims (u32), dims (u64 × n_dims),
+        // type (u32), offset (u64).
+        struct TensorDesc {
+            name: String,
+            shape: Vec<u64>,
+            ggml_type: u32,
+            offset: u64,
+        }
+        let mut descs: Vec<TensorDesc> = Vec::with_capacity(n_tensors);
+        for _ in 0..n_tensors {
+            let (name, n) = gguf_read_string(&bytes, cur)?;
+            cur += n;
+            let n_dims = u32::from_le_bytes(read_4(&bytes, cur)?) as usize;
+            cur += 4;
+            if n_dims > 8 {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!("tensor '{name}' has unreasonable n_dims {n_dims}"),
+                });
+            }
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(u64::from_le_bytes(read_8(&bytes, cur)?));
+                cur += 8;
+            }
+            let ggml_type = u32::from_le_bytes(read_4(&bytes, cur)?);
+            cur += 4;
+            let offset = u64::from_le_bytes(read_8(&bytes, cur)?);
+            cur += 8;
+            descs.push(TensorDesc {
+                name,
+                shape,
+                ggml_type,
+                offset,
+            });
+        }
+
+        // ─── Tensor data section ───
+        // Aligned to 32 bytes (GGUF default alignment) past the end of
+        // the descriptor section.
+        const GGUF_DEFAULT_ALIGNMENT: usize = 32;
+        let data_start =
+            (cur + GGUF_DEFAULT_ALIGNMENT - 1) / GGUF_DEFAULT_ALIGNMENT * GGUF_DEFAULT_ALIGNMENT;
+
+        // Pair `<name>.in_sum2` with `<name>.counts` and reconstruct Stats.
+        let mut col = Self::new();
+        let mut by_base: HashMap<String, (Option<&TensorDesc>, Option<&TensorDesc>)> = HashMap::new();
+        for d in &descs {
+            if let Some(base) = d.name.strip_suffix(".in_sum2") {
+                by_base.entry(base.to_string()).or_default().0 = Some(d);
+            } else if let Some(base) = d.name.strip_suffix(".counts") {
+                by_base.entry(base.to_string()).or_default().1 = Some(d);
+            }
+            // Unknown-suffix tensors silently ignored.
+        }
+
+        for (base, (sum2_d, counts_d)) in by_base.into_iter() {
+            let sum2_d = match sum2_d {
+                Some(d) => d,
+                None => continue, // missing in_sum2 — skip incomplete pair
+            };
+            let counts_d = match counts_d {
+                Some(d) => d,
+                None => continue,
+            };
+            if sum2_d.ggml_type != 0 || counts_d.ggml_type != 0 {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!(
+                        "tensor '{base}': in_sum2/counts must be F32 (type 0), got {}/{}",
+                        sum2_d.ggml_type, counts_d.ggml_type
+                    ),
+                });
+            }
+
+            // in_sum2 shape = [row_size, nmat]
+            // counts shape = [1, nmat]
+            // GGUF stores dims in fastest-changing-first order (matches ggml).
+            if sum2_d.shape.len() != 2 || counts_d.shape.len() != 2 {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!(
+                        "tensor '{base}': in_sum2/counts shapes must be 2D, got {}D/{}D",
+                        sum2_d.shape.len(),
+                        counts_d.shape.len()
+                    ),
+                });
+            }
+            let row_size = sum2_d.shape[0] as usize;
+            let nmat_sum = sum2_d.shape[1] as usize;
+            let nmat_cnt = counts_d.shape[1] as usize;
+            if nmat_sum != nmat_cnt {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!(
+                        "tensor '{base}': in_sum2 nmat={nmat_sum} != counts nmat={nmat_cnt}"
+                    ),
+                });
+            }
+            if counts_d.shape[0] != 1 {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!(
+                        "tensor '{base}': counts shape[0] must be 1, got {}",
+                        counts_d.shape[0]
+                    ),
+                });
+            }
+
+            let nval = row_size * nmat_sum;
+            let sum2_start = data_start + sum2_d.offset as usize;
+            let sum2_end = sum2_start + nval * 4;
+            let counts_start = data_start + counts_d.offset as usize;
+            let counts_end = counts_start + nmat_cnt * 4;
+            if bytes.len() < sum2_end || bytes.len() < counts_end {
+                return Err(ImatrixError::MalformedLegacy {
+                    reason: format!(
+                        "tensor '{base}': data section ends at {} but tensor expects {}",
+                        bytes.len(),
+                        sum2_end.max(counts_end)
+                    ),
+                });
+            }
+
+            let mut values = Vec::with_capacity(nval);
+            for chunk in bytes[sum2_start..sum2_end].chunks_exact(4) {
+                values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            let mut counts = Vec::with_capacity(nmat_cnt);
+            for chunk in bytes[counts_start..counts_end].chunks_exact(4) {
+                let cf = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                // Reverse the i64→f32 cast from save (lossy for very
+                // large counts; matches llama.cpp's lossy-cast
+                // semantics).
+                counts.push(cf as i64);
+            }
+
+            col.stats.insert(base, Stats { values, counts });
+        }
+
+        col.total_chunks = _chunk_count as i64;
+
+        Ok((col, datasets))
+    }
 }
 
 /// Read a little-endian i32 from a `Read` instance.
@@ -821,6 +1056,99 @@ fn read_i32_le<R: Read>(r: &mut R) -> Result<i32, ImatrixError> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     Ok(i32::from_le_bytes(buf))
+}
+
+/// Read a 4-byte slice from `bytes` at `cur`, returning a typed
+/// `[u8; 4]` for use with `from_le_bytes`. Errors when the buffer
+/// is too short.
+fn read_4(bytes: &[u8], cur: usize) -> Result<[u8; 4], ImatrixError> {
+    bytes.get(cur..cur + 4)
+        .map(|s| [s[0], s[1], s[2], s[3]])
+        .ok_or_else(|| ImatrixError::MalformedLegacy {
+            reason: format!("truncated GGUF: expected 4 bytes at offset {cur}"),
+        })
+}
+
+/// Read an 8-byte slice from `bytes` at `cur`.
+fn read_8(bytes: &[u8], cur: usize) -> Result<[u8; 8], ImatrixError> {
+    bytes.get(cur..cur + 8)
+        .map(|s| [s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        .ok_or_else(|| ImatrixError::MalformedLegacy {
+            reason: format!("truncated GGUF: expected 8 bytes at offset {cur}"),
+        })
+}
+
+/// Read a GGUF string at `cur`. Returns `(string, total_bytes_read)`
+/// where `total_bytes_read = 8 + len`.
+fn gguf_read_string(bytes: &[u8], cur: usize) -> Result<(String, usize), ImatrixError> {
+    let len = u64::from_le_bytes(read_8(bytes, cur)?) as usize;
+    let start = cur + 8;
+    let end = start + len;
+    if bytes.len() < end {
+        return Err(ImatrixError::MalformedLegacy {
+            reason: format!("truncated GGUF string at offset {cur}, len {len}"),
+        });
+    }
+    let s = std::str::from_utf8(&bytes[start..end])
+        .map_err(|e| ImatrixError::MalformedLegacy {
+            reason: format!("non-utf8 GGUF string at offset {cur}: {e}"),
+        })?
+        .to_string();
+    Ok((s, 8 + len))
+}
+
+/// Compute the byte size of a GGUF metadata KV value (after the type
+/// tag) so the reader can skip unknown KVs without parsing their
+/// payload.
+///
+/// GGUF type codes:
+/// - 0/1: u8/i8 → 1 byte
+/// - 2/3: u16/i16 → 2 bytes
+/// - 4/5/6: u32/i32/f32 → 4 bytes
+/// - 7: bool → 1 byte
+/// - 8: string → u64 length + N bytes
+/// - 9: array → u32 elem_type + u64 length + N elements
+/// - 10/11/12: u64/i64/f64 → 8 bytes
+fn skip_kv_value(bytes: &[u8], cur: usize, kv_type: u32) -> Result<usize, ImatrixError> {
+    match kv_type {
+        0 | 1 | 7 => Ok(1),
+        2 | 3 => Ok(2),
+        4 | 5 | 6 => Ok(4),
+        10 | 11 | 12 => Ok(8),
+        8 => {
+            let len = u64::from_le_bytes(read_8(bytes, cur)?) as usize;
+            Ok(8 + len)
+        }
+        9 => {
+            let elem_type = u32::from_le_bytes(read_4(bytes, cur)?);
+            let n = u64::from_le_bytes(read_8(bytes, cur + 4)?) as usize;
+            let mut total = 12usize;
+            for _ in 0..n {
+                let elem_size = match elem_type {
+                    0 | 1 | 7 => 1,
+                    2 | 3 => 2,
+                    4 | 5 | 6 => 4,
+                    10 | 11 | 12 => 8,
+                    8 => {
+                        let s_len = u64::from_le_bytes(read_8(bytes, cur + total)?) as usize;
+                        8 + s_len
+                    }
+                    _ => {
+                        return Err(ImatrixError::MalformedLegacy {
+                            reason: format!(
+                                "unsupported GGUF array element type {elem_type} at offset {cur}"
+                            ),
+                        });
+                    }
+                };
+                total += elem_size;
+            }
+            Ok(total)
+        }
+        _ => Err(ImatrixError::MalformedLegacy {
+            reason: format!("unsupported GGUF KV type {kv_type} at offset {cur}"),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1297,6 +1625,117 @@ mod tests {
         assert_eq!(n_tensors, 0);
         let n_kv = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         assert_eq!(n_kv, 4);
+    }
+
+    /// **Save → Load round trip via GGUF format**. The GGUF writer
+    /// is bit-exact for `values` (F32 round-trip) and lossy-by-design
+    /// for `counts` (i64 → f32 → i64 — preserves up to 2^24 exactly).
+    /// Verify on a moderate-magnitude dense stat that everything
+    /// round-trips byte-equal to the original collector.
+    #[test]
+    fn gguf_imatrix_round_trip_dense() {
+        let mut col = ImatrixCollector::new();
+        // 4-column dense layer with two batches of 2 tokens each.
+        col.accumulate_dense("blk.0.attn_q.weight", &[1.0, 2.0, 3.0, 4.0], 4, 1)
+            .unwrap();
+        col.accumulate_dense("blk.0.attn_q.weight", &[5.0, 6.0, 7.0, 8.0], 4, 1)
+            .unwrap();
+        col.record_chunk();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 256, &["wikitext-2.txt", "calib.txt"])
+            .unwrap();
+
+        let (loaded, datasets) = ImatrixCollector::load_imatrix_gguf(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(datasets, vec!["wikitext-2.txt".to_string(), "calib.txt".to_string()]);
+        assert_eq!(loaded.total_chunks, col.total_chunks);
+        assert_eq!(loaded.stats.len(), col.stats.len());
+
+        let orig = &col.stats["blk.0.attn_q.weight"];
+        let got = &loaded.stats["blk.0.attn_q.weight"];
+        assert_eq!(got.values, orig.values, "values byte-equal");
+        assert_eq!(got.counts, orig.counts, "counts byte-equal");
+    }
+
+    /// MoE round trip: per-expert counts must be preserved exactly
+    /// (the legacy format collapses them; GGUF preserves them by
+    /// design).
+    #[test]
+    fn gguf_imatrix_round_trip_moe_preserves_counts() {
+        let mut col = ImatrixCollector::new();
+        // 4 experts, row_size=2. Activations route 2 tokens to expert 0
+        // and 1 token to expert 2.
+        let activations = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3 tokens × 2 cols
+        let expert_ids: [i64; 3] = [0, 0, 2];
+        col.accumulate_moe("blk.0.ffn_down.weight", &activations, &expert_ids, 3, 2, 4)
+            .unwrap();
+        col.record_chunk();
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-roundtrip-moe");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.imatrix.gguf");
+        let _ = std::fs::remove_file(&path);
+
+        col.save_imatrix_gguf(&path, 512, &["calib.txt"]).unwrap();
+        let (loaded, _) = ImatrixCollector::load_imatrix_gguf(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let orig = &col.stats["blk.0.ffn_down.weight"];
+        let got = &loaded.stats["blk.0.ffn_down.weight"];
+
+        // Per-expert counts preserved exactly: expert 0 = 2, expert 1 = 0,
+        // expert 2 = 1, expert 3 = 0.
+        assert_eq!(got.counts, vec![2_i64, 0, 1, 0]);
+        assert_eq!(got.counts, orig.counts, "MoE counts byte-equal");
+        assert_eq!(got.values, orig.values, "MoE values byte-equal");
+    }
+
+    /// Reading a non-GGUF file rejected with malformed-format error.
+    #[test]
+    fn gguf_imatrix_rejects_non_gguf() {
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-bad");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("not_gguf.bin");
+        std::fs::write(&path, b"NOTGGUFXXXXXXXXXXXXXXXXXXXXXXXXXX").unwrap();
+
+        let err = ImatrixCollector::load_imatrix_gguf(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            ImatrixError::MalformedLegacy { reason } => {
+                assert!(reason.contains("GGUF magic"), "got: {reason}");
+            }
+            _ => panic!("expected MalformedLegacy"),
+        }
+    }
+
+    /// Reading a GGUF v2 file (wrong version) rejected.
+    #[test]
+    fn gguf_imatrix_rejects_wrong_version() {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // version 2
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // n_tensors
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // n_kv
+
+        let dir = std::env::temp_dir().join("hf2q-imatrix-gguf-v2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("v2.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = ImatrixCollector::load_imatrix_gguf(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            ImatrixError::MalformedLegacy { reason } => {
+                assert!(reason.contains("version"), "got: {reason}");
+            }
+            _ => panic!("expected MalformedLegacy"),
+        }
     }
 
     #[test]
