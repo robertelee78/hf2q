@@ -64,12 +64,6 @@ const EXIT_SUCCESS: u8 = 0;
 const EXIT_CONVERSION_ERROR: u8 = 1;
 const EXIT_QUALITY_EXCEEDED: u8 = 2;
 const EXIT_INPUT_ERROR: u8 = 3;
-// Smoke preflight (mirrored from `arch::smoke` so callers don't need to
-// import the inner constants).
-const EXIT_SMOKE_LLAMA_CLI_MISSING: u8 = 4;
-const EXIT_SMOKE_BINARY_MISSING: u8 = 5;
-const EXIT_SMOKE_REPO_MISSING: u8 = 6;
-
 /// Error types for exit code classification.
 #[derive(Debug)]
 enum AppError {
