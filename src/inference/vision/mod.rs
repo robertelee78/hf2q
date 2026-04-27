@@ -6,17 +6,19 @@
 //! resizes to the ViT's expected patch grid, and normalizes to a CHW
 //! float tensor ready for a future ViT forward pass.
 //!
-//! # Supported input formats (day-one)
+//! # Supported input formats
 //!
 //!   - `data:image/png;base64,<payload>`  — inline base64, Open WebUI default.
 //!   - `data:image/jpeg;base64,<payload>` — same shape, JPEG payload.
 //!   - `file:///absolute/path/to/image.{png,jpg,jpeg}` — local file URL.
 //!   - `/absolute/path/to/image.{png,jpg,jpeg}` — bare path (shorthand).
+//!   - `https://<host>/<path>` — fetched via reqwest blocking client.
+//!   - `http://<host>/<path>` — same fetch path as HTTPS.
 //!
-//! HTTP URLs are **not** fetched in this iter — that'd introduce a
-//! network-fetch code path on the request hot path, which is out of scope
-//! for Phase 2c's minimum viable preprocessor. A later iter can add the
-//! `reqwest::blocking::get` path when a real deployment needs it.
+//! HTTPS URLs are fetched via `reqwest::blocking::Client` with a 10-second
+//! timeout and a 20 MB response-body cap. The blocking I/O is wrapped in
+//! `tokio::task::block_in_place` so the axum executor thread is not starved
+//! while waiting on the network.
 //!
 //! # Preprocessing pipeline
 //!
@@ -36,6 +38,7 @@
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub mod mmproj;
 pub mod mmproj_weights;
@@ -76,8 +79,7 @@ pub enum ImageInput {
     },
     /// Local filesystem path.
     FilePath(PathBuf),
-    /// HTTP(S) URL — **not loaded** by this module. Caller is expected to
-    /// reject with an error until the network-fetch path is enabled.
+    /// HTTP(S) URL — fetched at load time with a 10 s timeout + 20 MB cap.
     HttpUrl(String),
 }
 
@@ -132,7 +134,7 @@ pub fn parse_image_url(url: &str) -> Result<ImageInput> {
         return Ok(ImageInput::FilePath(PathBuf::from(url)));
     }
 
-    // http(s):// — not fetched in this iter.
+    // http(s):// — fetched via fetch_https_image.
     if url.starts_with("http://") || url.starts_with("https://") {
         return Ok(ImageInput::HttpUrl(url.to_string()));
     }
@@ -142,8 +144,7 @@ pub fn parse_image_url(url: &str) -> Result<ImageInput> {
     ))
 }
 
-/// Read an `ImageInput` into a raw bytes buffer. HTTP URLs are rejected in
-/// this iter with a specific error so the caller can map to 400.
+/// Read an `ImageInput` into a raw bytes buffer.
 pub fn load_image_bytes(input: &ImageInput) -> Result<Vec<u8>> {
     match input {
         ImageInput::DataUri { payload_base64, .. } => {
@@ -154,11 +155,7 @@ pub fn load_image_bytes(input: &ImageInput) -> Result<Vec<u8>> {
             Ok(payload)
         }
         ImageInput::FilePath(p) => read_file_bounded(p),
-        ImageInput::HttpUrl(url) => Err(anyhow!(
-            "HTTP image URLs are not yet loaded by this build ({}). \
-             Send a `data:image/png;base64,...` or `file:///` URL instead.",
-            url
-        )),
+        ImageInput::HttpUrl(url) => fetch_https_image(url),
     }
 }
 
@@ -177,6 +174,87 @@ fn read_file_bounded(p: &Path) -> Result<Vec<u8>> {
         ));
     }
     std::fs::read(p).map_err(|e| anyhow!("read {}: {e}", p.display()))
+}
+
+/// Fetch an HTTPS image URL via reqwest blocking, enforcing:
+///   - 10-second total timeout (connect + transfer).
+///   - 20 MB response-body cap checked against Content-Length before download,
+///     then enforced again on the byte stream to guard against missing headers.
+///
+/// The call runs inside `tokio::task::block_in_place` when a tokio runtime
+/// is active, so the axum executor thread yields to the blocking pool for the
+/// duration of the network I/O instead of stalling it.
+fn fetch_https_image(url: &str) -> Result<Vec<u8>> {
+    const MAX_BYTES: u64 = 20 * 1024 * 1024; // 20 MB
+
+    let fetch = || -> Result<Vec<u8>> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| anyhow!("HTTPS fetch: failed to build client: {e}"))?;
+
+        let resp = client
+            .get(url)
+            .send()
+            .map_err(|e| {
+                if e.is_timeout() {
+                    anyhow!("HTTPS fetch timed out after 10 s ({})", url)
+                } else {
+                    anyhow!("HTTPS fetch network error ({}): {e}", url)
+                }
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "HTTPS fetch received HTTP {} from {}",
+                status.as_u16(),
+                url
+            ));
+        }
+
+        // Reject oversized payloads early via Content-Length when present.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_BYTES {
+                return Err(anyhow!(
+                    "HTTPS fetch: Content-Length {} exceeds {}-byte cap ({})",
+                    len,
+                    MAX_BYTES,
+                    url
+                ));
+            }
+        }
+
+        // Stream body bytes with enforced cap.
+        let bytes = resp
+            .bytes()
+            .map_err(|e| {
+                if e.is_timeout() {
+                    anyhow!("HTTPS fetch body read timed out ({})", url)
+                } else {
+                    anyhow!("HTTPS fetch body read error ({}): {e}", url)
+                }
+            })?;
+
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(anyhow!(
+                "HTTPS fetch: response body {} bytes exceeds {}-byte cap ({})",
+                bytes.len(),
+                MAX_BYTES,
+                url
+            ));
+        }
+
+        Ok(bytes.to_vec())
+    };
+
+    // If a tokio runtime is active (axum handler context), use block_in_place
+    // so the blocking I/O does not stall the async executor thread.
+    // Outside a runtime (unit tests, CLI) call directly.
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(fetch),
+        Err(_) => fetch(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_image_url_http_preserved_for_deferred_fetch() {
+    fn parse_image_url_http_preserved_for_fetch() {
         let got = parse_image_url("https://example.com/img.jpg").unwrap();
         assert!(matches!(got, ImageInput::HttpUrl(_)));
     }
@@ -254,10 +332,27 @@ mod tests {
     }
 
     #[test]
-    fn load_image_bytes_rejects_http_url() {
-        let input = ImageInput::HttpUrl("https://example.com/cat.jpg".into());
+    fn load_image_bytes_https_url_attempts_fetch() {
+        // Verify that HttpUrl no longer returns the old "not yet loaded"
+        // static error — it now attempts a network fetch. Using an
+        // unresolvable host ensures the test does not egress while still
+        // exercising the dispatch path. The error must be a network error,
+        // not the old static rejection string.
+        let input = ImageInput::HttpUrl("https://example.invalid/cat.jpg".into());
         let err = load_image_bytes(&input).unwrap_err();
-        assert!(format!("{err}").contains("not yet loaded"));
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("not yet loaded"),
+            "expected network error, got static rejection: {msg}"
+        );
+        // The error must mention the URL or a network-level failure.
+        assert!(
+            msg.contains("example.invalid")
+                || msg.contains("network error")
+                || msg.contains("timed out")
+                || msg.contains("HTTPS fetch"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

@@ -33,11 +33,10 @@
 //!   2. `image_url_jpeg_data_uri_supported` (LIVE) — same shape with a
 //!      JPEG payload; confirms `parse_image_url` + `preprocess_gemma4v`
 //!      handle the second mandated mime type symmetrically.
-//!   3. `image_url_https_url_rejected_at_load` (LIVE, additionally
-//!      gated on `HF2Q_NETWORK_TESTS=1`) — confirms HTTPS URLs return
-//!      a 400 (load_image_bytes intentionally rejects HTTP fetches per
-//!      `src/inference/vision/mod.rs:157-161`); documents the AC-3106
-//!      data-URI scope.
+//!   3. `image_url_https_url_fetched` (LIVE, additionally gated on
+//!      `HF2Q_NETWORK_TESTS=1`) — confirms HTTPS URLs are now fetched
+//!      successfully via `fetch_https_image` (ADR-005 Phase 2c T1.4);
+//!      previously asserted 400; now asserts 200 + non-empty content.
 //!   4. `image_url_webp_data_uri_rejected` (LIVE) — confirms WEBP
 //!      data URIs return a clear 400 (parse_image_url rejects mime
 //!      types outside png/jpeg per `mod.rs:104-109`); same scope-doc
@@ -58,9 +57,8 @@
 //!     to `tests/fixtures/openwebui_multiturn/scenario4_vision_chunks.txt`.
 //!     Subsequent runs without RECORD replay-and-assert.
 //!   * `HF2Q_NETWORK_TESTS=1`              — additionally required for
-//!     scenario 3 (HTTPS URL); the request still doesn't egress
-//!     because `load_image_bytes` rejects HTTPS, but this gate keeps
-//!     anyone from being surprised by a network-tagged test.
+//!     scenario 3 (`image_url_https_url_fetched`); enables real HTTPS
+//!     egress to httpbin.org. Absent → test skips with a note.
 //!
 //! # Run
 //!
@@ -432,19 +430,36 @@ fn image_url_webp_data_uri_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 4d — HTTPS URL rejected at load (AC-3106 scope doc)
+// Scenario 4d — HTTPS URL fetched successfully (ADR-005 Phase 2c T1.4)
 // ---------------------------------------------------------------------------
+//
+// Previously this scenario asserted a 400 because `load_image_bytes`
+// unconditionally rejected HTTP(S) URLs. Since T1.4 (ADR-005 Phase 2c
+// wave-1 Worker C) added `fetch_https_image` with a 10 s timeout and
+// 20 MB cap, the path now fetches the remote image and preprocesses it.
+//
+// Fixture: `https://httpbin.org/image/png` returns a small (few-KB) PNG
+// square — stable, no auth required, deterministic image format. The
+// assertion does NOT check image-awareness (an httpbin test card is not
+// the four-dots fixture the peer-overlap words were tuned on); it asserts
+// only that the request succeeds (HTTP 200) and the response carries a
+// non-empty assistant content, proving end-to-end HTTPS-fetch routing works.
+//
+// If httpbin.org is unreachable the fetch path returns 400 with a network
+// error message. The test is gated on HF2Q_NETWORK_TESTS=1 to prevent
+// unintended egress in offline CI.
 
 #[test]
-fn image_url_https_url_rejected_at_load() {
+fn image_url_https_url_fetched() {
     if std::env::var(ENV_NETWORK).as_deref() != Ok("1") {
         eprintln!(
-            "image_url_https_url_rejected_at_load: {ENV_NETWORK} != \"1\" — \
-             skipping. Set {ENV_NETWORK}=1 alongside {ENV_GATE}=1 to run."
+            "image_url_https_url_fetched: {ENV_NETWORK} != \"1\" — \
+             skipping. Set {ENV_NETWORK}=1 alongside {ENV_GATE}=1 to run \
+             (requires outbound HTTPS to httpbin.org)."
         );
         return;
     }
-    let Some((gguf, mmproj)) = resolve_fixtures_or_skip("image_url_https_url_rejected_at_load")
+    let Some((gguf, mmproj)) = resolve_fixtures_or_skip("image_url_https_url_fetched")
     else {
         return;
     };
@@ -459,19 +474,18 @@ fn image_url_https_url_rejected_at_load() {
         .expect("build tokio runtime");
 
     let model_id = rt.block_on(fetch_canonical_model_id());
-    // The host is irrelevant — `load_image_bytes` rejects every HTTP
-    // URL before any network egress (`src/inference/vision/mod.rs:157-161`).
-    // Using a stable non-resolvable host keeps the test flake-proof if
-    // someone removes the network gate: there is no DNS query and no
-    // socket open in the request path that fails this assertion.
-    let https_url = "https://example.invalid/four-dots.png";
+
+    // httpbin.org/image/png returns a small PNG — stable public fixture.
+    // The 10 s timeout in fetch_https_image covers typical latency; if the
+    // host is unreachable this assertion fires with a clear 400 body.
+    let https_url = "https://httpbin.org/image/png";
     let body = serde_json::json!({
         "model": model_id,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe."},
+                    {"type": "text", "text": "Describe what you see."},
                     {"type": "image_url", "image_url": {"url": https_url}},
                 ]
             }
@@ -481,22 +495,20 @@ fn image_url_https_url_rejected_at_load() {
         "temperature": 0,
     });
     let (status, json) = rt.block_on(nonstreaming_chat_status_and_body(body));
-    assert_eq!(status, 400, "HTTPS URL: expected 400, got {status}; body={json}");
-    let err_type = json["error"]["type"].as_str().unwrap_or("");
     assert_eq!(
-        err_type, "invalid_request_error",
-        "HTTPS URL: expected error.type=invalid_request_error; body={json}"
+        status, 200,
+        "HTTPS URL fetch: expected 200, got {status}; body={json}"
     );
-    let err_msg = json["error"]["message"].as_str().unwrap_or("");
+    // The response must carry a non-empty assistant content field.
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
     assert!(
-        err_msg.contains("HTTP image URLs are not yet loaded")
-            || err_msg.contains("load failed")
-            || err_msg.contains("not yet loaded"),
-        "HTTPS URL: error.message lacks identification of the HTTP-load \
-         limitation; body={json}"
+        !content.trim().is_empty(),
+        "HTTPS URL fetch: expected non-empty assistant content; body={json}"
     );
     eprintln!(
-        "openwebui_vision: HTTPS URL rejected (AC-3106 scope doc) — \
-         status=400 error.message={err_msg:?}"
+        "openwebui_vision: HTTPS URL fetched OK (ADR-005 T1.4) — \
+         status=200 content={content:?}"
     );
 }

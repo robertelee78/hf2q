@@ -109,6 +109,14 @@ tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
 
+# ADR-005 Phase 2c T1.4: HTTPS image URL fetch in vision/mod.rs.
+# Promoted from dev-dep (where it served only E2E streaming tests) to runtime
+# dep to support `fetch_https_image`. The `blocking` feature pulls reqwest's
+# synchronous client; `rustls-tls` keeps TLS off system OpenSSL.
+# We do NOT enable `stream` here (that stays in dev-dep below for SSE testing)
+# nor `json` — vision fetch only needs raw bytes.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
@@ -126,6 +134,9 @@ tower = { version = "0.4", features = ["util"] }
 # build off any system OpenSSL link; the server is plain HTTP so we never
 # negotiate TLS, but reqwest's default features include OpenSSL-linked TLS
 # which would add a system dep for nothing.
+# Note: reqwest is also a runtime dep (see [dependencies] above); Cargo
+# unifies features. `json` + `stream` here add test-only capabilities on top
+# of the runtime `blocking` + `rustls-tls` base.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # Stream consumption helpers (`StreamExt`, `try_next`) for the SSE bytes_stream.
 # `futures` is a runtime dep but only re-exports a subset; `futures-util` is
