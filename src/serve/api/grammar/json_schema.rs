@@ -28,11 +28,13 @@
 //! unset (the default per JSON Schema spec) allows extra keys permissively.
 //! `additionalProperties: {schema}` is deferred (treated as permissive).
 //!
-//! Object key order (iter 75): grammar accepts keys in ANY order. Previously
-//! keys were required alphabetically (a deliberate simplification in iter 8
-//! that was never a feature — just a coincidence of BTreeMap iteration order).
-//! The new algorithm generates O(2^N) permutation sub-rules for N required
-//! keys and O(N^2) optional-chain sub-rules for optional keys.
+//! Object key order (iter 75): grammar accepts keys in ANY order for up to
+//! 8 required keys (2^8 = 256 rules worst-case). For N_req > 8 the emitter
+//! returns a `SchemaError` → HTTP 400; no sequential fallback is provided
+//! because sorted-order is a semantic downgrade (Moshier & Rounds ACL 1987).
+//! Previously keys were required alphabetically (iter 8 simplification, never
+//! a feature). The algorithm generates O(2^N_req) permutation sub-rules for
+//! N required keys and O(N^2) optional-chain sub-rules for optional keys.
 //!
 //! The output is a GBNF string that can be parsed by
 //! `super::parser::parse(...)` and consumed by `super::sampler::GrammarRuntime`.
@@ -497,14 +499,18 @@ impl Converter {
         //
         // The bitmask-based any-order algorithm generates O(2^N_req) unique
         // grammar rules — one per subset of remaining required keys.  This is
-        // practical for small N_req but becomes intractable at N_req > ~16.
-        // Threshold = 8 keeps the worst-case to 2^8 = 256 rules, which compiles
-        // in microseconds while covering the common case (tools schemas rarely
+        // practical for small N_req but intractable at N_req > ~16.
+        // Threshold = 8 keeps the worst-case to 2^8 = 256 rules, compiling
+        // in microseconds and covering the common case (tool schemas rarely
         // have more than 8 required keys at the same level).
         //
-        // For N_req > threshold we fall back to sequential (sorted) required-key
-        // order — the same behaviour as llama.cpp's json-schema-to-grammar.cpp.
-        // Optional keys still accept any order via the opt-chain.
+        // For N_req > threshold a hard SchemaError (→ HTTP 400) is returned.
+        // A sequential-sorted fallback would silently change semantics from
+        // "any-position" to "fixed-sorted" — a semantic downgrade prohibited by
+        // the no-shortcuts mantra.  Production engines (llama.cpp, llguidance,
+        // xgrammar, outlines-core) all enforce declaration order for the same
+        // reason: Moshier & Rounds ACL 1987 prove CFG-for-permutations is
+        // exponential; Barton 1985 proves ID/LP recognition is NP-complete.
         const ANY_ORDER_MAX_REQUIRED: usize = 8;
 
         // Build extra-kv wildcard rule (shared across all states if allowed).
@@ -557,20 +563,28 @@ impl Converter {
                 !additional_closed,
             )
         } else {
-            // Many required keys: fall back to sequential (sorted) order.
+            // Too many required keys: the bitmask any-position grammar grows as
+            // O(2^N_req), which is provably exponential for permutations of N
+            // keys (Moshier & Rounds ACL 1987).  Sequential-order fallback would
+            // silently change semantics from "any-position" to "fixed-sorted",
+            // which is a semantic downgrade.
             //
-            // Required keys are emitted in sorted order (deterministic).
-            // Optional keys still accept any order via the opt-chain.
-            // Extra keys are accepted before any required key, between required
-            // keys, and after the last required key — provided
-            // additionalProperties is permissive.
-            self.build_sequential_required(
-                &slug,
-                &required_keys,
-                &optional_keys,
-                &kv_rule_name,
-                !additional_closed,
-            )
+            // Hard error.  Operator must reduce required parameters or split the
+            // function.  The threshold is ANY_ORDER_MAX_REQUIRED = 8 (256 rules
+            // worst-case — practical and fast).  Propagates as HTTP 400.
+            return Err(SchemaError {
+                path: path.to_string(),
+                message: format!(
+                    "object at '{}' has {} required properties; \
+                     ADR-005 grammar enforcement supports at most {} required \
+                     properties per object (CFG-for-permutation is provably \
+                     exponential per Moshier & Rounds ACL 1987). \
+                     Reduce required properties or split the schema.",
+                    if path.is_empty() { "root" } else { path },
+                    required_keys.len(),
+                    ANY_ORDER_MAX_REQUIRED,
+                ),
+            });
         };
 
         Ok(format!(r#""{{" space {} "}}" space"#, inner))
@@ -770,83 +784,6 @@ impl Converter {
         let body = alts.join(" | ");
         self.rules.insert(rule_name.clone(), body);
         rule_name
-    }
-
-    /// Build a sequential (fixed-order) required-key inner rule for schemas
-    /// with many required keys where the bitmask any-order algorithm would
-    /// produce an exponentially large grammar.
-    ///
-    /// Required keys are emitted in the sorted order they were passed.
-    /// Optional keys still accept any order via `build_optional_suffix_masked`.
-    /// Extra keys (when `allow_extra_kv`) may appear before any required key
-    /// and between consecutive required keys — via a recursive `extra-star`
-    /// rule — as well as after the last required key via the opt-suffix.
-    ///
-    /// Returns a GBNF inline fragment (not a separate named rule) because the
-    /// body is uniquely determined by the key list and has exactly one call site.
-    fn build_sequential_required(
-        &mut self,
-        slug: &str,
-        required_keys: &[String],
-        optional_keys: &[String],
-        kv_rule_name: &HashMap<String, String>,
-        allow_extra_kv: bool,
-    ) -> String {
-        // n_opt bitmask seed for the optional suffix (all optional keys remain).
-        let opt_full: u32 = if optional_keys.is_empty() {
-            0
-        } else {
-            let n_opt = optional_keys.len();
-            u32::MAX >> (32 - n_opt)
-        };
-
-        // Optional tail after all required keys have been emitted.
-        let opt_suffix = self.build_optional_suffix_masked(
-            slug,
-            opt_full,
-            optional_keys,
-            kv_rule_name,
-            allow_extra_kv,
-        );
-
-        // Zero-or-more extra keys (if additionalProperties is permissive):
-        // `extra-star` is a recursive GBNF rule that matches
-        // (extra-kv "," space)* — i.e., any number of extra key-value pairs
-        // each followed by a mandatory comma before the next required key.
-        let extra_star_prefix: String = if allow_extra_kv {
-            let extra_kv_name = format!("{}-extra-kv", slug);
-            let star_name = format!("{}-extra-star", slug);
-            self.rules.entry(star_name.clone()).or_insert_with(|| {
-                // star ::= ( extra-kv "," space star )?
-                format!(r#"( {} "," space {} )?"#, extra_kv_name, star_name)
-            });
-            // Include a trailing space so the prefix can be directly
-            // concatenated with the kv rule name.
-            format!("{} ", star_name)
-        } else {
-            String::new()
-        };
-
-        // Build the body as a flat string:
-        //   extra-star? req0-kv "," space extra-star? req1-kv ... reqN-1-kv opt-suffix?
-        let mut body = String::new();
-        for (idx, k) in required_keys.iter().enumerate() {
-            let kv = &kv_rule_name[k];
-            if idx > 0 {
-                // Mandatory comma between required keys.
-                body.push_str(" \",\" space ");
-            }
-            // Optional run of extra keys before this required key.
-            body.push_str(&extra_star_prefix);
-            body.push_str(kv);
-        }
-
-        if !opt_suffix.is_empty() {
-            body.push(' ');
-            body.push_str(&opt_suffix);
-        }
-
-        body
     }
 
     fn visit_array(
@@ -1664,14 +1601,67 @@ mod tests {
         );
     }
 
-    /// T1.8 large-schema guard: a schema with exactly 32 properties must
-    /// compile successfully (boundary condition: 32 is the last allowed value).
+    /// T1.8 large-schema guard: a schema with 4 required + 4 optional = 8
+    /// total properties must compile successfully.
+    ///
+    /// Wave 2.6 W-β2: the required-key cap is 8 (ANY_ORDER_MAX_REQUIRED).
+    /// The n_total > 32 guard still caps total properties at 32.  This test
+    /// uses a small, fast schema to verify the happy-path for mixed
+    /// required/optional, staying well within both caps.
+    ///
+    /// The original test exercised the now-deleted sequential fallback with
+    /// 32 all-required keys.  That path no longer exists; the cap is 8 req.
     #[test]
     fn large_schema_32_properties_compiles_ok() {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
-        for i in 0..32usize {
-            let key = format!("prop{:02}", i);
+        // 4 required keys.
+        for i in 0..4usize {
+            let key = format!("req{:02}", i);
+            props.insert(key.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(key));
+        }
+        // 4 optional keys.
+        for i in 0..4usize {
+            let key = format!("opt{:02}", i);
+            props.insert(key.clone(), serde_json::json!({"type": "string"}));
+        }
+        let schema = serde_json::Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), serde_json::json!("object"));
+            m.insert("properties".into(), serde_json::Value::Object(props));
+            m.insert("required".into(), serde_json::Value::Array(required));
+            m
+        });
+
+        // Must not error — 4 required (≤ 8 cap) + 4 optional = 8 total (≤ 32 cap).
+        let result = schema_to_gbnf(&schema);
+        assert!(
+            result.is_ok(),
+            "4-required + 4-optional schema failed to compile: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Q3 — hard 400 at >8 required keys (Wave 2.6 W-β2)
+    //
+    // Research grounding: Moshier & Rounds ACL 1987 prove CFG-for-permutations
+    // of n required keys is exponential. All production engines (llama.cpp,
+    // llguidance, xgrammar, outlines-core) enforce declaration order at large N.
+    // Sequential-sorted fallback is a semantic downgrade (Wave-2.5 mantra
+    // violation). Replaced with hard SchemaError → HTTP 400.
+    // -----------------------------------------------------------------
+
+    /// Boundary at 9 required keys (just over ANY_ORDER_MAX_REQUIRED=8):
+    /// must return SchemaError with an operator-actionable message.
+    /// HTTP 400 propagation is handled by compile_tool_grammar → ApiError.
+    #[test]
+    fn nine_required_keys_returns_too_many_required_keys() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..9usize {
+            let key = format!("k{}", i);
             props.insert(key.clone(), serde_json::json!({"type": "string"}));
             required.push(serde_json::Value::String(key));
         }
@@ -1683,12 +1673,65 @@ mod tests {
             m
         });
 
-        // Must not error — 32 is exactly the cap.
+        let err = schema_to_gbnf(&schema).unwrap_err();
+        // Message must be operator-actionable: cite the count, the limit, and
+        // the theoretical justification.
+        assert!(
+            err.message.contains("9") && err.message.contains("8"),
+            "expected error mentioning count=9 and limit=8; got: {:?}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Moshier") || err.message.contains("ADR-005"),
+            "expected operator-actionable citation; got: {:?}",
+            err.message
+        );
+        assert!(
+            err.message.contains("Reduce") || err.message.contains("split"),
+            "expected actionable instruction; got: {:?}",
+            err.message
+        );
+    }
+
+    /// Boundary at exactly 8 required keys (the supported maximum):
+    /// must compile successfully with full any-position semantics.
+    #[test]
+    fn eight_required_keys_compiles_ok() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..8usize {
+            let key = format!("k{}", i);
+            props.insert(key.clone(), serde_json::json!({"type": "integer"}));
+            required.push(serde_json::Value::String(key));
+        }
+        let schema = serde_json::Value::Object({
+            let mut m = serde_json::Map::new();
+            m.insert("type".into(), serde_json::json!("object"));
+            m.insert("properties".into(), serde_json::Value::Object(props));
+            m.insert("required".into(), serde_json::Value::Array(required));
+            m
+        });
+
+        // Must compile without error.
         let result = schema_to_gbnf(&schema);
         assert!(
             result.is_ok(),
-            "32-property schema failed to compile (must be <= cap=32): {:?}",
+            "8 required keys should compile (is the supported max); got: {:?}",
             result.err()
         );
+
+        // Spot-check: any-position must be enforced — reversed order accepted.
+        let gbnf = result.unwrap();
+        let g = super::super::parser::parse(&gbnf)
+            .unwrap_or_else(|e| panic!("parse gbnf: {}", e));
+        let rid = g.rule_id("root").unwrap();
+        let mut rt = GrammarRuntime::new(g, rid).unwrap();
+        // Emit keys in reverse alphabetical order (k7..k0).
+        let reversed = br#"{"k7":7,"k6":6,"k5":5,"k4":4,"k3":3,"k2":2,"k1":1,"k0":0}"#;
+        assert!(
+            rt.accept_bytes(reversed),
+            "8-key schema rejected reversed-order input (any-position not enforced)"
+        );
+        assert!(rt.is_accepted(), "8-key schema not accepted after reversed input");
     }
 }
