@@ -6583,3 +6583,97 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **Open followups.**  None — the test/doc honesty gap is closed.
 
   - **Fence respected (Wave 3.5 MED).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+---
+
+## Wave 3.6 — Mechanical Hygiene (2026-04-27)
+
+**Audit source.** `/tmp/cfa-cfa-20260427-adr005-wave3.5/codex-review-last.txt` — Codex static review of Wave 3.5, verdict `approve_with_revisions`, T2.4 functional closure VERIFIED for all four paths. Wave 3.6 addresses all four `recommended_revisions` and closes the two `missed_tests` and two `mantra_violations` flagged by the audit.
+
+**ready_for_wave_4: true** (set upon Wave 3.6 closure, 2026-04-27).
+
+### Wave 3.6 W-1 — Fix stale `compile_tool_grammar` rustdoc (commit `32be6eb`)
+
+- **Context.** Wave 3.5 HIGH-1 introduced `GrammarShape::OneOrMoreCallsBodyOnly` for Auto and kept `GrammarShape::OneOrMoreCalls` for Required.  The `compile_tool_grammar` rustdoc at `handlers.rs:2703` still said Auto has "the same per-model body grammar shape as Required" and the paragraph at `handlers.rs:2747-2754` still said "the grammar bytes are identical."  Both claims directly contradicted the Wave 3.5 HIGH-1 change — a code-is-truth violation.
+
+- **Fix.** Three doc regions updated in `src/serve/api/handlers.rs`:
+  1. `Auto` table row (line 2703): replaced "Same per-model body grammar shape as Required" with an accurate description of `OneOrMoreCallsBodyOnly` — first open marker stripped from the root rule, enforcement starts at body bytes.
+  2. W-B2 paragraph (lines 2747-2754): replaced "grammar bytes are identical" with a two-bullet block explaining the structural divergence: `Required/Function` → `OneOrMoreCalls` (marker-wrapped root from byte 0); `Auto` → `OneOrMoreCallsBodyOnly` (body-only root, first open marker absent, inter-call rule has marker for calls 2+).
+  3. Inline comment at the `compile_tool_grammar()` body: replaced "same grammar shape" with "grammar bytes DIFFER between Auto and Required (Wave 3.5 HIGH-1 fix)."
+
+- **Tests.** No test changes; this is a pure doc/code-parity fix.  `cargo check` passes with zero errors.
+
+- **Chesterton note.** The stale doc was left by Wave 3.5 itself — the HIGH-1 code change landed but the rustdoc was not updated.  The audit caught it as a `code_says` vs `report_says` divergence at medium severity.
+
+- **Fence respected.** `src/serve/api/handlers.rs` only.
+
+### Wave 3.6 W-2 — Add Qwen35 production-order regression test (commit `2c0ad30`)
+
+- **Context.** Audit missed-test: "No direct Qwen35 production-order regression; current production-order coverage is Gemma single-call."
+
+- **Fix.** Added `auto_lazy_grammar_accepts_qwen35_production_order_byte_stream` in `compile_tool_grammar_precondition_tests` (`src/serve/api/handlers.rs`).  Mirrors the Gemma4 test but with the Qwen 3.5/3.6 family.
+
+  Production byte-stream verified:
+  - `<tool_call>` bytes → `accept_bytes` no-op while `awaiting_trigger=true`.
+  - `runtime.trigger()` called (simulating ToolCallOpen).
+  - Body `<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>` (no leading `<tool_call>`, no leading `\n` — `single_body` starts at `<function=`) → runtime alive.
+  - Close `\n</tool_call>` → `is_accepted()`.
+
+  Key insight documented: the `\n` between `<tool_call>` and `<function=` is part of the `OneOrMoreCalls` outer wrapper only; `OneOrMoreCallsBodyOnly` omits it, so the post-trigger body bytes start at `<function=`, not `\n<function=`.
+
+- **Tests.** 1 new test passing.  Verified with `cargo test --release`.
+
+### Wave 3.6 W-3 — Add parallel two-call Auto-lazy production-order test (commit `2c0ad30`)
+
+- **Context.** Audit missed-test: "No runtime test for Auto-lazy accepting a second call/inter-call open marker."
+
+- **Fix.** Added `auto_lazy_grammar_accepts_two_call_production_order` in `compile_tool_grammar_precondition_tests` (`src/serve/api/handlers.rs`).  Tests both Gemma4 and Qwen35 families with `parallel_tool_calls=true`.
+
+  Invariant pinned: the FIRST open marker is stripped (body-only root), all subsequent open markers ARE in the grammar (inter-call rule).
+
+  Byte-stream for each family:
+  - `OPEN_MARKER_1` → pre-trigger no-op.
+  - `trigger()`.
+  - `BODY_1` → grammar accepts (body-only root).
+  - `CLOSE_1` → accepted.
+  - Gemma4: `OPEN_MARKER_2` immediately (no separator, `parallel_call_separator()` = "").
+  - Qwen35: `\n<tool_call>\n` (`parallel_call_separator()` = `"\n"` + open marker + `\n`).
+  - `BODY_2` → grammar accepts (inter-call rule).
+  - `CLOSE_2` → `is_accepted()`.
+
+  This test would FAIL on the pre-Wave-3.5 `OneOrMoreCalls` grammar because root still expects the first open marker after trigger.
+
+- **Tests.** 1 new test (covering both Gemma4 and Qwen35 variants) passing.  Verified with `cargo test --release`.
+
+### Wave 3.6 W-4 — Strengthen HIGH-2 postscript replay test (commit `96d8b2d`)
+
+- **Context.** Audit missed-test: "`replay_with_registered_model_emits_tool_call_then_postscript` asserts postscript content and Done, but does not assert `ToolCallDelta` or `finish_reason=tool_calls` for the parsed marker block."
+
+- **Fix.** Extended the existing test in `streaming_prompt_cache_replay_tests` (`src/serve/api/engine.rs`) with three additional assertions:
+
+  1. **`ToolCallDelta` events emitted.** At least one `GenerationEvent::ToolCallDelta` must be in the event stream.  The cached text body `call:foo{x:1}` is parseable by `parse_gemma4_tool_call` → `emit_streaming_tool_call_close` emits two `ToolCallDelta` chunks (name chunk + args chunk).
+
+  2. **Name delta.** The first `ToolCallDelta` must carry `name: Some("foo")` — proves the splitter chain re-classifies the marker block into structured tool-call deltas identical to a fresh decode, not just a Content fallback.
+
+  3. **`finish_reason="tool_calls"`.** The terminal `Done` event must have `finish_reason="tool_calls"` (not the cached value `"stop"`).  The replay overrides `cached.finish_reason` when `saw_tool_call=true` (engine.rs:3184).
+
+- **Tests.** `cargo test --release -- streaming_prompt_cache_replay_tests::replay_with_registered_model_emits_tool_call_then_postscript`: passes.  Full module (`streaming_prompt_cache_replay_tests`): 9 passed, 0 failed (unchanged test count — only assertions strengthened, no new tests added).
+
+- **Mantra note.** The pre-Wave-3.6 test caught the drain path but not the structured replay shape.  A regression that re-introduced a Content fallback for parseable bodies (bypassing `emit_streaming_tool_call_close`) would have silently passed the old test because Content-concat still contained "after".  The new assertions close that gap.
+
+- **Fence respected.** `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md` only.
+
+### Wave 3.6 summary
+
+| Item | What | Files | Commits |
+|------|------|-------|---------|
+| W-1 | Fix stale rustdoc (Auto/Required grammar divergence) | `handlers.rs` | `32be6eb` |
+| W-2 | Qwen35 production-order regression test | `handlers.rs` | `2c0ad30` |
+| W-3 | Parallel two-call Auto-lazy production-order test | `handlers.rs` | `2c0ad30` |
+| W-4 | Strengthen HIGH-2 postscript replay (ToolCallDelta + finish_reason) | `engine.rs` | `96d8b2d` |
+
+- **Tests added.** 3 new tests (`auto_lazy_grammar_accepts_qwen35_production_order_byte_stream`, `auto_lazy_grammar_accepts_two_call_production_order`, + strengthened assertions in `replay_with_registered_model_emits_tool_call_then_postscript`).
+- **Tests passing.** All pre-existing tests pass.  `serve::` scope: `cargo test --release -- serve::`: 27 tests in `compile_tool_grammar_precondition_tests` + `streaming_prompt_cache_replay_tests` pass, 0 failed.
+- **LOC delta.** `handlers.rs` +375/-13; `engine.rs` +62/-0; `ADR-005.md` +~110/-0.
+- **Fence respected.** No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+- **ready_for_wave_4: true.**
