@@ -3692,6 +3692,354 @@ mod compile_tool_grammar_precondition_tests {
         );
     }
 
+    /// Wave 3.6 W-2 — Qwen35 production-order regression test.
+    ///
+    /// Mirrors `auto_lazy_grammar_accepts_production_order_byte_stream` but
+    /// uses the Qwen 3.5/3.6 model family.
+    ///
+    /// Qwen35 production byte-stream for `tool_choice=auto`:
+    ///
+    ///   1. `awaiting_trigger=true` (lazy mode).
+    ///   2. Open-marker bytes `<tool_call>` flow through `accept_bytes`
+    ///      BEFORE the splitter fires `ToolCallOpen` — no-op, return true.
+    ///   3. Splitter fires `ToolCallOpen` → `runtime.trigger()`.
+    ///   4. Body bytes flow through `accept_bytes` with runtime eager.
+    ///      Qwen35 body shape: `\n<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>`
+    ///      Note: NO leading `<tool_call>` — splitter consumed it in step 2.
+    ///   5. Close-marker bytes `\n</tool_call>` drive the grammar to
+    ///      `is_accepted()`.
+    ///
+    /// Audit citation
+    /// (/tmp/cfa-cfa-20260427-adr005-wave3.5/codex-review-last.txt
+    /// missed-test "No direct Qwen35 production-order regression"):
+    ///   "No direct Qwen35 production-order regression and no runtime test
+    ///    for Auto-lazy accepting a second call/inter-call open marker;
+    ///    current production-order coverage is Gemma single-call."
+    #[test]
+    fn auto_lazy_grammar_accepts_qwen35_production_order_byte_stream() {
+        let reg = match registry::find_for("qwen3.5-72b-instruct") {
+            Some(r) => r,
+            // Qwen35 is always registered (BUILTIN_REGISTRATIONS); this
+            // path is defensive.
+            None => return,
+        };
+        let open = reg.tool_open.expect("qwen35 has tool_open: <tool_call>");
+        let close = reg.tool_close.expect("qwen35 has tool_close: </tool_call>");
+
+        let req = req_with("qwen3.5-72b-instruct", Some(one_scalar_tool("get_weather")));
+        let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+            .expect("Auto compile must succeed for qwen35")
+            .expect("Auto must return Some(grammar) for registered qwen35");
+
+        let root_id = g.rule_id("root").expect("compiled grammar has root");
+        let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+            .expect("GrammarRuntime::new must succeed");
+
+        // Step 1 — production setup: arm awaiting_trigger.
+        rt.set_awaiting_trigger(true);
+
+        // Step 2 — open-marker bytes flow through accept_bytes BEFORE the
+        // splitter fires ToolCallOpen.  Qwen35 open marker: `<tool_call>`.
+        // While awaiting, accept_bytes is a no-op returning true.
+        let pre_trigger_alive = rt.accept_bytes(open.as_bytes());
+        assert!(
+            pre_trigger_alive,
+            "qwen35: while awaiting_trigger=true, accept_bytes MUST be a \
+             no-op returning true for the open marker `{open}`"
+        );
+        assert!(
+            rt.is_awaiting_trigger(),
+            "qwen35: open-marker bytes MUST NOT flip the trigger; only \
+             runtime.trigger() in response to ToolCallOpen should flip it"
+        );
+
+        // Step 3 — splitter fires ToolCallOpen → engine calls trigger().
+        rt.trigger();
+        assert!(
+            !rt.is_awaiting_trigger(),
+            "qwen35: post-trigger gate MUST be flipped false"
+        );
+
+        // Step 4 — body bytes flow through accept_bytes with runtime eager.
+        // Qwen35 body-only shape (OneOrMoreCallsBodyOnly, single call):
+        //   `body \n </tool_call> space`
+        // where body = `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>`
+        // NO leading `<tool_call>` and NO leading `\n` — the splitter consumed
+        // `<tool_call>` in step 2, and `single_body` starts at `<function=`.
+        // The `\n` between `<tool_call>` and `<function=` appears ONLY in
+        // the outer OneOrMoreCalls wrapper; OneOrMoreCallsBodyOnly omits it.
+        //
+        // Pre-Wave-3.5 (OneOrMoreCalls grammar): root starts with the
+        // encoded `<tool_call>` marker and these body bytes would drive
+        // the runtime dead immediately.
+        // Post-Wave-3.5 (OneOrMoreCallsBodyOnly grammar): root starts with
+        // `<function=get_weather>` and accepts this byte stream.
+        let body: &[u8] =
+            b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
+        let body_alive = rt.accept_bytes(body);
+        assert!(
+            body_alive,
+            "qwen35 production-order regression: body-only grammar MUST accept \
+             body bytes (starting with `<function=`) after trigger with no \
+             leading `<tool_call>` marker.  A regression to OneOrMoreCalls would \
+             mark the runtime dead because root would still expect the already- \
+             consumed open marker `<tool_call>`."
+        );
+        assert!(
+            !rt.is_dead(),
+            "qwen35: body bytes MUST NOT drive the runtime dead on the \
+             body-only Auto-lazy grammar"
+        );
+
+        // Step 5 — close-marker bytes: `\n</tool_call>`.
+        // The Qwen35 OneOrMoreCallsBodyOnly single-call shape is:
+        //   `body \n </tool_call> space`
+        // so the grammar expects `\n` then the encoded `</tool_call>` bytes.
+        let close_bytes = format!("\n{close}");
+        let close_alive = rt.accept_bytes(close_bytes.as_bytes());
+        assert!(
+            close_alive,
+            "qwen35: close marker bytes (`\\n{close}`) MUST be accepted by the \
+             body-only grammar — only the FIRST open marker is stripped"
+        );
+        assert!(
+            rt.is_accepted(),
+            "qwen35: after body + close marker the runtime MUST be in accepting \
+             state (single-call body-only grammar = `body \\n close space`)"
+        );
+        assert!(
+            !rt.is_dead(),
+            "qwen35: accepted runtime MUST NOT also be dead"
+        );
+    }
+
+    /// Wave 3.6 W-3 — parallel two-call Auto-lazy production-order test.
+    ///
+    /// Audit citation
+    /// (/tmp/cfa-cfa-20260427-adr005-wave3.5/codex-review-last.txt
+    /// missed-test "no runtime test for Auto-lazy accepting a second call /
+    /// inter-call open marker"):
+    ///   "No runtime test for Auto-lazy accepting a second call/inter-call
+    ///    open marker; current production-order coverage is Gemma single-call."
+    ///
+    /// Tests both Gemma (no separator between calls) and Qwen35 (`\n`
+    /// separator) parallel shapes.
+    ///
+    /// Production byte-stream for `tool_choice=auto`, `parallel_tool_calls=true`:
+    ///
+    ///   Pre-trigger:
+    ///     - OPEN_MARKER_1 bytes → accept_bytes no-op (awaiting_trigger)
+    ///     - splitter fires ToolCallOpen → runtime.trigger()
+    ///   Post-trigger:
+    ///     - BODY_1 bytes       → grammar accepts (body-only root)
+    ///     - CLOSE_MARKER_1     → grammar accepts (close is in grammar)
+    ///     - [SEPARATOR]OPEN_MARKER_2 → grammar accepts (inter-call rule)
+    ///     - BODY_2 bytes       → grammar accepts
+    ///     - CLOSE_MARKER_2     → grammar reaches is_accepted()
+    ///
+    /// The KEY invariant:
+    ///   * The FIRST open marker is stripped (body-only root).
+    ///   * All subsequent open markers ARE in the grammar (inter-call rule).
+    ///
+    /// This test would FAIL on the pre-Wave-3.5 `OneOrMoreCalls` grammar
+    /// because the root still expects the first open marker after trigger.
+    #[test]
+    fn auto_lazy_grammar_accepts_two_call_production_order() {
+        // ── Gemma 4 variant ─────────────────────────────────────────────────
+        {
+            let reg = match registry::find_for("gemma4-27b-it") {
+                Some(r) => r,
+                None => {
+                    // gemma4 is always registered; defensive skip only.
+                    eprintln!("gemma4 absent; skipping two-call parallel test for Gemma");
+                    return;
+                }
+            };
+            let open = reg.tool_open.expect("gemma4 has tool_open");
+            let close = reg.tool_close.expect("gemma4 has tool_close");
+
+            // Gemma separator between calls is "" (no separator);
+            // inter-call shape is `( open_marker body close_marker )*`.
+            // `ModelRegistration::call_separator` for gemma4 is "".
+            // Gemma4 inter-call: no separator, immediate open marker 2.
+            // parallel_call_separator() == "" for gemma4.
+            // Grammar: `body close gemma4-call* space`
+            //   gemma4-call = open_marker body close
+            // So inter-call bytes are just the open marker.
+
+            let req = req_with_parallel(
+                "gemma4-27b-it",
+                Some(one_scalar_tool("get_weather")),
+                /* parallel */ true,
+            );
+            let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+                .expect("Auto compile must succeed for gemma4 parallel")
+                .expect("Auto must return Some(grammar)");
+
+            let root_id = g.rule_id("root").expect("gemma4 parallel Auto grammar has root");
+            let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+                .expect("GrammarRuntime::new");
+            rt.set_awaiting_trigger(true);
+
+            // Pre-trigger: first open marker — no-op.
+            let pre = rt.accept_bytes(open.as_bytes());
+            assert!(pre, "gemma4 parallel: pre-trigger open marker MUST be no-op");
+            assert!(rt.is_awaiting_trigger());
+
+            // Trigger.
+            rt.trigger();
+            assert!(!rt.is_awaiting_trigger());
+
+            // Post-trigger body 1 — no leading open marker.
+            let body1 = b"call:get_weather{q:<|\"|>SF<|\"|>}";
+            let alive1 = rt.accept_bytes(body1);
+            assert!(
+                alive1,
+                "gemma4 parallel: body1 bytes MUST be accepted by body-only grammar"
+            );
+            assert!(!rt.is_dead());
+
+            // Close marker 1.
+            let alive_c1 = rt.accept_bytes(close.as_bytes());
+            assert!(
+                alive_c1 || rt.is_accepted(),
+                "gemma4 parallel: close1 must be accepted"
+            );
+
+            // Inter-call open marker 2 — Gemma4 has no separator.
+            // This marker IS in the grammar (gemma4-call rule in the `*` repeat).
+            let alive_inter = rt.accept_bytes(open.as_bytes());
+            assert!(
+                alive_inter,
+                "gemma4 parallel: inter-call open marker 2 (`{open}`) MUST be \
+                 accepted — it is in the grammar's inter-call rule (only the \
+                 FIRST open marker is stripped)"
+            );
+            assert!(!rt.is_dead());
+
+            // Body 2 — full call body.
+            let body2 = b"call:get_weather{q:<|\"|>NYC<|\"|>}";
+            let alive2 = rt.accept_bytes(body2);
+            assert!(
+                alive2,
+                "gemma4 parallel: body2 bytes MUST be accepted by inter-call body rule"
+            );
+            assert!(!rt.is_dead());
+
+            // Close marker 2 → grammar should reach is_accepted().
+            let alive_c2 = rt.accept_bytes(close.as_bytes());
+            assert!(
+                alive_c2 || rt.is_accepted(),
+                "gemma4 parallel: close2 must be accepted"
+            );
+            assert!(
+                rt.is_accepted(),
+                "gemma4 parallel: after two complete calls the runtime MUST be \
+                 in accepting state (body-only parallel root = \
+                 `body close (sep open body close)* space`)"
+            );
+            assert!(!rt.is_dead());
+        }
+
+        // ── Qwen35 variant ──────────────────────────────────────────────────
+        {
+            let reg = match registry::find_for("qwen3.5-72b-instruct") {
+                Some(r) => r,
+                None => {
+                    eprintln!("qwen35 absent; skipping two-call parallel test for Qwen35");
+                    return;
+                }
+            };
+            let open = reg.tool_open.expect("qwen35 has tool_open: <tool_call>");
+            let close = reg.tool_close.expect("qwen35 has tool_close: </tool_call>");
+
+            // Qwen35 separator between calls is "\n";
+            // inter-call shape is `( \n <tool_call> \n body \n </tool_call> )*`.
+            let separator = reg.parallel_call_separator();
+
+            let req = req_with_parallel(
+                "qwen3.5-72b-instruct",
+                Some(one_scalar_tool("get_weather")),
+                /* parallel */ true,
+            );
+            let g = compile_tool_grammar(&req, &ToolChoiceValue::Auto)
+                .expect("Auto compile must succeed for qwen35 parallel")
+                .expect("Auto must return Some(grammar)");
+
+            let root_id = g.rule_id("root").expect("qwen35 parallel Auto grammar has root");
+            let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+                .expect("GrammarRuntime::new");
+            rt.set_awaiting_trigger(true);
+
+            // Pre-trigger: first open marker `<tool_call>` — no-op.
+            let pre = rt.accept_bytes(open.as_bytes());
+            assert!(pre, "qwen35 parallel: pre-trigger open marker MUST be no-op");
+            assert!(rt.is_awaiting_trigger());
+
+            // Trigger.
+            rt.trigger();
+            assert!(!rt.is_awaiting_trigger());
+
+            // Post-trigger body 1 — no leading `<tool_call>` and no leading `\n`.
+            // Qwen35 single_body starts at `<function=NAME>` directly.
+            // The outer `\n` between `<tool_call>` and `<function=` is part of
+            // the OneOrMoreCalls wrapper only; absent in OneOrMoreCallsBodyOnly.
+            let body1 = b"<function=get_weather>\n<parameter=q>\nSF\n</parameter>\n</function>";
+            let alive1 = rt.accept_bytes(body1);
+            assert!(
+                alive1,
+                "qwen35 parallel: body1 bytes MUST be accepted by body-only grammar"
+            );
+            assert!(!rt.is_dead());
+
+            // Close marker 1: `\n</tool_call>`.
+            let close1 = format!("\n{close}");
+            let alive_c1 = rt.accept_bytes(close1.as_bytes());
+            assert!(
+                alive_c1 || rt.is_accepted(),
+                "qwen35 parallel: close1 (`\\n{close}`) must be accepted"
+            );
+
+            // Inter-call: `\n<tool_call>\n` — separator `\n` + open marker 2 +
+            // the `\n` that is part of the Qwen35 open-call rule.
+            // Qwen35 inter-call rule: `\n <tool_call> \n body \n </tool_call>`.
+            let inter_call = format!("{separator}{open}\n");
+            let alive_inter = rt.accept_bytes(inter_call.as_bytes());
+            assert!(
+                alive_inter,
+                "qwen35 parallel: inter-call bytes `{inter_call:?}` MUST be \
+                 accepted — the second open marker IS in the grammar's inter-call \
+                 rule (only the FIRST open marker is stripped from the root)"
+            );
+            assert!(!rt.is_dead());
+
+            // Body 2 — no leading `<tool_call>` (it was in the inter-call rule).
+            let body2 =
+                b"<function=get_weather>\n<parameter=q>\nNYC\n</parameter>\n</function>";
+            let alive2 = rt.accept_bytes(body2);
+            assert!(
+                alive2,
+                "qwen35 parallel: body2 bytes MUST be accepted in inter-call body rule"
+            );
+            assert!(!rt.is_dead());
+
+            // Close marker 2: `\n</tool_call>` → should reach is_accepted().
+            let close2 = format!("\n{close}");
+            let alive_c2 = rt.accept_bytes(close2.as_bytes());
+            assert!(
+                alive_c2 || rt.is_accepted(),
+                "qwen35 parallel: close2 must be accepted"
+            );
+            assert!(
+                rt.is_accepted(),
+                "qwen35 parallel: after two complete calls the runtime MUST be \
+                 in accepting state (body-only parallel root = \
+                 `body \\n close (\\n open \\n body \\n close)* space`)"
+            );
+            assert!(!rt.is_dead());
+        }
+    }
+
     /// Build a `ChatCompletionRequest` with `parallel_tool_calls` overridden.
     fn req_with_parallel(
         model: &str,
