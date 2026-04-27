@@ -422,9 +422,21 @@ mod tests {
 
     fn load_gemma4_tokenizer_or_skip() -> Option<tokenizers::Tokenizer> {
         if !std::path::Path::new(GEMMA4_TOKENIZER_PATH).exists() {
+            // Fixture absent — CI without models/gemma4/ skips cleanly.
             return None;
         }
-        tokenizers::Tokenizer::from_file(GEMMA4_TOKENIZER_PATH).ok()
+        // Wave 2.9 W-ι: file exists, so a load failure is a corrupt fixture,
+        // not a missing-env skip. Panic with a diagnostic rather than silently
+        // returning None (which would let the test pass while exercising
+        // nothing — the audit gap "tokenizer fixture load failure").
+        match tokenizers::Tokenizer::from_file(GEMMA4_TOKENIZER_PATH) {
+            Ok(t) => Some(t),
+            Err(e) => panic!(
+                "Tokenizer fixture exists at {} but failed to load: {}\n\
+                 Fix or remove the fixture; do not silence this error.",
+                GEMMA4_TOKENIZER_PATH, e
+            ),
+        }
     }
 
     /// Build the per-vocab byte table for a small id range using the
