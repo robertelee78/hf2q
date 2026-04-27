@@ -938,6 +938,120 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-3w — proves the imatrix calibration path is
+    /// genuinely end-to-end functional through `VariantKQuantizer` +
+    /// `quantize_streaming`: imatrix-weighted quantization produces a
+    /// **different** byte sequence than uncalibrated (`CalibrationData::None`)
+    /// on the same F32 input, while keeping the same block size.
+    ///
+    /// Why this matters: iter-3v's variant-menu smoke used
+    /// `CalibrationData::None` only.  Without an explicit divergence
+    /// gate, a future regression could silently route the imatrix
+    /// path back through the uncalibrated codec (e.g. by passing the
+    /// wrong calibration value down the call stack) and every existing
+    /// test would still pass.  Locking the divergence makes that
+    /// failure mode visible.
+    ///
+    /// Mechanism: the imatrix-weighted `make_qkx3_quants` codebook
+    /// search at `ggml-quants.c:902` minimises the **importance-weighted**
+    /// L2 error, while `make_qkx2_quants` minimises uniform L2.  When
+    /// the importance vector is non-uniform (here: 100× boost on the
+    /// first 16 columns, 0.01× elsewhere), the two searches converge
+    /// to different codebooks → different quantized bytes.
+    #[test]
+    fn variant_imatrix_diverges_from_none_through_streaming() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+        // attn_q at middle layer → never bumps for Q4_K_M, so the codec
+        // hits the Q4_K target on both paths and bytes are directly
+        // comparable.
+        const TENSOR: &str = "blk.5.attn_q.weight";
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        // F32 → F16 input row with realistic spread.
+        let make_f16_payload = |len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![1, QK_K], DType::F16),
+                make_f16_payload(QK_K),
+            ));
+            m
+        };
+
+        // Build calibration: 100× boost first 16 columns, 0.01× rest.
+        let mut col = ImatrixCollector::new();
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|i| if i < 16 { 100.0 } else { 0.01 })
+            .collect();
+        col.accumulate_dense(TENSOR, &acts, 1, QK_K).unwrap();
+        col.record_chunk();
+        let imatrix = CalibrationData::from_imatrix_collector(&col);
+        // sanity: the calibration carries entries
+        assert!(imatrix.is_some(), "imatrix should be populated");
+
+        // Run the SAME input through BOTH paths.
+        let q_none = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let q_imatrix = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            imatrix,
+            N_LAYERS,
+        );
+
+        let out_none = quantize_streaming(
+            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
+        )
+        .unwrap();
+        let out_imatrix = quantize_streaming(
+            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
+        )
+        .unwrap();
+
+        let t_none = out_none.tensors.get(TENSOR).expect("none-path missing");
+        let t_imatrix = out_imatrix.tensors.get(TENSOR).expect("imatrix-path missing");
+
+        // Both produce Q4_K blocks (same target, same size).
+        assert_eq!(t_none.data.len(), 144,
+            "none path should emit one Q4_K block");
+        assert_eq!(t_imatrix.data.len(), 144,
+            "imatrix path should emit one Q4_K block");
+        assert_eq!(
+            t_none.quant_info.ggml_type.as_deref(),
+            t_imatrix.quant_info.ggml_type.as_deref(),
+            "ggml_type tag should match"
+        );
+
+        // The divergence gate: bytes MUST differ.  If they're equal,
+        // the imatrix calibration is silently being ignored.
+        assert_ne!(
+            t_none.data, t_imatrix.data,
+            "imatrix-weighted Q4_K bytes must differ from uncalibrated \
+             Q4_K bytes when the importance vector is non-uniform — \
+             otherwise the calibration plumbing is broken"
+        );
+    }
+
     /// ADR-014 P7 iter-3v — every `KQuantVariant` in `all()` produces
     /// non-empty quantized output through the streaming pipeline with
     /// the correct ggml_type tag and block-size byte count for the
