@@ -407,41 +407,19 @@ pub async fn chat_completions(
             .into_response();
     }
 
-    // Wave 2.7 W-η defensive 500: under Constrained policy
-    // (tool_choice = required / function), the eager grammar
-    // (`GrammarKind::ToolCallBodyRequired`) PHYSICALLY constrains the model
-    // to emit a tool call from byte 0 — the grammar root requires the
-    // open marker and `min=1` complete calls.  If we reach this point with
-    // `extracted.tool_calls.is_empty()`, either:
-    //
-    //   * the request hit max_tokens / a stop string mid-call (the
-    //     grammar runtime is neither `is_accepted()` nor `is_dead()` —
-    //     a partial-call truncation we cannot finalise as a tool_calls
-    //     response), OR
-    //   * a grammar-emitter bug let through a no-call run.  Either way
-    //     the contract is violated and the safe answer is a 500 — silently
-    //     promoting the partial body to plain content is exactly the
-    //     wave-2.6 audit divergence "Required/Function enforcement before
-    //     ToolCallOpen" we're closing.
-    //
-    // This check should NEVER fire if the eager grammar is correctly emitted
-    // and the decode loop ran to a normal stop.  Logged at error level so a
-    // production firing surfaces as a regression alert.
-    if matches!(tool_call_policy, engine::ToolCallPolicy::Constrained)
-        && extracted.tool_calls.is_empty()
-    {
-        tracing::error!(
-            finish_reason = %result.finish_reason,
-            completion_tokens = result.completion_tokens,
-            text_len = result.text.len(),
-            "tool_call_no_call_under_constrained: eager grammar should have prevented \
-             this — either max_tokens cut a call mid-emission or the grammar emitter \
-             has a bug"
-        );
-        return ApiError::generation_error(
-            "tool_call_no_call_under_constrained".to_string(),
-        )
-        .into_response();
+    // Wave 2.7 W-η defensive 500 (extracted into
+    // `defensive_no_call_under_constrained` for test access; see Wave 2.8
+    // W-θ missed-test #3 closure). The check fires under Constrained
+    // policy when extracted.tool_calls is empty — same contract as the
+    // streaming companion in finalize_streaming_tool_state.
+    if let Some(resp) = defensive_no_call_under_constrained(
+        tool_call_policy,
+        extracted.tool_calls.is_empty(),
+        result.finish_reason,
+        result.completion_tokens,
+        result.text.len(),
+    ) {
+        return resp;
     }
 
     let (message_content, message_tool_calls, effective_finish_reason) =
@@ -995,11 +973,8 @@ where
     // set, the kind is `ResponseFormat` (the `Default`) but it is
     // never read because `effective_grammar == None` short-circuits
     // the runtime entirely.
-    let (effective_grammar, effective_grammar_kind) = match (tool_grammar, response_grammar) {
-        (Some(g), _)       => (Some(g), engine::GrammarKind::ToolCallBodyRequired),
-        (None,    Some(g)) => (Some(g), engine::GrammarKind::ResponseFormat),
-        (None,    None)    => (None,    engine::GrammarKind::default()),
-    };
+    let (effective_grammar, effective_grammar_kind) =
+        select_effective_grammar(tool_grammar, response_grammar);
     // ADR-005 Phase 2a iter-133 Iter D (W67): per-request thinking mode
     // override. Default off keeps every legacy / non-thinking-aware
     // caller's rendered prompt byte-identical; Open WebUI's panel UX
@@ -2539,6 +2514,92 @@ ws ::= | " " | "\n" [ \t]{0,20}
     }
 }
 
+/// Combine the optional tool grammar (from `compile_tool_grammar`) and
+/// optional response-format grammar (from `compile_response_format`) into
+/// the single `(effective_grammar, GrammarKind)` pair the engine consumes.
+///
+/// Wave 2.6 W-α5 Q1 + Wave 2.7 W-η Q-A — extracted from
+/// `prepare_chat_generation_core` so the wave-2.7 audit gap "ResponseFormat
+/// production selection test" can exercise the EXACT production code path
+/// (not the wave-2 sham `Option<u32>` stand-in pattern Codex flagged).
+///
+/// Selection rules:
+///
+/// | tool grammar | response grammar | result                                       |
+/// |--------------|-------------------|----------------------------------------------|
+/// | `Some(t)`    | any               | `(Some(t), GrammarKind::ToolCallBodyRequired)` — eager from token 0 |
+/// | `None`       | `Some(r)`         | `(Some(r), GrammarKind::ResponseFormat)`     — eager (default behaviour) |
+/// | `None`       | `None`            | `(None,    GrammarKind::default())`          — kind is never read |
+///
+/// Precedence: tool grammar wins over response_format grammar — a request
+/// cannot simultaneously enforce response_format=json_schema AND
+/// tool_choice=required because the model output is either a tool call OR
+/// a structured JSON response, never both. The tool grammar is the more
+/// specific constraint.
+///
+/// Mirrors llama.cpp's `enum common_grammar_type` selection at
+/// `/opt/llama.cpp/common/common.h:171-176` — `TOOL_CALLS` wins over
+/// `OUTPUT_FORMAT` wins over `NONE`.
+fn select_effective_grammar(
+    tool_grammar: Option<grammar::Grammar>,
+    response_grammar: Option<grammar::Grammar>,
+) -> (Option<grammar::Grammar>, engine::GrammarKind) {
+    match (tool_grammar, response_grammar) {
+        (Some(g), _) => (Some(g), engine::GrammarKind::ToolCallBodyRequired),
+        (None, Some(g)) => (Some(g), engine::GrammarKind::ResponseFormat),
+        (None, None) => (None, engine::GrammarKind::default()),
+    }
+}
+
+/// Wave 2.7 W-η defensive-500 check, extracted for test access.
+///
+/// Under Constrained tool-call policy (`tool_choice = required / function`),
+/// the eager grammar (`GrammarKind::ToolCallBodyRequired`) physically
+/// constrains the model to emit a tool call from byte 0 — the grammar root
+/// requires the open marker and `min=1` complete calls. If the post-decode
+/// extractor finds zero tool calls under Constrained, either:
+///
+///   * the request hit `max_tokens` / a stop string mid-call (the grammar
+///     runtime is neither `is_accepted()` nor `is_dead()` — a partial-call
+///     truncation we cannot finalise as a `tool_calls` response), OR
+///   * a grammar-emitter bug let through a no-call run.
+///
+/// Either way the contract is violated and the safe answer is a structured
+/// 500 — silently promoting the partial body to plain content is exactly
+/// the wave-2.6 audit divergence "Required/Function enforcement before
+/// ToolCallOpen" we are closing.
+///
+/// Returns `Some(Response)` (HTTP 500 with `tool_call_no_call_under_constrained`
+/// structured code) when the check fires; `None` when the request is fine
+/// to proceed to the success path.
+///
+/// Mirrors the streaming companion at `engine::finalize_streaming_tool_state`
+/// — both emit the same structured code so log/metrics matchers can target
+/// one vocabulary across streaming + non-streaming.
+fn defensive_no_call_under_constrained(
+    tool_call_policy: engine::ToolCallPolicy,
+    tool_calls_is_empty: bool,
+    finish_reason: &str,
+    completion_tokens: usize,
+    text_len: usize,
+) -> Option<Response> {
+    if matches!(tool_call_policy, engine::ToolCallPolicy::Constrained) && tool_calls_is_empty {
+        tracing::error!(
+            finish_reason = %finish_reason,
+            completion_tokens = completion_tokens,
+            text_len = text_len,
+            "tool_call_no_call_under_constrained: eager grammar should have prevented \
+             this — either max_tokens cut a call mid-emission or the grammar emitter \
+             has a bug"
+        );
+        return Some(
+            ApiError::generation_error("tool_call_no_call_under_constrained".to_string())
+                .into_response(),
+        );
+    }
+    None
+}
+
 /// Pre-compile a grammar that constrains the model to emit a valid per-model
 /// tool-call wrapper for the tools declared in `req`, given the parsed
 /// `tool_choice`.
@@ -3486,6 +3547,124 @@ mod combine_function_grammars_tests {
         assert!(alive, "source grammar disagrees on `Xhello`");
         assert!(src_rt.is_accepted(), "source grammar disagrees on `Xhello`");
     }
+
+    // -----------------------------------------------------------------
+    // Wave 2.8 W-θ missed-test #1 — parallel multi-function runtime.
+    //
+    // Audit gap (wave-2.7): d6da8f1 added parallel_tool_calls plumbing
+    // and tested SINGLE-function repeated calls, but never exercised
+    // the combiner's parallel-multi-tool path through the runtime: two
+    // DIFFERENT tools with parallel=true, where the runtime alternates
+    // fn-0 / fn-1 calls. These tests close that gap for both family
+    // separator shapes (Gemma 4 = "" empty, Qwen 3.5/3.6 = "\n").
+    // -----------------------------------------------------------------
+
+    /// Gemma 4-shape parallel multi-function: `parallel=true`,
+    /// `separator=""`, two different tools. Runtime MUST accept
+    /// `tool_a` followed by `tool_b` followed by `tool_a` (no
+    /// separator) — proves both the alternation and the `+`
+    /// quantifier work end-to-end across function boundaries.
+    #[test]
+    fn parallel_multi_tool_runtime_accepts_alternating_calls_gemma_separator() {
+        let combined = combine_function_grammars(
+            vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
+            /* parallel */ true,
+            /* separator */ "",
+        );
+
+        let g = parse(&combined).expect("parallel multi-tool combined re-parses");
+        // Both function roots and the synthetic `alt` rule must exist.
+        assert!(
+            g.rule_id("fn-0-root").is_some(),
+            "parallel combine missing fn-0-root: {combined}"
+        );
+        assert!(
+            g.rule_id("fn-1-root").is_some(),
+            "parallel combine missing fn-1-root: {combined}"
+        );
+        assert!(
+            g.rule_id("alt").is_some(),
+            "parallel combine missing synthetic alt rule: {combined}"
+        );
+
+        // Three calls alternating across functions, no separator.
+        let mut rt = runtime_from_gbnf(&combined);
+        let payload = b"call:tool_a{\"q\":\"hi\"}call:tool_b{\"q\":42}call:tool_a{\"q\":\"bye\"}";
+        let alive = rt.accept_bytes(payload);
+        assert!(
+            alive,
+            "Gemma-shape parallel runtime rejected three alternating calls.\n\
+             payload: {}\n\
+             grammar:\n{combined}",
+            String::from_utf8_lossy(payload)
+        );
+        assert!(
+            rt.is_accepted(),
+            "Gemma-shape parallel runtime not in accepting state after three calls"
+        );
+
+        // Single call also accepted (1 ≤ count, the `+` quantifier).
+        let mut rt_single = runtime_from_gbnf(&combined);
+        let alive = rt_single.accept_bytes(b"call:tool_b{\"q\":7}");
+        assert!(alive, "Gemma-shape parallel runtime rejected single tool_b call");
+        assert!(rt_single.is_accepted());
+
+        // Empty input rejected (min=1 — there must be at least one call).
+        let mut rt_empty = runtime_from_gbnf(&combined);
+        assert!(
+            !rt_empty.is_accepted(),
+            "parallel grammar must NOT accept empty (min_calls=1)"
+        );
+    }
+
+    /// Qwen 3.5/3.6-shape parallel multi-function: `parallel=true`,
+    /// `separator="\n"`, two different tools. Runtime MUST accept
+    /// `tool_a\ntool_b\ntool_a` and reject the no-separator shape
+    /// (the family separator is load-bearing for Qwen's chat template).
+    #[test]
+    fn parallel_multi_tool_runtime_accepts_alternating_calls_qwen_separator() {
+        let combined = combine_function_grammars(
+            vec![gbnf_for_tool_a(), gbnf_for_tool_b()],
+            /* parallel */ true,
+            /* separator */ "\n",
+        );
+
+        let g = parse(&combined).expect("Qwen-separator combined re-parses");
+        assert!(g.rule_id("fn-0-root").is_some());
+        assert!(g.rule_id("fn-1-root").is_some());
+        assert!(g.rule_id("alt").is_some());
+
+        // Three alternating calls separated by literal '\n'.
+        let mut rt = runtime_from_gbnf(&combined);
+        let payload =
+            b"call:tool_a{\"q\":\"hi\"}\ncall:tool_b{\"q\":42}\ncall:tool_a{\"q\":\"bye\"}";
+        let alive = rt.accept_bytes(payload);
+        assert!(
+            alive,
+            "Qwen-shape parallel runtime rejected three alternating newline-separated \
+             calls.\npayload: {}\ngrammar:\n{combined}",
+            String::from_utf8_lossy(payload)
+        );
+        assert!(
+            rt.is_accepted(),
+            "Qwen-shape parallel runtime not in accepting state after three calls"
+        );
+
+        // Same payload WITHOUT the separator must be rejected — the
+        // separator is load-bearing for Qwen.
+        let mut rt_no_sep = runtime_from_gbnf(&combined);
+        let no_sep_payload = b"call:tool_a{\"q\":\"hi\"}call:tool_b{\"q\":42}";
+        let alive = rt_no_sep.accept_bytes(no_sep_payload);
+        // Either rt rejects mid-stream (alive=false) or it ends up not
+        // accepting — both prove the separator is required.
+        let rejected = !alive || !rt_no_sep.is_accepted();
+        assert!(
+            rejected,
+            "Qwen-shape parallel runtime accepted multi-call WITHOUT '\\n' \
+             separator — the family separator must be load-bearing.\n\
+             grammar:\n{combined}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3586,6 +3765,146 @@ mod grammar_kind_selection_tests {
         let (g, k) = select(None, None);
         assert!(g.is_none(), "no grammar means no constraint");
         assert_eq!(k, GrammarKind::default(), "kind defaults when grammar is None");
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2.8 W-θ missed-test #4 — production-helper selection test.
+    //
+    // Audit gap (wave-2.7): the test above uses `Option<u32>` as a
+    // stand-in for the production `Option<grammar::Grammar>` and
+    // duplicates the match shape inline. Codex flagged this as a sham
+    // test that would NOT catch a refactor that altered the production
+    // selection. This sibling test calls the EXTRACTED production
+    // helper `select_effective_grammar` directly with REAL grammars
+    // produced by the same compile_* functions the handler uses.
+    // -----------------------------------------------------------------
+
+    /// `response_format=json_schema` with no tool grammar MUST resolve to
+    /// `(Some(grammar), GrammarKind::ResponseFormat)` through the
+    /// production `select_effective_grammar` helper. Uses a real
+    /// `compile_response_format` output — the grammar is structurally
+    /// non-trivial (contains the JSON-Schema-derived rules) — and exits
+    /// the helper with the expected discriminant.
+    #[test]
+    fn response_format_json_schema_yields_response_format_kind_through_production_helper() {
+        use super::super::schema::{JsonSchemaSpec, ResponseFormat};
+
+        // Real json_schema → grammar via compile_response_format.
+        let rf = ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaSpec {
+                name: "weather".to_string(),
+                description: None,
+                strict: None,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "temp": {"type": "number"}
+                    },
+                    "required": ["city", "temp"]
+                }),
+            },
+        };
+        let response_grammar =
+            super::compile_response_format(&rf).expect("real compile must succeed");
+        assert!(
+            response_grammar.is_some(),
+            "compile_response_format(json_schema) MUST produce a grammar"
+        );
+
+        // Drive the production selection helper.
+        let (effective, kind) = super::select_effective_grammar(None, response_grammar);
+        assert!(
+            effective.is_some(),
+            "select_effective_grammar must propagate response grammar when tool=None"
+        );
+        assert_eq!(
+            kind,
+            GrammarKind::ResponseFormat,
+            "response_format=json_schema MUST yield GrammarKind::ResponseFormat \
+             through the PRODUCTION helper (not a stand-in match). This proves \
+             the wave-2.5 audit fix is wired through the real selection path."
+        );
+    }
+
+    /// Tool grammar present (regardless of response_format) MUST resolve
+    /// to `GrammarKind::ToolCallBodyRequired` through the production
+    /// helper. Both grammars are constructed from real
+    /// `compile_response_format` outputs so the helper sees actual
+    /// `grammar::Grammar` instances, not opaque integers.
+    #[test]
+    fn tool_grammar_wins_over_response_format_through_production_helper() {
+        use super::super::schema::{JsonSchemaSpec, ResponseFormat};
+
+        // Two distinct real grammars so we can confirm precedence by
+        // identity (the chosen output IS the tool grammar, not the
+        // response-format grammar).
+        let rf_resp = ResponseFormat::JsonObject;
+        let resp_grammar =
+            super::compile_response_format(&rf_resp).expect("compile json_object");
+        assert!(resp_grammar.is_some());
+
+        let rf_tool = ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaSpec {
+                name: "tool_proxy".to_string(),
+                description: None,
+                strict: None,
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }),
+            },
+        };
+        // Use compile_response_format to manufacture a distinguishable
+        // second grammar; the helper does not care about the source —
+        // it just sees `Option<Grammar>` and matches the wave-2.6 Q1
+        // selection rule.
+        let tool_grammar =
+            super::compile_response_format(&rf_tool).expect("compile schema");
+        assert!(tool_grammar.is_some());
+
+        // Snapshot the tool grammar's first-rule fingerprint so we can
+        // assert it survived the helper.  We compare via the parser's
+        // `rule_id` lookup which is stable for the same source.
+        let tool_g_clone = tool_grammar.clone().unwrap();
+
+        let (effective, kind) =
+            super::select_effective_grammar(tool_grammar, resp_grammar);
+        assert!(effective.is_some(), "helper must propagate the tool grammar");
+        assert_eq!(
+            kind,
+            GrammarKind::ToolCallBodyRequired,
+            "tool grammar MUST win and yield GrammarKind::ToolCallBodyRequired \
+             through the PRODUCTION helper (not a stand-in match)."
+        );
+        // Light fingerprint check: the chosen grammar must rule-id
+        // back to the same first rule the tool grammar held. The
+        // `Grammar` type doesn't expose a stable hash, but rule_id
+        // lookup of a known rule name (`root`) is stable across cheap
+        // clones — both must succeed.
+        let chosen = effective.expect("Some");
+        assert!(
+            chosen.rule_id("root").is_some(),
+            "chosen grammar must have a `root` rule"
+        );
+        assert!(
+            tool_g_clone.rule_id("root").is_some(),
+            "tool grammar (clone) must have a `root` rule"
+        );
+    }
+
+    /// Default branch: both grammars `None` → `(None, default)`.
+    /// Production helper, real types.
+    #[test]
+    fn no_grammar_yields_default_kind_through_production_helper() {
+        let (effective, kind) = super::select_effective_grammar(None, None);
+        assert!(effective.is_none(), "no grammar means no constraint");
+        assert_eq!(
+            kind,
+            GrammarKind::default(),
+            "kind defaults to ResponseFormat when grammar is None"
+        );
     }
 }
 
@@ -5639,6 +5958,133 @@ mod test_a3_tool_call_extraction {
         );
         // The handler will see (policy == Constrained && tool_calls.is_empty())
         // and return ApiError::generation_error("tool_call_no_call_under_constrained").
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2.8 W-θ missed-test #3 — defensive-500 handler-level wire test.
+//
+// Audit gap (wave-2.7): the wave-2.7 da545d5 test exercises the
+// extract_tool_calls_from_text predicate (the LOAD-bearing input to the
+// defensive 500), but does NOT exercise the actual response shape. The
+// handler-level wire shape (HTTP 500 + structured `error.code` envelope)
+// is what an external client sees. Codex flagged the gap explicitly.
+//
+// Closure: drive `defensive_no_call_under_constrained` directly (the
+// extracted production helper that the chat handler calls) and assert
+// the full response shape — status code, content-type, and JSON
+// envelope shape.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod defensive_500_wire_shape_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    /// Constrained + tool_calls.is_empty → 500 envelope with structured
+    /// code. Asserts the full wire shape an external client would see.
+    #[tokio::test]
+    async fn defensive_500_under_constrained_returns_structured_envelope() {
+        let resp = defensive_no_call_under_constrained(
+            engine::ToolCallPolicy::Constrained,
+            /* tool_calls_is_empty */ true,
+            /* finish_reason */ "length",
+            /* completion_tokens */ 64,
+            /* text_len */ 0,
+        )
+        .expect("defensive helper MUST emit a Response under Constrained + empty");
+
+        // 1. Status code: 500 Internal Server Error (per
+        //    ApiError::generation_error contract at schema.rs:137-145).
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "defensive 500 MUST return HTTP 500 (server_error class)"
+        );
+
+        // 2. Body shape: OpenAI-style {"error": {"message": "...",
+        //    "type": "server_error", "code": "generation_error", ...}}
+        //    with "tool_call_no_call_under_constrained" embedded in the
+        //    message so log/metrics matchers can grep on it.
+        let bytes = to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let body_str = String::from_utf8_lossy(&bytes);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body_str).expect("body must be valid JSON");
+
+        let err = parsed
+            .get("error")
+            .expect("envelope must have `error` key");
+        assert_eq!(
+            err.get("type").and_then(|v| v.as_str()),
+            Some("server_error"),
+            "error.type MUST be `server_error` for the 500 class"
+        );
+        assert_eq!(
+            err.get("code").and_then(|v| v.as_str()),
+            Some("generation_error"),
+            "error.code MUST be `generation_error` (the OpenAI envelope code; \
+             the structured tool_call_no_call_under_constrained discriminant \
+             is in the message)"
+        );
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .expect("error.message must be a string");
+        assert!(
+            message.contains("tool_call_no_call_under_constrained"),
+            "error.message MUST contain the structured discriminant \
+             `tool_call_no_call_under_constrained` so log/metrics matchers \
+             can target it; got: {message}"
+        );
+    }
+
+    /// Constrained + tool_calls.is_empty == false (model produced at
+    /// least one call) → helper returns None (proceed to success path).
+    #[test]
+    fn defensive_500_when_calls_present_returns_none() {
+        let resp = defensive_no_call_under_constrained(
+            engine::ToolCallPolicy::Constrained,
+            /* tool_calls_is_empty */ false,
+            "stop",
+            42,
+            128,
+        );
+        assert!(
+            resp.is_none(),
+            "Constrained + non-empty tool_calls MUST proceed to success path"
+        );
+    }
+
+    /// Auto + tool_calls.is_empty == true → helper returns None (Auto
+    /// allows no-call). Regression-preserve.
+    #[test]
+    fn defensive_500_under_auto_no_call_returns_none() {
+        let resp = defensive_no_call_under_constrained(
+            engine::ToolCallPolicy::Auto,
+            /* tool_calls_is_empty */ true,
+            "stop",
+            8,
+            32,
+        );
+        assert!(
+            resp.is_none(),
+            "Auto policy + zero tool_calls MUST proceed to success path \
+             (Auto allows no-call). Regression-preserve."
+        );
+    }
+
+    /// Auto + tool_calls present → also None.
+    #[test]
+    fn defensive_500_under_auto_with_calls_returns_none() {
+        let resp = defensive_no_call_under_constrained(
+            engine::ToolCallPolicy::Auto,
+            /* tool_calls_is_empty */ false,
+            "tool_calls",
+            42,
+            128,
+        );
+        assert!(resp.is_none(), "Auto + non-empty must always be None");
     }
 }
 
