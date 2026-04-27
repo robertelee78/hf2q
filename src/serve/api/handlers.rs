@@ -429,9 +429,9 @@ pub async fn chat_completions(
 ///   - `X-HF2Q-Overflow-Policy` — the policy the server applied for THIS
 ///     request (request's override if present, else the server default).
 ///   - `X-HF2Q-Summarized-Messages` — count of messages that were replaced
-///     by a synthetic summary (Decision #23 summarize path; when the
-///     summarization path is wired in a later iter, handlers set this to
-///     the count).
+///     by a synthetic summary (Decision #23 summarize path; handlers set
+///     this to the count produced by `apply_summarize`, which is live as
+///     of iter-211 / wave-1 fixup — Codex wave-1.5 item 5).
 ///   - `X-HF2Q-Summary-Tokens` — token count of the synthetic summary.
 ///
 /// Present on EVERY chat-completion response so clients don't have to
@@ -1702,14 +1702,15 @@ mod truncate_tests {
 /// | yes (bad URL)  | either        | Err(400 invalid_request on that part).     |
 ///
 /// Returns the preprocessed image tensors in message order. Empty vec when
-/// the request is text-only. The caller is responsible for deciding what
-/// to do with a non-empty vec: until the ViT forward pass lands (Task #15),
-/// the handler short-circuits with a 501.
+/// the request is text-only. The caller passes the non-empty vec to
+/// `Engine::generate_with_soft_tokens` (iter-211 / wave-1) — the ViT
+/// forward pass + LM forward are live end-to-end as of iter-211 W79
+/// (commit d5fe985; AC 5466/5467 closed). The prior 501 short-circuit
+/// was removed in the same iter.
 ///
 /// Per mantra ("no stubs"): we refuse to silently strip images from a
-/// request that supplied them, and we refuse to claim the ViT forward
-/// pass is ready when it isn't. The preprocessing stage IS done for real
-/// so the request exercises the full load→decode→normalize→CHW pipeline.
+/// request that supplied them. The preprocessing stage runs the full
+/// load→decode→normalize→CHW pipeline before the ViT forward.
 fn process_multimodal_content(
     messages: &[super::schema::ChatMessage],
     mmproj: Option<&super::state::LoadedMmproj>,
