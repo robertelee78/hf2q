@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use crate::inference::models::qwen35::activation_capture::MockActivationCapture;
     use crate::ir::{DType, TensorRef};
-    use crate::quantize::dwq::DwqArch;
+    use crate::calibrate::dwq::DwqArch;
 
     fn tiny_metadata(num_layers: u32, hidden_size: u32) -> ModelMetadata {
         ModelMetadata {

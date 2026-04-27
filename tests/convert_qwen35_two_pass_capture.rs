@@ -16,7 +16,7 @@
 //! Step 2 is the load-bearing roundtrip. Test (1) is covered by
 //! `backends::gguf::tests::test_emit_gguf_from_tensor_map_smoke`.
 //! Test (3) with **mock** activations is covered by 6 unit tests in
-//! `quantize::dwq_activation::tests`.
+//! `calibrate::dwq_activation::tests`.
 //!
 //! This test fills the remaining gap: step (3) with the **real**
 //! `Qwen35Model::run_calibration_prompt` forward pass driving the

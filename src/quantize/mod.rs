@@ -4,20 +4,19 @@
 //! Sub-modules:
 //! - `static_quant`: f16, q8, q4, q2 round-to-nearest
 //! - `mixed`: Mixed-bit with --sensitive-layers
-//! - `dwq`: DWQ calibration via InferenceRunner
+//!
+//! ADR-014 P7 iter-8: `dwq`, `dwq_activation`, `sensitivity`, and `apex`
+//! migrated to [`crate::calibrate`] (Layout A) — calibrators belong with
+//! their orchestration shell, not with the static quantizer hierarchy.
 
-pub mod apex;
-pub mod dwq;
 pub mod k_quant;
 pub mod k_quant_codec;
 pub mod k_quant_codec_quantizer;
 pub mod layer_mix;
 pub mod q_legacy;
 pub mod variant_quantizer;
-pub mod dwq_activation;
 pub mod intermediate_moe_q8;
 pub mod mixed;
-pub mod sensitivity;
 pub mod static_quant;
 
 use thiserror::Error;

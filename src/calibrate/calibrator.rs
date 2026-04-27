@@ -121,7 +121,7 @@ pub enum CalibrationData {
 
     /// DWQ sensitivity scores — per-layer scalar importance that
     /// drives the bit-pair allocation in
-    /// [`crate::quantize::dwq::DwqQuantizer`]. Each entry's `Vec<f32>`
+    /// [`crate::calibrate::dwq::DwqQuantizer`]. Each entry's `Vec<f32>`
     /// is a single value (the layer's sensitivity score) wrapped for
     /// uniform shape with the imatrix variant.
     Dwq(HashMap<String, Vec<f32>>),

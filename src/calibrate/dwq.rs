@@ -687,7 +687,7 @@ mod tests {
         use crate::inference::models::qwen35::activation_capture::{
             ActivationCapture, MockActivationCapture,
         };
-        use crate::quantize::sensitivity::compute_layer_sensitivity;
+        use crate::calibrate::sensitivity::compute_layer_sensitivity;
 
         let mut mock = MockActivationCapture::new(4, 8);
         let tokens = vec![42u32, 100, 7, 255];

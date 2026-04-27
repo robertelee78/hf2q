@@ -243,6 +243,55 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
     }
 }
 
+/// Select the [`Calibrator`] impl for a given `--quant` variant
+/// (ADR-014 P7 iter-8 minimal dispatch).
+///
+/// This is the seam P2 iter-2 will pull on for the full
+/// `(Calibrator, OutputFormat)` cmd_convert restructure. For now, the
+/// helper returns a `Box<dyn Calibrator>` that downstream code logs
+/// (via `tracing::info!`) and otherwise leaves the existing
+/// `DwqQuantizer` / `KQuantCodecQuantizer` / `VariantKQuantizer`
+/// dispatch unchanged.
+///
+/// Mapping:
+/// * [`cli::QuantMethod::DwqMixed46`] / `DwqMixed48` / `DwqMixed68` /
+///   `DwqMixed28` → [`calibrate::dwq_calibrator::DwqCalibrator`].
+/// * Every other variant — including [`cli::QuantMethod::Apex`] (which
+///   uses its own pipeline) and the imatrix-Q4_K_M variants (which
+///   land in P8 once the CLI variant strings exist) — →
+///   [`calibrate::calibrator::NoneCalibrator`].
+///
+/// `dwq_arch` is the routing decision driving
+/// [`calibrate::dwq_calibrator::DwqCalibrator::requires_forward_pass`].
+/// `capture` is the runtime-supplied `ActivationCapture` (None when
+/// the dispatch hasn't yet attached a real capture — the helper
+/// surfaces a typed error at calibrate-time, never silently falls
+/// back).
+fn select_calibrator(
+    method: cli::QuantMethod,
+    dwq_arch: calibrate::dwq::DwqArch,
+    capture: Option<Box<dyn crate::inference::models::qwen35::activation_capture::ActivationCapture + Send + Sync>>,
+    base_bits: u8,
+    sensitive_bits: u8,
+    calibration_samples: u32,
+) -> Box<dyn calibrate::calibrator::Calibrator> {
+    use cli::QuantMethod::*;
+    match method {
+        DwqMixed46 | DwqMixed48 | DwqMixed68 | DwqMixed28 => {
+            Box::new(calibrate::dwq_calibrator::DwqCalibrator::new(
+                dwq_arch,
+                capture,
+                base_bits,
+                sensitive_bits,
+                calibration_samples,
+            ))
+        }
+        Auto | F16 | Q8 | Q4 | Q2 | Mixed26 | Mixed36 | Mixed46 | Apex => {
+            Box::new(calibrate::calibrator::NoneCalibrator::new())
+        }
+    }
+}
+
 /// Handle the `convert` subcommand.
 fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use backends::gguf::GgufBackend;
@@ -286,6 +335,41 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
             config.input_dir.display()
         )));
     };
+
+    // ADR-014 P7 iter-8 — Calibrator dispatch seam.
+    //
+    // `select_calibrator` returns a `Box<dyn Calibrator>` based on the
+    // `--quant` variant. This iter logs the selection but leaves the
+    // existing `DwqQuantizer` / `KQuantCodecQuantizer` /
+    // `VariantKQuantizer` dispatch unchanged — the full
+    // `(Calibrator, OutputFormat)` restructure is P2 iter-2 (separate
+    // task; do not preempt). The seam exists so that future iter can
+    // pull on it without re-deriving the variant → calibrator map.
+    {
+        let dwq_arch = calibrate::dwq::DwqArch::from_hf_architecture(
+            &metadata.architecture,
+            metadata.is_moe(),
+        );
+        let (base_bits, sensitive_bits) = config
+            .quant
+            .dwq_bit_pair()
+            .unwrap_or((4, 6));
+        let calibrator = select_calibrator(
+            config.quant,
+            dwq_arch,
+            None, // capture is attached at the live DWQ dispatch site below
+            base_bits,
+            sensitive_bits,
+            config.calibration_samples,
+        );
+        tracing::info!(
+            calibrator = %calibrator.name(),
+            requires_forward_pass = calibrator.requires_forward_pass(),
+            quant = %config.quant,
+            arch = ?dwq_arch,
+            "selected calibrator"
+        );
+    }
 
     // Phase 0.25: Initialize RuVector
     let mut ruvector_db = match RuVectorDb::open_default() {
@@ -890,12 +974,12 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
                 // Resolve the DWQ architecture for routing (ADR-012 Decision 13).
                 // qwen35 / qwen35moe MUST use ActivationCapture — no weight-space fallback.
-                let dwq_arch = quantize::dwq::DwqArch::from_hf_architecture(
+                let dwq_arch = calibrate::dwq::DwqArch::from_hf_architecture(
                     &metadata.architecture,
                     metadata.is_moe(),
                 );
 
-                let dwq_config = quantize::dwq::DwqConfig {
+                let dwq_config = calibrate::dwq::DwqConfig {
                     calibration_samples: config.calibration_samples,
                     sensitive_layers: config.sensitive_layers.clone(),
                     group_size: config.group_size,
@@ -903,10 +987,10 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     sensitive_bits,
                     use_activations: has_tokenizer,
                     arch: dwq_arch,
-                    ..quantize::dwq::DwqConfig::default()
+                    ..calibrate::dwq::DwqConfig::default()
                 };
 
-                let dwq_quantizer = quantize::dwq::DwqQuantizer::new(dwq_config.clone())
+                let dwq_quantizer = calibrate::dwq::DwqQuantizer::new(dwq_config.clone())
                     .context("Failed to create DWQ quantizer")
                     .map_err(AppError::Conversion)?;
                 tracing::info!(
@@ -999,7 +1083,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                         "ADR-012 P9b: capturing activations from intermediate F16 GGUF"
                     );
                     let derived_sensitive_ranges =
-                        quantize::dwq_activation::capture_activations_to_sensitive_ranges(
+                        calibrate::dwq_activation::capture_activations_to_sensitive_ranges(
                             &metadata,
                             &dwq_config,
                             &mut capture,
@@ -1138,7 +1222,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                         "ADR-012 P9b: running DWQ scale calibration with {} activation-derived sensitive layer ranges",
                         derived_sensitive_ranges.len()
                     );
-                    let model = quantize::dwq_activation::run_dwq_with_sensitive_ranges(
+                    let model = calibrate::dwq_activation::run_dwq_with_sensitive_ranges(
                         &tensor_map_re,
                         &metadata,
                         &dwq_config,
@@ -1155,7 +1239,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                     tracing::info!(
                         "Using DWQ weight-space calibration (non-qwen35 arch)"
                     );
-                    quantize::dwq::run_dwq_calibration(
+                    calibrate::dwq::run_dwq_calibration(
                         &tensor_map,
                         &metadata,
                         &dwq_config,
@@ -1166,14 +1250,14 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
                 }
             }
             cli::QuantMethod::Apex => {
-                let apex_config = quantize::apex::ApexConfig {
+                let apex_config = calibrate::apex::ApexConfig {
                     calibration_tokens: config.calibration_samples as usize,
                     target_bpw: args.target_bpw,
                     min_type: "Q3_K_S".to_string(),
                     max_type: "Q6_K".to_string(),
                 };
 
-                quantize::apex::run_apex_quantization(
+                calibrate::apex::run_apex_quantization(
                     &tensor_map,
                     &metadata,
                     &config.input_dir,

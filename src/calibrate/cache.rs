@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Pinned version string for the sensitivity computation algorithm.
-/// Bump when [`crate::quantize::sensitivity::compute_layer_sensitivity`]
+/// Bump when [`crate::calibrate::sensitivity::compute_layer_sensitivity`]
 /// or any of its inputs (variance/max-magnitude formula, prefilter
 /// rules, layer enumeration order) changes — the bump invalidates
 /// every previously-cached entry by changing the key derivation.
@@ -160,7 +160,7 @@ pub struct SensitivityCacheEntry {
     pub corpus_sha: String,
 
     /// Per-layer sensitivity vector. Mirrors the public shape of
-    /// [`crate::quantize::sensitivity::LayerSensitivity`] for direct
+    /// [`crate::calibrate::sensitivity::LayerSensitivity`] for direct
     /// round-trip; the JSON field names match. Stored here as plain
     /// f64 fields for serde-friendliness without depending on the
     /// `LayerSensitivity` type (which lives in src/quantize/ until P7).
