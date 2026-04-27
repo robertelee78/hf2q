@@ -2613,9 +2613,12 @@ fn defensive_no_call_under_constrained(
 /// | `Required`           | Grammar = alternation of ALL function grammars.   |
 /// | `Function(name)`     | Grammar = that function's grammar only.           |
 ///
-/// Returns `Ok(None)` when no grammar constraint applies (auto / none /
-/// no tools / no matching model registration). Returns `Err(Response)` with
-/// the 400 `grammar_error` envelope when the grammar can't be compiled.
+/// Returns `Ok(None)` when no grammar constraint applies (`tool_choice=auto`
+/// or `tool_choice=none`). Returns `Err(Response)` with a 400
+/// `invalid_request` envelope when preconditions for a constrained grammar
+/// cannot be met (`tool_choice=required/function` with empty/missing
+/// `tools[]` or with an unregistered model). Returns `Err(Response)` with
+/// a 400 `grammar_error` when preconditions pass but the emitter fails.
 ///
 /// WHY we need a model registration to emit the grammar:
 /// Each model emits tool calls in a model-specific wrapper format (Gemma 4 uses
@@ -2623,8 +2626,9 @@ fn defensive_no_call_under_constrained(
 /// The grammar must match the actual format the model emits — if we constrained
 /// plain JSON the model would fight the mask. `registry::find_for(model_id)`
 /// returns the registration so we can call `reg.tool_call_gbnf(fn, params)`.
-/// When no registration is found (unknown model), we log a warning and return
-/// `Ok(None)` — the T2.4 fallback stays in place for unregistered models.
+/// When no registration is found under `tool_choice=required/function`, we
+/// hard-error with 400 — silently returning `Ok(None)` here would re-open the
+/// wave-2.6 audit divergence (unconstrained engine path for Required/Function).
 ///
 /// T2.4 unblock evidence: once this function is wired (and tool_choice=required
 /// / tool_choice=function is used), the grammar physically prevents malformed
