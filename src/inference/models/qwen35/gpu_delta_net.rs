@@ -1326,6 +1326,35 @@ pub fn build_delta_net_layer(
         // contract verbatim.
         let chunk_route = chunk_path_eligible(seq_len, d_k);
 
+        // Wave 5b.3 walk-bar observability — log the routing decision exactly
+        // once per process so external validators can confirm the chunk path
+        // actually fired (vs silently falling through to the autoregressive
+        // path when seq_len % 64 != 0 or d_k != 128). Static atomic = no
+        // per-layer spam after first hit.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static CHUNK_LOGGED: AtomicBool = AtomicBool::new(false);
+            static AUTOREG_LOGGED: AtomicBool = AtomicBool::new(false);
+            if chunk_route {
+                if !CHUNK_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "hf2q::wave5b3",
+                        seq_len, d_k,
+                        "chunk-pipeline ENGAGED for prefill (HF2Q_CHUNK_SCAN_PREFILL=1)"
+                    );
+                }
+            } else if INVESTIGATION_ENV.chunk_scan_prefill
+                && !AUTOREG_LOGGED.swap(true, Ordering::Relaxed)
+            {
+                tracing::info!(
+                    target: "hf2q::wave5b3",
+                    seq_len, d_k,
+                    "chunk-pipeline gate set but predicate FAILED — autoregressive path running (seq_len%64={}, d_k={})",
+                    seq_len % 64, d_k
+                );
+            }
+        }
+
         let output = if chunk_route {
             // ---- CHUNK PREFILL (3-encoder split) ----
             //
