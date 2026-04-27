@@ -6367,3 +6367,67 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
   - **Open followups.**
     - Auto body-parse-failure → full T2.4 closure (requires Wave 3 Phase B lazy Auto-mode grammar via `GrammarShape::SingleBody` + `ToolCallBodyAuto`).
   - **Fence respected (W-A3).** Edits confined to `src/serve/api/engine.rs` and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-3 W-B2 — Auto-mode lazy grammar wiring + T2.4 FINAL closure on registered families (commits `81df9f2` + `b1b9fb4`)**
+
+  - **Context.** Wave-2.6 W-α5 (commits `e3241df` + `49b904e`) introduced `GrammarKind::ToolCallBodyAuto` as a forward-looking discriminant — `compile_tool_grammar` short-circuited to `Ok(None)` for `tool_choice=auto` regardless of tools[] / registration state, leaving the variant unreachable from chat-completions. Wave-2.7 audit confirmed Auto stayed `Ok(None)`; wave-3 W-A3 closed the Constrained body-parse-failure branch and explicitly deferred Auto's content fallback "until Wave 3 Phase B Auto lazy grammar lands." This worker (W-B2) wires the canonical llama.cpp `grammar_lazy=true` pattern (research-report.md Q2 + Q1; `/opt/llama.cpp/common/chat.cpp:898-913, 1177-1200, 1399-1416, 1626-1628`) and lands the T2.4 final closure on the registered-family Auto-with-tools path.
+
+  - **Chesterton note.** The wave-2.6 design specified `awaiting_trigger=true` for `ToolCallBodyAuto` runtimes at construction (sampler.rs:444 + engine.rs:1496-1498, :2724-2726) AND wired the `route_content` ToolCallOpen handler to call `runtime.trigger()` (engine.rs:1640-1642, :2577-2579). Both halves of the lazy-grammar runtime contract were already in place — only the upstream "compile a grammar for Auto" decision was missing. W-B2 is purely the compilation-side wiring; engine/sampler runtime semantics required NO changes. The lazy grammar runtime tests in `tool_call_open_triggers_grammar_runtime` (engine.rs:4598) were already exercising the production trigger pattern, just with synthetic GBNF — W-B2's new `auto_lazy_grammar_constrains_body_after_marker` test exercises the same pattern with the REAL Auto-compiled per-model grammar.
+
+  - **Code changes — Commit 1 `81df9f2` (Auto lazy grammar wiring, `src/serve/api/handlers.rs`).**
+    - `compile_tool_grammar`: refactored the early-return gate. Pre-W-B2: `Auto`/`None` short-circuited to `Ok(None)`. Post-W-B2: `None` short-circuits unchanged; `Auto` falls through into the same compile path as `Required`, with `Auto`-specific tolerances on missing tools[] / unknown family (return `Ok(None)` instead of 400). The `matching_tools` arm `Required | Auto` now emits the same alternation across all declared tools (mirrors llama.cpp Auto's per-tool grammar shape).
+    - `select_effective_grammar`: gained a `tool_grammar_kind: GrammarKind` parameter so the eager-vs-lazy decision derived at the call site flows through to the engine.
+    - New helper `tool_grammar_kind_for(&ToolChoiceValue)`: single source of truth for the kind mapping. `Auto → ToolCallBodyAuto` (lazy), `Required | Function → ToolCallBodyRequired` (eager), `None → Default` (unused).
+    - `prepare_chat_generation_core` call site: derives the kind once (`tool_grammar_kind_for(&tool_choice)`) and passes it to `select_effective_grammar`.
+
+  - **Code changes — Commit 2 `b1b9fb4` (T2.4 final Auto-branch closure, `src/serve/api/engine.rs` + `src/serve/api/handlers.rs`).**
+    - `ToolCallPolicy` enum gains `AutoLazyGrammar` variant. New helper `ToolCallPolicy::enforces_body_grammar() -> bool` returns `true` for `Constrained | AutoLazyGrammar`, `false` for `Auto` (no grammar). This is the single source of truth for the loud-error decision shared by streaming + non-streaming paths.
+    - `prepare_chat_generation_core` (handlers.rs): policy derivation extended. Required/Function → `Constrained`; Auto with `effective_grammar.is_some()` AND `effective_grammar_kind == ToolCallBodyAuto` → `AutoLazyGrammar`; otherwise → `Auto`. The `effective_grammar_kind` guard ensures we only flip to `AutoLazyGrammar` when the tool slot won precedence in `select_effective_grammar` (not when a response_format grammar landed there).
+    - `emit_streaming_tool_call_close` (engine.rs): unified the loud-error gate via `policy.enforces_body_grammar()`. Both `Constrained` AND `AutoLazyGrammar` body-parse failures now emit `GenerationEvent::Error("tool_call_unreachable_fallback_required")` + `Err(())`. `Auto` (no grammar) preserves the content fallback. Same structured error code is reused so log/metrics matchers continue to work unchanged.
+    - `finalize_streaming_tool_state` (engine.rs): mid-call truncation also unified via `policy.enforces_body_grammar()` — both `Constrained` and `AutoLazyGrammar` emit `GenerationEvent::Error("tool_call_truncated_under_constrained")`. The post-drain no-call check stays `Constrained`-ONLY because Auto explicitly allows zero-call runs (preamble freedom is the lazy-grammar contract).
+    - `extract_tool_calls_from_text` (handlers.rs): non-streaming companion updated identically — `policy.enforces_body_grammar()` triggers `constrained_parse_failure = Some(body)` on parse failure, which the chat handler at `handlers.rs:401-408` promotes to HTTP 500 + `tool_call_parse_failure` structured envelope.
+    - `defensive_no_call_under_constrained` (handlers.rs): NO change — stays Constrained-only by design (Auto explicitly allows no-call).
+
+  - **Tests added — Commit 1 (`compile_tool_grammar_precondition_tests` + `grammar_kind_selection_tests`).**
+    - `compile_tool_grammar_auto_with_tools_compiles_lazy_grammar`: Auto + tools[] + registered family → `Ok(Some(grammar))` (pre-W-B2: `Ok(None)`).
+    - `compile_tool_grammar_auto_grammar_bytes_match_required`: Auto and Required produce byte-identical GBNF on the same registered family + tools[] (proves the eager/lazy decision is purely a runtime flag flip).
+    - `auto_lazy_grammar_allows_preamble_content`: real GrammarRuntime with `awaiting_trigger=true` accepts arbitrary preamble bytes (no-op return-true via the suspended-runtime gate).
+    - `auto_lazy_grammar_constrains_body_after_marker`: post-trigger garbage bytes drive runtime dead; valid Gemma4 prefix (`<|tool_call>call:get_weather{q:`) stays alive (control to confirm dead came from grammar enforcement, not wiring bug).
+    - `tool_grammar_kind_for_auto_is_lazy` / `_required_is_eager` / `_function_is_eager` / `_none_is_default`: full coverage of the helper mapping.
+
+  - **Tests added — Commit 2 (`emit_streaming_tool_call_close_tests` + `finalize_streaming_tool_state_tests` + `test_a3_tool_call_extraction`).**
+    - `auto_lazy_grammar_body_parse_failure_yields_error_not_content`: AutoLazyGrammar + parse failure → Error (identical to Constrained).
+    - `streaming_auto_lazy_grammar_mid_call_truncation_yields_error_event`: AutoLazyGrammar mid-call truncation → `tool_call_truncated_under_constrained` Error.
+    - `streaming_auto_lazy_grammar_no_call_emits_no_events`: AutoLazyGrammar + no call → Continue (NOT Error — preamble freedom).
+    - `malformed_body_under_auto_lazy_grammar_yields_parse_failure`: non-streaming AutoLazyGrammar parse failure → `constrained_parse_failure = Some(body)`.
+    - `malformed_body_under_auto_no_grammar_demotes_to_content`: regression-preserve — vanilla Auto (no grammar) still demotes to Content.
+
+  - **Test results.** `cargo test --release --bin hf2q 'serve::api'`: 485 passed; 0 failed (13 new W-B2 tests across both commits + 472 pre-existing). Regression-preserve tests still pass: `auto_body_parse_failure_preserves_content_fallback`, `streaming_auto_mid_call_truncation_emits_content_fallback`, `streaming_auto_no_call_emits_no_events`, `auto_parse_failure_fallback_to_content`, `compile_tool_grammar_auto_with_no_tools_returns_ok_none`, `compile_tool_grammar_auto_with_unknown_family_returns_ok_none`.
+
+  - **LOC delta.** Commit 1: `src/serve/api/handlers.rs` +473/-57 (net +416). Commit 2: `src/serve/api/engine.rs` +402/-67, `src/serve/api/handlers.rs` +149/-22 (net +462). Total W-B2: +551/-89 (net +462) plus +473/-57 = +1024/-146 (net +878) across 2 commits.
+
+  - **T2.4 final closure status — by path:**
+
+    ```text
+    | tool_choice | tools[] | model family | T2.4 status                       |
+    |-------------|---------|--------------|-----------------------------------|
+    | Required    | yes     | known        | CLOSED (W-A3, eager grammar)      |
+    | Required    | yes/no  | unknown      | CLOSED (W-θ MED, 400)             |
+    | Required    | empty   | known        | CLOSED (W-θ MED, 400)             |
+    | Function    | yes     | known        | CLOSED (W-A3, eager grammar)      |
+    | Function    | yes/no  | unknown      | CLOSED (W-θ MED, 400)             |
+    | Function    | empty   | known        | CLOSED (W-θ MED, 400)             |
+    | Auto        | yes     | known        | CLOSED (W-B2 final, lazy grammar) |
+    | Auto        | empty   | any          | open by design (no grammar        |
+    |             |         |              |   contract; content fallback)     |
+    | Auto        | yes     | unknown      | open by design (no per-model      |
+    |             |         |              |   format to constrain)            |
+    | None        | any     | any          | not applicable (tools suppressed) |
+    ```
+
+    T2.4 IS NOW FULLY CLOSED on all four registered-family paths. The two remaining "open by design" Auto branches are not regressions — they correctly preserve the content-fallback semantics for the unconstrained paths where no per-model grammar contract exists.
+
+  - **Open followups.**
+    - End-to-end live test: streaming chat completion with `tool_choice=auto` + `tools=[real]` + Gemma4 model, asserting the model can emit content first, then optionally a constrained tool call. Currently exercised at unit level only (real GrammarRuntime + real registry); the live SSE harness extension is a sibling test-infra concern, not a W-B2 correctness gap.
+
+  - **Fence respected (W-B2, 2 commits at `addb68c..b1b9fb4`).** Edits confined to `src/serve/api/handlers.rs`, `src/serve/api/engine.rs`, and `docs/ADR-005-inference-server.md`. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
