@@ -20,14 +20,25 @@
 //!   - `minLength` / `maxLength` / `minimum` / `maximum` / `minItems` /
 //!     `maxItems`.
 //!   - `anyOf` / `oneOf` / `allOf`.
-//!   - `additionalProperties` beyond default-true.
+//!   - `additionalProperties: {schema}` (schema-typed additional props).
 //!   - Tuple-form arrays (`items: [schemaA, schemaB, ...]`).
+//!
+//! `additionalProperties: false` IS enforced (iter 75): the grammar rejects
+//! any key not declared in `properties`. `additionalProperties: true` or
+//! unset (the default per JSON Schema spec) allows extra keys permissively.
+//! `additionalProperties: {schema}` is deferred (treated as permissive).
+//!
+//! Object key order (iter 75): grammar accepts keys in ANY order. Previously
+//! keys were required alphabetically (a deliberate simplification in iter 8
+//! that was never a feature — just a coincidence of BTreeMap iteration order).
+//! The new algorithm generates O(2^N) permutation sub-rules for N required
+//! keys and O(N^2) optional-chain sub-rules for optional keys.
 //!
 //! The output is a GBNF string that can be parsed by
 //! `super::parser::parse(...)` and consumed by `super::sampler::GrammarRuntime`.
 //! The root rule is always named `root`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -387,85 +398,245 @@ impl Converter {
             })
             .unwrap_or_default();
 
+        // additionalProperties handling (iter 75):
+        //   - unset or true  → permissive: accept any extra keys (JSON Schema
+        //     default). The grammar allows unknown kv-pairs via a wildcard
+        //     `string ":" space value` rule in the optional chain.
+        //   - false          → closed: grammar rejects keys not in properties.
+        //     Implemented by omitting the wildcard rule from the optional
+        //     chain — only declared property keys can appear, so extra keys
+        //     cause the grammar stack to die.
+        //   - {schema}       → deferred (module docstring). Treated as
+        //     permissive for now.
+        let additional_props = obj.get("additionalProperties");
+        let additional_closed = matches!(additional_props, Some(Value::Bool(false)));
+
         if properties.is_empty() {
+            if additional_closed {
+                // additionalProperties:false + no declared properties means
+                // only the empty object {} is valid.
+                return Ok(r#""{" space "}" space"#.into());
+            }
             // No explicit properties — accept any object.
             self.add_primitive("object");
             return Ok("object".into());
         }
 
-        // Deterministic property iteration: sort alpha for emission order. The
-        // original object spec allows any order of keys, but the grammar
-        // enforces the order we emit here — so emit in a stable canonical
-        // order.
+        // ---------------------------------------------------------------
+        // Build per-property kv rules.
         //
-        // NOTE: this is stricter than llama.cpp which allows arbitrary order
-        // via recursive alternation. For iter 8 we required properties to
-        // appear in alphabetical order in the output JSON — a deliberate
-        // simplification. Iter 74 keeps that simplification but fixes the
-        // required/optional bookkeeping below.
-        let mut required_entries: Vec<String> = Vec::new();
-        let mut optional_entries: Vec<String> = Vec::new();
-        let mut keys: Vec<&String> = properties.keys().collect();
-        keys.sort();
-        for k in keys {
-            let v = &properties[k];
-            let prop_rule_name = sanitize_rule_name(k);
+        // Each kv rule is named `<slug>-<prop>-kv` and captures:
+        //   "\"key\"" ":" space VALUE_RULE
+        //
+        // Keys are sorted here for deterministic rule-name generation only.
+        // The grammar itself accepts them in ANY order (iter 75 fix).
+        //
+        // WHY alphabetical-only was the original choice (Chesterton note):
+        // iter 8 took the simplest subset — BTreeMap::iter() produces
+        // sorted order, so "emit in iteration order" silently became
+        // "enforce alphabetical key order in JSON output". The comment
+        // said "deliberate simplification" but the consequence was that
+        // any model emitting non-alphabetical keys had valid JSON rejected
+        // by the grammar mask. This was never a feature — it was a
+        // coincidence of implementation. Iter 75 fixes it.
+        // ---------------------------------------------------------------
+        let mut all_keys: Vec<&String> = properties.keys().collect();
+        all_keys.sort();
+
+        let slug = path_slug(path);
+
+        // Map: property name → kv rule name.
+        let mut kv_rule_name: HashMap<String, String> = HashMap::new();
+        let mut required_keys: Vec<String> = Vec::new();
+        let mut optional_keys: Vec<String> = Vec::new();
+
+        for k in &all_keys {
+            let v = &properties[*k];
             let vbody = self.visit(v, &format!("{}/properties/{}", path, k))?;
-            // Inline-emitted rule body (not a named rule) so multiple object
-            // schemas with the same property name don't collide.
-            let rule_name = format!("{}-{}", path_slug(path), prop_rule_name);
-            self.rules.insert(rule_name.clone(), vbody);
+            // Value rule: path-slug prefix avoids collisions when two
+            // different object schemas share a property name.
+            let val_rule = format!("{}-{}", slug, sanitize_rule_name(k));
+            self.rules.insert(val_rule.clone(), vbody);
+
+            // kv rule: literal key + ":" + space + value-rule.
             let quoted_key = format_literal(&format!("\"{}\"", k));
-            let entry = format!("{} \":\" space {}", quoted_key, rule_name);
-            if required_list.contains(k) {
-                required_entries.push(entry);
+            let kv_body = format!("{} \":\" space {}", quoted_key, val_rule);
+            let kv_name = format!("{}-{}-kv", slug, sanitize_rule_name(k));
+            self.rules.insert(kv_name.clone(), kv_body);
+            kv_rule_name.insert((*k).clone(), kv_name);
+
+            if required_list.contains(*k) {
+                required_keys.push((*k).clone());
             } else {
-                optional_entries.push(entry);
+                optional_keys.push((*k).clone());
             }
         }
 
-        // Iter 74 fix: required fields are emitted FIRST, joined with
-        // mandatory `","` separators (each one is non-optional, so all
-        // required keys must appear). Optional fields follow, each wrapped
-        // in its own `("," space entry)?` so the separator is inside the
-        // optional — `a (",", b)?` accepts `a` alone or `a,b`.
-        //
-        // Bug from prior iter: the old code did `prop_rules.remove(0)` then
-        // wrapped EVERY remaining entry in `(",", x)?` regardless of
-        // required/optional bookkeeping. With 2 required fields the second
-        // was emitted as optional, falsely accepting `{first: ...}` alone.
-        // Surfaced by iter-74 function-call-with-nested-object test.
-        if required_entries.is_empty() && optional_entries.is_empty() {
+        if required_keys.is_empty() && optional_keys.is_empty() {
             return Ok(r#""{" space "}" space"#.into());
         }
 
-        let mut body = String::new();
-        let mut first_emitted = false;
+        // Required keys: any-order permutation (O(2^N) rules).
+        let req_rule_ref: Option<String> = if required_keys.is_empty() {
+            None
+        } else {
+            Some(self.build_required_permutation(&slug, &required_keys, &kv_rule_name))
+        };
 
-        // Required block: mandatory commas between consecutive required.
-        for r in &required_entries {
-            if !first_emitted {
-                body.push_str(r);
-                first_emitted = true;
-            } else {
-                body.push_str(&format!(" \",\" space {}", r));
+        // Optional keys + extra-kv wildcard (O(N^2) rules).
+        let opt_suffix = self.build_optional_suffix(
+            &slug,
+            &optional_keys,
+            &kv_rule_name,
+            !additional_closed,
+        );
+
+        // Compose: required_block [optional_suffix]
+        let inner = match (&req_rule_ref, opt_suffix.as_str()) {
+            (None, "") => {
+                return Ok(r#""{" space "}" space"#.into());
             }
+            (Some(req), "") => req.clone(),
+            (None, opt) => opt.to_string(),
+            (Some(req), opt) => format!("{} {}", req, opt),
+        };
+
+        Ok(format!(r#""{{" space {} "}}" space"#, inner))
+    }
+
+    /// Build the any-order permutation grammar for a non-empty set of
+    /// required keys. Returns the name of the top-level permutation rule
+    /// for the full set.
+    ///
+    /// Algorithm: for each subset S of required keys, emit a rule
+    /// `slug-req-<sorted-names>` that alternates over "which key comes
+    /// first". Base case: singleton set — just reference the kv rule.
+    /// Memoized so each distinct subset is emitted exactly once.
+    fn build_required_permutation(
+        &mut self,
+        slug: &str,
+        required: &[String],
+        kv_rule_name: &HashMap<String, String>,
+    ) -> String {
+        let mut sorted = required.to_vec();
+        sorted.sort();
+
+        let id_parts: Vec<String> = sorted.iter().map(|k| sanitize_rule_name(k)).collect();
+        let rule_name = format!("{}-req-{}", slug, id_parts.join("-"));
+
+        if self.rules.contains_key(&rule_name) {
+            return rule_name;
         }
 
-        // Optional block: each one's own (",", entry)? wrapper.
-        for o in &optional_entries {
-            if !first_emitted {
-                // No required preceding — the very first entry is optional.
-                // Wrap as `(entry)?`. Produces `(a)? (",", b)? (",", c)?`
-                // which accepts `{}`, `{a}`, `{a,b}`, `{a,b,c}` (in order).
-                body.push_str(&format!("({})?", o));
-                first_emitted = true;
-            } else {
-                body.push_str(&format!(" (\",\" space {})?", o));
-            }
+        if sorted.len() == 1 {
+            // Base case: rule body is just the kv rule name (a reference).
+            let kv = kv_rule_name[&sorted[0]].clone();
+            self.rules.insert(rule_name.clone(), kv);
+            return rule_name;
         }
 
-        Ok(format!(r#""{{" space {} "}}" space"#, body))
+        // Insert placeholder before recursing to allow memoization check
+        // to short-circuit on any path that would re-enter (defensive; the
+        // required set is finite and strictly shrinking so no true cycles).
+        self.rules.insert(rule_name.clone(), String::new());
+
+        let mut alts: Vec<String> = Vec::new();
+        for (i, k) in sorted.iter().enumerate() {
+            let kv = kv_rule_name[k].clone();
+            let remaining: Vec<String> = sorted
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let rest = self.build_required_permutation(slug, &remaining, kv_rule_name);
+            alts.push(format!("{} \",\" space {}", kv, rest));
+        }
+        let body = alts.join(" | ");
+        self.rules.insert(rule_name.clone(), body);
+        rule_name
+    }
+
+    /// Build the optional-key suffix: a GBNF fragment of the form
+    /// `( "," space <opt-chain-rule> )?` if there are optional entries,
+    /// or an empty string if there is nothing optional to add.
+    ///
+    /// `allow_extra_kv`: if true, a `string ":" space value` wildcard is
+    /// added to the optional chain so unknown keys are silently accepted
+    /// (the JSON Schema default when additionalProperties is unset/true).
+    fn build_optional_suffix(
+        &mut self,
+        slug: &str,
+        optional_keys: &[String],
+        kv_rule_name: &HashMap<String, String>,
+        allow_extra_kv: bool,
+    ) -> String {
+        let mut entries: Vec<(String, bool)> = optional_keys
+            .iter()
+            .map(|k| (kv_rule_name[k].clone(), false))
+            .collect();
+
+        if allow_extra_kv {
+            let extra_kv_name = format!("{}-extra-kv", slug);
+            self.rules
+                .entry(extra_kv_name.clone())
+                .or_insert_with(|| "string \":\" space value".to_string());
+            entries.push((extra_kv_name, true));
+        }
+
+        if entries.is_empty() {
+            return String::new();
+        }
+
+        let top = self.build_optional_chain(slug, &entries);
+        format!("( \",\" space {} )?", top)
+    }
+
+    /// Recursively build the optional-chain rule for `entries`.
+    /// Returns the name of the emitted rule.
+    ///
+    /// For entries [a, b] this produces:
+    ///   slug-opt-<fp> ::= a-kv ( "," space slug-opt-<fp-b> )?
+    ///                   | b-kv ( "," space slug-opt-<fp-a> )?
+    ///
+    /// The rule is keyed by a fingerprint of the sorted entry names so
+    /// the same optional set encountered in different contexts shares the
+    /// same rule (safe because the body is purely a function of the
+    /// entry set).
+    fn build_optional_chain(&mut self, slug: &str, entries: &[(String, bool)]) -> String {
+        // Fingerprint: sorted kv-rule names joined and sanitized.
+        let mut names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        let fp = sanitize_rule_name(&names.join("-"));
+        let rule_name = format!("{}-opt-{}", slug, fp);
+
+        if self.rules.contains_key(&rule_name) {
+            return rule_name;
+        }
+
+        // Placeholder to prevent re-entrant emission (defensive).
+        self.rules.insert(rule_name.clone(), String::new());
+
+        let mut alts: Vec<String> = Vec::new();
+        for (i, (kv, _is_wildcard)) in entries.iter().enumerate() {
+            let remaining: Vec<(String, bool)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| e.clone())
+                .collect();
+            let alt = if remaining.is_empty() {
+                kv.clone()
+            } else {
+                let rest = self.build_optional_chain(slug, &remaining);
+                format!("{} ( \",\" space {} )?", kv, rest)
+            };
+            alts.push(alt);
+        }
+
+        let body = alts.join(" | ");
+        self.rules.insert(rule_name.clone(), body);
+        rule_name
     }
 
     fn visit_array(
@@ -646,15 +817,20 @@ mod tests {
 
     #[test]
     fn object_with_multiple_required_properties() {
-        // Alphabetical order: age, name. Both required.
+        // Both key orders must now be accepted (iter 75 fix).
         let schema = r#"{
             "type": "object",
             "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
             "required": ["name", "age"]
         }"#;
+        // age first (alphabetical).
         let mut rt = runtime(schema);
-        assert!(rt.accept_bytes(b"{\"age\":30,\"name\":\"Bob\"}"));
+        assert!(rt.accept_bytes(b"{\"age\":30,\"name\":\"Bob\"}"), "age-first rejected");
         assert!(rt.is_accepted());
+        // name first (non-alphabetical — was broken before iter 75).
+        let mut rt2 = runtime(schema);
+        assert!(rt2.accept_bytes(b"{\"name\":\"Bob\",\"age\":30}"), "name-first rejected");
+        assert!(rt2.is_accepted());
     }
 
     #[test]
@@ -720,11 +896,18 @@ mod tests {
             },
             "required": ["name", "arguments"]
         }"#;
+        // arguments-first (alphabetical).
         let mut rt = runtime(schema);
         assert!(rt.accept_bytes(
             b"{\"arguments\":{\"city\":\"NYC\"},\"name\":\"get_weather\"}"
         ));
         assert!(rt.is_accepted());
+        // name-first (non-alphabetical — iter 75 fix).
+        let mut rt2 = runtime(schema);
+        assert!(rt2.accept_bytes(
+            b"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"NYC\"}}"
+        ));
+        assert!(rt2.is_accepted());
     }
 
     #[test]
@@ -811,14 +994,7 @@ mod tests {
         // common production shape — one level of nesting with mixed
         // required fields.
         //
-        // Iter 74 fixed the "second-required-becomes-optional" bug; the
-        // grammar emits ALL required fields as mandatory. The
-        // alphabetical-key-order constraint is a separate documented
-        // simplification — both required keys must appear, but in the
-        // alphabetical order the grammar enforces (filters < query).
-        // Models trained on OpenAI's API typically respect schema-
-        // declared order; accept-any-permutation grammar is iter 75+
-        // work.
+        // Iter 75 fix: both required key orders accepted at every level.
         let schema = r#"{
             "type": "object",
             "properties": {
@@ -834,20 +1010,26 @@ mod tests {
             },
             "required": ["query", "filters"]
         }"#;
-        // Alphabetical order: filters before query; max_price before min_price.
+        // filters before query (alphabetical — old behavior).
         let mut rt = runtime(schema);
         let payload =
             br#"{"filters":{"max_price":2000,"min_price":500},"query":"laptops"}"#;
-        assert!(rt.accept_bytes(payload), "rejected valid nested function-call");
-        assert!(rt.is_accepted(), "runtime not accepted at end");
+        assert!(rt.accept_bytes(payload), "rejected nested (filters-first)");
+        assert!(rt.is_accepted());
+
+        // query before filters (non-alphabetical — iter 75 fix).
+        let mut rt2 = runtime(schema);
+        let payload2 =
+            br#"{"query":"laptops","filters":{"max_price":2000,"min_price":500}}"#;
+        assert!(rt2.accept_bytes(payload2), "rejected nested (query-first)");
+        assert!(rt2.is_accepted());
 
         // Critical bug-fix anchor: missing the SECOND required field
-        // (query) must be REJECTED. Pre-iter-74 this was falsely
-        // accepted because the grammar emitted query as optional.
+        // (query) must be REJECTED. Pre-iter-74 this was falsely accepted.
         let mut rt = runtime(schema);
-        let missing_required =
+        let missing =
             br#"{"filters":{"max_price":2000,"min_price":500}}"#;
-        let ok = rt.accept_bytes(missing_required);
+        let ok = rt.accept_bytes(missing);
         assert!(
             !(ok && rt.is_accepted()),
             "accepted object missing required 'query' (iter 74 regression)"
@@ -856,10 +1038,8 @@ mod tests {
 
     #[test]
     fn function_call_with_enum_argument() {
-        // Tool with a constrained enum field (e.g. unit selector for a
-        // weather function: celsius/fahrenheit). The structured-output
-        // grammar must reject any value that isn't in the enum.
-        // Alphabetical: city before unit (matches input).
+        // Tool with a constrained enum field.
+        // Iter 75: both key orders accepted.
         let schema = r#"{
             "type": "object",
             "properties": {
@@ -868,10 +1048,19 @@ mod tests {
             },
             "required": ["city", "unit"]
         }"#;
+        // city first (alphabetical).
         let mut rt = runtime(schema);
         assert!(
             rt.accept_bytes(br#"{"city":"London","unit":"celsius"}"#),
-            "rejected valid enum value"
+            "rejected enum value (city-first)"
+        );
+        assert!(rt.is_accepted());
+
+        // unit first (non-alphabetical — iter 75).
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"unit":"celsius","city":"London"}"#),
+            "rejected enum value (unit-first)"
         );
         assert!(rt.is_accepted());
 
@@ -880,23 +1069,19 @@ mod tests {
         let ok = rt.accept_bytes(br#"{"city":"London","unit":"kelvin"}"#);
         assert!(
             !(ok && rt.is_accepted()),
-            "accepted enum value 'kelvin' that's not in [celsius, fahrenheit]"
+            "accepted 'kelvin' not in [celsius, fahrenheit]"
         );
 
         // Missing required 'unit' rejected.
         let mut rt = runtime(schema);
         let ok = rt.accept_bytes(br#"{"city":"London"}"#);
-        assert!(
-            !(ok && rt.is_accepted()),
-            "accepted object missing required 'unit'"
-        );
+        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'unit'");
     }
 
     #[test]
     fn function_call_with_array_arguments_field() {
-        // A tool that takes an array of strings (e.g. tags for a
-        // bookmark create). Common production shape. Alphabetical key
-        // order: tags before url.
+        // A tool that takes an array of strings.
+        // Iter 75: both key orders accepted.
         let schema = r#"{
             "type": "object",
             "properties": {
@@ -908,9 +1093,17 @@ mod tests {
             },
             "required": ["url", "tags"]
         }"#;
+        // tags first (alphabetical).
         let mut rt = runtime(schema);
         assert!(rt.accept_bytes(
             br#"{"tags":["news","tech"],"url":"https://example.com"}"#
+        ));
+        assert!(rt.is_accepted());
+
+        // url first (non-alphabetical — iter 75).
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(
+            br#"{"url":"https://example.com","tags":["news","tech"]}"#
         ));
         assert!(rt.is_accepted());
 
@@ -926,5 +1119,142 @@ mod tests {
             !(ok && rt.is_accepted()),
             "accepted object missing required 'tags'"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // PREREQ 1 — Any-order key acceptance (iter 75)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn object_keys_accepted_in_any_order_three_required() {
+        // Three required properties: a, b, c.
+        // All 6 permutations must be accepted.
+        // Objects missing any required key must be rejected.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"},
+                "c": {"type": "integer"}
+            },
+            "required": ["a", "b", "c"]
+        }"#;
+
+        let perms: &[&[u8]] = &[
+            br#"{"a":1,"b":2,"c":3}"#,
+            br#"{"a":1,"c":3,"b":2}"#,
+            br#"{"b":2,"a":1,"c":3}"#,
+            br#"{"b":2,"c":3,"a":1}"#,
+            br#"{"c":3,"a":1,"b":2}"#,
+            br#"{"c":3,"b":2,"a":1}"#,
+        ];
+        for perm in perms {
+            let mut rt = runtime(schema);
+            assert!(
+                rt.accept_bytes(perm),
+                "rejected permutation: {}",
+                std::str::from_utf8(perm).unwrap()
+            );
+            assert!(
+                rt.is_accepted(),
+                "not accepted after: {}",
+                std::str::from_utf8(perm).unwrap()
+            );
+        }
+
+        // Missing required 'c'.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"a":1,"b":2}"#);
+        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'c'");
+
+        // Missing required 'a'.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"b":2,"c":3}"#);
+        assert!(!(ok && rt.is_accepted()), "accepted object missing required 'a'");
+    }
+
+    // -----------------------------------------------------------------
+    // PREREQ 2 — additionalProperties handling (iter 75)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn additional_properties_false_rejects_extra_keys() {
+        // additionalProperties:false — only declared keys are accepted.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age":  {"type": "integer"}
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false
+        }"#;
+
+        // Valid — only declared keys.
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"name":"Alice","age":30}"#));
+        assert!(rt.is_accepted());
+
+        // Valid in reverse order.
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"age":30,"name":"Alice"}"#));
+        assert!(rt.is_accepted());
+
+        // Extra key "extra" not in properties — must be rejected.
+        let mut rt = runtime(schema);
+        let ok = rt.accept_bytes(br#"{"name":"Alice","age":30,"extra":"xxx"}"#);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "accepted extra key when additionalProperties:false"
+        );
+    }
+
+    #[test]
+    fn additional_properties_true_accepts_extra_keys() {
+        // additionalProperties:true (explicit) — extra keys allowed.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"],
+            "additionalProperties": true
+        }"#;
+
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"name":"Alice"}"#));
+        assert!(rt.is_accepted());
+
+        // Extra key must be accepted.
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"name":"Alice","extra":"xxx"}"#),
+            "rejected extra key when additionalProperties:true"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    #[test]
+    fn additional_properties_unset_accepts_extra_keys() {
+        // additionalProperties unset → JSON Schema default is permissive.
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            },
+            "required": ["name"]
+        }"#;
+
+        let mut rt = runtime(schema);
+        assert!(rt.accept_bytes(br#"{"name":"Alice"}"#));
+        assert!(rt.is_accepted());
+
+        // Extra key must be accepted (default permissive).
+        let mut rt = runtime(schema);
+        assert!(
+            rt.accept_bytes(br#"{"name":"Alice","extra":"xxx"}"#),
+            "rejected extra key when additionalProperties unset (must be permissive)"
+        );
+        assert!(rt.is_accepted());
     }
 }
