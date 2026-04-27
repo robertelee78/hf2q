@@ -3034,6 +3034,126 @@ mod compile_tool_grammar_precondition_tests {
             "happy path MUST return Some(grammar); got None"
         );
     }
+
+    /// Build a `ChatCompletionRequest` with `parallel_tool_calls` overridden.
+    fn req_with_parallel(
+        model: &str,
+        tools: Option<Vec<Tool>>,
+        parallel: bool,
+    ) -> ChatCompletionRequest {
+        let mut r = req_with(model, tools);
+        r.parallel_tool_calls = Some(parallel);
+        r
+    }
+
+    /// Two real Tool entries, registered gemma4 model, `parallel_tool_calls=true`.
+    ///
+    /// Wave 2.9 W-ι: audit gap "parallel multi-function production wiring".
+    /// The existing wave-2.8 parallel tests drive `combine_function_grammars`
+    /// with synthetic GBNF strings; this test goes through the full production
+    /// path: `compile_tool_grammar` → registered emitter → combiner → parser.
+    /// GrammarRuntime then accepts alternating fn-0/fn-1 Gemma4-shaped calls,
+    /// proving the end-to-end wiring is correct.
+    ///
+    /// Gemma 4 call format: `call:FUNCNAME{KEY:VALUE}` where string values
+    /// are delimited with the 5-byte marker `<|"|>` (chat_template.jinja:113).
+    #[test]
+    fn compile_tool_grammar_parallel_two_real_tools_alternates() {
+        // Skip if gemma4 is not registered.
+        if registry::find_for("gemma4-27b-it").is_none() {
+            return;
+        }
+
+        // Tool 0: search(query: string)
+        let tool_search = Tool {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: "search".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                })),
+            },
+        };
+
+        // Tool 1: add_numbers(x: integer, y: integer)
+        let tool_add = Tool {
+            tool_type: "function".to_string(),
+            function: ToolFunction {
+                name: "add_numbers".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"}
+                    },
+                    "required": ["x", "y"]
+                })),
+            },
+        };
+
+        let req = req_with_parallel(
+            "gemma4-27b-it",
+            Some(vec![tool_search, tool_add]),
+            /* parallel */ true,
+        );
+
+        let g = compile_tool_grammar(&req, &ToolChoiceValue::Required)
+            .expect("compile_tool_grammar must succeed for registered gemma4")
+            .expect("must return Some(grammar) for Required + 2 tools + gemma4");
+
+        // Serialize the combined grammar for runtime construction.
+        let gbnf = grammar::serialize::serialize(&g);
+
+        // The combined grammar must expose namespaced per-function roots.
+        assert!(
+            g.rule_id("fn-0-root").is_some(),
+            "parallel combine must have fn-0-root; grammar:\n{gbnf}"
+        );
+        assert!(
+            g.rule_id("fn-1-root").is_some(),
+            "parallel combine must have fn-1-root; grammar:\n{gbnf}"
+        );
+
+        // Build GrammarRuntime from the serialized GBNF.
+        let root_id = g.rule_id("root").expect("combined grammar must have root rule");
+        let mut rt = grammar::sampler::GrammarRuntime::new(g, root_id)
+            .expect("GrammarRuntime::new must succeed for valid combined grammar");
+
+        // Gemma 4 real call format (from registry.rs + chat_template.jinja):
+        //   <|tool_call>call:NAME{KEY:VALUE}<tool_call|>
+        // String values use the 5-byte marker `<|"|>` as delimiter.
+        // Integer values are bare decimal digits.
+        //
+        // Tool call 0 (search):
+        //   <|tool_call>call:search{query:<|"|>hello<|"|>}<tool_call|>
+        // Tool call 1 (add_numbers) — permutation grammar accepts x,y or y,x:
+        //   <|tool_call>call:add_numbers{x:1,y:2}<tool_call|>
+        //
+        // No separator between calls (Gemma4 separator is "").
+        let call_0: &[u8] = b"<|tool_call>call:search{query:<|\"|>hello<|\"|>}<tool_call|>";
+        let call_1: &[u8] = b"<|tool_call>call:add_numbers{x:1,y:2}<tool_call|>";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(call_0);
+        payload.extend_from_slice(call_1);
+
+        let alive = rt.accept_bytes(&payload);
+        assert!(
+            alive || rt.is_accepted(),
+            "parallel gemma4 two-tool runtime did not accept alternating calls.\n\
+             payload: {}\ngrammar:\n{gbnf}",
+            String::from_utf8_lossy(&payload)
+        );
+        assert!(
+            rt.is_accepted(),
+            "parallel gemma4 two-tool runtime must be in accepting state after \
+             two alternating calls.\npayload: {}\ngrammar:\n{gbnf}",
+            String::from_utf8_lossy(&payload)
+        );
+    }
 }
 
 /// Combine multiple per-function GBNF grammars into a single grammar whose
