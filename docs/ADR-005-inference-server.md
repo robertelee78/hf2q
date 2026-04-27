@@ -6043,3 +6043,34 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - Existing wave-2.5 tests (`max_tokens`, `stops`, `logit_bias`, `response_format`, `tool_choice`, `hit_requires_all_params_equal`) all continue to pass. Total: 33 pass.
   - **Chesterton block:** The wave-2.5 commit rationale said "frequency_penalty and presence_penalty are plumbed but currently not wired; they are excluded here and will be added when they become effective." This logic is precisely the fence that was supposed to be torn down — it pushes the responsibility to whoever wires the param to also remember to update the cache key, which is non-local and easy to forget. The correct invariant is: the cache key is always a superset of generation-affecting params. Including params early costs only comparison bytes, never a stale replay.
   - **Fence respected.** W-ε edits in `src/serve/api/engine.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
+
+- **2026-04-27 wave-2.6 Worker W-β2 (session cfa-20260427-adr005-wave2.6, items Q3 + B4-extras) — kill sequential fallback; hard 400 at >8 required keys; fix extra-kv wildcard repeatability.**
+  - **Research grounding (Q3):**
+    - Moshier & Rounds, "On the Succinctness Properties of Unordered Context-Free Grammars," ACL 25 (1987): CFG for permutations of n required keys is provably exponential in n.
+    - Barton (1985): ID/LP grammar recognition is NP-complete.
+    - Production engines (llama.cpp `_build_object_rule`, llguidance `gen_json_object`, xgrammar `GenerateObject`, outlines-core `parse_properties`) all enforce declaration order at large N for the same reason.
+    - Wave-2.5 added `build_sequential_required` as a "fallback" at >8 required keys. This is a semantic downgrade from "any-position" to "fixed-sorted" — a mantra violation caught by the cfa-20260427-adr005-wave2.5 codex review (audit item B4, HIGH severity).
+  - **Q3 — DELETE build_sequential_required; hard SchemaError → HTTP 400:**
+    - Deleted the 68-LOC `build_sequential_required` function.
+    - The `else` branch (formerly calling the fallback at N_req > ANY_ORDER_MAX_REQUIRED=8) now returns `SchemaError` with an operator-actionable message: cites the count, the 8-key limit, Moshier & Rounds 1987, and instructs "Reduce required properties or split the schema."
+    - Error propagates as HTTP 400 via the existing `compile_tool_grammar → ApiError::grammar_error` wiring in `handlers.rs:2594-2601` (verified unchanged).
+    - Updated module-level doc and inline comment block to remove false sequential-fallback claim.
+    - Updated `large_schema_32_properties_compiles_ok`: was testing the now-deleted 32-required sequential path. Replaced with 4-required + 4-optional = 8 total (valid any-position schema well within caps).
+  - **B4-extras — fix wildcard repeatability in build_optional_chain (MED):**
+    - Audit finding: `_is_wildcard` flag was ignored in `build_optional_chain`'s entry enumeration. The extra-kv wildcard was removed from `remaining` after first emission, identical to a declared optional key → one-shot only → objects with multiple trailing extra keys rejected by grammar.
+    - Fix: when `is_wildcard == true`, keep the entry in `remaining`. This makes the GBNF rule self-referential, providing Kleene-star semantics for extra keys via GBNF optional recursion.
+    - Applies to all permissive-extra cases: trailing extras after required key(s), extras before and after required keys, and optional-only objects.
+  - **Tests added (4 new, all pass):**
+    - `nine_required_keys_returns_too_many_required_keys` — boundary at 9, just over cap; verifies SchemaError message contents.
+    - `eight_required_keys_compiles_ok` — boundary at 8, the supported max; verifies full any-position semantics (reversed order accepted at runtime).
+    - `large_schema_32_properties_compiles_ok` — updated (see above).
+    - `additional_properties_permissive_accepts_multiple_extras` — 3 sub-cases: trailing extras, surrounding extras, multiple extras in optional-only object.
+    - Existing prereq tests (W-δ) and all other json_schema tests continue to pass. Full grammar suite: 106 pass.
+  - **Commits:**
+    - Q3: `5110dc0` fix(wave2.6 W-β2 Q3): kill build_sequential_required; hard 400 at >8 required keys
+    - B4-extras: `74999fd` fix(wave2.6 W-β2 B4-extras): wildcard extra-kv repeatable in build_optional_chain
+  - **LOC delta:** Q3 commit: 1 file, +150/-107 (net -1 fn, 68 LOC deleted). B4-extras commit: 1 file, +63/-2 (net +61).
+  - **Chesterton notes:**
+    - `build_sequential_required` was not inert — it was called for every schema with 9–32 required keys, silently sorting them. Any model emitting required keys in non-sorted order on a schema with N_req >= 9 would have been rejected by the grammar. Deleting the function removes a latent semantic contract violation.
+    - The `_is_wildcard` prefix in the original was a future-hook note, not a tombstone — the field was always there but never consulted. The Kleene-star behavior was the intended design (the extra-kv rule is "zero or more extra pairs"), but the implementation forgot to implement the "repeat" half.
+  - **Fence respected.** W-β2 edits in `src/serve/api/grammar/json_schema.rs` only. No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`.
