@@ -495,7 +495,76 @@ note for traceability.
    **Track B for iter5/iter6: port the rope_multi cache to gemma's
    `forward_mlx.rs` rope call sites.**
 
-### Phase plan implication
+### 2026-04-27 — §P3a'' gemma live profile pass (iter5)
+
+**Provenance.** Same xctrace TimeProfiler harness as §P3a' (`scripts/profile-p3aprime.sh`) with `FIXTURE` and `OUT_DIR` overridden for gemma.  5 cold-SoC trials × 64 decode tokens on `gemma-4-26B-A4B-it-ara-abliterated-dwq` at hf2q@`675c83c` / mlx-native@`19f5569`.  No thermal warning recorded any trial.  Aggregated by `scripts/aggregate_decode.py --decode-filter 'forward_decode(?!_kernel_profile)'` (newly added decode-filter scopes aggregation to samples whose backtrace contains the gemma decode entry, mirroring the §P3a' filter on `forward_gpu_greedy`).
+
+**Headline finding — gemma decode is GPU-BOUND, not CPU-bound.**
+
+| trial | decode-filtered CPU samples | CPU ms attributed | µs/token (CPU only) |
+|---|---:|---:|---:|
+| 1 | 57 | 57 | 891 |
+| 2 | 87 | 87 | 1359 |
+| 3 | 30 | 30 | 469 |
+| 4 | 31 | 31 | 484 |
+| 5 | 42 | 42 | 656 |
+
+Median trial CPU wall = **42 ms / 64 tokens = 656 µs/token CPU**.  Total decode wall (P0 iter4) = **11.4 ms/token** (87.8 tok/s).  CPU share = **5.7 %**, GPU share = **94.3 %**.
+
+Implication: **even closing the entire CPU wall to 0 saves only ~6% of decode wall.**  The 19% gemma gap to llama.cpp lives almost entirely in **GPU compute**, not CPU orchestration.  This **falsifies** the pre-iter5 "shared P3b lever" hypothesis from the iter4 reshape subsection above for the gemma family.
+
+**Per-hypothesis live measurements (decode-filtered, 5-trial median µs/token):**
+
+| ID | canonical frame | median µs/token | per-trial |
+|---|---|---:|---|
+| G1 | `fused_head_norm_rope::dispatch_fused_head_norm_rope_f32` | 15.6 | 47 / 109 / 16 / 0 / 16 |
+| G2 | `hadamard_quantize_kv::dispatch_hadamard_quantize_kv` | 46.9 | 62 / 78 / 47 / 47 / 16 |
+| G3 | `fused_norm_add::dispatch_fused_norm_add_f32` | 0.0 | 31 / 62 / 0 / 0 / 0 |
+| G4 | `argmax::dispatch_argmax_f32` | 0.0 | 0 / 0 / 0 / 16 / 0 |
+| G5-Shared-AllocBuffer | `MlxDevice::alloc_buffer::` | **0.0** | all 0 |
+| G6-CommandBuffer | `GraphSession\|exec.begin\|s.finish` | 218.8 | 312 / 422 / 188 / 141 / 219 |
+| G7-FormatString | `anyhow::Context::with_context` | 0.0 | all 0 |
+| G8-Barrier | `issue_metal_buffer_barrier` | 0.0 | all 0 (sub-1ms sample resolution; counter-based via iter2 instead) |
+
+**Verdicts:**
+
+- **G5 confirmed at 0 µs/token on gemma.**  `MlxDevice::alloc_buffer` does not appear in any decode-filtered sample — gemma's fused-kernel pipeline reuses caller-provided buffers and parameter buffers via `KernelArg::Bytes`.  **The qwen35 §P3a' rank-1 lever (3719 µs/token alloc_buffer Mach-IPC chain) does NOT exist on gemma.**  The iter7 alloc_buffer pool will be 0 µs win for gemma.
+- **G6 GraphSession bookkeeping = 219 µs/token median.**  Largest CPU contributor.  `mlx_native::graph::GraphSession::barrier_between` appears at rank 10-14 in every trial's top-15.  Single-CB collapse can shave some of this but bound by the 656 µs/token CPU wall total.
+- **G2 Hadamard KV-encode = 47 µs/token.**  TQ-KV path fires per layer; gemma-only relative to qwen35.  Small contributor.
+- **G1 fused head-norm+RoPE = 16 µs/token.**  Already-fused, alloc-free, well-tuned.  Confirmed not a lever.
+- **G8 barrier sub-1ms.**  Same as §P3a' H4 verdict (counter resolution required, not TimeProfiler).  iter2 BARRIER_COUNT/BARRIER_NS atomics are the right tool; rerun under `MLX_PROFILE_BARRIERS=1` if needed.
+
+**Rank stability — top-N frames in EVERY trial's top-15 (n_trials=5):**
+
+```
+rank 1   : forward_decode (the entry — every trial)
+rank 2   : cmd_generate
+rank 3   : run
+rank 4   : main
+rank 10-14: GraphSession::barrier_between
+rank 11-13: AGX::ComputeContext encode internals
+            (insertIndirectTGOptKernel, performEnqueueKernel)
+            (-[AGXG17XFamilyComputeContext memoryBarrierWithScope:])
+rank 12-16: -[AGXG17XFamilyComputeContext dispatchThreadgroups:...]
+```
+
+The CPU work that IS sampled is: dispatching threadgroups + barriers + encoder bookkeeping.  Same shape as qwen35.  Different scale (~300 µs/token total, vs qwen35's ~3700 µs/token alloc_buffer alone).
+
+**Coverage caveat — TimeProfiler sees CPU only.**  The 94.3% GPU share lives outside this trace.  Wave 2c+ work for gemma needs **Metal System Trace** (Instruments → Metal System Trace template → GPU counters) to attribute the 10.7 ms/token of GPU work.  Q-NAX-1 / Q-NAX-4 from the §"M5 Neural Accelerators" section call this out — Metal System Trace is the right tool, not TimeProfiler.
+
+**Wave 2c hard gates** (gemma-side levers; supersedes the iter4 "P3b is the lever for both families" claim for gemma specifically):
+
+1. **Metal System Trace** of gemma decode: 5 cold trials × 64 tokens on the same fixture, capture per-kernel GPU time + GPU-counter occupancy (`gpu.counters.shaderUtilization`, `gpu.counters.alu`, `gpu.counters.l2HitRate`, and if exposed `gpu.counters.neuralAcceleratorUtil`).  Establishes the GPU-side ranked residual.
+2. **Kernel-by-kernel comparison vs llama.cpp** on the same model.  llama.cpp's `ggml-metal` kernels for Q4_K mat-vec (and gemma's TQ-KV-equivalent — `ggml-metal-quants/q4_K_mv.metal` etc.) are the ground-truth reference for this hardware.  Attribute the 1820 µs/token gap by tensor-format kernel.
+3. **Decision point:** if gemma's kernel choice / dispatch pattern is the gap, ADR-015 P3c (M5 Neural Accelerator decode kernels) becomes a hard prerequisite for D4 second bullet — currently P3c is scoped TTFT-only.  Re-scope P3c to include decode mat-vec NAX routing if the data supports it.
+
+**Implication for iter6 / iter7 / D4:**
+
+- iter6 (gemma single-CB unification) — refactor-for-uniformity ROI on perf is bounded by ~219 µs/token (G6).  Worth doing for code consistency, not for the 19% gap.
+- iter7 (P3b alloc_buffer pool) — applies to qwen35 ONLY for gemma's purposes; the dense qwen35-Q analog from §P3a' (3063 µs/token without trial-3 outlier) is real, gemma's analog is 0.
+- **iter6 effort is shifted to Wave 2c gemma GPU profiling** (Metal System Trace + kernel comparison) so D4 second bullet is closable on evidence rather than hope.
+
+
 
 Original P3 (qwen35 single-CB rewrite) recovers ~30% of the gap.
 **A new P3b (Rust-orchestration profiling sweep) is added** that targets
@@ -1200,6 +1269,7 @@ P3c does NOT change the ~288 µs/token Rust-orchestration residual identified in
 - **2026-04-26 — P3a calibration empirical:** `µs/dispatch ≈ 0.16 µs` at N≥500 — within ±15% of llama.cpp's ~0.14 µs/dispatch.  Shader-launch path is **not** materially slower.  Budget reconciliation: ~252 µs of the 540 µs gap is encode-time (CB + dispatch); ~288 µs (~53%) is **residual unaccounted** that lives in Rust-side orchestration.  P3b (Rust orchestration sweep) added as parallel phase to P3 single-CB rewrite.  Together P3 + P3b target ≥1.00× exit criteria.
 - **2026-04-26 — Literature foundations infused.**  11 arxiv papers fetched + verified pre-training-cutoff, organized into Kernel-level (FlashAttention 1+2), System architecture (vLLM, SGLang, Sarathi-Serve), Decode acceleration (Speculative Decoding, Medusa, EAGLE, Lookahead), and Graph compilation (TVM, Hidet) categories.  Each entry calls out Apple-Silicon applicability honestly.  Apple-Silicon-specific gap acknowledged: no pre-cutoff arxiv work on M-series LLM inference perf that I could verify by direct fetch.  Added §Architectural implications given full-stack ownership — single-CB is the conservative first lever; megakernel + cross-token pipelining open as next-octave levers given we own both layers.
 - **2026-04-27 — §"P3a' live profile pass" infused (CFA Wave 2a, `cfa-20260426-adr015-wave2a-p3aprime`).** xctrace TimeProfiler captured 3 cold-SoC trials × 64 decode tokens on macOS 26.4.1 / M5 Max with the qwen3.6-27b-dwq46 dense fixture.  Decode-only stack filtering (`forward_gpu_greedy`) yields the live ranked residual: rank 1 is `MlxDevice::alloc_buffer` → `IOGPUResourceCreate` → `mach_msg2_trap` at 3719 µs/token (Mach-IPC kernel-call dominated, ~1 IPC per GPU resource × ~hundreds of decode-token allocations); rank 3 is `command_encoder()` churn at 724 µs/token (closes under P3 single-CB); rank 4's `build_rope_multi_buffers` at 208 µs/token is independently fixable by hoisting per-call rope-params buffers to model-load time.  Hypothesis register: H1 (`gpu_ffn.rs:397-404` proj alloc) NOT FOUND at literal site (dense path doesn't call proj()) but the underlying *category* CONFIRMED at 37× the static estimate via the rank-1 alloc_buffer chain; H2 (apply_imrope) CONFIRMED 5.8× larger than estimated; H3 (command_encoder churn) CONFIRMED 13× larger; H4 (memory_barrier) FALSIFIED at literal site (sub-1ms-sample at 1ms granularity); H5 (with_context allocation) FALSIFIED — confirms Codex Wave 1 prior (`format!` lazy via closure).  Coverage gap flagged: dense fixture does not exercise the apex MoE expert proj path; Wave 2b must re-validate H1's literal site against the apex 35B-A3B fixture before committing P3b reductions to MoE-specific call sites.  Supersession note added to §Diagnosis pointing at §P3a'.  NAX questions Q-NAX-1, Q-NAX-3, Q-NAX-4 received in-row updates where the trace informed them (Q-NAX-3: confirmed macOS 26.4.1 ≥ 26.2 NAX threshold; Q-NAX-1, Q-NAX-4: noted that decode-only TimeProfiler trace cannot inform GPU-counter / long-K-prefill questions, both remain open).  Trace artifacts referenced by absolute path (not committed); only `scripts/profile-p3aprime.sh`, this ADR section, and `docs/perf-traces/.gitkeep` land in git.  The 9th static-evidence kernel hypothesis class (Wave 1 P3b suspect list) joins the falsified-by-live-evidence list per `project_metal_compiler_auto_optimizes_static_levers` — the Mach-IPC / IOGPU-resource-creation overhead was not on Wave 1's static suspect list because grep against Rust source can't see kernel boundary crossings.
+- **2026-04-27 — §P3a'' gemma live profile pass (iter5).**  5-cold-trial xctrace TimeProfiler capture aggregated via `aggregate_decode.py --decode-filter forward_decode`.  Headline: **gemma decode is GPU-BOUND, not CPU-bound.**  Median per-trial CPU wall = 656 µs/token (5.7% of 11.4 ms decode wall); GPU = 94.3%.  G5 alloc_buffer = **0 µs/token** on gemma (qwen35 §P3a' rank-1 lever does NOT exist here).  G6 GraphSession bookkeeping = 219 µs/token (largest CPU contributor; bounded by 656 µs/token total).  Pre-iter5 "shared P3b lever" hypothesis FALSIFIED for gemma; the 19% gap to llama.cpp lives in GPU compute.  Aggregator gained `--decode-filter <regex>` option to scope per-token aggregation (mirrors §P3a' on `forward_gpu_greedy`).  New Wave 2c hard gates introduced: Metal System Trace + kernel comparison vs llama.cpp; P3c scope may need to extend to decode mat-vec NAX routing if data supports.  iter6 / iter7 plans rescoped: alloc_buffer pool is qwen35-only; gemma's lever is GPU-side.  Raw artifacts at `/tmp/adr015-gemma-p3aprime/` (traces + topcalls XML + aggregate.md).
 - **2026-04-27 — P0 gemma baseline measured (iter4).**  hf2q `35fdcc8` / mlx-native `19f5569` measured against same-day llama-bench on `gemma-4-26B-A4B-it-ara-abliterated-dwq` n=256 cold-SoC: hf2q **87.8 t/s** (per-trial 87.7 / 87.8 / 88.0; σ ≈ 0.15) vs llama-bench **104.52 t/s** (per-trial 103.96 / 104.58 / 104.52) = **0.840×**, recovery required **+19.0%**.  Fills D4 second-bullet placeholder + closes Phasing P0 row.  Bench harness `scripts/bench-baseline.sh` lands alongside (RAM-headroom precheck + thermal-gate + JSON metadata + tee summary).  Two harness bugs caught + fixed in the follow-up commit (`run_*_trial` progress echo bled into captured stdout; llama-bench awk grabbed std-dev not median).  New diagnosis subsection ("2026-04-27 — P0 Gemma baseline (iter4) reshapes the phasing budget") captures the implications: gemma gap is structurally larger than qwen35 ADR-012 baseline (0.840× vs 0.94×) AND lives entirely outside CB-count (gemma is already at 1-2 CBs/token), so D1's gemma half is refactor-for-uniformity not perf lever; the lever is shared P3b orchestration, particularly rank-1 alloc_buffer pool which can apply to both families.  Adds a Track B for iter5/iter6: port the iter1 rope_multi cache pattern to gemma's `forward_mlx.rs` rope call sites.
 - **2026-04-27 — Wave 2b iter3 landed (aggregate_decode.py rewrite + 5-trial median harness).**  hf2q @ `bcd08dd` lands `scripts/aggregate_decode.py` + `scripts/aggregate_hypotheses.json` + `scripts/profile-p3aprime.sh` (default `N_TRIALS=5`).  Replaces the volatile `/tmp/cfa-adr015-wave2a-p3a-prime/aggregate_decode.py` working-copy that had AF3 (overlapping-inclusive-frame double-count) + AF4 (rank-stability split-on-tuple) bugs and used 3-trial mean instead of 5-trial median.  The new aggregator: (a) reports ONE canonical frame per hypothesis via the regex in `scripts/aggregate_hypotheses.json`, (b) lists named subcomponents side-by-side without summing them into the primary, (c) keeps frame names as `str` end-to-end with a typed dataclass for trial state, (d) defaults to 5-trial median (outlier-absorbing without silent discard).  Hypothesis register includes the new H6-Wave2b-AllocBuffer entry pointing at `MlxDevice::alloc_buffer::` for the rank-1 P3b lever.  H4's regex now targets `issue_metal_buffer_barrier` (the new `#[inline(never)]` frame from iter2) so TimeProfiler can attribute it; the `BARRIER_COUNT`/`BARRIER_NS` counters from iter2 provide the authoritative number.  Smoke-tested on synthetic xctrace XML — correct per-trial totals, median, subcomponent isolation, rank-stability table.  Closes Wave 2b hard gates #3, #4, #5.  Remaining Wave 2b hard gates: #1 (apex 35B-A3B MoE 5-cold-trial × 64-decode-token re-measurement) and #2 (already closed by iter2 BARRIER counters).
 - **2026-04-27 — Wave 2b iter2 landed (H4 counter-based barrier accounting).**  mlx-native @ `19f5569` adds atomic `BARRIER_COUNT` (always tracked) + `BARRIER_NS` (env-gated under `MLX_PROFILE_BARRIERS=1`) around the `memoryBarrierWithScope:` `objc::msg_send!` site at `/opt/mlx-native/src/encoder.rs:498-512`.  The objc dispatch is moved into a `#[inline(never)]` helper (`issue_metal_buffer_barrier`) so xctrace / Instruments has a stable Rust frame to attribute barrier time against, rather than being inlined / hidden under sibling Objective-C frames as it was at 1 ms TimeProfiler resolution in Wave 2a.  Public API: `mlx_native::barrier_count() -> u64`, `mlx_native::barrier_total_ns() -> u64`, `reset_counters()` extended.  Hot-path cost: 1 atomic fetch_add (~5 ns) + 1 OnceLock load when env-disabled (default); 2 × `Instant::now()` (~100-200 ns) when `MLX_PROFILE_BARRIERS=1` (opt-in only — adds ~22-44 µs/token at 440 barriers/token, comparable to what is being measured).  Tests in `tests/test_barrier_counter.rs` cover: pre-dispatch no-op skip, capture-mode skip, +3-after-3-barriers post-active-dispatch, ns-stays-0 with profile disabled.  Closes Wave 2b hard gate #2 (the H4 OPEN status from §"P3a' live profile pass" hypothesis register).
