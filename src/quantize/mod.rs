@@ -938,6 +938,175 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-3z — proves imatrix actually **improves** the
+    /// importance-weighted error vs uncalibrated, not just produces
+    /// different bytes (iter-3w).  Closes the divergence-direction
+    /// gap: a regression that flips the imatrix codebook search to
+    /// minimise the **wrong** objective (or accidentally inverts the
+    /// importance vector) would still pass iter-3w's "bytes differ"
+    /// gate but would fail this gate.
+    ///
+    /// Mechanism: `make_qkx3_quants` minimises `sum(weight[c] * err[c]^2)`
+    /// where `weight[c]` is the imatrix importance for column `c`.
+    /// `make_qkx2_quants` (the uncalibrated path) minimises uniform
+    /// `sum(err[c]^2)`.  When the importance vector is highly non-uniform
+    /// (here: 10000× ratio on first 16 columns), the imatrix path's
+    /// importance-weighted SSE must be **lower** than the uncalibrated
+    /// path's, even though its uniform-RMSE on the full row may be
+    /// higher (by design — imatrix trades low-importance accuracy for
+    /// high-importance accuracy).
+    #[test]
+    fn variant_imatrix_lowers_importance_weighted_error() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
+
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 4;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+        const HIGH_IMPORTANCE_COLS: usize = 16;
+
+        // Activations → after `accumulate_dense`, ImatrixCollector stores
+        // `values[c] = sum_t activations[c]^2`.  With 1 token and
+        // activations[c] = 10.0 for c<16 / 0.1 for c≥16, importance
+        // becomes 100 vs 0.01 → 10000× ratio.
+        let acts: Vec<f32> = (0..QK_K)
+            .map(|c| if c < HIGH_IMPORTANCE_COLS { 10.0 } else { 0.1 })
+            .collect();
+
+        let mut col = ImatrixCollector::new();
+        col.accumulate_dense(TENSOR, &acts, 1, QK_K).unwrap();
+        col.record_chunk();
+        let imatrix = CalibrationData::from_imatrix_collector(&col);
+
+        // Per-column importance weight for the SSE computation: square
+        // of the activation magnitude (matches what the codec sees).
+        let importance: Vec<f64> = (0..QK_K)
+            .map(|c| if c < HIGH_IMPORTANCE_COLS { 100.0_f64 } else { 0.01_f64 })
+            .collect();
+
+        // Adversarial-ish input that exposes codebook tradeoffs:
+        // high-importance columns have wide magnitude range (forces
+        // the codebook to spend bits on them) while low-importance
+        // columns have small steady values (cheap to skimp on).  On a
+        // smooth ramp Q4_K_M is already near-optimal in both codebooks
+        // and the imatrix improvement washes out in the noise.
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| {
+                let c = i % QK_K;
+                let r = (i / QK_K) as f32;
+                if c < HIGH_IMPORTANCE_COLS {
+                    // wide range: -3 .. 3 across rows × column index
+                    let t = (c as f32 / HIGH_IMPORTANCE_COLS as f32) + r * 0.5;
+                    -3.0 + 6.0 * (t.fract())
+                } else {
+                    // small steady values: ~ -0.1 .. 0.1
+                    let t = ((c as f32) / QK_K as f32) + r * 0.01;
+                    -0.1 + 0.2 * (t.fract())
+                }
+            })
+            .collect();
+        let f16_bytes: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let expected_post_f16: Vec<f32> = original_f32
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let make_lazy_map = || -> LazyTensorMap {
+            let mut m = LazyTensorMap::new();
+            m.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+                f16_bytes.clone(),
+            ));
+            m
+        };
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        let q_none = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M, CalibrationData::None, 32,
+        );
+        let q_imatrix = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M, imatrix, 32,
+        );
+
+        let out_none = quantize_streaming(
+            make_lazy_map(), &metadata, &q_none, 0, 0, &progress, false,
+        ).unwrap();
+        let out_imatrix = quantize_streaming(
+            make_lazy_map(), &metadata, &q_imatrix, 0, 0, &progress, false,
+        ).unwrap();
+
+        let bytes_none = &out_none.tensors[TENSOR].data;
+        let bytes_imatrix = &out_imatrix.tensors[TENSOR].data;
+
+        let mut decoded_none = vec![0.0_f32; TOTAL];
+        let mut decoded_imatrix = vec![0.0_f32; TOTAL];
+        dequantize_row_q4_k_bytes(bytes_none, &mut decoded_none).unwrap();
+        dequantize_row_q4_k_bytes(bytes_imatrix, &mut decoded_imatrix).unwrap();
+
+        // Importance-weighted SSE: sum over (row, col) of weight[col] * err^2.
+        let weighted_sse = |decoded: &[f32]| -> f64 {
+            let mut s = 0.0_f64;
+            for r in 0..N_BLOCKS {
+                for c in 0..QK_K {
+                    let i = r * QK_K + c;
+                    let e = (decoded[i] as f64) - (expected_post_f16[i] as f64);
+                    s += importance[c] * e * e;
+                }
+            }
+            s
+        };
+
+        let wsse_none = weighted_sse(&decoded_none);
+        let wsse_imatrix = weighted_sse(&decoded_imatrix);
+
+        // The gate: imatrix path's importance-weighted SSE must be
+        // strictly lower.  If they're equal, calibration is being
+        // ignored.  If imatrix is higher, the codec is minimising the
+        // wrong objective (sign-flipped weights, etc).
+        assert!(
+            wsse_imatrix < wsse_none,
+            "imatrix-weighted SSE {wsse_imatrix:.6} should be < uncalibrated \
+             SSE {wsse_none:.6} — imatrix path is failing to minimise the \
+             importance-weighted objective"
+        );
+
+        // Sanity: the high-importance columns specifically should see
+        // a meaningful improvement (>= 5% reduction in SSE on those
+        // columns alone).  Catches a bug where the gate technically
+        // passes via tiny noise improvements unrelated to the
+        // importance vector.
+        let high_col_sse = |decoded: &[f32]| -> f64 {
+            let mut s = 0.0_f64;
+            for r in 0..N_BLOCKS {
+                for c in 0..HIGH_IMPORTANCE_COLS {
+                    let i = r * QK_K + c;
+                    let e = (decoded[i] as f64) - (expected_post_f16[i] as f64);
+                    s += e * e;
+                }
+            }
+            s
+        };
+        let high_none = high_col_sse(&decoded_none);
+        let high_imatrix = high_col_sse(&decoded_imatrix);
+        assert!(
+            high_imatrix < high_none * 0.95,
+            "high-importance-column SSE: imatrix={high_imatrix:.6} \
+             uncalibrated={high_none:.6}; imatrix should reduce error \
+             on these columns by ≥ 5% (got {:.2}%)",
+            (1.0 - high_imatrix / high_none) * 100.0
+        );
+    }
+
     /// ADR-014 P7 iter-3y — round-trip RMSE bounds for Q5_K_M and Q6_K
     /// through the streaming pipeline, paralleling iter-3x's Q4_K_M
     /// gate. Confirms the variant dispatch correctly routes to the
