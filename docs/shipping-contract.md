@@ -56,6 +56,7 @@ an explicit acknowledgment: `HF2Q_UNSAFE_EXPERIMENTS=1`.
 | Var | Unsafe-ack | Purpose |
 |---|---|---|
 | `HF2Q_LMHEAD_RERANK=0` | **required** | Measure raw Q8 argmax cost. Reintroduces the rare near-tiebreak flip (observed as mid-decode `<pad>` emission). |
+| `HF2Q_CHUNK_SCAN_PREFILL=1` | **required** | Wave 5b iter 5 opt-in: route Qwen3.6 prefills at `seq_len > 64` through the mlx-native chunk-parallel delta-rule pipeline (`mlx_native::ops::chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`). Closes the long-prefill SOTA path on ADR-005 ACs 5468/5470 (currently only-partial via `HF2Q_QWEN36_AUTOREG`). Decode parity ±5% (AC 5468) and walk-bar parity at pp4096+ (W-5b.3) are validated as separate iters before this becomes Category 1. |
 
 ---
 

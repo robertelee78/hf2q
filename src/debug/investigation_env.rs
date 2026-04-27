@@ -234,6 +234,30 @@ pub struct InvestigationEnv {
     pub qwen36_autoreg: bool,
 
     // ========================================================================
+    // Category 3 (ack-required) — Wave 5b iter 5: chunk-scan prefill opt-in.
+    //
+    // Routes Qwen3.6 prefills at `seq_len > 64` through the mlx-native
+    // chunk-parallel delta-rule pipeline (`mlx_native::ops::
+    // chunk_gated_delta_rule::dispatch_chunk_gated_delta_rule_fwd`)
+    // instead of the autoregressive per-token path.  Closes the long-
+    // prefill SOTA perf path on ADR-005 ACs 5468/5470 (currently
+    // only-partial via Wave 5a's autoregressive opt-in).
+    //
+    // Classified Category 3 (benchmarking-only, ack-required) because it
+    // changes the forward-pass dispatch — sourdough byte-prefix gates and
+    // walk-bar parity at pp4096+ are validated as separate iters before
+    // this becomes Category 1. Effective only when
+    // `HF2Q_UNSAFE_EXPERIMENTS=1` is also set.
+    // ========================================================================
+    /// `HF2Q_CHUNK_SCAN_PREFILL=1` — opt in to dispatching Qwen3.6 prefills
+    /// at `seq_len > 64` through the chunk-parallel delta-rule pipeline.
+    /// Effective: `true` only when the env var is `"1"` AND
+    /// `HF2Q_UNSAFE_EXPERIMENTS=1` is set.  Wave 5b iter 5.
+    /// Original parse (none — new field): `env_eq_one("HF2Q_CHUNK_SCAN_PREFILL")`
+    /// gated by `env_eq_one("HF2Q_UNSAFE_EXPERIMENTS")`.
+    pub chunk_scan_prefill: bool,
+
+    // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
     // These two vars select per-layer dense vs TQ SDPA dispatch.
     // Read per-token per-layer in the decode loop when gate_h_inactive and
@@ -347,6 +371,7 @@ struct RawAckIntent {
     skip_tq_encode: bool,
     skip_tq_sdpa: bool,
     lmhead_rerank_disabled: bool,
+    chunk_scan_prefill: bool,
 }
 
 impl InvestigationEnv {
@@ -363,6 +388,7 @@ impl InvestigationEnv {
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
             ),
+            chunk_scan_prefill: env_eq_one("HF2Q_CHUNK_SCAN_PREFILL"),
         };
         let ack = env_eq_one("HF2Q_UNSAFE_EXPERIMENTS");
 
@@ -373,6 +399,7 @@ impl InvestigationEnv {
             skip_tq_encode: raw.skip_tq_encode && ack,
             skip_tq_sdpa: raw.skip_tq_sdpa && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
+            chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
             // Warn-only — no gate.
             graph_opt: env_eq_one("HF2Q_GRAPH_OPT"),
@@ -509,6 +536,13 @@ impl InvestigationEnv {
                 "raw Q8 argmax; rare near-tiebreak flips",
             ));
         }
+        if self.chunk_scan_prefill {
+            active_unsafe.push((
+                "HF2Q_CHUNK_SCAN_PREFILL=1",
+                "Wave 5b iter 5 chunk-pipeline prefill at seq_len > 64; \
+                 sourdough/walk-bar parity validation pending",
+            ));
+        }
 
         // Refused (user set ack-required toggle but HF2Q_UNSAFE_EXPERIMENTS=1 missing).
         let mut refused: Vec<(&str, &str)> = Vec::new();
@@ -539,6 +573,12 @@ impl InvestigationEnv {
         if self.raw.lmhead_rerank_disabled && !self.lmhead_rerank_disabled {
             refused.push((
                 "HF2Q_LMHEAD_RERANK=0",
+                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
+            ));
+        }
+        if self.raw.chunk_scan_prefill && !self.chunk_scan_prefill {
+            refused.push((
+                "HF2Q_CHUNK_SCAN_PREFILL=1",
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
@@ -998,6 +1038,74 @@ mod tests {
         let env = InvestigationEnv::from_env();
         assert!(env.qwen36_autoreg);
         assert!(!env.unsafe_experiments_acked);
+    }
+
+    // ── chunk_scan_prefill (Wave 5b iter 5) ──────────────────────────
+
+    #[test]
+    fn chunk_scan_prefill_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "HF2Q_CHUNK_SCAN_PREFILL",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+        assert!(
+            !InvestigationEnv::from_env().chunk_scan_prefill,
+            "unset => default false (chunk-pipeline prefill must be opt-in)"
+        );
+    }
+
+    #[test]
+    fn chunk_scan_prefill_requires_unsafe_ack() {
+        // Ack-required gate: HF2Q_CHUNK_SCAN_PREFILL=1 alone does NOT take
+        // effect. Both vars must be set for the field to read true.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_CHUNK_SCAN_PREFILL",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+        guard.set("HF2Q_CHUNK_SCAN_PREFILL", "1");
+        // Note: HF2Q_UNSAFE_EXPERIMENTS deliberately not set.
+        let env = InvestigationEnv::from_env();
+        assert!(
+            !env.chunk_scan_prefill,
+            "raw intent without ack must be REFUSED (effective false)"
+        );
+        assert!(env.raw.chunk_scan_prefill, "raw intent must be captured for REFUSED reporting");
+        assert!(!env.unsafe_experiments_acked);
+    }
+
+    #[test]
+    fn chunk_scan_prefill_enabled_with_ack() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_CHUNK_SCAN_PREFILL",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+        guard.set("HF2Q_CHUNK_SCAN_PREFILL", "1");
+        guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
+        let env = InvestigationEnv::from_env();
+        assert!(env.chunk_scan_prefill, "1 + ack => effective true");
+        assert!(env.unsafe_experiments_acked);
+    }
+
+    #[test]
+    fn chunk_scan_prefill_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&[
+            "HF2Q_CHUNK_SCAN_PREFILL",
+            "HF2Q_UNSAFE_EXPERIMENTS",
+        ]);
+        guard.set("HF2Q_UNSAFE_EXPERIMENTS", "1");
+        // env_eq_one accepts only "1" — these must all be rejected.
+        for bad in &["0", "true", "yes", "TRUE", "on", ""] {
+            guard.set("HF2Q_CHUNK_SCAN_PREFILL", bad);
+            assert!(
+                !InvestigationEnv::from_env().chunk_scan_prefill,
+                "value {:?} must not enable chunk_scan_prefill",
+                bad
+            );
+        }
     }
 
     // ── layer_policy ─────────────────────────────────────────────────
