@@ -235,10 +235,19 @@ impl MlxModelWeights {
         //   [n_kv_heads, capacity, head_dim]
         // This layout matches flash_attn_vec's K,V input format.
         //
-        // Capacity = seq_len + max_decode_tokens. dense flash_attn_vec
-        // requires a linear (non-ring-buffer) cache, so capacity must
-        // cover the full generation budget. A ring-buffer path for
-        // sliding layers is deferred (ADR-010).
+        // Per-layer capacity is set in the loop at lines 254-275:
+        //   - LayerType::Sliding (ring): capacity = sliding_window.
+        //     Writes wrap via `slot = tok_pos % capacity`; reads use
+        //     `kv_seq_len = min(tok_i + 1, sliding_window)` (lines 963-967).
+        //   - LayerType::Global (linear): capacity = seq_len + max_decode_tokens.
+        //     Writes are monotonically increasing.
+        // The dense flash_attn_vec dispatch at lines 960-981 uses
+        // `mask_type=1` (pure causal) for both layer types. Ring
+        // correctness rests on attention being permutation-invariant
+        // over the K,V set: once the ring wraps, the oldest slot is
+        // overwritten with the newest token, but which physical slot
+        // is oldest is immaterial — the causal mask within the
+        // sliding window still yields the correct attention pattern.
         // ===================================================================
         // ADR-009 Phase 3A finding: matching llama.cpp's F16 KV cache
         // REGRESSED our parity (sourdough 3656→3095, sliding_wrap 752→627).
