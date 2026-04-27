@@ -150,8 +150,11 @@ impl Quantizer for VariantKQuantizer {
     ) -> Result<QuantizedTensor, QuantizeError> {
         // Preserve path matches StaticQuantizer / KQuantCodecQuantizer:
         // norms, biases, vision tensors, explicit-preserve flags pass
-        // through at original precision.
-        if config.preserve {
+        // through at original precision.  Also catches the layer_mix
+        // skip rule for `ffn_gate_inp.weight` (`llama-quant.cpp:307`).
+        let must_preserve = config.preserve
+            || crate::quantize::layer_mix::should_skip_quantization(&tensor.name);
+        if must_preserve {
             let (data, dtype) = if tensor.dtype == DType::BF16 {
                 match tensor.to_f16() {
                     Ok(converted) => (converted.data, DType::F16),

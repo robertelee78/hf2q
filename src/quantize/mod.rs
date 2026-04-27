@@ -937,4 +937,114 @@ mod tests {
         assert_eq!(eager.quant_method, "Q4_K_M");
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
+
+    /// ADR-014 P7 iter-3u — `VariantKQuantizer` honors the
+    /// `should_skip_quantization` rule for `ffn_gate_inp.weight` AND
+    /// the new MoE-aware classification (`*_exps`, `*_shexp`) through
+    /// the streaming pipeline.  Locks two iter-3u behaviors end-to-end:
+    ///
+    /// 1. `blk.X.ffn_gate_inp.weight` passes through preserved (no
+    ///    quantization) regardless of `LayerQuantConfig.preserve` —
+    ///    matches `llama-quant.cpp:307`.
+    /// 2. `blk.X.ffn_down_exps.weight` gets the Q4_K_M `use_more_bits`
+    ///    Q6_K bump at qualifying layers (was a parity gap pre-iter-3u
+    ///    where MoE expert tensors fell through to the `Other` category).
+    #[test]
+    fn variant_streaming_honors_iter3u_moe_classification() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+
+        const QK_K: usize = 256;
+        const N_LAYERS: usize = 32;
+
+        let make_f16_payload = |seed: f32, len: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(len * 2);
+            for i in 0..len {
+                let v = (i as f32 / len as f32) * 2.0 - 1.0 + seed * 0.01;
+                let h = half::f16::from_f32(v);
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+            bytes
+        };
+
+        // Three MoE-style fixtures:
+        //   1. ffn_gate_inp.weight   → skip-quantize → passthrough preserved
+        //   2. ffn_down_exps.weight  layer 0 → Q6_K (use_more_bits + new
+        //                                            substring-classify)
+        //   3. ffn_up_exps.weight    layer 0 → Q4_K base (FfnUp is
+        //                                            classified now but
+        //                                            policy still falls
+        //                                            to base — locks
+        //                                            the documented
+        //                                            iter-3u behavior)
+        let fixtures: Vec<(&str, Vec<usize>, &str, Option<&str>)> = vec![
+            ("blk.0.ffn_gate_inp.weight",  vec![1, QK_K], "passthrough",         None),
+            ("blk.0.ffn_down_exps.weight", vec![1, QK_K], "k_quant_codec_direct", Some("Q6_K")),
+            ("blk.0.ffn_up_exps.weight",   vec![1, QK_K], "k_quant_codec_direct", Some("Q4_K")),
+        ];
+
+        let mut lazy_map = LazyTensorMap::new();
+        for (i, (name, shape, _expected_method, _expected_type)) in fixtures.iter().enumerate() {
+            let len: usize = shape.iter().product();
+            let data = make_f16_payload(i as f32, len);
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(name.to_string(), shape.clone(), DType::F16),
+                data,
+            ));
+        }
+
+        let metadata = dummy_metadata();
+        let quantizer = VariantKQuantizer::new(
+            KQuantVariant::Q4_K_M,
+            CalibrationData::None,
+            N_LAYERS,
+        );
+        let progress = crate::progress::ProgressReporter::new();
+
+        let result = quantize_streaming(
+            lazy_map, &metadata, &quantizer, 0, 0, &progress, /* bf16_to_f16 */ false,
+        )
+        .unwrap();
+
+        for (name, _shape, expected_method, expected_type) in &fixtures {
+            let t = result.tensors.get(*name).unwrap_or_else(||
+                panic!("streaming output missing {name}"));
+            assert_eq!(
+                t.quant_info.method, *expected_method,
+                "{name} method mismatch (iter-3u)"
+            );
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(),
+                *expected_type,
+                "{name} ggml_type mismatch (iter-3u)"
+            );
+
+            if name.contains("ffn_gate_inp") {
+                // ffn_gate_inp passes through — original F16 bytes
+                // preserved 1:1, NOT block-quantized.
+                let len: usize = QK_K;
+                assert_eq!(
+                    t.data.len(), len * 2,
+                    "{name} should preserve F16 bytes (2 per element)"
+                );
+                assert!(t.quant_info.preserved, "{name} should be marked preserved");
+            } else {
+                // expert tensors get block-quantized to either Q4_K (144) or
+                // Q6_K (210) bytes per super-block.
+                let expected_bytes = match expected_type.unwrap() {
+                    "Q4_K" => 144,
+                    "Q6_K" => 210,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    t.data.len(), expected_bytes,
+                    "{name} should emit {expected_bytes}-byte blocks for {}",
+                    expected_type.unwrap()
+                );
+                assert!(!t.quant_info.preserved, "{name} should be quantized");
+            }
+        }
+    }
 }

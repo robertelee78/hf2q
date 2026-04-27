@@ -122,8 +122,11 @@ impl KQuantVariant {
 }
 
 /// Tensor category — coarse classification of GGUF weight tensors,
-/// used to route per-tensor targets. Matches the subset of llama.cpp's
-/// `tensor_category` enum the policy actually branches on.
+/// used to route per-tensor targets. **Matches llama.cpp's full
+/// `tensor_category` enum** (`llama-quant.cpp:99-108` + classification
+/// at `:115-150`) so MoE expert variants (`*_exps.weight`,
+/// `*_shexp.weight`) and merged-attention QKV / KV-B layouts route to
+/// the same per-tensor policy llama.cpp would pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorCategory {
     /// `output.weight` (lm_head). With tied embeddings, also covers
@@ -131,24 +134,69 @@ pub enum TensorCategory {
     Output,
     /// `token_embd.weight` (separate from output for non-tied archs).
     TokenEmbd,
-    /// `blk.<i>.attn_v.weight` — value projection in attention.
+    /// `attn_qkv.weight` — merged Q/K/V projection (treated as
+    /// attn_v-equivalent in `category_is_attn_v`,
+    /// `llama-quant.cpp:153-157`).
+    AttentionQkv,
+    /// `attn_kv_b.weight` — DeepSeek MLA's KV down-projection
+    /// (treated as attn_v-equivalent likewise).
+    AttentionKvB,
+    /// `attn_v.weight` — value projection in attention. Substring
+    /// match → covers `blk.<i>.attn_v.weight` and any future
+    /// arch-specific names ending in `attn_v.weight`.
     AttentionV,
-    /// `blk.<i>.attn_k.weight` — key projection in attention.
+    /// `attn_k.weight` — key projection.
     AttentionK,
-    /// `blk.<i>.attn_q.weight` — query projection in attention.
+    /// `attn_q.weight` — query projection.
     AttentionQ,
-    /// `blk.<i>.ffn_down.weight` — FFN down-projection (the per-layer
-    /// special case for `_K_M` upgrades).
+    /// `attn_output.weight` — attention output projection.
+    AttentionOutput,
+    /// `ffn_up*` — FFN up-projection. Substring match covers MoE
+    /// variants (`ffn_up_exps.weight`, `ffn_up_shexp.weight`).
+    FfnUp,
+    /// `ffn_gate*` — FFN gate. Substring match covers MoE variants
+    /// (`ffn_gate_exps.weight`, `ffn_gate_shexp.weight`) AND the
+    /// router gate `ffn_gate_inp.weight` (which `should_skip_quantization`
+    /// then filters out per `llama-quant.cpp:307`).
+    FfnGate,
+    /// `ffn_down*` — FFN down-projection. Substring match covers MoE
+    /// variants (`ffn_down_exps.weight`, `ffn_down_shexp.weight`).
+    /// The per-layer special case for `_K_M` upgrades.
     FfnDown,
-    /// Any other weight tensor (norm, gate, up, etc.) — gets the
-    /// variant's base target unchanged.
+    /// Any other weight tensor (norm, embedding scale, etc.) — gets
+    /// the variant's base target unchanged.
     Other,
 }
 
 impl TensorCategory {
     /// Classify a tensor by its GGUF name (post-`map_tensor_name_to_gguf`
-    /// transformation). Recognises the standard `blk.<i>.<role>.weight`
-    /// + `output.weight` + `token_embd.weight` patterns.
+    /// transformation). Pure substring-matching port of llama.cpp's
+    /// `tensor_get_category` (`llama-quant.cpp:115-150`):
+    ///
+    /// ```c
+    /// if (tensor_name_match_output_weight(...))         return OUTPUT;
+    /// if (tensor_name_match_token_embd(...))            return TOKEN_EMBD;
+    /// if (find("attn_qkv.weight"))                      return ATTENTION_QKV;
+    /// if (find("attn_kv_b.weight"))                     return ATTENTION_KV_B;
+    /// if (find("attn_v.weight"))                        return ATTENTION_V;
+    /// if (find("attn_k.weight"))                        return ATTENTION_K;
+    /// if (find("attn_q.weight"))                        return ATTENTION_Q;
+    /// if (find("attn_output.weight"))                   return ATTENTION_OUTPUT;
+    /// if (find("ffn_up"))                               return FFN_UP;
+    /// if (find("ffn_gate"))                             return FFN_GATE;
+    /// if (find("ffn_down"))                             return FFN_DOWN;
+    /// return OTHER;
+    /// ```
+    ///
+    /// Priority order matters: `attn_qkv.weight` contains the substring
+    /// `attn_v`, so the QKV check must run first. Likewise `attn_kv_b`
+    /// before `attn_v`, `attn_v` before `attn_k`, etc.
+    ///
+    /// **Substring matching → MoE coverage:** `blk.0.ffn_down_exps.weight`
+    /// matches the `ffn_down` substring → `FfnDown`. The pre-iter-3u
+    /// exact-match logic was a real Q4_K_M parity gap on MoE models —
+    /// expert FFN tensors fell through to `Other` and missed the
+    /// `use_more_bits → Q6_K` bump llama.cpp applies.
     pub fn classify(tensor_name: &str) -> Self {
         if tensor_name == "output.weight" {
             return Self::Output;
@@ -156,23 +204,53 @@ impl TensorCategory {
         if tensor_name == "token_embd.weight" {
             return Self::TokenEmbd;
         }
-        // Strip `blk.<N>.` prefix.
-        let suffix = tensor_name.strip_prefix("blk.").and_then(|s| {
-            let dot = s.find('.')?;
-            Some(&s[dot + 1..])
-        });
-        if let Some(role) = suffix {
-            match role {
-                "attn_v.weight" => Self::AttentionV,
-                "attn_k.weight" => Self::AttentionK,
-                "attn_q.weight" => Self::AttentionQ,
-                "ffn_down.weight" => Self::FfnDown,
-                _ => Self::Other,
-            }
-        } else {
-            Self::Other
+        // llama.cpp priority order: attn_qkv → attn_kv_b → attn_v →
+        // attn_k → attn_q → attn_output → ffn_up → ffn_gate → ffn_down.
+        if tensor_name.contains("attn_qkv.weight") {
+            return Self::AttentionQkv;
         }
+        if tensor_name.contains("attn_kv_b.weight") {
+            return Self::AttentionKvB;
+        }
+        if tensor_name.contains("attn_v.weight") {
+            return Self::AttentionV;
+        }
+        if tensor_name.contains("attn_k.weight") {
+            return Self::AttentionK;
+        }
+        if tensor_name.contains("attn_q.weight") {
+            return Self::AttentionQ;
+        }
+        if tensor_name.contains("attn_output.weight") {
+            return Self::AttentionOutput;
+        }
+        if tensor_name.contains("ffn_up") {
+            return Self::FfnUp;
+        }
+        if tensor_name.contains("ffn_gate") {
+            return Self::FfnGate;
+        }
+        if tensor_name.contains("ffn_down") {
+            return Self::FfnDown;
+        }
+        Self::Other
     }
+}
+
+/// `true` if this tensor must NOT be quantized regardless of variant —
+/// matches `llama-quant.cpp:307`:
+///
+/// ```c
+/// quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
+/// ```
+///
+/// `ffn_gate_inp.weight` is the MoE router gate (small, [n_experts,
+/// hidden_size] typically) — llama.cpp keeps it at original precision
+/// because routing decisions are extremely sensitive to perturbation.
+/// Without this skip, MoE Q4_K_M output diverges from llama.cpp's gguf
+/// at the router tensor.
+pub fn should_skip_quantization(tensor_name: &str) -> bool {
+    tensor_name.contains("ffn_gate_inp.weight")
 }
 
 /// llama.cpp's `use_more_bits` predicate (line 417-419):
@@ -230,7 +308,12 @@ pub fn target_for(
             KQuantVariant::Q4_K_M | KQuantVariant::Q5_K_M => KQuantTarget::Q6K,
             _ => base,
         },
-        TensorCategory::AttentionV => match variant {
+        // ATTENTION_V, ATTENTION_QKV, ATTENTION_KV_B — `category_is_attn_v`
+        // at `llama-quant.cpp:153-157` lumps these together so the V-policy
+        // applies to all three.
+        TensorCategory::AttentionV
+        | TensorCategory::AttentionQkv
+        | TensorCategory::AttentionKvB => match variant {
             KQuantVariant::Q4_K_M | KQuantVariant::Q5_K_M => {
                 if use_more_bits(i_layer, n_layers) {
                     KQuantTarget::Q6K
@@ -257,8 +340,18 @@ pub fn target_for(
             }
             _ => base,
         },
+        // ATTENTION_K, ATTENTION_Q, ATTENTION_OUTPUT, FFN_UP, FFN_GATE,
+        // OTHER → base target.  llama.cpp has stateful per-layer
+        // counters for FFN_UP / FFN_GATE / ATTENTION_OUTPUT (`i_ffn_up`,
+        // `i_ffn_gate`, etc.) that drive `use_more_bits`-style bumps;
+        // those need a stateful call site (P7 iter-3v: track per-layer
+        // counters in `VariantKQuantizer` if/when MoE quality data
+        // shows the bumps matter).
         TensorCategory::AttentionK
         | TensorCategory::AttentionQ
+        | TensorCategory::AttentionOutput
+        | TensorCategory::FfnUp
+        | TensorCategory::FfnGate
         | TensorCategory::Other => base,
     }
 }
@@ -328,7 +421,10 @@ mod tests {
         assert_eq!(TensorCategory::classify("blk.5.attn_k.weight"), TensorCategory::AttentionK);
         assert_eq!(TensorCategory::classify("blk.10.attn_q.weight"), TensorCategory::AttentionQ);
         assert_eq!(TensorCategory::classify("blk.0.ffn_down.weight"), TensorCategory::FfnDown);
-        assert_eq!(TensorCategory::classify("blk.0.ffn_up.weight"), TensorCategory::Other);
+        // iter-3u: substring matching brings ffn_up under FfnUp (was
+        // Other under the pre-iter-3u exact-match logic).  This closes
+        // the parity gap with `llama-quant.cpp:140-142`.
+        assert_eq!(TensorCategory::classify("blk.0.ffn_up.weight"), TensorCategory::FfnUp);
         assert_eq!(TensorCategory::classify("blk.0.attn_norm.weight"), TensorCategory::Other);
         assert_eq!(TensorCategory::classify("rope_freqs.weight"), TensorCategory::Other);
     }
@@ -499,5 +595,201 @@ mod tests {
         match err {
             LayerMixError::UnknownVariant { variant } => assert_eq!(variant, "garbage"),
         }
+    }
+
+    // ── iter-3u: classify() substring-priority tests ────────────────
+
+    /// llama.cpp priority order: `attn_qkv` checked before `attn_v`
+    /// because `attn_qkv` contains the substring `attn_v`.
+    #[test]
+    fn classify_attn_qkv_before_attn_v() {
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_qkv.weight"),
+            TensorCategory::AttentionQkv
+        );
+        // Pure attn_v.
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_v.weight"),
+            TensorCategory::AttentionV
+        );
+    }
+
+    /// `attn_kv_b.weight` (DeepSeek MLA) classifies as AttentionKvB.
+    #[test]
+    fn classify_attn_kv_b() {
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_kv_b.weight"),
+            TensorCategory::AttentionKvB
+        );
+    }
+
+    /// `attn_output.weight` is its own category (was Other pre-iter-3u).
+    #[test]
+    fn classify_attn_output() {
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_output.weight"),
+            TensorCategory::AttentionOutput
+        );
+    }
+
+    /// MoE FFN expert variants classify under their non-MoE category
+    /// via substring matching — closes the Q4_K_M parity gap on MoE
+    /// models pre-iter-3u where `*_exps.weight` fell through to Other.
+    #[test]
+    fn classify_moe_ffn_expert_variants() {
+        // ffn_down_exps → FfnDown (eligible for use_more_bits Q6_K bump
+        // on _K_M variants).
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_down_exps.weight"),
+            TensorCategory::FfnDown
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_down_shexp.weight"),
+            TensorCategory::FfnDown
+        );
+        // ffn_up* and ffn_gate* match analogously.
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_up_exps.weight"),
+            TensorCategory::FfnUp
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_up_shexp.weight"),
+            TensorCategory::FfnUp
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_gate_exps.weight"),
+            TensorCategory::FfnGate
+        );
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_gate_shexp.weight"),
+            TensorCategory::FfnGate
+        );
+    }
+
+    /// MoE router gate `ffn_gate_inp.weight` classifies as FfnGate
+    /// (substring match), AND `should_skip_quantization` returns true
+    /// — matches `llama-quant.cpp:307` skip rule.
+    #[test]
+    fn ffn_gate_inp_classifies_then_skips() {
+        assert_eq!(
+            TensorCategory::classify("blk.0.ffn_gate_inp.weight"),
+            TensorCategory::FfnGate
+        );
+        assert!(should_skip_quantization("blk.0.ffn_gate_inp.weight"));
+        // Non-router ffn_gate variants do NOT trigger the skip.
+        assert!(!should_skip_quantization("blk.0.ffn_gate.weight"));
+        assert!(!should_skip_quantization("blk.0.ffn_gate_exps.weight"));
+        assert!(!should_skip_quantization("blk.0.ffn_gate_shexp.weight"));
+        assert!(!should_skip_quantization("blk.0.ffn_down.weight"));
+    }
+
+    /// AttentionQkv / AttentionKvB get the AttentionV policy per
+    /// `category_is_attn_v` at `llama-quant.cpp:153-157`.
+    #[test]
+    fn target_attn_qkv_kvb_follow_attn_v_policy() {
+        // Q4_K_M + use_more_bits at layer 0 → Q6K.
+        for name in ["blk.0.attn_qkv.weight", "blk.0.attn_kv_b.weight"] {
+            assert_eq!(
+                target_for(KQuantVariant::Q4_K_M, name, 0, 32),
+                KQuantTarget::Q6K,
+                "{name} should bump to Q6_K with Q4_K_M + use_more_bits"
+            );
+        }
+        // Q4_K_S + i_layer<4 → Q5_K bump.
+        for name in ["blk.0.attn_qkv.weight", "blk.0.attn_kv_b.weight"] {
+            assert_eq!(
+                target_for(KQuantVariant::Q4_K_S, name, 2, 32),
+                KQuantTarget::Q5K,
+                "{name} should bump to Q5_K with Q4_K_S at i_layer<4"
+            );
+        }
+        // Q6_K → base (Q6K) for both.
+        for name in ["blk.0.attn_qkv.weight", "blk.0.attn_kv_b.weight"] {
+            assert_eq!(
+                target_for(KQuantVariant::Q6_K, name, 0, 32),
+                KQuantTarget::Q6K,
+                "{name} on Q6_K stays at base Q6_K"
+            );
+        }
+    }
+
+    /// MoE FfnDown experts on Q4_K_M get the use_more_bits Q6_K bump
+    /// — was a parity gap pre-iter-3u (fell through to Other → Q4_K).
+    #[test]
+    fn target_moe_ffn_down_exps_q4km_use_more_bits_bump() {
+        // Layer 0 (first 1/8): bump.
+        assert_eq!(
+            target_for(KQuantVariant::Q4_K_M, "blk.0.ffn_down_exps.weight", 0, 32),
+            KQuantTarget::Q6K
+        );
+        // Layer 6 (every-3rd-after-1/8): bump.
+        assert_eq!(
+            target_for(KQuantVariant::Q4_K_M, "blk.6.ffn_down_exps.weight", 6, 32),
+            KQuantTarget::Q6K
+        );
+        // Layer 5 (middle, not every-3rd): no bump.
+        assert_eq!(
+            target_for(KQuantVariant::Q4_K_M, "blk.5.ffn_down_exps.weight", 5, 32),
+            KQuantTarget::Q4K
+        );
+    }
+
+    /// FfnUp / FfnGate / AttentionOutput / AttentionK / AttentionQ /
+    /// Other still default to base — explicit coverage to lock current
+    /// policy and catch any future drift.  llama.cpp's per-layer
+    /// counters for these categories are stateful (need
+    /// `i_ffn_up`/`i_ffn_gate`/etc.) so a stateless dispatch can't
+    /// reproduce them — that's deferred to iter-3v.
+    #[test]
+    fn target_other_attn_and_ffn_categories_get_base() {
+        let names_and_categories = [
+            ("blk.0.attn_q.weight", TensorCategory::AttentionQ),
+            ("blk.0.attn_k.weight", TensorCategory::AttentionK),
+            ("blk.0.attn_output.weight", TensorCategory::AttentionOutput),
+            ("blk.0.ffn_up.weight", TensorCategory::FfnUp),
+            ("blk.0.ffn_gate.weight", TensorCategory::FfnGate),
+            ("blk.0.ffn_up_exps.weight", TensorCategory::FfnUp),
+            ("blk.0.ffn_gate_exps.weight", TensorCategory::FfnGate),
+            ("rope_freqs.weight", TensorCategory::Other),
+        ];
+        for (name, expected_cat) in names_and_categories {
+            assert_eq!(
+                TensorCategory::classify(name),
+                expected_cat,
+                "{name} classify"
+            );
+            assert_eq!(
+                target_for(KQuantVariant::Q4_K_M, name, 0, 32),
+                KQuantTarget::Q4K,
+                "{name} target_for Q4_K_M"
+            );
+            assert_eq!(
+                target_for(KQuantVariant::Q5_K_S, name, 0, 32),
+                KQuantTarget::Q5K,
+                "{name} target_for Q5_K_S"
+            );
+        }
+    }
+
+    /// `output.weight` and `token_embd.weight` still match exactly —
+    /// substring-matching for *other* names doesn't accidentally pull
+    /// these into the wrong branch.
+    #[test]
+    fn classify_output_token_embd_exact_match_preserved() {
+        assert_eq!(
+            TensorCategory::classify("output.weight"),
+            TensorCategory::Output
+        );
+        assert_eq!(
+            TensorCategory::classify("token_embd.weight"),
+            TensorCategory::TokenEmbd
+        );
+        // Crucially, "output.weight" doesn't classify via attn_output
+        // substring (which it doesn't contain).  Sanity-check that
+        // `attn_output.weight` does NOT classify as Output.
+        assert_eq!(
+            TensorCategory::classify("blk.0.attn_output.weight"),
+            TensorCategory::AttentionOutput
+        );
     }
 }
