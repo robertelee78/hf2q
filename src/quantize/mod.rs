@@ -938,6 +938,130 @@ mod tests {
         assert_eq!(streaming.quant_method, "Q4_K_M");
     }
 
+    /// ADR-014 P7 iter-3y — round-trip RMSE bounds for Q5_K_M and Q6_K
+    /// through the streaming pipeline, paralleling iter-3x's Q4_K_M
+    /// gate. Confirms the variant dispatch correctly routes to the
+    /// Q5_K and Q6_K codecs (not just Q4_K) and the resulting bytes
+    /// dequantize to numerically meaningful values within the
+    /// canonical bounds:
+    ///
+    /// - Q5_K: ≤ 0.025 RMSE (5.5-bpw codebook → ~half Q4_K error)
+    /// - Q6_K: ≤ 0.012 RMSE (6.5-bpw codebook → ~quarter Q4_K error)
+    ///
+    /// Uses the same `blk.5.attn_q.weight` layer-5/32 setup as iter-3x
+    /// so attn_q never bumps and each variant lands at its base
+    /// target — Q5_K_M → Q5_K, Q6_K → Q6_K.  This means a regression
+    /// in the policy that silently routes Q5_K_M to Q4_K (or any other
+    /// target) would round-trip with wrong bytes-per-block AND wrong
+    /// RMSE.  The two assertions catch the bug at different layers.
+    #[test]
+    fn variant_streaming_q5km_q6k_round_trip_rmse_bounds() {
+        use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};
+        use crate::quantize::layer_mix::KQuantVariant;
+        use crate::quantize::variant_quantizer::VariantKQuantizer;
+        use crate::calibrate::calibrator::CalibrationData;
+        use crate::quantize::k_quant::{
+            dequantize_row_q5_k_bytes, dequantize_row_q6_k_bytes,
+        };
+
+        const QK_K: usize = 256;
+        const N_BLOCKS: usize = 4;
+        const TOTAL: usize = N_BLOCKS * QK_K;
+        const TENSOR: &str = "blk.5.attn_q.weight";
+
+        let original_f32: Vec<f32> = (0..TOTAL)
+            .map(|i| (i as f32 / TOTAL as f32) * 2.0 - 1.0)
+            .collect();
+
+        let f16_bytes: Vec<u8> = original_f32
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+
+        let expected_post_f16: Vec<f32> = original_f32
+            .iter()
+            .map(|v| half::f16::from_f32(*v).to_f32())
+            .collect();
+
+        let metadata = dummy_metadata();
+        let progress = crate::progress::ProgressReporter::new();
+
+        // Per-variant: (variant, expected_target, expected_block_size, rmse_bound, dequant_fn)
+        type DequantFn = fn(&[u8], &mut [f32])
+            -> Result<usize, crate::quantize::k_quant::KQuantError>;
+        let cases: Vec<(KQuantVariant, &str, usize, f64, DequantFn)> = vec![
+            (
+                KQuantVariant::Q5_K_M, "Q5_K", N_BLOCKS * 176, 0.025,
+                dequantize_row_q5_k_bytes as DequantFn,
+            ),
+            (
+                KQuantVariant::Q6_K, "Q6_K", N_BLOCKS * 210, 0.012,
+                dequantize_row_q6_k_bytes as DequantFn,
+            ),
+        ];
+
+        for (variant, expected_type, expected_bytes, rmse_bound, dequant) in cases {
+            let mut lazy_map = LazyTensorMap::new();
+            lazy_map.insert(LazyTensor::from_bytes(
+                LazyMeta::new(TENSOR.to_string(), vec![N_BLOCKS, QK_K], DType::F16),
+                f16_bytes.clone(),
+            ));
+
+            let q = VariantKQuantizer::new(variant, CalibrationData::None, 32);
+            let out = quantize_streaming(
+                lazy_map, &metadata, &q, 0, 0, &progress, /* bf16_to_f16 */ false,
+            )
+            .unwrap_or_else(|e| panic!("streaming failed for {variant}: {e}"));
+
+            let t = out.tensors.get(TENSOR)
+                .unwrap_or_else(|| panic!("{variant}: missing tensor"));
+
+            // structural: variant routed to the expected base target
+            assert_eq!(
+                t.data.len(), expected_bytes,
+                "{variant}: bytes ({}) != expected ({expected_bytes})",
+                t.data.len()
+            );
+            assert_eq!(
+                t.quant_info.ggml_type.as_deref(), Some(expected_type),
+                "{variant}: ggml_type mismatch"
+            );
+
+            // dequantize via the matching codec path
+            let mut decoded = vec![0.0_f32; TOTAL];
+            let n_decoded = dequant(&t.data, &mut decoded)
+                .unwrap_or_else(|e| panic!("{variant}: dequant failed: {e:?}"));
+            assert_eq!(n_decoded, TOTAL,
+                "{variant}: dequant should populate every element");
+
+            // RMSE bound vs F16-cast original (apples-to-apples — codec
+            // saw the F16-cast values).
+            let sse: f64 = decoded
+                .iter()
+                .zip(expected_post_f16.iter())
+                .map(|(d, e)| {
+                    let diff = (*d as f64) - (*e as f64);
+                    diff * diff
+                })
+                .sum();
+            let rmse = (sse / TOTAL as f64).sqrt();
+
+            assert!(
+                rmse <= rmse_bound,
+                "{variant}: round-trip RMSE {rmse:.6} exceeds {rmse_bound} bound — \
+                 quantize→dequantize chain through VariantKQuantizer is producing \
+                 numerically wrong {expected_type} blocks"
+            );
+
+            // sanity: not all zeros
+            let nonzero = decoded.iter().filter(|v| v.abs() > 1e-6).count();
+            assert!(
+                nonzero > TOTAL / 2,
+                "{variant}: decoded mostly zero — likely target/tag mismatch"
+            );
+        }
+    }
+
     /// ADR-014 P7 iter-3x — round-trip dequant RMSE bound on
     /// `VariantKQuantizer` output, exercised through `quantize_streaming`.
     /// Closes the quantize→dequantize loop end-to-end via the variant
