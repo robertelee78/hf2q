@@ -6166,3 +6166,66 @@ This commit unblocks every gate up to and including the ViT forward pass; the po
     - HIGH T2.4: Required/Function produces no error if no ToolCallOpen appears before EOS.
     - MED multi-tool re-entry: no `(call)+` grammar shape emitted; `parallel_tool_calls` not wired.
   - **Fence respected.** W-ζ edits in `src/serve/api/registry.rs`, `src/serve/api/grammar/serialize.rs`, `src/serve/api/grammar/json_schema.rs`.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/`.
+
+- **2026-04-27 wave-2.7 W-η design closure (session cfa-20260427-adr005-wave2.7, commits `da09af0` Q-A + `d6da8f1` Q-B + `da545d5` defensive-500) — eager grammar from token 0 + parallel_tool_calls (call)+ shape; closes the 2 wave-2.6 HIGH design divergences.**
+
+  Wave-2.6 Codex audit returned REJECT with 2 design-class divergences (severity high + med) that W-ζ explicitly handed off to a goalie research scout:
+
+  * **HIGH "Required/Function enforcement before ToolCallOpen":** `ToolCallBody`-kind grammars were always-lazy (`awaiting_trigger=true`), so under `tool_choice=required/function` the model could emit arbitrary content before any tool-call open marker fired and the request would silently degrade to plain content.  No production engine implements this — llama.cpp, vLLM, and SGLang all use eager grammar (`grammar_lazy=false`) with `min_calls=1` for `tool_choice=REQUIRED`.
+  * **MED "Multi-tool re-entry":** Wave-2.6 landed the no-reset-on-`ToolCallClose` runtime semantics (correct) but kept the single-call grammar shape — under `parallel_tool_calls=true` the model emitting a second open marker would silently drive the runtime dead.
+
+  Goalie research dossier (`/tmp/cfa-cfa-20260427-adr005-wave2.7/research-report.md`, 738 lines, Q-A + Q-B + cross-cutting + 26 primary citations) refuted the wave-2.7 prompt's "special-token mask loophole" framing (engine.rs:973-998 builds `token_bytes_table` via `Tokenizer::decode(&[id], false)` so Gemma 4 `<|tool_call>` id 48 decodes to literal bytes `b"<|tool_call>"` — fully maskable) and recommended llama.cpp's `grammar_lazy=false` + `p.repeat(call, 1, parallel?-1:1)` pattern (common/chat.cpp:898-913, 1177-1200, 1399-1416).
+
+  - **Q-A HIGH-1 (commit `da09af0`) — eager grammar from token 0 for tool_choice=required/function:**
+    - **Engine.rs `GrammarKind`:** split `ToolCallBody` into two cases mirroring llama.cpp's `grammar_lazy` discriminant:
+      - `ToolCallBodyAuto` — lazy / `awaiting_trigger=true` (forward-looking; not reachable from `compile_tool_grammar` today since AUTO doesn't compile a tool grammar — placeholder for a future wave that wires AUTO to a marker-aware lazy grammar).
+      - `ToolCallBodyRequired` — EAGER from token 0, `awaiting_trigger=false`.  The grammar root wraps the body in open/close markers.  Mask path zeros every other token via the existing `token_bytes_table`.
+    - **Registry.rs `GrammarShape` enum:** unified emitter API; `SingleBody` (legacy, body-only — for the forward-looking AUTO path) vs `OneOrMoreCalls{parallel}` (eager, marker-wrapped, repeated `min=1`).  Per-model emitters compute a shape-independent `single_body` and select the root rule per shape.  Gemma 4 markers `<|tool_call>` / `<tool_call|>` and Qwen 3.5/3.6 markers `<tool_call>\n` / `\n</tool_call>` are baked into the per-call rule when shape is `OneOrMoreCalls`.
+    - **`compile_tool_grammar`:** passes `OneOrMoreCalls{parallel:false}` to per-function emitters (Q-A scope; Q-B extends to `parallel:true`); selects `ToolCallBodyRequired` in the `(effective_grammar, kind)` tuple.
+    - **Tests added (5 new, audit-driving runtime-level):**
+      - `gemma4_required_grammar_accepts_marker_wrapped_call`
+      - `qwen35_required_grammar_accepts_marker_wrapped_call`
+      - `required_eager_grammar_masks_non_marker_first_token` — the load-bearing test: builds an 8-token fake vocab + runs `mask::mask_invalid_tokens`; asserts only marker-prefix tokens (0,1) survive, content tokens (2..=6) are masked, and the empty/EOS token (7) is exempt per `mask.rs:77-80`.
+      - `auto_lazy_grammar_allows_preamble_content` — same vocab under `awaiting_trigger=true`; asserts mask returns 0 (every token survives) — preserves the AUTO contract.
+      - `gemma4_required_grammar_rejects_second_call_when_parallel_false` — single-call cap.
+    - **LOC delta:** `engine.rs` +60/-24, `handlers.rs` +30/-12, `registry.rs` +362/-58, `grammar/sampler.rs` +5/-3.
+
+  - **Q-B HIGH-multi-tool (commit `d6da8f1`) — wire parallel_tool_calls to (call)+ grammar shape:**
+    - **Plumbing:** `compile_tool_grammar` reads `req.parallel_tool_calls.unwrap_or(true)` (OpenAI default = true; Open WebUI default).  Single-function path: per-function emitter directly handles repetition via `OneOrMoreCalls{parallel}` (Q-A's grammar — `g4-call g4-call*` for Gemma, `qwen-call ( "\n" qwen-call )*` for Qwen).  Multi-function path: per-function emits SINGLE wrapped calls (`parallel:false`) and `combine_function_grammars` extends to take `(parallel: bool, separator_literal: &str)`.
+    - **`ModelRegistration::parallel_call_separator()`:** new method returning the per-family chat-template separator — empty string for Gemma 4 (chat_template.jinja:189-205 emits calls back-to-back); `"\n"` for Qwen 3.5/3.6 (tokenizer_config.json:285+ chat_template's loop "else" branch prepends `\n` to calls 2+).  Threaded into the combiner so the alternated-across-functions repetition uses the family-correct form.
+    - **Combiner shapes:**
+      - `parallel=false`: `root ::= fn-0-root | fn-1-root | …` (wave-2.6 behaviour preserved).
+      - `parallel=true,  empty separator`: `alt ::= fn-0-root | …`; `root ::= alt alt*`.
+      - `parallel=true,  non-empty separator`: `alt ::= fn-0-root | …`; `root ::= alt ( "<sep>" alt )*`.
+    - **Tests added (4 new, audit-driving runtime-level):**
+      - `gemma4_parallel_grammar_accepts_two_calls` — back-to-back, no separator.
+      - `qwen35_parallel_grammar_accepts_two_calls_separated_by_newline` — `\n` between calls.
+      - `qwen35_parallel_grammar_rejects_calls_without_newline_separator` — separator REQUIRED for Qwen.
+      - `qwen35_required_grammar_rejects_second_call_when_parallel_false` — symmetry with the Gemma equivalent.
+    - **LOC delta:** `handlers.rs` +84/-23, `registry.rs` +130/-1.
+
+  - **Defensive-500 (commit `da545d5`) — error-safe net for no-call under Constrained tool_choice:**
+    - **Inline in `chat_completions_with_state` after `extracted.constrained_parse_failure` handling:** if `tool_call_policy == Constrained && extracted.tool_calls.is_empty()` ⇒ `ApiError::generation_error("tool_call_no_call_under_constrained")`.
+    - **Should never fire** if Q-A's eager grammar is correctly emitted and the decode loop ran to a normal stop.  Documented inline as a SAFETY NET.  Two edge cases the safety net catches: (1) max_tokens / a stop string fires mid-call, (2) a grammar-emitter bug lets through a no-call run.  Without it the handler would fall through to the empty-tool-calls content branch — exactly the wave-2.6 audit divergence Q-A closed.
+    - **Test added (1 new):** `no_marker_under_constrained_yields_empty_tool_calls` — exercises the load-bearing predicate so any future refactor that breaks it fails at the unit-test boundary.
+    - **LOC delta:** `handlers.rs` +71/-0.
+
+  - **Validation (W-η HEAD `da545d5`):**
+    - `cargo build --bin hf2q` → clean.
+    - `cargo test --bin hf2q -- serve::api` → 436 passed, 0 failed.  10 new tests added across registry::tests + handlers::test_a3 (5 Q-A + 4 Q-B + 1 defensive).
+    - Wave-2.6 + W-ζ fixes verified intact:
+      - Q1 GrammarKind threading (now 3-way: `ResponseFormat`, `ToolCallBodyAuto`, `ToolCallBodyRequired`) — `tool_choice_required_yields_tool_call_body_kind` updated to assert `ToolCallBodyRequired` for the tool branch.
+      - Q2 awaiting_trigger gate intact at `grammar/sampler.rs:381-491`; `engine.rs:1488` and `:2207` arming sites only fire for `ToolCallBodyAuto` (eager path uses default `awaiting_trigger=false`).
+      - Q3 hard 400 cap at >8 required keys (W-ζ HIGH-2) — registry tests `nine_required_keys_in_*` + `eight_required_keys_in_*_compiles_ok` pass.
+      - Q4-A CharAny suppression fix (W-ζ MED) intact in `serialize.rs`.
+      - Q4-B AST combiner intact + extended in `combine_function_grammars(gbnfs, parallel, separator)`.
+      - W-ε PromptCacheKey full-inventory expansion intact at `engine.rs:512-547`; the `parallel_tool_calls`, `tool_call_policy`, and `grammar_kind` fields all participate in the cache key — `prompt_cache_miss_on_different_grammar_kind` test updated to use `ToolCallBodyAuto`.
+
+  - **Refutation of wave-2.7 prompt framing.**  The prompt asserted the `<|tool_call>` open marker was a "special token unmaskable via mask.rs:77-80", creating a "loophole" for eager-with-marker grammars.  Goalie scout traced `Engine::token_bytes_table` (`engine.rs:973-998`) which calls `Tokenizer::decode(&[id], false)` for every vocab id — `false` is HuggingFace's `skip_special_tokens=false`, so any special token whose `tokenizer.json` entry has a non-empty `content` field decodes back to the literal bytes (Gemma 4 `<|tool_call>` id 48 → `b"<|tool_call>"`, 12 bytes; Qwen 3.6 `<tool_call>` id 248058 is `special: false` and decodes to `b"<tool_call>"`).  The mask path CAN block every non-marker token at byte 0 of an eager grammar.  The `bytes.is_empty()` clause at `mask.rs:77-80` only fires for tokens whose decode returns the empty string (typically EOS variants); the engine's stop-on-EOS handler is the safety net for those.
+
+  - **Open followups (none HIGH).**
+    - Forward-looking: wire AUTO to a marker-aware lazy grammar via `GrammarShape::SingleBody` + `ToolCallBodyAuto` (currently AUTO doesn't compile a tool grammar at all).  This would let AUTO benefit from grammar-constrained body emission when the splitter does fire `ToolCallOpen`.
+    - Streaming-path equivalent of the defensive 500: the streaming path's per-token splitter already handles parse failures via `tool_call_policy == Constrained` promotion at `engine.rs:2047`; the no-call case for streaming would surface as a `finish_reason="length"` with no `tool_calls` — clients would see the omission.  Adding a streaming-side defensive error event is a Wave 3 candidate.
+    - T2.4 fallback removal: with Q-A + Q-B + defensive-500 in place, the three preconditions the audit cited (no-call enforcement, multi-call grammar shape, unknown-registration handling) are all addressed.  The remaining unknown-family-fallback in `compile_tool_grammar` (returns `Ok(None)` with a warning) is the one open T2.4 path; converting to hard-error is on the Wave 3 table.
+
+  - **Fence respected.** W-η edits in `src/serve/api/engine.rs`, `src/serve/api/grammar/sampler.rs`, `src/serve/api/handlers.rs`, `src/serve/api/registry.rs`, `docs/ADR-005-inference-server.md`.  No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`, `src/quality/`, `src/quantize/k_quant.rs` (concurrent ADR-014 P7 worker territory).
