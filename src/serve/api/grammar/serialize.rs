@@ -102,8 +102,8 @@ fn write_rule(
 
     // Walk elements; for each char-element close the bracket only when
     // the next element is NOT another char-class continuation (CharAlt
-    // / CharRngUpper / CharAny).  CharAny here is llama.cpp's exact
-    // logic — it's a degenerate "no close" since `.` is its own atom.
+    // or CharRngUpper).  CharAny (`.`) is a top-level atom, not a
+    // class continuation — it must NOT suppress bracket-close (W-ζ fix).
     //
     // Empty-alternative disambiguation:
     // An alternative whose source form is empty (zero atoms) is
@@ -179,23 +179,31 @@ fn write_rule(
             }
         }
 
-        // Bracket-close lookahead — exact port of llama.cpp lines
-        // 359-368.  Only char-elements (Char / CharNot / CharAlt /
-        // CharRngUpper / CharAny) need the trailing `] `.  We close
-        // when the NEXT element is NOT one of {CharAlt, CharRngUpper,
-        // CharAny} — which means the current char-class run ends here.
+        // Bracket-close lookahead — mirrors llama.cpp lines 359-368.
+        //
+        // A char-class run (opened by Char or CharNot) continues only
+        // while the NEXT element is CharAlt or CharRngUpper — both of
+        // which are syntactically INSIDE the `[...]` bracket.
+        //
+        // CharAny (`.`) is a top-level alternative, NOT a char-class
+        // continuation.  Including it in `inside_class_continues` was a
+        // bug: `root ::= "a" .` would parse to [Char('a'), CharAny],
+        // and when serializing Char('a') the lookahead saw CharAny as
+        // "class continues", suppressing `]`, producing `[a.` instead of
+        // `[a] .`.  The bracket never closed, breaking round-trip.
+        //
+        // Fix (W-ζ MED): remove CharAny from inside_class_continues.
+        // CharAny is handled separately below (no bracket needed).
         if elem.ty.is_char_element() {
-            // Note: rule[i+1] always exists because `i < n` and there's
-            // always the End element at index n.
+            // rule[i+1] always exists — End is always last.
             let next_ty = rule[i + 1].ty;
             let inside_class_continues = matches!(
                 next_ty,
-                GretType::CharAlt | GretType::CharRngUpper | GretType::CharAny
+                GretType::CharAlt | GretType::CharRngUpper
             );
             if !inside_class_continues {
-                // CharAny does not need a closing bracket — it was
-                // emitted as `.`.  Suppress the `] ` for that case;
-                // the test below short-circuits via the outer match.
+                // CharAny was emitted as `.` (a standalone atom, no
+                // bracket).  Suppress `] ` for that case only.
                 if elem.ty != GretType::CharAny {
                     let _ = write!(out, "] ");
                 }
@@ -746,6 +754,41 @@ mod tests {
             "escaped close-bracket in class did not round-trip:\n  serialized: {}",
             serialized
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // W-ζ MED — Q4-A CharAny adjacency round-trip tests
+    //
+    // These three tests cover the three shapes called out in the wave-2.7
+    // audit: CharAny following a quoted literal, a positive class, and a
+    // negated class.  In all three cases the previous (broken) lookahead
+    // included CharAny in `inside_class_continues`, which suppressed the
+    // `] ` bracket-close when the next element was `.`.
+    // -----------------------------------------------------------------------
+
+    /// W-ζ MED Q4-A: `root ::= "a" .` — CharAny following a quoted literal.
+    /// Pre-fix: serialize emitted `"a" .` (no bracket) — already fine; this
+    /// test confirms the literal+dot case was never broken.  Included for
+    /// completeness as the audit's canonical example.
+    #[test]
+    fn parser_round_trip_char_any_after_quoted_literal() {
+        roundtrip("root ::= \"a\" .\n");
+    }
+
+    /// W-ζ MED Q4-A: `root ::= [a] .` — CharAny following a positive char class.
+    /// Pre-fix: serialize emitted `[a.` (bracket never closed).
+    /// Post-fix: serialize emits `[a] .` which re-parses correctly.
+    #[test]
+    fn parser_round_trip_char_any_after_class() {
+        roundtrip("root ::= [a] .\n");
+    }
+
+    /// W-ζ MED Q4-A: `root ::= [^a] .` — CharAny following a negated char class.
+    /// Pre-fix: serialize emitted `[^a.` (bracket never closed).
+    /// Post-fix: serialize emits `[^a] .` which re-parses correctly.
+    #[test]
+    fn parser_round_trip_char_any_after_negated_class() {
+        roundtrip("root ::= [^a] .\n");
     }
 
     /// Used as a vector for the unused-import warnings — keeps
