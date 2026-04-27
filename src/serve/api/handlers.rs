@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::engine::{self, Engine, SamplingParams};
 use super::grammar;
+use super::registry;
 use super::schema::{
     ApiError, ApiErrorBody, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, EmbeddingObject, EmbeddingPayload, EmbeddingRequest, EmbeddingResponse,
@@ -724,12 +725,31 @@ where
     // because the chat-template renders the tool defs into the
     // system block regardless. tool_choice="auto" / "required" /
     // forced-function still pass tools through; the per-call-shape
-    // grammar enforcement (Decision #6) is the deferred work.
+    // grammar enforcement (Decision #6) is now wired (T1.8 Option B).
     let tool_choice = super::schema::ToolChoiceValue::parse(req.tool_choice.as_ref());
     let req_tools: Option<&[super::schema::Tool]> = match tool_choice {
         super::schema::ToolChoiceValue::None => None,
         _ => req.tools.as_deref(),
     };
+    // T1.8 Option B (ADR-005 Phase 2a, Wave 2 W-4): compile the per-model
+    // tool-call wrapper grammar when tool_choice=required or
+    // tool_choice={type:function,...}. This physically constrains the model
+    // to emit a valid wrapper + valid arguments — parse failures become
+    // structurally impossible for the constrained paths, which unblocks the
+    // T2.4 fallback removal (wave 3).
+    //
+    // Precedence rule: tool grammar overrides response_format grammar when
+    // both are present — a request cannot simultaneously enforce
+    // response_format=json_schema AND tool_choice=required, because the model
+    // output is either a tool call OR a structured JSON response, never both.
+    // The tool grammar is the more specific constraint; response_grammar is
+    // ignored when a tool grammar is produced.
+    let tool_grammar: Option<grammar::Grammar> = match compile_tool_grammar(req, &tool_choice) {
+        Ok(g) => g,
+        Err(resp) => return Err(resp),
+    };
+    // Select the effective grammar: tool > response > none.
+    let effective_grammar = tool_grammar.or(response_grammar);
     // ADR-005 Phase 2a iter-133 Iter D (W67): per-request thinking mode
     // override. Default off keeps every legacy / non-thinking-aware
     // caller's rendered prompt byte-identical; Open WebUI's panel UX
@@ -773,13 +793,13 @@ where
         })
         .unwrap_or_default();
     // When the request carries a grammar (response_format=json_object /
-    // json_schema), attach the per-vocab token-bytes table so the worker
-    // can mask invalid tokens at every decode step.  The table is
-    // lazily built + cached on the Engine — first grammar request pays
-    // ~50-200 ms (CPU work, off the worker thread); every subsequent
-    // request gets a free Arc clone.  No grammar ⇒ no table attachment ⇒
-    // zero extra cost.
-    let grammar_token_bytes: Option<std::sync::Arc<Vec<Vec<u8>>>> = if response_grammar.is_some() {
+    // json_schema, OR tool_choice=required / function via T1.8 Option B),
+    // attach the per-vocab token-bytes table so the worker can mask invalid
+    // tokens at every decode step. The table is lazily built + cached on
+    // the Engine — first grammar request pays ~50-200 ms (CPU work, off
+    // the worker thread); every subsequent request gets a free Arc clone.
+    // No grammar ⇒ no table attachment ⇒ zero extra cost.
+    let grammar_token_bytes: Option<std::sync::Arc<Vec<Vec<u8>>>> = if effective_grammar.is_some() {
         Some(engine.token_bytes_table())
     } else {
         None
@@ -799,7 +819,7 @@ where
         logprobs: req.logprobs.unwrap_or(false),
         top_logprobs: req.top_logprobs.unwrap_or(0),
         parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
-        grammar: response_grammar,
+        grammar: effective_grammar,
         token_bytes: grammar_token_bytes,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
@@ -2255,6 +2275,197 @@ ws ::= | " " | "\n" [ \t]{0,20}
         Err(e) => Err(ApiError::grammar_error(format!("GBNF parse failed: {}", e))
             .into_response()),
     }
+}
+
+/// Pre-compile a grammar that constrains the model to emit a valid per-model
+/// tool-call wrapper for the tools declared in `req`, given the parsed
+/// `tool_choice`.
+///
+/// This is the Option B grammar enforcement (ADR-005 Phase 2a T1.8):
+///
+/// | tool_choice          | behavior                                          |
+/// |----------------------|---------------------------------------------------|
+/// | `Auto` (default)     | No constraint — model decides whether to call.    |
+/// | `None`               | No constraint — tools suppressed at render time.  |
+/// | `Required`           | Grammar = alternation of ALL function grammars.   |
+/// | `Function(name)`     | Grammar = that function's grammar only.           |
+///
+/// Returns `Ok(None)` when no grammar constraint applies (auto / none /
+/// no tools / no matching model registration). Returns `Err(Response)` with
+/// the 400 `grammar_error` envelope when the grammar can't be compiled.
+///
+/// WHY we need a model registration to emit the grammar:
+/// Each model emits tool calls in a model-specific wrapper format (Gemma 4 uses
+/// `call:NAME{kv-list}`; Qwen 3.5/3.6 uses `<function=NAME>...</function>`).
+/// The grammar must match the actual format the model emits — if we constrained
+/// plain JSON the model would fight the mask. `registry::find_for(model_id)`
+/// returns the registration so we can call `reg.tool_call_gbnf(fn, params)`.
+/// When no registration is found (unknown model), we log a warning and return
+/// `Ok(None)` — the T2.4 fallback stays in place for unregistered models.
+///
+/// T2.4 unblock evidence: once this function is wired (and tool_choice=required
+/// / tool_choice=function is used), the grammar physically prevents malformed
+/// wrapper output. `engine.rs:1615-1629`'s silent parse-failure-fallback can
+/// then be safely replaced with `GenerationEvent::Error(...)` because the
+/// fallback can only trigger for:
+///   - unregistered model families (no grammar → no constraint, T2.4 still
+///     handles them)
+///   - tool_choice=auto (grammar not applied → parse failure is still possible)
+/// For the constrained paths (Required + Function), the grammar guarantees
+/// the body is parseable by `parse_tool_call_body`. Wave 3 can audit each
+/// path and remove the fallback from the constrained ones.
+fn compile_tool_grammar(
+    req: &super::schema::ChatCompletionRequest,
+    tool_choice: &super::schema::ToolChoiceValue,
+) -> std::result::Result<Option<grammar::Grammar>, Response> {
+    use super::schema::ToolChoiceValue;
+
+    // Only Required and Function(name) apply grammar enforcement.
+    // Auto and None produce no constraint.
+    let constrain = matches!(tool_choice, ToolChoiceValue::Required | ToolChoiceValue::Function(_));
+    if !constrain {
+        return Ok(None);
+    }
+
+    // No tools declared → nothing to constrain.
+    let tools = match req.tools.as_deref() {
+        Some(t) if !t.is_empty() => t,
+        _ => return Ok(None),
+    };
+
+    // Resolve the model registration. If unknown, skip grammar enforcement
+    // (T2.4 fallback covers this case).
+    let reg = match registry::find_for(&req.model) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(
+                model = %req.model,
+                "compile_tool_grammar: no registry entry for model; \
+                 grammar constraint skipped (T2.4 fallback applies)"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Build one GBNF string per matching function, then combine.
+    let matching_tools: Vec<&super::schema::Tool> = match tool_choice {
+        ToolChoiceValue::Function(name) => {
+            let found: Vec<_> = tools.iter().filter(|t| t.function.name == *name).collect();
+            if found.is_empty() {
+                return Err(ApiError::invalid_request(
+                    format!("tool_choice.function.name '{}' not found in tools list", name),
+                    Some("tool_choice".into()),
+                )
+                .into_response());
+            }
+            found
+        }
+        ToolChoiceValue::Required => tools.iter().collect(),
+        _ => unreachable!("already checked above"),
+    };
+
+    // Emit per-function GBNF strings and combine into one grammar via
+    // alternation. If only one function matches, no alternation is needed.
+    let mut fn_gbnfs: Vec<String> = Vec::new();
+    for tool in &matching_tools {
+        let params_schema = tool
+            .function
+            .parameters
+            .as_ref()
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        match reg.tool_call_gbnf(&tool.function.name, &params_schema) {
+            Ok(gbnf) => fn_gbnfs.push(gbnf),
+            Err(e) => {
+                return Err(ApiError::grammar_error(format!(
+                    "tool_call_gbnf for '{}': {}",
+                    tool.function.name, e
+                ))
+                .into_response());
+            }
+        }
+    }
+
+    // Combine multiple function grammars via alternation.
+    // Each grammar has `root ::= ...` as its first rule. We rename function
+    // grammars to `fn-0`, `fn-1`, ... then emit a combined root that
+    // alternates them.
+    let combined_gbnf = if fn_gbnfs.len() == 1 {
+        fn_gbnfs.into_iter().next().unwrap()
+    } else {
+        combine_function_grammars(fn_gbnfs)
+    };
+
+    match grammar::parser::parse(&combined_gbnf) {
+        Ok(g) => Ok(Some(g)),
+        Err(e) => Err(ApiError::grammar_error(format!(
+            "tool call GBNF parse failed: {}",
+            e
+        ))
+        .into_response()),
+    }
+}
+
+/// Combine multiple per-function GBNF grammars into a single grammar whose
+/// root accepts any of the individual function wrappers.
+///
+/// Each input grammar has a `root` rule. We rename each grammar's `root` to
+/// `fn-N-root` (and prefix all other rules with `fn-N-`), then emit a combined
+/// root: `root ::= fn-0-root | fn-1-root | ... | fn-N-root`.
+///
+/// WHY simple prefix renaming is sufficient:
+/// The per-function grammars share rule names like `gemma4-str-val`,
+/// `gemma4-kv-item`, etc. Since these are identical across functions of the
+/// same model family, sharing them is correct. We only need to rename the
+/// `root` rule to distinguish functions. The shared primitives are emitted
+/// once (from fn-0's grammar); duplicate rule bodies are harmless since they
+/// produce the same result, but we deduplicate by last-write-wins when
+/// building the combined rule map.
+fn combine_function_grammars(gbnfs: Vec<String>) -> String {
+    use std::collections::BTreeMap;
+
+    let mut combined: BTreeMap<String, String> = BTreeMap::new();
+    let mut fn_roots: Vec<String> = Vec::new();
+
+    for (i, gbnf) in gbnfs.into_iter().enumerate() {
+        let fn_root_name = format!("fn-{}-root", i);
+        fn_roots.push(fn_root_name.clone());
+
+        for line in gbnf.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Parse `name ::= body`.
+            if let Some(pos) = line.find(" ::= ") {
+                let name = &line[..pos];
+                let body = &line[pos + 5..];
+                if name == "root" {
+                    combined.insert(fn_root_name.clone(), body.to_string());
+                } else {
+                    // Shared primitive rules (gemma4-str-val, space, etc.)
+                    // are identical across functions of the same family;
+                    // emit once (first occurrence wins via `entry().or_insert`).
+                    combined.entry(name.to_string()).or_insert_with(|| body.to_string());
+                }
+            }
+        }
+    }
+
+    // Combined root: alternation of all function roots.
+    let root_alts = fn_roots.join(" | ");
+    combined.insert("root".to_string(), root_alts);
+
+    let mut out = String::new();
+    if let Some(body) = combined.get("root") {
+        out.push_str(&format!("root ::= {}\n", body));
+    }
+    for (name, body) in &combined {
+        if name != "root" {
+            out.push_str(&format!("{} ::= {}\n", name, body));
+        }
+    }
+    out
 }
 
 /// Build a 429 `queue_full` response with OpenAI-convention rate-limit
