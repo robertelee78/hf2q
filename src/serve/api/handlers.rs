@@ -2610,53 +2610,155 @@ fn compile_tool_grammar(
 /// Combine multiple per-function GBNF grammars into a single grammar whose
 /// root accepts any of the individual function wrappers.
 ///
-/// Each input grammar has a `root` rule. We rename each grammar's `root` to
-/// `fn-N-root` (and prefix all other rules with `fn-N-`), then emit a combined
-/// root: `root ::= fn-0-root | fn-1-root | ... | fn-N-root`.
+/// # Algorithm (B2 fix — full namespace isolation)
 ///
-/// WHY simple prefix renaming is sufficient:
-/// The per-function grammars share rule names like `gemma4-str-val`,
-/// `gemma4-kv-item`, etc. Since these are identical across functions of the
-/// same model family, sharing them is correct. We only need to rename the
-/// `root` rule to distinguish functions. The shared primitives are emitted
-/// once (from fn-0's grammar); duplicate rule bodies are harmless since they
-/// produce the same result, but we deduplicate by last-write-wins when
-/// building the combined rule map.
+/// 1. For each grammar *i*, rename every rule `X` → `fn-{i}-X` (including root
+///    → `fn-{i}-root`). Rewrite every reference inside rule bodies to use the
+///    new namespaced names.  This prevents rule-name collisions when two
+///    functions share a parameter name with different types: both grammars may
+///    contain a rule called e.g. `root-q-kv`; namespacing gives
+///    `fn-0-root-q-kv` (string) and `fn-1-root-q-kv` (integer), which are
+///    distinct and can coexist.
+///
+/// 2. Deduplication of identical rules.  Shared primitive rules (e.g. `space`,
+///    `string`, `char`) are generated identically by every per-function grammar.
+///    After namespacing they appear as `fn-0-space`, `fn-1-space`, … with equal
+///    bodies.  We fold them back to a single un-prefixed name (`space`) and
+///    rewrite all references accordingly.  This keeps the combined grammar
+///    compact and satisfies the invariant that shared primitives appear once.
+///
+/// 3. The combined root is `fn-0-root | fn-1-root | … | fn-N-root`.
+///
+/// # Reference rewriting
+///
+/// Rule names in GBNF bodies are whitespace/paren-delimited tokens.  We use
+/// a simple whole-token replacement walk: split the body on ASCII whitespace
+/// and brackets, rename matching tokens, rejoin.  This avoids a full GBNF
+/// parse (mechanical string rewriting per task spec).
 fn combine_function_grammars(gbnfs: Vec<String>) -> String {
     use std::collections::BTreeMap;
 
-    let mut combined: BTreeMap<String, String> = BTreeMap::new();
-    let mut fn_roots: Vec<String> = Vec::new();
+    // Step 1 — parse each grammar into (name → body) maps and collect the
+    // full set of rule names per grammar.
+    let parsed: Vec<Vec<(String, String)>> = gbnfs
+        .iter()
+        .map(|gbnf| {
+            gbnf.lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    let pos = line.find(" ::= ")?;
+                    Some((line[..pos].to_string(), line[pos + 5..].to_string()))
+                })
+                .collect()
+        })
+        .collect();
 
-    for (i, gbnf) in gbnfs.into_iter().enumerate() {
-        let fn_root_name = format!("fn-{}-root", i);
-        fn_roots.push(fn_root_name.clone());
+    // Step 2 — build namespace mappings for each grammar.
+    // Every rule name `X` in grammar i → `fn-{i}-X`.
+    let ns_maps: Vec<BTreeMap<String, String>> = parsed
+        .iter()
+        .enumerate()
+        .map(|(i, rules)| {
+            rules
+                .iter()
+                .map(|(name, _)| (name.clone(), format!("fn-{}-{}", i, name)))
+                .collect()
+        })
+        .collect();
 
-        for line in gbnf.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+    // Step 3 — rewrite rule bodies.  Replace each token that matches a rule
+    // name in the local grammar with its namespaced equivalent.
+    // "Token" in GBNF: a contiguous run of alphanumeric / '-' / '_' characters
+    // that is not inside a double-quoted literal.
+    let mut namespaced: Vec<BTreeMap<String, String>> = Vec::with_capacity(parsed.len());
+    for (i, rules) in parsed.iter().enumerate() {
+        let ns_map = &ns_maps[i];
+        let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+        for (name, body) in rules {
+            let new_name = ns_map.get(name).cloned().unwrap_or_else(|| name.clone());
+            let new_body = rewrite_gbnf_references(body, ns_map);
+            renamed.insert(new_name, new_body);
+        }
+        namespaced.push(renamed);
+    }
+
+    // Step 4 — deduplicate: for each base name `X`, check whether all grammars
+    // that have `fn-N-X` agree on the body.  If so, collapse to a single `X`.
+    //
+    // Build a reverse map: base_name → Vec<(ns_name, body)> across all grammars.
+    let mut base_bodies: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for ns_rules in &namespaced {
+        for (ns_name, body) in ns_rules {
+            // Recover the base name: strip leading `fn-{digits}-`.
+            let base = strip_fn_prefix(ns_name);
+            base_bodies
+                .entry(base.to_string())
+                .or_default()
+                .push((ns_name.clone(), body.clone()));
+        }
+    }
+
+    // Rules where all copies have identical bodies → shared; collapse to base name.
+    let mut shared: BTreeMap<String, String> = BTreeMap::new(); // base → body
+    let mut ns_to_canonical: BTreeMap<String, String> = BTreeMap::new(); // fn-i-X → canonical
+    for (base, copies) in &base_bodies {
+        if base == "root" {
+            // root is always namespaced (fn-N-root).
+            for (ns, body) in copies {
+                ns_to_canonical.insert(ns.clone(), ns.clone());
+                // Store each fn-N-root separately (bodies differ per function).
+                let _ = body; // will be inserted below
             }
-            // Parse `name ::= body`.
-            if let Some(pos) = line.find(" ::= ") {
-                let name = &line[..pos];
-                let body = &line[pos + 5..];
-                if name == "root" {
-                    combined.insert(fn_root_name.clone(), body.to_string());
-                } else {
-                    // Shared primitive rules (gemma4-str-val, space, etc.)
-                    // are identical across functions of the same family;
-                    // emit once (first occurrence wins via `entry().or_insert`).
-                    combined.entry(name.to_string()).or_insert_with(|| body.to_string());
-                }
+            continue;
+        }
+        let all_same = copies.windows(2).all(|w| w[0].1 == w[1].1);
+        if all_same {
+            let body = copies[0].1.clone();
+            shared.insert(base.clone(), body.clone());
+            for (ns, _) in copies {
+                ns_to_canonical.insert(ns.clone(), base.clone());
+            }
+        } else {
+            // Distinct bodies — each copy keeps its namespaced name.
+            for (ns, _) in copies {
+                ns_to_canonical.insert(ns.clone(), ns.clone());
             }
         }
     }
 
-    // Combined root: alternation of all function roots.
+    // Step 5 — assemble combined rule map.
+    // First, insert all namespaced rules (only those whose canonical is themselves).
+    // For shared rules, insert under the base name with collapsed body.
+    let mut combined: BTreeMap<String, String> = BTreeMap::new();
+
+    // Insert shared (collapsed) rules.
+    for (base, body) in &shared {
+        // Rewrite any remaining fn-N-X references in the body to their canonical names.
+        let canonical_body = rewrite_gbnf_references(body, &ns_to_canonical);
+        combined.insert(base.clone(), canonical_body);
+    }
+
+    // Insert non-shared namespaced rules.
+    for ns_rules in &namespaced {
+        for (ns_name, body) in ns_rules {
+            let canonical = ns_to_canonical.get(ns_name).cloned().unwrap_or_else(|| ns_name.clone());
+            if canonical == *ns_name {
+                // Not shared — insert under namespaced name with rewritten body.
+                let canonical_body = rewrite_gbnf_references(body, &ns_to_canonical);
+                combined.insert(ns_name.clone(), canonical_body);
+            }
+            // If canonical != ns_name, the rule was collapsed to `canonical` above.
+        }
+    }
+
+    // Step 6 — combined root: alternation of fn-0-root | fn-1-root | …
+    let fn_roots: Vec<String> = (0..parsed.len())
+        .map(|i| format!("fn-{}-root", i))
+        .collect();
     let root_alts = fn_roots.join(" | ");
     combined.insert("root".to_string(), root_alts);
 
+    // Serialize: root first, then alpha.
     let mut out = String::new();
     if let Some(body) = combined.get("root") {
         out.push_str(&format!("root ::= {}\n", body));
@@ -2667,6 +2769,99 @@ fn combine_function_grammars(gbnfs: Vec<String>) -> String {
         }
     }
     out
+}
+
+/// Rewrite GBNF rule references in `body` using `map`.
+///
+/// Scans the body text token by token (splitting on ASCII whitespace and GBNF
+/// structural characters: `(`, `)`, `|`, `?`, `*`, `+`, `[`, `]`).  Any token
+/// that exactly matches a key in `map` is replaced by the corresponding value.
+/// Quoted literals (between `"…"`) are left untouched.
+///
+/// The reconstruction preserves the original whitespace as single spaces
+/// between tokens; this is safe for GBNF which treats whitespace as
+/// insignificant between tokens.
+fn rewrite_gbnf_references(body: &str, map: &std::collections::BTreeMap<String, String>) -> String {
+    if map.is_empty() {
+        return body.to_string();
+    }
+
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut in_quote = false;
+    let mut token = String::new();
+    let mut first = true;
+
+    let flush = |token: &mut String, out: &mut String, map: &std::collections::BTreeMap<String, String>, first: &mut bool| {
+        if token.is_empty() {
+            return;
+        }
+        if !*first {
+            out.push(' ');
+        }
+        *first = false;
+        if let Some(replacement) = map.get(token.as_str()) {
+            out.push_str(replacement);
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quote {
+            // Inside a double-quoted literal: pass through verbatim.
+            token.push(c);
+            if c == '"' && (i == 0 || chars[i - 1] != '\\') {
+                in_quote = false;
+                flush(&mut token, &mut out, map, &mut first);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                // Start of a quoted literal.
+                flush(&mut token, &mut out, map, &mut first);
+                token.push(c);
+                in_quote = true;
+            }
+            ' ' | '\t' | '\n' => {
+                flush(&mut token, &mut out, map, &mut first);
+            }
+            '(' | ')' | '|' | '?' | '*' | '+' | '[' | ']' | '{' | '}' => {
+                flush(&mut token, &mut out, map, &mut first);
+                if !first {
+                    out.push(' ');
+                }
+                first = false;
+                out.push(c);
+            }
+            _ => {
+                token.push(c);
+            }
+        }
+        i += 1;
+    }
+    flush(&mut token, &mut out, map, &mut first);
+    out
+}
+
+/// Strip the `fn-{digits}-` prefix from a namespaced rule name.
+/// Returns the original base name (without the fn-N- prefix).
+fn strip_fn_prefix(name: &str) -> &str {
+    // Match `fn-` followed by one or more digits followed by `-`.
+    if let Some(rest) = name.strip_prefix("fn-") {
+        if let Some(dash_pos) = rest.find('-') {
+            let digits = &rest[..dash_pos];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return &rest[dash_pos + 1..];
+            }
+        }
+    }
+    name
 }
 
 // ---------------------------------------------------------------------------
