@@ -38,8 +38,8 @@ use crate::quantize::k_quant::{
     quantize_row_q6_k_imatrix_to_bytes, quantize_row_q6_k_to_bytes, KQuantError,
 };
 use crate::quantize::q_legacy::{
-    quantize_row_q4_0_to_bytes, quantize_row_q5_0_to_bytes, quantize_row_q5_1_to_bytes,
-    quantize_row_q8_0_to_bytes, QLegacyError,
+    quantize_row_q4_0_to_bytes, quantize_row_q4_1_to_bytes, quantize_row_q5_0_to_bytes,
+    quantize_row_q5_1_to_bytes, quantize_row_q8_0_to_bytes, QLegacyError,
 };
 
 /// Target GGUF block format. Spans the K-family (Q4_K/Q5_K/Q6_K) plus
@@ -64,6 +64,10 @@ pub enum KQuantTarget {
     /// `Q4_0`. 4.5 bpw, symmetric (`max / -8`), 32-element blocks.
     /// Fallback for `Q3_K`/`Q2_K` rows that aren't 256-aligned.
     Q4Legacy,
+    /// `Q4_1`. 5.0 bpw, asymmetric (per-block min), 32-element blocks.
+    /// Not currently used in the K-family fallback chain at
+    /// `src/backends/gguf.rs:354-358`; included for completeness.
+    Q4Legacy1,
     /// `Q5_0`. 5.5 bpw, symmetric (`max / -16`), 32-element blocks.
     /// Fallback for `Q4_K` rows.
     Q5Legacy0,
@@ -81,6 +85,7 @@ impl KQuantTarget {
     pub fn from_ggml_type(ggml_type: u32) -> Option<Self> {
         match ggml_type {
             2 => Some(Self::Q4Legacy),  // GGML_TYPE_Q4_0
+            3 => Some(Self::Q4Legacy1), // GGML_TYPE_Q4_1
             6 => Some(Self::Q5Legacy0), // GGML_TYPE_Q5_0
             7 => Some(Self::Q5Legacy1), // GGML_TYPE_Q5_1
             8 => Some(Self::Q8Legacy),  // GGML_TYPE_Q8_0
@@ -95,6 +100,7 @@ impl KQuantTarget {
     pub fn ggml_type(&self) -> u32 {
         match self {
             Self::Q4Legacy => 2,
+            Self::Q4Legacy1 => 3,
             Self::Q5Legacy0 => 6,
             Self::Q5Legacy1 => 7,
             Self::Q8Legacy => 8,
@@ -111,6 +117,7 @@ impl KQuantTarget {
             Self::Q5K => crate::quantize::k_quant::BLOCK_Q5_K_SIZE,
             Self::Q6K => crate::quantize::k_quant::BLOCK_Q6_K_SIZE,
             Self::Q4Legacy => crate::quantize::q_legacy::BLOCK_Q4_0_SIZE,
+            Self::Q4Legacy1 => crate::quantize::q_legacy::BLOCK_Q4_1_SIZE,
             Self::Q5Legacy0 => crate::quantize::q_legacy::BLOCK_Q5_0_SIZE,
             Self::Q5Legacy1 => crate::quantize::q_legacy::BLOCK_Q5_1_SIZE,
             Self::Q8Legacy => crate::quantize::q_legacy::BLOCK_Q8_0_SIZE,
@@ -122,6 +129,7 @@ impl KQuantTarget {
         match self {
             Self::Q4K | Self::Q5K | Self::Q6K => crate::quantize::k_quant::QK_K,
             Self::Q4Legacy => crate::quantize::q_legacy::QK4_0,
+            Self::Q4Legacy1 => crate::quantize::q_legacy::QK4_1,
             Self::Q5Legacy0 => crate::quantize::q_legacy::QK5_0,
             Self::Q5Legacy1 => crate::quantize::q_legacy::QK5_1,
             Self::Q8Legacy => crate::quantize::q_legacy::QK8_0,
@@ -142,6 +150,7 @@ impl KQuantTarget {
             Self::Q5K => 5.5,
             Self::Q6K => 6.5625,
             Self::Q4Legacy => 4.5,
+            Self::Q4Legacy1 => 5.0,
             Self::Q5Legacy0 => 5.5,
             Self::Q5Legacy1 => 6.0,
             Self::Q8Legacy => 8.5,
@@ -252,6 +261,7 @@ pub fn quantize_row_to_bytes(
         // Legacy: always _ref. Imatrix weights silently ignored
         // (legacy formats don't support per-element-weighted codebook search).
         (KQuantTarget::Q4Legacy, _) => quantize_row_q4_0_to_bytes(row)?,
+        (KQuantTarget::Q4Legacy1, _) => quantize_row_q4_1_to_bytes(row)?,
         (KQuantTarget::Q5Legacy0, _) => quantize_row_q5_0_to_bytes(row)?,
         (KQuantTarget::Q5Legacy1, _) => quantize_row_q5_1_to_bytes(row)?,
         (KQuantTarget::Q8Legacy, _) => quantize_row_q8_0_to_bytes(row)?,
@@ -644,6 +654,20 @@ mod tests {
         assert_eq!(bytes.len(), 18);
     }
 
+    /// Q4_1 dispatch: 32 elements → 20 bytes.
+    #[test]
+    fn dispatch_none_q4_1() {
+        let row: Vec<f32> = (0..32).map(|i| (i as f32) / 32.0).collect();
+        let bytes = quantize_row_to_bytes(
+            &row,
+            KQuantTarget::Q4Legacy1,
+            &CalibrationData::None,
+            "blk.0.attn_norm.weight",
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), 20);
+    }
+
     /// Q5_0 dispatch: 32 elements → 22 bytes.
     #[test]
     fn dispatch_none_q5_0() {
@@ -865,6 +889,10 @@ mod tests {
             KQuantTarget::Q4Legacy => {
                 dequantize_row_q4_0_bytes(bytes, &mut out).unwrap();
             }
+            KQuantTarget::Q4Legacy1 => {
+                use crate::quantize::q_legacy::dequantize_row_q4_1_bytes;
+                dequantize_row_q4_1_bytes(bytes, &mut out).unwrap();
+            }
             KQuantTarget::Q5Legacy0 => {
                 dequantize_row_q5_0_bytes(bytes, &mut out).unwrap();
             }
@@ -884,6 +912,7 @@ mod tests {
             KQuantTarget::Q5K => 0.025,
             KQuantTarget::Q6K => 0.012,
             KQuantTarget::Q4Legacy => 0.05,
+            KQuantTarget::Q4Legacy1 => 0.025,
             KQuantTarget::Q5Legacy0 => 0.025,
             KQuantTarget::Q5Legacy1 => 0.025,
             KQuantTarget::Q8Legacy => 0.005,

@@ -124,6 +124,7 @@ fn target_to_ggml_name(target: KQuantTarget) -> String {
         KQuantTarget::Q5K => "Q5_K".to_string(),
         KQuantTarget::Q6K => "Q6_K".to_string(),
         KQuantTarget::Q4Legacy => "Q4_0".to_string(),
+        KQuantTarget::Q4Legacy1 => "Q4_1".to_string(),
         KQuantTarget::Q5Legacy0 => "Q5_0".to_string(),
         KQuantTarget::Q5Legacy1 => "Q5_1".to_string(),
         KQuantTarget::Q8Legacy => "Q8_0".to_string(),
