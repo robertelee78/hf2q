@@ -214,10 +214,19 @@ pub enum GrammarKind {
     /// Mirrors llama.cpp `grammar_lazy = true` for `tool_choice == AUTO`
     /// at `/opt/llama.cpp/common/chat.cpp:913, 1200, 1416`.
     ///
-    /// NOTE — wave 2.7 W-η has not yet wired AUTO to a marker-aware lazy
-    /// grammar (`compile_tool_grammar` only fires for Required/Function).
-    /// This variant is forward-looking; today it is unreachable from the
-    /// chat-completions path.
+    /// Wired post-wave-3 W-B2 + Wave 3.5 HIGH-1: `compile_tool_grammar`'s
+    /// Auto branch produces this kind whenever `tool_choice=Auto` AND
+    /// `tools[]` is non-empty AND the model family is registered.  The
+    /// grammar shape is `OneOrMoreCallsBodyOnly` (Wave 3.5 HIGH-1) — the
+    /// first open marker is consumed by `ToolCallSplitter` before
+    /// `runtime.trigger()` fires, so the grammar root expects body bytes
+    /// (NOT the already-consumed marker).  Inter-call open markers
+    /// (parallel) and the close marker remain part of the grammar.
+    ///
+    /// Auto with `tools[]` empty OR an unregistered model family stays
+    /// at the prior `Ok(None)` no-grammar branch (open by design — Auto
+    /// allows zero-call runs and there is no per-model wrapper to
+    /// constrain).
     ToolCallBodyAuto,
     /// Tool-call body grammar under `tool_choice = required` or
     /// `tool_choice = function(name)`.
@@ -5581,17 +5590,24 @@ mod streaming_prompt_cache_replay_tests {
              events: {events:?}"
         );
 
-        // The first ToolCallDelta MUST carry the function name (name chunk).
-        let has_name_delta = events.iter().any(|e| matches!(
-            e,
-            GenerationEvent::ToolCallDelta { name: Some(_), .. }
-        ));
-        assert!(
-            has_name_delta,
-            "Wave 3.6 W-4: the first ToolCallDelta MUST carry `name: Some(...)` \
-             (function name = \"foo\"); subsequent deltas carry arguments. \
-             tool_call_deltas: {tool_call_deltas:?}"
-        );
+        // The FIRST ToolCallDelta MUST carry the function name (name chunk);
+        // subsequent deltas carry arguments only.  Wave 3.7 strengthening
+        // per Codex audit MED: previously asserted `events.iter().any()`
+        // which would have passed if name appeared on a later delta.
+        let first_delta = tool_call_deltas
+            .first()
+            .expect("at least one ToolCallDelta asserted above");
+        match first_delta {
+            GenerationEvent::ToolCallDelta { name, .. } => {
+                assert_eq!(
+                    name.as_deref(),
+                    Some("foo"),
+                    "Wave 3.6 W-4 (Wave 3.7 strengthened): the FIRST ToolCallDelta \
+                     MUST carry `name: Some(\"foo\")`. Got: {first_delta:?}"
+                );
+            }
+            _ => unreachable!("filtered to ToolCallDelta above"),
+        }
 
         // The Done event MUST report finish_reason="tool_calls" because
         // saw_tool_call is set by emit_streaming_tool_call_close when parse
