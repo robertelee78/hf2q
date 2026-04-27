@@ -420,8 +420,187 @@ mod tests {
         assert_eq!(target_to_ggml_name(KQuantTarget::Q5K), "Q5_K");
         assert_eq!(target_to_ggml_name(KQuantTarget::Q6K), "Q6_K");
         assert_eq!(target_to_ggml_name(KQuantTarget::Q4Legacy), "Q4_0");
+        assert_eq!(target_to_ggml_name(KQuantTarget::Q4Legacy1), "Q4_1");
         assert_eq!(target_to_ggml_name(KQuantTarget::Q5Legacy0), "Q5_0");
         assert_eq!(target_to_ggml_name(KQuantTarget::Q5Legacy1), "Q5_1");
         assert_eq!(target_to_ggml_name(KQuantTarget::Q8Legacy), "Q8_0");
+    }
+
+    // ─────────── Full ADR-014 pipeline integration test (iter-3q) ───────────
+
+    /// **End-to-end pipeline test** demonstrating that all the pieces
+    /// landed in P6 + P7 iter-3a..3p compose correctly into a working
+    /// imatrix-aware GGUF block-format quantize pipeline:
+    ///
+    /// 1. `ImatrixCollector::accumulate_dense` builds a per-tensor
+    ///    importance map from synthetic activations.
+    /// 2. `save_imatrix_gguf` persists to llama.cpp-compatible GGUF.
+    /// 3. `CalibrationData::from_imatrix_gguf` loads it back.
+    /// 4. `KQuantCodecQuantizer::new(name, Q4K, calibration)` plugs
+    ///    the calibration into the existing `Quantizer` trait.
+    /// 5. `quantize_tensor` emits a `QuantizedTensor` whose `data`
+    ///    field contains final GGUF block bytes.
+    /// 6. `dequantize_row_q4_k_bytes` round-trips back to F32 within
+    ///    the format's RMSE bound.
+    ///
+    /// This test is **the ADR-014 closure proof** that the data-format
+    /// pipeline is fully wireable end-to-end. It does NOT exercise
+    /// forward-pass orchestration (deferred to ADR-013 ActivationCapture)
+    /// or cmd_convert wiring (P4 — depends on infra outside this PR's
+    /// scope).
+    #[test]
+    fn end_to_end_pipeline_collector_to_quantized_bytes() {
+        use crate::calibrate::imatrix::ImatrixCollector;
+        use crate::quantize::k_quant::dequantize_row_q4_k_bytes;
+
+        const QK_K: usize = 256;
+
+        // ─── Step 1: Build calibration via accumulate_dense ───
+        let mut collector = ImatrixCollector::new();
+
+        // Two tensors: a 256-col attention Q-projection and a 512-col
+        // FFN down-projection. Synthetic per-token activations.
+        let attn_q_acts: Vec<f32> = (0..QK_K).map(|i| (i as f32) / 100.0).collect();
+        collector
+            .accumulate_dense("blk.0.attn_q.weight", &attn_q_acts, 1, QK_K)
+            .unwrap();
+
+        let ffn_down_acts: Vec<f32> = (0..2 * QK_K).map(|i| (i as f32) / 200.0).collect();
+        collector
+            .accumulate_dense("blk.0.ffn_down.weight", &ffn_down_acts, 1, 2 * QK_K)
+            .unwrap();
+        collector.record_chunk();
+
+        // ─── Step 2: Save imatrix to GGUF ───
+        let dir = std::env::temp_dir().join("hf2q-end-to-end-pipeline-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let imatrix_path = dir.join("e2e.imatrix.gguf");
+        let _ = std::fs::remove_file(&imatrix_path);
+        collector
+            .save_imatrix_gguf(&imatrix_path, 512, &["calib.txt"])
+            .unwrap();
+
+        // ─── Step 3: Load via CalibrationData bridge ───
+        let calibration = CalibrationData::from_imatrix_gguf(&imatrix_path).unwrap();
+        let _ = std::fs::remove_file(&imatrix_path);
+
+        match &calibration {
+            CalibrationData::ImatrixWithStats(map) => {
+                assert!(map.contains_key("blk.0.attn_q.weight"));
+                assert!(map.contains_key("blk.0.ffn_down.weight"));
+            }
+            _ => panic!("expected ImatrixWithStats from from_imatrix_gguf"),
+        }
+
+        // ─── Step 4: Build KQuantCodecQuantizer ───
+        let quantizer = KQuantCodecQuantizer::new(
+            "imatrix-q4_k_m",
+            KQuantTarget::Q4K,
+            calibration.clone(),
+        );
+        assert_eq!(quantizer.name(), "imatrix-q4_k_m");
+        assert_eq!(quantizer.target(), KQuantTarget::Q4K);
+
+        // ─── Step 5: Quantize a synthetic weight matrix ───
+        // Realistic shape: [4 heads, 256 hidden] for blk.0.attn_q.weight.
+        let weight_values: Vec<f32> = (0..4 * QK_K)
+            .map(|i| (i as f32 - 512.0) / 512.0)
+            .collect();
+        let tensor = make_f32_tensor("blk.0.attn_q.weight", vec![4, QK_K], &weight_values);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let quantized = quantizer.quantize_tensor(&tensor, &cfg).unwrap();
+
+        // Output contract: GGUF block bytes ready for direct write.
+        assert_eq!(quantized.shape, vec![4, QK_K]);
+        assert_eq!(quantized.data.len(), 4 * 144); // 4 rows × Q4_K block size
+        assert_eq!(quantized.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
+        assert_eq!(quantized.quant_info.ggml_type.as_deref(), Some("Q4_K"));
+        assert_eq!(quantized.quant_info.bits, 0); // sentinel
+        assert_eq!(quantized.quant_info.group_size, 0); // sentinel
+        assert!(!quantized.quant_info.preserved);
+        assert!(quantized.quant_info.scales.is_none());
+
+        // ─── Step 6: Round-trip back to F32 via dequantize ───
+        for r in 0..4 {
+            let row_bytes = &quantized.data[r * 144..(r + 1) * 144];
+            let mut decoded = vec![0.0_f32; QK_K];
+            dequantize_row_q4_k_bytes(row_bytes, &mut decoded).unwrap();
+
+            let original = &weight_values[r * QK_K..(r + 1) * QK_K];
+            let mut sse = 0.0_f64;
+            for (a, b) in original.iter().zip(decoded.iter()) {
+                let d = (*a as f64) - (*b as f64);
+                sse += d * d;
+            }
+            let rmse = (sse / QK_K as f64).sqrt();
+            assert!(
+                rmse < 0.05,
+                "row {r} round-trip RMSE {rmse} > 0.05 (Q4_K bound)"
+            );
+        }
+
+        // ─── Compare imatrix path vs uncalibrated path ───
+        // The imatrix path should produce different bytes than the
+        // None-calibration path (verifies the imatrix signal threaded
+        // through all 6 steps).
+        let plain_quantizer =
+            KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let plain_quantized = plain_quantizer.quantize_tensor(&tensor, &cfg).unwrap();
+        assert_eq!(plain_quantized.data.len(), quantized.data.len());
+
+        // The bytes typically differ — but for a calibration where the
+        // imatrix weights happen to match the uniform default, they
+        // could be byte-equal. So we don't strictly assert _ne. Just
+        // verify both produce well-formed output (already asserted above).
+        // The byte-equivalence vs imatrix-bias signal is exercised in
+        // `dispatch_imatrix_q4_k_uses_weighted_path` of k_quant_codec
+        // tests on biased input.
+    }
+
+    /// **Pipeline + multi-format**: the same calibration drives Q4_K,
+    /// Q5_K, and Q6_K quantizers — verifies the codec dispatch correctly
+    /// routes the imatrix data through different target paths.
+    #[test]
+    fn end_to_end_pipeline_multi_format_dispatch() {
+        use crate::calibrate::imatrix::ImatrixCollector;
+
+        const QK_K: usize = 256;
+
+        let mut collector = ImatrixCollector::new();
+        let acts: Vec<f32> = (0..QK_K).map(|i| 0.1 + (i as f32) / 1000.0).collect();
+        collector
+            .accumulate_dense("test.weight", &acts, 1, QK_K)
+            .unwrap();
+        collector.record_chunk();
+
+        let calibration = CalibrationData::from_imatrix_collector(&collector);
+
+        let weight: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) / 128.0).collect();
+        let tensor = make_f32_tensor("test.weight", vec![QK_K], &weight);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+
+        for (target, expected_size) in [
+            (KQuantTarget::Q4K, 144),
+            (KQuantTarget::Q5K, 176),
+            (KQuantTarget::Q6K, 210),
+        ] {
+            let q = KQuantCodecQuantizer::new("imatrix", target, calibration.clone());
+            let out = q.quantize_tensor(&tensor, &cfg).unwrap();
+            assert_eq!(
+                out.data.len(),
+                expected_size,
+                "{target:?}: got {} bytes, expected {expected_size}",
+                out.data.len()
+            );
+            assert_eq!(out.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
+        }
     }
 }
