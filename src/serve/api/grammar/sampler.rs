@@ -459,9 +459,9 @@ impl GrammarRuntime {
     }
 
     /// Explicitly set the trigger gate.  Engine callers wire this to
-    /// `true` for `GrammarKind::ToolCallBody` runtimes at construction;
-    /// `GrammarKind::ResponseFormat` runtimes leave the default
-    /// (`false`) so enforcement is eager.
+    /// `true` for `GrammarKind::ToolCallBodyAuto` runtimes at construction;
+    /// `GrammarKind::ResponseFormat` and `GrammarKind::ToolCallBodyRequired`
+    /// runtimes leave the default (`false`) so enforcement is eager.
     ///
     /// Mirrors llama.cpp's `lazy` parameter to `llama_grammar_init_impl`
     /// at `/opt/llama.cpp/src/llama-grammar.cpp:1287-1298`:
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     /// `set_awaiting_trigger(true)` then `trigger()` is the explicit
-    /// path used by the engine for `GrammarKind::ToolCallBody`
+    /// path used by the engine for `GrammarKind::ToolCallBodyAuto`
     /// runtimes.  Verifies the round-trip restores normal enforcement.
     #[test]
     fn runtime_set_then_trigger_restores_eager_enforcement() {

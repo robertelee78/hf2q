@@ -147,19 +147,41 @@ pub enum GrammarKind {
     /// constructs `SamplingParams` without setting the field.
     #[default]
     ResponseFormat,
-    /// Tool-call body grammar (output of `compile_tool_grammar`).
+    /// Tool-call body grammar under `tool_choice = auto`.
+    ///
     /// Applies ONLY after the model emits the per-model open marker
-    /// (e.g. Gemma 4 `call:`, Qwen 3.5 `<function=`).  Until then, the
-    /// runtime sits in `awaiting_trigger == true`: `apply()` is a no-op
-    /// (no mask), `accept()` is a no-op (no advance, no
+    /// (e.g. Gemma 4 `<|tool_call>`, Qwen 3.5/3.6 `<tool_call>`).  Until
+    /// then, the runtime sits in `awaiting_trigger == true`: `apply()`
+    /// is a no-op (no mask), `accept()` is a no-op (no advance, no
     /// dead/accepted-state termination check).  When the
     /// ToolCallSplitter sees the open marker, the engine calls
     /// `runtime.trigger()` to flip the flag false; the runtime then
     /// enforces every subsequent token through to the close marker.
     ///
-    /// Mirrors `COMMON_GRAMMAR_TYPE_TOOL_CALLS` + `grammar_lazy=true`
-    /// in llama.cpp (`/opt/llama.cpp/src/llama-grammar.cpp:1287-1344`).
-    ToolCallBody,
+    /// Mirrors llama.cpp `grammar_lazy = true` for `tool_choice == AUTO`
+    /// at `/opt/llama.cpp/common/chat.cpp:913, 1200, 1416`.
+    ///
+    /// NOTE — wave 2.7 W-η has not yet wired AUTO to a marker-aware lazy
+    /// grammar (`compile_tool_grammar` only fires for Required/Function).
+    /// This variant is forward-looking; today it is unreachable from the
+    /// chat-completions path.
+    ToolCallBodyAuto,
+    /// Tool-call body grammar under `tool_choice = required` or
+    /// `tool_choice = function(name)`.
+    ///
+    /// EAGER from token 0 — the runtime never enters `awaiting_trigger`
+    /// state; the mask fires every step starting at the very first
+    /// decode token.  The grammar root is shape `OneOrMoreCalls` with the
+    /// per-model open marker, body, and close marker all wired into the
+    /// root rule (see `registry::GrammarShape`).  The model is
+    /// structurally unable to emit non-call output: byte 0 must be the
+    /// first byte of the open marker (e.g. `<` for Gemma 4 `<|tool_call>`)
+    /// or the request rejects every other token via the mask.
+    ///
+    /// Mirrors llama.cpp `grammar_lazy = false` for
+    /// `tool_choice == REQUIRED` at `/opt/llama.cpp/common/chat.cpp:898-913,
+    /// 1177-1200, 1399-1416`.  Wave 2.7 W-η HIGH-1.
+    ToolCallBodyRequired,
 }
 
 /// - `parallel_tool_calls` — Tier 4; lands with the tool-call path
@@ -231,7 +253,10 @@ pub struct SamplingParams {
     /// is unconditionally enforcing (`ResponseFormat`, the default) or
     /// trigger-gated (`ToolCallBody`).  Set by:
     ///   * `compile_response_format` → `GrammarKind::ResponseFormat`
-    ///   * `compile_tool_grammar`    → `GrammarKind::ToolCallBody`
+    ///   * `compile_tool_grammar`    → `GrammarKind::ToolCallBodyRequired`
+    ///                                 (or `ToolCallBodyAuto` when wave 2.7+
+    ///                                  wires AUTO to a marker-aware lazy
+    ///                                  grammar — not yet reachable)
     ///
     /// Default = `ResponseFormat` so any caller that builds
     /// `SamplingParams` without touching the field gets the
@@ -1460,7 +1485,15 @@ fn generate_once_with_soft_tokens(
                 .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
             let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
                 .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
-            if matches!(params.grammar_kind, GrammarKind::ToolCallBody) {
+            // Wave 2.7 W-η Q-A: only `ToolCallBodyAuto` arms the lazy
+            // (awaiting_trigger) gate.  `ToolCallBodyRequired` is EAGER
+            // from token 0 — the grammar root already wraps the body in
+            // open/close markers, so the mask must fire at byte 0 and
+            // reject any token whose decoded bytes don't prefix the
+            // open marker.  Mirrors llama.cpp `grammar_lazy = false` for
+            // `tool_choice == REQUIRED` at common/chat.cpp:898-913,
+            // 1177-1200, 1399-1416.
+            if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
                 rt.set_awaiting_trigger(true);
             }
             Some(rt)
@@ -1539,13 +1572,15 @@ fn generate_once_with_soft_tokens(
     // tokens 2..N.  The greedy-fast-path skips logits readback entirely.
     //
     // Wave 2.6 W-α5 Q2: the mask + accept calls are UNCONDITIONAL.  For
-    // `GrammarKind::ToolCallBody` the runtime is suspended
+    // `GrammarKind::ToolCallBodyAuto` the runtime is suspended
     // (`is_awaiting_trigger() == true`) so both calls are no-ops and the
     // first token is naturally unconstrained — the same behavior the
     // wave-2.5 explicit `in_body_first = false` short-circuit
     // produced, but achieved structurally via the runtime self-gate.
-    // For `GrammarKind::ResponseFormat` the runtime enforces from token
-    // 0 (this fixes audit divergence A1 / response_format regression).
+    // For `GrammarKind::ResponseFormat` and Wave 2.7 W-η Q-A's
+    // `ToolCallBodyRequired` the runtime enforces from token 0
+    // (response_format fixes audit divergence A1; Required eagerly
+    // constrains the model to emit a tool call from byte 0).
     let mut next_token = if sample_logits {
         let tok = sample_from_live_logits(&mut loaded.weights, &[], grammar_runtime.as_ref())?;
         // Feed the chosen token's bytes through the grammar runtime so
@@ -2163,11 +2198,14 @@ fn generate_stream_once(
     } else {
         None
     };
-    // Wave 2.6 W-α5 Q2: arm the trigger gate when the request carries a
-    // tool-call body grammar (`GrammarKind::ToolCallBody`).  For
-    // `ResponseFormat`-kind runtimes the gate stays disarmed (eager
+    // Wave 2.6 W-α5 Q2 + Wave 2.7 W-η Q-A: arm the trigger gate ONLY when
+    // the request carries an AUTO-mode tool-call body grammar
+    // (`GrammarKind::ToolCallBodyAuto`).  `ResponseFormat` and
+    // `ToolCallBodyRequired` runtimes leave the gate disarmed for eager
     // enforcement from token 0 — fixes audit divergence A1 /
-    // response_format regression).
+    // response_format regression for ResponseFormat, and forces tool-call
+    // emission for Required/Function (mirrors llama.cpp grammar_lazy=false
+    // in common/chat.cpp:898-913, 1177-1200, 1399-1416).
     let mut grammar_runtime: Option<super::grammar::GrammarRuntime> = match params.grammar.as_ref() {
         Some(g) => {
             let start_rule_id = match g.rule_id("root") {
@@ -2179,7 +2217,11 @@ fn generate_stream_once(
             };
             match super::grammar::GrammarRuntime::new(g.clone(), start_rule_id) {
                 Some(mut rt) => {
-                    if matches!(params.grammar_kind, GrammarKind::ToolCallBody) {
+                    // Wave 2.7 W-η Q-A: see non-streaming arming above —
+                    // `ToolCallBodyRequired` keeps the eager gate
+                    // (`awaiting_trigger=false`); only `ToolCallBodyAuto`
+                    // suspends until ToolCallSplitter sees the open marker.
+                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
                         rt.set_awaiting_trigger(true);
                     }
                     Some(rt)
@@ -3521,14 +3563,14 @@ assistant:
         base.grammar_kind = GrammarKind::ResponseFormat;
         let cache = make_cached(&tokens, &base, "x");
 
-        // Same grammar, but ToolCallBody kind — enforcement timing differs → MISS.
+        // Same grammar, but ToolCallBodyAuto kind — enforcement timing differs → MISS.
         let mut req = SamplingParams::default();
         req.grammar = Some(grammar);
-        req.grammar_kind = GrammarKind::ToolCallBody;
+        req.grammar_kind = GrammarKind::ToolCallBodyAuto;
         assert!(
             cache.lookup(&tokens, &req).is_none(),
             "same grammar + different grammar_kind must not hit cache \
-             (ResponseFormat enforces unconditionally; ToolCallBody is trigger-gated)"
+             (ResponseFormat enforces unconditionally; ToolCallBodyAuto is trigger-gated)"
         );
     }
 
@@ -3801,7 +3843,7 @@ mod test_a1_conditional_grammar_wire {
                 .expect("ToolCallSplitter::from_registration must return Some for gemma4");
 
         // Build a real GrammarRuntime in the lazy state, the way
-        // generate_stream_once does for `GrammarKind::ToolCallBody`.
+        // generate_stream_once does for `GrammarKind::ToolCallBodyAuto`.
         let g = parse("root ::= \"x\"\n").expect("parse");
         let rid = g.rule_id("root").expect("root rule");
         let mut runtime = GrammarRuntime::new(g, rid).expect("runtime");

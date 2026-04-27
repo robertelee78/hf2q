@@ -940,18 +940,26 @@ where
     };
     // Select the effective grammar: tool > response > none.
     //
-    // Wave 2.6 W-α5 Q1: also pick the `GrammarKind` discriminant so the
-    // engine knows whether to enforce unconditionally (`ResponseFormat`,
-    // mask + advance every token) or trigger-gated (`ToolCallBody`, no-op
-    // until the per-model open marker fires).  Mirrors llama.cpp
-    // `enum common_grammar_type` selection in
-    // `tools/server/server-task.cpp:381-403`: response_format /
-    // json_schema → OUTPUT_FORMAT (eager); tool_choice=required/function
-    // → TOOL_CALLS (lazy).  When neither grammar is set, the kind is
-    // `ResponseFormat` (the `Default`) but it is never read because
-    // `effective_grammar == None` short-circuits the runtime entirely.
+    // Wave 2.6 W-α5 Q1 + Wave 2.7 W-η Q-A: also pick the `GrammarKind`
+    // discriminant so the engine knows whether to enforce
+    // unconditionally (`ResponseFormat`, mask + advance every token),
+    // trigger-gated (`ToolCallBodyAuto`, no-op until the per-model open
+    // marker fires — forward-looking, not reachable through this path),
+    // or EAGERLY for tool calls (`ToolCallBodyRequired`, mask + advance
+    // every token starting at byte 0; the grammar root already wraps
+    // the body in open/close markers).  Mirrors llama.cpp
+    // `enum common_grammar_type` + `bool grammar_lazy` selection in
+    // `tools/server/server-task.cpp:381-403` and `common/chat.cpp:898-913,
+    // 1177-1200, 1399-1416`.
+    //
+    // `compile_tool_grammar` only returns `Some` for
+    // `tool_choice = required / function`, so the tool branch always
+    // resolves to `ToolCallBodyRequired`.  When neither grammar is
+    // set, the kind is `ResponseFormat` (the `Default`) but it is
+    // never read because `effective_grammar == None` short-circuits
+    // the runtime entirely.
     let (effective_grammar, effective_grammar_kind) = match (tool_grammar, response_grammar) {
-        (Some(g), _)       => (Some(g), engine::GrammarKind::ToolCallBody),
+        (Some(g), _)       => (Some(g), engine::GrammarKind::ToolCallBodyRequired),
         (None,    Some(g)) => (Some(g), engine::GrammarKind::ResponseFormat),
         (None,    None)    => (None,    engine::GrammarKind::default()),
     };
@@ -2591,7 +2599,13 @@ fn compile_tool_grammar(
             .as_ref()
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        match reg.tool_call_gbnf(&tool.function.name, &params_schema) {
+        // Wave 2.7 W-η Q-A: `compile_tool_grammar` only fires for
+        // `tool_choice = required / function`, so the emitter shape is
+        // always the eager full-call form.  `parallel` is wired to
+        // `false` here (Q-A scope); Wave 2.7 W-η Q-B extends this with
+        // `req.parallel_tool_calls`.
+        let shape = registry::GrammarShape::OneOrMoreCalls { parallel: false };
+        match reg.tool_call_gbnf(&tool.function.name, &params_schema, shape) {
             Ok(gbnf) => fn_gbnfs.push(gbnf),
             Err(e) => {
                 return Err(ApiError::grammar_error(format!(
@@ -3157,15 +3171,20 @@ mod grammar_kind_selection_tests {
 
     /// Replicates the exact `(tool, resp) → (Option, GrammarKind)` match
     /// from `prepare_chat_generation_core`. Confirms:
-    ///   * tool_grammar present  → kind = ToolCallBody (lazy / trigger-gated)
+    ///   * tool_grammar present  → kind = ToolCallBodyRequired (eager from token 0)
     ///   * tool_grammar absent + response_grammar present → kind = ResponseFormat (eager)
     ///   * both absent → kind = ResponseFormat (default; never read because
     ///     grammar is None)
     ///
     /// This is the property that fixes audit divergence A1 / response_format
     /// regression: when only response_grammar is set, the kind MUST be
-    /// `ResponseFormat`, not `ToolCallBody` (which would gate enforcement
+    /// `ResponseFormat`, not `ToolCallBodyAuto` (which would gate enforcement
     /// on a tool open marker that never fires for non-tool requests).
+    /// Wave 2.7 W-η Q-A flipped the tool-grammar branch from `ToolCallBody`
+    /// (always lazy) to `ToolCallBodyRequired` (eager): `compile_tool_grammar`
+    /// only fires for Required/Function, and llama.cpp's `grammar_lazy=false`
+    /// for those modes is what makes the model structurally unable to skip
+    /// the tool call.
     #[test]
     fn tool_choice_required_yields_tool_call_body_kind() {
         // Stand in for compile_tool_grammar / compile_response_format outputs.
@@ -3174,7 +3193,7 @@ mod grammar_kind_selection_tests {
         // mod, while letting us also emit the GrammarKind discriminant.
         fn select(tool: Option<u32>, resp: Option<u32>) -> (Option<u32>, GrammarKind) {
             match (tool, resp) {
-                (Some(g), _)       => (Some(g), GrammarKind::ToolCallBody),
+                (Some(g), _)       => (Some(g), GrammarKind::ToolCallBodyRequired),
                 (None,    Some(g)) => (Some(g), GrammarKind::ResponseFormat),
                 (None,    None)    => (None,    GrammarKind::default()),
             }
@@ -3186,10 +3205,11 @@ mod grammar_kind_selection_tests {
         assert_eq!(g, Some(1), "tool grammar must win precedence");
         assert_eq!(
             k,
-            GrammarKind::ToolCallBody,
-            "tool_choice=required/function MUST yield GrammarKind::ToolCallBody \
-             so the runtime starts in awaiting_trigger=true and the mask is \
-             skipped for preamble tokens (Option B boundary)."
+            GrammarKind::ToolCallBodyRequired,
+            "tool_choice=required/function MUST yield GrammarKind::ToolCallBodyRequired \
+             so the runtime is EAGER from token 0 — the grammar root already \
+             wraps the body in open/close markers, mirroring llama.cpp \
+             grammar_lazy=false at common/chat.cpp:898-913, 1177-1200."
         );
 
         // Case 2: response_format only.

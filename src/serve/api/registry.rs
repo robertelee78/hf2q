@@ -139,12 +139,27 @@ impl ModelRegistration {
     /// well-formed tool-call wrapper for function `fn_name` with parameters
     /// matching `params_schema` (a JSON Schema object).
     ///
-    /// The emitted GBNF is **between** the open/close markers — i.e. the
-    /// portion the `ToolCallSplitter` hands to `parse_tool_call_body`. The
-    /// caller (`compile_tool_grammar` in handlers.rs) prepends nothing; the
-    /// marker bytes are never fed to the grammar sampler because the sampler
-    /// is wired to run only after the open marker has been observed (or, in
-    /// the forced-tool-call case, from the first decode token).
+    /// `shape` selects the root rule's overall structure (Wave 2.7 W-η):
+    ///
+    ///   * `GrammarShape::SingleBody` — root accepts ONLY the body
+    ///     (e.g. Gemma `call:NAME{...}`, Qwen `<function=NAME>...</function>`).
+    ///     Open/close markers are NOT in the grammar; the caller relies on
+    ///     `ToolCallSplitter` to swallow them and on `awaiting_trigger`-gated
+    ///     lazy enforcement (`GrammarKind::ToolCallBodyAuto`) so the runtime
+    ///     only kicks in after the open marker is observed.  Pre-W-η
+    ///     behaviour, preserved for forward-looking AUTO support.
+    ///
+    ///   * `GrammarShape::OneOrMoreCalls { parallel }` — root accepts the
+    ///     FULL CALL: `marker_open + body + marker_close` (Gemma 4),
+    ///     `\n<tool_call>\n<function=NAME>\n...\n</function>\n</tool_call>`
+    ///     (Qwen 3.5/3.6), with `min_calls = 1` so at least one call is
+    ///     produced.  When `parallel = true`, the root accepts repetition
+    ///     (Gemma: bare `(call)+`; Qwen: `call ("\n" call)*`).  Used by
+    ///     `compile_tool_grammar` for `tool_choice = required / function`
+    ///     paired with `GrammarKind::ToolCallBodyRequired` for eager
+    ///     enforcement from token 0.  Mirrors llama.cpp
+    ///     `p.repeat(call, min=1, max=parallel?-1:1)` at
+    ///     `/opt/llama.cpp/common/chat.cpp:898-902, 1177-1181, 1399-1404`.
     ///
     /// Returns `Err(String)` when the family is unknown or when `params_schema`
     /// contains a feature the per-model emitter doesn't support yet. The error
@@ -160,11 +175,12 @@ impl ModelRegistration {
         &self,
         fn_name: &str,
         params_schema: &serde_json::Value,
+        shape: GrammarShape,
     ) -> Result<String, String> {
         match self.family {
-            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema)
+            "gemma4" => gemma4_tool_call_gbnf(fn_name, params_schema, shape)
                 .map_err(|e| e.to_string()),
-            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema)
+            "qwen35" => qwen35_tool_call_gbnf(fn_name, params_schema, shape)
                 .map_err(|e| e.to_string()),
             other => Err(format!(
                 "tool_call_gbnf: no per-model grammar emitter for family '{}'",
@@ -172,6 +188,32 @@ impl ModelRegistration {
             )),
         }
     }
+}
+
+/// Root-rule shape selector for `tool_call_gbnf`.
+///
+/// Wave 2.7 W-η Q-A + Q-B: unified emitter API for the eager-grammar
+/// (REQUIRED/Function) and forward-looking lazy-grammar (AUTO) paths.
+///
+/// See `ModelRegistration::tool_call_gbnf` for the per-variant semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrammarShape {
+    /// Body-only root.  Open/close markers handled by the splitter; the
+    /// runtime is expected to be `awaiting_trigger`-gated by the caller
+    /// (`GrammarKind::ToolCallBodyAuto`).  Pre-Wave 2.7 behaviour.
+    SingleBody,
+    /// Full-call root (`marker_open + body + marker_close`, repeated
+    /// `min=1`, `max=parallel?∞:1`).  Open/close markers ARE in the
+    /// grammar; the runtime is expected to be EAGER from token 0
+    /// (`GrammarKind::ToolCallBodyRequired`).
+    ///
+    /// `parallel = true` accepts repetition (Wave 2.7 W-η Q-B):
+    ///   * Gemma 4: bare back-to-back `(call)+` (no separator —
+    ///     chat_template.jinja:189-205 emits calls with no inter-call
+    ///     bytes).
+    ///   * Qwen 3.5/3.6: `call ("\n" call)*` (template separates calls
+    ///     2+ with literal `\n`; tokenizer_config.json:285+).
+    OneOrMoreCalls { parallel: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1078,7 @@ fn gemma4_value_gbnf(
 fn gemma4_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
+    shape: GrammarShape,
 ) -> Result<String, EmitterError> {
     let mut rules: Vec<(String, String)> = Vec::new();
     let mut rule_counter: u32 = 0;
@@ -1109,9 +1152,14 @@ fn gemma4_tool_call_gbnf(
     let close_lit = gbnf_literal("}");
     let comma_lit = gbnf_literal(",");
 
-    if let Some(props) = properties {
+    // Build the per-call body (shape-independent).  The `single_body`
+    // string is the GBNF expression that matches exactly one Gemma 4
+    // tool-call body (`call:NAME{kv-list}`), with no enclosing markers.
+    // The shape selector below wraps it in either the body-only
+    // (SingleBody) or marker-wrapped + repeat (OneOrMoreCalls) shape.
+    let single_body: String = if let Some(props) = properties {
         if props.is_empty() {
-            rules.push(("root".to_string(), format!("{} {} {} space", prefix_lit, open_lit, close_lit)));
+            format!("{} {} {}", prefix_lit, open_lit, close_lit)
         } else {
             let mut required_kv_names: Vec<String> = Vec::new();
             let mut optional_kv_names: Vec<String> = Vec::new();
@@ -1176,21 +1224,45 @@ fn gemma4_tool_call_gbnf(
                 }
             };
 
-            rules.push((
-                "root".to_string(),
-                format!("{} {} {} {} space", prefix_lit, open_lit, kv_body_rule, close_lit),
-            ));
+            format!("{} {} {} {}", prefix_lit, open_lit, kv_body_rule, close_lit)
         }
     } else {
         rules.push((
             "gemma4-any-kv-char".to_string(),
             r#"[^}]"#.to_string(),
         ));
-        rules.push((
-            "root".to_string(),
-            format!("{} {} gemma4-any-kv-char* {} space", prefix_lit, open_lit, close_lit),
-        ));
-    }
+        format!("{} {} gemma4-any-kv-char* {}", prefix_lit, open_lit, close_lit)
+    };
+
+    // Wave 2.7 W-η: select root rule per `shape`.
+    //
+    //   * `SingleBody`         → body-only root (legacy lazy path).
+    //   * `OneOrMoreCalls{p}`  → wrap body with Gemma 4 marker pair
+    //     `<|tool_call>` / `<tool_call|>` (verbatim from
+    //     models/gemma4/chat_template.jinja:189-205) and repeat per
+    //     `parallel`.  No separator: chat_template emits calls 2+
+    //     immediately after the previous call's close marker.
+    let root_body = match shape {
+        GrammarShape::SingleBody => format!("{} space", single_body),
+        GrammarShape::OneOrMoreCalls { parallel } => {
+            let open_marker = gbnf_literal("<|tool_call>");
+            let close_marker = gbnf_literal("<tool_call|>");
+            let g4_call_rule = "gemma4-call".to_string();
+            rules.push((
+                g4_call_rule.clone(),
+                format!("{} {} {}", open_marker, single_body, close_marker),
+            ));
+            // `(call)+` GBNF idiom: `call call*` — at least one, optional
+            // repeat.  Mirrors llama.cpp `p.repeat(call, 1, parallel?-1:1)`
+            // at common/chat.cpp:898-902, 1177-1181.
+            if parallel {
+                format!("{} {}* space", g4_call_rule, g4_call_rule)
+            } else {
+                format!("{} space", g4_call_rule)
+            }
+        }
+    };
+    rules.push(("root".to_string(), root_body));
 
     rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
@@ -1286,6 +1358,7 @@ fn build_gemma4_required_permutation(
 fn qwen35_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
+    shape: GrammarShape,
 ) -> Result<String, EmitterError> {
     let mut rules: Vec<(String, String)> = Vec::new();
 
@@ -1351,12 +1424,14 @@ fn qwen35_tool_call_gbnf(
     let func_close_lit = gbnf_literal("</function>");
     let newline_lit = gbnf_literal("\n");
 
-    if let Some(props) = properties {
+    // Build the per-call body (shape-independent).  `single_body` is the
+    // GBNF expression for exactly one Qwen 3.5/3.6 tool-call body
+    // (`<function=NAME>...\n</function>`).  The shape selector below
+    // wraps it in either the body-only (SingleBody) or marker-wrapped +
+    // repeat (OneOrMoreCalls) shape.
+    let single_body: String = if let Some(props) = properties {
         if props.is_empty() {
-            rules.push((
-                "root".to_string(),
-                format!("{} {} space", func_open_lit, func_close_lit),
-            ));
+            format!("{} {}", func_open_lit, func_close_lit)
         } else {
             let mut required_block_names: Vec<String> = Vec::new();
             let mut optional_block_names: Vec<String> = Vec::new();
@@ -1422,27 +1497,62 @@ fn qwen35_tool_call_gbnf(
                 }
             };
 
-            // Root: `<function=NAME>\n` + param sequence + `</function>`.
+            // Body: `<function=NAME>\n` + param sequence + `</function>`.
             // The newline after `<function=NAME>` is part of the template
             // emission pattern (verified from tokenizer_config.json).
-            rules.push((
-                "root".to_string(),
-                format!(
-                    "{} {} {} {} space",
-                    func_open_lit, newline_lit, param_body_rule, func_close_lit
-                ),
-            ));
+            format!(
+                "{} {} {} {}",
+                func_open_lit, newline_lit, param_body_rule, func_close_lit
+            )
         }
     } else {
         rules.push((
             "qwen35-inner-char".to_string(),
             r#"[^<\\] | [\\] [^\x00-\x1F]"#.to_string(),
         ));
-        rules.push((
-            "root".to_string(),
-            format!("{} qwen35-inner-char* {} space", func_open_lit, func_close_lit),
-        ));
-    }
+        format!("{} qwen35-inner-char* {}", func_open_lit, func_close_lit)
+    };
+
+    // Wave 2.7 W-η: select root rule per `shape`.
+    //
+    //   * `SingleBody`         → body-only root (legacy lazy path).
+    //   * `OneOrMoreCalls{p}`  → wrap body with Qwen 3.5/3.6 marker pair
+    //     `<tool_call>\n` / `\n</tool_call>` (verbatim from
+    //     models/qwen3.6-27b-dwq46/tokenizer_config.json:285+) and
+    //     repeat per `parallel`.  Calls 2+ are separated by a literal
+    //     `\n` per the chat_template's `{%- else %}{{- '\n<tool_call>\n...
+    //     ' }}` branch.
+    let root_body = match shape {
+        GrammarShape::SingleBody => format!("{} space", single_body),
+        GrammarShape::OneOrMoreCalls { parallel } => {
+            let open_marker = gbnf_literal("<tool_call>");
+            let close_marker = gbnf_literal("</tool_call>");
+            let qwen_call_rule = "qwen35-call".to_string();
+            // Full call shape per chat_template:
+            //   `<tool_call>\n<function=NAME>\n...\n</function>\n</tool_call>`
+            // (single_body already starts with `<function=NAME>\n` and ends
+            // with `</function>` — we add the surrounding `<tool_call>\n` and
+            // `\n</tool_call>`).
+            rules.push((
+                qwen_call_rule.clone(),
+                format!(
+                    "{} {} {} {} {}",
+                    open_marker, newline_lit, single_body, newline_lit, close_marker
+                ),
+            ));
+            if parallel {
+                // `call ("\n" call)*` — Qwen separates calls 2+ with literal `\n`
+                // (template's loop "else" branch — see citation above).
+                format!(
+                    "{} ( {} {} )* space",
+                    qwen_call_rule, newline_lit, qwen_call_rule
+                )
+            } else {
+                format!("{} space", qwen_call_rule)
+            }
+        }
+    };
+    rules.push(("root".to_string(), root_body));
 
     rules.push(("space".to_string(), r#"| " " | "\n"{1,2} [ \t]{0,20}"#.to_string()));
 
@@ -2136,15 +2246,19 @@ mod tests {
     }
 
     fn gemma4_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        // Wave 2.7 W-η: legacy tests use body-only grammars (no markers in the
+        // grammar; lazy/auto path).  Tests that exercise the eager
+        // marker-wrapped form pass `OneOrMoreCalls{...}` directly via the
+        // public emitter API.
         let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
-        let gbnf = GEMMA4.tool_call_gbnf(fn_name, &schema)
+        let gbnf = GEMMA4.tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
     }
 
     fn qwen35_runtime(fn_name: &str, schema_json: &str) -> crate::serve::api::grammar::sampler::GrammarRuntime {
         let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
-        let gbnf = QWEN35.tool_call_gbnf(fn_name, &schema)
+        let gbnf = QWEN35.tool_call_gbnf(fn_name, &schema, GrammarShape::SingleBody)
             .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
         grammar_runtime_for_gbnf(&gbnf)
     }
@@ -2380,7 +2494,7 @@ mod tests {
             tool_preamble: None,
         };
         let schema: serde_json::Value = serde_json::json!({});
-        let result = unknown.tool_call_gbnf("f", &schema);
+        let result = unknown.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "expected Err for unknown family");
         assert!(result.unwrap_err().contains("unknown_llama"));
     }
@@ -2460,7 +2574,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = GEMMA4.tool_call_gbnf("f", &schema);
+        let result = GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error message should mention count: {}", msg);
@@ -2483,7 +2597,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = GEMMA4.tool_call_gbnf("tool9", &schema);
+        let result = GEMMA4.tool_call_gbnf("tool9", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error must mention count 9: {}", msg);
@@ -2505,7 +2619,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = GEMMA4.tool_call_gbnf("tool8", &schema);
+        let result = GEMMA4.tool_call_gbnf("tool8", &schema, GrammarShape::SingleBody);
         assert!(result.is_ok(), "8 required keys must compile without error");
     }
 
@@ -2578,7 +2692,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = QWEN35.tool_call_gbnf("f", &schema);
+        let result = QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error message should mention count: {}", msg);
@@ -2600,7 +2714,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = QWEN35.tool_call_gbnf("qtool9", &schema);
+        let result = QWEN35.tool_call_gbnf("qtool9", &schema, GrammarShape::SingleBody);
         assert!(result.is_err(), "9 required keys must return TooManyRequiredKeys");
         let msg = result.unwrap_err();
         assert!(msg.contains("9"), "error must mention count 9: {}", msg);
@@ -2622,7 +2736,7 @@ mod tests {
             "properties": props,
             "required": required
         });
-        let result = QWEN35.tool_call_gbnf("qtool8", &schema);
+        let result = QWEN35.tool_call_gbnf("qtool8", &schema, GrammarShape::SingleBody);
         assert!(result.is_ok(), "8 required keys must compile without error");
     }
 
@@ -2640,7 +2754,7 @@ mod tests {
                 "name": {"type": "string"}
             }
         }"#;
-        let result = GEMMA4.tool_call_gbnf("process", &serde_json::from_str(schema).unwrap());
+        let result = GEMMA4.tool_call_gbnf("process", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
         assert!(result.is_err(), "array type must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
@@ -2657,7 +2771,7 @@ mod tests {
                 "config": {"type": "object"}
             }
         }"#;
-        let result = GEMMA4.tool_call_gbnf("configure", &serde_json::from_str(schema).unwrap());
+        let result = GEMMA4.tool_call_gbnf("configure", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
         assert!(result.is_err(), "object type must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
@@ -2672,7 +2786,7 @@ mod tests {
                 "tags": {"type": "array"}
             }
         }"#;
-        let result = QWEN35.tool_call_gbnf("tag_item", &serde_json::from_str(schema).unwrap());
+        let result = QWEN35.tool_call_gbnf("tag_item", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
         assert!(result.is_err(), "array type must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
@@ -2688,7 +2802,7 @@ mod tests {
                 "metadata": {"type": "object"}
             }
         }"#;
-        let result = QWEN35.tool_call_gbnf("set_meta", &serde_json::from_str(schema).unwrap());
+        let result = QWEN35.tool_call_gbnf("set_meta", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
         assert!(result.is_err(), "object type must return Err");
         let msg = result.unwrap_err();
         assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
@@ -2705,8 +2819,8 @@ mod tests {
                 "enabled": {"type": "boolean"}
             }
         });
-        assert!(GEMMA4.tool_call_gbnf("f", &schema).is_ok(), "scalars must not be rejected by B3");
-        assert!(QWEN35.tool_call_gbnf("f", &schema).is_ok(), "scalars must not be rejected by B3");
+        assert!(GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must not be rejected by B3");
+        assert!(QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must not be rejected by B3");
     }
 
     // -----------------------------------------------------------------------
@@ -2775,6 +2889,195 @@ mod tests {
         assert!(
             !(ok && rt.is_accepted()),
             "emission without trailing \\n after </parameter> must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave 2.7 W-η Q-A — eager-grammar acceptance + non-marker rejection
+    //
+    // Audit-driving tests for the `tool_choice=required` enforcement model.
+    // These exercise the FULL emit→parse→runtime→mask path on real per-vocab
+    // byte tables, mirroring the production decode loop's wiring.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a runtime for the eager (`OneOrMoreCalls`) shape.
+    fn gemma4_required_runtime(
+        fn_name: &str,
+        schema_json: &str,
+        parallel: bool,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = GEMMA4
+            .tool_call_gbnf(fn_name, &schema, GrammarShape::OneOrMoreCalls { parallel })
+            .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
+        grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    fn qwen35_required_runtime(
+        fn_name: &str,
+        schema_json: &str,
+        parallel: bool,
+    ) -> crate::serve::api::grammar::sampler::GrammarRuntime {
+        let schema: serde_json::Value = serde_json::from_str(schema_json).unwrap();
+        let gbnf = QWEN35
+            .tool_call_gbnf(fn_name, &schema, GrammarShape::OneOrMoreCalls { parallel })
+            .unwrap_or_else(|e| panic!("tool_call_gbnf error: {}", e));
+        grammar_runtime_for_gbnf(&gbnf)
+    }
+
+    /// T-QA-1: Gemma 4 eager grammar accepts the canonical marker-wrapped call.
+    /// Validates the body bytes the model emits between markers (which the
+    /// `ToolCallSplitter` swallows in production) by emitting the full
+    /// `<|tool_call>...<tool_call|>` form at the runtime's grammar layer.
+    #[test]
+    fn gemma4_required_grammar_accepts_marker_wrapped_call() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_required_runtime("get_weather", schema, false);
+        let input = b"<|tool_call>call:get_weather{location:<|\"|>SF<|\"|>}<tool_call|>";
+        assert!(
+            rt.accept_bytes(input),
+            "eager-grammar runtime must accept marker-wrapped call"
+        );
+        assert!(rt.is_accepted(), "not accepted at end");
+    }
+
+    /// T-QA-2 (audit-driving): mask path under `OneOrMoreCalls{parallel:false}`
+    /// REJECTS the first non-marker byte at token 0.
+    ///
+    /// This is the structural-enforcement guarantee: the runtime is eager
+    /// (`awaiting_trigger == false`) and the grammar root requires `<` (the
+    /// first byte of `<|tool_call>`).  Any token whose decoded bytes don't
+    /// prefix the open marker MUST be masked to -inf.
+    ///
+    /// Mirrors llama.cpp `grammar_lazy=false` for `tool_choice=REQUIRED`
+    /// at common/chat.cpp:1200, 1416 — the model is structurally unable
+    /// to skip the tool call.
+    #[test]
+    fn required_eager_grammar_masks_non_marker_first_token() {
+        use crate::serve::api::grammar::mask;
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let rt = gemma4_required_runtime("get_weather", schema, false);
+        assert!(
+            !rt.is_awaiting_trigger(),
+            "eager grammar runtime must NOT be in awaiting_trigger state"
+        );
+        // Build a tiny vocab: one token that starts the open marker (`<`),
+        // and several non-marker tokens that the grammar must reject.
+        // token_bytes table mirrors what `Engine::token_bytes_table`
+        // produces from `Tokenizer::decode(&[id], false)`.
+        let token_bytes: Vec<Vec<u8>> = vec![
+            b"<".to_vec(),                  // 0: starts <|tool_call> — survives
+            b"<|tool_call>".to_vec(),       // 1: full open marker     — survives
+            b"hello".to_vec(),              // 2: plain content        — masked
+            b"the".to_vec(),                // 3: plain content        — masked
+            b" ".to_vec(),                  // 4: whitespace           — masked
+            b"\n".to_vec(),                 // 5: newline              — masked
+            b"call:".to_vec(),              // 6: body-prefix          — masked
+            b"".to_vec(),                   // 7: empty / EOS          — exempt by design
+        ];
+        let mut logits = vec![0.0_f32; token_bytes.len()];
+        let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
+
+        // Marker-prefix tokens (0, 1) survive; empty token (7) is exempt;
+        // everything else (2..=6) is masked to -inf.  That's 5 masked tokens.
+        assert_eq!(masked, 5, "expected 5 masked tokens, logits = {:?}", logits);
+        assert!(logits[0].is_finite(), "token 0 (`<`) must survive — prefixes open marker");
+        assert!(logits[1].is_finite(), "token 1 (`<|tool_call>`) must survive — full open marker");
+        assert!(!logits[2].is_finite(), "token 2 (`hello`) must be masked");
+        assert!(!logits[3].is_finite(), "token 3 (`the`) must be masked");
+        assert!(!logits[4].is_finite(), "token 4 (` `) must be masked");
+        assert!(!logits[5].is_finite(), "token 5 (`\\n`) must be masked");
+        assert!(
+            !logits[6].is_finite(),
+            "token 6 (`call:`) must be masked — body bytes only legal AFTER open marker"
+        );
+        assert!(
+            logits[7].is_finite(),
+            "token 7 (empty bytes) is exempt from mask per mask.rs:77-80 (EOS contract)"
+        );
+    }
+
+    /// T-QA-3 (audit-driving): mask path under `SingleBody` + lazy
+    /// (`awaiting_trigger=true`) ALLOWS every non-marker token at token 0.
+    ///
+    /// This is the AUTO-mode contract: the runtime is suspended until the
+    /// `ToolCallSplitter` sees the open marker; preamble content tokens
+    /// flow through unconstrained.  Matches llama.cpp `grammar_lazy=true`
+    /// for `tool_choice=AUTO` at common/chat.cpp:913, 1200, 1416.
+    #[test]
+    fn auto_lazy_grammar_allows_preamble_content() {
+        use crate::serve::api::grammar::mask;
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        // Body-only grammar — what `compile_tool_grammar` would emit for AUTO
+        // under a future Wave 2.7+ wiring.
+        let mut rt = gemma4_runtime("get_weather", schema);
+        // Arm the lazy gate the way `engine.rs` does for ToolCallBodyAuto.
+        rt.set_awaiting_trigger(true);
+        assert!(rt.is_awaiting_trigger());
+
+        let token_bytes: Vec<Vec<u8>> = vec![
+            b"<".to_vec(),
+            b"<|tool_call>".to_vec(),
+            b"hello".to_vec(),
+            b"the".to_vec(),
+            b" ".to_vec(),
+            b"\n".to_vec(),
+            b"call:".to_vec(),
+        ];
+        let mut logits = vec![0.0_f32; token_bytes.len()];
+        let masked = mask::mask_invalid_tokens(&rt, &token_bytes, &mut logits);
+        assert_eq!(masked, 0, "lazy/awaiting_trigger runtime must mask zero tokens");
+        for (i, l) in logits.iter().enumerate() {
+            assert!(l.is_finite(), "token {} masked under awaiting_trigger; logits = {:?}", i, logits);
+        }
+    }
+
+    /// T-QA-4: Qwen 3.5/3.6 eager grammar accepts the canonical
+    /// marker-wrapped single call.
+    #[test]
+    fn qwen35_required_grammar_accepts_marker_wrapped_call() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = qwen35_required_runtime("get_weather", schema, false);
+        // `<tool_call>\n<function=NAME>\n...\n</function>\n</tool_call>`.
+        let input = b"<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n</parameter>\n</function>\n</tool_call>";
+        assert!(
+            rt.accept_bytes(input),
+            "eager Qwen35 grammar must accept canonical single-call emission"
+        );
+        assert!(rt.is_accepted());
+    }
+
+    /// T-QA-5: under `parallel=false`, the eager grammar REJECTS a second
+    /// open marker after the first call's close marker — single-call cap.
+    #[test]
+    fn gemma4_required_grammar_rejects_second_call_when_parallel_false() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {"location": {"type": "string"}}
+        }"#;
+        let mut rt = gemma4_required_runtime("get_weather", schema, false);
+        // First call accepted in full.
+        let first = b"<|tool_call>call:get_weather{location:<|\"|>SF<|\"|>}<tool_call|>";
+        assert!(rt.accept_bytes(first));
+        assert!(rt.is_accepted(), "first call must reach accepted state");
+        // Second open marker must drive the runtime dead under parallel=false.
+        let second_open = b"<|tool_call>";
+        let alive = rt.accept_bytes(second_open);
+        assert!(
+            !alive || rt.is_dead(),
+            "second `<|tool_call>` must be rejected under parallel=false"
         );
     }
 }
