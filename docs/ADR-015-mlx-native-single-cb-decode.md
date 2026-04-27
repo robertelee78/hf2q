@@ -435,6 +435,22 @@ holds.  The acceptance-criterion ≥150 µs of the **apex-MoE 288 µs
 residual** is **NOT MET** by this run; it is re-scoped as a Wave 2b
 gate per the supersession note at line 19.
 
+**Commit-history note (2026-04-27).** This rev1 revision content
+landed at commit **`1c056c6`** ("docs(adr-014): record iter-3u commit
+hash") rather than under the queen-prescribed message
+`docs(adr-015 wave 2a iter P3a' rev1): apply Codex review revisions`
+because of a staging-index race with a parallel ADR-014 session — the
+parallel session's `git commit` swept the queen's already-staged
+ADR-015 + harness diffs into its own commit before the queen's
+`git commit` fired.  The commit was already on `origin/main` when the
+race was detected, so an amend was unsafe.  The substantive content
+(this §"Codex review acceptance" subsection, the H1/H4 verdict
+changes, the rank-1 hazard list, the supersession-note rescoping, the
+13.6× headline removal, and the harness-comment fix) is fully present
+at `1c056c6` regardless of the misleading commit subject.  This
+follow-up commit (queue-correct subject) adds only this commit-history
+note for traceability.
+
 ### Phase plan implication
 
 Original P3 (qwen35 single-CB rewrite) recovers ~30% of the gap.
