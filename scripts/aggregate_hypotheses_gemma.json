@@ -1,0 +1,82 @@
+{
+  "_doc": "ADR-015 §P3a'' (gemma analog of §P3a') hypothesis register. Canonical frames for the gemma-4-26B-A4B-it-ara-abliterated-dwq decode hot path. Static-evidence shortlist drawn from grep-against /opt/hf2q/src/serve/forward_mlx.rs (forward_decode entry @ line 1320). Live measurements land in ADR-015 §P3a'' after iter5's xctrace traces are aggregated. ONE canonical frame per hypothesis (no overlapping-inclusive sums per AF3); subcomponents reported side-by-side. Static estimates are PLACEHOLDERS to be falsified-or-confirmed by the live trace, not authoritative budgets.",
+  "hypotheses": [
+    {
+      "id": "G1",
+      "description": "ADR-015 §P3a'' candidate — fused head_norm + RoPE per-layer Q/K (decode hot path: 30 layers × 2 calls/layer = 60 calls/token).  Already alloc-free (KernelArg::Bytes for params).  Hypothesis: GPU compute throughput, not orchestration.  Live trace tells us inclusive ms.",
+      "canonical_frame_regex": "fused_head_norm_rope::dispatch_fused_head_norm_rope_f32",
+      "subcomponent_regexes": {
+        "kernel_dispatch": "encode_threadgroups_with_args_and_shared",
+        "pipeline_lookup": "registry::get_pipeline"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G2",
+      "description": "Hadamard quantize KV (TQ-KV encode path).  Per project_tq_state_2026_04_21 TQ is gated off via ADR-009 Track 3 dense_kvs fallback; the encode dispatches still fire and SDPA reads dense_kvs. Two extra dispatches per layer in the gemma single CB — gemma-only relative to qwen35.",
+      "canonical_frame_regex": "hadamard_quantize_kv::dispatch_hadamard_quantize_kv",
+      "subcomponent_regexes": {
+        "hadamard_quantize_kv_hb": "hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G3",
+      "description": "fused norm + residual add (post-attention + pre-FFN + post-FFN + final).  Fires multiple times per layer.  Already fused on disk per ADR-006; if this row dominates, the lever is encoder churn around it, not the kernel itself.",
+      "canonical_frame_regex": "fused_norm_add::dispatch_fused_norm_add_f32",
+      "subcomponent_regexes": {
+        "moe_routing": "fused_norm_add::dispatch_fused_moe_routing_f32",
+        "norm_add_scalar": "fused_norm_add::dispatch_fused_norm_add_scalar_f32"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G4",
+      "description": "Output head — argmax + softcap + final RMS norm + lm_head.  Single call per token.  If this is the dominant residual it means we have too much work in the head pipeline.",
+      "canonical_frame_regex": "argmax::dispatch_argmax_f32",
+      "subcomponent_regexes": {
+        "lm_head": "lm_head|output_head",
+        "rms_norm_final": "rms_norm::dispatch_rms_norm"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G5-Shared-AllocBuffer",
+      "description": "Shared lever with qwen35 (§P3a' rank-1).  MlxDevice::alloc_buffer Mach-IPC chain → IOGPUResourceCreate → mach_msg2_trap.  Decode-token allocations through forward_mlx.rs.  Hypothesis: gemma hits this less than dense qwen35-Q (gemma's fused kernels reuse buffers more aggressively per ADR-006 Phase 4e B8/B9/B10/B11), but we expect non-trivial ms.",
+      "canonical_frame_regex": "MlxDevice::alloc_buffer::",
+      "subcomponent_regexes": {
+        "IOGPUResourceCreate": "IOGPUResourceCreate",
+        "mach_msg2_trap": "mach_msg2_trap"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G6-CommandBuffer",
+      "description": "GraphSession / CommandBuffer creation churn.  Per the merged P1 audit gemma is already at 1-2 CBs/token (begin + finish).  This row should be ~0 if HF2Q_DUAL_BUFFER=0; under default split=3 we expect 2 begins.  If this row shows up large, that indicates the dual-buffer split is paying its cost in the live trace.",
+      "canonical_frame_regex": "GraphSession|exec\\.begin|s\\.finish",
+      "subcomponent_regexes": {
+        "command_encoder": "MlxDevice::command_encoder",
+        "command_buffer_init": "AGXG.*FamilyCommandBuffer"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G7-FormatString",
+      "description": "Regression detection — `with_context(|| format!(...))` String allocation.  §P3a' falsified this for qwen35 (lazy via closure on success path); kept here to confirm gemma also clean.",
+      "canonical_frame_regex": "anyhow::Context::with_context",
+      "subcomponent_regexes": {
+        "fmt_format": "core::fmt::format"
+      },
+      "static_estimate_us_per_token": null
+    },
+    {
+      "id": "G8-Barrier",
+      "description": "Memory barrier accounting.  iter2 added BARRIER_COUNT/BARRIER_NS atomics so per-barrier cost is measurable at counter resolution (not 1 ms TimeProfiler).  Run with MLX_PROFILE_BARRIERS=1 set if you want BARRIER_NS populated.",
+      "canonical_frame_regex": "issue_metal_buffer_barrier",
+      "subcomponent_regexes": {
+        "memory_barrier_wrapper": "CommandEncoder::memory_barrier"
+      },
+      "static_estimate_us_per_token": null
+    }
+  ]
+}
