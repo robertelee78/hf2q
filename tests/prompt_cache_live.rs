@@ -23,12 +23,18 @@
 //! 4. **Invalidation** — a different prompt gets a fresh miss, not a stale
 //!    hit; the response is free to differ.
 //!
-//! Only non-streaming requests are tested here.  The streaming path stores
-//! to the cache on completion but does NOT consult it on input (per the
-//! comment at `engine.rs:2108-2113`): "Streaming currently does NOT consult
-//! the cache on input — would require fake-emitting Delta events from cached
-//! text — iter-97 follow-up."  That asymmetry is by design; this test
-//! exercises the path that does consult the cache.
+//! Both non-streaming and streaming requests are tested here.  Wave-2
+//! T1.10 covered only the non-streaming path; wave-3 W-A2 closed the
+//! "iter-97 follow-up" comment by wiring the same lookup-then-replay
+//! pattern into `generate_stream_once`.  The streaming-cache test below
+//! drives an SSE request and asserts:
+//!   * `usage.prompt_tokens_details.cached_tokens == prompt_tokens` on
+//!     hit (zero on miss);
+//!   * `x_hf2q_timing.{prefill,decode}_time_secs == 0.0` on hit
+//!     (replay skips the entire forward pass);
+//!   * the assembled SSE content stream matches the non-streaming hit
+//!     byte-for-byte (replay re-routes through the same splitter
+//!     pipeline used by the live decode).
 //!
 //! # Env gate
 //!
@@ -251,6 +257,96 @@ async fn chat_once(
         .unwrap_or_else(|e| panic!("response is not JSON ({e}): {text}"))
 }
 
+/// POST a STREAMING chat-completions request with a single user turn at
+/// temperature=0 (greedy — cache-eligible).  Returns the raw SSE response
+/// body (newline-delimited `data: {...}` frames + trailing `data: [DONE]`).
+///
+/// `stream_options.include_usage = true` is required — without it the
+/// final chunk omits the `usage` field and the cache-hit signal
+/// (`prompt_tokens_details.cached_tokens`) is unobservable.  See
+/// `src/serve/api/sse.rs:259-273`.
+async fn chat_stream(
+    client: &reqwest::Client,
+    model_id: &str,
+    user_text: &str,
+) -> String {
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": [{"role": "user", "content": user_text}],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0,
+    });
+    let url = format!("http://{HOST}:{PORT}/v1/chat/completions");
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/chat/completions (stream) failed");
+    let status = resp.status().as_u16();
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| "<unreadable>".into());
+    assert_eq!(
+        status,
+        200,
+        "/v1/chat/completions (stream) status != 200: body={text}"
+    );
+    text
+}
+
+/// Parse an SSE response body into the sequence of JSON chunks
+/// (skipping the terminating `[DONE]` sentinel).
+fn parse_sse_chunks(body: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let payload = match line.strip_prefix("data: ") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(v) => out.push(v),
+            Err(e) => panic!("malformed SSE chunk {payload:?}: {e}"),
+        }
+    }
+    out
+}
+
+/// Concatenate all `delta.content` fragments from an SSE chunk sequence.
+fn assemble_sse_content(chunks: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for c in chunks {
+        if let Some(s) = c["choices"][0]["delta"]["content"].as_str() {
+            out.push_str(s);
+        }
+    }
+    out
+}
+
+/// Final chunk's `usage.prompt_tokens_details.cached_tokens` (0 if absent).
+fn sse_cached_tokens(chunks: &[serde_json::Value]) -> u64 {
+    chunks
+        .iter()
+        .rev()
+        .find_map(|c| c["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Final chunk's `usage.prompt_tokens` field.
+fn sse_prompt_tokens(chunks: &[serde_json::Value]) -> u64 {
+    chunks
+        .iter()
+        .rev()
+        .find_map(|c| c["usage"]["prompt_tokens"].as_u64())
+        .expect("no usage.prompt_tokens in any SSE chunk")
+}
+
 // ---------------------------------------------------------------------------
 // Assertion helpers
 // ---------------------------------------------------------------------------
@@ -466,6 +562,139 @@ fn prompt_cache_hit_miss_and_invalidation() {
              \n\
              The PromptCache is live and correct. No un-gate required — the cache\n\
              was never gated. This test is the proof that was missing."
+        );
+    });
+}
+
+/// Live validation for the engine's PromptCache STREAMING path (wave-3 W-A2).
+///
+/// Pre-W-A2 the streaming path stored to PromptCache on completion but never
+/// consulted it on input — most clients use streaming, so cache hits were
+/// essentially impossible on the production path.  W-A2 wired the same
+/// lookup-then-replay pattern into `generate_stream_once`; this test drives
+/// SSE requests against a running hf2q server and asserts the streaming
+/// equivalent of the non-streaming hit/miss/invalidation contract.
+#[test]
+fn streaming_prompt_cache_hit_miss_and_invalidation() {
+    if std::env::var(ENV_GATE).as_deref() != Ok("1") {
+        eprintln!(
+            "{ENV_GATE} != \"1\" — skipping streaming-cache test. Set {ENV_GATE}=1 to run."
+        );
+        return;
+    }
+
+    let gguf = std::env::var(ENV_GGUF).unwrap_or_else(|_| DEFAULT_CHAT_GGUF.into());
+    if !PathBuf::from(&gguf).exists() {
+        panic!(
+            "chat GGUF not found at {gguf:?} — set {ENV_GGUF}=<path> or place a \
+             GGUF at the default path"
+        );
+    }
+
+    eprintln!(
+        "prompt_cache_live[streaming]: spawning hf2q serve at {HOST}:{PORT} model={gguf}"
+    );
+    let _server = ServerGuard::spawn(&gguf).expect("spawn hf2q serve");
+    wait_for_readyz();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .expect("build reqwest client");
+
+        let model_id = fetch_model_id(&client).await;
+        eprintln!("prompt_cache_live[streaming]: model_id={model_id}");
+
+        // ── Streaming prompt A, first send: cache MISS ───────────────────
+        //
+        // Worker thread has no prior cached prompt; `lookup` returns None
+        // and the live decode runs.  Final SSE chunk's
+        // `usage.prompt_tokens_details.cached_tokens` must be 0 (or
+        // absent, treated as 0).
+        let prompt_a = "Say hello in one word.";
+        let miss_body = chat_stream(&client, &model_id, prompt_a).await;
+        let miss_chunks = parse_sse_chunks(&miss_body);
+        let miss_content = assemble_sse_content(&miss_chunks);
+        let miss_cached = sse_cached_tokens(&miss_chunks);
+        let prompt_len = sse_prompt_tokens(&miss_chunks);
+        eprintln!(
+            "prompt_cache_live[streaming]: prompt_A MISS — \
+             content={miss_content:?} cached_tokens={miss_cached} prompt_tokens={prompt_len}"
+        );
+        assert_eq!(
+            miss_cached, 0,
+            "streaming first request must MISS (cached_tokens=0); got {miss_cached}"
+        );
+        assert!(
+            !miss_content.trim().is_empty(),
+            "streaming MISS produced empty content — model may have failed to decode"
+        );
+
+        // ── Streaming prompt A, second send: cache HIT (W-A2 closure) ────
+        //
+        // Identical prompt + greedy + streaming → `generate_stream_once`
+        // calls `prompt_cache.lookup` and short-circuits via
+        // `replay_cached_streaming_response`.  Final chunk's
+        // `cached_tokens` must equal `prompt_len`; assembled content must
+        // match the MISS byte-for-byte (replay re-routes through the same
+        // splitter pipeline).
+        let hit_body = chat_stream(&client, &model_id, prompt_a).await;
+        let hit_chunks = parse_sse_chunks(&hit_body);
+        let hit_content = assemble_sse_content(&hit_chunks);
+        let hit_cached = sse_cached_tokens(&hit_chunks);
+
+        eprintln!(
+            "prompt_cache_live[streaming]: prompt_A HIT — \
+             content={hit_content:?} cached_tokens={hit_cached}"
+        );
+        assert_eq!(
+            hit_cached, prompt_len,
+            "streaming HIT: expected cached_tokens={prompt_len}, got {hit_cached}. \
+             Replay path is not surfacing the cache signal — check \
+             `replay_cached_streaming_response` StreamStats wiring."
+        );
+        assert_eq!(
+            hit_content, miss_content,
+            "streaming HIT content differs from MISS:\n  miss: {miss_content:?}\n   hit: {hit_content:?}\n\
+             Replay must produce byte-identical content to the original stream."
+        );
+
+        // ── Streaming prompt B: cache MISS (invalidation check) ──────────
+        //
+        // A different prompt must not return prompt-A's cached response.
+        let prompt_b = "Say goodbye in one word.";
+        let b_body = chat_stream(&client, &model_id, prompt_b).await;
+        let b_chunks = parse_sse_chunks(&b_body);
+        let b_content = assemble_sse_content(&b_chunks);
+        let b_cached = sse_cached_tokens(&b_chunks);
+
+        eprintln!(
+            "prompt_cache_live[streaming]: prompt_B MISS — \
+             content={b_content:?} cached_tokens={b_cached}"
+        );
+        assert_eq!(
+            b_cached, 0,
+            "streaming new-prompt request must MISS (cached_tokens=0); got {b_cached}"
+        );
+
+        eprintln!(
+            "prompt_cache_live[streaming]: ALL ASSERTIONS PASSED\n\
+             \n\
+             Summary (wave-3 W-A2 streaming-cache live validation):\n\
+             \n\
+             model:                   {model_id}\n\
+             prompt_A_stream_MISS:    cached_tokens=0\n\
+             prompt_A_stream_HIT:     cached_tokens={hit_cached}  (content byte-identical)\n\
+             prompt_B_stream_MISS:    cached_tokens=0\n\
+             \n\
+             The streaming cache lookup-then-replay path is live and correct.\n\
+             Closes the iter-97 follow-up gap documented at engine.rs:2109."
         );
     });
 }

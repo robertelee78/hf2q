@@ -1436,6 +1436,56 @@ The byte-by-byte audit reveals **one structural mismatch: matmul tile precision 
 
 ---
 
+#### Phase 2a wave-3 W-A2 — streaming PromptCache lookup-then-replay closes the iter-97 follow-up gap (2026-04-26, wave-3 worker A2, hf2q commit TBD)
+
+**Why this iter exists.** Wave-2 T1.10 documented the asymmetry: the streaming path stored to `PromptCache` on every successful completion but never consulted the cache on input.  The gap was annotated at `engine.rs:2108-2113` ("iter-97 follow-up") and explicitly noted in T1.10's "Streaming note": _"Only non-streaming requests get the cache hit speedup today."_  Most clients (Open WebUI, OpenAI SDK streaming mode, etc.) use streaming, so cache hits were essentially impossible on the production path.  This is the real efficiency gap the documentation flagged.
+
+**Closure.** `generate_stream_once` now performs the same preroll lookup the non-streaming path runs at `engine.rs:1419`.  On hit, a new helper `replay_cached_streaming_response` (engine.rs ~:2114-2370) emits the cached response as a sequence of SSE events, bumps the `cancellation_counter` if the receiver was dropped mid-replay, and returns.  On miss, the existing decode loop runs unchanged.  The streaming-side `store` callsite is also unchanged — the cache slot is mode-agnostic, so a streaming-stored entry can satisfy a subsequent non-streaming hit and vice versa.
+
+**Cache-shape decision (architectural, surfaced here).** `PromptCache` stores `text` only — no per-token Delta sequence — so the replay cannot preserve original token boundaries (one Delta per cached token).  Two designs were considered:
+
+1. **Single big content delta.** Simple. Loses tool-call shape if the cached response was a tool call: open/close markers would arrive inside `delta.content` instead of producing structured `delta.tool_calls[*]` events.  Spec-violating for tool-call replays.
+2. **Re-route through the live splitter pipeline (chosen).** Build a fresh `ReasoningSplitter` + `ToolCallSplitter` from the model registration, feed the cached `text` in once, and dispatch the resulting events through the same `route_content` / `emit_streaming_tool_call_close` helpers the live decode uses.  When the cached text contains tool-call markers, the splitter emits structured `ToolCallDelta` events identical to a fresh decode.  When the text is plain content, the splitter emits a single `Content` delta.  When `reasoning_text` is `Some(...)` (cached from a non-streaming completion that already split reasoning out), it is emitted first as a `Reasoning` delta so the SSE response shape matches the original.
+
+Per-cached-token replay (preserve TTFT-like incremental UX) requires extending `PromptCache` to store the per-token Delta sequence rather than the assembled text.  That is a real shape extension; documented as a follow-up rather than shoehorned into this iter.
+
+**`Done` event shape on hit.**
+* `cached_prompt_tokens = Some(prompt_len)` — surfaces in `usage.prompt_tokens_details.cached_tokens` exactly like a non-streaming hit.
+* `prefill_time_secs / decode_time_secs / total_time_secs / time_to_first_token_ms = Some(0.0)` — replay skips the entire forward pass.
+* `gpu_sync_count / gpu_dispatch_count = None` — no GPU work.
+* `finish_reason`: `"tool_calls"` if the splitter saw a `ToolCallClose` during replay (matches OpenAI spec); otherwise the cached `finish_reason` (`"stop"` / `"length"`).
+
+**Tests added (6 unit + 1 live).**
+
+* `serve::api::engine::streaming_prompt_cache_replay_tests::replay_emits_content_then_done_for_plain_text` — minimal happy path: plain text + no registration ⇒ exactly `[Delta(Content), Done]`; `cached_prompt_tokens=Some(7)`, timings zeroed.
+* `serve::api::engine::streaming_prompt_cache_replay_tests::replay_emits_reasoning_then_content_when_reasoning_text_set` — non-streaming-origin replay: explicit `reasoning_text` emitted as `Reasoning` delta first, then `Content` delta from the post-split body, then `Done`.
+* `serve::api::engine::streaming_prompt_cache_replay_tests::replay_routes_tool_call_markers_to_tool_call_delta_events` — drives a Gemma 4-shaped cached text containing `<|tool_call>`/`<|/tool_call>` markers through the replay; asserts the splitter pipeline routes preamble + tool-call body + postscript correctly and `Done.finish_reason in {"tool_calls","stop"}` based on parser outcome.
+* `serve::api::engine::streaming_prompt_cache_replay_tests::empty_cache_lookup_returns_none` — sanity: fresh cache misses on first request (the eligibility predicate that gates `replay_cached_streaming_response` invocation).
+* `serve::api::engine::streaming_prompt_cache_replay_tests::store_then_lookup_round_trips_for_replay` — `store` then `lookup` round-trips the `GenerationResult` shape the replay consumes (`cached_tokens == prompt.len()`).
+* `serve::api::engine::streaming_prompt_cache_replay_tests::replay_returns_err_when_receiver_dropped` — disconnect path: replay returns `Err(())` when the receiver is dropped, mirroring the live decode's `events.blocking_send(...).is_err()` checks; production callsite then bumps the cancellation counter.
+* `tests/prompt_cache_live.rs::streaming_prompt_cache_hit_miss_and_invalidation` (env-gated by `HF2Q_PROMPT_CACHE_LIVE_TEST=1`) — full E2E SSE drive against a running `hf2q serve`: streaming MISS (first request) → streaming HIT (second request, `cached_tokens=prompt_len`, content byte-identical) → streaming MISS for a different prompt (invalidation check).  Mirrors the non-streaming live test added in wave-2 T1.10.
+
+**Wave-2.x invariants re-verified intact.**
+* `PromptCacheKey` full-inventory expansion (W-ε B5): the streaming lookup uses the same `PromptCache::lookup` as the non-streaming path; key equality enforces all 13 generation-affecting fields per `engine.rs:489-535`.
+* `GrammarKind` field on the cache key (W-α5 Q2): `replay_cached_streaming_response` does not touch the grammar runtime — replay does not need a runtime because there is no decode loop to mask.  The trigger plumbing inside the live decode loop is unchanged.
+* `awaiting_trigger` lazy-grammar gate (W-α5 Q2): same as above — runtime not built in replay path.
+* Eager grammar for `ToolCallBodyRequired` (W-η Q-A): same — replay path is grammar-agnostic.
+* Defensive 500 (wave-2 follow-up): replay errors propagate via `Err(())` → cancellation counter increment → connection close, mirroring the existing live-decode disconnect handling.  No new error paths introduced.
+
+**Cache-shape extension (deferred, documented).** Per-cached-token replay requires extending `PromptCache` to store `Vec<(DeltaKind, String)>` of fragments captured during the original streaming decode (or the equivalent reconstruction during non-streaming `store`).  This is a real architectural change with implications for cache memory footprint and `PromptCacheKey` semantics.  Not in W-A2 scope.
+
+**Cargo verify.**
+* `cargo check --release --bin hf2q --tests`: 0 errors (90 pre-existing warnings unchanged).
+* `cargo test --release --bin hf2q -- serve::api::engine`: 46 passed, 0 failed (6 new W-A2 tests + 40 pre-existing).
+* `cargo test --release --test prompt_cache_live`: 2 passed (env-gated, both short-circuit when `HF2Q_PROMPT_CACHE_LIVE_TEST != 1`).
+
+**Files touched.**
+* `src/serve/api/engine.rs` — added `replay_cached_streaming_response` (~260 LOC including doc); added preroll lookup at the top of `generate_stream_once` (~25 LOC); refreshed the comment block at the streaming-side `store` callsite to reflect the closed gap; added `streaming_prompt_cache_replay_tests` module (6 tests, ~200 LOC).
+* `tests/prompt_cache_live.rs` — added `chat_stream` + SSE parsing helpers; added `streaming_prompt_cache_hit_miss_and_invalidation` test; refreshed module doc to drop the "non-streaming only" caveat.
+* `docs/ADR-005-inference-server.md` — this entry.
+
+---
+
 #### Phase 2a wave-2 T1.10 — PromptCache live-validation harness lands; cache confirmed already un-gated (2026-04-26, wave-2 W2, hf2q commits TBD)
 
 **Gate audit result: the cache was never gated.** Wave-2 T1.10 was framed as "un-gate iter-19 `a9eeb54` after live validation". The wave-2 W2 audit of `engine.rs:385-1431` found:

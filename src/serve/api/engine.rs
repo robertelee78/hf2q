@@ -2410,6 +2410,52 @@ fn generate_stream_once(
     let prompt_len = prompt_tokens.len();
     let max_tokens = params.max_tokens.max(1);
 
+    // ── Prompt cache fast-path (Wave 3 W-A2) ──────────────────────────────
+    //
+    // Mirrors the non-streaming preroll lookup at engine.rs:1419 (iter-96
+    // / wave-2.5 B5).  Pre-W-A2 the streaming path stored to PromptCache on
+    // every successful completion (`store` call below the decode loop) but
+    // never consulted it on input — most clients use streaming, so cache
+    // hits were essentially impossible on the production path.  W-A2
+    // closes the documented gap (former engine.rs:2109 "iter-97 follow-up"
+    // comment).
+    //
+    // Eligibility: `PromptCache::lookup` self-gates on temperature/top_k/
+    // top_p/repetition_penalty/seed (sampling-mode bypass), prompt-token
+    // equality, AND PromptCacheKey full-inventory equality (wave-2.5 B5
+    // expansion: max_tokens, stop_strings, logit_bias, grammar,
+    // grammar_kind, frequency/presence/min_p penalties, tool_call_policy,
+    // logprobs/top_logprobs, parallel_tool_calls).  See PromptCacheKey
+    // doc at engine.rs:489-535 for the full inventory.
+    //
+    // On hit, `replay_cached_streaming_response` re-routes the cached
+    // text through the same Reasoning + ToolCall splitter pipeline the
+    // live decode uses, so the SSE shape (Content / Reasoning /
+    // ToolCallDelta) matches what the original request produced.  See
+    // that helper's doc for the cache-shape decision (text-only ⇒ single
+    // splitter pass, NOT per-token replay; per-token replay would require
+    // extending PromptCache to store the Delta sequence).
+    if let Some(cached) = loaded.prompt_cache.lookup(prompt_tokens, params) {
+        tracing::debug!(
+            "prompt_cache: STREAMING HIT — {} tokens served from cache, prefill+decode skipped",
+            cached.prompt_tokens
+        );
+        if replay_cached_streaming_response(
+            &cached,
+            registration,
+            params.tool_call_policy,
+            events,
+        )
+        .is_err()
+        {
+            tracing::info!("SSE stream dropped by client during cache replay; aborting");
+            if let Some(c) = cancellation_counter {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+
     // Reasoning splitter — classifies each decoded fragment into the
     // content / reasoning_content slot. `None` when the model has no
     // registered reasoning markers; all fragments then route to `Content`.
@@ -3031,12 +3077,25 @@ fn generate_stream_once(
         stats,
     });
 
-    // Iter-96 prompt cache update on streaming completion.  Streaming
-    // currently does NOT consult the cache on input (would require
-    // fake-emitting Delta events from cached text — iter-97 follow-up).
-    // But updating the cache on EVERY successful generation, regardless
-    // of streaming mode, means that a streaming request followed by a
-    // non-streaming request with the same prompt will hit the cache.
+    // Iter-96 prompt cache update on streaming completion.
+    //
+    // Wave 3 W-A2: the streaming path now ALSO consults the cache on
+    // input via `replay_cached_streaming_response` (see lookup at the
+    // top of this function).  The store here is unchanged; updating on
+    // every successful completion lets BOTH a subsequent streaming AND a
+    // subsequent non-streaming request with the same prompt+params hit
+    // the cache (the cache slot is mode-agnostic; only the lookup +
+    // replay path differs).
+    //
+    // Cache-shape note: `text` is set to the full pre-split
+    // `accumulated_text` (markers and all).  The replay helper re-routes
+    // through fresh ReasoningSplitter + ToolCallSplitter to re-emit the
+    // proper SSE shape, so embedded markers re-classify correctly.
+    // `reasoning_text: None` because the live splitter already routed
+    // reasoning fragments into Reasoning deltas during decode — there is
+    // no separately-tracked reasoning string to replay (the assembled
+    // text alone, fed back through a fresh splitter, reproduces the
+    // same event sequence on hit).
     let cache_result = GenerationResult {
         text: accumulated_text.clone(),
         reasoning_text: None, // splitter already routed reasoning into Delta events
@@ -4172,6 +4231,283 @@ assistant:
             "identical full-inventory params must hit cache"
         );
         assert_eq!(hit.unwrap().text, "full-inventory-hit");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3 W-A2 — streaming PromptCache replay tests
+//
+// Drive `replay_cached_streaming_response` directly through a real
+// `mpsc::channel`, drain the receiver, and assert SSE event shape.
+// Single-shot per test — no full engine, no live model load.  Mirrors the
+// same direct-helper pattern wave-2.8 finalize_streaming_tool_state_tests
+// used (no sham reconstruction of the production codepath).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod streaming_prompt_cache_replay_tests {
+    use super::*;
+    use super::super::sse::{DeltaKind, GenerationEvent};
+
+    /// Build a `GenerationResult` that looks like a non-streaming-origin
+    /// cache entry (post-reasoning-split text + explicit reasoning_text).
+    fn cached_non_streaming(text: &str, reasoning: Option<&str>) -> GenerationResult {
+        GenerationResult {
+            text: text.to_string(),
+            reasoning_text: reasoning.map(|s| s.to_string()),
+            prompt_tokens: 7,
+            completion_tokens: 5,
+            reasoning_tokens: reasoning.map(|_| 3),
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 7,
+        }
+    }
+
+    /// Drain all events the helper produces synchronously.  Helper writes
+    /// to a tokio mpsc via `blocking_send`, which works against a tokio
+    /// receiver from a non-async context if the channel has capacity (we
+    /// use 32, well over what any single replay needs).
+    fn drain(rx: &mut mpsc::Receiver<GenerationEvent>) -> Vec<GenerationEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn replay_emits_content_then_done_for_plain_text() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let cached = cached_non_streaming("Hello, world!", None);
+
+        let res = replay_cached_streaming_response(
+            &cached,
+            None, // no registration ⇒ everything routes as Content
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed when no client disconnect");
+
+        // Drop the sender so try_recv finds events without blocking.
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Expected: 1 Delta(Content) + 1 Done.
+        assert_eq!(events.len(), 2, "got events: {events:?}");
+        match &events[0] {
+            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                assert_eq!(text, "Hello, world!");
+            }
+            other => panic!("expected Delta(Content); got {other:?}"),
+        }
+        match &events[1] {
+            GenerationEvent::Done {
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+                stats,
+            } => {
+                assert_eq!(*finish_reason, "stop");
+                assert_eq!(*prompt_tokens, 7);
+                assert_eq!(*completion_tokens, 5);
+                // Cache-hit signal: cached_prompt_tokens populated, timings zeroed.
+                assert_eq!(stats.cached_prompt_tokens, Some(7));
+                assert_eq!(stats.prefill_time_secs, Some(0.0));
+                assert_eq!(stats.decode_time_secs, Some(0.0));
+            }
+            other => panic!("expected Done; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_emits_reasoning_then_content_when_reasoning_text_set() {
+        let (tx, mut rx) = mpsc::channel(32);
+        // Non-streaming-origin entry: reasoning was split out into its own
+        // field; the assembled `text` is post-split content only.
+        let cached = cached_non_streaming("the answer", Some("let me think..."));
+
+        let res = replay_cached_streaming_response(
+            &cached,
+            None,
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok());
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Expected: Reasoning, Content, Done.
+        assert_eq!(events.len(), 3, "got events: {events:?}");
+        match &events[0] {
+            GenerationEvent::Delta { kind: DeltaKind::Reasoning, text } => {
+                assert_eq!(text, "let me think...");
+            }
+            other => panic!("expected Delta(Reasoning); got {other:?}"),
+        }
+        match &events[1] {
+            GenerationEvent::Delta { kind: DeltaKind::Content, text } => {
+                assert_eq!(text, "the answer");
+            }
+            other => panic!("expected Delta(Content); got {other:?}"),
+        }
+        assert!(matches!(events[2], GenerationEvent::Done { .. }));
+    }
+
+    /// Replay a cache entry whose `text` contains tool-call markers
+    /// (mirrors a streaming-origin cache entry where `accumulated_text`
+    /// captures the raw pre-split stream).  The replay must re-route
+    /// through the live-decode tool-call splitter so the SSE shape is
+    /// `ToolCallDelta` events, not raw content text.
+    #[test]
+    fn replay_routes_tool_call_markers_to_tool_call_delta_events() {
+        let (tx, mut rx) = mpsc::channel(32);
+
+        // Use the gemma4 registration so we have real tool open/close
+        // markers + a body-parser registered.
+        let reg = match super::super::registry::find_for("gemma4-27b-it") {
+            Some(r) => r,
+            None => {
+                eprintln!("gemma4 registration absent; skipping tool-call replay test");
+                return;
+            }
+        };
+        let (open, close) = match (reg.tool_open, reg.tool_close) {
+            (Some(o), Some(c)) => (o, c),
+            _ => {
+                eprintln!("gemma4 has no tool markers; skipping tool-call replay test");
+                return;
+            }
+        };
+
+        // Construct a cached `text` shaped like Gemma 4's tool-call output:
+        //     "preamble<open>{"name":"foo","arguments":{}}<close>postscript"
+        // The body uses the per-model parser-friendly shape; since we don't
+        // know gemma4's exact body grammar offline, the assertion focuses
+        // on event-class-shape (Content + ToolCallDelta + Content) — NOT
+        // on whether parse succeeds.  Both Some(parsed) → ToolCallDelta×2
+        // and None (under Auto) → Content fallback are valid replay
+        // shapes per `emit_streaming_tool_call_close`'s policy matrix.
+        let cached_text = format!(
+            "preamble {open}{{\"name\":\"foo\",\"arguments\":{{}}}}{close} postscript"
+        );
+        let cached = GenerationResult {
+            text: cached_text,
+            reasoning_text: None,
+            prompt_tokens: 4,
+            completion_tokens: 9,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 4,
+        };
+
+        let res = replay_cached_streaming_response(
+            &cached,
+            Some(&reg),
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(res.is_ok(), "replay must succeed");
+        drop(tx);
+        let events = drain(&mut rx);
+
+        // Must contain at least one Delta (preamble) and a terminal Done.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GenerationEvent::Delta { kind: DeltaKind::Content, text } if text.contains("preamble")
+            )),
+            "preamble must be emitted as Content delta; got {events:?}"
+        );
+        let done_idx = events.iter().position(|e| matches!(e, GenerationEvent::Done { .. }))
+            .expect("Done event missing");
+        assert_eq!(done_idx, events.len() - 1, "Done must be last event");
+
+        // Extract the Done and assert cached_tokens surfaces.
+        if let GenerationEvent::Done { stats, finish_reason, .. } = &events[done_idx] {
+            assert_eq!(stats.cached_prompt_tokens, Some(4));
+            // finish_reason: if the splitter drove ToolCallOpen+Close to
+            // completion AND parser succeeded, we expect "tool_calls"; if
+            // parser failed under Auto the body re-emits as content and
+            // saw_tool_call stays false (cached.finish_reason="stop"
+            // wins).  Both are valid here — the test asserts the BRANCH
+            // wires correctly, not the per-model parser outcome.
+            assert!(
+                *finish_reason == "tool_calls" || *finish_reason == "stop",
+                "finish_reason should be tool_calls or stop; got {finish_reason:?}"
+            );
+        }
+    }
+
+    /// Sanity: the streaming preroll lookup is gated on the same
+    /// eligibility predicate as the non-streaming preroll.  An empty cache
+    /// with a default-greedy request returns None — the lookup short-
+    /// circuits and the live decode runs.  This is the miss path probe.
+    #[test]
+    fn empty_cache_lookup_returns_none() {
+        let cache = PromptCache::new();
+        let params = SamplingParams::default();
+        let prompt = vec![1u32, 2, 3];
+        assert!(
+            cache.lookup(&prompt, &params).is_none(),
+            "fresh cache must miss on first request"
+        );
+    }
+
+    /// After `store`, the SAME prompt + params hits and produces a
+    /// `GenerationResult` with `cached_tokens == prompt.len()`.  This is
+    /// the same contract the non-streaming preroll relies on — the
+    /// streaming replay just consumes that result.
+    #[test]
+    fn store_then_lookup_round_trips_for_replay() {
+        let prompt = vec![10u32, 20, 30, 40];
+        let params = SamplingParams::default();
+        let result = GenerationResult {
+            text: "cached body".into(),
+            reasoning_text: None,
+            prompt_tokens: prompt.len(),
+            completion_tokens: 11,
+            reasoning_tokens: None,
+            finish_reason: "stop",
+            prefill_duration: Duration::ZERO,
+            decode_duration: Duration::ZERO,
+            cached_tokens: 0,
+        };
+        let mut cache = PromptCache::new();
+        cache.store(&prompt, &params, &result);
+
+        let hit = cache
+            .lookup(&prompt, &params)
+            .expect("must hit after store");
+        assert_eq!(hit.text, "cached body");
+        assert_eq!(hit.cached_tokens, prompt.len());
+        assert_eq!(hit.completion_tokens, 11);
+        assert_eq!(hit.finish_reason, "stop");
+    }
+
+    /// Replay returns Err(()) when the receiver is dropped mid-replay —
+    /// the production callsite then bumps the cancellation counter.  This
+    /// exercises the disconnect path which mirrors the live decode's
+    /// `events.blocking_send(...).is_err()` checks.
+    #[test]
+    fn replay_returns_err_when_receiver_dropped() {
+        let (tx, rx) = mpsc::channel(1); // tiny buffer
+        // Drop receiver so all sends fail.
+        drop(rx);
+
+        let cached = cached_non_streaming("anything", None);
+        let res = replay_cached_streaming_response(
+            &cached,
+            None,
+            ToolCallPolicy::Auto,
+            &tx,
+        );
+        assert!(
+            res.is_err(),
+            "replay must return Err when receiver was dropped"
+        );
     }
 }
 
